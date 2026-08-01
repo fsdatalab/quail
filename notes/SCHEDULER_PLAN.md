@@ -2,209 +2,225 @@
 
 This document proposes the next phase of the project: building a
 scheduler for the model serving engine that understands the query it is
-running. It is written to be read without any prior context. It first
-defines every term it uses, then states what our measurements showed,
-then lays out the work in five steps, each with a cost, a deliverable,
-and a decision gate.
+running. It is written to be read without prior context. It defines
+every term it uses, states what our measurements showed, then lays out
+the work in five steps, each with a cost, a deliverable, and a decision
+gate.
+
+Scope decisions reflected in this revision: we build on vLLM only and do
+not evaluate other engines; we do not pursue keeping documents in memory
+between queries, because at realistic corpus sizes that is impossible
+and every query must start from scratch; and the experiments move from
+2,000 documents to 10,000, which is deliberately more than the card can
+hold at once.
 
 ## The terms this document uses
 
 - A language model reads and writes text in units called tokens. A token
-  is roughly a short word. Our test documents are about 300 tokens each.
+  is roughly a short word. Our test documents are about 330 tokens each.
 - Reading and writing are different kinds of work. Reading (the technical
-  term is prefill) means the model processes a prompt's tokens to
-  understand them. Writing (the technical term is decode) means the model
-  produces answer tokens one at a time. In our workload each request
-  writes exactly one token, YES or NO, so almost all the work is reading.
+  term is prefill) means the model processes a prompt's tokens. Writing
+  (decode) means it produces answer tokens one at a time. Each of our
+  requests writes exactly one token, YES or NO, so almost all the work
+  is reading.
 - When the model reads text, it builds internal notes about that text,
-  called the KV cache. Think of it as the model's working memory. If
-  those notes are kept on the graphics card, the model can answer a new
-  question about the same text without re-reading it. The notes are
-  large, about 72 kilobytes per token for our small model, so keeping
-  them is a real storage decision, not a free trick.
+  called the KV cache. Think of it as working memory. While a document's
+  notes are on the card, the model can answer another question about
+  that document without re-reading it. The notes are large, about 72
+  kilobytes per token for our small model, so what to keep and what to
+  discard is a real decision.
 - The serving engine is the open source software that runs the model on
-  the graphics card. We use one called vLLM. You hand it requests, each
-  being a prompt, and it returns completions. Inside, it packs many
-  requests together to keep the card busy.
+  the graphics card. We use vLLM. You hand it requests and it returns
+  completions, packing many requests together to keep the card busy.
 - The scheduler is the part of the engine that decides, at every moment,
-  which requests to work on next and which working memory to keep or
-  discard. Today's scheduler is general purpose. It serves requests in
-  arrival order and keeps whatever memory was used most recently. It
-  knows nothing about our queries.
-- Cold and warm describe the state of that working memory when a query
-  starts. Cold means the memory holds nothing useful, so the first thing
-  the query must do is read every document from scratch. We call that
-  first pass the cold first wave, and it is the single most expensive
-  part of a query. Warm means an earlier query over the same documents
-  already left their notes in memory, so reading is skipped entirely.
+  which requests to work on next and which notes to keep or discard.
+  Today's scheduler is general purpose. It serves requests in arrival
+  order and keeps whichever notes were used most recently. It knows
+  nothing about our queries.
+- Cold means the working memory holds nothing useful when a query
+  starts, so the query must read every document from scratch. We call
+  that first read-everything pass the cold first wave. At realistic
+  corpus sizes every query is cold, so cold is the only regime this plan
+  optimizes. (Our earlier measurements included warm runs, where a
+  previous run had left notes in memory. They remain useful as a
+  diagnostic, because they isolate the engine's per request overhead,
+  but warmness is not something we can rely on at scale.)
 - Our queries are chains of filters. Each filter asks a yes or no
   question about each document, and a document that fails one filter
   skips the rest. The pass rate of a filter is the fraction of documents
-  that pass it. The scheduling question is when to ask each filter: wait
-  for each answer before asking the next question (the pipeline), ask
-  several questions ahead without waiting (speculation, where questions
-  asked about a document that then fails are wasted), or re-read the
-  surviving documents for every filter (the naive way most people use
-  these engines today).
+  that pass it. The scheduling choices are when to ask each filter's
+  question (wait for each answer, or ask ahead and accept waste when a
+  document fails) and in what order to move documents through the
+  filters.
 - The ideal calculator is our cost formula from the paper. It prices
-  only the unavoidable arithmetic, at the card's maximum speed. No real
-  system can reach it. Its value is as a fixed floor, so we can say how
-  far from perfect any real run is.
+  only the unavoidable arithmetic at the card's maximum speed. No real
+  system reaches it. Its value is as a fixed floor for measuring how far
+  from perfect any real run is.
 
-## What the measurements showed
+## What the measurements showed, and what changes at 10,000 documents
 
-We rented one H100 graphics card by the hour and ran a controlled grid
-of 33 query runs over 2,000 movie reviews, with the correct answers
-planted inside the documents so we control the pass rates exactly. Five
-findings matter for this plan.
+We rented one H100 card by the hour and ran 33 controlled query runs
+over 2,000 movie reviews with the correct answers planted inside the
+documents, so pass rates are under our control. The findings that drive
+this plan:
 
 1. Reading each document once and asking the filters on top of the kept
-   notes beats re-reading documents for every filter, in every
-   configuration, by 1.2 to 2.6 times. The advantage grows with more
-   filters and higher pass rates.
-2. The choice between waiting and asking ahead follows the pass rate the
-   way our theory says it should. Waiting wins when filters reject most
-   documents. Asking ahead wins when most documents survive.
-3. Every run lands 3.3 to 4.1 times slower than the ideal calculator,
-   and one number explains almost all of it. The engine reads about
-   58,000 to 78,000 tokens per second on our short documents, against a
-   theoretical card maximum of about 275,000. That gap lives in the math
-   kernels, not in scheduling, and no scheduler will close it.
-4. The warm runs are the striking ones. When a query runs over documents
-   whose notes are already in memory, the pipeline finishes in 3.3
-   seconds instead of 10.2 at two filters, and 4.7 instead of 12.4 at
-   four. Warm queries get within 1.2 to 1.5 times of the ideal floor. A
-   document store answers many queries over the same corpus, so this is
-   the regime that matters commercially, and today it happens only by
-   accident.
-5. Even when there is nothing left to read, the engine spends about 1.0
-   to 1.4 milliseconds of wall clock per request on software overhead,
-   things like converting text to tokens, bookkeeping, and picking the
-   next answer token. At four filters and a high pass rate, the filter
-   stages after the first read involve about 4,400 requests, which is 5
-   to 6 seconds of overhead wrapped around roughly 0.3 seconds of
-   actual model work.
+   notes beat re-reading documents for every filter in every
+   configuration, by 1.2 to 2.6 times.
+2. The choice between waiting and asking ahead followed the pass rate
+   the way our theory predicts.
+3. Every run landed 3.3 to 4.1 times above the ideal calculator. The
+   engine read 58,000 to 78,000 tokens per second against a theoretical
+   card maximum of about 275,000.
+4. Even with nothing to read, the engine spent 1.0 to 1.4 milliseconds
+   of wall clock per request on software overhead. At four filters that
+   is 5 to 6 seconds wrapped around roughly 0.3 seconds of model work.
 
-Two more facts set up the plan. First, today's engine threw away the
-entire corpus memory in one of our runs because its keep-the-most-recent
-rule had no idea the corpus would be needed again seconds later. Second,
-our harness currently moves documents through filters in rounds: send a
-batch of questions, wait for every answer, send the next batch. The
-fastest document always waits for the slowest, and that waiting is our
-code's fault, not the engine's.
+The 2,000 document setting had one property that made life artificially
+easy: all 2,000 documents' notes fit on the card at once, about 45 of
+the roughly 60 gigabytes available for notes. Nothing ever had to be
+evicted, so almost any execution order got the full benefit of keeping
+notes.
 
-## What a better scheduler can and cannot win
+At 10,000 documents that is no longer true. The notes for the whole
+corpus would need about 230 gigabytes, and the card holds about a
+quarter of that, roughly 2,700 documents' worth at a time. Now execution
+order decides everything. If we naively send all 10,000 first-stage
+questions, then all the second-stage questions, the notes of the early
+documents are long gone by the time their second question arrives, and
+the engine silently re-reads them. The measured advantage of keeping
+notes should collapse toward the re-read-everything cost. The fix is to
+move documents through the query in blocks sized to the card: admit
+about 2,500 documents, run them through all the filters while their
+notes are hot, discard, admit the next block. Our analytical schedule
+builders already produce exactly these blocked schedules; at 2,000
+documents they made no measurable difference because nothing needed
+blocking, and at 10,000 they should be the difference between keeping
+the 2.6 times advantage and losing it. That claim is testable and is
+the centerpiece experiment of this plan.
 
-It cannot speed up the cold first wave. Reading two thousand documents
-for the first time runs at whatever speed the math kernels deliver.
+## Where we can win, corrected
 
-It can win almost everything after that: the 5 to 6 seconds of software
-overhead in later filter stages, the waiting caused by our
-batch-and-wait rounds, the wasted work from asking ahead when waiting
-would have been fine, and, largest of all, the difference between cold
-and warm across repeated queries, worth about 3 times, by keeping the
-corpus notes in memory on purpose instead of by luck.
+An earlier version of this plan claimed the cold first wave cannot be
+sped up. That was too strong. The honest split has three parts.
+
+- Truly fixed: the arithmetic efficiency of the math kernels on this
+  model at these document lengths. Whatever tokens per second the
+  kernels can deliver on a well fed card is a floor a scheduler cannot
+  move. We do not yet know that number; today we only know the ceiling
+  (275,000) and today's achieved rate (58,000 to 78,000).
+- Recoverable during the first read: everything between today's rate
+  and the kernel floor. Candidates include how many tokens the engine
+  packs into each internal step, how many requests it keeps in flight,
+  per step bookkeeping, and the cost of converting text to tokens,
+  which we currently pay repeatedly for the same document. Measuring how
+  much of the 3.7 times gap this explains is step one.
+- Recoverable after the first read: the per request software overhead
+  (measured directly by the warm diagnostic runs), the waiting caused by
+  our batch-and-wait rounds, wasted ask-ahead work, and, at 10,000
+  documents, the re-reading caused by naive execution order.
 
 ## The plan, in five steps
 
-### Step 1. Find out exactly where the 1.4 milliseconds goes
+### Step 1. Measure the engine's true speed limit and the overhead split
 
-Before building anything, we change our own test harness in two ways
-that require no engine changes, and measure what each is worth. First,
-hand the engine pre-converted token numbers instead of raw text, because
-today the engine re-converts the same document text at every filter
-stage. Second, replace the batch-and-wait rounds with streaming, where
-each document advances to its next filter the instant its own answer
-arrives. The engine already offers a streaming interface.
+Two micro-measurements, no engine changes, on the existing harness.
 
-The deliverable is a table splitting the per request overhead into our
-share and the engine's share. The decision gate: whatever overhead
-survives both fixes is the honest size of the prize for a custom
-scheduler. If the floor collapses to a fraction of a millisecond, the
-scheduler case rests mostly on memory control (step 4) and we can skip
-parts of step 3. About two days of work and under ten dollars of GPU
-time.
+First, the reading speed limit. Feed the engine one giant reading-only
+job with pre-converted token numbers and sweep its batching settings
+(tokens per internal step, concurrent requests). The best rate we
+observe is the empirical kernel floor for this model on this card. This
+tells us exactly how much of the 3.7 times gap is recoverable at all,
+and how much of it the engine's default settings were leaving on the
+table.
 
-### Step 2. Run the same grid on the competing engine
+Second, the overhead split. Re-run a small grid with two client fixes:
+hand the engine pre-converted token numbers instead of raw text, and
+stream answers so each document advances the moment its own answer
+arrives instead of waiting for the whole round. Whatever per request
+overhead survives is genuinely internal to the engine and is the prize
+for step 4.
 
-There is a second open source engine, SGLang, whose working memory is
-organized as a tree of shared prefixes. Our workload is exactly tree
-shaped, one document trunk with several question branches, so some of
-what we plan to build may come for free there. We run the identical grid
-and compare. The decision gate: build on vLLM or on SGLang, whichever
-starts closer to where we want to end. About two days and under ten
-dollars.
+About two to three days of work and under ten dollars of GPU time.
 
-### Step 3. Prototype a scheduler that knows the query plan
+### Step 2. The 10,000 document experiment: show that order decides
+
+Scale the grid to 10,000 documents, all cold. Run each configuration two
+ways: the naive order (every document through stage one, then every
+survivor through stage two, and so on) and the blocked order produced by
+our analytical schedule builders, driven through the engine batch by
+batch exactly as we already do in manifest mode. Record the engine's own
+counters for how many tokens were re-read.
+
+Expected result, stated as a falsifiable prediction: naive
+document-first execution loses most of its advantage over
+re-read-everything, and the blocked schedule keeps it. If the prediction
+holds, this is the core demonstration that query-aware scheduling is
+necessary at scale, not just helpful. If it fails, the engine's memory
+management is better than we think and the plan shrinks. Runtime per
+full pass over the corpus is about 45 seconds of pure reading, so a
+twenty-run grid fits in roughly two GPU hours, under ten dollars.
+
+### Step 3. Build the blocked, streaming scheduler as a client library
+
+Combine what steps 1 and 2 validated into a small library that anyone
+can use in front of an unmodified engine: it takes the filters, their
+pass rates, and a document list; sizes blocks to the card's memory;
+admits a block, streams each document through all its filters while its
+notes are hot, frees failed documents' slots by letting them finish,
+admits the next block as capacity frees; and asks ahead only when the
+card would otherwise sit idle, with the pass rates setting the dial.
+This is the practical near-term deliverable, useful on day one without
+touching the engine. Success criteria: at 10,000 documents, beat naive
+execution in every cell, and land within the step 1 kernel floor's
+implied budget rather than today's 3.7 times. Roughly one to two weeks.
+
+### Step 4. Move the scheduler inside the engine
 
 vLLM allows a replacement scheduler to be plugged in as a class, without
-maintaining a private fork of the whole project. We build one that is
-told the query plan: the filters, their order, and their pass rates.
+maintaining a fork. Inside the engine we can do what the client library
+cannot: advance a document to its next filter in the same internal step
+its answer token is produced; pin the current block's live documents so
+the recency rule cannot evict what the plan knows is needed; free a
+document's notes the instant it fails a filter, so the next block
+starts sooner; and prototype running each document as one ongoing
+conversation that appends the next question after each answer, so later
+filters stop paying the per request cost entirely. That last change
+fights the engine's one-request-one-answer design the most, so it stays
+on a branch until proven. Two to four weeks depending on how much of
+this survives contact with the engine's internals.
 
-It does two things differently. It advances each document the moment
-that document's answer token is produced, so nothing waits for
-stragglers. And it treats asking ahead as a dial rather than a policy:
-it asks the next question early only when the card would otherwise sit
-idle, using the known pass rates to decide how much asking ahead is
-worth the waste. Success criteria: recover at least half of the
-later-stage overhead measured in step 1, and make the informed scheduler
-match or beat both fixed policies in every cell of the grid. Roughly two
-to three weeks of engineering.
+### Step 5. Put the optimizer's numbers in charge
 
-### Step 4. Control the working memory deliberately
-
-This is the deeper change, touching how the engine keeps and discards
-notes. Three behaviors, in order of increasing difficulty. Keep the
-notes of documents that are still alive in the query, because they will
-be needed at the next filter. Discard the notes of a document the moment
-it fails a filter, because they are dead weight. Protect the corpus
-notes across queries, so the second query over the same corpus starts
-warm by design, which our measurements price at about 3 times.
-
-A fourth behavior is worth prototyping here: run each document as one
-ongoing conversation instead of a fresh request per filter, appending
-the next question to the same conversation after reading the answer.
-Later filters then stop paying the per request cost at all. This fights
-the engine's one-request-one-answer design more than anything else in
-this plan, so it stays on a branch until proven. Roughly three to four
-weeks.
-
-### Step 5. Put the optimizer in charge when memory is scarce
-
-Everything above runs in a regime where all the documents' notes fit in
-the card's memory at once. With a bigger model or more documents they do
-not fit, and then real decisions appear: how many documents to admit at
-a time, and which notes to keep versus re-read later. Our paper's
-optimizer computes the best rates for exactly these decisions, and this
-scheduler is the first place those computed rates can be enforced on
-real hardware. The experiment: the 32 billion parameter model, or ten
-times the documents, where the naive engine degrades and the informed
-scheduler should not. This step is the research payoff and the paper's
-closing demonstration.
+At 10,000 documents the interesting decisions (how many documents to
+admit, what to keep versus re-read, how far ahead to ask) are exactly
+the quantities our paper's optimizer computes best values for. The final
+step wires those computed rates into the step 4 scheduler as its
+admission and retention policy and measures how close the result gets to
+the calculator's floor. One hero run at 100,000 documents makes the
+headline demonstration. This closes the loop the paper opens: plan a
+query on a formula, execute it on real hardware, and land where the
+formula said you would.
 
 ## Costs and risks
 
-GPU rental is noise. The card costs a few dollars per hour and no
-experiment here needs more than two hours. The real cost is engineering
-time: steps 1 and 2 are days, steps 3 and 4 are two to four weeks each.
-
-Risks. The engine's internals change quickly between versions, so we pin
-the version we build against (0.26) and keep our changes behind its
-official plug-in seam where one exists. The conversation-per-document
-design in step 4 is the most invasive and could be rejected by the
-engine's architecture; it is staged last among the engine changes for
-that reason. Separately, our tiny test questions are answered correctly
-82 to 99.5 percent of the time depending on wording, which is an
-accuracy matter, not a scheduling one, and can be improved independently
-at any time.
+GPU rental stays trivial. Steps 1 and 2 are days of work and tens of
+dollars. Step 3 is one to two weeks. Steps 4 and 5 are two to four
+weeks. The engineering risks: the engine's internals change quickly
+between versions, so we pin the version we build against (0.26) and
+stay behind its official plug-in seam where one exists; and the
+conversation-per-document design may be rejected by the engine's
+architecture, which is why it is staged last. The step 2 prediction
+could also simply be wrong, which would be cheap to learn and would
+redirect effort toward steps 1 and 4.
 
 ## What we can show when this is done
 
-One demo, same corpus, same filters, side by side. Today's engine used
-the way most people use it, against the informed scheduler. The first
-query is somewhat faster. Every filter stage after the first read is
-several times faster. The second query over the same corpus is about
-three times faster, because the scheduler kept the corpus in memory on
-purpose. And the measured times sit within about 15 percent of what the
-paper's calculator predicts, which is the claim the whole project is
-built on: that these systems are predictable enough to plan for.
+One demo, same corpus, same filters, all cold, side by side: the engine
+used the way most people use it against the informed scheduler. At
+10,000 documents the naive run re-reads most of the corpus at every
+filter and the informed run does not, every filter stage after the first
+read costs close to its real arithmetic, and the measured times sit
+within the step 1 kernel floor's distance of the paper's calculator.
+The claim the project rests on is that these systems are predictable
+enough to plan for, and this demo is that claim running on hardware.
