@@ -1,107 +1,157 @@
-# Solved schedules: what the solvers actually show
+# Results from the solved schedules
 
-All numbers are **analytical-model results under τ₀** with conventions C1–C12
-(`notes/PLAN.md`): nominal ceilings, R_A=R_D, S=2 GB, fp8 KV, p_j=50, the
-seeded 10k-doc IMDb workload (Σd = 2.966M tokens, mean 297). Raw grids:
-`results/n10k_two_stage.csv`, manifests in `results/manifests/`, small-N
-study in `experiments/run_smallN.py`. Every schedule cited was replayed by
-the independent validator.
+## What was solved and how to read the numbers
 
-The results split into three regimes, and being explicit about which regime a
-number comes from is the whole story:
+The paper in this repo (paper.md) studies a database query that runs a chain
+of yes or no language model filters over documents on one graphics card. A
+document that fails a filter skips the rest, so the work depends on how many
+documents pass each stage. The paper compares three scheduling policies.
+Task-first reprocesses every surviving document at each filter stage under a
+shared prompt. Pipeline reads each document once, keeps the model's stored
+memory of it (the KV cache) on the card, and runs each filter as a prompt of
+about 50 tokens on top, waiting for each answer. Speculation runs future
+filter prompts without waiting, wasting them when an early filter fails.
 
-## 1. N = 10,000: the τ₀ problem is ledger-dominated (and that is the finding)
+Every number below comes from the paper's ideal cost model, not from
+hardware. The ideal model charges each batch the larger of its compute time
+and its weight loading time, plus the larger of its attention compute time
+and its memory traffic time, using the card's advertised peak speeds. The
+conventions from notes/PLAN.md (C1 to C12) apply, including the corrected
+attention width, a 2 gigabyte memory reserve, 1 byte per stored element, and
+50 token prompts. The workload is 10,000 real IMDb reviews with 2,966,000
+document tokens in total, tokenized for the Qwen3 models. The pass rate of a
+filter is the fraction of documents that pass it. A lower bound here means a
+finish time that no schedule can beat given the card's speeds, computed per
+policy from the smallest possible work totals.
 
-Feasible schedules for all four model×device configs, s₁ ∈ {0.1…0.9}, land
-within **0.07% of LB_res** (most at equality ⇒ optimality certificates,
-Prop. 9.1). Full table in the CSV; representative numbers (seconds, τ₀):
+Raw data lives in results/n10k_two_stage.csv, per batch schedule records in
+results/manifests/, and the small instance study in
+experiments/run_smallN.py. An independent checker replayed every schedule
+cited here and confirmed its cost and its legality.
 
-| config | policy | s₁=0.10 | 0.50 | 0.90 |
+The results split into three regimes, and each claim below names its
+regime.
+
+## At 10,000 documents, token counts decide everything
+
+For every combination of two models (Qwen3-4B, Qwen3-32B), two cards (H100,
+L40S), and first filter pass rates from 0.1 to 0.9, the schedules we built
+finish within 0.07 percent of the lower bound, and most land exactly on it.
+Landing on the bound proves no schedule can do better under the ideal model.
+Finish times in seconds, averaged over two random outcome tables, with the
+best policy per column in bold:
+
+| model and card | policy | pass rate 0.10 | 0.50 | 0.90 |
 |---|---|---|---|---|
-| 4B/H100 | task | **12.12** | 16.56 | 20.98 |
-| | pipe | 13.05 | **13.80** | **14.54** |
-| | fullspec | 14.73 | 14.73 | 14.73 |
-| 32B/L40S | task | **280.8** | 383.5 | 485.1 |
-| | pipe | 301.8 | **319.3** | **336.3** |
-| | fullspec | 340.5 | 340.5 | 340.5 |
+| 4B on H100 | task-first | **12.12** | 16.56 | 20.98 |
+| | pipeline | 13.05 | **13.80** | **14.54** |
+| | full speculation | 14.73 | 14.73 | 14.73 |
+| 32B on L40S | task-first | **280.8** | 383.5 | 485.1 |
+| | pipeline | 301.8 | **319.3** | **336.3** |
+| | full speculation | 340.5 | 340.5 | 340.5 |
 
-Read this correctly: the near-zero gaps do **not** mean the constructors are
-clever — they mean that at this scale, under τ₀, batches hold 10⁵–10⁶ tokens,
-dense compute binds in every batch, and *any* capacity-filling packing
-achieves the resource bound. The schedule-construction layer moves < 0.1%.
-Consequently:
+The near zero gaps do not mean the schedule builders are clever. They mean
+the problem is easy at that scale. Each batch holds hundreds of thousands of
+tokens, so the card's compute speed is the only binding limit, and any
+sensible packing reaches the bound. The choice between policies then reduces
+to counting tokens, with the following consequences.
 
-- The certified optimum equals the token ledger (eqs. 32–34) evaluated on the
-  realized d. Policy ranking at N=10k is decided by token totals alone.
-- Task↔pipeline break-even: s₁* = N·p₁/(Σd − N·p₂) = **0.203** on every
-  config (grid-bracketed in (0.10, 0.25); the batch layer shifts it < 0.01).
-- Full speculation never wins at this scale: its extra (1−s₁)·N·p₂ prompt
-  tokens are never repaid because outcome barriers are hidden behind other
-  work (see §2) and retention never forces recompute even at 3.3% KV
-  residency (32B/L40S) — outcome-conditioned retention with a one-batch
-  retention span is enough.
-- Attention ≤ 2.5% of makespan at these document lengths (grows as Σd² for
-  length-scaled runs); weight reads ≤ 1.2 s even at 70 batches.
+- Task-first beats pipeline only when the first filter's pass rate is below
+  about 0.20, on every model and card. The exact crossing point is the
+  number of documents times the prompt length, divided by the total document
+  tokens minus that same product, which is 500,000 over 2,466,000, or 0.203.
+  Below it, rereading the few survivors costs less than giving every
+  document its own prompt tokens.
+- Full speculation never wins at this scale. Its extra prompts on documents
+  that fail early are never paid back, because waiting for answers costs
+  nothing when there are always other documents to work on. Even on the
+  tightest pair, the 32B model on the L40S, where only 3.3 percent of the
+  corpus fits on the card, the pipeline never has to recompute anything,
+  because it keeps each document's stored state for only one batch.
+- Attention is at most 2.5 percent of the finish time at these document
+  lengths, and weight loading is at most 1.2 seconds even when a run needs
+  70 batches. Runs that scale document lengths up would change both, since
+  attention grows with the square of length.
 
-## 2. Small N: the exact DP earns its keep (real 4B/H100 numbers)
+## At small document counts, the exact optimizer finds better schedules
 
-Exact offline DP (Dijkstra, atomic prefill, real doc lengths, s=0.5 coupled
-outcomes) against the same constructors, τ₀ in ms:
+Small queries are the regime where scheduling is a live problem, because
+batches are small, loading the model weights costs as much as computing,
+and waiting for a filter answer can waste a batch. The exact optimizer runs
+here. On real Qwen3-4B and H100 numbers with real review lengths, whole
+document chunks, and a 0.5 pass rate, finish times in milliseconds:
 
-| N | task (exact) | pipe (exact) | fullspec (exact) | pipe (constructor) |
+| documents | task-first, exact | pipeline, exact | full speculation, exact | pipeline, builder |
 |---|---|---|---|---|
 | 2 | 2.44 | 2.17 | **2.09** | 2.80 |
-| 3 | 3.92 | **3.12** | 3.30 | — |
+| 3 | 3.92 | **3.12** | 3.30 | not run |
 | 4 | 5.98 | **4.52** | 4.70 | 5.05 |
 
-Two certified findings:
+The optimizer found a schedule shape we did not anticipate. At 3 documents,
+the best pipeline schedule puts documents 0 and 1 with their filter 1
+prompts in batch 1, and puts document 2's reading, document 2's filter 1
+prompt, and the filter 2 prompts of batch 1's survivors together in batch 2.
+Holding document 2 back gives the scheduler useful work to run while the
+filter 1 answers arrive, so waiting costs nothing, and the pipeline gets
+speculation's batch count without its wasted prompts. A simple prediction
+that ignores holding documents back says speculation should win up to about
+6 documents. In fact it wins only at 2, when there is nothing left to hold
+back. Speculation should also win at the tail end of any query, for the
+same reason.
 
-- **Staggered pipelining hides outcome barriers.** The optimal N=3 pipeline
-  is: batch 1 = docs {0,1} prefill + their F₁ branches; batch 2 = doc 2
-  prefill + doc 2's F₁ + the F₂ branches of batch-1 survivors. The F₂ gate
-  costs nothing because it overlaps a held-back document's prefill, so
-  pipeline gets speculation's batch count without its wasted prompts. This
-  kills the naive prediction that speculation wins whenever N·p₂ is below
-  the weight-read floor (U* = R_D·W_run/(2P·BW) ≈ 295 tokens on H100):
-  speculation wins only when there is no other work to hide behind — here
-  N=2, and generally the tail of a query.
-- **The constructors are ledger-optimal, not schedule-optimal.** They do not
-  stagger, and are 12–24% above exact at N ≤ 8 (2.80 vs 2.17 at N=2; 5.05 vs
-  4.52 at N=4), converging by N ≈ 16 where staggering stops mattering. At
-  N=10k this gap is invisible (§1); any small-N or tail-of-query claims must
-  use the exact DP or a stagger-aware constructor.
+The schedule builders used for the 10,000 document runs do not hold
+documents back, and they finish 12 to 24 percent behind the exact optimizer
+at 8 documents or fewer (2.80 versus 2.17 milliseconds at 2 documents, 5.05
+versus 4.52 at 4). The gap fades by about 16 documents and is invisible at
+10,000. Any claim about small queries should come from the exact optimizer,
+or from a builder taught to hold documents back, which is on the plan.
 
-Exact-DP practical boundary (recorded per sec. 10.5 step 3): with atomic
-prefill and no memory pressure, N=4 solves in seconds at real lengths; at
-δ=1 token granularity with evictions, the toy study reached N=4 with
-d≈(7,6,6,4) in ~146 s offline, N=3 online (859 states). Beyond that the
-state space explodes — consistent with strong NP-hardness; large-N claims
-rest on feasible schedules + matching lower bounds instead.
+The exact optimizer's practical limit, recorded per the paper's section
+10.5: with single token chunks and deletion choices it reaches 4 documents
+of about 7 tokens in roughly 146 seconds, and 3 documents for the online
+case. With whole document chunks it reaches 4 documents at real lengths in
+seconds. Past that, the number of states blows up, which matches the
+paper's hardness claim, so large runs rely on built schedules plus lower
+bounds instead.
 
-## 3. n = 4 lookahead (single coupled scenario, validated)
+## With four filters, pipeline still wins at full scale
 
-| s/stage | config | task | k=1 | k=2 | k=4 |
+A run with four filters, each with the same per stage pass rate, on the
+tightest and loosest model and card pairs, from one outcome table, finish
+times in seconds:
+
+| pass rate per stage | model and card | task-first | lookahead 1 | lookahead 2 | lookahead 4 |
 |---|---|---|---|---|---|
-| 0.50 | 32B/L40S | 473.8 | **334.8** | 361.6 | 426.5 |
-| 0.95 | 32B/L40S | 946.8 | **414.4** | 418.4 | 426.5 |
-| 0.95 | 4B/H100 | 41.0 | **17.9** | 18.1 | 18.5 |
+| 0.50 | 32B on L40S | 473.8 | **334.8** | 361.6 | 426.5 |
+| 0.95 | 32B on L40S | 946.8 | **414.4** | 418.4 | 426.5 |
+| 0.95 | 4B on H100 | 41.0 | **17.9** | 18.1 | 18.5 |
 
-Strict pipelining dominates for n=4 at N=10k too (same §1 logic); task-first
-degrades sharply with n (document re-prefilled at every reached stage).
-Speculation's real currency is batch count: 138 (k=1) vs 53 (k=4) batches at
-s=0.95 on 32B/L40S. Under a **calibrated** cost with per-batch overhead β₀,
-the k=4 block wins once β₀ ≳ (426.5−414.4)/(138−53) ≈ 140 ms per batch —
-that, plus the small-N/tail regime of §2, is where speculation lives, and it
-is the first thing the calibrated layer should measure.
+Lookahead 1 is the pipeline and lookahead 4 is full speculation. The
+pipeline wins everywhere, and task-first falls far behind because it rereads
+every surviving document at each of the four stages. Speculation's one
+advantage is batch count. At a 0.95 pass rate on the 32B model and L40S,
+the pipeline needs 138 batches and full speculation needs 53. The ideal
+model charges nothing per batch beyond the work inside it, but real serving
+software pays some fixed cost per batch. If that fixed cost exceeds about
+140 milliseconds (the 12.1 second gap divided by the 85 extra batches),
+speculation starts winning. Measuring that fixed cost is the first thing
+the calibration phase should do.
 
 ## Caveats
 
-- τ₀ omits per-batch software overhead by design; every "X never wins" above
-  is a claim about the ideal model at the stated scale, per the paper's
-  three-layer discipline (sec. 5.5).
-- W_mem/W_run are nominal placeholders (C5), not yet measured from
-  safetensors; they enter through the ≤1.2 s weight-read term and U*.
-- Small-N exact numbers are per-realization (one coupled X per N), not Monte
-  Carlo averages; the N=2 vs N=3 flip point moves with the realization.
-- Attention uses the corrected width n_q·d_h (C1) — with the paper's
-  eq. (20) as written, all attention terms would be 1.6× smaller.
+- The ideal model omits per batch software overhead on purpose, so every
+  claim that a policy never wins is a claim about the ideal model at the
+  stated scale, following the paper's rule of labeling each number as a
+  bound, a model result, or a measurement.
+- The weight sizes are estimates from parameter counts, not measurements
+  from the released model files. They enter only through the weight loading
+  term, which stays under 1.2 seconds in these runs, and through the batch
+  size at which computing overtakes loading.
+- The small instance numbers come from one random outcome table each, so
+  the exact document count where speculation stops winning moves from run
+  to run.
+- Attention uses the corrected width from convention C1. With the paper's
+  equation 20 as written, every attention term would be 1.6 times smaller.
+- The break-even pass rate of 0.203 is bracketed by the grid points 0.10
+  and 0.25 in the actual runs, per the paper's rule against reporting a
+  crossing point more precisely than the grid supports.

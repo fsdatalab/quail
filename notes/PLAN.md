@@ -1,182 +1,219 @@
-# Solver plan: schedules for the n-stage AI-filter model
+# Plan for solving the schedules
 
-Goal: **solve the schedulers** of `paper.md` analytically — no GPU runs. Concretely:
-(1) an exact DP (offline Dijkstra + online stochastic-shortest-path) that is provably
-optimal on small instances; (2) strong feasible schedules plus resource lower bounds
-for the real N=10,000 IMDb workload on all four model×device configs; (3) the
-validator, manifests, and break-even sweeps the paper specifies. GPU measurement
-(H100/L40S) is a later, separate phase.
+## What the project is
 
-## 0. Workload grounding (done)
+The file paper.md in this repo is a working paper about a database query
+that runs a chain of yes or no language model filters over a table of
+documents. A document that fails one filter skips the rest, so the amount of
+model work depends on how many documents pass each stage. All model calls
+run on one graphics card, and the goal is to finish every required filter
+decision as fast as possible. The paper fixes the filter order, defines a
+cost model built from the card's compute speed, memory bandwidth, and memory
+capacity, and compares three ways to schedule the work:
 
-`workloads/documents.parquet` (built by `scripts/build_workload.py`, seed 20260731):
-10,000 reviews sampled without replacement from the 50k labeled stanfordnlp/imdb
-pool, tokenized with the Qwen3 tokenizer (byte-identical for 4B-FP8 and 32B-FP8,
-sha256 `aeb13307…`).
+- **Task-first** processes every document under filter 1, then reprocesses
+  the surviving documents under filter 2, and so on. The card rereads each
+  surviving document at every stage, but the short filter prompt is shared
+  across all documents at a stage.
+- **Pipeline**, which the paper also calls document-first, reads each
+  document once, keeps the model's stored memory of the document (the KV
+  cache) on the card, and runs each filter as a prompt of about 50 tokens on
+  top of that stored memory, waiting for each answer before running the next
+  prompt.
+- **Speculation** runs one or more future filter prompts on a document
+  without waiting for the earlier answers. The later prompts are wasted
+  whenever an early filter fails. A lookahead of k means k prompts run at
+  once; a lookahead of 1 is the pipeline, and a lookahead equal to the
+  number of filters is full speculation.
 
-| quantity | pool (50k) | sample (10k) |
-|---|---|---|
-| mean / p50 / p90 / p99 / max tokens | 295 / 220 / 580 / 1153 / 3112 | 297 / 223 / 588 / 1142 / 2924 |
-| Σd_i | 14.75M | **2.966M** |
-| tokens per whitespace word | 1.276 | — |
+The paper asks for solvers that find the best schedule under its cost model,
+lower bounds that no schedule can beat, and an experiment program on two
+models (Qwen3-4B-FP8 and Qwen3-32B-FP8) and two cards (NVIDIA H100 and
+L40S). The plan below covers all of that with no runs on real hardware.
+Hardware measurement is a separate later phase.
 
-Residency capacity (M − W_mem − 2 GB reserve, fp8 KV): 4B/H100 ≈ 1.00M tokens
-(**34%** of corpus), 4B/L40S ≈ 570k (19%), 32B/H100 ≈ 343k (12%), 32B/L40S ≈ 99k
-(**3.3%**). Retention is therefore genuinely capacity-bound at N=10k — the paper's
-central tension is present in the real data.
+## The data
 
-Ideal-ledger rooflines (eqs 32–37, R_A=R_D, corrected attention width, expected
-values, p1=p2=50): task-first beats pipeline only for s ≲ 0.2; full speculation is
-within 7–15% of pipeline everywhere; attention ≤ 2.5% of dense time at these
-lengths (e.g. 4B/H100 s=0.5: dense 14.4 s, attention 0.30 s, weight-reads ≤ 0.01 s).
-So on this workload the schedulers are decided by **batch-level effects** — outcome
-barriers, weight-read counts, and capacity-forced recomputation — which is exactly
-what the DP and the N=10k constructions must capture. (For length-scaled
-sensitivity runs the Σd² attention term grows quadratically and the balance shifts.)
+The workload is real. The script scripts/build_workload.py samples 10,000
+reviews without replacement from the 50,000 labeled reviews of the standard
+IMDb movie review dataset, using seed 20260731, and counts each review's
+tokens with the Qwen3 tokenizer. A token is a piece of text the model reads,
+usually a word or part of a word. Both released model checkpoints ship
+tokenizer files that are identical byte for byte, so one length list serves
+both models. The result is workloads/documents.parquet.
 
-## 1. Conventions (resolving the review's ambiguities)
+The 10,000 sampled reviews contain 2,966,000 document tokens in total. The
+median review is 223 tokens, the average is 297, the 99th percentile is
+1,142, and the longest is 2,924. Review length in tokens is about 1.28 times
+the length in words.
 
-Adopted defaults, all recorded in configs and revisitable (see `notes/REVIEW.md`
-for why each is needed):
+Memory capacity shapes the whole problem. Keeping a document's stored state
+on the card costs 72 kilobytes per token for the 4B model and 128 for the
+32B model. After subtracting the model weights and a reserve, the card can
+hold the stored state of only part of the corpus at once: about 34 percent
+of it for the 4B model on the H100, 19 percent on the L40S, 12 percent for
+the 32B model on the H100, and 3.3 percent on the L40S. So the schedulers
+face the tradeoff the paper is about, which is whether to keep a document's
+stored state, delete it and recompute it later, or avoid the question by
+speculating.
 
-- **C1 — attention width.** F_A(B) = 4·L·(n_q·d_h)·A(B), not 4·L·h·A(B): Qwen3
-  decouples attention width from hidden width (4B: 32×128 = 4096 vs h = 2560;
-  32B: 64×128 = 8192 vs h = 5120). The paper's eq. (20) undercounts by 1.6×.
-- **C2 — offline oracle keeps structural gates.** For non-speculative policies the
-  offline optimum may not co-batch F_j(i) with work that requires F_j(i)'s result;
-  clairvoyance affects only packing, retention, and eviction. This isolates the
-  value of information from barrier removal (otherwise offline task-first morphs
-  into zero-waste speculation and the VoI estimand conflates two effects). The
-  gate-free oracle is a cheap sensitivity run later.
-- **C3 — KV write/temp accounting.** K_W(B) = new positions whose KV survives their
-  producing operation: (a) new document tokens that persist into K_{t+1}, and
-  (b) document tokens consumed by a *different* operation in the same batch.
-  Positions consumed only inside their own fused operation, and final prompt-branch
-  positions with no future consumer, are not written. K_tmp(B) = all new document
-  tokens + all prompt-branch tokens live during the batch (conservative peak).
-- **C4 — algorithms.** Offline: on-demand Dijkstra (positive batch costs; handles
-  evict/recompute cycles). Online: eq. (54) has cycles too (prefill → evict →
-  re-prefill revisits a state), so it is solved as a stochastic shortest path by
-  value iteration over the reachable state graph, not by naive recursion.
-- **C5 — weights.** W_run = bytes of the L repeated transformer blocks in the FP8
-  checkpoint (weights + FP8 scale tensors, read from the safetensors index);
-  W_mem = full loaded checkpoint bytes. Nominal placeholders until measured:
-  4B ≈ 3.6/4.5 GB, 32B ≈ 31.2/33.5 GB.
-- **C6 — reserve.** Speed-of-light runs: S = 2 GB nominal, stated (S = 0 as a
-  labeled variant). Calibrated S comes from engine measurement later.
-- **C7 — rates.** Primary R_A = R_D (labeled optimistic); sensitivity R_A = R_D/2.
-- **C8 — B_min.** Under C3 every new document token's KV exists in HBM during its
-  batch, so per-batch document tokens ≤ free-KV capacity C and
-  B_min = ceil(doc_tokens_total / C); if a new-token cap is configured, take the
-  max with ceil(U_tot / cap). Without either, B_min = 1 (weak, reported as such).
-- **C9 — chunk quantum.** δ = 1 (token-exact) for exact DP instances; δ = 256 for
-  N=10k constructions, always reported (OPT_1 ≤ OPT_δ, eq. 50).
-- **C10 — workload.** Pool = 50k labeled reviews, doc_id = split/row; 418 duplicate
-  texts kept as distinct rows; no cross-document KV sharing for identical texts in
-  v1. p_j = 50 exactly, all j. Primary KV dtype fp8 (q_KV=1); bf16 sensitivity.
-- **C11 — T_init = 0.** Task prompts are prefilled inside the first batch that
-  needs them; never double-counted.
-- **C12 — online estimand.** OPT_on is the expected makespan of the optimal online
-  policy computed from s; offline Monte Carlo uses coupled X matrices reused
-  across policies (paper sec. 10.3).
+## Decisions that pin down open points
 
-## 2. Repository architecture
+The review in notes/REVIEW.md found places where the paper has an error or
+where two implementers could read a definition differently. The solver
+adopts the following conventions, labeled C1 to C12, and records them so any
+result can be traced to them.
+
+- **C1, attention width.** Attention compute is counted with the width
+  n_q·d_h (number of query heads times width per head), not the hidden
+  width h that the paper's equation 20 uses. For Qwen3 the two differ by 1.6
+  times. See finding 1 in the review.
+- **C2, gate timing.** No batch may contain work that needs a filter answer
+  still unresolved when the batch starts, and the rule applies even to the
+  offline solver that knows all outcomes in advance. Section 3.4 of the
+  paper states the rule; knowing the future helps only with packing,
+  retention, and deletion choices.
+- **C3, what counts as written and stored.** New document tokens and shared
+  task prompt blocks count as written to card memory, because something
+  reads their stored state later. Filter prompt tokens never count as
+  written, because nothing reads them after their answer is produced. During
+  a batch, all of the batch's new tokens count toward peak memory. Reads are
+  counted only for blocks that were already on the card when the batch
+  started, and a block shared by several operations in one batch is counted
+  once.
+- **C4, algorithms.** The offline solver is Dijkstra's algorithm over
+  scheduler states, which stays correct when deletion and recomputation
+  create loops. The online case, where answers arrive only as batches
+  finish, is solved as a stochastic shortest path problem (a shortest path
+  problem in which each move has random outcomes) by value iteration.
+- **C5, weight sizes.** The per batch weight traffic is the byte size of the
+  repeated transformer blocks in the released checkpoint, and the memory
+  footprint is the full loaded checkpoint. Until measured from the released
+  files, the solver uses estimates: 3.6 and 4.5 gigabytes for the 4B model,
+  and 31.2 and 33.5 for the 32B model.
+- **C6, reserve.** The ideal model runs with a 2 gigabyte memory reserve for
+  the runtime, recorded as such.
+- **C7, attention speed ceiling.** The primary runs set the attention speed
+  ceiling equal to the dense compute ceiling, which is optimistic and
+  labeled. A sensitivity run uses half of it.
+- **C8, minimum batch count for the lower bound.** Every new document
+  token's stored state must sit on the card during its batch, so the number
+  of batches is at least the total document tokens divided by the card's
+  free capacity, rounded up. If a token cap per batch is configured, the
+  bound also uses it.
+- **C9, chunk quantum.** A document may be split into chunks. Exact runs on
+  small instances allow any split (quantum 1). The 10,000 document runs
+  restrict chunk boundaries to multiples of 256, which can only make the
+  reported schedule slower than the unrestricted best, and is recorded.
+- **C10, workload details.** The document pool is the 50,000 labeled
+  reviews, with a document id of the form split/row. 418 reviews are exact
+  duplicates of another review and are kept as separate rows; the scheduler
+  does not share stored state between identical texts. Every filter prompt
+  is exactly 50 tokens. Stored state uses 1 byte per element, with 2 bytes
+  as a sensitivity case.
+- **C11, startup.** There is no separate startup term. Shared prompt blocks
+  are loaded inside the first batch that needs them and are never counted
+  twice.
+- **C12, what is being estimated.** The online value is the expected finish
+  time of the best policy that never uses an unrevealed answer. Offline
+  values are averaged over random outcome tables, and the same outcome
+  table is reused across policies so comparisons are fair.
+
+## How the code is organized
 
 ```
 docengine/
-  configs/models.py      # Qwen3-4B/32B: P, L, h, n_q, n_kv, d_h, L_ctx, κ(q_KV), W_mem, W_run
-  configs/devices.py     # H100 SXM, L40S: M, BW, R_D, R_A
-  workload.py            # load documents.parquet; length-scaling transforms
-  outcomes.py            # coupled latent X matrices, seeds, selectivity grids
-  costmodel.py           # a(c,q), U/A/K_R/K_W/K_tmp/M_peak per batch; D(B), H(B), τ0, τθ
-  lb.py                  # eq. 55 resource LB with C8 B_min rules, per policy instance
-  manifest.py            # eq. 57 schema, JSONL IO
+  configs.py             model and device numbers
+  instance.py            a problem instance: lengths, prompts, pass rates, limits
+  costmodel.py           batch statistics and the ideal batch cost
+  lb.py                  the lower bound from convention C8
+  manifest.py            writes a schedule out as one record per batch
   exact/
-    state.py             # canonical state (z, r, K-residency, H) per policy family
-    actions.py           # feasible-batch generator: task-first / pipeline / spec-k, δ, evictions
-    offline.py           # on-demand Dijkstra + predecessor reconstruction → manifest
-    online.py            # reachable-graph SSP value iteration (eq. 54)
+    engine.py            states, legal batches, transitions (shared by both solvers)
+    offline.py           Dijkstra over states, returns the best schedule
+    online.py            value iteration for the online case
   sched/
-    taskfirst.py         # N=10k constructive scheduler + local search
-    pipeline.py          # cohorted retention scheduler (knapsack eviction scoring)
-    speculate.py         # fused-tree scheduler, per-stage lookahead k choice
-    improve.py           # merge/split/move local search on manifests
-  validator/check.py     # independent replay: feasibility, information, U/A/B_KV/M_peak/τ recompute
-  experiments/           # runners → results/{manifests,bounds}; sweep drivers
-  tests/                 # hand-enumerated instances, invariants, property tests
+    blockwise.py         schedule builders for large document counts
+  validator/check.py     independent checker that replays a schedule
+experiments/
+  run_n10k.py            the 10,000 document runs
+  run_smallN.py          exact runs on small instances with real hardware numbers
 scripts/build_workload.py
-workloads/documents.parquet
+tests/                   15 checks
 ```
 
-The validator shares **no** cost-model code with the solver (App. B contract): it
-re-implements a(c,q), τ, memory, and information checks from the paper text alone,
-and returns batch-indexed errors.
+The checker in validator/check.py deliberately shares no cost code with the
+solver. It replays each schedule record, recomputes every quantity from the
+paper's formulas on its own, checks memory limits and answer timing, and
+reports errors per batch. The paper's appendix B requires the separation.
 
-## 3. Exact DP (small instances)
+## The exact optimizer
 
-**State.** Per document: (z_i, prefix kind ∈ {task-j, doc}, r_i, complete-flag);
-plus pinned prompt set and revealed outcomes. Resident KV is exactly determined by
-these per-doc residencies + pins, so K needs no separate arbitrary-set state —
-this matches the paper's (z, r, K, H) without blowing up the encoding.
+A scheduler state records, per document, the next filter whose answer is
+still needed and how many of the document's tokens have stored state on the
+card, plus which shared prompt blocks are loaded. An action is one batch
+(document chunks, filter prompts, and prompt block loads) followed by a
+deletion choice. The offline solver runs Dijkstra's algorithm over these
+states and rebuilds the best schedule from the visited states. The online
+solver first lists every state reachable from the start, then runs value
+iteration until the values stop changing.
 
-**Actions.** Per batch: per-doc increments Δ_i (multiples of δ), branch ops
-(pipeline: F_{z_i} when r_i = d_i; speculation: contiguous k_i block), then
-post-batch eviction keep-sets. Pruning that provably preserves optimality only:
-lazy eviction (evict at a boundary only what the next chosen batch needs freed —
-delaying eviction is WLOG only in this per-transition form), and never evict pinned
-prompt blocks under task-first. Everything else is enumerated.
+The tests check the solver against hand worked answers and against the
+paper's own claims. On instances small enough to enumerate by hand, the
+solver returns the hand computed schedule. Allowing chunks never makes the
+best schedule slower, and a case built like the paper's section 6.6 example
+shows a strict win. Forced full speculation costs the same for every
+outcome table, and its online value equals its offline value. The average
+offline value never exceeds the online value, checked over all 16 outcome
+tables of a two document, two filter instance. When memory is too small to
+keep both documents, the solver deletes and recomputes, and the checker
+accepts the result. The checker rejects schedules with a corrupted count or
+with a prompt that uses an answer not yet revealed.
 
-**Search.** Offline: Dijkstra, states materialized on demand, predecessor map →
-schedule manifest. Online: BFS-enumerate the reachable graph, then Gauss–Seidel
-value iteration to convergence (positive costs + a proper policy ⇒ unique fixed
-point); the policy at each state is (argmin batch, then per-outcome argmin evict).
+Exact solving is limited to small instances, which matches the paper's own
+hardness claim. With single token chunks and deletion choices, the offline
+solver handles 4 documents of about 7 tokens in roughly 146 seconds, and
+the online solver handles 3 documents. With whole document chunks at real
+document lengths, 4 documents solve in seconds. The boundary is recorded
+rather than hidden.
 
-**Verification battery.**
-- N=1..2, d ∈ {2..4}, tiny synthetic device (small M, W_run) hand-enumerated =
-  DP output, all three policies, δ=1.
-- Invariants: chunk attention identity (eq. 16); chunking dominance (eq. 31) as
-  OPT_chunk ≤ OPT_atomic on every instance; speculation outcome-independence
-  (eq. 41): identical value for all X; VoI inequality E[OPT_off] ≤ OPT_on (eq. 42)
-  on every solvable instance; validator accepts every DP manifest.
-- Scaling study: grow N and d until state count explodes; record the frontier
-  (paper sec. 10.5 step 3) — expected practical limit ≈ N ≤ 6–8 with d_i ≤ ~12δ.
-- Small-instance science: barrier cost (task-first vs pipeline vs spec as s and
-  W_run vary), forced-eviction regimes (shrink M), lookahead k transitions for
-  n = 3, 4.
+## Schedules for 10,000 documents
 
-## 4. N = 10,000 feasible schedules + bounds
+Exact search cannot reach 10,000 documents, so the plan follows the paper:
+build a good feasible schedule, compute the lower bound, and report both
+with the gap. Two builders in sched/blockwise.py cover the three policies.
+The task-first builder processes documents in waves, one wave per filter,
+packing each batch up to the card's free memory and splitting the document
+that straddles a batch boundary. The blockwise builder covers pipeline and
+speculation with a lookahead setting. It reads new documents up to capacity,
+runs their first block of filter prompts in the same batch, keeps the
+survivors' stored state for exactly one batch, and runs their next prompts
+in the following batch alongside the next group of documents. Failed
+documents are deleted at the batch boundary. If high pass rates leave no
+room to make progress, the builder deletes part of the backlog and
+recomputes those documents later, which is the paper's deletion and
+recomputation path, not a failure.
 
-Exact DP cannot reach N=10k (strongly NP-hard; sec. 7.6). Per the paper, report
-constructive feasible schedules against LB_res, with the gap.
+Both builders only use answers that earlier batches revealed, so a real
+scheduler could follow them without knowing the future. Their schedules are
+therefore valid upper bounds for the offline and the online problem at
+once.
 
-- **Task-first:** stage waves; within a wave, greedy length-aware packing of doc
-  chunks into batches sized near the device crossover U* = R_D/(2·BW) new tokens
-  (≈ 295 on H100, 424 on L40S — model-independent at FP8 since both terms scale
-  with P) or larger; last partial chunks filled with δ-chunks of the next docs.
-- **Pipeline:** cohorts sized to residency capacity: prefill cohort docs + F_1
-  branches; retain survivors' doc KV (offline: exactly the X_i=1 docs; online:
-  eviction scored by s·recompute_cost/bytes), run F_2 branches next batch, evict,
-  next cohort. Piggyback next-cohort prefill chunks into branch-heavy batches to
-  keep U near target.
-- **Speculation:** per-doc fused trees (doc chunks + all/k prompt branches in one
-  batch); no retention pressure; pure packing. Lookahead k per stage chosen by
-  marginal break-even π_{j+k}·(recompute-or-barrier saving) vs (1−π_{j+k})·p
-  waste, then validated by sweep.
-- **Local search** on all three: merge/split batches, move chunks, retention swaps,
-  accept on τ0 improvement; stop at local optimum. Report LB gap per config.
-- **Sweeps:** s ∈ {0.05, 0.1, …, 0.95} (n=2), length scales ×{1, 2, 4, 8} (context
-  rule enforced), n ∈ {2, 3, 4} with per-stage s grids for lookahead study,
-  4 model×device configs, KV dtype {fp8, bf16}, R = 32 coupled outcome replications
-  (means ± CI via eq. 59–60).
+Planned but not yet built: a local search pass that merges, splits, and
+moves work between batches to close any remaining gap, and a builder that
+holds documents back the way the exact optimizer does (see notes/RESULTS.md
+on why the current builders lose 12 to 24 percent on small instances).
 
-## 5. Deliverables & order
+## Order of work and status
 
-1. `costmodel` + `lb` + `manifest` + `validator` + tests.  (foundation)
-2. Exact DP offline → verify battery → exact DP online.  (paper sec. 10.5 steps 1–3)
-3. Small-instance result grid + plots (selectivity × policy × device).
-4. N=10k constructors + local search + LB gaps; break-even maps.  (step 4)
-5. Report tables/plots per paper sec. 10.7; every point labeled
-   {LB, exact, feasible+gap}; manifests in `results/manifests/`.
-
-Not in scope here: engine calibration (τθ fitting), vLLM/engine profiling, any
-H100/L40S execution — the manifests are designed so those plug in later.
+1. Cost model, lower bound, manifest, checker, tests. Done.
+2. Exact offline and online solvers, with the verification battery. Done.
+3. The 10,000 document runs on all four model and device pairs, pass rates
+   0.1 to 0.9, with coupled outcome tables. Done; results and gaps are in
+   notes/RESULTS.md and results/.
+4. Small instance study on real hardware numbers, and the four filter
+   lookahead study. Done.
+5. Remaining: measure the true weight bytes from the released checkpoints,
+   run the pass rate grid at finer steps with more repetitions, add the
+   held back document builder, produce the paper's plots, and only then
+   calibrate against real hardware.
