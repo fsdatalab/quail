@@ -64,8 +64,7 @@ def _flags_line(flags):
 
 
 def _question(j):
-    return (f"\n\nQuestion: according to the [FLAGS] line above, is FLAG_{j} "
-            f"set to YES? The answer (YES or NO) is")
+    return f"\n\nCopy the value from the [FLAGS] line: FLAG_{j}="
 
 
 def _task_prefix(j):
@@ -74,7 +73,8 @@ def _task_prefix(j):
             f"Document:\n")
 
 
-TASK_SUFFIX = "\n\nThe answer (YES or NO) is"
+def _task_suffix(j):
+    return f"\n\nFrom the [FLAGS] line, FLAG_{j}="
 
 
 @app.function(image=image, gpu="H100!", timeout=3600,
@@ -115,7 +115,7 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
         bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
         d_tok = [n_tokens(b) for b in bodies]
         p_tok = [n_tokens(_question(j + 1)) for j in range(n)]
-        p_task = [n_tokens(_task_prefix(j + 1)) + n_tokens(TASK_SUFFIX)
+        p_task = [n_tokens(_task_prefix(j + 1)) + n_tokens(_task_suffix(j + 1))
                   for j in range(n)]
 
         waves = []
@@ -125,7 +125,7 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
             for j in range(1, n + 1):
                 if not alive:
                     break
-                prompts = [_task_prefix(j) + bodies[i] + TASK_SUFFIX
+                prompts = [_task_prefix(j) + bodies[i] + _task_suffix(j)
                            for i in alive]
                 outs, dt, toks, cached = wave(prompts)
                 waves.append(dict(stage=j, requests=len(prompts), s=dt,
@@ -221,3 +221,29 @@ def main(smoke: bool = False, out: str = ""):
     for r in data["results"]:
         print(f"n={r['n']} s={r['s']} {r['policy']} k={r['k']}: "
               f"{r['makespan']:.2f}s, agreement {r['answer_agreement']:.3f}")
+
+
+@app.function(image=image, gpu="H100!", timeout=1200,
+              volumes={"/root/.cache/huggingface": hf_cache})
+def probe() -> list:
+    """Print raw completions for candidate answer-extraction patterns."""
+    from vllm import LLM, SamplingParams
+    docs = _build_pool(3)
+    llm = LLM(model=MODEL, kv_cache_dtype="fp8", max_model_len=4352,
+              gpu_memory_utilization=0.92, enable_prefix_caching=True)
+    sp = SamplingParams(temperature=0.0, max_tokens=8)
+    body = docs[0] + _flags_line([1, 0])
+    variants = {
+        "answer_is": body + _question(2),
+        "copy": body + "\n\nCopy the value from the [FLAGS] line: FLAG_2=",
+        "task": _task_prefix(2) + body + _task_suffix(2),
+        "task_copy": (_task_prefix(2) + body
+                      + "\n\nFrom the [FLAGS] line, FLAG_2="),
+    }
+    outs = llm.generate(list(variants.values()), sp, use_tqdm=False)
+    report = []
+    for (name, _p), o in zip(variants.items(), outs):
+        toks = [llm.get_tokenizer().decode([t]) for t in o.outputs[0].token_ids]
+        report.append((name, repr(o.outputs[0].text), [repr(t) for t in toks]))
+        print(name, "->", repr(o.outputs[0].text), "tokens:", toks, flush=True)
+    return report
