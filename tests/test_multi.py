@@ -67,3 +67,18 @@ def test_multi_gpu_builder_scaling():
     assert mk2 <= mk1
     assert mk2 >= 0.45 * mk1        # cannot beat perfect halving by much
     assert len(per) == 2
+
+
+def test_additive_repricing_orders():
+    """tau_add >= tau_max on any schedule (the max cannot exceed the sum),
+    and the additive class bound holds for the pipeline builder."""
+    from docengine.reprice import reprice_records, resource_lb_additive
+    rng = np.random.default_rng(11)
+    d = rng.integers(4, 14, size=30).tolist()
+    it = inst(d, [1, 2], [0.7, 0.5], kv_tokens=90)
+    X = sample_outcomes(it, rng)
+    recs = schedule_blockwise(it, X, 1)
+    assert validate(it, "pipe", recs, X, kmax=1) == []
+    r = reprice_records(it, recs)
+    assert r["tau_add"] >= r["tau_max"] - 1e-12
+    assert resource_lb_additive(it, "pipe", X, k=1) <= r["tau_add"] + 1e-9
