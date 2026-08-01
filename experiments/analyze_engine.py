@@ -16,6 +16,7 @@ into the document length for the ideal instance.
 """
 
 import argparse
+import gzip
 import json
 import sys, os
 
@@ -71,7 +72,9 @@ def main():
     ap.add_argument("path")
     ap.add_argument("--csv", default="")
     args = ap.parse_args()
-    data = json.load(open(args.path))
+    opener = (lambda p: gzip.open(p, "rt")) if args.path.endswith(".gz") \
+        else open
+    data = json.load(opener(args.path))
     rows = []
     print(f"{'n':>2} {'s1':>5} {'policy':>6} {'k':>2} | {'measured':>9} "
           f"{'ideal':>8} {'ratio':>6} | {'tok/s':>8} {'cachehit%':>9} "

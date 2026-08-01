@@ -93,12 +93,14 @@ class _BatchBuilder:
         return self.rec
 
 
-def schedule_taskfirst(inst: Instance, X):
+def schedule_taskfirst(inst: Instance, X, cap: int = None):
     """Stage waves; wave j prefills [F_j][D_i] for every doc with Y_ij = 1.
     Task-doc KV is consumed by its own completion, so nothing but the pinned
-    p_j prompt blocks survives a wave."""
+    p_j prompt blocks survives a wave. `cap` overrides the analytic KV
+    capacity, for driving a real engine whose pool size is measured."""
     Y = survival(X)
-    cap = kv_capacity_tokens(inst.model, inst.device)
+    cap = cap if cap is not None else kv_capacity_tokens(inst.model,
+                                                         inst.device)
     records = []
     pins = set()
     t = 0
@@ -150,11 +152,13 @@ def schedule_taskfirst(inst: Instance, X):
     return records
 
 
-def schedule_blockwise(inst: Instance, X, k: int):
+def schedule_blockwise(inst: Instance, X, k: int, cap: int = None):
     """Document-first with contiguous speculative blocks of size k
-    (k=1 pipeline, k=n full speculation)."""
+    (k=1 pipeline, k=n full speculation). `cap` overrides the analytic KV
+    capacity, for driving a real engine whose pool size is measured."""
     Y = survival(X)  # noqa: F841  (outcomes are read directly from X below)
-    cap = kv_capacity_tokens(inst.model, inst.device)
+    cap = cap if cap is not None else kv_capacity_tokens(inst.model,
+                                                         inst.device)
     policy = "pipe" if k == 1 else "spec"
     records = []
     t = 0
