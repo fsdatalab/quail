@@ -225,6 +225,23 @@ question in the plan: the cold first read has no recoverable scheduling
 or configuration overhead, and 80,000 becomes the calibration constant
 for everything below. Raw data: results/engine/speed_limit.json.
 
+A follow-up measurement beneath the serving stack splits the 80,000
+into its causes (results/engine/model_floor.json). The model's four
+matrix multiply shapes, benchmarked alone in FP8, sustain about
+186,000 tokens per second worth of arithmetic (1,350 trillion
+operations per second against the 1,979 spec number, so the spec
+ceiling itself is one third marketing at these shapes). A bare forward
+pass of the bf16 model through plain transformers, with no engine and
+no scheduler, reaches 48,000 against its own measured multiply ceiling
+of 100,000, so the non-multiply parts of a transformer (attention,
+normalization, memory movement, kernel launches) cost a factor of
+about 0.48. Applying that factor to the FP8 multiply rate projects a
+bare FP8 model floor near 89,000, and vLLM's measured 80,000 is about
+90 percent of it. The serving stack's tax on reading is therefore
+roughly ten percent, and the distance from the 275,000 paper ceiling
+is mostly sustained-versus-spec silicon and the transformer's
+non-multiply work, not engine overhead.
+
 Step one, second half. The per request overhead splits half and half
 between our client and the engine. On a four filter query over 2,000
 documents, run cold and then warm through the async interface in a two
