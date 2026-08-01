@@ -73,14 +73,16 @@ result can be traced to them.
   offline solver that knows all outcomes in advance. Section 3.4 of the
   paper states the rule; knowing the future helps only with packing,
   retention, and deletion choices.
-- **C3, what counts as written and stored.** New document tokens and shared
-  task prompt blocks count as written to card memory, because something
-  reads their stored state later. Filter prompt tokens never count as
-  written, because nothing reads them after their answer is produced. During
-  a batch, all of the batch's new tokens count toward peak memory. Reads are
-  counted only for blocks that were already on the card when the batch
-  started, and a block shared by several operations in one batch is counted
-  once.
+- **C3, what counts as written and stored.** The revised paper's
+  write-through rule is adopted exactly: every new token whose stored state
+  a later token or branch reads counts as written, and only a final
+  position with no descendant is skipped. So document tokens are written
+  (except the decision position of a task-first call), the first 49 tokens
+  of every 50 token filter prompt are written, and shared prompt blocks are
+  written. During a batch, all of the batch's new tokens count toward peak
+  memory. Reads are counted only for blocks already on the card when the
+  batch started, and a block shared by several operations in one batch is
+  counted once.
 - **C4, algorithms.** The offline solver is Dijkstra's algorithm over
   scheduler states, which stays correct when deletion and recomputation
   create loops. The online case, where answers arrive only as batches
@@ -126,20 +128,25 @@ docengine/
   configs.py             model and device numbers
   instance.py            a problem instance: lengths, prompts, pass rates, limits
   costmodel.py           batch statistics and the ideal batch cost
-  lb.py                  the lower bound from convention C8
+  lb.py                  certified lower ledgers and the resource bound
   manifest.py            writes a schedule out as one record per batch
-  exact/
-    engine.py            states, legal batches, transitions (shared by both solvers)
+  optimizer/
+    state_actions.py     length types, cache states, and batch actions per policy
+    steady_state_lp.py   the expected-flow linear program and its residuals
+    queue_augmented.py   the exact bounded-queue program for small checks
+  runtime/replay.py      converts program rates into real validated batches
+  reference/             the exact small-instance solvers (validation role)
+    engine.py            states, legal batches, transitions
     offline.py           Dijkstra over states, returns the best schedule
     online.py            value iteration for the online case
-  sched/
-    blockwise.py         schedule builders for large document counts
+  sched/blockwise.py     direct schedule builders (also the replay fallback)
   validator/check.py     independent checker that replays a schedule
 experiments/
-  run_n10k.py            the 10,000 document runs
+  run_lp.py              program plus replay on the 10,000 document runs
+  run_n10k.py            the direct-builder 10,000 document runs
   run_smallN.py          exact runs on small instances with real hardware numbers
 scripts/build_workload.py
-tests/                   15 checks
+tests/                   19 checks
 ```
 
 The checker in validator/check.py deliberately shares no cost code with the
@@ -213,7 +220,12 @@ on why the current builders lose 12 to 24 percent on small instances).
    notes/RESULTS.md and results/.
 4. Small instance study on real hardware numbers, and the four filter
    lookahead study. Done.
-5. Remaining: measure the true weight bytes from the released checkpoints,
-   run the pass rate grid at finer steps with more repetitions, add the
-   held back document builder, produce the paper's plots, and only then
-   calibrate against real hardware.
+5. The revised paper's program layer: state and action generators per
+   policy, the expected-flow linear program, the exact bounded-queue
+   program for small checks, and the replay runtime with fill, core,
+   repair, and drain phases. Done; results in notes/RESULTS.md.
+6. Remaining: measure the true weight bytes from the released checkpoints,
+   run the pass rate grid at finer steps with more repetitions, teach the
+   replay and builders to hold documents back, extend the pipeline program
+   past two filters, produce the paper's plots, and only then calibrate
+   against real hardware.

@@ -7,7 +7,7 @@ objective implementation. Returns batch-indexed errors, not a boolean.
 Replay model: the validator tracks, per document, the logical frontier z_i,
 the resident prefix length r_i (task-first: progress under the current task
 prefix; doc-first: document prefix), the pinned prompt set, and which filter
-evaluations have completed. It recomputes U, A, K_R, K_W, K_tmp, M_peak, D,
+evaluations have completed. It recomputes U, A, K_L, K_W, K_tmp, M_peak, D,
 H, tau for every batch from the configuration and compares with the manifest
 fields (rel. tol 1e-9)."""
 
@@ -84,6 +84,9 @@ def validate(inst, policy, records, X, kmax=1):
                 U += q; A += _a(cache, q); K_W += q; K_tmp += q
                 inbatch_doc[i] = inbatch_doc.get(i, 0) + q
                 if r[i] + inbatch_doc[i] == inst.d[i] and policy == "task":
+                    # write-through ledger: the final task-template position is
+                    # the decision leaf with no descendant -> ephemeral
+                    K_W -= 1
                     completions.append((i, z[i], 1))
             elif kind == "branch":
                 if policy == "task":
@@ -97,7 +100,10 @@ def validate(inst, policy, records, X, kmax=1):
                 if r[i] > 0:
                     read_blocks[("doc", i)] = r[i]
                 A += _a(inst.d[i], q)
-                U += q; K_tmp += q   # branch KV transient, never written (C3)
+                # write-through ledger: interior branch tokens are consumed by
+                # later tokens of the same prompt and are stored; only the
+                # final decision position is an ephemeral leaf
+                U += q; K_W += q - 1; K_tmp += q
             else:
                 err(t, f"unknown op kind {kind}")
 
@@ -122,11 +128,11 @@ def validate(inst, policy, records, X, kmax=1):
             err(t, "peak memory exceeds device capacity")
         if inst.max_new_tokens is not None and U > inst.max_new_tokens:
             err(t, "new-token cap violated")
-        K_R = sum(read_blocks.values())
+        K_L = sum(read_blocks.values())
         D = max(2.0 * m.P * U / dev.R_D, m.W_run / dev.BW) if U > 0 else 0.0
-        H = max(4.0 * m.L * attn_w * A / dev.R_A, kappa * (K_R + K_W) / dev.BW)
+        H = max(4.0 * m.L * attn_w * A / dev.R_A, kappa * (K_L + K_W) / dev.BW)
         tau = D + H
-        for name, got in (("U", U), ("A", A), ("K_R", K_R), ("K_W", K_W),
+        for name, got in (("U", U), ("A", A), ("K_L", K_L), ("K_W", K_W),
                           ("K_tmp", K_tmp)):
             if rec[name] != got:
                 err(t, f"{name}: manifest {rec[name]} != recomputed {got}")

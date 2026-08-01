@@ -21,11 +21,12 @@ class ModelConfig:
     q_kv: int           # bytes per stored KV element (1=fp8, 2=bf16)
     W_mem: float        # resident weight footprint, bytes
     W_run: float        # compulsory transformer-weight traffic per nonempty batch, bytes
+    kappa_meta: int = 0  # per-token scale/metadata bytes (idealized runs: 0)
 
     @property
     def kappa(self) -> int:
-        """KV bytes per cached token (eq. 18)."""
-        return 2 * self.L * self.n_kv * self.d_h * self.q_kv
+        """KV bytes per cached token: 2*L*n_kv*d_h*q_kv + kappa_meta."""
+        return 2 * self.L * self.n_kv * self.d_h * self.q_kv + self.kappa_meta
 
     @property
     def attn_width(self) -> int:

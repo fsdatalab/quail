@@ -12,146 +12,113 @@ memory of it (the KV cache) on the card, and runs each filter as a prompt of
 about 50 tokens on top, waiting for each answer. Speculation runs future
 filter prompts without waiting, wasting them when an early filter fails.
 
-Every number below comes from the paper's ideal cost model, not from
-hardware. The ideal model charges each batch the larger of its compute time
-and its weight loading time, plus the larger of its attention compute time
-and its memory traffic time, using the card's advertised peak speeds. The
-conventions from notes/PLAN.md (C1 to C12) apply, including the corrected
-attention width, a 2 gigabyte memory reserve, 1 byte per stored element, and
-50 token prompts. The workload is 10,000 real IMDb reviews with 2,966,000
-document tokens in total, tokenized for the Qwen3 models. The pass rate of a
-filter is the fraction of documents that pass it. A lower bound here means a
-finish time that no schedule can beat given the card's speeds, computed per
-policy from the smallest possible work totals.
+The revised paper organizes every claim into four layers, and the repo now
+computes the first three: a resource lower bound that no schedule can beat,
+an asymptotic latency target from a linear program over steady batch rates,
+a constructed finite schedule replayed from the program's rates and checked
+by an independent validator, and a measured engine number that is a later
+phase and deliberately not started. Every number below comes from the
+paper's ideal cost model with its corrected attention width and its
+write-through storage rule, on 10,000 real IMDb reviews (2,966,000 document
+tokens) tokenized for the Qwen3 models. The pass rate of a filter is the
+fraction of documents that pass it.
 
-Raw data lives in results/n10k_two_stage.csv, per batch schedule records in
+Raw data: results/lp_two_stage.csv (the program and its replays),
+results/n10k_two_stage.csv (direct schedule builders), manifests in
 results/manifests/, and the small instance study in
-experiments/run_smallN.py. An independent checker replayed every schedule
-cited here and confirmed its cost and its legality.
+experiments/run_smallN.py.
 
-The results split into three regimes, and each claim below names its
-regime.
-
-## At 10,000 documents, token counts decide everything
+## The three computed layers agree, which is the main check
 
 For every combination of two models (Qwen3-4B, Qwen3-32B), two cards (H100,
-L40S), and first filter pass rates from 0.1 to 0.9, the schedules we built
-finish within 0.07 percent of the lower bound, and most land exactly on it.
-Landing on the bound proves no schedule can do better under the ideal model.
-Finish times in seconds, averaged over two random outcome tables, with the
-best policy per column in bold:
+L40S), pass rates 0.1, 0.5, 0.9, and the three policies, all of the
+following hold:
+
+- The lower bound never exceeds the replayed finite latency, in all 36
+  cells.
+- The replayed finite latency lands within 0.5 percent of the program's
+  asymptotic target. The signed difference runs from minus 0.07 to plus 2.0
+  seconds and is legitimately either sign, because the asymptotic target is
+  not a bound for a finite run.
+- Where the direct schedule builders had already produced certified optima,
+  the program reproduces them to the digit. For example, task-first on the
+  4B model and H100 at pass rate 0.5 gives 16.56 seconds by ledger, by
+  built schedule, and by program target, and the replay gives 16.62.
+
+Selected finite latencies in seconds (replayed, validated):
 
 | model and card | policy | pass rate 0.10 | 0.50 | 0.90 |
 |---|---|---|---|---|
-| 4B on H100 | task-first | **12.12** | 16.56 | 20.98 |
+| 4B on H100 | task-first | **12.14** | 16.62 | 21.04 |
 | | pipeline | 13.05 | **13.80** | **14.54** |
-| | full speculation | 14.73 | 14.73 | 14.73 |
-| 32B on L40S | task-first | **280.8** | 383.5 | 485.1 |
-| | pipeline | 301.8 | **319.3** | **336.3** |
-| | full speculation | 340.5 | 340.5 | 340.5 |
+| | full speculation | 14.74 | 14.74 | 14.74 |
+| 32B on L40S | task-first | **281.9** | 384.3 | 486.1 |
+| | pipeline | 301.7 | **319.1** | **336.2** |
+| | full speculation | 340.9 | 340.9 | 340.9 |
 
-The near zero gaps do not mean the schedule builders are clever. They mean
-the problem is easy at that scale. Each batch holds hundreds of thousands of
-tokens, so the card's compute speed is the only binding limit, and any
-sensible packing reaches the bound. The choice between policies then reduces
-to counting tokens, with the following consequences.
+The conclusions from the earlier direct builders stand. Task-first wins
+below a pass rate of about 0.20 (the crossing point is 500,000 over
+2,466,000, or 0.203). Pipeline wins above it. Full speculation never wins
+at this scale under the ideal cost model, because there is always other
+work to hide filter waits behind, and even at 3.3 percent KV residency
+(32B on L40S) the pipeline never recomputes anything.
 
-- Task-first beats pipeline only when the first filter's pass rate is below
-  about 0.20, on every model and card. The exact crossing point is the
-  number of documents times the prompt length, divided by the total document
-  tokens minus that same product, which is 500,000 over 2,466,000, or 0.203.
-  Below it, rereading the few survivors costs less than giving every
-  document its own prompt tokens.
-- Full speculation never wins at this scale. Its extra prompts on documents
-  that fail early are never paid back, because waiting for answers costs
-  nothing when there are always other documents to work on. Even on the
-  tightest pair, the 32B model on the L40S, where only 3.3 percent of the
-  corpus fits on the card, the pipeline never has to recompute anything,
-  because it keeps each document's stored state for only one batch.
-- Attention is at most 2.5 percent of the finish time at these document
-  lengths, and weight loading is at most 1.2 seconds even when a run needs
-  70 batches. Runs that scale document lengths up would change both, since
-  attention grows with the square of length.
+## What the program layer adds
 
-## At small document counts, the exact optimizer finds better schedules
+The linear program chooses long-run rates for state-conditioned batch
+actions, subject to queue balance, cache-state balance, and one GPU second
+per second, and its optimum is a certified throughput ceiling for its
+supplied state and action set. Details of this implementation, all
+recorded in the result files:
 
-Small queries are the regime where scheduling is a live problem, because
-batches are small, loading the model weights costs as much as computing,
-and waiting for a filter answer can waste a batch. The exact optimizer runs
-here. On real Qwen3-4B and H100 numbers with real review lengths, whole
-document chunks, and a 0.5 pass rate, finish times in milliseconds:
+- Task-first and full speculation keep no per-document KV between batches,
+  so their cache state collapses to a single state and the program runs
+  over batch templates with exact empirical length types (1,037 distinct
+  lengths, no averaging).
+- The pipeline uses a one-dimensional quantized count of resident
+  survivors. Under the paper's assumption that pass rates do not depend on
+  document length, the length mix of survivors equals the admission mix
+  exactly, so per-survivor costs use the exact mix and no per-length cache
+  state is needed. Survivor counts above the capacity share overflow to a
+  recompute queue, which is the model's eviction path.
+- Costs of fluid actions are expectations over the mix, which the paper
+  permits when declared. Real feasibility is enforced during replay, and
+  the independent validator replays every batch of every reported schedule.
 
-| documents | task-first, exact | pipeline, exact | full speculation, exact | pipeline, builder |
-|---|---|---|---|---|
-| 2 | 2.44 | 2.17 | **2.09** | 2.80 |
-| 3 | 3.92 | **3.12** | 3.30 | not run |
-| 4 | 5.98 | **4.52** | 4.70 | 5.05 |
+The replay converts rates into actual batches with real documents and
+tags every batch as fill, core, repair, or drain. Repair batches were never
+needed in these runs. One structural observation: the task-first replay
+executes many batches far below their template size (its queues hold at
+most a few documents of each exact length), which costs nothing under the
+ideal model because those batches stay compute-bound, but it would cost
+real time under a calibrated model with a fixed charge per batch. The
+pipeline replay packs 7 to 100 large batches instead.
 
-The optimizer found a schedule shape we did not anticipate. At 3 documents,
-the best pipeline schedule puts documents 0 and 1 with their filter 1
-prompts in batch 1, and puts document 2's reading, document 2's filter 1
-prompt, and the filter 2 prompts of batch 1's survivors together in batch 2.
-Holding document 2 back gives the scheduler useful work to run while the
-filter 1 answers arrive, so waiting costs nothing, and the pipeline gets
-speculation's batch count without its wasted prompts. A simple prediction
-that ignores holding documents back says speculation should win up to about
-6 documents. In fact it wins only at 2, when there is nothing left to hold
-back. Speculation should also win at the tail end of any query, for the
-same reason.
+## Small documents counts and the exact reference solver
 
-The schedule builders used for the 10,000 document runs do not hold
-documents back, and they finish 12 to 24 percent behind the exact optimizer
-at 8 documents or fewer (2.80 versus 2.17 milliseconds at 2 documents, 5.05
-versus 4.52 at 4). The gap fades by about 16 documents and is invisible at
-10,000. Any claim about small queries should come from the exact optimizer,
-or from a builder taught to hold documents back, which is on the plan.
-
-The exact optimizer's practical limit, recorded per the paper's section
-10.5: with single token chunks and deletion choices it reaches 4 documents
-of about 7 tokens in roughly 146 seconds, and 3 documents for the online
-case. With whole document chunks it reaches 4 documents at real lengths in
-seconds. Past that, the number of states blows up, which matches the
-paper's hardness claim, so large runs rely on built schedules plus lower
-bounds instead.
-
-## With four filters, pipeline still wins at full scale
-
-A run with four filters, each with the same per stage pass rate, on the
-tightest and loosest model and card pairs, from one outcome table, finish
-times in seconds:
-
-| pass rate per stage | model and card | task-first | lookahead 1 | lookahead 2 | lookahead 4 |
-|---|---|---|---|---|---|
-| 0.50 | 32B on L40S | 473.8 | **334.8** | 361.6 | 426.5 |
-| 0.95 | 32B on L40S | 946.8 | **414.4** | 418.4 | 426.5 |
-| 0.95 | 4B on H100 | 41.0 | **17.9** | 18.1 | 18.5 |
-
-Lookahead 1 is the pipeline and lookahead 4 is full speculation. The
-pipeline wins everywhere, and task-first falls far behind because it rereads
-every surviving document at each of the four stages. Speculation's one
-advantage is batch count. At a 0.95 pass rate on the 32B model and L40S,
-the pipeline needs 138 batches and full speculation needs 53. The ideal
-model charges nothing per batch beyond the work inside it, but real serving
-software pays some fixed cost per batch. If that fixed cost exceeds about
-140 milliseconds (the 12.1 second gap divided by the 85 extra batches),
-speculation starts winning. Measuring that fixed cost is the first thing
-the calibration phase should do.
+The exact solver (offline Dijkstra plus online value iteration) is now the
+validation reference the revised paper assigns it. On real Qwen3-4B and
+H100 numbers it solves up to 4 documents in seconds, and it found the one
+schedule shape the other layers miss: holding a document back so that the
+survivors' next filter prompts run inside the held document's prefill
+batch, which makes filter waits free. Speculation wins only when nothing is
+left to hold back (2 documents, or the tail of a query). The direct
+builders run 12 to 24 percent behind the exact optimum below 8 documents,
+and the program layer inherits a milder version of the same limitation
+through its restricted action menu.
 
 ## Caveats
 
-- The ideal model omits per batch software overhead on purpose, so every
-  claim that a policy never wins is a claim about the ideal model at the
-  stated scale, following the paper's rule of labeling each number as a
-  bound, a model result, or a measurement.
-- The weight sizes are estimates from parameter counts, not measurements
-  from the released model files. They enter only through the weight loading
-  term, which stays under 1.2 seconds in these runs, and through the batch
-  size at which computing overtakes loading.
-- The small instance numbers come from one random outcome table each, so
-  the exact document count where speculation stops winning moves from run
-  to run.
-- Attention uses the corrected width from convention C1. With the paper's
-  equation 20 as written, every attention term would be 1.6 times smaller.
-- The break-even pass rate of 0.203 is bracketed by the grid points 0.10
-  and 0.25 in the actual runs, per the paper's rule against reporting a
-  crossing point more precisely than the grid supports.
+- Every "X never wins" statement is about the ideal cost model at the
+  stated scale. The batch-count differences (for example 100 pipeline
+  batches versus 53 full-speculation batches at high pass rates on the
+  32B model and L40S) mean a fixed per-batch overhead of roughly 140
+  milliseconds would start reversing the speculation conclusion; that is
+  the first target for the calibrated phase.
+- The program's value is the optimum of a restricted state and action set,
+  labeled per the paper: a fuller action search could raise it, and the
+  achievability of the rate is established here only by the successful
+  replays, not by the program itself.
+- Weight sizes are still estimates from parameter counts, not measured
+  from the released files.
+- The small instance numbers come from single outcome draws.

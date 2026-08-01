@@ -31,12 +31,12 @@ def _a(c, q):
     return c * q + q * (q + 1) // 2
 
 
-def _tau_fields(inst, U, A, K_R, K_W, peak_tokens):
+def _tau_fields(inst, U, A, K_L, K_W, peak_tokens):
     m, dev = inst.model, inst.device
     D = max(2.0 * m.P * U / dev.R_D, m.W_run / dev.BW) if U > 0 else 0.0
     H = max(4.0 * m.L * m.attn_width * A / dev.R_A,
-            m.kappa * (K_R + K_W) / dev.BW)
-    return dict(U=U, A=A, K_R=K_R, K_W=K_W,
+            m.kappa * (K_L + K_W) / dev.BW)
+    return dict(U=U, A=A, K_L=K_L, K_W=K_W,
                 M_peak=m.W_mem + m.kappa * peak_tokens, D=D, H=H, tau=D + H)
 
 
@@ -66,12 +66,16 @@ class _BatchBuilder:
                                     token_start=start, token_end=end))
         q = end - start
         self.U += q; self.A += _a(cached, q); self.K_W += q; self.K_tmp += q
+        if stage > 0 and end == self.inst.d[i]:
+            self.K_W -= 1   # task decision leaf is ephemeral (write-through)
 
     def add_branch(self, i, j, d_i, resident_prefix):
         p = self.inst.p[j - 1]
         self.rec["ops"].append(dict(kind="branch", doc=i, stage=j,
                                     token_start=0, token_end=p))
-        self.U += p; self.A += _a(d_i, p); self.K_tmp += p
+        # interior branch tokens are stored (write-through); the final
+        # decision position is the only ephemeral leaf
+        self.U += p; self.A += _a(d_i, p); self.K_W += p - 1; self.K_tmp += p
         if resident_prefix > 0:
             self.reads[("doc", i)] = resident_prefix
 
@@ -79,8 +83,8 @@ class _BatchBuilder:
         self.reads[block] = tokens
 
     def finish(self, retained_r, pins, outcomes):
-        K_R = sum(self.reads.values())
-        self.rec.update(_tau_fields(self.inst, self.U, self.A, K_R, self.K_W,
+        K_L = sum(self.reads.values())
+        self.rec.update(_tau_fields(self.inst, self.U, self.A, K_L, self.K_W,
                                     self.resident_start + self.K_tmp))
         self.rec["K_tmp"] = self.K_tmp
         self.rec["retained_r"] = list(retained_r)

@@ -4,7 +4,7 @@ independent validator can replay it without solver internals."""
 import json
 
 from .costmodel import dense_time, attn_time
-from .exact import engine
+from .reference import engine
 from .instance import Instance
 
 
@@ -32,11 +32,11 @@ def emit(inst: Instance, policy: str, schedule, X) -> list:
             ops=op_rows,
             outcomes={str(i): int(passes) for i, passes in rec["outcomes"].items()},
             retained_r=list(rs_a), retained_pins=sorted(pins_a),
-            U=st.U, A=st.A, K_R=st.K_R, K_W=st.K_W, K_tmp=st.K_tmp,
+            U=st.U, A=st.A, K_L=st.K_L, K_W=st.K_W, K_tmp=st.K_tmp,
             M_peak=inst.model.W_mem + inst.model.kappa
                    * (engine.resident_tokens(inst, state) + st.K_tmp),
             D=dense_time(inst.model, inst.device, st.U),
-            H=attn_time(inst.model, inst.device, st.A, st.K_R, st.K_W),
+            H=attn_time(inst.model, inst.device, st.A, st.K_L, st.K_W),
             tau=cost,
         ))
     return records

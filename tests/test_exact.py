@@ -9,8 +9,8 @@ import pytest
 
 from docengine.configs import DeviceConfig, ModelConfig
 from docengine.costmodel import a_pairs, dense_time, attn_time
-from docengine.exact.offline import solve_offline
-from docengine.exact.online import solve_online
+from docengine.reference.offline import solve_offline
+from docengine.reference.online import solve_online
 from docengine.instance import Instance, survival
 from docengine.lb import resource_lb
 from docengine.manifest import emit
@@ -50,26 +50,30 @@ def test_chunk_attention_invariance():
         assert total == d * (d + 1) // 2  # eq. (16)
 
 
-def hand_tau(U, A, K_R, K_W, dev):
+def hand_tau(U, A, K_L, K_W, dev):
     D = max(2 * TOY_MODEL.P * U / dev.R_D, TOY_MODEL.W_run / dev.BW) if U else 0
     H = max(4 * TOY_MODEL.L * TOY_MODEL.attn_width * A / dev.R_A,
-            TOY_MODEL.kappa * (K_R + K_W) / dev.BW)
+            TOY_MODEL.kappa * (K_L + K_W) / dev.BW)
     return D + H
 
 
 def test_single_doc_single_filter_hand_check():
-    """N=1, n=1, d=4, p=2, ample memory: optimum is one batch for each policy."""
+    """N=1, n=1, d=4, p=2, ample memory: optimum is one batch for each policy.
+
+    Write-through ledger: task-first stores the prompt block (2) plus the doc
+    interior (4-1=3, decision leaf ephemeral) -> K_W=5; pipeline stores the
+    doc (4, branches consume it) plus the branch interior (2-1=1) -> K_W=5."""
     it = inst([4], [2], [0.5])
     X = np.array([[1]])
     dev = it.device
     # task-first: prompt prefill (U2, A3) + doc under prompt (U4, A=a(2,4)=18)
     v_task, sched = solve_offline(it, "task", X)
     assert len(sched) == 1
-    assert math.isclose(v_task, hand_tau(6, 21, 0, 6, dev), rel_tol=1e-12)
-    # pipeline: doc (U4, A10) + branch (U2, A=a(4,2)=11); K_W = doc only (C3)
+    assert math.isclose(v_task, hand_tau(6, 21, 0, 5, dev), rel_tol=1e-12)
+    # pipeline: doc (U4, A10) + branch (U2, A=a(4,2)=11)
     v_pipe, sched_p = solve_offline(it, "pipe", X)
     assert len(sched_p) == 1
-    assert math.isclose(v_pipe, hand_tau(6, 21, 0, 4, dev), rel_tol=1e-12)
+    assert math.isclose(v_pipe, hand_tau(6, 21, 0, 5, dev), rel_tol=1e-12)
     # full speculation with n=1 degenerates to the pipeline batch
     v_spec, _ = solve_offline(it, "spec", X, kmax=1)
     assert math.isclose(v_spec, v_pipe, rel_tol=1e-12)

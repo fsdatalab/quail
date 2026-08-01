@@ -27,7 +27,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from docengine.configs import DEVICES, MODELS                     # noqa: E402
-from docengine.exact.offline import solve_offline                 # noqa: E402
+from docengine.reference.offline import solve_offline                 # noqa: E402
 from docengine.instance import Instance, sample_outcomes          # noqa: E402
 from docengine.sched.blockwise import (schedule_blockwise,        # noqa: E402
                                        schedule_taskfirst)

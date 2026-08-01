@@ -151,7 +151,8 @@ def evaluate_batch(inst: Instance, policy: str, state, b: Batch):
             ops.append(Op(kind="doc_chunk", doc=i, stage=z, new=dl,
                           cached_resident=(inst.p[z - 1] if pinned else 0) + rs[i],
                           cached_inbatch=(inst.p[z - 1] if prefilled else 0),
-                          read_blocks=tuple(reads)))
+                          read_blocks=tuple(reads),
+                          ephemeral_tail=1 if rs[i] + dl == inst.d[i] else 0))
         else:
             reads = [("doc", i)] if rs[i] > 0 else []
             ops.append(Op(kind="doc_chunk", doc=i, stage=0, new=dl,
@@ -166,7 +167,7 @@ def evaluate_batch(inst: Instance, policy: str, state, b: Batch):
         for jj in range(z, z + k):
             ops.append(Op(kind="branch", doc=i, stage=jj, new=inst.p[jj - 1],
                           cached_resident=rs[i], cached_inbatch=dl,
-                          read_blocks=tuple(reads)))
+                          read_blocks=tuple(reads), ephemeral_tail=1))
 
     st = batch_stats(ops, resident_map)
     if inst.max_new_tokens is not None and st.U > inst.max_new_tokens:

@@ -4,7 +4,7 @@ the exact optimum on instances small enough to solve exactly."""
 import numpy as np
 import pytest
 
-from docengine.exact.offline import solve_offline
+from docengine.reference.offline import solve_offline
 from docengine.instance import Instance
 from docengine.sched.blockwise import schedule_blockwise, schedule_taskfirst
 from docengine.validator.check import validate

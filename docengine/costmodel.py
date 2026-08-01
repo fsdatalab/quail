@@ -1,4 +1,4 @@
-"""Batch statistics and the analytical latency tau_0 (paper sec. 3-4).
+"""Batch statistics and the analytical latency tau_0 (paper secs. 3-4).
 
 A batch is a list of Ops. Three op kinds cover every policy family:
 
@@ -9,20 +9,30 @@ A batch is a list of Ops. Three op kinds cover every policy family:
   branch          -- p_j prompt tokens evaluated after a complete document
                      prefix (document-first / speculative template); cached = d_i
 
-Accounting conventions (C3):
-  K_W = new doc_chunk tokens + new prompt_prefill tokens (their KV has future
-        consumers: later chunks, branches, or batches). branch tokens end at
-        logits and are never written.
-  K_tmp = all new tokens of the batch (doc chunks + prompt blocks + branches)
-        live simultaneously at the batch peak; branch KV is discarded at the
-        boundary, doc/prompt KV persists into K_{t+1}.
-  K_R = resident tokens read, deduplicated per physical block: a shared task
-        prompt block is counted once per batch regardless of how many docs use
-        it; a document prefix block is counted once even if several branches
-        of that doc read it (tree-aware kernel assumption, paper sec. 4.5).
+KV accounting follows the paper's primary write-through fused ledger
+(sec. 4.5 of the revised paper): every new KV position with a later causal
+consumer has one store event; only a terminal leaf position with no
+descendant is ephemeral. Fusion removes later loads, never the store.
+Concretely, per op, K_W counts op.new - op.ephemeral_tail where
+ephemeral_tail is 1 for a branch (its final decision position has no
+descendant) and 1 for a task-context doc chunk that completes the document
+(the decision is read at the final document token), else 0. Interior prompt
+and document tokens are always stored because later tokens of the same
+sequence, or later branches, attend to them.
+
+K_L counts HBM load events in token spans. Each batch is modeled as one
+supported fused producer-consumer group, so blocks produced earlier in the
+batch are streamed (no load event); only launch-resident blocks create
+loads, deduplicated per physical block (tree-aware kernel assumption).
+
+Peak memory uses the conservative lifetime convention that all of a batch's
+new tokens are live simultaneously with the launch-resident set. Blocks
+retained under any outcome must stay live through the outcome boundary, so
+the convention satisfies the paper's exact ordinal rule; it can only
+overestimate the true peak.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from .configs import DeviceConfig, ModelConfig
@@ -37,14 +47,15 @@ def a_pairs(c: int, q: int) -> int:
 class Op:
     kind: str                 # 'prompt_prefill' | 'doc_chunk' | 'branch'
     doc: int                  # document index; -1 for prompt_prefill
-    stage: int                # filter j (1-based); for doc_chunk under ctx='doc': 0
+    stage: int                # filter j (1-based); doc_chunk under ctx='doc': 0
     new: int                  # new tokens evaluated by this op
     cached_resident: int      # prefix tokens resident at batch start visible to op
     cached_inbatch: int = 0   # prefix tokens produced earlier in this same batch
     read_blocks: tuple = ()   # physical block ids read (resident at batch start)
+    ephemeral_tail: int = 0   # trailing positions with no causal descendant
     # block id conventions: ('prompt', j) shared task-prompt block;
-    # ('doc', i) document prefix under doc-first; ('taskdoc', i, j) document
-    # prefix under the F_j task template (specific to (i,j), paper Table 1).
+    # ('doc', i) document prefix under doc-first; ('taskdoc', i) document
+    # prefix under the current task template (specific to (i, z_i)).
 
     @property
     def cached(self) -> int:
@@ -55,22 +66,18 @@ class Op:
 class BatchStats:
     U: int = 0
     A: int = 0
-    K_R: int = 0          # deduplicated resident tokens read
-    K_W: int = 0          # new token positions written for a future consumer
+    K_L: int = 0          # token spans over HBM load events (launch-resident reads)
+    K_W: int = 0          # new positions stored under the write-through ledger
     K_tmp: int = 0        # peak additional token-equivalent KV during the batch
     n_segments: int = 0   # distinct causal segments (for tau_theta's beta_Q term)
 
 
 def batch_stats(ops: Iterable[Op], resident_block_tokens: dict) -> BatchStats:
-    """Compute U, A, K_R, K_W, K_tmp for a batch.
+    """Compute U, A, K_L, K_W, K_tmp for a batch.
 
     resident_block_tokens maps physical block id -> resident token count at
-    batch start, used to deduplicate K_R across ops sharing a block. An op's
-    read_blocks must reference only blocks present in this map; the tokens it
-    actually reads from a block are min(op.cached_resident allocation) --
-    here we charge the full referenced extent per block once (union), which
-    matches the paper's "union of physical resident KV token blocks".
-    """
+    batch start, used to deduplicate K_L across ops sharing a block (the
+    paper's one-load credit for a shared block in one load group)."""
     st = BatchStats()
     read: dict = {}
     for op in ops:
@@ -78,14 +85,12 @@ def batch_stats(ops: Iterable[Op], resident_block_tokens: dict) -> BatchStats:
         st.A += a_pairs(op.cached, op.new)
         st.n_segments += 1
         st.K_tmp += op.new
-        if op.kind in ("doc_chunk", "prompt_prefill"):
-            st.K_W += op.new
+        st.K_W += op.new - op.ephemeral_tail
         for b in op.read_blocks:
             if b not in resident_block_tokens:
                 raise ValueError(f"op reads non-resident block {b}")
-            # union semantics: full resident extent of the block, once
             read[b] = resident_block_tokens[b]
-    st.K_R = sum(read.values())
+    st.K_L = sum(read.values())
     return st
 
 
@@ -107,10 +112,10 @@ def dense_time(model: ModelConfig, device: DeviceConfig, U: int) -> float:
 
 
 def attn_time(model: ModelConfig, device: DeviceConfig, A: int,
-              K_R: int, K_W: int) -> float:
-    """H(B), eq. (25), with the C1 attention width n_q*d_h."""
+              K_L: int, K_W: int) -> float:
+    """H(B), eq. (25), with the attention width w_Q = n_Q * d_h."""
     f_a = 4.0 * model.L * model.attn_width * A
-    b_kv = model.kappa * (K_R + K_W)
+    b_kv = model.kappa * (K_L + K_W)
     return max(f_a / device.R_A, b_kv / device.BW)
 
 
@@ -119,13 +124,13 @@ def tau(model: ModelConfig, device: DeviceConfig, st: BatchStats,
     """tau_theta(B), eq. (26)/(27). Default params give tau_0."""
     p = params or CostParams()
     D = dense_time(model, device, st.U)
-    H = attn_time(model, device, st.A, st.K_R, st.K_W)
+    H = attn_time(model, device, st.A, st.K_L, st.K_W)
     return p.beta_0 + p.beta_D * D + p.beta_H * H + p.beta_U * st.U \
         + p.beta_Q * st.n_segments
 
 
 def peak_memory(model: ModelConfig, resident_tokens: int, k_tmp: int) -> float:
-    """LHS of eq. (22)."""
+    """LHS of the peak-memory condition under the conservative lifetime rule."""
     return model.W_mem + model.kappa * (resident_tokens + k_tmp)
 
 
