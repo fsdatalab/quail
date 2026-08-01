@@ -1,166 +1,193 @@
-# Review of `paper.md` (Scheduling n-Stage AI Filters Under KV-Cache Constraints)
+# Review of paper.md (Scheduling n-Stage AI Filters Under KV-Cache Constraints)
 
-Process: five independent review lenses (math, hardware facts, scheduling
-semantics, algorithms/complexity, reproducibility) swept the full source; 28
-raw findings were deduplicated to 9, and each survivor was adversarially
-verified by an agent instructed to refute it. Verdicts: 4 confirmed, 3
-confirmed in weakened form, 2 refuted. The refuted ones are listed too —
-they mark places where the paper is right and a careless reader (me
-included) gets it wrong. Everything below was additionally cross-checked
-against the working solver in this repo, which implements the model
-end-to-end.
+Five reviewer agents read the full paper source independently, each with a
+different focus (mathematics, hardware facts, scheduling semantics,
+algorithms and complexity, and reproducibility). They produced 28 raw
+findings, which were merged into 9 after removing duplicates. A second set
+of agents then tried to refute each finding. Four findings survived as
+stated, three survived in a weaker form, and two were refuted. The refuted
+ones are listed too, because they mark places where the paper is right and a
+careless reader gets it wrong. Every finding was also checked against the
+working solver in this repo, which implements the paper's model end to end.
 
-**Bottom line: the framework is sound and implementable — the solvers in
-this repo reproduce its propositions on real data. But two technical errors
-need fixing before any reported number is checkpoint-faithful, one proof and
-one well-foundedness argument need repair, and two accounting definitions
-need to be pinned before independent implementations can agree.**
+The paper's framework is sound and can be implemented, and the solvers in
+this repo reproduce its propositions on real data. Before any reported
+number can be trusted for the named models, the paper needs two formula
+fixes, one repaired proof, one added convergence argument, and two
+accounting definitions pinned down.
 
 ## Confirmed errors
 
-### E1 (critical). Attention FLOPs use the wrong width: `4·L·h` should be `4·L·n_q·d_h` — an exact 1.6× undercount for both committed models
-Eq. (20) (`eq:attention-flops`), propagating into H(B) (eq. 25), τ₀, and the
-attention term of LB_res (eq. 55). The paper's own derivation — one QK dot
-product plus one AV accumulation per allowed pair — yields `4·n_q·d_h` FLOPs
-per pair per layer (GQA shares KV *storage*, not query-side compute). The
-substitution `n_q·d_h = h` is false for both committed checkpoints because
-Qwen3 fixes `d_h = 128` independently of hidden width: 4B has `n_q·d_h =
-4,096` vs `h = 2,560`; 32B has `8,192` vs `5,120` — 1.6× in both cases, an
-internal inconsistency with the paper's own Table 3. The neighboring κ
-formula (eq. 18) correctly uses `heads·d_h` (72/128 KiB verified), isolating
-the bug to the `4Lh` factor. Materiality: at `L_ctx = 40,960` on 4B, correct
-attention FLOPs (4.95e14) exceed dense FLOPs (2.95e14) — the 60% error
-dominates exactly where the length-scaling plots live, and since A_T, A_P,
-A_S differ per policy it can flip break-evens rather than rescale them.
-**Fix:** define `h_attn = n_q·d_h`, use `F_A = 4·L·h_attn·A(B)` in eqs. (20),
-(25), (55); add `n_q`/`h_attn` to Tables 2–3 and the recorded-configuration
-list (line 984, which currently omits `n_q` entirely). The solver already
-does this (convention C1).
+### 1. The attention cost formula uses the wrong width, undercounting by 1.6 times for both models (critical)
 
-### E2 (major). The strong NP-hardness proof does not cover the model's optimum: the 3-PARTITION reduction collapses under chunking
-Prop. 7.2 asserts hardness of "the offline optimum", but the offline optimum
-(what the δ=1 exact DP computes) ranges over Σ_chunk, and the paper itself
-proves Σ_atomic ⊊ Σ_chunk (Prop. 5.4). On the constructed instances chunking
-fills every batch to exactly B tokens by splitting the straddling document,
-so OPT over Σ_chunk equals m·c whether or not a 3-partition exists — the
-reduction proves hardness only for the atomic-restricted class. Also, the
-proof's "positive constant cost per nonempty batch" and "zero attention
-cost" are not primitives of τ₀; they hold only in the (unstated)
-weight-read-bound regime. **Fix options:** (a) restate the proposition for
-atomic prefill (δ ≥ max d_i) with the parameter regime stated; or (b) repair
-the reduction so chunking cannot help — e.g. drive capacity through the
-peak-memory constraint with fused branch evaluation: a document's *entire*
-KV must be resident in the batch where its branches run regardless of how
-prefill was chunked, so branch placement induces the partition. (b) restores
-the stronger claim.
+Equation (20) computes attention floating point operations as 4·L·h·A(B),
+where h is the model's hidden width. The paper's own derivation, one dot
+product plus one accumulation per allowed token pair, actually gives
+4·L·n_q·d_h, where n_q is the number of query heads and d_h is the width of
+each head. Grouped query attention shares stored keys and values across
+heads, but it does not reduce compute on the query side. The two widths
+agree for older models, but Qwen3 fixes d_h at 128 regardless of hidden
+width, so for Qwen3-4B the true width is 4,096 while h is 2,560, and for
+Qwen3-32B the true width is 8,192 while h is 5,120. Both are off by exactly
+1.6 times, and the paper's own Table 3 lists the head counts that contradict
+the formula. The neighboring formula for stored bytes per token (equation
+18) uses heads times head width correctly, which isolates the bug to
+equation (20). The error is largest for long documents. At the maximum
+context length on Qwen3-4B the corrected attention work exceeds the dense
+work, so the 60 percent error dominates exactly where the length scaling
+plots live. The three policies also have different attention totals, so the
+error can flip break-even conclusions rather than rescale them.
 
-### E3 (critical). The online recurrence is not well-founded as stated
-The paper fixes eviction/recomputation cycles for the *offline* search
-(Dijkstra, line 873) but then says the online table is obtained by
-"enumerating the same states and evaluating this recurrence" (eq. 54, line
-889). The online state graph has the same positive-cost cycles (prefill →
-evict → same state), so eq. (54) is a fixed-point equation, not a recursion;
-no evaluation order, uniqueness, or convergence argument is given, and the
-optimality proofs assume well-founded backward induction. **Fix:** state
-that eq. (54) is a stochastic shortest-path problem: positive batch costs +
-existence of a proper policy give a unique fixed point, computable by value
-iteration (or a label-correcting SSP method). The solver implements exactly
-this (convention C4; Gauss–Seidel VI over the reachable graph).
+The fix is to define an attention width equal to n_q·d_h, use it in
+equations (20), (25), and (55), and add the query head count to the
+parameter tables and to the recorded configuration list, which currently
+omits it. The solver already computes attention this way (convention C1 in
+notes/PLAN.md).
 
-### E4 (major). LB_res uses schedule-dependent totals as if they were instance constants, and B_min has no derivation rule
-Eq. (55) introduces U_tot, A_tot, B_KV,tot "for a fixed policy instance",
-but under the paper's own rules these vary across schedules (recompute after
-eviction, adaptive branch sets, chunking-dependent re-reads), and B_min is
-"any valid lower bound" with no rule for obtaining one. As written, LB_res
-is ill-defined and the equality certificate could compare a schedule against
-a bound computed from a *different* schedule's totals. **Fix:** define each
-total as the schedule-independent minimum over the policy class — the
-recomputation-free, maximal-sharing ledger for the realized X (the realized
-analogues of eqs. 32–37/43–45) — and give B_min a stated derivation, e.g.
-from the peak-memory constraint: every new document token's KV occupies HBM
-during its batch, so B_min = ⌈doc_tokens/((M−W_mem−S)/κ)⌉, plus any
-configured cap. This is what `docengine/lb.py` implements (C8), and with it
-the N=10k certificates are legitimate.
+### 2. The hardness proof does not cover the model it claims to (major)
 
-## Confirmed in weakened form
+Proposition 7.2 claims that computing the offline optimum is strongly
+NP-hard, by a reduction from the 3-PARTITION problem that packs indivisible
+documents into batches of a fixed size. But the paper's offline optimum
+allows splitting documents into chunks, and the paper itself proves that
+splitting can only help (Proposition 5.4). On the instances the proof
+constructs, splitting lets every batch be filled exactly, so the schedule
+cost no longer depends on whether a partition exists, and the reduction
+proves hardness only for the restricted class with indivisible documents.
+The proof also assumes a constant cost per batch and zero attention cost,
+and neither is a primitive of the cost model. They hold only in a regime the
+proof does not state.
 
-### P1 (major). K_W / K_R accounting is genuinely ambiguous for fused batches
-Line 426's consumer-based K_W ("written … for use by a later chunk, branch,
-or batch") never says whether "later branch" includes *same-batch* branches,
-and the notation table gives a conflicting second definition ("new KV token
-positions materialized"). K_R's "resident" is likewise unpinned for
-in-batch-produced blocks. For a fully fused batch (doc + branches, nothing
-persists), the ledger admits 0, κ·d, or 2κ·d per document — 147.5 MB per
-2,000-token doc on 4B, so B_KV and the H(B) crossover move materially.
-**Fix:** pick one convention and state it. The solver's C3: K_W = new doc
-and prompt-block tokens (their KV has consumers beyond their producing
-operation); branch tokens never; K_R = resident-at-batch-start blocks only,
-deduplicated per physical block. The manifest then needs the op→physical-
-block mapping so a validator can tell fused from reload (the repo's manifest
-records per-op `read_blocks` for this reason — eq. 57 as written cannot).
+The fix is either to restate the proposition for indivisible documents with
+the cost regime stated, or to repair the reduction so splitting cannot help.
+The repair is possible by routing capacity through the memory limit instead
+of a token cap. A document's entire stored state must sit on the card in the
+batch where its filter prompts run, no matter how the reading was split, so
+prompt placement forces the partition and the stronger claim comes back.
 
-### P2 (major, mostly resolved by careful reading). The eviction-timing "contradiction" between eqs. (30) and (54) is a readability defect, not two different optima
-Line 514's joint (batch, eviction) action is explicitly the *offline*
-action; the online protocol is defined sequentially in the very next
-sentence, and eq. (54) encodes it. But eq. (30)'s single `min_a` invites the
-precommitted-eviction misreading (min_E E[V] ≥ E[min_E V], strict under
-memory pressure), and three of five reviewers initially misread it. **Fix:**
-one sentence at eq. (30) defining the online action as the batch alone with
-eviction chosen in the post-outcome state, or write eq. (30) in the two-stage
-form of eq. (54) from the start.
+### 3. The online algorithm is not well defined as written (critical)
 
-### P3 (minor). The speed-of-light model is computable, but several run parameters still need pinning
-The W_run "not computable" claim was refuted: line 386 defines it
-operationally (recorded bytes of the repeated transformer blocks of the
-pinned checkpoint — a static safetensors inspection, ≈P bytes within ~1% at
-FP8). What genuinely remains unpinned and must be recorded per run: primary
-R_A (2× swing on the attention term if calibrated ≈ R_D/2), primary q_KV
-(2× on κ and capacity), chunk quantum δ for the 10k runs, the selectivity
-grid and Monte Carlo R, exact prompts (p_j content, not just ≈50), the IMDb
-pool ("the source dataset" is ambiguous among 25k/50k/100k; file IDs are
-unique only per split/class), and tokenizer revision. The repo pins all of
-these (C5–C11; workload builder records pool = 50k labeled, doc_id =
-split/row, tokenizer sha `aeb13307…`, both FP8 repos ship byte-identical
-tokenizers).
+The paper handles loops in the schedule graph for the offline case by using
+Dijkstra's algorithm (line 873), because evicting and recomputing a document
+can return the scheduler to a state it has already visited. The online case
+has the same loops, but the paper says the online answer is obtained by
+"enumerating the same states and evaluating this recurrence" (equation 54).
+With loops, equation 54 is a fixed point equation rather than a recursion,
+so evaluating it is not a terminating procedure, and the optimality proofs
+assume an evaluation order that does not exist.
 
-## Refuted on verification (the paper is right; worth keeping as reader traps)
+The fix is to state that equation 54 defines a stochastic shortest path
+problem, meaning a shortest path problem in which each move has random
+outcomes. Positive batch costs, plus the existence of at least one policy
+that always finishes, give a unique fixed point, and value iteration
+computes it. The solver does exactly this (convention C4).
 
-- **R1. Offline oracle gate semantics.** Suspected ambiguity: may the
-  clairvoyant scheduler co-batch F_j(i) and F_{j+1}(i)? Refuted — Sec 3.4
-  pins gates at the execution-model level, before any information model:
-  outcomes become visible only at batch boundaries, and a non-speculative
-  batch cannot include F_{j+1}(i) while F_j(i) is unresolved *at the start of
-  that batch*. This binds the oracle too; clairvoyance affects only packing,
-  retention, and eviction. The solver enforces exactly this (C2).
-- **R2. Speculative-block atomicity.** Suspected unrepresentable state for
-  blocks spanning batches. Refuted — since outcomes are revealed at every
-  batch boundary, a "block" split across batches is definitionally just
-  sequential (pipeline) execution; speculation is intra-batch by
-  construction, so S_S = (z, r, K) suffices.
+### 4. The lower bound is built from quantities that depend on the schedule (major)
+
+Equation 55 builds the bound from total tokens, total attention pairs, total
+stored bytes, and a minimum batch count, and treats them as properties of
+the instance. Under the paper's own rules they are not fixed. Eviction
+forces recomputation, adaptive speculation changes which prompts run, and
+splitting changes how much stored data is reread. As written, a schedule
+could be compared against a bound computed from a different schedule's
+totals. The minimum batch count also has no derivation rule anywhere in the
+paper.
+
+The fix is to define each total as the smallest value any feasible schedule
+of the policy could have, which is the ledger with no recomputation and
+maximal sharing for the realized outcomes, and to derive the minimum batch
+count from the memory limit, since every new document token's stored state
+must sit on the card during its batch. The solver's bound is built this way
+(convention C8), and with it the certificates at 10,000 documents are
+legitimate.
+
+## Findings that survived in weaker form
+
+### 5. The stored data accounting is ambiguous for fused batches (major)
+
+K_W counts the new tokens whose stored state must be written to card memory
+"for use by a later chunk, branch, or batch" (line 426), and the notation
+table gives a second, different definition ("new KV token positions
+materialized"). Neither says what happens when a document is read and all
+its filter prompts run inside one batch. The fused case therefore admits
+three values: zero bytes, one write of the document, or a write plus a read
+back. The three differ by about 147 megabytes per 2,000 token document on
+the 4B model, enough to change which term of the cost is binding. The
+manifest format also cannot record which prompts shared one physical copy of
+a document, so a checker cannot tell sharing from reloading. The fix is to
+pick one convention and state it. The solver counts document and prompt
+block tokens as written and filter prompt tokens as never written, counts
+reads only for blocks that were on the card when the batch started
+(convention C3), and its manifest records which blocks each operation read.
+
+### 6. One equation invites a wrong reading of when eviction is chosen (minor after verification)
+
+Equation 30 minimizes over a single action before the random outcomes are
+drawn, which reads as if the scheduler commits to its evictions before
+seeing the filter results. Section 5.2 defines the joint action only for the
+offline case, and the online protocol, which is to choose a batch, observe
+the results, and then evict, is stated in the next sentence and encoded
+correctly in equation 54. So there is one optimum, not two, but three of the
+five reviewers misread it. The fix is one sentence at equation 30 saying the
+online action is the batch alone, with eviction chosen in the state after
+outcomes are seen.
+
+### 7. Some run parameters still need pinning (minor)
+
+The claim that the model is not computable was refuted. The per batch weight
+traffic is defined operationally at line 386 as the recorded bytes of the
+repeated transformer blocks of the fixed checkpoint, which is a static file
+inspection. What genuinely remains open, and must be recorded per run, is
+the following: the attention speed ceiling (a factor of 2 swing if set from
+measurement instead of the dense ceiling), the stored data precision (a
+factor of 2 on capacity), the chunk quantum for the large runs, the
+selectivity grid and the number of random repetitions, the exact prompt
+texts, which IMDb pool "the source dataset" means (the standard release has
+25,000 labeled training reviews, 25,000 labeled test reviews, and 50,000
+unlabeled ones, with file names unique only within a folder), and the
+tokenizer revision. The repo pins all of these, and the two released
+checkpoints ship tokenizer files that are identical byte for byte.
+
+## Refuted findings, where the paper is right
+
+- **Gate timing for the offline scheduler.** The suspicion was that the
+  paper never says whether the offline scheduler, which knows all outcomes
+  in advance, may run filter j and filter j+1 on the same document in one
+  batch. Section 3.4 does say it, at the execution level and before any
+  information model. Outcomes become visible only at batch boundaries, and a
+  batch that does not speculate cannot contain work that needs an outcome
+  still unresolved when the batch starts. The rule binds the offline
+  scheduler too, so knowing the future helps only with packing, retention,
+  and eviction. The solver enforces this (convention C2).
+- **Partial speculative blocks.** The suspicion was that the state cannot
+  represent a speculative block split across batches. It does not need to,
+  because outcomes are revealed at every batch boundary, so a block split
+  across batches is by definition just sequential execution. Speculation is
+  within one batch by construction.
 
 ## Minor notes
 
-- Eq. (2) LaTeX bug: `X_{ik}quad` — missing backslash on `\quad`; the
-  compiled equation renders spurious math-italic "quad" inside the survival
-  definition.
+- Equation 2 has a LaTeX bug. A missing backslash renders the letters
+  "quad" inside the survival definition.
 - Line 93 says decisions are read "from the logits at the final prompt
-  position", but under the task-first template `[F_j][D_i]` the final
-  position is a document token. Reword to "final position of the serialized
-  sequence".
-- FP8 KV (q_KV = 1) silently drops quantization-scale storage; depending on
-  granularity this is 0–3% of κ. Worth one sentence (ideal model excludes
-  scales; calibrated layer measures them).
-- T_init (eq. 28) has no cost model and unstated interaction with K_1 and
-  LB_res. The solver sets T_init = 0 and prefills prompt blocks inside
-  ordinary batches (C11), which the text should either adopt or price.
+  position", but in the task-first layout the document comes last, so the
+  final position is a document token. Reword to the final position of the
+  sequence.
+- Counting one byte per stored element ignores the scale factors that 8 bit
+  storage needs, which add 0 to 3 percent depending on granularity. One
+  sentence would cover it.
+- T_init in equation 28 has no cost formula and an unstated relation to the
+  first batch's memory check and to the lower bound. The solver sets it to
+  zero and loads prompt blocks inside ordinary batches (convention C11), and
+  the text should either adopt that or price it.
 
-## What the implementation already shows about the fixed model
+## What the implementation shows about the fixed model
 
-With E1/E3/E4 fixed as above (the repo's C1/C4/C8) the model is not just
-consistent but *solvable*: exact DP optima on small instances reproduce
-every proposition (chunking dominance with strictness, forced-speculation
-outcome independence, the VoI inequality over all outcome scenarios), the
-N=10k feasible schedules meet their lower bounds to <0.07% (ledger-dominated
-regime), and the small-N exact optima exhibit staggered pipelining — outcome
-gates hidden behind held-back document prefill — which is the scheduling
-phenomenon the paper's framework exists to capture. See `notes/RESULTS.md`.
+With findings 1, 3, and 4 fixed as above, the model is solvable, not just
+consistent. Exact optima on small instances reproduce every proposition,
+including strict improvement from chunking, outcome independence of forced
+speculation, and the value of information inequality. The schedules built
+for 10,000 documents meet their lower bounds to within 0.07 percent. The
+exact optimizer also shows the scheduling behavior the framework exists to
+capture, which is holding documents back so that filter answers are waited
+out inside useful work. See notes/RESULTS.md.
