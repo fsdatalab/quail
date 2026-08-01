@@ -210,6 +210,83 @@ often than the task template, 82 to 97 against 96 to 99.5 percent, so
 part of any accuracy gap between policies here is template wording, not
 scheduling.
 
+## Scheduler plan steps one and two, measured
+
+Step one, first half. The engine's reading speed limit is about 80,000
+tokens per second and it is a kernel fact, not a settings problem. Five
+engine configurations (step token budgets from 8,192 to 32,768,
+concurrent request limits from 256 to 1,024, prefix caching on and off)
+were each measured on reading-only jobs in three forms (pre-tokenized
+short documents, four-document concatenations, raw text), and every
+one of the fifteen measurements landed between 74,000 and 81,000 tokens
+per second, 27 to 29 percent of the theoretical 275,000 ceiling. The
+engine's defaults were already at the limit. This settles an open
+question in the plan: the cold first read has no recoverable scheduling
+or configuration overhead, and 80,000 becomes the calibration constant
+for everything below. Raw data: results/engine/speed_limit.json.
+
+Step one, second half. The per request overhead splits half and half
+between our client and the engine. On a four filter query over 2,000
+documents, run cold and then warm through the async interface in a two
+by two design, the warm floor per request was 1.12 milliseconds for
+staged execution with raw text (today's harness), 0.74 with
+pre-converted token numbers, 1.05 for streaming with raw text, and 0.55
+for streaming with token numbers. So pre-tokenization and streaming,
+neither of which touches the engine, recover half the floor, and 0.55
+milliseconds per request is the genuinely engine-internal share that
+only an in-engine scheduler can attack. Cold times moved only 9 percent
+across the arms, as expected for a read-bound pass. Raw data:
+results/engine/overhead.json.
+
+Step two. At 10,000 documents the corpus needs about 3.4 times the
+card's note capacity (3.1 million tokens against a measured 981,728
+token pool), and execution order becomes the decisive variable, exactly
+as predicted. Cold makespans in seconds, with the winner in bold:
+
+| configuration | task-first | naive k=1 | blocked k=1 | naive k=2 | blocked k=2 |
+|---|---|---|---|---|---|
+| n=2, s=0.5 | 61.7 | 64.4 | 53.8 | 89.5 | **52.8** |
+| n=4, s=0.8 | 122.8 | 111.3 | **74.0** | | |
+| n=4, s=0.95 | 158.3 | 153.7 | **84.2** | | |
+
+The engine's cached token counters give the mechanism directly as a
+read multiplier, computed tokens over corpus tokens. Naive stage-order
+execution reads 1.62 times the corpus at two filters and 3.82 times at
+four filters and 0.95, statistically identical to task-first's 1.58 and
+3.93, with cache hits at zero: by the time a survivor's next question
+arrives, ten thousand documents have passed through the cache and its
+notes are gone. The document-first advantage that was worth 25 percent
+at 2,000 documents is fully erased at 10,000. Naive speculation is the
+worst case, 2.30 times, because a document's second branch trails its
+first by ten thousand requests. The blocked schedules from the
+analytical builders read 1.18 to 1.32 times the corpus and win every
+cell, by 1.15 times at two filters and up to 1.88 times over task-first
+at four filters and 0.95.
+
+Run one of this experiment failed in an instructive way and is kept as
+results/engine/scale10k_run1.json.gz. The builder's schedules were
+right, but the conversion submitted each batch's new document prefills
+before its branch requests, and under the engine's keep-the-most-recent
+rule the new writes evicted exactly the resident bodies the branches
+were about to reuse, erasing the blocked advantage at two filters. The
+lesson is that under recency-based eviction, submission order inside a
+batch is itself a scheduling decision: requests that consume resident
+notes must run before requests that produce new ones. One sort fixed
+it, and it is the first concrete design requirement for the step four
+in-engine scheduler, which would pin instead of relying on order.
+
+Calibration closes the loop. Multiplying the ideal calculator by the
+measured kernel factor of about 3.44 (275,000 over 80,000), task-first
+lands within 3 to 4 percent of prediction in all three cells, and the
+blocked schedules land at 1.03 to 1.34 times prediction, the residual
+being per request overhead this arm still pays (raw text, staged calls)
+plus boundary misses. The naive runs sit at 1.35 to 2.55 times
+prediction, and they are the one arm the model cannot describe, because
+the engine silently broke the model's retention assumption. The step
+three client library (blocked order plus streaming plus
+pre-tokenization) targets exactly the measured residual. Raw data:
+results/engine/scale10k.json.gz and scale10k_analysis.csv.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
