@@ -370,3 +370,164 @@ def _product(lists):
     for head in lists[0]:
         for rest in _product(lists[1:]):
             yield (head,) + tuple(rest)
+
+
+# --------------------------------------- n-filter blockwise (lookahead k) LP
+
+def build_blockwise_lp(inst: Instance, types: List[LengthType], k: int,
+                       levels: int = 5, rho: float = 0.85,
+                       fill: float = 1.0) -> MethodModel:
+    """n-filter document-first execution with lookahead-k blocks.
+
+    Filters are grouped into contiguous blocks of k (the last block may be
+    shorter). A document's admission runs its prefill fused with block 1;
+    survivors of a non-final block wait, with resident document KV, at the
+    waiting point after that block; a drain runs their next whole block.
+    k = 1 is the strict pipeline, k = n is full speculation.
+
+    The cache state is one quantized survivor count per waiting point
+    (blocks minus one dimensions), each with a capacity share proportional
+    to its steady inflow. As in build_pipeline, survivor length mix equals
+    admission mix under length-independent selectivity, so per-survivor
+    costs use the exact mass-weighted mix and compositions are fractional.
+    Overflow at waiting point w becomes the ('unc', w) host queue, consumed
+    by recompute actions (re-prefill fused with the next block).
+    """
+    n = inst.n
+    blocks = []
+    j = 1
+    while j <= n:
+        blocks.append(tuple(range(j, min(j + k - 1, n) + 1)))
+        j += k
+    B = len(blocks)
+    W = B - 1
+    s = inst.s
+    rho_b = [float(np.prod([s[jj - 1] for jj in blk])) for blk in blocks]
+    P_b = [sum(inst.p[jj - 1] for jj in blk) for blk in blocks]
+    nb = [len(blk) for blk in blocks]
+    d_mean = sum(t.mass * t.d for t in types)
+    a0_mean = sum(t.mass * a_pairs(0, t.d) for t in types)
+    a_blk = [sum(t.mass * sum(a_pairs(t.d, inst.p[jj - 1]) for jj in blk)
+                 for t in types) for blk in blocks]
+    cap = kv_capacity_tokens(inst.model, inst.device)
+
+    if W == 0:
+        states = [()]
+        quanta, cap_docs = [], []
+    else:
+        pi_w = []
+        acc = 1.0
+        for b in range(W):
+            acc *= rho_b[b]
+            pi_w.append(acc)
+        tot = sum(pi_w)
+        quanta, cap_docs = [], []
+        for w in range(W):
+            cb = max(1, int(rho * cap * (pi_w[w] / tot) / d_mean))
+            q = max(1, math.ceil(cb / levels))
+            quanta.append(q)
+            cap_docs.append(max(q, (cb // q) * q))
+        grids = [list(range(0, cap_docs[w] + 1, quanta[w])) for w in range(W)]
+        states = [tuple(m) for m in _product(grids)]
+
+    host = [("new", b) for b in range(len(types))] + \
+        [("unc", w) for w in range(W)]
+    bmass = {("new", b): types[b].mass for b in range(len(types))}
+    actions: List[Action] = []
+
+    def make_action(state, drain_frac, rec_w, tag, only_w: int = -1):
+        m = list(state)
+        resident = sum(m[w] * d_mean for w in range(W))
+        room = fill * cap - resident
+        if only_w >= 0:
+            v = [m[w] * drain_frac if w == only_w else 0.0 for w in range(W)]
+        else:
+            v = [m[w] * drain_frac for w in range(W)]
+        room -= sum(v[w] * P_b[w + 1] for w in range(W))
+        if room < 0:
+            return
+        rec = 0.0
+        if rec_w is not None:
+            rec = (room * 0.5) / (d_mean + P_b[rec_w + 1])
+            room -= rec * (d_mean + P_b[rec_w + 1])
+        u = room / (d_mean + P_b[0])
+        if u + sum(v) + rec <= 1e-9:
+            return
+        tly = _Tally()
+        for t_ in types:
+            w_ = t_.mass
+            tly.U += int(round((u + rec) * w_ * t_.d))
+            tly.K_W += int(round((u + rec) * w_ * t_.d))
+        tly.A += int(round(u * (a0_mean + a_blk[0])))
+        tly.U += int(round(u * P_b[0]))
+        tly.K_W += int(round(u * (P_b[0] - nb[0])))
+        for w in range(W):
+            b = w + 1
+            tly.U += int(round(v[w] * P_b[b]))
+            tly.A += int(round(v[w] * a_blk[b]))
+            tly.K_W += int(round(v[w] * (P_b[b] - nb[b])))
+            tly.K_L += int(round(v[w] * d_mean))
+        if rec > 0:
+            b = rec_w + 1
+            tly.U += int(round(rec * P_b[b]))
+            tly.A += int(round(rec * (a0_mean + a_blk[b])))
+            tly.K_W += int(round(rec * (P_b[b] - nb[b])))
+        tly.segments = int(math.ceil(u * (1 + nb[0]) + sum(v) * 2 + rec * 2))
+        t, U, peak = _finish(inst, tly, int(resident))
+        if peak > cap + max(64, len(types)):
+            return
+        consume = {("new", b): u * types[b].mass
+                   for b in range(len(types)) if u > 0}
+        if rec > 0:
+            consume[("unc", rec_w)] = rec
+        produce = {}
+        # completions and inflows to the next waiting point
+        complete = u * (1.0 - rho_b[0]) if B > 1 else u
+        inflow = [0.0] * W
+        if W > 0:
+            inflow[0] = u * rho_b[0]
+        for w in range(W):
+            b = w + 1
+            amt = v[w] + (rec if rec_w == w else 0.0)
+            if b == B - 1:
+                complete += amt                      # final block: all done
+            else:
+                complete += amt * (1.0 - rho_b[b])
+                inflow[b] += amt * rho_b[b]
+        per_dim = []
+        for w in range(W):
+            target = m[w] - v[w] + inflow[w]
+            dist, over = _two_point(target, quanta[w], cap_docs[w])
+            per_dim.append(dist)
+            if over > 1e-12:
+                produce[("unc", w)] = produce.get(("unc", w), 0.0) + over
+        trans: Dict = {}
+        if W == 0:
+            trans[()] = 1.0
+        else:
+            for combo in _product([list(dd.items()) for dd in per_dim]):
+                nxt = tuple(level for level, _pr in combo)
+                pr = 1.0
+                for _level, p in combo:
+                    pr *= p
+                if pr > 1e-12:
+                    trans[nxt] = trans.get(nxt, 0.0) + pr
+        actions.append(Action(
+            key=f"blk{k}:{'-'.join(map(str, state))}:{tag}", state=state,
+            tau=t, U=U, peak_tokens=peak, consume=consume, produce=produce,
+            complete=complete, trans=trans,
+            detail=dict(u=u, v=list(v), rec=rec, rec_w=rec_w)))
+
+    for state in states:
+        for frac, ftag in ((1.0, "drainall"), (0.5, "half"), (0.0, "keep")):
+            make_action(state, frac, None, ftag)
+        for w in range(W):
+            make_action(state, 1.0, w, f"drainall+rec{w}")
+            if W > 1:
+                make_action(state, 1.0, None, f"drain-w{w}", only_w=w)
+
+    return MethodModel(method=f"blockwise{k}", types=types, states=states,
+                       actions=actions, host_types=host, b=bmass,
+                       meta=dict(cap=cap, cap_docs=cap_docs, quanta=quanta,
+                                 rho=rho, levels=levels, k=k, blocks=blocks,
+                                 d_mean=d_mean))
