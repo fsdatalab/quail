@@ -319,6 +319,135 @@ async def overhead_split(n_docs: int = 2000) -> dict:
                 vllm_version=vllm.__version__, arms=arms)
 
 
+# ------------------------------------------------------------- phase C
+
+@app.function(image=image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def pinned_run(variant: str = "pinned", n_docs: int = 10000) -> dict:
+    """Phase C acceptance: the in-engine scheduler (pinning plus
+    priorities) against the stock engine, each with and without an
+    adversarial co-tenant stream that hammers the cache."""
+    import asyncio
+    import inspect
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import EngineTags, run_filter_chain
+
+    ext = variant == "pinned"
+    kwargs = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+                  gpu_memory_utilization=0.92, enable_prefix_caching=True)
+    if ext:
+        kwargs["scheduling_policy"] = "priority"
+        kwargs["scheduler_cls"] = \
+            "docengine.engineext.scheduler.DocEngineScheduler"
+    docs = _build_pool(n_docs)
+    engine = Engine.from_engine_args(AsyncEngineArgs(**kwargs))
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    pool = 981_728
+    try:
+        cc = engine.vllm_config.cache_config
+        if cc.num_gpu_blocks:
+            pool = int(cc.num_gpu_blocks) * int(cc.block_size)
+    except Exception:
+        pass
+    budget = int((0.85 if ext else 0.9) * pool)
+    print(f"[pinned] variant={variant} pool={pool} budget={budget}",
+          flush=True)
+
+    async def reset_cache():
+        for _ in range(15):
+            res = engine.reset_prefix_cache()
+            if inspect.isawaitable(res):
+                res = await res
+            if res is not False:
+                return
+            await asyncio.sleep(1.0)
+        raise RuntimeError("prefix cache reset kept failing")
+
+    async def cotenant(stop, stats, rate=25.0, length=800):
+        rng = np.random.default_rng(4321)
+        jobs = []
+
+        async def one(uid, ids):
+            t0 = time.time()
+            kw = {"priority": 1} if ext else {}
+            async for _ in engine.generate({"prompt_token_ids": ids}, sp,
+                                           f"junk-{uid}", **kw):
+                pass
+            stats["done"] += 1
+            stats["lat_s"] += time.time() - t0
+
+        uid = 0
+        while not stop.is_set():
+            uid += 1
+            ids = rng.integers(1000, 100_000, size=length).tolist()
+            jobs.append(asyncio.create_task(one(uid, ids)))
+            await asyncio.sleep(1.0 / rate)
+        await asyncio.gather(*jobs, return_exceptions=True)
+
+    grid = [(2, (0.5, 0.5), False), (4, (0.8,) * 4, False),
+            (4, (0.95,) * 4, False), (4, (0.8,) * 4, True)] if ext else \
+           [(4, (0.8,) * 4, False), (4, (0.8,) * 4, True)]
+
+    results = []
+    for n, s_vec, junk in grid:
+        rng = np.random.default_rng(FLAG_SEED + 1000 * n + int(100 * s_vec[0]))
+        flags = (rng.random((len(docs), n)) < np.asarray(s_vec)).astype(int)
+        bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+        body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+        q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+                 for j in range(n)]
+        await reset_cache()
+        stop = asyncio.Event()
+        stats = dict(done=0, lat_s=0.0)
+        bg = asyncio.create_task(cotenant(stop, stats)) if junk else None
+        res = await run_filter_chain(
+            engine, sp, body_ids, q_ids, budget, lookahead=1,
+            tag=f"n{n}s{int(100 * s_vec[0])}",
+            tags=EngineTags() if ext else None, use_priority=ext)
+        if bg is not None:
+            stop.set()
+            await bg
+        answers = {f"{i},{j}": a for (i, j), a in res["answers"].items()}
+        agree = sum(1 for (i, j), a in res["answers"].items()
+                    if a == flags[i][j - 1]) / max(1, len(answers))
+        results.append(dict(
+            n=n, s=list(s_vec), policy="block", k=1, mode=variant,
+            junk=junk, junk_stats=stats, makespan=res["wall"],
+            waves=[dict(stage=1, requests=res["requests"], s=res["wall"],
+                        prompt_tokens=res["prompt_tokens"],
+                        cached_tokens=res["cached_tokens"])],
+            d_tok=[len(x) for x in body_ids],
+            p_tok=[len(q) for q in q_ids],
+            p_task=[0] * n, answers=answers, flags=flags.tolist(),
+            answer_agreement=agree, budget=budget, kv_tokens=pool))
+        hit = res["cached_tokens"] / max(1, res["prompt_tokens"])
+        print(f"[pinned] {variant} n={n} s={s_vec[0]} junk={junk}: "
+              f"{res['wall']:.1f}s, hit {100 * hit:.1f}%, "
+              f"junk done {stats['done']}, agree {agree:.3f}", flush=True)
+
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    import vllm
+    return dict(model=MODEL, n_docs=n_docs, variant=variant,
+                vllm_version=vllm.__version__, results=results)
+
+
 # ------------------------------------------------------- beneath the stack
 
 @app.function(image=image, gpu="H100!", timeout=1800,
@@ -706,6 +835,16 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "floor":
         data = model_floor.remote()
         path = out or "results/engine/model_floor.json"
+    elif phase == "pinned":
+        nd = n_docs or 10000
+        hp = pinned_run.spawn("pinned", nd)
+        hs = pinned_run.spawn("stock", nd)
+        dp, ds = hp.get(), hs.get()
+        data = dict(model=dp["model"], n_docs=nd,
+                    vllm_version=dp["vllm_version"],
+                    results=dp["results"] + ds["results"])
+        path = out or ("results/engine/pinned10k.json.gz" if nd == 10000
+                       else f"results/engine/pinned_{nd}.json.gz")
     else:
         raise SystemExit(f"unknown phase {phase}")
     os.makedirs(os.path.dirname(path), exist_ok=True)

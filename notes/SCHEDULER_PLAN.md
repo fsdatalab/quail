@@ -113,13 +113,35 @@ against LP driven schedule. This is the step where the LP either earns
 its place as a controller or is demoted, with a measurement either
 way.
 
-## Phase C. Deferred, each with an explicit trigger
+## Phase C. The engine skeleton, run in parallel with phase A
 
-- In-engine scheduler (pinning, co-scheduling, eager freeing).
-  Trigger: phase A finds a material attention read share or phase B
-  finds residency losses that ordering luck cannot hold; or
-  multi-tenant operation is wanted (pinning becomes correctness, not
-  optimization).
+The in-engine work starts now rather than after phases A and B, for
+three reasons. The project's thesis is that the engine should
+understand queries, and the client library demonstrates that thesis
+only by workaround, winning through accidental alignments (recency
+luck, ordering races). Phase B's fair trial of the LP requires real
+retention control, because the client cannot faithfully execute a
+retention decision when eviction belongs to the engine's recency rule.
+And learning the engine's internals is the longest lead item on the
+board, so it should overlap the other phases, not follow them.
+
+The skeleton has two parts. The engine's scheduler is officially
+replaceable by a custom class, so admission, ordering, and later
+co-scheduling move inside it. The memory manager is not replaceable,
+so a small contained patch to its block pool adds two per request
+hooks: pin and unpin, which exclude a document's notes from eviction
+until released, and free now, which drops notes immediately for
+failed documents and, later, thinking tokens.
+
+The acceptance test is also the demonstration that guarantees beat
+luck. First reproduce the client library's 10,000 document numbers
+with pinning in place of ordering tricks, no regression allowed. Then
+inject an adversarial co-tenant, a background stream of unrelated
+requests hammering the cache, and show that the client library on the
+stock engine degrades while the pinned scheduler holds its makespan.
+
+## Phase D. Gated items
+
 - Cascade fused evaluation of a document's filters. Trigger: phase A
   item 6. Known worthless for one token filters at any document
   length (about two milliseconds per question on a 100,000 token
@@ -129,7 +151,8 @@ way.
   shared prefix for the next filter; the right shape becomes fork
   from the document notes, not extend past the answer.
 - Multiple queries sharing the card, and continuous arrival
-  (throughput mode). The LP's native setting. After phase B.
+  (throughput mode). The LP's native setting. Builds on the phase C
+  skeleton after phase B.
 - 100,000 document demonstration run with the client (about ten
   minutes of GPU). Any time a headline is wanted.
 - 32 billion parameter model cell. Fold into phase B if wanted; it

@@ -30,11 +30,44 @@ def _yes(out):
     return 1 if out.outputs[0].text.strip().upper().startswith("Y") else 0
 
 
+class EngineTags:
+    """Builds the de1| request ids for the in-engine scheduler: a pin
+    directive on each document's first request, releases piggybacked on
+    later submissions, and the end-of-run flush that releases every
+    remaining pin."""
+
+    def __init__(self, batch=40):
+        self.pending = []
+        self.batch = batch
+
+    def rid(self, suffix, doc=None, pin_tokens=0):
+        parts = ["de1"]
+        if pin_tokens and doc is not None:
+            parts.append(f"p{pin_tokens}")
+            parts.append(f"d{doc}")
+        if self.pending:
+            take, self.pending = (self.pending[:self.batch],
+                                  self.pending[self.batch:])
+            parts.append("r" + ",".join(take))
+        parts.append(suffix)
+        return "|".join(parts)
+
+    def release(self, doc):
+        self.pending.append(str(doc))
+
+
 async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
-                           budget_tokens, lookahead=1, tag="q"):
+                           budget_tokens, lookahead=1, tag="q", tags=None,
+                           use_priority=False):
     """Run every document through the filter chain; return timings,
     counters, per-call answers keyed (doc, stage) with stages 1-indexed,
-    and the surviving document ids."""
+    and the surviving document ids.
+
+    With `tags` set (an EngineTags), request ids carry pin and release
+    directives for the in-engine scheduler and a flush request releases
+    all pins at the end. With `use_priority`, resident-consumer requests
+    (stage two onward) are submitted at a higher engine priority than
+    first reads."""
     n = len(q_ids)
     q_cost = sum(len(q) for q in q_ids) + n
     used = 0
@@ -43,16 +76,26 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
     answers = {}
     survivors = []
 
-    async def ask(ids, rid):
+    async def ask(ids, rid, pri=0, count=True):
         final = None
+        kw = {"priority": pri} if use_priority else {}
         async for out in engine.generate({"prompt_token_ids": ids},
-                                         sampling_params, rid):
+                                         sampling_params, rid, **kw):
             final = out
-        counters["requests"] += 1
-        counters["prompt_tokens"] += len(final.prompt_token_ids)
-        counters["cached_tokens"] += (getattr(final, "num_cached_tokens", 0)
-                                      or 0)
+        if count:
+            counters["requests"] += 1
+            counters["prompt_tokens"] += len(final.prompt_token_ids)
+            counters["cached_tokens"] += (
+                getattr(final, "num_cached_tokens", 0) or 0)
         return _yes(final)
+
+    def rid_for(i, j0):
+        suffix = f"{tag}-{i}-{j0}"
+        if tags is None:
+            return suffix
+        if j0 == 0:
+            return tags.rid(suffix, doc=i, pin_tokens=len(body_ids[i]))
+        return tags.rid(suffix)
 
     async def chain(i, cost):
         nonlocal used
@@ -61,7 +104,8 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
             while j < n:
                 kk = min(lookahead, n - j)
                 got = await asyncio.gather(*[
-                    ask(body_ids[i] + q_ids[j + off], f"{tag}-{i}-{j + off}")
+                    ask(body_ids[i] + q_ids[j + off], rid_for(i, j + off),
+                        pri=0 if j + off > 0 else 1)
                     for off in range(kk)])
                 passes = 0
                 for off in range(kk):
@@ -73,6 +117,8 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
                 j += kk
             survivors.append(i)
         finally:
+            if tags is not None:
+                tags.release(i)
             async with cond:
                 used -= cost
                 cond.notify_all()
@@ -88,5 +134,8 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
         tasks.append(asyncio.create_task(chain(i, cost)))
     await asyncio.gather(*tasks)
     wall = time.time() - t0
+    if tags is not None:
+        # release every remaining pin so the engine can reset cleanly
+        await ask(q_ids[0], f"de1|r*|{tag}-0-99", pri=0, count=False)
     return dict(wall=wall, survivors=sorted(survivors), answers=answers,
                 **counters)
