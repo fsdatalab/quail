@@ -29,7 +29,8 @@ app = modal.App("docengine-engine")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("vllm", "huggingface_hub", "pandas", "pyarrow", "numpy")
-    .env({"VLLM_LOGGING_LEVEL": "WARNING"})
+    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+          "VLLM_USE_FLASHINFER_SAMPLER": "0"})
 )
 hf_cache = modal.Volume.from_name("docengine-hf-cache", create_if_missing=True)
 
