@@ -319,6 +319,99 @@ async def overhead_split(n_docs: int = 2000) -> dict:
                 vllm_version=vllm.__version__, arms=arms)
 
 
+# ------------------------------------------------------- beneath the stack
+
+@app.function(image=image, gpu="H100!", timeout=1800,
+              volumes={"/root/.cache/huggingface": hf_cache})
+def model_floor() -> dict:
+    """Measure reading speed with no serving stack at all, to split
+    vLLM's 80k tokens per second into silicon, model, and serving tax.
+
+    Part A: the four per-layer matrix multiplies of Qwen3-4B at their
+    exact shapes, in FP8 and bf16. Their per-token cost is 7.27e9
+    operations, which matches the 2P pricing convention, so measured
+    arithmetic rate divides directly into a tokens-per-second
+    equivalent: the kernel-only ceiling.
+
+    Part B: a bare forward pass of the bf16 model through the plain
+    transformers library on packed 352-token rows of the real corpus,
+    no engine, no scheduler, no per-request objects. The ratio of this
+    to the bf16 kernel-only ceiling is the model tax (attention,
+    normalization, memory-bound ops, launches). Applying the same tax
+    to the FP8 kernel ceiling projects the FP8 model floor, and vLLM's
+    measured 80k against that floor is the serving tax."""
+    import torch
+
+    dev = "cuda"
+    SHAPES = [(2560, 6144), (4096, 2560), (2560, 19456), (9728, 2560)]
+    LAYERS = 36
+    FLOP_TOK = 2 * LAYERS * sum(k * n for k, n in SHAPES)   # ~7.27e9
+
+    def bench(fn, iters=50, warmup=10):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        t0, t1 = torch.cuda.Event(True), torch.cuda.Event(True)
+        t0.record()
+        for _ in range(iters):
+            fn()
+        t1.record()
+        torch.cuda.synchronize()
+        return t0.elapsed_time(t1) / 1000 / iters
+
+    def gemm_tok_rate(dtype, M):
+        t = 0.0
+        for k, n in SHAPES:
+            if dtype == "fp8":
+                a = torch.randn(M, k, device=dev).to(torch.float8_e4m3fn)
+                b = torch.randn(n, k, device=dev).to(torch.float8_e4m3fn).t()
+                s = torch.ones((), device=dev)
+
+                def fn(a=a, b=b, s=s):
+                    r = torch._scaled_mm(a, b, scale_a=s, scale_b=s,
+                                         out_dtype=torch.bfloat16)
+                    return r[0] if isinstance(r, tuple) else r
+            else:
+                a = torch.randn(M, k, device=dev, dtype=torch.bfloat16)
+                b = torch.randn(k, n, device=dev, dtype=torch.bfloat16)
+
+                def fn(a=a, b=b):
+                    return a @ b
+            t += bench(fn)
+        toks = M / (t * LAYERS)          # M tokens need LAYERS x these GEMMs
+        flops = FLOP_TOK * toks
+        return toks, flops / 1e12
+
+    out = dict(flop_per_token=FLOP_TOK, gemm={})
+    for dtype in ("fp8", "bf16"):
+        for M in (2048, 8192, 16384):
+            toks, tf = gemm_tok_rate(dtype, M)
+            out["gemm"][f"{dtype}_M{M}"] = dict(tok_s=toks, tflops=tf)
+            print(f"[floor] GEMM {dtype} M={M}: {toks:,.0f} tok/s equiv "
+                  f"({tf:.0f} TFLOP/s)", flush=True)
+
+    # Part B: bare bf16 model forward on packed real-corpus rows
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    docs = _build_pool(2000)
+    ids = tok("\n\n".join(docs), add_special_tokens=False)["input_ids"]
+    model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-4B", torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa").to(dev).eval()
+    out["bare_model"] = {}
+    with torch.inference_mode():
+        for B in (16, 64):
+            rows = B * 352
+            x = torch.tensor(ids[:rows], device=dev).view(B, 352)
+            sec = bench(lambda: model(x, use_cache=False), iters=20,
+                        warmup=5)
+            rate = rows / sec
+            out["bare_model"][f"bf16_B{B}x352"] = rate
+            print(f"[floor] bare bf16 model B={B}x352: {rate:,.0f} tok/s",
+                  flush=True)
+    return out
+
+
 # ---------------------------------------------------------------- step 3
 
 @app.function(image=image, gpu="H100!", timeout=3600,
@@ -610,6 +703,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "client":
         data = client_run.remote(n_docs or 10000)
         path = out or "results/engine/client10k.json.gz"
+    elif phase == "floor":
+        data = model_floor.remote()
+        path = out or "results/engine/model_floor.json"
     else:
         raise SystemExit(f"unknown phase {phase}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
