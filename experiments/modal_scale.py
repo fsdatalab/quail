@@ -403,9 +403,27 @@ def scale10k(n_docs: int = 10000) -> dict:
                         branch_of.append((i, 0))
                 if not prompts:
                     continue
-                order = sorted(range(len(prompts)),
-                               key=lambda t: (1, branch_of[t][1])
-                               if branch_of[t][1] > 0 else (0, 0))
+                # Submission order matters under LRU eviction: requests
+                # whose prefixes are already resident (branches owed to
+                # docs read in earlier batches) must run BEFORE new
+                # document prefills, or the new writes evict exactly the
+                # bodies the branches are about to reuse. Within the new
+                # docs, branches go stage-major so a doc's later branch
+                # reuses its earlier branch's prefix in flight. Bare
+                # prefills for future batches go last, leaving them the
+                # most recently touched.
+                chunked = {op["doc"] for op in rec["ops"]
+                           if op["kind"] == "doc_chunk"}
+
+                def order_key(t):
+                    i, jj = branch_of[t]
+                    if jj == 0:
+                        return (2, 0, t)
+                    if i not in chunked:
+                        return (0, jj, t)
+                    return (1, jj, t)
+
+                order = sorted(range(len(prompts)), key=order_key)
                 prompts = [prompts[t] for t in order]
                 branch_of = [branch_of[t] for t in order]
                 outs, dt, toks, cached = wave(prompts)

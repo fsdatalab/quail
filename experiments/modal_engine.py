@@ -172,10 +172,21 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
                         branch_of.append((i, 0))
                 if not prompts:
                     continue
-                # branch-major within the batch, bare-document prefills first
-                order = sorted(range(len(prompts)),
-                               key=lambda t: (1, branch_of[t][1])
-                               if branch_of[t][1] > 0 else (0, 0))
+                # Resident-prefix branches first (before new prefills can
+                # evict their bodies under LRU), then new docs' branches
+                # stage-major, then bare prefills for future batches.
+                chunked = {op["doc"] for op in rec["ops"]
+                           if op["kind"] == "doc_chunk"}
+
+                def order_key(t):
+                    i, jj = branch_of[t]
+                    if jj == 0:
+                        return (2, 0, t)
+                    if i not in chunked:
+                        return (0, jj, t)
+                    return (1, jj, t)
+
+                order = sorted(range(len(prompts)), key=order_key)
                 prompts = [prompts[t] for t in order]
                 branch_of = [branch_of[t] for t in order]
                 outs, dt, toks, cached = wave(prompts)
