@@ -31,6 +31,7 @@ image = (
     .pip_install("vllm", "huggingface_hub", "pandas", "pyarrow", "numpy")
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0"})
+    .add_local_python_source("docengine")
 )
 hf_cache = modal.Volume.from_name("docengine-hf-cache", create_if_missing=True)
 
@@ -64,7 +65,8 @@ def _flags_line(flags):
 
 
 def _question(j):
-    return f"\n\nCopy the value from the [FLAGS] line: FLAG_{j}="
+    return (f"\n\nInstruction: output only the value of FLAG_{j} from the "
+            f"[FLAGS] line above.\nFLAG_{j}=")
 
 
 def _task_prefix(j):
@@ -120,7 +122,49 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
 
         waves = []
         answers = {}          # (doc, stage) -> model's 0/1
-        if policy == "task":
+        if cfg.get("mode") == "manifest":
+            # drive the engine batch-for-batch from the analytical builder's
+            # schedule, with outcomes planted (the offline coupled scenario)
+            from docengine.configs import DEVICES, MODELS
+            from docengine.instance import Instance
+            from docengine.sched.blockwise import (schedule_blockwise,
+                                                   schedule_taskfirst)
+            inst = Instance(model=MODELS["Qwen3-4B-FP8"],
+                            device=DEVICES["H100-SXM-80GB"],
+                            d=tuple(d_tok),
+                            p=tuple(x + 1 for x in
+                                    (p_task if policy == "task" else p_tok)),
+                            s=tuple(s_vec), delta=max(d_tok) + 1)
+            X = np.array(flags, dtype=np.int8)
+            recs = (schedule_taskfirst(inst, X) if policy == "task"
+                    else schedule_blockwise(inst, X, k))
+            for rec in recs:
+                prompts = []
+                branch_of = []
+                branched = {op["doc"] for op in rec["ops"]
+                            if op["kind"] == "branch"}
+                for op in rec["ops"]:
+                    i, jj = op["doc"], op["stage"]
+                    if op["kind"] == "branch":
+                        prompts.append(bodies[i] + _question(jj))
+                        branch_of.append((i, jj))
+                    elif op["kind"] == "doc_chunk" and policy == "task":
+                        prompts.append(_task_prefix(jj) + bodies[i]
+                                       + _task_suffix(jj))
+                        branch_of.append((i, jj))
+                    elif (op["kind"] == "doc_chunk" and policy != "task"
+                          and i not in branched):
+                        prompts.append(bodies[i])   # prefill-only, cache doc
+                        branch_of.append((i, 0))
+                if not prompts:
+                    continue
+                outs, dt, toks, cached = wave(prompts)
+                waves.append(dict(stage=rec["t"], requests=len(prompts), s=dt,
+                                  prompt_tokens=toks, cached_tokens=cached))
+                for (i, jj), o in zip(branch_of, outs):
+                    if jj > 0:
+                        answers[f"{i},{jj}"] = answer_of(o)
+        elif policy == "task":
             alive = list(range(len(docs)))
             for j in range(1, n + 1):
                 if not alive:
@@ -178,6 +222,7 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
                     if a == flags[i][j - 1])
         results.append(dict(
             n=n, s=list(s_vec), policy=policy, k=k,
+            mode=cfg.get("mode", "waves"),
             makespan=sum(w["s"] for w in waves), waves=waves,
             d_tok=d_tok, p_tok=p_tok, p_task=p_task,
             answers=answers, flags=flags.tolist(),
@@ -204,6 +249,10 @@ def _grid(smoke: bool):
     for s in (0.8, 0.95):
         for p, k in (("task", 0), ("block", 1), ("block", 2), ("block", 4)):
             cfgs.append(dict(n=4, s=(s,) * 4, policy=p, k=k))
+    for p, k in (("task", 0), ("block", 1), ("block", 2)):
+        cfgs.append(dict(n=2, s=(0.5, 0.5), policy=p, k=k, mode="manifest"))
+    for p, k in (("task", 0), ("block", 1), ("block", 4)):
+        cfgs.append(dict(n=4, s=(0.8,) * 4, policy=p, k=k, mode="manifest"))
     return cfgs, 2000
 
 
@@ -232,13 +281,16 @@ def probe() -> list:
     llm = LLM(model=MODEL, kv_cache_dtype="fp8", max_model_len=4352,
               gpu_memory_utilization=0.92, enable_prefix_caching=True)
     sp = SamplingParams(temperature=0.0, max_tokens=8)
-    body = docs[0] + _flags_line([1, 0])
+    b_yes = docs[0] + _flags_line([1, 0])
+    b_no = docs[1] + _flags_line([0, 1])
+    A = "\n\n[ANSWER] FLAG_1="
+    B = ("\n\nInstruction: output only the value of FLAG_1 from the "
+         "[FLAGS] line above.\nFLAG_1=")
+    C = "\n\nQ: FLAG_1?\nA: FLAG_1="
     variants = {
-        "answer_is": body + _question(2),
-        "copy": body + "\n\nCopy the value from the [FLAGS] line: FLAG_2=",
-        "task": _task_prefix(2) + body + _task_suffix(2),
-        "task_copy": (_task_prefix(2) + body
-                      + "\n\nFrom the [FLAGS] line, FLAG_2="),
+        "A_yes": b_yes + A, "A_no": b_no + A,
+        "B_yes": b_yes + B, "B_no": b_no + B,
+        "C_yes": b_yes + C, "C_no": b_no + C,
     }
     outs = llm.generate(list(variants.values()), sp, use_tqdm=False)
     report = []

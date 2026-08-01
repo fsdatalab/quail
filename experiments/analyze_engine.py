@@ -33,9 +33,9 @@ CUE_TOKENS_FALLBACK = 7
 
 
 def answers_matrix(r):
-    N = len(r["d_tok"])
-    n = r["n"]
-    X = np.array(r["flags"], dtype=np.int8)      # default: planted
+    X = np.array(r["flags"], dtype=np.int8)      # planted flags
+    if r.get("mode", "waves") == "manifest":
+        return X          # manifest runs schedule by the planted outcomes
     for key, a in r["answers"].items():
         i, j = map(int, key.split(","))
         X[i][j - 1] = a
@@ -88,7 +88,9 @@ def main():
                          cache_hit=cached / max(1, total_prompt),
                          agreement=r["answer_agreement"],
                          waves=len(r["waves"])))
-        print(f"{r['n']:>2} {r['s'][0]:>5} {r['policy']:>6} {r['k']:>2} | "
+        print(f"{r['n']:>2} {r['s'][0]:>5} "
+              f"{(r['policy'] + ('*' if r.get('mode') == 'manifest' else '')):>7} "
+              f"{r['k']:>2} | "
               f"{r['makespan']:>9.2f} {ideal:>8.2f} "
               f"{r['makespan']/ideal:>6.2f} | {rate:>8.0f} "
               f"{100*cached/max(1,total_prompt):>8.1f}% "
