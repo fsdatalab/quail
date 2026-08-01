@@ -34,13 +34,47 @@ KV cache so the whole corpus stays resident, prefix caching on, one
 generated token per request, weights cached in a Modal volume, one warm
 container for the whole grid.
 
+## Run isolation and request order
+
+The prefix cache persists across runs on the shared engine, so without a
+reset a run inherits document KV computed by the run before it. The first
+grid had no resets, and its per wave counts show what that did. Task and
+k=1 runs were effectively cold, because each task run touches about one
+million tokens of KV that nothing else shares (the task prompt sits before
+the document, so task KV can never match a document first prompt) and that
+volume flushes the cache before the next run. Every run with k of 2 or more
+followed a k=1 run of the same configuration and started with 96 to 97
+percent of its prompt tokens already cached, so those runs never paid for
+document prefill and their makespans measured a different regime than their
+competitors. The fixed protocol resets the prefix cache before every run.
+
+Two request order rules make a cold speculative run pay for each document
+once rather than k times. Within a wave the branch requests are issued
+branch major, meaning all first branches, then all second branches, so a
+later branch reaches the scheduler after an earlier branch of the same
+document has finished computing the shared document prefix. Within a
+manifest batch the bare document prefill requests go first and the branch
+requests follow in stage order.
+
+A small warm arm deliberately skips the reset for two configurations. It
+measures the regime where the corpus KV is already resident from an
+earlier query over the same documents, which is the recurring query case a
+document store cares about. Only the document first templates can use
+resident KV. Task first cannot, whatever the cache holds, because its
+template puts the task prompt before the document.
+
 ## Grid
 
 - 2 filters: s1 in {0.25, 0.5, 0.8} with s2 = 0.5, policies task, k=1, k=2.
 - 3 filters: s per stage in {0.7, 0.9}, policies task, k=1, k=3.
 - 4 filters: s per stage in {0.8, 0.95}, policies task, k=1, k=2, k=4.
+- Warm arm: k=1 and k=n again at n=2 with s1=0.5 and at n=4 with s=0.8,
+  without the cache reset.
+- Manifest driven: task, k=1, and k=n at n=2 with s1=0.5 and at n=4 with
+  s=0.8, where the engine is driven batch for batch from the analytical
+  builder's schedule.
 
-About 23 runs and 30 to 45 GPU minutes.
+That is 33 runs and roughly 45 to 60 GPU minutes.
 
 ## Comparison
 

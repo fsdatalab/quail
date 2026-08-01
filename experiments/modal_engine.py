@@ -14,6 +14,16 @@ Policies are wave structures over one shared vLLM engine:
                 document KV reuse via vLLM automatic prefix caching
   lookahead k   same template, all k branch questions issued ungated
 
+Run isolation. The engine's prefix cache persists across runs, so without a
+reset a run inherits document KV computed by the run before it. The prefix
+cache is therefore reset before every run except runs marked mode="warm",
+which deliberately measure the regime where the corpus KV is already
+resident from an earlier query. Within a speculative wave the branch
+requests are issued branch-major (all first branches, then all second
+branches) so that a later branch of a document reaches the scheduler after
+an earlier branch has finished computing the shared document prefix, and
+the document is prefilled once, not k times.
+
 Run with:
   modal run experiments/modal_engine.py --smoke true
   modal run experiments/modal_engine.py
@@ -121,6 +131,9 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
         p_task = [n_tokens(_task_prefix(j + 1)) + n_tokens(_task_suffix(j + 1))
                   for j in range(n)]
 
+        if cfg.get("mode") != "warm":
+            assert llm.reset_prefix_cache(), "prefix cache reset failed"
+
         waves = []
         answers = {}          # (doc, stage) -> model's 0/1
         if cfg.get("mode") == "manifest":
@@ -159,6 +172,12 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
                         branch_of.append((i, 0))
                 if not prompts:
                     continue
+                # branch-major within the batch, bare-document prefills first
+                order = sorted(range(len(prompts)),
+                               key=lambda t: (1, branch_of[t][1])
+                               if branch_of[t][1] > 0 else (0, 0))
+                prompts = [prompts[t] for t in order]
+                branch_of = [branch_of[t] for t in order]
                 outs, dt, toks, cached = wave(prompts)
                 waves.append(dict(stage=rec["t"], requests=len(prompts), s=dt,
                                   prompt_tokens=toks, cached_tokens=cached))
@@ -188,11 +207,12 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
             wave_no = 0
             while frontier:
                 wave_no += 1
-                reqs = []
-                for i, j0 in frontier.items():
-                    kk = min(k, n - j0 + 1)
-                    for jj in range(j0, j0 + kk):
-                        reqs.append((i, j0, kk, jj))
+                reqs = []           # branch-major: docs prefill once per wave
+                for off in range(k):
+                    for i, j0 in frontier.items():
+                        kk = min(k, n - j0 + 1)
+                        if off < kk:
+                            reqs.append((i, j0, kk, j0 + off))
                 prompts = [bodies[i] + _question(jj)
                            for (i, _j0, _kk, jj) in reqs]
                 outs, dt, toks, cached = wave(prompts)
@@ -229,11 +249,14 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
             answers=answers, flags=flags.tolist(),
             answer_agreement=agree / max(1, len(answers)),
         ))
-        print(f"[grid] n={n} s={s_vec} {policy}: "
+        print(f"[grid] n={n} s={s_vec} {policy} k={k} "
+              f"{cfg.get('mode', 'waves')}: "
               f"{results[-1]['makespan']:.1f}s over {len(waves)} waves, "
               f"agreement {results[-1]['answer_agreement']:.3f}", flush=True)
 
-    return dict(model=MODEL, n_docs=n_docs, load_s=load_s, results=results)
+    import vllm
+    return dict(model=MODEL, n_docs=n_docs, load_s=load_s,
+                vllm_version=vllm.__version__, results=results)
 
 
 def _grid(smoke: bool):
@@ -244,12 +267,22 @@ def _grid(smoke: bool):
     for s1 in (0.25, 0.5, 0.8):
         for p, k in (("task", 0), ("block", 1), ("block", 2)):
             cfgs.append(dict(n=2, s=(s1, 0.5), policy=p, k=k))
+        if s1 == 0.5:       # resident-corpus arm: no reset, docs already hot
+            cfgs.append(dict(n=2, s=(s1, 0.5), policy="block", k=1,
+                             mode="warm"))
+            cfgs.append(dict(n=2, s=(s1, 0.5), policy="block", k=2,
+                             mode="warm"))
     for s in (0.7, 0.9):
         for p, k in (("task", 0), ("block", 1), ("block", 3)):
             cfgs.append(dict(n=3, s=(s,) * 3, policy=p, k=k))
     for s in (0.8, 0.95):
         for p, k in (("task", 0), ("block", 1), ("block", 2), ("block", 4)):
             cfgs.append(dict(n=4, s=(s,) * 4, policy=p, k=k))
+        if s == 0.8:
+            cfgs.append(dict(n=4, s=(s,) * 4, policy="block", k=1,
+                             mode="warm"))
+            cfgs.append(dict(n=4, s=(s,) * 4, policy="block", k=4,
+                             mode="warm"))
     for p, k in (("task", 0), ("block", 1), ("block", 2)):
         cfgs.append(dict(n=2, s=(0.5, 0.5), policy=p, k=k, mode="manifest"))
     for p, k in (("task", 0), ("block", 1), ("block", 4)):

@@ -76,20 +76,25 @@ def main():
     print(f"{'n':>2} {'s1':>5} {'policy':>6} {'k':>2} | {'measured':>9} "
           f"{'ideal':>8} {'ratio':>6} | {'tok/s':>8} {'cachehit%':>9} "
           f"{'agree':>6} {'waves':>5}")
+    marks = {"manifest": "*", "warm": "~"}
     for r in data["results"]:
         ideal, lb = ideal_for(r)
         total_prompt = sum(w["prompt_tokens"] for w in r["waves"])
         cached = sum(w["cached_tokens"] for w in r["waves"])
         computed = total_prompt - cached
         rate = computed / r["makespan"]
+        w1 = r["waves"][0]
         rows.append(dict(n=r["n"], s1=r["s"][0], policy=r["policy"], k=r["k"],
+                         mode=r.get("mode", "waves"),
                          measured=r["makespan"], ideal=ideal, lb=lb,
                          ratio=r["makespan"] / ideal, tok_s=rate,
                          cache_hit=cached / max(1, total_prompt),
+                         cache_hit_w1=w1["cached_tokens"]
+                         / max(1, w1["prompt_tokens"]),
                          agreement=r["answer_agreement"],
                          waves=len(r["waves"])))
-        print(f"{r['n']:>2} {r['s'][0]:>5} "
-              f"{(r['policy'] + ('*' if r.get('mode') == 'manifest' else '')):>7} "
+        mk = marks.get(r.get("mode", "waves"), "")
+        print(f"{r['n']:>2} {r['s'][0]:>5} {(r['policy'] + mk):>7} "
               f"{r['k']:>2} | "
               f"{r['makespan']:>9.2f} {ideal:>8.2f} "
               f"{r['makespan']/ideal:>6.2f} | {rate:>8.0f} "
