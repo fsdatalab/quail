@@ -79,7 +79,7 @@ def main():
     print(f"{'n':>2} {'s1':>5} {'policy':>6} {'k':>2} | {'measured':>9} "
           f"{'ideal':>8} {'ratio':>6} | {'tok/s':>8} {'cachehit%':>9} "
           f"{'agree':>6} {'waves':>5}")
-    marks = {"manifest": "*", "warm": "~"}
+    marks = {"manifest": "*", "warm": "~", "client": "+"}
     for r in data["results"]:
         ideal, lb = ideal_for(r)
         total_prompt = sum(w["prompt_tokens"] for w in r["waves"])

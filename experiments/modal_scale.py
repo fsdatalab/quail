@@ -319,6 +319,94 @@ async def overhead_split(n_docs: int = 2000) -> dict:
                 vllm_version=vllm.__version__, arms=arms)
 
 
+# ---------------------------------------------------------------- step 3
+
+@app.function(image=image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def client_run(n_docs: int = 10000) -> dict:
+    import inspect
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import run_filter_chain
+
+    docs = _build_pool(n_docs)
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True))
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    pool = 981_728            # measured KV pool for this config (scale runs)
+    try:
+        cc = engine.vllm_config.cache_config
+        if cc.num_gpu_blocks:
+            pool = int(cc.num_gpu_blocks) * int(cc.block_size)
+    except Exception:
+        pass
+    budget = int(0.9 * pool)
+    print(f"[client] KV pool {pool} tokens, admission budget {budget}",
+          flush=True)
+
+    async def reset_cache():
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    results = []
+    grid = ((2, (0.5, 0.5), 1), (2, (0.5, 0.5), 2),
+            (4, (0.8,) * 4, 1), (4, (0.95,) * 4, 1), (4, (0.95,) * 4, 2))
+    for n, s_vec, k in grid:
+        rng = np.random.default_rng(FLAG_SEED + 1000 * n + int(100 * s_vec[0]))
+        flags = (rng.random((len(docs), n)) < np.asarray(s_vec)).astype(int)
+        bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+        body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+        q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+                 for j in range(n)]
+        p_task = [len(tok(_task_prefix(j + 1) + _task_suffix(j + 1),
+                          add_special_tokens=False)["input_ids"])
+                  for j in range(n)]
+        await reset_cache()
+        res = await run_filter_chain(
+            engine, sp, body_ids, q_ids, budget, lookahead=k,
+            tag=f"n{n}s{int(100 * s_vec[0])}k{k}")
+        answers = {f"{i},{j}": a for (i, j), a in res["answers"].items()}
+        agree = sum(1 for (i, j), a in res["answers"].items()
+                    if a == flags[i][j - 1]) / max(1, len(answers))
+        results.append(dict(
+            n=n, s=list(s_vec), policy="block", k=k, mode="client",
+            makespan=res["wall"],
+            waves=[dict(stage=1, requests=res["requests"], s=res["wall"],
+                        prompt_tokens=res["prompt_tokens"],
+                        cached_tokens=res["cached_tokens"])],
+            d_tok=[len(x) for x in body_ids],
+            p_tok=[len(q) for q in q_ids], p_task=p_task,
+            answers=answers, flags=flags.tolist(),
+            answer_agreement=agree, budget=budget, kv_tokens=pool))
+        print(f"[client] n={n} s={s_vec} k={k}: {res['wall']:.1f}s, "
+              f"{res['requests']} requests, "
+              f"hit {100 * res['cached_tokens'] / max(1, res['prompt_tokens']):.1f}%, "
+              f"agreement {agree:.3f}", flush=True)
+
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    import vllm
+    return dict(model=MODEL, n_docs=n_docs, vllm_version=vllm.__version__,
+                results=results)
+
+
 # ---------------------------------------------------------------- step 2
 
 @app.function(image=image, gpu="H100!", timeout=5400,
@@ -519,6 +607,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "scale":
         data = scale10k.remote(n_docs or 10000)
         path = out or "results/engine/scale10k.json.gz"
+    elif phase == "client":
+        data = client_run.remote(n_docs or 10000)
+        path = out or "results/engine/client10k.json.gz"
     else:
         raise SystemExit(f"unknown phase {phase}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
