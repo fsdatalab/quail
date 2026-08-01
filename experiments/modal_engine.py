@@ -65,8 +65,9 @@ def _flags_line(flags):
 
 
 def _question(j):
-    return (f"\n\nInstruction: output only the value of FLAG_{j} from the "
-            f"[FLAGS] line above.\nFLAG_{j}=")
+    return (f"\n\nExample: if the line said [FLAGS] FLAG_9=NO, then FLAG_9 "
+            f"has value NO.\nInstruction: output only the value of FLAG_{j} "
+            f"from the [FLAGS] line above.\nFLAG_{j}=")
 
 
 def _task_prefix(j):
@@ -299,3 +300,54 @@ def probe() -> list:
         report.append((name, repr(o.outputs[0].text), [repr(t) for t in toks]))
         print(name, "->", repr(o.outputs[0].text), "tokens:", toks, flush=True)
     return report
+
+
+@app.function(image=image, gpu="H100!", timeout=1200,
+              volumes={"/root/.cache/huggingface": hf_cache})
+def probe2() -> dict:
+    """Accuracy of candidate doc-first answer suffixes over 20 docs x 2 flags."""
+    import numpy as np
+    from vllm import LLM, SamplingParams
+    docs = _build_pool(20)
+    llm = LLM(model=MODEL, kv_cache_dtype="fp8", max_model_len=4352,
+              gpu_memory_utilization=0.92, enable_prefix_caching=True)
+    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    rng = np.random.default_rng(7)
+    flags = (rng.random((len(docs), 2)) < 0.5).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+
+    def v1(j):
+        return (f"\n\nInstruction: output only the value of FLAG_{j} from "
+                f"the [FLAGS] line above.\nFLAG_{j}=")
+
+    def v2(j):
+        return (f"\n\nExample: if the line said [FLAGS] FLAG_9=NO, then "
+                f"FLAG_9 has value NO.\nInstruction: output only the value "
+                f"of FLAG_{j} from the [FLAGS] line above.\nFLAG_{j}=")
+
+    def v3(j):
+        return (f"\n\nQuestion: in the [FLAGS] line above, what is the value "
+                f"of FLAG_{j}? Reply with only YES or NO.\nAnswer:")
+
+    def line_flags(f):
+        return "\n\n[FLAGS]\n" + "\n".join(
+            f"FLAG_{j+1}={'YES' if x else 'NO'}" for j, x in enumerate(f))
+    bodies_ln = [d + line_flags(f) for d, f in zip(docs, flags)]
+    out = {}
+    for name, fn, bods in (("v1", v1, bodies), ("v2", v2, bodies),
+                           ("v3", v3, bodies), ("v4", v2, bodies_ln),
+                           ("v5", v3, bodies_ln)):
+        prompts, truth = [], []
+        for i in range(len(docs)):
+            for j in (1, 2):
+                prompts.append(bods[i] + fn(j))
+                truth.append(flags[i][j - 1])
+        outs = llm.generate(prompts, sp, use_tqdm=False)
+        acc = sum(1 for o, t in zip(outs, truth)
+                  if (o.outputs[0].text.strip().upper().startswith("Y")) == bool(t))
+        out[name] = acc / len(truth)
+        wrong = [(o.outputs[0].text) for o, t in zip(outs, truth)
+                 if (o.outputs[0].text.strip().upper().startswith("Y")) != bool(t)][:6]
+        print(name, "accuracy", out[name], "sample wrong outputs:", wrong,
+              flush=True)
+    return out
