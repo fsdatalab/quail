@@ -13,20 +13,21 @@ about 50 tokens on top, waiting for each answer. Speculation runs future
 filter prompts without waiting, wasting them when an early filter fails.
 
 The revised paper organizes every claim into four layers, and the repo now
-computes the first three: a resource lower bound that no schedule can beat,
-an asymptotic latency target from a linear program over steady batch rates,
-a constructed finite schedule replayed from the program's rates and checked
-by an independent validator, and a measured engine number that is a later
-phase and deliberately not started. Every number below comes from the
-paper's ideal cost model with its corrected attention width and its
-write-through storage rule, on 10,000 real IMDb reviews (2,966,000 document
-tokens) tokenized for the Qwen3 models. The pass rate of a filter is the
-fraction of documents that pass it.
+computes all four: a resource lower bound that no schedule can beat, an
+asymptotic latency target from a linear program over steady batch rates, a
+constructed finite schedule replayed from the program's rates and checked
+by an independent validator, and a measured number from real H100 runs,
+reported in its own section near the end. Except in that measured section,
+every number below comes from the paper's ideal cost model with its
+corrected attention width and its write-through storage rule, on 10,000
+real IMDb reviews (2,966,000 document tokens) tokenized for the Qwen3
+models. The pass rate of a filter is the fraction of documents that pass
+it.
 
 Raw data: results/lp_two_stage.csv (the program and its replays),
 results/n10k_two_stage.csv (direct schedule builders), manifests in
-results/manifests/, and the small instance study in
-experiments/run_smallN.py.
+results/manifests/, the small instance study in experiments/run_smallN.py,
+and the measured engine runs in results/engine/.
 
 ## The three computed layers agree, which is the main check
 
@@ -107,14 +108,118 @@ builders run 12 to 24 percent behind the exact optimum below 8 documents,
 and the program layer inherits a milder version of the same limitation
 through its restricted action menu.
 
+## The measured layer: real H100 runs against the ideal model
+
+The fourth layer runs the policies on a rented H100 through Modal, with
+vLLM 0.26 serving Qwen3-4B-FP8, an fp8 KV cache, prefix caching on, and
+2,000 documents from the seeded sample. Selectivity is planted. Each
+document ends with a metadata line such as "[FLAGS] FLAG_1=YES FLAG_2=NO"
+drawn from a recorded seed, and filter j asks the model to output the
+value of flag j as one token at temperature zero. The engine records
+realized token lengths, per wave timings, and per request cached token
+counts. experiments/analyze_engine.py rebuilds the exact instance from
+those lengths and runs the analytical builders on the same realized
+outcome matrix, so measured and ideal describe the same workload. The
+model's answers match the planted flags on 96 to 99.5 percent of calls for
+the task template and 82 to 97 percent for the shorter document-first
+question, and the schedules follow the model's answers, so each comparison
+is internally consistent. Raw data: results/engine/grid.json and
+grid_analysis.csv, with the plot in results/plots/engine_measured.png.
+
+One protocol lesson cost a full grid. The engine's prefix cache persists
+across runs, and in the first grid every speculation run followed a k=1
+run over the same documents and started 96 to 97 percent cached, so it
+never paid document prefill and appeared to win everywhere by a factor of
+two. The per wave cached token counts exposed this. That grid is kept as
+results/engine/grid_run1.json and reads as a warm regime measurement for
+its k of 2 or more rows only. The fixed protocol resets the prefix cache
+before every run and issues speculative branches in branch major order,
+all first branches then all second branches, so a cold speculative wave
+prefills each document once rather than k times. The cold first wave cache
+hits confirm both fixes: 47 percent at k=2, 63 at k=3, and 71 at k=4,
+each exactly the in flight sharing ceiling where every branch after a
+document's first reuses its KV, and zero for k=1.
+
+Cold measured makespans in seconds, 2,000 documents, best per row in bold:
+
+| configuration | task-first | pipeline k=1 | lookahead 2 | full speculation |
+|---|---|---|---|---|
+| n=2, s=0.25 | 11.2 | **9.4** | | 11.0 |
+| n=2, s=0.5 | 13.6 | **10.2** | | 10.7 |
+| n=2, s=0.8 | 15.6 | 10.8 | | **10.0** |
+| n=3, s=0.7 | 20.0 | **11.8** | | 12.5 |
+| n=3, s=0.9 | 24.7 | 13.2 | | **11.5** |
+| n=4, s=0.8 | 26.4 | **12.4** | 12.5 | 13.7 |
+| n=4, s=0.95 | 33.2 | 14.3 | 13.7 | **12.9** |
+
+What the cold grid shows:
+
+- The document-first template beats task-first in every cell, by 1.19
+  times at two filters and the lowest pass rate up to 2.58 times at four
+  filters and 0.95, growing with stage count and pass rate exactly as the
+  re-prefill arithmetic says it must.
+- The gate or speculate choice follows pass rate the way the ideal model
+  predicts, with the crossover shifted toward speculation. Gating wins the
+  low pass rate cells and speculation the high ones, but the real engine
+  flips at a lower pass rate than the ideal model does (at n=2 the model
+  flips above 0.8 while the measurement flips at 0.8; at three filters
+  and 0.9 and at four filters and 0.95 the measurement inverts the
+  model's order within the document-first family),
+  because a real gate costs a wave barrier while a wasted branch is cheap
+  when most documents survive. At n=4 and 0.8 the measured order k=1, then
+  k=2, then k=4 matches the ideal order exactly.
+- All 27 cold runs land between 3.31 and 4.10 times their ideal number.
+  The reason is a single rate. The engine prefills at 58,000 to 78,000
+  prompt tokens per second on these roughly 350 token requests, against
+  the 275,000 per second dense FP8 ceiling the ideal model prices. One
+  calibration constant of about 3.7 therefore puts the ideal model within
+  about 12 percent of every cold measurement, and the residual spread is
+  what the wave barriers and per request overheads add on top.
+
+The warm arm reruns four cells without the reset, so the corpus KV is
+already resident from the previous run over the same documents. This is
+the recurring query regime, where the same document store answers query
+after query. Pipeline query time collapses from 10.2 to 3.3 seconds at
+n=2 and from 12.4 to 4.7 seconds at n=4, which is 1.17 and 1.48 times the
+cold ideal number even though the warm run skips the document prefill the
+ideal still prices. In that regime the engine processes only 7,000 to
+9,000 new tokens per second, so per request overhead and the one decode
+step per filter call set the floor. Warm gating beats warm speculation
+decisively at n=4, 4.7 against 8.0 seconds, because with prefill gone
+wasted branches are the only remaining cost, which is the ideal model's
+logic exactly. Task-first can never use residency, whatever the cache
+holds, because its template puts the task prompt before the document and
+the prefix match fails at position zero.
+
+The manifest arm drives the engine batch for batch from the analytical
+builder's schedule instead of letting the policy loop compose waves, on
+six cells. Manifest and wave times agree within 10 percent everywhere:
+13.6 against 13.6 and 26.8 against 26.4 for task-first, 10.5 against 10.2
+and 13.6 against 12.4 for k=1, 10.8 against 10.7 for full speculation at
+n=2, and 12.7 against 13.7 at n=4, where the manifest is faster because
+the builder splits the 8,000 request wave into two capacity sized batches.
+The analytical schedules are executable as written.
+
+These runs test the policy structure, meaning templates, gating, branch
+order, and wave membership, not the paper's exact batch compositions,
+because vLLM composes batches inside each wave through continuous
+batching and chunked prefill, and the kernels are vLLM's. Each cell is a
+single run with no repetition statistics, on one model and one card. The
+document-first question template disagrees with the planted flags more
+often than the task template, 82 to 97 against 96 to 99.5 percent, so
+part of any accuracy gap between policies here is template wording, not
+scheduling.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
   stated scale. The batch-count differences (for example 100 pipeline
   batches versus 53 full-speculation batches at high pass rates on the
   32B model and L40S) mean a fixed per-batch overhead of roughly 140
-  milliseconds would start reversing the speculation conclusion; that is
-  the first target for the calibrated phase.
+  milliseconds would start reversing the speculation conclusion; the
+  measured layer above confirms the direction: on the real engine the
+  crossover toward speculation arrives at lower pass rates than the ideal
+  model predicts.
 - The program's value is the optimum of a restricted state and action set,
   labeled per the paper: a fuller action search could raise it, and the
   achievability of the rate is established here only by the successful
