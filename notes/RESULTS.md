@@ -287,6 +287,46 @@ three client library (blocked order plus streaming plus
 pre-tokenization) targets exactly the measured residual. Raw data:
 results/engine/scale10k.json.gz and scale10k_analysis.csv.
 
+## Scheduler plan step three: the client library closes the gap
+
+Step three packages the three measured wins into one client scheduler
+(docengine/runtime/engine_client.py) that runs against an unmodified
+engine: prompts pre-tokenized once, admission controlled by a token
+budget sized to the engine's KV pool so a document enters only when its
+notes can stay resident, and per document streaming so each document
+runs all its filters back to back while hot and returns its budget in
+seconds. This produces blocked execution with no stage barriers at all.
+On the same 10,000 document cold grid:
+
+| configuration | task-first | naive k=1 | blocked batches | client library |
+|---|---|---|---|---|
+| n=2, s=0.5 | 61.7 | 64.4 | 53.8 | **48.9** |
+| n=4, s=0.8 | 122.8 | 111.3 | 74.0 | **52.5** |
+| n=4, s=0.95 | 158.3 | 153.7 | 84.2 | **57.9** |
+
+The client reads 1.17 to 1.30 times the corpus (questions account for
+about seven points of that) and beats task-first and naive execution by
+2.3 to 2.7 times at four filters. Against the calculator with the one
+measured kernel constant applied, it lands at 1.02 times prediction at
+two filters and 0.96 at four, slightly below one because the single
+constant also scales the attention share of the ideal, which is not
+kernel limited in the same way. Within measurement noise, the query now
+runs at the engine's own speed limit, and the paper's claim holds on
+hardware: plan the query on the formula, execute it, land where the
+formula said.
+
+Two smaller findings. Speculation is now neutral or slightly harmful
+(50.4 against 48.9 seconds at two filters, 56.7 against 57.9 at four),
+confirming that its measured value in the earlier grids was
+compensation for stage barriers, which streaming removes; its remaining
+role is filling the admission tail, invisible at this scale. And the
+whole result rests on client side control only, which bounds what the
+step four in-engine scheduler can still add: roughly the residual
+between the client and the pure read floor (about 40 seconds of reading
+in a 52 to 58 second query), the per request floor of 0.55
+milliseconds, and robustness where this arm relies on recency luck.
+Raw data: results/engine/client10k.json.gz and client10k_analysis.csv.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
