@@ -386,6 +386,27 @@ Raw data: results/engine/pinned10k.json.gz (acceptance one and the
 gentle co-tenant), pinned10k_v3.json.gz (the closing demonstration),
 and the run logs for the intermediate iteration.
 
+## Single tenant strict mode, the shipping configuration, validated
+
+Strict mode makes the plan's governance total: untagged requests are
+refused at the door, every block a planned request leaves behind
+unpinned is stripped on free, and a heuristic eviction raises instead
+of silently substituting for the plan. The validated result on the
+10,000 document grid: 48.5, 52.3, and 54.7 seconds across the three
+configurations, equal to or better than every earlier mode, with zero
+heuristic evictions in every run, exact pin accounting, and the
+untagged canary refused.
+
+The first strict flight also did exactly what the mode exists to do.
+It surfaced an under-claim: the stage questions share their first
+sixteen or so tokens, so the block straddling the document and
+question boundary was genuinely reused across stages, previously kept
+alive by recency luck. Tail stripping evicted it, the invariant made
+the cost visible as an honest 8 to 20 percent regression, and the fix
+went into the plan's claim (each document's pin now covers the common
+question preamble) rather than back into a heuristic. The silent
+fallback had been absorbing that accounting gap in every earlier run.
+
 ## Phase A, analytical layer: reasoning filters before any GPU run
 
 notes/REASONING_MODEL.md defines the extended cost model (stepwise
