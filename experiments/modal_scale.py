@@ -323,7 +323,9 @@ async def overhead_split(n_docs: int = 2000) -> dict:
 
 @app.function(image=image, gpu="H100!", timeout=3600,
               volumes={"/root/.cache/huggingface": hf_cache})
-async def pinned_run(variant: str = "pinned", n_docs: int = 10000) -> dict:
+async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
+                     junk_rate: float = 25.0, junk_len: int = 800,
+                     junk_only: bool = False) -> dict:
     """Phase C acceptance: the in-engine scheduler (pinning plus
     priorities) against the stock engine, each with and without an
     adversarial co-tenant stream that hammers the cache."""
@@ -377,7 +379,7 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000) -> dict:
             await asyncio.sleep(1.0)
         raise RuntimeError("prefix cache reset kept failing")
 
-    async def cotenant(stop, stats, rate=25.0, length=800):
+    async def cotenant(stop, stats, rate=junk_rate, length=junk_len):
         rng = np.random.default_rng(4321)
         jobs = []
 
@@ -398,9 +400,12 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000) -> dict:
             await asyncio.sleep(1.0 / rate)
         await asyncio.gather(*jobs, return_exceptions=True)
 
-    grid = [(2, (0.5, 0.5), False), (4, (0.8,) * 4, False),
-            (4, (0.95,) * 4, False), (4, (0.8,) * 4, True)] if ext else \
-           [(4, (0.8,) * 4, False), (4, (0.8,) * 4, True)]
+    if junk_only:
+        grid = [(4, (0.8,) * 4, False), (4, (0.8,) * 4, True)]
+    else:
+        grid = [(2, (0.5, 0.5), False), (4, (0.8,) * 4, False),
+                (4, (0.95,) * 4, False), (4, (0.8,) * 4, True)] if ext \
+            else [(4, (0.8,) * 4, False), (4, (0.8,) * 4, True)]
 
     results = []
     for n, s_vec, junk in grid:
@@ -426,7 +431,8 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000) -> dict:
                     if a == flags[i][j - 1]) / max(1, len(answers))
         results.append(dict(
             n=n, s=list(s_vec), policy="block", k=1, mode=variant,
-            junk=junk, junk_stats=stats, makespan=res["wall"],
+            junk=junk, junk_rate=junk_rate, junk_len=junk_len,
+            junk_stats=stats, makespan=res["wall"],
             waves=[dict(stage=1, requests=res["requests"], s=res["wall"],
                         prompt_tokens=res["prompt_tokens"],
                         cached_tokens=res["cached_tokens"])],
@@ -845,6 +851,15 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
                     results=dp["results"] + ds["results"])
         path = out or ("results/engine/pinned10k.json.gz" if nd == 10000
                        else f"results/engine/pinned_{nd}.json.gz")
+    elif phase == "pinned2":
+        nd = n_docs or 10000
+        hp = pinned_run.spawn("pinned", nd, 60.0, 1500, True)
+        hs = pinned_run.spawn("stock", nd, 60.0, 1500, True)
+        dp, ds = hp.get(), hs.get()
+        data = dict(model=dp["model"], n_docs=nd,
+                    vllm_version=dp["vllm_version"],
+                    results=dp["results"] + ds["results"])
+        path = out or "results/engine/pinned10k_hard.json.gz"
     else:
         raise SystemExit(f"unknown phase {phase}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
