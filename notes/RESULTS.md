@@ -386,6 +386,48 @@ Raw data: results/engine/pinned10k.json.gz (acceptance one and the
 gentle co-tenant), pinned10k_v3.json.gz (the closing demonstration),
 and the run logs for the intermediate iteration.
 
+## Phase A, analytical layer: reasoning filters before any GPU run
+
+notes/REASONING_MODEL.md defines the extended cost model (stepwise
+generation priced per decode cohort, thinking notes as transient
+memory, full waste on failed speculative branches), the Bellman value
+recurrences for task-first and for every stage composition of the
+document-first family, and the per-policy throughput program. The
+implementation lives in docengine/reasoning/ with eight structural
+checks in tests/test_reasoning.py, and experiments/run_reasoning.py
+produces the crossover map in results/reasoning_sweep.csv.
+
+The anchor comes first: at zero thinking the calibrated model
+reproduces the measured 10,000 document world within about ten
+percent with no per-cell fitting (pipeline 48.7 against 52.5 measured
+seconds at four filters and 0.8, task-first 127.7 against 122.8), so
+the extension stands on the measured base rather than beside it.
+
+What the map says, sweeping mean thinking length over 0, 32, 128, and
+512 tokens:
+
+- Generation takes over. At 512 thinking tokens the pipeline's query
+  grows from 48.7 to 238 seconds at four filters and 0.8, and
+  throughput falls from about 205 to 42 documents per second. The
+  policy gap compresses as predicted: task-first's penalty shrinks
+  from 2.6 times to 1.3 times, because re-reading matters less when
+  writing dominates.
+- The Bellman optimum is the pure pipeline in every cell. Speculation
+  never wins under streaming, and thinking makes it strictly worse
+  (30 percent above the pipeline at four filters, 0.8, and 512
+  thinking tokens), because a wasted branch now wastes a whole
+  reasoning trace. This agrees with the phase C measurement that
+  speculation's earlier value was only stage-barrier compensation.
+- Blocks shrink and cohorts with them: the per-document footprint
+  grows from about 340 to about 2,450 tokens at full speculation with
+  512 thinking tokens, exactly the double punishment of large
+  lookahead the model note predicts.
+
+The measured phase that follows has a sharp question: do the
+generation-dominated makespans and the no-speculation verdict survive
+contact with the engine at 10,000 documents, using the same layered
+comparison as before.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
