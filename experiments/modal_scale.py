@@ -506,16 +506,31 @@ async def strict_run(n_docs: int = 10000) -> dict:
         if inspect.isawaitable(res):
             await res
 
-    # canary: an untagged request must be refused, not served
+    # canary: an untagged request must be refused, not served. The
+    # scheduler aborts it before its first step, so no final output
+    # ever reaches this generator; a bounded wait treats never-served
+    # as refused and cleans up the client-side request state.
     canary = None
-    try:
+    rejected = False
+
+    async def _canary():
+        nonlocal canary
         async for out in engine.generate({"prompt_token_ids": [100] * 8},
-                                         sp, "canary-1", priority=2):
+                                         sp, "canary-1"):
             canary = out
+
+    try:
+        await asyncio.wait_for(_canary(), timeout=60)
         rejected = bool(canary and canary.outputs
                         and canary.outputs[0].finish_reason == "abort")
-    except Exception:
-        rejected = True
+    except (asyncio.TimeoutError, Exception):
+        rejected = canary is None
+        try:
+            res = engine.abort("canary-1")
+            if inspect.isawaitable(res):
+                await res
+        except Exception:
+            pass
     print(f"[strict] untagged canary refused: {rejected}", flush=True)
 
     results = []
