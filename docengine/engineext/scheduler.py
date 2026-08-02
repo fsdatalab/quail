@@ -30,7 +30,6 @@ ride inside request ids. Protocol, fields separated by "|":
 """
 
 import os
-from collections import deque
 
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus, StreamingUpdate
@@ -114,6 +113,9 @@ class DocEngineScheduler(Scheduler):
                 self._de_yes = {int(x) for x in part[1:].split(",")}
         super().add_request(request)
         self._de_stats["registered"] = len(qs)
+        print(f"[de-sched] chain registered: {len(qs)} questions, "
+              f"lengths {[len(q) for q in qs]}, "
+              f"yes ids {sorted(self._de_yes)}", flush=True)
         self.finish_requests(request.request_id,
                              RequestStatus.FINISHED_ABORTED)
 
@@ -135,18 +137,53 @@ class DocEngineScheduler(Scheduler):
             del blocks[keep:]
             self._de_evict({b.block_id for b in tail if not b.is_null})
             self.kv_cache_manager.block_pool.free_blocks(reversed(tail))
+        if blocks and d % self.block_size and len(blocks) >= keep:
+            # the boundary block keeps positions past d that the next
+            # question overwrites; its cache entry describes the old
+            # content and must not survive to serve a hit
+            b = blocks[keep - 1]
+            if not b.is_null:
+                self._de_evict({b.block_id})
         self._de_stats["rewinds"] = self._de_stats.get("rewinds", 0) + 1
+
+    def _update_request_with_output(self, request, new_token_ids):
+        new_token_ids, stopped = super()._update_request_with_output(
+            request, new_token_ids)
+        st = self._de_chain.get(request.request_id)
+        if st is not None and stopped:
+            out = request._output_token_ids
+            tok = out[-1] if out else None
+            st["tok"] = tok
+            st["advance"] = (tok in self._de_yes
+                             and st["stage"] < len(self._de_questions))
+            if st["advance"]:
+                # The stop path reads a finish reason from the status
+                # right after this returns and sends it to the client,
+                # which would end the client's stream mid-chain. Erase
+                # the stop status before it is read; the final stage
+                # keeps its real finish and closes the stream.
+                request.status = RequestStatus.RUNNING
+        return new_token_ids, stopped
 
     def _handle_stopped_request(self, request):
         st = self._de_chain.get(request.request_id)
         if st is None:
             return super()._handle_stopped_request(request)
-        out = request._output_token_ids
-        passed = bool(out) and out[-1] in self._de_yes
-        if not passed or st["stage"] >= len(self._de_questions):
+        self._de_stats["chain_stops"] = (
+            self._de_stats.get("chain_stops", 0) + 1)
+        if self._de_stats["chain_stops"] <= 6:
+            print(f"[de-sched] chain stop {request.request_id}: stage "
+                  f"{st['stage']}, token {st.get('tok')}, "
+                  f"advance {st.get('advance')}", flush=True)
+        if not st.get("advance"):
             del self._de_chain[request.request_id]
-            request.resumable = False
+            self._de_stats["chain_done"] = (
+                self._de_stats.get("chain_done", 0) + 1)
+            if not self._de_chain:
+                print(f"[de-sched] chains drained: stats {self._de_stats}",
+                      flush=True)
             return True
+        st["advance"] = False
         self._de_rewind(request, st["d"])
         st["stage"] += 1
         update = StreamingUpdate(
@@ -166,9 +203,6 @@ class DocEngineScheduler(Scheduler):
             return
         if rid.startswith("de1|") and "|c|" in rid:
             assert self._de_questions, "chain request before registration"
-            request.resumable = True
-            if request.streaming_queue is None:
-                request.streaming_queue = deque()
             self._de_chain[rid] = dict(
                 stage=1,
                 d=request.num_prompt_tokens - len(self._de_questions[0]))

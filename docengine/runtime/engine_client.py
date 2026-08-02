@@ -207,14 +207,14 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
                 counters["prompt_tokens"] += len(final.prompt_token_ids)
                 counters["cached_tokens"] += (
                     getattr(final, "num_cached_tokens", 0) or 0)
-            # each stage's answer is one sampled token, and the rewind
-            # clears the output record between stages, so every yield
-            # with a single token is one stage's answer (the exact
-            # stream shape is verified by the smoke run, which prints
-            # raw snapshots for the first document)
-            stage_toks = [snap[0] for snap in toks if len(snap) == 1]
-            if not stage_toks and toks:
-                stage_toks = [toks[-1][-1]]
+            # the engine's rewind is invisible on this side: the
+            # client's cumulative output record only grows, one answer
+            # token per stage. The new tokens each snapshot adds are
+            # the per-stage answers, in stage order.
+            stage_toks, seen = [], 0
+            for snap in toks:
+                stage_toks.extend(snap[seen:])
+                seen = max(seen, len(snap))
             if i == 0:
                 answers[("raw", 0)] = tuple(tuple(s) for s in toks[:8])
             for j, t in enumerate(stage_toks[:n]):
