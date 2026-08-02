@@ -130,9 +130,10 @@ One protocol lesson cost a full grid. The engine's prefix cache persists
 across runs, and in the first grid every speculation run followed a k=1
 run over the same documents and started 96 to 97 percent cached, so it
 never paid document prefill and appeared to win everywhere by a factor of
-two. The per wave cached token counts exposed this. That grid is kept as
-results/engine/grid_run1.json and reads as a warm regime measurement for
-its k of 2 or more rows only. The fixed protocol resets the prefix cache
+two. The per wave cached token counts exposed this. That grid was removed
+from the repository as invalid (its numbers survive in git history and
+this note; the deliberate warm arm of later runs supersedes its
+accidental warm rows). The fixed protocol resets the prefix cache
 before every run and issues speculative branches in branch major order,
 all first branches then all second branches, so a cold speculative wave
 prefills each document once rather than k times. The cold first wave cache
@@ -280,8 +281,9 @@ analytical builders read 1.18 to 1.32 times the corpus and win every
 cell, by 1.15 times at two filters and up to 1.88 times over task-first
 at four filters and 0.95.
 
-Run one of this experiment failed in an instructive way and is kept as
-results/engine/scale10k_run1.json.gz. The builder's schedules were
+Run one of this experiment failed in an instructive way (its file was
+removed as invalid; the numbers live in git history and in this
+paragraph). The builder's schedules were
 right, but the conversion submitted each batch's new document prefills
 before its branch requests, and under the engine's keep-the-most-recent
 rule the new writes evicted exactly the resident bodies the branches
