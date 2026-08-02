@@ -575,6 +575,14 @@ by cutting requests per document from n to one; and the deepcopy
 share is a candidate upstream contribution independent of anything
 else we build.
 
+Follow-up, measured: setting the engine's own skip_clone switch on our
+parameters object removes the deep copy entirely (absent from the
+re-profiled table), and with telemetry also off, total CPU falls from
+28.5 to 16.3 seconds on the reference run. The clock gains only about
+0.4 seconds because most of that CPU ran alongside the GPU; the value
+is headroom for short-step regimes and a clean remaining table, all of
+it per-request machinery that sequence truncation removes wholesale.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
