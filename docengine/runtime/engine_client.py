@@ -151,3 +151,92 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
         await ask(q_ids[0], f"de1|r*|{tag}-0-99", pri=0, count=False)
     return dict(wall=wall, survivors=sorted(survivors), answers=answers,
                 **counters)
+
+
+async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
+                                  budget_tokens, yes_ids, tag="c"):
+    """Chain mode: the engine itself runs each document's whole filter
+    chain (register questions once, then one request per document; the
+    scheduler judges answers, rewinds, and continues). Returns the same
+    result shape as run_filter_chain."""
+    import asyncio
+    import time as _time
+
+    n = len(q_ids)
+    reg = [n]
+    for q in q_ids:
+        reg += [len(q)] + list(q)
+    reg_rid = f"de1|reg|Y{','.join(map(str, sorted(yes_ids)))}|{tag}-reg"
+
+    async def _reg():
+        async for _ in engine.generate({"prompt_token_ids": reg},
+                                       sampling_params, reg_rid):
+            pass
+
+    try:
+        await asyncio.wait_for(_reg(), timeout=30)
+    except (asyncio.TimeoutError, Exception):
+        try:
+            res = engine.abort(reg_rid)
+            if hasattr(res, "__await__"):
+                await res
+        except Exception:
+            pass
+
+    used = 0
+    cond = asyncio.Condition()
+    counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
+    answers = {}
+    survivors = []
+    q_cost = sum(len(q) for q in q_ids) + n
+
+    async def chain(i, cost):
+        nonlocal used
+        toks = []
+        try:
+            final = None
+            async for out in engine.generate(
+                    {"prompt_token_ids": body_ids[i] + q_ids[0]},
+                    sampling_params, f"de1|c|d{i}|{tag}-{i}-0"):
+                final = out
+                ids = list(out.outputs[0].token_ids or ())
+                if ids:
+                    toks.append(ids)
+            counters["requests"] += 1
+            if final is not None:
+                counters["prompt_tokens"] += len(final.prompt_token_ids)
+                counters["cached_tokens"] += (
+                    getattr(final, "num_cached_tokens", 0) or 0)
+            # each stage's answer is one sampled token, and the rewind
+            # clears the output record between stages, so every yield
+            # with a single token is one stage's answer (the exact
+            # stream shape is verified by the smoke run, which prints
+            # raw snapshots for the first document)
+            stage_toks = [snap[0] for snap in toks if len(snap) == 1]
+            if not stage_toks and toks:
+                stage_toks = [toks[-1][-1]]
+            if i == 0:
+                answers[("raw", 0)] = tuple(tuple(s) for s in toks[:8])
+            for j, t in enumerate(stage_toks[:n]):
+                answers[(i, j + 1)] = 1 if t in yes_ids else 0
+            if len(stage_toks) >= n \
+                    and all(t in yes_ids for t in stage_toks[:n]):
+                survivors.append(i)
+        finally:
+            async with cond:
+                used -= cost
+                cond.notify_all()
+
+    t0 = _time.time()
+    tasks = []
+    for i in range(len(body_ids)):
+        cost = len(body_ids[i]) + q_cost
+        async with cond:
+            while used + cost > budget_tokens and used > 0:
+                await cond.wait()
+            used += cost
+        tasks.append(asyncio.create_task(chain(i, cost)))
+    await asyncio.gather(*tasks)
+    wall = _time.time() - t0
+    return dict(wall=wall, survivors=sorted(survivors), answers=answers,
+                **counters)

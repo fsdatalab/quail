@@ -679,6 +679,95 @@ async def longdoc_run() -> dict:
                 rope_scaling="yarn x4", results=results)
 
 
+
+
+# ------------------------------------------------------------ chain proof
+
+@app.function(image=image, gpu="H100!", timeout=2400,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def chain_run(n_docs: int = 50) -> dict:
+    """Milestone one of sequence truncation: the same 50 documents run
+    the old way (one request per filter) and the new way (one request
+    per document, the engine rewinding between filters). Pass means the
+    surviving documents match exactly and the rewind count equals the
+    number of documents that passed filter one."""
+    import inspect
+    import os
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import (EngineTags,
+                                                 run_filter_chain,
+                                                 run_filter_chain_engine)
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    docs = _build_pool(n_docs)
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True, scheduling_policy="priority",
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
+    n, s = 2, 0.7
+    rng = np.random.default_rng(FLAG_SEED + 7)
+    flags = (rng.random((len(docs), n)) < s).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(n)]
+    yes_ids = set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            yes_ids.add(ids[0])
+
+    async def reset_cache():
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    a = await run_filter_chain(engine, sp, body_ids, q_ids, 830_000,
+                               lookahead=1, tag="rm", tags=EngineTags(),
+                               use_priority=True)
+    await reset_cache()
+    b = await run_filter_chain_engine(engine, sp, body_ids, q_ids,
+                                      830_000, yes_ids, tag="cm")
+    raw = b["answers"].pop(("raw", 0), None)
+    same_surv = a["survivors"] == b["survivors"]
+    shared = [k for k in a["answers"] if k in b["answers"]]
+    agree = sum(1 for k in shared if a["answers"][k] == b["answers"][k])
+    print(f"[chain] request mode: {a['requests']} requests, "
+          f"{a['wall']:.2f}s; chain mode: {b['requests']} requests, "
+          f"{b['wall']:.2f}s", flush=True)
+    print(f"[chain] survivors match: {same_surv} "
+          f"({len(a['survivors'])} vs {len(b['survivors'])}); shared "
+          f"answers agree {agree}/{len(shared)}", flush=True)
+    print(f"[chain] doc0 raw snapshots: {raw}", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return dict(n_docs=n_docs,
+                request_mode=dict(requests=a["requests"], wall=a["wall"],
+                                  survivors=a["survivors"]),
+                chain_mode=dict(requests=b["requests"], wall=b["wall"],
+                                survivors=b["survivors"]),
+                survivors_match=same_surv,
+                answers_agree=[agree, len(shared)],
+                doc0_raw=[list(x) for x in (raw or ())])
+
 # ---------------------------------------------------- single tenant mode
 
 @app.function(image=image, gpu="H100!", timeout=3600,
@@ -1212,6 +1301,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
         data = strict_run.remote(nd)
         path = out or ("results/engine/strict10k.json.gz" if nd == 10000
                        else f"results/engine/strict_{nd}.json.gz")
+    elif phase == "chain":
+        data = chain_run.remote(n_docs or 50)
+        path = out or "results/engine/chain_smoke.json"
     elif phase == "profile":
         data = profile_run.remote(n_docs or 4000)
         path = out or "results/engine/profile.json"
