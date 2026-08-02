@@ -98,12 +98,20 @@ class DocEngineScheduler(Scheduler):
             self.finish_requests(request.request_id,
                                  RequestStatus.FINISHED_ABORTED)
             return
+        # Ordering is the plan's decision, not the client's: rank is
+        # assigned here from the verified tag, and whatever priority a
+        # client requested is overridden. Consumers of resident notes
+        # run first, new document reads next, unplanned traffic (only
+        # possible outside strict mode) last.
         if tag is not None:
             pin, doc, rel = tag
+            request.priority = 1 if pin > 0 else 0
             if rel:
                 self._de_release(rel)
             if pin > 0 and doc is not None and doc not in self._de_pins:
                 self._de_intent[request.request_id] = (pin, doc)
+        else:
+            request.priority = 2
         super().add_request(request)
 
     def _de_release(self, docs):
