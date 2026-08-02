@@ -423,10 +423,36 @@ What the map says, sweeping mean thinking length over 0, 32, 128, and
   512 thinking tokens, exactly the double punishment of large
   lookahead the model note predicts.
 
+The exact layer (docengine/reasoning/exact.py) rebuilds the small-N
+certification discipline for the reasoning world: integer documents,
+decisions at event boundaries, outcomes as the only randomness, an
+offline clairvoyant solver and an online expectimax solver over the
+same transitions, with the fixed policies as restricted action sets.
+Anchors are hand-computed epochs at N=1 and the exact expectation of
+the clairvoyant optimum over all outcome scenarios. Three findings
+from the N=3 study (results/reasoning_exact.csv):
+
+- On a starved machine speculation wins even with heavy thinking,
+  because tiny decode cohorts pay the weight-read floor regardless of
+  width, so waste is free in time while parallelism cuts depth. The
+  fluid layer's no-speculation verdict is a saturated-machine
+  statement, and the two layers now bracket the regimes.
+- When memory binds under thinking, the adaptive optimum beats every
+  fixed composition by 33 percent, by mixing speculation depths
+  across documents to exactly fill the budget. This is the first cell
+  in the project where adaptivity strictly beats all fixed policies,
+  it is invisible to the fluid layer by construction, and it is the
+  concrete preview of phase B's thesis that binding memory turns the
+  mix into a real decision.
+- Clairvoyance is worth less than one percent: knowing outcomes in
+  advance barely helps, so the value of scheduling lies in resource
+  orchestration, not prediction.
+
 The measured phase that follows has a sharp question: do the
-generation-dominated makespans and the no-speculation verdict survive
-contact with the engine at 10,000 documents, using the same layered
-comparison as before.
+generation-dominated makespans, the saturated no-speculation verdict,
+and the adaptive gain under memory pressure survive contact with the
+engine at 10,000 documents, using the same layered comparison as
+before.
 
 ## Caveats
 

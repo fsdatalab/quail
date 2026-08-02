@@ -30,6 +30,7 @@ class RInstance:
     g: tuple                # per-stage generated tokens (thinking + answer)
     f: tuple = None         # task template extra tokens (prefix + cue)
     calib: float = 1.0      # phi: effective compute = calib * R_D
+    cap_tokens: int = None  # override the analytic KV capacity
 
     @property
     def n(self):
@@ -40,6 +41,8 @@ class RInstance:
 
     @property
     def cap(self):
+        if self.cap_tokens is not None:
+            return self.cap_tokens
         return kv_capacity_tokens(self.model, self.device)
 
     @property
