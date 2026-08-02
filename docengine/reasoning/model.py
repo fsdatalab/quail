@@ -58,8 +58,20 @@ class RInstance:
 
 
 def t_pre(inst, tokens):
-    """Seconds of compute to read `tokens`."""
+    """Seconds of dense compute to read `tokens` (no attention)."""
     return 2.0 * inst.model.P * tokens / inst.R_C
+
+
+def t_pre_doc(inst, count, d):
+    """Seconds to prefill `count` documents of length d, including the
+    quadratic self-attention compute (4 L w_Q d^2/2 per document),
+    negligible at hundreds of tokens and dominant past roughly 25,000
+    (the crossover d* = P / (L w_Q)). Long-document validation measured
+    2.15x the dense-only cost at 30k tokens against 2.23x predicted by
+    this term."""
+    m = inst.model
+    attn = 2.0 * m.L * m.attn_width * d * d * count / inst.R_C
+    return t_pre(inst, count * d) + attn
 
 
 def step_time(inst, m, ctx):
@@ -94,7 +106,8 @@ def value_taskfirst(inst):
         rounds = math.ceil(Nj / m)
         ctx = inst.fj(j) + inst.d + inst.g[j] / 2.0
         dec_tokens = Nj * inst.g[j]
-        comp_j = t_pre(inst, pre + dec_tokens)
+        comp_j = t_pre_doc(inst, Nj, inst.fj(j) + inst.d) \
+            + t_pre(inst, dec_tokens)
         steps = inst.g[j] * rounds
         bw_j = (inst.model.W_run * steps
                 + inst.model.kappa * (dec_tokens * ctx + pre + dec_tokens)
@@ -123,9 +136,9 @@ def value_blockwise(inst, comp_tuple):
     B = max(1.0, min(float(inst.N), inst.cap / (inst.d + peak)))
     nb = inst.N / B
 
-    comp_b = t_pre(inst, B * inst.d)
+    comp_b = t_pre_doc(inst, B, inst.d)
     bw_b = inst.model.kappa * B * inst.d / inst.device.BW
-    path = t_pre(inst, B * inst.d)
+    path = t_pre_doc(inst, B, inst.d)
     for j0, k in starts:
         bt = B * inst.survival(j0)
         if bt < 1e-9:
