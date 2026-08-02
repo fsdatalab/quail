@@ -45,7 +45,8 @@ app = modal.App("docengine-scale")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("vllm", "huggingface_hub", "pandas", "pyarrow", "numpy")
+    .pip_install("vllm", "huggingface_hub", "pandas", "pyarrow", "numpy",
+                 "py-spy")
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0"})
     .add_local_python_source("docengine")
@@ -454,6 +455,227 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
     import vllm
     return dict(model=MODEL, n_docs=n_docs, variant=variant,
                 vllm_version=vllm.__version__, results=results)
+
+
+# ---------------------------------------------------------- profiling
+
+def _engine_core_pids():
+    import os
+    pids = []
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            with open(f"/proc/{p}/cmdline", "rb") as f:
+                cmd = f.read()
+        except OSError:
+            continue
+        if b"EngineCore" in cmd:
+            pids.append(int(p))
+    return pids
+
+
+def _top_from_speedscope(path, top=25):
+    import json as _json
+    with open(path) as f:
+        data = _json.load(f)
+    frames = [fr["name"] for fr in data["shared"]["frames"]]
+    self_w = {}
+    total_w = {}
+    for prof in data["profiles"]:
+        if prof.get("type") != "sampled":
+            continue
+        for sample, w in zip(prof["samples"], prof["weights"]):
+            if not sample:
+                continue
+            leaf = frames[sample[-1]]
+            self_w[leaf] = self_w.get(leaf, 0.0) + w
+            for fi in set(sample):
+                total_w[frames[fi]] = total_w.get(frames[fi], 0.0) + w
+    grand = sum(self_w.values()) or 1.0
+    rows = sorted(self_w.items(), key=lambda kv: -kv[1])[:top]
+    return [dict(fn=k, self_pct=100.0 * v / grand,
+                 total_pct=100.0 * total_w.get(k, 0.0) / grand)
+            for k, v in rows]
+
+
+@app.function(image=image, gpu="H100!", timeout=2400,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def profile_run(n_docs: int = 4000) -> dict:
+    """Split the per-request software bundle: sample both the client
+    process and the engine core with py-spy during a reference query,
+    and rank functions by self time."""
+    import asyncio  # noqa: F401
+    import inspect
+    import os
+    import subprocess
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import EngineTags, run_filter_chain
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    n, s_vec = 4, (0.8,) * 4
+    docs = _build_pool(n_docs)
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        scheduling_policy="priority",
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    rng = np.random.default_rng(FLAG_SEED + 1000 * n + int(100 * s_vec[0]))
+    flags = (rng.random((len(docs), n)) < np.asarray(s_vec)).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(n)]
+    res = engine.reset_prefix_cache()
+    if inspect.isawaitable(res):
+        await res
+
+    cores = _engine_core_pids()
+    dur = "40"
+    procs = [subprocess.Popen(
+        ["py-spy", "record", "--pid", str(os.getpid()), "-o",
+         "/tmp/client.ss", "--format", "speedscope", "--rate", "100",
+         "--duration", dur])]
+    for i, pid in enumerate(cores):
+        procs.append(subprocess.Popen(
+            ["py-spy", "record", "--pid", str(pid), "-o",
+             f"/tmp/core{i}.ss", "--format", "speedscope", "--rate",
+             "100", "--duration", dur]))
+    out = await run_filter_chain(engine, sp, body_ids, q_ids,
+                                 budget_tokens=830_000, lookahead=1,
+                                 tag="prof", tags=EngineTags(),
+                                 use_priority=True)
+    for p in procs:
+        p.wait()
+    report = dict(makespan=out["wall"], requests=out["requests"],
+                  n_docs=n_docs, cores=len(cores))
+    report["client_top"] = _top_from_speedscope("/tmp/client.ss")
+    for i in range(len(cores)):
+        report[f"core{i}_top"] = _top_from_speedscope(f"/tmp/core{i}.ss")
+    for name in ("client_top",) + tuple(
+            f"core{i}_top" for i in range(len(cores))):
+        print(f"[profile] === {name} ===", flush=True)
+        for r in report[name][:20]:
+            print(f"[profile] {r['self_pct']:5.1f}% self "
+                  f"{r['total_pct']:6.1f}% total  {r['fn'][:90]}",
+                  flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return report
+
+
+# ------------------------------------------------------ long documents
+
+@app.function(image=image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def longdoc_run() -> dict:
+    """Long-document validation on the shipped configuration: the model
+    predicts the read floor with policy differences compressed. Uses a
+    YaRN rope-scaling override to reach 100k contexts (native limit is
+    32k); noted in the results."""
+    import inspect
+    import os
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import EngineTags, run_filter_chain
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    pool = _build_pool(10000)
+    lens = [len(x) for x in
+            tok(pool, add_special_tokens=False)["input_ids"]]
+
+    def build_long(count, target):
+        docs, i = [], 0
+        for _ in range(count):
+            parts, total = [], 0
+            while total < target - 400:
+                parts.append(pool[i % len(pool)])
+                total += lens[i % len(pool)] + 2
+                i += 1
+            docs.append("\n\n".join(parts))
+        return docs
+
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=102_400,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        scheduling_policy="priority",
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler",
+        hf_overrides={"rope_scaling": {
+            "rope_type": "yarn", "factor": 4.0,
+            "original_max_position_embeddings": 32768}}))
+    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    n, s = 2, 0.7
+
+    async def reset_cache():
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    results = []
+    for count, target, k in ((100, 30_000, 1), (100, 30_000, 2),
+                             (30, 100_000, 1)):
+        docs = build_long(count, target)
+        rng = np.random.default_rng(FLAG_SEED + count)
+        flags = (rng.random((count, n)) < s).astype(int)
+        bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+        body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+        q_ids = [tok(_question(j + 1), add_special_tokens=False)
+                 ["input_ids"] for j in range(n)]
+        corpus = sum(len(x) for x in body_ids)
+        await reset_cache()
+        res = await run_filter_chain(engine, sp, body_ids, q_ids,
+                                     budget_tokens=830_000, lookahead=k,
+                                     tag=f"ld{target}k{k}",
+                                     tags=EngineTags(), use_priority=True)
+        agree = sum(1 for (i, j), a in res["answers"].items()
+                    if a == flags[i][j - 1]) / max(1, len(res["answers"]))
+        floor = corpus / 80_000.0
+        hit = res["cached_tokens"] / max(1, res["prompt_tokens"])
+        results.append(dict(count=count, target=target, k=k,
+                            corpus_tokens=corpus, makespan=res["wall"],
+                            floor_s=floor, ratio=res["wall"] / floor,
+                            cache_hit=hit, agreement=agree,
+                            requests=res["requests"]))
+        print(f"[longdoc] {count}x{target} k={k}: {res['wall']:.1f}s, "
+              f"floor {floor:.1f}s, ratio {res['wall'] / floor:.2f}, "
+              f"hit {100 * hit:.1f}%, agree {agree:.3f}", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    import vllm
+    return dict(model=MODEL, vllm_version=vllm.__version__,
+                rope_scaling="yarn x4", results=results)
 
 
 # ---------------------------------------------------- single tenant mode
@@ -988,6 +1210,12 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
         data = strict_run.remote(nd)
         path = out or ("results/engine/strict10k.json.gz" if nd == 10000
                        else f"results/engine/strict_{nd}.json.gz")
+    elif phase == "profile":
+        data = profile_run.remote(n_docs or 4000)
+        path = out or "results/engine/profile.json"
+    elif phase == "longdoc":
+        data = longdoc_run.remote()
+        path = out or "results/engine/longdoc.json"
     else:
         raise SystemExit(f"unknown phase {phase}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
