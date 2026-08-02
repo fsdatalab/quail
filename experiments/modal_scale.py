@@ -362,7 +362,7 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
     docs = _build_pool(n_docs)
     engine = Engine.from_engine_args(AsyncEngineArgs(**kwargs))
     tok = AutoTokenizer.from_pretrained(MODEL)
-    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     pool = 981_728
     try:
         cc = engine.vllm_config.cache_config
@@ -498,7 +498,7 @@ async def profile_run(n_docs: int = 4000) -> dict:
     n, s_vec = 4, (0.8,) * 4
     docs = _build_pool(n_docs)
     tok = AutoTokenizer.from_pretrained(MODEL)
-    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     rng = np.random.default_rng(FLAG_SEED + 1000 * n + int(100 * s_vec[0]))
     flags = (rng.random((len(docs), n)) < np.asarray(s_vec)).astype(int)
     bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
@@ -634,7 +634,7 @@ async def longdoc_run() -> dict:
         hf_overrides={"rope_scaling": {
             "rope_type": "yarn", "factor": 4.0,
             "original_max_position_embeddings": 32768}}))
-    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     n, s = 2, 0.7
 
     async def reset_cache():
@@ -715,7 +715,7 @@ async def strict_run(n_docs: int = 10000) -> dict:
         scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
     tok = AutoTokenizer.from_pretrained(MODEL)
-    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     pool = 981_728
     try:
         cc = engine.vllm_config.cache_config
@@ -917,7 +917,7 @@ async def client_run(n_docs: int = 10000) -> dict:
         model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True))
     tok = AutoTokenizer.from_pretrained(MODEL)
-    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     pool = 981_728            # measured KV pool for this config (scale runs)
     try:
         cc = engine.vllm_config.cache_config
