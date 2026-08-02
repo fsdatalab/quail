@@ -146,13 +146,25 @@ stock engine degrades while the pinned scheduler holds its makespan.
   item 6. Known worthless for one token filters at any document
   length (about two milliseconds per question on a 100,000 token
   document against seconds of prefill).
-- Sequence extension (one living conversation per document). Note:
-  reasoning inverts this design, because thinking tokens pollute the
-  shared prefix for the next filter; the right shape becomes fork
-  from the document notes, not extend past the answer.
-- Multiple queries sharing the card, and continuous arrival
-  (throughput mode). The LP's native setting. Builds on the phase C
-  skeleton after phase B.
+- Sequence truncation, promoted to the top engineering candidate: one
+  engine-level sequence per document that appends a question, reads
+  the answer, truncates the question and answer notes back to the
+  document prefix, and appends the next question. Prompts are
+  unchanged and each question sees exactly the context it sees today;
+  what changes is that a document costs one request instead of n, and
+  the per-request software floor (about 0.55 milliseconds times
+  24,000 calls in the four filter query, the bulk of the roughly five
+  second residual above the work floor) collapses. Prompt fusion
+  (asking all questions in one call) was considered and rejected: it
+  computes the same document reads plus extra cross-question
+  attention, changes what each question conditions on, and its only
+  real edge over speculation with note reuse is the same request
+  count reduction that truncation achieves without touching prompts.
+- Multiple queries sharing one card: out of scope by product decision
+  (each tenant runs one query on a dedicated GPU). Shared scans stay
+  on the roadmap: queued queries over the same corpus can be merged
+  so the corpus is read once for all of them, a throughput multiplier
+  that needs no engine changes.
 - 100,000 document demonstration run with the client (about ten
   minutes of GPU). Any time a headline is wanted.
 - 32 billion parameter model cell. Fold into phase B if wanted; it
