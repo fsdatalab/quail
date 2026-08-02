@@ -30,9 +30,10 @@ ride inside request ids. Protocol, fields separated by "|":
 """
 
 import os
+from collections import deque
 
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import RequestStatus, StreamingUpdate
 
 
 def parse_tag(request_id):
@@ -56,6 +57,9 @@ class DocEngineScheduler(Scheduler):
         self._de_pins = {}          # doc key -> list of pinned blocks
         self._de_pinned_ids = set()  # block ids currently pinned
         self._de_intent = {}        # request id -> (pin_tokens, doc key)
+        self._de_questions = None   # registered question token lists
+        self._de_yes = set()        # token ids that mean yes
+        self._de_chain = {}         # request id -> dict(stage, d)
         self._de_strict = os.environ.get(
             "DOCENGINE_SINGLE_TENANT", "1") == "1"
         self._de_plan_evicting = False
@@ -89,7 +93,88 @@ class DocEngineScheduler(Scheduler):
         finally:
             self._de_plan_evicting = False
 
+    # ---- chain mode: one living request runs a document's whole filter
+    # chain. The client registers the question token lists and the yes
+    # token ids once; after that, each stage's answer is judged here,
+    # the request is rewound to the document boundary (question and
+    # answer notes erased, document notes kept), and the next question
+    # is appended through the engine's own session mechanism.
+
+    def _de_register(self, request):
+        toks = list(request.prompt_token_ids)
+        nq, i, qs = toks[0], 1, []
+        for _ in range(nq):
+            ln = toks[i]
+            i += 1
+            qs.append(toks[i:i + ln])
+            i += ln
+        self._de_questions = qs
+        for part in request.request_id.split("|"):
+            if part.startswith("Y") and len(part) > 1:
+                self._de_yes = {int(x) for x in part[1:].split(",")}
+        super().add_request(request)
+        self._de_stats["registered"] = len(qs)
+        self.finish_requests(request.request_id,
+                             RequestStatus.FINISHED_ABORTED)
+
+    def _de_rewind(self, request, d):
+        """Erase everything past the document boundary d: the token
+        record, the block hashes, and the notes' memory blocks. The
+        document's own notes stay untouched."""
+        del request._all_token_ids[d:]
+        del request.prompt_token_ids[d:]
+        request._output_token_ids.clear()
+        request.num_prompt_tokens = d
+        request.num_computed_tokens = min(request.num_computed_tokens, d)
+        del request.block_hashes[d // self.block_size:]
+        mgr = self.kv_cache_manager.coordinator.single_type_managers[0]
+        blocks = mgr.req_to_blocks.get(request.request_id)
+        keep = -(-d // self.block_size)
+        if blocks and len(blocks) > keep:
+            tail = blocks[keep:]
+            del blocks[keep:]
+            self._de_evict({b.block_id for b in tail if not b.is_null})
+            self.kv_cache_manager.block_pool.free_blocks(reversed(tail))
+        self._de_stats["rewinds"] = self._de_stats.get("rewinds", 0) + 1
+
+    def _handle_stopped_request(self, request):
+        st = self._de_chain.get(request.request_id)
+        if st is None:
+            return super()._handle_stopped_request(request)
+        out = request._output_token_ids
+        passed = bool(out) and out[-1] in self._de_yes
+        if not passed or st["stage"] >= len(self._de_questions):
+            del self._de_chain[request.request_id]
+            request.resumable = False
+            return True
+        self._de_rewind(request, st["d"])
+        st["stage"] += 1
+        update = StreamingUpdate(
+            mm_features=None,
+            prompt_token_ids=list(self._de_questions[st["stage"] - 1]),
+            max_tokens=request.max_tokens,
+            arrival_time=request.arrival_time,
+            sampling_params=request.sampling_params)
+        self._update_request_as_session(request, update)
+        self._enqueue_waiting_request(request)
+        return False
+
     def add_request(self, request):
+        rid = request.request_id
+        if rid.startswith("de1|") and "|reg|" in rid:
+            self._de_register(request)
+            return
+        if rid.startswith("de1|") and "|c|" in rid:
+            assert self._de_questions, "chain request before registration"
+            request.resumable = True
+            if request.streaming_queue is None:
+                request.streaming_queue = deque()
+            self._de_chain[rid] = dict(
+                stage=1,
+                d=request.num_prompt_tokens - len(self._de_questions[0]))
+            request.priority = 0
+            super().add_request(request)
+            return
         tag = parse_tag(request.request_id)
         if tag is None and self._de_strict:
             # a single tenant appliance serves only planned work
