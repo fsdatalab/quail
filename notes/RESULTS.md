@@ -344,6 +344,48 @@ in a 52 to 58 second query), the per request floor of 0.55
 milliseconds, and robustness where this arm relies on recency luck.
 Raw data: results/engine/client10k.json.gz and client10k_analysis.csv.
 
+## Phase C: the in-engine scheduler, built and demonstrated
+
+The engine skeleton moves the client library's decisions inside vLLM.
+A custom scheduler class (docengine/engineext/scheduler.py, loaded
+through vLLM's official replacement seam) pins each live document's
+notes by holding an extra block reference, frees a dead document's
+notes the instant the plan learns of its death, and runs the query's
+requests ahead of foreign traffic through the engine's priority queue.
+Client directives ride inside request ids because the scheduler lives
+in the engine core process. After these changes no query memory is
+governed by the engine's keep-the-most-recent rule at all: admission
+decides what enters, pins decide what stays, eager frees decide what
+leaves, and the recency rule's only remaining jurisdiction is memory
+belonging to traffic the plan has never heard of.
+
+Acceptance one, no regression: on the 10,000 document grid the pinned
+engine matches or slightly beats the client library (49.2, 52.1, and
+54.8 seconds against 48.9, 52.5, and 57.9), with exactly 10,000 pins
+taken and released per run and identical answers.
+
+Acceptance two, guarantees against luck, took three iterations, each
+of which taught something. A gentle co-tenant (25 requests per second
+of 800 token junk) hurt nobody: its in-flight footprint never exceeded
+the pool's spare room, the free queue never drained, and recency alone
+protected both variants, so the streaming client is naturally robust
+to moderate neighbors. A heavy co-tenant (60 per second of 1,500
+tokens, about twice the spare room) with the tenant at the same
+priority as the query's first reads protected memory perfectly (cache
+hits identical to running alone, zero re-reads) but let the tenant
+take most of the machine time, stretching the query from 53 to 231
+seconds: the card has two scarce resources, and pinning defends only
+one of them. With both defended, the demonstration landed. Query alone
+52.2 seconds; query under the same heavy neighbor 52.0 seconds, cache
+hits unchanged, while the neighbor still received about 4.3 million
+tokens of service from the query's slack (2,851 of its requests). The
+stock engine under the identical neighbor did not finish within the
+one hour harness limit, its queue head blocked by the neighbor's
+stuck allocations, against 52 seconds for the plan-managed engine.
+Raw data: results/engine/pinned10k.json.gz (acceptance one and the
+gentle co-tenant), pinned10k_v3.json.gz (the closing demonstration),
+and the run logs for the intermediate iteration.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
