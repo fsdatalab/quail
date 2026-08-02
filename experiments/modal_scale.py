@@ -46,7 +46,7 @@ app = modal.App("docengine-scale")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("vllm", "huggingface_hub", "pandas", "pyarrow", "numpy",
-                 "py-spy")
+                 "yappi")
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0"})
     .add_local_python_source("docengine")
@@ -459,58 +459,25 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
 
 # ---------------------------------------------------------- profiling
 
-def _engine_core_pids():
-    import os
-    pids = []
-    for p in os.listdir("/proc"):
-        if not p.isdigit():
-            continue
-        try:
-            with open(f"/proc/{p}/cmdline", "rb") as f:
-                cmd = f.read()
-        except OSError:
-            continue
-        if b"EngineCore" in cmd:
-            pids.append(int(p))
-    return pids
-
-
-def _top_from_speedscope(path, top=25):
-    import json as _json
-    with open(path) as f:
-        data = _json.load(f)
-    frames = [fr["name"] for fr in data["shared"]["frames"]]
-    self_w = {}
-    total_w = {}
-    for prof in data["profiles"]:
-        if prof.get("type") != "sampled":
-            continue
-        for sample, w in zip(prof["samples"], prof["weights"]):
-            if not sample:
-                continue
-            leaf = frames[sample[-1]]
-            self_w[leaf] = self_w.get(leaf, 0.0) + w
-            for fi in set(sample):
-                total_w[frames[fi]] = total_w.get(frames[fi], 0.0) + w
-    grand = sum(self_w.values()) or 1.0
-    rows = sorted(self_w.items(), key=lambda kv: -kv[1])[:top]
-    return [dict(fn=k, self_pct=100.0 * v / grand,
-                 total_pct=100.0 * total_w.get(k, 0.0) / grand)
-            for k, v in rows]
-
-
-@app.function(image=image, gpu="H100!", timeout=2400,
+@app.function(image=image, gpu="H100!", timeout=3000,
               volumes={"/root/.cache/huggingface": hf_cache})
 async def profile_run(n_docs: int = 4000) -> dict:
-    """Split the per-request software bundle: sample both the client
-    process and the engine core with py-spy during a reference query,
-    and rank functions by self time."""
-    import asyncio  # noqa: F401
+    """Split the per-request software bundle without attach profiling
+    (the sandbox forbids it). Three runs of the same workload:
+
+      A  engine core in its own process, unprofiled: the shipped
+         baseline makespan.
+      B  engine core in-process, unprofiled: the makespan delta A - B
+         is the direct price of cross-process serialization.
+      C  engine core in-process under yappi (all threads, CPU clock):
+         a ranked table of where the remaining software time goes,
+         with waits excluded by the CPU clock."""
+    import gc
     import inspect
     import os
-    import subprocess
 
     import numpy as np
+    import torch
     from transformers import AutoTokenizer
     from vllm import SamplingParams
 
@@ -528,11 +495,6 @@ async def profile_run(n_docs: int = 4000) -> dict:
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
     n, s_vec = 4, (0.8,) * 4
     docs = _build_pool(n_docs)
-    engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
-        gpu_memory_utilization=0.92, enable_prefix_caching=True,
-        scheduling_policy="priority",
-        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
     tok = AutoTokenizer.from_pretrained(MODEL)
     sp = SamplingParams(temperature=0.0, max_tokens=1)
     rng = np.random.default_rng(FLAG_SEED + 1000 * n + int(100 * s_vec[0]))
@@ -541,39 +503,74 @@ async def profile_run(n_docs: int = 4000) -> dict:
     body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
     q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
              for j in range(n)]
-    res = engine.reset_prefix_cache()
-    if inspect.isawaitable(res):
-        await res
 
-    cores = _engine_core_pids()
-    dur = "40"
-    procs = [subprocess.Popen(
-        ["py-spy", "record", "--pid", str(os.getpid()), "-o",
-         "/tmp/client.ss", "--format", "speedscope", "--rate", "100",
-         "--duration", dur])]
-    for i, pid in enumerate(cores):
-        procs.append(subprocess.Popen(
-            ["py-spy", "record", "--pid", str(pid), "-o",
-             f"/tmp/core{i}.ss", "--format", "speedscope", "--rate",
-             "100", "--duration", dur]))
-    out = await run_filter_chain(engine, sp, body_ids, q_ids,
-                                 budget_tokens=830_000, lookahead=1,
-                                 tag="prof", tags=EngineTags(),
-                                 use_priority=True)
-    for p in procs:
-        p.wait()
-    report = dict(makespan=out["wall"], requests=out["requests"],
-                  n_docs=n_docs, cores=len(cores))
-    report["client_top"] = _top_from_speedscope("/tmp/client.ss")
-    for i in range(len(cores)):
-        report[f"core{i}_top"] = _top_from_speedscope(f"/tmp/core{i}.ss")
-    for name in ("client_top",) + tuple(
-            f"core{i}_top" for i in range(len(cores))):
-        print(f"[profile] === {name} ===", flush=True)
-        for r in report[name][:20]:
-            print(f"[profile] {r['self_pct']:5.1f}% self "
-                  f"{r['total_pct']:6.1f}% total  {r['fn'][:90]}",
-                  flush=True)
+    def make_engine():
+        return Engine.from_engine_args(AsyncEngineArgs(
+            model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+            gpu_memory_utilization=0.92, enable_prefix_caching=True,
+            scheduling_policy="priority",
+            scheduler_cls="docengine.engineext.scheduler."
+                          "DocEngineScheduler"))
+
+    async def one_query(engine, tag):
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+        out = await run_filter_chain(engine, sp, body_ids, q_ids,
+                                     budget_tokens=830_000, lookahead=1,
+                                     tag=tag, tags=EngineTags(),
+                                     use_priority=True)
+        return out
+
+    report = dict(n_docs=n_docs)
+
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
+    engine = make_engine()
+    out = await one_query(engine, "profa")
+    report["A_multiproc_s"] = out["wall"]
+    report["requests"] = out["requests"]
+    print(f"[profile] A multiproc: {out['wall']:.2f}s "
+          f"({out['requests']} requests)", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+    import time as _t
+    _t.sleep(8)
+
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    engine = make_engine()
+    out = await one_query(engine, "profb")
+    report["B_inproc_s"] = out["wall"]
+    print(f"[profile] B in-process: {out['wall']:.2f}s "
+          f"(IPC price ~ {report['A_multiproc_s'] - out['wall']:+.2f}s)",
+          flush=True)
+
+    import yappi
+    yappi.set_clock_type("cpu")
+    yappi.start()
+    out = await one_query(engine, "profc")
+    yappi.stop()
+    report["C_profiled_s"] = out["wall"]
+    stats = yappi.get_func_stats()
+    rows = []
+    for st in stats:
+        rows.append(dict(fn=f"{st.module.split('/')[-1]}:{st.name}",
+                         self_s=st.tsub, total_s=st.ttot,
+                         calls=st.ncall))
+    rows.sort(key=lambda r: -r["self_s"])
+    total_cpu = sum(r["self_s"] for r in rows) or 1.0
+    report["top"] = rows[:40]
+    report["total_cpu_s"] = total_cpu
+    print(f"[profile] C profiled run: {out['wall']:.2f}s, total CPU "
+          f"{total_cpu:.1f}s", flush=True)
+    for r in rows[:30]:
+        print(f"[profile] {100 * r['self_s'] / total_cpu:5.1f}% "
+              f"{r['self_s']:7.2f}s self {r['calls']:>9} calls  "
+              f"{r['fn'][:80]}", flush=True)
     try:
         engine.shutdown()
     except Exception:
