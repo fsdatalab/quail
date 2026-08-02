@@ -89,12 +89,24 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
                 getattr(final, "num_cached_tokens", 0) or 0)
         return _yes(final)
 
+    # the pin must claim everything with a future consumer: the document
+    # plus the shared prefix of the stage questions (their common
+    # preamble straddles the boundary block and is reused by every
+    # later stage)
+    q_common = 0
+    if len(q_ids) > 1:
+        for col in zip(*q_ids):
+            if len(set(col)) != 1:
+                break
+            q_common += 1
+
     def rid_for(i, j0):
         suffix = f"{tag}-{i}-{j0}"
         if tags is None:
             return suffix
         if j0 == 0:
-            return tags.rid(suffix, doc=i, pin_tokens=len(body_ids[i]))
+            return tags.rid(suffix, doc=i,
+                            pin_tokens=len(body_ids[i]) + q_common)
         return tags.rid(suffix)
 
     async def chain(i, cost):
