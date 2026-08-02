@@ -238,7 +238,8 @@ async def overhead_split(n_docs: int = 2000) -> dict:
 
     engine = Engine.from_engine_args(AsyncEngineArgs(
         model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
-        gpu_memory_utilization=0.92, enable_prefix_caching=True))
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True))
     sp = SamplingParams(temperature=0.0, max_tokens=1)
 
     async def reset_cache():
@@ -352,7 +353,8 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
     os.environ["DOCENGINE_SINGLE_TENANT"] = "0"   # co-tenant is legitimate
     ext = variant == "pinned"
     kwargs = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
-                  gpu_memory_utilization=0.92, enable_prefix_caching=True)
+                  gpu_memory_utilization=0.92, enable_prefix_caching=True,
+                  disable_log_stats=True)
     if ext:
         kwargs["scheduling_policy"] = "priority"
         kwargs["scheduler_cls"] = \
@@ -508,6 +510,7 @@ async def profile_run(n_docs: int = 4000) -> dict:
         return Engine.from_engine_args(AsyncEngineArgs(
             model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
             gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True,
             scheduling_policy="priority",
             scheduler_cls="docengine.engineext.scheduler."
                           "DocEngineScheduler"))
@@ -625,6 +628,7 @@ async def longdoc_run() -> dict:
     engine = Engine.from_engine_args(AsyncEngineArgs(
         model=MODEL, kv_cache_dtype="fp8", max_model_len=102_400,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True,
         scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler",
         hf_overrides={"rope_scaling": {
@@ -707,6 +711,7 @@ async def strict_run(n_docs: int = 10000) -> dict:
     engine = Engine.from_engine_args(AsyncEngineArgs(
         model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True,
         scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
     tok = AutoTokenizer.from_pretrained(MODEL)

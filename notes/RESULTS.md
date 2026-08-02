@@ -545,6 +545,34 @@ model tier (where the persisted notes store also pays best) or
 chunked evaluation, and any long context benchmark of this system
 must report agreement next to makespan.
 
+## The request toll, profiled and named
+
+Attach profiling is forbidden by the sandbox, so the profiler runs one
+workload three ways: engine core in its own process (21.57 seconds),
+engine core in-process (21.68 seconds, so cross-process serialization
+costs nothing measurable, a surprise), and in-process under a tracing
+profiler with the CPU clock. The ranked table for 9,428 requests
+(results/engine/profile.json):
+
+- About 22 percent of all CPU is copy.deepcopy of the sampling
+  parameters and its helpers, 367,692 calls, thirty nine per request:
+  the engine defensively deep-copies the parameters object for every
+  request. The single biggest toll.
+- About 10 percent is telemetry (histogram, gauge, and mutex counter
+  updates) that nothing reads. Disabled from here on with
+  disable_log_stats, a free win.
+- About 5 percent is per request input processing and validation, and
+  about 4 percent asyncio event machinery; both scale with request
+  count.
+- Prefix hashing, the suspected culprit, is absent from the top
+  thirty: under 0.7 percent.
+
+Consequences: the toll is defensive copying and telemetry, not
+communication or hashing; sequence truncation attacks it at the root
+by cutting requests per document from n to one; and the deepcopy
+share is a candidate upstream contribution independent of anything
+else we build.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
