@@ -506,6 +506,45 @@ read-floor prediction at document lengths never measured in this
 project (the first real test of the cost model's attention terms at
 one hundred thousand token contexts).
 
+## Long documents measured: corrections, a race, a quality cliff
+
+The validation run (results/engine/longdoc.json; one hundred documents
+of thirty thousand tokens and thirty of one hundred thousand, two
+filters, the shipped configuration, YaRN rope scaling for the 100k
+contexts) did three things.
+
+First it corrected the analytical layer. The fluid model had priced
+document prefill as dense compute only; the 30k cell measured 2.15
+times that floor against 2.23 predicted by the quadratic
+self-attention term the port had dropped (the paper's own H formula
+carries it; the crossover where attention passes dense compute is
+d = P/(L w_Q), about 24,000 tokens for this model). With the term
+restored the model predicts 83.7 seconds against 79.8 measured at
+30k and 191 against 174.6 at 100k, conservative by five to nine
+percent, and the short document anchors are unmoved (the term is 1.3
+percent there).
+
+Second, lookahead of two or more is pathological at long documents on
+the raw request abstraction. The k=2 cell took 158.5 seconds, almost
+exactly twice the k=1 read ratio, with cache hits collapsing to half
+a percent: both branches of each document prefilled the full thirty
+thousand tokens separately, because the second branch is co-scheduled
+before the first branch's blocks commit. The in-flight sharing that
+reached its theoretical ceiling at three hundred token documents was
+queue depth luck, not a guarantee. The principled fixes are the
+engine level mechanisms already planned: sequence truncation
+serializes a document's questions on one set of notes, and the
+cascade kernel shares the read explicitly.
+
+Third, a quality cliff that scheduling cannot fix: answer agreement
+falls from 0.92 at three hundred tokens to 0.81 at thirty thousand
+and 0.63 at one hundred thousand, barely above chance. The 4B model
+under context extension cannot reliably read a fact at the end of a
+hundred thousand tokens. Long document products need the larger
+model tier (where the persisted notes store also pays best) or
+chunked evaluation, and any long context benchmark of this system
+must report agreement next to makespan.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
