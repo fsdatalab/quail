@@ -385,7 +385,7 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
 
         async def one(uid, ids):
             t0 = time.time()
-            kw = {"priority": 1} if ext else {}
+            kw = {"priority": 2} if ext else {}
             async for _ in engine.generate({"prompt_token_ids": ids}, sp,
                                            f"junk-{uid}", **kw):
                 pass
@@ -860,6 +860,10 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
                     vllm_version=dp["vllm_version"],
                     results=dp["results"] + ds["results"])
         path = out or "results/engine/pinned10k_hard.json.gz"
+    elif phase == "pinned3":
+        nd = n_docs or 10000
+        data = pinned_run.remote("pinned", nd, 60.0, 1500, True)
+        path = out or "results/engine/pinned10k_v3.json.gz"
     else:
         raise SystemExit(f"unknown phase {phase}")
     os.makedirs(os.path.dirname(path), exist_ok=True)

@@ -63,6 +63,12 @@ class DocEngineScheduler(Scheduler):
         for key in keys:
             blocks = self._de_pins.pop(key, None)
             if blocks:
+                # The plan knows this document is dead: strip its cache
+                # entries first (so nothing can hit them), then drop the
+                # pin references. Hashless blocks join the head of the
+                # free queue, so the space is reusable immediately
+                # instead of waiting for demand-time eviction.
+                pool.evict_blocks({b.block_id for b in blocks})
                 pool.free_blocks(reversed(blocks))
                 self._de_stats["released"] += 1
         if docs == ["*"]:
