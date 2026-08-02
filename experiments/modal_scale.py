@@ -347,6 +347,8 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
 
     from docengine.runtime.engine_client import EngineTags, run_filter_chain
 
+    import os
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "0"   # co-tenant is legitimate
     ext = variant == "pinned"
     kwargs = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
                   gpu_memory_utilization=0.92, enable_prefix_caching=True)
@@ -452,6 +454,108 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
     import vllm
     return dict(model=MODEL, n_docs=n_docs, variant=variant,
                 vllm_version=vllm.__version__, results=results)
+
+
+# ---------------------------------------------------- single tenant mode
+
+@app.function(image=image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def strict_run(n_docs: int = 10000) -> dict:
+    """Shipping-mode validation: single tenant strict, where the
+    recency rule is unreachable and any firing raises. Runs the
+    10k grid and one untagged canary request that must be refused."""
+    import asyncio  # noqa: F401
+    import inspect
+    import os
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import EngineTags, run_filter_chain
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    docs = _build_pool(n_docs)
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        scheduling_policy="priority",
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    pool = 981_728
+    try:
+        cc = engine.vllm_config.cache_config
+        if cc.num_gpu_blocks:
+            pool = int(cc.num_gpu_blocks) * int(cc.block_size)
+    except Exception:
+        pass
+    budget = int(0.85 * pool)
+
+    async def reset_cache():
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    # canary: an untagged request must be refused, not served
+    canary = None
+    try:
+        async for out in engine.generate({"prompt_token_ids": [100] * 8},
+                                         sp, "canary-1", priority=2):
+            canary = out
+        rejected = bool(canary and canary.outputs
+                        and canary.outputs[0].finish_reason == "abort")
+    except Exception:
+        rejected = True
+    print(f"[strict] untagged canary refused: {rejected}", flush=True)
+
+    results = []
+    for n, s_vec in ((2, (0.5, 0.5)), (4, (0.8,) * 4), (4, (0.95,) * 4)):
+        rng = np.random.default_rng(FLAG_SEED + 1000 * n + int(100 * s_vec[0]))
+        flags = (rng.random((len(docs), n)) < np.asarray(s_vec)).astype(int)
+        bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+        body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+        q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+                 for j in range(n)]
+        await reset_cache()
+        res = await run_filter_chain(
+            engine, sp, body_ids, q_ids, budget, lookahead=1,
+            tag=f"n{n}s{int(100 * s_vec[0])}", tags=EngineTags(),
+            use_priority=True)
+        answers = {f"{i},{j}": a for (i, j), a in res["answers"].items()}
+        agree = sum(1 for (i, j), a in res["answers"].items()
+                    if a == flags[i][j - 1]) / max(1, len(answers))
+        results.append(dict(
+            n=n, s=list(s_vec), policy="block", k=1, mode="strict",
+            junk=False, makespan=res["wall"],
+            waves=[dict(stage=1, requests=res["requests"], s=res["wall"],
+                        prompt_tokens=res["prompt_tokens"],
+                        cached_tokens=res["cached_tokens"])],
+            d_tok=[len(x) for x in body_ids],
+            p_tok=[len(q) for q in q_ids], p_task=[0] * n,
+            answers=answers, flags=flags.tolist(),
+            answer_agreement=agree, budget=budget, kv_tokens=pool,
+            canary_rejected=rejected))
+        hit = res["cached_tokens"] / max(1, res["prompt_tokens"])
+        print(f"[strict] n={n} s={s_vec[0]}: {res['wall']:.1f}s, "
+              f"hit {100 * hit:.1f}%, agree {agree:.3f}", flush=True)
+
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    import vllm
+    return dict(model=MODEL, n_docs=n_docs, vllm_version=vllm.__version__,
+                canary_rejected=rejected, results=results)
 
 
 # ------------------------------------------------------- beneath the stack
@@ -864,6 +968,11 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
         nd = n_docs or 10000
         data = pinned_run.remote("pinned", nd, 60.0, 1500, True)
         path = out or "results/engine/pinned10k_v3.json.gz"
+    elif phase == "strict":
+        nd = n_docs or 10000
+        data = strict_run.remote(nd)
+        path = out or ("results/engine/strict10k.json.gz" if nd == 10000
+                       else f"results/engine/strict_{nd}.json.gz")
     else:
         raise SystemExit(f"unknown phase {phase}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
