@@ -475,6 +475,37 @@ and the adaptive gain under memory pressure survive contact with the
 engine at 10,000 documents, using the same layered comparison as
 before.
 
+## Phase B, analytical layer: a null result with a sharp boundary
+
+The premise was that long documents create the contested memory regime
+where the LP's retain-or-re-read decisions matter. The map
+(results/longdoc_map.csv, experiments/run_longdoc.py) says otherwise
+for a single query, and says precisely why. At one hundred documents
+of thirty thousand tokens or thirty documents of one hundred thousand
+(three million tokens of corpus either way), the pipeline ties the
+Bellman optimum everywhere, its predicted makespan sits on the read
+floor (37.5 to 38.2 calibrated seconds), task-first still pays 1.7
+times, and thinking barely registers because generated tokens per
+document are tiny next to the document itself. The exact solver
+agrees: at capacity 2.5 footprints the adaptive gain is zero at long
+documents, and boundary probes show why the earlier 33 percent win
+was a corner: adaptivity needs a footprint lever (thinking length
+comparable to document length), a mix space (three or more stages),
+and memory near two to three footprints, together. Long documents
+alone deliver none of these; blocked admission absorbs the capacity
+constraint with zero extra reads.
+
+Where the long document regime does bind is throughput, not makespan:
+the sustained-rate program drops from 0.80 to 0.31 documents per
+second at one hundred thousand tokens with thinking, because
+residency token-seconds per document explode. The LP's genuine trial
+is therefore multi-query or streaming-arrival operation, as the plan
+originally suspected under "the LP's native habitat," and the
+single-query measured phase B reduces to a cheap validation: the
+read-floor prediction at document lengths never measured in this
+project (the first real test of the cost model's attention terms at
+one hundred thousand token contexts).
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
