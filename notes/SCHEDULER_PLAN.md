@@ -1,181 +1,173 @@
-# Plan: where the scheduler work stands and what comes next
+# DocEngine: the plan from zero
 
-This document replaces the earlier five step plan, most of which is now
-executed. It records what the measurements established, the decisions
-they force, and the next phases in priority order. Terms are defined in
-notes/RESULTS.md, which also holds all numbers cited here.
+The objective, everywhere in this document: minimize end to end
+makespan, the wall clock from the moment a query starts to the moment
+the last document's last answer exists. One query, one dedicated H100,
+single tenant, prompts fixed. The reference query used for every
+number below: four yes or no filters, pass rate 0.8 each, over 10,000
+movie reviews, about 3.1 million tokens of documents in total, model
+Qwen3-4B-FP8. A document that fails a filter skips the rest.
 
-## What is done and what it established
+## The ceiling, derived
 
-- The engine reads at about 80,000 tokens per second and that is the
-  machine, not the software. Kernel benchmarks beneath the stack put
-  the serving tax at ten percent or less. 80,000 is the calibration
-  constant that turns the paper's formula into wall clock predictions.
-- The per request overhead is 1.12 milliseconds, half ours (fixed with
-  pre-tokenization and streaming, no engine changes) and 0.55
-  milliseconds engine internal.
-- At 10,000 documents (3.4 times the card's note capacity) naive
-  execution silently re-reads the corpus until the document-first
-  advantage vanishes. Execution order is the decisive variable.
-- The streaming client library (docengine/runtime/engine_client.py)
-  recovers it all: 2.3 to 2.7 times faster than naive use of the same
-  engine, reads within a few percent of once per document, and lands
-  at 0.96 to 1.02 times the calibrated prediction. The query runs at
-  the machine's speed limit with zero engine modifications.
-- Speculation's measured value was compensation for stage barriers.
-  Under streaming it is neutral. Its remaining rationale at this
-  operating point is filling the final tail.
-- The LP's role at this operating point is certification, not control:
-  with short documents and short residence times, greedy admission
-  provably ties the optimum. Its decisions become real when memory is
-  genuinely contested.
-- Under recency based eviction, submission order within a batch is
-  itself a scheduling decision (consumers of resident notes before
-  producers of new ones). An in-engine scheduler would pin instead.
+Reading dominates this workload, so the ceiling is a reading rate.
+Four layers, each derived or measured, each below the last:
 
-Decision that follows: modifying the engine's internals is deferred.
-At the current operating point it can win 5 to 15 percent plus
-robustness, and both frontier phases below will re-price it before we
-commit.
+1. Spec sheet arithmetic: reading one token through a P parameter
+   model costs about 2P arithmetic operations, here 2 x 3.6 billion =
+   7.2 GFLOP per token. The H100's advertised dense FP8 rate is
+   1.979e15 operations per second. Dividing gives 275,000 tokens per
+   second, or 11.3 seconds for the corpus. Unreachable: it assumes
+   the multiply units never stall and prices everything except
+   multiplies at zero.
+2. Measured silicon: the model's four matrix multiply shapes,
+   benchmarked alone in FP8, sustain 1.35e15 operations per second
+   (68 percent of spec), equivalent to 186,000 tokens per second.
+3. Measured model: a transformer is only half multiplies by time.
+   The bare model floor, bracketed by benchmarks with no serving
+   stack, is 62,000 to 89,000 tokens per second.
+4. Measured engine: vLLM reads at 80,000 tokens per second, flat
+   across every setting, input form, and sequence length we tried.
+   Its serving tax is at most ten percent and possibly near zero.
 
-## Phase A. Reasoning filters (requested; changes the design space)
+So the operating floor is 80,000 tokens per second. For the reference
+query that means: corpus once, 39.5 seconds; plus the question tokens
+and answers, about 7.5 seconds; a work floor near 47 seconds. Any
+schedule that reads every document exactly once and does nothing else
+wasteful lands there. Reading each document at least once is
+unavoidable within a query, so nothing goes below 39.5 seconds except
+the one idea that bypasses reading entirely (priority four below).
 
-Today's filters answer in one token, which is why reading dominates
-everything. Letting a filter think first (the model writes out
-reasoning, then answers) is expected to raise accuracy, and it changes
-the physics enough that the whole policy analysis must be redone
-rather than patched. The arithmetic that says so: with 2,500 documents
-in flight and 300 thinking tokens per filter call, generation costs
-roughly as much wall clock as reading the whole corpus once, so the
-bottleneck moves from reading to writing. Worse, thinking occupies
-note memory: 300 tokens across 2,500 in-flight documents is about
-55 gigabytes, which alone exceeds the card's pool, so admission must
-charge each document for its expected thinking, roughly halving
-concurrency. And a wasted speculative branch now wastes an entire
-reasoning trace, not 25 tokens, so the gate or speculate crossover
-moves hard toward gating. None of the measured conclusions can be
-assumed to survive this; they must be re-derived and re-measured.
+## The ladder: what we built and measured, from vanilla vLLM up
 
-Work items, in order.
+Every rung is measured on the reference query, cold start.
 
-1. A harder planted task. The current flags line is too easy to show
-   any accuracy benefit from thinking. Plant indirect facts instead,
-   for example a line stating "the screening was at home" with the
-   filter asking whether the reviewer saw the film in a theater, so
-   selectivity stays controlled by us while the question needs an
-   actual inference step. Shorten the question templates at the same
-   time (a five to ten percent read saving already identified).
-2. Accuracy measurement. Thinking on against thinking off, same
-   planted truth, on the harder task. This prices the accuracy side of
-   the trade before any scheduling work.
-3. Cost model extension. Add a generation phase to the instance and
-   cost model: a thinking length distribution per filter, decode steps
-   priced by weight reads plus per token note reads over the growing
-   context, and note memory that grows during a call and is freed
-   after it. Then re-derive the policy comparison analytically:
-   task-first against document-first against lookahead, now as a
-   function of thinking length. Publish the crossover map before
-   burning GPU hours.
-4. Client library update. Admission budget charges expected thinking
-   tokens; free a document's thinking notes eagerly after its answer;
-   re-evaluate the lookahead dial (expected default: off).
-5. Measured grid. The 10,000 document experiment repeated with
-   reasoning filters at two or three thinking budgets, against the
-   extended model's predictions, with the same layered comparison.
-6. Re-price fusion. With reasoning, every generated token re-reads the
-   document's notes, so k filters sharing one pass over the notes
-   (cascade attention, which exists as a kernel primitive in the
-   ecosystem) may become first order. Measure the attention read share
-   in the reasoning runs; if it is material, co-scheduling a
-   document's filters plus cascade becomes the first concrete
-   in-engine work item.
+Rung 0, vanilla vLLM, task prompts. How nearly everyone uses these
+engines: one prompt per document per filter, the task text in front.
+122.8 seconds. The engine silently re-reads surviving documents at
+every filter (3.03 times the corpus read in total), because nothing
+tells it the requests are related.
 
-## Phase B. Long documents: where contested memory and the LP get real
+Rung 1, vanilla vLLM, cache friendly prompts. Put the document first
+so the engine's prefix cache could reuse it. 111.3 seconds, reading
+2.74 times the corpus. The advantage almost vanishes at scale: the
+cache holds about a quarter of the corpus, and by the time a
+document's next filter arrives its notes are evicted. Lesson: a good
+template without execution order control is worth almost nothing.
 
-Every remaining open question converges on the regime where a
-document's notes are large relative to memory. Document length
-variance only creates real decisions when a sacrifice must be made,
-and then the LP's length weighted retain-or-re-read choices are
-exactly the tool; at 300 token documents no sacrifice ever happens,
-which is why greedy tied the optimum. At 30,000 to 300,000 token
-documents (contracts, transcripts), the card holds a handful, chains
-cannot always finish while resident, re-reading a discarded document
-costs seconds, and admission, retention, and chunked reading become
-genuine choices.
+Rung 2, precomputed blocked schedules. Our analytical builder laid
+out every batch in advance (possible only with outcomes planted) and
+drove the engine batch by batch. 74.0 seconds, reading 1.27 times the
+corpus. Lesson: order control recovers the reads, but closed batches
+idle the machine while stragglers finish, and even a clairvoyant
+timetable loses to reactive rules. Scheduling structure belongs up
+front; timing belongs to the run.
 
-Work items: build a long document workload with the same planted
-selectivity trick; solve the LP against greedy on the model first and
-publish the predicted gap (a null result here would itself be worth
-knowing before hardware); extend the client for partial document
-admission (the paper's chunking machinery, until now theoretical,
-becomes operational); then the hardware comparison, greedy client
-against LP driven schedule. This is the step where the LP either earns
-its place as a controller or is demoted, with a measurement either
-way.
+Rung 3, the client library. Streaming with budget admission: a
+document enters only when its notes fit, runs all its filters
+back to back the moment each answer arrives, then releases its
+budget; prompts pre-tokenized. Zero engine changes. 52.5 seconds,
+reading 1.23 times the corpus, within a few percent of the calibrated
+prediction. Along the way we measured the per request software floor:
+1.12 milliseconds, half of it ours (fixed), 0.55 milliseconds
+engine internal.
 
-## Phase C. The engine skeleton, run in parallel with phase A
+Rung 4, the in-engine scheduler, the shipping configuration. The
+plan's decisions move inside vLLM through its official scheduler
+seam: live documents' notes pinned, dead documents' notes freed the
+instant the plan learns of death, request order assigned from
+verified plan tags, unplanned requests refused, and the recency rule
+left with zero authority (its firing is a crash, and it fired zero
+times across the validated grid). 52.3 seconds alone, identical
+answers, and the property no client side code can provide: under a
+hostile co-tenant demanding more than the card's whole read
+bandwidth, the query holds 52.0 seconds while stock vLLM never
+finished inside an hour.
 
-The in-engine work starts now rather than after phases A and B, for
-three reasons. The project's thesis is that the engine should
-understand queries, and the client library demonstrates that thesis
-only by workaround, winning through accidental alignments (recency
-luck, ordering races). Phase B's fair trial of the LP requires real
-retention control, because the client cannot faithfully execute a
-retention decision when eviction belongs to the engine's recency rule.
-And learning the engine's internals is the longest lead item on the
-board, so it should overlap the other phases, not follow them.
+The analytical stack stands beside the measured one: a cost model
+calibrated by the single measured constant that predicts every
+measured cell within about five to ten percent; exact small instance
+solvers, Bellman recurrences, and throughput programs for both answer
+only and reasoning filters; the reasoning map (generation dominates
+above roughly one hundred thinking tokens, speculation is punished
+when saturated, favored when starved); the long document null result
+(pipeline ties the optimum on the read floor; the contested regime
+needs thinking comparable to document length, three or more stages,
+and memory near 2.5 footprints together); and the finding that
+clairvoyance is worth under one percent, so scheduling's value is
+orchestration, not prediction.
 
-The skeleton has two parts. The engine's scheduler is officially
-replaceable by a custom class, so admission, ordering, and later
-co-scheduling move inside it. The memory manager is not replaceable,
-so a small contained patch to its block pool adds two per request
-hooks: pin and unpin, which exclude a document's notes from eviction
-until released, and free now, which drops notes immediately for
-failed documents and, later, thinking tokens.
+Position today: 52.3 seconds, against a 47 second work floor, a 39.5
+second read floor, and an 11.3 second spec sheet fiction.
 
-The acceptance test is also the demonstration that guarantees beat
-luck. First reproduce the client library's 10,000 document numbers
-with pinning in place of ordering tricks, no regression allowed. Then
-inject an adversarial co-tenant, a background stream of unrelated
-requests hammering the cache, and show that the client library on the
-stock engine degrades while the pinned scheduler holds its makespan.
+## What is left, in priority order
 
-## Phase D. Gated items
+Priority one, the profile (about fifteen GPU minutes). Split the 0.55
+millisecond per request bundle into named parts (serialization,
+prefix hashing, detokenizer setup, scheduler bookkeeping, sampling,
+client wakeups) with a profiler on both processes during a reference
+run. We have bounded this bundle end to end but never split it; the
+split ranks what truncation must keep cheap on the once-per-document
+path and whether anything else is worth precomputing (block hashes
+are precomputable in principle; we suspect they are tens of
+microseconds, and the profile will say).
 
-- Cascade fused evaluation of a document's filters. Trigger: phase A
-  item 6. Known worthless for one token filters at any document
-  length (about two milliseconds per question on a 100,000 token
-  document against seconds of prefill).
-- Sequence truncation, promoted to the top engineering candidate: one
-  engine-level sequence per document that appends a question, reads
-  the answer, truncates the question and answer notes back to the
-  document prefix, and appends the next question. Prompts are
-  unchanged and each question sees exactly the context it sees today;
-  what changes is that a document costs one request instead of n, and
-  the per-request software floor (about 0.55 milliseconds times
-  24,000 calls in the four filter query, the bulk of the roughly five
-  second residual above the work floor) collapses. Prompt fusion
-  (asking all questions in one call) was considered and rejected: it
-  computes the same document reads plus extra cross-question
-  attention, changes what each question conditions on, and its only
-  real edge over speculation with note reuse is the same request
-  count reduction that truncation achieves without touching prompts.
-- Multiple queries sharing one card: out of scope by product decision
-  (each tenant runs one query on a dedicated GPU). Shared scans stay
-  on the roadmap: queued queries over the same corpus can be merged
-  so the corpus is read once for all of them, a throughput multiplier
-  that needs no engine changes.
-- 100,000 document demonstration run with the client (about ten
-  minutes of GPU). Any time a headline is wanted.
-- 32 billion parameter model cell. Fold into phase B if wanted; it
-  shrinks the note budget several fold and slows reading about eight
-  fold, so it also raises the generation share.
+Priority two, sequence truncation (days; the last big makespan item).
+One living engine sequence per document: append a question's tokens,
+decode the answer, roll the sequence back to the document boundary,
+append the next question; the gate runs inside the scheduler, which
+knows the yes and no token ids. Prompts unchanged, each question sees
+exactly today's context, and a document costs one request instead of
+n, collapsing the per request residual (about five seconds of the
+reference query). Target: high forties, essentially the work floor.
+vLLM's existing streaming input sessions provide the append
+machinery; we add rollback and the gate. Milestones: rewind proved
+correct against separate request answers, in-scheduler gate, the 10k
+grid.
 
-## Costs
+Priority three, long document validation (an afternoon). Run thirty
+100,000 token documents and one hundred 30,000 token documents
+through the shipped configuration. The model predicts the read floor
+with policy differences compressed; this is the first measurement of
+100,000 token contexts and of pins that large, and it closes the
+single query story across document lengths.
 
-Phase A: items 1 and 2 are about two days and tens of dollars of GPU
-time; item 3 is two to four days of modeling; items 4 and 5 about a
-week with two or three GPU hours; item 6 rides along free. Phase B is
-roughly a week, dominated by the workload build and the client's
-chunked admission. Phase C items are re-priced by A and B before any
-commitment.
+Priority four, the disk KV tier (about a week; the only path below
+the read floor). At corpus ingest, read every document once and
+persist its notes; at query time, stream notes from disk instead of
+re-reading text. Break even is disk bandwidth above kappa times the
+prefill rate: 72 KB per token times 80,000 per second, about 5.7
+GB/s for the 4B model (a wash on good NVMe), but only about 1.2 GB/s
+for a 32B model (a five to ten times prefill bypass, since big
+models read slowly but their notes grow little). vLLM's KV connector
+interface is the integration point. This also revives warm starts in
+the only durable form: a million documents' notes fit on tens of
+terabytes of NVMe, per model, written once.
+
+Priority five, shared scans (days, client side only). Queued queries
+over the same corpus merge so the corpus is read once for all of
+them. With one GPU per query as the product shape, this is the
+throughput multiplier for the common case, and it needs no engine
+work.
+
+Priority six, the reasoning measured grid. When reasoning filters
+matter, validate the phase A map on hardware using the forced length
+instrument (generate exactly G tokens, answer first), which needs no
+artificially hard task. Decode pricing, the saturated no speculation
+verdict, and truncation rolling back through thinking all get tested
+at once.
+
+Parked, with explicit triggers: the cascade or Hydragen style shared
+prefix kernel (trigger: measured reasoning filters with a material
+attention read share; complementary to truncation, since cascade
+saves note reads within a speculated block while truncation saves
+software cost between gated stages); the adaptive mix scheduler
+(trigger: workloads in the proven corner of three plus stages,
+thinking near document length, memory near 2.5 footprints); multi
+query arbitration (out of scope by product decision); the 100,000
+document demonstration (whenever a headline is wanted); the 32B
+model tier (bundle with the disk KV tier, where it shines).
+
+Standing decisions: prompts are a fixed interface; single tenant;
+one GPU per query; the artificially hard filter accuracy study is
+skipped; strict mode is the shipping default.
