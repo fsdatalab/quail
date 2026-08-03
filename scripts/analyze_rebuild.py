@@ -201,6 +201,36 @@ def build_summary(rows, cost_catalog):
             ),
         })
 
+    fused_scale = []
+    k1_2000 = headline_by_key.get((2000, "custom-k1"))
+    if k1_2000 is not None:
+        for metadata, result in rows:
+            config = metadata.get("config", {})
+            if not (
+                metadata["phase"] == "custom-smoke"
+                and config.get("n_docs") == 2000
+                and config.get("k") in {2, 4}
+                and config.get("multigroup_cascade") is False
+            ):
+                continue
+            shared = (
+                set(k1_2000["answers"])
+                & set(result["answers"])
+            )
+            fused_scale.append({
+                "run_id": metadata["run_id"],
+                "k": config["k"],
+                "seconds": result["wall_ns"] / 1e9,
+                "steps": result["steps"],
+                "shared_answers": len(shared),
+                "answer_flips_from_k1": sum(
+                    k1_2000["answers"][key] != result["answers"][key]
+                    for key in shared
+                ),
+                "survivors": len(result["survivors"]),
+            })
+    fused_scale.sort(key=lambda row: row["k"])
+
     kernel_rows = []
     for row in cost_catalog.get("comparisons", []):
         kernel_rows.append({
@@ -217,6 +247,7 @@ def build_summary(rows, cost_catalog):
         "non_regression": non_regression,
         "fixed_work_shapes": shape_rows,
         "headline_results": headlines,
+        "fused_scale_validation": fused_scale,
         "attention_cost_validation": cost_catalog.get("validation", {}),
         "attention_kernel_shapes": kernel_rows,
     }
@@ -293,6 +324,25 @@ def render_markdown(summary):
         lines.extend([
             "",
             f"Fused k changed {fused_flips} fixed-work answers. It does not pass the semantic shipping gate.",
+        ])
+    if summary["fused_scale_validation"]:
+        lines.extend([
+            "",
+            "### Fused 2,000-document semantic check",
+            "",
+            "| k | Time | Steps | Shared answers | Flips from k=1 | Survivors |",
+            "|---:|---:|---:|---:|---:|---:|",
+        ])
+        for row in summary["fused_scale_validation"]:
+            lines.append(
+                f"| {row['k']} | {row['seconds']:.2f} s | "
+                f"{row['steps']} | {row['shared_answers']} | "
+                f"{row['answer_flips_from_k1']} | "
+                f"{row['survivors']} |"
+            )
+        lines.extend([
+            "",
+            "These verified one-prefix-group runs fail semantics and performance. Fused FP8 cascade must not ship.",
         ])
     lines.extend([
         "",
