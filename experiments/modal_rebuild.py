@@ -87,10 +87,11 @@ def _resize_documents(documents, tokenizer, n_docs, target_tokens):
     )["input_ids"]
     resized = []
     cursor = 0
+    body_target = max(1, target_tokens - 80)
     for _ in range(n_docs):
         parts = []
         total = 0
-        while total < target_tokens - 400:
+        while total < body_target:
             index = cursor % len(documents)
             parts.append(documents[index])
             total += len(lengths[index]) + 2
@@ -243,6 +244,7 @@ def custom_smoke(
         "n_filters": n_filters,
         "k": k,
         "target_document_tokens": document_tokens,
+        "body_token_lengths": [len(row) for row in body_ids],
         "short_circuit": short_circuit,
         "model": MODEL,
         "model_revision": MODEL_REVISION,
@@ -399,6 +401,7 @@ async def stock_smoke(
         "n_docs": n_docs,
         "n_filters": n_filters,
         "target_document_tokens": document_tokens,
+        "body_token_lengths": [len(row) for row in body_ids],
         "short_circuit": short_circuit,
         "wall_ns": ended - started,
         "answers": {
