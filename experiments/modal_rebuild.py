@@ -6,7 +6,10 @@ import modal
 app = modal.App("docengine-rebuild")
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.2-devel-ubuntu22.04",
+        add_python="3.12",
+    )
     .pip_install(
         "vllm==0.26.0",
         "huggingface_hub",
