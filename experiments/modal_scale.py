@@ -788,6 +788,118 @@ async def longdoc_run() -> dict:
 
 
 
+@app.function(image=image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
+    """Milestone three, long documents. At 30,000 tokens per document
+    the two-in-flight plan measured about twice the reads: a document's
+    two filter requests race, each computes the whole prefix, and the
+    cache hit rate collapses to half a percent. Chain mode cannot race,
+    because a document is one living request that answers both filters
+    in one residency. Three arms on one engine: request mode one filter
+    in flight, request mode two in flight, chain mode."""
+    import inspect
+    import os
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import (EngineTags,
+                                                 run_filter_chain,
+                                                 run_filter_chain_engine)
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    pool = _build_pool(10000)
+    lens = [len(x) for x in
+            tok(pool, add_special_tokens=False)["input_ids"]]
+
+    def build_long(cnt, tgt):
+        docs, i = [], 0
+        for _ in range(cnt):
+            parts, total = [], 0
+            while total < tgt - 400:
+                parts.append(pool[i % len(pool)])
+                total += lens[i % len(pool)] + 2
+                i += 1
+            docs.append("\n\n".join(parts))
+        return docs
+
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=102_400,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True,
+        scheduling_policy="priority",
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler",
+        hf_overrides={"rope_scaling": {
+            "rope_type": "yarn", "factor": 4.0,
+            "original_max_position_embeddings": 32768}}))
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
+    n, s = 2, 0.7
+    docs = build_long(count, target)
+    rng = np.random.default_rng(FLAG_SEED + count)
+    flags = (rng.random((count, n)) < s).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(n)]
+    yes_ids = set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            yes_ids.add(ids[0])
+    corpus = sum(len(x) for x in body_ids)
+    floor = corpus / 80_000.0
+
+    async def reset_cache():
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    arms = {}
+    for arm in ("k1", "k2", "chain"):
+        await reset_cache()
+        if arm == "chain":
+            res = await run_filter_chain_engine(
+                engine, sp, body_ids, q_ids, 830_000, yes_ids, tag="lc")
+            res["answers"].pop(("raw", 0), None)
+        else:
+            res = await run_filter_chain(
+                engine, sp, body_ids, q_ids, 830_000,
+                lookahead=int(arm[1]), tag=f"l{arm}",
+                tags=EngineTags(), use_priority=True)
+        agree = sum(1 for (i, j), a in res["answers"].items()
+                    if not isinstance(i, str) and a == flags[i][j - 1])
+        n_ans = sum(1 for k in res["answers"] if not isinstance(k[0], str))
+        hit = res["cached_tokens"] / max(1, res["prompt_tokens"])
+        arms[arm] = dict(makespan=res["wall"], requests=res["requests"],
+                         ratio=res["wall"] / floor, cache_hit=hit,
+                         agreement=agree / max(1, n_ans),
+                         survivors=res["survivors"])
+        print(f"[longchain] {arm}: {res['wall']:.1f}s, ratio "
+              f"{res['wall'] / floor:.2f} of the {floor:.1f}s floor, "
+              f"{res['requests']} requests, hit {100 * hit:.1f}%, "
+              f"agree {agree}/{n_ans}", flush=True)
+    same = arms["k1"]["survivors"] == arms["chain"]["survivors"]
+    print(f"[longchain] chain survivors match k1: {same}", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return dict(count=count, target=target, corpus_tokens=corpus,
+                floor_s=floor, survivors_match=same, arms=arms)
+
+
 # ------------------------------------------------------------ chain proof
 
 @app.function(image=image, gpu="H100!", timeout=2400,
@@ -1436,6 +1548,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "chainsteps":
         data = chain_run.remote(n_docs or 10000, 4, 0.8, 2)
         path = out or "results/engine/chainsteps10k.json"
+    elif phase == "longchain":
+        data = longchain_run.remote()
+        path = out or "results/engine/longchain.json"
     elif phase == "profile":
         data = profile_run.remote(n_docs or 4000)
         path = out or "results/engine/profile.json"
