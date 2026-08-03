@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from docengine.runtime.batch_cost import (
     AttentionShapePoint,
     AttentionShapeTable,
+    ValidationRow,
+    summarize_validation,
 )
 
 
@@ -39,6 +41,14 @@ def load_kernel_rows(root: Path) -> list[dict]:
 
 
 def build_catalog(rows: list[dict]) -> dict:
+    calibration = [
+        row for row in rows
+        if row["groups"] == 8 and row["tail_tokens"] == 32
+    ]
+    held_out = [
+        row for row in rows
+        if row not in calibration
+    ]
     cascade = AttentionShapeTable([
         AttentionShapePoint(
             groups=row["groups"],
@@ -47,7 +57,7 @@ def build_catalog(rows: list[dict]) -> dict:
             tail_tokens=row["tail_tokens"],
             time_ns=row["cascade_ns"],
         )
-        for row in rows
+        for row in calibration
     ])
     standard = AttentionShapeTable([
         AttentionShapePoint(
@@ -57,18 +67,54 @@ def build_catalog(rows: list[dict]) -> dict:
             tail_tokens=row["tail_tokens"],
             time_ns=row["standard_ns"],
         )
-        for row in rows
+        for row in calibration
     ])
+    validation_rows = []
+    for row in held_out:
+        predicted = cascade.estimate_ns(
+            groups=row["groups"],
+            k=row["k"],
+            prefix_tokens=row["prefix_tokens"],
+            tail_tokens=row["tail_tokens"],
+        )
+        validation_rows.append({
+            "run_id": row["run_id"],
+            "predicted_ns": predicted,
+            "measured_ns": row["cascade_ns"],
+            "absolute_error_fraction": abs(
+                predicted - row["cascade_ns"]
+            ) / row["cascade_ns"],
+        })
+    if validation_rows:
+        summary = summarize_validation([
+            ValidationRow(
+                predicted_ns=row["predicted_ns"],
+                measured_ns=row["measured_ns"],
+                label=row["run_id"],
+            )
+            for row in validation_rows
+        ])
+        validation = {
+            "status": "passed" if summary.passes else "failed",
+            "count": summary.count,
+            "median_absolute_error": summary.median_absolute_error,
+            "p95_absolute_error": summary.p95_absolute_error,
+            "mean_signed_error": summary.mean_signed_error,
+            "rows": validation_rows,
+        }
+    else:
+        validation = {
+            "status": "needs-held-out-runs",
+            "reason": "No non-calibration shapes were found.",
+        }
     return {
         "schema_version": 1,
         "kv_cache_dtype": "fp8",
         "cascade_attention": cascade.to_rows(),
         "standard_attention": standard.to_rows(),
-        "comparisons": rows,
-        "validation": {
-            "status": "needs-held-out-runs",
-            "reason": "The first grid supplies calibration points only.",
-        },
+        "comparisons": calibration,
+        "held_out_comparisons": held_out,
+        "validation": validation,
     }
 
 
