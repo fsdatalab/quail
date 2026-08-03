@@ -39,6 +39,7 @@ class KVPageAllocator:
         page_size_tokens: int,
         bytes_per_token: int,
         activation_reserve_bytes: int = 0,
+        audit_on_mutation: bool = False,
     ):
         if total_pages <= 0:
             raise ValueError("total_pages must be positive")
@@ -52,6 +53,7 @@ class KVPageAllocator:
         self.page_size_tokens = int(page_size_tokens)
         self.bytes_per_token = int(bytes_per_token)
         self.activation_reserve_bytes = int(activation_reserve_bytes)
+        self.audit_on_mutation = bool(audit_on_mutation)
         self._free = list(range(self.total_pages - 1, -1, -1))
         self._owners: dict[Owner, _OwnerState] = {}
         self._references: dict[int, set[Owner]] = {
@@ -125,7 +127,7 @@ class KVPageAllocator:
         )
         for page_id in page_ids:
             self._references[page_id].add(owner)
-        self.validate()
+        self._audit()
         return self.allocation(owner)
 
     def extend(self, owner: Owner, token_count: int) -> KVAllocation:
@@ -150,7 +152,7 @@ class KVPageAllocator:
         state.token_count = new_total
         for page_id in added:
             self._references[page_id].add(owner)
-        self.validate()
+        self._audit()
         return self.allocation(owner)
 
     def extend_with_pages(
@@ -175,7 +177,7 @@ class KVPageAllocator:
         state.token_count += int(token_count)
         for page_id in added:
             self._references[page_id].add(owner)
-        self.validate()
+        self._audit()
         return self.allocation(owner)
 
     def share_prefix(
@@ -205,7 +207,7 @@ class KVPageAllocator:
         )
         for page_id in page_ids:
             self._references[page_id].add(target)
-        self.validate()
+        self._audit()
         return self.allocation(target)
 
     def truncate(self, owner: Owner, token_count: int) -> KVAllocation:
@@ -219,7 +221,7 @@ class KVPageAllocator:
         del state.page_ids[keep_pages:]
         state.token_count = int(token_count)
         self._drop_references(owner, removed)
-        self.validate()
+        self._audit()
         return self.allocation(owner)
 
     def free(self, owner: Owner) -> None:
@@ -227,7 +229,7 @@ class KVPageAllocator:
         if state is None:
             raise KVOwnershipError(f"unknown KV owner {owner!r}")
         self._drop_references(owner, state.page_ids)
-        self.validate()
+        self._audit()
 
     def reserve_temporary(self, byte_count: int) -> None:
         if byte_count < 0:
@@ -248,6 +250,10 @@ class KVPageAllocator:
             )
         return [self._free.pop() for _ in range(count)]
 
+    def _audit(self) -> None:
+        if self.audit_on_mutation:
+            self.validate()
+
     def _drop_references(self, owner: Owner, page_ids: list[int]) -> None:
         for page_id in page_ids:
             references = self._references[page_id]
@@ -258,7 +264,6 @@ class KVPageAllocator:
             references.remove(owner)
             if not references:
                 self._free.append(page_id)
-        self._free.sort(reverse=True)
 
     def validate(self) -> None:
         free = set(self._free)
