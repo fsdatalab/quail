@@ -581,6 +581,110 @@ async def profile_run(n_docs: int = 4000) -> dict:
     return report
 
 
+@app.function(image=image, gpu="H100!", timeout=2400,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def chainprof_run(n_docs: int = 4000) -> dict:
+    """Name where chain mode's extra seconds go. The 10k flight showed
+    chain mode at 56.8 seconds against request mode's 52.4: each
+    continuation (stop, rewind, park, full worker re-sync) costs more
+    than the per-request toll it replaces. This runs both modes on one
+    in-process engine, each under the CPU-clock profiler, and returns
+    ranked tables so the difference has function names."""
+    import gc
+    import inspect
+    import os
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import (EngineTags,
+                                                 run_filter_chain,
+                                                 run_filter_chain_engine)
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    n, s = 4, 0.8
+    docs = _build_pool(n_docs)
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
+    rng = np.random.default_rng(FLAG_SEED + 7)
+    flags = (rng.random((len(docs), n)) < s).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(n)]
+    yes_ids = set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            yes_ids.add(ids[0])
+
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True, scheduling_policy="priority",
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
+
+    async def reset_cache():
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    import yappi
+    yappi.set_clock_type("cpu")
+
+    def table():
+        rows = []
+        for st in yappi.get_func_stats():
+            rows.append(dict(fn=f"{st.module.split('/')[-1]}:{st.name}",
+                             self_s=st.tsub, total_s=st.ttot,
+                             calls=st.ncall))
+        rows.sort(key=lambda r: -r["self_s"])
+        return rows
+
+    report = dict(n_docs=n_docs)
+    for mode in ("request", "chain"):
+        await reset_cache()
+        gc.collect()
+        yappi.clear_stats()
+        yappi.start()
+        if mode == "request":
+            out = await run_filter_chain(
+                engine, sp, body_ids, q_ids, budget_tokens=830_000,
+                lookahead=1, tag="cpa", tags=EngineTags(),
+                use_priority=True)
+        else:
+            out = await run_filter_chain_engine(
+                engine, sp, body_ids, q_ids, 830_000, yes_ids, tag="cpb")
+        yappi.stop()
+        rows = table()
+        total_cpu = sum(r["self_s"] for r in rows) or 1.0
+        report[mode] = dict(wall=out["wall"], requests=out["requests"],
+                            total_cpu_s=total_cpu, top=rows[:60])
+        print(f"[chainprof] {mode} mode: {out['wall']:.2f}s wall, "
+              f"{out['requests']} requests, total CPU {total_cpu:.1f}s",
+              flush=True)
+        for r in rows[:30]:
+            print(f"[chainprof] {mode} {100 * r['self_s'] / total_cpu:5.1f}% "
+                  f"{r['self_s']:7.2f}s self {r['calls']:>9} calls  "
+                  f"{r['fn'][:80]}", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return report
+
+
 # ------------------------------------------------------ long documents
 
 @app.function(image=image, gpu="H100!", timeout=3600,
@@ -749,6 +853,10 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
     same_surv = a["survivors"] == b["survivors"]
     shared = [k for k in a["answers"] if k in b["answers"]]
     agree = sum(1 for k in shared if a["answers"][k] == b["answers"][k])
+    flips = sorted(k for k in shared if a["answers"][k] != b["answers"][k])
+    if flips:
+        print(f"[chain] flipped answers (doc, stage): {flips[:20]}",
+              flush=True)
     print(f"[chain] request mode: {a['requests']} requests, "
           f"{a['wall']:.2f}s; chain mode: {b['requests']} requests, "
           f"{b['wall']:.2f}s", flush=True)
@@ -767,6 +875,7 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
                                 survivors=b["survivors"]),
                 survivors_match=same_surv,
                 answers_agree=[agree, len(shared)],
+                flipped=[list(k) for k in flips[:50]],
                 doc0_raw=[list(x) for x in (raw or ())])
 
 # ---------------------------------------------------- single tenant mode
@@ -1311,6 +1420,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "chain10k":
         data = chain_run.remote(n_docs or 10000, 4, 0.8)
         path = out or "results/engine/chain10k.json"
+    elif phase == "chainprof":
+        data = chainprof_run.remote(n_docs or 4000)
+        path = out or "results/engine/chainprof.json"
     elif phase == "profile":
         data = profile_run.remote(n_docs or 4000)
         path = out or "results/engine/profile.json"
