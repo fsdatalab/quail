@@ -414,6 +414,206 @@ async def stock_smoke(
     }
 
 
+@app.function(
+    image=image,
+    gpu="H100!",
+    timeout=1800,
+)
+def cascade_kernel(
+    groups: int = 8,
+    k: int = 2,
+    prefix_tokens: int = 304,
+    tail_tokens: int = 32,
+    repetitions: int = 20,
+) -> dict:
+    import flashinfer
+    import torch
+
+    if groups <= 0 or k <= 0:
+        raise ValueError("groups and k must be positive")
+    page_size = 16
+    if prefix_tokens % page_size:
+        raise ValueError("prefix_tokens must be page aligned")
+    prefix_pages = prefix_tokens // page_size
+    unique_pages = (tail_tokens + page_size - 1) // page_size
+    total_tails = groups * k
+    shared_page_indices = []
+    shared_indptr = [0]
+    unique_page_indices = []
+    unique_indptr = [0]
+    full_page_indices = []
+    full_indptr = [0]
+    page = 0
+    group_shared = []
+    tail_unique = []
+    for _group in range(groups):
+        shared = list(range(page, page + prefix_pages))
+        page += prefix_pages
+        group_shared.append(shared)
+        shared_page_indices.extend(shared)
+        shared_indptr.append(len(shared_page_indices))
+        for _tail in range(k):
+            unique = list(range(page, page + unique_pages))
+            page += unique_pages
+            tail_unique.append(unique)
+            unique_page_indices.extend(unique)
+            unique_indptr.append(len(unique_page_indices))
+            full_page_indices.extend(shared + unique)
+            full_indptr.append(len(full_page_indices))
+    num_qo_heads = 32
+    num_kv_heads = 8
+    head_dim = 128
+    q_tokens = total_tails * tail_tokens
+    query = torch.randn(
+        q_tokens,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.randn(
+        page,
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    workspace = torch.empty(
+        256 * (1 << 20),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    top_qo = torch.tensor(
+        [group * k * tail_tokens for group in range(groups + 1)],
+        dtype=torch.int32,
+        device="cpu",
+    )
+    bottom_qo = torch.tensor(
+        [tail * tail_tokens for tail in range(total_tails + 1)],
+        dtype=torch.int32,
+        device="cpu",
+    )
+    shared_indptr_tensor = torch.tensor(
+        shared_indptr,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    unique_indptr_tensor = torch.tensor(
+        unique_indptr,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    shared_indices_tensor = torch.tensor(
+        shared_page_indices,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    unique_indices_tensor = torch.tensor(
+        unique_page_indices,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    shared_last = torch.full(
+        (groups,),
+        page_size,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    unique_last = torch.full(
+        (total_tails,),
+        tail_tokens % page_size or page_size,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    cascade = flashinfer.MultiLevelCascadeAttentionWrapper(
+        2,
+        workspace,
+        "NHD",
+    )
+    cascade.plan(
+        [top_qo, bottom_qo],
+        [shared_indptr_tensor, unique_indptr_tensor],
+        [shared_indices_tensor, unique_indices_tensor],
+        [shared_last, unique_last],
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        q_data_type=query.dtype,
+        kv_data_type=kv_cache.dtype,
+    )
+    full_indptr_tensor = torch.tensor(
+        full_indptr,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    full_indices_tensor = torch.tensor(
+        full_page_indices,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    standard = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace,
+        "NHD",
+    )
+    standard.plan(
+        bottom_qo,
+        full_indptr_tensor,
+        full_indices_tensor,
+        unique_last,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        q_data_type=query.dtype,
+        kv_data_type=kv_cache.dtype,
+    )
+    for _ in range(3):
+        cascade_output = cascade.run(query, kv_cache)
+        standard_output = standard.run(query, kv_cache)
+    torch.cuda.synchronize()
+
+    def measure(fn):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(repetitions):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / repetitions
+
+    cascade_ms = measure(lambda: cascade.run(query, kv_cache))
+    standard_ms = measure(lambda: standard.run(query, kv_cache))
+    difference = (
+        cascade_output.float() - standard_output.float()
+    ).abs()
+    return {
+        "phase": "cascade-kernel",
+        "groups": groups,
+        "k": k,
+        "prefix_tokens": prefix_tokens,
+        "tail_tokens": tail_tokens,
+        "q_tokens": q_tokens,
+        "kv_cache_dtype": str(kv_cache.dtype),
+        "cascade_ms": cascade_ms,
+        "standard_ms": standard_ms,
+        "speedup": standard_ms / cascade_ms,
+        "max_absolute_difference": difference.max().item(),
+        "mean_absolute_difference": difference.mean().item(),
+        "finite": bool(torch.isfinite(cascade_output).all()),
+        "gpu": {
+            "name": torch.cuda.get_device_name(0),
+            "total_memory": torch.cuda.get_device_properties(0).total_memory,
+            "compute_capability": list(torch.cuda.get_device_capability(0)),
+        },
+    }
+
+
 @app.local_entrypoint()
 def main(
     phase: str = "custom-smoke",
@@ -422,6 +622,10 @@ def main(
     k: int = 1,
     document_tokens: int = 0,
     short_circuit: bool = True,
+    groups: int = 8,
+    prefix_tokens: int = 304,
+    tail_tokens: int = 32,
+    repetitions: int = 20,
     out: str = "results/runs",
 ):
     import sys
@@ -462,6 +666,14 @@ def main(
             "custom": custom_handle.get(),
             "stock": stock_handle.get(),
         }
+    elif phase == "cascade-kernel":
+        data = cascade_kernel.remote(
+            groups,
+            k,
+            prefix_tokens,
+            tail_tokens,
+            repetitions,
+        )
     else:
         raise SystemExit(f"unknown phase {phase}")
     metadata = RunMetadata.create(
@@ -472,6 +684,10 @@ def main(
             "k": k,
             "document_tokens": document_tokens,
             "short_circuit": short_circuit,
+            "groups": groups,
+            "prefix_tokens": prefix_tokens,
+            "tail_tokens": tail_tokens,
+            "repetitions": repetitions,
         },
         seeds={
             "workload": WORKLOAD_SEED,
