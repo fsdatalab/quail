@@ -29,7 +29,6 @@ Run with:
   modal run experiments/modal_engine.py
 """
 
-import json
 import time
 
 import modal
@@ -38,7 +37,8 @@ app = modal.App("docengine-engine")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("vllm", "huggingface_hub", "pandas", "pyarrow", "numpy")
+    .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
+                 "numpy")
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0"})
     .add_local_python_source("docengine")
@@ -46,6 +46,8 @@ image = (
 hf_cache = modal.Volume.from_name("docengine-hf-cache", create_if_missing=True)
 
 MODEL = "Qwen/Qwen3-4B-FP8"
+MODEL_REVISION = "96b30dc13593a244a5e59e84687309f53c375cfa"
+DATASET_REVISION = "e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
 WORKLOAD_SEED = 20260731
 FLAG_SEED = 424242
 
@@ -61,7 +63,8 @@ def _build_pool(n_docs):
         path = hf_hub_download(
             "stanfordnlp/imdb",
             f"plain_text/{split}-00000-of-00001.parquet",
-            repo_type="dataset")
+            repo_type="dataset",
+            revision=DATASET_REVISION)
         frames.append(pd.read_parquet(path)["text"])
     pool = list(frames[0]) + list(frames[1])
     rng = np.random.default_rng(WORKLOAD_SEED)
@@ -98,7 +101,8 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
 
     t0 = time.time()
     docs = _build_pool(n_docs)
-    llm = LLM(model=MODEL, kv_cache_dtype="fp8",
+    llm = LLM(model=MODEL, revision=MODEL_REVISION,
+              kv_cache_dtype="fp8",
               max_model_len=4352, gpu_memory_utilization=0.92,
               enable_prefix_caching=True)
     tok = llm.get_tokenizer()
@@ -255,6 +259,9 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
         results.append(dict(
             n=n, s=list(s_vec), policy=policy, k=k,
             mode=cfg.get("mode", "waves"),
+            answer_visibility=("oracle"
+                               if cfg.get("mode") == "manifest"
+                               else "online"),
             makespan=sum(w["s"] for w in waves), waves=waves,
             d_tok=d_tok, p_tok=p_tok, p_task=p_task,
             answers=answers, flags=flags.tolist(),
@@ -305,13 +312,27 @@ def _grid(smoke: bool):
 def main(smoke: bool = False, out: str = ""):
     cfgs, n_docs = _grid(smoke)
     data = run_grid.remote(cfgs, n_docs)
-    path = out or ("results/engine/smoke.json" if smoke
-                   else "results/engine/grid.json")
-    import os
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f)
-    print(f"saved {path}")
+    import sys
+
+    from docengine.runtime.artifacts import RunMetadata, write_run_artifact
+
+    metadata = RunMetadata.create(
+        phase="engine-smoke" if smoke else "engine-grid",
+        config={
+            "n_docs": n_docs,
+            "configurations": cfgs,
+            "remote_vllm_version": data.get("vllm_version"),
+        },
+        seeds={"workload": WORKLOAD_SEED, "ground_truth": FLAG_SEED},
+        model_revision=MODEL_REVISION,
+        dataset_revision=DATASET_REVISION,
+        gpu=data.get("gpu", {}),
+        cache_reset_confirmed=True,
+        command=tuple(sys.argv),
+    )
+    root = out or "results/runs"
+    directory = write_run_artifact(root, metadata, data)
+    print(f"saved immutable run {directory}")
     for r in data["results"]:
         print(f"n={r['n']} s={r['s']} {r['policy']} k={r['k']}: "
               f"{r['makespan']:.2f}s, agreement {r['answer_agreement']:.3f}")
@@ -323,7 +344,8 @@ def probe() -> list:
     """Print raw completions for candidate answer-extraction patterns."""
     from vllm import LLM, SamplingParams
     docs = _build_pool(3)
-    llm = LLM(model=MODEL, kv_cache_dtype="fp8", max_model_len=4352,
+    llm = LLM(model=MODEL, revision=MODEL_REVISION,
+              kv_cache_dtype="fp8", max_model_len=4352,
               gpu_memory_utilization=0.92, enable_prefix_caching=True)
     sp = SamplingParams(temperature=0.0, max_tokens=8)
     b_yes = docs[0] + _flags_line([1, 0])
@@ -353,7 +375,8 @@ def probe2() -> dict:
     import numpy as np
     from vllm import LLM, SamplingParams
     docs = _build_pool(20)
-    llm = LLM(model=MODEL, kv_cache_dtype="fp8", max_model_len=4352,
+    llm = LLM(model=MODEL, revision=MODEL_REVISION,
+              kv_cache_dtype="fp8", max_model_len=4352,
               gpu_memory_utilization=0.92, enable_prefix_caching=True)
     sp = SamplingParams(temperature=0.0, max_tokens=1)
     rng = np.random.default_rng(7)

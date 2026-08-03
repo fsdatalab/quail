@@ -25,6 +25,8 @@ and `outputs[0].text`.
 import asyncio
 import time
 
+from .protocol import FilterQuery
+
 
 def _yes(out):
     return 1 if out.outputs[0].text.strip().upper().startswith("Y") else 0
@@ -171,6 +173,25 @@ async def run_query(engine, sampling_params, body_ids, q_ids,
                                   q_ids, budget_tokens, lookahead=1,
                                   tag=tag, tags=EngineTags(),
                                   use_priority=True)
+
+
+async def run_filter_query(
+    engine,
+    sampling_params,
+    query: FilterQuery,
+    budget_tokens: int,
+    tag: str = "q",
+):
+    query.validate()
+    return await run_query(
+        engine,
+        sampling_params,
+        query.body_token_ids,
+        query.question_token_ids,
+        budget_tokens,
+        yes_ids=query.yes_token_ids,
+        tag=tag,
+    )
 
 
 async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,

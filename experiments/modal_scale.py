@@ -35,8 +35,6 @@ Run with:
   modal run experiments/modal_scale.py --phase scale
 """
 
-import gzip
-import json
 import time
 
 import modal
@@ -57,6 +55,8 @@ image = (
 hf_cache = modal.Volume.from_name("docengine-hf-cache", create_if_missing=True)
 
 MODEL = "Qwen/Qwen3-4B-FP8"
+MODEL_REVISION = "96b30dc13593a244a5e59e84687309f53c375cfa"
+DATASET_REVISION = "e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
 WORKLOAD_SEED = 20260731
 FLAG_SEED = 424242
 CEIL = 275_000            # dense FP8 prefill ceiling, tokens per second
@@ -73,7 +73,8 @@ def _build_pool(n_docs):
         path = hf_hub_download(
             "stanfordnlp/imdb",
             f"plain_text/{split}-00000-of-00001.parquet",
-            repo_type="dataset")
+            repo_type="dataset",
+            revision=DATASET_REVISION)
         frames.append(pd.read_parquet(path)["text"])
     pool = list(frames[0]) + list(frames[1])
     rng = np.random.default_rng(WORKLOAD_SEED)
@@ -105,6 +106,27 @@ def _task_suffix(j):
 def _answer_of(out):
     txt = out.outputs[0].text.strip().upper()
     return 1 if txt.startswith("Y") else 0
+
+
+async def _reset_prefix_cache_checked(engine, attempts: int = 15) -> bool:
+    import asyncio
+    import inspect
+
+    for _ in range(attempts):
+        result = engine.reset_prefix_cache()
+        if inspect.isawaitable(result):
+            result = await result
+        if result is not False:
+            return True
+        await asyncio.sleep(1.0)
+    raise RuntimeError("prefix cache reset did not complete")
+
+
+def _reset_prefix_cache_checked_sync(engine) -> bool:
+    result = engine.reset_prefix_cache()
+    if result is False:
+        raise RuntimeError("prefix cache reset did not complete")
+    return True
 
 
 def _kv_tokens(llm):
@@ -154,7 +176,8 @@ def speed_limit(n_docs: int = 4000) -> dict:
     short_ids = None
     results = []
     for cfg in configs:
-        kwargs = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=8192,
+        kwargs = dict(model=MODEL, revision=MODEL_REVISION,
+                      kv_cache_dtype="fp8", max_model_len=8192,
                       gpu_memory_utilization=cfg["util"],
                       enable_prefix_caching=cfg["apc"])
         if cfg["mnbt"]:
@@ -188,10 +211,7 @@ def speed_limit(n_docs: int = 4000) -> dict:
                   f"{dt:.2f}s = {rate:,.0f} tok/s "
                   f"({100 * rate / CEIL:.1f}% of ceiling)", flush=True)
             if cfg["apc"]:
-                try:
-                    llm.reset_prefix_cache()
-                except Exception:
-                    pass
+                _reset_prefix_cache_checked_sync(llm)
         results.append(dict(cfg=cfg, sched=_sched_cfg(llm),
                             kv_tokens=_kv_tokens(llm), runs=runs))
         try:
@@ -234,22 +254,20 @@ async def overhead_split(n_docs: int = 2000) -> dict:
     flags = (rng.random((len(docs), n)) < np.asarray(s_vec)).astype(int)
     bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
 
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
     q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
              for j in range(n)]
 
     engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        model=MODEL, revision=MODEL_REVISION,
+        kv_cache_dtype="fp8", max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True))
     sp = SamplingParams(temperature=0.0, max_tokens=1)
 
     async def reset_cache():
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            res = await res
-        return res
+        return await _reset_prefix_cache_checked(engine)
 
     async def ask(prompt, rid):
         final = None
@@ -355,7 +373,8 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
     import os
     os.environ["DOCENGINE_SINGLE_TENANT"] = "0"   # co-tenant is legitimate
     ext = variant == "pinned"
-    kwargs = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+    kwargs = dict(model=MODEL, revision=MODEL_REVISION,
+                  kv_cache_dtype="fp8", max_model_len=4608,
                   gpu_memory_utilization=0.92, enable_prefix_caching=True,
                   disable_log_stats=True)
     if ext:
@@ -364,7 +383,7 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
             "docengine.engineext.scheduler.DocEngineScheduler"
     docs = _build_pool(n_docs)
     engine = Engine.from_engine_args(AsyncEngineArgs(**kwargs))
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     pool = 981_728
     try:
@@ -378,14 +397,7 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
           flush=True)
 
     async def reset_cache():
-        for _ in range(15):
-            res = engine.reset_prefix_cache()
-            if inspect.isawaitable(res):
-                res = await res
-            if res is not False:
-                return
-            await asyncio.sleep(1.0)
-        raise RuntimeError("prefix cache reset kept failing")
+        return await _reset_prefix_cache_checked(engine)
 
     async def cotenant(stop, stats, rate=junk_rate, length=junk_len):
         rng = np.random.default_rng(4321)
@@ -500,7 +512,7 @@ async def profile_run(n_docs: int = 4000) -> dict:
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
     n, s_vec = 4, (0.8,) * 4
     docs = _build_pool(n_docs)
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     rng = np.random.default_rng(FLAG_SEED + 1000 * n + int(100 * s_vec[0]))
     flags = (rng.random((len(docs), n)) < np.asarray(s_vec)).astype(int)
@@ -511,7 +523,8 @@ async def profile_run(n_docs: int = 4000) -> dict:
 
     def make_engine():
         return Engine.from_engine_args(AsyncEngineArgs(
-            model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+            model=MODEL, revision=MODEL_REVISION,
+            kv_cache_dtype="fp8", max_model_len=4608,
             gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True,
             scheduling_policy="priority",
@@ -519,9 +532,7 @@ async def profile_run(n_docs: int = 4000) -> dict:
                           "DocEngineScheduler"))
 
     async def one_query(engine, tag):
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
+        await _reset_prefix_cache_checked(engine)
         out = await run_filter_chain(engine, sp, body_ids, q_ids,
                                      budget_tokens=830_000, lookahead=1,
                                      tag=tag, tags=EngineTags(),
@@ -618,7 +629,7 @@ async def chainprof_run(n_docs: int = 4000) -> dict:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     n, s = 4, 0.8
     docs = _build_pool(n_docs)
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     rng = np.random.default_rng(FLAG_SEED + 7)
     flags = (rng.random((len(docs), n)) < s).astype(int)
@@ -633,15 +644,14 @@ async def chainprof_run(n_docs: int = 4000) -> dict:
             yes_ids.add(ids[0])
 
     engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        model=MODEL, revision=MODEL_REVISION,
+        kv_cache_dtype="fp8", max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True, scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
 
     async def reset_cache():
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
+        return await _reset_prefix_cache_checked(engine)
 
     import yappi
     yappi.set_clock_type("cpu")
@@ -730,7 +740,7 @@ async def persist_run(n_docs: int = 2000) -> dict:
     from docengine.runtime.engine_client import run_filter_chain
 
     docs = _build_pool(n_docs)
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     n, s = 2, 0.7
     rng = np.random.default_rng(FLAG_SEED + 7)
@@ -757,7 +767,8 @@ async def persist_run(n_docs: int = 2000) -> dict:
     print(f"[persist] raw disk write {wbw:.2f} GB/s", flush=True)
 
     def engine_args(store):
-        kw = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        kw = dict(model=MODEL, revision=MODEL_REVISION,
+                  kv_cache_dtype="fp8", max_model_len=4608,
                   gpu_memory_utilization=0.92, enable_prefix_caching=True,
                   disable_log_stats=True)
         if store:
@@ -775,9 +786,7 @@ async def persist_run(n_docs: int = 2000) -> dict:
                                       830_000, lookahead=1, tag=tag)
 
     async def reset(engine):
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
+        return await _reset_prefix_cache_checked(engine)
 
     def tier_bytes():
         try:
@@ -881,7 +890,7 @@ async def longdoc_run() -> dict:
     from docengine.runtime.engine_client import EngineTags, run_filter_chain
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     pool = _build_pool(10000)
     lens = [len(x) for x in
             tok(pool, add_special_tokens=False)["input_ids"]]
@@ -898,7 +907,8 @@ async def longdoc_run() -> dict:
         return docs
 
     engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=102_400,
+        model=MODEL, revision=MODEL_REVISION,
+        kv_cache_dtype="fp8", max_model_len=102_400,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True,
         scheduling_policy="priority",
@@ -910,9 +920,7 @@ async def longdoc_run() -> dict:
     n, s = 2, 0.7
 
     async def reset_cache():
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
+        return await _reset_prefix_cache_checked(engine)
 
     results = []
     for count, target, k in ((100, 30_000, 1), (100, 30_000, 2),
@@ -984,7 +992,7 @@ async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
                                                  run_filter_chain_engine)
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     pool = _build_pool(10000)
     lens = [len(x) for x in
             tok(pool, add_special_tokens=False)["input_ids"]]
@@ -1001,7 +1009,8 @@ async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
         return docs
 
     engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=102_400,
+        model=MODEL, revision=MODEL_REVISION,
+        kv_cache_dtype="fp8", max_model_len=102_400,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True,
         scheduling_policy="priority",
@@ -1027,9 +1036,7 @@ async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
     floor = corpus / 80_000.0
 
     async def reset_cache():
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
+        return await _reset_prefix_cache_checked(engine)
 
     arms = {}
     for arm in ("k1", "k2", "chain"):
@@ -1115,13 +1122,14 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
     budget = 830_000 if kv.startswith("fp8") else 400_000
     engine = Engine.from_engine_args(AsyncEngineArgs(
         model=MODEL,
+        revision=MODEL_REVISION,
         kv_cache_dtype="fp8" if kv.startswith("fp8") else "auto",
         calculate_kv_scales=(kv == "fp8calib"),
         max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True, scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     n = n_filters
     rng = np.random.default_rng(FLAG_SEED + 7)
@@ -1137,9 +1145,7 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
             yes_ids.add(ids[0])
 
     async def reset_cache():
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
+        return await _reset_prefix_cache_checked(engine)
 
     a = await run_filter_chain(engine, sp, body_ids, q_ids, budget,
                                lookahead=1, tag="rm", tags=EngineTags(),
@@ -1219,12 +1225,13 @@ async def strict_run(n_docs: int = 10000) -> dict:
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
     docs = _build_pool(n_docs)
     engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        model=MODEL, revision=MODEL_REVISION,
+        kv_cache_dtype="fp8", max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True,
         scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     pool = 981_728
     try:
@@ -1236,9 +1243,7 @@ async def strict_run(n_docs: int = 10000) -> dict:
     budget = int(0.85 * pool)
 
     async def reset_cache():
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
+        return await _reset_prefix_cache_checked(engine)
 
     # canary: an untagged request must be refused, not served. The
     # scheduler aborts it before its first step, so no final output
@@ -1380,7 +1385,7 @@ def model_floor() -> dict:
 
     # Part B: bare bf16 model forward on packed real-corpus rows
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     docs = _build_pool(2000)
     ids = tok("\n\n".join(docs), add_special_tokens=False)["input_ids"]
     model = AutoModelForCausalLM.from_pretrained(
@@ -1424,9 +1429,10 @@ async def client_run(n_docs: int = 10000) -> dict:
 
     docs = _build_pool(n_docs)
     engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        model=MODEL, revision=MODEL_REVISION,
+        kv_cache_dtype="fp8", max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True))
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL, revision=MODEL_REVISION)
     sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     pool = 981_728            # measured KV pool for this config (scale runs)
     try:
@@ -1440,9 +1446,7 @@ async def client_run(n_docs: int = 10000) -> dict:
           flush=True)
 
     async def reset_cache():
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
+        return await _reset_prefix_cache_checked(engine)
 
     results = []
     grid = ((2, (0.5, 0.5), 1), (2, (0.5, 0.5), 2),
@@ -1502,7 +1506,8 @@ def scale10k(n_docs: int = 10000) -> dict:
 
     t0 = time.time()
     docs = _build_pool(n_docs)
-    llm = LLM(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+    llm = LLM(model=MODEL, revision=MODEL_REVISION,
+              kv_cache_dtype="fp8", max_model_len=4608,
               gpu_memory_utilization=0.92, enable_prefix_caching=True)
     tok = llm.get_tokenizer()
     sp = SamplingParams(temperature=0.0, max_tokens=1)
@@ -1546,7 +1551,7 @@ def scale10k(n_docs: int = 10000) -> dict:
                           add_special_tokens=False)["input_ids"])
                   for j in range(n)]
 
-        assert llm.reset_prefix_cache(), "prefix cache reset failed"
+        _reset_prefix_cache_checked_sync(llm)
 
         waves = []
         answers = {}
@@ -1660,6 +1665,8 @@ def scale10k(n_docs: int = 10000) -> dict:
                     if a == flags[i][j - 1])
         results.append(dict(
             n=n, s=list(s_vec), policy=policy, k=k, mode=cfg["mode"],
+            answer_visibility=("oracle" if cfg["mode"] == "manifest"
+                               else "online"),
             makespan=sum(w["s"] for w in waves), waves=waves,
             d_tok=d_tok, p_tok=p_tok, p_task=p_task,
             answers=answers, flags=flags.tolist(),
@@ -1676,7 +1683,6 @@ def scale10k(n_docs: int = 10000) -> dict:
 
 @app.local_entrypoint()
 def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
-    import os
     if phase == "speed":
         data = speed_limit.remote(n_docs or 4000)
         path = out or "results/engine/speed_limit.json"
@@ -1760,11 +1766,25 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
         path = out or "results/engine/longdoc.json"
     else:
         raise SystemExit(f"unknown phase {phase}")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if path.endswith(".gz"):
-        with gzip.open(path, "wt") as f:
-            json.dump(data, f)
-    else:
-        with open(path, "w") as f:
-            json.dump(data, f)
-    print(f"saved {path}")
+    import sys
+
+    from docengine.runtime.artifacts import RunMetadata, write_run_artifact
+
+    metadata = RunMetadata.create(
+        phase=phase,
+        config={
+            "n_docs": n_docs,
+            "legacy_output_name": path,
+            "remote_vllm_version": data.get("vllm_version"),
+        },
+        seeds={"workload": WORKLOAD_SEED, "ground_truth": FLAG_SEED},
+        model_revision=MODEL_REVISION,
+        dataset_revision=DATASET_REVISION,
+        gpu=data.get("gpu", {}),
+        cache_reset_confirmed=None if phase == "floor" else True,
+        command=tuple(sys.argv),
+    )
+    root = out if out and not out.endswith((".json", ".json.gz")) \
+        else "results/runs"
+    directory = write_run_artifact(root, metadata, data)
+    print(f"saved immutable run {directory}")

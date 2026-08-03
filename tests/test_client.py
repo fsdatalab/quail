@@ -6,7 +6,8 @@ import asyncio
 import numpy as np
 
 from docengine.runtime.engine_client import (EngineTags, run_filter_chain,
-                                             run_query)
+                                             run_filter_query, run_query)
+from docengine.runtime.protocol import FilterQuery
 
 
 class _Out:
@@ -164,6 +165,23 @@ def test_run_query_single_filter_uses_requests():
     assert res["survivors"] == [i for i in range(15) if flags[i][0]]
     assert sum(1 for r in eng.rids if "|p" in r) == 15
     assert "r*" in eng.rids[-1].split("|")
+
+
+def test_filter_query_api_cannot_receive_ground_truth():
+    flags, body_ids, q_ids = _setup(30, 3, seed=17)
+    query = FilterQuery.from_sequences(
+        body_ids,
+        q_ids,
+        yes_token_ids={YES_TOK},
+    )
+    eng = ChainStubEngine(flags)
+    res = asyncio.run(run_filter_query(
+        eng,
+        None,
+        query,
+        budget_tokens=10 ** 6,
+    ))
+    assert res["survivors"] == [i for i in range(30) if all(flags[i])]
 
 
 def test_lookahead_waste_recorded():
