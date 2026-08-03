@@ -208,6 +208,7 @@ class VLLMModelRunner:
             groups.append(CascadeGroup(
                 request_count=chunk.k,
                 shared_blocks=common_pages,
+                shared_page_ids=tuple(shared_pages),
             ))
         output = SchedulerOutput(
             scheduled_new_reqs=requests,

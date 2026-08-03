@@ -8,6 +8,7 @@ from typing import Sequence
 class CascadeGroup:
     request_count: int
     shared_blocks: int
+    shared_page_ids: tuple[int, ...]
 
 
 _CURRENT_GROUPS: tuple[CascadeGroup, ...] | None = None
@@ -62,8 +63,32 @@ def install_multigroup_patch() -> None:
         unique_indptr = [0]
         unique_indices = []
         unique_last_page = []
-        request_offset = 0
+        ordered_groups = []
         for group in groups:
+            matching = [
+                request
+                for request in range(request_count)
+                if tuple(
+                    block_tables[
+                        request,
+                        :group.shared_blocks,
+                    ].tolist()
+                ) == group.shared_page_ids
+            ]
+            if len(matching) != group.request_count:
+                raise RuntimeError(
+                    "cascade group pages do not match request block tables"
+                )
+            if matching != list(range(matching[0], matching[-1] + 1)):
+                raise RuntimeError(
+                    "cascade group requests are not contiguous"
+                )
+            ordered_groups.append((matching[0], group))
+        ordered_groups.sort(key=lambda row: row[0])
+        request_offset = 0
+        for first_request, group in ordered_groups:
+            if first_request != request_offset:
+                raise RuntimeError("cascade groups do not cover request order")
             group_end = request_offset + group.request_count
             top_query_starts.append(int(query_starts[group_end]))
             first_table = block_tables[request_offset]
