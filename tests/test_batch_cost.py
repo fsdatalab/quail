@@ -72,7 +72,8 @@ def test_estimator_sums_measured_primitive_groups():
     assert estimate.dense_ns == 100
     assert estimate.output_ns == 30
     assert estimate.kv_transfer_ns == 40
-    assert estimate.total_ns == 177
+    assert estimate.standard_attention_ns == 40
+    assert estimate.total_ns == 217
 
 
 def test_estimator_round_trips_json(tmp_path):
