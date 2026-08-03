@@ -677,6 +677,36 @@ steps, so the lost lookahead is worth approximately nothing at this
 workload; reasoning filters, with real decode work, are the trigger
 to adopt the async scheduler base and a placeholder-aware rewind.
 
+## Persisted notes, milestone one: mechanics proven, 4B loses
+
+The engine's tiering store (RAM primary, container-local disk
+secondary) ran end to end at 2,000 documents: query one computed
+cold and offloaded 53.1 GB of notes; after a full prefix-cache
+reset, queries two and three restored from the store instead of
+recomputing. Measured on one container: baseline cold 11.0 seconds
+and recompute-after-reset 10.5; with the store, first query 29.5
+seconds (the write path), restores 20.3 then 18.4. Raw disk write
+measured 5.2 GB/s.
+
+This is the break-even table's prediction landing: the corpus is 53
+GB of notes but only about 630,000 tokens of compute, the GPU
+re-reads at about 80,000 tokens a second, so beating an 8-second
+recompute requires moving those bytes at about 7 GB/s - above this
+disk before any bookkeeping. At this model size the tier loses
+roughly two to one. The value case is unchanged from the plan: the
+32B tier, where prefill runs about eight times slower and the bytes
+per token barely grow, turns the same arithmetic into a several-fold
+win; durable S3 with a disk cache rides the same mechanics.
+
+Caveats: survivor lists across the four runs are not identical -
+consistent with the measured borderline-call noise between any two
+batch compositions, but per-call diffs were not instrumented here,
+so equality-under-restore is an open item for milestone two. The
+store ran on the stock scheduler; reconciling it with strict
+plan-owned memory is named follow-up work. The sandbox lacks the
+store's page pre-fault call, which is worked around by running the
+engine core in-process and letting pages fault in lazily.
+
 ## Answer accuracy against planted truth: the noise was the model
 
 Scoring every call against the planted flags at 10,000 documents and

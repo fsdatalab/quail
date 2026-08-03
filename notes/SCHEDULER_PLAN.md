@@ -194,8 +194,16 @@ with policy differences compressed; this is the first measurement of
 100,000 token contexts and of pins that large, and it closes the
 single query story across document lengths.
 
-Priority four, the persisted notes tier (about a week; the only path
-below the read floor). At corpus ingest, read every document once and
+Priority four, the persisted notes tier (the only path below the
+read floor). Milestone one is measured: the engine's own tiering
+store (RAM primary, disk secondary) ran end to end at 2,000
+documents - 53 GB of notes saved during query one, restored after a
+full cache reset for queries two and three. And the break-even
+table's 4B prediction landed as written: restore 20.3 then 18.4
+seconds against 10.5 seconds of plain recompute (the container's
+disk writes 5.2 GB/s against the 5.9 needed), so at 4B the tier
+loses about two to one and stays parked; the case remains the 32B
+tier, bundled below. At corpus ingest, read every document once and
 persist its notes; at query time, stream notes into the card instead
 of re-reading text. The break even rule: the store's bandwidth must
 exceed kappa times the prefill rate, because that is the rate at
