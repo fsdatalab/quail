@@ -67,6 +67,9 @@ class DocEngineScheduler(Scheduler):
         self._de_chain = {}         # request id -> dict(stage, d)
         self._de_strict = os.environ.get(
             "DOCENGINE_SINGLE_TENANT", "1") == "1"
+        print(f"[de-sched] init: strict {self._de_strict}, overlapped "
+              f"scheduling {self.scheduler_config.async_scheduling}",
+              flush=True)
         self._de_plan_evicting = False
         # Core-process profiling: this object lives in the engine core,
         # the one process the client-side profiler cannot see, so the

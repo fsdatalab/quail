@@ -91,11 +91,21 @@ are to the extracted wheel source in the session scratchpad.
   but the finish reason being captured before the hook and sent to
   the client unconditionally. Fixed by judging in the stop check and
   erasing the stop status there (see "Detecting the answer" above).
-- Async scheduling overlap: does not apply. vLLM disables async
-  scheduling whenever the scheduler is a subclass of the plain
-  Scheduler class, which ours is (the engine logs a warning saying
-  exactly this). Sampled tokens are processed at step boundaries
-  where the request is not scheduled.
+- Async scheduling overlap: safe, for a subtler reason than first
+  recorded. The engine's overlap machinery (a two-deep batch queue)
+  keys only on the config flag and runs even with our custom
+  scheduler class; the warning's "async scheduling being disabled"
+  claim is loose wording. What a plain-Scheduler subclass actually
+  loses is decode lookahead: a request whose sampled token is in
+  flight has zero new tokens to schedule and is skipped for a step
+  (the num_new_tokens == 0 path), rather than scheduled ahead
+  against a placeholder. That skip is also exactly why the rewind is
+  safe: a chain request at its stage boundary is never in the
+  in-flight step. Our filter calls sample one token at the end of a
+  prefill chunk and have no decode steps, so decode lookahead is
+  worth nothing here. Reasoning filters, whose thinking tokens are
+  real decode work, are the trigger to subclass AsyncScheduler and
+  make the rewind placeholder-aware.
 - Two smaller findings from the same flight. First, the block at the
   document boundary was cached with question-one content that the
   next question overwrites; the rewind now strips that cache entry.

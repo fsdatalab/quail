@@ -251,7 +251,13 @@ software cost between gated stages); the adaptive mix scheduler
 thinking near document length, memory near 2.5 footprints); multi
 query arbitration (out of scope by product decision); the 100,000
 document demonstration (whenever a headline is wanted); the 32B
-model tier (bundle with the disk KV tier, where it shines).
+model tier (bundle with the disk KV tier, where it shines); decode
+lookahead for the in-engine scheduler, meaning the async scheduler
+base class plus a placeholder-aware rewind (trigger: reasoning
+filters measured on the GPU - today's filter calls sample one token
+per prefill chunk and have no decode steps to look ahead on, and
+the engine's batch-queue overlap already covers the prefill side
+even with our plain subclass).
 
 Standing decisions: prompts are a fixed interface; single tenant;
 one GPU per query; the artificially hard filter accuracy study is

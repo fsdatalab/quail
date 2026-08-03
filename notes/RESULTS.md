@@ -664,11 +664,18 @@ with "r" made every request id suffix parse as a release directive
 and silently swallowed all releases, including the end-of-run flush;
 the id parser now never reads the last field as a directive.
 
-One fact that simplifies the risk picture: vLLM disables its
-overlapped (async) scheduling whenever the scheduler is subclassed
-from the plain scheduler class, which ours is. Answer tokens are
-therefore always processed at a step boundary where the request is
-not scheduled, and the rewind needs no extra guard.
+One fact that simplifies the risk picture, corrected after reading
+the engine's overlap machinery to the bottom: the two-deep batch
+queue that overlaps scheduling with execution runs even with our
+custom scheduler class (it keys only on a config flag). What a
+plain-scheduler subclass loses is decode lookahead - scheduling a
+request's next token before the current one lands. A request whose
+token is in flight is simply skipped for a step, which is exactly
+why the rewind never touches an in-flight request. Our filter calls
+sample one token at the end of a prefill chunk and have no decode
+steps, so the lost lookahead is worth approximately nothing at this
+workload; reasoning filters, with real decode work, are the trigger
+to adopt the async scheduler base and a placeholder-aware rewind.
 
 ## Caveats
 
