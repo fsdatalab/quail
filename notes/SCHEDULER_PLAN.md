@@ -251,10 +251,14 @@ verdict, and truncation rolling back through thinking all get tested
 at once.
 
 Parked, with explicit triggers: the cascade or Hydragen style shared
-prefix kernel (trigger: measured reasoning filters with a material
-attention read share; complementary to truncation, since cascade
-saves note reads within a speculated block while truncation saves
-software cost between gated stages); the adaptive mix scheduler
+prefix kernel (applies whenever several branches in one batch attend
+over the same document notes - which plain one-token speculation
+already does, not only reasoning; the trigger is a regime where that
+shared attention read is a material share of step time: documents
+past the roughly 24,000-token attention crossover run speculatively,
+or reasoning filters with long thinking. Complementary to
+truncation, since cascade saves note reads within a speculated block
+while truncation saves software cost between gated stages); the adaptive mix scheduler
 (trigger: workloads in the proven corner of three plus stages,
 thinking near document length, memory near 2.5 footprints); multi
 query arbitration (out of scope by product decision); the 100,000

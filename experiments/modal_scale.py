@@ -57,6 +57,7 @@ image = (
 hf_cache = modal.Volume.from_name("docengine-hf-cache", create_if_missing=True)
 
 MODEL = "Qwen/Qwen3-4B-FP8"
+MODEL32 = "Qwen/Qwen3-32B-FP8"
 WORKLOAD_SEED = 20260731
 FLAG_SEED = 424242
 CEIL = 275_000            # dense FP8 prefill ceiling, tokens per second
@@ -586,110 +587,6 @@ async def profile_run(n_docs: int = 4000) -> dict:
 
 @app.function(image=image, gpu="H100!", timeout=2400,
               volumes={"/root/.cache/huggingface": hf_cache})
-async def chainprof_run(n_docs: int = 4000) -> dict:
-    """Name where chain mode's extra seconds go. The 10k flight showed
-    chain mode at 56.8 seconds against request mode's 52.4: each
-    continuation (stop, rewind, park, full worker re-sync) costs more
-    than the per-request toll it replaces. This runs both modes on one
-    in-process engine, each under the CPU-clock profiler, and returns
-    ranked tables so the difference has function names."""
-    import gc
-    import inspect
-    import os
-
-    import numpy as np
-    from transformers import AutoTokenizer
-    from vllm import SamplingParams
-
-    try:
-        from vllm.v1.engine.async_llm import AsyncLLM as Engine
-    except ImportError:
-        from vllm import AsyncLLMEngine as Engine
-    try:
-        from vllm.engine.arg_utils import AsyncEngineArgs
-    except ImportError:
-        from vllm import AsyncEngineArgs
-
-    from docengine.runtime.engine_client import (EngineTags,
-                                                 run_filter_chain,
-                                                 run_filter_chain_engine)
-
-    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    n, s = 4, 0.8
-    docs = _build_pool(n_docs)
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
-    rng = np.random.default_rng(FLAG_SEED + 7)
-    flags = (rng.random((len(docs), n)) < s).astype(int)
-    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
-    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
-    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
-             for j in range(n)]
-    yes_ids = set()
-    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
-        ids = tok(w, add_special_tokens=False)["input_ids"]
-        if ids:
-            yes_ids.add(ids[0])
-
-    engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
-        gpu_memory_utilization=0.92, enable_prefix_caching=True,
-        disable_log_stats=True, scheduling_policy="priority",
-        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
-
-    async def reset_cache():
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
-
-    import yappi
-    yappi.set_clock_type("cpu")
-
-    def table():
-        rows = []
-        for st in yappi.get_func_stats():
-            rows.append(dict(fn=f"{st.module.split('/')[-1]}:{st.name}",
-                             self_s=st.tsub, total_s=st.ttot,
-                             calls=st.ncall))
-        rows.sort(key=lambda r: -r["self_s"])
-        return rows
-
-    report = dict(n_docs=n_docs)
-    for mode in ("request", "chain"):
-        await reset_cache()
-        gc.collect()
-        yappi.clear_stats()
-        yappi.start()
-        if mode == "request":
-            out = await run_filter_chain(
-                engine, sp, body_ids, q_ids, budget_tokens=830_000,
-                lookahead=1, tag="cpa", tags=EngineTags(),
-                use_priority=True)
-        else:
-            out = await run_filter_chain_engine(
-                engine, sp, body_ids, q_ids, 830_000, yes_ids, tag="cpb")
-        yappi.stop()
-        rows = table()
-        total_cpu = sum(r["self_s"] for r in rows) or 1.0
-        report[mode] = dict(wall=out["wall"], requests=out["requests"],
-                            total_cpu_s=total_cpu, top=rows[:60])
-        print(f"[chainprof] {mode} mode: {out['wall']:.2f}s wall, "
-              f"{out['requests']} requests, total CPU {total_cpu:.1f}s",
-              flush=True)
-        for r in rows[:30]:
-            print(f"[chainprof] {mode} {100 * r['self_s'] / total_cpu:5.1f}% "
-                  f"{r['self_s']:7.2f}s self {r['calls']:>9} calls  "
-                  f"{r['fn'][:80]}", flush=True)
-    try:
-        engine.shutdown()
-    except Exception:
-        pass
-    return report
-
-
-@app.function(image=image, gpu="H100!", timeout=2400,
-              volumes={"/root/.cache/huggingface": hf_cache})
 async def persist_run(n_docs: int = 2000) -> dict:
     """Persisted-notes tier, milestone one: the same query repeated on
     one engine with a two-tier note store (RAM primary, container-local
@@ -846,6 +743,154 @@ async def persist_run(n_docs: int = 2000) -> dict:
     print(f"[persist] disk holds {b1 / 1e9:.1f} GB after query one, "
           f"{b3 / 1e9:.1f} GB at end; outcomes identical: "
           f"{report['outcomes_identical']}", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return report
+
+
+@app.function(image=image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def model32_run(n_docs: int = 1000) -> dict:
+    """The physical operators on the 32B tier, 1,000 documents, four
+    filters at 0.8. Everything measured so far is the 4B model; the
+    32B changes the constants that decide every tradeoff (prefill
+    about eight times slower, notes 128 KB per token, so the corpus
+    slightly overflows the pool and memory policy matters). Four arms:
+    stage-major gated waves and the naive streaming client on a stock
+    engine, then ranked pinned requests and chain mode on the strict
+    in-engine scheduler. All arms scored against planted truth."""
+    import asyncio
+    import gc
+    import inspect
+    import os
+    import time as _time
+
+    import numpy as np
+    import torch
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import (EngineTags,
+                                                 run_filter_chain,
+                                                 run_filter_chain_engine)
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    docs = _build_pool(n_docs)
+    tok = AutoTokenizer.from_pretrained(MODEL32)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
+    n, s = 4, 0.8
+    rng = np.random.default_rng(FLAG_SEED + 7)
+    flags = (rng.random((len(docs), n)) < s).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(n)]
+    yes_ids = set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            yes_ids.add(ids[0])
+    corpus = sum(len(b) for b in body_ids)
+    report = dict(n_docs=n_docs, n_filters=n, s=s, model=MODEL32,
+                  corpus_tokens=int(corpus))
+    print(f"[m32] corpus {corpus} tokens across {n_docs} documents",
+          flush=True)
+
+    def make_engine(ours):
+        kw = dict(model=MODEL32, kv_cache_dtype="fp8", max_model_len=4608,
+                  gpu_memory_utilization=0.92, enable_prefix_caching=True,
+                  disable_log_stats=True)
+        if ours:
+            kw.update(scheduling_policy="priority",
+                      scheduler_cls="docengine.engineext.scheduler."
+                                    "DocEngineScheduler")
+        return Engine.from_engine_args(AsyncEngineArgs(**kw))
+
+    async def reset(engine):
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    async def wave_arm(engine):
+        """Stage-major gated waves: every living document is asked the
+        current stage's question as one burst, survivors advance."""
+        alive = list(range(len(body_ids)))
+        answers = {}
+        counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
+        t0 = _time.time()
+        for j in range(n):
+            async def one(i, jj=j):
+                final = None
+                async for out in engine.generate(
+                        {"prompt_token_ids": body_ids[i] + q_ids[jj]},
+                        sp, f"m32w-{i}-{jj}"):
+                    final = out
+                counters["requests"] += 1
+                counters["prompt_tokens"] += len(final.prompt_token_ids)
+                counters["cached_tokens"] += (
+                    getattr(final, "num_cached_tokens", 0) or 0)
+                txt = final.outputs[0].text.strip().upper()
+                answers[(i, jj + 1)] = 1 if txt.startswith("Y") else 0
+            await asyncio.gather(*[one(i) for i in alive])
+            alive = [i for i in alive if answers[(i, j + 1)]]
+        return dict(wall=_time.time() - t0, survivors=sorted(alive),
+                    answers=answers, **counters)
+
+    def wrong(res):
+        return sum(1 for k, v in res["answers"].items()
+                   if v != flags[k[0]][k[1] - 1])
+
+    def bank(name, res):
+        mult = (res["prompt_tokens"] - res["cached_tokens"]) / corpus
+        report[name] = dict(wall=round(res["wall"], 2),
+                            requests=res["requests"],
+                            read_multiplier=round(mult, 2),
+                            survivors=len(res["survivors"]),
+                            survivor_ids=res["survivors"],
+                            wrong=wrong(res))
+        print(f"[m32] {name}: {res['wall']:.2f}s, {res['requests']} "
+              f"requests, reads {mult:.2f}x corpus, "
+              f"{len(res['survivors'])} survivors, wrong "
+              f"{wrong(res)}/{len(res['answers'])}", flush=True)
+
+    engine = make_engine(ours=False)
+    bank("task_waves", await wave_arm(engine))
+    await reset(engine)
+    r = await run_filter_chain(engine, sp, body_ids, q_ids,
+                               budget_tokens=10 ** 9, lookahead=1,
+                               tag="m32n")
+    bank("doc_naive", r)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+    _time.sleep(8)
+
+    engine = make_engine(ours=True)
+    r = await run_filter_chain(engine, sp, body_ids, q_ids,
+                               budget_tokens=200_000, lookahead=1,
+                               tag="m32r", tags=EngineTags(),
+                               use_priority=True)
+    bank("request_ranked", r)
+    await reset(engine)
+    r = await run_filter_chain_engine(engine, sp, body_ids, q_ids,
+                                      200_000, yes_ids, tag="m32c")
+    r.pop("doc0_raw", None)
+    bank("chain", r)
     try:
         engine.shutdown()
     except Exception:
@@ -1731,9 +1776,6 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "chain10k":
         data = chain_run.remote(n_docs or 10000, 4, 0.8)
         path = out or "results/engine/chain10k.json"
-    elif phase == "chainprof":
-        data = chainprof_run.remote(n_docs or 4000)
-        path = out or "results/engine/chainprof.json"
     elif phase == "chaincore":
         data = chain_run.remote(n_docs or 10000, 4, 0.8, 1)
         path = out or "results/engine/chaincore10k.json"
@@ -1749,6 +1791,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "persist":
         data = persist_run.remote(n_docs or 2000)
         path = out or "results/engine/persist2000.json"
+    elif phase == "model32":
+        data = model32_run.remote(n_docs or 1000)
+        path = out or "results/engine/model32_1k.json"
     elif phase == "longchain":
         data = longchain_run.remote()
         path = out or "results/engine/longchain.json"

@@ -236,7 +236,6 @@ class DocEngineScheduler(Scheduler):
         if st is not None and stopped:
             out = request._output_token_ids
             tok = out[-1] if out else None
-            st["tok"] = tok
             st["advance"] = (tok in self._de_yes
                              and st["stage"] < len(self._de_questions))
             if st["advance"]:
@@ -254,10 +253,6 @@ class DocEngineScheduler(Scheduler):
             return super()._handle_stopped_request(request)
         self._de_stats["chain_stops"] = (
             self._de_stats.get("chain_stops", 0) + 1)
-        if self._de_stats["chain_stops"] <= 6:
-            print(f"[de-sched] chain stop {request.request_id}: stage "
-                  f"{st['stage']}, token {st.get('tok')}, "
-                  f"advance {st.get('advance')}", flush=True)
         if not st.get("advance"):
             del self._de_chain[request.request_id]
             self._de_stats["chain_done"] = (
