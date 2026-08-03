@@ -36,11 +36,16 @@ from vllm.v1.request import RequestStatus, StreamingUpdate
 
 
 def parse_tag(request_id):
-    """Return (pin_tokens, doc_key, releases) for a tagged id, else None."""
+    """Return (pin_tokens, doc_key, releases) for a tagged id, else None.
+
+    The last field is the free-text suffix and is never read as a
+    directive: a suffix that happens to start with p, d, or r must not
+    shadow a real directive (a tag like "rm" once swallowed every
+    release, including the end-of-run flush)."""
     if not request_id.startswith("de1|"):
         return None
     pin, doc, rel = 0, None, []
-    for part in request_id.split("|")[1:]:
+    for part in request_id.split("|")[1:-1]:
         if part.startswith("p") and part[1:].isdigit():
             pin = int(part[1:])
         elif part.startswith("d") and len(part) > 1:
