@@ -197,6 +197,8 @@ def custom_smoke(
         enforce_eager=True,
         disable_log_stats=True,
         attention_backend="FLASHINFER",
+        max_num_batched_tokens=16_384,
+        max_num_seqs=1_024,
     ).create_engine_config()
     executor, kv_config = initialize_model_executor(vllm_config)
     page_size = vllm_config.cache_config.block_size
