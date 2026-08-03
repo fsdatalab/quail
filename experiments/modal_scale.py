@@ -804,6 +804,25 @@ async def persist_run(n_docs: int = 2000) -> dict:
     torch.cuda.empty_cache()
     _time.sleep(8)
 
+    # The store's shared region pre-faults its pages with
+    # MADV_POPULATE_WRITE, which this sandbox does not implement
+    # (EINVAL). Pre-faulting is an optimization only - pages fault in
+    # lazily without it - so run the store engine's core in-process
+    # (the client cannot patch a separate process) and swallow the
+    # unsupported call. The baseline above ran out-of-process; the
+    # profile phase measured that difference at about zero.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    import mmap as _mmap
+
+    class _TolerantMmap(_mmap.mmap):
+        def madvise(self, *a, **kw):
+            try:
+                return super().madvise(*a, **kw)
+            except OSError:
+                return None
+
+    _mmap.mmap = _TolerantMmap
+
     engine = Engine.from_engine_args(engine_args(store=True))
     q1 = await one_query(engine, "ps1")
     _time.sleep(8)                     # let offload writes drain
