@@ -87,6 +87,7 @@ def custom_smoke(
     n_docs: int = 8,
     n_filters: int = 2,
     k: int = 1,
+    document_tokens: int = 0,
 ) -> dict:
     import numpy as np
     import torch
@@ -112,7 +113,7 @@ def custom_smoke(
         initialize_model_executor,
     )
 
-    documents = _documents(n_docs)
+    documents = _documents(n_docs if not document_tokens else 10_000)
     labels_array = (
         np.random.default_rng(GROUND_TRUTH_SEED)
         .random((n_docs, n_filters)) < 0.8
@@ -125,6 +126,25 @@ def custom_smoke(
         MODEL,
         revision=MODEL_REVISION,
     )
+    if document_tokens:
+        lengths = tokenizer(
+            documents,
+            add_special_tokens=False,
+        )["input_ids"]
+        resized = []
+        cursor = 0
+        for _ in range(n_docs):
+            parts = []
+            total = 0
+            while total < document_tokens - 400:
+                index = cursor % len(documents)
+                parts.append(documents[index])
+                total += len(lengths[index]) + 2
+                cursor += 1
+            resized.append("\n\n".join(parts))
+        documents = resized
+    else:
+        documents = documents[:n_docs]
     body_ids = tokenizer(
         bodies,
         add_special_tokens=False,
@@ -157,7 +177,7 @@ def custom_smoke(
         revision=MODEL_REVISION,
         kv_cache_dtype="fp8",
         gpu_memory_utilization=0.90,
-        max_model_len=4608,
+        max_model_len=max(4608, document_tokens + 1024),
         enforce_eager=True,
         disable_log_stats=True,
         attention_backend="FLASHINFER",
@@ -206,6 +226,7 @@ def custom_smoke(
         "n_docs": n_docs,
         "n_filters": n_filters,
         "k": k,
+        "target_document_tokens": document_tokens,
         "model": MODEL,
         "model_revision": MODEL_REVISION,
         "dataset_revision": DATASET_REVISION,
@@ -253,6 +274,7 @@ def main(
     n_docs: int = 8,
     n_filters: int = 2,
     k: int = 1,
+    document_tokens: int = 0,
     out: str = "results/runs",
 ):
     import sys
@@ -261,10 +283,15 @@ def main(
 
     if phase != "custom-smoke":
         raise SystemExit(f"unknown phase {phase}")
-    data = custom_smoke.remote(n_docs, n_filters, k)
+    data = custom_smoke.remote(n_docs, n_filters, k, document_tokens)
     metadata = RunMetadata.create(
         phase=phase,
-        config={"n_docs": n_docs, "n_filters": n_filters, "k": k},
+        config={
+            "n_docs": n_docs,
+            "n_filters": n_filters,
+            "k": k,
+            "document_tokens": document_tokens,
+        },
         seeds={
             "workload": WORKLOAD_SEED,
             "ground_truth": GROUND_TRUTH_SEED,
