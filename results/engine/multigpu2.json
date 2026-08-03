@@ -1,0 +1,1 @@
+{"gpus": 2, "n_docs": 10000, "makespan": 25.303746461868286, "walls": [25.3, 25.21], "survivors": 3523, "per_worker": [{"widx": 0, "n": 4999, "tokens": 1582453, "requests": 4999, "wall": 25.3}, {"widx": 1, "n": 5001, "tokens": 1582491, "requests": 5001, "wall": 25.21}]}
