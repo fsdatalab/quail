@@ -677,6 +677,36 @@ steps, so the lost lookahead is worth approximately nothing at this
 workload; reasoning filters, with real decode work, are the trigger
 to adopt the async scheduler base and a placeholder-aware rewind.
 
+## Answer accuracy against planted truth: the noise was the model
+
+Scoring every call against the planted flags at 10,000 documents and
+four filters (ideal: 4,096 surviving documents) overturned the
+working assumption that 8-bit notes cost about a percent of answers:
+
+- Shipping fp8, scale 1.0: 2,929 of 23,904 calls wrong (12.3
+  percent), 3,524 survivors. The most accurate configuration.
+- Runtime-calibrated fp8: 3,371 of 22,869 wrong (14.7 percent),
+  3,167 survivors. The deprecated calibration path computes scales
+  from whatever runs first, which is not representative data.
+- Full-precision (bf16) notes: 3,979 of 21,635 wrong (18.4 percent),
+  2,615 survivors, and half the memory pool. Moving the attention
+  numerics away from what this fp8-quantized checkpoint was tuned
+  for hurts rather than helps.
+
+Two facts frame this. First, request mode and chain mode produce
+identical wrong sets under every precision (two borderline flips in
+roughly 24,000 calls, direction varying run to run): the scheduler
+machinery is precision-independent and bit-faithful; the misreads
+are the model's reading accuracy on this task, visible since the
+first 2,000-document grids as the 0.92 per-call agreement. Second,
+the earlier "two misreads in 23,904" statement was mode agreement,
+not accuracy - the truth scoring did not exist yet.
+
+Decision: ship fp8 with scale 1.0 - most accurate of the three and
+the full 981k-token pool. The remaining accuracy lever is a
+checkpoint calibrated offline on representative data (or a stronger
+model), a model artifact question, not an engine one.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
