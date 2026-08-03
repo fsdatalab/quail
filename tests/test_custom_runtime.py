@@ -64,7 +64,7 @@ def query():
     )
 
 
-def runtime(speculation_k=1, trace=None):
+def runtime(speculation_k=1, trace=None, short_circuit=True):
     q = query()
     outcomes = [
         [1, 1],
@@ -87,6 +87,7 @@ def runtime(speculation_k=1, trace=None):
         ),
         trace=trace,
         speculation_k=speculation_k,
+        short_circuit=short_circuit,
     )
     return engine, runner
 
@@ -132,3 +133,11 @@ def test_hot_path_does_not_deepcopy(monkeypatch):
     monkeypatch.setattr(copy, "deepcopy", fail)
     engine, _runner = runtime()
     assert engine.run().survivors == (0,)
+
+
+def test_forced_work_runs_filters_after_false_answer():
+    engine, _runner = runtime(short_circuit=False)
+    result = engine.run()
+    assert result.answers[(2, 1)] == 0
+    assert result.answers[(2, 2)] == 1
+    assert result.rejected == (1, 2)

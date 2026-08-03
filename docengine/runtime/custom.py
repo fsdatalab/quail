@@ -92,6 +92,7 @@ class DocEngineRuntime:
         planner: RuntimeBatchPlanner | None = None,
         speculation_k: int = 1,
         filter_temporary_bytes_per_token: int | None = None,
+        short_circuit: bool = True,
     ):
         query.validate()
         if speculation_k <= 0:
@@ -103,6 +104,7 @@ class DocEngineRuntime:
         self.trace = trace or TraceRecorder()
         self.planner = planner
         self.speculation_k = int(speculation_k)
+        self.short_circuit = bool(short_circuit)
         self.filter_temporary_bytes_per_token = int(
             filter_temporary_bytes_per_token or kv.bytes_per_token
         )
@@ -303,17 +305,20 @@ class DocEngineRuntime:
             for answer in returned:
                 value = int(answer)
                 state.answers.append(value)
-                if value and passed == len(state.answers) - state.stage - 1:
+                if value:
                     passed += 1
-                else:
+                elif self.short_circuit:
                     break
-            if passed < chunk.k:
+            if self.short_circuit and passed < chunk.k:
                 state.status = DocumentStatus.REJECTED
                 self.kv.free(state.kv_owner)
                 continue
             state.stage += chunk.k
             if state.stage >= self.query.n_filters:
-                state.status = DocumentStatus.PASSED
+                state.status = (
+                    DocumentStatus.PASSED
+                    if all(state.answers) else DocumentStatus.REJECTED
+                )
                 self.kv.free(state.kv_owner)
 
     def _record_trace(

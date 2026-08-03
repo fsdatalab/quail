@@ -77,6 +77,27 @@ def _question(stage):
     )
 
 
+def _resize_documents(documents, tokenizer, n_docs, target_tokens):
+    if not target_tokens:
+        return documents[:n_docs]
+    lengths = tokenizer(
+        documents,
+        add_special_tokens=False,
+    )["input_ids"]
+    resized = []
+    cursor = 0
+    for _ in range(n_docs):
+        parts = []
+        total = 0
+        while total < target_tokens - 400:
+            index = cursor % len(documents)
+            parts.append(documents[index])
+            total += len(lengths[index]) + 2
+            cursor += 1
+        resized.append("\n\n".join(parts))
+    return resized
+
+
 @app.function(
     image=image,
     gpu="H100!",
@@ -88,6 +109,7 @@ def custom_smoke(
     n_filters: int = 2,
     k: int = 1,
     document_tokens: int = 0,
+    short_circuit: bool = True,
 ) -> dict:
     import numpy as np
     import torch
@@ -126,25 +148,12 @@ def custom_smoke(
         MODEL,
         revision=MODEL_REVISION,
     )
-    if document_tokens:
-        lengths = tokenizer(
-            documents,
-            add_special_tokens=False,
-        )["input_ids"]
-        resized = []
-        cursor = 0
-        for _ in range(n_docs):
-            parts = []
-            total = 0
-            while total < document_tokens - 400:
-                index = cursor % len(documents)
-                parts.append(documents[index])
-                total += len(lengths[index]) + 2
-                cursor += 1
-            resized.append("\n\n".join(parts))
-        documents = resized
-    else:
-        documents = documents[:n_docs]
+    documents = _resize_documents(
+        documents,
+        tokenizer,
+        n_docs,
+        document_tokens,
+    )
     body_ids = tokenizer(
         bodies,
         add_special_tokens=False,
@@ -213,6 +222,7 @@ def custom_smoke(
         kv=kv,
         trace=trace,
         speculation_k=k,
+        short_circuit=short_circuit,
     )
     result = runtime.run()
     evaluation = evaluate_answers(result.answers, ground_truth)
@@ -227,6 +237,7 @@ def custom_smoke(
         "n_filters": n_filters,
         "k": k,
         "target_document_tokens": document_tokens,
+        "short_circuit": short_circuit,
         "model": MODEL,
         "model_revision": MODEL_REVISION,
         "dataset_revision": DATASET_REVISION,
@@ -268,6 +279,141 @@ def custom_smoke(
     }
 
 
+@app.function(
+    image=image,
+    gpu="H100!",
+    timeout=3600,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+async def stock_smoke(
+    n_docs: int = 8,
+    n_filters: int = 2,
+    document_tokens: int = 0,
+    short_circuit: bool = True,
+) -> dict:
+    import asyncio
+    import time
+
+    import numpy as np
+    import torch
+    from transformers import AutoTokenizer
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    documents = _documents(n_docs if not document_tokens else 10_000)
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL,
+        revision=MODEL_REVISION,
+    )
+    documents = _resize_documents(
+        documents,
+        tokenizer,
+        n_docs,
+        document_tokens,
+    )
+    labels_array = (
+        np.random.default_rng(GROUND_TRUTH_SEED)
+        .random((n_docs, n_filters)) < 0.8
+    ).astype(int)
+    bodies = [
+        document + _flags_line(flags)
+        for document, flags in zip(documents, labels_array)
+    ]
+    body_ids = tokenizer(
+        bodies,
+        add_special_tokens=False,
+    )["input_ids"]
+    question_ids = [
+        tokenizer(
+            _question(stage + 1),
+            add_special_tokens=False,
+        )["input_ids"]
+        for stage in range(n_filters)
+    ]
+    engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
+        model=MODEL,
+        revision=MODEL_REVISION,
+        kv_cache_dtype="fp8",
+        gpu_memory_utilization=0.90,
+        max_model_len=max(4608, document_tokens + 1024),
+        enforce_eager=True,
+        disable_log_stats=True,
+        enable_prefix_caching=True,
+        attention_backend="FLASHINFER",
+    ))
+    sampling = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+        skip_clone=True,
+    )
+    answers = {}
+
+    async def ask(document, stage):
+        final = None
+        prompt = {
+            "prompt_token_ids": (
+                body_ids[document] + question_ids[stage]
+            )
+        }
+        async for output in engine.generate(
+            prompt,
+            sampling,
+            f"stock-{document}-{stage}",
+        ):
+            final = output
+        text = final.outputs[0].text.strip().upper()
+        return 1 if text.startswith("Y") else 0
+
+    async def document_chain(document):
+        for stage in range(n_filters):
+            answer = await ask(document, stage)
+            answers[(document, stage + 1)] = answer
+            if short_circuit and not answer:
+                break
+
+    started = time.perf_counter_ns()
+    await asyncio.gather(*[
+        document_chain(document)
+        for document in range(n_docs)
+    ])
+    ended = time.perf_counter_ns()
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    attempted = len(answers)
+    correct = sum(
+        answer == labels_array[document][stage - 1]
+        for (document, stage), answer in answers.items()
+    )
+    properties = torch.cuda.get_device_properties(0)
+    return {
+        "phase": "stock-smoke",
+        "n_docs": n_docs,
+        "n_filters": n_filters,
+        "target_document_tokens": document_tokens,
+        "short_circuit": short_circuit,
+        "wall_ns": ended - started,
+        "answers": {
+            f"{document},{stage}": answer
+            for (document, stage), answer in answers.items()
+        },
+        "accuracy": correct / attempted if attempted else 0.0,
+        "ground_truth_used_by_runtime": False,
+        "gpu": {
+            "name": properties.name,
+            "total_memory": properties.total_memory,
+            "compute_capability": [
+                properties.major,
+                properties.minor,
+            ],
+        },
+        "cache_reset_confirmed": True,
+        "vllm_version": __import__("vllm").__version__,
+    }
+
+
 @app.local_entrypoint()
 def main(
     phase: str = "custom-smoke",
@@ -275,15 +421,49 @@ def main(
     n_filters: int = 2,
     k: int = 1,
     document_tokens: int = 0,
+    short_circuit: bool = True,
     out: str = "results/runs",
 ):
     import sys
 
     from docengine.runtime.artifacts import RunMetadata, write_run_artifact
 
-    if phase != "custom-smoke":
+    if phase == "custom-smoke":
+        data = custom_smoke.remote(
+            n_docs,
+            n_filters,
+            k,
+            document_tokens,
+            short_circuit,
+        )
+    elif phase == "stock-smoke":
+        data = stock_smoke.remote(
+            n_docs,
+            n_filters,
+            document_tokens,
+            short_circuit,
+        )
+    elif phase == "packing-compare":
+        custom_handle = custom_smoke.spawn(
+            n_docs,
+            n_filters,
+            1,
+            document_tokens,
+            False,
+        )
+        stock_handle = stock_smoke.spawn(
+            n_docs,
+            n_filters,
+            document_tokens,
+            False,
+        )
+        data = {
+            "phase": phase,
+            "custom": custom_handle.get(),
+            "stock": stock_handle.get(),
+        }
+    else:
         raise SystemExit(f"unknown phase {phase}")
-    data = custom_smoke.remote(n_docs, n_filters, k, document_tokens)
     metadata = RunMetadata.create(
         phase=phase,
         config={
@@ -291,6 +471,7 @@ def main(
             "n_filters": n_filters,
             "k": k,
             "document_tokens": document_tokens,
+            "short_circuit": short_circuit,
         },
         seeds={
             "workload": WORKLOAD_SEED,
@@ -298,7 +479,10 @@ def main(
         },
         model_revision=MODEL_REVISION,
         dataset_revision=DATASET_REVISION,
-        gpu=data["gpu"],
+        gpu=(
+            data.get("gpu")
+            or data.get("custom", {}).get("gpu", {})
+        ),
         cache_reset_confirmed=True,
         command=tuple(sys.argv),
     )
