@@ -817,8 +817,10 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
                                                  run_filter_chain_engine)
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
-    if profile_core:
+    if profile_core == 1:
         os.environ["DOCENGINE_PROFILE"] = "1"
+    elif profile_core == 2:
+        os.environ["DOCENGINE_STEPSTATS"] = "1"
     docs = _build_pool(n_docs)
     engine = Engine.from_engine_args(AsyncEngineArgs(
         model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
@@ -1428,6 +1430,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "chaincore":
         data = chain_run.remote(n_docs or 10000, 4, 0.8, 1)
         path = out or "results/engine/chaincore10k.json"
+    elif phase == "chainsteps":
+        data = chain_run.remote(n_docs or 10000, 4, 0.8, 2)
+        path = out or "results/engine/chainsteps10k.json"
     elif phase == "profile":
         data = profile_run.remote(n_docs or 4000)
         path = out or "results/engine/profile.json"

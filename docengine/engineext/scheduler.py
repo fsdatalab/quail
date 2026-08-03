@@ -76,6 +76,10 @@ class DocEngineScheduler(Scheduler):
             import yappi
             yappi.set_clock_type("cpu")
             yappi.start()
+        # Step recorder: near-zero overhead, for finding where wall
+        # time goes when CPU profiling says CPU is not the problem.
+        self._de_steps = ([] if os.environ.get(
+            "DOCENGINE_STEPSTATS", "0") == "1" else None)
         self._de_stats = dict(pinned=0, released=0, blocks=0,
                               foreign_rejected=0, heuristic_evictions=0)
 
@@ -95,9 +99,36 @@ class DocEngineScheduler(Scheduler):
 
         pool._maybe_evict_cached_block = guarded
 
+    def schedule(self):
+        out = super().schedule()
+        if self._de_steps is not None:
+            import time
+            self._de_steps.append((time.monotonic(),
+                                   out.total_num_scheduled_tokens))
+        return out
+
+    def _de_dump_steps(self, label):
+        steps = self._de_steps
+        if not steps:
+            return
+        self._de_steps = []
+        times = [t for t, _tok in steps]
+        toks = [tok for _t, tok in steps]
+        span = times[-1] - times[0] if len(times) > 1 else 0.0
+        gaps = sorted((times[i + 1] - times[i], times[i] - times[0])
+                      for i in range(len(times) - 1))[-5:]
+        small = sum(1 for tok in toks if tok < 2048)
+        print(f"[de-steps] {label}: {len(steps)} steps over {span:.2f}s, "
+              f"{sum(toks)} tokens, mean {sum(toks) / len(toks):.0f} "
+              f"tokens/step, {small} steps under 2048 tokens", flush=True)
+        for gap, at in reversed(gaps):
+            print(f"[de-steps] {label} gap {gap * 1000:.0f}ms at "
+                  f"t={at:.2f}s", flush=True)
+
     def _de_dump_profile(self, label):
         """Print the core process's CPU table since the last dump (or
         since the first request), then restart the counters."""
+        self._de_dump_steps(label)
         if not self._de_prof:
             return
         import yappi
