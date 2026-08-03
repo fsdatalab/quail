@@ -118,6 +118,7 @@ def custom_smoke(
 
     if debug_sync:
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if k > 1 else "0"
     import numpy as np
     import torch
     from transformers import AutoTokenizer
