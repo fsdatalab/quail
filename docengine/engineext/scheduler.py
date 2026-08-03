@@ -99,8 +99,8 @@ class DocEngineScheduler(Scheduler):
 
         pool._maybe_evict_cached_block = guarded
 
-    def schedule(self):
-        out = super().schedule()
+    def schedule(self, *args, **kwargs):
+        out = super().schedule(*args, **kwargs)
         if self._de_steps is not None:
             import time
             self._de_steps.append((time.monotonic(),
