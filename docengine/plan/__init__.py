@@ -1,3 +1,3 @@
 """The declarative layer: typed plans and the optimizer."""
-from .planner import (Corpus, Device, Plan, Store,  # noqa: F401
+from .planner import (CorpusStats, Plan, StoreSpec,  # noqa: F401
                       plan_query)
