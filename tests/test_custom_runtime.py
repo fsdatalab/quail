@@ -113,7 +113,7 @@ def test_runtime_continuously_packs_variable_length_work():
     assert any(
         chunk.new_tokens < 20
         for chunk in runner.calls
-        if chunk.kind is WorkKind.PREFILL
+        if chunk.kind is WorkKind.INITIAL_FILTER
         and chunk.document_id == 1
     )
 
