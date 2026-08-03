@@ -938,6 +938,68 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
     return report
 
 
+@app.function(image=image, gpu="H100!", timeout=2400,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def shard_worker(gpus: int, widx: int, n_docs: int = 10000) -> dict:
+    """One worker of a planner-sharded multi-GPU query. Every worker
+    computes the same deterministic plan (same pool, same tokenizer,
+    same planner), takes its own shard, and runs chain mode on it; no
+    data moves between workers because documents are independent."""
+    import os
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    from vllm.engine.arg_utils import AsyncEngineArgs
+
+    from docengine.configs import DEVICES, MODELS
+    from docengine.planner import plan_query
+    from docengine.runtime.engine_client import run_filter_chain_engine
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    docs = _build_pool(n_docs)
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
+    n, s = 4, 0.8
+    rng = np.random.default_rng(FLAG_SEED + 7)
+    flags = (rng.random((len(docs), n)) < s).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(n)]
+    yes_ids = set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            yes_ids.add(ids[0])
+
+    plan = plan_query(n, [len(b) for b in body_ids],
+                      MODELS["Qwen3-4B-FP8"], DEVICES["H100-SXM-80GB"],
+                      gpus=gpus, selectivity=s)
+    mine = list(plan.shards[widx])
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True, scheduling_policy="priority",
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
+    res = await run_filter_chain_engine(
+        engine, sp, [body_ids[i] for i in mine], q_ids,
+        plan.budget_tokens, yes_ids, tag=f"mg{widx}")
+    print(f"[shard {widx}/{gpus}] {len(mine)} docs, "
+          f"{sum(len(body_ids[i]) for i in mine)} tokens, "
+          f"{res['wall']:.2f}s", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return dict(widx=widx, wall=res["wall"], n=len(mine),
+                tokens=int(sum(len(body_ids[i]) for i in mine)),
+                requests=res["requests"],
+                survivors=sorted(mine[i] for i in res["survivors"]))
+
+
 # ------------------------------------------------------ long documents
 
 @app.function(image=image, gpu="H100!", timeout=3600,
@@ -1837,6 +1899,24 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "model32probe":
         data = model32_run.remote(n_docs or 16, 1)
         path = out or "results/engine/model32_probe.json"
+    elif phase in ("multigpu2", "multigpu4", "multigpu8"):
+        g = int(phase[len("multigpu"):])
+        nd = n_docs or 10000
+        outs = list(shard_worker.starmap([(g, i, nd) for i in range(g)]))
+        walls = [o["wall"] for o in outs]
+        surv = sorted(x for o in outs for x in o["survivors"])
+        data = dict(gpus=g, n_docs=nd, makespan=max(walls),
+                    walls=[round(w, 2) for w in walls],
+                    survivors=len(surv),
+                    per_worker=[dict(widx=o["widx"], n=o["n"],
+                                     tokens=o["tokens"],
+                                     requests=o["requests"],
+                                     wall=round(o["wall"], 2))
+                                for o in outs])
+        print(f"[multigpu] {g} GPUs: makespan {max(walls):.2f}s, walls "
+              f"{[round(w, 2) for w in walls]}, {len(surv)} survivors",
+              flush=True)
+        path = out or f"results/engine/multigpu{g}.json"
     elif phase == "longchain":
         data = longchain_run.remote()
         path = out or "results/engine/longchain.json"
