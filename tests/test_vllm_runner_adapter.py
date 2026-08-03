@@ -192,3 +192,42 @@ def test_split_prefill_reports_previous_tokens_once(monkeypatch):
     third_prefill = executor.outputs[2].scheduled_cached_reqs
     assert second_prefill.num_computed_tokens == [8]
     assert third_prefill.num_computed_tokens == [16]
+
+
+def test_adapter_batches_multiple_cascade_prefix_groups(monkeypatch):
+    monkeypatch.setattr(vllm_runner, "_scheduler_types", fake_types)
+    query = FilterQuery.from_sequences(
+        body_token_ids=[
+            [1, 2, 3, 4],
+            [11, 12, 13, 14],
+        ],
+        question_token_ids=[[5, 6], [7, 8]],
+        yes_token_ids=[99],
+    )
+    kv = KVPageAllocator(
+        total_pages=16,
+        page_size_tokens=4,
+        bytes_per_token=8,
+    )
+    executor = FakeExecutor()
+    runtime = DocEngineRuntime(
+        query=query,
+        runner=VLLMModelRunner(
+            query=query,
+            kv=kv,
+            model_executor=executor,
+            sampling_params=object(),
+        ),
+        packer=VariableLengthBatchPacker(BatchLimits(
+            max_new_tokens=32,
+            max_sequences=4,
+            max_temporary_bytes=1024,
+        )),
+        kv=kv,
+        speculation_k=2,
+    )
+    result = runtime.run()
+    assert result.survivors == (0, 1)
+    cascade = executor.outputs[1]
+    assert len(cascade.scheduled_new_reqs) == 4
+    assert cascade.num_common_prefix_blocks == [0]

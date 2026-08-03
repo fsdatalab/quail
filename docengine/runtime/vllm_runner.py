@@ -80,102 +80,126 @@ class VLLMModelRunner:
         batch: BatchPlan,
         states: Mapping[int, DocumentState],
     ) -> RunnerOutput:
-        if len(batch.chunks) != 1:
-            raise NotImplementedError(
-                "the first cascade implementation runs one prefix group"
-            )
-        chunk = batch.chunks[0]
-        if chunk.kind is not WorkKind.FUSED_FILTER:
-            raise ValueError("cascade batch contains non-fused work")
-        state = states[chunk.document_id]
-        scheduler_output, req_ids = self._build_cascade_output(chunk, state)
+        from .flashinfer_multigroup import (
+            set_cascade_groups,
+        )
+
+        scheduler_output, work_requests, groups = (
+            self._build_cascade_output(batch, states)
+        )
         started_ns = perf_counter_ns()
-        model_output = self.model_executor.execute_model(scheduler_output)
-        if model_output is None:
-            model_output = self.model_executor.sample_tokens(None)
+        set_cascade_groups(groups)
+        try:
+            model_output = self.model_executor.execute_model(scheduler_output)
+            if model_output is None:
+                model_output = self.model_executor.sample_tokens(None)
+        finally:
+            set_cascade_groups(None)
         ended_ns = perf_counter_ns()
         sampled = dict(
             zip(model_output.req_ids, model_output.sampled_token_ids)
         )
-        answers = []
-        for req_id in req_ids:
-            token_ids = sampled.get(req_id, ())
-            if not token_ids:
-                raise RuntimeError(
-                    f"cascade tail {req_id} returned no answer token"
+        answers = {}
+        finished = []
+        for work_id, req_ids in work_requests.items():
+            work_answers = []
+            for req_id in req_ids:
+                token_ids = sampled.get(req_id, ())
+                if not token_ids:
+                    raise RuntimeError(
+                        f"cascade tail {req_id} returned no answer token"
+                    )
+                work_answers.append(
+                    1 if token_ids[0] in self.query.yes_token_ids else 0
                 )
-            answers.append(
-                1 if token_ids[0] in self.query.yes_token_ids else 0
-            )
-        self._finished_pending.update(req_ids)
+            answers[work_id] = tuple(work_answers)
+            finished.extend(req_ids)
+        self._finished_pending.update(finished)
         return RunnerOutput(
-            answers={chunk.work_id: tuple(answers)},
+            answers=answers,
             started_ns=started_ns,
             ended_ns=ended_ns,
             extra={
                 "vllm_commit": VLLM_COMMIT,
                 "cascade": True,
-                "shared_prefix_tokens": chunk.cached_prefix_tokens,
-                "tails": chunk.k,
+                "prefix_groups": len(batch.chunks),
+                "tails": sum(chunk.k for chunk in batch.chunks),
             },
         )
 
     def _build_cascade_output(
         self,
-        chunk,
-        state: DocumentState,
+        batch: BatchPlan,
+        states: Mapping[int, DocumentState],
     ):
+        from .flashinfer_multigroup import CascadeGroup
+
         (
             CachedRequestData,
             NewRequestData,
             ScheduledEncoderInputStats,
             SchedulerOutput,
         ) = _scheduler_types()
-        allocation = self.kv.allocation(chunk.owner)
-        common_pages = (
-            chunk.cached_prefix_tokens // self.kv.page_size_tokens
-        )
-        shared_pages = list(allocation.page_ids[:common_pages])
-        unique_pages = list(allocation.page_ids[common_pages:])
-        boundary_tokens = (
-            state.body_tokens - chunk.cached_prefix_tokens
-        )
-        req_ids = []
         requests = []
         scheduled = {}
-        page_offset = 0
-        for offset in range(chunk.k):
-            stage = chunk.filter_start + offset
-            question = list(self.query.question_token_ids[stage])
-            tail_tokens = boundary_tokens + len(question)
-            tail_pages = ceil(tail_tokens / self.kv.page_size_tokens)
-            pages = (
-                shared_pages
-                + unique_pages[page_offset:page_offset + tail_pages]
+        work_requests = {}
+        groups = []
+        for chunk in batch.chunks:
+            if chunk.kind is not WorkKind.FUSED_FILTER:
+                raise ValueError("cascade batch contains non-fused work")
+            state = states[chunk.document_id]
+            allocation = self.kv.allocation(chunk.owner)
+            common_pages = (
+                chunk.cached_prefix_tokens // self.kv.page_size_tokens
             )
-            page_offset += tail_pages
-            req_id = f"{chunk.work_id}-tail-{offset}"
-            req_ids.append(req_id)
-            prompt = (
-                list(self.query.body_token_ids[state.document_id])
-                + question
+            shared_pages = list(allocation.page_ids[:common_pages])
+            unique_pages = list(allocation.page_ids[common_pages:])
+            boundary_tokens = (
+                state.body_tokens - chunk.cached_prefix_tokens
             )
-            requests.append(NewRequestData(
-                req_id=req_id,
-                prompt_token_ids=prompt,
-                mm_features=[],
-                sampling_params=self.sampling_params,
-                pooling_params=None,
-                block_ids=self._block_groups(pages),
-                num_computed_tokens=chunk.cached_prefix_tokens,
-                lora_request=None,
-                prompt_embeds=None,
-                prompt_is_token_ids=None,
-                prefill_token_ids=prompt,
+            req_ids = []
+            page_offset = 0
+            for offset in range(chunk.k):
+                stage = chunk.filter_start + offset
+                question = list(self.query.question_token_ids[stage])
+                tail_tokens = boundary_tokens + len(question)
+                tail_pages = ceil(
+                    tail_tokens / self.kv.page_size_tokens
+                )
+                pages = (
+                    shared_pages
+                    + unique_pages[page_offset:page_offset + tail_pages]
+                )
+                page_offset += tail_pages
+                req_id = f"{chunk.work_id}-tail-{offset}"
+                req_ids.append(req_id)
+                prompt = (
+                    list(self.query.body_token_ids[state.document_id])
+                    + question
+                )
+                requests.append(NewRequestData(
+                    req_id=req_id,
+                    prompt_token_ids=prompt,
+                    mm_features=[],
+                    sampling_params=self.sampling_params,
+                    pooling_params=None,
+                    block_ids=self._block_groups(pages),
+                    num_computed_tokens=chunk.cached_prefix_tokens,
+                    lora_request=None,
+                    prompt_embeds=None,
+                    prompt_is_token_ids=None,
+                    prefill_token_ids=prompt,
+                ))
+                scheduled[req_id] = tail_tokens
+            if page_offset != len(unique_pages):
+                raise RuntimeError(
+                    "fused KV pages were not partitioned exactly"
+                )
+            work_requests[chunk.work_id] = req_ids
+            groups.append(CascadeGroup(
+                request_count=chunk.k,
+                shared_blocks=common_pages,
             ))
-            scheduled[req_id] = tail_tokens
-        if page_offset != len(unique_pages):
-            raise RuntimeError("fused KV pages were not partitioned exactly")
         output = SchedulerOutput(
             scheduled_new_reqs=requests,
             scheduled_cached_reqs=CachedRequestData.make_empty(),
@@ -183,7 +207,7 @@ class VLLMModelRunner:
             total_num_scheduled_tokens=sum(scheduled.values()),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[common_pages] * self.kv_cache_groups,
+            num_common_prefix_blocks=[0] * self.kv_cache_groups,
             finished_req_ids=set(self._finished_pending),
             free_encoder_mm_hashes=[],
             scheduled_encoder_input_stats=ScheduledEncoderInputStats(),
@@ -198,7 +222,7 @@ class VLLMModelRunner:
             num_spec_tokens_to_schedule=0,
         )
         self._finished_pending.clear()
-        return output, req_ids
+        return output, work_requests, groups
 
     def _build_scheduler_output(
         self,

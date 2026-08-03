@@ -142,6 +142,11 @@ def custom_smoke(
         VLLMModelRunner,
         initialize_model_executor,
     )
+    if k > 1:
+        from docengine.runtime.flashinfer_multigroup import (
+            install_multigroup_patch,
+        )
+        install_multigroup_patch()
 
     documents = _documents(n_docs if not document_tokens else 10_000)
     tokenizer = AutoTokenizer.from_pretrained(
@@ -226,7 +231,7 @@ def custom_smoke(
         runner=runner,
         packer=VariableLengthBatchPacker(BatchLimits(
             max_new_tokens=16_384,
-            max_sequences=(1 if k > 1 else 1_024),
+            max_sequences=1_024,
             max_temporary_bytes=2 * (1 << 30),
         )),
         kv=kv,
