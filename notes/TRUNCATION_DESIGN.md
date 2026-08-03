@@ -40,13 +40,20 @@ are to the extracted wheel source in the session scratchpad.
   Positions past d inside the retained partial boundary block are
   simply overwritten when the next question computes at those
   positions; the block is private to the request, so this is safe.
-- Detecting the answer: our scheduler subclass sees sampled tokens in
-  update_from_output. A chain request that has produced its stage's
-  answer token is intercepted there, before stop processing can
-  finish it (max_tokens=2 on the request means the engine's own stop
-  check never fires between stages, because each rewind clears the
-  output count; the final stage is finished explicitly by the
-  scheduler).
+- Detecting the answer: each stage runs with max_tokens=1, so the
+  engine's own stop check fires on the answer token. The scheduler
+  judges the token inside that stop check
+  (`_update_request_with_output`). The subtlety, found by the first
+  smoke run: the engine captures the finish reason from the request's
+  status BEFORE the stopped-request hook runs, and sends it to the
+  client even when the hook keeps the request alive — which ends the
+  client's stream mid-chain. So when a stage passes and questions
+  remain, the scheduler erases the stop status right there in the
+  stop check. The captured finish reason is then empty, the client's
+  stream stays open, and the stop path still routes into
+  `_handle_stopped_request`, which rewinds and appends the next
+  question. The final stage (or a failed one) keeps its real finish
+  and closes the stream normally.
 - The gate: the client registers the yes token ids and each stage's
   question token list once per run, via a registration request whose
   prompt tokens carry the question lists separated by a sentinel and
@@ -70,16 +77,24 @@ are to the extracted wheel source in the session scratchpad.
    30k-document k=1 cell unchanged while chain mode replaces the
    pathological k=2.
 
-## Risks, named
+## Risks, named (and how milestone 1 settled them)
 
-- The stop path (request.resumable handling near scheduler.py 1755)
-  may finish a chain request before our intercept in some orderings;
-  milestone 1 exists to find this.
-- Async scheduling overlap means the sampled token for step t is
-  processed while step t+1 may already include the request; the
-  rewind must only be applied at a step boundary where the request is
-  not scheduled, or the request must be held out of scheduling for
-  one step (the session mechanism already tolerates this by parking
-  the request in WAITING).
+- The stop path finishing a chain request before our intercept: this
+  was real, and it was the first flight's bug — not an ordering race
+  but the finish reason being captured before the hook and sent to
+  the client unconditionally. Fixed by judging in the stop check and
+  erasing the stop status there (see "Detecting the answer" above).
+- Async scheduling overlap: does not apply. vLLM disables async
+  scheduling whenever the scheduler is a subclass of the plain
+  Scheduler class, which ours is (the engine logs a warning saying
+  exactly this). Sampled tokens are processed at step boundaries
+  where the request is not scheduled.
+- Two smaller findings from the same flight. First, the block at the
+  document boundary was cached with question-one content that the
+  next question overwrites; the rewind now strips that cache entry.
+  Second, a run tag starting with "r" (or "p", "d") made every
+  request id suffix look like a directive and silently swallowed all
+  releases; the parser now never reads the last id field as a
+  directive.
 - Spec decode, LoRA, and multimodal interactions are out of scope and
   asserted absent for chain requests.
