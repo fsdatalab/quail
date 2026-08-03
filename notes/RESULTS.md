@@ -707,6 +707,47 @@ plan-owned memory is named follow-up work. The sandbox lacks the
 store's page pre-fault call, which is worked around by running the
 engine core in-process and letting pages fault in lazily.
 
+## The 32B tier, first measurement: chain mode at 1.07 times the floor
+
+One thousand documents (323,541 tokens), four filters at 0.8, on
+Qwen3-32B-FP8, where prefill runs at a measured 10,800 tokens per
+second (the plan estimated 9,300) and the corpus slightly overflows
+the memory pool, so memory policy binds. Four arms, one flight:
+
+- Stage-major gated waves (stock engine): 49.5 seconds, reading 1.68
+  times the corpus.
+- Naive streaming client (stock engine): 48.1 seconds, 1.68 reads.
+- Ranked pinned requests (strict scheduler): 54.5 seconds, 1.25
+  reads - fewer reads, more time. Under pool overflow the pins hold
+  memory that blocks admission; holding a document resident until
+  its chain finishes costs more than the re-reads it saves. The pin
+  discipline needs an overflow policy before it ships on this tier.
+- Chain mode: 32.0 seconds, 1.14 reads - 1.07 times the 30-second
+  read floor, and 33 to 41 percent faster than every other arm. One
+  request per document also pays the six-token sampling change only
+  once per stage actually needed.
+
+The read-floor arithmetic that decides everything on this tier: a
+corpus pass costs 30 seconds of compute but its notes are 41 GB, so
+the persisted-notes break-even flips - at the measured 5 GB/s disk,
+restore is about 8 seconds against 30 of recompute, the several-fold
+win the plan projected.
+
+Two protocol findings. The 32B model does not keep the one-token
+answer contract: it restates the flag line (the answer arriving as a
+fused "=YES" token in position four) or chatters, so the gate grew a
+decisive-token mode - register no-tokens alongside yes-tokens, allow
+several tokens per stage, stop at the first decisive one (the 4B
+path is unchanged by construction). With it, chain mode decided
+2,616 calls with only 9 contradicting the planted flags. But about
+ten percent of calls produce no decisive token within six tokens
+(the model chatters before deciding), and an indecisive stage kills
+the chain: every arm lands about 270 survivors against a realized
+truth of 406. The open follow-up is a longer decode budget for the
+indecisive tail (with the early stop, decided calls never pay it) -
+or accepting that a fixed one-line prompt underdetermines a
+reasoning-tuned model's output format.
+
 ## Answer accuracy against planted truth: the noise was the model
 
 Scoring every call against the planted flags at 10,000 documents and

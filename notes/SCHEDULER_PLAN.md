@@ -263,7 +263,15 @@ while truncation saves software cost between gated stages); the adaptive mix sch
 thinking near document length, memory near 2.5 footprints); multi
 query arbitration (out of scope by product decision); the 100,000
 document demonstration (whenever a headline is wanted); the 32B
-model tier (bundle with the disk KV tier, where it shines); decode
+model tier (first measurement done: chain mode 32.0 seconds at 1.07
+times the read floor against 48 to 55 for every other arm at 1,000
+documents, prefill measured 10,800 tokens per second, and the
+persisted-notes break-even flips as projected - 8 seconds of restore
+against 30 of recompute at the measured disk rate. Open before it
+ships: an overflow policy for the pin discipline, which loses to
+churn when the corpus exceeds the pool, and a decode budget for the
+roughly ten percent of calls where the model chatters six tokens
+without deciding); decode
 lookahead for the in-engine scheduler, meaning the async scheduler
 base class plus a placeholder-aware rewind (trigger: reasoning
 filters measured on the GPU - today's filter calls sample one token
