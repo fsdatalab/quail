@@ -752,7 +752,7 @@ async def persist_run(n_docs: int = 2000) -> dict:
 
 @app.function(image=image, gpu="H100!", timeout=3600,
               volumes={"/root/.cache/huggingface": hf_cache})
-async def model32_run(n_docs: int = 1000) -> dict:
+async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
     """The physical operators on the 32B tier, 1,000 documents, four
     filters at 0.8. Everything measured so far is the 4B model; the
     32B changes the constants that decide every tradeoff (prefill
@@ -806,6 +806,35 @@ async def model32_run(n_docs: int = 1000) -> dict:
                   corpus_tokens=int(corpus))
     print(f"[m32] corpus {corpus} tokens across {n_docs} documents",
           flush=True)
+
+    if probe:
+        # First flight answered 69 percent of calls wrong across every
+        # arm including stock vLLM: the 32B model is not emitting
+        # YES/NO as its first token on this raw prompt. Print what it
+        # actually emits so the classification is fixed on evidence.
+        engine = Engine.from_engine_args(AsyncEngineArgs(
+            model=MODEL32, kv_cache_dtype="fp8", max_model_len=4608,
+            gpu_memory_utilization=0.92, enable_prefix_caching=True,
+            disable_log_stats=True))
+        spp = SamplingParams(temperature=0.0, max_tokens=8,
+                             skip_clone=True)
+        outs = {}
+        for i in range(min(4, len(body_ids))):
+            final = None
+            async for out in engine.generate(
+                    {"prompt_token_ids": body_ids[i] + q_ids[0]},
+                    spp, f"m32p-{i}"):
+                final = out
+            o = final.outputs[0]
+            outs[str(i)] = dict(token_ids=list(o.token_ids), text=o.text)
+            print(f"[m32] probe doc {i} (truth {flags[i][0]}): "
+                  f"{list(o.token_ids)} -> {o.text!r}", flush=True)
+        print(f"[m32] yes ids in use: {sorted(yes_ids)}", flush=True)
+        try:
+            engine.shutdown()
+        except Exception:
+            pass
+        return dict(probe=outs, yes_ids=sorted(yes_ids))
 
     def make_engine(ours):
         kw = dict(model=MODEL32, kv_cache_dtype="fp8", max_model_len=4608,
@@ -1794,6 +1823,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "model32":
         data = model32_run.remote(n_docs or 1000)
         path = out or "results/engine/model32_1k.json"
+    elif phase == "model32probe":
+        data = model32_run.remote(n_docs or 16, 1)
+        path = out or "results/engine/model32_probe.json"
     elif phase == "longchain":
         data = longchain_run.remote()
         path = out or "results/engine/longchain.json"
