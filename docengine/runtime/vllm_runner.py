@@ -84,7 +84,6 @@ class VLLMModelRunner:
         cached_output = []
         all_token_ids = {}
         num_scheduled_tokens = {}
-        new_pages_to_zero = []
 
         for chunk in batch.chunks:
             req_id = chunk.work_id
@@ -93,10 +92,6 @@ class VLLMModelRunner:
             block_ids = list(allocation.page_ids)
             computed = chunk.cached_prefix_tokens + chunk.token_start
             num_scheduled_tokens[req_id] = chunk.new_tokens
-            if chunk.kv_pages_added:
-                new_pages_to_zero.extend(
-                    block_ids[-chunk.kv_pages_added:]
-                )
             known = self._known.get(req_id)
             if known is None:
                 sampling = (
@@ -162,7 +157,7 @@ class VLLMModelRunner:
             num_invalid_spec_tokens=None,
             kv_connector_metadata=None,
             ec_connector_metadata=None,
-            new_block_ids_to_zero=sorted(set(new_pages_to_zero)),
+            new_block_ids_to_zero=None,
             kv_cache_block_copies=None,
             num_spec_tokens_to_schedule=0,
         )
