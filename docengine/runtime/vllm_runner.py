@@ -42,6 +42,15 @@ class VLLMModelRunner:
         self._known: dict[str, _KnownRequest] = {}
         self._finished_pending: set[str] = set()
 
+    def flush_finished(self) -> None:
+        if not self._finished_pending:
+            return
+        SchedulerOutput = _scheduler_types()[-1]
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = set(self._finished_pending)
+        self.model_executor.execute_model(output)
+        self._finished_pending.clear()
+
     def execute(
         self,
         batch: BatchPlan,

@@ -208,37 +208,48 @@ def custom_smoke(
     ).create_engine_config()
     executor, kv_config = initialize_model_executor(vllm_config)
     page_size = vllm_config.cache_config.block_size
-    kv = KVPageAllocator(
-        total_pages=kv_config.num_blocks,
-        page_size_tokens=page_size,
-        bytes_per_token=QWEN3_4B_FP8.kappa,
-    )
     sampling = SamplingParams(
         temperature=0.0,
         max_tokens=1,
         skip_clone=True,
     )
-    runner = VLLMModelRunner(
-        query=query,
-        kv=kv,
-        model_executor=executor,
-        sampling_params=sampling,
-        kv_cache_groups=len(kv_config.kv_cache_groups),
-    )
-    trace = TraceRecorder()
-    runtime = DocEngineRuntime(
-        query=query,
-        runner=runner,
-        packer=VariableLengthBatchPacker(BatchLimits(
-            max_new_tokens=16_384,
-            max_sequences=1_024,
-            max_temporary_bytes=2 * (1 << 30),
-        )),
-        kv=kv,
-        trace=trace,
-        speculation_k=k,
-        short_circuit=short_circuit,
-    )
+
+    def make_runtime():
+        kv = KVPageAllocator(
+            total_pages=kv_config.num_blocks,
+            page_size_tokens=page_size,
+            bytes_per_token=QWEN3_4B_FP8.kappa,
+        )
+        runner = VLLMModelRunner(
+            query=query,
+            kv=kv,
+            model_executor=executor,
+            sampling_params=sampling,
+            kv_cache_groups=len(kv_config.kv_cache_groups),
+        )
+        trace = TraceRecorder()
+        runtime = DocEngineRuntime(
+            query=query,
+            runner=runner,
+            packer=VariableLengthBatchPacker(BatchLimits(
+                max_new_tokens=16_384,
+                max_sequences=1_024,
+                max_temporary_bytes=2 * (1 << 30),
+            )),
+            kv=kv,
+            trace=trace,
+            speculation_k=k,
+            short_circuit=short_circuit,
+        )
+        return runner, trace, runtime
+
+    warmup_wall_ns = None
+    if k > 1:
+        warmup_runner, _warmup_trace, warmup_runtime = make_runtime()
+        warmup_result = warmup_runtime.run()
+        warmup_wall_ns = warmup_result.wall_ns
+        warmup_runner.flush_finished()
+    runner, trace, runtime = make_runtime()
     result = runtime.run()
     evaluation = evaluate_answers(result.answers, ground_truth)
     try:
@@ -263,6 +274,7 @@ def custom_smoke(
         "kv_pages": kv_config.num_blocks,
         "steps": result.steps,
         "wall_ns": result.wall_ns,
+        "unreported_warmup_wall_ns": warmup_wall_ns,
         "survivors": list(result.survivors),
         "answers": {
             f"{document},{stage}": answer
