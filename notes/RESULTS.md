@@ -583,6 +583,49 @@ re-profiled table), and with telemetry also off, total CPU falls from
 is headroom for short-step regimes and a clean remaining table, all of
 it per-request machinery that sequence truncation removes wholesale.
 
+## Sequence truncation, milestone one: the chain proof
+
+The build under test: one living engine request per document runs the
+whole filter chain. The client registers the question token lists and
+the yes token ids once; after that the scheduler judges each sampled
+answer in-engine, rolls the sequence back to the document boundary
+(question and answer notes erased, document notes kept), and appends
+the next question through the engine's own session mechanism. One
+request per document instead of one per filter call.
+
+The proof run: 50 documents, two filters, selectivity 0.7 per stage,
+planted flag outcomes, both modes cold. Every pass criterion met:
+
+- Surviving documents identical: 18 in both modes, the same 18.
+- Every shared answer identical: 80 of 80 agree.
+- Requests: 50 in chain mode against 80 in request mode (50 stage-one
+  calls plus 30 stage-two calls).
+- Rewinds: 30, exactly the number of documents that passed stage one.
+- Zero heuristic evictions: the strict single-tenant invariant held
+  through all the rewind block surgery.
+- Wall clock 0.29 seconds in chain mode against 0.32 seconds in
+  request mode at this tiny scale (the corpus is 50 short documents;
+  the real payoff test is the 10,000-document grid, milestone three).
+
+Three bugs found and fixed on the way, all now encoded in the design
+note. First and central: the engine captures the finish reason from
+the request status before the stopped-request hook runs and sends it
+to the client unconditionally, so a mid-chain stage ended the
+client's stream even when the engine continued correctly; the fix
+judges the answer inside the stop check and erases the stop status
+when the chain continues. Second: the memory block straddling the
+document boundary stayed cached with the previous question's content;
+the rewind now strips that cache entry. Third: a run tag starting
+with "r" made every request id suffix parse as a release directive
+and silently swallowed all releases, including the end-of-run flush;
+the id parser now never reads the last field as a directive.
+
+One fact that simplifies the risk picture: vLLM disables its
+overlapped (async) scheduling whenever the scheduler is subclassed
+from the plain scheduler class, which ours is. Answer tokens are
+therefore always processed at a step boundary where the request is
+not scheduled, and the rewind needs no extra guard.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
