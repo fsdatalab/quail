@@ -13,3 +13,5 @@ engineers talking to each other at a whiteboard. No jargon.
 - When something failed or is uncertain, say so directly and say what
   would settle it.
 - Code comments state constraints the code cannot show; nothing else.
+- Call the KV cache "KV". Do not rename it with analogies
+  like "notes".

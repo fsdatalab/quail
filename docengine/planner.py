@@ -1,7 +1,7 @@
 """The declarative layer: describe the query, get a physical plan.
 
 plan_query takes what the user knows (filters, corpus statistics,
-model, device, GPU count, whether a note store exists) and returns a
+model, device, GPU count, whether a KV store exists) and returns a
 Plan choosing everything the measurements showed to matter:
 
 - evaluation mode: chain (one living request per document) against
@@ -11,12 +11,12 @@ Plan choosing everything the measurements showed to matter:
   are independent, so every floor divides by the worker count) and
   split the model only when its weights do not fit one card
 - admission budget: how many tokens of documents may be resident at
-  once, kept under the note pool so the strict memory invariant can
+  once, kept under the KV pool so the strict memory invariant can
   never force an eviction
 - pinning: only for the request path, and only when the corpus fits
   the pool - the 32B measurement showed pins losing to churn under
   overflow (54.5s against 48.1 naive), so overflow turns them off
-- access: restore notes from a store instead of recomputing when the
+- access: restore KV from a store instead of recomputing when the
   store's bandwidth beats the rate at which prefill would recreate
   them (kappa times the prefill rate, the measured break-even that
   lost two to one at 4B and wins several-fold at 32B)
@@ -52,7 +52,7 @@ class CorpusStats:
 
 @dataclass(frozen=True)
 class StoreSpec:
-    """A persisted-notes store: measured read bandwidth, bytes/s."""
+    """A persisted-KV store: measured read bandwidth, bytes/s."""
     read_bw: float
     warm: bool = False        # notes for this corpus already saved
 
@@ -68,13 +68,13 @@ class Plan:
     access: str               # "read" | "restore"
     stage_token_window: int   # decode budget per filter stage
     predicted_makespan_s: float
-    notes: tuple = field(default_factory=tuple)
+    remarks: tuple = field(default_factory=tuple)
 
 
 def _pool_tokens(model: ModelConfig, device: DeviceConfig, tp: int) -> int:
-    """Note-pool tokens per worker: free memory after weights, spread
+    """KV-pool tokens per worker: free memory after weights, spread
     over the tensor-parallel group (each card holds 1/tp of weights
-    and 1/tp of every token's notes)."""
+    and 1/tp of every token's KV)."""
     free = device.M * BOOT_POOL_FRACTION * tp - model.W_mem
     return max(0, int(free / model.kappa))
 
@@ -107,7 +107,7 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
     corpus = CorpusStats(n_docs=len(doc_tokens),
                          total_tokens=int(sum(doc_tokens)),
                          max_doc_tokens=int(max(doc_tokens)))
-    notes = []
+    remarks = []
 
     # GPU layout: split the model only when one card cannot hold it;
     # otherwise every card is an independent worker on its own shard.
@@ -115,7 +115,7 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
     while model.W_mem > device.M * BOOT_POOL_FRACTION * tp:
         tp *= 2
     if tp > 1:
-        notes.append(f"model needs {tp} cards; workers are {tp}-card")
+        remarks.append(f"model needs {tp} cards; workers are {tp}-card")
     workers = max(1, gpus // tp)
     shards, worst_load = _balanced_shards(doc_tokens, workers)
 
@@ -125,7 +125,7 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
                          worst_load)))
     overflow = worst_load > pool
     if overflow:
-        notes.append("shard overflows the note pool; pins off")
+        remarks.append("shard overflows the KV pool; pins off")
 
     mode = "chain" if n_filters >= 2 else "requests"
     # A pin keeps notes for a future consumer. One filter has no
@@ -143,7 +143,7 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
         if restore_s < read_s:
             access = "restore"
             read_s = restore_s
-            notes.append("store beats recompute at the break-even")
+            remarks.append("store beats recompute at the break-even")
 
     # Question work per shard: stage one reads its whole question,
     # later stages only the tail past the shared preamble, and the
@@ -160,4 +160,4 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
                 access=access,
                 stage_token_window=1 if one_token_answers else 6,
                 predicted_makespan_s=round(predicted, 1),
-                notes=tuple(notes))
+                remarks=tuple(remarks))

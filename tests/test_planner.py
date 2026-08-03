@@ -25,7 +25,7 @@ def test_32b_overflow_turns_pins_off():
     p = plan_query(4, DOCS_1K, M32B, H100, selectivity=0.8)
     assert p.mode == "chain"
     assert not p.pin
-    assert any("overflow" in n for n in p.notes)
+    assert any("overflow" in n for n in p.remarks)
     # banked: 32.0 seconds measured; the rate model runs about
     # fifteen percent under on this tier, so the band is loose
     assert 26 <= p.predicted_makespan_s <= 48
