@@ -790,7 +790,7 @@ async def longdoc_run() -> dict:
 @app.function(image=image, gpu="H100!", timeout=2400,
               volumes={"/root/.cache/huggingface": hf_cache})
 async def chain_run(n_docs: int = 50, n_filters: int = 2,
-                    s: float = 0.7) -> dict:
+                    s: float = 0.7, profile_core: int = 0) -> dict:
     """Sequence truncation proof at any scale: the same documents run
     the old way (one request per filter) and the new way (one request
     per document, the engine rewinding between filters). Pass means the
@@ -817,6 +817,8 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
                                                  run_filter_chain_engine)
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    if profile_core:
+        os.environ["DOCENGINE_PROFILE"] = "1"
     docs = _build_pool(n_docs)
     engine = Engine.from_engine_args(AsyncEngineArgs(
         model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
@@ -1423,6 +1425,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "chainprof":
         data = chainprof_run.remote(n_docs or 4000)
         path = out or "results/engine/chainprof.json"
+    elif phase == "chaincore":
+        data = chain_run.remote(n_docs or 10000, 4, 0.8, 1)
+        path = out or "results/engine/chaincore10k.json"
     elif phase == "profile":
         data = profile_run.remote(n_docs or 4000)
         path = out or "results/engine/profile.json"

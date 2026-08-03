@@ -67,6 +67,15 @@ class DocEngineScheduler(Scheduler):
         self._de_strict = os.environ.get(
             "DOCENGINE_SINGLE_TENANT", "1") == "1"
         self._de_plan_evicting = False
+        # Core-process profiling: this object lives in the engine core,
+        # the one process the client-side profiler cannot see, so the
+        # profiler must be started from here.
+        self._de_prof = os.environ.get("DOCENGINE_PROFILE", "0") == "1"
+        self._de_prof_cleared = False
+        if self._de_prof:
+            import yappi
+            yappi.set_clock_type("cpu")
+            yappi.start()
         self._de_stats = dict(pinned=0, released=0, blocks=0,
                               foreign_rejected=0, heuristic_evictions=0)
 
@@ -85,6 +94,25 @@ class DocEngineScheduler(Scheduler):
             return evicted
 
         pool._maybe_evict_cached_block = guarded
+
+    def _de_dump_profile(self, label):
+        """Print the core process's CPU table since the last dump (or
+        since the first request), then restart the counters."""
+        if not self._de_prof:
+            return
+        import yappi
+        yappi.stop()
+        rows = [(st.tsub, st.ncall,
+                 f"{st.module.split('/')[-1]}:{st.name}")
+                for st in yappi.get_func_stats()]
+        rows.sort(reverse=True)
+        total = sum(r[0] for r in rows) or 1.0
+        print(f"[de-prof] {label}: core CPU {total:.1f}s", flush=True)
+        for tsub, ncall, fn in rows[:25]:
+            print(f"[de-prof] {label} {100 * tsub / total:5.1f}% "
+                  f"{tsub:7.2f}s {ncall:>9} calls  {fn[:80]}", flush=True)
+        yappi.clear_stats()
+        yappi.start()
 
     def _de_evict(self, block_ids):
         """Plan-initiated cache-entry removal (not a heuristic event)."""
@@ -187,6 +215,7 @@ class DocEngineScheduler(Scheduler):
             if not self._de_chain:
                 print(f"[de-sched] chains drained: stats {self._de_stats}",
                       flush=True)
+                self._de_dump_profile("chain-mode")
             return True
         st["advance"] = False
         self._de_rewind(request, st["d"])
@@ -202,6 +231,11 @@ class DocEngineScheduler(Scheduler):
         return False
 
     def add_request(self, request):
+        if self._de_prof and not self._de_prof_cleared:
+            # drop engine-boot CPU so the first dump covers requests only
+            import yappi
+            yappi.clear_stats()
+            self._de_prof_cleared = True
         rid = request.request_id
         if rid.startswith("de1|") and "|reg|" in rid:
             self._de_register(request)
@@ -255,6 +289,7 @@ class DocEngineScheduler(Scheduler):
         if docs == ["*"]:
             print(f"[de-sched] release-all: stats {self._de_stats}",
                   flush=True)
+            self._de_dump_profile("request-mode")
 
     def _free_request_blocks(self, request):
         if parse_tag(request.request_id) is not None:
