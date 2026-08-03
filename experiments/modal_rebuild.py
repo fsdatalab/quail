@@ -22,6 +22,7 @@ image = (
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
         "VLLM_USE_DEEP_GEMM": "0",
         "VLLM_DEEP_GEMM_WARMUP": "skip",
+        "VLLM_USE_V2_MODEL_RUNNER": "0",
     })
     .add_local_python_source("docengine")
 )
