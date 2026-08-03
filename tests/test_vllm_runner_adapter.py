@@ -34,15 +34,39 @@ class EncoderStats:
 class FakeExecutor:
     def __init__(self):
         self.outputs = []
+        self.requests = {}
 
     def execute_model(self, scheduler_output):
         self.outputs.append(scheduler_output)
         sampled_ids = []
         req_ids = []
         for request in scheduler_output.scheduled_new_reqs:
-            if request.sampling_params is not None:
+            self.requests[request.req_id] = request
+            computed = (
+                request.num_computed_tokens
+                + scheduler_output.num_scheduled_tokens[request.req_id]
+            )
+            if (
+                request.sampling_params is not None
+                and computed >= len(request.prompt_token_ids)
+            ):
                 req_ids.append(request.req_id)
                 sampled_ids.append([99])
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, computed in zip(
+            cached.req_ids,
+            cached.num_computed_tokens,
+        ):
+            request = self.requests[req_id]
+            scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            if (
+                request.sampling_params is not None
+                and computed + scheduled >= len(request.prompt_token_ids)
+            ):
+                req_ids.append(req_id)
+                sampled_ids.append([99])
+        for req_id in scheduler_output.finished_req_ids:
+            self.requests.pop(req_id, None)
         return SimpleNamespace(
             req_ids=req_ids,
             sampled_token_ids=sampled_ids,
@@ -86,14 +110,11 @@ def test_adapter_builds_scheduler_output_without_vllm_scheduler(monkeypatch):
     result = runtime.run()
     assert result.survivors == (0,)
     assert result.answers == {(0, 1): 1}
-    assert len(executor.outputs) == 2
-    prefill, filter_step = executor.outputs
-    assert prefill.total_num_scheduled_tokens == 4
-    assert prefill.scheduled_new_reqs[0].sampling_params is None
-    assert filter_step.total_num_scheduled_tokens == 2
-    assert filter_step.scheduled_new_reqs[0].sampling_params is sampling
-    assert filter_step.scheduled_new_reqs[0].num_computed_tokens == 4
-    assert filter_step.finished_req_ids == {"prefill-0"}
+    assert len(executor.outputs) == 1
+    initial = executor.outputs[0]
+    assert initial.total_num_scheduled_tokens == 6
+    assert initial.scheduled_new_reqs[0].sampling_params is sampling
+    assert initial.scheduled_new_reqs[0].num_computed_tokens == 0
 
 
 def test_adapter_builds_shared_prefix_cascade_batch(monkeypatch):

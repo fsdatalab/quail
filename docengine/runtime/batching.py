@@ -11,6 +11,7 @@ from .kv import KVPageAllocator
 
 class WorkKind(str, Enum):
     PREFILL = "prefill"
+    INITIAL_FILTER = "initial_filter"
     FILTER = "filter"
     DECODE = "decode"
     FUSED_FILTER = "fused_filter"

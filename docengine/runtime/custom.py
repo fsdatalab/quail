@@ -36,6 +36,7 @@ class DocumentState:
     body_tokens: int
     stage: int = 0
     prefill_offset: int = 0
+    initial_offset: int = 0
     filter_offset: int = 0
     status: DocumentStatus = DocumentStatus.ACTIVE
     answers: list[int] = field(default_factory=list)
@@ -184,7 +185,10 @@ class DocEngineRuntime:
             if state.status is not DocumentStatus.ACTIVE:
                 continue
             if state.prefill_offset < state.body_tokens:
-                prefills.append(self._prefill_work(state))
+                if self.speculation_k == 1:
+                    prefills.append(self._initial_filter_work(state))
+                else:
+                    prefills.append(self._prefill_work(state))
             else:
                 filters.append(self._filter_work(state))
         return filters + prefills
@@ -254,6 +258,23 @@ class DocEngineRuntime:
             ),
         )
 
+    def _initial_filter_work(self, state: DocumentState) -> WorkItem:
+        question_tokens = len(self.query.question_token_ids[state.stage])
+        total_tokens = state.body_tokens + question_tokens
+        return WorkItem(
+            work_id=f"initial-{state.document_id}-{state.stage}",
+            owner=state.kv_owner,
+            document_id=state.document_id,
+            filter_start=state.stage,
+            k=1,
+            kind=WorkKind.INITIAL_FILTER,
+            token_offset=state.initial_offset,
+            total_new_tokens=total_tokens,
+            cached_prefix_tokens=0,
+            temporary_bytes=self.filter_temporary_bytes_per_token,
+            writes_persistent_kv=True,
+        )
+
     def _reserve_batch(self, batch: BatchPlan) -> None:
         self.kv.reserve_temporary(batch.temporary_bytes)
         for chunk in batch.chunks:
@@ -289,18 +310,31 @@ class DocEngineRuntime:
             if chunk.kind is WorkKind.PREFILL:
                 state.prefill_offset = chunk.token_end
                 continue
-            state.filter_offset = chunk.token_end
-            work = self._filter_work(state)
-            if state.filter_offset < work.total_new_tokens:
+            if chunk.kind is WorkKind.INITIAL_FILTER:
+                state.initial_offset = chunk.token_end
+                complete = (
+                    state.initial_offset >= chunk.total_new_tokens
+                )
+            else:
+                state.filter_offset = chunk.token_end
+                complete = (
+                    state.filter_offset >= chunk.total_new_tokens
+                )
+            if not complete:
                 continue
             returned = tuple(output.answers.get(chunk.work_id, ()))
             if len(returned) != chunk.k:
                 raise RuntimeError(
                     f"runner returned {len(returned)} answers for k={chunk.k}"
                 )
-            state.filter_offset = 0
-            if self.kv.has_owner(chunk.owner):
-                self.kv.free(chunk.owner)
+            if chunk.kind is WorkKind.INITIAL_FILTER:
+                state.initial_offset = 0
+                state.prefill_offset = state.body_tokens
+                self.kv.truncate(state.kv_owner, state.body_tokens)
+            else:
+                state.filter_offset = 0
+                if self.kv.has_owner(chunk.owner):
+                    self.kv.free(chunk.owner)
             passed = 0
             for answer in returned:
                 value = int(answer)
@@ -337,12 +371,20 @@ class DocEngineRuntime:
         prefill_tokens = sum(
             chunk.new_tokens
             for chunk in batch.chunks
-            if chunk.kind is WorkKind.PREFILL
+            if chunk.kind in (
+                WorkKind.PREFILL,
+                WorkKind.INITIAL_FILTER,
+            )
         )
         decode_tokens = sum(
             chunk.k
             for chunk in batch.chunks
-            if chunk.kind in (WorkKind.FILTER, WorkKind.FUSED_FILTER)
+            if chunk.kind in (
+                WorkKind.INITIAL_FILTER,
+                WorkKind.FILTER,
+                WorkKind.FUSED_FILTER,
+            )
+            and chunk.token_end >= chunk.total_new_tokens
         )
         self.trace.record(EngineStepTrace(
             step=step,

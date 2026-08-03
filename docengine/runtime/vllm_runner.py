@@ -53,7 +53,11 @@ class VLLMModelRunner:
         started_ns = perf_counter_ns()
         model_output = self.model_executor.execute_model(scheduler_output)
         needs_sampling = any(
-            chunk.kind in (WorkKind.FILTER, WorkKind.DECODE)
+            chunk.kind in (
+                WorkKind.INITIAL_FILTER,
+                WorkKind.FILTER,
+                WorkKind.DECODE,
+            )
             for chunk in batch.chunks
         )
         if model_output is None and needs_sampling:
@@ -230,7 +234,11 @@ class VLLMModelRunner:
             if known is None:
                 sampling = (
                     self.sampling_params
-                    if chunk.kind in (WorkKind.FILTER, WorkKind.DECODE)
+                    if chunk.kind in (
+                        WorkKind.INITIAL_FILTER,
+                        WorkKind.FILTER,
+                        WorkKind.DECODE,
+                    )
                     else None
                 )
                 new_requests.append(NewRequestData(
@@ -306,6 +314,11 @@ class VLLMModelRunner:
         body = list(self.query.body_token_ids[state.document_id])
         if chunk.kind is WorkKind.PREFILL:
             return body
+        if chunk.kind is WorkKind.INITIAL_FILTER:
+            question = list(
+                self.query.question_token_ids[chunk.filter_start]
+            )
+            return body + question
         if chunk.k != 1:
             raise NotImplementedError("standard vLLM runner supports k=1")
         question = list(self.query.question_token_ids[chunk.filter_start])
@@ -323,7 +336,11 @@ class VLLMModelRunner:
         )
         answers = {}
         for chunk in batch.chunks:
-            if chunk.kind not in (WorkKind.FILTER, WorkKind.DECODE):
+            if chunk.kind not in (
+                WorkKind.INITIAL_FILTER,
+                WorkKind.FILTER,
+                WorkKind.DECODE,
+            ):
                 continue
             token_ids = sampled.get(chunk.work_id, ())
             if token_ids:
