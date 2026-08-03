@@ -53,6 +53,8 @@ class VLLMModelRunner:
         scheduler_output = self._build_scheduler_output(batch, states)
         started_ns = perf_counter_ns()
         model_output = self.model_executor.execute_model(scheduler_output)
+        if model_output is None:
+            model_output = self.model_executor.sample_tokens(None)
         ended_ns = perf_counter_ns()
         answers = self._read_answers(batch, model_output)
         self._mark_completed(batch)
