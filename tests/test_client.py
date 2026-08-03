@@ -5,7 +5,8 @@ import asyncio
 
 import numpy as np
 
-from docengine.runtime.engine_client import EngineTags, run_filter_chain
+from docengine.runtime.engine_client import (EngineTags, run_filter_chain,
+                                             run_query)
 
 
 class _Out:
@@ -96,6 +97,73 @@ def test_engine_tags_protocol():
                 released.update(part[1:].split(","))
     assert "r*" in eng.rids[-1].split("|")      # flush is the last call
     assert released <= {str(i) for i in range(25)}
+
+
+YES_TOK, NO_TOK = 111, 222
+
+
+class _ChainOut:
+    def __init__(self, prompt_ids, snapshots):
+        self.prompt_token_ids = list(prompt_ids)
+        self.num_cached_tokens = 0
+        o = type("O", (), {})()
+        o.token_ids = list(snapshots)
+        self.outputs = [o]
+
+
+class ChainStubEngine:
+    """Speaks the chain protocol: accepts the registration request,
+    then plays each document's whole chain from the planted flags as
+    one stream of growing snapshots (the engine-side rewind is
+    invisible to the client, which only sees the record grow)."""
+
+    def __init__(self, flags):
+        self.flags = flags
+        self.rids = []
+
+    async def generate(self, prompt, sampling_params, request_id,
+                       priority=0):
+        self.rids.append(request_id)
+        ids = prompt["prompt_token_ids"]
+        await asyncio.sleep(0)
+        if "|reg|" in request_id:
+            yield _ChainOut(ids, [NO_TOK])
+            return
+        i = int(request_id.split("|")[2][1:])
+        toks = []
+        for j in range(len(self.flags[0])):
+            toks.append(YES_TOK if self.flags[i][j] else NO_TOK)
+            yield _ChainOut(ids, list(toks))
+            if not self.flags[i][j]:
+                return
+
+
+def test_run_query_dispatches_to_chain_mode():
+    """Multi-filter queries take the chain path: one request per
+    document, a registration first, outcomes from the flags."""
+    flags, body_ids, q_ids = _setup(30, 3, seed=11)
+    eng = ChainStubEngine(flags)
+    res = asyncio.run(run_query(eng, None, body_ids, q_ids,
+                                budget_tokens=10 ** 6,
+                                yes_ids={YES_TOK}))
+    assert res["survivors"] == [i for i in range(30) if all(flags[i])]
+    assert res["requests"] == 30
+    assert "|reg|" in eng.rids[0]
+    assert all("|c|" in r for r in eng.rids[1:])
+    for (i, j), a in res["answers"].items():
+        assert a == flags[i][j - 1]
+
+
+def test_run_query_single_filter_uses_requests():
+    """One filter has nothing to chain: the tagged request path runs,
+    with a pin per document and the end-of-run flush."""
+    flags, body_ids, q_ids = _setup(15, 1, seed=13)
+    eng = StubEngine(flags)
+    res = asyncio.run(run_query(eng, None, body_ids, q_ids,
+                                budget_tokens=10 ** 6))
+    assert res["survivors"] == [i for i in range(15) if flags[i][0]]
+    assert sum(1 for r in eng.rids if "|p" in r) == 15
+    assert "r*" in eng.rids[-1].split("|")
 
 
 def test_lookahead_waste_recorded():

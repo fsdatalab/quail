@@ -872,7 +872,7 @@ async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
         if arm == "chain":
             res = await run_filter_chain_engine(
                 engine, sp, body_ids, q_ids, 830_000, yes_ids, tag="lc")
-            res["answers"].pop(("raw", 0), None)
+            res.pop("doc0_raw", None)
         else:
             res = await run_filter_chain(
                 engine, sp, body_ids, q_ids, 830_000,
@@ -968,7 +968,7 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
     await reset_cache()
     b = await run_filter_chain_engine(engine, sp, body_ids, q_ids,
                                       830_000, yes_ids, tag="cm")
-    raw = b["answers"].pop(("raw", 0), None)
+    raw = b.pop("doc0_raw", None)
     same_surv = a["survivors"] == b["survivors"]
     shared = [k for k in a["answers"] if k in b["answers"]]
     agree = sum(1 for k in shared if a["answers"][k] == b["answers"][k])

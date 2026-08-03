@@ -153,6 +153,26 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
                 **counters)
 
 
+async def run_query(engine, sampling_params, body_ids, q_ids,
+                    budget_tokens, yes_ids=None, tag="q"):
+    """The shipped plan. Multi-filter queries run in chain mode: one
+    living engine request per document runs the whole filter chain,
+    the scheduler judging answers and rewinding between filters
+    (yes_ids, the token ids that mean yes, is required for the
+    in-engine gate). A single-filter query has nothing to chain and
+    runs as pinned, ranked requests."""
+    if len(q_ids) >= 2:
+        assert yes_ids, "chain mode needs the yes token ids for its gate"
+        return await run_filter_chain_engine(engine, sampling_params,
+                                             body_ids, q_ids,
+                                             budget_tokens, yes_ids,
+                                             tag=tag)
+    return await run_filter_chain(engine, sampling_params, body_ids,
+                                  q_ids, budget_tokens, lookahead=1,
+                                  tag=tag, tags=EngineTags(),
+                                  use_priority=True)
+
+
 async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
                                   budget_tokens, yes_ids, tag="c"):
     """Chain mode: the engine itself runs each document's whole filter
@@ -188,6 +208,7 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
     counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
     answers = {}
     survivors = []
+    raw0 = []
     q_cost = sum(len(q) for q in q_ids) + n
 
     async def chain(i, cost):
@@ -216,7 +237,7 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
                 stage_toks.extend(snap[seen:])
                 seen = max(seen, len(snap))
             if i == 0:
-                answers[("raw", 0)] = tuple(tuple(s) for s in toks[:8])
+                raw0.extend(tuple(s) for s in toks[:8])
             for j, t in enumerate(stage_toks[:n]):
                 answers[(i, j + 1)] = 1 if t in yes_ids else 0
             if len(stage_toks) >= n \
@@ -239,4 +260,4 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
     await asyncio.gather(*tasks)
     wall = _time.time() - t0
     return dict(wall=wall, survivors=sorted(survivors), answers=answers,
-                **counters)
+                doc0_raw=raw0, **counters)

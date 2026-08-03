@@ -182,8 +182,10 @@ document - erasing the preamble made every continuation recompute
 it, which was the entire first-flight deficit. Long documents: chain
 mode matches the one-in-flight plan at 79.0 seconds with identical
 outcomes and makes the pathological two-in-flight plan (156.9
-seconds, corpus read twice) obsolete by construction. Remaining:
-adopt chain mode as the shipped plan for multi-filter queries.
+seconds, corpus read twice) obsolete by construction. Adopted: the
+client library's shipped entry (run_query) now runs chain mode for
+every multi-filter query and pinned ranked requests for single-filter
+queries, where there is nothing to chain.
 
 Priority three, long document validation (an afternoon). Run thirty
 100,000 token documents and one hundred 30,000 token documents
