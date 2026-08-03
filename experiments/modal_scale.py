@@ -905,12 +905,19 @@ async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
 @app.function(image=image, gpu="H100!", timeout=2400,
               volumes={"/root/.cache/huggingface": hf_cache})
 async def chain_run(n_docs: int = 50, n_filters: int = 2,
-                    s: float = 0.7, profile_core: int = 0) -> dict:
+                    s: float = 0.7, profile_core: int = 0,
+                    kv: str = "fp8") -> dict:
     """Sequence truncation proof at any scale: the same documents run
     the old way (one request per filter) and the new way (one request
     per document, the engine rewinding between filters). Pass means the
     surviving documents match exactly and the rewind count equals the
-    number of chain continuations."""
+    number of chain continuations.
+
+    kv picks the notes precision: "fp8" (shipping), "fp8calib" (fp8
+    with attention scales calibrated from the first forward pass), or
+    "bf16" (full precision, half the memory pool, budget lowered to
+    fit). Both modes' answers are also scored against the planted
+    flags, the ground truth."""
     import inspect
     import os
 
@@ -937,8 +944,15 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
     elif profile_core == 2:
         os.environ["DOCENGINE_STEPSTATS"] = "1"
     docs = _build_pool(n_docs)
+    # bf16 notes double the per-token size, so the pool halves and the
+    # admission budget must fit under it or preemption would violate
+    # the strict invariant
+    budget = 830_000 if kv.startswith("fp8") else 400_000
     engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        model=MODEL,
+        kv_cache_dtype="fp8" if kv.startswith("fp8") else "auto",
+        calculate_kv_scales=(kv == "fp8calib"),
+        max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True, scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
@@ -962,12 +976,12 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
         if inspect.isawaitable(res):
             await res
 
-    a = await run_filter_chain(engine, sp, body_ids, q_ids, 830_000,
+    a = await run_filter_chain(engine, sp, body_ids, q_ids, budget,
                                lookahead=1, tag="rm", tags=EngineTags(),
                                use_priority=True)
     await reset_cache()
     b = await run_filter_chain_engine(engine, sp, body_ids, q_ids,
-                                      830_000, yes_ids, tag="cm")
+                                      budget, yes_ids, tag="cm")
     raw = b.pop("doc0_raw", None)
     same_surv = a["survivors"] == b["survivors"]
     shared = [k for k in a["answers"] if k in b["answers"]]
@@ -976,18 +990,31 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
     if flips:
         print(f"[chain] flipped answers (doc, stage): {flips[:20]}",
               flush=True)
+
+    def wrong(res):
+        """Calls whose answer contradicts the planted flag."""
+        return sorted(k for k, v in res["answers"].items()
+                      if v != flags[k[0]][k[1] - 1])
+
+    wrong_a, wrong_b = wrong(a), wrong(b)
     print(f"[chain] request mode: {a['requests']} requests, "
           f"{a['wall']:.2f}s; chain mode: {b['requests']} requests, "
           f"{b['wall']:.2f}s", flush=True)
     print(f"[chain] survivors match: {same_surv} "
           f"({len(a['survivors'])} vs {len(b['survivors'])}); shared "
           f"answers agree {agree}/{len(shared)}", flush=True)
+    print(f"[chain] against planted truth ({kv}): request mode wrong "
+          f"{len(wrong_a)}/{len(a['answers'])} {wrong_a[:10]}, chain "
+          f"mode wrong {len(wrong_b)}/{len(b['answers'])} "
+          f"{wrong_b[:10]}", flush=True)
     print(f"[chain] doc0 raw snapshots: {raw}", flush=True)
     try:
         engine.shutdown()
     except Exception:
         pass
-    return dict(n_docs=n_docs, n_filters=n_filters, s=s,
+    return dict(n_docs=n_docs, n_filters=n_filters, s=s, kv=kv,
+                wrong_request=[list(k) for k in wrong_a[:50]],
+                wrong_chain=[list(k) for k in wrong_b[:50]],
                 request_mode=dict(requests=a["requests"], wall=a["wall"],
                                   survivors=a["survivors"]),
                 chain_mode=dict(requests=b["requests"], wall=b["wall"],
@@ -1548,6 +1575,12 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "chainsteps":
         data = chain_run.remote(n_docs or 10000, 4, 0.8, 2)
         path = out or "results/engine/chainsteps10k.json"
+    elif phase == "chaincalib":
+        data = chain_run.remote(n_docs or 10000, 4, 0.8, 0, "fp8calib")
+        path = out or "results/engine/chaincalib10k.json"
+    elif phase == "chainbf16":
+        data = chain_run.remote(n_docs or 10000, 4, 0.8, 0, "bf16")
+        path = out or "results/engine/chainbf16_10k.json"
     elif phase == "longchain":
         data = longchain_run.remote()
         path = out or "results/engine/longchain.json"
