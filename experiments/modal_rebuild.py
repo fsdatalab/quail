@@ -435,6 +435,7 @@ def cascade_kernel(
     tail_tokens: int = 32,
     repetitions: int = 20,
     debug_sync: bool = False,
+    held_out: bool = False,
 ) -> dict:
     import flashinfer
     import torch
@@ -616,6 +617,7 @@ def cascade_kernel(
         "max_absolute_difference": difference.max().item(),
         "mean_absolute_difference": difference.mean().item(),
         "finite": bool(torch.isfinite(cascade_output).all()),
+        "held_out": held_out,
         "gpu": {
             "name": torch.cuda.get_device_name(0),
             "total_memory": torch.cuda.get_device_properties(0).total_memory,
@@ -637,6 +639,7 @@ def main(
     tail_tokens: int = 32,
     repetitions: int = 20,
     debug_sync: bool = False,
+    held_out: bool = False,
     out: str = "results/runs",
 ):
     import sys
@@ -686,6 +689,8 @@ def main(
             prefix_tokens,
             tail_tokens,
             repetitions,
+            debug_sync,
+            held_out,
         )
     else:
         raise SystemExit(f"unknown phase {phase}")
@@ -702,6 +707,7 @@ def main(
             "tail_tokens": tail_tokens,
             "repetitions": repetitions,
             "debug_sync": debug_sync,
+            "held_out": held_out,
         },
         seeds={
             "workload": WORKLOAD_SEED,

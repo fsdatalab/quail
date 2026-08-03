@@ -36,6 +36,7 @@ def load_kernel_rows(root: Path) -> list[dict]:
             "standard_ns": round(result["standard_ms"] * 1e6),
             "speedup": result["speedup"],
             "max_absolute_difference": result["max_absolute_difference"],
+            "held_out": result.get("held_out", False),
         })
     return rows
 
@@ -43,11 +44,11 @@ def load_kernel_rows(root: Path) -> list[dict]:
 def build_catalog(rows: list[dict]) -> dict:
     calibration = [
         row for row in rows
-        if row["tail_tokens"] not in {24, 40}
+        if not row["held_out"]
     ]
     held_out = [
         row for row in rows
-        if row not in calibration
+        if row["held_out"]
     ]
     cascade = AttentionShapeTable([
         AttentionShapePoint(
