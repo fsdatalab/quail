@@ -26,8 +26,9 @@ class ScriptedRunner:
             if chunk.kind is WorkKind.PREFILL:
                 continue
             state = states[chunk.document_id]
+            boundary = state.body_tokens - chunk.cached_prefix_tokens
             total = sum(
-                len(self.query.question_token_ids[stage]) + 1
+                boundary + len(self.query.question_token_ids[stage])
                 for stage in range(
                     state.stage,
                     state.stage + chunk.k,

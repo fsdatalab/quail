@@ -31,6 +31,7 @@ class WorkItem:
     max_chunk_tokens: int | None = None
     useful_probability: float = 1.0
     writes_persistent_kv: bool = True
+    prefix_owner: Hashable | None = None
 
     @property
     def remaining_tokens(self) -> int:
@@ -84,10 +85,12 @@ class BatchChunk:
     kind: WorkKind
     token_start: int
     token_end: int
+    total_new_tokens: int
     cached_prefix_tokens: int
     temporary_bytes: int
     kv_pages_added: int
     useful_probability: float
+    prefix_owner: Hashable | None
 
     @property
     def new_tokens(self) -> int:
@@ -165,10 +168,12 @@ class VariableLengthBatchPacker:
                 kind=item.kind,
                 token_start=item.token_offset,
                 token_end=item.token_offset + chunk_tokens,
+                total_new_tokens=item.total_new_tokens,
                 cached_prefix_tokens=item.cached_prefix_tokens,
                 temporary_bytes=item.temporary_bytes,
                 kv_pages_added=pages,
                 useful_probability=item.useful_probability,
+                prefix_owner=item.prefix_owner,
             ))
             total_tokens += chunk_tokens
             temporary_bytes += item.temporary_bytes

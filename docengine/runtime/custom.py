@@ -190,30 +190,44 @@ class DocEngineRuntime:
             self.speculation_k,
             self.query.n_filters - state.stage,
         )
+        shared_prefix = (
+            state.body_tokens // self.kv.page_size_tokens
+        ) * self.kv.page_size_tokens
+        boundary_tokens = state.body_tokens - shared_prefix
         new_tokens = sum(
-            len(self.query.question_token_ids[stage]) + 1
+            boundary_tokens + len(self.query.question_token_ids[stage])
             for stage in range(state.stage, state.stage + k)
         )
         return WorkItem(
             work_id=f"filter-{state.document_id}-{state.stage}-{k}",
-            owner=state.kv_owner,
+            owner=("filter", state.document_id, state.stage, k),
             document_id=state.document_id,
             filter_start=state.stage,
             k=k,
             kind=(WorkKind.FUSED_FILTER if k > 1 else WorkKind.FILTER),
             token_offset=state.filter_offset,
             total_new_tokens=new_tokens,
-            cached_prefix_tokens=state.body_tokens,
+            cached_prefix_tokens=shared_prefix,
             temporary_bytes=(
-                new_tokens * self.filter_temporary_bytes_per_token
+                (new_tokens + k) * self.filter_temporary_bytes_per_token
             ),
-            writes_persistent_kv=False,
+            writes_persistent_kv=True,
+            prefix_owner=state.kv_owner,
         )
 
     def _reserve_batch(self, batch: BatchPlan) -> None:
         self.kv.reserve_temporary(batch.temporary_bytes)
         for chunk in batch.chunks:
             if chunk.kv_pages_added:
+                if (
+                    chunk.prefix_owner is not None
+                    and not self.kv.has_owner(chunk.owner)
+                ):
+                    self.kv.share_prefix(
+                        chunk.prefix_owner,
+                        chunk.owner,
+                        chunk.cached_prefix_tokens,
+                    )
                 self.kv.extend(chunk.owner, chunk.new_tokens)
 
     def _release_batch_temporary(self, batch: BatchPlan) -> None:
@@ -239,6 +253,7 @@ class DocEngineRuntime:
                     f"runner returned {len(returned)} answers for k={chunk.k}"
                 )
             state.filter_offset = 0
+            self.kv.free(chunk.owner)
             passed = 0
             for answer in returned:
                 value = int(answer)
