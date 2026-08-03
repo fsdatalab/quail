@@ -183,38 +183,38 @@ class AttentionShapeTable:
             {point.k for point in self.points},
             key=lambda value: abs(value - k),
         )
-        measured_tail = min(
-            {
-                point.tail_tokens
-                for point in self.points
-                if point.k == measured_k
-            },
-            key=lambda value: abs(value - tail_tokens),
-        )
-        candidates = [
-            point for point in self.points
+        tail_rows = []
+        measured_tails = sorted({
+            point.tail_tokens
+            for point in self.points
             if point.k == measured_k
-            and point.tail_tokens == measured_tail
-        ]
-        by_group = {}
-        for point in candidates:
-            by_group.setdefault(point.groups, []).append(point)
-        group_rows = [
-            (
-                measured_groups,
-                self._estimate_prefix(
-                    points,
-                    prefix_tokens,
-                    measured_tail,
-                ),
-            )
-            for measured_groups, points in sorted(by_group.items())
-        ]
-        base = self._interpolate_group(group_rows, groups)
-        query_scale = (
-            k * tail_tokens
-        ) / (measured_k * measured_tail)
-        return round(base * query_scale)
+        })
+        for measured_tail in measured_tails:
+            candidates = [
+                point for point in self.points
+                if point.k == measured_k
+                and point.tail_tokens == measured_tail
+            ]
+            by_group = {}
+            for point in candidates:
+                by_group.setdefault(point.groups, []).append(point)
+            group_rows = [
+                (
+                    measured_groups,
+                    self._estimate_prefix(
+                        points,
+                        prefix_tokens,
+                        measured_tail,
+                    ),
+                )
+                for measured_groups, points in sorted(by_group.items())
+            ]
+            tail_rows.append((
+                measured_tail,
+                self._interpolate_axis(group_rows, groups),
+            ))
+        base = self._interpolate_axis(tail_rows, tail_tokens)
+        return round(base * k / measured_k)
 
     def _estimate_prefix(
         self,
@@ -249,25 +249,25 @@ class AttentionShapeTable:
             right.time_ns - left.time_ns
         )
 
-    def _interpolate_group(
+    def _interpolate_axis(
         self,
         rows: Sequence[tuple[int, float]],
-        groups: int,
+        value: int,
     ) -> float:
         if len(rows) == 1:
-            measured_groups, measured_time = rows[0]
-            return measured_time * groups / measured_groups
-        if groups <= rows[0][0]:
+            measured_value, measured_time = rows[0]
+            return measured_time * value / measured_value
+        if value <= rows[0][0]:
             left, right = rows[0], rows[1]
-        elif groups >= rows[-1][0]:
+        elif value >= rows[-1][0]:
             left, right = rows[-2], rows[-1]
         else:
             left, right = next(
                 (left, right)
                 for left, right in zip(rows, rows[1:])
-                if left[0] <= groups <= right[0]
+                if left[0] <= value <= right[0]
             )
-        fraction = (groups - left[0]) / (right[0] - left[0])
+        fraction = (value - left[0]) / (right[0] - left[0])
         return left[1] + fraction * (right[1] - left[1])
 
     def to_rows(self) -> list[dict[str, int]]:

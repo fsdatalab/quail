@@ -160,3 +160,16 @@ def test_attention_shape_table_interpolates_group_count():
         prefix_tokens=2000,
         tail_tokens=32,
     ) == 350
+
+
+def test_attention_shape_table_interpolates_tail_length():
+    table = AttentionShapeTable([
+        AttentionShapePoint(8, 4, 1000, 16, 100),
+        AttentionShapePoint(8, 4, 1000, 48, 300),
+    ])
+    assert table.estimate_ns(
+        groups=8,
+        k=4,
+        prefix_tokens=1000,
+        tail_tokens=32,
+    ) == 200

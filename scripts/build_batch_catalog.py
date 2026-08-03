@@ -43,7 +43,7 @@ def load_kernel_rows(root: Path) -> list[dict]:
 def build_catalog(rows: list[dict]) -> dict:
     calibration = [
         row for row in rows
-        if row["tail_tokens"] == 32
+        if row["tail_tokens"] not in {24, 40}
     ]
     held_out = [
         row for row in rows
