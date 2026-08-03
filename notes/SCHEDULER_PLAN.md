@@ -169,18 +169,19 @@ path and whether anything else is worth precomputing (block hashes
 are precomputable in principle; we suspect they are tens of
 microseconds, and the profile will say).
 
-Priority two, sequence truncation (days; the last big makespan item).
-One living engine sequence per document: append a question's tokens,
-decode the answer, roll the sequence back to the document boundary,
-append the next question; the gate runs inside the scheduler, which
-knows the yes and no token ids. Prompts unchanged, each question sees
-exactly today's context, and a document costs one request instead of
-n, collapsing the per request residual (about five seconds of the
-reference query). Target: high forties, essentially the work floor.
-vLLM's existing streaming input sessions provide the append
-machinery; we add rollback and the gate. Milestones: rewind proved
-correct against separate request answers, in-scheduler gate, the 10k
-grid.
+Priority two, sequence truncation: BUILT AND MEASURED. One living
+engine sequence per document; the gate runs inside the scheduler.
+The 10k reference query lands at 49.9 seconds against 52.0 for the
+best request-mode run of the same flight (target was high forties
+against 52.3). Outcome identical up to two border-line 8-bit
+attention calls out of 23,902, whose direction varies with batch
+shape and has gone against request mode more often than against
+chain mode. The decisive fix along the way: the rewind must stop at
+document plus the questions' 33-token shared preamble, not at the
+document - erasing the preamble made every continuation recompute
+it, which was the entire first-flight deficit. Remaining: the
+long-document arm (in flight), then adopting chain mode as the
+shipped plan for multi-filter queries.
 
 Priority three, long document validation (an afternoon). Run thirty
 100,000 token documents and one hundred 30,000 token documents

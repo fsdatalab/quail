@@ -67,15 +67,19 @@ are to the extracted wheel source in the session scratchpad.
 
 ## Milestones
 
-1. Rewind proof: chain mode for two filters at fifty documents,
-   answers bit-identical to request mode, requests exactly one per
-   document, notes accounting clean (strict mode's zero heuristic
-   eviction invariant must keep holding).
-2. The gate and registration protocol; chains of four filters; kill
-   on failure.
-3. The 10k grid: target high forties against 52.3 seconds, and the
-   30k-document k=1 cell unchanged while chain mode replaces the
-   pathological k=2.
+1. DONE. Rewind proof at fifty documents, two filters: identical
+   survivors and answers, one request per document, clean notes
+   accounting, zero heuristic evictions.
+2. DONE. Gate, registration, kill on failure, four-filter chains:
+   identical outcomes, three rewinds per surviving document.
+3. 10k half DONE: 49.9 seconds against request mode's 52.0 (target
+   was high forties against 52.3), after the rewind learned to keep
+   the questions' 33-token shared preamble - erasing it made every
+   continuation recompute it, which was the entire first-flight
+   deficit of 4.4 seconds (353,654 extra tokens at 80,000 per
+   second). Long-document half in flight: chain mode against the
+   one-in-flight and pathological two-in-flight request plans at 100
+   documents of 30,000 tokens.
 
 ## Risks, named (and how milestone 1 settled them)
 

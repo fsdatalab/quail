@@ -607,6 +607,39 @@ planted flag outcomes, both modes cold. Every pass criterion met:
   request mode at this tiny scale (the corpus is 50 short documents;
   the real payoff test is the 10,000-document grid, milestone three).
 
+Milestones two and three followed. Four-filter chains at 50
+documents: 11 of 11 survivors match, 92 of 92 answers, 42 rewinds
+for 42 continuations, three per surviving document. Then the
+10,000-document run, four filters at selectivity 0.8:
+
+- First flight: chain mode 56.8 seconds against request mode's 52.4.
+  The step recorder named the entire gap: chain mode scheduled
+  4,264,138 tokens against 3,910,484, and the 353,654 extra tokens at
+  the 80,000-per-second operating rate are the 4.4 seconds. Each
+  continuation was recomputing the questions' 33-token shared
+  preamble that request mode reuses from cache, because the rewind
+  erased back to the document instead of document plus preamble.
+- With the rewind stopping at document plus preamble (identical for
+  every question, so no prompt content changes): chain mode 49.9
+  seconds against request mode's 52.0. Chain mode now schedules
+  105,094 fewer tokens than request mode (the rewind keeps notes at
+  exact token positions; cache hits are 16-token-block granular) and
+  the target from the plan - high forties against 52.3 - is met.
+- Profiling along the way: chain mode halves client-process CPU (7.1
+  seconds against 16.8 at 4,000 documents) and cuts engine-core CPU
+  about 16 percent (it hashes half the tokens and polls a quarter as
+  many inputs), confirming the per-request paperwork story.
+- Honest accounting of disagreements at 10,000 documents: two calls
+  of 23,902 flip between modes, at the corpus tail, and the flipped
+  pair changes when batch packing changes - border-line cases of the
+  uncalibrated 8-bit attention, not scheduler state. Direction is
+  symmetric: in two flights both errors were request mode's; in one
+  flight each mode misread one, costing chain mode one of 3,524
+  survivors. Separately, both modes lose about 560 of the 4,088
+  planted survivors identically (roughly one percent of flag lookups
+  misread by the model regardless of scheduling); that error is
+  model-side and cancels in every between-mode comparison.
+
 Three bugs found and fixed on the way, all now encoded in the design
 note. First and central: the engine captures the finish reason from
 the request status before the stopped-request hook runs and sends it
