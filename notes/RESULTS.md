@@ -748,6 +748,24 @@ indecisive tail (with the early stop, decided calls never pay it) -
 or accepting that a fixed one-line prompt underdetermines a
 reasoning-tuned model's output format.
 
+## Multi-GPU scaling: the planner shards, the floors divide
+
+The declarative layer (plan_query) chooses the physical plan from
+the calibrated models; its first measured validation is GPU scaling
+on the banked 10,000-document query (49.9 seconds on one H100):
+
+- 2 GPUs: 25.30 seconds, 1.97 times faster. Shards balanced to
+  within 38 tokens of 1.58 million; worker walls within 0.09s.
+- 4 GPUs: 13.30 seconds, 3.75 times faster. Shards within 39
+  tokens; walls within 0.40s.
+
+Documents are independent, so workers share nothing; each computes
+the same deterministic plan and runs chain mode on its shard. The
+bend from 4.0 to 3.75 is the fixed per-query software residue that
+does not shrink with the shard. Survivors: 3,523 and 3,526 against
+the single-GPU 3,524 - the known borderline-call noise, a few calls
+in 24,000 landing differently in different batch compositions.
+
 ## Answer accuracy against planted truth: the noise was the model
 
 Scoring every call against the planted flags at 10,000 documents and
