@@ -45,8 +45,11 @@ app = modal.App("docengine-scale")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("vllm", "huggingface_hub", "pandas", "pyarrow", "numpy",
-                 "yappi")
+    # Pinned: the scheduler subclass reaches into a non-public engine
+    # interface, so a silent version jump on image rebuild could break
+    # it mid-study. Every recorded result is stamped with this version.
+    .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
+                 "numpy", "yappi")
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0"})
     .add_local_python_source("docengine")
