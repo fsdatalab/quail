@@ -137,6 +137,105 @@ class PrimitiveTimeTable:
 
 
 @dataclass(frozen=True)
+class AttentionShapePoint:
+    groups: int
+    k: int
+    prefix_tokens: int
+    tail_tokens: int
+    time_ns: int
+
+
+class AttentionShapeTable:
+    def __init__(self, points: Sequence[AttentionShapePoint]):
+        if not points:
+            raise ValueError("attention shape table needs measured points")
+        if any(
+            point.groups <= 0
+            or point.k <= 0
+            or point.prefix_tokens < 0
+            or point.tail_tokens <= 0
+            or point.time_ns <= 0
+            for point in points
+        ):
+            raise ValueError("invalid attention shape point")
+        keys = [
+            (
+                point.groups,
+                point.k,
+                point.prefix_tokens,
+                point.tail_tokens,
+            )
+            for point in points
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("attention shape points must be unique")
+        self.points = tuple(points)
+
+    def estimate_ns(
+        self,
+        *,
+        groups: int,
+        k: int,
+        prefix_tokens: int,
+        tail_tokens: int,
+    ) -> int:
+        series = self._nearest_series(groups, k, tail_tokens)
+        ordered = sorted(series, key=lambda point: point.prefix_tokens)
+        if len(ordered) == 1:
+            point = ordered[0]
+            query_scale = (groups * k) / (point.groups * point.k)
+            prefix_work = max(1, prefix_tokens + tail_tokens)
+            measured_work = max(
+                1,
+                point.prefix_tokens + point.tail_tokens,
+            )
+            return round(
+                point.time_ns * query_scale * prefix_work / measured_work
+            )
+        table = PrimitiveTimeTable([
+            PrimitivePoint(point.prefix_tokens, point.time_ns)
+            for point in ordered
+        ])
+        base = table.estimate_ns(prefix_tokens)
+        exemplar = ordered[0]
+        query_scale = (groups * k) / (exemplar.groups * exemplar.k)
+        return round(base * query_scale)
+
+    def _nearest_series(
+        self,
+        groups: int,
+        k: int,
+        tail_tokens: int,
+    ) -> list[AttentionShapePoint]:
+        series_keys = {
+            (point.groups, point.k, point.tail_tokens)
+            for point in self.points
+        }
+        key = min(
+            series_keys,
+            key=lambda candidate: (
+                abs(candidate[0] - groups) / max(groups, 1)
+                + abs(candidate[1] - k) / max(k, 1)
+                + abs(candidate[2] - tail_tokens) / max(tail_tokens, 1)
+            ),
+        )
+        return [
+            point for point in self.points
+            if (point.groups, point.k, point.tail_tokens) == key
+        ]
+
+    def to_rows(self) -> list[dict[str, int]]:
+        return [asdict(point) for point in self.points]
+
+    @classmethod
+    def from_rows(
+        cls,
+        rows: Sequence[dict[str, int]],
+    ) -> "AttentionShapeTable":
+        return cls([AttentionShapePoint(**row) for row in rows])
+
+
+@dataclass(frozen=True)
 class BatchTimeEstimate:
     dense_ns: int
     standard_attention_ns: int

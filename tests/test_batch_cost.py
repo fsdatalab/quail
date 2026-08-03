@@ -1,6 +1,8 @@
 import pytest
 
 from docengine.runtime.batch_cost import (
+    AttentionShapePoint,
+    AttentionShapeTable,
     BatchFeatures,
     MeasuredBatchTimeEstimator,
     PrimitivePoint,
@@ -98,3 +100,42 @@ def test_validation_gate():
     assert summary.median_absolute_error == pytest.approx(0.045)
     assert summary.p95_absolute_error == pytest.approx(0.08)
     assert summary.passes
+
+
+def test_attention_shape_table_keeps_k_specific_curves():
+    table = AttentionShapeTable([
+        AttentionShapePoint(8, 2, 300, 32, 100),
+        AttentionShapePoint(8, 2, 3000, 32, 200),
+        AttentionShapePoint(8, 4, 300, 32, 80),
+        AttentionShapePoint(8, 4, 3000, 32, 160),
+    ])
+    assert table.estimate_ns(
+        groups=8,
+        k=2,
+        prefix_tokens=300,
+        tail_tokens=32,
+    ) == 100
+    assert table.estimate_ns(
+        groups=8,
+        k=4,
+        prefix_tokens=300,
+        tail_tokens=32,
+    ) == 80
+    assert 100 < table.estimate_ns(
+        groups=8,
+        k=2,
+        prefix_tokens=1500,
+        tail_tokens=32,
+    ) < 200
+
+
+def test_attention_shape_table_round_trips_rows():
+    rows = [{
+        "groups": 4,
+        "k": 2,
+        "prefix_tokens": 512,
+        "tail_tokens": 32,
+        "time_ns": 1000,
+    }]
+    table = AttentionShapeTable.from_rows(rows)
+    assert table.to_rows() == rows
