@@ -351,6 +351,8 @@ async def stock_smoke(
         disable_log_stats=True,
         enable_prefix_caching=True,
         attention_backend="FLASHINFER",
+        max_num_batched_tokens=16_384,
+        max_num_seqs=1_024,
     ))
     sampling = SamplingParams(
         temperature=0.0,
