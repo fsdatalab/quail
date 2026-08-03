@@ -68,6 +68,18 @@ def test_temporary_hbm_accounting():
     assert pool.temporary_bytes == 0
 
 
+def test_explicit_page_padding_for_fused_tails():
+    pool = allocator()
+    pool.allocate("document", 16)
+    pool.share_prefix("document", "fused", 16)
+    allocation = pool.extend_with_pages("fused", token_count=17, page_count=2)
+    assert allocation.token_count == 33
+    assert allocation.page_ids == (0, 1, 2)
+    pool.free("fused")
+    pool.free("document")
+    assert pool.free_pages == 8
+
+
 def test_double_free_is_rejected():
     pool = allocator()
     pool.allocate("a", 1)

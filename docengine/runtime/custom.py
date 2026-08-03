@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from math import ceil
 from time import perf_counter_ns
 from typing import Mapping, Protocol
 
@@ -198,21 +199,42 @@ class DocEngineRuntime:
             boundary_tokens + len(self.query.question_token_ids[stage])
             for stage in range(state.stage, state.stage + k)
         )
+        fused = k > 1
+        if fused:
+            temporary_kv_bytes = sum(
+                ceil(
+                    (
+                        boundary_tokens
+                        + len(self.query.question_token_ids[stage])
+                    ) / self.kv.page_size_tokens
+                ) * self.kv.page_bytes
+                for stage in range(state.stage, state.stage + k)
+            )
+        else:
+            temporary_kv_bytes = (
+                ceil(new_tokens / self.kv.page_size_tokens)
+                * self.kv.page_bytes
+            )
         return WorkItem(
             work_id=f"filter-{state.document_id}-{state.stage}-{k}",
             owner=("filter", state.document_id, state.stage, k),
             document_id=state.document_id,
             filter_start=state.stage,
             k=k,
-            kind=(WorkKind.FUSED_FILTER if k > 1 else WorkKind.FILTER),
+            kind=(WorkKind.FUSED_FILTER if fused else WorkKind.FILTER),
             token_offset=state.filter_offset,
             total_new_tokens=new_tokens,
             cached_prefix_tokens=shared_prefix,
             temporary_bytes=(
-                (new_tokens + k) * self.filter_temporary_bytes_per_token
+                k * self.filter_temporary_bytes_per_token
             ),
+            max_chunk_tokens=(new_tokens if fused else None),
             writes_persistent_kv=True,
             prefix_owner=state.kv_owner,
+            kv_pages_to_add=(
+                temporary_kv_bytes // self.kv.page_bytes
+                if fused else None
+            ),
         )
 
     def _reserve_batch(self, batch: BatchPlan) -> None:
@@ -228,7 +250,14 @@ class DocEngineRuntime:
                         chunk.owner,
                         chunk.cached_prefix_tokens,
                     )
-                self.kv.extend(chunk.owner, chunk.new_tokens)
+                if chunk.kind is WorkKind.FUSED_FILTER:
+                    self.kv.extend_with_pages(
+                        chunk.owner,
+                        chunk.new_tokens,
+                        chunk.kv_pages_added,
+                    )
+                else:
+                    self.kv.extend(chunk.owner, chunk.new_tokens)
 
     def _release_batch_temporary(self, batch: BatchPlan) -> None:
         self.kv.release_temporary(batch.temporary_bytes)
@@ -253,7 +282,8 @@ class DocEngineRuntime:
                     f"runner returned {len(returned)} answers for k={chunk.k}"
                 )
             state.filter_offset = 0
-            self.kv.free(chunk.owner)
+            if self.kv.has_owner(chunk.owner):
+                self.kv.free(chunk.owner)
             passed = 0
             for answer in returned:
                 value = int(answer)

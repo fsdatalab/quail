@@ -32,6 +32,7 @@ class WorkItem:
     useful_probability: float = 1.0
     writes_persistent_kv: bool = True
     prefix_owner: Hashable | None = None
+    kv_pages_to_add: int | None = None
 
     @property
     def remaining_tokens(self) -> int:
@@ -144,7 +145,15 @@ class VariableLengthBatchPacker:
                 blocked_by_temporary = True
                 continue
 
-            if item.writes_persistent_kv:
+            if item.kv_pages_to_add is not None:
+                if item.token_offset != 0 or chunk_tokens != item.remaining_tokens:
+                    raise ValueError(
+                        "explicit KV page counts require one complete chunk"
+                    )
+                if item.kv_pages_to_add > kv.free_pages - reserved_pages:
+                    blocked_by_hbm = True
+                    continue
+            elif item.writes_persistent_kv:
                 free_pages = kv.free_pages - reserved_pages
                 hbm_token_limit = self._tokens_that_fit(
                     item, kv, free_pages
@@ -155,10 +164,13 @@ class VariableLengthBatchPacker:
             if chunk_tokens <= 0:
                 blocked_by_hbm = True
                 continue
-            pages = (
-                kv.additional_pages_needed(item.owner, chunk_tokens)
-                if item.writes_persistent_kv else 0
-            )
+            if item.kv_pages_to_add is not None:
+                pages = item.kv_pages_to_add
+            else:
+                pages = (
+                    kv.additional_pages_needed(item.owner, chunk_tokens)
+                    if item.writes_persistent_kv else 0
+                )
             chunks.append(BatchChunk(
                 work_id=item.work_id,
                 owner=item.owner,

@@ -78,7 +78,11 @@ def _question(stage):
     timeout=3600,
     volumes={"/root/.cache/huggingface": hf_cache},
 )
-def custom_smoke(n_docs: int = 8, n_filters: int = 2) -> dict:
+def custom_smoke(
+    n_docs: int = 8,
+    n_filters: int = 2,
+    k: int = 1,
+) -> dict:
     import numpy as np
     import torch
     from transformers import AutoTokenizer
@@ -151,6 +155,7 @@ def custom_smoke(n_docs: int = 8, n_filters: int = 2) -> dict:
         max_model_len=4608,
         enforce_eager=True,
         disable_log_stats=True,
+        attention_backend="FLASHINFER",
     ).create_engine_config()
     executor, kv_config = initialize_model_executor(vllm_config)
     page_size = vllm_config.cache_config.block_size
@@ -182,7 +187,7 @@ def custom_smoke(n_docs: int = 8, n_filters: int = 2) -> dict:
         )),
         kv=kv,
         trace=trace,
-        speculation_k=1,
+        speculation_k=k,
     )
     result = runtime.run()
     evaluation = evaluate_answers(result.answers, ground_truth)
@@ -195,6 +200,7 @@ def custom_smoke(n_docs: int = 8, n_filters: int = 2) -> dict:
         "phase": "custom-smoke",
         "n_docs": n_docs,
         "n_filters": n_filters,
+        "k": k,
         "model": MODEL,
         "model_revision": MODEL_REVISION,
         "dataset_revision": DATASET_REVISION,
@@ -241,6 +247,7 @@ def main(
     phase: str = "custom-smoke",
     n_docs: int = 8,
     n_filters: int = 2,
+    k: int = 1,
     out: str = "results/runs",
 ):
     import sys
@@ -249,10 +256,10 @@ def main(
 
     if phase != "custom-smoke":
         raise SystemExit(f"unknown phase {phase}")
-    data = custom_smoke.remote(n_docs, n_filters)
+    data = custom_smoke.remote(n_docs, n_filters, k)
     metadata = RunMetadata.create(
         phase=phase,
-        config={"n_docs": n_docs, "n_filters": n_filters},
+        config={"n_docs": n_docs, "n_filters": n_filters, "k": k},
         seeds={
             "workload": WORKLOAD_SEED,
             "ground_truth": GROUND_TRUTH_SEED,

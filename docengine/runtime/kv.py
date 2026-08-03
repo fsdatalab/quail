@@ -153,6 +153,31 @@ class KVPageAllocator:
         self.validate()
         return self.allocation(owner)
 
+    def extend_with_pages(
+        self,
+        owner: Owner,
+        token_count: int,
+        page_count: int,
+    ) -> KVAllocation:
+        if token_count < 0 or page_count < 0:
+            raise ValueError("token and page counts cannot be negative")
+        state = self._owners.get(owner)
+        if state is None:
+            state = _OwnerState(token_count=0, page_ids=[])
+            self._owners[owner] = state
+        minimum = self.additional_pages_needed(owner, token_count)
+        if page_count < minimum:
+            raise KVOwnershipError(
+                f"{page_count} pages cannot hold {token_count} new KV tokens"
+            )
+        added = self._take_pages(page_count)
+        state.page_ids.extend(added)
+        state.token_count += int(token_count)
+        for page_id in added:
+            self._references[page_id].add(owner)
+        self.validate()
+        return self.allocation(owner)
+
     def share_prefix(
         self,
         source: Owner,
@@ -247,7 +272,7 @@ class KVPageAllocator:
                 )
         for owner, state in self._owners.items():
             expected = ceil(state.token_count / self.page_size_tokens)
-            if expected != len(state.page_ids):
+            if expected > len(state.page_ids):
                 raise KVOwnershipError(
                     f"owner {owner!r} has wrong KV page count"
                 )
