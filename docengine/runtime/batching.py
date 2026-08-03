@@ -30,6 +30,7 @@ class WorkItem:
     temporary_bytes: int = 0
     max_chunk_tokens: int | None = None
     useful_probability: float = 1.0
+    writes_persistent_kv: bool = True
 
     @property
     def remaining_tokens(self) -> int:
@@ -140,15 +141,21 @@ class VariableLengthBatchPacker:
                 blocked_by_temporary = True
                 continue
 
-            free_pages = kv.free_pages - reserved_pages
-            hbm_token_limit = self._tokens_that_fit(item, kv, free_pages)
-            if hbm_token_limit < chunk_tokens:
-                blocked_by_hbm = True
-            chunk_tokens = min(chunk_tokens, hbm_token_limit)
+            if item.writes_persistent_kv:
+                free_pages = kv.free_pages - reserved_pages
+                hbm_token_limit = self._tokens_that_fit(
+                    item, kv, free_pages
+                )
+                if hbm_token_limit < chunk_tokens:
+                    blocked_by_hbm = True
+                chunk_tokens = min(chunk_tokens, hbm_token_limit)
             if chunk_tokens <= 0:
                 blocked_by_hbm = True
                 continue
-            pages = kv.additional_pages_needed(item.owner, chunk_tokens)
+            pages = (
+                kv.additional_pages_needed(item.owner, chunk_tokens)
+                if item.writes_persistent_kv else 0
+            )
             chunks.append(BatchChunk(
                 work_id=item.work_id,
                 owner=item.owner,
