@@ -640,6 +640,17 @@ for 42 continuations, three per surviving document. Then the
   misread by the model regardless of scheduling); that error is
   model-side and cancels in every between-mode comparison.
 
+The long-document half closes the milestone. One hundred documents of
+30,000 tokens, two filters: chain mode 79.0 seconds with 100
+requests, bit-identical answers and survivors to the one-in-flight
+request plan's 79.0 seconds with 150 requests, while the
+two-in-flight plan measured 156.9 seconds (its two branches race,
+the hit rate collapses to half a percent, and the corpus is read
+about twice). The race is eliminated by construction, not by
+scheduling care: a document that is one living request cannot race
+itself. The 81 percent flag-reading agreement at this length is the
+already-measured long-context quality cliff, identical in both modes.
+
 Three bugs found and fixed on the way, all now encoded in the design
 note. First and central: the engine captures the finish reason from
 the request status before the stopped-request hook runs and sends it

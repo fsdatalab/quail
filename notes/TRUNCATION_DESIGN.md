@@ -72,14 +72,17 @@ are to the extracted wheel source in the session scratchpad.
    accounting, zero heuristic evictions.
 2. DONE. Gate, registration, kill on failure, four-filter chains:
    identical outcomes, three rewinds per surviving document.
-3. 10k half DONE: 49.9 seconds against request mode's 52.0 (target
-   was high forties against 52.3), after the rewind learned to keep
-   the questions' 33-token shared preamble - erasing it made every
-   continuation recompute it, which was the entire first-flight
-   deficit of 4.4 seconds (353,654 extra tokens at 80,000 per
-   second). Long-document half in flight: chain mode against the
-   one-in-flight and pathological two-in-flight request plans at 100
-   documents of 30,000 tokens.
+3. DONE, both halves. 10k grid: 49.9 seconds against request mode's
+   52.0 (target was high forties against 52.3), after the rewind
+   learned to keep the questions' 33-token shared preamble - erasing
+   it made every continuation recompute it, which was the entire
+   first-flight deficit of 4.4 seconds (353,654 extra tokens at
+   80,000 per second). Long documents, 100 at 30,000 tokens: chain
+   mode 79.0 seconds, identical answers and survivors to the
+   one-in-flight plan's 79.0, with 100 requests against 150; the
+   pathological two-in-flight plan (156.9 seconds, half-percent hit
+   rate, corpus read twice) is obsolete - a document that is one
+   living request cannot race itself.
 
 ## Risks, named (and how milestone 1 settled them)
 

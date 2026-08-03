@@ -179,9 +179,11 @@ shape and has gone against request mode more often than against
 chain mode. The decisive fix along the way: the rewind must stop at
 document plus the questions' 33-token shared preamble, not at the
 document - erasing the preamble made every continuation recompute
-it, which was the entire first-flight deficit. Remaining: the
-long-document arm (in flight), then adopting chain mode as the
-shipped plan for multi-filter queries.
+it, which was the entire first-flight deficit. Long documents: chain
+mode matches the one-in-flight plan at 79.0 seconds with identical
+outcomes and makes the pathological two-in-flight plan (156.9
+seconds, corpus read twice) obsolete by construction. Remaining:
+adopt chain mode as the shipped plan for multi-filter queries.
 
 Priority three, long document validation (an afternoon). Run thirty
 100,000 token documents and one hundred 30,000 token documents
