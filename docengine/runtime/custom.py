@@ -191,6 +191,8 @@ class DocEngineRuntime:
                     prefills.append(self._prefill_work(state))
             else:
                 filters.append(self._filter_work(state))
+        if self.speculation_k > 1 and filters:
+            return filters
         return filters + prefills
 
     def _prefill_work(self, state: DocumentState) -> WorkItem:
