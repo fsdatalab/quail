@@ -20,6 +20,8 @@ image = (
     .env({
         "VLLM_LOGGING_LEVEL": "WARNING",
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        "VLLM_USE_DEEP_GEMM": "0",
+        "VLLM_DEEP_GEMM_WARMUP": "skip",
     })
     .add_local_python_source("docengine")
 )
@@ -185,7 +187,7 @@ def custom_smoke(
         runner=runner,
         packer=VariableLengthBatchPacker(BatchLimits(
             max_new_tokens=16_384,
-            max_sequences=1_024,
+            max_sequences=(1 if k > 1 else 1_024),
             max_temporary_bytes=2 * (1 << 30),
         )),
         kv=kv,
