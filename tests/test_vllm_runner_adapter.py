@@ -135,3 +135,39 @@ def test_adapter_builds_shared_prefix_cascade_batch(monkeypatch):
     first, second = cascade.scheduled_new_reqs
     assert first.block_ids[0][0] == second.block_ids[0][0]
     assert first.block_ids[0][1] != second.block_ids[0][1]
+
+
+def test_split_prefill_reports_previous_tokens_once(monkeypatch):
+    monkeypatch.setattr(vllm_runner, "_scheduler_types", fake_types)
+    query = FilterQuery.from_sequences(
+        body_token_ids=[[1] * 20],
+        question_token_ids=[[5, 6]],
+        yes_token_ids=[99],
+    )
+    kv = KVPageAllocator(
+        total_pages=16,
+        page_size_tokens=4,
+        bytes_per_token=8,
+    )
+    executor = FakeExecutor()
+    runner = VLLMModelRunner(
+        query=query,
+        kv=kv,
+        model_executor=executor,
+        sampling_params=object(),
+    )
+    runtime = DocEngineRuntime(
+        query=query,
+        runner=runner,
+        packer=VariableLengthBatchPacker(BatchLimits(
+            max_new_tokens=8,
+            max_sequences=1,
+            max_temporary_bytes=1024,
+        )),
+        kv=kv,
+    )
+    assert runtime.run().survivors == (0,)
+    second_prefill = executor.outputs[1].scheduled_cached_reqs
+    third_prefill = executor.outputs[2].scheduled_cached_reqs
+    assert second_prefill.num_computed_tokens == [8]
+    assert third_prefill.num_computed_tokens == [16]

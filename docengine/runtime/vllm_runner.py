@@ -220,7 +220,11 @@ class VLLMModelRunner:
             prompt = self._prompt_tokens(chunk, states[chunk.document_id])
             allocation = self.kv.allocation(chunk.owner)
             block_ids = list(allocation.page_ids)
-            computed = chunk.cached_prefix_tokens + chunk.token_start
+            computed = (
+                chunk.token_start
+                if chunk.kind is WorkKind.PREFILL
+                else chunk.cached_prefix_tokens + chunk.token_start
+            )
             num_scheduled_tokens[req_id] = chunk.new_tokens
             known = self._known.get(req_id)
             if known is None:
