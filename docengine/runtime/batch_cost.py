@@ -179,50 +179,96 @@ class AttentionShapeTable:
         prefix_tokens: int,
         tail_tokens: int,
     ) -> int:
-        series = self._nearest_series(groups, k, tail_tokens)
-        ordered = sorted(series, key=lambda point: point.prefix_tokens)
+        measured_k = min(
+            {point.k for point in self.points},
+            key=lambda value: abs(value - k),
+        )
+        measured_tail = min(
+            {
+                point.tail_tokens
+                for point in self.points
+                if point.k == measured_k
+            },
+            key=lambda value: abs(value - tail_tokens),
+        )
+        candidates = [
+            point for point in self.points
+            if point.k == measured_k
+            and point.tail_tokens == measured_tail
+        ]
+        by_group = {}
+        for point in candidates:
+            by_group.setdefault(point.groups, []).append(point)
+        group_rows = [
+            (
+                measured_groups,
+                self._estimate_prefix(
+                    points,
+                    prefix_tokens,
+                    measured_tail,
+                ),
+            )
+            for measured_groups, points in sorted(by_group.items())
+        ]
+        base = self._interpolate_group(group_rows, groups)
+        query_scale = (
+            k * tail_tokens
+        ) / (measured_k * measured_tail)
+        return round(base * query_scale)
+
+    def _estimate_prefix(
+        self,
+        points: Sequence[AttentionShapePoint],
+        prefix_tokens: int,
+        tail_tokens: int,
+    ) -> float:
+        ordered = sorted(points, key=lambda point: point.prefix_tokens)
         if len(ordered) == 1:
             point = ordered[0]
-            query_scale = (groups * k) / (point.groups * point.k)
-            prefix_work = max(1, prefix_tokens + tail_tokens)
-            measured_work = max(
+            work = max(1, prefix_tokens + tail_tokens)
+            measured = max(
                 1,
                 point.prefix_tokens + point.tail_tokens,
             )
-            return round(
-                point.time_ns * query_scale * prefix_work / measured_work
+            return point.time_ns * work / measured
+        if prefix_tokens <= ordered[0].prefix_tokens:
+            left, right = ordered[0], ordered[1]
+        elif prefix_tokens >= ordered[-1].prefix_tokens:
+            left, right = ordered[-2], ordered[-1]
+        else:
+            left, right = next(
+                (left, right)
+                for left, right in zip(ordered, ordered[1:])
+                if left.prefix_tokens <= prefix_tokens <= right.prefix_tokens
             )
-        table = PrimitiveTimeTable([
-            PrimitivePoint(point.prefix_tokens, point.time_ns)
-            for point in ordered
-        ])
-        base = table.estimate_ns(prefix_tokens)
-        exemplar = ordered[0]
-        query_scale = (groups * k) / (exemplar.groups * exemplar.k)
-        return round(base * query_scale)
-
-    def _nearest_series(
-        self,
-        groups: int,
-        k: int,
-        tail_tokens: int,
-    ) -> list[AttentionShapePoint]:
-        series_keys = {
-            (point.groups, point.k, point.tail_tokens)
-            for point in self.points
-        }
-        key = min(
-            series_keys,
-            key=lambda candidate: (
-                abs(candidate[0] - groups) / max(groups, 1)
-                + abs(candidate[1] - k) / max(k, 1)
-                + abs(candidate[2] - tail_tokens) / max(tail_tokens, 1)
-            ),
+        fraction = (
+            (prefix_tokens - left.prefix_tokens)
+            / (right.prefix_tokens - left.prefix_tokens)
         )
-        return [
-            point for point in self.points
-            if (point.groups, point.k, point.tail_tokens) == key
-        ]
+        return left.time_ns + fraction * (
+            right.time_ns - left.time_ns
+        )
+
+    def _interpolate_group(
+        self,
+        rows: Sequence[tuple[int, float]],
+        groups: int,
+    ) -> float:
+        if len(rows) == 1:
+            measured_groups, measured_time = rows[0]
+            return measured_time * groups / measured_groups
+        if groups <= rows[0][0]:
+            left, right = rows[0], rows[1]
+        elif groups >= rows[-1][0]:
+            left, right = rows[-2], rows[-1]
+        else:
+            left, right = next(
+                (left, right)
+                for left, right in zip(rows, rows[1:])
+                if left[0] <= groups <= right[0]
+            )
+        fraction = (groups - left[0]) / (right[0] - left[0])
+        return left[1] + fraction * (right[1] - left[1])
 
     def to_rows(self) -> list[dict[str, int]]:
         return [asdict(point) for point in self.points]

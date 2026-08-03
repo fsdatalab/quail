@@ -139,3 +139,24 @@ def test_attention_shape_table_round_trips_rows():
     }]
     table = AttentionShapeTable.from_rows(rows)
     assert table.to_rows() == rows
+
+
+def test_attention_shape_table_interpolates_group_count():
+    table = AttentionShapeTable([
+        AttentionShapePoint(4, 2, 1000, 32, 100),
+        AttentionShapePoint(4, 2, 2000, 32, 200),
+        AttentionShapePoint(16, 2, 1000, 32, 300),
+        AttentionShapePoint(16, 2, 2000, 32, 500),
+    ])
+    assert table.estimate_ns(
+        groups=10,
+        k=2,
+        prefix_tokens=1000,
+        tail_tokens=32,
+    ) == 200
+    assert table.estimate_ns(
+        groups=10,
+        k=2,
+        prefix_tokens=2000,
+        tail_tokens=32,
+    ) == 350
