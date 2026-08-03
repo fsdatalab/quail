@@ -668,6 +668,7 @@ def main(
     repetitions: int = 20,
     debug_sync: bool = False,
     held_out: bool = False,
+    multigroup_cascade: bool = False,
     out: str = "results/runs",
 ):
     import sys
