@@ -53,7 +53,11 @@ class VLLMModelRunner:
         scheduler_output = self._build_scheduler_output(batch, states)
         started_ns = perf_counter_ns()
         model_output = self.model_executor.execute_model(scheduler_output)
-        if model_output is None:
+        needs_sampling = any(
+            chunk.kind in (WorkKind.FILTER, WorkKind.DECODE)
+            for chunk in batch.chunks
+        )
+        if model_output is None and needs_sampling:
             model_output = self.model_executor.sample_tokens(None)
         ended_ns = perf_counter_ns()
         answers = self._read_answers(batch, model_output)
