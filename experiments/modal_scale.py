@@ -685,12 +685,13 @@ async def longdoc_run() -> dict:
 
 @app.function(image=image, gpu="H100!", timeout=2400,
               volumes={"/root/.cache/huggingface": hf_cache})
-async def chain_run(n_docs: int = 50) -> dict:
-    """Milestone one of sequence truncation: the same 50 documents run
+async def chain_run(n_docs: int = 50, n_filters: int = 2,
+                    s: float = 0.7) -> dict:
+    """Sequence truncation proof at any scale: the same documents run
     the old way (one request per filter) and the new way (one request
     per document, the engine rewinding between filters). Pass means the
     surviving documents match exactly and the rewind count equals the
-    number of documents that passed filter one."""
+    number of chain continuations."""
     import inspect
     import os
 
@@ -720,7 +721,7 @@ async def chain_run(n_docs: int = 50) -> dict:
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
     tok = AutoTokenizer.from_pretrained(MODEL)
     sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
-    n, s = 2, 0.7
+    n = n_filters
     rng = np.random.default_rng(FLAG_SEED + 7)
     flags = (rng.random((len(docs), n)) < s).astype(int)
     bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
@@ -759,7 +760,7 @@ async def chain_run(n_docs: int = 50) -> dict:
         engine.shutdown()
     except Exception:
         pass
-    return dict(n_docs=n_docs,
+    return dict(n_docs=n_docs, n_filters=n_filters, s=s,
                 request_mode=dict(requests=a["requests"], wall=a["wall"],
                                   survivors=a["survivors"]),
                 chain_mode=dict(requests=b["requests"], wall=b["wall"],
@@ -1304,6 +1305,12 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "chain":
         data = chain_run.remote(n_docs or 50)
         path = out or "results/engine/chain_smoke.json"
+    elif phase == "chain4":
+        data = chain_run.remote(n_docs or 50, 4, 0.8)
+        path = out or "results/engine/chain4_smoke.json"
+    elif phase == "chain10k":
+        data = chain_run.remote(n_docs or 10000, 4, 0.8)
+        path = out or "results/engine/chain10k.json"
     elif phase == "profile":
         data = profile_run.remote(n_docs or 4000)
         path = out or "results/engine/profile.json"
