@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
 from time import perf_counter_ns
-from typing import Mapping, Protocol
+from typing import Mapping, Protocol, Sequence
 
 from .batching import (
     BatchChunk,
@@ -62,6 +62,15 @@ class BatchModelRunner(Protocol):
         ...
 
 
+class RuntimeBatchPlanner(Protocol):
+    def choose(
+        self,
+        ready: Sequence[WorkItem],
+        kv: KVPageAllocator,
+    ) -> BatchPlan:
+        ...
+
+
 @dataclass(frozen=True)
 class RuntimeResult:
     answers: Mapping[tuple[int, int], int]
@@ -80,6 +89,7 @@ class DocEngineRuntime:
         packer: VariableLengthBatchPacker,
         kv: KVPageAllocator,
         trace: TraceRecorder | None = None,
+        planner: RuntimeBatchPlanner | None = None,
         speculation_k: int = 1,
         filter_temporary_bytes_per_token: int | None = None,
     ):
@@ -91,6 +101,7 @@ class DocEngineRuntime:
         self.packer = packer
         self.kv = kv
         self.trace = trace or TraceRecorder()
+        self.planner = planner
         self.speculation_k = int(speculation_k)
         self.filter_temporary_bytes_per_token = int(
             filter_temporary_bytes_per_token or kv.bytes_per_token
@@ -110,7 +121,11 @@ class DocEngineRuntime:
         while self._has_active_documents():
             planning_started = perf_counter_ns()
             ready = self._ready_work()
-            batch = self.packer.pack(ready, self.kv)
+            batch = (
+                self.planner.choose(ready, self.kv)
+                if self.planner is not None
+                else self.packer.pack(ready, self.kv)
+            )
             planning_ended = perf_counter_ns()
             if not batch.chunks:
                 raise RuntimeError(
