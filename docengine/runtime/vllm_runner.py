@@ -33,12 +33,14 @@ class VLLMModelRunner:
         model_executor,
         sampling_params,
         kv_cache_groups: int = 1,
+        multigroup_cascade: bool = False,
     ):
         self.query = query
         self.kv = kv
         self.model_executor = model_executor
         self.sampling_params = sampling_params
         self.kv_cache_groups = int(kv_cache_groups)
+        self.multigroup_cascade = bool(multigroup_cascade)
         self._known: dict[str, _KnownRequest] = {}
         self._finished_pending: set[str] = set()
 
@@ -93,11 +95,19 @@ class VLLMModelRunner:
             set_cascade_groups,
         )
 
+        if not self.multigroup_cascade and len(batch.chunks) != 1:
+            raise RuntimeError(
+                "verified cascade execution allows one prefix group"
+            )
         scheduler_output, work_requests, groups = (
-            self._build_cascade_output(batch, states)
+            self._build_cascade_output(
+                batch,
+                states,
+                multigroup=self.multigroup_cascade,
+            )
         )
         started_ns = perf_counter_ns()
-        set_cascade_groups(groups)
+        set_cascade_groups(groups if self.multigroup_cascade else None)
         try:
             model_output = self.model_executor.execute_model(scheduler_output)
             if model_output is None:
@@ -140,6 +150,8 @@ class VLLMModelRunner:
         self,
         batch: BatchPlan,
         states: Mapping[int, DocumentState],
+        *,
+        multigroup: bool,
     ):
         from .flashinfer_multigroup import CascadeGroup
 
@@ -217,7 +229,11 @@ class VLLMModelRunner:
             total_num_scheduled_tokens=sum(scheduled.values()),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[0] * self.kv_cache_groups,
+            num_common_prefix_blocks=(
+                [0] * self.kv_cache_groups
+                if multigroup
+                else [groups[0].shared_blocks] * self.kv_cache_groups
+            ),
             finished_req_ids=set(self._finished_pending),
             free_encoder_mm_hashes=[],
             scheduled_encoder_input_stats=ScheduledEncoderInputStats(),

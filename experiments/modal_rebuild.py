@@ -113,6 +113,7 @@ def custom_smoke(
     document_tokens: int = 0,
     short_circuit: bool = True,
     debug_sync: bool = False,
+    multigroup_cascade: bool = False,
 ) -> dict:
     import os
 
@@ -142,7 +143,7 @@ def custom_smoke(
         VLLMModelRunner,
         initialize_model_executor,
     )
-    if k > 1:
+    if k > 1 and multigroup_cascade:
         from docengine.runtime.flashinfer_multigroup import (
             install_multigroup_patch,
         )
@@ -226,6 +227,7 @@ def custom_smoke(
             model_executor=executor,
             sampling_params=sampling,
             kv_cache_groups=len(kv_config.kv_cache_groups),
+            multigroup_cascade=multigroup_cascade,
         )
         trace = TraceRecorder()
         runtime = DocEngineRuntime(
@@ -233,7 +235,9 @@ def custom_smoke(
             runner=runner,
             packer=VariableLengthBatchPacker(BatchLimits(
                 max_new_tokens=16_384,
-                max_sequences=1_024,
+                max_sequences=(
+                    1 if k > 1 and not multigroup_cascade else 1_024
+                ),
                 max_temporary_bytes=2 * (1 << 30),
             )),
             kv=kv,
@@ -265,6 +269,7 @@ def custom_smoke(
         "target_document_tokens": document_tokens,
         "body_token_lengths": [len(row) for row in body_ids],
         "short_circuit": short_circuit,
+        "multigroup_cascade": multigroup_cascade,
         "model": MODEL,
         "model_revision": MODEL_REVISION,
         "dataset_revision": DATASET_REVISION,
@@ -458,6 +463,7 @@ def cascade_kernel(
     repetitions: int = 20,
     debug_sync: bool = False,
     held_out: bool = False,
+    multigroup_cascade: bool = False,
 ) -> dict:
     import flashinfer
     import torch
@@ -676,6 +682,7 @@ def main(
             document_tokens,
             short_circuit,
             debug_sync,
+            multigroup_cascade,
         )
     elif phase == "stock-smoke":
         data = stock_smoke.remote(
@@ -692,6 +699,7 @@ def main(
             document_tokens,
             False,
             debug_sync,
+            multigroup_cascade,
         )
         stock_handle = stock_smoke.spawn(
             n_docs,
@@ -730,6 +738,7 @@ def main(
             "repetitions": repetitions,
             "debug_sync": debug_sync,
             "held_out": held_out,
+            "multigroup_cascade": multigroup_cascade,
         },
         seeds={
             "workload": WORKLOAD_SEED,
