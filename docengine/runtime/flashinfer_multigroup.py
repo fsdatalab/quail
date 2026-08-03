@@ -118,7 +118,7 @@ def install_multigroup_patch() -> None:
             sm_scale=self.sm_scale,
             window_left=self.window_left,
             logits_soft_cap=self.logits_soft_cap,
-            q_data_type=self.q_data_type_prefill,
+            q_data_type=torch.bfloat16,
             kv_data_type=self.kv_cache_dtype,
         )
         metadata.use_cascade = True
