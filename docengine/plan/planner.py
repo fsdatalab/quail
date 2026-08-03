@@ -128,7 +128,7 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
         remarks.append("shard overflows the KV pool; pins off")
 
     mode = "chain" if n_filters >= 2 else "requests"
-    # A pin keeps notes for a future consumer. One filter has no
+    # A pin keeps KV for a future consumer. One filter has no
     # future consumer, and chain mode keeps documents resident by
     # construction, so pins apply only to a multi-filter request plan
     # (kept for when chain mode is unavailable) and never under
