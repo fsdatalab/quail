@@ -144,14 +144,6 @@ def custom_smoke(
     )
 
     documents = _documents(n_docs if not document_tokens else 10_000)
-    labels_array = (
-        np.random.default_rng(GROUND_TRUTH_SEED)
-        .random((n_docs, n_filters)) < 0.8
-    ).astype(int)
-    bodies = [
-        document + _flags_line(flags)
-        for document, flags in zip(documents, labels_array)
-    ]
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL,
         revision=MODEL_REVISION,
@@ -162,6 +154,14 @@ def custom_smoke(
         n_docs,
         document_tokens,
     )
+    labels_array = (
+        np.random.default_rng(GROUND_TRUTH_SEED)
+        .random((n_docs, n_filters)) < 0.8
+    ).astype(int)
+    bodies = [
+        document + _flags_line(flags)
+        for document, flags in zip(documents, labels_array)
+    ]
     body_ids = tokenizer(
         bodies,
         add_special_tokens=False,
