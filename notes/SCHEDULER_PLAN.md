@@ -1,5 +1,9 @@
 # DocEngine: the plan from zero
 
+> Historical plan. The implemented rebuild is described in
+> [PHYSICAL_PLANS.md](PHYSICAL_PLANS.md), and its current measurements are in
+> [REBUILD_RESULTS.md](REBUILD_RESULTS.md).
+
 The objective, everywhere in this document: minimize end to end
 makespan, the wall clock from the moment a query starts to the moment
 the last document's last answer exists. One query, one dedicated H100,

@@ -1,5 +1,9 @@
 # Results from the solved schedules
 
+> Historical analytical results. These numbers predate the custom runtime rebuild.
+> Use [REBUILD_RESULTS.md](REBUILD_RESULTS.md) for current measured results and
+> [EXPERIMENTS.md](EXPERIMENTS.md) for immutable run artifacts.
+
 ## What was solved and how to read the numbers
 
 The paper in this repo (paper.md) studies a database query that runs a chain

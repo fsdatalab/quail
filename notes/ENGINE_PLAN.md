@@ -1,5 +1,8 @@
 # Measured layer plan: real H100 runs on Modal
 
+> Historical harness plan. New runs use `experiments/modal_rebuild.py` and are
+> indexed in [EXPERIMENTS.md](EXPERIMENTS.md).
+
 The goal is to measure real wall-clock makespans for the scheduling
 policies on a rented H100 with Qwen3-4B-FP8 under vLLM, with selectivity
 under our control, and to compare each run against the ideal model's

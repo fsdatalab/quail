@@ -1,5 +1,8 @@
 # Plan for solving the schedules
 
+> Historical analytical plan. The current runtime boundary and physical plans
+> are in [PHYSICAL_PLANS.md](PHYSICAL_PLANS.md).
+
 ## What the project is
 
 The file paper.md in this repo is a working paper about a database query

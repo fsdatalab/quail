@@ -83,6 +83,14 @@ def build_summary(rows, cost_catalog):
             row["lengths_match"] for row in comparisons
         ),
         "rows": comparisons,
+        "median_runtime_overhead_fraction": (
+            statistics.median(
+                row["runtime_overhead_seconds"]
+                / row["model_runner_seconds"]
+                for row in comparisons
+            )
+            if comparisons else None
+        ),
     }
     non_regression["passes"] = bool(
         ratios
@@ -109,6 +117,7 @@ def build_summary(rows, cost_catalog):
             "steps": result["steps"],
             "body_token_lengths": result.get("body_token_lengths"),
             "accuracy": result["accuracy"],
+            "answers": result["answers"],
         }
     shape_rows = [
         {
@@ -118,6 +127,16 @@ def build_summary(rows, cost_catalog):
         }
         for (length, k), value in sorted(fixed_shapes.items())
     ]
+    for row in shape_rows:
+        baseline = fixed_shapes.get((row["document_tokens"], 1))
+        row["answer_flips_from_k1"] = (
+            sum(
+                answer != baseline["answers"].get(key)
+                for key, answer in row["answers"].items()
+            )
+            if baseline is not None else None
+        )
+        del row["answers"]
 
     headline_by_key = {}
     for metadata, result in rows:
@@ -173,6 +192,13 @@ def build_summary(rows, cost_catalog):
             "runtime_overhead_seconds": (
                 custom["seconds"] - custom["model_runner_seconds"]
             ),
+            "runtime_overhead_fraction": (
+                (
+                    custom["seconds"]
+                    - custom["model_runner_seconds"]
+                ) / custom["model_runner_seconds"]
+                if custom["model_runner_seconds"] else None
+            ),
         })
 
     kernel_rows = []
@@ -212,6 +238,7 @@ def render_markdown(summary):
         f"- Median custom time divided by stock time: {gate['median_custom_to_stock']:.4f}" if gate["median_custom_to_stock"] is not None else "- No runs",
         f"- 95 percent upper bootstrap bound: {gate['upper_95_bootstrap_median']:.4f}" if gate["upper_95_bootstrap_median"] is not None else "- No bound",
         f"- Answer flips: {gate['answer_flips']}",
+        f"- Median runtime overhead above model-runner time: {100 * gate['median_runtime_overhead_fraction']:.2f}%" if gate["median_runtime_overhead_fraction"] is not None else "- No overhead measurement",
         f"- Gate: {'passed' if gate['passes'] else 'failed'}",
         "",
         "| Run | Custom | Stock | Custom / stock | Runtime overhead | Flips |",
@@ -240,19 +267,33 @@ def render_markdown(summary):
         )
     lines.extend([
         "",
+        "Model-runner time is the measured lower reference for the same chosen batches. It is not a hardware lower bound over all possible schedules.",
+        "",
         "## Fixed-work fused k",
         "",
         "Each row executes all four filters. These are one-document operator checks.",
+        "The verified fused implementation runs one prefix group per forward. Multi-group full-model runs are excluded because they changed Boolean answers.",
         "",
-        "| Target document tokens | k | Time | Steps | Accuracy |",
-        "|---:|---:|---:|---:|---:|",
+        "| Target document tokens | k | Time | Steps | Accuracy | Flips from k=1 |",
+        "|---:|---:|---:|---:|---:|---:|",
     ])
     for row in summary["fixed_work_shapes"]:
         lines.append(
             f"| {row['document_tokens']} | {row['k']} | "
             f"{row['seconds']:.4f} s | {row['steps']} | "
-            f"{100 * row['accuracy']:.2f}% |"
+            f"{100 * row['accuracy']:.2f}% | "
+            f"{row['answer_flips_from_k1']} |"
         )
+    fused_flips = sum(
+        row["answer_flips_from_k1"]
+        for row in summary["fixed_work_shapes"]
+        if row["k"] > 1
+    )
+    if fused_flips:
+        lines.extend([
+            "",
+            f"Fused k changed {fused_flips} fixed-work answers. It does not pass the semantic shipping gate.",
+        ])
     lines.extend([
         "",
         "## Attention cost estimator",
