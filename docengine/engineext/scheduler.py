@@ -62,6 +62,7 @@ class DocEngineScheduler(Scheduler):
         self._de_pinned_ids = set()  # block ids currently pinned
         self._de_intent = {}        # request id -> (pin_tokens, doc key)
         self._de_questions = None   # registered question token lists
+        self._de_qc = 0             # shared question preamble length
         self._de_yes = set()        # token ids that mean yes
         self._de_chain = {}         # request id -> dict(stage, d)
         self._de_strict = os.environ.get(
@@ -172,16 +173,31 @@ class DocEngineScheduler(Scheduler):
             qs.append(toks[i:i + ln])
             i += ln
         self._de_questions = qs
+        # The questions' shared preamble is identical for every stage
+        # by definition, so its notes survive the rewind and each
+        # continuation appends only the question's tail. Without this,
+        # every continuation recomputed the preamble: about 25 tokens
+        # times 13,906 continuations was the entire 4.4-second loss at
+        # 10,000 documents.
+        qc = 0
+        for col in zip(*qs):
+            if len(set(col)) != 1:
+                break
+            qc += 1
+        self._de_qc = qc if len(qs) > 1 else 0
         for part in request.request_id.split("|"):
             if part.startswith("Y") and len(part) > 1:
                 self._de_yes = {int(x) for x in part[1:].split(",")}
-        super().add_request(request)
         self._de_stats["registered"] = len(qs)
         print(f"[de-sched] chain registered: {len(qs)} questions, "
-              f"lengths {[len(q) for q in qs]}, "
-              f"yes ids {sorted(self._de_yes)}", flush=True)
-        self.finish_requests(request.request_id,
-                             RequestStatus.FINISHED_ABORTED)
+              f"lengths {[len(q) for q in qs]}, shared preamble "
+              f"{self._de_qc} tokens, yes ids {sorted(self._de_yes)}",
+              flush=True)
+        # Let the registration request finish normally: one step of a
+        # tiny prompt. Aborting it here left the client waiting out a
+        # 30-second timeout, because an abort before scheduling never
+        # sends the client anything.
+        super().add_request(request)
 
     def _de_rewind(self, request, d):
         """Erase everything past the document boundary d: the token
@@ -249,11 +265,12 @@ class DocEngineScheduler(Scheduler):
                 self._de_dump_profile("chain-mode")
             return True
         st["advance"] = False
-        self._de_rewind(request, st["d"])
+        self._de_rewind(request, st["d"] + self._de_qc)
         st["stage"] += 1
         update = StreamingUpdate(
             mm_features=None,
-            prompt_token_ids=list(self._de_questions[st["stage"] - 1]),
+            prompt_token_ids=list(
+                self._de_questions[st["stage"] - 1][self._de_qc:]),
             max_tokens=request.max_tokens,
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params)
