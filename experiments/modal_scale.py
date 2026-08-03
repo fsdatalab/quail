@@ -781,14 +781,20 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
     except ImportError:
         from vllm import AsyncEngineArgs
 
-    from docengine.runtime.engine_client import (EngineTags,
+    from docengine.runtime.engine_client import (EngineTags, _yes,
                                                  run_filter_chain,
                                                  run_filter_chain_engine)
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
     docs = _build_pool(n_docs)
     tok = AutoTokenizer.from_pretrained(MODEL32)
-    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
+    # The 32B model does not keep the one-token answer contract: the
+    # probe showed it restating the flag line (the answer arriving as
+    # a fused "=YES" token in position four) or appending chatter. So
+    # every arm samples up to six tokens, request arms classify by
+    # first decisive word, and chain mode registers both token sets so
+    # the engine stops each stage at the first decisive token.
+    sp = SamplingParams(temperature=0.0, max_tokens=6, skip_clone=True)
     n, s = 4, 0.8
     rng = np.random.default_rng(FLAG_SEED + 7)
     flags = (rng.random((len(docs), n)) < s).astype(int)
@@ -796,11 +802,16 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
     body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
     q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
              for j in range(n)]
-    yes_ids = set()
-    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+    yes_ids, no_ids = set(), set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y", "=YES", "=Yes"):
         ids = tok(w, add_special_tokens=False)["input_ids"]
         if ids:
-            yes_ids.add(ids[0])
+            yes_ids.add(ids[-1] if w.startswith("=") else ids[0])
+    for w in ("NO", " NO", "No", " No", "N", " N", "=NO", "=No"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            no_ids.add(ids[-1] if w.startswith("=") else ids[0])
+    no_ids -= yes_ids
     corpus = sum(len(b) for b in body_ids)
     report = dict(n_docs=n_docs, n_filters=n, s=s, model=MODEL32,
                   corpus_tokens=int(corpus))
@@ -869,8 +880,7 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
                 counters["prompt_tokens"] += len(final.prompt_token_ids)
                 counters["cached_tokens"] += (
                     getattr(final, "num_cached_tokens", 0) or 0)
-                txt = final.outputs[0].text.strip().upper()
-                answers[(i, jj + 1)] = 1 if txt.startswith("Y") else 0
+                answers[(i, jj + 1)] = _yes(final)
             await asyncio.gather(*[one(i) for i in alive])
             alive = [i for i in alive if answers[(i, j + 1)]]
         return dict(wall=_time.time() - t0, survivors=sorted(alive),
@@ -917,7 +927,8 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
     bank("request_ranked", r)
     await reset(engine)
     r = await run_filter_chain_engine(engine, sp, body_ids, q_ids,
-                                      200_000, yes_ids, tag="m32c")
+                                      200_000, yes_ids, tag="m32c",
+                                      no_ids=no_ids)
     r.pop("doc0_raw", None)
     bank("chain", r)
     try:

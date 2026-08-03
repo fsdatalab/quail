@@ -64,6 +64,7 @@ class DocEngineScheduler(Scheduler):
         self._de_questions = None   # registered question token lists
         self._de_qc = 0             # shared question preamble length
         self._de_yes = set()        # token ids that mean yes
+        self._de_no = set()         # token ids that mean no (optional)
         self._de_chain = {}         # request id -> dict(stage, d)
         self._de_strict = os.environ.get(
             "DOCENGINE_SINGLE_TENANT", "1") == "1"
@@ -191,11 +192,13 @@ class DocEngineScheduler(Scheduler):
         for part in request.request_id.split("|"):
             if part.startswith("Y") and len(part) > 1:
                 self._de_yes = {int(x) for x in part[1:].split(",")}
+            elif part.startswith("N") and len(part) > 1:
+                self._de_no = {int(x) for x in part[1:].split(",")}
         self._de_stats["registered"] = len(qs)
         print(f"[de-sched] chain registered: {len(qs)} questions, "
               f"lengths {[len(q) for q in qs]}, shared preamble "
-              f"{self._de_qc} tokens, yes ids {sorted(self._de_yes)}",
-              flush=True)
+              f"{self._de_qc} tokens, yes ids {sorted(self._de_yes)}, "
+              f"no ids {sorted(self._de_no)}", flush=True)
         # Let the registration request finish normally: one step of a
         # tiny prompt. Aborting it here left the client waiting out a
         # 30-second timeout, because an abort before scheduling never
@@ -233,9 +236,19 @@ class DocEngineScheduler(Scheduler):
         new_token_ids, stopped = super()._update_request_with_output(
             request, new_token_ids)
         st = self._de_chain.get(request.request_id)
-        if st is not None and stopped:
-            out = request._output_token_ids
-            tok = out[-1] if out else None
+        if st is None:
+            return new_token_ids, stopped
+        out = request._output_token_ids
+        tok = out[-1] if out else None
+        if (not stopped and self._de_no and tok is not None
+                and (tok in self._de_yes or tok in self._de_no)):
+            # Decisive-token mode (a no set is registered): the model
+            # may restate the line or append chatter, so the stage is
+            # allowed several tokens but ends at the first token that
+            # decides the answer; the trailing chatter never decodes.
+            request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+            stopped = True
+        if stopped:
             st["advance"] = (tok in self._de_yes
                              and st["stage"] < len(self._de_questions))
             if st["advance"]:

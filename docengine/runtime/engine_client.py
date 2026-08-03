@@ -27,7 +27,15 @@ import time
 
 
 def _yes(out):
-    return 1 if out.outputs[0].text.strip().upper().startswith("Y") else 0
+    """First decisive word wins. The 4B model answers with the bare
+    token; the 32B sometimes restates the flag line (the answer lands
+    mid-text) or appends chatter after it."""
+    t = out.outputs[0].text.upper()
+    iy = t.find("YES")
+    if iy < 0:
+        return 0
+    ino = t.find("NO")
+    return 1 if ino < 0 or iy < ino else 0
 
 
 class EngineTags:
@@ -154,7 +162,7 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
 
 
 async def run_query(engine, sampling_params, body_ids, q_ids,
-                    budget_tokens, yes_ids=None, tag="q"):
+                    budget_tokens, yes_ids=None, tag="q", no_ids=None):
     """The shipped plan. Multi-filter queries run in chain mode: one
     living engine request per document runs the whole filter chain,
     the scheduler judging answers and rewinding between filters
@@ -166,7 +174,7 @@ async def run_query(engine, sampling_params, body_ids, q_ids,
         return await run_filter_chain_engine(engine, sampling_params,
                                              body_ids, q_ids,
                                              budget_tokens, yes_ids,
-                                             tag=tag)
+                                             tag=tag, no_ids=no_ids)
     return await run_filter_chain(engine, sampling_params, body_ids,
                                   q_ids, budget_tokens, lookahead=1,
                                   tag=tag, tags=EngineTags(),
@@ -174,11 +182,17 @@ async def run_query(engine, sampling_params, body_ids, q_ids,
 
 
 async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
-                                  budget_tokens, yes_ids, tag="c"):
+                                  budget_tokens, yes_ids, tag="c",
+                                  no_ids=None):
     """Chain mode: the engine itself runs each document's whole filter
     chain (register questions once, then one request per document; the
     scheduler judges answers, rewinds, and continues). Returns the same
-    result shape as run_filter_chain."""
+    result shape as run_filter_chain.
+
+    With no_ids given, the gate runs in decisive-token mode for models
+    that do not answer in one token: each stage may sample several
+    tokens, the engine stops the stage at the first token in either
+    set, and only those tokens count as stage answers."""
     import asyncio
     import time as _time
 
@@ -186,7 +200,9 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
     reg = [n]
     for q in q_ids:
         reg += [len(q)] + list(q)
-    reg_rid = f"de1|reg|Y{','.join(map(str, sorted(yes_ids)))}|{tag}-reg"
+    npart = (f"N{','.join(map(str, sorted(no_ids)))}|" if no_ids else "")
+    reg_rid = (f"de1|reg|Y{','.join(map(str, sorted(yes_ids)))}|"
+               f"{npart}{tag}-reg")
 
     async def _reg():
         async for _ in engine.generate({"prompt_token_ids": reg},
@@ -229,12 +245,16 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
                 counters["cached_tokens"] += (
                     getattr(final, "num_cached_tokens", 0) or 0)
             # the engine's rewind is invisible on this side: the
-            # client's cumulative output record only grows, one answer
-            # token per stage. The new tokens each snapshot adds are
-            # the per-stage answers, in stage order.
+            # client's cumulative output record only grows. Without
+            # no_ids every new token is one stage's answer; with them,
+            # only decisive tokens are answers and the rest is the
+            # model's trailing chatter, cut short engine-side.
+            decisive = set(yes_ids) | set(no_ids or ())
             stage_toks, seen = [], 0
             for snap in toks:
-                stage_toks.extend(snap[seen:])
+                for t in snap[seen:]:
+                    if not no_ids or t in decisive:
+                        stage_toks.append(t)
                 seen = max(seen, len(snap))
             if i == 0:
                 raw0.extend(tuple(s) for s in toks[:8])
