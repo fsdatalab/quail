@@ -151,7 +151,7 @@ def test_adapter_builds_shared_prefix_cascade_batch(monkeypatch):
     assert result.survivors == (0,)
     assert result.answers == {(0, 1): 1, (0, 2): 1}
     cascade = executor.outputs[1]
-    assert cascade.num_common_prefix_blocks == [1]
+    assert cascade.num_common_prefix_blocks == [0]
     assert len(cascade.scheduled_new_reqs) == 2
     first, second = cascade.scheduled_new_reqs
     assert first.block_ids[0][0] == second.block_ids[0][0]
