@@ -110,7 +110,12 @@ def custom_smoke(
     k: int = 1,
     document_tokens: int = 0,
     short_circuit: bool = True,
+    debug_sync: bool = False,
 ) -> dict:
+    import os
+
+    if debug_sync:
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     import numpy as np
     import torch
     from transformers import AutoTokenizer
@@ -425,6 +430,7 @@ def cascade_kernel(
     prefix_tokens: int = 304,
     tail_tokens: int = 32,
     repetitions: int = 20,
+    debug_sync: bool = False,
 ) -> dict:
     import flashinfer
     import torch
@@ -626,6 +632,7 @@ def main(
     prefix_tokens: int = 304,
     tail_tokens: int = 32,
     repetitions: int = 20,
+    debug_sync: bool = False,
     out: str = "results/runs",
 ):
     import sys
@@ -639,6 +646,7 @@ def main(
             k,
             document_tokens,
             short_circuit,
+            debug_sync,
         )
     elif phase == "stock-smoke":
         data = stock_smoke.remote(
@@ -654,6 +662,7 @@ def main(
             1,
             document_tokens,
             False,
+            debug_sync,
         )
         stock_handle = stock_smoke.spawn(
             n_docs,
@@ -688,6 +697,7 @@ def main(
             "prefix_tokens": prefix_tokens,
             "tail_tokens": tail_tokens,
             "repetitions": repetitions,
+            "debug_sync": debug_sync,
         },
         seeds={
             "workload": WORKLOAD_SEED,
