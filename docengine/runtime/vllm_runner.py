@@ -115,7 +115,7 @@ class VLLMModelRunner:
                     lora_request=None,
                     prompt_embeds=None,
                     prompt_is_token_ids=None,
-                    prefill_token_ids=None,
+                    prefill_token_ids=prompt,
                 ))
                 self._known[req_id] = _KnownRequest(
                     prompt_token_ids=prompt,
