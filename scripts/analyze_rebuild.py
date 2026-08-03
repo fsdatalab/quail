@@ -119,6 +119,62 @@ def build_summary(rows, cost_catalog):
         for (length, k), value in sorted(fixed_shapes.items())
     ]
 
+    headline_by_key = {}
+    for metadata, result in rows:
+        config = metadata.get("config", {})
+        n_docs = config.get("n_docs")
+        if n_docs not in {2000, 10000}:
+            continue
+        if metadata["phase"] == "stock-smoke":
+            key = (n_docs, "stock")
+        elif (
+            metadata["phase"] == "custom-smoke"
+            and config.get("k") == 1
+        ):
+            key = (n_docs, "custom-k1")
+        else:
+            continue
+        runner_ns = sum(
+            step["duration_ns"] for step in result.get("trace", [])
+        )
+        headline_by_key[key] = {
+            "run_id": metadata["run_id"],
+            "seconds": result["wall_ns"] / 1e9,
+            "answers": result["answers"],
+            "body_token_lengths": result.get("body_token_lengths"),
+            "model_runner_seconds": runner_ns / 1e9,
+        }
+    headlines = []
+    for n_docs in (2000, 10000):
+        custom = headline_by_key.get((n_docs, "custom-k1"))
+        stock = headline_by_key.get((n_docs, "stock"))
+        if custom is None or stock is None:
+            continue
+        flips = sum(
+            custom["answers"][key] != stock["answers"].get(key)
+            for key in custom["answers"]
+        )
+        headlines.append({
+            "n_docs": n_docs,
+            "custom_run_id": custom["run_id"],
+            "stock_run_id": stock["run_id"],
+            "custom_seconds": custom["seconds"],
+            "stock_seconds": stock["seconds"],
+            "stock_to_custom_speedup": (
+                stock["seconds"] / custom["seconds"]
+            ),
+            "answer_count": len(custom["answers"]),
+            "answer_flips": flips,
+            "lengths_match": (
+                custom["body_token_lengths"]
+                == stock["body_token_lengths"]
+            ),
+            "model_runner_seconds": custom["model_runner_seconds"],
+            "runtime_overhead_seconds": (
+                custom["seconds"] - custom["model_runner_seconds"]
+            ),
+        })
+
     kernel_rows = []
     for row in cost_catalog.get("comparisons", []):
         kernel_rows.append({
@@ -134,6 +190,7 @@ def build_summary(rows, cost_catalog):
     return {
         "non_regression": non_regression,
         "fixed_work_shapes": shape_rows,
+        "headline_results": headlines,
         "attention_cost_validation": cost_catalog.get("validation", {}),
         "attention_kernel_shapes": kernel_rows,
     }
@@ -166,6 +223,20 @@ def render_markdown(summary):
             f"{row['stock_seconds']:.4f} s | {row['custom_to_stock']:.4f} | "
             f"{row['runtime_overhead_seconds']:.4f} s | "
             f"{len(row['answer_flips'])} |"
+        )
+    lines.extend([
+        "",
+        "## Headline scale results",
+        "",
+        "| Documents | Custom k=1 | Stock vLLM | Stock / custom | Answers | Flips |",
+        "|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in summary["headline_results"]:
+        lines.append(
+            f"| {row['n_docs']} | {row['custom_seconds']:.2f} s | "
+            f"{row['stock_seconds']:.2f} s | "
+            f"{row['stock_to_custom_speedup']:.3f} | "
+            f"{row['answer_count']} | {row['answer_flips']} |"
         )
     lines.extend([
         "",
