@@ -1,0 +1,1 @@
+{"n_docs": 50, "n_filters": 4, "s": 0.8, "request_mode": {"requests": 92, "wall": 0.4153425693511963, "survivors": [1, 9, 16, 22, 24, 33, 34, 44, 45, 48, 49]}, "chain_mode": {"requests": 50, "wall": 0.35339856147766113, "survivors": [1, 9, 16, 22, 24, 33, 34, 44, 45, 48, 49]}, "survivors_match": true, "answers_agree": [92, 92], "doc0_raw": [[14080], [14080, 8996]]}
