@@ -688,6 +688,152 @@ async def chainprof_run(n_docs: int = 4000) -> dict:
     return report
 
 
+@app.function(image=image, gpu="H100!", timeout=2400,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def persist_run(n_docs: int = 2000) -> dict:
+    """Persisted-notes tier, milestone one: the same query repeated on
+    one engine with a two-tier note store (RAM primary, container-local
+    disk secondary, vLLM's tiering offload connector). Query one
+    computes cold and offloads as it goes; the prefix cache is then
+    reset, so later queries must restore notes from the store instead
+    of recomputing. A separate engine without the store gives the
+    honest baseline for both the overhead of saving and the payoff of
+    restoring. Runs on the stock scheduler: the store manages the
+    note lifecycle, and the strict plan-owned-memory discipline is a
+    separate mechanism to reconcile with it later.
+
+    Also measures raw disk write bandwidth to anchor the break-even:
+    restoring pays bytes-per-token divided by disk rate against
+    recompute at the prefill rate, and at this model size the two are
+    close by design (the win is projected for bigger models)."""
+    import gc
+    import inspect
+    import os
+    import subprocess
+    import time as _time
+
+    import numpy as np
+    import torch
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+    from vllm.config import KVTransferConfig
+
+    from docengine.runtime.engine_client import run_filter_chain
+
+    docs = _build_pool(n_docs)
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
+    n, s = 2, 0.7
+    rng = np.random.default_rng(FLAG_SEED + 7)
+    flags = (rng.random((len(docs), n)) < s).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(n)]
+    report = dict(n_docs=n_docs,
+                  corpus_tokens=int(sum(len(b) for b in body_ids)))
+
+    # raw disk write bandwidth on the same filesystem the tier uses
+    os.makedirs("/root/kvtier", exist_ok=True)
+    buf = os.urandom(1 << 28)
+    t0 = _time.time()
+    fd = os.open("/root/kvtier/bwprobe", os.O_WRONLY | os.O_CREAT)
+    for _ in range(8):
+        os.write(fd, buf)
+    os.fsync(fd)
+    os.close(fd)
+    wbw = (8 * len(buf)) / (_time.time() - t0) / 1e9
+    os.unlink("/root/kvtier/bwprobe")
+    report["disk_write_GBps"] = round(wbw, 2)
+    print(f"[persist] raw disk write {wbw:.2f} GB/s", flush=True)
+
+    def engine_args(store):
+        kw = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+                  gpu_memory_utilization=0.92, enable_prefix_caching=True,
+                  disable_log_stats=True)
+        if store:
+            kw["kv_transfer_config"] = KVTransferConfig(
+                kv_connector="OffloadingConnector", kv_role="kv_both",
+                kv_connector_extra_config=dict(
+                    spec_name="TieringOffloadingSpec",
+                    cpu_bytes_to_use=16 * (1 << 30),
+                    secondary_tiers=[dict(type="fs",
+                                          root_dir="/root/kvtier")]))
+        return AsyncEngineArgs(**kw)
+
+    async def one_query(engine, tag):
+        return await run_filter_chain(engine, sp, body_ids, q_ids,
+                                      830_000, lookahead=1, tag=tag)
+
+    async def reset(engine):
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    def tier_bytes():
+        try:
+            out = subprocess.run(["du", "-sb", "/root/kvtier"],
+                                 capture_output=True, text=True)
+            return int(out.stdout.split()[0])
+        except Exception:
+            return -1
+
+    engine = Engine.from_engine_args(engine_args(store=False))
+    base = await one_query(engine, "pb")
+    await reset(engine)
+    base2 = await one_query(engine, "pb2")
+    report["baseline_cold_s"] = round(base["wall"], 2)
+    report["baseline_recompute_s"] = round(base2["wall"], 2)
+    print(f"[persist] baseline cold {base['wall']:.2f}s, recompute "
+          f"after reset {base2['wall']:.2f}s", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+    _time.sleep(8)
+
+    engine = Engine.from_engine_args(engine_args(store=True))
+    q1 = await one_query(engine, "ps1")
+    _time.sleep(8)                     # let offload writes drain
+    b1 = tier_bytes()
+    await reset(engine)
+    q2 = await one_query(engine, "ps2")
+    await reset(engine)
+    q3 = await one_query(engine, "ps3")
+    b3 = tier_bytes()
+    report["store_cold_offload_s"] = round(q1["wall"], 2)
+    report["store_restore_s"] = round(q2["wall"], 2)
+    report["store_restore2_s"] = round(q3["wall"], 2)
+    report["tier_disk_bytes_after_q1"] = b1
+    report["tier_disk_bytes_final"] = b3
+    report["outcomes_identical"] = (
+        base["survivors"] == q1["survivors"] == q2["survivors"]
+        == q3["survivors"])
+    print(f"[persist] with store: cold+offload {q1['wall']:.2f}s, "
+          f"restore {q2['wall']:.2f}s, restore again {q3['wall']:.2f}s",
+          flush=True)
+    print(f"[persist] disk holds {b1 / 1e9:.1f} GB after query one, "
+          f"{b3 / 1e9:.1f} GB at end; outcomes identical: "
+          f"{report['outcomes_identical']}", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return report
+
+
 # ------------------------------------------------------ long documents
 
 @app.function(image=image, gpu="H100!", timeout=3600,
@@ -1581,6 +1727,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "chainbf16":
         data = chain_run.remote(n_docs or 10000, 4, 0.8, 0, "bf16")
         path = out or "results/engine/chainbf16_10k.json"
+    elif phase == "persist":
+        data = persist_run.remote(n_docs or 2000)
+        path = out or "results/engine/persist2000.json"
     elif phase == "longchain":
         data = longchain_run.remote()
         path = out or "results/engine/longchain.json"
