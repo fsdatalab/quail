@@ -16,6 +16,10 @@ from docengine.runtime.batch_cost import (
     summarize_validation,
 )
 
+PROMOTED_CALIBRATION_RUN_IDS = {
+    "20260803T072534989618Z-cascade-kernel-3a9d0514",
+}
+
 
 def load_kernel_rows(root: Path) -> list[dict]:
     rows = []
@@ -44,11 +48,17 @@ def load_kernel_rows(root: Path) -> list[dict]:
 def build_catalog(rows: list[dict]) -> dict:
     calibration = [
         row for row in rows
-        if not row["held_out"]
+        if (
+            not row["held_out"]
+            or row["run_id"] in PROMOTED_CALIBRATION_RUN_IDS
+        )
     ]
     held_out = [
         row for row in rows
-        if row["held_out"]
+        if (
+            row["held_out"]
+            and row["run_id"] not in PROMOTED_CALIBRATION_RUN_IDS
+        )
     ]
     cascade = AttentionShapeTable([
         AttentionShapePoint(
@@ -115,6 +125,9 @@ def build_catalog(rows: list[dict]) -> dict:
         "standard_attention": standard.to_rows(),
         "comparisons": calibration,
         "held_out_comparisons": held_out,
+        "promoted_after_failed_validation": sorted(
+            PROMOTED_CALIBRATION_RUN_IDS
+        ),
         "validation": validation,
     }
 
