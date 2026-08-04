@@ -6,14 +6,17 @@ import numpy as np
 import pytest
 
 from docengine.instance import Instance, sample_outcomes
-from docengine.optimizer.queue_augmented import solve_queue_augmented_taskfirst
-from docengine.optimizer.state_actions import (build_fullspec, build_pipeline,
-                                               build_taskfirst, make_types)
-from docengine.optimizer.steady_state_lp import solve_expected_flow
-from docengine.runtime.replay import replay
 from docengine.validator.check import validate
 
-from test_exact import TOY_MODEL, inst
+from attic.theory.optimizer.queue_augmented import \
+    solve_queue_augmented_taskfirst
+from attic.theory.optimizer.state_actions import (build_fullspec,
+                                                  build_pipeline,
+                                                  build_taskfirst, make_types)
+from attic.theory.optimizer.steady_state_lp import solve_expected_flow
+from attic.theory.replay import replay
+
+from test_exact_reference import TOY_MODEL, inst
 
 
 def test_lp_matches_hand_rate_single_type():

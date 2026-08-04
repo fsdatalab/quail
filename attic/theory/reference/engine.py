@@ -24,9 +24,10 @@ from dataclasses import dataclass
 from itertools import combinations as _combinations_iter, product
 from typing import Iterator, Optional
 
-from ..configs import DeviceConfig, ModelConfig
-from ..costmodel import BatchStats, Op, batch_stats, memory_ok, peak_memory, tau
-from ..instance import Instance
+from docengine.configs import DeviceConfig, ModelConfig
+from docengine.costmodel import (BatchStats, Op, batch_stats, memory_ok,
+                                 peak_memory, tau)
+from docengine.instance import Instance
 
 DONE = "done"  # sentinel
 

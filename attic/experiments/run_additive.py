@@ -19,14 +19,18 @@ import sys
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# repo root, so both docengine (installed or not) and attic import
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
 
 from docengine.configs import DEVICES, MODELS                      # noqa: E402
 from docengine.instance import Instance, sample_outcomes           # noqa: E402
-from docengine.reprice import reprice_records, resource_lb_additive  # noqa: E402
 from docengine.sched.blockwise import (schedule_blockwise,          # noqa: E402
                                        schedule_taskfirst)
 from docengine.validator.check import validate                      # noqa: E402
+
+from attic.theory.reprice import (reprice_records,                 # noqa: E402
+                                  resource_lb_additive)
 
 SEED = 20260801
 

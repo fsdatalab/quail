@@ -9,7 +9,8 @@ observe x, choose E."""
 
 from typing import Dict
 
-from ..instance import Instance
+from docengine.instance import Instance
+
 from . import engine
 
 

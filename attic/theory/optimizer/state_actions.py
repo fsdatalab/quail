@@ -40,8 +40,8 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from ..costmodel import BatchStats, a_pairs, kv_capacity_tokens, tau
-from ..instance import Instance
+from docengine.costmodel import BatchStats, a_pairs, kv_capacity_tokens, tau
+from docengine.instance import Instance
 
 
 @dataclass(frozen=True)

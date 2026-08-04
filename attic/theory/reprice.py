@@ -23,9 +23,9 @@ later-stage branch, executed with the realized reach of that stage."""
 
 import numpy as np
 
-from .costmodel import kv_capacity_tokens
-from .instance import Instance, survival
-from .lb import ledgers
+from docengine.costmodel import kv_capacity_tokens
+from docengine.instance import Instance, survival
+from docengine.lb import ledgers
 
 
 def reprice_records(inst: Instance, records) -> dict:

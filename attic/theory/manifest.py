@@ -3,9 +3,10 @@ independent validator can replay it without solver internals."""
 
 import json
 
-from .costmodel import dense_time, attn_time
+from docengine.costmodel import dense_time, attn_time
+from docengine.instance import Instance
+
 from .reference import engine
-from .instance import Instance
 
 
 def emit(inst: Instance, policy: str, schedule, X) -> list:

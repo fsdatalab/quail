@@ -2,16 +2,17 @@
 
 import numpy as np
 
-from docengine.cluster import partition_docs, run_builder_multi
 from docengine.instance import Instance, sample_outcomes
-from docengine.optimizer.state_actions import (build_blockwise_lp,
-                                               build_fullspec, build_pipeline,
-                                               make_types)
-from docengine.optimizer.steady_state_lp import solve_expected_flow
 from docengine.sched.blockwise import schedule_blockwise
 from docengine.validator.check import validate
 
-from test_exact import inst
+from attic.theory.cluster import partition_docs, run_builder_multi
+from attic.theory.optimizer.state_actions import (build_blockwise_lp,
+                                                  build_fullspec,
+                                                  build_pipeline, make_types)
+from attic.theory.optimizer.steady_state_lp import solve_expected_flow
+
+from test_exact_reference import inst
 
 
 def test_blockwise_lp_consistency():
@@ -72,7 +73,7 @@ def test_multi_gpu_builder_scaling():
 def test_additive_repricing_orders():
     """tau_add >= tau_max on any schedule (the max cannot exceed the sum),
     and the additive class bound holds for the pipeline builder."""
-    from docengine.reprice import reprice_records, resource_lb_additive
+    from attic.theory.reprice import reprice_records, resource_lb_additive
     rng = np.random.default_rng(11)
     d = rng.integers(4, 14, size=30).tolist()
     it = inst(d, [1, 2], [0.7, 0.5], kv_tokens=90)

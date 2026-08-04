@@ -20,17 +20,21 @@ import sys
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# repo root, so both docengine (installed or not) and attic import
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
 
 from docengine.configs import DEVICES, MODELS                     # noqa: E402
 from docengine.instance import Instance, sample_outcomes          # noqa: E402
 from docengine.lb import resource_lb                              # noqa: E402
-from docengine.optimizer.state_actions import (build_fullspec,    # noqa: E402
-                                               build_pipeline,
-                                               build_taskfirst, make_types)
-from docengine.optimizer.steady_state_lp import solve_expected_flow  # noqa: E402
-from docengine.runtime.replay import replay                       # noqa: E402
 from docengine.validator.check import validate                    # noqa: E402
+
+from attic.theory.optimizer.state_actions import (build_fullspec,  # noqa: E402
+                                                  build_pipeline,
+                                                  build_taskfirst,
+                                                  make_types)
+from attic.theory.optimizer.steady_state_lp import solve_expected_flow  # noqa: E402
+from attic.theory.replay import replay                            # noqa: E402
 
 S_GRID = (0.10, 0.50, 0.90)
 P = (50, 50)

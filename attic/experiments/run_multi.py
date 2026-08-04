@@ -21,18 +21,22 @@ import sys
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# repo root, so both docengine (installed or not) and attic import
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
 
-from docengine.cluster import lb_multi, run_builder_multi          # noqa: E402
 from docengine.configs import DEVICES, MODELS                      # noqa: E402
 from docengine.instance import Instance, sample_outcomes           # noqa: E402
 from docengine.lb import resource_lb                               # noqa: E402
-from docengine.optimizer.state_actions import (build_blockwise_lp,  # noqa: E402
-                                               build_taskfirst, make_types)
-from docengine.optimizer.steady_state_lp import solve_expected_flow  # noqa: E402
 from docengine.sched.blockwise import (schedule_blockwise,          # noqa: E402
                                        schedule_taskfirst)
 from docengine.validator.check import validate                      # noqa: E402
+
+from attic.theory.cluster import lb_multi, run_builder_multi       # noqa: E402
+from attic.theory.optimizer.state_actions import (build_blockwise_lp,  # noqa: E402
+                                                  build_taskfirst,
+                                                  make_types)
+from attic.theory.optimizer.steady_state_lp import solve_expected_flow  # noqa: E402
 
 SEED = 20260801
 

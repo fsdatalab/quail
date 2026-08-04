@@ -24,14 +24,17 @@ import time
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# repo root, so both docengine (installed or not) and attic import
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
 
 from docengine.configs import DEVICES, MODELS                     # noqa: E402
-from docengine.reference.offline import solve_offline                 # noqa: E402
 from docengine.instance import Instance, sample_outcomes          # noqa: E402
 from docengine.sched.blockwise import (schedule_blockwise,        # noqa: E402
                                        schedule_taskfirst)
 from docengine.validator.check import validate                    # noqa: E402
+
+from attic.theory.reference.offline import solve_offline          # noqa: E402
 
 MODEL, DEVICE = MODELS["Qwen3-4B-FP8"], DEVICES["H100-SXM-80GB"]
 S1 = 0.5

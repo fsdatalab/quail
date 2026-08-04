@@ -23,8 +23,8 @@ import numpy as np
 from scipy.optimize import linprog
 from scipy.sparse import lil_matrix
 
-from ..costmodel import Op, batch_stats, tau
-from ..instance import Instance
+from docengine.costmodel import Op, batch_stats, tau
+from docengine.instance import Instance
 
 
 def _binom_pmf(k, n, p):

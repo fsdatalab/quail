@@ -14,8 +14,8 @@ from typing import Callable, List
 
 import numpy as np
 
-from .instance import Instance
-from .lb import resource_lb
+from docengine.instance import Instance
+from docengine.lb import resource_lb
 
 
 def partition_docs(d, G: int) -> List[List[int]]:

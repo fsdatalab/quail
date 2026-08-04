@@ -26,11 +26,12 @@ from typing import Dict, List
 
 import numpy as np
 
-from ..costmodel import kv_capacity_tokens
-from ..instance import Instance
-from ..optimizer.state_actions import LengthType, MethodModel
-from ..optimizer.steady_state_lp import LPResult
-from ..sched.blockwise import _BatchBuilder
+from docengine.costmodel import kv_capacity_tokens
+from docengine.instance import Instance
+from docengine.sched.blockwise import _BatchBuilder
+
+from .optimizer.state_actions import LengthType, MethodModel
+from .optimizer.steady_state_lp import LPResult
 
 
 def _type_index(types: List[LengthType]):

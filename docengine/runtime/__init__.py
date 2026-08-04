@@ -1,1 +1,1 @@
-"""Runtime layer: LP-guided replay into finite validated schedules."""
+"""Runtime layer: the client scheduler that drives a serving engine."""

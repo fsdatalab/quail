@@ -19,7 +19,9 @@ import time
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# repo root, so docengine imports whether or not it is pip-installed
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
 
 from docengine.configs import MODELS, DEVICES                     # noqa: E402
 from docengine.instance import Instance, sample_outcomes          # noqa: E402
