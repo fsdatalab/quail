@@ -1104,3 +1104,15 @@ much less and varies by container - either the headline query is
 less read-bound than the old calculus assumed, or host variance
 and in-window JIT are polluting the wall. Repetition three decides
 what the paper quotes.
+
+### Run 3b, the client library: 48.9 seconds at the reference cell
+
+results/engine/client10k.json.gz, re-banked. The reference cell
+(four filters at 0.8, k=1) lands at 48.9 seconds against the stale
+52.5; the other cells move similarly (44.3 against 48.9 at two
+filters; 53.5 against 57.9 at 0.95). The gains are 5 to 9 percent,
+not the 17 percent a purely read-bound wall would show at the new
+prefill rate - more weight behind run 2's interim reading that the
+10k query's wall carries substantial non-prefill time. Agreement at
+the reference cell is 0.762, the third independent measurement of
+the doubled wrong-answer rate on the new kernel set.
