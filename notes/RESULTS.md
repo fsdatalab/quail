@@ -1265,3 +1265,22 @@ attention kernels from the GEMM path: if its wrong rate stays near
 is convicted; if it reverts toward 12.3, FlashInfer attention is
 convicted. Walls for the record, same host caveats as everywhere:
 chain 44.6 seconds, request mode 51.7, at the halved bf16 pool.
+
+### The FLASH_ATTN arm: it was the default all along - the suspects reorder
+
+results/engine/chain10k_flashattn.json, re-banked through the real
+attention_backend engine argument (the engine boots and accepts the
+enum, and the leftover env-var warning is cosmetic). The wrong set
+is bit-identical to the default run: 4,744 of 20,125. So FLASH_ATTN
+is what the default was already running, and FlashInfer attention
+was never in this path. The mechanism reading changes: the q-scale
+warning names flash-attn itself as an FP8 attention backend, so the
+prime suspect is the new FA build running attention in fp8 over the
+fp8 KV with the borrowed q scale - a path the old image's FA build
+did not engage. The FLASHINFER arm now flying is the last
+discriminator: if its wrong set matches FA's, the fp8-attention
+semantics are shared across backends and the mechanism is pinned to
+fp8 attention with substituted scales; the fix is then a checkpoint
+that ships real q scales - a model artifact, exactly where the old
+accuracy section left the lever. Walls: chain 43.2 seconds, request
+45.1, on a fast host.
