@@ -10,15 +10,45 @@ fixed interface. Minimize makespan subject to answer fidelity:
 executions must produce token-identical answers to the naive
 one-call-per-predicate reference.
 
-## The contract and its floor
+## Execution model and lower bound (rewrite in paper style)
 
-Under the contract (every document token processed once, by this
-model, at this precision, cold), the floor is arithmetic:
-T >= max(2 P C / R_flops, (W + kappa C) / BW) for corpus tokens C.
-Every relaxation of a contract clause (persist: not cold; cascade:
-not this model; span reading: not every token) yields its own floor
-by the same arithmetic. All claims are stated against the contract
-in force.
+Definition (semantic scan). A semantic scan S = (D, P) applies
+predicates P = p_1..p_n to documents D = d_1..d_N, where each
+predicate is evaluated by prompting model M with the document
+followed by the predicate's fixed prompt text and reading the
+answer from the model's output. An execution is faithful if it
+produces, for every (document, predicate) pair it evaluates, the
+same answer tokens as evaluating that pair in isolation.
+
+Assumption 1 (exact evaluation). Every predicate that the query
+semantics require is evaluated by M at serving precision; no
+surrogate model, prompt modification, or input truncation.
+
+Assumption 2 (cold start). No key-value (KV) state for D exists
+before the query begins.
+
+Proposition 1 (scan lower bound). Let C be the total token count
+of D, P the parameter count of M, W its weight bytes, kappa the KV
+bytes per token, and let the device sustain F floating-point
+operations per second and B bytes per second of memory bandwidth.
+Any faithful execution under Assumptions 1-2 has makespan at least
+    T_low = max( 2 P C / F ,  (W + kappa * C) / B ).
+Proof sketch: a forward pass over a token performs at least 2P
+operations (one multiply-accumulate per parameter); Assumption 1
+forces every document token through a forward pass at least once,
+giving the compute term. Producing the corpus KV writes kappa*C
+bytes and any pass reads the weights at least once, giving the
+bandwidth term. Both are device maxima, so their maximum bounds
+any schedule. (The paper version also states the tighter measured
+ceiling F', B' - achievable rates at our shapes - and reports the
+engine against both.)
+
+Each assumption, when relaxed, defines a variant problem with its
+own bound by the same argument: warm start (persisted KV) removes
+the kappa*C write and the read of D; surrogate models replace P in
+the compute term for the fraction of pairs they settle; span
+evaluation replaces C. Sections report which assumptions are in
+force per claim.
 
 ## Thesis
 
