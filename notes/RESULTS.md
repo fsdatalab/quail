@@ -1207,3 +1207,16 @@ wrong (22.5 percent) on SGLang's own stack with 430 of 2,000
 surviving, matching vLLM's 23.6 percent on the new kernels - the 4B
 fp8 accuracy shift is a property of the kernel family on this
 checkpoint, present in both engines.
+
+### Run 8a, the gentle co-tenant: protection holds as a same-container ratio
+
+results/engine/pinned10k.json.gz, re-banked. This container was a
+slow host (pinned alone 61.3 seconds, stock alone 70.3, against
+stale 49.2 and 53.8), which no longer surprises anyone; the
+quotable objects are the within-container ratios. Under the gentle
+junk neighbor (25 requests per second of 800 tokens), the pinned
+engine's wall does not move - 60.2 seconds against 61.3 alone -
+while the stock scheduler degrades 48 percent, 70.3 to 103.7.
+Neighbor stats are banked with offered counts and latencies. Zero
+heuristic evictions across every arm, pins and releases balanced
+exactly (40,000 in, 40,000 out).
