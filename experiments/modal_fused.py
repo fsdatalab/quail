@@ -32,7 +32,7 @@ import modal
 app = modal.App("docengine-fused")
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     # Pinned: the fused patch replaces a non-public builder method, so a
     # silent version jump on image rebuild could break it mid-study.
     # Every recorded result is stamped with this version.
