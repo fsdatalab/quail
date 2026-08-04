@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 from ..configs import DeviceConfig, ModelConfig
 from ..costmodel import kv_capacity_tokens
+from ..plan.cost import (decode_step_seconds, dense_seconds,
+                         fluid_block_seconds)
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ class RInstance:
 
 def t_pre(inst, tokens):
     """Seconds of dense compute to read `tokens` (no attention)."""
-    return 2.0 * inst.model.P * tokens / inst.R_C
+    return dense_seconds(inst.model, tokens, inst.R_C)
 
 
 def t_pre_doc(inst, count, d):
@@ -76,9 +78,7 @@ def t_pre_doc(inst, count, d):
 
 def step_time(inst, m, ctx):
     """Seconds for one decode step advancing m calls at mean context ctx."""
-    comp = 2.0 * inst.model.P * m / inst.R_C
-    bw = (inst.model.W_run + inst.model.kappa * ctx * m) / inst.device.BW
-    return max(comp, bw)
+    return decode_step_seconds(inst.model, inst.device, m, ctx, inst.R_C)
 
 
 def compositions(n):
@@ -186,7 +186,7 @@ def block_cost_fluid(inst, j0, k, surv):
     exhaustive enumeration instead."""
     docs = inst.N * surv
     toks = docs * sum(inst.p[j] + inst.g[j] for j in range(j0, j0 + k))
-    return t_pre(inst, toks) + inst.model.kappa * toks / inst.device.BW
+    return fluid_block_seconds(inst.model, inst.device, toks, inst.R_C)
 
 
 def group_stages(inst, block_cost=block_cost_fluid):

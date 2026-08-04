@@ -23,7 +23,7 @@ of the branch-owing backlog and recomputes those documents later -- the
 eviction/recompute path of the model, not a failure.
 """
 
-from ..costmodel import kv_capacity_tokens
+from ..costmodel import attn_time, dense_time, kv_capacity_tokens
 from ..instance import Instance, survival
 
 
@@ -32,10 +32,9 @@ def _a(c, q):
 
 
 def _tau_fields(inst, U, A, K_L, K_W, peak_tokens):
-    m, dev = inst.model, inst.device
-    D = max(2.0 * m.P * U / dev.R_D, m.W_run / dev.BW) if U > 0 else 0.0
-    H = max(4.0 * m.L * m.attn_width * A / dev.R_A,
-            m.kappa * (K_L + K_W) / dev.BW)
+    m = inst.model
+    D = dense_time(m, inst.device, U)
+    H = attn_time(m, inst.device, A, K_L, K_W)
     return dict(U=U, A=A, K_L=K_L, K_W=K_W,
                 M_peak=m.W_mem + m.kappa * peak_tokens, D=D, H=H, tau=D + H)
 
