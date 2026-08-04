@@ -1162,3 +1162,17 @@ wrong (22.5 percent) on SGLang's own kernel stack, matching the
 23.6 percent vLLM measures on the same toolchain family - the 4B
 accuracy shift reproduces across engines, so it is the kernel
 numerics on this checkpoint, not an engine bug.
+
+### Run 5, four GPUs: 12.0 seconds, and the refactor survives contact
+
+results/engine/multigpu4.json, re-banked. Makespan 12.02 seconds
+against the stale 13.30, worker walls 11.14 to 12.02 - the 0.9-second
+spread across four containers is the same host variance run 2
+exposed, where the old flight saw 0.40. Survivors 2,337, the
+new-kernel answer profile. Scaling efficiency depends on which
+single-GPU wall it is measured against; with walls spanning 43.5 to
+62.9 seconds, the honest statement is 3.6x to 5.2x on four GPUs, and
+the tight claim waits for the host-variance protocol. One structural
+note: this run drove the engine through the refactored path -
+plan_query to run_query(plan=...) to the in-engine scheduler - the
+first hardware exercise of the merged entry point, clean.
