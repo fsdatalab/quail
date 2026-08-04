@@ -1193,3 +1193,17 @@ mechanism that would flip borderline calls in bulk. Two arms now in
 flight test it: FLASH_ATTN on the new image, and bf16 KV on the new
 image (bf16 KV sidesteps fp8 attention; the old image's bf16 arm
 measured 18.4 percent wrong, so that is the number to match).
+
+### Run 7, cross-engine completeness: parity to 0.2 percent
+
+results/engine/xengine.json, two arms added. With fp8 KV writes -
+the control's configuration - SGLang reads 97,393 tokens per second
+against the same-toolchain vLLM's 97,220: 0.2 percent apart. The
+original 1.23x SGLang lead decomposes completely: about 21 percent
+was the toolchain (FlashInfer JIT), about 1.4 percent was writing
+KV in bf16 instead of fp8, and nothing measurable is engine
+architecture. The accuracy arm is banked too: 900 of 3,999 calls
+wrong (22.5 percent) on SGLang's own stack with 430 of 2,000
+surviving, matching vLLM's 23.6 percent on the new kernels - the 4B
+fp8 accuracy shift is a property of the kernel family on this
+checkpoint, present in both engines.
