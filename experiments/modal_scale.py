@@ -1848,6 +1848,15 @@ async def client_run(n_docs: int = 10000) -> dict:
 @app.function(image=image, gpu="H100!", timeout=5400,
               volumes={"/root/.cache/huggingface": hf_cache})
 def scale10k(n_docs: int = 10000) -> dict:
+    import os
+
+    # The CUDA 13 kernels' workspace plus CUDA graphs OOMed this
+    # phase's large naive waves at the banked 0.92 utilization (3.50
+    # GiB requested, 3.27 free, 1.49 reserved-but-unallocated), so the
+    # allocator gets expandable segments before torch loads; the
+    # measured engine configuration is unchanged.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
+                          "expandable_segments:True")
     import numpy as np
     from vllm import LLM, SamplingParams
 
