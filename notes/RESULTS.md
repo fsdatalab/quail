@@ -1116,3 +1116,23 @@ prefill rate - more weight behind run 2's interim reading that the
 10k query's wall carries substantial non-prefill time. Agreement at
 the reference cell is 0.762, the third independent measurement of
 the doubled wrong-answer rate on the new kernel set.
+
+### Run 2 verdict: the walls have host variance the old flights never saw
+
+chainsteps10k_r3.json banked: chain 62.9 seconds, request mode 72.6
+- slower than the STALE image's 52.0, which toolchain physics cannot
+produce. The four chain walls on the new image are 43.5, 48.1, 51.2,
+and 62.9 seconds, with bit-identical answers each time, so the
+spread (45 percent, worst over best) is the host, not the workload:
+Modal containers land on different machines with different thermal
+and neighbor conditions, and the wall carries it. Two consequences.
+First, within one container the comparisons stay meaningful (chain
+beats request mode in every repetition, by 3 to 13 percent), so
+same-container ratios are the quotable objects. Second, no absolute
+wall from this flight is quotable as a headline number yet: the
+paper needs a host-variance protocol - several repetitions with the
+distribution stated, or dedicated hosts, or a per-container
+calibration burst that normalizes rates. The speed control is safe:
+its arms ran inside one container and agreed within 4 percent.
+ENGINE_OVERHEAD_S cannot be recalibrated from these walls; PHI can,
+from the within-container speed control.
