@@ -1081,16 +1081,16 @@ async def reason_run(n_docs: int = 2000, big: int = 0) -> dict:
         sp = SamplingParams(temperature=0.0, max_tokens=m,
                             min_tokens=m, skip_clone=True)
         cell = {}
-        for policy in ("pipeline", "spec", "waves"):
+        for policy in ("pipeline", "spec2", "spec", "waves"):
             await reset()
             if policy == "waves":
                 r = await waves(sp)
             else:
+                k = dict(pipeline=1, spec2=2, spec=n)[policy]
                 r = await run_filter_chain(
                     engine, sp, body_ids, q_ids, budget,
-                    lookahead=1 if policy == "pipeline" else n,
-                    tag=f"rg{g}{policy[0]}", tags=EngineTags(),
-                    use_priority=True)
+                    lookahead=k, tag=f"rg{g}{policy}",
+                    tags=EngineTags(), use_priority=True)
             wrong = sum(1 for k, v in r["answers"].items()
                         if v != flags[k[0]][k[1] - 1])
             cell[policy] = dict(wall=round(r["wall"], 2),
