@@ -22,6 +22,28 @@ Arms, each in its own container with its own dependency stack:
           bounds how much of the 80k is engine software rather than
           the model's matmuls.
 
+Attribution arms, added after the first flight (vllm control 80,556
+tok/s reproduced; sglang 98,746 = 1.23x; torch 20,493). sglang beat
+the control, so each hypothesis for WHY gets its own cell:
+
+  vllm_new       The toolchain hypothesis. The newest vLLM on PyPI —
+                 which at time of writing is 0.26.0, the control's own
+                 pin — rebuilt on the same CUDA 13 devel image the
+                 sglang arm used. Same engine code, same config;
+                 only the toolchain underneath changes (nvcc present,
+                 so flashinfer can JIT kernels the slim control image
+                 cannot build). If this arm speeds up, the gap was
+                 never engine software.
+
+  vllm_bf16attn  The fp8-attention-path hypothesis. The control ran
+                 fp8 KV, which makes prefill attention quantize K/V
+                 on the fly; sglang ran bf16 KV. Same pinned vllm,
+                 same image, same config, only kv_cache_dtype="auto".
+
+  vllm_new_tuned The scheduling-overhead hypothesis at its best:
+                 vllm_new plus async (overlapped) scheduling pinned
+                 on and the documented prefill-throughput flags.
+
 Fairness rules, enforced in code:
   - Every arm feeds the same documents (_build_pool(4000), same seed
     as every other experiment) tokenized the same way (no special
@@ -35,9 +57,11 @@ Fairness rules, enforced in code:
     recorded in the JSON next to the numbers they qualify.
 
 Run with:
-  modal run experiments/modal_xengine.py                 # all three arms
+  modal run experiments/modal_xengine.py                 # every arm
   modal run experiments/modal_xengine.py --arm sglang    # one arm; merges
                                                          # into xengine.json
+  modal run experiments/modal_xengine.py \
+      --arm vllm_new,vllm_bf16attn,vllm_new_tuned        # attribution only
 """
 
 import hashlib
@@ -55,6 +79,11 @@ MODEL_BF16_FALLBACK = "Qwen/Qwen3-4B"
 WORKLOAD_SEED = 20260731
 CEIL = 275_000            # dense FP8 prefill ceiling, tokens per second
 VLLM_PIN = "0.26.0"       # same pin as experiments/modal_scale.py
+# Newest vLLM release on PyPI at time of writing. It happens to equal
+# the control's pin, so the version half of the toolchain/version
+# hypothesis is settled by construction: any difference the vllm_new
+# arm shows is the image and toolchain, not the engine code.
+VLLM_NEW_PIN = "0.26.0"
 SGLANG_PIN = "0.5.16"     # latest sglang release at time of writing
 TORCH_PIN = "2.8.0"
 TRANSFORMERS_PIN = "4.57.6"
@@ -67,6 +96,23 @@ vllm_image = (
                  "pyarrow", "numpy", "yappi")
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0"})
+)
+
+# Attribution arms: the newest vLLM on the same CUDA 13 devel
+# toolchain the sglang arm gets. vllm 0.26.0 pins the very same
+# torch==2.11.0 and flashinfer-python==0.6.14 that sglang 0.5.16
+# pins, so with this image the two engines stand on an identical
+# substrate: devel base with nvcc, so flashinfer can JIT kernels
+# (the slim control image has no CUDA toolkit and cannot). The
+# control image's VLLM_USE_FLASHINFER_SAMPLER=0 pin is dropped here
+# on purpose: this arm is vLLM's defaults on a full toolchain.
+vllm_new_image = (
+    modal.Image.from_registry("nvidia/cuda:13.0.1-devel-ubuntu24.04",
+                              add_python="3.12")
+    .entrypoint([])
+    .pip_install(f"vllm=={VLLM_NEW_PIN}", "huggingface_hub", "pandas",
+                 "pyarrow", "numpy")
+    .env({"VLLM_LOGGING_LEVEL": "WARNING"})
 )
 
 # sglang 0.5.16 pins torch==2.11.0 (CUDA 13 wheels) and
@@ -161,6 +207,59 @@ def _line(arm, tokens, wall):
           f"{rate:,.0f} tok/s ({100 * rate / CEIL:.1f}% of 275k spec)",
           flush=True)
     return rate
+
+
+def _vllm_measure(arm, n_docs, llm_kwargs, drop_on_error=()):
+    """Measurement body shared by the vLLM attribution arms: build the
+    engine, warm it on random tokens, read the corpus cold, count fed
+    minus cached. drop_on_error lists kwargs to remove one at a time
+    (and record) if this vLLM build rejects them, so an arm degrades
+    loudly instead of dying."""
+    import torch
+    import vllm
+    from vllm import LLM, SamplingParams
+
+    ids = _corpus_ids(n_docs)
+    fed = sum(len(x) for x in ids)
+    kwargs = dict(llm_kwargs)
+    dropped = []
+    llm = None
+    while llm is None:
+        try:
+            llm = LLM(**kwargs)
+        except Exception:
+            k = next((k for k in drop_on_error if k in kwargs), None)
+            if k is None:
+                raise
+            kwargs.pop(k)
+            dropped.append(k)
+            print(f"[xengine] {arm}: engine rejected {k}; retrying "
+                  f"without it", flush=True)
+    sp = SamplingParams(temperature=0.0, max_tokens=1)
+
+    llm.generate([{"prompt_token_ids": x} for x in _warm_ids()], sp,
+                 use_tqdm=False)
+
+    t0 = time.time()
+    outs = llm.generate([{"prompt_token_ids": x} for x in ids], sp,
+                        use_tqdm=False)
+    wall = time.time() - t0
+    cached = sum(getattr(o, "num_cached_tokens", 0) or 0 for o in outs)
+    prefilled = sum(len(o.prompt_token_ids) for o in outs) - cached
+    rate = _line(arm, prefilled, wall)
+    try:
+        llm.shutdown()
+    except Exception:
+        pass
+    cfg = {k: v for k, v in kwargs.items() if k != "model"}
+    return dict(
+        arm=arm, engine=f"vllm {vllm.__version__}",
+        versions=dict(vllm=vllm.__version__, torch=torch.__version__),
+        model=MODEL, n_docs=n_docs, fed_tokens=fed,
+        cached_tokens=cached, prefilled_tokens=prefilled,
+        wall_s=wall, tok_per_s=rate, pct_of_spec=rate / CEIL,
+        token_fingerprint=_fingerprint(ids),
+        config=cfg, dropped_flags=dropped)
 
 
 # ------------------------------------------------------------ arm 1: vllm
