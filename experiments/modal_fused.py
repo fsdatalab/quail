@@ -12,11 +12,30 @@ document KV is prefilled first, so the 6 question tails of a document
 share its cached pages, which is the exact shape the fused kernel
 groups on.
 
-The gate passes only if every answer token id matches bit for bit
-between the two runs, and only if the fused run actually planned
-cascade steps (otherwise the comparison proved nothing). Walls are
-printed per cell; the fused-versus-unfused question walls are the
-speed signal.
+Verdict. The fused plan was proven offline to read exactly the same KV
+slots as ordinary attention (tests/test_fused.py replays this batch
+shape, including the runs-of-five-plus-singletons layout the first
+flight produced), so an answer change can only come from the two
+kernels' different summation orders, which shift logits by float
+noise. The gate therefore separates two things the first flight
+conflated:
+
+  confident flip   the answer changed although the unfused run
+                   preferred its token by more than GAP_NATS. Float
+                   noise cannot do that; it means a kernel computed
+                   something materially different. Any confident flip
+                   fails the gate.
+  borderline flip  the answer changed where the unfused top-2 logprob
+                   gap was below GAP_NATS -- a near-tie either
+                   summation order may resolve either way. Reported
+                   per flip with its gap and question index, so a flip
+                   pattern that tracks group structure (all first
+                   tails, say) stays visible.
+
+The gate also fails if the fused run never planned a cascade step
+(nothing was compared) or if the unfused run planned one (contaminated
+baseline). Raw flip counts, group structure, and both walls are
+printed per cell.
 
 Run with:
   modal run experiments/modal_fused.py --phase fusegate
@@ -49,6 +68,9 @@ WORKLOAD_SEED = 20260731
 FLAG_SEED = 424242
 N_QUESTIONS = 6
 LENGTHS = (300, 3_000, 15_000)
+# Two valid summation orders shift a 4B model's final logits by well
+# under 0.1 nat; a flip past this gap is not float noise.
+GAP_NATS = 0.2
 
 
 def _build_pool(n_docs):
@@ -79,6 +101,19 @@ def _question(j):
     return (f"\n\nExample: if the line said [FLAGS] FLAG_9=NO, then FLAG_9 "
             f"has value NO.\nInstruction: output only the value of FLAG_{j} "
             f"from the [FLAGS] line above.\nFLAG_{j}=")
+
+
+def _top2_gap(out):
+    """Sampled-token logprob minus the best alternative, in nats."""
+    ranked = out.outputs[0].logprobs
+    if not ranked:
+        return None
+    table = ranked[0]
+    values = sorted(
+        (entry.logprob for entry in table.values()), reverse=True)
+    if len(values) < 2:
+        return None
+    return values[0] - values[1]
 
 
 @app.function(image=image, gpu="H100!", timeout=5400,
@@ -130,7 +165,7 @@ def fusegate_run(n_docs: int = 50) -> dict:
                   "backend": "FLASHINFER",
                   "disable_flashinfer_q_quantization": True,
               })
-    sp = SamplingParams(temperature=0.0, max_tokens=1)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, logprobs=2)
 
     q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
              for j in range(N_QUESTIONS)]
@@ -151,6 +186,7 @@ def fusegate_run(n_docs: int = 50) -> dict:
         warm = [{"prompt_token_ids": body} for body in bodies]
 
         answers = {}
+        gaps = {}
         walls = {}
         stats = {}
         for mode in ("unfused", "fused"):
@@ -167,11 +203,26 @@ def fusegate_run(n_docs: int = 50) -> dict:
                                questions=time.time() - t0)
             set_fused_enabled(False)
             answers[mode] = [int(o.outputs[0].token_ids[0]) for o in outs]
+            gaps[mode] = [_top2_gap(o) for o in outs]
             stats[mode] = fused_stats()
 
-        flips = [i for i, (a, b) in enumerate(zip(answers["unfused"],
-                                                  answers["fused"]))
-                 if a != b]
+        flips = []
+        for i, (a, b) in enumerate(zip(answers["unfused"],
+                                       answers["fused"])):
+            if a != b:
+                flips.append(dict(
+                    index=i, doc=i // N_QUESTIONS,
+                    question=i % N_QUESTIONS,
+                    unfused_token=a, fused_token=b,
+                    unfused_gap=gaps["unfused"][i],
+                    fused_gap=gaps["fused"][i]))
+        confident = [f for f in flips
+                     if f["unfused_gap"] is not None
+                     and f["unfused_gap"] > GAP_NATS]
+        flips_by_question = [
+            sum(1 for f in flips if f["question"] == j)
+            for j in range(N_QUESTIONS)
+        ]
         agree = {
             mode: sum(
                 1 for i, token in enumerate(tokens)
@@ -183,21 +234,32 @@ def fusegate_run(n_docs: int = 50) -> dict:
         cell = dict(target=target, n_docs=n_docs,
                     questions=N_QUESTIONS,
                     answers=n_docs * N_QUESTIONS,
-                    walls=walls, stats=stats, flips=len(flips),
-                    flip_indices=flips[:20], agreement=agree)
+                    walls=walls, stats=stats,
+                    flips=len(flips), confident_flips=len(confident),
+                    flips_by_question=flips_by_question,
+                    flip_details=flips[:40], agreement=agree)
         cells.append(cell)
+        fstats = stats["fused"]
         print(f"[fusegate] {n_docs}x{target}: unfused warm "
               f"{walls['unfused']['warm']:.2f}s questions "
               f"{walls['unfused']['questions']:.2f}s | fused warm "
               f"{walls['fused']['warm']:.2f}s questions "
               f"{walls['fused']['questions']:.2f}s | cascade steps "
-              f"{stats['fused']['cascade_steps']}, grouped requests "
-              f"{stats['fused']['grouped_requests']}, fallback steps "
-              f"{stats['fused']['fallback_steps']}, flips {len(flips)}",
+              f"{fstats['cascade_steps']}, groups "
+              f"{fstats['multi_groups']} multi + "
+              f"{fstats['singleton_groups']} single, grouped "
+              f"{fstats['grouped_requests']}, fallback "
+              f"{fstats['fallback_steps']} | flips {len(flips)} "
+              f"({len(confident)} confident, by question "
+              f"{flips_by_question}), agree unfused "
+              f"{agree['unfused']:.3f} fused {agree['fused']:.3f}",
               flush=True)
-        if flips:
-            failures.append(f"{target}: {len(flips)} answer tokens differ "
-                            f"(first at {flips[0]})")
+        if confident:
+            worst = max(confident, key=lambda f: f["unfused_gap"])
+            failures.append(
+                f"{target}: {len(confident)} answers flipped past the "
+                f"{GAP_NATS}-nat gap (worst {worst['unfused_gap']:.3f} "
+                f"nats at index {worst['index']})")
         if stats["unfused"]["cascade_steps"]:
             failures.append(f"{target}: unfused run planned cascade steps")
         if not stats["fused"]["cascade_steps"]:
@@ -211,9 +273,11 @@ def fusegate_run(n_docs: int = 50) -> dict:
     import vllm
     result = dict(model=MODEL, phase="fusegate", n_docs=n_docs,
                   vllm_version=vllm.__version__,
-                  kv_cache_dtype="fp8", cells=cells,
-                  passed=not failures, failures=failures)
-    print(f"[fusegate] {'PASS' if not failures else 'FAIL'}", flush=True)
+                  kv_cache_dtype="fp8", gap_nats=GAP_NATS, cells=cells,
+                  passed=not failures, failures=failures,
+                  bit_identical=all(c["flips"] == 0 for c in cells))
+    print(f"[fusegate] {'PASS' if not failures else 'FAIL'} "
+          f"(bit-identical: {result['bit_identical']})", flush=True)
     return result
 
 

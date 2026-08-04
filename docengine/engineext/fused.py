@@ -41,7 +41,8 @@ class CascadeGroup:
 
 _CURRENT_GROUPS: tuple[CascadeGroup, ...] | None = None
 _FUSED_ENABLED: bool = False
-_STATS = {"cascade_steps": 0, "fallback_steps": 0, "grouped_requests": 0}
+_STATS = {"cascade_steps": 0, "fallback_steps": 0, "grouped_requests": 0,
+          "multi_groups": 0, "singleton_groups": 0}
 
 
 def set_cascade_groups(groups: Sequence[CascadeGroup] | None) -> None:
@@ -91,6 +92,12 @@ def _check_group(
             raise RuntimeError(
                 "cascade group pages do not match request block tables"
             )
+        # Computed tokens can include pages another request of this same
+        # batch is writing this step: vLLM registers full blocks in the
+        # prefix cache at allocation, before their KV exists. That is
+        # sound here for the same reason it is sound for ordinary
+        # attention -- the runner scatters every scheduled token's KV
+        # before any attention kernel of the layer reads it.
         computed = int(sequence_lengths[request]) - int(
             query_lengths[request]
         )
@@ -344,6 +351,12 @@ def install_fused_patch() -> None:
             # non-cascade trtllm paths, so the plan must state the model
             # dtype, not q_data_type_prefill (fp8 on SM90 with fp8 KV).
             q_data_type=self.model_config.dtype,
+            # The cascade run call cannot pass per-layer k/v/q scales
+            # (FlashInfer's cascade wrapper has no scale arguments), so
+            # a quantized KV cache is only read correctly when those
+            # scales are 1.0 -- true for fp8 KV without checkpoint
+            # calibration, which vLLM warns about at load. A checkpoint
+            # that ships calibrated kv scales must not use this patch.
             kv_data_type=self.kv_cache_dtype,
         )
         metadata.use_cascade = True
@@ -355,6 +368,12 @@ def install_fused_patch() -> None:
             group.request_count
             for _, group in ordered
             if group.request_count > 1
+        )
+        _STATS["multi_groups"] += sum(
+            1 for _, group in ordered if group.request_count > 1
+        )
+        _STATS["singleton_groups"] += sum(
+            1 for _, group in ordered if group.request_count == 1
         )
         return metadata
 
