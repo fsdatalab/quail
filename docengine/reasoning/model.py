@@ -171,3 +171,40 @@ def best_composition(inst):
         if best is None or v["T"] < best[1]["T"]:
             best = (K, v)
     return best
+
+
+def block_cost_fluid(inst, j0, k, surv):
+    """Additive fluid cost, in seconds, of one lookahead block covering
+    0-indexed stages j0..j0+k-1 entered by fraction `surv` of the N
+    documents. Inside a block every question launches at block entry
+    (ungated), so each member stage is charged at the block's entering
+    survival; every question and generated token passes the forward
+    pass once and writes its KV once. Additive across blocks, which
+    the prefix dynamic program group_stages requires; value_blockwise's
+    certified envelope takes a max over resource totals, is not
+    additive, and is therefore minimized by best_composition's
+    exhaustive enumeration instead."""
+    docs = inst.N * surv
+    toks = docs * sum(inst.p[j] + inst.g[j] for j in range(j0, j0 + k))
+    return t_pre(inst, toks) + inst.model.kappa * toks / inst.device.BW
+
+
+def group_stages(inst, block_cost=block_cost_fluid):
+    """Algorithm 3 of the paper: cheapest contiguous partition of the
+    fixed stage order by a prefix dynamic program. The survival
+    entering a block is a product of earlier selectivities only
+    (Lemma 1), so prefix optima compose. n(n+1)/2 block-cost
+    evaluations. Returns (composition tuple, cost)."""
+    n = inst.n
+    best = [0.0] + [float("inf")] * n
+    cut = [0] * (n + 1)
+    for j in range(1, n + 1):
+        for i in range(j):
+            c = best[i] + block_cost(inst, i, j - i, inst.survival(i))
+            if c < best[j]:
+                best[j], cut[j] = c, i
+    blocks, j = [], n
+    while j > 0:
+        blocks.append(j - cut[j])
+        j = cut[j]
+    return tuple(reversed(blocks)), best[n]

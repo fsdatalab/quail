@@ -7,7 +7,8 @@ import math
 from docengine.configs import DEVICES, MODELS
 from docengine.reasoning.lp import lp_throughput
 from docengine.reasoning.model import (RInstance, best_composition,
-                                       compositions, t_pre,
+                                       block_cost_fluid, compositions,
+                                       group_stages, t_pre,
                                        value_blockwise, value_taskfirst)
 
 
@@ -64,6 +65,31 @@ def test_bellman_composition_consistent():
     K, v = best_composition(it)
     for K2 in compositions(4):
         assert v["T"] <= value_blockwise(it, K2)["T"] + 1e-9
+
+
+def test_grouping_dp_matches_exhaustive():
+    """Algorithm 3 cross-check: for every n <= 6 the prefix dynamic
+    program equals the minimum over all 2^(n-1) contiguous partitions
+    of the same additive block cost, enumerated exhaustively, on
+    heterogeneous per-stage selectivities, prompts, and thinking."""
+    S = (0.9, 0.5, 0.8, 0.3, 0.95, 0.7)
+    P = (25, 40, 15, 60, 30, 20)
+    G = (5, 90, 17, 33, 60, 8)
+    for n in range(1, 7):
+        it = RInstance(model=MODELS["Qwen3-4B-FP8"],
+                       device=DEVICES["H100-SXM-80GB"],
+                       N=10_000, d=313.0, s=S[:n], p=P[:n], g=G[:n])
+        K, v = group_stages(it)
+        assert sum(K) == n
+        assert len(compositions(n)) == 2 ** (n - 1)
+        best = None
+        for K2 in compositions(n):
+            j0, tot = 0, 0.0
+            for k in K2:
+                tot += block_cost_fluid(it, j0, k, it.survival(j0))
+                j0 += k
+            best = tot if best is None else min(best, tot)
+        assert abs(v - best) <= 1e-9 * max(1.0, best)
 
 
 def test_lp_and_recurrence_agree():
