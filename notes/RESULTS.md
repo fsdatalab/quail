@@ -1333,3 +1333,35 @@ ratio with the neighbor's own served load banked beside it (35,587
 junk completions against the pinned engine's 2,889 - the pinned
 engine also starves the junk, which is the single-tenant contract
 working). Zero heuristic evictions; pins and releases balanced.
+
+### Flight close-out
+
+Run 3a's re-fly landed the naive ladder on the new image: task-first
+waves 98.2 seconds (stale 122.8), document-first waves 71.5 (stale
+111.3), blocked manifest 63.7 (stale 74.0) at the reference cell,
+with the same ladder order as before down through client 48.9,
+strict 44.1, and chain mode's 43.2 to 51.2 across hosts. One more
+attribution datum rode along: the task-first template's agreement
+with planted truth is unshifted on the new substrate (0.968 to
+0.993, where it always was), while the document-first templates
+carry the full shift (0.762 to 0.833) - the regression lives in the
+reads that attend far back over the document, not in the near reads.
+
+The flight is closed. What it re-anchored: the achieved read rate
+(97,889 tokens per second best cell; PHI updated in
+docengine/plan/cost.py), the 32B tier (chain 29.3 seconds, prefill
+12,611 to 13,123 tokens per second, accuracy untouched), engine
+parity (vLLM and SGLang within 0.2 percent at matching config), the
+co-tenant story (pinned 1.06x under the heavy neighbor, stock
+14.5x, banked), and four GPUs at 12.0 seconds through the
+refactored planner path. What it blocked, by its own rules: the
+multi-query claim (60 confident flips; mechanism suspected in fp8
+scale sharing) and every absolute single-container wall (up to 45
+percent host spread; within-container ratios only). What it found
+that nobody asked for: the substrate-wide 4B accuracy regression
+(21.7 to 23.8 percent wrong on the new toolchain against 12.3 to
+18.4 on the old, both engines, every KV dtype and backend), with
+the fp8 GEMM path the leading suspect and checkpoint-side scale
+calibration the durable fix. ENGINE_OVERHEAD_S is deliberately not
+re-anchored until a host-controlled protocol exists. GPU spent:
+about 20 container-runs across roughly five hours of wall time.

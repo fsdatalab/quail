@@ -14,14 +14,21 @@ decode_step_seconds, fluid_block_seconds - so no rate law in the
 package is derived twice.
 """
 
-# Every calibrated constant of the estimator, in one table. Constraint
-# the code cannot show: all anchors were measured on the old toolchain
-# image, whose 80,556 tok/s read ceiling the falsification flight beat
-# by 21 percent (97,220 on CUDA 13); the re-baseline flight
-# (notes/NEXT.md item 1) re-measures every one of them. Update them
-# here and nowhere else.
-PHI = 80_000 / 275_000        # serving rate over spec ceiling, 4B anchor
-ENGINE_OVERHEAD_S = 3.2       # c0: per-query software residue at 10k docs
+# Every calibrated constant of the estimator, in one table. Update
+# them here and nowhere else. Anchors are from the re-baseline flight
+# on the CUDA 13 image (results/engine/speed_limit.json: best cell
+# 97,889 tok/s, cross-checked by xengine.json's 97,220 vLLM and
+# 97,393 SGLang at matching config). Constraint the code cannot show:
+# the achieved rate is a property of the image, not the engine - the
+# old slim image sustained 80,556 - and accuracy moves with the same
+# substrate (see the attribution table in notes/RESULTS.md), so a
+# stack change requires re-anchoring BOTH numbers together.
+PHI = 97_000 / 275_000        # serving rate over spec ceiling, 4B anchor
+ENGINE_OVERHEAD_S = 3.2       # c0: per-query software residue at 10k docs.
+                              # NOT re-anchored: the flight measured up to
+                              # 45 percent wall spread across containers
+                              # (host variance), so c0 waits for a
+                              # host-controlled protocol.
 BOOT_POOL_FRACTION = 0.92     # gpu_memory_utilization we ship
 POOL_HEADROOM = 0.80          # admission budget stays under the pool by this
 
