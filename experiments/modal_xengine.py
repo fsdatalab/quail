@@ -310,6 +310,103 @@ def vllm_arm(n_docs: int = 4000) -> dict:
         ])
 
 
+# ----------------------------------------- attribution arm: vllm_new
+
+@app.function(image=vllm_new_image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+def vllm_new_arm(n_docs: int = 4000) -> dict:
+    """Toolchain hypothesis: newest released vLLM (== the control's
+    pin, see VLLM_NEW_PIN) on the same CUDA 13 devel image and the
+    same torch 2.11 + flashinfer 0.6.14 substrate the sglang arm ran
+    on. Engine config is byte-identical to the control."""
+    res = _vllm_measure("vllm_new", n_docs, dict(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=8192,
+        gpu_memory_utilization=0.92, enable_prefix_caching=False))
+    res["precision"] = ("fp8 checkpoint weights, fp8 KV (identical to "
+                        "the control)")
+    res["caveats"] = [
+        "The newest PyPI vLLM at time of writing equals the control's "
+        "pin (0.26.0), so this arm isolates the toolchain alone: CUDA "
+        "13 devel base with nvcc (flashinfer can JIT kernels) versus "
+        "the control's slim image with no CUDA toolkit.",
+        "The control image's VLLM_USE_FLASHINFER_SAMPLER=0 override "
+        "is not set here; with max_tokens=1 over 4,000 prompts the "
+        "sampler is a negligible share of the wall.",
+    ]
+    return res
+
+
+# ------------------------------------ attribution arm: vllm_bf16attn
+
+@app.function(image=vllm_image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+def vllm_bf16attn_arm(n_docs: int = 4000) -> dict:
+    """fp8-attention-path hypothesis: exactly the control (same pinned
+    vllm, same image) except the KV dtype is 'auto' (bf16), the same
+    attention path the sglang arm ran. With fp8 KV, prefill attention
+    must quantize K and V as it writes them; this arm removes that."""
+    res = _vllm_measure("vllm_bf16attn", n_docs, dict(
+        model=MODEL, kv_cache_dtype="auto", max_model_len=8192,
+        gpu_memory_utilization=0.92, enable_prefix_caching=False))
+    res["precision"] = ("fp8 checkpoint weights, bf16 KV ('auto') - "
+                        "the KV/attention configuration sglang ran")
+    res["caveats"] = [
+        "bf16 KV doubles the bytes per cached token, so the KV pool "
+        "holds about half the tokens of the fp8-KV control (~490k vs "
+        "~981k). Irrelevant for this measurement: prefill-only work "
+        "never reads KV back, and no document approaches "
+        "max_model_len, so pool size does not gate throughput.",
+    ]
+    return res
+
+
+# ----------------------------------- attribution arm: vllm_new_tuned
+
+@app.function(image=vllm_new_image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+def vllm_new_tuned_arm(n_docs: int = 4000) -> dict:
+    """Scheduling-overhead hypothesis at its best: vllm_new plus every
+    documented prefill-throughput flag.
+
+    Flags and why:
+      async_scheduling=True   vLLM 0.26's overlapped scheduler
+                              (AsyncScheduler): prepares step N+1 on
+                              the CPU while step N runs on the GPU,
+                              "helps to avoid gaps in GPU utilization"
+                              per the vLLM config docs. 0.26 turns it
+                              on by default when compatible; passing
+                              True pins it on and fails loudly instead
+                              of silently falling back (with a
+                              recorded retry if this build rejects the
+                              flag for the offline executor).
+      max_num_batched_tokens=8192, max_num_seqs=256
+                              The best prefill cell from the repo's
+                              own speed_limit sweep on this exact
+                              corpus (80,688 tok/s, versus 80,563 at
+                              engine defaults).
+      disable_log_stats=True  Removes per-step stats collection from
+                              the hot loop; documented flag, used by
+                              every other experiment in modal_scale.
+    """
+    res = _vllm_measure(
+        "vllm_new_tuned", n_docs,
+        dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=8192,
+             gpu_memory_utilization=0.92, enable_prefix_caching=False,
+             async_scheduling=True, max_num_batched_tokens=8192,
+             max_num_seqs=256, disable_log_stats=True),
+        drop_on_error=("async_scheduling",))
+    res["precision"] = ("fp8 checkpoint weights, fp8 KV (identical to "
+                        "the control)")
+    res["caveats"] = [
+        "vLLM 0.26 already defaults async scheduling on when "
+        "compatible, so if this arm matches vllm_new the scheduling "
+        "hypothesis is dead, not merely untested.",
+        "Batch shape (8192 tokens, 256 seqs) is the measured best "
+        "from the speed_limit sweep, not a new sweep on this image.",
+    ]
+    return res
+
+
 # ---------------------------------------------------------- arm 2: sglang
 
 @app.function(image=sglang_image, gpu="H100!", timeout=3600,
@@ -512,7 +609,9 @@ def torch_arm(n_docs: int = 4000, batch_tokens: int = 32768) -> dict:
 def main(arm: str = "all", n_docs: int = 4000, out: str = ""):
     import os
 
-    fns = dict(vllm=vllm_arm, sglang=sglang_arm, torch=torch_arm)
+    fns = dict(vllm=vllm_arm, sglang=sglang_arm, torch=torch_arm,
+               vllm_new=vllm_new_arm, vllm_bf16attn=vllm_bf16attn_arm,
+               vllm_new_tuned=vllm_new_tuned_arm)
     names = list(fns) if arm == "all" else \
         [a.strip() for a in arm.split(",")]
     for a in names:
