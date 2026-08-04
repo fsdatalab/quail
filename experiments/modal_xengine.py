@@ -494,10 +494,28 @@ def sglang_arm(n_docs: int = 4000) -> dict:
         ])
 
 
+def _plain_result(fn):
+    """A remote exception pickles with its library's types, and a local
+    client without torch cannot open that pickle. Return errors as
+    plain dicts instead so every result deserializes anywhere."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            return dict(arm=fn.__name__.removesuffix("_arm"),
+                        error=repr(e), traceback=traceback.format_exc())
+    return wrapped
+
+
 # --------------------------------------- completeness arm: sglang fp8 KV
 
 @app.function(image=sglang_image, gpu="H100!", timeout=3600,
               volumes={"/root/.cache/huggingface": hf_cache})
+@_plain_result
 def sglang_fp8kv_arm(n_docs: int = 4000) -> dict:
     """The missing speed cell: the sglang arm ran KV at 'auto' (bf16)
     while the vllm control wrote fp8 KV. Same sglang pin, same image,
@@ -553,6 +571,7 @@ def sglang_fp8kv_arm(n_docs: int = 4000) -> dict:
 
 @app.function(image=sglang_image, gpu="H100!", timeout=3600,
               volumes={"/root/.cache/huggingface": hf_cache})
+@_plain_result
 def sglang_acc_arm(n_docs: int = 2000, kv: str = "auto") -> dict:
     """Truth-scored accuracy through sglang: the standard planted-flags
     query (4 filters at s=0.8, the modal_scale seeds and prompt bytes)
@@ -825,7 +844,13 @@ def main(arm: str = "all", n_docs: int = 4000, acc_docs: int = 2000,
         # The accuracy arm reads the planted-flags workload, sized by
         # acc-docs (2,000 matches the banked vLLM accuracy grids).
         docs = acc_docs if name == "sglang_acc" else n_docs
-        data["arms"][name] = fns[name].remote(docs)
+        try:
+            data["arms"][name] = fns[name].remote(docs)
+        except Exception as e:  # noqa: BLE001 - one bad arm must not
+            data["arms"][name] = dict(arm=name, error=repr(e))
+        if data["arms"][name].get("error"):
+            print(f"[xengine] ARM FAILED {name}: "
+                  f"{data['arms'][name]['error']}", flush=True)
 
     # Arms without a fingerprint (the accuracy arm) read a different,
     # flagged workload on purpose and stay out of this check.
