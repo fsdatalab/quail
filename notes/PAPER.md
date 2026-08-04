@@ -1,8 +1,9 @@
 # Plan-Governed KV State for Semantic Scans (working draft)
 
 This note is the paper's working skeleton: the formal problem, the
-lower bound, the retention theory, the contributions, and the twelve
-experiments. Every measured number is taken from notes/RESULTS.md and
+lower bound, the optimizer with its algorithms and proofs, the
+retention theory, the contributions, and the twelve experiments.
+Every measured number is taken from notes/RESULTS.md and
 notes/SCHEDULER_PLAN.md and the raw result files they name; expected
 outcomes are stated in advance and labeled as such.
 
@@ -40,9 +41,21 @@ issues one isolated model call per (document, predicate) pair.
 | B | device peak memory bandwidth, bytes per second |
 | F', B' | measured sustained rates at our workload shapes |
 | T_low | the lower-bound makespan of Proposition 1 |
-| s | selectivity of a filter: the fraction of documents that pass |
+| s_i, s | selectivity of predicate i: the fraction of documents that pass it |
+| S_i | survival: fraction of documents that pass predicates 1..i |
 | k | lookahead depth: predicate prompts issued without waiting for a gate |
 | G | mean thinking length: reasoning tokens generated before an answer |
+| g | number of GPUs used by a plan |
+| L_d | mean document length in tokens |
+| l_i | prompt length of predicate i in tokens |
+| L_a | answer length in tokens |
+| R | measured sustained token-reading rate, tokens per second |
+| R_dec | measured sustained decode (generation) rate, tokens per second |
+| f | per-document KV footprint in bytes: kappa times the document's resident tokens |
+| w | width: number of documents resident concurrently |
+| w_sat | saturation width: smallest w that keeps the device fully busy |
+| c_req | per-request software overhead in seconds |
+| c_q | fixed per-query software overhead in seconds |
 | z_i | size in bytes of KV segment i |
 | r_i | recompute time in seconds of KV segment i |
 | K | KV pool size in bytes |
@@ -60,9 +73,8 @@ every (document, predicate) pair it evaluates, it produces the same
 answer tokens as evaluating that pair alone in a fresh context.
 
 Assumption 1 (exact evaluation). Every pair the query semantics
-require is evaluated by M at serving precision. No model cascade
-(routing some inputs to a smaller model), no prompt modification, no
-input truncation.
+require is evaluated by M at serving precision. No smaller stand-in
+model, no prompt modification, no input truncation.
 
 Assumption 2 (cold start). No KV for D exists before the query
 begins.
@@ -88,26 +100,28 @@ device-wide maxima, so the larger term bounds any schedule.
 The spec-sheet bound is loose on real silicon, so we also state the
 bound with the measured sustained rates F' and B' in place of F and
 B, and report the engine against both. On our reference query
-(Section 7, E1) the spec bound is 11.3 seconds, the measured read
+(Section 8, E1) the spec bound is 11.3 seconds, the measured read
 floor is 39.5 seconds, and the measured work floor — corpus plus
 question and answer tokens — is about 47 seconds.
 
-Relaxing an assumption defines a variant problem whose bound follows
-by the same argument. Warm start (persisted KV already available)
+One relaxation is built and measured, and it is why Assumption 2
+must be stated: warm start. If the corpus KV was persisted by an
+earlier query, execution loads it instead of recomputing it, which
 removes the kappa C write and the forward passes over document
-tokens. A model cascade replaces P by the smaller model's parameter
-count on the fraction of pairs the smaller model settles. Span
-evaluation — answering a predicate from a selected span rather than
-the whole document — replaces C by the span total. Each results
-section states which assumptions are in force for its claims.
+tokens, and the bound follows by the same argument with those terms
+deleted. E3 measures both sides of this trade: on the 4B tier
+loading loses about two to one against recompute, and on the 32B
+tier it wins — about 8 seconds of restore, compared with 30 seconds
+of recompute. Each results section states which assumptions are in
+force for its claims.
 
 ## 4. Thesis: KV as a plan-governed object
 
 Serving engines treat KV as an anonymous cache managed by a recency
 rule: evict whatever was used least recently. Our thesis is that for
-semantic scans, KV should be a
-first-class object whose lifetime the query plan governs. Five
-operations on KV generate the physical operator space:
+semantic scans, KV should be a first-class object whose lifetime the
+query plan governs. Five operations on KV generate the physical
+operator space:
 
 - Fork: start a second branch that reads an existing document KV as
   its shared prefix, instead of recomputing the document.
@@ -120,18 +134,146 @@ operations on KV generate the physical operator space:
 - Persist: write KV durably at corpus ingest so later queries load
   it instead of recomputing it.
 
-An optimizer with measured device constants chooses among the
-resulting operators per query. Two execution primitives cover the
-workload family. Rewind execution runs a gated filter chain as one
-live sequence per document: append a question, read the answer,
-rewind to the document boundary, append the next question. Forked —
-and, when priced favorably, fused — branches run all-answers sets,
-predicate sets where every answer is required and gating is
-impossible. Filters, classifier sets, and joins are nestings of
-these two primitives, indexed by the selectivity vector, the
-document length, and the mean thinking length G.
+The optimizer of Section 5 chooses among the resulting operators per
+query, from measured device constants. Two execution primitives
+cover the workload family. Rewind execution runs a gated filter
+chain as one live sequence per document: append a question, read the
+answer, rewind to the document boundary, append the next question.
+Forked — and, when priced favorably, fused — branches run
+all-answers sets, predicate sets where every answer is required and
+gating is impossible. Filters, classifier sets, and joins are
+nestings of these two primitives, indexed by the selectivity vector,
+the document length, and the mean thinking length G.
 
-## 5. The plan-aware KV retention problem
+## 5. The optimizer: cost estimation, plan enumeration, grouping
+
+The optimizer has three parts: a cost estimator that predicts the
+makespan of one candidate plan (Algorithm 1), an enumerator that
+filters illegal plans and takes the minimum over the rest
+(Algorithm 2), and a dynamic program that groups predicates into
+blocks (Algorithm 3). All three work in the fluid model: costs are
+computed from long-run rates, work is treated as continuously
+divisible, and batch boundaries are ignored. Every device constant
+consumed here is a measured number attributed to a named calibration
+run; on the reference hardware the calibrated estimator predicts
+every measured cell within about five to ten percent.
+
+Assumption 3 (length-independent selectivity). Whether a document
+passes a predicate is independent of the document's length, so a
+survival fraction applies uniformly to the corpus token mix.
+
+Algorithm 1 (cost estimator). Input: a candidate plan (execution
+mode, predicate grouping, per-block width, retention choice, GPU
+count g); workload statistics (N, L_d, l_1..l_n, L_a, G, s_1..s_n);
+device constants (R, R_dec, K, kappa, c_req, c_q, beta). Output: the
+predicted makespan.
+
+```
+ 1  S_0 <- 1;  S_i <- S_{i-1} * s_i  for i = 1..n
+       // survival after predicate i (Assumption 3)
+ 2  A_i <- fraction of documents that issue predicate i:
+       S_{i-1} if p_i is gated; the block-entry survival if p_i
+       sits inside an ungated width-k block
+ 3  T_read  <- N * L_d / (g * R)
+       // input pass: every document read once
+ 4  T_quest <- (N / (g * R)) * sum_i A_i * l_i
+       // question tokens, thinned by selectivity
+ 5  X <- recomputed tokens forced by the retention choice
+       // 0 if all live KV stays resident; otherwise each
+       // non-retained gap is priced by Section 6
+ 6  T_reread <- X / (g * R)
+ 7  T_dec   <- (N / (g * R_dec)) * sum_i A_i * (G + L_a)
+       // decode: thinking plus answer tokens
+ 8  T_mem   <- admission stall time: nonzero only when retained
+       KV caps the width below w_sat, i.e. K - retained bytes
+       < w_sat * f
+ 9  T_fix   <- c_q + c_req * requests(plan) / g
+       // requests(plan): one per (document, predicate) call in
+       // request mode; one per document in rewind mode
+10  return T_read + T_quest + T_reread + T_dec + T_mem + T_fix
+```
+
+Algorithm 2 (plan enumeration). Input: the query, workload
+statistics, and the device table. Output: the cheapest legal plan,
+or a refusal.
+
+```
+ 1  candidates <- empty
+ 2  for mode in {task-prompt, forked branches, rewind chain}:
+ 3    for g in the available GPU counts:
+ 4      for retention in {resident, drop-recompute, spill,
+                          persist-load}:
+ 5        for width w in the candidate widths:
+ 6          if W > g * (device memory):    continue
+               // the model must fit on g cards
+ 7          if w * f > K:                  continue
+               // the shard's working set must fit the pool
+ 8          if K < w_sat * f:              continue
+               // feasibility gate: the pool left after weights
+               // must cover saturation width times the
+               // per-document footprint
+ 9          add plan(mode, g, retention, w) to candidates
+10  if candidates is empty:  return REFUSE
+       // reported as a refusal, not a run (E12)
+11  return argmin over candidates of Algorithm 1
+```
+
+Algorithm 3 (predicate grouping). Input: predicates p_1..p_n in
+fixed order; blockcost(i+1..j, S), defined as Algorithm 1's terms
+restricted to predicates i+1..j with entering survival S. Output:
+the cheapest partition of the order into contiguous blocks.
+
+```
+ 1  best(0) <- 0;  cut(0) <- none
+ 2  for j = 1..n:
+ 3    best(j) <- min over 0 <= i < j of
+                   best(i) + blockcost(i+1..j, S_i)
+ 4    cut(j)  <- the minimizing i
+ 5  return the partition read off cut(n), cut(cut(n)), ...,
+      with cost best(n)
+```
+
+Lemma 1 (block decomposition). Under the fluid model and
+Assumption 3, for any partition of p_1..p_n (order fixed) into
+contiguous blocks B_1..B_m: (i) the fraction of documents entering
+B_t equals the product of the selectivities of all predicates before
+B_t, and does not depend on how those predicates are grouped;
+(ii) the cost of B_t is a function blockcost(B_t, S) of the block's
+members and its entering survival S alone; (iii) the plan's total
+cost is the sum of its block costs.
+
+Proof. (i) A document enters B_t exactly when it passes every
+preceding predicate, so the entering fraction is the product of the
+preceding selectivities; by Assumption 3 this fraction applies to
+the full token mix, and no term of the product depends on grouping.
+(ii) A block reads its surviving inputs, issues its own questions,
+decodes its own answers, and applies its own retention; in the fluid
+model no KV state crosses a block boundary, so every term of
+Algorithm 1 evaluated on the block references only block members,
+the entering survival, and device constants. (iii) The fluid model
+charges time additively and blocks perform disjoint work, so the
+totals add.
+
+Proposition 2 (optimality of Algorithm 3). Algorithm 3 returns the
+minimum of Algorithm 1's cost over all partitions of the fixed
+predicate order into contiguous blocks, using at most n(n+1)/2
+blockcost evaluations, which is O(n^2).
+
+Proof. By induction on j. Base: the empty prefix has cost 0. Step:
+any optimal partition of p_1..p_j ends in some last block
+p_{i+1}..p_j with i < j. By Lemma 1(i) the survival entering that
+block is S_i regardless of how p_1..p_i are partitioned, so by
+Lemma 1(ii) the last block's cost is the fixed number
+blockcost(i+1..j, S_i); by Lemma 1(iii) the remainder of the cost is
+the cost of a partition of p_1..p_i, which by the induction
+hypothesis is at least best(i). Hence the optimum for the prefix of
+length j is min over i of best(i) + blockcost(i+1..j, S_i), which is
+what line 3 computes. The double loop evaluates blockcost once per
+pair (i, j), at most n(n+1)/2 times. As an implementation check, for
+n <= 6 we enumerate all 2^(n-1) contiguous partitions exhaustively
+and confirm the dynamic program returns the same optimum.
+
+## 6. The plan-aware KV retention problem
 
 The plan fixes, before execution, the order in which KV segments are
 read; retention is then a well-posed offline problem rather than a
@@ -154,81 +296,135 @@ z_i/beta seconds before the next access). Kept segments must fit in
 K at every point. Minimize the total time added to the plan's base
 compute.
 
-Claim 1 (decoupled prices). Suppose spill traffic is charged as pure
-serial delay: transfers overlap nothing and do not share beta with
-each other or with the schedule's own reads. Then any non-keep
-decision affects only its own gap, so the cheaper alternative is
-always taken, and the price of not keeping segment i across a gap is
-min(r_i, 2 z_i / beta). The problem reduces to offline caching with
-a per-gap eviction price: choose which segments stay resident under
-capacity K, paying min(r_i, 2 z_i / beta) each time segment i is not
-retained across one of its gaps.
+Lemma 2 (per-gap price decoupling). In the decoupled cost model —
+every transfer is charged as pure serial delay, overlapping no
+compute and sharing beta with no other transfer — some optimal
+schedule charges every non-kept gap of segment i exactly
+min(r_i, 2 z_i / beta), and the only remaining decision is which
+gaps to keep.
 
-Claim 2 (complexity of the decoupled problem). With uniform segment
-sizes, the decoupled problem is offline weighted caching — unit-size
-items with item-specific eviction prices — and is solvable in
-polynomial time by a minimum-cost flow formulation, a network
-optimization solvable exactly in polynomial time; with uniform
-prices as well, it collapses to Belady's rule, evicting the segment
-whose next access is farthest in the future, so the formulation is a
-generalization of Belady's algorithm. With heterogeneous segment
-sizes the decoupled problem contains offline caching with item sizes
-and prices (general weighted caching), and it inherits that
-problem's NP-hardness unchanged, because by Claim 1 the keep, drop,
-and spill choices contribute only a fixed per-gap price.
+Proof. Fix any feasible schedule and any gap in which segment i is
+not kept. Drop frees z_i bytes for the entire gap and adds r_i of
+delay at the gap's end; spill frees the same z_i bytes over the same
+interval and adds z_i/beta of delay near the gap's start and
+z_i/beta before its end. In the decoupled model all delays are
+serial constants, so where they fall does not matter, and neither
+action's charge appears in any other gap's charge. The two actions
+also occupy identical pool space over identical intervals, so
+exchanging one for the other preserves feasibility of every other
+decision unchanged. Replacing the dearer action by the cheaper one
+therefore lowers total cost with no side effects; applying this
+exchange at every non-kept gap yields an optimal schedule in which
+each non-kept gap of segment i pays min(r_i, 2 z_i / beta).
 
-Claim 3 (the bandwidth-coupled variant is open). In the engine,
-spill transfers share bandwidth with the schedule's own weight and
-KV reads and can overlap compute. The effective price of a spill
-then depends on how much bandwidth slack the schedule has while the
+Proposition 3 (complexity of the decoupled problem).
+
+(a) Reduction to offline caching. Build a caching instance: one item
+per segment, item i of size z_i with fault price
+q_i = min(r_i, 2 z_i / beta); the request sequence is a_1..a_m; the
+cache capacity is K. Map schedules both ways by "segment i kept
+across a gap if and only if item i stays in cache between the two
+consecutive requests." By Lemma 2 an optimal retention schedule pays
+q_i exactly on each non-kept gap, which is exactly the fault cost of
+the corresponding caching schedule, so the two optima coincide.
+
+(b) Uniform sizes. With z_i equal for all i, the instance is offline
+weighted caching — unit-size items with item-specific fault prices —
+which is solvable in polynomial time by a classical minimum-cost
+flow formulation (minimum-cost flow is a network optimization
+problem solvable exactly in polynomial time). With uniform prices as
+well, the optimal policy is Belady's rule — evict the item whose
+next request is farthest in the future — so the flow formulation is
+a generalization of Belady's algorithm.
+
+(c) Heterogeneous sizes. Offline caching with arbitrary item sizes
+is NP-hard even in the fault model, where every fault price is
+equal (Chrobak et al.). The hardness transfers to our problem by
+reduction from that caching problem: given such an instance, set
+z_i to the item sizes, set r_i to the common fault price, and choose
+beta small enough that 2 z_i / beta >= r_i for every i, so the
+per-gap price of part (a) is exactly r_i. By (a) the decoupled
+retention optimum then equals the caching optimum, so deciding it is
+NP-hard.
+
+Open Problem 1 (bandwidth-coupled retention). In the engine, spill
+transfers share bandwidth with the schedule's own weight and KV
+reads and can overlap compute. The effective price of a spill then
+depends on how much bandwidth slack the schedule has while the
 transfer runs, which couples every gap decision to the global timing
 of the plan. We state this variant — minimize makespan when
 transfers may overlap compute and all traffic shares beta — as an
 open problem. We claim neither an algorithm nor a hardness result
-for it. The engine's spill scheduler is a heuristic for this
-variant and is evaluated empirically against a clairvoyant reference
-in E9.
+for it. The engine's spill scheduler is a heuristic for this variant
+and is evaluated empirically against a clairvoyant reference in E9.
 
-## 6. Contributions
+## 7. Contributions
 
-1. The engine. Plan-governed KV lifetimes inside a production
-   serving engine: admission by KV budget (a document enters only
-   when its KV fits the pool), pins for live documents (references
-   that make their KV ineligible for eviction), eager frees at
-   document death, and a strict mode in which any
-   heuristic eviction raises an error — zero occurred across every
-   validated run. Rewind execution reaches 1.07 times the read-floor
-   lower bound on the 32B tier (32.0 seconds, compared with the
-   30-second floor). Two protocol rules the runs forced: the rewind
-   boundary rule (rewind to the document plus the questions' shared
-   33-token preamble, not to the document alone), and the
-   decisive-token gate (register the yes and no token ids, allow a
-   few answer tokens, stop at the first decisive one) for models
-   that do not keep a one-token answer format.
-2. The optimizer. A cost model in which every constant is a measured
-   number attributed to a named calibration run; an O(n^2) dynamic
-   program over predicate partitions that is exact under the fluid
-   model, the relaxation that prices work as long-run rates and
-   ignores batch boundaries; a feasibility gate that refuses
-   device-model pairs whose bound cannot be met rather than emitting
-   a bad plan; and transfer to a new device from two measured
-   constants, its sustained token-reading rate and its KV pool size.
-3. The theory. The plan-aware KV retention problem of Section 5:
-   formal statement, the price decomposition and complexity results
-   for the decoupled variants, the bandwidth-coupled variant stated
-   as open, and an engine implementation evaluated in E9.
-4. The fused-fork operator. For all-answers sets, a shared-prefix
-   attention kernel evaluates all branch suffixes in one pass over
-   the document KV. It is correctness-gated — enabled only where
-   answers are bit-identical to unfused execution — and the planner
-   prices it from the measured crossover surface of E5.
-5. The method. A floor discipline applied to every claim: state the
-   lower bound, solve the rate program, construct the schedule,
-   measure the run, and check it with an independent validator — on
-   both model tiers, and across GPU counts (measured at one, two,
-   and four GPUs; the eight-GPU point is planned).
+1. The engine. We build the five operations of Section 4 into a
+   production serving engine and make the plan the sole owner of
+   query KV: admission by KV budget (a document enters only when its
+   KV fits the pool), pins for live documents (references that make
+   their KV ineligible for eviction), eager frees at document death,
+   and a strict mode in which any heuristic eviction raises an error
+   rather than silently substituting for the plan — zero such
+   evictions occurred across every validated run. Rewind execution
+   reaches 1.07 times the read-floor form of Proposition 1 on the
+   32B tier (32.0 seconds, compared with the 30-second floor; E1).
+   Two protocol rules the measurements forced are part of the
+   contribution: the rewind boundary rule, which rewinds to the
+   document plus the questions' shared 33-token preamble rather than
+   to the document alone, and the decisive-token gate, which
+   registers the yes and no token ids, allows a few answer tokens,
+   and stops at the first decisive one, for models that do not keep
+   a one-token answer format.
 
-## 7. Experiment plan
+2. The optimizer. We give a calibrated cost estimator
+   (Algorithm 1) in which every constant is a measured number
+   attributed to a named calibration run, a plan enumerator with an
+   explicit legality filter and feasibility gate (Algorithm 2), and
+   a predicate-grouping dynamic program (Algorithm 3) that is exact
+   under the fluid model by Lemma 1 and Proposition 2, at O(n^2)
+   block-cost evaluations, cross-checked exhaustively for n <= 6.
+   The estimator predicts every measured cell on the reference
+   hardware within about five to ten percent, and the same machinery
+   transfers to a new device from two measured constants — its
+   sustained token-reading rate and its KV pool size — which E12
+   tests, including the gate's refusal of an infeasible
+   configuration.
+
+3. The theory. We formalize retention as the plan-aware KV
+   retention problem (Problem 1), prove the per-gap price
+   decoupling (Lemma 2), reduce the decoupled variant to offline
+   caching with per-gap eviction prices and settle its complexity —
+   polynomial-time by minimum-cost flow at uniform sizes,
+   generalizing Belady's algorithm, and NP-hard at heterogeneous
+   sizes (Proposition 3) — and we state the bandwidth-coupled
+   variant as Open Problem 1 without claiming an algorithm or a
+   hardness result for it; the engine's heuristic for the coupled
+   variant is evaluated in E9.
+
+4. The fused-fork operator. For all-answers sets we contribute the
+   fuse operation of Section 4 as an executable operator: a
+   shared-prefix attention kernel evaluates all forked branch
+   suffixes in one pass over the document KV, gated for correctness
+   — enabled only where answers are bit-identical to unfused
+   execution, the fidelity requirement of Definition 2 — and priced
+   by the planner from the measured crossover surface of E5, with
+   fork and fuse priced separately by E6 and exercised at production
+   width by E7.
+
+5. The method. Every claim in the paper follows one discipline:
+   state the lower bound (Proposition 1), solve the rate program of
+   the fluid model, construct the schedule, measure the run, and
+   check it with an independent validator that replays every batch.
+   The discipline is applied on both model tiers and across GPU
+   counts — measured at one, two, and four GPUs with the eight-GPU
+   point planned (E2) — and it is what turned two silent
+   accounting gaps (the rewind boundary rule and the pin coverage of
+   the shared question preamble) into stated rules rather than
+   lingering luck.
+
+## 8. Experiment plan
 
 E1 through E4 are complete and are rerun only if a refactor changes
 their numbers; E5 through E12 are planned, with expected outcomes
@@ -270,10 +466,9 @@ restore path, each run on both tiers. Outcome: pins match the
 client library at 4B (49.2 versus 48.9 seconds) but lose under 32B
 pool overflow (54.5 seconds at 1.25 corpus reads, against 48.1 for
 an unpinned streaming client — fewer reads, more time); restore
-loses about two
-to one at 4B (20.3 and 18.4 seconds against 10.5 of recompute, at
-a measured 5.2 GB/s of disk bandwidth) and flips at 32B (about 8
-seconds of restore against 30 of recompute).
+loses about two to one at 4B (20.3 and 18.4 seconds against 10.5 of
+recompute, at a measured 5.2 GB/s of disk bandwidth) and flips at
+32B (about 8 seconds of restore against 30 of recompute).
 
 E4, reasoning grids (analytical layer measured; GPU run planned).
 Goal: locate where generation overtakes reading and what that does
@@ -320,7 +515,7 @@ ungated evaluation wins at small N where the device is starved —
 as the exact solver already shows at N = 3 — and gating wins at
 large N, with the measured boundary matching the planner's.
 
-E9, retention in practice (planned). Goal: test the Section 5
+E9, retention in practice (planned). Goal: test the Section 6
 heuristic where spilling should beat recomputing. Setup: a
 length-variance workload with natural thinking lengths on the 32B
 tier, comparing the planner's spill schedule, the engine's default
@@ -351,10 +546,10 @@ configuration on an L40S from the L40S's measured token-reading
 rate and KV pool size, then run it; also submit the 32B-on-L40S
 configuration to the planner. Expected outcome: measurements land
 within the model's established five-to-ten-percent envelope, and
-the 32B-on-L40S configuration is rejected by the feasibility gate —
-reported as a refusal, not a run.
+the 32B-on-L40S configuration is rejected by the feasibility gate
+of Algorithm 2 — reported as a refusal, not a run.
 
-## 8. Non-claims
+## 9. Non-claims
 
 We claim no new attention kernel: fusion uses existing shared-prefix
 primitives (FlashInfer), and the contribution is the operator and
@@ -370,7 +565,7 @@ ground truth identically across scheduling modes, and long-context
 agreement falls from 0.92 at 300-token documents to 0.63 at
 100,000 tokens; scheduling neither causes nor fixes this.
 
-## 9. Related work: positioning checklist
+## 10. Related work: positioning checklist
 
 The question asked of each line of work: does it plan engine state
 from query semantics against a stated lower bound?
