@@ -1053,3 +1053,23 @@ the flight proceeds. The KV pool on the new image is 978,464 tokens,
 compared with 981,728 before, a 0.3 percent change from the image's
 memory layout. Every constant downstream reprices off this run once
 the chain repetitions land.
+
+### Run 3d, the chain accuracy flight: faster, and twice as wrong
+
+results/engine/chain10k.json, re-banked with full wrong lists. Walls
+fell as the toolchain ratio predicts: chain mode 43.5 seconds against
+the stale 51.1, request mode 44.9 against 55.2. Mode fidelity holds
+exactly as before: the two modes agree on 20,122 of 20,123 shared
+calls (one borderline flip). The surprise is accuracy against planted
+truth: 4,744 of 20,125 calls wrong (23.6 percent), compared with
+2,929 of 23,904 (12.3 percent) on the old image, and 2,348 survivors
+against 3,524. Same seeds, same prompt bytes, same vllm==0.26.0; the
+toolchain is the only variable, and it changes which attention
+kernels run (the devel base lets FlashInfer compile). The fusion gate
+already showed FlashInfer's cascade kernel flips answers confidently;
+this run says the plain prefill path on the new stack also moves
+borderline calls, at scale, in the wrong direction. Open question,
+and the next attribution arm: force the old attention backend on the
+new image and see whether accuracy returns to 12.3 percent and what
+read rate that backend sustains. Until that lands, the speed anchor
+and the accuracy number cannot be quoted from the same stack.
