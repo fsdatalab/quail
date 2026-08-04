@@ -118,7 +118,7 @@ def _top2_gap(out):
 
 @app.function(image=image, gpu="H100!", timeout=5400,
               volumes={"/root/.cache/huggingface": hf_cache})
-def fusegate_run(n_docs: int = 50) -> dict:
+def fusegate_run(n_docs: int = 50, kv: str = "fp8") -> dict:
     # The patch lives in this process, so the engine must too.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     import numpy as np
@@ -154,7 +154,7 @@ def fusegate_run(n_docs: int = 50) -> dict:
             cursor += 1
         return ids[:target]
 
-    llm = LLM(model=MODEL, kv_cache_dtype="fp8", max_model_len=16_384,
+    llm = LLM(model=MODEL, kv_cache_dtype=kv, max_model_len=16_384,
               gpu_memory_utilization=0.92, enable_prefix_caching=True,
               enforce_eager=True, disable_log_stats=True,
               max_num_batched_tokens=16_384, max_num_seqs=1_024,
@@ -282,11 +282,12 @@ def fusegate_run(n_docs: int = 50) -> dict:
 
 
 @app.local_entrypoint()
-def main(phase: str = "fusegate", n_docs: int = 0, out: str = ""):
+def main(phase: str = "fusegate", n_docs: int = 0, out: str = "",
+         kv: str = "fp8"):
     if phase != "fusegate":
         raise SystemExit(f"unknown phase {phase}")
-    data = fusegate_run.remote(n_docs or 50)
-    path = out or "results/engine/fusegate.json"
+    data = fusegate_run.remote(n_docs or 50, kv)
+    path = out or f"results/engine/fusegate_{kv.replace(chr(47), chr(45))}.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f)
