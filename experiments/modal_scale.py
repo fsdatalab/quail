@@ -1002,7 +1002,7 @@ async def shard_worker(gpus: int, widx: int, n_docs: int = 10000) -> dict:
 
 @app.function(image=image, gpu="H100!", timeout=3600,
               volumes={"/root/.cache/huggingface": hf_cache})
-async def reason_run(n_docs: int = 2000, big: int = 0) -> dict:
+async def reason_run(n_docs: int = 2000, big: int = 0, width_sweep: int = 0) -> dict:
     """The measured reasoning grid (plan priority six). Thinking is
     simulated by force: min_tokens pins every filter call to exactly
     g+1 output tokens (g of decode before the window closes), so
@@ -1075,6 +1075,27 @@ async def reason_run(n_docs: int = 2000, big: int = 0) -> dict:
                     answers=answers, requests=len(answers))
 
     report = dict(n_docs=n_docs, n_filters=n, s=s, model=mdl)
+    if width_sweep:
+        # Is decode width the binding resource? Same workload, g=128,
+        # gated pipeline, admission budget swept from starved to the
+        # pool: if the wall falls inversely with width until the pool
+        # binds, width-first planning is the reasoning regime's knob.
+        g = 128
+        sp = SamplingParams(temperature=0.0, max_tokens=g + 1,
+                            min_tokens=g + 1, skip_clone=True)
+        for b in (50_000, 100_000, 200_000, 400_000, 700_000):
+            await reset()
+            r = await run_filter_chain(
+                engine, sp, body_ids, q_ids, b, lookahead=1,
+                tag=f"wd{b // 1000}", tags=EngineTags(),
+                use_priority=True)
+            report[f"b{b // 1000}k"] = round(r["wall"], 2)
+            print(f"[width] budget {b}: {r['wall']:.2f}s", flush=True)
+        try:
+            engine.shutdown()
+        except Exception:
+            pass
+        return report
     for g in (0, 32, 128, 512):
         # forced thinking: exactly g decode tokens, then the window
         m = g + 1
@@ -2029,6 +2050,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "reason":
         data = reason_run.remote(n_docs or 2000)
         path = out or "results/engine/reason_grid.json"
+    elif phase == "width":
+        data = reason_run.remote(n_docs or 2000, 0, 1)
+        path = out or "results/engine/width_scaling.json"
     elif phase == "reason32":
         data = reason_run.remote(n_docs or 500, 1)
         path = out or "results/engine/reason_grid32.json"
