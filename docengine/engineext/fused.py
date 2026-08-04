@@ -379,7 +379,3 @@ def install_fused_patch() -> None:
 
     FlashInferMetadataBuilder.build = build
     FlashInferMetadataBuilder._docengine_fused_installed = True
-
-
-# The experiment branch imports the patch under its old name.
-install_multigroup_patch = install_fused_patch

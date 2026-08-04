@@ -1,0 +1,361 @@
+"""Checks for the scheduler's pure decision logic (chainlogic.py),
+driven from planted flags and hand-built request ids, with no vLLM
+installed. Numbers mirror the banked flight shape where it helps:
+block size 16, a 345-token document (21 full blocks plus 9 tokens),
+and the questions' 33-token shared preamble."""
+
+import re
+
+from docengine.engineext import chainlogic
+from docengine.engineext.chainlogic import (
+    FAILED, KEEP_DECODING, PASSED, UNDECIDED, PinLedger,
+    continuation_tail, document_boundary, full_blocks, gate_decision,
+    is_chain, is_heuristic_eviction, is_registration, is_release_all,
+    new_pin_intent, parse_qid, parse_registration, parse_tag,
+    parse_yes_no, partial_boundary, pin_ready, plan_priority,
+    retained_blocks, rewind_target, shared_preamble, stage_advances,
+    strict_violation)
+
+PAGE = 16
+BODY = 345          # 21 full blocks of 16, plus 9 remainder tokens
+Q_COMMON = 33       # question tokens shared by every stage
+YES_TOK, NO_TOK = 111, 222
+
+
+# ---- request-id protocol ----------------------------------------------
+
+def test_tag_parses_all_directives():
+    """The shared-scan chain id shape: pin, doc, uses, releases."""
+    assert parse_tag("de1|c|Q1|p345|d7|u2|r3,4|s-7-1") == (
+        345, "7", ["3", "4"], 2)
+    assert parse_tag("de1|c|d7|q-7-0") == (0, "7", [], 1)   # uses defaults
+    assert parse_tag("de1|r*|q-flz") == (0, None, ["*"], 1)
+    assert parse_tag("plain-id") is None
+    assert parse_tag("q|p345|d7|x") is None
+
+
+def test_tag_suffix_never_read_as_directive():
+    """The r/p/d trap: a run tag starting with r, p, d (or u) makes
+    every suffix look like a directive. The suffix is the last field
+    and must never shadow one - a tag named "rm" once swallowed every
+    release, including the end-of-run flush."""
+    pin, doc, rel, uses = parse_tag("de1|p345|d7|r0,1|rm-0-99")
+    assert rel == ["0", "1"]           # not ["m-0-99"], not swallowed
+    assert (pin, doc) == (345, "7")
+    assert parse_tag("de1|d3|rm-7-0")[2] == []      # no phantom release
+    assert parse_tag("de1|p100|d2|p999")[0] == 100  # pin not overridden
+    assert parse_tag("de1|p100|d2|d9")[1] == "2"    # doc not overridden
+    assert parse_tag("de1|p10|d1|u7")[3] == 1       # uses not overridden
+    # the flush still works under a hostile tag: the real r* directive
+    # sits before the suffix
+    assert parse_tag("de1|r*|rm-flz")[2] == ["*"]
+
+
+def test_release_all_is_star_only():
+    assert is_release_all(["*"])
+    assert not is_release_all(["3", "4"])
+    assert not is_release_all([])
+
+
+def test_qid_defaults_and_ignores_suffix():
+    assert parse_qid("de1|c|Q1|p345|d7|u2|s-7-1") == "1"
+    assert parse_qid("de1|c|d7|q-7-0") == "0"       # single-query default
+    assert parse_qid("de1|c|d1|Q9-x") == "0"        # suffix never read
+
+
+def test_yes_no_sets_and_suffix_trap():
+    yes, no = parse_yes_no("de1|reg|Q0|Y111,112|N222|run-a")
+    assert yes == {111, 112} and no == {222}
+    yes, no = parse_yes_no("de1|reg|Y111|s")
+    assert yes == {111} and no == set()             # no set optional
+    _, no = parse_yes_no("de1|reg|Y111|N9")         # suffix "N9" is text
+    assert no == set()
+
+
+def test_request_classification():
+    assert is_registration("de1|reg|Q1|Y111|N222|s-reg")
+    assert is_chain("de1|c|d7|q-7-0")
+    assert is_chain("de1|c|Q1|p345|d7|u2|s-7-1")
+    assert not is_chain("de1|p345|d7|q-7-0")        # request mode
+    assert not is_registration("de1|c|d7|q-7-0")
+    assert not is_chain("foreign-42")
+
+
+def test_plan_priority_ranks():
+    """Consumers of resident KV first, new reads next, unplanned
+    last."""
+    assert plan_priority((0, "7", ["3"], 1)) == 0   # no pin: consumer
+    assert plan_priority((345, "7", [], 1)) == 1    # pin: new read
+    assert plan_priority(None) == 2                 # foreign
+
+
+# ---- registration payload ---------------------------------------------
+
+def _questions():
+    """Three questions sharing a 33-token preamble, distinct tails of
+    different lengths (the client's real shape)."""
+    pre = list(range(1000, 1000 + Q_COMMON))
+    return [pre + [2000 + j] * (3 + j) for j in range(3)]
+
+
+def test_registration_prompt_roundtrip():
+    """Decode the [count, len, tokens, ...] layout the client builds."""
+    qs = _questions()
+    reg = [len(qs)]
+    for q in qs:
+        reg += [len(q)] + list(q)
+    assert parse_registration(reg) == qs
+    assert parse_registration([1, 2, 5, 6]) == [[5, 6]]
+
+
+def test_shared_preamble_is_33_tokens():
+    qs = _questions()
+    assert shared_preamble(qs) == Q_COMMON
+    # kept preamble plus appended tail is exactly the question again
+    for q in qs:
+        assert q[:Q_COMMON] + continuation_tail(q, Q_COMMON) == q
+
+
+def test_shared_preamble_edges():
+    """A single question has no continuation, so no preamble; a
+    question that is a prefix of another shares its full length."""
+    assert shared_preamble([[1, 2, 3, 4]]) == 0
+    assert shared_preamble([[1, 2, 3], [1, 2, 3, 4]]) == 3
+    assert shared_preamble([[1, 2], [3, 4]]) == 0
+
+
+# ---- rewind arithmetic ------------------------------------------------
+
+def test_rewind_target_keeps_document_plus_preamble():
+    """The 4.4-second trap: rewinding to the document boundary alone
+    erases the shared preamble and every continuation recomputes it.
+    The target must sit exactly one preamble past the boundary."""
+    d = BODY
+    assert rewind_target(d, Q_COMMON) == d + Q_COMMON == 378
+    assert rewind_target(d, Q_COMMON) > d
+    assert rewind_target(d, 0) == d          # single-question chain
+
+
+def test_boundary_block_arithmetic():
+    """Hashes exist only for full blocks; the partly filled boundary
+    block is retained but its cache entry must be stripped."""
+    assert full_blocks(BODY, PAGE) == 21          # 336 of 345 tokens
+    assert retained_blocks(BODY, PAGE) == 22      # the 9-token remainder
+    assert partial_boundary(BODY, PAGE)
+    target = rewind_target(BODY, Q_COMMON)        # 378 tokens
+    assert full_blocks(target, PAGE) == 23
+    assert retained_blocks(target, PAGE) == 24
+    assert partial_boundary(target, PAGE)
+    # an exact multiple has no partial block and nothing to strip
+    assert full_blocks(352, PAGE) == retained_blocks(352, PAGE) == 22
+    assert not partial_boundary(352, PAGE)
+
+
+def test_block_counts_consistent_at_every_length():
+    """The hash cut can never pass the retained count, and the two
+    differ by exactly the partial boundary block."""
+    for d in range(0, 3 * PAGE + 1):
+        fb, rb = full_blocks(d, PAGE), retained_blocks(d, PAGE)
+        assert rb - fb == (1 if partial_boundary(d, PAGE) else 0)
+        assert fb * PAGE <= d <= rb * PAGE
+
+
+def test_rewind_reconstructs_each_stage_prompt():
+    """Walk one document's token record through three passing stages
+    the way the scheduler does: rewind to the target, append the next
+    tail. Every stage must see exactly [document + its question]."""
+    doc = [10] * BODY
+    qs = _questions()
+    qc = shared_preamble(qs)
+    record = doc + list(qs[0])
+    d = document_boundary(len(record), len(qs[0]))
+    assert d == BODY
+    for stage in (2, 3):
+        record = (record[:rewind_target(d, qc)]
+                  + continuation_tail(qs[stage - 1], qc))
+        assert record == doc + qs[stage - 1]
+
+
+# ---- the decisive-token gate ------------------------------------------
+
+def test_decisive_token_in_later_position():
+    """A fused "=YES"-style token may arrive after restated chatter.
+    With a no set registered, the chatter keeps decoding and the first
+    decisive token ends the stage before the window is exhausted."""
+    yes, no = {YES_TOK}, {NO_TOK}
+    window = [900, 901, YES_TOK]
+    seen = [gate_decision(t, False, yes, no) for t in window]
+    assert seen == [KEEP_DECODING, KEEP_DECODING, PASSED]
+    assert stage_advances(seen[-1], 1, 3)
+    # a decisive no ends the stage the same way, without advancing
+    assert gate_decision(NO_TOK, False, yes, no) == FAILED
+    assert not stage_advances(FAILED, 1, 3)
+
+
+def test_gate_without_no_set_waits_for_the_stop():
+    """Single-token mode (no no set): nothing ends the window early,
+    and the engine's own stop decides - any non-yes token fails."""
+    yes = {YES_TOK}
+    assert gate_decision(YES_TOK, False, yes, set()) == KEEP_DECODING
+    assert gate_decision(YES_TOK, True, yes, set()) == PASSED
+    assert gate_decision(777, True, yes, set()) == FAILED
+    assert gate_decision(None, True, yes, set()) == FAILED
+
+
+def test_gate_window_exhausted_without_decision():
+    """With a no set, a stop on a non-decisive token is undecided; a
+    decisive token at the cap still counts."""
+    yes, no = {YES_TOK}, {NO_TOK}
+    assert gate_decision(900, True, yes, no) == UNDECIDED
+    assert gate_decision(None, True, yes, no) == UNDECIDED
+    assert gate_decision(YES_TOK, True, yes, no) == PASSED
+    assert gate_decision(NO_TOK, True, yes, no) == FAILED
+    for verdict in (UNDECIDED, FAILED, KEEP_DECODING):
+        assert not stage_advances(verdict, 1, 3)
+
+
+def test_final_stage_never_advances():
+    """The last stage keeps its real finish so the client's stream
+    closes; only a pass with stages remaining rewinds."""
+    assert stage_advances(PASSED, 1, 3)
+    assert stage_advances(PASSED, 2, 3)
+    assert not stage_advances(PASSED, 3, 3)
+
+
+def _walk_chain(doc, qs, flags_row):
+    """Drive one document's chain from planted flags: judge each
+    stage's token, rewind, append the next tail. Returns the per-stage
+    answers and the rewind count."""
+    qc = shared_preamble(qs)
+    record = doc + list(qs[0])
+    d = document_boundary(len(record), len(qs[0]))
+    stage, answers, rewinds = 1, [], 0
+    while True:
+        assert record == doc + qs[stage - 1]
+        tok = YES_TOK if flags_row[stage - 1] else NO_TOK
+        verdict = gate_decision(tok, True, {YES_TOK}, set())
+        answers.append(verdict == PASSED)
+        if not stage_advances(verdict, stage, len(qs)):
+            return answers, rewinds
+        record = (record[:rewind_target(d, qc)]
+                  + continuation_tail(qs[stage], qc))
+        rewinds += 1
+        stage += 1
+
+
+def test_chain_walk_from_planted_flags():
+    """The composed pieces reproduce chain semantics: stop at the
+    first failure, survive only on all-yes, one rewind per advance
+    (n-1 rewinds for a surviving n-stage chain)."""
+    doc = [10] * BODY
+    qs = _questions()
+    flags = [[1, 1, 1], [1, 0, 1], [0, 1, 1], [1, 1, 0]]
+    want_stages = [3, 2, 1, 3]
+    for row, stages in zip(flags, want_stages):
+        answers, rewinds = _walk_chain(doc, qs, row)
+        assert len(answers) == stages       # never asked past a failure
+        assert answers == [bool(f) for f in row[:stages]]
+        assert rewinds == stages - 1
+        survived = all(answers) and len(answers) == len(qs)
+        assert survived == all(row)
+
+
+# ---- the strict-mode invariant ----------------------------------------
+
+def test_strict_mode_predicates():
+    """Any eviction the plan did not initiate is heuristic; in strict
+    mode it must raise, and plan-initiated evictions never count."""
+    assert is_heuristic_eviction(True, False)
+    assert not is_heuristic_eviction(True, True)    # plan-initiated
+    assert not is_heuristic_eviction(False, False)  # nothing evicted
+    assert strict_violation(True, False, True)
+    assert not strict_violation(True, True, True)
+    assert not strict_violation(True, False, False)  # shared card mode
+    assert not strict_violation(False, False, True)
+
+
+# ---- pin refcount bookkeeping -----------------------------------------
+
+def test_pin_frees_exactly_once():
+    """A pin with uses=2 survives the first release mention, frees on
+    the second, and later mentions are ignored - one free event
+    total."""
+    ledger = PinLedger()
+    ledger.add("7", ["blockA", "blockB"], 2)
+    events = []
+    for _ in range(4):
+        events += ledger.to_free(["7"])
+    assert events == [("7", ["blockA", "blockB"])]
+    assert "7" not in ledger
+    # a fresh pin on the same key starts a fresh count
+    ledger.add("7", ["blockC"], 1)
+    assert ledger.to_free(["7"]) == [("7", ["blockC"])]
+
+
+def test_release_all_ignores_counts():
+    """The end-of-run flush frees every pin outright, whatever its
+    remaining mention count, and a second flush finds nothing."""
+    ledger = PinLedger()
+    ledger.add("1", ["a"], 5)
+    ledger.add("2", ["b"], 5)
+    ledger.add("3", ["c"], 1)
+    assert ledger.to_free(["2"]) == []      # 4 mentions still owed
+    freed = dict(ledger.to_free(["*"]))
+    assert freed == {"1": ["a"], "2": ["b"], "3": ["c"]}
+    assert ledger.to_free(["*"]) == []
+
+
+def test_shared_scan_release_balance():
+    """Two queries over five documents: after each query releases
+    every document once, every pin freed exactly once and the flush
+    finds nothing left (the test_client balance invariants, ledger
+    side)."""
+    ledger = PinLedger()
+    docs = [str(i) for i in range(5)]
+    for key in docs:
+        ledger.add(key, [f"blk{key}"], 2)
+    assert ledger.to_free(docs) == []                     # query 0
+    assert [k for k, _ in ledger.to_free(docs)] == docs   # query 1
+    assert ledger.to_free(["*"]) == []
+
+
+def test_unknown_and_batched_releases():
+    """Releases for absent documents are ignored (a release can
+    outlive its pin), and one batched mention list decrements each
+    listed pin once."""
+    ledger = PinLedger()
+    assert ledger.to_free(["9"]) == []
+    ledger.add("1", ["a"], 1)
+    ledger.add("2", ["b"], 2)
+    freed = ledger.to_free(["1", "2", "9"])
+    assert freed == [("1", ["a"])]
+    assert "2" in ledger
+
+
+def test_pin_intent_predicates():
+    """An intent needs a positive pin span and a document key not yet
+    pinned; the pin is taken at free time only if the request computed
+    past the span and no sibling pinned first."""
+    ledger = PinLedger()
+    assert new_pin_intent(345, "7", ledger)
+    assert not new_pin_intent(0, "7", ledger)
+    assert not new_pin_intent(345, None, ledger)
+    ledger.add("7", ["a"], 1)
+    assert not new_pin_intent(345, "7", ledger)     # already pinned
+    intent = (345, "3", 2)
+    assert pin_ready(intent, 345, ledger)
+    assert not pin_ready(intent, 344, ledger)       # never computed span
+    assert not pin_ready(None, 10 ** 9, ledger)
+    ledger.add("3", ["b"], 1)
+    assert not pin_ready(intent, 345, ledger)       # sibling won
+
+
+# ---- module purity ----------------------------------------------------
+
+def test_chainlogic_imports_no_engine():
+    """The whole point of the module: it must stay importable and
+    testable with no vLLM, torch, or numpy installed."""
+    with open(chainlogic.__file__) as f:
+        src = f.read()
+    assert re.search(r"^\s*(?:import|from)\s+(?:vllm|torch|numpy)\b",
+                     src, re.M) is None
