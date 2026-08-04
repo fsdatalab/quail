@@ -1095,3 +1095,12 @@ parameters and image, so the container-to-container spread is
 about 18 percent - host variance or FlashInfer JIT inside the
 measured window. Verdict on the headline wall waits for
 repetitions one and three; the paper quotes mean and spread.
+
+Repetition one: chain 48.1 seconds, request mode 53.3, answers
+bit-identical to the other repetitions. Chain walls so far on the
+new image: 43.5 (the un-instrumented accuracy flight), 48.1, 51.2.
+Prefill alone got 21 percent faster, but the chain wall is moving
+much less and varies by container - either the headline query is
+less read-bound than the old calculus assumed, or host variance
+and in-window JIT are polluting the wall. Repetition three decides
+what the paper quotes.
