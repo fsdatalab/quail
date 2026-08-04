@@ -1316,3 +1316,20 @@ properties of the stack pair, both stacks are banked with image
 stamps, and the durable fix is checkpoint-side scale calibration -
 a model artifact, which is where the accuracy section already
 placed the lever.
+
+### Run 8b, the heavy neighbor: the log-only claim becomes a measurement
+
+results/engine/pinned10k_hard.json.gz, banked for the first time -
+the old flight's stock arm died with its container and left only
+prose. Under the heavy neighbor (60 requests per second of 1,500
+junk tokens): the pinned engine runs the query in 53.3 seconds
+against 50.3 alone (6 percent slower), holding a 47.7 percent cache
+hit rate; the stock scheduler finishes at 658.2 seconds against
+45.4 alone (14.5 times slower), its hit rate collapsed to 2.2
+percent because the junk flushed the prefix cache the query
+depended on. The paper's claim upgrades from "never finished inside
+an hour" (unbanked) to a measured, same-container 12.3x degradation
+ratio with the neighbor's own served load banked beside it (35,587
+junk completions against the pinned engine's 2,889 - the pinned
+engine also starves the junk, which is the single-tenant contract
+working). Zero heuristic evictions; pins and releases balanced.
