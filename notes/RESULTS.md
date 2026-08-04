@@ -1032,3 +1032,24 @@ the top of this file says how to read the numbers meanwhile.
 - Weight sizes are still estimates from parameter counts, not measured
   from the released files.
 - The small instance numbers come from single outcome draws.
+
+## The re-baseline flight, run by run
+
+The flight of experiments/REBASELINE.md, on the CUDA 13 devel image.
+Every result in this section carries the image stamp; each run is
+banked here in the same commit as its JSON.
+
+### Run 1, the speed control: the new anchor is 97,889 tokens per second
+
+results/engine/speed_limit.json, re-banked. Fifteen measurements over
+the same five engine configurations and three input forms as the
+stale file: 89,638 to 97,889 tokens per second, compared with the
+stale 74,067 to 80,688. The best cell (32k batched tokens, 1,024
+sequences, prefix caching on, short prompt ids) reads 1,198,838
+tokens in 12.29 seconds, which is 35.6 percent of the 275,000 spec
+ceiling. This matches the attribution flight's prediction (97,220 on
+the same base in results/engine/xengine.json), so the rebase took and
+the flight proceeds. The KV pool on the new image is 978,464 tokens,
+compared with 981,728 before, a 0.3 percent change from the image's
+memory layout. Every constant downstream reprices off this run once
+the chain repetitions land.
