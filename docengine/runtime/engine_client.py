@@ -66,7 +66,7 @@ class EngineTags:
 
 async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
                            budget_tokens, lookahead=1, tag="q", tags=None,
-                           use_priority=False):
+                           use_priority=False, composition=None):
     """Run every document through the filter chain; return timings,
     counters, per-call answers keyed (doc, stage) with stages 1-indexed,
     and the surviving document ids.
@@ -121,8 +121,11 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
         nonlocal used
         try:
             j = 0
+            blocks = list(composition) if composition else None
             while j < n:
-                kk = min(lookahead, n - j)
+                kk = (blocks.pop(0) if blocks
+                      else min(lookahead, n - j))
+                kk = min(kk, n - j)
                 got = await asyncio.gather(*[
                     ask(body_ids[i] + q_ids[j + off], rid_for(i, j + off),
                         pri=0 if j + off > 0 else 1)

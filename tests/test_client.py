@@ -182,3 +182,19 @@ def test_lookahead_waste_recorded():
             assert (i, 3) not in res["answers"]
     want = [i for i in range(30) if all(flags[i])]
     assert res["survivors"] == want
+
+
+def test_asymmetric_composition():
+    """composition=(1,2,1) gates after filter one, speculates filters
+    two and three together, gates filter four."""
+    flags, body_ids, q_ids = _setup(30, 4, seed=29)
+    eng = StubEngine(flags)
+    res = asyncio.run(run_filter_chain(eng, None, body_ids, q_ids,
+                                       budget_tokens=10 ** 6,
+                                       composition=(1, 2, 1)))
+    assert res["survivors"] == [i for i in range(30) if all(flags[i])]
+    for i in range(30):
+        if flags[i][0]:
+            assert (i, 3) in res["answers"]   # block two both asked
+        else:
+            assert (i, 2) not in res["answers"]
