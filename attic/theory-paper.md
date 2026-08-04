@@ -1,3 +1,37 @@
+% ARCHIVED 2026-08-04.
+%
+% What this is: the theory program's working paper, "Scheduling
+% n-Stage AI Filters Under KV-Cache Constraints" — the finished
+% first generation of this repo. It defines the batch-level cost
+% model and the exact schedule solvers that the code in attic/
+% implements.
+%
+% What supersedes it: paper/PAPER.md ("Plan-Governed KV State for
+% Semantic Scans") is the submission now. This file is kept because
+% banked claims still cite its machinery.
+%
+% What survives where:
+% - The retention theory lives on as the new paper's Section 6
+%   (the plan-aware KV retention problem, its caching reduction,
+%   and its complexity results).
+% - The solver semantics live on as the attic's validation layer:
+%   the exact solvers, the expected-flow linear program, and the
+%   replay checker, kept runnable beside this file. Their evidence
+%   fills the first half of notes/RESULTS.md.
+% - The review (notes/REVIEW.md) found four real errors, all fixed
+%   in the solvers and to be fixed in any future edit of this text:
+%   (1) the attention-compute formula used the hidden width where
+%   query heads times head width belongs, a 1.6-times undercount on
+%   both Qwen3 models; (2) the NP-hardness reduction from
+%   3-PARTITION collapsed once documents may split, and holds only
+%   for indivisible documents unless capacity is routed through the
+%   memory limit; (3) the online recurrence has loops, so it is a
+%   stochastic shortest-path problem solved by value iteration, not
+%   a recursion to evaluate; (4) the lower bound was built from
+%   schedule-dependent totals, and must take each total's minimum
+%   over feasible schedules, with the batch count derived from the
+%   memory limit.
+%
 \documentclass[11pt]{article}
 
 \usepackage[T1]{fontenc}

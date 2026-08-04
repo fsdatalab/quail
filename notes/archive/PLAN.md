@@ -1,3 +1,5 @@
+*Archived 2026-08-04; describes a completed phase; superseded by notes/PROPOSAL.md and paper/PAPER.md.*
+
 # Plan for solving the schedules
 
 ## What the project is

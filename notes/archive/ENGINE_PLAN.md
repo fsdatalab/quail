@@ -1,3 +1,5 @@
+*Archived 2026-08-04; describes a completed phase; superseded by notes/PROPOSAL.md and paper/PAPER.md.*
+
 # Measured layer plan: real H100 runs on Modal
 
 The goal is to measure real wall-clock makespans for the scheduling
