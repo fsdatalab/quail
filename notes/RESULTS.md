@@ -1220,3 +1220,28 @@ while the stock scheduler degrades 48 percent, 70.3 to 103.7.
 Neighbor stats are banked with offered counts and latencies. Zero
 heuristic evictions across every arm, pins and releases balanced
 exactly (40,000 in, 40,000 out).
+
+### Run 6, the shared-scan discriminator: 60 confident flips - the claim holds
+
+results/engine/shared2000.json.gz, re-banked with per-call top-2
+logprob gaps in both arms. The pre-registered rule was: near-ties
+only, and the multi-query claim ships with a tolerance; confident
+flips, and there is a bug to find. The verdict at q=8: 60 confident
+flips (both arms past the 0.2-nat gap on different tokens), 20
+near-ties, zero calls with an unreadable gap, over 27,932 paired
+calls - so the claim is blocked, and the number that would have
+shipped (5.09x on the old image; 3.4x this flight, 31.2 against
+105.9 seconds on a slower host) appears nowhere as a claim. The
+structure of the flips is the lead: queries 1 and 2 agree
+perfectly, while queries 3, 5, and 6 carry 16, 16, and 18 confident
+flips plus 37 to 40 calls that exist in only one arm downstream of
+a divergence. Sharing itself is implicated, not chain mode: the
+shared arm's chains attend over document KV written by another
+query's prefill through the prefix cache, and with fp8 KV that path
+shares quantization scales too. The named next probe: the same
+shared-versus-separate run with bf16 KV, which removes the fp8
+scale sharing; it waits on the two attribution arms in flight,
+since the shipping stack itself is in question. Wrong answers
+against planted truth: 9,097 of 27,935 shared and 9,040 of 28,033
+separate (32.6 percent) - the 4B kernel accuracy shift compounds on
+this 32-flag workload, up from 19.2 percent on the old image.
