@@ -41,6 +41,7 @@ class CascadeGroup:
 
 _CURRENT_GROUPS: tuple[CascadeGroup, ...] | None = None
 _FUSED_ENABLED: bool = False
+_STATS = {"cascade_steps": 0, "fallback_steps": 0, "grouped_requests": 0}
 
 
 def set_cascade_groups(groups: Sequence[CascadeGroup] | None) -> None:
@@ -52,6 +53,17 @@ def set_fused_enabled(enabled: bool) -> None:
     """Turn block-table-derived grouping on or off for later steps."""
     global _FUSED_ENABLED
     _FUSED_ENABLED = bool(enabled)
+
+
+def fused_stats() -> dict:
+    """Counters since the last reset. A gate must see cascade_steps > 0,
+    or its fused-versus-unfused comparison proved nothing."""
+    return dict(_STATS)
+
+
+def reset_fused_stats() -> None:
+    for key in _STATS:
+        _STATS[key] = 0
 
 
 def _check_group(
@@ -240,6 +252,7 @@ def install_fused_patch() -> None:
                 page_size,
             )
             if derived is None:
+                _STATS["fallback_steps"] += 1
                 return metadata
             ordered = derived
         for first_request, group in ordered:
@@ -325,6 +338,12 @@ def install_fused_patch() -> None:
         metadata.prefill = None
         metadata.decode = None
         metadata.cascade_wrapper = wrapper
+        _STATS["cascade_steps"] += 1
+        _STATS["grouped_requests"] += sum(
+            group.request_count
+            for _, group in ordered
+            if group.request_count > 1
+        )
         return metadata
 
     FlashInferMetadataBuilder.build = build
