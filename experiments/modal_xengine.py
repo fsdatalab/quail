@@ -56,12 +56,29 @@ Fairness rules, enforced in code:
     documents. Per-arm caveats (precision, padding, KV dtype) are
     recorded in the JSON next to the numbers they qualify.
 
+Completeness arms, closing the cross-engine question:
+
+  sglang_fp8kv   The sglang arm with KV written in fp8 (e4m3), the KV
+                 configuration the vllm control ran. The original
+                 sglang arm left KV at 'auto' (bf16), so the fp8-KV
+                 speed cell was missing from the table.
+
+  sglang_acc     Truth-scored accuracy: the standard planted-flags
+                 query (2,000 docs, 4 filters at s=0.8, modal_scale's
+                 exact seeds and prompt bytes) as plain per-stage
+                 requests through sglang's generate API, scored
+                 against the planted flags. Banks wrong counts and
+                 survivors so the paper can state answer parity
+                 across engines. Not a speed cell.
+
 Run with:
   modal run experiments/modal_xengine.py                 # every arm
   modal run experiments/modal_xengine.py --arm sglang    # one arm; merges
                                                          # into xengine.json
   modal run experiments/modal_xengine.py \
       --arm vllm_new,vllm_bf16attn,vllm_new_tuned        # attribution only
+  modal run experiments/modal_xengine.py \
+      --arm sglang_fp8kv,sglang_acc                      # completeness
 """
 
 import hashlib
@@ -77,6 +94,7 @@ MODEL = "Qwen/Qwen3-4B-FP8"
 # load the fp8 checkpoint; the result is then marked bf16 loudly.
 MODEL_BF16_FALLBACK = "Qwen/Qwen3-4B"
 WORKLOAD_SEED = 20260731
+FLAG_SEED = 424242        # same planted-flags seed as modal_scale.py
 CEIL = 275_000            # dense FP8 prefill ceiling, tokens per second
 VLLM_PIN = "0.26.0"       # same pin as experiments/modal_scale.py
 # Newest vLLM release on PyPI at time of writing. It happens to equal
@@ -176,6 +194,19 @@ def _corpus_ids(n_docs):
     docs = _build_pool(n_docs)
     tok = AutoTokenizer.from_pretrained(MODEL)
     return tok(docs, add_special_tokens=False)["input_ids"]
+
+
+def _flags_line(flags):
+    """Byte-identical to modal_scale.py's planted metadata line."""
+    return "\n\n[FLAGS] " + " ".join(
+        f"FLAG_{j+1}={'YES' if f else 'NO'}" for j, f in enumerate(flags))
+
+
+def _question(j):
+    """Byte-identical to modal_scale.py's doc-first question."""
+    return (f"\n\nExample: if the line said [FLAGS] FLAG_9=NO, then FLAG_9 "
+            f"has value NO.\nInstruction: output only the value of FLAG_{j} "
+            f"from the [FLAGS] line above.\nFLAG_{j}=")
 
 
 def _fingerprint(ids):
@@ -463,6 +494,161 @@ def sglang_arm(n_docs: int = 4000) -> dict:
         ])
 
 
+# --------------------------------------- completeness arm: sglang fp8 KV
+
+@app.function(image=sglang_image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+def sglang_fp8kv_arm(n_docs: int = 4000) -> dict:
+    """The missing speed cell: the sglang arm ran KV at 'auto' (bf16)
+    while the vllm control wrote fp8 KV. Same sglang pin, same image,
+    same config, only kv_cache_dtype='fp8_e4m3' (the e4m3 format vLLM
+    means by 'fp8'). Prefill-only speed with fp8 KV writes closes the
+    cross-engine table."""
+    import sglang
+    import torch
+
+    ids = _corpus_ids(n_docs)
+    fed = sum(len(x) for x in ids)
+    engine = sglang.Engine(model_path=MODEL, disable_radix_cache=True,
+                           mem_fraction_static=0.90, context_length=8192,
+                           log_level="warning",
+                           kv_cache_dtype="fp8_e4m3")
+    spm = {"temperature": 0.0, "max_new_tokens": 1}
+
+    engine.generate(input_ids=_warm_ids(), sampling_params=spm)
+
+    t0 = time.time()
+    outs = engine.generate(input_ids=ids, sampling_params=spm)
+    wall = time.time() - t0
+    if isinstance(outs, dict):
+        outs = [outs]
+    cached = sum(int(o.get("meta_info", {}).get("cached_tokens", 0) or 0)
+                 for o in outs)
+    prefilled = fed - cached
+    rate = _line("sglang_fp8kv", prefilled, wall)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return dict(
+        arm="sglang_fp8kv", engine=f"sglang {sglang.__version__}",
+        versions=dict(sglang=sglang.__version__,
+                      torch=torch.__version__),
+        model=MODEL,
+        precision="fp8 checkpoint weights, fp8 KV (e4m3) - the KV "
+                  "write configuration the vllm control ran",
+        n_docs=n_docs, fed_tokens=fed, cached_tokens=cached,
+        prefilled_tokens=prefilled, wall_s=wall, tok_per_s=rate,
+        pct_of_spec=rate / CEIL, token_fingerprint=_fingerprint(ids),
+        config=dict(disable_radix_cache=True, mem_fraction_static=0.90,
+                    context_length=8192, kv_cache_dtype="fp8_e4m3"),
+        caveats=[
+            "Differs from the sglang arm only in KV dtype: fp8 KV "
+            "makes prefill quantize K/V on the fly as it writes them, "
+            "the same extra work the vllm control paid.",
+        ])
+
+
+# ------------------------------------- completeness arm: sglang accuracy
+
+@app.function(image=sglang_image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+def sglang_acc_arm(n_docs: int = 2000, kv: str = "auto") -> dict:
+    """Truth-scored accuracy through sglang: the standard planted-flags
+    query (4 filters at s=0.8, the modal_scale seeds and prompt bytes)
+    as plain per-stage gated requests. Answers are scored against the
+    planted flags, and wrong counts plus survivors are banked, so the
+    paper can state answer parity across engines - or its absence.
+
+    This arm reads a different token stream than the speed arms (the
+    documents carry flag lines and questions), so it records no corpus
+    fingerprint and stays out of the identical-corpus check."""
+    import numpy as np
+    import sglang
+    import torch
+    from transformers import AutoTokenizer
+
+    n, s = 4, 0.8
+    docs = _build_pool(n_docs)
+    # Same seed arithmetic as modal_scale.py, so the flags match the
+    # banked vLLM runs planted on this workload.
+    rng = np.random.default_rng(FLAG_SEED + 1000 * n + int(100 * s))
+    flags = (rng.random((len(docs), n)) < s).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(n)]
+    corpus = sum(len(b) for b in body_ids)
+
+    # Radix (prefix) cache stays at sglang's default ON: the vLLM
+    # accuracy runs all had prefix caching on, and cache reuse is the
+    # per-stage protocol's point. 4608 is modal_scale's context limit.
+    engine = sglang.Engine(model_path=MODEL, mem_fraction_static=0.90,
+                           context_length=4608, log_level="warning",
+                           kv_cache_dtype=kv)
+    spm = {"temperature": 0.0, "max_new_tokens": 1}
+
+    def answer_of(o):
+        return 1 if o.get("text", "").strip().upper().startswith("Y") \
+            else 0
+
+    alive = list(range(len(bodies)))
+    answers = {}
+    stages = []
+    t0 = time.time()
+    for j in range(n):
+        outs = engine.generate(
+            input_ids=[body_ids[i] + q_ids[j] for i in alive],
+            sampling_params=spm)
+        if isinstance(outs, dict):
+            outs = [outs]
+        stage_wrong = 0
+        nxt = []
+        for i, o in zip(alive, outs):
+            a = answer_of(o)
+            answers[(i, j + 1)] = a
+            if a != int(flags[i][j]):
+                stage_wrong += 1
+            if a:
+                nxt.append(i)
+        stages.append(dict(stage=j + 1, requests=len(alive),
+                           wrong=stage_wrong))
+        print(f"[xengine] sglang_acc stage {j + 1}: {len(alive)} asked, "
+              f"{stage_wrong} wrong, {len(nxt)} advance", flush=True)
+        alive = nxt
+    wall = time.time() - t0
+    survivors = sorted(alive)
+    wrong = [[i, j] for (i, j), a in sorted(answers.items())
+             if a != int(flags[i][j - 1])]
+    print(f"[xengine] sglang_acc: {len(answers)} calls, {len(wrong)} "
+          f"wrong ({100 * len(wrong) / max(1, len(answers)):.1f}%), "
+          f"{len(survivors)} survivors, {wall:.1f}s", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return dict(
+        arm="sglang_acc", engine=f"sglang {sglang.__version__}",
+        versions=dict(sglang=sglang.__version__,
+                      torch=torch.__version__),
+        model=MODEL, workload="planted_flags",
+        n_docs=n_docs, n_filters=n, s=s, flag_seed=FLAG_SEED,
+        corpus_tokens=int(corpus), wall_s=wall,
+        calls=len(answers), wrong=len(wrong), wrong_calls=wrong,
+        stages=stages, survivors=len(survivors),
+        survivor_ids=survivors,
+        config=dict(kv_cache_dtype=kv, context_length=4608,
+                    mem_fraction_static=0.90, radix_cache="default on"),
+        caveats=[
+            "Not a speed cell: gated per-stage requests re-read "
+            "documents through the radix cache, the way the vLLM "
+            "accuracy runs did through their prefix cache.",
+            "Wrong counts compare against the banked vLLM runs on the "
+            "same seeds (12.3 percent of calls at 10k docs).",
+        ])
+
+
 # ----------------------------------------------------------- arm 3: torch
 
 @app.function(image=torch_image, gpu="H100!", timeout=3600,
@@ -606,12 +792,15 @@ def torch_arm(n_docs: int = 4000, batch_tokens: int = 32768) -> dict:
 # ------------------------------------------------------------- entrypoint
 
 @app.local_entrypoint()
-def main(arm: str = "all", n_docs: int = 4000, out: str = ""):
+def main(arm: str = "all", n_docs: int = 4000, acc_docs: int = 2000,
+         out: str = ""):
     import os
 
     fns = dict(vllm=vllm_arm, sglang=sglang_arm, torch=torch_arm,
                vllm_new=vllm_new_arm, vllm_bf16attn=vllm_bf16attn_arm,
-               vllm_new_tuned=vllm_new_tuned_arm)
+               vllm_new_tuned=vllm_new_tuned_arm,
+               sglang_fp8kv=sglang_fp8kv_arm,
+               sglang_acc=sglang_acc_arm)
     names = list(fns) if arm == "all" else \
         [a.strip() for a in arm.split(",")]
     for a in names:
@@ -633,10 +822,16 @@ def main(arm: str = "all", n_docs: int = 4000, out: str = ""):
     data.setdefault("arms", {})
 
     for name in names:                      # sequential, one container each
-        data["arms"][name] = fns[name].remote(n_docs)
+        # The accuracy arm reads the planted-flags workload, sized by
+        # acc-docs (2,000 matches the banked vLLM accuracy grids).
+        docs = acc_docs if name == "sglang_acc" else n_docs
+        data["arms"][name] = fns[name].remote(docs)
 
+    # Arms without a fingerprint (the accuracy arm) read a different,
+    # flagged workload on purpose and stay out of this check.
     fps = {a: r.get("token_fingerprint")
-           for a, r in data["arms"].items()}
+           for a, r in data["arms"].items()
+           if r.get("token_fingerprint")}
     data["token_fingerprints"] = fps
     data["identical_corpus"] = len(set(fps.values())) == 1
     if not data["identical_corpus"]:
@@ -647,6 +842,8 @@ def main(arm: str = "all", n_docs: int = 4000, out: str = ""):
     ctrl = data["arms"].get("vllm")
     if ctrl:
         for a, r in sorted(data["arms"].items()):
+            if not r.get("tok_per_s"):      # accuracy arm: no rate
+                continue
             print(f"[xengine] summary {a}: {r['tok_per_s']:,.0f} tok/s "
                   f"= {r['tok_per_s'] / ctrl['tok_per_s']:.2f}x the "
                   f"vllm control", flush=True)

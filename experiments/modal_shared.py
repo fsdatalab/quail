@@ -18,6 +18,19 @@ The printed table compares makespans, read multipliers ((prompt minus
 cached) tokens over corpus tokens: 1.0 means the corpus was prefilled
 exactly once), and truth-scored wrong answer counts.
 
+Fidelity discriminator. The first flight showed survivor sets
+diverging in 6 of 8 queries at q=8; this run decides whether that is
+borderline noise or a routing bug. Every call samples with logprobs=2
+in BOTH arms, so each sampled answer token carries its top-2 logprob
+gap. Per-call records (query, doc, stage, token id, gap in nats) are
+banked for both arms, and a call-by-call classification is printed
+and banked per q: agreements, then disagreements split into confident
+flips (both arms' gaps above GAP_NATS with different tokens - a
+routing bug to find before the multi-query speedup ships) versus
+near-ties (either gap at or under GAP_NATS - the claim ships with a
+measured tolerance). The protocol is otherwise unchanged: cache reset
+between arms, refcounted pins, same budgets.
+
 Run with:
   modal run experiments/modal_shared.py --phase shared
 """
@@ -29,8 +42,18 @@ import modal
 
 app = modal.App("docengine-shared")
 
+# CUDA devel base, same recipe as the xengine vllm_new arm: nvcc is
+# present, so FlashInfer can JIT its kernels (the old slim image
+# could not, and read 80,556 tok/s where this base reads 97,220).
+# Same vllm pin, same env, same code - the toolchain is the only
+# variable versus the pre-rebase banked run. Results carry
+# IMAGE_STAMP so post-rebase JSONs are recognizable.
+IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
+IMAGE_STAMP = dict(base=IMAGE_BASE, toolchain="cuda13-devel")
+
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
+    .entrypoint([])
     # Pinned: the scheduler subclass reaches into a non-public engine
     # interface, so a silent version jump on image rebuild could break
     # it mid-study. Every recorded result is stamped with this version.
@@ -46,6 +69,9 @@ MODEL = "Qwen/Qwen3-4B-FP8"
 WORKLOAD_SEED = 20260731
 FLAG_SEED = 424242
 N_FLAGS = 32              # 8 queries x 4 filters, all columns distinct
+# A flip past this top-2 logprob gap is not float noise (same
+# threshold as the fusion gate in modal_fused.py).
+GAP_NATS = 0.2
 
 
 def _build_pool(n_docs):
@@ -76,6 +102,117 @@ def _question(j):
     return (f"\n\nExample: if the line said [FLAGS] FLAG_9=NO, then FLAG_9 "
             f"has value NO.\nInstruction: output only the value of FLAG_{j} "
             f"from the [FLAGS] line above.\nFLAG_{j}=")
+
+
+class _FinalRecorder:
+    """Wraps the engine so the client library's calls pass through
+    unchanged while the final RequestOutput of every request is kept,
+    keyed by the request id's last |-part (the client's own suffix).
+    The client library stays untouched; this file reads the sampled
+    tokens and their top-2 logprob gaps out of the kept outputs."""
+
+    def __init__(self, engine):
+        self._engine = engine
+        self.finals = {}
+
+    def generate(self, prompt, sampling_params, request_id, **kw):
+        agen = self._engine.generate(prompt, sampling_params,
+                                     request_id, **kw)
+        key = request_id.split("|")[-1]
+        finals = self.finals
+
+        async def _wrap():
+            final = None
+            async for out in agen:
+                final = out
+                yield out
+            finals[key] = final
+
+        return _wrap()
+
+    def __getattr__(self, name):
+        return getattr(self._engine, name)
+
+
+def _call_records(final, n_stages):
+    """Per-stage (sampled token id, top-2 logprob gap in nats) from a
+    chain request's cumulative output. The engine's rewind only
+    appends to the record, so position j holds stage j+1's answer
+    token, and logprobs[j] its top-2 table. A missing table gives
+    gap None, counted separately by the classifier - never silently
+    folded into a near-tie."""
+    if final is None or not final.outputs:
+        return []
+    out = final.outputs[0]
+    toks = list(out.token_ids or ())[:n_stages]
+    lps = out.logprobs or []
+    recs = []
+    for j, t in enumerate(toks):
+        gap = None
+        if j < len(lps) and lps[j]:
+            vals = sorted((e.logprob for e in lps[j].values()),
+                          reverse=True)
+            if len(vals) >= 2:
+                gap = round(float(vals[0] - vals[1]), 4)
+        recs.append((int(t), gap))
+    return recs
+
+
+def _collect_calls(finals, parse, n_stages):
+    """{(query, doc, stage): (token, gap)} from recorded finals.
+    parse maps a request-id suffix to (query, doc) or None."""
+    calls = {}
+    for key, final in finals.items():
+        ki = parse(key)
+        if ki is None:
+            continue
+        k, i = ki
+        for j, rec in enumerate(_call_records(final, n_stages)):
+            calls[(k, i, j + 1)] = rec
+    return calls
+
+
+def _classify(sh_calls, sp_calls, q):
+    """Call-by-call comparison of the two arms, one row per query.
+    agree: same sampled token. confident flip: tokens differ and BOTH
+    arms preferred theirs by more than GAP_NATS. near_tie: tokens
+    differ and either gap is at or under GAP_NATS. gap_missing:
+    tokens differ but a gap could not be read. only_shared and
+    only_separate count calls the other arm never made (survivor
+    divergence upstream cuts a chain short)."""
+    rows = []
+    for k in range(q):
+        keys_sh = {c for c in sh_calls if c[0] == k}
+        keys_sp = {c for c in sp_calls if c[0] == k}
+        both = keys_sh & keys_sp
+        agree = conf = near = missing = 0
+        flips = []
+        for c in sorted(both):
+            t1, g1 = sh_calls[c]
+            t2, g2 = sp_calls[c]
+            if t1 == t2:
+                agree += 1
+                continue
+            detail = dict(doc=c[1], stage=c[2], shared_token=t1,
+                          separate_token=t2, shared_gap=g1,
+                          separate_gap=g2)
+            if g1 is None or g2 is None:
+                missing += 1
+                detail["kind"] = "gap_missing"
+            elif g1 > GAP_NATS and g2 > GAP_NATS:
+                conf += 1
+                detail["kind"] = "confident"
+            else:
+                near += 1
+                detail["kind"] = "near_tie"
+            flips.append(detail)
+        rows.append(dict(query=k, calls_both=len(both), agree=agree,
+                         confident_flips=conf, near_ties=near,
+                         gap_missing=missing,
+                         only_shared=len(keys_sh - keys_sp),
+                         only_separate=len(keys_sp - keys_sh),
+                         flips=flips))
+    return rows
 
 
 @app.function(image=image, gpu="H100!", timeout=3600,
@@ -113,12 +250,19 @@ async def shared_run(n_docs: int = 2000) -> dict:
         if ids:
             yes_ids.add(ids[0])
 
-    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
+    # logprobs=2 is the confident-flip discriminator: every sampled
+    # answer token comes back with its top-2 logprob gap, in both
+    # arms, so each disagreement can be classified as a confident
+    # flip (both arms sure, past GAP_NATS) or a near-tie. Identical
+    # in both arms, so the comparison stays fair.
+    sp = SamplingParams(temperature=0.0, max_tokens=1, logprobs=2,
+                        skip_clone=True)
     engine = Engine.from_engine_args(AsyncEngineArgs(
         model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True, scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
+    rec = _FinalRecorder(engine)
     pool = 981_728
     try:
         cc = engine.vllm_config.cache_config
@@ -144,9 +288,20 @@ async def shared_run(n_docs: int = 2000) -> dict:
         queries = [dict(q_ids=q_ids_of[k], yes_ids=yes_ids)
                    for k in range(q)]
 
+        def parse_sh(key, want=f"sh{q}"):
+            parts = key.split("-")
+            if len(parts) != 3 or parts[0] != want:
+                return None
+            try:
+                return int(parts[2]), int(parts[1])   # (query, doc)
+            except ValueError:
+                return None
+
         await reset()
-        sh = await run_shared_scan(engine, sp, body_ids, queries,
+        rec.finals = {}
+        sh = await run_shared_scan(rec, sp, body_ids, queries,
                                    budget, tag=f"sh{q}")
+        sh_lp = _collect_calls(rec.finals, parse_sh, n)
         sh_wrong = sum(wrong(sh["queries"][k]["answers"], k)
                        for k in range(q))
         sh_calls = sum(len(sh["queries"][k]["answers"]) for k in range(q))
@@ -156,11 +311,25 @@ async def shared_run(n_docs: int = 2000) -> dict:
         sep_wall = 0.0
         sep_prompt = sep_cached = sep_wrong = sep_calls = 0
         sep_survivors = []
+        sp_lp = {}
         for k in range(q):
+
+            def parse_sp(key, want=f"sp{q}x{k}", kk=k):
+                parts = key.split("-")
+                if (len(parts) != 3 or parts[0] != want
+                        or parts[2] != "0"):
+                    return None
+                try:
+                    return kk, int(parts[1])          # (query, doc)
+                except ValueError:
+                    return None
+
             await reset()
+            rec.finals = {}
             r = await run_filter_chain_engine(
-                engine, sp, body_ids, queries[k]["q_ids"], budget,
+                rec, sp, body_ids, queries[k]["q_ids"], budget,
                 yes_ids, tag=f"sp{q}x{k}")
+            sp_lp.update(_collect_calls(rec.finals, parse_sp, n))
             sep_wall += r["wall"]
             sep_prompt += r["prompt_tokens"]
             sep_cached += r["cached_tokens"]
@@ -175,6 +344,11 @@ async def shared_run(n_docs: int = 2000) -> dict:
                       f"{len(r['survivors'])})", flush=True)
 
         sep_mult = (sep_prompt - sep_cached) / corpus
+        fid = _classify(sh_lp, sp_lp, q)
+        tot = {f: sum(fr[f] for fr in fid)
+               for f in ("calls_both", "agree", "confident_flips",
+                         "near_ties", "gap_missing", "only_shared",
+                         "only_separate")}
         rows.append(dict(
             q=q, shared_s=round(sh["wall"], 2),
             separate_s=round(sep_wall, 2),
@@ -188,13 +362,34 @@ async def shared_run(n_docs: int = 2000) -> dict:
             shared_survivors=[len(x["survivors"]) for x in sh["queries"]],
             separate_survivors=[len(x) for x in sep_survivors],
             survivors_match=[sh["queries"][k]["survivors"]
-                             == sep_survivors[k] for k in range(q)]))
+                             == sep_survivors[k] for k in range(q)],
+            fidelity=fid, fidelity_totals=tot,
+            calls=dict(columns=["query", "doc", "stage", "token_id",
+                                "gap_nats"],
+                       shared=[[c[0], c[1], c[2], v[0], v[1]]
+                               for c, v in sorted(sh_lp.items())],
+                       separate=[[c[0], c[1], c[2], v[0], v[1]]
+                                 for c, v in sorted(sp_lp.items())])))
         r = rows[-1]
         print(f"[shared] q={q}: shared {r['shared_s']}s vs separate "
               f"{r['separate_s']}s ({r['speedup']}x), reads "
               f"{r['shared_read_mult']}x vs {r['separate_read_mult']}x "
               f"corpus, wrong {r['shared_wrong']}/{r['shared_calls']} vs "
               f"{r['separate_wrong']}/{r['separate_calls']}", flush=True)
+        print(f"[shared] q={q} fidelity {'k':>2} {'both':>6} "
+              f"{'agree':>6} {'conf':>5} {'near':>5} {'nogap':>6} "
+              f"{'sh_only':>8} {'sp_only':>8}", flush=True)
+        for fr in fid:
+            print(f"[shared] q={q} fidelity {fr['query']:>2} "
+                  f"{fr['calls_both']:>6} {fr['agree']:>6} "
+                  f"{fr['confident_flips']:>5} {fr['near_ties']:>5} "
+                  f"{fr['gap_missing']:>6} {fr['only_shared']:>8} "
+                  f"{fr['only_separate']:>8}", flush=True)
+        print(f"[shared] q={q} verdict: {tot['confident_flips']} "
+              f"confident flips, {tot['near_ties']} near-ties, "
+              f"{tot['gap_missing']} with no readable gap, "
+              f"{tot['agree']} agreements over {tot['calls_both']} "
+              f"paired calls", flush=True)
 
     print(f"[shared] {'q':>2} {'shared':>8} {'separate':>9} {'x':>5} "
           f"{'rd_sh':>6} {'rd_sep':>7} {'wrong_sh':>9} {'wrong_sep':>10}",
@@ -213,8 +408,9 @@ async def shared_run(n_docs: int = 2000) -> dict:
     import vllm
     return dict(model=MODEL, n_docs=n_docs, n_filters=n, s=s,
                 n_flags=N_FLAGS, corpus_tokens=int(corpus),
-                budget=budget, kv_tokens=pool,
-                vllm_version=vllm.__version__, rows=rows)
+                budget=budget, kv_tokens=pool, gap_nats=GAP_NATS,
+                vllm_version=vllm.__version__, image=IMAGE_STAMP,
+                rows=rows)
 
 
 @app.local_entrypoint()

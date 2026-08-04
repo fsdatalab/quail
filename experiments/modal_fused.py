@@ -271,9 +271,12 @@ def fusegate_run(n_docs: int = 50, kv: str = "fp8") -> dict:
     except Exception:
         pass
     import vllm
+    # kv_cache_dtype must record the kv ARGUMENT, not a constant: the
+    # bf16 isolation flight (--kv auto) was banked as "fp8" by the old
+    # hardcoded field, and fusegate_auto.json still carries that lie.
     result = dict(model=MODEL, phase="fusegate", n_docs=n_docs,
                   vllm_version=vllm.__version__,
-                  kv_cache_dtype="fp8", gap_nats=GAP_NATS, cells=cells,
+                  kv_cache_dtype=kv, gap_nats=GAP_NATS, cells=cells,
                   passed=not failures, failures=failures,
                   bit_identical=all(c["flips"] == 0 for c in cells))
     print(f"[fusegate] {'PASS' if not failures else 'FAIL'} "

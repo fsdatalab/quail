@@ -36,9 +36,20 @@ import modal
 
 app = modal.App("docengine-engine")
 
+# CUDA devel base, same recipe as the xengine vllm_new arm: nvcc is
+# present, so FlashInfer can JIT its kernels (the old slim image
+# could not, and read 80,556 tok/s where this base reads 97,220).
+# vllm is now pinned to 0.26.0 like every other experiment file (it
+# was unpinned here), so the toolchain is the only variable versus
+# the pre-rebase banked runs. Results carry IMAGE_STAMP.
+IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
+IMAGE_STAMP = dict(base=IMAGE_BASE, toolchain="cuda13-devel")
+
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("vllm", "huggingface_hub", "pandas", "pyarrow", "numpy")
+    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
+    .entrypoint([])
+    .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
+                 "numpy")
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0"})
     .add_local_python_source("docengine")
@@ -267,7 +278,8 @@ def run_grid(configs: list, n_docs: int = 2000) -> dict:
 
     import vllm
     return dict(model=MODEL, n_docs=n_docs, load_s=load_s,
-                vllm_version=vllm.__version__, results=results)
+                vllm_version=vllm.__version__, image=IMAGE_STAMP,
+                results=results)
 
 
 def _grid(smoke: bool):

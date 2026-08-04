@@ -20,7 +20,7 @@ Three independent experiments, selected by --phase:
             arm's per request floor.
 
   scale     Step 2. The 10,000 document cold experiment. The corpus
-            needs about four times the card's note capacity, so execution
+            needs about four times the card's KV capacity, so execution
             order decides how much is silently re-read. Each
             configuration runs as naive stage-order waves and as the
             analytical builder's capacity-blocked schedule driven batch
@@ -43,8 +43,18 @@ import modal
 
 app = modal.App("docengine-scale")
 
+# CUDA devel base, same recipe as the xengine vllm_new arm: nvcc is
+# present, so FlashInfer can JIT its kernels (the old slim image
+# could not, and read 80,556 tok/s where this base reads 97,220).
+# Same vllm pin, same env, same code - the toolchain is the only
+# variable versus the pre-rebase banked runs. Every banked result
+# carries IMAGE_STAMP so post-rebase JSONs are recognizable.
+IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
+IMAGE_STAMP = dict(base=IMAGE_BASE, toolchain="cuda13-devel")
+
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
+    .entrypoint([])
     # Pinned: the scheduler subclass reaches into a non-public engine
     # interface, so a silent version jump on image rebuild could break
     # it mid-study. Every recorded result is stamped with this version.
@@ -61,6 +71,10 @@ MODEL32 = "Qwen/Qwen3-32B-FP8"
 WORKLOAD_SEED = 20260731
 FLAG_SEED = 424242
 CEIL = 275_000            # dense FP8 prefill ceiling, tokens per second
+# Hard cap on a co-tenant (junk) arm. A run that exceeds it banks
+# {finished: false, timeout_s} instead of dying with the container:
+# "did not finish within 15 minutes" needs an artifact, not prose.
+JUNK_TIMEOUT_S = 900
 
 
 def _build_pool(n_docs):
@@ -205,7 +219,7 @@ def speed_limit(n_docs: int = 4000) -> dict:
         time.sleep(8)
     import vllm
     return dict(model=MODEL, n_docs=n_docs, vllm_version=vllm.__version__,
-                ceiling=CEIL, results=results)
+                ceiling=CEIL, image=IMAGE_STAMP, results=results)
 
 
 # ---------------------------------------------------------------- step 1b
@@ -322,7 +336,8 @@ async def overhead_split(n_docs: int = 2000) -> dict:
         pass
     import vllm
     return dict(model=MODEL, n_docs=n_docs, n=n, s=list(s_vec),
-                vllm_version=vllm.__version__, arms=arms)
+                vllm_version=vllm.__version__, image=IMAGE_STAMP,
+                arms=arms)
 
 
 # ------------------------------------------------------------- phase C
@@ -404,6 +419,7 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
         uid = 0
         while not stop.is_set():
             uid += 1
+            stats["offered"] = uid
             ids = rng.integers(1000, 100_000, size=length).tolist()
             jobs.append(asyncio.create_task(one(uid, ids)))
             await asyncio.sleep(1.0 / rate)
@@ -426,22 +442,52 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
                  for j in range(n)]
         await reset_cache()
         stop = asyncio.Event()
-        stats = dict(done=0, lat_s=0.0)
+        stats = dict(done=0, lat_s=0.0, offered=0)
         bg = asyncio.create_task(cotenant(stop, stats)) if junk else None
-        res = await run_filter_chain(
+        chain_coro = run_filter_chain(
             engine, sp, body_ids, q_ids, budget, lookahead=1,
             tag=f"n{n}s{int(100 * s_vec[0])}",
             tags=EngineTags() if ext else None, use_priority=ext)
+        timed_out = False
+        if junk:
+            try:
+                res = await asyncio.wait_for(chain_coro, JUNK_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                timed_out = True
+                res = None
+        else:
+            res = await chain_coro
         if bg is not None:
             stop.set()
-            await bg
+            # After a timeout the engine may be clogged; do not wait
+            # forever for the neighbor's in-flight requests to drain.
+            try:
+                await asyncio.wait_for(bg, timeout=60)
+            except asyncio.TimeoutError:
+                bg.cancel()
+            stats["mean_lat_s"] = round(
+                stats["lat_s"] / max(1, stats["done"]), 3)
+        if timed_out:
+            results.append(dict(
+                n=n, s=list(s_vec), policy="block", k=1, mode=variant,
+                junk=junk, junk_rate=junk_rate, junk_len=junk_len,
+                junk_stats=stats, finished=False,
+                timeout_s=JUNK_TIMEOUT_S, budget=budget, kv_tokens=pool))
+            print(f"[pinned] {variant} n={n} s={s_vec[0]} junk={junk}: "
+                  f"DID NOT FINISH within {JUNK_TIMEOUT_S}s; neighbor "
+                  f"served {stats['done']} of {stats['offered']} offered",
+                  flush=True)
+            # A timed-out engine still holds the query's requests, so
+            # later rows would not start clean. Junk rows are last in
+            # every grid, so stopping here loses nothing.
+            break
         answers = {f"{i},{j}": a for (i, j), a in res["answers"].items()}
         agree = sum(1 for (i, j), a in res["answers"].items()
                     if a == flags[i][j - 1]) / max(1, len(answers))
         results.append(dict(
             n=n, s=list(s_vec), policy="block", k=1, mode=variant,
             junk=junk, junk_rate=junk_rate, junk_len=junk_len,
-            junk_stats=stats, makespan=res["wall"],
+            junk_stats=stats, finished=True, makespan=res["wall"],
             waves=[dict(stage=1, requests=res["requests"], s=res["wall"],
                         prompt_tokens=res["prompt_tokens"],
                         cached_tokens=res["cached_tokens"])],
@@ -460,7 +506,8 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
         pass
     import vllm
     return dict(model=MODEL, n_docs=n_docs, variant=variant,
-                vllm_version=vllm.__version__, results=results)
+                vllm_version=vllm.__version__, image=IMAGE_STAMP,
+                results=results)
 
 
 # ---------------------------------------------------------- profiling
@@ -529,7 +576,7 @@ async def profile_run(n_docs: int = 4000) -> dict:
                                      use_priority=True)
         return out
 
-    report = dict(n_docs=n_docs)
+    report = dict(n_docs=n_docs, image=IMAGE_STAMP)
 
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
     engine = make_engine()
@@ -588,15 +635,15 @@ async def profile_run(n_docs: int = 4000) -> dict:
 @app.function(image=image, gpu="H100!", timeout=2400,
               volumes={"/root/.cache/huggingface": hf_cache})
 async def persist_run(n_docs: int = 2000) -> dict:
-    """Persisted-notes tier, milestone one: the same query repeated on
-    one engine with a two-tier note store (RAM primary, container-local
+    """Persisted-KV tier, milestone one: the same query repeated on
+    one engine with a two-tier KV store (RAM primary, container-local
     disk secondary, vLLM's tiering offload connector). Query one
     computes cold and offloads as it goes; the prefix cache is then
-    reset, so later queries must restore notes from the store instead
+    reset, so later queries must restore KV from the store instead
     of recomputing. A separate engine without the store gives the
     honest baseline for both the overhead of saving and the payoff of
     restoring. Runs on the stock scheduler: the store manages the
-    note lifecycle, and the strict plan-owned-memory discipline is a
+    KV lifecycle, and the strict plan-owned-memory discipline is a
     separate mechanism to reconcile with it later.
 
     Also measures raw disk write bandwidth to anchor the break-even:
@@ -636,7 +683,7 @@ async def persist_run(n_docs: int = 2000) -> dict:
     body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
     q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
              for j in range(n)]
-    report = dict(n_docs=n_docs,
+    report = dict(n_docs=n_docs, image=IMAGE_STAMP,
                   corpus_tokens=int(sum(len(b) for b in body_ids)))
 
     # raw disk write bandwidth on the same filesystem the tier uses
@@ -756,7 +803,7 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
     """The physical operators on the 32B tier, 1,000 documents, four
     filters at 0.8. Everything measured so far is the 4B model; the
     32B changes the constants that decide every tradeoff (prefill
-    about eight times slower, notes 128 KB per token, so the corpus
+    about eight times slower, KV 128 KB per token, so the corpus
     slightly overflows the pool and memory policy matters). Four arms:
     stage-major gated waves and the naive streaming client on a stock
     engine, then ranked pinned requests and chain mode on the strict
@@ -814,7 +861,7 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
     no_ids -= yes_ids
     corpus = sum(len(b) for b in body_ids)
     report = dict(n_docs=n_docs, n_filters=n, s=s, model=MODEL32,
-                  corpus_tokens=int(corpus))
+                  corpus_tokens=int(corpus), image=IMAGE_STAMP)
     print(f"[m32] corpus {corpus} tokens across {n_docs} documents",
           flush=True)
 
@@ -892,14 +939,20 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
 
     def bank(name, res):
         mult = (res["prompt_tokens"] - res["cached_tokens"]) / corpus
+        # The measured 32B prefill rate: tokens actually computed (fed
+        # minus cached) over the arm's wall. Banked per arm so the
+        # paper's "10,800 tokens per second" has an artifact.
+        rate = ((res["prompt_tokens"] - res["cached_tokens"])
+                / max(res["wall"], 1e-9))
         report[name] = dict(wall=round(res["wall"], 2),
                             requests=res["requests"],
                             read_multiplier=round(mult, 2),
+                            prefill_tok_s=round(rate),
                             survivors=len(res["survivors"]),
                             survivor_ids=res["survivors"],
                             wrong=wrong(res))
         print(f"[m32] {name}: {res['wall']:.2f}s, {res['requests']} "
-              f"requests, reads {mult:.2f}x corpus, "
+              f"requests, reads {mult:.2f}x corpus = {rate:,.0f} tok/s, "
               f"{len(res['survivors'])} survivors, wrong "
               f"{wrong(res)}/{len(res['answers'])}", flush=True)
 
@@ -955,8 +1008,8 @@ async def shard_worker(gpus: int, widx: int, n_docs: int = 10000) -> dict:
     from vllm.engine.arg_utils import AsyncEngineArgs
 
     from docengine.configs import DEVICES, MODELS
-    from docengine.planner import plan_query
-    from docengine.runtime.engine_client import run_filter_chain_engine
+    from docengine.plan import plan_query
+    from docengine.runtime.engine_client import run_query
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
     docs = _build_pool(n_docs)
@@ -984,9 +1037,9 @@ async def shard_worker(gpus: int, widx: int, n_docs: int = 10000) -> dict:
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True, scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
-    res = await run_filter_chain_engine(
+    res = await run_query(
         engine, sp, [body_ids[i] for i in mine], q_ids,
-        plan.budget_tokens, yes_ids, tag=f"mg{widx}")
+        yes_ids=yes_ids, tag=f"mg{widx}", plan=plan)
     print(f"[shard {widx}/{gpus}] {len(mine)} docs, "
           f"{sum(len(body_ids[i]) for i in mine)} tokens, "
           f"{res['wall']:.2f}s", flush=True)
@@ -1074,7 +1127,8 @@ async def reason_run(n_docs: int = 2000, big: int = 0, width_sweep: int = 0) -> 
         return dict(wall=_time.time() - t0, survivors=sorted(alive),
                     answers=answers, requests=len(answers))
 
-    report = dict(n_docs=n_docs, n_filters=n, s=s, model=mdl)
+    report = dict(n_docs=n_docs, n_filters=n, s=s, model=mdl,
+                  image=IMAGE_STAMP)
     if width_sweep:
         # Is decode width the binding resource? Same workload, g=128,
         # gated pipeline, admission budget swept from starved to the
@@ -1225,7 +1279,8 @@ async def longdoc_run() -> dict:
         pass
     import vllm
     return dict(model=MODEL, vllm_version=vllm.__version__,
-                rope_scaling="yarn x4", results=results)
+                rope_scaling="yarn x4", image=IMAGE_STAMP,
+                results=results)
 
 
 
@@ -1339,7 +1394,8 @@ async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
     except Exception:
         pass
     return dict(count=count, target=target, corpus_tokens=corpus,
-                floor_s=floor, survivors_match=same, arms=arms)
+                floor_s=floor, survivors_match=same, image=IMAGE_STAMP,
+                arms=arms)
 
 
 # ------------------------------------------------------------ chain proof
@@ -1355,7 +1411,7 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
     surviving documents match exactly and the rewind count equals the
     number of chain continuations.
 
-    kv picks the notes precision: "fp8" (shipping), "fp8calib" (fp8
+    kv picks the KV precision: "fp8" (shipping), "fp8calib" (fp8
     with attention scales calibrated from the first forward pass), or
     "bf16" (full precision, half the memory pool, budget lowered to
     fit). Both modes' answers are also scored against the planted
@@ -1386,7 +1442,7 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
     elif profile_core == 2:
         os.environ["DOCENGINE_STEPSTATS"] = "1"
     docs = _build_pool(n_docs)
-    # bf16 notes double the per-token size, so the pool halves and the
+    # bf16 KV doubles the per-token size, so the pool halves and the
     # admission budget must fit under it or preemption would violate
     # the strict invariant
     budget = 830_000 if kv.startswith("fp8") else 400_000
@@ -1454,16 +1510,20 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
         engine.shutdown()
     except Exception:
         pass
+    # Full lists, not the first 50: the paper's wrong-answer counts
+    # must have a banked artifact, and truncated lists cannot back a
+    # count. At 10k docs this adds ~100 KB of JSON, which is fine.
     return dict(n_docs=n_docs, n_filters=n_filters, s=s, kv=kv,
-                wrong_request=[list(k) for k in wrong_a[:50]],
-                wrong_chain=[list(k) for k in wrong_b[:50]],
+                image=IMAGE_STAMP,
+                wrong_request=[list(k) for k in wrong_a],
+                wrong_chain=[list(k) for k in wrong_b],
                 request_mode=dict(requests=a["requests"], wall=a["wall"],
                                   survivors=a["survivors"]),
                 chain_mode=dict(requests=b["requests"], wall=b["wall"],
                                 survivors=b["survivors"]),
                 survivors_match=same_surv,
                 answers_agree=[agree, len(shared)],
-                flipped=[list(k) for k in flips[:50]],
+                flipped=[list(k) for k in flips],
                 doc0_raw=[list(x) for x in (raw or ())])
 
 # ---------------------------------------------------- single tenant mode
@@ -1581,7 +1641,8 @@ async def strict_run(n_docs: int = 10000) -> dict:
         pass
     import vllm
     return dict(model=MODEL, n_docs=n_docs, vllm_version=vllm.__version__,
-                canary_rejected=rejected, results=results)
+                image=IMAGE_STAMP, canary_rejected=rejected,
+                results=results)
 
 
 # ------------------------------------------------------- beneath the stack
@@ -1647,7 +1708,7 @@ def model_floor() -> dict:
         flops = FLOP_TOK * toks
         return toks, flops / 1e12
 
-    out = dict(flop_per_token=FLOP_TOK, gemm={})
+    out = dict(flop_per_token=FLOP_TOK, image=IMAGE_STAMP, gemm={})
     for dtype in ("fp8", "bf16"):
         for M in (2048, 8192, 16384):
             toks, tf = gemm_tok_rate(dtype, M)
@@ -1762,7 +1823,7 @@ async def client_run(n_docs: int = 10000) -> dict:
         pass
     import vllm
     return dict(model=MODEL, n_docs=n_docs, vllm_version=vllm.__version__,
-                results=results)
+                image=IMAGE_STAMP, results=results)
 
 
 # ---------------------------------------------------------------- step 2
@@ -1948,7 +2009,8 @@ def scale10k(n_docs: int = 10000) -> dict:
 
     import vllm
     return dict(model=MODEL, n_docs=n_docs, load_s=load_s,
-                vllm_version=vllm.__version__, results=results)
+                vllm_version=vllm.__version__, image=IMAGE_STAMP,
+                results=results)
 
 
 @app.local_entrypoint()
@@ -1978,6 +2040,7 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
         dp, ds = hp.get(), hs.get()
         data = dict(model=dp["model"], n_docs=nd,
                     vllm_version=dp["vllm_version"],
+                    image=dp.get("image"),
                     results=dp["results"] + ds["results"])
         path = out or ("results/engine/pinned10k.json.gz" if nd == 10000
                        else f"results/engine/pinned_{nd}.json.gz")
@@ -1988,6 +2051,7 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
         dp, ds = hp.get(), hs.get()
         data = dict(model=dp["model"], n_docs=nd,
                     vllm_version=dp["vllm_version"],
+                    image=dp.get("image"),
                     results=dp["results"] + ds["results"])
         path = out or "results/engine/pinned10k_hard.json.gz"
     elif phase == "pinned3":
@@ -2036,6 +2100,7 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
         walls = [o["wall"] for o in outs]
         surv = sorted(x for o in outs for x in o["survivors"])
         data = dict(gpus=g, n_docs=nd, makespan=max(walls),
+                    image=IMAGE_STAMP,
                     walls=[round(w, 2) for w in walls],
                     survivors=len(surv),
                     per_worker=[dict(widx=o["widx"], n=o["n"],
