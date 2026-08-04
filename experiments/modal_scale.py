@@ -1000,6 +1000,113 @@ async def shard_worker(gpus: int, widx: int, n_docs: int = 10000) -> dict:
                 survivors=sorted(mine[i] for i in res["survivors"]))
 
 
+@app.function(image=image, gpu="H100!", timeout=3600,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def reason_run(n_docs: int = 2000) -> dict:
+    """The measured reasoning grid (plan priority six). Thinking is
+    simulated by force: min_tokens pins every filter call to exactly
+    g+1 output tokens (g of decode before the window closes), so
+    selectivity and length stay controlled with no artificial hard
+    task. Grid: g in {0, 32, 128, 512} x three policies - gated chain
+    (pipeline), full speculation via ungated requests (lookahead n),
+    and stage-major task waves - at n=4, s=0.8, on one engine.
+    Answers come from the planted flags via the decisive-word rule on
+    the full output text; correctness is anchored by the g=0 column
+    (the banked one-token world)."""
+    import asyncio
+    import inspect
+    import os
+    import time as _time
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+
+    from docengine.runtime.engine_client import (EngineTags, _yes,
+                                                 run_filter_chain)
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    docs = _build_pool(n_docs)
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    n, s = 4, 0.8
+    rng = np.random.default_rng(FLAG_SEED + 7)
+    flags = (rng.random((len(docs), n)) < s).astype(int)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(n)]
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True, scheduling_policy="priority",
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
+
+    async def reset():
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    async def waves(sp):
+        alive = list(range(len(body_ids)))
+        answers = {}
+        t0 = _time.time()
+        for j in range(n):
+            async def one(i, jj=j):
+                final = None
+                async for out in engine.generate(
+                        {"prompt_token_ids": body_ids[i] + q_ids[jj]},
+                        sp, f"de1|rw{jj}|{i}-w"):
+                    final = out
+                answers[(i, jj + 1)] = _yes(final)
+            await asyncio.gather(*[one(i) for i in alive])
+            alive = [i for i in alive if answers[(i, j + 1)]]
+        return dict(wall=_time.time() - t0, survivors=sorted(alive),
+                    answers=answers, requests=len(answers))
+
+    report = dict(n_docs=n_docs, n_filters=n, s=s)
+    for g in (0, 32, 128, 512):
+        # forced thinking: exactly g decode tokens, then the window
+        m = g + 1
+        sp = SamplingParams(temperature=0.0, max_tokens=m,
+                            min_tokens=m, skip_clone=True)
+        cell = {}
+        for policy in ("pipeline", "spec", "waves"):
+            await reset()
+            if policy == "waves":
+                r = await waves(sp)
+            else:
+                r = await run_filter_chain(
+                    engine, sp, body_ids, q_ids, 700_000,
+                    lookahead=1 if policy == "pipeline" else n,
+                    tag=f"rg{g}{policy[0]}", tags=EngineTags(),
+                    use_priority=True)
+            wrong = sum(1 for k, v in r["answers"].items()
+                        if v != flags[k[0]][k[1] - 1])
+            cell[policy] = dict(wall=round(r["wall"], 2),
+                                requests=r["requests"],
+                                survivors=len(r["survivors"]),
+                                wrong=wrong)
+            print(f"[reason] g={g} {policy}: {r['wall']:.2f}s, "
+                  f"{r['requests']} requests, "
+                  f"{len(r['survivors'])} survivors, wrong {wrong}",
+                  flush=True)
+        report[f"g{g}"] = cell
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return report
+
+
 # ------------------------------------------------------ long documents
 
 @app.function(image=image, gpu="H100!", timeout=3600,
@@ -1917,6 +2024,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
               f"{[round(w, 2) for w in walls]}, {len(surv)} survivors",
               flush=True)
         path = out or f"results/engine/multigpu{g}.json"
+    elif phase == "reason":
+        data = reason_run.remote(n_docs or 2000)
+        path = out or "results/engine/reason_grid.json"
     elif phase == "longchain":
         data = longchain_run.remote()
         path = out or "results/engine/longchain.json"
