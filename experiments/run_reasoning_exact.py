@@ -7,15 +7,12 @@ compute pricing, phi=1)."""
 import csv
 import itertools
 import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
 
-import numpy as np                                              # noqa: E402
-
-from docengine.configs import DEVICES, MODELS                   # noqa: E402
-from docengine.reasoning.exact import solve_offline, solve_online  # noqa: E402
-from docengine.reasoning.model import RInstance                 # noqa: E402
+from docengine.configs import DEVICES, MODELS
+from docengine.reasoning.exact import solve_offline, solve_online
+from docengine.reasoning.model import RInstance
 
 
 def make(s, g, cap):

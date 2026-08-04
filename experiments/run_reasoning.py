@@ -11,13 +11,10 @@ CSV, the table prints calibrated seconds.
 
 import csv
 import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from docengine.configs import DEVICES, MODELS                  # noqa: E402
-from docengine.reasoning.lp import lp_throughput               # noqa: E402
-from docengine.reasoning.model import (RInstance,              # noqa: E402
+from docengine.configs import DEVICES, MODELS
+from docengine.reasoning.lp import lp_throughput
+from docengine.reasoning.model import (RInstance,
                                        best_composition,
                                        value_blockwise, value_taskfirst)
 

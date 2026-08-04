@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docengine"
+version = "0.1.0"
+description = "Plan-governed KV state for semantic scans: planner, engine client, and scheduler extensions."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+# dev covers the CPU test suite, including the attic (theory-paper) tests:
+# scipy for the expected-flow LP, pandas + pyarrow for the parquet workload.
+dev = [
+    "pytest",
+    "scipy",
+    "pandas",
+    "pyarrow",
+]
+# The measured system runs against this exact engine build; the scheduler
+# subclass reaches into private vLLM internals pinned at this version.
+engine = [
+    "vllm==0.26.0",
+]
+
+[tool.setuptools.packages.find]
+# The attic (superseded theory-paper stack) stays runnable from the repo
+# but is never installed.
+include = ["docengine", "docengine.*"]

@@ -18,16 +18,14 @@ into the document length for the ideal instance.
 import argparse
 import gzip
 import json
-import sys, os
+import os
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from docengine.configs import DEVICES, MODELS                      # noqa: E402
-from docengine.instance import Instance                            # noqa: E402
-from docengine.lb import resource_lb                               # noqa: E402
-from docengine.sched.blockwise import (schedule_blockwise,          # noqa: E402
+from docengine.configs import DEVICES, MODELS
+from docengine.instance import Instance
+from docengine.lb import resource_lb
+from docengine.sched.blockwise import (schedule_blockwise,
                                        schedule_taskfirst)
 
 CUE_TOKENS_FALLBACK = 7
