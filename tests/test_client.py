@@ -349,6 +349,38 @@ def test_shared_scan_single_query_matches_chain_mode():
     assert all("|u" not in r for r in eng.rids if "|c|" in r)
 
 
+def _plan(n, body_ids, **kw):
+    from docengine.configs import DEVICES, MODELS
+    from docengine.plan import plan_query
+    return plan_query(n, [len(b) for b in body_ids],
+                      MODELS["Qwen3-4B-FP8"],
+                      DEVICES["H100-SXM-80GB"], **kw)
+
+
+def test_run_plan_chain_dispatch():
+    """run_query obeys the plan: a multi-filter plan says chain mode,
+    with the budget taken from the plan."""
+    flags, body_ids, q_ids = _setup(20, 3, seed=21)
+    p = _plan(3, body_ids)
+    assert p.mode == "chain"
+    eng = ChainStubEngine(flags)
+    res = asyncio.run(run_query(eng, None, body_ids, q_ids, plan=p,
+                                yes_ids={YES_TOK}))
+    assert res["survivors"] == [i for i in range(20) if all(flags[i])]
+    assert res["requests"] == 20
+
+
+def test_run_plan_single_filter_requests():
+    """A single-filter plan says requests mode; run_query dispatches
+    to the tagged request path."""
+    flags, body_ids, q_ids = _setup(10, 1, seed=23)
+    p = _plan(1, body_ids)
+    assert p.mode == "requests"
+    eng = StubEngine(flags)
+    res = asyncio.run(run_query(eng, None, body_ids, q_ids, plan=p))
+    assert res["survivors"] == [i for i in range(10) if flags[i][0]]
+
+
 def test_shared_scan_tiny_budget_completes():
     """A budget below two documents' cost still finishes one at a
     time; outcomes and the balance invariants are unchanged."""

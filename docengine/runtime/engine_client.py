@@ -169,13 +169,36 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
 
 
 async def run_query(engine, sampling_params, body_ids, q_ids,
-                    budget_tokens, yes_ids=None, tag="q", no_ids=None):
-    """The shipped plan. Multi-filter queries run in chain mode: one
-    living engine request per document runs the whole filter chain,
-    the scheduler judging answers and rewinding between filters
-    (yes_ids, the token ids that mean yes, is required for the
-    in-engine gate). A single-filter query has nothing to chain and
-    runs as pinned, ranked requests."""
+                    budget_tokens=None, yes_ids=None, tag="q", no_ids=None,
+                    plan=None):
+    """The one entry point for executing a query on one worker's engine.
+
+    With `plan` given, the plan chooses the backend. Any object with
+    the attributes mode ("chain" | "requests"), budget_tokens, pin,
+    and stage_token_window works; this module deliberately does not
+    import the planner. Chain mode runs the whole filter chain inside
+    the engine under the plan's budget; requests mode runs pinned,
+    ranked requests (pins only when the plan says so), and decisive
+    no-token ids are forwarded only when the plan's per-stage decode
+    window is wider than one token. Sharding across workers happens
+    above; each worker receives its shard's body_ids.
+
+    Without `plan`, the shipped default applies. Multi-filter queries
+    run in chain mode: one living engine request per document runs the
+    whole filter chain, the scheduler judging answers and rewinding
+    between filters (yes_ids, the token ids that mean yes, is required
+    for the in-engine gate). A single-filter query has nothing to
+    chain and runs as pinned, ranked requests under `budget_tokens`."""
+    if plan is not None:
+        if plan.mode == "chain":
+            return await run_filter_chain_engine(
+                engine, sampling_params, body_ids, q_ids,
+                plan.budget_tokens, yes_ids, tag=tag,
+                no_ids=no_ids if plan.stage_token_window > 1 else None)
+        return await run_filter_chain(
+            engine, sampling_params, body_ids, q_ids, plan.budget_tokens,
+            lookahead=1, tag=tag,
+            tags=EngineTags() if plan.pin else None, use_priority=True)
     if len(q_ids) >= 2:
         assert yes_ids, "chain mode needs the yes token ids for its gate"
         return await run_filter_chain_engine(engine, sampling_params,
