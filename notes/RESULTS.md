@@ -1,15 +1,31 @@
 # Results from the solved schedules
 
+## Read this first (added 2026-08-04): the speed anchor moved
+
+Every measured number below was produced on the old slim Docker
+image. The falsification flight then showed that the same vLLM
+reads 97,220 tokens per second on a CUDA 13 devel image, compared
+with the 80,556 tokens per second all these runs assume
+(results/engine/xengine.json; the devel image carries the compiler
+that lets FlashInfer build its fast kernels). A re-baseline flight
+re-measures the headline cells on the new image; notes/PROPOSAL.md
+lays it out. Until that flight lands, treat every absolute second
+below as stale, and treat ratios between arms of the same flight as
+provisional.
+
 ## What was solved and how to read the numbers
 
-The paper in this repo (paper.md) studies a database query that runs a chain
+The theory paper (attic/theory-paper.md) studies a database query that runs a chain
 of yes or no language model filters over documents on one graphics card. A
 document that fails a filter skips the rest, so the work depends on how many
 documents pass each stage. The paper compares three scheduling policies.
 Task-first reprocesses every surviving document at each filter stage under a
 shared prompt. Pipeline reads each document once, keeps the model's stored
-memory of it (the KV cache) on the card, and runs each filter as a prompt of
-about 50 tokens on top, waiting for each answer. Speculation runs future
+memory of it on the card, and runs each filter as a prompt of
+about 50 tokens on top, waiting for each answer. That stored memory
+is the KV cache, "KV" from here on: the per-token state the model
+writes while reading, which lets it answer new prompts about a
+document without re-reading it. Speculation runs future
 filter prompts without waiting, wasting them when an early filter fails.
 
 The revised paper organizes every claim into four layers, and the repo now
@@ -26,8 +42,9 @@ it.
 
 Raw data: results/lp_two_stage.csv (the program and its replays),
 results/n10k_two_stage.csv (direct schedule builders), manifests in
-results/manifests/, the small instance study in experiments/run_smallN.py,
-and the measured engine runs in results/engine/.
+results/manifests/, the small instance study in
+attic/experiments/run_smallN.py, and the measured engine runs in
+results/engine/.
 
 ## The three computed layers agree, which is the main check
 
@@ -37,14 +54,18 @@ following hold:
 
 - The lower bound never exceeds the replayed finite latency, in all 36
   cells.
-- The replayed finite latency lands within 0.5 percent of the program's
-  asymptotic target. The signed difference runs from minus 0.07 to plus 2.0
+- The replayed finite latency lands within 0.56 percent of the program's
+  asymptotic target. The worst case is 32B task-first on L40S at pass rate
+  0.1: the replay lands 1.578 seconds above the 280.35-second target, at
+  281.93 seconds. The signed difference runs from minus 0.07 to plus 2.0
   seconds and is legitimately either sign, because the asymptotic target is
   not a bound for a finite run.
 - Where the direct schedule builders had already produced certified optima,
-  the program reproduces them to the digit. For example, task-first on the
-  4B model and H100 at pass rate 0.5 gives 16.56 seconds by ledger, by
-  built schedule, and by program target, and the replay gives 16.62.
+  the program reproduces their mean. For example, task-first on the 4B
+  model and H100 at pass rate 0.5: the two builder replicates give 16.5887
+  and 16.5267 seconds, their mean of 16.558 matches the program target of
+  16.558, and the replay gives 16.62. The agreement is mean-of-replicates,
+  not to-the-digit for either single run.
 
 Selected finite latencies in seconds (replayed, validated):
 
@@ -169,7 +190,10 @@ What the cold grid shows:
   because a real gate costs a wave barrier while a wasted branch is cheap
   when most documents survive. At n=4 and 0.8 the measured order k=1, then
   k=2, then k=4 matches the ideal order exactly.
-- All 27 cold runs land between 3.31 and 4.10 times their ideal number.
+- All 23 cold policy runs land between 3.31 and 4.10 times their ideal
+  number. (The grid file holds 23 cold policy cells, plus 6 cold manifest
+  cells and 4 warm cells; an earlier version of this note said 27 cold
+  runs.)
   The reason is a single rate. The engine prefills at 58,000 to 78,000
   prompt tokens per second on these roughly 350 token requests, against
   the 275,000 per second dense FP8 ceiling the ideal model prices. One
@@ -257,7 +281,7 @@ across the arms, as expected for a read-bound pass. Raw data:
 results/engine/overhead.json.
 
 Step two. At 10,000 documents the corpus needs about 3.4 times the
-card's note capacity (3.1 million tokens against a measured 981,728
+card's KV capacity (3.1 million tokens against a measured 981,728
 token pool), and execution order becomes the decisive variable, exactly
 as predicted. Cold makespans in seconds, with the winner in bold:
 
@@ -273,7 +297,7 @@ execution reads 1.62 times the corpus at two filters and 3.82 times at
 four filters and 0.95, statistically identical to task-first's 1.58 and
 3.93, with cache hits at zero: by the time a survivor's next question
 arrives, ten thousand documents have passed through the cache and its
-notes are gone. The document-first advantage that was worth 25 percent
+KV is gone. The document-first advantage that was worth 25 percent
 at 2,000 documents is fully erased at 10,000. Naive speculation is the
 worst case, 2.30 times, because a document's second branch trails its
 first by ten thousand requests. The blocked schedules from the
@@ -290,7 +314,7 @@ rule the new writes evicted exactly the resident bodies the branches
 were about to reuse, erasing the blocked advantage at two filters. The
 lesson is that under recency-based eviction, submission order inside a
 batch is itself a scheduling decision: requests that consume resident
-notes must run before requests that produce new ones. One sort fixed
+KV must run before requests that write new KV. One sort fixed
 it, and it is the first concrete design requirement for the step four
 in-engine scheduler, which would pin instead of relying on order.
 
@@ -312,7 +336,7 @@ Step three packages the three measured wins into one client scheduler
 (docengine/runtime/engine_client.py) that runs against an unmodified
 engine: prompts pre-tokenized once, admission controlled by a token
 budget sized to the engine's KV pool so a document enters only when its
-notes can stay resident, and per document streaming so each document
+KV can stay resident, and per document streaming so each document
 runs all its filters back to back while hot and returns its budget in
 seconds. This produces blocked execution with no stage barriers at all.
 On the same 10,000 document cold grid:
@@ -351,8 +375,8 @@ Raw data: results/engine/client10k.json.gz and client10k_analysis.csv.
 The engine skeleton moves the client library's decisions inside vLLM.
 A custom scheduler class (docengine/engineext/scheduler.py, loaded
 through vLLM's official replacement seam) pins each live document's
-notes by holding an extra block reference, frees a dead document's
-notes the instant the plan learns of its death, and runs the query's
+KV by holding an extra block reference, frees a dead document's
+KV the instant the plan learns of its death, and runs the query's
 requests ahead of foreign traffic through the engine's priority queue.
 Client directives ride inside request ids because the scheduler lives
 in the engine core process. After these changes no query memory is
@@ -412,7 +436,7 @@ fallback had been absorbing that accounting gap in every earlier run.
 ## Phase A, analytical layer: reasoning filters before any GPU run
 
 notes/REASONING_MODEL.md defines the extended cost model (stepwise
-generation priced per decode cohort, thinking notes as transient
+generation priced per decode cohort, thinking KV as transient
 memory, full waste on failed speculative branches), the Bellman value
 recurrences for task-first and for every stage composition of the
 document-first family, and the per-policy throughput program. The
@@ -475,7 +499,10 @@ The measured phase that follows has a sharp question: do the
 generation-dominated makespans, the saturated no-speculation verdict,
 and the adaptive gain under memory pressure survive contact with the
 engine at 10,000 documents, using the same layered comparison as
-before.
+before. (Answered: see "The reasoning grid, measured" below. The
+first two survive on hardware; the memory-pressure corner was never
+reached, because the width sweep shows the pool does not bind on the
+4B model.)
 
 ## Phase B, analytical layer: a null result with a sharp boundary
 
@@ -535,7 +562,7 @@ before the first branch's blocks commit. The in-flight sharing that
 reached its theoretical ceiling at three hundred token documents was
 queue depth luck, not a guarantee. The principled fixes are the
 engine level mechanisms already planned: sequence truncation
-serializes a document's questions on one set of notes, and the
+serializes a document's questions on one KV copy, and the
 cascade kernel shares the read explicitly.
 
 Third, a quality cliff that scheduling cannot fix: answer agreement
@@ -543,7 +570,7 @@ falls from 0.92 at three hundred tokens to 0.81 at thirty thousand
 and 0.63 at one hundred thousand, barely above chance. The 4B model
 under context extension cannot reliably read a fact at the end of a
 hundred thousand tokens. Long document products need the larger
-model tier (where the persisted notes store also pays best) or
+model tier (where the persisted-KV store also pays best) or
 chunked evaluation, and any long context benchmark of this system
 must report agreement next to makespan.
 
@@ -589,7 +616,7 @@ The build under test: one living engine request per document runs the
 whole filter chain. The client registers the question token lists and
 the yes token ids once; after that the scheduler judges each sampled
 answer in-engine, rolls the sequence back to the document boundary
-(question and answer notes erased, document notes kept), and appends
+(question and answer KV erased, document KV kept), and appends
 the next question through the engine's own session mechanism. One
 request per document instead of one per filter call.
 
@@ -622,7 +649,7 @@ for 42 continuations, three per surviving document. Then the
 - With the rewind stopping at document plus preamble (identical for
   every question, so no prompt content changes): chain mode 49.9
   seconds against request mode's 52.0. Chain mode now schedules
-  105,094 fewer tokens than request mode (the rewind keeps notes at
+  105,094 fewer tokens than request mode (the rewind keeps KV at
   exact token positions; cache hits are 16-token-block granular) and
   the target from the plan - high forties against 52.3 - is met.
 - Profiling along the way: chain mode halves client-process CPU (7.1
@@ -677,11 +704,11 @@ steps, so the lost lookahead is worth approximately nothing at this
 workload; reasoning filters, with real decode work, are the trigger
 to adopt the async scheduler base and a placeholder-aware rewind.
 
-## Persisted notes, milestone one: mechanics proven, 4B loses
+## Persisted KV, milestone one: mechanics proven, 4B loses
 
 The engine's tiering store (RAM primary, container-local disk
 secondary) ran end to end at 2,000 documents: query one computed
-cold and offloaded 53.1 GB of notes; after a full prefix-cache
+cold and offloaded 53.1 GB of KV; after a full prefix-cache
 reset, queries two and three restored from the store instead of
 recomputing. Measured on one container: baseline cold 11.0 seconds
 and recompute-after-reset 10.5; with the store, first query 29.5
@@ -689,7 +716,7 @@ seconds (the write path), restores 20.3 then 18.4. Raw disk write
 measured 5.2 GB/s.
 
 This is the break-even table's prediction landing: the corpus is 53
-GB of notes but only about 630,000 tokens of compute, the GPU
+GB of KV but only about 630,000 tokens of compute, the GPU
 re-reads at about 80,000 tokens a second, so beating an 8-second
 recompute requires moving those bytes at about 7 GB/s - above this
 disk before any bookkeeping. At this model size the tier loses
@@ -728,8 +755,8 @@ the memory pool, so memory policy binds. Four arms, one flight:
   once per stage actually needed.
 
 The read-floor arithmetic that decides everything on this tier: a
-corpus pass costs 30 seconds of compute but its notes are 41 GB, so
-the persisted-notes break-even flips - at the measured 5 GB/s disk,
+corpus pass costs 30 seconds of compute but its KV is 41 GB, so
+the persisted-KV break-even flips - at the measured 5 GB/s disk,
 restore is about 8 seconds against 30 of recompute, the several-fold
 win the plan projected.
 
@@ -770,14 +797,14 @@ in 24,000 landing differently in different batch compositions.
 
 Scoring every call against the planted flags at 10,000 documents and
 four filters (ideal: 4,096 surviving documents) overturned the
-working assumption that 8-bit notes cost about a percent of answers:
+working assumption that 8-bit KV cost about a percent of answers:
 
 - Shipping fp8, scale 1.0: 2,929 of 23,904 calls wrong (12.3
   percent), 3,524 survivors. The most accurate configuration.
 - Runtime-calibrated fp8: 3,371 of 22,869 wrong (14.7 percent),
   3,167 survivors. The deprecated calibration path computes scales
   from whatever runs first, which is not representative data.
-- Full-precision (bf16) notes: 3,979 of 21,635 wrong (18.4 percent),
+- Full-precision (bf16) KV: 3,979 of 21,635 wrong (18.4 percent),
   2,615 survivors, and half the memory pool. Moving the attention
   numerics away from what this fp8-quantized checkpoint was tuned
   for hurts rather than helps.
@@ -796,16 +823,208 @@ the full 981k-token pool. The remaining accuracy lever is a
 checkpoint calibrated offline on representative data (or a stronger
 model), a model artifact question, not an engine one.
 
+## Eight GPUs: the scaling curve closes at 7.50 times
+
+The scaling story above stopped at four GPUs. The eight-GPU point
+is banked (results/engine/multigpu8.json): makespan 6.66 seconds,
+which is 7.50 times faster than the 49.9-second single-GPU run of
+the same 10,000-document query, against a perfect 8.00. The full
+curve: 49.9 seconds on 1 GPU, 25.30 on 2, 13.30 on 4, 6.66 on 8
+(multigpu2.json and multigpu4.json hold the middle points).
+
+Balance, from the file: the eight shards hold 395,609 to 395,647
+tokens each, a spread of 38 tokens on shards of about 395,600. The
+eight worker walls run 6.40 to 6.66 seconds, a spread of 0.26
+seconds; the makespan is the slowest wall. Survivors: 3,526,
+against 3,524 on one GPU and 3,523 on two. That is the known
+borderline-call noise, a few calls in 24,000 landing differently
+in different batch compositions.
+
+## The reasoning grid, measured: phase A's open question is answered
+
+Phase A closed by asking whether the generation-dominated
+makespans, the saturated no-speculation verdict, and the adaptive
+gain under memory pressure survive contact with the engine. The
+first two now have measured answers: yes and yes. The third corner
+was not reached, because on this model the memory pool never binds
+(the width sweep below says why). The flight ran 2,000 documents -
+not the 10,000 the question named - with four filters at pass rate
+0.8 on Qwen3-4B-FP8, and thinking forced to exactly g tokens per
+call (results/engine/reason_grid.json).
+
+Measured walls in seconds at thinking length g, best per column in
+bold:
+
+| policy | g=0 | g=32 | g=128 | g=512 |
+|---|---|---|---|---|
+| pipeline | **10.92** | **32.62** | **79.70** | **275.33** |
+| lookahead 2, the (2,2) composition | 20.24 | 49.40 | 101.18 | 328.49 |
+| full speculation | 22.23 | 58.46 | 135.03 | 461.25 |
+| stage waves | 23.83 | 44.53 | 89.60 | 283.88 |
+
+The pipeline wins every column. Three phase A predictions land:
+
+- The policy gap compresses as thinking grows. Stage waves cost 2.2
+  times the pipeline at g=0 (23.83 against 10.92 seconds) but only
+  1.03 times at g=512 (283.88 against 275.33). Re-reading matters
+  less when generating dominates the wall.
+- A wasted speculative branch now carries its whole thinking trace.
+  Full speculation pays about 186 seconds over the pipeline at
+  g=512 (461.25 against 275.33), compared with about 11 seconds at
+  g=0.
+- The interior (2,2) composition never beats the pipeline in any
+  column on this saturated corpus. The theory reserves partial
+  speculation for starved machines, and 2,000 documents keep this
+  card saturated.
+
+Survivor counts run 656 to 661 across the sixteen cells, the usual
+borderline noise scale. (The banking commit says survivors were
+identical across all sixteen cells; the file shows the 656-to-661
+spread. Quote the file.)
+
+The width sweep at g=128 answers the pool question
+(results/engine/width_scaling.json, same corpus and query): 95.07
+seconds when admission is starved at a 50,000-token budget, then
+78.11 seconds at a 100,000-token budget and flat from there (78.10
+at 200,000 and 400,000, 78.31 at 700,000). Decode width saturates
+near 100,000 admitted tokens, far below the roughly 985,000-token
+KV pool the chain flights measured, so the pool never binds on the
+4B at these document lengths. The planner's rule: admit just above
+the measured saturation width. The footprint cap can only bind
+where the pool is smaller than that width - the 32B tier, long
+documents, or much larger g.
+
+## The fusion verdict: the cascade kernel flips answers; fusion is closed
+
+The fused-fork operator ran its bit-identity gate: the same 50
+documents, six questions each (300 answers per cell), executed with
+the cascade kernel on and then off, at document lengths of 300,
+3,000, and 15,000 tokens (results/engine/fusegate.json; fp8 KV,
+vLLM 0.26.0). A flip is an answer that changes between the two
+paths. A confident flip is a flip where the gap between the two
+answers' log probabilities exceeds 0.2 nats (natural-log units: 0.2
+nats means one answer was at least 1.22 times as probable as the
+other), which is past anything borderline noise produces.
+
+On fp8 KV the kernel flips answers confidently at every length: 29,
+16, and 43 confident flips of 300 answers per cell at 300, 3,000,
+and 15,000 tokens (41, 23, and 52 total flips; worst gap 1.875
+nats). The fused path was genuinely engaged: 250 of 300 requests
+grouped per cell, zero fallbacks. The flips are the kernel's.
+
+The bf16 isolation arm (results/engine/fusegate_auto.json) rules
+out the fp8 KV format as the cause: with bf16 KV the kernel still
+makes 20 and 12 confident flips at 300 and 3,000 tokens. That arm's
+15,000-token cell reports zero flips, but the zero proves nothing:
+bf16 doubles the bytes per KV token, the documents no longer fit
+the grouping budget, and the cell fell back to the normal unfused
+path (fallback_steps 46; 6 of 300 requests grouped, against 250 in
+the cells that ran fused). One recorder bug to know about:
+fusegate_auto.json's kv_cache_dtype field says "fp8", but the arm
+ran KV dtype "auto", which is bf16. The field is wrong in the file;
+a parallel fix to the recorder is in progress.
+
+The fused path was also far slower at this scale: 7.78 seconds of
+question time against 0.31 unfused at 300-token documents, about 25
+times slower, and roughly even at the two longer lengths (0.86
+against 0.88 seconds, and 3.69 against 3.77).
+
+Verdict: fusion is closed on this stack. The kernel is wrong at
+every document length, in both KV formats, and slower where
+documents are short. The two gate files, plus the offline proof
+that the grouping plan itself is exact, form an evidence chain that
+is effectively an upstream kernel bug report. The paper carries
+fusion as a documented negative result, and the gate becomes part
+of the fidelity method (notes/PROPOSAL.md).
+
+## Shared scans: 5.09 times at eight queries, blocked on fidelity
+
+q concurrent queries over the same 2,000 documents share one corpus
+pass. Each query filters on its own planted flag columns, and the
+scheduler refcounts each document's pin so its KV stays until the
+last query releases it (results/engine/shared2000.json.gz; four
+filters per query, pass rate 0.8, 926,191 corpus tokens).
+
+| q | shared (s) | separate (s) | speedup | shared reads | separate reads |
+|---|---|---|---|---|---|
+| 1 | 14.13 | 14.12 | 1.00 | 1.10 | 1.10 |
+| 2 | 15.11 | 28.04 | 1.86 | 1.14 | 2.20 |
+| 4 | 17.22 | 56.34 | 3.27 | 1.23 | 4.40 |
+| 8 | 22.34 | 113.67 | 5.09 | 1.42 | 8.82 |
+
+"Reads" is the corpus read multiplier, computed tokens over corpus
+tokens. Eight queries in shared mode read 1.42 times the corpus and
+finish in 22.34 seconds, compared with 8.82 times the corpus and
+113.67 seconds run separately. That is the 5.09x headline.
+
+The caveat, stated plainly: the answers are not the same. At q=8
+the shared and separate survivor sets differ in 6 of the 8 queries,
+by up to 30 documents in one query (604 shared against 634
+separate). At q=4 they differ in 2 of 4 queries; at q=2 in none.
+The divergence grows with query count. Shared mode also has 123
+more wrong answers against the planted truth: 6,519 wrong of 34,027
+scored calls, against separate mode's 6,396 of 34,251. That is too
+large to accept as borderline noise without the confident-flip
+discriminator run: rerun with log probabilities and classify every
+disagreement by the 0.2-nat gap, as the fusion gate does. Until
+that run lands, the 5.09x claim is blocked. Divergence that grows
+with query count looks like state, not noise, so treat the
+discriminator run as a bug hunt (notes/PROPOSAL.md).
+
+## The falsification flight: 80,000 was an image fact
+
+Phase xengine tried to break the calibration anchor: can any
+independent stack read the identical corpus faster than the 80,000
+tokens per second our vLLM sustains? Six arms, each fed the same
+1,198,838 tokens cold, prefill only, with a token fingerprint
+(59817c51d2b74578) cross-checked so every arm read byte-identical
+input (results/engine/xengine.json):
+
+| arm | tokens per second | times the control |
+|---|---|---|
+| control: vLLM 0.26.0 on our slim image | 80,556 | 1.00 |
+| SGLang 0.5.16 on its own CUDA 13 stack | 98,746 | 1.23 |
+| the same vLLM 0.26.0 on a CUDA 13 devel base | 97,220 | 1.21 |
+| vLLM with bf16 KV instead of fp8 | 83,775 | 1.04 |
+| vLLM on CUDA 13 with tuned batch flags | 92,583 | 1.15 |
+| plain transformers forward passes | 20,493 | 0.25 |
+
+The falsification landed: SGLang reads the same corpus 1.23 times
+faster than the control. The attribution arms then explained the
+gap. The decisive arm is the third: the identical vllm==0.26.0 pin
+reads 97,220 tokens per second on a CUDA 13 devel base, compared
+with 80,556 on our slim image. The devel base carries the CUDA
+compiler, so FlashInfer can build its fast attention kernels there;
+the slim image cannot. With the substrate matched, vLLM and SGLang
+agree within 1.6 percent (97,220 against 98,746). The bf16-KV arm
+(83,775, or 1.04 times the control) shows the KV format explains
+almost none of the gap. The gap was the toolchain, not the engine
+architecture. No engine port is needed.
+
+The consequence for this ledger: the section "Scheduler plan steps
+one and two, measured" above claims the 80,000 reading limit "is a
+kernel fact, not a settings problem." That claim is falsified as
+written. It was an image fact. All fifteen configurations in that
+sweep landed between 74,000 and 81,000 tokens per second because
+they all ran on the same image, not because the silicon had nothing
+more to give. Everything calibrated against 80,556 - the 3.44
+kernel factor, the planner's rate constant, every "times the floor"
+ratio - is stale until the re-baseline flight re-measures the
+headline cells on the new image (notes/PROPOSAL.md). The banner at
+the top of this file says how to read the numbers meanwhile.
+
 ## Caveats
 
 - Every "X never wins" statement is about the ideal cost model at the
-  stated scale. The batch-count differences (for example 100 pipeline
-  batches versus 53 full-speculation batches at high pass rates on the
-  32B model and L40S) mean a fixed per-batch overhead of roughly 140
-  milliseconds would start reversing the speculation conclusion; the
-  measured layer above confirms the direction: on the real engine the
-  crossover toward speculation arrives at lower pass rates than the ideal
-  model predicts.
+  stated scale. The batch-count differences mean a fixed per-batch
+  overhead of roughly 140 milliseconds would start reversing the
+  speculation conclusion. An example, with each count from its own
+  experiment, both 32B on L40S: the two-stage program at pass rate 0.9
+  builds 100 pipeline batches (results/lp_two_stage.csv), while the
+  four-filter k=4 arm builds 53 full-speculation batches
+  (results/multi_filters.csv). The measured layer above confirms the
+  direction: on the real engine the crossover toward speculation arrives
+  at lower pass rates than the ideal model predicts.
 - The program's value is the optimum of a restricted state and action set,
   labeled per the paper: a fuller action search could raise it, and the
   achievability of the rate is established here only by the successful

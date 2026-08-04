@@ -5,12 +5,105 @@ to the strict in-engine scheduler, with the calibrated model prediction
 as a hairline per configuration. Panel b: the mechanism, corpus read
 multipliers. Panel c: contention at n=4 s=0.8 under the heavy
 co-tenant. Panel d: the reasoning-filter analytical map (phase A).
+
+Every plotted number is read from a banked results file, except the
+two log-only contention arms declared in PROSE_ONLY below. The map:
+
+  panel a bars      results/engine/scale10k.json.gz (task waves, naive
+                    block-k1 waves, blocked block-k1 manifest),
+                    client10k.json.gz (client), strict10k.json.gz
+  panel a hairline  ideal column of client10k_analysis.csv times
+                    KERNEL_FACTOR (the one calibration constant)
+  panel b bars      read multiplier recomputed from each row's wave
+                    token counters in the same three .gz files
+  panel c bars      pinned10k.json.gz (stock alone), pinned10k_v3
+                    .json.gz (plan-ranked alone and under the
+                    neighbor), PROSE_ONLY for the two log-only arms
+  panel d curves    results/reasoning_sweep.csv (n=4, s=0.8 rows)
+  panel d diamond   strict10k.json.gz (n=4, s=0.8)
 """
+
+import csv
+import gzip
+import json
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+ENG = ROOT / "results" / "engine"
+
+# STALE PENDING RE-BASELINE. These numbers exist only in prose and run
+# logs (notes/RESULTS.md), with no banked results file. Like every
+# number this figure reads, they were measured on the old slim image;
+# the re-baseline flight (notes/PROPOSAL.md) replaces them.
+PROSE_ONLY = {
+    # Stock engine under the heavy co-tenant: never finished inside
+    # the one-hour harness limit; plotted at the 3,600-second cutoff.
+    "stock_with_neighbor_cutoff_s": 3600,
+    # The intermediate pinned iteration (equal-rank requests): memory
+    # defended, compute lost. Its file (pinned10k_hard.json.gz) was
+    # never banked.
+    "equal_rank_with_neighbor_s": 231.2,
+}
+
+# The calibration constant: the 275,000 tokens-per-second ideal-model
+# ceiling over the 80,000 measured operating rate. The 80,000 anchor
+# is stale (xengine.json: the same vLLM reads 97,220 on a CUDA 13
+# devel image); recompute after the re-baseline flight.
+KERNEL_FACTOR = 275_000 / 80_000
+
+CONFIGS = [(2, 0.5), (4, 0.8), (4, 0.95)]
+
+
+def load_rows(path):
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt") as f:
+        return json.load(f)["results"]
+
+
+def pick(rows, n, s, policy, k, mode, junk=None):
+    for r in rows:
+        s0 = r["s"][0] if isinstance(r.get("s"), list) else r.get("s")
+        if (r["n"] == n and abs(s0 - s) < 1e-9 and r["policy"] == policy
+                and r["k"] == k and r["mode"] == mode
+                and (junk is None or r.get("junk") == junk)):
+            return r
+    raise KeyError((n, s, policy, k, mode, junk))
+
+
+def read_mult(row):
+    corpus = sum(row["d_tok"])
+    computed = sum(w["prompt_tokens"] - w["cached_tokens"]
+                   for w in row["waves"])
+    return computed / corpus
+
+
+scale = load_rows(ENG / "scale10k.json.gz")
+client = load_rows(ENG / "client10k.json.gz")
+strict = load_rows(ENG / "strict10k.json.gz")
+pinned1 = load_rows(ENG / "pinned10k.json.gz")
+pinned3 = load_rows(ENG / "pinned10k_v3.json.gz")
+
+selectors = [
+    ("vLLM naive, task prompts", scale, dict(policy="task", k=0,
+                                             mode="waves")),
+    ("vLLM naive, doc-first", scale, dict(policy="block", k=1,
+                                          mode="waves")),
+    ("blocked batches", scale, dict(policy="block", k=1,
+                                    mode="manifest")),
+    ("client library", client, dict(policy="block", k=1, mode="client")),
+    ("in-engine, strict", strict, dict(policy="block", k=1,
+                                       mode="strict")),
+]
+
+with open(ENG / "client10k_analysis.csv") as f:
+    ideal = {(int(r["n"]), float(r["s1"])): float(r["ideal"])
+             for r in csv.DictReader(f)
+             if r["policy"] == "block" and r["k"] == "1"}
 
 SURF = "#fcfcfb"; INK = "#0b0b0b"; INK2 = "#52514e"; MUTED = "#898781"
 GRID = "#e1e0d9"; BASE = "#c3c2b7"
@@ -24,19 +117,16 @@ plt.rcParams.update({
     "grid.linewidth": 0.7, "legend.frameon": False, "legend.fontsize": 8,
 })
 
+COLORS = [MUTED, ORANGE, YELLOW, AQUA, BLUE]
+SYSTEMS = []
+MULT = []
+for (name, rows, sel), col in zip(selectors, COLORS):
+    picked = [pick(rows, n, s, **sel) for n, s in CONFIGS]
+    SYSTEMS.append((name, col, [r["makespan"] for r in picked]))
+    MULT.append([read_mult(r) for r in picked])
+PRED = [ideal[cfg] * KERNEL_FACTOR for cfg in CONFIGS]
+
 CFGS = ["n=2\ns=0.5", "n=4\ns=0.8", "n=4\ns=0.95"]
-SYSTEMS = [
-    ("vLLM naive, task prompts", MUTED, [61.7, 122.8, 158.3]),
-    ("vLLM naive, doc-first", ORANGE, [64.4, 111.3, 153.7]),
-    ("blocked batches", YELLOW, [53.8, 74.0, 84.2]),
-    ("client library", AQUA, [48.9, 52.5, 57.9]),
-    ("in-engine, strict", BLUE, [48.5, 52.3, 54.7]),
-]
-PRED = [47.8, 54.7, 60.3]
-MULT = [
-    ([1.58, 3.03, 3.93]), ([1.62, 2.74, 3.82]), ([1.18, 1.27, 1.32]),
-    ([1.17, 1.23, 1.29]), ([1.18, 1.23, 1.30]),
-]
 
 fig, axes = plt.subplots(2, 2, figsize=(11.2, 8.2), dpi=200)
 fig.subplots_adjust(top=0.87, bottom=0.07, left=0.06, right=0.985,
@@ -68,14 +158,21 @@ ax_b.set_title("b. The mechanism: how many times the corpus is read",
 
 ct_labels = ["stock\nalone", "stock +\nneighbor", "equal-rank\n+ neighbor",
              "plan-ranked\nalone", "plan-ranked\n+ neighbor"]
-ct_vals = [53.5, 3600, 231.2, 52.2, 52.0]
+stock_alone = pick(pinned1, 4, 0.8, "block", 1, "stock", junk=False)
+plan_alone = pick(pinned3, 4, 0.8, "block", 1, "pinned", junk=False)
+plan_junk = pick(pinned3, 4, 0.8, "block", 1, "pinned", junk=True)
+ct_vals = [stock_alone["makespan"],
+           PROSE_ONLY["stock_with_neighbor_cutoff_s"],
+           PROSE_ONLY["equal_rank_with_neighbor_s"],
+           plan_alone["makespan"], plan_junk["makespan"]]
+ct_text = [f"{ct_vals[0]:.1f}", "never\nfinished", f"{ct_vals[2]:.0f}",
+           f"{ct_vals[3]:.1f}", f"{ct_vals[4]:.1f}"]
 ct_cols = [MUTED, MUTED, YELLOW, BLUE, BLUE]
 pos = np.arange(5) * 0.75
 bars = ax_c.bar(pos, ct_vals, width=0.55, color=ct_cols)
 ax_c.set_yscale("log")
 ax_c.set_ylim(30, 6000)
-for xp, v, lab in zip(pos, ct_vals,
-                      ["53.5", "never\nfinished", "231", "52.2", "52.0"]):
+for xp, v, lab in zip(pos, ct_vals, ct_text):
     ax_c.text(xp, v * 1.15, lab, ha="center", fontsize=7.2, color=INK2)
 ax_c.set_xticks(pos)
 ax_c.set_xticklabels(ct_labels, fontsize=7.5)
@@ -83,13 +180,19 @@ ax_c.set_ylabel("makespan (s), log scale")
 ax_c.set_title("c. Contention: a heavy co-tenant on the same card "
                "(n=4, s=0.8)", loc="left", color=INK)
 
-think = [0, 32, 128, 512]
-series_d = [("task-first", MUTED, [127.7, 139.6, 175.0, 316.8]),
-            ("pipeline", BLUE, [48.7, 60.6, 96.0, 237.8]),
-            ("full speculation", AQUA, [52.2, 68.2, 116.2, 308.3])]
+with open(ROOT / "results" / "reasoning_sweep.csv") as f:
+    sweep = [r for r in csv.DictReader(f)
+             if r["n"] == "4" and r["s"] == "0.8"]
+sweep.sort(key=lambda r: int(r["think"]))
+think = [int(r["think"]) for r in sweep]
+series_d = [("task-first", MUTED, [float(r["task"]) for r in sweep]),
+            ("pipeline", BLUE, [float(r["pipeline"]) for r in sweep]),
+            ("full speculation", AQUA,
+             [float(r["fullspec"]) for r in sweep])]
 for name, col, vals in series_d:
     ax_d.plot(think, vals, color=col, lw=2, marker="o", ms=4, label=name)
-ax_d.plot([0], [52.3], marker="D", ms=7, color=INK, ls="none",
+strict_meas = pick(strict, 4, 0.8, "block", 1, "strict")["makespan"]
+ax_d.plot([0], [strict_meas], marker="D", ms=7, color=INK, ls="none",
           label="measured (strict engine)")
 ax_d.set_xlabel("thinking tokens per filter call")
 ax_d.set_ylabel("predicted makespan (s), calibrated")
@@ -113,5 +216,7 @@ fig.legend(handles, labels, loc="upper left", ncol=3,
 fig.suptitle("DocEngine on one H100: the same query, five ways",
              x=0.06, y=0.985, ha="left", fontsize=14, color=INK,
              fontweight="bold")
-fig.savefig("results/plots/docengine_story.png")
-print("done")
+out = ROOT / "results" / "plots" / "docengine_story.png"
+out.parent.mkdir(parents=True, exist_ok=True)
+fig.savefig(out)
+print(f"wrote {out}")

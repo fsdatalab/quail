@@ -6,7 +6,10 @@ the last document's last answer exists. One query, one dedicated H100,
 single tenant, prompts fixed. The reference query used for every
 number below: four yes or no filters, pass rate 0.8 each, over 10,000
 movie reviews, about 3.1 million tokens of documents in total, model
-Qwen3-4B-FP8. A document that fails a filter skips the rest.
+Qwen3-4B-FP8. A document that fails a filter skips the rest. One
+term used throughout: KV, the KV cache, is the per-token state the
+model writes while reading text; a document whose KV is on the card
+can take new questions without being re-read.
 
 ## The ceiling, derived
 
@@ -52,7 +55,7 @@ Rung 1, vanilla vLLM, cache friendly prompts. Put the document first
 so the engine's prefix cache could reuse it. 111.3 seconds, reading
 2.74 times the corpus. The advantage almost vanishes at scale: the
 cache holds about a quarter of the corpus, and by the time a
-document's next filter arrives its notes are evicted. Lesson: a good
+document's next filter arrives its KV is evicted. Lesson: a good
 template without execution order control is worth almost nothing.
 
 Rung 2, precomputed blocked schedules. Our analytical builder laid
@@ -64,7 +67,7 @@ timetable loses to reactive rules. Scheduling structure belongs up
 front; timing belongs to the run.
 
 Rung 3, the client library. Streaming with budget admission: a
-document enters only when its notes fit, runs all its filters
+document enters only when its KV fits, runs all its filters
 back to back the moment each answer arrives, then releases its
 budget; prompts pre-tokenized. Zero engine changes. 52.5 seconds,
 reading 1.23 times the corpus, within a few percent of the calibrated
@@ -74,7 +77,7 @@ engine internal.
 
 Rung 4, the in-engine scheduler, the shipping configuration. The
 plan's decisions move inside vLLM through its official scheduler
-seam: live documents' notes pinned, dead documents' notes freed the
+seam: live documents' KV pinned, dead documents' KV freed the
 instant the plan learns of death, request order assigned from
 verified plan tags, unplanned requests refused, and the recency rule
 left with zero authority (its firing is a crash, and it fired zero
@@ -105,11 +108,11 @@ second read floor, and an 11.3 second spec sheet fiction.
 A query plan composes one operator from each family, per document
 batch. This is the database view of everything above and below.
 
-Access operators, how a document's notes get on the card:
-  A1 text scan: read the text, compute notes (2P per token at the
+Access operators, how a document's KV gets on the card:
+  A1 text scan: read the text, compute KV (2P per token at the
      operating rate). The default.
-  A2 resident read: notes already on the card and pinned; near free.
-  A3 notes load: stream persisted notes from the tier (priority
+  A2 resident read: KV already on the card and pinned; near free.
+  A3 KV load: stream persisted KV from the tier (priority
      four); cost is bytes over store bandwidth.
   A4 chunked scan: partial document admission for documents larger
      than memory (exists in the model, unused at current lengths).
@@ -117,18 +120,18 @@ Access operators, how a document's notes get on the card:
 Evaluation operators, how a question is asked:
   E1 task call: task text plus document plus cue, full re-read per
      call. The naive operator, rung zero.
-  E2 branch call: document first request per stage, notes reused
+  E2 branch call: document first request per stage, KV reused
      through the cache or pins. Shipped today.
   E3 truncated continuation: one living sequence per document,
      append question, read answer, roll back, append next. Priority
      two; kills the per request toll.
   E4 cascade call: k question tails evaluated concurrently over one
-     pass through the notes (the Hydragen or tokasaurus style
+     pass through the KV (the Hydragen or tokasaurus style
      kernel). Semantics preserving, unlike prompt fusion, because
      each tail still attends over only the document and itself.
-     Parked until reasoning filters make note reads material.
+     Parked until reasoning filters make KV reads material.
   E5 shared scan call: tails from several queued queries evaluated
-     while the notes are hot. Priority five; the cross query twin of
+     while the KV is hot. Priority five; the cross query twin of
      E4.
 
 Gating operators, when calls are issued:
@@ -146,7 +149,7 @@ Memory operators:
   M2 pin and eager free: plan claimed retention. Shipped.
   M3 spill and recompute: the retain some, re-read some mix the LP
      prices; relevant only in the contested corner.
-  M4 persist and restore: ingest time notes writing, query time
+  M4 persist and restore: ingest time KV writing, query time
      loading; the memory side of A3.
 
 The measured ladder in these terms: rung zero is (A1 per call, E1,
@@ -194,22 +197,22 @@ with policy differences compressed; this is the first measurement of
 100,000 token contexts and of pins that large, and it closes the
 single query story across document lengths.
 
-Priority four, the persisted notes tier (the only path below the
+Priority four, the persisted-KV tier (the only path below the
 read floor). Milestone one is measured: the engine's own tiering
 store (RAM primary, disk secondary) ran end to end at 2,000
-documents - 53 GB of notes saved during query one, restored after a
+documents - 53 GB of KV saved during query one, restored after a
 full cache reset for queries two and three. And the break-even
 table's 4B prediction landed as written: restore 20.3 then 18.4
 seconds against 10.5 seconds of plain recompute (the container's
 disk writes 5.2 GB/s against the 5.9 needed), so at 4B the tier
 loses about two to one and stays parked; the case remains the 32B
 tier, bundled below. At corpus ingest, read every document once and
-persist its notes; at query time, stream notes into the card instead
+persist its KV; at query time, stream KV into the card instead
 of re-reading text. The break even rule: the store's bandwidth must
 exceed kappa times the prefill rate, because that is the rate at
-which recomputation produces notes. The table:
+which recomputation produces KV. The table:
 
-  model   notes/token   prefill rate   break even    NVMe (7-14 GB/s)   S3
+  model   KV/token      prefill rate   break even    NVMe (7-14 GB/s)   S3
   4B      72 KB         80,000/s       5.9 GB/s      yes, comfortably   only with a 100 Gbps
                                                                         class network path
   32B     128 KB        ~9,300/s       1.2 GB/s      trivially          yes, even on common
@@ -219,14 +222,14 @@ So the right architecture is a tier, not a choice: S3 (or any object
 store) as the durable, cheap layer (roughly 4 times cheaper per byte
 than attached NVMe, elastic, survives machines), NVMe as a read
 through cache in front of it, and the loader prefetching along the
-admission order the scheduler already computes, so notes arrive just
-before their document is admitted. For the 32B tier S3 alone clears
+admission order the scheduler already computes, so KV arrives just
+before its document is admitted. For the 32B tier S3 alone clears
 the bar; for 4B a cold S3 read is roughly a wash with recompute on a
 common network and a win once the NVMe cache is warm. KV compression
 (two to four times, decoded on the card) would put S3 above the bar
 for 4B as well and is the known refinement.
 
-On zero copy: mostly yes, with one boundary. If notes are serialized
+On zero copy: mostly yes, with one boundary. If KV is serialized
 at ingest in the engine's native paged block layout (fp8, per layer,
 block aligned), loading needs no format conversion at all, and from
 local NVMe the transfer can bypass host memory entirely via GPUDirect
@@ -252,12 +255,12 @@ at once.
 
 Parked, with explicit triggers: the cascade or Hydragen style shared
 prefix kernel (applies whenever several branches in one batch attend
-over the same document notes - which plain one-token speculation
+over the same document KV - which plain one-token speculation
 already does, not only reasoning; the trigger is a regime where that
 shared attention read is a material share of step time: documents
 past the roughly 24,000-token attention crossover run speculatively,
 or reasoning filters with long thinking. Complementary to
-truncation, since cascade saves note reads within a speculated block
+truncation, since cascade saves KV reads within a speculated block
 while truncation saves software cost between gated stages); the adaptive mix scheduler
 (trigger: workloads in the proven corner of three plus stages,
 thinking near document length, memory near 2.5 footprints); multi
@@ -266,7 +269,7 @@ document demonstration (whenever a headline is wanted); the 32B
 model tier (first measurement done: chain mode 32.0 seconds at 1.07
 times the read floor against 48 to 55 for every other arm at 1,000
 documents, prefill measured 10,800 tokens per second, and the
-persisted-notes break-even flips as projected - 8 seconds of restore
+persisted-KV break-even flips as projected - 8 seconds of restore
 against 30 of recompute at the measured disk rate. Open before it
 ships: an overflow policy for the pin discipline, which loses to
 churn when the corpus exceeds the pool, and a decode budget for the
