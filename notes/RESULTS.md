@@ -1073,3 +1073,25 @@ and the next attribution arm: force the old attention backend on the
 new image and see whether accuracy returns to 12.3 percent and what
 read rate that backend sustains. Until that lands, the speed anchor
 and the accuracy number cannot be quoted from the same stack.
+
+### Run 3c, strict mode: 44.1 seconds, and the accuracy shift reproduces
+
+results/engine/strict10k.json.gz, re-banked. The three cells: 41.9
+seconds at two filters and 0.5 (stale 48.5), 44.1 at four filters
+and 0.8 (stale 52.3), 45.8 at four filters and 0.95 (stale 54.7) -
+each within a few percent of the 0.83 toolchain ratio. The untagged
+canary is still refused, so strict mode holds on the new image.
+Independent confirmation of run 3d's finding: per-call agreement
+with planted truth at four filters and 0.8 is 0.762 on this stack,
+compared with about 0.88 before - the same doubling of wrong
+answers, from a different phase.
+
+### Run 2, chain repetitions: the spread is real (interim)
+
+chainsteps10k_r2.json banked: chain 51.2 seconds, request mode 59.2,
+identical answers to run 3d (2,348 against 2,349 survivors, one
+borderline flip). Run 3d's chain wall was 43.5 seconds on the same
+parameters and image, so the container-to-container spread is
+about 18 percent - host variance or FlashInfer JIT inside the
+measured window. Verdict on the headline wall waits for
+repetitions one and three; the paper quotes mean and spread.

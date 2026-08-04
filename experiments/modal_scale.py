@@ -1404,7 +1404,7 @@ async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
               volumes={"/root/.cache/huggingface": hf_cache})
 async def chain_run(n_docs: int = 50, n_filters: int = 2,
                     s: float = 0.7, profile_core: int = 0,
-                    kv: str = "fp8") -> dict:
+                    kv: str = "fp8", attn_backend: str = "") -> dict:
     """Sequence truncation proof at any scale: the same documents run
     the old way (one request per filter) and the new way (one request
     per document, the engine rewinding between filters). Pass means the
@@ -1415,9 +1415,19 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
     with attention scales calibrated from the first forward pass), or
     "bf16" (full precision, half the memory pool, budget lowered to
     fit). Both modes' answers are also scored against the planted
-    flags, the ground truth."""
+    flags, the ground truth.
+
+    attn_backend, when set (e.g. "FLASH_ATTN"), pins
+    VLLM_ATTENTION_BACKEND before engine boot - the attribution knob
+    for the toolchain accuracy question: the CUDA devel image lets
+    FlashInfer JIT its kernels, and run 3d measured 23.6 percent
+    wrong against planted truth where the old image's kernel set
+    measured 12.3."""
     import inspect
     import os
+
+    if attn_backend:
+        os.environ["VLLM_ATTENTION_BACKEND"] = attn_backend
 
     import numpy as np
     from transformers import AutoTokenizer
@@ -2014,7 +2024,8 @@ def scale10k(n_docs: int = 10000) -> dict:
 
 
 @app.local_entrypoint()
-def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
+def main(phase: str = "speed", n_docs: int = 0, out: str = "",
+         attn_backend: str = ""):
     import os
     if phase == "speed":
         data = speed_limit.remote(n_docs or 4000)
@@ -2070,7 +2081,8 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
         data = chain_run.remote(n_docs or 50, 4, 0.8)
         path = out or "results/engine/chain4_smoke.json"
     elif phase == "chain10k":
-        data = chain_run.remote(n_docs or 10000, 4, 0.8)
+        data = chain_run.remote(n_docs or 10000, 4, 0.8,
+                                attn_backend=attn_backend)
         path = out or "results/engine/chain10k.json"
     elif phase == "chaincore":
         data = chain_run.remote(n_docs or 10000, 4, 0.8, 1)
