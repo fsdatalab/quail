@@ -1176,3 +1176,20 @@ the tight claim waits for the host-variance protocol. One structural
 note: this run drove the engine through the refactored path -
 plan_query to run_query(plan=...) to the in-engine scheduler - the
 first hardware exercise of the merged entry point, clean.
+
+### The attribution knob, corrected, and a mechanism suspect named
+
+The first FLASH_ATTN arm was void: vllm 0.26 dropped the
+VLLM_ATTENTION_BACKEND environment variable (the engine logged
+"unknown environment variable" and ran its default kernels -
+identical wrong counts prove it). The supported knob is the
+attention_backend engine argument; the arm re-flies with it. The
+void run still paid for itself: the engine warns "Checkpoint does
+not provide a q scaling factor. Setting it to k_scale. This only
+matters for FP8 Attention backends." So on the new toolchain the
+attention itself runs in fp8 with a borrowed q scale - a numerics
+substitution the old image's kernels never made, and a concrete
+mechanism that would flip borderline calls in bulk. Two arms now in
+flight test it: FLASH_ATTN on the new image, and bf16 KV on the new
+image (bf16 KV sidesteps fp8 attention; the old image's bf16 arm
+measured 18.4 percent wrong, so that is the number to match).

@@ -1456,14 +1456,21 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
     # admission budget must fit under it or preemption would violate
     # the strict invariant
     budget = 830_000 if kv.startswith("fp8") else 400_000
-    engine = Engine.from_engine_args(AsyncEngineArgs(
+    engine_kw = dict(
         model=MODEL,
         kv_cache_dtype="fp8" if kv.startswith("fp8") else "auto",
         calculate_kv_scales=(kv == "fp8calib"),
         max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True, scheduling_policy="priority",
-        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler")
+    if attn_backend:
+        # vllm 0.26 dropped the VLLM_ATTENTION_BACKEND env var (the
+        # first attribution arm proved it: "unknown environment
+        # variable" and unchanged kernels); the supported knob is the
+        # attention_backend engine argument.
+        engine_kw["attention_backend"] = attn_backend
+    engine = Engine.from_engine_args(AsyncEngineArgs(**engine_kw))
     tok = AutoTokenizer.from_pretrained(MODEL)
     sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
     n = n_filters
