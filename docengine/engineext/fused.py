@@ -119,6 +119,18 @@ def _explicit_groups(
         )
     placed = []
     for group in groups:
+        if group.request_count < 1 or group.shared_blocks < 1:
+            # A zero-page shared level would hand FlashInfer an empty
+            # kv row, a shape vLLM never plans; leave such requests to
+            # ordinary attention instead.
+            raise RuntimeError(
+                "cascade groups need at least one request and one "
+                "fully shared page"
+            )
+        if len(group.shared_page_ids) != group.shared_blocks:
+            raise RuntimeError(
+                "cascade group page ids do not match shared_blocks"
+            )
         matching = [
             request
             for request in range(request_count)
