@@ -1284,3 +1284,35 @@ fp8 attention with substituted scales; the fix is then a checkpoint
 that ships real q scales - a model artifact, exactly where the old
 accuracy section left the lever. Walls: chain 43.2 seconds, request
 45.1, on a fast host.
+
+### The attribution verdict: the substrate moved, not a backend
+
+results/engine/chain10k_flashinfer.json banked, closing the arm
+set. FLASHINFER lands at 4,780 of 20,055 wrong (23.8 percent)
+against FLASH_ATTN's 23.6 - the same rate through different
+borderline calls (the wrong sets differ call by call). The full
+table on the 10k reference query:
+
+| stack | KV | attention | wrong | read rate |
+|---|---|---|---|---|
+| old slim image | fp8 | FA, bf16 math | 12.3% | 80,556 tok/s |
+| old slim image | bf16 | FA, bf16 math | 18.4% | (halved pool) |
+| CUDA 13 image | fp8 | FA default | 23.6% | ~97,400 |
+| CUDA 13 image | fp8 | FlashInfer | 23.8% | (slow host) |
+| CUDA 13 image | bf16 | FA, bf16 math | 21.7% | (halved pool) |
+
+Every configuration on the new toolchain sits at 21.7 to 23.8
+percent wrong; every configuration on the old one sat at 12.3 to
+18.4. So the regression is substrate-wide: it survives a KV dtype
+change and a backend change, and individual flips are
+backend-specific borderline calls. The leading suspect for the
+common component is the fp8 GEMM path over the block-quantized
+weights (the new image warms DeepGEMM; the old image could not
+build it), with fp8 attention's borrowed q scale adding about two
+points on top. Named follow-up, not flown in this flight: a
+GEMM-path knob arm forcing the old fp8 GEMM kernels on the new
+image. The engineering position until then: speed and accuracy are
+properties of the stack pair, both stacks are banked with image
+stamps, and the durable fix is checkpoint-side scale calibration -
+a model artifact, which is where the accuracy section already
+placed the lever.
