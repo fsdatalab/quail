@@ -21,12 +21,20 @@ rule is its default policy.
 The scheduler lives in the engine core process, so client directives
 ride inside request ids. Protocol, fields separated by "|":
 
-    de1|p<tokens>|d<doc>|r<doc,doc,...>|<suffix>
+    de1|p<tokens>|d<doc>|u<count>|r<doc,doc,...>|<suffix>
 
   p<tokens>  pin the document prefix covering the first <tokens> tokens
              when this request's blocks are freed
   d<doc>     document key that owns the pin
-  r<...>     release the pins of these document keys; "*" releases all
+  u<count>   the pin expects <count> release mentions before it frees
+             (shared scans: one per query reading the document);
+             missing means one, the single-query behavior
+  r<...>     release one mention of each listed document key's pin;
+             a pin frees when its mention count reaches zero.
+             "*" frees every pin outright regardless of counts
+  Q<qid>     on registration and chain requests: the query these
+             questions or this chain belong to; missing means the
+             default query id "0", the single-query protocol
 """
 
 import os
@@ -36,7 +44,9 @@ from vllm.v1.request import RequestStatus, StreamingUpdate
 
 
 def parse_tag(request_id):
-    """Return (pin_tokens, doc_key, releases) for a tagged id, else None.
+    """Return (pin_tokens, doc_key, releases, uses) for a tagged id,
+    else None. `uses` is the number of release mentions the pin waits
+    for before freeing; one when absent.
 
     The last field is the free-text suffix and is never read as a
     directive: a suffix that happens to start with p, d, or r must not
@@ -44,7 +54,7 @@ def parse_tag(request_id):
     release, including the end-of-run flush)."""
     if not request_id.startswith("de1|"):
         return None
-    pin, doc, rel = 0, None, []
+    pin, doc, rel, uses = 0, None, [], 1
     for part in request_id.split("|")[1:-1]:
         if part.startswith("p") and part[1:].isdigit():
             pin = int(part[1:])
@@ -52,20 +62,29 @@ def parse_tag(request_id):
             doc = part[1:]
         elif part.startswith("r") and len(part) > 1:
             rel = ["*"] if part[1:] == "*" else part[1:].split(",")
-    return pin, doc, rel
+        elif part.startswith("u") and part[1:].isdigit():
+            uses = int(part[1:])
+    return pin, doc, rel, uses
+
+
+def parse_qid(request_id):
+    """The query id a registration or chain request belongs to; "0"
+    when the id carries no Q part (the single-query protocol)."""
+    for part in request_id.split("|")[1:-1]:
+        if part.startswith("Q") and len(part) > 1:
+            return part[1:]
+    return "0"
 
 
 class DocEngineScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._de_pins = {}          # doc key -> list of pinned blocks
+        self._de_pin_refs = {}      # doc key -> release mentions left
         self._de_pinned_ids = set()  # block ids currently pinned
-        self._de_intent = {}        # request id -> (pin_tokens, doc key)
-        self._de_questions = None   # registered question token lists
-        self._de_qc = 0             # shared question preamble length
-        self._de_yes = set()        # token ids that mean yes
-        self._de_no = set()         # token ids that mean no (optional)
-        self._de_chain = {}         # request id -> dict(stage, d)
+        self._de_intent = {}        # request id -> (pin_tokens, doc, uses)
+        self._de_queries = {}       # query id -> dict(qs, qc, yes, no)
+        self._de_chain = {}         # request id -> dict(stage, d, qid)
         self._de_strict = os.environ.get(
             "DOCENGINE_SINGLE_TENANT", "1") == "1"
         print(f"[de-sched] init: strict {self._de_strict}, overlapped "
@@ -176,7 +195,6 @@ class DocEngineScheduler(Scheduler):
             i += 1
             qs.append(toks[i:i + ln])
             i += ln
-        self._de_questions = qs
         # The questions' shared preamble is identical for every stage
         # by definition, so its notes survive the rewind and each
         # continuation appends only the question's tail. Without this,
@@ -188,17 +206,21 @@ class DocEngineScheduler(Scheduler):
             if len(set(col)) != 1:
                 break
             qc += 1
-        self._de_qc = qc if len(qs) > 1 else 0
-        for part in request.request_id.split("|"):
+        yes, no = set(), set()
+        for part in request.request_id.split("|")[1:-1]:
             if part.startswith("Y") and len(part) > 1:
-                self._de_yes = {int(x) for x in part[1:].split(",")}
+                yes = {int(x) for x in part[1:].split(",")}
             elif part.startswith("N") and len(part) > 1:
-                self._de_no = {int(x) for x in part[1:].split(",")}
-        self._de_stats["registered"] = len(qs)
-        print(f"[de-sched] chain registered: {len(qs)} questions, "
-              f"lengths {[len(q) for q in qs]}, shared preamble "
-              f"{self._de_qc} tokens, yes ids {sorted(self._de_yes)}, "
-              f"no ids {sorted(self._de_no)}", flush=True)
+                no = {int(x) for x in part[1:].split(",")}
+        qid = parse_qid(request.request_id)
+        self._de_queries[qid] = dict(qs=qs, qc=qc if len(qs) > 1 else 0,
+                                     yes=yes, no=no)
+        self._de_stats["registered"] = sum(
+            len(q["qs"]) for q in self._de_queries.values())
+        print(f"[de-sched] chain registered: query {qid}, {len(qs)} "
+              f"questions, lengths {[len(q) for q in qs]}, shared "
+              f"preamble {self._de_queries[qid]['qc']} tokens, yes ids "
+              f"{sorted(yes)}, no ids {sorted(no)}", flush=True)
         # Let the registration request finish normally: one step of a
         # tiny prompt. Aborting it here left the client waiting out a
         # 30-second timeout, because an abort before scheduling never
@@ -238,10 +260,11 @@ class DocEngineScheduler(Scheduler):
         st = self._de_chain.get(request.request_id)
         if st is None:
             return new_token_ids, stopped
+        q = self._de_queries[st["qid"]]
         out = request._output_token_ids
         tok = out[-1] if out else None
-        if (not stopped and self._de_no and tok is not None
-                and (tok in self._de_yes or tok in self._de_no)):
+        if (not stopped and q["no"] and tok is not None
+                and (tok in q["yes"] or tok in q["no"])):
             # Decisive-token mode (a no set is registered): the model
             # may restate the line or append chatter, so the stage is
             # allowed several tokens but ends at the first token that
@@ -249,8 +272,8 @@ class DocEngineScheduler(Scheduler):
             request.status = RequestStatus.FINISHED_LENGTH_CAPPED
             stopped = True
         if stopped:
-            st["advance"] = (tok in self._de_yes
-                             and st["stage"] < len(self._de_questions))
+            st["advance"] = (tok in q["yes"]
+                             and st["stage"] < len(q["qs"]))
             if st["advance"]:
                 # The stop path reads a finish reason from the status
                 # right after this returns and sends it to the client,
@@ -276,12 +299,13 @@ class DocEngineScheduler(Scheduler):
                 self._de_dump_profile("chain-mode")
             return True
         st["advance"] = False
-        self._de_rewind(request, st["d"] + self._de_qc)
+        q = self._de_queries[st["qid"]]
+        self._de_rewind(request, st["d"] + q["qc"])
         st["stage"] += 1
         update = StreamingUpdate(
             mm_features=None,
             prompt_token_ids=list(
-                self._de_questions[st["stage"] - 1][self._de_qc:]),
+                q["qs"][st["stage"] - 1][q["qc"]:]),
             max_tokens=request.max_tokens,
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params)
@@ -300,11 +324,25 @@ class DocEngineScheduler(Scheduler):
             self._de_register(request)
             return
         if rid.startswith("de1|") and "|c|" in rid:
-            assert self._de_questions, "chain request before registration"
+            qid = parse_qid(rid)
+            q = self._de_queries.get(qid)
+            assert q, f"chain request before query {qid}'s registration"
             self._de_chain[rid] = dict(
-                stage=1,
-                d=request.num_prompt_tokens - len(self._de_questions[0]))
+                stage=1, qid=qid,
+                d=request.num_prompt_tokens - len(q["qs"][0]))
             request.priority = 0
+            # Shared scans pin the document under its chains: the pin
+            # (taken by whichever of the document's chains frees first)
+            # keeps the document's cache entries alive for sibling
+            # queries' chains that have not computed yet, and releases
+            # ride on later chain submissions like in request mode.
+            tag = parse_tag(rid)
+            if tag is not None:
+                pin, doc, rel, uses = tag
+                if rel:
+                    self._de_release(rel)
+                if pin > 0 and doc is not None and doc not in self._de_pins:
+                    self._de_intent[rid] = (pin, doc, uses)
             super().add_request(request)
             return
         tag = parse_tag(request.request_id)
@@ -321,34 +359,47 @@ class DocEngineScheduler(Scheduler):
         # run first, new document reads next, unplanned traffic (only
         # possible outside strict mode) last.
         if tag is not None:
-            pin, doc, rel = tag
+            pin, doc, rel, uses = tag
             request.priority = 1 if pin > 0 else 0
             if rel:
                 self._de_release(rel)
             if pin > 0 and doc is not None and doc not in self._de_pins:
-                self._de_intent[request.request_id] = (pin, doc)
+                self._de_intent[request.request_id] = (pin, doc, uses)
         else:
             request.priority = 2
         super().add_request(request)
 
+    def _de_free_pin(self, key):
+        blocks = self._de_pins.pop(key, None)
+        self._de_pin_refs.pop(key, None)
+        if blocks:
+            # dead by the plan's decree: strip cache entries, then
+            # drop the pin references; hashless blocks join the head
+            # of the free queue and are reusable immediately
+            self._de_evict({b.block_id for b in blocks})
+            self._de_pinned_ids.difference_update(
+                b.block_id for b in blocks)
+            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            self._de_stats["released"] += 1
+
     def _de_release(self, docs):
-        pool = self.kv_cache_manager.block_pool
-        keys = list(self._de_pins) if docs == ["*"] else docs
-        for key in keys:
-            blocks = self._de_pins.pop(key, None)
-            if blocks:
-                # dead by the plan's decree: strip cache entries, then
-                # drop the pin references; hashless blocks join the head
-                # of the free queue and are reusable immediately
-                self._de_evict({b.block_id for b in blocks})
-                self._de_pinned_ids.difference_update(
-                    b.block_id for b in blocks)
-                pool.free_blocks(reversed(blocks))
-                self._de_stats["released"] += 1
         if docs == ["*"]:
+            for key in list(self._de_pins):
+                self._de_free_pin(key)
             print(f"[de-sched] release-all: stats {self._de_stats}",
                   flush=True)
             self._de_dump_profile("request-mode")
+            return
+        for key in docs:
+            if key not in self._de_pins:
+                continue
+            # one mention per registered consumer: the pin frees only
+            # when every query that reads this document has released it
+            left = self._de_pin_refs.get(key, 1) - 1
+            if left > 0:
+                self._de_pin_refs[key] = left
+            else:
+                self._de_free_pin(key)
 
     def _free_request_blocks(self, request):
         if parse_tag(request.request_id) is not None:
@@ -359,12 +410,13 @@ class DocEngineScheduler(Scheduler):
             if (intent is not None
                     and request.num_computed_tokens >= intent[0]
                     and intent[1] not in self._de_pins):
-                pin_tokens, doc = intent
+                pin_tokens, doc, uses = intent
                 keep = [b for b in blocks[:pin_tokens // self.block_size]
                         if not b.is_null]
                 if keep:
                     self.kv_cache_manager.block_pool.touch(keep)
                     self._de_pins[doc] = keep
+                    self._de_pin_refs[doc] = uses
                     self._de_pinned_ids.update(b.block_id for b in keep)
                     self._de_stats["pinned"] += 1
                     self._de_stats["blocks"] += len(keep)
