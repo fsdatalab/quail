@@ -1245,3 +1245,23 @@ since the shipping stack itself is in question. Wrong answers
 against planted truth: 9,097 of 27,935 shared and 9,040 of 28,033
 separate (32.6 percent) - the 4B kernel accuracy shift compounds on
 this 32-flag workload, up from 19.2 percent on the old image.
+
+### The bf16-KV arm: no rescue, and the mechanism splits in two
+
+results/engine/chainbf16_10k.json, re-banked on the new image. With
+bf16 KV - which rules out fp8 attention entirely - the wrong rate
+is 4,462 of 20,591 calls (21.7 percent), against 18.4 percent for
+bf16 KV on the old image and 23.6 for fp8 KV on the new one. Chain
+and request mode agree perfectly here (identical wrong sets). So
+bf16 KV does not restore the old accuracy, and the shift decomposes
+into two parts: about 3 points that arrive with the new kernel
+substrate regardless of KV dtype (the GEMM path over the fp8
+weights - the new image warms DeepGEMM - and the FlashInfer prefill
+kernels are the candidates), plus about 8 further points specific
+to fp8 KV on the new stack (where the borrowed-q-scale fp8
+attention lives). The FLASH_ATTN arm in flight separates the
+attention kernels from the GEMM path: if its wrong rate stays near
+23 percent, the attention kernels are acquitted and the GEMM path
+is convicted; if it reverts toward 12.3, FlashInfer attention is
+convicted. Walls for the record, same host caveats as everywhere:
+chain 44.6 seconds, request mode 51.7, at the halved bf16 pool.
