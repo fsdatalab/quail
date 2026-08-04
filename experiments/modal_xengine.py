@@ -285,7 +285,7 @@ def _vllm_measure(arm, n_docs, llm_kwargs, drop_on_error=()):
     cfg = {k: v for k, v in kwargs.items() if k != "model"}
     return dict(
         arm=arm, engine=f"vllm {vllm.__version__}",
-        versions=dict(vllm=vllm.__version__, torch=torch.__version__),
+        versions=dict(vllm=vllm.__version__, torch=str(torch.__version__)),
         model=MODEL, n_docs=n_docs, fed_tokens=fed,
         cached_tokens=cached, prefilled_tokens=prefilled,
         wall_s=wall, tok_per_s=rate, pct_of_spec=rate / CEIL,
@@ -474,7 +474,7 @@ def sglang_arm(n_docs: int = 4000) -> dict:
     return dict(
         arm="sglang", engine=f"sglang {sglang.__version__}",
         versions=dict(sglang=sglang.__version__,
-                      torch=torch.__version__),
+                      torch=str(torch.__version__)),
         model=MODEL,
         precision="fp8 checkpoint weights, KV dtype 'auto' (sglang "
                   "default, bf16 KV); prefill compute is unaffected, "
@@ -551,7 +551,7 @@ def sglang_fp8kv_arm(n_docs: int = 4000) -> dict:
     return dict(
         arm="sglang_fp8kv", engine=f"sglang {sglang.__version__}",
         versions=dict(sglang=sglang.__version__,
-                      torch=torch.__version__),
+                      torch=str(torch.__version__)),
         model=MODEL,
         precision="fp8 checkpoint weights, fp8 KV (e4m3) - the KV "
                   "write configuration the vllm control ran",
@@ -650,7 +650,7 @@ def sglang_acc_arm(n_docs: int = 2000, kv: str = "auto") -> dict:
     return dict(
         arm="sglang_acc", engine=f"sglang {sglang.__version__}",
         versions=dict(sglang=sglang.__version__,
-                      torch=torch.__version__),
+                      torch=str(torch.__version__)),
         model=MODEL, workload="planted_flags",
         n_docs=n_docs, n_filters=n, s=s, flag_seed=FLAG_SEED,
         corpus_tokens=int(corpus), wall_s=wall,
@@ -791,8 +791,8 @@ def torch_arm(n_docs: int = 4000, batch_tokens: int = 32768) -> dict:
     return dict(
         arm="torch",
         engine=f"transformers {transformers.__version__} + "
-               f"torch {torch.__version__}",
-        versions=dict(torch=torch.__version__,
+               f"torch {str(torch.__version__)}",
+        versions=dict(torch=str(torch.__version__),
                       transformers=transformers.__version__,
                       attn_implementation=attn_impl,
                       torch_compile=compiled),

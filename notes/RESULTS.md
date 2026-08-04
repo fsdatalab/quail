@@ -1136,3 +1136,29 @@ calibration burst that normalizes rates. The speed control is safe:
 its arms ran inside one container and agreed within 4 percent.
 ENGINE_OVERHEAD_S cannot be recalibrated from these walls; PHI can,
 from the within-container speed control.
+
+### Run 4, the 32B tier: chain still wins, and 32B accuracy is untouched
+
+results/engine/model32_1k.json, re-banked, all four arms in one
+container so the comparisons are clean. Chain mode 29.3 seconds
+(stale 32.0), ranked requests 32.0 (stale 54.5 - that stale number
+carried the pin-overflow pathology), naive streaming 41.4 (stale
+48.1), task waves 42.1 (stale 49.5). The measured 32B prefill rate
+is now a banked field: 12,611 to 13,123 tokens per second across
+arms, compared with the 10,800 that lived only in prose - the
+toolchain gain reaches the 32B tier too, at about 17 percent. The
+decisive datum for the accuracy question: chain mode is wrong on 12
+of 2,531 decided calls (0.5 percent), the same order as the stale
+run's 9 of 2,616 - the new kernel set does NOT degrade the 32B
+checkpoint. The doubled wrong-answer rate is specific to the 4B fp8
+checkpoint on the new kernels. The request arms are wrong on 217 of
+2,738 calls, as before: the decisive-token gate is what protects
+accuracy on this tier, unchanged.
+
+The SGLang accuracy arm's first successful execution (its banking
+failed twice on a serialization bug, now fixed; the numbers below
+are from the run log and re-fly in progress): 900 of 3,999 calls
+wrong (22.5 percent) on SGLang's own kernel stack, matching the
+23.6 percent vLLM measures on the same toolchain family - the 4B
+accuracy shift reproduces across engines, so it is the kernel
+numerics on this checkpoint, not an engine bug.
