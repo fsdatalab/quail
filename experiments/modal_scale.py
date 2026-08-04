@@ -1002,7 +1002,7 @@ async def shard_worker(gpus: int, widx: int, n_docs: int = 10000) -> dict:
 
 @app.function(image=image, gpu="H100!", timeout=3600,
               volumes={"/root/.cache/huggingface": hf_cache})
-async def reason_run(n_docs: int = 2000) -> dict:
+async def reason_run(n_docs: int = 2000, big: int = 0) -> dict:
     """The measured reasoning grid (plan priority six). Thinking is
     simulated by force: min_tokens pins every filter call to exactly
     g+1 output tokens (g of decode before the window closes), so
@@ -1036,7 +1036,9 @@ async def reason_run(n_docs: int = 2000) -> dict:
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
     docs = _build_pool(n_docs)
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    mdl = MODEL32 if big else MODEL
+    budget = 200_000 if big else 700_000
+    tok = AutoTokenizer.from_pretrained(mdl)
     n, s = 4, 0.8
     rng = np.random.default_rng(FLAG_SEED + 7)
     flags = (rng.random((len(docs), n)) < s).astype(int)
@@ -1045,7 +1047,7 @@ async def reason_run(n_docs: int = 2000) -> dict:
     q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
              for j in range(n)]
     engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        model=mdl, kv_cache_dtype="fp8", max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True, scheduling_policy="priority",
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
@@ -1072,7 +1074,7 @@ async def reason_run(n_docs: int = 2000) -> dict:
         return dict(wall=_time.time() - t0, survivors=sorted(alive),
                     answers=answers, requests=len(answers))
 
-    report = dict(n_docs=n_docs, n_filters=n, s=s)
+    report = dict(n_docs=n_docs, n_filters=n, s=s, model=mdl)
     for g in (0, 32, 128, 512):
         # forced thinking: exactly g decode tokens, then the window
         m = g + 1
@@ -1085,7 +1087,7 @@ async def reason_run(n_docs: int = 2000) -> dict:
                 r = await waves(sp)
             else:
                 r = await run_filter_chain(
-                    engine, sp, body_ids, q_ids, 700_000,
+                    engine, sp, body_ids, q_ids, budget,
                     lookahead=1 if policy == "pipeline" else n,
                     tag=f"rg{g}{policy[0]}", tags=EngineTags(),
                     use_priority=True)
@@ -2027,6 +2029,9 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = ""):
     elif phase == "reason":
         data = reason_run.remote(n_docs or 2000)
         path = out or "results/engine/reason_grid.json"
+    elif phase == "reason32":
+        data = reason_run.remote(n_docs or 500, 1)
+        path = out or "results/engine/reason_grid32.json"
     elif phase == "longchain":
         data = longchain_run.remote()
         path = out or "results/engine/longchain.json"
