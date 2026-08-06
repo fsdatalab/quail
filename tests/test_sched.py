@@ -1,6 +1,6 @@
 """The N=10k constructors must emit validator-clean schedules. The
-comparison against the exact reference optimum lives in
-attic/tests/test_sched_exact.py with the reference solvers."""
+comparison against the deleted theory program's exact reference
+optimum is in git history with the program."""
 
 import numpy as np
 

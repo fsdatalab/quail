@@ -1,8 +1,7 @@
 """Checks for the live cost-model and instance layers, plus the toy
 model/device helpers shared by the test files. The verification battery
-for the exact reference solvers lives in attic/tests/test_exact_reference.py
-(same toy helpers, duplicated there so neither suite reaches across
-directories)."""
+for the deleted theory program's exact reference solvers is in git
+history with the program."""
 
 import random
 

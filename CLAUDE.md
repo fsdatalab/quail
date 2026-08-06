@@ -3,6 +3,13 @@
 Write every response simply, plainly, and clearly, like two human
 engineers talking to each other at a whiteboard. No jargon.
 
+- Use bullet points for any response longer than a few sentences.
+- No analogies or metaphors, ever. Say the literal thing: "the
+  experiment is running on Modal", not "the flight is in the air".
+- No invented shorthand or dramatic phrasing ("banked", "landed",
+  "armed", "healthy") when a plain verb exists: saved, finished,
+  set up, running.
+
 - Use everyday words. If a technical term is unavoidable, define it in
   one sentence the first time it appears, then use it consistently.
 - Short sentences. One idea per sentence. Lead with the answer, then
@@ -15,3 +22,13 @@ engineers talking to each other at a whiteboard. No jargon.
 - Code comments state constraints the code cannot show; nothing else.
 - Call the KV cache "KV". Do not rename it with analogies
   like "notes".
+- Call the one-question-at-a-time gated policy "pipelined", not
+  "gated chain". Call the ask-every-question policy "speculation".
+  Never describe a policy as a "chain" in responses; "chain" is a
+  code name, not an explanation.
+- When describing an experiment, state the setup in plain numbers
+  first: how many filters, the selectivity of each filter, how many
+  documents, the answer length, and the admission budget when it
+  matters.
+- Never say "arm" or "arms" for the runs of an experiment. Say
+  "run", "configuration", or name the policy being run.

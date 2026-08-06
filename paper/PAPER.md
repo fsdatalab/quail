@@ -697,6 +697,20 @@ seconds at a 50,000-token budget, 78.1 at 100,000, then flat
 within about 0.2 seconds out to 700,000 — the pool never binds at
 this scale.
 
+Correction, 2026-08-05: the speculation and lookahead walls above
+carry an instrument artifact. The client launched a document's
+speculative questions simultaneously, and the prefix cache reuses
+only committed blocks, so the branches each prefilled the document
+(results/engine/reason_race.json: with the launch staggered, full
+speculation at g=0 costs 10.15 seconds against the pipeline's
+9.27, not the 2x this grid shows; without the stagger the race
+reproduces, 19.51 seconds at 2.41 corpus reads). The pipeline and
+waves rows are unaffected. The grid's result file was retracted
+(deleted from results/; in git history) so the artifact cells
+cannot be quoted; the grid re-fly with the fixed client re-banks
+it. The g>0 speculation penalty (a wasted branch carries its
+thinking trace) is real but smaller than the rows above state.
+
 E5, fusion gate and crossover (complete; negative result). Goal as
 stated in advance: measure the surface from which the planner
 prices the fused-fork operator, and validate its correctness gate.

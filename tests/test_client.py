@@ -116,7 +116,9 @@ class ChainStubEngine:
     """Speaks the chain protocol: accepts the registration request,
     then plays each document's whole chain from the planted flags as
     one stream of growing snapshots (the engine-side rewind is
-    invisible to the client, which only sees the record grow)."""
+    invisible to the client, which only sees the record grow). A
+    chain carrying the "s" part is speculative: every stage answers,
+    the gate never ends the stream early."""
 
     def __init__(self, flags):
         self.flags = flags
@@ -130,12 +132,18 @@ class ChainStubEngine:
         if "|reg|" in request_id:
             yield _ChainOut(ids, [NO_TOK])
             return
-        i = int(request_id.split("|")[2][1:])
+        parts = request_id.split("|")[1:-1]
+        spec = "s" in parts
+        sw = next((int(p[2:]) for p in parts
+                   if p.startswith("sw") and p[2:].isdigit()), None)
+        i = int(next(p[1:] for p in parts
+                     if p.startswith("d") and len(p) > 1))
         toks = []
         for j in range(len(self.flags[0])):
             toks.append(YES_TOK if self.flags[i][j] else NO_TOK)
             yield _ChainOut(ids, list(toks))
-            if not self.flags[i][j]:
+            gated_here = not spec and (sw is None or j + 1 <= sw)
+            if not self.flags[i][j] and gated_here:
                 return
 
 
@@ -155,6 +163,317 @@ def test_run_query_dispatches_to_chain_mode():
         assert a == flags[i][j - 1]
 
 
+def test_spec_chain_answers_every_stage():
+    """A speculative chain records all n answers for every document,
+    survivors still judged by the all-yes rule, and stays one request
+    per document with the s directive on each."""
+    flags, body_ids, q_ids = _setup(30, 3, seed=11)
+    eng = ChainStubEngine(flags)
+    res = asyncio.run(run_filter_chain_engine(eng, None, body_ids, q_ids,
+                                              budget_tokens=10 ** 6,
+                                              yes_ids={YES_TOK},
+                                              spec=True))
+    for i in range(30):
+        for j in range(3):
+            assert res["answers"][(i, j + 1)] == flags[i][j]
+    assert res["survivors"] == [i for i in range(30) if all(flags[i])]
+    assert res["requests"] == 30
+    assert all("|s|" in r for r in eng.rids[1:])
+
+
+def test_run_query_dispatches_to_spec_mode():
+    """A plan with mode "spec" takes the speculative chain path; the
+    decisive-token window is never forwarded in spec mode."""
+    flags, body_ids, q_ids = _setup(20, 3, seed=7)
+
+    class _P:
+        mode = "spec"
+        budget_tokens = 10 ** 6
+        pin = False
+        stage_token_window = 1
+
+    eng = ChainStubEngine(flags)
+    res = asyncio.run(run_query(eng, None, body_ids, q_ids,
+                                yes_ids={YES_TOK}, plan=_P()))
+    assert len(res["answers"]) == 20 * 3
+    assert all("|s|" in r for r in eng.rids[1:])
+
+
+def test_query_takes_strings():
+    """The string entry point: documents and filters in, answers and
+    survivors out, tokenization inside."""
+    from docengine.api import query
+
+    flags, _, _ = _setup(20, 3, seed=17)
+
+    class _Tok:
+        def __call__(self, text, add_special_tokens=False):
+            if isinstance(text, list):
+                return {"input_ids": [self._ids(t) for t in text]}
+            return {"input_ids": self._ids(text)}
+
+        @staticmethod
+        def _ids(t):
+            u = t.strip().upper()
+            if u in ("YES", "Y"):
+                return [YES_TOK]
+            if u in ("NO", "N"):
+                return [NO_TOK]
+            return [7 + (len(t) + ord(t[0])) % 88] * max(4, len(t) // 4)
+
+    docs = [f"document number {i} says things" for i in range(20)]
+    fs = [f"Does condition {j} hold? Answer YES or NO." for j in range(3)]
+    eng = ChainStubEngine(flags)
+    res = asyncio.run(query(eng, docs, fs, est_selectivities=[0.6] * 3,
+                            tokenizer=_Tok(), sampling_params=None))
+    assert res["plan"].mode == "chain"
+    assert res["survivors"] == [i for i in range(20) if all(flags[i])]
+    for (i, j), a in res["answers"].items():
+        assert a == flags[i][j - 1]
+
+
+def test_query_policy_override_runs_speculation():
+    """policy="hybrid" forces the fork through the same string entry
+    point, and every filter answers (hybrid_map on a small corpus)."""
+    from docengine.api import query
+
+    flags, _, _ = _setup(12, 3, seed=19)
+
+    class _Tok:
+        def __call__(self, text, add_special_tokens=False):
+            if isinstance(text, list):
+                return {"input_ids": [self._ids(t) for t in text]}
+            return {"input_ids": self._ids(text)}
+
+        @staticmethod
+        def _ids(t):
+            u = t.strip().upper()
+            if u in ("YES", "Y"):
+                return [YES_TOK]
+            if u in ("NO", "N"):
+                return [NO_TOK]
+            return [9 + (len(t) + ord(t[0])) % 80] * 5
+
+    docs = [f"doc {i} with words in it" for i in range(12)]
+    fs = [f"Is property {j} present? Answer YES or NO." for j in range(3)]
+    eng = ChainStubEngine(flags)
+    res = asyncio.run(query(eng, docs, fs, policy="hybrid", gated=False,
+                            tokenizer=_Tok(), sampling_params=None))
+    assert res["plan"].operator == "hybrid_map"
+    assert len(res["answers"]) == 12 * 3
+
+
+def test_hybrid_gates_early_and_forks_late():
+    """spec_after=2: a document failing filter one or two stops (gated),
+    a document passing filter two answers everything remaining, and
+    survivors still need all yes."""
+    flags, body_ids, q_ids = _setup(30, 4, seed=23)
+    eng = ChainStubEngine(flags)
+    res = asyncio.run(run_filter_chain_engine(eng, None, body_ids, q_ids,
+                                              budget_tokens=10 ** 6,
+                                              yes_ids={YES_TOK},
+                                              spec_after=2))
+    for i in range(30):
+        if flags[i][0] and flags[i][1]:
+            assert (i, 3) in res["answers"]    # forked tail answers
+            assert (i, 4) in res["answers"]
+        elif flags[i][0]:
+            assert (i, 2) in res["answers"]    # failed at the gate
+            assert (i, 3) not in res["answers"]
+        else:
+            assert (i, 2) not in res["answers"]
+    assert res["survivors"] == [i for i in range(30) if all(flags[i])]
+    assert all("|sw2|" in r for r in eng.rids[1:])
+
+
+def test_query_orders_filters_cheapest_rejection_first():
+    """Estimated selectivities reorder execution (most selective
+    first for equal-cost prompts), answers come back under the
+    caller's original indices, and survivors are order-invariant."""
+    from docengine.api import query
+
+    rng = np.random.default_rng(41)
+    flags = (rng.random((20, 3)) < np.array([0.9, 0.05, 0.6])).astype(int)
+    order = (1, 2, 0)      # by (1 - s): 0.05, then 0.6, then 0.9
+    flags_exec = flags[:, list(order)]
+
+    class _Tok:
+        def __call__(self, text, add_special_tokens=False):
+            if isinstance(text, list):
+                return {"input_ids": [self._ids(t) for t in text]}
+            return {"input_ids": self._ids(text)}
+
+        @staticmethod
+        def _ids(t):
+            u = t.strip().upper()
+            if u in ("YES", "Y"):
+                return [YES_TOK]
+            if u in ("NO", "N"):
+                return [NO_TOK]
+            return [11 + (len(t) + ord(t[0])) % 80] * 6
+
+    docs = [f"document {i} contents here" for i in range(20)]
+    fs = [f"Does property {j} hold? Answer YES or NO." for j in range(3)]
+    eng = ChainStubEngine(flags_exec)
+    res = asyncio.run(query(eng, docs, fs,
+                            est_selectivities=[0.9, 0.05, 0.6],
+                            tokenizer=_Tok(), sampling_params=None))
+    assert res["filter_order"] == order
+    for i in range(20):
+        # the most selective filter (original index 1) ran first,
+        # so every document has its answer, under the original key
+        assert res["answers"][(i, 2)] == flags[i][1]
+    assert res["survivors"] == [i for i in range(20) if all(flags[i])]
+    for i in res["survivors"]:
+        assert res["answers"][(i, 1)] == flags[i][0]
+        assert res["answers"][(i, 3)] == flags[i][2]
+
+
+class _LabelTok:
+    """Maps class labels to fixed single tokens, everything else to
+    deterministic filler."""
+
+    LABELS = {"alpha": 301, "beta": 302, "gamma": 303}
+    eos_token_id = 999
+
+    @staticmethod
+    def decode(ids):
+        return " ".join(str(t) for t in ids)
+
+    def __call__(self, text, add_special_tokens=False):
+        if isinstance(text, list):
+            return {"input_ids": [self._ids(t) for t in text]}
+        return {"input_ids": self._ids(text)}
+
+    @classmethod
+    def _ids(cls, t):
+        u = t.strip()
+        if u in cls.LABELS:
+            return [cls.LABELS[u]]
+        if u.upper() in ("YES", "Y"):
+            return [YES_TOK]
+        if u.upper() in ("NO", "N"):
+            return [NO_TOK]
+        return [15 + (len(t) + ord(t[0])) % 70] * 5
+
+
+def test_classify_multiclass_single_token():
+    """classify: every prompt on every document, each answer exactly
+    one class label, judged by the sampled token."""
+    from docengine.api import classify
+
+    toks = [301, 302, 303]
+    rng = np.random.default_rng(43)
+    cls = rng.integers(0, 3, size=(15, 2))
+
+    class _ClassStub:
+        async def generate(self, prompt, sampling_params, request_id,
+                           priority=0):
+            ids = prompt["prompt_token_ids"]
+            await asyncio.sleep(0)
+            if "|reg|" in request_id:
+                yield _ChainOut(ids, [toks[0]])
+                return
+            parts = request_id.split("|")[1:-1]
+            i = int(next(p[1:] for p in parts
+                         if p.startswith("d") and len(p) > 1))
+            out = []
+            for j in range(2):
+                out.append(toks[cls[i][j]])
+                yield _ChainOut(ids, list(out))
+
+    docs = [f"document {i} with words" for i in range(15)]
+    prompts = ["Tone: alpha, beta, or gamma?",
+               "Topic: alpha, beta, or gamma?"]
+    res = asyncio.run(classify(_ClassStub(), docs, prompts,
+                               ["alpha", "beta", "gamma"],
+                               tokenizer=_LabelTok(),
+                               sampling_params=None))
+    labels = ["alpha", "beta", "gamma"]
+    for i in range(15):
+        for j in range(2):
+            assert res["answers"][(i, j + 1)] == labels[cls[i][j]]
+
+
+def test_map_generates_and_avoids_the_prefill_race():
+    """map: generated text per (document, prompt), and a document's
+    later prompts never launch before its first prompt has streamed
+    (the prefill-race discipline)."""
+    from docengine.api import map as map_docs
+
+    class _GenStub:
+        def __init__(self):
+            self.first_seen = set()
+            self.races = []
+
+        async def generate(self, prompt, sampling_params, request_id,
+                           priority=0):
+            i, j = (int(x) for x in request_id.rsplit("-", 2)[1:])
+            if j > 0 and i not in self.first_seen:
+                self.races.append((i, j))
+            await asyncio.sleep(0)
+            out = _ChainOut(prompt["prompt_token_ids"], [7])
+            out.outputs[0].text = f"generated {i}.{j}"
+            if j == 0:
+                self.first_seen.add(i)
+            yield out
+
+    # 200 documents: the rule says pipelined_map, per-pair requests
+    eng = _GenStub()
+    docs = [f"document {i} full of content" for i in range(200)]
+    res = asyncio.run(map_docs(eng, docs,
+                               ["Summarize this.", "List the dates."],
+                               tokenizer=_LabelTok(),
+                               sampling_params=None))
+    assert res["plan"].operator == "pipelined_map"
+    assert eng.races == []
+    for i in range(200):
+        assert res["texts"][(i, 1)] == f"generated {i}.0"
+        assert res["texts"][(i, 2)] == f"generated {i}.1"
+
+
+def test_map_forked_one_request_per_document():
+    """A small corpus plans hybrid_map: one request per document,
+    sibling generations spliced back with the end-of-sequence token
+    between stages, decoded under the caller's prompt indices."""
+    from docengine.api import map as map_docs
+
+    SEP = _LabelTok.eos_token_id
+
+    class _ForkGenStub:
+        def __init__(self):
+            self.rids = []
+
+        async def generate(self, prompt, sampling_params, request_id,
+                           priority=0):
+            self.rids.append(request_id)
+            ids = prompt["prompt_token_ids"]
+            await asyncio.sleep(0)
+            if "|reg|" in request_id:
+                yield _ChainOut(ids, [0])
+                return
+            parts = request_id.split("|")[1:-1]
+            i = int(next(p[1:] for p in parts
+                         if p.startswith("d") and len(p) > 1))
+            g1 = [500 + i, 501 + i]
+            yield _ChainOut(ids, list(g1))
+            yield _ChainOut(ids, g1 + [SEP, 600 + i]
+                            + [SEP, 700 + i, 701 + i])
+
+    eng = _ForkGenStub()
+    docs = [f"short doc {i}" for i in range(8)]
+    res = asyncio.run(map_docs(eng, docs,
+                               ["Summarize.", "Dates?", "People?"],
+                               tokenizer=_LabelTok(),
+                               sampling_params=None))
+    assert res["plan"].operator == "hybrid_map"
+    assert sum(1 for r in eng.rids if "|c|" in r and "|s|" in r) == 8
+    for i in range(8):
+        assert res["texts"][(i, 1)] == f"{500 + i} {501 + i}"
+        assert res["texts"][(i, 2)] == f"{600 + i}"
+        assert res["texts"][(i, 3)] == f"{700 + i} {701 + i}"
+
+
 def test_run_query_single_filter_uses_requests():
     """One filter has nothing to chain: the tagged request path runs,
     with a pin per document and the end-of-run flush."""
@@ -165,40 +484,6 @@ def test_run_query_single_filter_uses_requests():
     assert res["survivors"] == [i for i in range(15) if flags[i][0]]
     assert sum(1 for r in eng.rids if "|p" in r) == 15
     assert "r*" in eng.rids[-1].split("|")
-
-
-def test_lookahead_waste_recorded():
-    """lookahead=2 asks the second question ungated, so a doc failing
-    stage 1 still has a stage-2 answer recorded (the wasted branch),
-    and docs never advance past a failed block."""
-    flags, body_ids, q_ids = _setup(30, 4, seed=9)
-    eng = StubEngine(flags)
-    res = asyncio.run(run_filter_chain(eng, None, body_ids, q_ids,
-                                       budget_tokens=10 ** 6, lookahead=2))
-    for i in range(30):
-        assert (i, 2) in res["answers"]          # block 1 always both
-        if flags[i][0] and flags[i][1]:
-            assert (i, 3) in res["answers"]
-        else:
-            assert (i, 3) not in res["answers"]
-    want = [i for i in range(30) if all(flags[i])]
-    assert res["survivors"] == want
-
-
-def test_asymmetric_composition():
-    """composition=(1,2,1) gates after filter one, speculates filters
-    two and three together, gates filter four."""
-    flags, body_ids, q_ids = _setup(30, 4, seed=29)
-    eng = StubEngine(flags)
-    res = asyncio.run(run_filter_chain(eng, None, body_ids, q_ids,
-                                       budget_tokens=10 ** 6,
-                                       composition=(1, 2, 1)))
-    assert res["survivors"] == [i for i in range(30) if all(flags[i])]
-    for i in range(30):
-        if flags[i][0]:
-            assert (i, 3) in res["answers"]   # block two both asked
-        else:
-            assert (i, 2) not in res["answers"]
 
 
 class SharedChainStubEngine:

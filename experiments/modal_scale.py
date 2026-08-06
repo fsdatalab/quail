@@ -445,7 +445,7 @@ async def pinned_run(variant: str = "pinned", n_docs: int = 10000,
         stats = dict(done=0, lat_s=0.0, offered=0)
         bg = asyncio.create_task(cotenant(stop, stats)) if junk else None
         chain_coro = run_filter_chain(
-            engine, sp, body_ids, q_ids, budget, lookahead=1,
+            engine, sp, body_ids, q_ids, budget,
             tag=f"n{n}s{int(100 * s_vec[0])}",
             tags=EngineTags() if ext else None, use_priority=ext)
         timed_out = False
@@ -571,7 +571,7 @@ async def profile_run(n_docs: int = 4000) -> dict:
         if inspect.isawaitable(res):
             await res
         out = await run_filter_chain(engine, sp, body_ids, q_ids,
-                                     budget_tokens=830_000, lookahead=1,
+                                     budget_tokens=830_000,
                                      tag=tag, tags=EngineTags(),
                                      use_priority=True)
         return out
@@ -716,7 +716,7 @@ async def persist_run(n_docs: int = 2000) -> dict:
 
     async def one_query(engine, tag):
         return await run_filter_chain(engine, sp, body_ids, q_ids,
-                                      830_000, lookahead=1, tag=tag)
+                                      830_000, tag=tag)
 
     async def reset(engine):
         res = engine.reset_prefix_cache()
@@ -960,7 +960,7 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
     bank("task_waves", await wave_arm(engine))
     await reset(engine)
     r = await run_filter_chain(engine, sp, body_ids, q_ids,
-                               budget_tokens=10 ** 9, lookahead=1,
+                               budget_tokens=10 ** 9,
                                tag="m32n")
     bank("doc_naive", r)
     try:
@@ -974,7 +974,7 @@ async def model32_run(n_docs: int = 1000, probe: int = 0) -> dict:
 
     engine = make_engine(ours=True)
     r = await run_filter_chain(engine, sp, body_ids, q_ids,
-                               budget_tokens=200_000, lookahead=1,
+                               budget_tokens=200_000,
                                tag="m32r", tags=EngineTags(),
                                use_priority=True)
     bank("request_ranked", r)
@@ -1053,23 +1053,22 @@ async def shard_worker(gpus: int, widx: int, n_docs: int = 10000) -> dict:
                 survivors=sorted(mine[i] for i in res["survivors"]))
 
 
-@app.function(image=image, gpu="H100!", timeout=3600,
+# ------------------------------------------------------ spec parity
+
+@app.function(image=image, gpu="H100!", timeout=1800,
               volumes={"/root/.cache/huggingface": hf_cache})
-async def reason_run(n_docs: int = 2000, big: int = 0, width_sweep: int = 0) -> dict:
-    """The measured reasoning grid (plan priority six). Thinking is
-    simulated by force: min_tokens pins every filter call to exactly
-    g+1 output tokens (g of decode before the window closes), so
-    selectivity and length stay controlled with no artificial hard
-    task. Grid: g in {0, 32, 128, 512} x three policies - gated chain
-    (pipeline), full speculation via ungated requests (lookahead n),
-    and stage-major task waves - at n=4, s=0.8, on one engine.
-    Answers come from the planted flags via the decisive-word rule on
-    the full output text; correctness is anchored by the g=0 column
-    (the banked one-token world)."""
-    import asyncio
+async def spec_smoke_run(n_docs: int = 500,
+                         step_budget: int = 0) -> dict:
+    """Parity smoke for the in-engine speculative chain: one corpus,
+    one question set, run two ways - pipelined (gated, in-engine) and
+    speculative (all answers, in-engine, one request per document,
+    forked siblings when DOCENGINE_FORKS=1, the default). Banks walls,
+    corpus read multipliers, and answer agreement. The original
+    three-arm run also measured the client-side speculation this
+    replaced (results/engine/spec_smoke.json, 2026-08-05); that arm
+    was deleted with the client path."""
     import inspect
     import os
-    import time as _time
 
     import numpy as np
     from transformers import AutoTokenizer
@@ -1084,25 +1083,58 @@ async def reason_run(n_docs: int = 2000, big: int = 0, width_sweep: int = 0) -> 
     except ImportError:
         from vllm import AsyncEngineArgs
 
-    from docengine.runtime.engine_client import (EngineTags, _yes,
-                                                 run_filter_chain)
+    from docengine.runtime.engine_client import (
+        EngineTags, run_filter_chain, run_filter_chain_engine)
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    # the step recorder prints, per drain, how many engine steps ran
+    # and the mean tokens per step: the direct measurement of batch
+    # size under each policy (forked speculation must show fewer
+    # steps at more tokens per step than the pipelined run)
+    os.environ["DOCENGINE_STEPSTATS"] = "1"
     docs = _build_pool(n_docs)
-    mdl = MODEL32 if big else MODEL
-    budget = 200_000 if big else 700_000
-    tok = AutoTokenizer.from_pretrained(mdl)
-    n, s = 4, 0.8
-    rng = np.random.default_rng(FLAG_SEED + 7)
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    # selectivity 1: every document passes every filter, so gating
+    # saves nothing and both policies do identical work, token for
+    # token. Any wall difference is pure execution shape - the
+    # cleanest cell for the fork's more-filters-per-batch claim, and
+    # the stand-in for classifier sets
+    n, s = 4, 1.0
+    rng = np.random.default_rng(FLAG_SEED + 11)
     flags = (rng.random((len(docs), n)) < s).astype(int)
     bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
     body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
     q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
              for j in range(n)]
+    yes_ids = set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            yes_ids.add(ids[0])
+    corpus = sum(len(b) for b in body_ids)
+    from vllm.config import KVTransferConfig
+    # step_budget = max_num_batched_tokens, the tokens one round may
+    # compute; 0 keeps the engine default, except that the engine
+    # requires round budget >= sequence cap, so the cap sets a floor
+    seq_cap = n_docs * n + 64
+    budget_kw = {"max_num_batched_tokens":
+                 max(step_budget or 2048, seq_cap)}
     engine = Engine.from_engine_args(AsyncEngineArgs(
-        model=mdl, kv_cache_dtype="fp8", max_model_len=4608,
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
         gpu_memory_utilization=0.92, enable_prefix_caching=True,
         disable_log_stats=True, scheduling_policy="priority",
+        **budget_kw,
+        # speculation multiplies live sequences by the filter count,
+        # so the sequence cap must not bind before the token budget
+        # does; sized from this instrument's own numbers, the same
+        # arithmetic plan_query ships in Plan.engine_max_seqs
+        max_num_seqs=seq_cap,
+        # the fork connector: siblings' partial boundary blocks are
+        # copied from the parent instead of recomputed
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="DocEngineForkConnector",
+            kv_connector_module_path="docengine.engineext.forkconnector",
+            kv_role="kv_both"),
         scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
 
     async def reset():
@@ -1110,73 +1142,197 @@ async def reason_run(n_docs: int = 2000, big: int = 0, width_sweep: int = 0) -> 
         if inspect.isawaitable(res):
             await res
 
-    async def waves(sp):
-        alive = list(range(len(body_ids)))
-        answers = {}
-        t0 = _time.time()
-        for j in range(n):
-            async def one(i, jj=j):
-                final = None
-                async for out in engine.generate(
-                        {"prompt_token_ids": body_ids[i] + q_ids[jj]},
-                        sp, f"de1|rw{jj}|{i}-w"):
-                    final = out
-                answers[(i, jj + 1)] = _yes(final)
-            await asyncio.gather(*[one(i) for i in alive])
-            alive = [i for i in alive if answers[(i, j + 1)]]
-        return dict(wall=_time.time() - t0, survivors=sorted(alive),
-                    answers=answers, requests=len(answers))
+    sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
+                        skip_clone=True)
+    report = dict(n_docs=n_docs, n_filters=n, s=s, model=MODEL,
+                  corpus_tokens=int(corpus), image=IMAGE_STAMP,
+                  step_budget=step_budget or "default")
+    # the workload is binary classification: every prompt on every
+    # document. classifier_pipelined asks one prompt per round;
+    # classifier_spec asks the remaining prompts in one round.
+    # gated_reference is the filter policy, kept only as a reference
+    # row - it is not a valid classifier executor (it drops answers)
+    runs = {}
+    await reset()
+    runs["gated_reference"] = await run_filter_chain_engine(
+        engine, sp, body_ids, q_ids, 700_000, yes_ids, tag="ps")
+    await reset()
+    runs["classifier_spec"] = await run_filter_chain_engine(
+        engine, sp, body_ids, q_ids, 700_000, yes_ids, tag="sf",
+        spec=True)
+    await reset()
+    runs["classifier_pipelined"] = await run_filter_chain_engine(
+        engine, sp, body_ids, q_ids, 700_000, yes_ids, tag="sq",
+        spec=True, forked=False)
+    for name, r in runs.items():
+        wrong = sum(1 for k, v in r["answers"].items()
+                    if v != flags[k[0]][k[1] - 1])
+        reads = round((r.get("prompt_tokens", 0)
+                       - r.get("cached_tokens", 0)) / corpus, 3)
+        report[name] = dict(wall=round(r["wall"], 2),
+                            requests=r["requests"],
+                            survivors=len(r["survivors"]),
+                            wrong=wrong, reads=reads)
+        print(f"[spec-smoke] {name}: {r['wall']:.2f}s, "
+              f"{r['requests']} requests, reads {reads}, wrong {wrong}",
+              flush=True)
+    sf = runs["classifier_spec"]["answers"]
+    sq = runs["classifier_pipelined"]["answers"]
+    pl = runs["gated_reference"]["answers"]
+    report["all_stages_answered"] = bool(
+        len(sf) == len(sq) == len(body_ids) * n)
+    # the decisive comparison: the two classifier executors, identical
+    # semantics, only the round packing differs
+    report["spec_vs_pipelined_mismatch"] = sum(
+        1 for k in sq if sf.get(k) != sq[k])
+    report["gated_prefix_mismatch"] = sum(
+        1 for k in pl if sq.get(k) != pl[k])
+    print(f"[spec-smoke] all stages answered "
+          f"{report['all_stages_answered']}, spec vs pipelined "
+          f"mismatches {report['spec_vs_pipelined_mismatch']}/{len(sq)},"
+          f" gated prefix mismatches "
+          f"{report['gated_prefix_mismatch']}/{len(pl)}", flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return report
 
-    report = dict(n_docs=n_docs, n_filters=n, s=s, model=mdl,
-                  image=IMAGE_STAMP)
-    if width_sweep:
-        # Is decode width the binding resource? Same workload, g=128,
-        # gated pipeline, admission budget swept from starved to the
-        # pool: if the wall falls inversely with width until the pool
-        # binds, width-first planning is the reasoning regime's knob.
-        g = 128
-        sp = SamplingParams(temperature=0.0, max_tokens=g + 1,
-                            min_tokens=g + 1, skip_clone=True)
-        for b in (50_000, 100_000, 200_000, 400_000, 700_000):
+
+
+# ------------------------------------------------------ underfilled rounds
+
+@app.function(image=image, gpu="H100!", timeout=2400,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def underfill_run(n_docs: int = 20, n_filters: int = 6,
+                        reps: int = 30) -> dict:
+    """The underfilled-round cell: few documents, many filters, so
+    rounds are paced by answer dependencies, not capacity. Stated
+    predictions, before the run: (a) classifier speculation saves
+    about n_filters - 2 round times per query against classifier
+    pipelining, because it answers everything two rounds after the
+    read instead of one round per filter; (b) the hybrid (gate, then
+    fork the survivors) never loses to pure gating. Small runs drown
+    in host noise, so each policy runs `reps` times and the
+    within-container means are the comparison. A second cell (500
+    documents, halving filters) checks the planner's mid-chain
+    switch stage against pure gating."""
+    import inspect
+    import time as _time
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+    from vllm.config import KVTransferConfig
+
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    except ImportError:
+        from vllm import AsyncLLMEngine as Engine
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except ImportError:
+        from vllm import AsyncEngineArgs
+    import os
+
+    from docengine.engineext.chainlogic import hybrid_switch_stage
+    from docengine.runtime.engine_client import run_filter_chain_engine
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    yes_ids = set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            yes_ids.add(ids[0])
+
+    def build(n, count, s, seed):
+        docs = _build_pool(count)
+        rng = np.random.default_rng(FLAG_SEED + seed)
+        flags = (rng.random((count, n)) < s).astype(int)
+        bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+        body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+        q_ids = [tok(_question(j + 1),
+                     add_special_tokens=False)["input_ids"]
+                 for j in range(n)]
+        return body_ids, q_ids, flags
+
+    engine = Engine.from_engine_args(AsyncEngineArgs(
+        model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+        gpu_memory_utilization=0.92, enable_prefix_caching=True,
+        disable_log_stats=True, scheduling_policy="priority",
+        max_num_seqs=max(512, 500 * n_filters + 64),
+        # the engine requires round budget >= sequence cap: every
+        # allowed sequence needs at least one token's room per round
+        max_num_batched_tokens=max(2048, 500 * n_filters + 64),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="DocEngineForkConnector",
+            kv_connector_module_path="docengine.engineext.forkconnector",
+            kv_role="kv_both"),
+        scheduler_cls="docengine.engineext.scheduler.DocEngineScheduler"))
+
+    async def reset():
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+
+    sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
+                        skip_clone=True)
+    report = dict(n_docs=n_docs, n_filters=n_filters, reps=reps,
+                  model=MODEL, image=IMAGE_STAMP)
+
+    # cell A: the latency cell - few documents, many filters
+    body_ids, q_ids, flags = build(n_filters, n_docs, 0.7, 31)
+    policies = dict(
+        gated_pipelined=dict(),
+        hybrid=dict(spec_after=hybrid_switch_stage(
+            n_docs, [0.7] * n_filters, 13, 2048) or 1),
+        classifier_pipelined=dict(spec=True, forked=False),
+        classifier_spec=dict(spec=True))
+    walls = {p: [] for p in policies}
+    answers0 = {}
+    for rep in range(reps):
+        for pol, kw in policies.items():
             await reset()
-            r = await run_filter_chain(
-                engine, sp, body_ids, q_ids, b, lookahead=1,
-                tag=f"wd{b // 1000}", tags=EngineTags(),
-                use_priority=True)
-            report[f"b{b // 1000}k"] = round(r["wall"], 2)
-            print(f"[width] budget {b}: {r['wall']:.2f}s", flush=True)
-        try:
-            engine.shutdown()
-        except Exception:
-            pass
-        return report
-    for g in (0, 32, 128, 512):
-        # forced thinking: exactly g decode tokens, then the window
-        m = g + 1
-        sp = SamplingParams(temperature=0.0, max_tokens=m,
-                            min_tokens=m, skip_clone=True)
-        cell = {}
-        for policy in ("pipeline", "spec2", "spec", "waves"):
+            t0 = _time.time()
+            r = await run_filter_chain_engine(
+                engine, sp, body_ids, q_ids, 700_000, yes_ids,
+                tag=f"u{rep}{pol[:3]}", **kw)
+            walls[pol].append(_time.time() - t0)
+            if rep == 0:
+                answers0[pol] = r["answers"]
+    cell_a = {}
+    for pol, ws in walls.items():
+        cell_a[pol] = dict(mean_s=round(float(np.mean(ws)), 4),
+                           std_s=round(float(np.std(ws)), 4),
+                           reps=len(ws))
+        print(f"[underfill] {pol}: mean {np.mean(ws):.4f}s "
+              f"std {np.std(ws):.4f} over {len(ws)} reps", flush=True)
+    sf, sq = answers0["classifier_spec"], answers0["classifier_pipelined"]
+    cell_a["spec_vs_pipelined_mismatch"] = sum(
+        1 for k in sq if sf.get(k) != sq[k])
+    report["latency_cell"] = cell_a
+
+    # cell B: the planner's mid-chain switch on a corpus where gating
+    # still fills rounds for two stages (500 docs, halving filters)
+    body_ids, q_ids, flags = build(6, 500, 0.5, 37)
+    sw = hybrid_switch_stage(500, [0.5] * 6, 13, 2048)
+    cell_b = dict(switch_stage=sw)
+    for pol, kw in (("gated_pipelined", {}),
+                    ("hybrid", dict(spec_after=sw))):
+        ws = []
+        for rep in range(3):
             await reset()
-            if policy == "waves":
-                r = await waves(sp)
-            else:
-                k = dict(pipeline=1, spec2=2, spec=n)[policy]
-                r = await run_filter_chain(
-                    engine, sp, body_ids, q_ids, budget,
-                    lookahead=k, tag=f"rg{g}{policy}",
-                    tags=EngineTags(), use_priority=True)
-            wrong = sum(1 for k, v in r["answers"].items()
-                        if v != flags[k[0]][k[1] - 1])
-            cell[policy] = dict(wall=round(r["wall"], 2),
-                                requests=r["requests"],
-                                survivors=len(r["survivors"]),
-                                wrong=wrong)
-            print(f"[reason] g={g} {policy}: {r['wall']:.2f}s, "
-                  f"{r['requests']} requests, "
-                  f"{len(r['survivors'])} survivors, wrong {wrong}",
-                  flush=True)
-        report[f"g{g}"] = cell
+            t0 = _time.time()
+            await run_filter_chain_engine(
+                engine, sp, body_ids, q_ids, 700_000, yes_ids,
+                tag=f"h{rep}{pol[:3]}", **kw)
+            ws.append(_time.time() - t0)
+        cell_b[pol] = dict(mean_s=round(float(np.mean(ws)), 3),
+                           reps=3)
+        print(f"[underfill] mid-chain {pol}: mean {np.mean(ws):.3f}s "
+              f"(switch after stage {sw})", flush=True)
+    report["midchain_cell"] = cell_b
     try:
         engine.shutdown()
     except Exception:
@@ -1245,9 +1401,11 @@ async def longdoc_run() -> dict:
         if inspect.isawaitable(res):
             await res
 
+    # the k=2 client-side lookahead arm was deleted with the client
+    # speculation path (its banked cell, longdoc.json's k=2 pathology,
+    # is about a mechanism that no longer exists)
     results = []
-    for count, target, k in ((100, 30_000, 1), (100, 30_000, 2),
-                             (30, 100_000, 1)):
+    for count, target in ((100, 30_000), (30, 100_000)):
         docs = build_long(count, target)
         rng = np.random.default_rng(FLAG_SEED + count)
         flags = (rng.random((count, n)) < s).astype(int)
@@ -1258,19 +1416,19 @@ async def longdoc_run() -> dict:
         corpus = sum(len(x) for x in body_ids)
         await reset_cache()
         res = await run_filter_chain(engine, sp, body_ids, q_ids,
-                                     budget_tokens=830_000, lookahead=k,
-                                     tag=f"ld{target}k{k}",
+                                     budget_tokens=830_000,
+                                     tag=f"ld{target}",
                                      tags=EngineTags(), use_priority=True)
         agree = sum(1 for (i, j), a in res["answers"].items()
                     if a == flags[i][j - 1]) / max(1, len(res["answers"]))
         floor = corpus / 80_000.0
         hit = res["cached_tokens"] / max(1, res["prompt_tokens"])
-        results.append(dict(count=count, target=target, k=k,
+        results.append(dict(count=count, target=target, k=1,
                             corpus_tokens=corpus, makespan=res["wall"],
                             floor_s=floor, ratio=res["wall"] / floor,
                             cache_hit=hit, agreement=agree,
                             requests=res["requests"]))
-        print(f"[longdoc] {count}x{target} k={k}: {res['wall']:.1f}s, "
+        print(f"[longdoc] {count}x{target}: {res['wall']:.1f}s, "
               f"floor {floor:.1f}s, ratio {res['wall'] / floor:.2f}, "
               f"hit {100 * hit:.1f}%, agree {agree:.3f}", flush=True)
     try:
@@ -1364,7 +1522,9 @@ async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
             await res
 
     arms = {}
-    for arm in ("k1", "k2", "chain"):
+    # the k2 client-side lookahead arm was deleted with the client
+    # speculation path; the in-engine speculative chain replaces it
+    for arm in ("k1", "chain"):
         await reset_cache()
         if arm == "chain":
             res = await run_filter_chain_engine(
@@ -1372,8 +1532,7 @@ async def longchain_run(count: int = 100, target: int = 30_000) -> dict:
             res.pop("doc0_raw", None)
         else:
             res = await run_filter_chain(
-                engine, sp, body_ids, q_ids, 830_000,
-                lookahead=int(arm[1]), tag=f"l{arm}",
+                engine, sp, body_ids, q_ids, 830_000, tag=f"l{arm}",
                 tags=EngineTags(), use_priority=True)
         agree = sum(1 for (i, j), a in res["answers"].items()
                     if not isinstance(i, str) and a == flags[i][j - 1])
@@ -1492,7 +1651,7 @@ async def chain_run(n_docs: int = 50, n_filters: int = 2,
             await res
 
     a = await run_filter_chain(engine, sp, body_ids, q_ids, budget,
-                               lookahead=1, tag="rm", tags=EngineTags(),
+                               tag="rm", tags=EngineTags(),
                                use_priority=True)
     await reset_cache()
     b = await run_filter_chain_engine(engine, sp, body_ids, q_ids,
@@ -1631,7 +1790,7 @@ async def strict_run(n_docs: int = 10000) -> dict:
                  for j in range(n)]
         await reset_cache()
         res = await run_filter_chain(
-            engine, sp, body_ids, q_ids, budget, lookahead=1,
+            engine, sp, body_ids, q_ids, budget,
             tag=f"n{n}s{int(100 * s_vec[0])}", tags=EngineTags(),
             use_priority=True)
         answers = {f"{i},{j}": a for (i, j), a in res["answers"].items()}
@@ -1799,9 +1958,11 @@ async def client_run(n_docs: int = 10000) -> dict:
         if inspect.isawaitable(res):
             await res
 
+    # the k=2 client-side lookahead rows were deleted with the client
+    # speculation path; the in-engine speculative chain replaces them
     results = []
-    grid = ((2, (0.5, 0.5), 1), (2, (0.5, 0.5), 2),
-            (4, (0.8,) * 4, 1), (4, (0.95,) * 4, 1), (4, (0.95,) * 4, 2))
+    grid = ((2, (0.5, 0.5), 1),
+            (4, (0.8,) * 4, 1), (4, (0.95,) * 4, 1))
     for n, s_vec, k in grid:
         rng = np.random.default_rng(FLAG_SEED + 1000 * n + int(100 * s_vec[0]))
         flags = (rng.random((len(docs), n)) < np.asarray(s_vec)).astype(int)
@@ -1814,7 +1975,7 @@ async def client_run(n_docs: int = 10000) -> dict:
                   for j in range(n)]
         await reset_cache()
         res = await run_filter_chain(
-            engine, sp, body_ids, q_ids, budget, lookahead=k,
+            engine, sp, body_ids, q_ids, budget,
             tag=f"n{n}s{int(100 * s_vec[0])}k{k}")
         answers = {f"{i},{j}": a for (i, j), a in res["answers"].items()}
         agree = sum(1 for (i, j), a in res["answers"].items()
@@ -2090,19 +2251,10 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = "",
         data = strict_run.remote(nd)
         path = out or ("results/engine/strict10k.json.gz" if nd == 10000
                        else f"results/engine/strict_{nd}.json.gz")
-    elif phase == "chain":
-        data = chain_run.remote(n_docs or 50)
-        path = out or "results/engine/chain_smoke.json"
-    elif phase == "chain4":
-        data = chain_run.remote(n_docs or 50, 4, 0.8)
-        path = out or "results/engine/chain4_smoke.json"
     elif phase == "chain10k":
         data = chain_run.remote(n_docs or 10000, 4, 0.8,
                                 attn_backend=attn_backend)
         path = out or "results/engine/chain10k.json"
-    elif phase == "chaincore":
-        data = chain_run.remote(n_docs or 10000, 4, 0.8, 1)
-        path = out or "results/engine/chaincore10k.json"
     elif phase == "chainsteps":
         data = chain_run.remote(n_docs or 10000, 4, 0.8, 2)
         path = out or "results/engine/chainsteps10k.json"
@@ -2118,9 +2270,6 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = "",
     elif phase == "model32":
         data = model32_run.remote(n_docs or 1000)
         path = out or "results/engine/model32_1k.json"
-    elif phase == "model32probe":
-        data = model32_run.remote(n_docs or 16, 1)
-        path = out or "results/engine/model32_probe.json"
     elif phase in ("multigpu2", "multigpu4", "multigpu8"):
         g = int(phase[len("multigpu"):])
         nd = n_docs or 10000
@@ -2140,15 +2289,12 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = "",
               f"{[round(w, 2) for w in walls]}, {len(surv)} survivors",
               flush=True)
         path = out or f"results/engine/multigpu{g}.json"
-    elif phase == "reason":
-        data = reason_run.remote(n_docs or 2000)
-        path = out or "results/engine/reason_grid.json"
-    elif phase == "width":
-        data = reason_run.remote(n_docs or 2000, 0, 1)
-        path = out or "results/engine/width_scaling.json"
-    elif phase == "reason32":
-        data = reason_run.remote(n_docs or 500, 1)
-        path = out or "results/engine/reason_grid32.json"
+    elif phase == "specsmoke":
+        data = spec_smoke_run.remote(n_docs or 500)
+        path = out or "results/engine/spec_smoke.json"
+    elif phase == "underfill":
+        data = underfill_run.remote(n_docs or 20)
+        path = out or "results/engine/underfill.json"
     elif phase == "longchain":
         data = longchain_run.remote()
         path = out or "results/engine/longchain.json"

@@ -8,7 +8,8 @@ state. tests/test_engineext_logic.py covers this module with no engine
 installed; a vLLM version bump can break the adapter, not these rules.
 
 The request-id protocol is documented in scheduler.py's module
-docstring; the rewind mechanics in notes/TRUNCATION_DESIGN.md.
+docstring; the rewind mechanics in paper/PAPER.md section 4 and the
+ledger's chain-proof section (notes/RESULTS.md).
 """
 
 
@@ -70,6 +71,49 @@ def is_chain(request_id):
     """A chain request: one living request runs a document's whole
     filter chain."""
     return request_id.startswith("de1|") and "|c|" in request_id
+
+
+def is_spec(request_id):
+    """A speculative chain: the same living request, but the engine
+    advances through every stage regardless of the gate, so a query
+    that needs all answers (a classifier set) gets them from one
+    request per document. The "s" part rides alongside "c"; the
+    machinery is identical except the advance rule."""
+    return request_id.startswith("de1|") and "|s|" in request_id
+
+
+def is_seq(request_id):
+    """The sq part forces a speculative chain onto the sequential
+    stage-by-stage path instead of forked siblings: the per-request
+    control for fork validation."""
+    return request_id.startswith("de1|") and "|sq|" in request_id
+
+
+def parse_switch(request_id):
+    """The hybrid policy's switch stage from the sw<j> part: a gated
+    chain that passes stage j forks all remaining filters instead of
+    appending the next one, because too few documents survive past j
+    to fill a round with gated work. None when absent (pure gating).
+    Like every directive, the suffix is never read."""
+    for part in request_id.split("|")[1:-1]:
+        if part.startswith("sw") and part[2:].isdigit():
+            return int(part[2:])
+    return None
+
+
+def hybrid_switch_stage(n_docs, selectivities, question_tail_tokens,
+                        round_tokens):
+    """The first stage j after which the expected survivors' gated
+    question work no longer fills a round: survivors(j) x tail <
+    round_tokens. Returns 0 when gating fills rounds through the
+    whole chain (never switch), and 1 when even stage two would run
+    underfilled (fork everything after the first answer)."""
+    surviving = float(n_docs)
+    for j, s in enumerate(selectivities[:-1], start=1):
+        surviving *= s
+        if surviving * question_tail_tokens < round_tokens:
+            return j
+    return 0
 
 
 def is_release_all(releases):
@@ -134,7 +178,8 @@ def rewind_target(d, qc):
     reference query the preamble is 33 tokens; erasing it made every
     continuation recompute it, and that recomputation - 353,654 extra
     tokens across the continuations of a 10,000-document run - was the
-    entire 4.4-second first-flight deficit (TRUNCATION_DESIGN.md)."""
+    entire 4.4-second first-flight deficit (the ledger's chain-proof
+    section in notes/RESULTS.md)."""
     return d + qc
 
 
@@ -211,6 +256,127 @@ def stage_advances(decision, stage, n_stages):
     A fail, an undecided window, or the final stage keeps the engine's
     real finish, which closes the client's stream."""
     return decision == PASSED and stage < n_stages
+
+
+def spec_advances(stage, n_stages):
+    """A speculative chain advances past every stage but the last,
+    whatever the gate said: the query needs all answers, so a failed
+    stage never ends the document early. Spec mode assumes the
+    one-token answer contract (no decisive-token window): every stage
+    emits exactly one token, so the client's stage record stays
+    aligned."""
+    return stage < n_stages
+
+
+# ---- forked speculation -------------------------------------------------
+
+def fork_rid(parent_rid, stage):
+    """The request id of a scheduler-fabricated sibling: the parent's
+    id with a fk<stage> part spliced before the suffix. Siblings never
+    pass through add_request's directive parsing (the scheduler
+    creates them directly), so the part is for logs and uniqueness,
+    not dispatch."""
+    head, _, suffix = parent_rid.rpartition("|")
+    return f"{head}|fk{stage}|{suffix}"
+
+
+class ForkBoard:
+    """Answer collection for one forked document. The parent request
+    samples stage 1 itself and parks; each fabricated sibling owns one
+    of stages 2..n and reports its single answer token here. When the
+    board is full, the parent's stream is finished with the collected
+    tokens in stage order, so the client sees the same n-token record
+    a sequential speculative chain produces."""
+
+    def __init__(self, stages):
+        self.want = frozenset(stages)
+        self.got = {}
+        self.diag = {}   # stage -> opaque per-sibling diagnostics
+
+    def record(self, stage, toks):
+        """Store a sibling's output (a token list: one token for
+        filters and classify, a whole generation for maps); returns
+        True when the board just became complete (exactly once)."""
+        was_done = self.done
+        self.got[stage] = list(toks)
+        return self.done and not was_done
+
+    @property
+    def done(self):
+        return set(self.got) >= self.want
+
+    def in_stage_order(self):
+        """The collected outputs sorted by stage."""
+        return [self.got[s] for s in sorted(self.got)]
+
+
+def splice(outputs, sep):
+    """Flatten per-stage outputs for the parent's stream. With no
+    separator (single-token stages), plain concatenation - the client
+    reads one token per stage. With a separator (generative stages),
+    one sep token lands between stages; generations stop at the
+    end-of-sequence token and so never contain it, which is what
+    makes the separator unambiguous."""
+    flat = []
+    for k, toks in enumerate(outputs):
+        if sep is not None and k > 0:
+            flat.append(sep)
+        flat.extend(toks)
+    return flat
+
+
+def parse_sep(request_id):
+    """The separator token id from a registration's E part; None when
+    absent (single-token stages need no separator)."""
+    for part in request_id.split("|")[1:-1]:
+        if part.startswith("E") and part[1:].isdigit():
+            return int(part[1:])
+    return None
+
+
+# ---- the step trace -----------------------------------------------------
+
+def doc_key(request_id):
+    """The document key (the d part) a request works for; None when
+    the id carries none (registrations, flushes, foreign traffic)."""
+    tag = parse_tag(request_id)
+    return tag[1] if tag else None
+
+
+def step_record(now_s, sched_cpu_s, tokens_by_request, doc_keys,
+                free_blocks, total_blocks, block_size, decoding=None):
+    """One scheduler step reduced to plain numbers for the trace file:
+    when it was scheduled and how long the packing decision took; how
+    many tokens moved, over how many sequences; the prefill and decode
+    split; how many distinct documents those sequences serve (sequences
+    over documents is the filters-in-flight-per-document ratio); and
+    the KV pool's occupancy in tokens.
+
+    `decoding` is the set of request ids that are generating - they
+    already hold sampled output, so the split is exact: a one-token
+    final prefill chunk counts as prefill. A one-token filter run must
+    therefore trace zero decode (each stage's answer is sampled from
+    its own last prefill chunk's forward pass, never a decode step);
+    any decode band on a filter trace is a misconfiguration. Without
+    `decoding` the split falls back to the one-token heuristic."""
+    counts = list(tokens_by_request.values())
+    if decoding is None:
+        decode_seqs = sum(1 for c in counts if c == 1)
+        prefill = sum(c for c in counts if c > 1)
+    else:
+        decode_seqs = sum(1 for r in tokens_by_request if r in decoding)
+        prefill = sum(c for r, c in tokens_by_request.items()
+                      if r not in decoding)
+    return dict(
+        t=round(now_s, 6),
+        sched_ms=round(sched_cpu_s * 1e3, 3),
+        tokens=int(sum(counts)),
+        seqs=len(counts),
+        decode_seqs=decode_seqs,
+        prefill_tokens=int(prefill),
+        unique_docs=len({d for d in doc_keys if d is not None}),
+        kv_used_tokens=(total_blocks - free_blocks) * block_size,
+        kv_total_tokens=total_blocks * block_size)
 
 
 # ---- the strict-mode invariant ----------------------------------------

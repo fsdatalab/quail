@@ -22,6 +22,149 @@ def test_4b_10k_matches_the_banked_run():
     assert 42 <= p.predicted_makespan_s <= 58
 
 
+def test_map_operators_by_corpus_size():
+    """A classifier (gated=False) on a large corpus runs
+    pipelined_map: rounds stay full, so forking buys nothing and
+    costs per-sibling CPU (the underfilled-round cell). On a small
+    corpus the same query runs hybrid_map, forking after the first
+    prompt. The sequence cap multiplies by the filter count only
+    when forks can exist."""
+    big = plan_query(4, DOCS_10K, M4B, H100, selectivity=0.8,
+                     gated=False)
+    assert big.mode == "spec" and big.operator == "pipelined_map"
+    assert big.spec_after_stage == 0
+    small = plan_query(4, DOCS_10K[:60], M4B, H100, selectivity=0.8,
+                       gated=False)
+    assert small.operator == "hybrid_map"
+    assert small.spec_after_stage == 1
+    # 60 documents all admitted, forked: 60 x 4 live sequences + 16
+    assert small.engine_max_seqs == 60 * 4 + 16
+
+
+def test_policy_override_forces_either_operator():
+    """policy forces the operator family for testing: "hybrid" turns
+    the fork on even where the rule says never; "pipelined" turns it
+    off even where the rule says switch. Semantics (filter or map)
+    stay with `gated` - pipelined_map still answers everything, one
+    prompt per round."""
+    p = plan_query(4, DOCS_10K, M4B, H100, selectivity=0.8,
+                   policy="hybrid")
+    assert p.operator == "hybrid_filter" and p.spec_after_stage >= 1
+    g = plan_query(6, DOCS_1K, M4B, H100, selectivity=0.5,
+                   policy="pipelined")
+    assert g.operator == "pipelined_filter" and g.spec_after_stage == 0
+    m = plan_query(4, DOCS_10K, M4B, H100, gated=False,
+                   policy="pipelined")
+    assert m.operator == "pipelined_map"
+
+
+def test_sequence_cap_robust_to_size_skew():
+    """One tiny outlier document must not inflate the cap. The old
+    bound divided the budget by the single smallest document (a
+    10-token outlier would have claimed sixty thousand sequences);
+    the exact bound is the longest ascending prefix that fits."""
+    uniform = plan_query(4, [300] * 2000, M4B, H100, gated=False)
+    skewed = plan_query(4, [10] + [300] * 1999, M4B, H100, gated=False)
+    assert skewed.engine_max_seqs == uniform.engine_max_seqs
+    assert skewed.engine_max_seqs == 2000 + 16
+
+
+def test_switch_uses_per_filter_selectivities():
+    """A survivor cliff sits where the selective filter sits; the
+    per-filter list finds it, the mean smears it away entirely."""
+    sels = [0.9, 0.9, 0.05, 0.9, 0.9, 0.9]
+    p = plan_query(6, DOCS_1K, M4B, H100, selectivity=sels)
+    # survivors 900, 810, then 40: forty documents' question work
+    # underfills a round, so the switch lands right after the cliff
+    assert p.spec_after_stage == 3
+    m = plan_query(6, DOCS_1K, M4B, H100,
+                   selectivity=sum(sels) / len(sels))
+    assert m.spec_after_stage != 3
+
+
+def test_step_budget_scales_with_pool_slack():
+    """The step budget is derived, not a constant: the largest value
+    whose activation reservation stays under STEP_POOL_FRACTION of
+    the KV pool. A fat pool packs large steps; a thin pool keeps the
+    floor rather than trade KV for under a percent of wall; the
+    budget never sits below the sequence cap (the engine requires
+    the step budget to cover it)."""
+    fat = plan_query(4, DOCS_10K, M4B, H100, selectivity=0.8)
+    assert 16_384 <= fat.engine_step_tokens <= 32_768
+    mid = plan_query(4, DOCS_10K, M32B, H100, selectivity=0.8)
+    assert 4_096 <= mid.engine_step_tokens < fat.engine_step_tokens
+    thin = plan_query(4, [300] * 100, M32B, L40S, selectivity=0.8)
+    assert thin.engine_step_tokens == 2_048
+    # forks multiply live sequences; the step budget must cover them
+    forked = plan_query(4, DOCS_10K[:60], M4B, H100, selectivity=0.8,
+                        gated=False)
+    assert forked.engine_step_tokens >= forked.engine_max_seqs
+
+
+def test_generation_is_priced_and_scales_with_context():
+    """A generative map's prediction carries decode time from the
+    calibrated decode model, and the per-token price grows with
+    document length (attention reads the whole context per generated
+    token)."""
+    base = plan_query(2, DOCS_1K, M4B, H100, gated=False)
+    gen = plan_query(2, DOCS_1K, M4B, H100, gated=False,
+                     gen_tokens=256)
+    short_delta = gen.predicted_makespan_s - base.predicted_makespan_s
+    assert short_delta > 5
+    assert any("decode" in r for r in gen.remarks)
+    long_docs = [30_000] * 20
+    lbase = plan_query(2, long_docs, M4B, H100, gated=False)
+    lgen = plan_query(2, long_docs, M4B, H100, gated=False,
+                      gen_tokens=256)
+    long_delta = lgen.predicted_makespan_s - lbase.predicted_makespan_s
+    # per generated token, 30k-token contexts must price well above
+    # ~350-token contexts (fewer pairs here, so compare per token)
+    per_tok_short = short_delta / (1000 * 2 * 256)
+    per_tok_long = long_delta / (20 * 2 * 256)
+    assert per_tok_long > 5 * per_tok_short
+
+
+def test_spill_plans_with_a_store_instead_of_refusing():
+    """A pool too small for the working set is a refusal without a
+    store, and a spill plan with one: the tiering store absorbs the
+    overflow, priced pessimistically at store bandwidth both ways."""
+    long_docs = [30_000] * 40 + [100_000] * 10
+    r = plan_query(2, long_docs, M32B, L40S, gpus=2,
+                   saturation_width_docs=4)
+    assert isinstance(r, Refusal)
+    assert r.constraint == "pool_under_working_set"
+    disk = StoreSpec(read_bw=2.7e9)
+    p = plan_query(2, long_docs, M32B, L40S, gpus=2,
+                   saturation_width_docs=4, store=disk)
+    assert p.access == "spill"
+    assert any("spills the overflow" in x for x in p.remarks)
+    # the spill traffic must be priced in, not free
+    no_spill_shape = plan_query(2, long_docs, M32B, L40S, gpus=2,
+                                saturation_width_docs=1, store=disk)
+    assert p.predicted_makespan_s >= no_spill_shape.predicted_makespan_s
+
+
+def test_hybrid_switch_stage_planned():
+    """A selective gated chain on a mid-size corpus switches to
+    speculation where survivors stop filling rounds; a huge corpus
+    with permissive filters never switches."""
+    p = plan_query(6, DOCS_1K, M4B, H100, selectivity=0.5)
+    assert p.mode == "chain" and p.spec_after_stage == 3
+    q = plan_query(4, DOCS_10K, M4B, H100, selectivity=0.95)
+    assert q.spec_after_stage == 0
+
+
+def test_spec_constrains_decisive_token_models():
+    """A chattering model still plans a spec chain: sampling is
+    constrained to the yes/no ids, so the stage window is one token
+    and the remark says the contract changed."""
+    p = plan_query(4, DOCS_1K, M32B, H100, selectivity=0.8,
+                   one_token_answers=False, gated=False)
+    assert p.mode == "spec"
+    assert p.stage_token_window == 1
+    assert any("constrains sampling" in r for r in p.remarks)
+
+
 def test_32b_overflow_turns_pins_off():
     p = plan_query(4, DOCS_1K, M32B, H100, selectivity=0.8)
     assert p.mode == "chain"

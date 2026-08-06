@@ -1,6 +1,6 @@
 """Checks for the reasoning-filter analytical layer: consistency with
-the answer-only world at g=1, and the structural predictions of
-notes/REASONING_MODEL.md."""
+the answer-only world at g=1, and the structural predictions of the
+reasoning-filter model (docengine/reasoning/model.py)."""
 
 import math
 

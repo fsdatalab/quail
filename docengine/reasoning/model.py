@@ -1,6 +1,8 @@
 """Cost primitives and Bellman value recurrences for reasoning filters.
 
-Implements notes/REASONING_MODEL.md at the fluid level: mean document
+Implements the reasoning-filter model (paper/PAPER.md sections 5 and
+8, E4; the original design note is in git history) at the fluid
+level: mean document
 length, mean thinking length per stage, fractional survivor counts.
 Makespan estimates are the maximum of three certified components
 (total compute seconds, total bandwidth seconds, one block's

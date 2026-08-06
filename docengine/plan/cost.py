@@ -1,4 +1,4 @@
-"""Algorithm 1 of notes/PAPER.md section 5.1: the calibrated cost estimator.
+"""Algorithm 1 of paper/PAPER.md section 5.1: the calibrated cost estimator.
 
 COST(p) predicts the makespan of one candidate plan as a sum of five
 terms plus a fixed overhead:
@@ -31,6 +31,36 @@ ENGINE_OVERHEAD_S = 3.2       # c0: per-query software residue at 10k docs.
                               # host-controlled protocol.
 BOOT_POOL_FRACTION = 0.92     # gpu_memory_utilization we ship
 POOL_HEADROOM = 0.80          # admission budget stays under the pool by this
+ROUND_TOKENS = 2048           # question work that keeps one round busy:
+#                               the observed practical round size at
+#                               corpus scale (step recorder, spec_smoke).
+#                               The hybrid switch errs conservative if
+#                               real rounds run bigger. Measured under
+#                               the old fixed 2,048 step budget; the
+#                               budget is now plan-derived (usually
+#                               larger), so this constant awaits
+#                               re-measurement from the step recorder.
+FORK_SEQ_S = 70e-6            # scheduler CPU per forked sibling, measured
+#                               (the ledger's fork section, spec_smoke
+#                               2026-08-05: the wall gap that survived
+#                               removing all recompute)
+ACT_BYTES_PER_HIDDEN = 32     # peak per-token activation bytes per hidden
+#                               dim (the MLP gate and up intermediates
+#                               dominate; ~82 KB/token at 4B, ~164 KB at
+#                               32B). An architecture estimate, not yet
+#                               measured - like the C5 weight sizes it
+#                               awaits a profiled number.
+STEP_TOKENS_MIN = 2048        # smallest step budget worth booting: below
+#                               this the weight pass stops amortizing
+STEP_TOKENS_MAX = 32768       # the sweep's largest tested budget; past
+#                               it nothing is measured
+STEP_POOL_FRACTION = 0.03     # the activation reservation a step budget
+#                               may take from the KV pool: steps are
+#                               compute-bound past ~105 tokens, so a
+#                               bigger budget buys only amortization
+#                               (measured 0.8 percent, defaults against
+#                               the 32k best cell) and must not charge
+#                               a thin pool for it
 
 
 # ------------------------------------------------------- rate primitives

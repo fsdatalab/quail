@@ -1,6 +1,7 @@
 """Steady-state throughput programs for reasoning filters.
 
-One program per policy family, per notes/REASONING_MODEL.md. Documents
+One program per policy family, per the reasoning-filter model in
+docengine/reasoning/model.py. Documents
 flow at rate lambda; three resource constraints bound lambda:
 
   compute    lambda * 2P * (prefill + decode tokens per doc) <= phi R_D

@@ -15,4 +15,4 @@ jobs:
       - name: Install
         run: pip install -e .[dev]
       - name: Run the CPU test suite
-        run: python -m pytest tests attic/tests -q
+        run: python -m pytest tests -q

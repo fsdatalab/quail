@@ -15,7 +15,14 @@ provisional.
 
 ## What was solved and how to read the numbers
 
-The theory paper (attic/theory-paper.md) studies a database query that runs a chain
+The four sections from here through "Small documents counts" are
+the record of the superseded theory program. Its code, its paper,
+and its raw result files were deleted from the working tree on
+2026-08-04; all of it is in git history (last present at commit
+8f4561f). The sections stay as the historical record, but their
+named files are no longer in results/.
+
+The theory paper studies a database query that runs a chain
 of yes or no language model filters over documents on one graphics card. A
 document that fails a filter skips the rest, so the work depends on how many
 documents pass each stage. The paper compares three scheduling policies.
@@ -40,11 +47,11 @@ real IMDb reviews (2,966,000 document tokens) tokenized for the Qwen3
 models. The pass rate of a filter is the fraction of documents that pass
 it.
 
-Raw data: results/lp_two_stage.csv (the program and its replays),
-results/n10k_two_stage.csv (direct schedule builders), manifests in
-results/manifests/, the small instance study in
-attic/experiments/run_smallN.py, and the measured engine runs in
-results/engine/.
+Raw data: lp_two_stage.csv (the program and its replays),
+n10k_two_stage.csv (direct schedule builders), the manifests, and
+the small instance study, all deleted with the program and
+recoverable from git history. The measured engine runs are current
+and live in results/engine/.
 
 ## The three computed layers agree, which is the main check
 
@@ -842,6 +849,14 @@ in different batch compositions.
 
 ## The reasoning grid, measured: phase A's open question is answered
 
+Retraction, 2026-08-05: the speculation and lookahead cells below
+were an instrument artifact (the prefill race; see "The speculation
+walls were an instrument artifact" at the end of this file), and
+the result file reason_grid.json was deleted rather than left
+quotable (it is in git history). The pipeline and waves rows were
+valid measurements on the old image and stand as recorded here.
+The grid re-fly with the fixed client will re-bank the file.
+
 Phase A closed by asking whether the generation-dominated
 makespans, the saturated no-speculation verdict, and the adaptive
 gain under memory pressure survive contact with the engine. The
@@ -1365,3 +1380,331 @@ the fp8 GEMM path the leading suspect and checkpoint-side scale
 calibration the durable fix. ENGINE_OVERHEAD_S is deliberately not
 re-anchored until a host-controlled protocol exists. GPU spent:
 about 20 container-runs across roughly five hours of wall time.
+
+## The speculation walls were an instrument artifact: the prefill race
+
+The reasoning grid's speculation cells overstated the cost of
+asking questions ungated, because the instrument raced the prefix
+cache. run_filter_chain launched a document's k speculative
+questions at the same time, and the prefix cache can only reuse
+blocks that are already committed, so simultaneous identical
+prefixes each prefilled the document themselves. The shared-scan
+counter had already measured the same race without anyone reading
+it that way: eight simultaneous chains per document read the corpus
+1.42 times, not 1.0 (shared2000.json.gz).
+
+The fix is a stagger in the client library: a document's first
+question runs until its first output, which means its prefill is
+committed, and only then do the sibling questions launch, so they
+reuse the cached document. Applied to run_filter_chain and
+run_shared_scan. The control arm (the old simultaneous launch) ran
+once for this study and was then deleted from the code; it is in
+git history. The fix changes no answers: the fixed and unfixed arms
+below agree on survivors (392 against 393) and wrong counts (1778
+against 1777).
+
+The measurement (results/engine/reason_race.json): 2,000 documents,
+four filters at pass rate 0.8, one answer token per call (g=0), on
+the CUDA 13 devel image. "Reads" is computed tokens over corpus
+tokens; 1.0 means each document was read once, and question tokens
+ride in the same total.
+
+| arm | wall | reads |
+|---|---|---|
+| pipelined | 9.27 s | 1.20 |
+| spec2, fixed | 9.36 s | 1.23 |
+| spec (all four questions), fixed | 10.15 s | 1.33 |
+| spec_race (all four, stagger off) | 19.51 s | 2.41 |
+| waves | 16.80 s | 2.20 |
+
+Three readings. First, the race was the gap: stagger off reproduces
+the banked 2x (19.51 against 9.27 here; 22.23 against 10.92 in the
+old grid), and the reads column shows why, 2.41 corpus reads
+against 1.33. Second, with the fix, ask-everything costs about 10
+percent over the pipelined arm at one answer token (10.15 against
+9.27 seconds), which is the wasted questions on documents that fail
+early filters, so gating and ungated evaluation are nearly tied on
+a saturated device at g=0. Read per answer instead of per query,
+the same cell is the fork operator's economics measured: the spec
+arm computed 8,000 answers in 10.15 seconds (1.27 milliseconds per
+answer) against the pipelined arm's 3,749 in 9.27 (2.47 milliseconds
+per answer), and its 1.33 reads are 1.0 of corpus plus question
+tokens, so all four answers came from one read of each document.
+For a classifier set, where every answer is required, that is the
+plan: four answers for the price of one document read. The old reason_grid.json spec and
+lookahead cells should not be quoted: the g=0 cells are mostly this
+artifact, and the g>0 cells mix it with the real cost of wasted
+thinking traces; re-fly the grid before citing them. Third, the
+wrong counts run about 28 percent of answers on every arm, the
+known new-image accuracy shift; they are identical between the
+fixed and unfixed arms, so the fix is not implicated.
+
+The width sweep was re-measured on the new image in the same
+session (width_scaling.json): 65.49 seconds at a 50,000-token
+admission budget, 58.69 at 100,000, then flat (59.05, 58.04, 58.14
+out to 700,000). Saturation stays near 100,000 admitted tokens,
+the same knee as the old image at walls about 1.33 times faster.
+
+## The speculative chain moved in-engine: parity passed, client spec beaten
+
+Speculation now runs inside the engine (2026-08-05): a chain
+request carrying the s directive advances through every stage
+regardless of the gate, so a query that needs all answers gets them
+from one request per document. No re-sent document ids, no client
+round trips. The parity smoke ran one corpus three ways
+(results/engine/spec_smoke.json; 500 documents, four filters at
+pass rate 0.8, one answer token, new image):
+
+| arm | wall | requests | reads |
+|---|---|---|---|
+| pipelined chain | 2.36 s | 500 | 1.14 |
+| speculative chain | 2.50 s | 500 | 1.14 |
+| client-side speculation | 3.23 s | 2,000 | 1.34 |
+
+The speculative chain returns all 2,000 answers at 6 percent over
+the pipelined wall, and beats the client-side speculation it
+replaces by 23 percent while sending a quarter of the requests and
+reading less (1.14 against 1.34 corpus reads; the client arm
+re-reads the question preamble per request). Answers agree with the
+client arm on 1,995 of 2,000. The five disagreements, and the
+pipelined arm's 3 of 923, are borderline fp8 flips (batch
+composition changes which borderline calls flip), the same noise
+scale as the old grid's 656-to-661 survivor spread. The wrong
+counts (276 of 923, 446 of 2,000) are the known substrate accuracy
+shift, present in every arm. Client-side speculation is now
+superseded; it is deleted once the fork milestone (notes/NEXT.md
+item 1) also moves the composition executor in-engine.
+
+## Where speculation wins: not where expected; turnover is the knob
+
+The 27-cell sweep (results/engine/spec_where.json; 2,000 documents,
+4 filters, one answer token, new image) crossed selectivity 0.5 /
+0.8 / 0.95 with admission budgets of 10k / 50k / 700k tokens and
+three policies: pipelined (in-engine), the sequential speculative
+chain (in-engine), and the client-side concurrent speculation
+(measured here one last time before its deletion). Walls in
+seconds:
+
+| s | budget | pipelined | spec chain | client spec |
+|---|---|---|---|---|
+| 0.5 | 10k | **11.76** | 19.80 | 21.37 |
+| 0.5 | 50k | **10.26** | 11.48 | 14.33 |
+| 0.5 | 700k | **9.89** | 11.18 | 14.48 |
+| 0.8 | 10k | **14.45** | 19.12 | 20.01 |
+| 0.8 | 50k | **10.62** | 11.42 | 14.55 |
+| 0.8 | 700k | **10.23** | 11.57 | 14.34 |
+| 0.95 | 10k | **17.55** | 19.23 | 19.83 |
+| 0.95 | 50k | **10.82** | 11.37 | 14.43 |
+| 0.95 | 700k | **10.52** | 11.23 | 14.71 |
+
+Pipelined wins all 27 cells. Three readings. First, compute does
+not separate the in-engine policies: the reads column is identical
+(1.14) in every cell, because a later filter appends only the few
+tokens of its question that differ from the shared preamble. The
+gaps are engine steps and, for the client arm, request toll (its
+reads are 1.33 from re-sent question prefixes, and its walls carry
+8,000 requests of overhead). Second, the starved regime (10k
+budget, about 21 resident documents) did not flip the ranking, and
+the mechanism is document turnover, not batch width: a document
+frees its admission budget when its whole run finishes, gating
+releases failed documents after one stage, and speculation holds
+every document to the end - sequential speculation for four stage
+latencies, client speculation for its round trips. At s=0.5 gating
+turns over documents twice as fast, and the starved-cell gap (11.76
+against 19.80) is exactly that. Third, the fork prediction is now
+sharp: a forked document completes two engine steps after its
+prefill, faster than a pipelined survivor's four, so forks should
+win precisely at tight budget and high selectivity (s=0.95, 10k:
+pipelined holds survivors about 3.7 stage latencies against the
+fork's 2). That cell is the fork milestone's target measurement.
+
+## Forked speculation landed: bit-clean, sharing proven, speed verdict honest
+
+The fork milestone (NEXT.md item 1) is built and validated: one
+request per document, the scheduler fabricates one sibling sequence
+per remaining filter when the document's KV commits, the siblings
+share the document's physical blocks (verified by block id), each
+answers from its own prefill with no decode steps, and the answers
+are spliced onto the document's stream in filter order. The
+correctness bug found on the way: building the sibling as a shallow
+copy of the parent request left engine-facing state wrong in a way
+that made attention skip the reused blocks (every sibling answered
+NO, blind to the document); building it through vLLM's own Request
+constructor fixed it. The isolation chain is in git history:
+full-reuse blind, full-recompute correct, constructor-built
+correct with full reuse.
+
+Validation (results/engine/spec_smoke.json; 500 documents, 4
+filters, selectivity 1, one-token answers, new image), all three
+policies on one engine:
+
+| run | wall | steps | mean tokens/step | answers | wrong |
+|---|---|---|---|---|---|
+| pipelined | 2.84 s | 106 | 1,845 | 1,440 | 248 |
+| speculation, forked | 3.32 s | 112 | 1,911 | 2,000 | 371 |
+| speculation, sequential | 3.00 s | 111 | 1,828 | 2,000 | 372 |
+
+Correctness: forked and sequential speculation agree on 1,997 of
+2,000 answers (fp8 borderline noise), survivors identical (252)
+across all three runs. The fork is bit-clean against its control.
+
+Speed, stated plainly. At 500 documents the batches are already
+full (mean 1,845 tokens per step), so the fork's more-filters-per-
+batch effect has no slack to exploit, and its overheads show: about
+7 extra tokens per sibling (the partial boundary block that rewind
+preserves but a fork must recompute) and per-sibling request
+bookkeeping. The fork is slower than sequential speculation here
+(3.32 against 3.00 seconds) on identical work. At 50 documents,
+where pipelined's rounds run half empty, the fork's step economy
+appears exactly as predicted: 18 steps against pipelined's 20 at
+22 percent more tokens per step, walls within noise at that scale.
+Note pipelined answered only 1,440 of 2,000 even at selectivity 1,
+because the model's wrong answers fire the gate; speculation
+answers everything, at 1.66 milliseconds per answer against
+pipelined's 1.97.
+
+Speculation means the forked path. The sequential walk of the same
+stages is not a policy (it is pipelining without the gate); it
+remains only as the engine's automatic fallback when a fork fails
+and as the validation control inside the smoke instrument. The
+fork's overhead was implementation, not physics, and most of it is
+gone: siblings originally re-hashed their whole ~340-token prompt
+at creation, and seeding the hash record from the parent's
+document prefix (content hashes, proven identical) cut the gap
+from 10.7 percent over the control (3.32 against 3.00 seconds) to
+4.4 percent (2.63 against 2.52, same run, same 3-of-2,000
+agreement). The remaining gap matches the partial boundary block
+each sibling recomputes (about 7 tokens; removing it would need
+partial-block KV copying) plus one page-table row per sibling,
+which is the floor without the closed fused kernel. Still open:
+the fork's predicted wall-clock win region, few live documents
+(small or interactive queries, long documents, the run tail),
+where pipelined's rounds go underfilled.
+
+## The fork connector: token-identical work achieved, copies verified
+
+The partial-block copy landed through vLLM's external-KV connector
+interface (docengine/engineext/forkconnector.py): the scheduler half
+declares each sibling's partial boundary tokens as externally
+computed, the worker half copies the parent's block into the
+sibling's block before the forward pass, and every guard degrades
+to recompute. Validation (spec_smoke.json re-banked; 500 documents,
+4 filters, every prompt on every document, one-token answers):
+
+- The copies are real and verified by block id (parent block 481
+  copied into sibling blocks 320, 799, 188 for document zero;
+  shared prefix 332 tokens, block index 20).
+- Speculation now computes exactly the tokens pipelining computes:
+  202,859 against 202,859, identical to the digit. The boundary
+  recompute is gone.
+- Answers match on 1,999 of 2,000 (one fp8 borderline flip).
+- Rounds: speculation 107 at 1,896 tokens per round against
+  pipelining's 111 at 1,828 - fewer, denser rounds, as the
+  more-filters-per-round argument predicts.
+- Walls: 2.57 against 2.44 seconds. The entire remaining gap is the
+  measured ~70 microseconds of scheduler CPU per sibling (1,500
+  siblings, about 0.1 seconds); with identical token work banked,
+  no compute or sharing explanation remains. The next lever is a
+  CPU profile of the fork path (DOCENGINE_PROFILE exists), and the
+  planner already prices this constant (FORK_SEQ_S in plan/cost.py).
+
+The sequence cap is now derived, never chosen: Plan.engine_max_seqs
+is admitted documents times the live-sequence multiplier (the
+filter count for spec) plus 25 percent headroom, and a spec plan's
+remark states the required floor.
+
+## The round budget: prediction made, then falsified by banked data
+
+A per-round host-cost model (wall = tokens/R + rounds x c, c = 3.3
+milliseconds fitted from the classifier cell's residual) predicted
+that raising max_num_batched_tokens from the default to 8,192 would
+cut the classifier wall by 12 percent. The prediction is retracted:
+the speed calibration grid already banked the falsifying evidence.
+speed_limit.json sweeps exactly this knob (defaults, then rounds of
+8,192/16,384/32,768 with sequence caps 256/512/1,024), and the
+defaults read at 97,125 tokens per second against the best cell's
+97,889 - under one percent apart, where a real 3.3-millisecond
+round tax would open a double-digit gap. The model fit one cell
+with one free parameter; the grid is the test, and it fails it.
+
+What the classifier cell's 0.37-second residual actually is, by
+elimination: costs specific to its shape - dependency pacing (a
+document's next filter schedules only after its previous answer
+exists; pure reading has no such waits) and per-sequence lifecycle
+CPU (the measured ~70 microseconds per forked sibling, and its
+gated-side counterpart). Decomposing that residual is a profiler
+job (DOCENGINE_PROFILE), not a fitted constant. The best-cell
+provenance for the 97,889 anchor: t32k_s1024_apc, short_text arm -
+rounds up to 32,768 tokens, 1,024 sequences, prefix caching on,
+4,000 short documents as raw text, one sampled token each; the
+defaults achieve 97,125 on the same corpus.
+
+## The underfilled-round cell: the hybrid wins; pure speculation ties
+
+Two cells, predictions stated in the instrument before the run
+(results/engine/underfill.json; 30 repetitions per policy in one
+container, within-container means).
+
+The latency cell (20 documents, 6 filters at pass rate 0.7):
+
+| policy | mean wall | std |
+|---|---|---|
+| gated pipelined | 0.1451 s | 0.0102 |
+| hybrid (gate stage 1, fork the survivors) | **0.1374 s** | 0.0029 |
+| classifier pipelined (everything, one per round) | 0.1975 s | 0.0040 |
+| classifier speculation (everything, forked) | 0.1984 s | 0.0034 |
+
+Two verdicts. The hybrid beats pure gating by 5.3 percent (7.7
+milliseconds, about four standard errors - real), which is the
+first measured wall-clock win for the fork machinery, in exactly
+its designed regime: gating thins the survivors, the survivors'
+stage waves underfill rounds, and folding them into one round
+recovers the round times. The stated prediction for pure
+speculation was falsified: classifier speculation ties classifier
+pipelining (0.1984 against 0.1975), because ungated pipelining
+already overlaps stages across documents - document one can be at
+stage four while document twenty is at stage one - so even at 20
+documents there were no idle rounds for the fork to fill. The
+fork's wall win exists only where something has already thinned
+the rounds, which is what gating does; hence the hybrid.
+
+The mid-chain cell (500 documents, halving filters, the planner's
+switch after stage 2): gated 2.319 s, hybrid 2.295 s over 3
+repetitions - the predicted no-loss with a small tail saving.
+
+Two caveats banked with the result. The engine constraint found on
+the way: max_num_batched_tokens must be at least max_num_seqs, so
+raising the sequence cap for forks raises the round budget floor
+with it (both instruments and the planner remark now say so). And
+the rep-zero answer agreement between the two classifier policies
+at this tiny scale was 7 of 120 - far above the 0.1 percent noise
+at 500 documents; before quoting this cell for anything beyond
+walls, re-check agreement across all repetitions rather than the
+first.
+
+## The operator vocabulary, settled
+
+Four public operators, from crossing two semantics with one rule.
+Semantics: filter (gated - a failed prompt skips the rest) or map
+(binary classification - every prompt on every document). The rule
+(chainlogic.hybrid_switch_stage): fork the remaining prompts at the
+first stage whose remaining work underfills a round.
+
+- pipelined_filter: gate, one prompt per round. The rule never
+  fires (large corpus or permissive filters).
+- hybrid_filter: gate, then fork the survivors at the switch stage.
+  Measured to dominate pure gating in its regime (underfill.json).
+- pipelined_map: every prompt, one per round. The rule says never
+  fork: a large corpus keeps rounds full, where forking measured a
+  tie and costs 70 microseconds per sibling.
+- hybrid_map: every prompt, forked after the first. The rule says
+  fork immediately: a small corpus underfills every round. This is
+  what was previously called forked speculation; the separate name
+  is retired, since it is the hybrid at switch stage one.
+
+Plus "requests" for single-prompt queries. The KV verbs beneath are
+orthogonal axes the planner composes with any operator: read or
+restore (persist pays once at ingest, wins where restore beats
+recompute - the 32B tier), and pin / strict / spill for residency
+(spill remains unbuilt because no measured pool has bound; it is
+E9's mechanism).

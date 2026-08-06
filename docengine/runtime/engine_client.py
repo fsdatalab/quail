@@ -11,10 +11,11 @@ its whole chain while hot and returns its budget quickly. This yields
 the blocked execution order without any stage barriers: the fastest
 document never waits for the slowest.
 
-Optional lookahead submits the next `lookahead` questions of a document
-concurrently, paying for wasted questions when an earlier one fails.
-Under streaming there are no stage barriers left for speculation to
-hide, so its expected value is limited to filling the admission tail.
+Speculation is not a client concern: it runs in-engine as the
+speculative chain (run_filter_chain_engine with spec=True), one
+request per document. The client-side concurrent-branch path was
+measured against it and deleted (the ledger's speculative-chain
+section; results/engine/spec_smoke.json).
 
 The engine object must expose the vLLM AsyncLLM interface:
 `generate(prompt, sampling_params, request_id)` returning an async
@@ -69,11 +70,12 @@ class EngineTags:
 
 
 async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
-                           budget_tokens, lookahead=1, tag="q", tags=None,
-                           use_priority=False, composition=None):
-    """Run every document through the filter chain; return timings,
-    counters, per-call answers keyed (doc, stage) with stages 1-indexed,
-    and the surviving document ids.
+                           budget_tokens, tag="q", tags=None,
+                           use_priority=False):
+    """Run every document through the filter chain as pinned, ranked
+    requests, one question at a time, gated; return timings, counters,
+    per-call answers keyed (doc, stage) with stages 1-indexed, and the
+    surviving document ids.
 
     With `tags` set (an EngineTags), request ids carry pin and release
     directives for the in-engine scheduler and a flush request releases
@@ -124,24 +126,12 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
     async def chain(i, cost):
         nonlocal used
         try:
-            j = 0
-            blocks = list(composition) if composition else None
-            while j < n:
-                kk = (blocks.pop(0) if blocks
-                      else min(lookahead, n - j))
-                kk = min(kk, n - j)
-                got = await asyncio.gather(*[
-                    ask(body_ids[i] + q_ids[j + off], rid_for(i, j + off),
-                        pri=0 if j + off > 0 else 1)
-                    for off in range(kk)])
-                passes = 0
-                for off in range(kk):
-                    answers[(i, j + off + 1)] = got[off]
-                    if got[off] and passes == off:
-                        passes += 1
-                if passes < kk:
+            for j in range(n):
+                got = await ask(body_ids[i] + q_ids[j], rid_for(i, j),
+                                pri=0 if j > 0 else 1)
+                answers[(i, j + 1)] = got
+                if not got:
                     return
-                j += kk
             survivors.append(i)
         finally:
             if tags is not None:
@@ -168,19 +158,152 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
                 **counters)
 
 
+async def run_map(engine, sampling_params, body_ids, prompt_ids,
+                  budget_tokens, tag="m"):
+    """Open-ended generation: every prompt against every document,
+    one request per (document, prompt) pair, generated text returned
+    keyed (doc, prompt) with prompts 1-indexed. Decode exists here.
+
+    The document reads once: its first prompt's request commits the
+    KV, and the remaining prompts launch on that request's first
+    streamed token so they reuse it - simultaneous identical
+    prefixes would each recompute the document (the measured prefill
+    race, results/engine/reason_race.json). Admission charges the
+    document plus its prompts plus the full generation budget, since
+    generated tokens occupy KV too. Multi-token outputs need their
+    own streams, which is why this is not the one-request-per-
+    document chain: routing sibling generations onto one stream is
+    the open fork extension."""
+    n = len(prompt_ids)
+    gen_budget = getattr(sampling_params, "max_tokens", 0) or 0
+    q_cost = sum(len(p) for p in prompt_ids) + n * gen_budget
+    used = 0
+    cond = asyncio.Condition()
+    counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
+    texts = {}
+
+    async def gen(ids, rid, started=None):
+        final = None
+        try:
+            async for out in engine.generate({"prompt_token_ids": ids},
+                                             sampling_params, rid):
+                final = out
+                if started is not None and not started.is_set():
+                    started.set()
+        finally:
+            if started is not None:
+                started.set()
+        counters["requests"] += 1
+        counters["prompt_tokens"] += len(final.prompt_token_ids)
+        counters["cached_tokens"] += (
+            getattr(final, "num_cached_tokens", 0) or 0)
+        return final.outputs[0].text
+
+    async def one_doc(i, cost):
+        nonlocal used
+        try:
+            ev = asyncio.Event()
+            first = asyncio.create_task(gen(
+                body_ids[i] + prompt_ids[0], f"de1|d{i}|{tag}-{i}-0",
+                started=ev))
+            await ev.wait()
+            rest = await asyncio.gather(*[
+                gen(body_ids[i] + prompt_ids[j],
+                    f"de1|d{i}|{tag}-{i}-{j}")
+                for j in range(1, n)])
+            texts[(i, 1)] = await first
+            for j, t in enumerate(rest, start=2):
+                texts[(i, j)] = t
+        finally:
+            async with cond:
+                used -= cost
+                cond.notify_all()
+
+    t0 = time.time()
+    tasks = []
+    for i in range(len(body_ids)):
+        cost = len(body_ids[i]) + q_cost
+        async with cond:
+            while used + cost > budget_tokens and used > 0:
+                await cond.wait()
+            used += cost
+        tasks.append(asyncio.create_task(one_doc(i, cost)))
+    await asyncio.gather(*tasks)
+    return dict(wall=time.time() - t0, texts=texts, **counters)
+
+
+async def run_map_forked(engine, sampling_params, body_ids, prompt_ids,
+                         budget_tokens, sep_id, tag="mf"):
+    """Generative map on the one-request-per-document protocol: the
+    document's first prompt generates on the parent request, the
+    engine forks the remaining prompts as siblings, and their
+    generations return spliced onto the parent's stream with the
+    separator token between stages. Generations stop at the
+    end-of-sequence token and never contain it, which makes the
+    separator unambiguous. Returns token lists keyed (doc, prompt)
+    with prompts 1-indexed; the caller detokenizes."""
+    n = len(prompt_ids)
+    await _register_query(engine, sampling_params, prompt_ids, set(),
+                          None, "", f"{tag}-reg", sep=sep_id)
+    gen_budget = getattr(sampling_params, "max_tokens", 0) or 0
+    q_cost = sum(len(p) for p in prompt_ids) + n * gen_budget
+    used = 0
+    cond = asyncio.Condition()
+    outs = {}
+
+    async def one_doc(i, cost):
+        nonlocal used
+        try:
+            toks = []
+            async for out in engine.generate(
+                    {"prompt_token_ids": body_ids[i] + prompt_ids[0]},
+                    sampling_params, f"de1|c|s|d{i}|{tag}-{i}-0"):
+                ids = list(out.outputs[0].token_ids or ())
+                if len(ids) > len(toks):
+                    toks = ids
+            parts, cur = [], []
+            for t in toks:
+                if t == sep_id:
+                    parts.append(cur)
+                    cur = []
+                else:
+                    cur.append(t)
+            parts.append(cur)
+            for k, p in enumerate(parts[:n], start=1):
+                outs[(i, k)] = p
+        finally:
+            async with cond:
+                used -= cost
+                cond.notify_all()
+
+    t0 = time.time()
+    tasks = []
+    for i in range(len(body_ids)):
+        cost = len(body_ids[i]) + q_cost
+        async with cond:
+            while used + cost > budget_tokens and used > 0:
+                await cond.wait()
+            used += cost
+        tasks.append(asyncio.create_task(one_doc(i, cost)))
+    await asyncio.gather(*tasks)
+    return dict(wall=time.time() - t0, tokens=outs)
+
+
 async def run_query(engine, sampling_params, body_ids, q_ids,
                     budget_tokens=None, yes_ids=None, tag="q", no_ids=None,
-                    plan=None):
+                    plan=None, class_map=None):
     """The one entry point for executing a query on one worker's engine.
 
     With `plan` given, the plan chooses the backend. Any object with
-    the attributes mode ("chain" | "requests"), budget_tokens, pin,
-    and stage_token_window works; this module deliberately does not
-    import the planner. Chain mode runs the whole filter chain inside
-    the engine under the plan's budget; requests mode runs pinned,
-    ranked requests (pins only when the plan says so), and decisive
-    no-token ids are forwarded only when the plan's per-stage decode
-    window is wider than one token. Sharding across workers happens
+    the attributes mode ("chain" | "spec" | "requests"), budget_tokens,
+    pin, and stage_token_window works; this module deliberately does
+    not import the planner. Chain mode runs the whole filter chain
+    inside the engine under the plan's budget; spec mode is the same
+    one request per document with the gate ignored for advancement,
+    so every stage answers (classifier sets); requests mode runs
+    pinned, ranked requests (pins only when the plan says so), and
+    decisive no-token ids are forwarded only when the plan's per-stage
+    decode window is wider than one token. Sharding across workers happens
     above; each worker receives its shard's body_ids.
 
     Without `plan`, the shipped default applies. Multi-filter queries
@@ -189,15 +312,34 @@ async def run_query(engine, sampling_params, body_ids, q_ids,
     between filters (yes_ids, the token ids that mean yes, is required
     for the in-engine gate). A single-filter query has nothing to
     chain and runs as pinned, ranked requests under `budget_tokens`."""
+    if class_map is not None:
+        # classification takes the engine path at any prompt count:
+        # the requests path judges answers as binary text, which a
+        # multi-class query cannot use
+        return await run_filter_chain_engine(
+            engine, sampling_params, body_ids, q_ids,
+            (plan.budget_tokens if plan is not None else budget_tokens),
+            yes_ids, tag=tag, spec=True,
+            forked=(getattr(plan, "operator", "") != "pipelined_map"
+                    if plan is not None else True),
+            class_map=class_map)
     if plan is not None:
-        if plan.mode == "chain":
+        if plan.mode in ("chain", "spec"):
+            spec = plan.mode == "spec"
+            op = getattr(plan, "operator", "")
             return await run_filter_chain_engine(
                 engine, sampling_params, body_ids, q_ids,
                 plan.budget_tokens, yes_ids, tag=tag,
-                no_ids=no_ids if plan.stage_token_window > 1 else None)
+                no_ids=(no_ids if not spec
+                        and plan.stage_token_window > 1 else None),
+                spec=spec,
+                # pipelined_map: every prompt, one per round, no forks
+                forked=(op != "pipelined_map"),
+                spec_after=(getattr(plan, "spec_after_stage", 0)
+                            if not spec else 0))
         return await run_filter_chain(
             engine, sampling_params, body_ids, q_ids, plan.budget_tokens,
-            lookahead=1, tag=tag,
+            tag=tag,
             tags=EngineTags() if plan.pin else None, use_priority=True)
     if len(q_ids) >= 2:
         assert yes_ids, "chain mode needs the yes token ids for its gate"
@@ -206,21 +348,26 @@ async def run_query(engine, sampling_params, body_ids, q_ids,
                                              budget_tokens, yes_ids,
                                              tag=tag, no_ids=no_ids)
     return await run_filter_chain(engine, sampling_params, body_ids,
-                                  q_ids, budget_tokens, lookahead=1,
+                                  q_ids, budget_tokens,
                                   tag=tag, tags=EngineTags(),
                                   use_priority=True)
 
 
 async def _register_query(engine, sampling_params, q_ids, yes_ids, no_ids,
-                          qpart, suffix):
+                          qpart, suffix, sep=None):
     """Send one query's chain-mode registration (question token lists
-    plus the yes/no token ids in the request id) and wait it out."""
+    plus the yes/no token ids in the request id) and wait it out.
+    `sep` registers a separator token for generative stages (the E
+    part): the fork splices sibling generations onto the parent's
+    stream with it between stages."""
     reg = [len(q_ids)]
     for q in q_ids:
         reg += [len(q)] + list(q)
     npart = (f"N{','.join(map(str, sorted(no_ids)))}|" if no_ids else "")
+    epart = f"E{sep}|" if sep is not None else ""
     reg_rid = (f"de1|reg|{qpart}"
-               f"Y{','.join(map(str, sorted(yes_ids)))}|{npart}{suffix}")
+               f"Y{','.join(map(str, sorted(yes_ids)))}|{npart}{epart}"
+               f"{suffix}")
 
     async def _reg():
         async for _ in engine.generate({"prompt_token_ids": reg},
@@ -257,7 +404,8 @@ def _stage_tokens(snapshots, yes_ids, no_ids):
 
 async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
                                   budget_tokens, yes_ids, tag="c",
-                                  no_ids=None):
+                                  no_ids=None, spec=False, forked=True,
+                                  spec_after=0, class_map=None):
     """Chain mode: the engine itself runs each document's whole filter
     chain (register questions once, then one request per document; the
     scheduler judges answers, rewinds, and continues). Returns the same
@@ -266,9 +414,22 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
     With no_ids given, the gate runs in decisive-token mode for models
     that do not answer in one token: each stage may sample several
     tokens, the engine stops the stage at the first token in either
-    set, and only those tokens count as stage answers."""
+    set, and only those tokens count as stage answers.
+
+    With spec=True the chain is speculative: the engine advances
+    through every stage regardless of the gate, so the query gets all
+    answers - still one request per document, no re-sent ids. Spec
+    requires the one-token answer contract; a decisive-token window
+    would misalign the stage record. For a model that chatters
+    free-running (the 32B tier), constrain the sampler instead:
+    SamplingParams(allowed_token_ids=yes|no ids, max_tokens=1) makes
+    every stage answer in one token by construction. forked=False
+    forces the sequential stage-by-stage path (the fork validation
+    control)."""
     import time as _time
 
+    assert not (spec and no_ids), \
+        "spec mode requires one-token answers (no decisive-token window)"
     n = len(q_ids)
     await _register_query(engine, sampling_params, q_ids, yes_ids, no_ids,
                           "", f"{tag}-reg")
@@ -286,9 +447,18 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
         toks = []
         try:
             final = None
+            if spec:
+                sq = "" if forked else "sq|"
+                rid = f"de1|c|s|{sq}d{i}|{tag}-{i}-0"
+            elif spec_after:
+                # the hybrid: gate through stage spec_after, then fork
+                # the remaining filters on the survivors
+                rid = f"de1|c|sw{spec_after}|d{i}|{tag}-{i}-0"
+            else:
+                rid = f"de1|c|d{i}|{tag}-{i}-0"
             async for out in engine.generate(
                     {"prompt_token_ids": body_ids[i] + q_ids[0]},
-                    sampling_params, f"de1|c|d{i}|{tag}-{i}-0"):
+                    sampling_params, rid):
                 final = out
                 ids = list(out.outputs[0].token_ids or ())
                 if ids:
@@ -302,7 +472,10 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
             if i == 0:
                 raw0.extend(tuple(s) for s in toks[:8])
             for j, t in enumerate(stage_toks[:n]):
-                answers[(i, j + 1)] = 1 if t in yes_ids else 0
+                # class_map generalizes the binary judgment: the
+                # sampled token maps to a class index (-1 = none)
+                answers[(i, j + 1)] = (class_map.get(t, -1) if class_map
+                                       else (1 if t in yes_ids else 0))
             if len(stage_toks) >= n \
                     and all(t in yes_ids for t in stage_toks[:n]):
                 survivors.append(i)
@@ -361,7 +534,7 @@ async def run_shared_scan(engine, sampling_params, body_ids, queries,
     per = [dict(survivors=[], answers={}, wall=0.0) for _ in queries]
     t0 = _time.time()
 
-    async def one_chain(i, k):
+    async def one_chain(i, k, started=None):
         qy = queries[k]
         n_k = len(qy["q_ids"])
         rid = tags.rid(f"{tag}-{i}-{k}", doc=i,
@@ -374,6 +547,8 @@ async def run_shared_scan(engine, sampling_params, body_ids, queries,
                     {"prompt_token_ids": body_ids[i] + qy["q_ids"][0]},
                     sampling_params, rid):
                 final = out
+                if started is not None and not started.is_set():
+                    started.set()
                 ids = list(out.outputs[0].token_ids or ())
                 if ids:
                     toks.append(ids)
@@ -393,12 +568,28 @@ async def run_shared_scan(engine, sampling_params, body_ids, queries,
                 rec["survivors"].append(i)
             rec["wall"] = _time.time() - t0
         finally:
+            # a chain that dies before yielding must still unblock the
+            # sibling queries waiting on the document's first commit
+            if started is not None:
+                started.set()
             tags.release(i)
 
     async def doc_run(i, cost):
         nonlocal used
         try:
-            await asyncio.gather(*[one_chain(i, k) for k in range(nq)])
+            if nq > 1:
+                # commit the document's KV once before the sibling
+                # queries launch: the prefix cache only dedups against
+                # committed blocks, so simultaneous identical prefixes
+                # would each prefill the document themselves
+                ev = asyncio.Event()
+                first = asyncio.create_task(one_chain(i, 0, started=ev))
+                await ev.wait()
+                await asyncio.gather(
+                    first, *[one_chain(i, k) for k in range(1, nq)])
+            else:
+                await asyncio.gather(
+                    *[one_chain(i, k) for k in range(nq)])
         finally:
             async with cond:
                 used -= cost

@@ -11,10 +11,10 @@ from docengine.engineext.chainlogic import (
     FAILED, KEEP_DECODING, PASSED, UNDECIDED, PinLedger,
     continuation_tail, document_boundary, full_blocks, gate_decision,
     is_chain, is_heuristic_eviction, is_registration, is_release_all,
-    new_pin_intent, parse_qid, parse_registration, parse_tag,
+    is_spec, new_pin_intent, parse_qid, parse_registration, parse_tag,
     parse_yes_no, partial_boundary, pin_ready, plan_priority,
-    retained_blocks, rewind_target, shared_preamble, stage_advances,
-    strict_violation)
+    retained_blocks, rewind_target, shared_preamble, spec_advances,
+    stage_advances, strict_violation)
 
 PAGE = 16
 BODY = 345          # 21 full blocks of 16, plus 9 remainder tokens
@@ -348,6 +348,112 @@ def test_pin_intent_predicates():
     assert not pin_ready(None, 10 ** 9, ledger)
     ledger.add("3", ["b"], 1)
     assert not pin_ready(intent, 345, ledger)       # sibling won
+
+
+# ---- speculative chains -----------------------------------------------
+
+def test_spec_directive():
+    """The "s" part marks a speculative chain; it rides alongside "c"
+    and the suffix is never read as a directive."""
+    assert is_spec("de1|c|s|d3|t-3-0")
+    assert is_chain("de1|c|s|d3|t-3-0")
+    assert not is_spec("de1|c|d3|t-3-0")
+    assert not is_spec("de1|c|d3|s")            # suffix, not directive
+    assert parse_tag("de1|c|s|d3|t-3-0")[1] == "3"   # d part unshadowed
+
+
+def test_spec_advances_every_stage_but_the_last():
+    """A speculative chain never ends a document early: it advances
+    past failed stages, and only the final stage closes the stream."""
+    for stage in (1, 2, 3):
+        assert spec_advances(stage, 4)
+        assert not stage_advances(FAILED, stage, 4)   # the gated rule
+    assert not spec_advances(4, 4)
+
+
+def test_fork_rid_keeps_directives_and_suffix_rules():
+    """A sibling id keeps the parent's directives, stays unique per
+    stage, and never introduces a part that shadows a directive."""
+    rid = chainlogic.fork_rid("de1|c|s|d3|t-3-0", 2)
+    assert rid == "de1|c|s|fk2|d3|t-3-0" or rid == "de1|c|s|d3|fk2|t-3-0"
+    assert chainlogic.is_spec(rid) and is_chain(rid)
+    assert parse_tag(rid)[1] == "3"
+    assert chainlogic.fork_rid("de1|c|s|d3|t-3-0", 3) != rid
+
+
+def test_fork_board_collects_out_of_order_and_fires_once():
+    """Siblings finish in any order; the board reports completion
+    exactly once and returns answers in stage order."""
+    b = chainlogic.ForkBoard([2, 3, 4])
+    assert not b.record(4, [907])
+    assert not b.record(2, [905])
+    assert b.record(3, [906])        # completion fires here, once
+    assert not b.record(3, [906])    # a duplicate does not re-fire
+    assert b.in_stage_order() == [[905], [906], [907]]
+    # single-token stages splice to one token per stage; generative
+    # stages splice with the separator between them, never inside
+    assert chainlogic.splice(b.in_stage_order(), None) == [905, 906, 907]
+    assert chainlogic.splice([[1, 2], [3], [4, 5]], 99) \
+        == [1, 2, 99, 3, 99, 4, 5]
+    assert chainlogic.parse_sep("de1|reg|Y5|E999|r-reg") == 999
+    assert chainlogic.parse_sep("de1|reg|Y5|r-reg") is None
+
+
+def test_switch_directive_and_rule():
+    """The hybrid's sw part parses like every directive (suffix never
+    read), and the switch rule fires at the first stage whose
+    survivors no longer fill a round with gated question work."""
+    assert chainlogic.parse_switch("de1|c|sw2|d3|t-3-0") == 2
+    assert chainlogic.parse_switch("de1|c|d3|t-3-0") is None
+    assert chainlogic.parse_switch("de1|c|d3|sw2") is None  # suffix
+    # 1,000 docs, halving filters, 13-token tails, 2,048-token rounds:
+    # survivors 500 (6,500 tokens, fills), 250 (3,250, fills),
+    # 125 (1,625, underfills) -> switch after stage 3
+    assert chainlogic.hybrid_switch_stage(1000, [0.5] * 6, 13, 2048) == 3
+    # 20 docs: even stage one's survivors underfill -> switch at 1
+    assert chainlogic.hybrid_switch_stage(20, [0.7] * 6, 13, 2048) == 1
+    # a huge corpus with permissive filters never underfills -> 0
+    assert chainlogic.hybrid_switch_stage(100000, [0.95] * 4,
+                                          13, 2048) == 0
+
+
+def test_step_record_reduces_a_step_to_plain_numbers():
+    """The trace record: token totals, the prefill/decode split,
+    unique documents (registrations carry no d part and do not
+    count), pool occupancy in tokens, and the packing CPU in
+    milliseconds. Without the generating set the split is the
+    one-token heuristic."""
+    toks = {"de1|c|d5|q-5-0": 340,      # prefill chunk of doc 5
+            "de1|c|d7|q-7-0": 1,        # doc 7: one scheduled token
+            "de1|c|fk3|d5|q-5-0": 12,   # doc 5's forked sibling
+            "de1|reg|Y9|q-reg": 8}      # registration: no document
+    rec = chainlogic.step_record(
+        10.5, 0.0012, toks, [chainlogic.doc_key(r) for r in toks],
+        free_blocks=900, total_blocks=1000, block_size=16)
+    assert rec["tokens"] == 361 and rec["seqs"] == 4
+    assert rec["decode_seqs"] == 1 and rec["prefill_tokens"] == 360
+    assert rec["unique_docs"] == 2
+    assert rec["kv_used_tokens"] == 1600
+    assert rec["kv_total_tokens"] == 16000
+    assert rec["sched_ms"] == 1.2
+
+
+def test_step_record_decode_split_is_exact_with_the_generating_set():
+    """With the generating set the split stops guessing: a request is
+    decode only if it already holds sampled output, so a one-token
+    final prefill chunk counts as prefill and a one-token filter run
+    traces zero decode."""
+    toks = {"de1|c|d5|q-5-0": 1,        # one-token prefill remainder
+            "de1|c|d7|q-7-0": 1}        # decisive-token decode (32B)
+    keys = [chainlogic.doc_key(r) for r in toks]
+    rec = chainlogic.step_record(0.0, 0.0, toks, keys, 0, 10, 16,
+                                 decoding={"de1|c|d7|q-7-0"})
+    assert rec["decode_seqs"] == 1
+    assert rec["prefill_tokens"] == 1   # the remainder chunk
+    # a pure filter step: nothing generating yet -> zero decode
+    rec = chainlogic.step_record(0.0, 0.0, toks, keys, 0, 10, 16,
+                                 decoding=set())
+    assert rec["decode_seqs"] == 0 and rec["prefill_tokens"] == 2
 
 
 # ---- module purity ----------------------------------------------------
