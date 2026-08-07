@@ -27,7 +27,13 @@ import json
 
 
 def load(path):
-    with open(path) as f:
+    # banked traces are gzipped (.jsonl.gz); sliced cells are plain
+    if path.endswith(".gz"):
+        import gzip
+        opener = gzip.open
+    else:
+        opener = open
+    with opener(path, "rt") as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
