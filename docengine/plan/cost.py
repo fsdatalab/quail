@@ -44,6 +44,32 @@ FORK_SEQ_S = 70e-6            # scheduler CPU per forked sibling, measured
 #                               (the ledger's fork section, spec_smoke
 #                               2026-08-05: the wall gap that survived
 #                               removing all recompute)
+DECODE_STEP_FIXED_S = 17e-3   # per-decode-step cost that no batch width
+#                               amortizes: kernel launches, the sampler,
+#                               python glue. Measured from the 4B maps
+#                               cap-64 step trace (2026-08-07): 52.1 ms
+#                               per decode step at 1,899 live sequences,
+#                               of which 19.6 ms is compute and 15.2 ms
+#                               packing CPU; the 17.3 ms remainder is
+#                               this constant. Prefill never pays it
+#                               separately - the PHI anchor was measured
+#                               end to end on prefill-only runs, so
+#                               prefill's per-step costs already live
+#                               inside PHI.
+DECODE_SEQ_CPU_S = 8e-6       # scheduler packing CPU per live sequence
+#                               per decode step (same trace: 15.2 ms
+#                               over 1,899 sequences). Scales with the
+#                               batch, so width does not amortize it;
+#                               with compute at 10.3 us/token (4B) this
+#                               caps decode near 55,000 tokens/second
+#                               however wide the batch runs.
+ENGINE_SEQS_MAX = 4096        # hard bound on max_num_seqs at boot:
+#                               per-sequence engine overheads (FlashInfer
+#                               workspace, sampler buffers) live outside
+#                               both the plan's and the engine's pool
+#                               accounting, and the unbounded cap OOM'd
+#                               a 25k-seq boot with ~6 GB unaccounted
+#                               (the opgrid flight's banked boot failure)
 ACT_BYTES_PER_HIDDEN = 32     # peak per-token activation bytes per hidden
 #                               dim (the MLP gate and up intermediates
 #                               dominate; ~82 KB/token at 4B, ~164 KB at
@@ -77,11 +103,17 @@ def decode_step_seconds(model, device, concurrent, context_tokens,
     """Seconds for one decode step advancing `concurrent` calls at mean
     context `context_tokens`: the larger of the step's dense compute
     and its memory traffic (one weight pass plus one KV read per
-    call). This is how the reasoning layer prices decode stepwise."""
+    call), plus the software floor a decode step pays regardless
+    (DECODE_STEP_FIXED_S) and the packing CPU that scales with the
+    batch (DECODE_SEQ_CPU_S per call). The software terms are why a
+    2,000-wide decode step measured 52 ms when its compute alone was
+    20 ms (the 4B maps cap-64 trace). This is how the reasoning layer
+    prices decode stepwise."""
     comp = 2.0 * model.P * concurrent / compute_rate
     bw = (model.W_run + model.kappa * context_tokens * concurrent) \
         / device.BW
-    return max(comp, bw)
+    return max(comp, bw) + DECODE_STEP_FIXED_S \
+        + DECODE_SEQ_CPU_S * concurrent
 
 
 def fluid_block_seconds(model, device, tokens, compute_rate):

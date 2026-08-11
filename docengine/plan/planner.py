@@ -41,10 +41,10 @@ from dataclasses import dataclass, field
 from docengine.configs import DeviceConfig, ModelConfig
 from docengine.engineext import chainlogic
 
-from .cost import (ACT_BYTES_PER_HIDDEN, BOOT_POOL_FRACTION, FORK_SEQ_S,
-                   POOL_HEADROOM, ROUND_TOKENS, STEP_POOL_FRACTION,
-                   STEP_TOKENS_MAX, STEP_TOKENS_MIN, decode_rate,
-                   predict_makespan, t_in)
+from .cost import (ACT_BYTES_PER_HIDDEN, BOOT_POOL_FRACTION,
+                   ENGINE_SEQS_MAX, FORK_SEQ_S, POOL_HEADROOM,
+                   ROUND_TOKENS, STEP_POOL_FRACTION, STEP_TOKENS_MAX,
+                   STEP_TOKENS_MIN, decode_rate, predict_makespan, t_in)
 
 
 @dataclass(frozen=True)
@@ -327,23 +327,32 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
     if gen_tokens:
         # generative maps: decode priced by the calibrated decode
         # model (cost.decode_rate: step time from device physics at
-        # the re-anchored PHI), at the mean context - each generated
-        # token's attention reads the whole context, so the rate
-        # falls with document length. Concurrency is live generations
-        # capped by the per-round token budget. Pessimistic: assumes
-        # every prompt generates its full cap.
+        # the re-anchored PHI plus the measured per-step software
+        # floor), at the mean context - each generated token's
+        # attention reads the whole context, so the rate falls with
+        # document length. Width is what admission actually allows:
+        # the budget holds documents at their worst-case charge (body
+        # plus every prompt plus the full cap per prompt), each live
+        # document runs all its prompts, and the engine's sequence
+        # cap bounds the total. Pessimistic: assumes every prompt
+        # generates its full cap.
         gen_ctx = int(corpus.mean_doc_tokens + question_tokens
                       + gen_tokens / 2)
-        concurrent = max(1, min(corpus.n_docs * n_filters // workers,
-                                ROUND_TOKENS))
+        per_doc_charge = corpus.mean_doc_tokens \
+            + n_filters * (question_tokens + gen_tokens)
+        docs_live = max(1.0, budget / max(1.0, per_doc_charge))
+        concurrent = int(max(1, min(
+            corpus.n_docs * n_filters / workers,
+            docs_live * n_filters,
+            ENGINE_SEQS_MAX)))
         rate = decode_rate(model, device, concurrent, gen_ctx)
         predicted += (corpus.n_docs * n_filters * gen_tokens
                       / rate / workers)
         remarks.append(
             f"generation priced at {rate:,.0f} tokens/second by the "
             f"calibrated decode model (~{gen_ctx}-token contexts, "
-            f"{concurrent} concurrent), assuming the full output cap "
-            "per prompt")
+            f"{concurrent} concurrent from the admission arithmetic), "
+            "assuming the full output cap per prompt")
     if operator == "hybrid_map":
         # forking runs one extra sequence per remaining prompt. Each
         # costs scheduler CPU (about 70 microseconds, measured: the
@@ -384,9 +393,13 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
             break
         admitted_worst += 1
     admitted_worst = max(1, admitted_worst)
-    live_mult = (n_filters
-                 if operator in ("hybrid_filter", "hybrid_map") else 1)
-    engine_max_seqs = admitted_worst * live_mult + 16
+    # every map runs all its prompts as live sequences at once (the
+    # hybrids by forking, pipelined_map by per-pair requests), so only
+    # the gated filters hold one live sequence per document
+    live_mult = (1 if operator in ("pipelined_filter", "requests")
+                 else n_filters)
+    engine_max_seqs = min(admitted_worst * live_mult + 16,
+                          ENGINE_SEQS_MAX)
 
     # the step budget (max_num_batched_tokens), derived: steps are
     # compute-bound past ~105 tokens, so a bigger budget buys only

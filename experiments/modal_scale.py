@@ -632,50 +632,185 @@ async def profile_run(n_docs: int = 4000) -> dict:
     return report
 
 
-@app.function(image=image, gpu="H100!", timeout=2400,
-              volumes={"/root/.cache/huggingface": hf_cache})
-async def persist_run(n_docs: int = 2000) -> dict:
-    """Persisted-KV tier, milestone one: the same query repeated on
-    one engine with a two-tier KV store (RAM primary, container-local
-    disk secondary, vLLM's tiering offload connector). Query one
-    computes cold and offloads as it goes; the prefix cache is then
-    reset, so later queries must restore KV from the store instead
-    of recomputing. A separate engine without the store gives the
-    honest baseline for both the overhead of saving and the payoff of
-    restoring. Runs on the stock scheduler: the store manages the
-    KV lifecycle, and the strict plan-owned-memory discipline is a
-    separate mechanism to reconcile with it later.
+# persist_run (the 4B two-tier persisted-KV cell, persist2000.json)
+# was deleted 2026-08-08: the tiering spec it depends on cannot
+# run in this sandbox (file-backed regions cannot be pinned and
+# the unpinned path dies natively - the ledger and
+# results/engine/README.md carry the evidence). persist32_run
+# with model_key="4b" is the working replacement on the plain
+# CPU spec. Last present at the 2026-08-08 close, in git
+# history.
 
-    Also measures raw disk write bandwidth to anchor the break-even:
-    restoring pays bytes-per-token divided by disk rate against
-    recompute at the prefill rate, and at this model size the two are
-    close by design (the win is projected for bigger models)."""
-    import gc
+
+@app.function(image=image, gpu="H100!", timeout=5400, memory=262144,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def mapwarm_run(stage: str = "ours", n_docs: int = 10000,
+                      cap: int = 16) -> dict:
+    """The warm-map cell: query 1 ingests the corpus (a neutral
+    one-token prompt per document, so only the DOCUMENT prefix is
+    shared with query 2 - the realistic cross-query shape), then
+    query 2 runs the five-prompt open-ended map at the cap.
+
+    stage "ours": the CPU tier (plain spec, alloc-pinned pool)
+    holds every document's KV; the GPU prefix cache is reset
+    between queries, so query 2's document reads come from the
+    tier at the measured 10.2 GB/s. Runs on the stock scheduler -
+    the tier is orthogonal to the plan scheduler, which is part of
+    the claim. stage "stock": no tier, no reset; query 2 gets
+    whatever the GPU prefix cache retained (about a third of a
+    10k-document corpus at 4B). 10,000 documents are required for
+    the cell to discriminate (a 4,000-document corpus fits stock's
+    GPU cache outright); the 219 GB CPU pool needs this function's
+    256 GiB container. Cap 16 by design: decode is untouched by
+    the tier, so bigger caps wash the signal out (the prediction
+    table's arithmetic)."""
     import inspect
-    import os
-    import subprocess
     import time as _time
 
-    import numpy as np
-    import torch
     from transformers import AutoTokenizer
     from vllm import SamplingParams
-
-    try:
-        from vllm.v1.engine.async_llm import AsyncLLM as Engine
-    except ImportError:
-        from vllm import AsyncLLMEngine as Engine
-    try:
-        from vllm.engine.arg_utils import AsyncEngineArgs
-    except ImportError:
-        from vllm import AsyncEngineArgs
     from vllm.config import KVTransferConfig
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM as Engine
 
-    from docengine.runtime.engine_client import run_filter_chain
+    from docengine.runtime.engine_client import run_map
 
     docs = _build_pool(n_docs)
     tok = AutoTokenizer.from_pretrained(MODEL)
-    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True)
+    body_ids = tok(docs, add_special_tokens=False)["input_ids"]
+    map_prompts = (
+        "\n\nInstruction: give a one-sentence summary of the review "
+        "above.\nSummary:",
+        "\n\nInstruction: in one sentence, state the reviewer's "
+        "overall sentiment and why.\nAnswer:",
+        "\n\nInstruction: name the movie or show being reviewed, if "
+        "stated; otherwise say unknown.\nAnswer:",
+        "\n\nInstruction: guess the genre of the movie in at most "
+        "five words.\nGenre:",
+        "\n\nInstruction: quote the single phrase from the review "
+        "that best captures its tone.\nQuote:",
+    )
+    p_ids = [tok(x, add_special_tokens=False)["input_ids"]
+             for x in map_prompts]
+    ingest_ids = [tok("\n\nInstruction: read the review.\nOK:",
+                      add_special_tokens=False)["input_ids"]]
+    corpus = int(sum(len(b) for b in body_ids))
+    budget = 749_782          # the maps flight's plan budget
+    report = dict(stage=stage, n_docs=n_docs, cap=cap,
+                  corpus_tokens=corpus, image=IMAGE_STAMP)
+
+    kw = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+              max_num_seqs=4096, max_num_batched_tokens=25_305,
+              gpu_memory_utilization=0.90 if stage == "ours" else 0.92,
+              enable_prefix_caching=True, disable_log_stats=True)
+    if stage == "ours":
+        kw["kv_transfer_config"] = KVTransferConfig(
+            kv_connector="OffloadingConnector", kv_role="kv_both",
+            kv_connector_extra_config=dict(
+                cpu_bytes_to_use=240 * (1 << 30)))
+    engine = Engine.from_engine_args(AsyncEngineArgs(**kw))
+
+    t0 = _time.time()
+    r1 = await run_map(engine, SamplingParams(temperature=0.0,
+                                              max_tokens=1),
+                       body_ids, ingest_ids, budget, tag="ing")
+    report["ingest_wall_s"] = round(_time.time() - t0, 2)
+    if stage == "ours":
+        _time.sleep(8)         # let offload writes drain
+        res = engine.reset_prefix_cache()
+        if inspect.isawaitable(res):
+            await res
+    t0 = _time.time()
+    r2 = await run_map(engine, SamplingParams(temperature=0.0,
+                                              max_tokens=cap),
+                       body_ids, p_ids, budget, tag="wm")
+    report["map_wall_s"] = round(_time.time() - t0, 2)
+    report["map_reads"] = round((r2["prompt_tokens"]
+                                 - r2["cached_tokens"])
+                                / max(1, corpus), 3)
+    report["ingest_reads"] = round((r1["prompt_tokens"]
+                                    - r1["cached_tokens"])
+                                   / max(1, corpus), 3)
+    print(f"[mapwarm] {stage}: ingest {report['ingest_wall_s']}s "
+          f"(reads {report['ingest_reads']}), warm map "
+          f"{report['map_wall_s']}s (reads {report['map_reads']})",
+          flush=True)
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
+    return report
+
+
+@app.function(image=image, gpu="H100!", timeout=3600, memory=131072,
+              volumes={"/root/.cache/huggingface": hf_cache})
+async def persist32_run(n_docs: int = 1000,
+                        stage: str = "baseline",
+                        model_key: str = "32b") -> dict:
+    """Persisted KV on the 32B tier, CPU tier only: the case where
+    restore should finally beat recompute. At 32B the KV is 128 KiB
+    per token (1,000 documents is about 40 GB) and prefill runs about
+    13,000 tokens per second, so recomputing the corpus costs ~23
+    seconds while restoring it at the 4B flight's measured ~2.7 GB/s
+    would cost ~15. Protocol split across two containers because a
+    second engine boot in one container died in DeepGEMM warmup (the
+    core forks from a CUDA-initialized parent; the in-process env
+    flag no longer takes effect on this vLLM): stage "baseline" runs
+    cold then recompute-after-reset with no store; stage "store" runs
+    cold+offload then two restores. Outcome identity is checked
+    across the two containers by the entrypoint - same seed, same
+    corpus, greedy decode. No disk tier in this cell. Banks walls,
+    effective restore bandwidth, and survivors."""
+    import inspect
+    import os
+    import time as _time
+
+    # No allocator flags on either stage: expandable segments
+    # corrupted answers under prefix caching (the banked 0.88-era
+    # trap), and the plain CPU spec needs no workarounds at all.
+    # The store stage uses the PLAIN CPU spec, not the tiering one.
+    # The tiering spec exists for disk secondaries and pays for them
+    # with a file-backed /dev/shm region that this sandbox cannot
+    # pin (cudaHostRegister 304 on file-backed mmaps; its unpinned
+    # fallback then died natively mid-query - the v8 run). The plain
+    # spec allocates its pool with pin_memory=True (cudaHostAlloc),
+    # which the probe measured at 55.4 GB/s here (pinprobe.json).
+    # This cell is CPU-only, so nothing needed the tiering spec.
+
+    import numpy as np
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    from vllm.config import KVTransferConfig
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM as Engine
+
+    from docengine.runtime.engine_client import run_filter_chain
+
+    # model_key "4b" re-flies the same protocol on the 4B tier: at
+    # the pinned channel's measured 10.2 GB/s the tier clears the 4B
+    # threshold (7.2 GB/s KV generation), which would reverse the
+    # banked "4B loses as predicted" - a conclusion of the broken
+    # channel, not the tier
+    model_name = MODEL if model_key == "4b" else MODEL32
+    kv_per_token = 73_728 if model_key == "4b" else 131_072
+    pool_budget = 830_000 if model_key == "4b" else 240_000
+    cpu_gb = 32 if model_key == "4b" else 56
+    docs = _build_pool(n_docs)
+    tok = AutoTokenizer.from_pretrained(model_name)
+    yes_ids, no_ids = set(), set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            yes_ids.add(ids[0])
+    for w in ("NO", " NO", "No", " No", "N", " N"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            no_ids.add(ids[0])
+    # the 32B free-runs past a one-token answer; constraining the
+    # sampler to the yes/no ids holds the one-token contract
+    sp = SamplingParams(temperature=0.0, max_tokens=1, skip_clone=True,
+                        allowed_token_ids=sorted(yes_ids | no_ids))
     n, s = 2, 0.7
     rng = np.random.default_rng(FLAG_SEED + 7)
     flags = (rng.random((len(docs), n)) < s).astype(int)
@@ -683,113 +818,67 @@ async def persist_run(n_docs: int = 2000) -> dict:
     body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
     q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
              for j in range(n)]
-    report = dict(n_docs=n_docs, image=IMAGE_STAMP,
-                  corpus_tokens=int(sum(len(b) for b in body_ids)))
-
-    # raw disk write bandwidth on the same filesystem the tier uses
-    os.makedirs("/root/kvtier", exist_ok=True)
-    buf = os.urandom(1 << 28)
-    t0 = _time.time()
-    fd = os.open("/root/kvtier/bwprobe", os.O_WRONLY | os.O_CREAT)
-    for _ in range(8):
-        os.write(fd, buf)
-    os.fsync(fd)
-    os.close(fd)
-    wbw = (8 * len(buf)) / (_time.time() - t0) / 1e9
-    os.unlink("/root/kvtier/bwprobe")
-    report["disk_write_GBps"] = round(wbw, 2)
-    print(f"[persist] raw disk write {wbw:.2f} GB/s", flush=True)
+    corpus = int(sum(len(b) for b in body_ids))
+    kv_bytes = corpus * kv_per_token   # fp8: 128 KiB/token at 32B, 72 at 4B
+    report = dict(n_docs=n_docs, model=model_name, image=IMAGE_STAMP,
+                  stage=stage, corpus_tokens=corpus,
+                  kv_bytes_estimate=kv_bytes)
+    print(f"[persist32] stage {stage}: corpus {corpus:,} tokens, KV "
+          f"about {kv_bytes / 1e9:.1f} GB", flush=True)
 
     def engine_args(store):
-        kw = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
-                  gpu_memory_utilization=0.92, enable_prefix_caching=True,
-                  disable_log_stats=True)
+        kw = dict(model=model_name, kv_cache_dtype="fp8",
+                  max_model_len=4608, gpu_memory_utilization=0.92,
+                  enable_prefix_caching=True, disable_log_stats=True)
         if store:
             kw["kv_transfer_config"] = KVTransferConfig(
                 kv_connector="OffloadingConnector", kv_role="kv_both",
                 kv_connector_extra_config=dict(
-                    spec_name="TieringOffloadingSpec",
-                    cpu_bytes_to_use=16 * (1 << 30),
-                    secondary_tiers=[dict(type="fs",
-                                          root_dir="/root/kvtier")]))
+                    cpu_bytes_to_use=cpu_gb * (1 << 30)))
         return AsyncEngineArgs(**kw)
 
     async def one_query(engine, tag):
         return await run_filter_chain(engine, sp, body_ids, q_ids,
-                                      830_000, tag=tag)
+                                      pool_budget, tag=tag)
 
     async def reset(engine):
         res = engine.reset_prefix_cache()
         if inspect.isawaitable(res):
             await res
 
-    def tier_bytes():
-        try:
-            out = subprocess.run(["du", "-sb", "/root/kvtier"],
-                                 capture_output=True, text=True)
-            return int(out.stdout.split()[0])
-        except Exception:
-            return -1
-
-    engine = Engine.from_engine_args(engine_args(store=False))
-    base = await one_query(engine, "pb")
-    await reset(engine)
-    base2 = await one_query(engine, "pb2")
-    report["baseline_cold_s"] = round(base["wall"], 2)
-    report["baseline_recompute_s"] = round(base2["wall"], 2)
-    print(f"[persist] baseline cold {base['wall']:.2f}s, recompute "
-          f"after reset {base2['wall']:.2f}s", flush=True)
-    try:
-        engine.shutdown()
-    except Exception:
-        pass
-    del engine
-    gc.collect()
-    torch.cuda.empty_cache()
-    _time.sleep(8)
-
-    # The store's shared region pre-faults its pages with
-    # MADV_POPULATE_WRITE, which this sandbox does not implement
-    # (EINVAL). Pre-faulting is an optimization only - pages fault in
-    # lazily without it - so run the store engine's core in-process
-    # (the client cannot patch a separate process) and swallow the
-    # unsupported call. The baseline above ran out-of-process; the
-    # profile phase measured that difference at about zero.
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    import mmap as _mmap
-
-    class _TolerantMmap(_mmap.mmap):
-        def madvise(self, *a, **kw):
-            try:
-                return super().madvise(*a, **kw)
-            except OSError:
-                return None
-
-    _mmap.mmap = _TolerantMmap
-
-    engine = Engine.from_engine_args(engine_args(store=True))
-    q1 = await one_query(engine, "ps1")
-    _time.sleep(8)                     # let offload writes drain
-    b1 = tier_bytes()
-    await reset(engine)
-    q2 = await one_query(engine, "ps2")
-    await reset(engine)
-    q3 = await one_query(engine, "ps3")
-    b3 = tier_bytes()
-    report["store_cold_offload_s"] = round(q1["wall"], 2)
-    report["store_restore_s"] = round(q2["wall"], 2)
-    report["store_restore2_s"] = round(q3["wall"], 2)
-    report["tier_disk_bytes_after_q1"] = b1
-    report["tier_disk_bytes_final"] = b3
-    report["outcomes_identical"] = (
-        base["survivors"] == q1["survivors"] == q2["survivors"]
-        == q3["survivors"])
-    print(f"[persist] with store: cold+offload {q1['wall']:.2f}s, "
-          f"restore {q2['wall']:.2f}s, restore again {q3['wall']:.2f}s",
-          flush=True)
-    print(f"[persist] disk holds {b1 / 1e9:.1f} GB after query one, "
-          f"{b3 / 1e9:.1f} GB at end; outcomes identical: "
-          f"{report['outcomes_identical']}", flush=True)
+    if stage == "baseline":
+        engine = Engine.from_engine_args(engine_args(store=False))
+        base = await one_query(engine, "pb")
+        await reset(engine)
+        base2 = await one_query(engine, "pb2")
+        report["baseline_cold_s"] = round(base["wall"], 2)
+        report["baseline_recompute_s"] = round(base2["wall"], 2)
+        report["survivors"] = base["survivors"]
+        print(f"[persist32] baseline cold {base['wall']:.2f}s, "
+              f"recompute after reset {base2['wall']:.2f}s",
+              flush=True)
+    else:
+        engine = Engine.from_engine_args(engine_args(store=True))
+        q1 = await one_query(engine, "ps1")
+        _time.sleep(8)                 # let offload writes drain
+        await reset(engine)
+        q2 = await one_query(engine, "ps2")
+        await reset(engine)
+        q3 = await one_query(engine, "ps3")
+        report["store_cold_offload_s"] = round(q1["wall"], 2)
+        report["store_restore_s"] = round(q2["wall"], 2)
+        report["store_restore2_s"] = round(q3["wall"], 2)
+        best = min(q2["wall"], q3["wall"])
+        report["restore_effective_GBps"] = round(
+            kv_bytes / best / 1e9, 2)
+        report["outcomes_identical_within_store"] = (
+            q1["survivors"] == q2["survivors"] == q3["survivors"])
+        report["survivors"] = q1["survivors"]
+        print(f"[persist32] with store: cold+offload "
+              f"{q1['wall']:.2f}s, restore {q2['wall']:.2f}s then "
+              f"{q3['wall']:.2f}s "
+              f"({report['restore_effective_GBps']} GB/s effective)",
+              flush=True)
     try:
         engine.shutdown()
     except Exception:
@@ -2264,9 +2353,24 @@ def main(phase: str = "speed", n_docs: int = 0, out: str = "",
     elif phase == "chainbf16":
         data = chain_run.remote(n_docs or 10000, 4, 0.8, 0, "bf16")
         path = out or "results/engine/chainbf16_10k.json"
-    elif phase == "persist":
-        data = persist_run.remote(n_docs or 2000)
-        path = out or "results/engine/persist2000.json"
+    elif phase == "mapwarm":
+        ho = mapwarm_run.spawn("ours", n_docs or 10000)
+        hs = mapwarm_run.spawn("stock", n_docs or 10000)
+        ours, stock = ho.get(), hs.get()
+        data = dict(ours=ours, stock=stock)
+        path = out or "results/engine/mapwarm4b_10k.json"
+    elif phase in ("persist32", "persist4bpin"):
+        nd = n_docs or 1000
+        mk = "4b" if phase == "persist4bpin" else "32b"
+        hb = persist32_run.spawn(nd, "baseline", mk)
+        hs = persist32_run.spawn(nd, "store", mk)
+        base, store = hb.get(), hs.get()
+        surv_b = base.pop("survivors", None)
+        surv_s = store.pop("survivors", None)
+        data = {**base, **store,
+                "outcomes_identical": surv_b == surv_s}
+        name = "persist4b_pin" if mk == "4b" else "persist32"
+        path = out or f"results/engine/{name}_1k_cpu.json"
     elif phase == "model32":
         data = model32_run.remote(n_docs or 1000)
         path = out or "results/engine/model32_1k.json"

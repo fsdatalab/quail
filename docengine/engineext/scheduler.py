@@ -76,6 +76,7 @@ class DocEngineScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._de_pins = chainlogic.PinLedger()  # doc key -> blocks, uses
+        self._de_rid_tag = {}       # request id -> parsed tag (once)
         self._de_pinned_ids = set()  # block ids currently pinned
         self._de_intent = {}        # request id -> (pin_tokens, doc, uses)
         self._de_queries = {}       # query id -> dict(qs, qc, yes, no)
@@ -144,6 +145,12 @@ class DocEngineScheduler(Scheduler):
     def schedule(self, *args, **kwargs):
         t0 = time.monotonic()
         out = super().schedule(*args, **kwargs)
+        # one-shot mid-run profile dump: map runs never hit the
+        # chain path's release-all trigger, and 900 steps lands
+        # inside cap-64's decode stretches
+        self._de_step_count = getattr(self, "_de_step_count", 0) + 1
+        if self._de_prof and self._de_step_count == 900:
+            self._de_dump_profile("map-900-steps")
         if self._de_steps is not None:
             self._de_steps.append((time.monotonic(),
                                    out.total_num_scheduled_tokens))
@@ -157,11 +164,18 @@ class DocEngineScheduler(Scheduler):
             decoding = {rid for rid in toks
                         if (req := self.requests.get(rid)) is not None
                         and req._output_token_ids}
-            self._de_trace_buf.append(chainlogic.step_record(
+            rec = chainlogic.step_record(
                 now, now - t0, toks,
-                [chainlogic.doc_key(rid) for rid in toks],
+                [t[1] if (t := self._de_tag(rid)) else None
+                 for rid in toks],
                 pool.get_num_free_blocks(), pool.num_gpu_blocks,
-                self.block_size, decoding=decoding))
+                self.block_size, decoding=decoding)
+            # queue depths name the decode-width binder: whether
+            # requests sit WAITING (engine chose not to run them) or
+            # simply were never submitted yet (client-side pacing)
+            rec["waiting"] = len(self.waiting)
+            rec["running"] = len(self.running)
+            self._de_trace_buf.append(rec)
             if len(self._de_trace_buf) >= 256:
                 self._de_trace_flush()
         return out
@@ -462,6 +476,21 @@ class DocEngineScheduler(Scheduler):
         if st is None:
             return new_token_ids, stopped
         q = self._de_queries[st["qid"]]
+        if st.get("compose"):
+            # composed stages end at their natural stop (EOS or the
+            # cap); no gate, no decisive token. On an advance the
+            # registered separator rides the outgoing tokens so the
+            # client can split stage segments - the record itself
+            # never contains it (the fork-splice convention)
+            if stopped:
+                st["advance"] = chainlogic.compose_advances(
+                    st["stage"], len(q["qs"]))
+                if st["advance"]:
+                    request.status = RequestStatus.RUNNING
+                    if q.get("sep") is not None:
+                        new_token_ids = (list(new_token_ids)
+                                         + [q["sep"]])
+            return new_token_ids, stopped
         out = request._output_token_ids
         tok = out[-1] if out else None
         decision = chainlogic.gate_decision(tok, stopped, q["yes"], q["no"])
@@ -502,6 +531,28 @@ class DocEngineScheduler(Scheduler):
                 self._de_dump_profile("chain-mode")
             return True
         st["advance"] = False
+        if st.get("compose"):
+            # the composed advance: absorb the generated output into
+            # the prompt record (its KV is already computed - no
+            # rewind, no block changes), then append the next stage's
+            # instruction through the same session mechanism the
+            # rewind path uses. The client sees this stage's output
+            # snapshot shrink to empty and accumulates the segment
+            # (run_compose's contract).
+            request.num_prompt_tokens = len(request._all_token_ids)
+            request.prompt_token_ids = list(request._all_token_ids)
+            request._output_token_ids.clear()
+            st["stage"] += 1
+            q = self._de_queries[st["qid"]]
+            update = StreamingUpdate(
+                mm_features=None,
+                prompt_token_ids=list(q["qs"][st["stage"] - 1]),
+                max_tokens=request.max_tokens,
+                arrival_time=request.arrival_time,
+                sampling_params=request.sampling_params)
+            self._update_request_as_session(request, update)
+            self._enqueue_waiting_request(request)
+            return False
         # the sq part on the request id forces the sequential path per
         # request (the control for fork validation); the env var is
         # the boot-time master switch, read in the core process
@@ -547,6 +598,11 @@ class DocEngineScheduler(Scheduler):
             yappi.clear_stats()
             self._de_prof_cleared = True
         rid = request.request_id
+        # parse the id ONCE per request. The step trace and the free
+        # path used to re-parse every scheduled request every step -
+        # 1.85 million parses in 900 steps at cap 64, 2.6 percent of
+        # core CPU (the map-900-steps profile)
+        self._de_rid_tag[rid] = chainlogic.parse_tag(rid)
         if chainlogic.is_registration(rid):
             self._de_register(request)
             return
@@ -557,6 +613,7 @@ class DocEngineScheduler(Scheduler):
             self._de_chain[rid] = dict(
                 stage=1, qid=qid, spec=chainlogic.is_spec(rid),
                 seq=chainlogic.is_seq(rid),
+                compose=chainlogic.is_compose(rid),
                 switch=chainlogic.parse_switch(rid),
                 d=chainlogic.document_boundary(
                     request.num_prompt_tokens, len(q["qs"][0])))
@@ -614,8 +671,19 @@ class DocEngineScheduler(Scheduler):
                   flush=True)
             self._de_dump_profile("request-mode")
 
+    def _de_tag(self, rid):
+        """The parsed tag for a request id, from the once-per-request
+        cache; falls back to parsing for ids that never passed
+        add_request (in-engine fabricated fork siblings)."""
+        try:
+            return self._de_rid_tag[rid]
+        except KeyError:
+            tag = chainlogic.parse_tag(rid)
+            self._de_rid_tag[rid] = tag
+            return tag
+
     def _free_request_blocks(self, request):
-        if chainlogic.parse_tag(request.request_id) is not None:
+        if self._de_tag(request.request_id) is not None:
             groups = self.kv_cache_manager.coordinator.get_blocks(
                 request.request_id)
             blocks = groups[0] if groups else []
@@ -634,9 +702,18 @@ class DocEngineScheduler(Scheduler):
                     self._de_stats["blocks"] += len(keep)
             # the plan owns its memory: whatever this request leaves
             # behind unpinned has no future consumer, so strip its
-            # cache entries rather than leave them to the recency rule
+            # cache entries rather than leave them to the recency rule.
+            # Blocks other live requests still hold are not dead - a
+            # map document's siblings share its prefix blocks, and
+            # stripping those entries when the first sibling finishes
+            # made every later sibling re-read the whole document (the
+            # cap-16 reads anomaly, 1.438 against the 1.374 block
+            # floor); the last holder strips them when it finishes
             tail = {b.block_id for b in blocks
                     if not b.is_null
-                    and b.block_id not in self._de_pinned_ids}
+                    and b.block_id not in self._de_pinned_ids
+                    and getattr(b, "ref_cnt", 1) <= 1}
             self._de_evict(tail)
         super()._free_request_blocks(request)
+        # the freed request's tag is never read again
+        self._de_rid_tag.pop(request.request_id, None)

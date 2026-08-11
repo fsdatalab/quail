@@ -91,7 +91,8 @@ N_FILTERS = 5
 async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
                          model_key: str = "4b", profile: str = "",
                          old_rider: bool = False,
-                         stock_only: bool = False) -> dict:
+                         stock_only: bool = False,
+                         classifier: bool = False) -> dict:
     import inspect
     import os
     import time as _time
@@ -163,11 +164,15 @@ async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
                  max_num_batched_tokens=max(2048, 500 * N_FILTERS + 64),
                  max_model_len=4608))
 
-    # the 32B restates the flags line free-running; constraining the
-    # sampler to the yes/no ids holds every stage to one token by
-    # construction (the map contract), keeping all executors uniform
-    kw = ({} if model_key == "4b"
-          else dict(allowed_token_ids=sorted(yes_ids | no_ids)))
+    # Constrain the sampler to the yes/no ids on BOTH tiers. The 32B
+    # always needed it (free-running restates the flags line). The 4B
+    # needs it for the baseline's sake: stock scores its one answer
+    # token as text, so a "Y" token scores as NO and the cliff and
+    # classifier stock cells read 25-55 percent wrong while our
+    # id-judged cells read 0.3 percent on the same corpus. With the
+    # constraint every executor emits only yes/no ids and the text
+    # parse cannot diverge from the id judgment.
+    kw = dict(allowed_token_ids=sorted(yes_ids | no_ids))
     sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
                         skip_clone=True, **kw)
     report = dict(n_docs=n_docs, n_filters=N_FILTERS, reps=reps,
@@ -178,15 +183,17 @@ async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
                   model=model_name, image=IMAGE_STAMP, cells=[],
                   traces={})
 
-    async def run_naive(engine, body_ids, q_ids, cap, tag):
+    async def run_naive(engine, body_ids, q_ids, cap, tag,
+                        gate=True):
         """The naive baseline: plain generate() per (doc, stage),
         gated client-side, no token budget, no pins, no priority.
-        Outstanding documents are bounded by a semaphore at the
-        engine's own sequence cap: the unbounded version (10,000
-        open requests) killed the stock engine core outright
-        (EngineDeadError, the 4b_stock job) - that crash is the
-        banked unbounded result, and any real client bounds its
-        concurrency."""
+        With gate=False this is the stock classifier baseline: every
+        question on every document, nothing skipped. Outstanding
+        documents are bounded by a semaphore at the engine's own
+        sequence cap: the unbounded version (10,000 open requests)
+        killed the stock engine core outright (EngineDeadError, the
+        4b_stock job) - that crash is the banked unbounded result,
+        and any real client bounds its concurrency."""
         import asyncio as _aio
         sem = _aio.Semaphore(cap)
         counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
@@ -206,14 +213,36 @@ async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
             return 1 if iy >= 0 and (ino < 0 or iy < ino) else 0
 
         async def chain(i):
+            if not gate:
+                # the COMPETENT classifier client: a document's
+                # questions are independent, so co-submit them (the
+                # maps access pattern, measured reads 1.36) instead
+                # of one at a time (reads 4.9-5.7: the pool churns
+                # between a document's questions - the sequential-
+                # client baselines banked before the client audit).
+                # The semaphore bounds requests, not documents, so
+                # concurrency matches the engine cap like naive_map.
+                async def one(j):
+                    async with sem:
+                        return await ask(body_ids[i] + q_ids[j],
+                                         f"{tag}-{i}-{j}")
+                got = await _aio.gather(*[one(j)
+                                          for j in range(len(q_ids))])
+                for j, g in enumerate(got):
+                    answers[(i, j + 1)] = g
+                if all(got):
+                    survivors.append(i)
+                return
             async with sem:
                 for j in range(len(q_ids)):
                     got = await ask(body_ids[i] + q_ids[j],
                                     f"{tag}-{i}-{j}")
                     answers[(i, j + 1)] = got
-                    if not got:
+                    if not got and gate:
                         return
-                survivors.append(i)
+                if all(answers[(i, j + 1)]
+                       for j in range(len(q_ids))):
+                    survivors.append(i)
 
         t0 = _time.time()
         await _aio.gather(*(chain(i) for i in range(len(body_ids))))
@@ -226,7 +255,10 @@ async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
         tag = f"{boot}-{prof[:4]}-{op[:4]}-{rep}"
         switch = 0
         t0m = _time.monotonic()
-        if op == "naive_vllm":
+        if op == "naive_classifier_cc":
+            r = await run_naive(engine, body_ids, q_ids, seq_cap, tag,
+                                gate=False)
+        elif op == "naive_vllm":
             r = await run_naive(engine, body_ids, q_ids, seq_cap, tag)
         else:
             spec = op == "ask_everything"
@@ -278,9 +310,19 @@ async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
                 scheduler_cls=("docengine.engineext.scheduler."
                                "DocEngineScheduler"))
                 if planned else {})
+            # Stock boots at 0.88: its flash_attn workspace OOMed at
+            # 0.92 (4.22 GiB tried, 2.79 free), and halving the step
+            # budget instead is self-defeating - the boot profiler
+            # hands the saved activation room straight to the KV
+            # pool (measured: free VRAM fell to 138 MiB). The wrong
+            # answers first blamed on 0.88 were the baseline's text
+            # parser scoring a "Y" token as NO; the sampler
+            # constraint above removes that failure mode for every
+            # executor.
             engine = Engine.from_engine_args(AsyncEngineArgs(
                 model=model_name, kv_cache_dtype="fp8",
-                gpu_memory_utilization=0.92, enable_prefix_caching=True,
+                gpu_memory_utilization=0.92 if planned else 0.88,
+                enable_prefix_caching=True,
                 disable_log_stats=True, **extra, **kw))
 
             async def reset():
@@ -293,7 +335,9 @@ async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
             # budget's effect on the floor-bound executor - so it
             # runs pipelined only
             ops = (("pipelined_filter",) if boot == "old"
-                   else planned_ops if planned else ("naive_vllm",))
+                   else planned_ops if planned
+                   else ("naive_classifier_cc",) if classifier
+                   else ("naive_vllm",))
             for rep in range(reps):
                 for prof in profs:
                     for op in ops:
@@ -302,15 +346,18 @@ async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
                             await run_cell(engine, boot, prof, op,
                                            rep, kw["max_num_seqs"])
                         except Exception as e:
-                            # a dead cell banks its error; later
-                            # cells still try (a dead engine fails
-                            # them fast, each recorded)
+                            # a dead cell banks its error WITH the
+                            # traceback; the EngineDeadError string
+                            # alone was undiagnosable last flight
+                            import traceback as _tb
                             report["cells"].append(dict(
                                 boot=boot, profile=prof, operator=op,
                                 rep=rep,
-                                error=f"{type(e).__name__}: {e}"))
+                                error=f"{type(e).__name__}: {e}",
+                                traceback=_tb.format_exc()[-4000:]))
                             print(f"[opgrid] cell {boot}/{prof}/{op}/"
                                   f"{rep} failed: {e}", flush=True)
+                            _tb.print_exc()
             try:
                 engine.shutdown()
             except Exception as e:
@@ -321,13 +368,18 @@ async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
                 with open(trace_path, "rb") as f:
                     report["traces"][boot] = gzip.compress(f.read())
         except Exception as e:
+            import traceback as _tb
             report.setdefault("boot_errors", {})[boot] = (
                 f"{type(e).__name__}: {e}")
+            report.setdefault("boot_tracebacks", {})[boot] = (
+                _tb.format_exc()[-4000:])
             print(f"[opgrid] boot {boot} failed: {e}", flush=True)
+            _tb.print_exc()
 
     # persist to the volume before returning: the return value dies
     # with a dropped client, the volume does not
     sfx = (f"_{model_key}" + (f"_{profile}" if profile else "")
+           + ("_classifier_cc" if classifier else "")
            + ("_stock" if stock_only else ""))
     traces = report.pop("traces")
     with open(f"/results/opgrid_filters{sfx}.json", "w") as f:
@@ -361,7 +413,10 @@ MAP_PROMPTS = (
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
 async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
-                      caps: list = (16, 64, 256)) -> dict:
+                      caps: str = "16,64,256",
+                      boots: str = "new,stock",
+                      profile: bool = False,
+                      trace: bool = True) -> dict:
     """Flight B: open-ended maps. Every prompt on every document,
     free decode up to the cap, one repetition per cell. Two
     executors: pipelined_map (run_map: per-pair requests, the first
@@ -393,8 +448,15 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
     from docengine.runtime.engine_client import run_map
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
-    os.environ["DOCENGINE_STEPSTATS"] = "1"
+    if trace:
+        os.environ["DOCENGINE_STEPSTATS"] = "1"
+    if profile:
+        # core-process CPU profile; the scheduler dumps a ranked
+        # table at step 900 (walls under profiling are NOT quotable)
+        os.environ["DOCENGINE_PROFILE"] = "1"
 
+    caps = [int(c) for c in str(caps).split(",") if str(c).strip()]
+    boot_names = [b.strip() for b in boots.split(",") if b.strip()]
     model_name = MODEL if model_key == "4b" else MODEL32
     cfg_name = "Qwen3-4B-FP8" if model_key == "4b" else "Qwen3-32B-FP8"
     tok = AutoTokenizer.from_pretrained(model_name)
@@ -410,6 +472,11 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
                              DEVICES["H100-SXM-80GB"], gated=False,
                              gen_tokens=cap) for cap in caps}
     boot_plan = plans[max(caps)]
+    # 4,096 is settled, not provisional: overlapped scheduling
+    # halves effective decode width (running pinned at the cap,
+    # half scheduled per step - the width-binder diagnostic), but
+    # 8,192 OOMs at boot from per-sequence overheads and the
+    # reachable width prices to a tie. The lever is closed.
     kw = dict(max_num_seqs=min(boot_plan.engine_max_seqs, 4096),
               max_num_batched_tokens=boot_plan.engine_step_tokens,
               max_model_len=4608)
@@ -446,9 +513,14 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
         return dict(wall=_time.time() - t0, texts=texts, **counters)
 
     for boot, planned in (("new", True), ("stock", False)):
+        if boot not in boot_names:
+            continue
         try:
             trace_path = f"/tmp/opgrid_maps_trace_{boot}.jsonl"
-            os.environ["DOCENGINE_STEPTRACE"] = trace_path
+            if trace:
+                os.environ["DOCENGINE_STEPTRACE"] = trace_path
+            else:
+                os.environ.pop("DOCENGINE_STEPTRACE", None)
             extra = (dict(
                 scheduling_policy="priority",
                 kv_transfer_config=KVTransferConfig(
@@ -459,9 +531,18 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
                 scheduler_cls=("docengine.engineext.scheduler."
                                "DocEngineScheduler"))
                 if planned else {})
+            # Maps stock keeps 0.92 at the full step budget - that
+            # exact configuration completed all three caps in the
+            # first flight (106/128/479 s), so it stays untouched
+            # for comparability. Our maps boot runs 0.90: the
+            # cap-256 death was mid-decode with the pool at 79%, so
+            # the workspace outside the pool gets the extra room,
+            # and the 0.90 cell measured clean (reads and step shape
+            # match the 0.92 run).
             engine = Engine.from_engine_args(AsyncEngineArgs(
                 model=model_name, kv_cache_dtype="fp8",
-                gpu_memory_utilization=0.92, enable_prefix_caching=True,
+                gpu_memory_utilization=0.90 if planned else 0.92,
+                enable_prefix_caching=True,
                 disable_log_stats=True, **extra, **kw))
 
             async def reset():
@@ -497,11 +578,14 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
                         for j in range(len(p_ids))]
                     print(f"[opgrid-maps] {cell}", flush=True)
                 except Exception as e:
+                    import traceback as _tb
                     report["cells"].append(dict(
                         boot=boot, operator=op, cap=cap,
-                        error=f"{type(e).__name__}: {e}"))
+                        error=f"{type(e).__name__}: {e}",
+                        traceback=_tb.format_exc()[-4000:]))
                     print(f"[opgrid-maps] {boot}/m{cap} failed: {e}",
                           flush=True)
+                    _tb.print_exc()
             try:
                 engine.shutdown()
             except Exception as e:
@@ -510,19 +594,25 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
                 with open(trace_path, "rb") as f:
                     report["traces"][boot] = gzip.compress(f.read())
         except Exception as e:
+            import traceback as _tb
             report.setdefault("boot_errors", {})[boot] = (
                 f"{type(e).__name__}: {e}")
+            report.setdefault("boot_tracebacks", {})[boot] = (
+                _tb.format_exc()[-4000:])
             print(f"[opgrid-maps] boot {boot} failed: {e}", flush=True)
+            _tb.print_exc()
 
     traces = report.pop("traces")
-    with open(f"/results/opgrid_maps_{model_key}.json", "w") as f:
+    sfx = model_key if len(boot_names) == 2 else (
+        f"{model_key}_" + "_".join(boot_names))
+    with open(f"/results/opgrid_maps_{sfx}.json", "w") as f:
         json.dump({k: v for k, v in report.items()}, f)
     for boot, blob in traces.items():
-        with open(f"/results/opgrid_maps_trace_{boot}_{model_key}"
+        with open(f"/results/opgrid_maps_trace_{boot}_{sfx}"
                   ".jsonl.gz", "wb") as f:
             f.write(blob)
     results_vol.commit()
-    print(f"[opgrid-maps] banked opgrid_maps_{model_key}.json",
+    print(f"[opgrid-maps] banked opgrid_maps_{sfx}.json",
           flush=True)
     report["traces"] = traces
     return report
@@ -531,11 +621,13 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
 @app.local_entrypoint()
 def main(n_docs: int = 10000, reps: int = 3, model: str = "4b",
          profile: str = "", old_rider: bool = False,
-         stock_only: bool = False, out: str = ""):
+         stock_only: bool = False, classifier: bool = False,
+         out: str = ""):
     import os
     data = opgrid_filters.remote(n_docs, reps, model, profile,
-                                 old_rider, stock_only)
+                                 old_rider, stock_only, classifier)
     sfx = (f"_{model}" + (f"_{profile}" if profile else "")
+           + ("_classifier_cc" if classifier else "")
            + ("_stock" if stock_only else ""))
     traces = data.pop("traces", {})
     path = out or f"results/engine/opgrid_filters{sfx}.json"

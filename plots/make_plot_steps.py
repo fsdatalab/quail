@@ -98,8 +98,16 @@ def main():
     ax.legend(loc="upper right", fontsize=8)
 
     ax = axes[1]
-    ax.plot(t, seqs, c="#4477aa", lw=0.8, label="live sequences")
+    ax.plot(t, seqs, c="#4477aa", lw=0.8, label="scheduled this step")
     ax.plot(t, docs, c="#228833", lw=0.8, label="unique documents")
+    # queue depths, when the trace carries them (added 2026-08-09):
+    # running pinned at the cap with scheduled at half of it is the
+    # overlapped-scheduling cohort split made visible
+    if "running" in recs[0]:
+        ax.plot(t, [r["running"] for r in recs], c="#ee6677", lw=0.8,
+                label="running (engine)")
+        ax.plot(t, [r["waiting"] for r in recs], c="#ccbb44", lw=0.8,
+                label="waiting (engine)")
     mean_ratio = (sum(seqs) / max(1, sum(docs)))
     ax.set_ylabel("count / step")
     ax.legend(loc="upper right", fontsize=8,

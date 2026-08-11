@@ -89,6 +89,22 @@ def is_seq(request_id):
     return request_id.startswith("de1|") and "|sq|" in request_id
 
 
+def is_compose(request_id):
+    """A composed chain: stage k+1 reads stage k's output, so the
+    advance APPENDS the next instruction at the current record end
+    instead of rewinding to the document boundary. The co part rides
+    alongside c; gating does not apply (stages end at their natural
+    stop) and forks never fire (stages are dependent by
+    construction)."""
+    return request_id.startswith("de1|") and "|co|" in request_id
+
+
+def compose_advances(stage, n_stages):
+    """A composed chain advances until its last stage; there is no
+    gate to fail and no speculation to cut short."""
+    return stage < n_stages
+
+
 def parse_switch(request_id):
     """The hybrid policy's switch stage from the sw<j> part: a gated
     chain that passes stage j forks all remaining filters instead of

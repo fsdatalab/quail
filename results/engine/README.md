@@ -52,6 +52,20 @@ parallel, so phase names may drift after that date.
 | fusegate_auto.json | modal_fused.py, fusegate --kv auto | the bf16 isolation arm: confident flips 20/12, third cell fell back to unfused | good as evidence; its kv_cache_dtype field wrongly says "fp8" (the arm ran "auto", bf16). A recorder fix is in progress |
 | xengine.json | modal_xengine.py, xengine | the falsification and attribution flight, six arms: control 80,556, SGLang 98,746, same vLLM on CUDA 13 devel 97,220 tokens per second | good; the anchor-moving evidence |
 
+## Files from the operator-grid second pass (2026-08-08)
+
+| file | producer | what it banks | status |
+|---|---|---|---|
+| opgrid_maps_4b_pair.json (+ trace opgrid_maps_trace_new_4b_pair.jsonl.gz) | modal_opgrid.py, opgrid_maps, boots new,stock | the SAME-CONTAINER map pairs at caps 64 and 256: ours 139.1/500.5 against stock 130.8/480.0; the two banked losses | good; the only valid ours-against-stock map comparison (host variance falsified cross-container walls) |
+| opgrid_maps_4b_new.json (+ traces) | modal_opgrid.py, opgrid_maps, boots new | the ours-only re-fly on a slow host: cap 16 70.9 s, cap 64 159.2, cap 256 637.7 with NO engine death | good for the survival claim and the host-variance evidence; do not quote its walls against stock |
+| opgrid_filters_4b_permissive_classifier_stock.json | modal_opgrid.py, --classifier --stock-only | stock classifier baseline: 167.8-169.8 s, reads 4.94 | good for walls; wrong counts carry the 0.88 caveat |
+| opgrid_filters_32b_permissive_classifier_stock.json | same, 32B, 1 rep | stock classifier baseline: 1,253.2 s, reads 5.72, wrong 138 (clean) | good |
+| opgrid_filters_4b_cliff_stock.json | same, cliff | stock cliff baseline at 0.88: 48.8-50.9 s | good for walls; wrong 7,893 carries the 0.88 caveat, biased in stock's favor |
+| pinprobe.json | modal_pinprobe.py | the channel calibration: 55.4 GB/s alloc-pinned, 9.7 unpinned, register works on anonymous mmaps and fails (304) on file-backed ones | good; the design doc's channel table |
+| persist32_1k_cpu.json | modal_scale.py, persist32 (two containers, PLAIN CPU spec: pinned pool) | 32B restore 4.04-4.16 s against recompute 27.7 (6.8x win); channel 10.23 GB/s; write-through at ingest free; outcomes identical | good; the tiering spec's file-backed region is unpinnable here and its unpinned path died natively - use the plain spec for CPU-only stores |
+| persist4b_pin_1k_cpu.json | modal_scale.py, persist4bpin | the 4B confirmation on the pinned channel: restore 2.28-2.39 s against recompute 4.54 (2x win, channel 10.22 GB/s) | good; REVERSES persist2000.json's "4B loses" - that conclusion was channel-bound. Caveat: outcomes_identical_within_store false (the checkpoint's borderline-call noise; 32B was fully identical) |
+| opgrid_maps_32b.json (+ trace) | modal_opgrid.py, opgrid_maps 32b, cap 16, boots new,stock | the same-container 32B map pair: 356.3 against 356.1 s, reads 1.36 both - a tie at the compute floor | good; cap 64 dropped by decision, stated in notes/OPGRID2_PREDICTIONS.md |
+
 ## Files that mislead if quoted blind
 
 - chain10k.json and chainsteps10k.json are two flights of one

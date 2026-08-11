@@ -680,3 +680,253 @@ def test_shared_scan_tiny_budget_completes():
     assert eng.admissions == {i: 1 for i in range(12)}
     assert eng.pins == 12 and eng.frees == 12
     assert eng.resident == {} and eng.star_freed == 0
+
+
+# ---------------------------------------------------- map admission
+
+
+class _GatedMapStub:
+    """A map engine the test drives by hand: every request parks until
+    the test finishes it, so admission decisions are observable. Also
+    tracks the worst-case KV the live requests could ever need (each
+    document's body once, plus prompt and full cap per live request),
+    which admission accounting must never let past the budget."""
+
+    def __init__(self, body_lens, gen_budget):
+        self.body_lens = body_lens
+        self.gen_budget = gen_budget
+        self.pending = []            # (future, rid)
+        self.live = {}               # rid -> (doc, prompt_tokens)
+        self.started_docs = set()
+        self.peak_worst_case = 0
+
+    def _worst_case(self):
+        docs = {i for i, _ in self.live.values()}
+        return (sum(self.body_lens[i] for i in docs)
+                + sum(p + self.gen_budget
+                      for _, p in self.live.values()))
+
+    async def generate(self, prompt, sampling_params, request_id,
+                       priority=0):
+        i, j = (int(x) for x in request_id.rsplit("-", 2)[1:])
+        self.started_docs.add(i)
+        self.live[request_id] = (
+            i, len(prompt["prompt_token_ids"]) - self.body_lens[i])
+        self.peak_worst_case = max(self.peak_worst_case,
+                                   self._worst_case())
+        fut = asyncio.get_event_loop().create_future()
+        self.pending.append((fut, request_id))
+        await fut
+        del self.live[request_id]
+        out = _Out(prompt["prompt_token_ids"], f"gen {i}.{j}")
+        yield out
+
+    async def drain(self, run_task):
+        """Finish parked requests oldest-first until the run returns."""
+        for _ in range(100000):
+            if run_task.done():
+                return run_task.result()
+            if self.pending:
+                fut, _rid = self.pending.pop(0)
+                fut.set_result(None)
+            await asyncio.sleep(0)
+        raise AssertionError("map run made no progress")
+
+
+def _map_case(n_docs=6, body=10, n_prompts=3, plen=2, cap=8):
+    body_ids = [[100 + i] * body for i in range(n_docs)]
+    prompt_ids = [[j] * plen for j in range(n_prompts)]
+    sp = type("SP", (), {"max_tokens": cap})()
+    return body_ids, prompt_ids, sp
+
+
+def test_map_per_prompt_release_admits_next_doc_early():
+    """A finished prompt releases its own charge (prompt plus cap)
+    immediately. Charge per doc: 10 + 3*2 + 3*8 = 40; budget 79 holds
+    one whole document. When the first document's first prompt
+    finishes (releasing 10), the second document admits while the
+    first still runs its other prompts - under the old
+    release-at-doc-end rule it could not. Sibling launch order is
+    untouched: every prompt still launches on the first streamed
+    token, so the shared document KV is never lost to admission."""
+    from docengine.runtime.engine_client import run_map
+
+    async def drive():
+        body_ids, prompt_ids, sp = _map_case()
+        eng = _GatedMapStub([len(b) for b in body_ids], 8)
+        task = asyncio.create_task(run_map(
+            eng, sp, body_ids, prompt_ids, budget_tokens=79))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        only_doc0 = set(eng.started_docs)
+        # finish doc 0's first prompt only
+        fut, _rid = eng.pending.pop(0)
+        fut.set_result(None)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        after_one = set(eng.started_docs)
+        doc0_still_live = any(i == 0 for i, _ in eng.live.values())
+        res = await eng.drain(task)
+        return eng, only_doc0, after_one, doc0_still_live, res
+
+    eng, only_doc0, after_one, doc0_live, res = asyncio.run(drive())
+    assert only_doc0 == {0}, only_doc0
+    assert 1 in after_one, "second doc never admitted early"
+    assert doc0_live, "doc 0 should still be running its siblings"
+    assert eng.peak_worst_case <= 79, eng.peak_worst_case
+    assert len(res["texts"]) == 6 * 3
+    assert res["texts"][(0, 1)] == "gen 0.0"
+
+
+def test_map_accounting_never_exceeds_budget_under_load():
+    """Many small documents against a mid-size budget: whatever order
+    requests start and finish in, the live requests' worst-case KV
+    stays under the budget."""
+    from docengine.runtime.engine_client import run_map
+
+    async def drive():
+        body_ids, prompt_ids, sp = _map_case(n_docs=20, body=7,
+                                             n_prompts=4, plen=3, cap=16)
+        eng = _GatedMapStub([len(b) for b in body_ids], 16)
+        task = asyncio.create_task(run_map(
+            eng, sp, body_ids, prompt_ids, budget_tokens=250))
+        res = await eng.drain(task)
+        return eng, res
+
+    eng, res = asyncio.run(drive())
+    assert eng.peak_worst_case <= 250, eng.peak_worst_case
+    assert len(res["texts"]) == 20 * 4
+
+
+def test_map_oversize_document_still_progresses():
+    """One document bigger than the whole budget: admission's escape
+    (used == 0) admits it alone, all its prompts run, and the run
+    finishes instead of deadlocking."""
+    from docengine.runtime.engine_client import run_map
+
+    async def drive():
+        body_ids, prompt_ids, sp = _map_case(n_docs=2, body=30,
+                                             n_prompts=3, plen=2, cap=8)
+        eng = _GatedMapStub([len(b) for b in body_ids], 8)
+        task = asyncio.create_task(run_map(
+            eng, sp, body_ids, prompt_ids, budget_tokens=5))
+        res = await eng.drain(task)
+        return res
+
+    res = asyncio.run(drive())
+    assert len(res["texts"]) == 2 * 3
+
+
+def test_map_forked_releases_stages_as_separators_stream():
+    """Forked map: a finished stage's separator releases its charge
+    immediately, so the next document admits while the first is still
+    streaming its later stages."""
+    from docengine.runtime.engine_client import run_map_forked
+
+    SEP = 9
+
+    class _StageStub:
+        def __init__(self):
+            self.started = []
+            self.doc2_started_while_doc0_open = False
+            self.doc0_open = False
+
+        async def generate(self, prompt, sampling_params, request_id,
+                           priority=0):
+            ids = prompt["prompt_token_ids"]
+            if "-reg" in request_id:
+                yield _ChainOut(ids, [0])
+                return
+            i = int(next(p[1:] for p in request_id.split("|")
+                         if p.startswith("d") and p[1:].isdigit()))
+            self.started.append(i)
+            if i == 0:
+                self.doc0_open = True
+                # stream stage by stage; yield control between stages
+                toks = []
+                for stage in range(3):
+                    toks = toks + [50 + stage, SEP]
+                    yield _ChainOut(ids, list(toks))
+                    for _ in range(20):
+                        await asyncio.sleep(0)
+                self.doc0_open = False
+            else:
+                if self.doc0_open:
+                    self.doc2_started_while_doc0_open = True
+                yield _ChainOut(ids, [60, SEP, 61, SEP, 62, SEP])
+
+    async def drive():
+        body_ids = [[100] * 10, [101] * 10]
+        prompt_ids = [[1, 1], [2, 2], [3, 3]]
+        sp = type("SP", (), {"max_tokens": 8})()
+        eng = _StageStub()
+        # budget fits one full document charge (10 + 6 + 24 = 40)
+        # plus one released stage, not two full documents
+        res = await run_map_forked(eng, sp, body_ids, prompt_ids,
+                                   budget_tokens=52, sep_id=SEP)
+        return eng, res
+
+    eng, res = asyncio.run(drive())
+    assert eng.doc2_started_while_doc0_open, \
+        "stage release never let the second document in"
+    assert res["tokens"][(0, 1)] == [50]
+    assert res["tokens"][(1, 3)] == [62]
+
+
+def test_compose_one_stream_per_document():
+    """Composed map on the client contract: one request per document
+    carrying the c|co parts, stage segments arriving on one stream
+    separated by the registered separator, reassembled under the
+    caller's stage indices. The stub plants each stage's tokens, so
+    equality against the planted segments IS parity with the resend
+    execution on the same truth."""
+    from docengine.engineext import chainlogic
+    from docengine.runtime.engine_client import run_compose
+
+    SEP = _LabelTok.eos_token_id
+
+    class _ComposeStub:
+        def __init__(self):
+            self.rids = []
+
+        async def generate(self, prompt, sampling_params, request_id,
+                           priority=0):
+            self.rids.append(request_id)
+            ids = prompt["prompt_token_ids"]
+            await asyncio.sleep(0)
+            if "-reg" in request_id:
+                yield _ChainOut(ids, [0])
+                return
+            i = int(next(p[1:] for p in request_id.split("|")
+                         if p.startswith("d") and p[1:].isdigit()))
+            a = [500 + i, 501 + i]          # stage A output
+            b = [600 + i]                   # stage B reads A
+            c = [700 + i, 701 + i]          # stage C reads A and B
+            yield _ChainOut(ids, list(a))
+            yield _ChainOut(ids, a + [SEP] + b)
+            yield _ChainOut(ids, a + [SEP] + b + [SEP] + c)
+
+    async def drive():
+        body_ids = [[100 + i] * 10 for i in range(6)]
+        stage_ids = [[1, 1], [2, 2], [3, 3]]
+        sp = type("SP", (), {"max_tokens": 8})()
+        eng = _ComposeStub()
+        res = await run_compose(eng, sp, body_ids, stage_ids,
+                                budget_tokens=10 ** 6, sep_id=SEP)
+        return eng, res
+
+    eng, res = asyncio.run(drive())
+    doc_rids = [r for r in eng.rids if "-reg" not in r]
+    assert len(doc_rids) == 6
+    for r in doc_rids:
+        assert "|c|co|" in r
+        assert chainlogic.is_compose(r) and chainlogic.is_chain(r)
+        assert not chainlogic.is_spec(r)
+    for i in range(6):
+        assert res["tokens"][(i, 1)] == [500 + i, 501 + i]
+        assert res["tokens"][(i, 2)] == [600 + i]
+        assert res["tokens"][(i, 3)] == [700 + i, 701 + i]
+    # the advance rule: stages run to the last and stop there
+    assert chainlogic.compose_advances(1, 3)
+    assert chainlogic.compose_advances(2, 3)
+    assert not chainlogic.compose_advances(3, 3)

@@ -168,12 +168,22 @@ async def run_map(engine, sampling_params, body_ids, prompt_ids,
     KV, and the remaining prompts launch on that request's first
     streamed token so they reuse it - simultaneous identical
     prefixes would each recompute the document (the measured prefill
-    race, results/engine/reason_race.json). Admission charges the
-    document plus its prompts plus the full generation budget, since
-    generated tokens occupy KV too. Multi-token outputs need their
-    own streams, which is why this is not the one-request-per-
+    race, results/engine/reason_race.json). Multi-token outputs need
+    their own streams, which is why this is not the one-request-per-
     document chain: routing sibling generations onto one stream is
-    the open fork extension."""
+    the open fork extension.
+
+    Admission charges a document its full worst case up front - body,
+    every prompt, the full generation cap per prompt - and every
+    prompt launches on the first streamed token exactly as before:
+    delaying a sibling for budget was measured to lose the shared
+    document KV outright (the sibling arrives after the first prompt
+    finished and the document's blocks were dropped; reads 2.35
+    against the 1.37 floor, wall 3x). What admission releases early:
+    each prompt's own charge (its tokens plus its cap) the moment
+    that prompt finishes, instead of holding the whole document until
+    its last prompt. The recycled budget admits the next documents
+    sooner, which is where the decode width comes from."""
     n = len(prompt_ids)
     gen_budget = getattr(sampling_params, "max_tokens", 0) or 0
     q_cost = sum(len(p) for p in prompt_ids) + n * gen_budget
@@ -201,22 +211,38 @@ async def run_map(engine, sampling_params, body_ids, prompt_ids,
 
     async def one_doc(i, cost):
         nonlocal used
+        held = cost          # this document's unreleased charge
+
+        def release(amount):
+            # under cond; never release more than the doc still holds
+            nonlocal used
+            nonlocal held
+            amt = min(amount, held)
+            held -= amt
+            used -= amt
+
+        async def one_prompt(j, started=None):
+            try:
+                return await gen(body_ids[i] + prompt_ids[j],
+                                 f"de1|d{i}|{tag}-{i}-{j}",
+                                 started=started)
+            finally:
+                async with cond:
+                    release(len(prompt_ids[j]) + gen_budget)
+                    cond.notify_all()
+
         try:
             ev = asyncio.Event()
-            first = asyncio.create_task(gen(
-                body_ids[i] + prompt_ids[0], f"de1|d{i}|{tag}-{i}-0",
-                started=ev))
+            first = asyncio.create_task(one_prompt(0, started=ev))
             await ev.wait()
-            rest = await asyncio.gather(*[
-                gen(body_ids[i] + prompt_ids[j],
-                    f"de1|d{i}|{tag}-{i}-{j}")
-                for j in range(1, n)])
+            rest = await asyncio.gather(*[one_prompt(j)
+                                          for j in range(1, n)])
             texts[(i, 1)] = await first
             for j, t in enumerate(rest, start=2):
                 texts[(i, j)] = t
         finally:
             async with cond:
-                used -= cost
+                release(held)
                 cond.notify_all()
 
     t0 = time.time()
@@ -229,6 +255,7 @@ async def run_map(engine, sampling_params, body_ids, prompt_ids,
             used += cost
         tasks.append(asyncio.create_task(one_doc(i, cost)))
     await asyncio.gather(*tasks)
+    assert used == 0, f"admission accounting leaked: {used}"
     return dict(wall=time.time() - t0, texts=texts, **counters)
 
 
@@ -241,7 +268,40 @@ async def run_map_forked(engine, sampling_params, body_ids, prompt_ids,
     separator token between stages. Generations stop at the
     end-of-sequence token and never contain it, which makes the
     separator unambiguous. Returns token lists keyed (doc, prompt)
-    with prompts 1-indexed; the caller detokenizes."""
+    with prompts 1-indexed; the caller detokenizes.
+
+    Admission charges the full worst case up front - the engine may
+    fork every sibling the moment the first token streams, so a
+    partial reserve would under-count live generations. What it does
+    release early: each separator on the stream marks a finished
+    stage, and that stage's prompt and cap come off the charge
+    immediately instead of waiting for the whole document."""
+    return await _run_stream_chain(engine, sampling_params, body_ids,
+                                   prompt_ids, budget_tokens, sep_id,
+                                   tag, "c|s")
+
+
+async def run_compose(engine, sampling_params, body_ids, stage_ids,
+                      budget_tokens, sep_id, tag="cp"):
+    """Composed map: stage k+1 reads stage k's output. One living
+    request per document; each stage generates to its natural stop,
+    the scheduler absorbs the output into the record (its KV stays,
+    nothing rewinds) and appends the next stage's instruction in
+    place. The client contract matches the forked map: one stream
+    whose segments arrive separated by the registered separator
+    token, which never enters the record. Returns token lists keyed
+    (doc, stage) with stages 1-indexed; the caller detokenizes.
+    Segments may carry a trailing stop token; the caller strips it.
+    Engine-level parity against the resend execution (fresh prompt
+    per stage) is required before any flight quotes this path."""
+    return await _run_stream_chain(engine, sampling_params, body_ids,
+                                   stage_ids, budget_tokens, sep_id,
+                                   tag, "c|co")
+
+
+async def _run_stream_chain(engine, sampling_params, body_ids,
+                            prompt_ids, budget_tokens, sep_id, tag,
+                            ridparts):
     n = len(prompt_ids)
     await _register_query(engine, sampling_params, prompt_ids, set(),
                           None, "", f"{tag}-reg", sep=sep_id)
@@ -253,14 +313,31 @@ async def run_map_forked(engine, sampling_params, body_ids, prompt_ids,
 
     async def one_doc(i, cost):
         nonlocal used
+        held = cost
+
+        def release(amount):
+            nonlocal used, held
+            amt = min(amount, held)
+            held -= amt
+            used -= amt
+
         try:
             toks = []
+            seps_released = 0
             async for out in engine.generate(
                     {"prompt_token_ids": body_ids[i] + prompt_ids[0]},
-                    sampling_params, f"de1|c|s|d{i}|{tag}-{i}-0"):
+                    sampling_params, f"de1|{ridparts}|d{i}|{tag}-{i}-0"):
                 ids = list(out.outputs[0].token_ids or ())
                 if len(ids) > len(toks):
                     toks = ids
+                seps = sum(1 for t in toks if t == sep_id)
+                if seps > seps_released:
+                    async with cond:
+                        for k in range(seps_released,
+                                       min(seps, n)):
+                            release(len(prompt_ids[k]) + gen_budget)
+                        seps_released = seps
+                        cond.notify_all()
             parts, cur = [], []
             for t in toks:
                 if t == sep_id:
@@ -273,7 +350,7 @@ async def run_map_forked(engine, sampling_params, body_ids, prompt_ids,
                 outs[(i, k)] = p
         finally:
             async with cond:
-                used -= cost
+                release(held)
                 cond.notify_all()
 
     t0 = time.time()

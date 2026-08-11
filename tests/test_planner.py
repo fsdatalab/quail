@@ -62,11 +62,16 @@ def test_sequence_cap_robust_to_size_skew():
     """One tiny outlier document must not inflate the cap. The old
     bound divided the budget by the single smallest document (a
     10-token outlier would have claimed sixty thousand sequences);
-    the exact bound is the longest ascending prefix that fits."""
-    uniform = plan_query(4, [300] * 2000, M4B, H100, gated=False)
-    skewed = plan_query(4, [10] + [300] * 1999, M4B, H100, gated=False)
+    the exact bound is the longest ascending prefix that fits. A map
+    holds every prompt live per admitted document, so the cap covers
+    admitted times prompts, and the engine bound (ENGINE_SEQS_MAX)
+    clamps what per-sequence boot overheads can survive."""
+    uniform = plan_query(4, [300] * 500, M4B, H100, gated=False)
+    skewed = plan_query(4, [10] + [300] * 499, M4B, H100, gated=False)
     assert skewed.engine_max_seqs == uniform.engine_max_seqs
-    assert skewed.engine_max_seqs == 2000 + 16
+    assert skewed.engine_max_seqs == 500 * 4 + 16
+    big = plan_query(4, [300] * 2000, M4B, H100, gated=False)
+    assert big.engine_max_seqs == 4096
 
 
 def test_switch_uses_per_filter_selectivities():

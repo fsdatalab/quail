@@ -1708,3 +1708,88 @@ restore (persist pays once at ingest, wins where restore beats
 recompute - the 32B tier), and pin / strict / spill for residency
 (spill remains unbuilt because no measured pool has bound; it is
 E9's mechanism).
+
+## The operator-grid second pass: the matrix closed, and what the wins measure (2026-08-08)
+
+Full detail, predictions-first tables, and the run-by-run record:
+notes/OPGRID2_PREDICTIONS.md. Provenance for every new file:
+results/engine/README.md. The digest, in the order it was learned:
+
+The matrix. Ours against stock vLLM, both models, no engine deaths
+in the final configuration. Filters: 2.0x / 1.12x / 1.24x at 4B
+(permissive / selective_early / cliff), 3.5x / 1.3x / 2.6x at 32B.
+Classifier: 3.4x and 4.2x against a sequential client (see the
+audit below). Open-ended maps: 1.5x at 4B cap 16; cap 64 closed at
+133.4 against 130.8 seconds (2 percent, same container, both
+engines untraced) after the parse-cache fix; 32B cap 16 tied at
+356 seconds with identical reads. The speedups track stock's read
+multipliers almost exactly - we never make a token cheaper, we
+make fewer tokens.
+
+The crash causes, all named with evidence. Stock's flash_attn
+workspace needs ~4 GiB outside the KV pool and dies at 0.92
+utilization on filter and classifier shapes (stock now boots at
+0.88; halving its step budget instead is self-defeating - the
+boot profiler hands the savings to the pool). Our cap-256 map
+death stopped reproducing at 0.90 utilization. Two traps banked:
+expandable allocator segments corrupt answers under prefix
+caching (24-28 percent wrong, deterministic per boot), and the 4B
+fp8 checkpoint's answers shift with the boot's memory fraction
+(clean at 0.92, ~24 percent wrong at 0.88, sampler constraint and
+parser both exonerated) - accuracy cells must pin the fraction.
+
+Protocol change: walls compare only within one container. Host
+variance moved a wall 20 percent on byte-identical work (step
+traces matched to the token; only CPU times inflated). And the
+step trace itself is measurement tax the baseline never pays -
+1.85 million request-id parses per 900 steps before the
+once-per-request cache - so paired cells now run untraced.
+
+The restore reversal. vLLM's tiering spec mmaps a /dev/shm file
+the sandbox cannot pin (cudaHostRegister 304 on file-backed
+mmaps; alloc-pinned memory runs 55.4 GB/s - pinprobe.json), and
+its unpinned fallback both crashed engines and moved 2.7 GB/s.
+The PLAIN CPU spec allocates its pool pinned: channel 10.2 GB/s
+end to end on both models. Measured: 32B restore 4.1 s against
+27.7 recompute (6.8x), 4B restore 2.3 against 4.5 (2x) -
+REVERSING persist2000.json's "4B loses", which was a property of
+the broken channel, not the tier. Write-through at ingest is
+free (0.16 s). The 4B store still shows borderline-answer noise
+across repeats; the 32B was bit-identical.
+
+The decode-width mechanism. Overlapped scheduling splits the
+running set into two alternating cohorts, so effective decode
+width is half of max_num_seqs; raising the cap to 8,192 OOMs at
+boot (per-sequence overheads), and the reachable width prices to
+a tie. The residual 2 percent on map decode is the strict guard,
+priority policy, and connector - capabilities maps do not use.
+
+The client-competence audit (the review point that reframed the
+headline). Document-first prompts and co-submitted questions are
+client-side table stakes, so each win must survive a competent
+client. Filters survive (gating forces sequencing; the banked
+four-arm 32B run already measured 1.4x against stage-major waves,
+the best client strategy). The classifier multipliers do NOT
+survive as stated - they measured a sequential client - and the
+competent-client re-baseline is queued with predictions written.
+Maps tie for co-submitted prompts by the same logic. The tier
+survives categorically: no client recovers evicted KV. The
+defensible headline: ~1.4x on gated work against the best client
+(2-3.5x against typical ones), 2x to 6.8x on cross-query reuse,
+parity on single-pass streaming work.
+
+Addendum, same night: both competent-client classifier cells
+measured. 4B: 47.5-50.3 s against ours 49.8 (predicted 80-95 - the
+toll term was wrong; concurrent one-token requests hide their cost
+inside prefill). 32B: 308.9 against ours 297.0 (predicted
+340-380). Both predictions missed low in the same direction. The
+classifier verdict on both tiers is PARITY against a competent
+client; the 3.4x and 4.2x measured the sequential client's
+re-reads. The final headline stands as: ~1.4x on gated work
+against the best client, parity on classifiers and single-pass
+maps, 2x to 6.8x on cross-query reuse, and the robustness claim -
+stock at 0.92 crashes outright on these shapes. A clean side
+finding: the 32B competent cell ran at 0.88 with wrong 138,
+matching the 0.92 runs exactly - the memory-fraction accuracy
+shift is confined to the 4B fp8 checkpoint, as the substrate
+history predicted.

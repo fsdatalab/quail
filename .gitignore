@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 docengine.egg-info/
 .env
+# raw torch-profiler pulls (38-385 MB); the volume holds them, the
+# slim *_slim.json.gz stay tracked
+results/engine/torchprof_*rank0.pt.trace.json.gz
