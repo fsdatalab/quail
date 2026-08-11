@@ -111,7 +111,7 @@ def main():
     mean_ratio = (sum(seqs) / max(1, sum(docs)))
     ax.set_ylabel("count / step")
     ax.legend(loc="upper right", fontsize=8,
-              title=f"mean {mean_ratio:.2f} filters/doc")
+              title=f"mean {mean_ratio:.2f} prompts per document")
 
     ax = axes[2]
     ax.plot(t, kv_used, c="#4477aa", lw=1, label="KV in use")

@@ -1,6 +1,6 @@
 # Progress update slides, outline only
 
-Audience is the GPU and inference experts from meeting 1. Fourteen
+Audience is the GPU and inference experts from meeting 1. Fifteen
 slides. Every number below comes from notes/OPGRID2_PREDICTIONS.md,
 notes/RESULTS.md, notes/TIERED_KV_DESIGN.md, notes/PINNED_POOL_PLAN.md,
 or the figures in results/plots/. Roofline framing follows the
@@ -14,10 +14,10 @@ strategy: "vLLM with a basic driver" asks a document's questions one
 at a time, and "vLLM with an optimized driver" puts the document
 first in every prompt, submits a document's independent questions
 together, and bounds open requests. Our four methods are "in-engine
-gated chain with KV rewind", "plan-derived admission", "plan-derived
+pipelined execution with KV rewind", "plan-derived admission", "plan-derived
 boot", and "tiered KV restore". Slide 2 carries the table mapping
 repo terms to these names. The two baselines get their own slides
-(6 and 7) before the four method slides (8 to 11).
+(7 and 8) before the four method slides (9 to 12).
 
 ## Slide 1. Progress update on LLM data operators over vLLM
 
@@ -69,12 +69,12 @@ the naming table below.
 
 | repo term | deck term | one-line meaning |
 |---|---|---|
-| sequential client | vLLM with a basic driver | asks a document's questions one at a time, waiting for each answer; slide 6 |
-| competent client | vLLM with an optimized driver | document first in every prompt, a document's questions submitted together, bounded open requests; slide 7 |
-| pipelined policy (code name "chain") | in-engine gated chain with KV rewind | the filter executor; slide 8 |
-| admission budget | plan-derived admission | the token-budget gate on what enters the engine; slide 9 |
-| boot config from the plan | plan-derived boot | step budget, sequence cap, memory fraction, and graph capture chosen from the query plan; slide 10 |
-| persist/restore | tiered KV restore | the CPU-memory KV cache written at ingest and restored by later queries; slide 11 |
+| sequential client | vLLM with a basic driver | asks a document's questions one at a time, waiting for each answer; slide 7 |
+| competent client | vLLM with an optimized driver | document first in every prompt, a document's questions submitted together, bounded open requests; slide 8 |
+| pipelined policy (code name "chain") | in-engine pipelined execution with KV rewind | the filter executor; slide 9 |
+| admission budget | plan-derived admission | the token-budget gate on what enters the engine; slide 10 |
+| boot config from the plan | plan-derived boot | step budget, sequence cap, memory fraction, and graph capture chosen from the query plan; slide 11 |
+| persist/restore | tiered KV restore | the CPU-memory KV cache written at ingest and restored by later queries; slide 12 |
 
 ## Slide 3. What you told us to do, and what we did
 
@@ -87,24 +87,25 @@ what we did on the right.
   saves per-step token counts, queue depths, and KV in use, and the
   rollups are wall time, corpus read multiplier (1.40 for the
   optimized driver against 4.94 to 5.72 for the basic driver on
-  classifiers), and per-step CPU cost.
-- Kernel-level profiling of vLLM runs. Done, with one platform
-  detour worth a single bullet. The torch profiler runs inside the
-  vLLM engine core through the profiler_config argument, over
-  15-second steady-state windows, with kernels binned by class. nsys
-  intercepts the CUDA API on Modal but its GPU-activity records never
-  arrive (Modal confirmed their sandbox blocks that collection path).
-  ncu works only as a microbenchmark at the prefill shapes with
-  --clock-control none, because on a live engine it intercepts every
-  boot kernel and times out. nvidia-smi/NVML is the coarse fallback.
+  classifiers), and per-step CPU cost. One per-request toll we found
+  and removed: 22 percent of baseline CPU time was vLLM cloning
+  sampling parameters per request (copy.deepcopy). We bypass it with
+  skip_clone on every request we issue, and the pipelined executor also
+  cuts requests per document from five to one.
+- Kernel-level profiling of vLLM runs. Done. The torch profiler runs
+  inside the vLLM engine core through the profiler_config argument,
+  over 15-second steady-state windows, with kernels binned by class.
+  ncu works only as shape-matched microbenchmarks with
+  --clock-control none, and nsys is retired on this platform. The
+  tool-by-tool report is slide 4.
 - Scheduling regret and gaps in GPU utilization. Done, with a
   mechanism. A decode step pays a measured 17 ms fixed cost plus 8
   microseconds per live sequence, and overlapped scheduling halves
   the effective decode width (width is the number of sequences
-  generating together in one engine step). Details on slide 5.
+  generating together in one engine step). Details on slide 6.
 - Speed-of-light and roofline latency estimates. Done. The achieved
   fraction of peak for 4B prefill is 97,000 of 275,000 tokens per
-  second, and slide 5 decomposes the gap with ncu plus the torch
+  second, and slide 6 decomposes the gap with ncu plus the torch
   trace.
 - Overhead multiplier from a linear model over empirical runs. Done
   as the decode law rate = width / (compute(width) + 17 ms + 8 us x
@@ -115,7 +116,29 @@ what we did on the right.
   Partially. 4B and 32B fp8 are measured on H100. L40S is in our
   device config but unmeasured, and H200 is deferred.
 
-## Slide 4. Filters saturate the GPU and open-ended decode does not
+## Slide 4. The instrument report. What each profiler gave us here
+
+Figure: none. A four-row table (tool, what works on this platform,
+what it gave us).
+
+- Torch profiler. Runs inside the engine core through the
+  profiler_config argument. It gave every busy fraction in this deck
+  and the decode gap attribution, and it is the tool we rely on for
+  timelines.
+- nsys. On this platform it returns CUDA API rows only, because its
+  GPU-activity collection uses a driver path whose permissions the
+  sandbox blocks (platform-confirmed). Retired here; the harness is
+  kept for other hosts.
+- ncu. Works with --clock-control none. Live-engine runs time out,
+  because it intercepts every boot kernel, so the usable recipe is
+  shape-matched microbenchmarks. It gave the GEMM speed-of-light
+  number, 91 to 93 percent of peak.
+- nvidia-smi/NVML. The always-available fallback for coarse busy
+  fractions.
+- The one-line lesson. Every tool's default path had to be replaced
+  by a measured recipe, which is the deck's thesis in miniature.
+
+## Slide 5. Filters saturate the GPU and open-ended decode does not
 
 Figure: results/plots/timeline_strips.png as the primary visual (one
 second of GPU timeline; the filter row is solid, the map row is
@@ -134,12 +157,12 @@ four busy fractions as bars).
   percent for our engine. Both leave the GPU idle almost
   identically, so the idle time is the workload's physics, not an
   engine difference. The idle share is host software, the step
-  floor that slide 5 measures and splits.
+  floor that slide 6 measures and splits.
 - Consequence for everything after this slide. A filter baseline at
   99.5 percent busy has no idle time to win back by scheduling. The
   only way to beat it is to compute fewer tokens.
 
-## Slide 5. The roofline, spec against measured, and the host step floor
+## Slide 6. The roofline, spec against measured, and the host step floor
 
 Figure: results/plots/roofline_4b.png (hollow markers are where the
 hardware spec puts each phase, filled markers are what we measured).
@@ -201,9 +224,11 @@ full kernel-class split.
   predicts the paired walls within 3 to 5 percent once measured
   width is substituted.
 
-## Slide 6. Baseline 1. vLLM with a basic driver
+## Slide 7. Baseline 1. vLLM with a basic driver
 
-Figure: none.
+Figure: panel b of results/plots/docengine_story.png (corpus read
+multipliers across submission strategies from the earlier
+five-configuration study).
 
 - Definition, repeated from slide 2 because the section starts here.
   A driver is the client program that submits requests to the
@@ -218,9 +243,10 @@ Figure: none.
   that costs 1,253.2 seconds, compared with 308.9 seconds for the
   optimized driver on the same engine.
 
-## Slide 7. Baseline 2. vLLM with an optimized driver
+## Slide 8. Baseline 2. vLLM with an optimized driver
 
-Figure: none.
+Figure: none. Its measured bars appear in results_matrix.png on
+slide 13.
 
 - What the optimized driver does. It puts the document first in
   every prompt so shared prefixes can hit the prefix cache, submits
@@ -239,11 +265,11 @@ Figure: none.
   engine restarts. The four method slides live in exactly those
   gaps.
 
-## Slide 8. Method. In-engine gated chain with KV rewind
+## Slide 9. Method. In-engine pipelined execution with KV rewind
 
-Figure: none. A small drawn diagram fits here (document KV kept
-resident, question-and-answer KV erased back to the boundary, the
-straddling block half-kept).
+Figure: results/plots/rewind_schematic.png (the three-row block
+diagram of prefill, erase to the boundary, and append, with the
+straddling block and the driver limitation annotated).
 
 - What it does. The filter executor keeps one living request per
   document. Each stage's question is appended onto the document's
@@ -268,18 +294,18 @@ straddling block half-kept).
 - Why no driver can replicate it. A driver submits whole prompts. It
   cannot hold a document's KV resident across stages and cannot
   erase part of a request's KV. Its best strategy is the stage-major
-  waves from slide 7, which depend on the prefix cache still holding
+  waves from slide 8, which depend on the prefix cache still holding
   each document and fail once the corpus exceeds the pool.
 - Measured effect. Corpus reads are 1.14x, compared with 3.2 to 4.6x
   for the driver strategies. At 32B the wall is 29.3 seconds,
   compared with 41.4 seconds for the best driver strategy, about
   1.4x.
 
-## Slide 9. Method. Plan-derived admission
+## Slide 10. Method. Plan-derived admission
 
-Figure: the KV-tokens panel of results/plots/board_map64_ours.png
-(KV in use stays under the 750,000 admission line while the pool
-holds 946,800).
+Figure: results/plots/admission_sawtooth.png (KV in use cycling
+under the 750,000 admission budget line, with the pool line at
+946,800).
 
 - What it does. Before any request is submitted, the plan computes
   how many KV tokens the query may hold in the engine at once
@@ -300,9 +326,12 @@ holds 946,800).
   document's KV is already gone. The shipped design leaves launch
   order alone and only releases early.
 
-## Slide 10. Method. Plan-derived boot
+## Slide 11. Method. Plan-derived boot
 
-Figure: none.
+Figure: results/plots/workspace_vs_free.png (three bars: 2.79 GiB
+free outside the KV pool at 0.92 utilization, the 4.22 GiB
+flash-attention workspace demand, and 5.99 GiB free at 0.88, which
+is the crash mechanism in one picture).
 
 - What it does. The plan sets the engine's boot parameters from the
   query before launch: the step token budget (25,305 in the map
@@ -325,11 +354,15 @@ Figure: none.
   0.92, shifted at 0.88), so accuracy comparisons must pin the
   fraction.
 
-## Slide 11. Method. Tiered KV restore, and the measured channel behind it
+## Slide 12. Method. Tiered KV restore, and the measured channel behind it
 
-Figure: the channel table from notes/TIERED_KV_DESIGN.md (tier, spec
-bandwidth, measured bandwidth) on the slide. A two-bar comparison
-(restore against recompute, both models) would be drawn new.
+Figures: results/plots/channel_ladder.png (the bandwidth ladder: 64
+GB/s spec, 55.4 alloc-pinned ceiling, 10.2 end to end through the
+pinned pool, 9.7 raw unpinned, 2.7 through the broken file-backed
+path, with both recompute thresholds, 7.2 GB/s at 4B and 1.7 at 32B,
+drawn as lines) and results/plots/restore_vs_recompute.png (the
+bars: 4B recompute 4.54 seconds against restore 2.33, 32B recompute
+27.7 against restore 4.10).
 
 - What it does. At ingest the engine writes each document's KV
   through to a pinned host-memory pool while the first query
@@ -360,11 +393,11 @@ bandwidth, measured bandwidth) on the slide. A two-bar comparison
   models must use measured constants, re-measured per deployment
   image, never spec numbers.
 
-## Slide 12. Results against both baselines, and what the wins measure
+## Slide 13. Results against both baselines, and what the wins measure
 
-Figure: the result matrix as a table on the slide. Optional
-mechanism figure: panel b of results/plots/docengine_story.png (the
-corpus read multiplier).
+Figure: results/plots/results_matrix.png (grouped bars per cell,
+basic driver against optimized driver against ours, log scale,
+absent bars labeled as not measured).
 
 - Protocol. Paired cells run in one container, because host variance
   moved a wall 20 percent on byte-identical work, and they run
@@ -382,7 +415,7 @@ corpus read multiplier).
   identical reads of 1.36).
 - Filters survive the optimized driver at about 1.4x (29.3 seconds
   against 41.4), because gating forces sequencing that no
-  submission order fixes. Only the in-engine gated chain with KV
+  submission order fixes. Only the in-engine pipelined execution with KV
   rewind keeps the document KV resident across stages.
 - The pattern. Our speedups track the corpus read multiplier almost
   exactly, so all of the speedup comes from computing fewer tokens,
@@ -396,7 +429,7 @@ corpus read multiplier).
   restore, and boots that survive request shapes that crash stock at
   0.92.
 
-## Slide 13. The proposal. A declarative execution engine for LLM data operators
+## Slide 14. The proposal. A declarative execution engine for LLM data operators
 
 Figure: none. A block diagram would be drawn new; no existing figure
 fits.
@@ -421,13 +454,13 @@ fits.
   in before eviction.
 - Benchmarks. Against Kalypso, naive vLLM, LOTUS and Palimpzest, and
   hosted LLM APIs, at 10,000 to 1,000,000 documents.
-- Scope, justified by slide 4. The engine is optimized for
+- Scope, justified by slide 5. The engine is optimized for
   prefill-heavy operators. Long open-ended maps are deliberately
   deferred, because both engines leave the GPU about 60 percent
   idle there and fixing that is decode-side work, not planning
   work.
 
-## Slide 14. Asks and next steps
+## Slide 15. Asks and next steps
 
 Figure: none.
 
