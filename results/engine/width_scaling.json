@@ -1,1 +1,0 @@
-{"n_docs": 2000, "n_filters": 4, "s": 0.8, "model": "Qwen/Qwen3-4B-FP8", "image": {"base": "nvidia/cuda:13.0.1-devel-ubuntu24.04", "toolchain": "cuda13-devel"}, "b50k": 65.49, "b100k": 58.69, "b200k": 59.05, "b400k": 58.04, "b700k": 58.14}

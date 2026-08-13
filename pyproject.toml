@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "docengine"
+name = "quail"
 version = "0.1.0"
-description = "Plan-governed KV state for semantic scans: planner, engine client, and scheduler extensions."
+description = "QUery-Aware Inference Layer: plan-governed KV state for AI filter queries."
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
@@ -25,4 +25,4 @@ engine = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["docengine", "docengine.*"]
+include = ["quail", "quail.*"]

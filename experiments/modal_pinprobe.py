@@ -24,7 +24,7 @@ image = (
     .pip_install("vllm==0.26.0")   # same torch build the flights use
 )
 
-app = modal.App("docengine-pinprobe")
+app = modal.App("quail-pinprobe")
 GB = 1 << 30
 
 

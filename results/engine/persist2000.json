@@ -1,1 +1,0 @@
-{"n_docs": 2000, "corpus_tokens": 628692, "disk_write_GBps": 5.19, "baseline_cold_s": 11.0, "baseline_recompute_s": 10.53, "store_cold_offload_s": 29.47, "store_restore_s": 20.27, "store_restore2_s": 18.44, "tier_disk_bytes_after_q1": 53111263856, "tier_disk_bytes_final": 53157274028, "outcomes_identical": false}

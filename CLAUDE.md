@@ -9,7 +9,6 @@ engineers talking to each other at a whiteboard. No jargon.
 - No invented shorthand or dramatic phrasing ("banked", "landed",
   "armed", "healthy") when a plain verb exists: saved, finished,
   set up, running.
-
 - Use everyday words. If a technical term is unavoidable, define it in
   one sentence the first time it appears, then use it consistently.
 - Short sentences. One idea per sentence. Lead with the answer, then
@@ -20,15 +19,39 @@ engineers talking to each other at a whiteboard. No jargon.
 - When something failed or is uncertain, say so directly and say what
   would settle it.
 - Code comments state constraints the code cannot show; nothing else.
-- Call the KV cache "KV". Do not rename it with analogies
-  like "notes".
-- Call the one-question-at-a-time gated policy "pipelined", not
-  "gated chain". Call the ask-every-question policy "speculation".
-  Never describe a policy as a "chain" in responses; "chain" is a
-  code name, not an explanation.
-- When describing an experiment, state the setup in plain numbers
-  first: how many filters, the selectivity of each filter, how many
-  documents, the answer length, and the admission budget when it
-  matters.
+- Call the KV cache "KV". Do not rename it with analogies like "notes".
 - Never say "arm" or "arms" for the runs of an experiment. Say
-  "run", "configuration", or name the policy being run.
+  "run", "configuration", or name the method being run.
+
+# Naming in this project
+
+- The project is Quail (QUery-Aware Inference Layer). The package is
+  `quail`. Nothing is called DocEngine any more.
+- The three mechanisms are "pipelining", "token-based admission", and
+  "KV rewind". Say those names.
+- "Chain mode" is the internal name for KV rewind (one living request
+  per document). Either is fine in code; prefer "KV rewind" in prose.
+- The comparison is against "stock vLLM", and say which submission
+  strategy it used: separate requests per stage, or stage-major waves.
+- `de1|` in request ids is a wire-format version tag, not a product
+  name. Leave it alone.
+
+# Scope
+
+Filter queries only, Qwen3 4B fp8, one H100. Open-ended maps,
+classification, speculation, forking, and the 32B model were removed
+on purpose. Do not reintroduce them without being asked; if a change
+needs one of them, say so instead of quietly adding it back.
+
+# Experiments
+
+- Every engine run goes through Modal; there is no local GPU.
+- Tee every Modal run to a file. The CLI drops old log lines.
+- State the prediction before the run, then report what happened
+  against it.
+- Compute from measured constants first; run one confirming cell, not
+  a sweep, unless the sweep is the point.
+- A baseline must be configured as well as the thing it is compared
+  with. If our side gets a plan-derived setting, the baseline gets the
+  analytically equivalent one. Report the setting alongside the
+  result.

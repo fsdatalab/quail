@@ -1,8 +1,9 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-docengine.egg-info/
+*.egg-info/
 .env
-# raw torch-profiler pulls (38-385 MB); the volume holds them, the
-# slim *_slim.json.gz stay tracked
+.DS_Store
+# raw torch-profiler pulls (127 MB each); the Modal volume holds them,
+# and plots/make_figures.py skips the timeline figure when they are absent
 results/engine/torchprof_*rank0.pt.trace.json.gz

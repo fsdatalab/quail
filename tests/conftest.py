@@ -1,7 +1,6 @@
-"""Put the repo root on sys.path so both import styles in the test
-files work under plain `pytest` as well as `python -m pytest`:
-bare imports of sibling test modules (`from test_exact import ...`)
-and package-style imports (`from tests.test_client import ...`)."""
+"""Put the repo root on sys.path so `import quail` resolves from a
+source checkout under plain `pytest` as well as `python -m pytest`,
+with no install step."""
 
 import os
 import sys
