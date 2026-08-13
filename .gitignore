@@ -7,3 +7,4 @@ __pycache__/
 # raw torch-profiler pulls (127 MB each); the Modal volume holds them,
 # and plots/make_figures.py skips the timeline figure when they are absent
 results/engine/torchprof_*rank0.pt.trace.json.gz
+logs/
