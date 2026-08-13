@@ -281,6 +281,26 @@ async def run_map_forked(engine, sampling_params, body_ids, prompt_ids,
                                    tag, "c|s")
 
 
+async def run_map_rewind(engine, sampling_params, body_ids, prompt_ids,
+                        budget_tokens, sep_id, tag="mr"):
+    """Map with KV rewind: one living request per document, sequential
+    prompts with rewind between them. Each prompt generates to its
+    natural stop (EOS or the cap), the scheduler rewinds to the
+    document boundary (erasing the prompt + generated tokens), and
+    appends the next prompt onto the resident document KV. The
+    document is read exactly once.
+
+    Admission charges body + one prompt + one gen cap at a time
+    (only one prompt is active per document), which is smaller than
+    run_map's charge of body + all prompts + all gen caps. The client
+    collects per-prompt outputs separated by the registered separator
+    token. Returns token lists keyed (doc, stage) with stages
+    1-indexed; the caller detokenizes."""
+    return await _run_stream_chain(engine, sampling_params, body_ids,
+                                   prompt_ids, budget_tokens, sep_id,
+                                   tag, "c|mr")
+
+
 async def run_compose(engine, sampling_params, body_ids, stage_ids,
                       budget_tokens, sep_id, tag="cp"):
     """Composed map: stage k+1 reads stage k's output. One living

@@ -476,14 +476,16 @@ class DocEngineScheduler(Scheduler):
         if st is None:
             return new_token_ids, stopped
         q = self._de_queries[st["qid"]]
-        if st.get("compose"):
-            # composed stages end at their natural stop (EOS or the
-            # cap); no gate, no decisive token. On an advance the
-            # registered separator rides the outgoing tokens so the
-            # client can split stage segments - the record itself
-            # never contains it (the fork-splice convention)
+        if st.get("compose") or st.get("map_rewind"):
+            # composed and map-rewind stages end at their natural
+            # stop (EOS or the cap); no gate, no decisive token. On
+            # an advance the registered separator rides the outgoing
+            # tokens so the client can split stage segments
             if stopped:
-                st["advance"] = chainlogic.compose_advances(
+                advance_fn = (chainlogic.map_rewind_advances
+                              if st.get("map_rewind")
+                              else chainlogic.compose_advances)
+                st["advance"] = advance_fn(
                     st["stage"], len(q["qs"]))
                 if st["advance"]:
                     request.status = RequestStatus.RUNNING
@@ -531,6 +533,24 @@ class DocEngineScheduler(Scheduler):
                 self._de_dump_profile("chain-mode")
             return True
         st["advance"] = False
+        if st.get("map_rewind"):
+            # map-rewind advance: rewind to the document boundary
+            # (erase the prompt + all generated tokens), then append
+            # the next prompt. The document KV stays resident.
+            q = self._de_queries[st["qid"]]
+            self._de_rewind(request,
+                            chainlogic.rewind_target(st["d"], q["qc"]))
+            st["stage"] += 1
+            update = StreamingUpdate(
+                mm_features=None,
+                prompt_token_ids=chainlogic.continuation_tail(
+                    q["qs"][st["stage"] - 1], q["qc"]),
+                max_tokens=request.max_tokens,
+                arrival_time=request.arrival_time,
+                sampling_params=request.sampling_params)
+            self._update_request_as_session(request, update)
+            self._enqueue_waiting_request(request)
+            return False
         if st.get("compose"):
             # the composed advance: absorb the generated output into
             # the prompt record (its KV is already computed - no
@@ -614,6 +634,7 @@ class DocEngineScheduler(Scheduler):
                 stage=1, qid=qid, spec=chainlogic.is_spec(rid),
                 seq=chainlogic.is_seq(rid),
                 compose=chainlogic.is_compose(rid),
+                map_rewind=chainlogic.is_map_rewind(rid),
                 switch=chainlogic.parse_switch(rid),
                 d=chainlogic.document_boundary(
                     request.num_prompt_tokens, len(q["qs"][0])))

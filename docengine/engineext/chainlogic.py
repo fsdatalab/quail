@@ -99,9 +99,25 @@ def is_compose(request_id):
     return request_id.startswith("de1|") and "|co|" in request_id
 
 
+def is_map_rewind(request_id):
+    """A map-rewind chain: like a filter chain but with multi-token
+    decode per stage. Each stage generates to its natural stop (EOS
+    or the cap), then the scheduler rewinds to the document boundary
+    and appends the next prompt. The mr part rides alongside c;
+    gating does not apply (every stage runs) and forks never fire
+    (stages are sequential by construction)."""
+    return request_id.startswith("de1|") and "|mr|" in request_id
+
+
 def compose_advances(stage, n_stages):
     """A composed chain advances until its last stage; there is no
     gate to fail and no speculation to cut short."""
+    return stage < n_stages
+
+
+def map_rewind_advances(stage, n_stages):
+    """A map-rewind chain advances until its last stage; every
+    prompt runs regardless."""
     return stage < n_stages
 
 

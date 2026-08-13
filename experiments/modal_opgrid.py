@@ -338,13 +338,31 @@ async def opgrid_filters(n_docs: int = 10000, reps: int = 3,
                    else planned_ops if planned
                    else ("naive_classifier_cc",) if classifier
                    else ("naive_vllm",))
+            # For stock: set the semaphore from the KV pool capacity,
+            # not max_num_seqs. This avoids overflowing the pool and
+            # causing artificial prefix-cache eviction.
+            if planned:
+                sem_cap = kw["max_num_seqs"]
+            else:
+                # Set the semaphore from KV pool capacity so that
+                # in-flight requests fit without eviction. Use the
+                # permissive profile's documents (the largest corpus).
+                _body_ids = corpora["permissive"][0]
+                _q_ids = corpora["permissive"][1]
+                mean_req = (int(sum(len(b) for b in _body_ids)
+                                / len(_body_ids))
+                            + max(len(q) for q in _q_ids))
+                sem_cap = max(256, budget // mean_req)
+                print(f"[opgrid] stock semaphore: budget {budget:,} / "
+                      f"{mean_req} tok/req = {sem_cap}", flush=True)
+
             for rep in range(reps):
                 for prof in profs:
                     for op in ops:
                         await reset()
                         try:
                             await run_cell(engine, boot, prof, op,
-                                           rep, kw["max_num_seqs"])
+                                           rep, sem_cap)
                         except Exception as e:
                             # a dead cell banks its error WITH the
                             # traceback; the EngineDeadError string
@@ -445,7 +463,7 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
 
     from docengine.configs import DEVICES, MODELS
     from docengine.plan import plan_query
-    from docengine.runtime.engine_client import run_map
+    from docengine.runtime.engine_client import run_map, run_map_rewind
 
     os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
     if trace:
@@ -550,42 +568,69 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
                 if inspect.isawaitable(res):
                     await res
 
+            eos_id = tok.eos_token_id
+            ops = (["pipelined_map", "rewind_map"]
+                   if planned else ["naive_vllm"])
             for cap in caps:
-                await reset()
-                sp = SamplingParams(temperature=0.0, max_tokens=cap)
-                op = "pipelined_map" if planned else "naive_vllm"
-                tag = f"{boot}-m{cap}"
-                t0m = _time.monotonic()
-                try:
-                    if planned:
-                        r = await run_map(engine, sp, body_ids, p_ids,
-                                          plans[cap].budget_tokens,
-                                          tag=tag)
-                    else:
-                        r = await naive_map(engine, sp,
-                                            kw["max_num_seqs"], tag)
-                    t1m = _time.monotonic()
-                    reads = round((r["prompt_tokens"]
-                                   - r["cached_tokens"])
-                                  / max(1, corpus), 3)
-                    cell = dict(boot=boot, operator=op, cap=cap,
-                                wall=round(r["wall"], 3),
-                                requests=r["requests"], reads=reads,
-                                t0m=round(t0m, 3), t1m=round(t1m, 3))
-                    report["cells"].append(cell)
-                    report["samples"][f"{op}-{cap}"] = [
-                        r["texts"].get((0, j + 1), "")[:160]
-                        for j in range(len(p_ids))]
-                    print(f"[opgrid-maps] {cell}", flush=True)
-                except Exception as e:
-                    import traceback as _tb
-                    report["cells"].append(dict(
-                        boot=boot, operator=op, cap=cap,
-                        error=f"{type(e).__name__}: {e}",
-                        traceback=_tb.format_exc()[-4000:]))
-                    print(f"[opgrid-maps] {boot}/m{cap} failed: {e}",
-                          flush=True)
-                    _tb.print_exc()
+                for op in ops:
+                    await reset()
+                    sp = SamplingParams(temperature=0.0, max_tokens=cap)
+                    tag = f"{boot}-{op[:3]}{cap}"
+                    t0m = _time.monotonic()
+                    try:
+                        if op == "rewind_map":
+                            r = await run_map_rewind(
+                                engine, sp, body_ids, p_ids,
+                                plans[cap].budget_tokens, eos_id,
+                                tag=tag)
+                            wall = r["wall"]
+                            texts = {k: tok.decode(v) for k, v in
+                                     r["tokens"].items()}
+                            reads = -1.0
+                            reqs = len(body_ids)
+                        elif op == "pipelined_map":
+                            r = await run_map(engine, sp, body_ids,
+                                              p_ids,
+                                              plans[cap].budget_tokens,
+                                              tag=tag)
+                            wall = r["wall"]
+                            texts = r["texts"]
+                            reads = round(
+                                (r["prompt_tokens"]
+                                 - r["cached_tokens"])
+                                / max(1, corpus), 3)
+                            reqs = r["requests"]
+                        else:
+                            r = await naive_map(engine, sp,
+                                                kw["max_num_seqs"],
+                                                tag)
+                            wall = r["wall"]
+                            texts = r["texts"]
+                            reads = round(
+                                (r["prompt_tokens"]
+                                 - r["cached_tokens"])
+                                / max(1, corpus), 3)
+                            reqs = r["requests"]
+                        t1m = _time.monotonic()
+                        cell = dict(boot=boot, operator=op, cap=cap,
+                                    wall=round(wall, 3),
+                                    requests=reqs, reads=reads,
+                                    t0m=round(t0m, 3),
+                                    t1m=round(t1m, 3))
+                        report["cells"].append(cell)
+                        report["samples"][f"{op}-{cap}"] = [
+                            texts.get((0, j + 1), "")[:160]
+                            for j in range(len(p_ids))]
+                        print(f"[opgrid-maps] {cell}", flush=True)
+                    except Exception as e:
+                        import traceback as _tb
+                        report["cells"].append(dict(
+                            boot=boot, operator=op, cap=cap,
+                            error=f"{type(e).__name__}: {e}",
+                            traceback=_tb.format_exc()[-4000:]))
+                        print(f"[opgrid-maps] {boot}/{op}/m{cap} "
+                              f"failed: {e}", flush=True)
+                        _tb.print_exc()
             try:
                 engine.shutdown()
             except Exception as e:
@@ -615,6 +660,163 @@ async def opgrid_maps(n_docs: int = 10000, model_key: str = "4b",
     print(f"[opgrid-maps] banked opgrid_maps_{sfx}.json",
           flush=True)
     report["traces"] = traces
+    return report
+
+
+# -----------------------------------------------------------------
+# Sync filter comparison: both stock and ours through LLM.generate()
+# so the submission path is identical and the comparison isolates
+# KV rewind vs prefix cache.
+# -----------------------------------------------------------------
+
+@app.function(image=opgrid_image, gpu="H100!", timeout=7200,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/results": results_vol})
+def sync_filters(n_docs: int = 10000, reps: int = 3,
+                 model_key: str = "4b") -> dict:
+    """Sync LLM.generate() comparison: stage-major waves (stock)
+    vs KV rewind (our scheduler), both through the sync API."""
+    import gc
+    import os
+    import time as _time
+
+    import numpy as np
+    import torch
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+
+    from docengine.configs import DEVICES, MODELS
+    from docengine.plan import plan_query
+
+    os.environ["DOCENGINE_SINGLE_TENANT"] = "1"
+
+    model_name = MODEL if model_key == "4b" else MODEL32
+    cfg_name = "Qwen3-4B-FP8" if model_key == "4b" else "Qwen3-32B-FP8"
+    tok = AutoTokenizer.from_pretrained(model_name)
+    yes_ids, no_ids = set(), set()
+    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            yes_ids.add(ids[0])
+    for w in ("NO", " NO", "No", " No", "N", " N"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            no_ids.add(ids[0])
+
+    rng = np.random.default_rng(FLAG_SEED + 100)
+    flags = (rng.random((n_docs, N_FILTERS))
+             < np.array(PROFILES["permissive"])[None, :]).astype(int)
+    docs = _build_pool(n_docs)
+    bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+    body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+    q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+             for j in range(N_FILTERS)]
+    corpus = sum(len(b) for b in body_ids)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
+                        allowed_token_ids=sorted(yes_ids | no_ids))
+
+    plan = plan_query(N_FILTERS, [len(b) for b in body_ids],
+                      MODELS[cfg_name], DEVICES["H100-SXM-80GB"],
+                      selectivity=list(PROFILES["permissive"]),
+                      policy="hybrid")
+    B = plan.engine_step_tokens
+    report = dict(n_docs=n_docs, model=model_name, B=B, cells=[])
+
+    def _yes_sync(out):
+        t = out.outputs[0].text.upper()
+        iy, ino = t.find("YES"), t.find("NO")
+        return 1 if iy >= 0 and (ino < 0 or iy < ino) else 0
+
+    # --- ARM 1: stock stage-major waves ---
+    for rep in range(reps):
+        llm = LLM(model=model_name, kv_cache_dtype="fp8",
+                   max_model_len=4608, max_num_seqs=4096,
+                   max_num_batched_tokens=B,
+                   gpu_memory_utilization=0.88,
+                   enable_prefix_caching=True,
+                   disable_log_stats=True)
+        alive = list(range(n_docs))
+        answers = {}
+        total_prompt = 0
+        total_cached = 0
+        t0 = _time.time()
+        for j in range(N_FILTERS):
+            prompts = [{"prompt_token_ids": body_ids[i] + q_ids[j]}
+                       for i in alive]
+            outs = llm.generate(prompts, sp, use_tqdm=False)
+            for idx, (i, out) in enumerate(zip(alive, outs)):
+                total_prompt += len(out.prompt_token_ids)
+                total_cached += getattr(out, "num_cached_tokens", 0) or 0
+                answers[(i, j + 1)] = _yes_sync(out)
+            alive = [i for i in alive if answers[(i, j + 1)]]
+        wall = _time.time() - t0
+        uncached = total_prompt - total_cached
+        reads = round(uncached / max(1, corpus), 3)
+        wrong = sum(1 for (i, j), v in answers.items()
+                    if v != int(flags[i][j - 1]))
+        cell = dict(method="stock_waves", rep=rep,
+                    wall=round(wall, 3), requests=sum(
+                        len([i for i in range(n_docs)]) for _ in range(1)),
+                    reads=reads, wrong=wrong, survivors=len(alive))
+        # count actual requests
+        cell["requests"] = len(answers)
+        report["cells"].append(cell)
+        print(f"[sync] {cell}", flush=True)
+        del llm
+        del llm; gc.collect(); torch.cuda.empty_cache()
+
+    # --- ARM 2: KV rewind through our scheduler ---
+    for rep in range(reps):
+        llm = LLM(model=model_name, kv_cache_dtype="fp8",
+                   max_model_len=4608, max_num_seqs=4096,
+                   max_num_batched_tokens=B,
+                   gpu_memory_utilization=0.92,
+                   enable_prefix_caching=True,
+                   disable_log_stats=True,
+                   scheduler_cls=("docengine.engineext.scheduler."
+                                  "DocEngineScheduler"))
+        # register the query (questions + yes/no ids)
+        reg = [len(q_ids)]
+        for q in q_ids:
+            reg += [len(q)] + list(q)
+        reg_rid = (f"de1|reg|"
+                   f"Y{','.join(map(str, sorted(yes_ids)))}|"
+                   f"reg-{rep}")
+        llm.generate([{"prompt_token_ids": reg}], sp,
+                     request_id=[reg_rid], use_tqdm=False)
+
+        # submit one chain request per document
+        prompts = [{"prompt_token_ids": body_ids[i] + q_ids[0]}
+                   for i in range(n_docs)]
+        rids = [f"de1|c|d{i}|sync-{rep}-{i}-0" for i in range(n_docs)]
+        t0 = _time.time()
+        outs = llm.generate(prompts, sp, request_id=rids,
+                            use_tqdm=False)
+        wall = _time.time() - t0
+
+        # parse chain outputs: each output has all stage answers
+        answers = {}
+        for i, out in enumerate(outs):
+            toks = list(out.outputs[0].token_ids or ())
+            for j, t in enumerate(toks[:N_FILTERS]):
+                answers[(i, j + 1)] = 1 if t in yes_ids else 0
+        survivors = [i for i in range(n_docs)
+                     if all(answers.get((i, j+1), 0)
+                            for j in range(N_FILTERS))]
+        wrong = sum(1 for (i, j), v in answers.items()
+                    if v != int(flags[i][j - 1]))
+        cell = dict(method="kv_rewind", rep=rep,
+                    wall=round(wall, 3), requests=n_docs,
+                    reads=-1, wrong=wrong,
+                    survivors=len(survivors))
+        report["cells"].append(cell)
+        print(f"[sync] {cell}", flush=True)
+        del llm
+        del llm; gc.collect(); torch.cuda.empty_cache()
+
+    with open("/results/sync_filters.json", "w") as f:
+        json.dump(report, f, indent=2)
+    results_vol.commit()
     return report
 
 

@@ -1,21 +1,20 @@
-"""Nsight Systems traces of the STOCK filter baselines: where the
-baseline's wall goes at the CUDA level (kernel busy fraction, gaps,
-memcpy share). Complements the yappi CPU profile of our scheduler.
+"""GPU profiling harness: torch profiler, ncu microbenchmarks, and
+the batch-size sweep for the component-level regression.
 
-Predictions, stated before the run: steady-state GPU busy at or
-above ~85 percent on both tiers; fp8 GEMM prefill kernels dominate;
-memcpy negligible; inter-step gaps a few milliseconds absolute on
-both models (host-side per-step costs), so a smaller relative share
-at 32B. A gappy 4B timeline would instead mean the stock baseline
-is host-limited and its banked walls carry recoverable headroom.
+The torch profiler runs inside the vLLM engine core and produces
+chrome traces of steady-state windows. ncu runs shape-matched
+microbenchmarks (live-engine runs time out). The batch-size sweep
+runs the same filter workload at several max_num_batched_tokens
+values and produces per-batch-size traces for the regression
+T(B) = a*B + b.
 
-CPU sampling and context-switch tracing stay off: the sandbox does
-not expose perf counters. The .nsys-rep files bank to the volume
-for the GUI; text summaries bank alongside for analysis without it.
+nsys is retired on this platform (sandbox blocks its GPU-activity
+driver path); its harness is kept but unused.
 
 Run:
-    modal run experiments/modal_nsys.py --model 4b
-    modal run experiments/modal_nsys.py --model 32b
+    modal run experiments/modal_profiling.py::torchprof
+    modal run experiments/modal_profiling.py::batchsweep
+    modal run experiments/modal_profiling.py::ncubench
 """
 import os
 import sys
@@ -627,3 +626,267 @@ def ncureport() -> str:
     out = "\n".join(keep[:60]) or r.stdout[-2000:] + r.stderr[-500:]
     print(out, flush=True)
     return out[:6000]
+
+
+# -----------------------------------------------------------------
+# Batch-size sweep for the component-level regression.
+#
+# Design (per user feedback):
+# 1. UNPROFILED runs at several B values → clean wall times and
+#    token counts for the regression T(B) = a*B + b.
+#    Profiling changes timing; the regression must use clean data.
+# 2. Existing PROFILED traces (torchprof at B=25305) explain what
+#    a and b consist of (GEMM, quantize, norm, attention, host gaps).
+# 3. Scatter plot of B vs throughput with the fitted line and
+#    residuals to check whether one line actually fits.
+#
+# The sweep boots the engine at each B, runs the full 5-filter
+# workload (10k docs, selectivity 0.9/0.9/0.9/0.8/0.8), and
+# records wall time, total prompt tokens, and cached tokens.
+# All runs in one container to eliminate host variance.
+# -----------------------------------------------------------------
+
+BSWEEP_RUNNER = r'''
+import gc, json, os, sys, time
+import numpy as np
+from transformers import AutoTokenizer
+from vllm import LLM, SamplingParams
+sys.path.insert(0, "/root")
+from modal_scale import FLAG_SEED, MODEL, _build_pool, \
+    _flags_line, _question
+
+n_docs = int(sys.argv[1])
+batch_sizes = [int(x) for x in sys.argv[2].split(",")]
+outpath = sys.argv[3]
+
+tok = AutoTokenizer.from_pretrained(MODEL)
+rng = np.random.default_rng(FLAG_SEED + 100)
+flags = (rng.random((n_docs, 5))
+         < np.array((0.9, 0.9, 0.9, 0.8, 0.8))[None, :]).astype(int)
+docs = _build_pool(n_docs)
+bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+q_ids = [tok(_question(j + 1), add_special_tokens=False)["input_ids"]
+         for j in range(5)]
+sp = SamplingParams(temperature=0.0, max_tokens=1)
+
+results = []
+for B in batch_sizes:
+    print(f"\n[bsweep] === B={B}, sync LLM, {n_docs} docs ===",
+          flush=True)
+    llm = LLM(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+              max_num_seqs=min(4096, B),
+              max_num_batched_tokens=B,
+              gpu_memory_utilization=0.88,
+              enable_prefix_caching=False,
+              disable_log_stats=True)
+    prompts = [{"prompt_token_ids": body_ids[i] + q_ids[0]}
+               for i in range(n_docs)]
+    t0 = time.time()
+    outs = llm.generate(prompts, sp, use_tqdm=False)
+    wall = time.time() - t0
+    toks = sum(len(o.prompt_token_ids) for o in outs)
+    cached = sum(getattr(o, "num_cached_tokens", 0) or 0 for o in outs)
+    uncached = toks - cached
+    rate = uncached / wall
+    row = dict(B=B, n_docs=n_docs, wall=round(wall, 3),
+               prompt_tokens=toks, cached_tokens=cached,
+               uncached_tokens=uncached, rate=round(rate, 1))
+    results.append(row)
+    print(f"[bsweep B={B}] wall {wall:.2f}s, "
+          f"{toks:,} prompt toks, {cached:,} cached, "
+          f"rate {rate:,.0f} tok/s", flush=True)
+    try:
+        llm.shutdown()
+    except Exception:
+        pass
+    del llm
+    gc.collect()
+    import torch; torch.cuda.empty_cache()
+    time.sleep(5)
+
+with open(outpath, "w") as f:
+    json.dump(results, f, indent=2)
+print(f"\n[bsweep] done: {json.dumps(results, indent=2)}", flush=True)
+'''
+
+
+@app.function(image=nsys_image, gpu="H100!", timeout=7200,
+              memory=65536,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/results": results_vol})
+def batchsweep(n_docs: int = 50000,
+               batch_sizes: str = "512,1024,2048,4096,8192,16384,25305",
+               n_filters: int = 1,
+               ) -> str:
+    """Run a filter workload at several max_num_batched_tokens
+    values WITHOUT the torch profiler. Clean wall times and token
+    counts for the regression T(B) = a*B + b. All runs in one
+    container to eliminate host variance.
+
+    Default: 1 filter on 50k docs. Each document submits one
+    request (~370 tokens), gets one token answer, done. No
+    cross-stage reuse, no gating, no eviction. Pure prefill
+    throughput measurement."""
+    import subprocess
+
+    tag = f"bsweep_4b_f{n_filters}_{n_docs//1000}k"
+    outpath = f"/results/{tag}.json"
+    with open("/tmp/bsweep_runner.py", "w") as f:
+        f.write(BSWEEP_RUNNER)
+    r = subprocess.run(["python", "/tmp/bsweep_runner.py",
+                        str(n_docs), batch_sizes, outpath,
+                        str(n_filters)])
+    results_vol.commit()
+    with open(outpath) as f:
+        data = f.read()
+    print(f"[batchsweep] exited {r.returncode}", flush=True)
+    print(data, flush=True)
+    return data
+
+
+# -----------------------------------------------------------------
+# Per-component profiled runs: torch profiler at a single B value.
+# Launched in parallel across containers (one per B) so the total
+# wall clock is one run, not three.
+# -----------------------------------------------------------------
+
+@app.function(image=nsys_image, gpu="H100!", timeout=3600,
+              memory=65536,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/results": results_vol})
+def component_profile(B: int = 25305, n_docs: int = 10000) -> str:
+    """Run the 1-filter workload at batch size B with the torch
+    profiler. Returns per-component kernel times from a 15-second
+    steady-state window."""
+    import subprocess
+    runner = r'''
+import asyncio, gzip, inspect, json, os, sys, time
+import numpy as np
+os.environ["VLLM_TORCH_PROFILER_DIR"] = "/tmp/tp_comp"
+from transformers import AutoTokenizer
+from vllm import SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM as Engine
+sys.path.insert(0, "/root")
+from modal_scale import FLAG_SEED, MODEL, _build_pool, \
+    _flags_line, _question
+
+B, n_docs = int(sys.argv[1]), int(sys.argv[2])
+outdir = sys.argv[3]
+
+tok = AutoTokenizer.from_pretrained(MODEL)
+rng = np.random.default_rng(FLAG_SEED + 100)
+flags = (rng.random((n_docs, 5))
+         < np.array((0.9, 0.9, 0.9, 0.8, 0.8))[None, :]).astype(int)
+docs = _build_pool(n_docs)
+bodies = [d + _flags_line(f) for d, f in zip(docs, flags)]
+body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
+q_ids = [tok(_question(1), add_special_tokens=False)["input_ids"]]
+sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
+                    skip_clone=True)
+
+try:
+    from vllm.config import ProfilerConfig
+    _pc = ProfilerConfig(profiler="torch", torch_profiler_dir=outdir)
+except Exception:
+    _pc = dict(profiler="torch", torch_profiler_dir=outdir)
+
+engine = Engine.from_engine_args(AsyncEngineArgs(
+    model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+    max_num_seqs=min(4096, B), max_num_batched_tokens=B,
+    gpu_memory_utilization=0.88, enable_prefix_caching=False,
+    disable_log_stats=True, profiler_config=_pc))
+
+async def maybe(x):
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+async def main():
+    sem = asyncio.Semaphore(2048)
+    async def ask(ids, rid):
+        final = None
+        async for out in engine.generate(
+                {"prompt_token_ids": ids}, sp, rid):
+            final = out
+    async def one_doc(i):
+        async with sem:
+            await ask(body_ids[i] + q_ids[0], f"p{B}-{i}")
+    async def window():
+        try:
+            await asyncio.sleep(15)
+            await maybe(engine.start_profile())
+            await asyncio.sleep(15)
+            await maybe(engine.stop_profile())
+            print(f"[component B={B}] profiler window ok", flush=True)
+        except Exception as e:
+            print(f"[component B={B}] WINDOW FAILED: {e}", flush=True)
+    t0 = time.time()
+    await asyncio.gather(window(),
+                         *(one_doc(i) for i in range(n_docs)))
+    print(f"[component B={B}] wall {time.time()-t0:.2f}s", flush=True)
+
+asyncio.run(main())
+
+# parse the trace and summarize kernel classes
+import glob
+traces = glob.glob(outdir + "/*rank0*")
+if traces:
+    trace_path = traces[0]
+    opener = gzip.open if trace_path.endswith(".gz") else open
+    with opener(trace_path, "rt") as f:
+        events = json.load(f)["traceEvents"]
+    gpu_cats = {"kernel", "gpu_memcpy", "gpu_memset"}
+    kernels = [e for e in events
+               if e.get("cat") in gpu_cats and e.get("dur", 0) > 0]
+    total_us = sum(e["dur"] for e in kernels)
+    # classify
+    classes = {"gemm": 0, "quantize": 0, "norm": 0,
+               "elementwise": 0, "attention": 0, "other": 0}
+    for e in kernels:
+        k = e["key"].lower() if "key" in e else e.get("name", "").lower()
+        if "gemm" in k or "cutlass" in k or "nvjet" in k:
+            classes["gemm"] += e["dur"]
+        elif "quant" in k or "scale" in k or "cast" in k:
+            classes["quantize"] += e["dur"]
+        elif "norm" in k or "rms" in k or "layer_norm" in k:
+            classes["norm"] += e["dur"]
+        elif "attn" in k or "attention" in k or "flash" in k or "fmha" in k:
+            classes["attention"] += e["dur"]
+        elif "silu" in k or "gelu" in k or "add" in k or "mul" in k or "residual" in k:
+            classes["elementwise"] += e["dur"]
+        else:
+            classes["other"] += e["dur"]
+    result = dict(B=B, n_docs=n_docs, total_kernel_us=total_us,
+                  n_kernels=len(kernels))
+    for cls, us in classes.items():
+        result[f"{cls}_us"] = us
+        result[f"{cls}_frac"] = round(us / total_us, 4) if total_us else 0
+    print(json.dumps(result, indent=2), flush=True)
+    with open(f"/results/component_B{B}.json", "w") as f:
+        json.dump(result, f, indent=2)
+    results_vol.commit()
+'''
+    outdir = f"/results/tp_component_B{B}"
+    os.makedirs(outdir, exist_ok=True)
+    with open("/tmp/comp_runner.py", "w") as f:
+        f.write(runner)
+    r = subprocess.run(["python", "/tmp/comp_runner.py",
+                        str(B), str(n_docs), outdir])
+    results_vol.commit()
+    try:
+        with open(f"/results/component_B{B}.json") as f:
+            return f.read()
+    except FileNotFoundError:
+        return f"FAILED exit {r.returncode}"
+
+
+@app.local_entrypoint()
+def run_component_profiles():
+    """Launch profiled runs at 3 batch sizes in parallel."""
+    handles = []
+    for B in [512, 4096, 25305]:
+        handles.append(component_profile.spawn(B=B, n_docs=10000))
+    for h in handles:
+        print(h.get())
