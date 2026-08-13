@@ -16,6 +16,9 @@ image read 80,556 and are not kept.
 | `persist_store.json` | `modal_persist.py --stage store` | restore against recompute, 1k docs |
 | `pinprobe.json` | `modal_pinprobe.py` | host-to-GPU bandwidth for three pinned-memory paths |
 | `speed_limit.json` | prefill throughput sweep | the 97,889 tok/s anchor `quail/plan/cost.py` calibrates PHI against |
+| `calibrate_all.json` | `modal_calibrate.py --families all` | the calibration sweep the fits use: 100 step cells (alpha, c1, c2, c4, c5) plus the c6 transfer probes, one container, synchronous eager boot |
+| `cost_model_fit.json` | `quail.plan.fit` | the fitted step, host, and prefill models, with t_read, eps, and the offload-vs-recompute crossover per transfer tier |
+| `calibrate_alpha.json`, `calibrate_c1.json`, `calibrate_c2-c4-c5.json`, `calibrate_c6.json` | `modal_calibrate.py --families <fam>` | the staged gate-check runs, one container each; the fits read only `calibrate_all.json` because rows from different containers must not mix |
 
 ## One measurement caveat
 

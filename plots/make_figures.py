@@ -850,6 +850,13 @@ def calib_validation():
     ax.plot(span, span, color=GRAY, lw=1, ls="--")
     ax.set_xscale("log")
     ax.set_yscale("log")
+    # The default log formatter labels every minor tick; over this
+    # narrow span (one and a half decades) the labels collide.
+    from matplotlib import ticker
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.set_major_locator(ticker.LogLocator(base=10, subs=(1, 2, 5)))
+        axis.set_major_formatter(ticker.ScalarFormatter())
+        axis.set_minor_formatter(ticker.NullFormatter())
     ax.set_xlabel("measured step time (ms, log)")
     ax.set_ylabel("model step time (ms, log)")
     held_m = g.get("held_mape")

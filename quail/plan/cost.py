@@ -67,6 +67,31 @@ STEP_POOL_FRACTION = 0.03     # the activation reservation a step budget
 STEP_TOKEN_S = 10.39734565764918e-6  # a: seconds per token
 STEP_FIXED_S = 2.939878716623444e-3  # b: seconds per step
 
+# The calibration-sweep fits, one container
+# (experiments/modal_calibrate.py --families all ->
+# results/engine/calibrate_all.json, fitted by quail/plan/fit.py).
+# Constraints the numbers cannot show: the sweep boots the engine
+# synchronous and eager (async_scheduling off, enforce_eager on - the
+# step trace and the single-graph padding required it), so STEP_B0_S
+# is the eager engine's host launch floor, not the ~3 ms graph-mode
+# step cost above. T_READ_S_PER_TOKEN is the f_P slope at the c=32
+# reference; the read price grows with suffix length (raw two-cell
+# slope 101 ns/token, fitted-over-raw 0.56), so it is a reference
+# point, not a universal per-byte rate. HOST_* fit with MAPE 5.3 -
+# the least-squares solution tracks the large-N cells only.
+# --- calibration fits (results/engine/cost_model_fit.json) ---
+ALPHA1_S_PER_TOKEN = 9.196521782489011e-06
+ALPHA2_S_PER_TOKEN2 = 4.933635085554017e-10
+T_READ_S_PER_TOKEN = 5.675842254567658e-08
+EPSILON_READ_OVER_PRE = 0.0061717270820528716
+STEP_B0_S = 0.016790614841073047
+STEP_BETA_N_S = 5.027248077955851e-05
+HOST_H0_S = 0.004670076010014978
+HOST_HN_S = 3.748036087793601e-05
+HOST_HA_S = 0.0
+TRANSPORT_BW_BPS = {'c6_d2h_unpinned': 11856448657.0, 'c6_h2d_unpinned': 10916219696.0, 'c6_d2h_pinned': 55339616543.0, 'c6_h2d_pinned': 55472110922.0, 'c6_disk_write': 2605516808.0, 'c6_disk_read': 3877713374.0, 'c6_volume_write': 856544232.0, 'c6_volume_read': 3242050855.0}
+OFFLOAD_CROSSOVER_TOKENS = {'c6_d2h_unpinned': 0.0, 'c6_h2d_unpinned': 0.0, 'c6_d2h_pinned': 0.0, 'c6_h2d_pinned': 0.0, 'c6_disk_write': 38714.5770760633, 'c6_disk_read': 19897.590958957873, 'c6_volume_write': 155827.48237132592, 'c6_volume_read': 27453.67024434094}
+
 
 # ------------------------------------------------------- rate primitives
 
