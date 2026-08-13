@@ -106,6 +106,37 @@ def build_corpus(tok, n_docs, seed_offset=100):
     return body_ids, q_ids, flags
 
 
+def build_flat_pool(tok):
+    """Every pool review joined by a blank line, tokenized once, and
+    flattened into a single token list. The calibration sweeps slice
+    documents of exact target lengths out of it; at 10,000 reviews it
+    holds about 3.2 million tokens, and slicing wraps around when the
+    sweep needs more."""
+    docs = build_pool(10_000)
+    doc_ids = tok(docs, add_special_tokens=False)["input_ids"]
+    sep = tok("\n\n", add_special_tokens=False)["input_ids"]
+    flat = []
+    for i, ids in enumerate(doc_ids):
+        if i:
+            flat.extend(sep)
+        flat.extend(ids)
+    return flat
+
+
+def nonce_alphabet(tok):
+    """Token ids the calibration nonce blocks are spelled in: single
+    tokens for " a" through " p". Distinct single-token ids so a
+    16-token block can encode a large counter."""
+    ids = []
+    for ch in "abcdefghijklmnop":
+        t = tok(f" {ch}", add_special_tokens=False)["input_ids"]
+        if len(t) == 1 and t[0] not in ids:
+            ids.append(t[0])
+    if len(ids) < 2:
+        raise RuntimeError("nonce alphabet needs 2+ single-token ids")
+    return ids
+
+
 def yes_no_ids(tok):
     """The token ids that mean YES and NO. Constraining the sampler to
     their union makes every stage answer in exactly one token, which
