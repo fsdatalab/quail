@@ -1,170 +1,215 @@
-# Quail — a QUery-Aware Inference Layer
+# Quail
 
-Quail runs AI SQL filter queries over document collections by
-scheduling the work *inside* vLLM instead of through its client API.
-It is a custom scheduler and memory manager: the query plan, not the
-engine's heuristics, decides what enters GPU memory and what stays.
+Quail runs SQL-style filter queries over documents with an LLM, and
+tries to make them fast by changing how the inference engine manages
+memory.
 
-The problem it exists for: an inference engine keeps or drops KV cache
-by recency, because it does not know what the query will ask next. A
-query does know. When five filters run over the same document, the
-engine re-reads that document up to five times; the plan can see that
-coming and hold the KV instead.
+This is a research repo. It holds one experiment, run six ways, and
+the code that produced it.
 
-Scope right now is deliberately narrow: **gated filter queries, Qwen3
-4B fp8, one H100**. Open-ended maps, classification, multi-model and
-multi-GPU work are out until the filter case is fully understood.
+## The problem
 
-## The workload
+Say you have 10,000 movie reviews and a query with five filters:
 
-Five gated yes/no filters over 10,000 IMDB movie reviews. Each
-document ends in a planted metadata line —
+    WHERE is_positive(review)
+      AND mentions_acting(review)
+      AND ...
+
+Each filter is a question the LLM answers about the document. Five
+filters, 10,000 documents, so up to 50,000 questions.
+
+The expensive part is not the answer. Each answer is one token
+("YES" or "NO"). The expensive part is reading the document — about
+320 tokens of it, five times over, once per filter.
+
+An inference engine like vLLM caches what it has already read, so in
+principle the second filter reuses the first filter's work. In
+practice it often cannot. The cache is sized for one model, and our
+corpus is 3.4 times bigger than it. So the engine drops documents to
+make room, and when the next filter asks about a dropped document, it
+reads the whole thing again.
+
+The engine drops by recency, because it does not know what is coming.
+A query does know. That gap is what Quail is about.
+
+## What we tried
+
+**Pipelining.** Send a document to filter 2 as soon as filter 1
+answers, instead of pushing all 10,000 documents through filter 1
+first. Obvious, and a normal client can do it.
+
+**Token-based admission.** Let a document into the engine only when
+its tokens fit a budget computed from the cache size. The usual
+alternative is to cap the number of concurrent requests, which cannot
+work well here: our documents range from 44 to 2,947 tokens, so a
+request count tells you nothing about how much memory they need.
+
+**KV rewind.** Keep one request alive per document for the whole
+chain of filters. After each answer, erase the question from the
+document's cached state and append the next question in its place.
+Because the request never ends, the engine cannot drop the document
+between filters. This needs changes inside the engine — no client can
+do it through the public API.
+
+## What we found
+
+On one H100 with Qwen3-4B (fp8), 10,000 documents, five filters:
+
+| | wall time | times the corpus is read |
+|---|---|---|
+| stock vLLM | 42.9 s | 1.23x |
+| KV rewind | 39.8 s | 1.14x |
+
+**1.08x faster.** Modest, and that is the honest number.
+
+We first measured 2x, then found the baseline was misconfigured. It
+was running 4,096 concurrent requests — the engine's default limit —
+which needs 1.6 times more memory than the cache has. The engine
+thrashed and read the corpus 2.40 times. Setting its concurrency from
+the cache size instead (2,048 documents) took it from 80.1 s to
+42.9 s. Most of the "win" was our baseline being badly set up.
+
+What survives is smaller and has a specific cause. The engine matches
+its cache in fixed 16-token blocks, so the block where the document
+ends and the question begins never matches and gets recomputed on
+every filter. A rewind cuts at the exact token instead, so it does
+not pay that.
+
+**Reusing work across queries is where the real win is.** If a second
+query arrives for the same documents, we can save their cached state
+to CPU memory and load it back rather than re-reading the documents:
+2.33 s instead of 4.54 s, a 2x speedup. That holds whenever the
+transfer is faster than re-reading, which for this model means faster
+than 7.2 GB/s. Bigger models make it easier, since they read more
+slowly.
+
+## Is the hardware even the limit?
+
+Before optimizing, we checked what the H100 can do at all.
+
+The GPU is busy 99.5% of the time during these queries, so there is
+no idle time to reclaim. But it only reaches 97,000 tokens per second
+against a theoretical 275,000. We looked at where the other two
+thirds go.
+
+Not slow matrix multiplies: Nsight Compute puts those at 91-93% of
+the hardware ceiling. The time goes to everything around them.
+Per token:
+
+| | time | share |
+|---|---|---|
+| matrix multiplies | 6.5 µs | 61% |
+| fp8 quantize/scale | 2.0 µs | 19% |
+| normalization | 1.35 µs | 13% |
+| activation functions | 0.74 µs | 7% |
+| attention | 0.45 µs | 4% |
+
+So 39% of every token is spent on small memory-bound operations
+between the matrix multiplies. Making the multiplies faster would
+barely help. This is a property of the model and the engine, not of
+our query.
+
+We also fitted a simple model of step cost by sweeping the batch
+size:
+
+    time per step = 10.7 µs × tokens + 3.1 ms
+
+The fixed 3.1 ms is per-step overhead — kernel launches, the
+scheduler, Python. It stops mattering past roughly 300 tokens per
+step, which matches where the analytical roofline says the matrix
+multiplies saturate (~400). Our batches are 25,305 tokens, far past
+both.
+
+## Try it
+
+```bash
+pip install -e ".[dev]"
+
+python -m pytest tests/ -q     # 45 tests, no GPU needed
+python -m quail.roofline       # what the hardware allows, from specs alone
+```
+
+The engine experiments need a GPU and run on Modal:
+
+```bash
+modal run experiments/modal_filters.py                # the main result
+modal run experiments/modal_profiling.py::batchsweep  # the step cost model
+modal run experiments/modal_profiling.py::torchprof   # where the time goes
+modal run experiments/modal_profiling.py::ncubench    # are the kernels good?
+modal run experiments/modal_persist.py --stage baseline
+modal run experiments/modal_persist.py --stage store  # reuse across queries
+
+python plots/make_figures.py                          # redraw the figures
+```
+
+There is no local GPU path. The engine code reaches into vLLM
+internals that are pinned to version 0.26.0.
+
+## The experiment
+
+Five yes/no filters over IMDB movie reviews. Each review has a line
+added to the end:
 
     [FLAGS] FLAG_1=YES FLAG_2=YES FLAG_3=NO FLAG_4=YES FLAG_5=NO
 
-— and filter *j* asks for the value of `FLAG_j`. A document that fails
-a filter skips the rest. Selectivities are 0.9, 0.9, 0.9, 0.8, 0.8, so
-about 47% of documents survive all five.
+Filter *j* asks what `FLAG_j` says. A document that fails a filter
+skips the rest.
 
-The answer is in the text, so the query measures execution rather than
-reasoning. Documents average 320 tokens (median 246, max 2,947),
-3,203,917 tokens in total — **3.4 times the KV pool**, so the corpus
-cannot be held resident and something has to decide what to keep.
+The answer is written in the document, so this measures how fast the
+system runs, not how well the model thinks. Pass rates are 0.9, 0.9,
+0.9, 0.8, 0.8, so about 47% of documents survive all five filters and
+the survivor count drops as the query goes — which is what makes
+skipping worth doing.
 
-Answers are constrained to the yes/no token ids with `max_tokens=1`,
-so every stage answers from its prefill pass and no decode step ever
-runs. That is what "zero decode" means here.
+Answers are restricted to the YES and NO tokens with a one-token
+limit, so each answer comes out of reading the document and no
+generation step ever runs.
 
-## What we measured
+## Where things are
 
-Qwen3-4B fp8 on one H100 SXM 80 GB, via Modal.
+```
+quail/
+  roofline.py             what the hardware allows, from specs alone
+  plan/planner.py         describe a query, get a plan
+  plan/cost.py            every measured constant, in one table
+  runtime/engine_client.py   the two ways to run a query
+  engineext/scheduler.py     the vLLM scheduler we substitute in
+  engineext/chainlogic.py    its decision logic, pure and testable
 
-**Speed of light.** The dense projections cross the roofline ridge
-(591 FLOP/byte) at about 400 tokens per step, so any step budget past
-~400 saturates them. Attention only overtakes the projections at a
-context of ~12,300 tokens, far past our 320-token documents. The
-analytical ceiling is 274,861 prefill tokens/s.
+experiments/
+  workload.py             the documents and questions everything shares
+  modal_filters.py        rewind vs stock
+  modal_profiling.py      batch sweep, profiler, Nsight Compute
+  modal_persist.py        reuse across queries
+  modal_pinprobe.py       how fast the CPU-GPU link actually is
 
-**The step model.** Sweeping `max_num_batched_tokens` from 512 to
-25,305, unprofiled, through the synchronous API:
-
-    T_step(B) = 10.7 us x B  +  3.1 ms
-
-a ceiling of about 94,000 tokens/s and a knee near B = 290, which
-agrees with the analytical ridge. Measured throughput at B = 25,305 is
-97,005 tokens/s against the 274,861 ceiling — an overhead multiplier
-of **0.49**.
-
-**Where the 10.7 us goes** (torch profiler inside the engine core):
-GEMMs 6.5 us (61%), fp8 quantize/scale 2.0 (19%), normalization 1.35
-(13%), elementwise 0.74 (7%), attention 0.45 (4%). Nsight Compute says
-the GEMM kernels themselves run at 91-93% of the compute ceiling with
-DRAM at 28-30%, so the gap to peak is the step *mix*, not slow
-kernels. The GPU is 99.5% busy and the host scheduling hides entirely
-behind it.
-
-**KV rewind against stock pipelining**, 10k documents, 5 filters, same
-container, 3 reps:
-
-| | wall | corpus reads | requests |
-|---|---|---|---|
-| stock pipelining (fair concurrency) | 42.9 s | 1.23x | 23,315 |
-| KV rewind | 39.8 s | 1.14x | 10,000 |
-
-**1.08x.** The honest number. Setting stock's concurrency to the
-engine's 4,096 sequence cap instead of the pool-derived 2,048
-overflows the KV pool by 1.6x, forces the prefix cache to evict
-between stages, and costs it 2.40x reads and 80.1 s — which would look
-like a 2x win for rewind and is really a misconfiguration. The
-surviving 0.09x of rereads is block alignment: a prefix cache matches
-whole 16-token blocks, so the block straddling the document boundary
-is recomputed on every stage, while a rewind cuts by token position
-and keeps it.
-
-**Persisted KV.** After the first query has computed the corpus, a
-second query can restore its KV from host memory instead of
-recomputing: 2.33 s against 4.54 s, **2.0x**. Restore wins when the
-channel beats `kappa x prefill_rate` = 7.2 GB/s at 4B. The measured
-channel: 64 GB/s PCIe Gen5 on paper, 55.4 GB/s for a raw copy from
-alloc-pinned host memory, and 10.2 GB/s end to end through vLLM's
-offload connector. That last gap is unexplained and open.
-
-## The three mechanisms
-
-**Pipelining** — send a document to the next filter the moment the
-previous one answers, instead of running the corpus through filter 1
-before starting filter 2. Obvious, and any client can do it.
-
-**Token-based admission** — a document enters the engine only when its
-worst-case tokens fit a budget sized from the KV pool. A request count
-cannot do this job: it cannot see that one document is 44 tokens and
-another 2,947. This is what makes the stock comparison fair, and what
-keeps the pool from overflowing.
-
-**KV rewind** — one living request per document for the whole chain.
-The scheduler judges each answer at prefill, erases the question's KV
-back to the document boundary *by token position*, and appends the
-next question onto the still-resident document KV. Because the request
-never finishes, its KV cannot be evicted between stages. No client can
-do this: the public API has no way to erase part of a request or to
-keep its KV pinned.
-
-## Layout
-
-    quail/
-      configs.py             model and device specs
-      roofline.py            analytical component roofline (no runs needed)
-      plan/cost.py           every calibrated constant, in one table
-      plan/planner.py        describe the query, get a plan or a refusal
-      runtime/engine_client.py  the two executors (stock baseline, rewind)
-      engineext/chainlogic.py   pure decision logic, no vLLM, unit-tested
-      engineext/scheduler.py    the vLLM scheduler subclass
-
-    experiments/
-      workload.py            the corpus, the questions, the Modal image
-      modal_filters.py       rewind against stock pipelining
-      modal_profiling.py     batch sweep, torch profiler, ncu
-      modal_persist.py       restore against recompute
-      modal_pinprobe.py      which pinned-memory paths work, and how fast
-
-    plots/make_figures.py    rebuilds every figure in results/plots
-
-`chainlogic.py` imports no vLLM, torch, or numpy: every decision the
-scheduler makes is computed there on plain values and unit-tested with
-no engine installed, so a vLLM version bump can break the adapter but
-not the rules.
-
-## Running it
-
-```bash
-pip install -e ".[dev]"      # CPU: planner, roofline, tests
-python -m pytest tests/ -q
-python -m quail.roofline     # the analytical table, no GPU needed
-
-modal run experiments/modal_filters.py                  # the headline result
-modal run experiments/modal_profiling.py::batchsweep    # the step model
-modal run experiments/modal_profiling.py::torchprof     # the kernel mix
-modal run experiments/modal_profiling.py::ncubench      # GEMM speed of light
-modal run experiments/modal_persist.py --stage baseline
-modal run experiments/modal_persist.py --stage store
-
-python plots/make_figures.py                            # rebuild figures
+plots/make_figures.py     redraws every figure in results/plots
 ```
 
-Engine work needs Modal (`vllm==0.26.0`, one H100); there is no local
-GPU path. The scheduler subclass reaches into vLLM internals pinned at
-that exact version.
+`chainlogic.py` imports no vLLM, torch, or numpy. Every decision the
+scheduler makes is computed there on plain values and tested with no
+engine installed, so a vLLM upgrade can break the glue without
+breaking the rules.
 
-## Open questions
+## Scope
 
-- The offload connector delivers 10.2 GB/s from memory that copies at
-  55.4 GB/s. Five-sixths of the channel is lost somewhere inside it.
-- `B = 1024` is reproducibly slower than `B = 512` in the sweep. Not
-  explained; excluded from the fit and reported.
-- The per-token cost is not really constant: it rises from 4.65 us at
-  B = 512 to 6.51 at B = 25,305 for the GEMMs alone, most likely L2
-  behaviour. The linear model absorbs this into an average.
-- The 4B fp8 checkpoint misreads about 27% of flag values it can see.
-  Identical across executors, so it does not affect any comparison
-  here, but it makes this checkpoint unfit for accuracy claims.
-- Decode is entirely unaddressed. Everything above is prefill.
+Filters only, Qwen3-4B, one H100. Open-ended text generation,
+classification, larger models, and multi-GPU are all out for now — we
+want the simplest case understood before adding any of it back. Git
+history has the removed code.
+
+## Known problems
+
+- Saving to CPU memory runs at 10.2 GB/s through vLLM's connector,
+  but the same memory copies at 55.4 GB/s directly. Five sixths of
+  the link disappears somewhere inside, and we do not know where.
+- A batch size of 1,024 is reproducibly slower than 512. No
+  explanation; we left it out of the fit rather than hide it.
+- The per-token cost is not really constant. Matrix multiplies cost
+  4.65 µs per token at small batches and 6.51 µs at large ones,
+  probably cache behaviour. The model averages over it.
+- This model gets about 27% of the flag values wrong, even though
+  they are written in the text. Both methods get them equally wrong,
+  so comparisons are unaffected, but do not use this setup to say
+  anything about accuracy.
+- Text generation is untouched. Everything here is about reading.
