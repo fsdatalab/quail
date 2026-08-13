@@ -25,12 +25,12 @@ BLUE, ORANGE, GREEN, YELLOW, PINK, GRAY = (
 MEASURED = dict(
     # --- batch-size sweep: 10k docs, 1 filter, synchronous API,
     # unprofiled, one container (modal_profiling.py::batchsweep) ---
-    sweep=[(512, 60_448), (1024, 39_287), (2048, 76_595), (4096, 84_184),
-           (8192, 91_222), (16384, 96_715), (25305, 97_005)],
-    sweep_outlier=1024,   # reproducibly slow; excluded from the fit
+    sweep=[(512, 61_425.3), (1024, 77_962.6), (2048, 83_749.6),
+           (4096, 86_180.6), (8192, 93_104.3), (16384, 95_466.1),
+           (25305, 96_749.2)],
     # --- the step model fitted to that sweep ---
-    a_us_per_token=10.7,
-    b_ms_per_step=3.1,
+    a_us_per_token=10.40,
+    b_ms_per_step=2.94,
     # --- torch profiler, stock 4B filter, B = 25,305, 15-second
     # window: share of GPU-busy time by kernel class ---
     kernel_mix=[("GEMMs\n(MLP + projections)", 6.51, BLUE),
@@ -212,22 +212,20 @@ def batchsweep_regression():
     data = MEASURED["sweep"]
     B = np.array([d[0] for d in data], float)
     rate = np.array([d[1] for d in data], float)
-    keep = B != MEASURED["sweep_outlier"]
-
     # 1/throughput = a + b/B is linear in 1/B
-    b_coef, a_coef = np.polyfit(1.0 / B[keep], 1.0 / rate[keep], 1)
+    b_coef, a_coef = np.polyfit(1.0 / B, 1.0 / rate, 1)
     ceiling, knee = 1.0 / a_coef, b_coef / a_coef
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle("Batch-size sweep: 10k documents, 1 filter, synchronous "
-                 "API, no profiler\n"
+                 "API, no profiler, one H100\n"
                  f"fit 1/throughput = a + b/B gives a = {a_coef*1e6:.1f} "
-                 f"us/token, b = {b_coef*1e3:.1f} ms/step",
+                 f"us/token, b = {b_coef*1e3:.2f} ms/step",
                  fontsize=11)
 
     ax = axes[0]
-    ax.semilogx(B[keep], rate[keep] / 1e3, "o", color=BLUE, ms=9, zorder=5)
-    ax.semilogx(B[~keep], rate[~keep] / 1e3, "o", color=GRAY, ms=9, zorder=5)
+    ax.semilogx(B, rate / 1e3, "o", color=BLUE, ms=9, zorder=5,
+                label="measured")
     grid = np.logspace(np.log10(300), np.log10(30_000), 200)
     ax.semilogx(grid, 1e-3 / (a_coef + b_coef / grid), "-", color=ORANGE,
                 lw=2, label=f"ceiling {ceiling/1e3:.0f}k tok/s")
@@ -235,8 +233,6 @@ def batchsweep_regression():
                label=f"knee B = {knee:,.0f}")
     ax.axvline(416, color=GRAY, ls=":", lw=1,
                label="analytical ridge B = 416")
-    ax.text(MEASURED["sweep_outlier"], rate[~keep][0] / 1e3 - 6,
-            "B=1024\noutlier", ha="center", fontsize=8, color=GRAY)
     ax.set_xlabel("max_num_batched_tokens (B)", fontsize=11)
     ax.set_ylabel("throughput (k tokens/s)", fontsize=11)
     ax.set_title("Throughput vs batch size", fontsize=11)
@@ -244,26 +240,14 @@ def batchsweep_regression():
     ax.legend(fontsize=8.5, loc="lower right")
 
     ax = axes[1]
-    ax.plot(1e3 / B[keep], 1e6 / rate[keep], "o", color=BLUE, ms=9,
-            label="used in fit")
-    ax.plot(1e3 / B[~keep], 1e6 / rate[~keep], "o", color=GRAY, ms=9,
-            label="excluded")
+    ax.plot(1e3 / B, 1e6 / rate, "o", color=BLUE, ms=9,
+            label="all points used")
     xs = np.linspace(0, 1e3 / B.min() * 1.1, 100)
     ax.plot(xs, (a_coef + b_coef * xs / 1e3) * 1e6, "-", color=ORANGE, lw=2)
     ax.set_xlabel("1000 / B", fontsize=11)
     ax.set_ylabel("1/throughput (us/token)", fontsize=11)
     ax.set_title("The fit is linear in 1/B", fontsize=11)
     ax.legend(fontsize=9)
-
-    ax = axes[2]
-    resid = (rate - 1.0 / (a_coef + b_coef / B)) / rate * 100
-    ax.bar(range(len(B)), resid,
-           color=[GRAY if not k else BLUE for k in keep])
-    ax.set_xticks(range(len(B)))
-    ax.set_xticklabels([f"{int(b):,}" for b in B], fontsize=8, rotation=45)
-    ax.axhline(0, color="black", lw=0.5)
-    ax.set_ylabel("residual (%)", fontsize=11)
-    ax.set_title("Residuals: one line does fit", fontsize=11)
 
     for ax in axes:
         for s in ("top", "right"):

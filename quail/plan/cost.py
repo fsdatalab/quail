@@ -61,11 +61,11 @@ STEP_POOL_FRACTION = 0.03     # the activation reservation a step budget
 # The per-token term is what a token costs once the dense projections
 # are compute-bound; the fixed term is kernel launches, the sampler,
 # and Python glue, paid once per step whatever the step holds. The
-# knee (STEP_FIXED_S / STEP_TOKEN_S, about 290 tokens) is where the
+# knee (STEP_FIXED_S / STEP_TOKEN_S, about 283 tokens) is where the
 # fixed cost stops dominating; the analytical dense-projection ridge
 # sits near 400 tokens, which is the same story from the other side.
-STEP_TOKEN_S = 10.7e-6        # a: seconds per token
-STEP_FIXED_S = 3.1e-3         # b: seconds per step
+STEP_TOKEN_S = 10.39734565764918e-6  # a: seconds per token
+STEP_FIXED_S = 2.939878716623444e-3  # b: seconds per step
 
 
 # ------------------------------------------------------- rate primitives

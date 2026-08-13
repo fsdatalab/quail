@@ -92,10 +92,10 @@ same documents:
 ## Is the hardware the limit?
 
 - GPU is **99.5% busy** during filters — no idle time to reclaim
-- Achieved **97,005 tok/s** against a **274,861 tok/s** ceiling → 0.35
+- Achieved **96,749 tok/s** against a **274,861 tok/s** ceiling → 0.35
 - Not slow kernels: ncu puts the GEMMs at **91-93% of peak** (DRAM 28-30%)
 
-Where each token's 10.7 µs goes (torch profiler, B=25,305):
+Where each token's 10.4 µs goes (torch profiler, B=25,305):
 
 | component | µs/token | share |
 |---|---|---|
@@ -109,9 +109,9 @@ Where each token's 10.7 µs goes (torch profiler, B=25,305):
 
 Step cost, fitted over B = 512 … 25,305 (unprofiled, synchronous API):
 
-    T_step(B) = 10.7 µs x B + 3.1 ms
+    T_step(B) = 10.40 µs x B + 2.94 ms
 
-- Ceiling 94k tok/s, knee at B ≈ 290
+- Ceiling 96.2k tok/s, knee at B ≈ 283
 - Analytical roofline puts the dense-projection ridge at B ≈ 416 —
   same story from the other side
 - Attention only overtakes the projections at S ≈ 12,300 tokens; our
