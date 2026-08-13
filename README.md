@@ -49,21 +49,30 @@ of a request's KV or to keep a request alive across answers.
 
 **Filters** — 10k docs, 5 filters, same container, 3 reps each:
 
-| | wall | corpus reads | requests |
+| | wall | prefill tokens | requests |
 |---|---|---|---|
-| stock vLLM | 42.9 s | 1.23x | 23,315 |
-| KV rewind | 39.8 s | 1.14x | 10,000 |
+| stock vLLM | 42.9 s | 1.23x corpus | 23,315 |
+| KV rewind | 39.8 s | 1.20x corpus | 10,000 |
 
-- **1.08x faster.** Reads ratio is 1.07x — the win is entirely less work
-- *Corpus reads* = (prompt tokens processed − cache hits) / 3,203,917.
-  1.00x = every document read once
+- **1.08x faster**, from two things: 2.6% fewer tokens prefilled, and
+  2.3x fewer requests to schedule, sample, and detokenize
+- *Prefill tokens* = tokens the engine actually computed, over the
+  3,203,917-token corpus. Both sides are above 1.00x because the
+  questions get prefilled too, not just the documents
 - Both sides get the same memory budget. vLLM's default 4,096
-  concurrent requests needs 1.58x the pool, thrashes, and reads 2.40x
-  in 80.1 s — not a fair baseline
-- The 23% of repeated reading left: the engine matches cache in
+  concurrent requests needs 1.58x the pool, thrashes, and prefills
+  2.40x the corpus in 80.1 s — not a fair baseline
+- Stock's extra 0.03x is block alignment: the engine matches cache in
   16-token blocks, so the block spanning the document/question
   boundary never matches and is recomputed every filter. A rewind cuts
   at the exact token
+- **Measurement note.** The client-side counter
+  (`prompt_tokens - cached_tokens`) is right for stock but wrong for
+  chain mode: a rewind rewrites `prompt_token_ids`, so the final
+  snapshot shows only `[document + last question]` and the
+  intermediate prefills vanish. It reported an identical 1.143x for
+  three operators that differ by 30% in wall time. Chain-mode numbers
+  here come from the scheduler's step trace, which sees every prefill
 
 **Cross-query reuse** — 1k docs (315k tokens), second query over the
 same documents:

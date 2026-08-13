@@ -129,6 +129,13 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
 
     for arm in [a.strip() for a in arms.split(",") if a.strip()]:
         planned = arm == "rewind"
+        # the step trace is the only honest source of prefill work for
+        # chain mode; it exists only on the planned boot
+        trace_path = f"/tmp/quail_trace_{arm}.jsonl" if planned else None
+        if trace_path:
+            os.environ["QUAIL_STEPTRACE"] = trace_path
+        else:
+            os.environ.pop("QUAIL_STEPTRACE", None)
         extra = (dict(scheduler_cls="quail.engineext.scheduler."
                                     "QuailScheduler")
                  if planned else {})
@@ -149,18 +156,54 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
                 if hasattr(res, "__await__"):
                     await res
                 tag = f"{arm}-{rep}"
+                t0m = _time.monotonic()
                 if planned:
                     r = await run_filter_chain_engine(
                         engine, sp, body_ids, q_ids, budget, yes_ids,
                         tag=tag)
                 else:
                     r = await run_stock(engine, tag)
-                reads = round((r["prompt_tokens"] - r["cached_tokens"])
-                              / max(1, corpus), 3)
+                t1m = _time.monotonic()
+                # Two ways to count the prefill work, and only one of
+                # them is right for each arm.
+                #
+                # Client side: (prompt tokens - cache hits) / corpus.
+                # Correct for the stock arm, where every request is
+                # submitted once and its final prompt IS what it asked
+                # for. WRONG for chain mode: a rewind truncates and
+                # re-extends prompt_token_ids, so the final snapshot
+                # shows only [document + last question] and the
+                # intermediate question prefills vanish. It reported
+                # an identical 1.143 for three operators that do
+                # visibly different amounts of work.
+                #
+                # Scheduler side: sum the step trace's prefill_tokens
+                # over the cell's window. The scheduler sees every
+                # prefill, so this is the honest number - but it only
+                # exists for the planned boot, which is the one
+                # running our scheduler.
+                client_reads = round(
+                    (r["prompt_tokens"] - r["cached_tokens"])
+                    / max(1, corpus), 3)
+                reads, source = client_reads, "client"
+                if planned and trace_path and os.path.exists(trace_path):
+                    pf = 0
+                    with open(trace_path) as tf:
+                        for line in tf:
+                            if not line.strip():
+                                continue
+                            rec = json.loads(line)
+                            if t0m <= rec["t"] <= t1m:
+                                pf += rec["prefill_tokens"]
+                    if pf:
+                        reads = round(pf / max(1, corpus), 3)
+                        source = "step-trace"
                 wrong = sum(1 for (i, j), v in r["answers"].items()
                             if v != int(flags[i][j - 1]))
                 cell = dict(arm=arm, rep=rep, wall=round(r["wall"], 3),
                             requests=r["requests"], reads=reads,
+                            reads_source=source,
+                            client_reads=client_reads,
                             wrong=wrong, answered=len(r["answers"]),
                             survivors=len(r["survivors"]))
                 report["cells"].append(cell)

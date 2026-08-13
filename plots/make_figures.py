@@ -48,8 +48,13 @@ MEASURED = dict(
     # 3 reps each (modal_filters.py) ---
     stock_walls=[42.831, 42.773, 43.161],
     rewind_walls=[39.994, 39.828, 39.694],
+    # stock's reads come from the client counter, which is correct for
+    # separate requests. rewind's come from the scheduler step trace:
+    # the client counter cannot see a chain's intermediate prefills
+    # (a rewind rewrites prompt_token_ids) and reported 1.143 for
+    # three operators doing visibly different work.
     stock_reads=1.228,
-    rewind_reads=1.143,
+    rewind_reads=1.197,
     stock_semaphore=2048,
     budget_tokens=749_782,
     mean_request_tokens=366,
@@ -510,11 +515,10 @@ def rewind_vs_stock_4b():
     fig.text(0.5, 0.015,
              f"fair concurrency: {m['budget_tokens']:,} token budget / "
              f"{m['mean_request_tokens']} tokens per request = "
-             f"{m['stock_semaphore']} documents in flight. "
-             "Stock's remaining 0.09x of rereads is block alignment: a "
-             "prefix cache matches whole 16-token blocks,\nso the block "
-             "straddling the document boundary is recomputed every "
-             "stage, while a rewind cuts by token position and keeps it.",
+             f"{m['stock_semaphore']} documents in flight.\n"
+             "Reads count prefill tokens against the 3.2M-token corpus, "
+             "so both sides sit above 1.00x: the questions are prefilled "
+             "too. Stock's extra 0.03x is block alignment.",
              ha="center", fontsize=8.5, color="#666666")
     for ax in (ax1, ax2):
         for s in ("top", "right"):
