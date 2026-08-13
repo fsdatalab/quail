@@ -13,12 +13,38 @@ The c6 family measures transfer rates with no engine: GPU-host copies
 both directions, pinned and unpinned, container disk, and the results
 volume.
 
+Predictions, stated before any run (from the constants in
+quail/plan/cost.py, quail/configs.py, and quail/roofline.py):
+
+  a1 (per-token prefill)   10.4 us/token (accept 8.5-12.5)
+  a2 (attention term)      ~4.2e-10 s/token^2 = a1 / (2 x 12,207)
+  T_pre at 16,384 tokens   ~286 ms, against 173 ms if the model
+                           were linear - the point of the alpha sweep
+  b0                       1.5-3.5 ms (the old 2.94 ms fixed step
+                           cost also absorbed per-request cost)
+  t_read                   ~22 ns/token (KV bytes over HBM bandwidth)
+  eps = t_read / a1        ~2.1e-3
+  cached step, N=32 c=32   ~30 ms (38.6 GB of KV read, plus compute)
+  at h=16,384
+  PCIe tiers               transfer beats recomputation at every
+                           length (per-token transfer under a1)
+  container disk           decided by the measured rate: recompute
+                           wins everywhere at 2 GB/s, transfer wins
+                           past ~10K tokens at 5 GB/s
+  c4 additivity            within 10 percent
+  c5 imbalance             within 5 percent of the equal-lengths cell
+
 Run with (tee every run):
   modal run experiments/modal_calibrate.py --families alpha
   modal run experiments/modal_calibrate.py --families c1
   modal run experiments/modal_calibrate.py --families c2,c4,c5
   modal run experiments/modal_calibrate.py --families c6
   modal run experiments/modal_calibrate.py --families all
+
+Then:
+  python -m quail.plan.fit --rows results/engine/calibrate_all.json \
+      --out results/engine/cost_model_fit.json
+  python plots/make_figures.py calib
 """
 
 import json
