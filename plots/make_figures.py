@@ -661,6 +661,209 @@ def rewind_schematic():
     _save(fig, "rewind_schematic")
 
 
+# ---------------------------------------------------- calibration
+
+CALIB_ROWS = "results/engine/calibrate_all.json"
+CALIB_FIT = "results/engine/cost_model_fit.json"
+
+
+def _calib_data(need_fit=True):
+    """The calibration rows and the fitted models, or None with a
+    skip message when the sweeps have not been run yet."""
+    if not os.path.exists(CALIB_ROWS):
+        print(f"skip: {CALIB_ROWS} not on disk "
+              "(run experiments/modal_calibrate.py --families all)")
+        return None
+    with open(CALIB_ROWS) as f:
+        rows = json.load(f)
+    fitted = None
+    if os.path.exists(CALIB_FIT):
+        with open(CALIB_FIT) as f:
+            fitted = json.load(f)
+    elif need_fit:
+        print(f"skip: {CALIB_FIT} not on disk (run python -m "
+              "quail.plan.fit)")
+        return None
+    return rows, fitted
+
+
+def _valid_cells(rows, families):
+    out = {}
+    for r in rows:
+        if r.get("family") in families and r.get("valid") \
+                and r.get("exec_ms_median") is not None:
+            out[r["cell"]] = r
+    return list(out.values())
+
+
+@figure("calib_alpha")
+def calib_alpha():
+    """Prefill time vs document length: the measured medians against
+    the quadratic fit and the linear-only fit it beats."""
+    data = _calib_data()
+    if not data:
+        return
+    rows, fitted = data
+    cells = sorted(_valid_cells(rows, ("alpha",)), key=lambda r: r["b"])
+    h = np.array([r["b"] for r in cells], float)
+    y = np.array([r["exec_ms_median"] for r in cells], float)
+    a = fitted["alpha"]
+    hh = np.linspace(0, h.max(), 200)
+    quad = (a["intercept_s"] + a["a1_s_per_token"] * hh
+            + a["a2_s_per_token2"] * hh * hh) * 1e3
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(7, 4.4))
+    ax.plot(hh, quad, color=BLUE, lw=2,
+            label=(f"quadratic fit: {a['a1_s_per_token'] * 1e6:.1f} us/tok"
+                   f" + {a['a2_s_per_token2']:.2e} s/tok$^2$"))
+    ax.plot(hh, (a["intercept_s"] + a["a1_s_per_token"] * hh) * 1e3,
+            color=GRAY, lw=2, ls="--", label="its linear part alone")
+    ax.plot(h, y, "o", color=ORANGE, ms=7, label="measured median step")
+    ax.set_xlabel("document length h (tokens)")
+    ax.set_ylabel("prefill step time (ms)")
+    bend = a.get("bend_tokens")
+    ax.set_title(
+        "Prefill time bends upward with length: the h$^2$ term is "
+        "attention\n(alpha cells, one request per step; bend a1/a2 = "
+        f"{bend and round(bend):,} tokens)",
+        fontsize=10)
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    _save(fig, "calib_alpha")
+
+
+@figure("calib_fb")
+def calib_fb():
+    """C1: step time vs fresh tokens per step, by suffix length, with
+    the fitted step model through each series."""
+    data = _calib_data()
+    if not data:
+        return
+    rows, fitted = data
+    from quail.plan import fit as calfit
+    cells = _valid_cells(rows, ("c1",))
+    g = fitted["gpu"]
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(7, 4.4))
+    for c, color in ((64, BLUE), (256, GREEN), (512, ORANGE)):
+        sub = sorted((r for r in cells if r["requests"][0]["new"] == c),
+                     key=lambda r: r["b"])
+        if not sub:
+            continue
+        B = np.array([r["b"] for r in sub], float)
+        y = np.array([r["exec_ms_median"] for r in sub], float)
+        pred = calfit.step_predict(g, sub) * 1e3
+        ax.plot(B, y, "o", color=color, ms=6, label=f"measured, c={c}")
+        ax.plot(B, pred, color=color, lw=1.5, alpha=0.7)
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.set_xlabel("fresh tokens per step B (log)")
+    ax.set_ylabel("step time (ms, log)")
+    ax.set_title(
+        "C1 prefill composition against the fitted step model\n"
+        f"(lines are the fit; b0 = {g['b0_s'] * 1e3:.2f} ms, "
+        f"beta_N = {g['beta_n_s'] * 1e6:.1f} us/request)",
+        fontsize=10)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.25, which="both")
+    fig.tight_layout()
+    _save(fig, "calib_fb")
+
+
+@figure("calib_fp")
+def calib_fp():
+    """C2: step time vs attention pairs, by suffix length. The f_P
+    slope here is the cached-read price."""
+    data = _calib_data()
+    if not data:
+        return
+    rows, fitted = data
+    from quail.plan import fit as calfit
+    cells = _valid_cells(rows, ("c2",))
+    g = fitted["gpu"]
+    t = fitted["t_read"]
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(7, 4.4))
+    for c, color in ((16, BLUE), (32, GREEN), (64, ORANGE)):
+        series = sorted(
+            (r for r in cells if r["requests"][0]["new"] == c
+             and r["n"] == 32),
+            key=lambda r: r["p"])
+        rest = [r for r in cells if r["requests"][0]["new"] == c
+                and r["n"] != 32]
+        if rest:
+            ax.plot([r["p"] for r in rest],
+                    [r["exec_ms_median"] for r in rest],
+                    "o", color=color, ms=4, alpha=0.3)
+        if series:
+            P = np.array([r["p"] for r in series], float)
+            y = np.array([r["exec_ms_median"] for r in series], float)
+            pred = calfit.step_predict(g, series) * 1e3
+            ax.plot(P, y, "o", color=color, ms=7,
+                    label=f"c={c}, N=32 (faint: other N)")
+            ax.plot(P, pred, color=color, lw=1.5, alpha=0.7)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("attention pairs per step P (log)")
+    ax.set_ylabel("step time (ms, log)")
+    eps = fitted.get("eps")
+    ax.set_title(
+        "C2 cached evaluation; lines are the fitted model at N=32\n"
+        f"(t_read {t['t_read_s_per_token'] * 1e9:.1f} ns per cached "
+        f"token at c=32; eps {eps:.2e})",
+        fontsize=10)
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(alpha=0.25, which="both")
+    fig.tight_layout()
+    _save(fig, "calib_fp")
+
+
+@figure("calib_validation")
+def calib_validation():
+    """Predicted against measured step time for every valid cell,
+    colored by regime, with the held-out validation numbers."""
+    data = _calib_data()
+    if not data:
+        return
+    rows, fitted = data
+    from quail.plan import fit as calfit
+    g = fitted["gpu"]
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(5.4, 5.2))
+    lo, hi = None, None
+    for fams, color, label in (
+            (("alpha", "c1"), BLUE, "pure prefill (alpha, c1)"),
+            (("c2", "c5"), GREEN, "cached (c2, c5)"),
+            (("c4",), ORANGE, "mixed (c4, held out)")):
+        sub = _valid_cells(rows, fams)
+        if not sub:
+            continue
+        y = np.array([r["exec_ms_median"] for r in sub], float)
+        pred = calfit.step_predict(g, sub) * 1e3
+        ax.plot(y, pred, "o", ms=6, color=color, alpha=0.8, label=label)
+        lo = min(y.min(), pred.min()) if lo is None else min(
+            lo, y.min(), pred.min())
+        hi = max(y.max(), pred.max()) if hi is None else max(
+            hi, y.max(), pred.max())
+    span = np.array([lo * 0.8, hi * 1.2])
+    ax.plot(span, span, color=GRAY, lw=1, ls="--")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("measured step time (ms, log)")
+    ax.set_ylabel("model step time (ms, log)")
+    held_m = g.get("held_mape")
+    held_r = g.get("held_ranking")
+    ax.set_title(
+        "Step model against every valid cell\n"
+        f"(held-out MAPE {held_m:.1%}, ranking {held_r:.1%})",
+        fontsize=10)
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(alpha=0.25, which="both")
+    fig.tight_layout()
+    _save(fig, "calib_validation")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("only", nargs="*", help="figure names; default all")
