@@ -53,35 +53,50 @@ do it through the public API.
 
 ## What we found
 
-On one H100 with Qwen3-4B (fp8), 10,000 documents, five filters:
+On one H100 with Qwen3-4B (fp8), 10,000 documents, five filters,
+three runs each in the same container:
 
-| | wall time | times the corpus is read |
+| | wall time | corpus reads |
 |---|---|---|
 | stock vLLM | 42.9 s | 1.23x |
 | KV rewind | 39.8 s | 1.14x |
 
-**1.08x faster.** Modest, and that is the honest number.
+**Corpus reads** is how many times the system actually computed the
+corpus. The engine reports, per request, how many prompt tokens it
+processed and how many of those it got from cache; the difference is
+what it really computed. Divide that by the 3,203,917 tokens in the
+corpus and you get this number. 1.00x means every document was read
+exactly once. 1.23x means 23% of the reading was repeated.
 
-We first measured 2x, then found the baseline was misconfigured. It
-was running 4,096 concurrent requests — the engine's default limit —
-which needs 1.6 times more memory than the cache has. The engine
-thrashed and read the corpus 2.40 times. Setting its concurrency from
-the cache size instead (2,048 documents) took it from 80.1 s to
-42.9 s. Most of the "win" was our baseline being badly set up.
+KV rewind is 1.08x faster. The reads ratio is 1.07x, so the speedup
+is entirely explained by doing less reading — not by doing the same
+reading faster. At 99.5% GPU utilization there is no idle time to
+win, so eliminating work is the only thing that can help.
 
-What survives is smaller and has a specific cause. The engine matches
-its cache in fixed 16-token blocks, so the block where the document
-ends and the question begins never matches and gets recomputed on
-every filter. A rewind cuts at the exact token instead, so it does
-not pay that.
+The 23% of repeated reading left in the baseline is block alignment.
+The engine matches its cache in fixed 16-token blocks. A document
+does not end on a block boundary, so the block holding the last few
+document tokens also holds the first few question tokens — and since
+the question changes every filter, that block never matches and is
+recomputed each time. A rewind cuts at the exact token instead, so it
+never pays this.
 
-**Reusing work across queries is where the real win is.** If a second
-query arrives for the same documents, we can save their cached state
-to CPU memory and load it back rather than re-reading the documents:
-2.33 s instead of 4.54 s, a 2x speedup. That holds whenever the
-transfer is faster than re-reading, which for this model means faster
-than 7.2 GB/s. Bigger models make it easier, since they read more
-slowly.
+**Both sides get the same memory budget**, which is the only way this
+comparison means anything. vLLM's default limit is 4,096 concurrent
+requests. For these documents that needs about 1.6 times more memory
+than the cache holds, so the engine spends the run evicting documents
+and reading them again: 2.40x reads, 80.1 s. Sizing its concurrency
+from the cache instead — 2,048 documents here — is the configuration
+a competent user would run, and is what the table reports.
+
+**Reusing work across queries is the larger win.** When a second
+query arrives for documents already processed, their cached state can
+be written to CPU memory during the first query and loaded back
+instead of re-reading the text. On a 1,000-document corpus (315,000
+tokens) that is 2.33 s against 4.54 s, a 2x speedup. Loading wins
+whenever the transfer is faster than re-reading, which for this model
+means faster than 7.2 GB/s. Larger models make it easier, since they
+read text more slowly while the transfer speed stays the same.
 
 ## Is the hardware even the limit?
 
