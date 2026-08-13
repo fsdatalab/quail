@@ -389,6 +389,36 @@ def test_step_record_decode_split_is_exact_with_the_generating_set():
     assert rec["decode_seqs"] == 0 and rec["prefill_tokens"] == 2
 
 
+def test_step_record_shapes_are_per_request_pairs():
+    """Calibration records each request's [new, cached] pair so a
+    measured step can be checked against its designed composition;
+    without the flag the record carries no shapes key at all."""
+    toks = {"a": 32, "b": 512}
+    keys = [None, None]
+    rec = chainlogic.step_record(0.0, 0.0, toks, keys, 0, 10, 16,
+                                 shapes=[[32, 4096], [512, 0]])
+    assert rec["shapes"] == [[32, 4096], [512, 0]]
+    rec = chainlogic.step_record(0.0, 0.0, toks, keys, 0, 10, 16)
+    assert "shapes" not in rec
+
+
+def test_request_shape_recovers_cached_from_advanced_count():
+    """schedule() advances the computed count by the scheduled share
+    before the record is built, so the cached context is the advanced
+    count minus this step's tokens: a 32-token suffix over a 4,096
+    cached document reads (32, 4128) there."""
+    assert chainlogic.request_shape(32, 4128) == [32, 4096]
+    assert chainlogic.request_shape(512, 512) == [512, 0]
+
+
+def test_attach_step_timing_amends_in_place():
+    rec = dict(t=1.0, sched_ms=0.3)
+    out = chainlogic.attach_step_timing(rec, 0.0421, 0.0007)
+    assert out is rec
+    assert rec["exec_ms"] == 42.1
+    assert rec["update_ms"] == 0.7
+
+
 # ---- module purity ----------------------------------------------------
 
 def test_chainlogic_imports_no_engine():

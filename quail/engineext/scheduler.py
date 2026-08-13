@@ -101,6 +101,16 @@ class QuailScheduler(Scheduler):
         # one batch unwritten.
         self._de_trace = os.environ.get("QUAIL_STEPTRACE") or None
         self._de_trace_buf = []
+        # Calibration extensions, both default off. QUAIL_STEPSHAPES
+        # records each scheduled request's [new, cached] token pair.
+        # QUAIL_STEPTRACE_FLUSH writes every record as soon as its
+        # timing lands - the 256-record batching would otherwise keep
+        # a short calibration run's records (1-3 per cell) unreadable
+        # until drain.
+        self._de_shapes = os.environ.get("QUAIL_STEPSHAPES", "0") == "1"
+        self._de_flush_every = os.environ.get(
+            "QUAIL_STEPTRACE_FLUSH", "0") == "1"
+        self._de_sched_exit = None
         if self._de_trace:
             tp = self.kv_cache_manager.block_pool
             if not (hasattr(tp, "get_num_free_blocks")
@@ -147,17 +157,49 @@ class QuailScheduler(Scheduler):
             decoding = {rid for rid in toks
                         if (req := self.requests.get(rid)) is not None
                         and req._output_token_ids}
+            shapes = None
+            if self._de_shapes:
+                # schedule() has already advanced each request's
+                # computed-token count by its scheduled share, so the
+                # cached context is recoverable here and nowhere later
+                shapes = [chainlogic.request_shape(
+                              c, req.num_computed_tokens)
+                          for rid, c in toks.items()
+                          if (req := self.requests.get(rid)) is not None]
             rec = chainlogic.step_record(
                 now, now - t0, toks,
                 [t[1] if (t := self._de_tag(rid)) else None
                  for rid in toks],
                 pool.get_num_free_blocks(), pool.num_gpu_blocks,
-                self.block_size, decoding=decoding)
+                self.block_size, decoding=decoding, shapes=shapes)
             rec["waiting"] = len(self.waiting)
             rec["running"] = len(self.running)
-            self._de_trace_buf.append(rec)
+            # flush the full batch before appending, never after: the
+            # newest record must stay in the buffer so the step's
+            # execution timing can still be attached to it
             if len(self._de_trace_buf) >= 256:
                 self._de_trace_flush()
+            self._de_trace_buf.append(rec)
+            self._de_sched_exit = now
+        return out
+
+    def update_from_output(self, *args, **kwargs):
+        """The engine calls this after the step's model execution, so
+        the span from schedule exit to here is the execution window
+        (in the synchronous engine: the GPU wait). Attach it and the
+        output-processing time to the step's trace record."""
+        if not self._de_trace:
+            return super().update_from_output(*args, **kwargs)
+        t_in = time.monotonic()
+        out = super().update_from_output(*args, **kwargs)
+        t_out = time.monotonic()
+        if self._de_trace_buf and self._de_sched_exit is not None:
+            chainlogic.attach_step_timing(
+                self._de_trace_buf[-1],
+                t_in - self._de_sched_exit, t_out - t_in)
+            self._de_sched_exit = None
+        if self._de_flush_every:
+            self._de_trace_flush()
         return out
 
     def _de_trace_flush(self):

@@ -223,7 +223,8 @@ def doc_key(request_id):
 
 
 def step_record(now_s, sched_cpu_s, tokens_by_request, doc_keys,
-                free_blocks, total_blocks, block_size, decoding=None):
+                free_blocks, total_blocks, block_size, decoding=None,
+                shapes=None):
     """One scheduler step reduced to plain numbers for the trace file:
     when it was scheduled and how long the packing decision took; how
     many tokens moved, over how many sequences; the prefill and decode
@@ -237,7 +238,11 @@ def step_record(now_s, sched_cpu_s, tokens_by_request, doc_keys,
     therefore trace zero decode (each stage's answer is sampled from
     its own last prefill chunk's forward pass, never a decode step);
     any decode band on a filter trace is a misconfiguration. Without
-    `decoding` the split falls back to the one-token heuristic."""
+    `decoding` the split falls back to the one-token heuristic.
+
+    `shapes` (calibration only) is a list of [new, cached] token pairs,
+    one per scheduled request, recorded so a measured step can be
+    checked against the composition it was designed to have."""
     counts = list(tokens_by_request.values())
     if decoding is None:
         decode_seqs = sum(1 for c in counts if c == 1)
@@ -246,7 +251,7 @@ def step_record(now_s, sched_cpu_s, tokens_by_request, doc_keys,
         decode_seqs = sum(1 for r in tokens_by_request if r in decoding)
         prefill = sum(c for r, c in tokens_by_request.items()
                       if r not in decoding)
-    return dict(
+    rec = dict(
         t=round(now_s, 6),
         sched_ms=round(sched_cpu_s * 1e3, 3),
         tokens=int(sum(counts)),
@@ -256,6 +261,29 @@ def step_record(now_s, sched_cpu_s, tokens_by_request, doc_keys,
         unique_docs=len({d for d in doc_keys if d is not None}),
         kv_used_tokens=(total_blocks - free_blocks) * block_size,
         kv_total_tokens=total_blocks * block_size)
+    if shapes is not None:
+        rec["shapes"] = [[int(new), int(cached)] for new, cached in shapes]
+    return rec
+
+
+def request_shape(scheduled_tokens, computed_tokens_after):
+    """The [new, cached] pair of one scheduled request. The scheduler
+    advances a request's computed-token count by its scheduled tokens
+    inside schedule(), so at schedule exit the cached context is the
+    computed count minus this step's share."""
+    return [int(scheduled_tokens),
+            int(computed_tokens_after) - int(scheduled_tokens)]
+
+
+def attach_step_timing(rec, exec_s, update_s):
+    """Amend a step record with the execution window (schedule exit to
+    output processing, which is the GPU wait in the synchronous
+    engine) and the output-processing time itself. Amended in place
+    after the step runs, because both spans end after the record is
+    built."""
+    rec["exec_ms"] = round(exec_s * 1e3, 3)
+    rec["update_ms"] = round(update_s * 1e3, 3)
+    return rec
 
 
 # ---- the strict-mode invariant ----------------------------------------
