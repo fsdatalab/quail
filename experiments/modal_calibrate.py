@@ -208,7 +208,15 @@ def calibrate(families: str = "all", reps: int = 5,
             stable=spread is not None and spread <= SPREAD_FLAG)
 
     if cells:
-        boot = calib.BOOT
+        # Two boot overrides the sweeps required, recorded in the boot
+        # row. enforce_eager: the single 8,192-token CUDA graph padded
+        # every smaller step to 8,192 tokens (alpha walls at h=512,
+        # 1,024, 2,048 were all ~84 ms). async_scheduling off: vllm
+        # 0.26 defaults it on, and its deferred output copy moves the
+        # GPU wait outside the schedule-to-update window that exec_ms
+        # measures; the step trace needs the synchronous engine.
+        boot = dict(calib.BOOT, enforce_eager=True,
+                    async_scheduling=False)
         print(f"[calib] boot {boot}", flush=True)
         llm = LLM(
             model=MODEL,
@@ -217,6 +225,8 @@ def calibrate(families: str = "all", reps: int = 5,
             max_num_seqs=boot["max_num_seqs"],
             max_num_batched_tokens=boot["max_num_batched_tokens"],
             gpu_memory_utilization=boot["gpu_memory_utilization"],
+            enforce_eager=boot["enforce_eager"],
+            async_scheduling=boot["async_scheduling"],
             enable_prefix_caching=True,
             disable_log_stats=True,
             scheduler_cls="quail.engineext.scheduler.QuailScheduler",
