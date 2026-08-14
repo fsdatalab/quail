@@ -122,13 +122,24 @@ def _load_vllm_model():
     engine and no KV pool - just the weights and layer modules."""
     import torch
     from vllm.config import set_current_vllm_config
+    from vllm.distributed.parallel_state import (
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.model_loader import get_model
+    from vllm.utils.network_utils import get_open_port
 
     # enforce_eager keeps compilation out of it; custom ops then
     # default on, so module calls run vLLM's CUDA kernels eagerly.
     config = EngineArgs(model=MODEL, dtype="bfloat16",
                         enforce_eager=True).create_engine_config()
+    # the model classes read the parallel groups even on one GPU
+    init_distributed_environment(
+        world_size=1, rank=0,
+        distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
+        local_rank=0, backend="nccl")
+    ensure_model_parallel_initialized(1, 1)
     with set_current_vllm_config(config):
         model = get_model(vllm_config=config)
     torch.cuda.synchronize()
