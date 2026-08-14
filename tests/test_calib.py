@@ -80,6 +80,14 @@ def test_new_blocks_counts_only_the_fresh_span():
     assert calib.new_blocks([dict(new=16, cached=16)]) == 1
 
 
+def test_resident_blocks_counts_the_whole_context():
+    # cached plus fresh, in whole blocks - the span the block tables cover
+    assert calib.resident_blocks([dict(new=32, cached=4096)]) == 258
+    assert calib.resident_blocks([dict(new=512, cached=0)]) == 32
+    assert calib.resident_blocks(
+        [dict(new=16, cached=16), dict(new=32, cached=0)]) == 4
+
+
 def test_feasibility_drops_oversized_cells():
     ok = calib._cell("c2", "fits", [dict(new=32, cached=2048)] * 4,
                      warm=[2048] * 4)

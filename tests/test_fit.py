@@ -12,7 +12,7 @@ from quail.plan import calib, fit
 # ---- synthetic rows ---------------------------------------------------
 
 B0, AB, AP, BN = 2.0e-3, 10.4e-6, 8.4e-10, 20e-6
-H0, HN, HA = 0.4e-3, 4e-6, 1.5e-6
+H0, HN, HA, HR = 0.4e-3, 4e-6, 1.5e-6, 1.2e-6
 
 
 def planted_step_s(cell):
@@ -26,7 +26,8 @@ def synthetic_rows(noise=0.0, seed=0):
     rows = []
     for cell in calib.cells_for("all"):
         exec_s = planted_step_s(cell) * (1 + noise * rng.standard_normal())
-        host_s = H0 + HN * cell["n"] + HA * cell["a"]
+        host_s = (H0 + HN * cell["n"] + HA * cell["a"]
+                  + HR * calib.resident_blocks(cell["requests"]))
         rows.append(dict(
             family=cell["family"], cell=cell["name"], valid=True,
             stable=True, n=cell["n"], b=cell["b"], p=cell["p"],
@@ -98,6 +99,7 @@ def test_fit_host_recovers_the_plane():
     assert h["h0_s"] == pytest.approx(H0, rel=0.2)
     assert h["h_n_s"] == pytest.approx(HN, rel=0.2)
     assert h["h_a_s"] == pytest.approx(HA, rel=0.2)
+    assert h["h_r_s"] == pytest.approx(HR, rel=0.2)
 
 
 def test_t_read_matches_the_planted_slope():

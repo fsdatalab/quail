@@ -5,7 +5,7 @@ fits the three cost models, and writes one JSON with every fitted
 constant, its producer, and the validation numbers:
 
     step time   T_step = b0 + f_B(B) + f_P(P) + bN * N
-    host time   T_host = h0 + hN * N + hA * A
+    host time   T_host = h0 + hN * N + hA * A + hR * R
     prefill     T_pre(h) = a1 * h + a2 * h * h   (a2 is attention)
 
 plus t_read (per-token cached-read time), eps = t_read / a1, and the
@@ -28,6 +28,7 @@ import json
 import numpy as np
 
 from ..configs import QWEN3_4B_FP8
+from .calib import resident_blocks
 
 B_KNOTS = (0, 512, 1024, 2048, 4096, 8192, 16384, 32768)
 P_KNOTS = (0, 1e5, 1e6, 4e6, 1.6e7, 6e7, 1.4e8)
@@ -265,6 +266,10 @@ def fit_gpu(rows, fit_R=False):
 # ---- the host model ---------------------------------------------------
 
 def fit_host(rows):
+    """R (resident blocks) is load-bearing: at fixed N and A the c2
+    cells' host time still rises sevenfold with h - the per-step
+    block tables span each request's whole context - so a plane
+    without R cannot fit prefill and cached cells at once."""
     usable = [r for r in cell_rows(rows, ("alpha", "c1", "c2"))
               if r.get("sched_ms_median") is not None
               and r.get("update_ms_median") is not None]
@@ -272,12 +277,14 @@ def fit_host(rows):
                   for r in usable]) / 1e3
     X = np.hstack([np.ones((len(usable), 1)),
                    np.array([r["n"] for r in usable], float)[:, None],
-                   np.array([r["a"] for r in usable], float)[:, None]])
+                   np.array([r["a"] for r in usable], float)[:, None],
+                   np.array([resident_blocks(r["requests"])
+                             for r in usable], float)[:, None]])
     theta = nnls(X, y)
     pred = X @ theta
     return dict(h0_s=float(theta[0]), h_n_s=float(theta[1]),
-                h_a_s=float(theta[2]), cells=len(usable),
-                mape=mape(pred, y))
+                h_a_s=float(theta[2]), h_r_s=float(theta[3]),
+                cells=len(usable), mape=mape(pred, y))
 
 
 # ---- prefill vs length ------------------------------------------------
@@ -403,6 +410,7 @@ def constants_block(fit):
         f"HOST_H0_S = {fit['host']['h0_s']!r}",
         f"HOST_HN_S = {fit['host']['h_n_s']!r}",
         f"HOST_HA_S = {fit['host']['h_a_s']!r}",
+        f"HOST_HR_S = {fit['host']['h_r_s']!r}",
         f"TRANSPORT_BW_BPS = {bw!r}",
         f"OFFLOAD_CROSSOVER_TOKENS = {xo!r}",
     ]

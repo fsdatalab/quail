@@ -110,6 +110,13 @@ def new_blocks(requests):
                for r in requests)
 
 
+def resident_blocks(requests):
+    """R: KV blocks the step's requests hold by its end - the whole
+    context in blocks, cached plus fresh. new_blocks counts only the
+    fresh span; the scheduler's per-step block tables span all of R."""
+    return sum(-(-(r["cached"] + r["new"]) // BLOCK) for r in requests)
+
+
 def _cell(family, name, requests, warm=None):
     return dict(
         family=family,
