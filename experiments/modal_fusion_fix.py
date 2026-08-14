@@ -445,8 +445,9 @@ llm = LLM(
     gpu_memory_utilization=0.88,
     enable_prefix_caching=False,
     disable_log_stats=True,
-    compilation_config={"max_cudagraph_capture_size": 8192,
-                        "cudagraph_capture_sizes": [8192],
+    # capture off: the dump needs the compile passes, not the graphs,
+    # and capture plus DEBUG logging is what timed out the first try
+    compilation_config={"cudagraph_mode": 0,
                         "custom_ops": ["+silu_and_mul"]},
 )
 llm.generate(prompts, sp, use_tqdm=False)
@@ -480,16 +481,23 @@ def graphdump() -> str:
     with open("/tmp/graphdump_runner.py", "w") as f:
         f.write(GRAPHDUMP_RUNNER)
 
+    # The dump is driven by VLLM_DEBUG_DUMP_PATH alone. DEBUG logging
+    # is not needed for it and made the first try time out.
     env = dict(os.environ)
     env.update({
-        "VLLM_LOGGING_LEVEL": "DEBUG",
         "VLLM_DEBUG_DUMP_PATH": "/tmp/gdump",
         "QUAIL_CUSTOM_SILU": "1",
         "QUAIL_PATTERN_MAYBE_INPLACE": "1",
     })
+    runner_exit = None
     with open("/tmp/graphdump.log", "w") as log:
-        r = subprocess.run(["python", "/tmp/graphdump_runner.py"],
-                           env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            r = subprocess.run(["python", "/tmp/graphdump_runner.py"],
+                               env=env, stdout=log,
+                               stderr=subprocess.STDOUT, timeout=2400)
+            runner_exit = r.returncode
+        except subprocess.TimeoutExpired:
+            runner_exit = "timeout, analyzing partial dumps"
 
     match_lines = []
     with open("/tmp/graphdump.log") as log:
@@ -532,7 +540,7 @@ def graphdump() -> str:
 
     result = {
         "patch": patch_note,
-        "runner_exit": r.returncode,
+        "runner_exit": runner_exit,
         "log_match_lines": match_lines,
         "n_dump_files": len(dump_files),
         "dump_files": [os.path.basename(p) for p in dump_files][:60],
