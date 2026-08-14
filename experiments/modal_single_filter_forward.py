@@ -43,6 +43,28 @@ Prediction, stated before the run, against the same-container control:
     rms_norm_per_block_quant and silu_and_mul_per_block_quant
     kernels; the separate-quant variant shows neither.
 
+Result: the pipeline works, the fused kernels finally fired, and they
+are slower than the kernels they replace. Means: vLLM 97,321 tokens
+per second, packed with separate quant 90,718 (0.932x, just past the
+predicted 5 percent band), packed fused 86,566 (0.889x - the fused
+variant lost 4.6 percent instead of gaining 4 to 8). The profile
+says why: silu_and_mul_per_block_quant costs 845 ms per profiled
+window against about 711 ms for the separate silu and quant pair it
+replaces (19 percent worse), while rms_norm_per_block_quant is about
+even with its pair (428 against about 410 ms). So the config-fusion
+prize this branch chased is not just unreachable through the
+compiler - at this batch size the shipped fused kernels lose
+outright, and any fusion win now requires writing better kernels
+than vLLM ships. Two real findings on the way: the packed pipeline
+is substantially more accurate than the engine (2,229 and 2,131
+wrong of 10,000 against the engine's 2,990), consistent with
+attention reading exact bf16 K and V instead of the engine's fp8 KV
+cache, and the remaining 6.8 percent speed gap to the engine is
+about one third extra kernel time (the bundled varlen FlashAttention
+dispatched an older kernel than the engine's FlashAttention-3, worth
+about 2.4 percent) and two thirds eager per-op launch gaps that CUDA
+graphs would close. Peak memory 7.57 GiB with no KV pool.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
