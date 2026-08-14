@@ -242,6 +242,22 @@ class PackedPipeline:
         self.torch.ops._C.silu_and_mul(out, gate_up)
         return out
 
+    def rms_norm(self, x, norm):
+        """vLLM's CUDA norm kernel directly: the eager module call
+        falls back to the native implementation and logs a priority
+        warning, which is the slow path."""
+        out = self.torch.empty_like(x)
+        self.torch.ops._C.rms_norm(out, x, norm.weight,
+                                   norm.variance_epsilon)
+        return out
+
+    def fused_add_rms_norm(self, hidden, residual, norm):
+        """Mutates in place: hidden becomes the normed value and
+        residual becomes the sum, vLLM's engine semantics."""
+        self.torch.ops._C.fused_add_rms_norm(
+            hidden, residual, norm.weight, norm.variance_epsilon)
+        return hidden, residual
+
     def attention(self, q, k, v, cu_seqlens, max_seqlen):
         from vllm.vllm_flash_attn import flash_attn_varlen_func
         n_tokens = q.shape[0]
@@ -289,24 +305,25 @@ class PackedPipeline:
             if residual is None:
                 # first layer: no residual to fuse, run unfused
                 residual = hidden
-                normed = layer.input_layernorm(hidden)
-                q_in, q_scale = self.quant(normed)
+                q_in, q_scale = self.quant(
+                    self.rms_norm(hidden, layer.input_layernorm))
             elif fused:
                 q_in, q_scale = self.fused_norm_quant(
                     hidden, layer.input_layernorm, residual)
             else:
-                normed, residual = layer.input_layernorm(hidden, residual)
+                normed, residual = self.fused_add_rms_norm(
+                    hidden, residual, layer.input_layernorm)
                 q_in, q_scale = self.quant(normed)
             qkv = self.gemm(q_in, q_scale, attn.qkv_proj)
 
             q_width = self.num_q_heads * self.head_dim
             kv_width = self.num_kv_heads * self.head_dim
             q, k, v = qkv.split([q_width, kv_width, kv_width], dim=-1)
-            q = attn.q_norm(
-                q.reshape(n_tokens, self.num_q_heads, self.head_dim)
+            q = self.rms_norm(
+                q.reshape(-1, self.head_dim).contiguous(), attn.q_norm
             ).reshape(n_tokens, q_width)
-            k = attn.k_norm(
-                k.reshape(n_tokens, self.num_kv_heads, self.head_dim)
+            k = self.rms_norm(
+                k.reshape(-1, self.head_dim).contiguous(), attn.k_norm
             ).reshape(n_tokens, kv_width)
             q, k = self.rotary(positions, q, k)
             attn_out = self.attention(q, k, v, cu_seqlens, max_seqlen)
@@ -320,8 +337,8 @@ class PackedPipeline:
                 g_in, g_scale = self.fused_norm_quant(
                     hidden, layer.post_attention_layernorm, residual)
             else:
-                normed, residual = layer.post_attention_layernorm(
-                    hidden, residual)
+                normed, residual = self.fused_add_rms_norm(
+                    hidden, residual, layer.post_attention_layernorm)
                 g_in, g_scale = self.quant(normed)
             gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
             if fused:
@@ -332,7 +349,8 @@ class PackedPipeline:
 
         last_hidden = hidden.index_select(0, final_indices)
         last_residual = residual.index_select(0, final_indices)
-        normed, _ = self.final_norm(last_hidden, last_residual)
+        normed, _ = self.fused_add_rms_norm(
+            last_hidden, last_residual, self.final_norm)
         return normed
 
 
@@ -345,20 +363,22 @@ def probe(n_docs: int = 8) -> str:
     import json
 
     import torch
+    import torch.nn.functional as F
     from transformers import AutoTokenizer
 
-    from workload import build_corpus
+    from workload import build_corpus, yes_no_ids
 
+    # the model load also loads vLLM's _C extension; op checks before
+    # it report every op missing
+    model = _load_vllm_model()
     result = {"ops": {}}
     for op_name in ("rms_norm_per_block_quant",
                     "silu_and_mul_per_block_quant",
-                    "silu_and_mul", "fused_add_rms_norm"):
+                    "silu_and_mul", "fused_add_rms_norm", "rms_norm"):
         op = getattr(torch.ops._C, op_name, None)
         result["ops"][op_name] = (
             str(op.default._schema) if op is not None else "MISSING"
         )
-
-    model = _load_vllm_model()
     pipeline = PackedPipeline(model)
     layer = model.model.layers[0]
     result["module"] = {
@@ -380,12 +400,32 @@ def probe(n_docs: int = 8) -> str:
     }
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    body_ids, question_ids, _flags = build_corpus(tokenizer, n_docs)
+    body_ids, question_ids, flags = build_corpus(tokenizer, n_docs)
     prompts = [body_ids[i] + question_ids[0] for i in range(n_docs)]
+    expected = [int(flags[i][0]) for i in range(n_docs)]
+    yes_ids, no_ids = yes_no_ids(tokenizer)
+    allowed_ids = sorted(yes_ids | no_ids)
+    selected_weights = model.lm_head.weight.index_select(
+        0, torch.tensor(allowed_ids, device="cuda")).to(torch.bfloat16)
+    yes_columns = torch.tensor(
+        [i for i, t in enumerate(allowed_ids) if t in yes_ids],
+        device="cuda")
+    no_columns = torch.tensor(
+        [i for i, t in enumerate(allowed_ids) if t in no_ids],
+        device="cuda")
+
+    def answers(normed):
+        scores = F.linear(normed, selected_weights)
+        yes_scores = scores.index_select(1, yes_columns).amax(dim=1)
+        no_scores = scores.index_select(1, no_columns).amax(dim=1)
+        return (yes_scores > no_scores).int().cpu().tolist()
+
     packed = PackedPipeline.pack(prompts)
     with torch.inference_mode():
         unfused = pipeline.forward_chunk(packed, fused=False)
         fused = pipeline.forward_chunk(packed, fused=True)
+    unfused_answers = answers(unfused)
+    fused_answers = answers(fused)
     diff = (unfused.float() - fused.float()).abs().max().item()
     result["chunk"] = {
         "tokens": int(packed[0].shape[0]),
@@ -393,6 +433,12 @@ def probe(n_docs: int = 8) -> str:
         "unfused_finite": bool(torch.isfinite(unfused).all().item()),
         "fused_finite": bool(torch.isfinite(fused).all().item()),
         "fused_vs_unfused_max_abs_diff": round(diff, 4),
+        "unfused_wrong": sum(
+            a != b for a, b in zip(unfused_answers, expected)),
+        "fused_wrong": sum(
+            a != b for a, b in zip(fused_answers, expected)),
+        "fused_vs_unfused_disagreements": sum(
+            a != b for a, b in zip(fused_answers, unfused_answers)),
     }
     print(json.dumps(result, indent=2), flush=True)
     return json.dumps(result)
