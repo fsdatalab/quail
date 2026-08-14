@@ -334,58 +334,10 @@ def filter_timeline_detail():
 
 # ---------------------------------------------------------------- 5
 
-@figure("component_decomposition")
-def component_decomposition():
-    """What the per-token cost a is made of, and how the mix shifts
-    with batch size."""
-    plt = _plt()
-    a_tot = MEASURED["a_us_per_token"]
-    b_ms = MEASURED["b_ms_per_step"]
-    comps = MEASURED["kernel_mix"]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
-    fig.suptitle(f"What costs {a_tot} us per token\n"
-                 "torch profiler inside the engine core, stock vLLM, "
-                 "4B fp8, B = 25,305", fontsize=12)
-
-    names = [c[0] for c in comps]
-    vals = [c[1] for c in comps]
-    ax1.barh(range(len(names)), vals, color=[c[2] for c in comps],
-             height=0.55)
-    ax1.set_yticks(range(len(names)))
-    ax1.set_yticklabels(names, fontsize=10)
-    ax1.invert_yaxis()
-    ax1.set_xlabel("us per token", fontsize=11)
-    for i, v in enumerate(vals):
-        ax1.text(v + 0.08, i, f"{v:.2f} us  ({v / a_tot * 100:.0f}%)",
-                 va="center", fontsize=10)
-    ax1.text(5.6, 0, "ncu: these kernels run at\n91-93% of the compute "
-             "ceiling", va="center", ha="center", fontsize=8.5,
-             color="white", weight="bold")
-    ax1.set_xlim(0, 9.5)
-    ax1.set_title("Per-token cost by component", fontsize=11)
-
-    Bs = np.logspace(np.log10(200), np.log10(30_000), 300)
-    bottom = np.zeros_like(Bs)
-    for name, a_i, color in comps:
-        frac = (a_i * Bs) / (a_tot * Bs + b_ms * 1000) * 100
-        ax2.fill_between(Bs, bottom, bottom + frac, color=color, alpha=0.8,
-                         label=f"{name.splitlines()[0]}: {a_i:.2f} us/tok")
-        bottom += frac
-    ax2.fill_between(Bs, bottom, 100, color=GRAY, alpha=0.4,
-                     label=f"per-step overhead: {b_ms} ms/step")
-    ax2.set_xscale("log")
-    ax2.set_xlabel("tokens per step (B)", fontsize=11)
-    ax2.set_ylabel("share of step time (%)", fontsize=11)
-    ax2.set_ylim(0, 100)
-    ax2.set_title("The mix shifts with batch size", fontsize=11)
-    ax2.legend(fontsize=8, loc="lower right")
-
-    for ax in (ax1, ax2):
-        for s in ("top", "right"):
-            ax.spines[s].set_visible(False)
-    fig.tight_layout(rect=(0, 0, 1, 0.90))
-    _save(fig, "component_decomposition")
+# component_decomposition was dropped: its kernel mix was profiled
+# with the old class rules, which filed the sm90 FlashAttention
+# mainloop (a cutlass::device_kernel) under gemm, and its mix-vs-B
+# panel is superseded by attnshare_profile's mix-vs-length sweep.
 
 
 # ---------------------------------------------------------------- 6
@@ -869,6 +821,65 @@ def calib_validation():
     ax.grid(alpha=0.25, which="both")
     fig.tight_layout()
     _save(fig, "calib_validation")
+
+
+ATTNSHARE_ROWS = "results/engine/attnshare.json"
+
+
+@figure("attnshare_profile")
+def attnshare_profile():
+    """Kernel-class shares of single-document prefills by length,
+    measured against the cost model. The predicted curves use a2
+    from the calibration fit; each class's linear per-token cost is
+    anchored at the h=2,048 row, so the curves are the model's
+    quadratic term acting on a profiled anchor, not a refit."""
+    data = _calib_data()
+    if not data:
+        return
+    _rows, fitted = data
+    if not os.path.exists(ATTNSHARE_ROWS):
+        print(f"skip: {ATTNSHARE_ROWS} not on disk "
+              "(run modal_profiling.py::attnshare_main)")
+        return
+    with open(ATTNSHARE_ROWS) as f:
+        rows = sorted(json.load(f), key=lambda r: r["h"])
+    h = np.array([r["h"] for r in rows], float)
+    att = np.array([r["attention_frac"] for r in rows]) * 100
+    gem = np.array([r["gemm_frac"] for r in rows]) * 100
+
+    a2_us = fitted["alpha"]["a2_s_per_token2"] * 1e6
+    anchor = next(r for r in rows if r["h"] == 2048)
+    t_anchor = anchor["kernel_us_per_prefill"] / anchor["h"]
+    att_lin = anchor["attention_frac"] * t_anchor - a2_us * anchor["h"]
+    gem_lin = anchor["gemm_frac"] * t_anchor
+    lin_tot = t_anchor - a2_us * anchor["h"]
+    hh = np.linspace(h.min(), h.max(), 300)
+    denom = lin_tot + a2_us * hh
+    cross = (gem_lin - att_lin) / a2_us
+
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(7, 4.4))
+    ax.plot(hh, (att_lin + a2_us * hh) / denom * 100, color=PINK,
+            lw=2, alpha=0.7, label="attention, predicted from the fit")
+    ax.plot(hh, gem_lin / denom * 100, color=BLUE, lw=2, alpha=0.7,
+            label="GEMMs, predicted from the fit")
+    ax.plot(h, att, "o", color=PINK, ms=7, label="attention, measured")
+    ax.plot(h, gem, "o", color=BLUE, ms=7, label="GEMMs, measured")
+    ax.axvline(cross, color=GRAY, lw=1, ls="--")
+    ax.text(cross + 300, 62, f"cross near\n{cross / 1e3:.1f}k tokens",
+            fontsize=9, color="#555")
+    ax.set_xlabel("document length h (tokens)")
+    ax.set_ylabel("share of GPU kernel time (%)")
+    ax.set_ylim(0, 80)
+    ax.set_title(
+        "Attention overtakes the GEMMs as documents grow\n"
+        f"(profiled prefills; curves from the fitted a2 = "
+        f"{fitted['alpha']['a2_s_per_token2']:.2e} s/token$^2$)",
+        fontsize=10)
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    _save(fig, "attnshare_profile")
 
 
 def main():
