@@ -25,9 +25,23 @@ cache matches in whole 16-token blocks, so the block straddling the
 document boundary is recomputed on every stage, while a rewind cuts
 by token position and keeps it.
 
+The c0 anchor (modal run experiments/modal_filters.py::c0_anchor)
+re-measures the per-query software residue with the host controlled:
+query walls spread up to 45 percent across containers, so c0 must be
+derived against the rate the same container actually serves, not the
+fleet anchor. The probe runs on the stock boot - one full stage-1
+pass, same submission machinery as the query - because single-tenant
+mode on the planned boot refuses untagged requests, and container
+speed is a property of the host, not the boot. Each arm's own
+scheduler and gating costs then land in that arm's c0, which is what
+a per-query residue means:
+
+    c0 = wall - reads x corpus / rate_this_container
+
 Run:
     modal run experiments/modal_filters.py
     modal run experiments/modal_filters.py --n-docs 2000 --reps 1
+    modal run experiments/modal_filters.py::c0_anchor
 """
 
 import json
@@ -46,7 +60,9 @@ filters_image = image.add_local_python_source("workload")
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
 async def filter_cells(n_docs: int = 10000, reps: int = 3,
-                       arms: str = "rewind,stock") -> dict:
+                       arms: str = "rewind,stock",
+                       probe_rate: bool = False,
+                       outname: str = "filter_cells.json") -> dict:
     import time as _time
 
     from transformers import AutoTokenizer
@@ -151,6 +167,39 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
             gpu_memory_utilization=0.92 if planned else 0.88,
             enable_prefix_caching=True, disable_log_stats=True, **extra))
         try:
+            if probe_rate and not planned:
+                # The container's own serving rate: one full stage-1
+                # pass through the same submission machinery as the
+                # query. Fresh engine, so nothing is cached; the rep
+                # loop resets the cache before rep 0, so the probe
+                # warms nothing the query sees.
+                import asyncio as _aio
+                sem = _aio.Semaphore(stock_sem)
+                pc = dict(prompt=0, cached=0)
+
+                async def probe_one(i):
+                    async with sem:
+                        final = None
+                        async for out in engine.generate(
+                                {"prompt_token_ids":
+                                 body_ids[i] + q_ids[0]},
+                                sp, f"probe-{i}"):
+                            final = out
+                        pc["prompt"] += len(final.prompt_token_ids)
+                        pc["cached"] += (
+                            getattr(final, "num_cached_tokens", 0) or 0)
+
+                t0p = _time.time()
+                await _aio.gather(*(probe_one(i) for i in range(n_docs)))
+                probe_wall = _time.time() - t0p
+                rate = (pc["prompt"] - pc["cached"]) / probe_wall
+                report["probe"] = dict(
+                    rate_tok_s=round(rate, 1),
+                    probe_tokens=pc["prompt"] - pc["cached"],
+                    probe_wall_s=round(probe_wall, 3),
+                    probe_docs=n_docs, boot="stock")
+                print(f"[filters] probe: {rate:,.0f} tok/s over "
+                      f"{probe_wall:.1f}s", flush=True)
             for rep in range(reps):
                 res = engine.reset_prefix_cache()
                 if hasattr(res, "__await__"):
@@ -214,10 +263,36 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
             except Exception as e:
                 print(f"[filters] shutdown: {e}", flush=True)
 
-    with open("/results/filter_cells.json", "w") as f:
+    if "probe" in report:
+        rate = report["probe"]["rate_tok_s"]
+        for cell in report["cells"]:
+            work_s = cell["reads"] * corpus / rate
+            cell["token_work_s"] = round(work_s, 3)
+            cell["c0_s"] = round(cell["wall"] - work_s, 3)
+
+    with open(f"/results/{outname}", "w") as f:
         json.dump(report, f, indent=2)
     results_vol.commit()
     return report
+
+
+@app.local_entrypoint()
+def c0_anchor(n_docs: int = 10000, reps: int = 3,
+              out: str = "results/engine/c0_anchor.json"):
+    data = filter_cells.remote(n_docs, reps, "rewind,stock",
+                               probe_rate=True, outname="c0_anchor.json")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"saved {out}")
+    print(f"  probe {data['probe']['rate_tok_s']:,.0f} tok/s")
+    for arm in ("stock", "rewind"):
+        c0s = sorted(c["c0_s"] for c in data["cells"]
+                     if c["arm"] == arm)
+        if c0s:
+            med = c0s[len(c0s) // 2]
+            print(f"  {arm:<8} c0 median {med:.2f}s over {len(c0s)} reps "
+                  f"(all: {c0s})")
 
 
 @app.local_entrypoint()
