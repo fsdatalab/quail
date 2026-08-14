@@ -25,6 +25,11 @@
                        MIX, not slow kernels.
     ncureport          render a banked ncu report's details page.
 
+    attnshare          kernel-class shares of single-document prefills
+                       by length, on the calibration boot. Says where
+                       attention overtakes the GEMMs as documents grow,
+                       which the fitted a1 and a2 predict.
+
 Platform note: nsys does not work here. Its GPU-activity collection
 uses a driver path the sandbox blocks, so it returns CUDA API rows and
 no kernels. torch.profiler's CUPTI path works, and ncu works with
@@ -36,6 +41,7 @@ Run:
     modal run experiments/modal_profiling.py::torchprof
     modal run experiments/modal_profiling.py::run_component_profiles
     modal run experiments/modal_profiling.py::ncubench
+    modal run experiments/modal_profiling.py::attnshare_main
 """
 
 import os
@@ -737,3 +743,134 @@ def ncureport() -> str:
     out = "\n".join(keep[:60]) or r.stdout[-2000:] + r.stderr[-500:]
     print(out, flush=True)
     return out[:6000]
+
+
+# -----------------------------------------------------------------
+# 5. Attention share vs document length: profiled long-doc prefills.
+# -----------------------------------------------------------------
+
+# The torchprof runner's kernel classes, first match wins, in the
+# runner's order. Kept identical so shares compare across instruments.
+KERNEL_CLASS_RULES = (
+    ("gemm", ("gemm", "cutlass", "nvjet")),
+    ("quantize", ("quant", "scale", "cast")),
+    ("norm", ("norm", "rms")),
+    ("attention", ("attn", "attention", "flash", "fmha")),
+    ("elementwise", ("silu", "gelu", "add", "mul", "residual")),
+)
+
+
+def classify_kernel(name):
+    k = name.lower()
+    for cls, keys in KERNEL_CLASS_RULES:
+        if any(s in k for s in keys):
+            return cls
+    return "other"
+
+
+@app.function(image=prof_image, gpu="H100!", timeout=5400, memory=65536,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/results": results_vol})
+def attnshare(lengths: str = "512,2048,4096,8192,12288,16384",
+              reps: int = 20, warmups: int = 3) -> str:
+    """Kernel-class shares of single-document prefills by length, on
+    the calibration boot (synchronous, eager) so the shares sit on the
+    same footing as the fitted a1 and a2. One profiler session per
+    length; the chrome trace is parsed with the torchprof kernel
+    classes and deleted. Sequences are built the calibration way:
+    a nonce block then pool content, so nothing hits the cache."""
+    # Env before any vllm import, exactly as the calibration boot.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ["QUAIL_SINGLE_TENANT"] = "0"
+
+    import gc
+    import json
+    import time
+
+    from torch.profiler import ProfilerActivity, profile
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+
+    from quail.plan import calib
+    from workload import build_flat_pool, nonce_alphabet, yes_no_ids
+
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    yes, no = yes_no_ids(tok)
+    sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
+                        allowed_token_ids=sorted(yes | no))
+    pool_ids = build_flat_pool(tok)
+    alphabet = nonce_alphabet(tok)
+    state = dict(counter=0, cursor=0)
+
+    def seq(n_tokens):
+        nonce = calib.make_nonce_ids(state["counter"], alphabet)
+        state["counter"] += 1
+        ids, state["cursor"] = calib.build_sequence(
+            pool_ids, state["cursor"], n_tokens, nonce)
+        return ids
+
+    boot = calib.BOOT
+    llm = LLM(
+        model=MODEL,
+        kv_cache_dtype="fp8",
+        max_model_len=boot["max_model_len"],
+        max_num_seqs=boot["max_num_seqs"],
+        max_num_batched_tokens=boot["max_num_batched_tokens"],
+        gpu_memory_utilization=boot["gpu_memory_utilization"],
+        enable_prefix_caching=True,
+        disable_log_stats=True,
+        enforce_eager=True,
+        async_scheduling=False,
+        scheduler_cls="quail.engineext.scheduler.QuailScheduler")
+
+    rows = []
+    for h in (int(x) for x in lengths.split(",")):
+        for _ in range(warmups):
+            llm.generate([{"prompt_token_ids": seq(h)}], sp,
+                         use_tqdm=False)
+        walls = []
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for _ in range(reps):
+                t0 = time.monotonic()
+                llm.generate([{"prompt_token_ids": seq(h)}], sp,
+                             use_tqdm=False)
+                walls.append((time.monotonic() - t0) * 1e3)
+        trace = f"/tmp/attnshare_h{h}.json"
+        prof.export_chrome_trace(trace)
+        with open(trace) as f:
+            events = json.load(f)["traceEvents"]
+        os.unlink(trace)
+        gpu_cats = {"kernel", "gpu_memcpy", "gpu_memset"}
+        classes = dict(gemm=0, quantize=0, norm=0, elementwise=0,
+                       attention=0, other=0)
+        total = 0
+        for e in events:
+            if e.get("cat") in gpu_cats and e.get("dur", 0) > 0:
+                classes[classify_kernel(e.get("name", ""))] += e["dur"]
+                total += e["dur"]
+        walls.sort()
+        row = dict(h=h, reps=reps,
+                   wall_ms_median=round(walls[len(walls) // 2], 3),
+                   kernel_us_per_prefill=round(total / reps, 1))
+        for cls, us in classes.items():
+            row[f"{cls}_frac"] = round(us / total, 4) if total else 0
+        rows.append(row)
+        print("[attnshare] " + json.dumps(row), flush=True)
+        del prof, events
+        gc.collect()
+
+    with open("/results/attnshare.json", "w") as f:
+        json.dump(rows, f, indent=2)
+    results_vol.commit()
+    return json.dumps(rows, indent=2)
+
+
+@app.local_entrypoint()
+def attnshare_main(lengths: str = "512,2048,4096,8192,12288,16384",
+                   reps: int = 20, warmups: int = 3,
+                   out: str = "results/engine/attnshare.json"):
+    data = attnshare.remote(lengths=lengths, reps=reps, warmups=warmups)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        f.write(data)
+    print(f"saved {out}")
