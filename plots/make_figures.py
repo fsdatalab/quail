@@ -32,12 +32,15 @@ MEASURED = dict(
     a_us_per_token=10.40,
     b_ms_per_step=2.94,
     # --- torch profiler, stock 4B filter, B = 25,305, 15-second
-    # window: share of GPU-busy time by kernel class ---
-    kernel_mix=[("GEMMs\n(MLP + projections)", 6.51, BLUE),
+    # window: share of GPU-busy time by kernel class. Classified with
+    # attention matched before the gemm patterns: the sm90
+    # FlashAttention mainloop is a cutlass::device_kernel, and the
+    # old order filed it under gemm ---
+    kernel_mix=[("GEMMs\n(MLP + projections)", 5.64, BLUE),
                 ("fp8 quantize/scale", 2.03, ORANGE),
                 ("normalization", 1.35, GREEN),
-                ("elementwise/activation", 0.74, YELLOW),
-                ("attention (QK^T, attn x V)", 0.45, PINK)],
+                ("attention (QK^T, attn x V)", 1.31, PINK),
+                ("elementwise/activation", 0.74, YELLOW)],
     gpu_busy_filter=0.995,
     # --- ncu speed-of-light, GEMM microbenchmark at prefill shapes,
     # --clock-control none (modal_profiling.py::ncubench) ---
@@ -342,8 +345,8 @@ def filter_timeline_detail():
 
 # ---------------------------------------------------------------- 6
 
-@figure("phi_budget_v2")
-def phi_budget_v2():
+@figure("phi_budget")
+def phi_budget():
     """The profiler's per-token split beside ncu's verdict on the
     GEMM kernels themselves."""
     plt = _plt()
@@ -393,7 +396,7 @@ def phi_budget_v2():
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
     fig.tight_layout(rect=(0, 0, 1, 0.90))
-    _save(fig, "phi_budget_v2")
+    _save(fig, "phi_budget")
 
 
 # ---------------------------------------------------------------- 7
