@@ -7,7 +7,8 @@ and how accurate the fit is. Every number comes from committed result
 files in `results/engine/`, produced this week on one H100 SXM
 (Qwen3 4B, fp8 weights and fp8 KV, vllm 0.26.0, CUDA 13 image). The
 draft's Remark 1 says its constants are analytical placeholders until
-calibrated values replace them; these are the calibrated values.
+calibrated values replace them; these are the calibrated values, and
+the draft text has been updated with them.
 
 Scope, fixed on purpose: filter queries only, one GPU, contexts to
 16,384 tokens, calibration family C3 skipped (Section 5 below says
@@ -161,43 +162,92 @@ is discussed below.
 | epsilon = t_read/a1 | 6.2e-3 | ~1.5e-3 (Prop. 2 discussion) | 4x |
 | effective read bandwidth | ~0.7 TB/s at c=32 | 3.35 TB/s | 21 percent of peak |
 
-The read price is not a per-byte constant: the raw h-slope is 82, 104,
-and 141 ns per cached token at c = 16, 32, 64. The cost tracks
-query-KV pairs, not bytes — paged attention reads 16-token pages
-against narrow query tiles and cannot amortize the fetches. This is
-also why the fitted single number (56.8 ns, a c=32 reference on the
-shared f_P curve) sits below the raw c=32 slope (101 ns): the fit's
-own cross-check ratio is 0.56, outside its 20-percent trust band, and
-the constant must be read as a reference point, not a universal rate.
+If reading cached context were a plain memory copy, the price per
+cached token would be one number: the token's 73,728 bytes divided
+by the 3.35 TB/s memory bandwidth, which is 22 ns. Measured, the
+price depends on how many suffix tokens are doing the reading.
+Repeating the raw subtraction at each suffix width gives 82 ns per
+cached token when the suffix is 16 tokens, 104 ns at 32, and 141 ns
+at 64. The reason is that attention is not a copy: every suffix
+token computes against every cached token, so each additional suffix
+token adds work per cached token. The kernel also fetches KV in
+16-token pages, and with only 16 to 64 suffix tokens per request it
+has little computation to overlap against each fetch, which is why
+even the cheapest width runs at roughly a quarter of the memory
+bandwidth.
 
-What survives in the draft: Proposition 2's structure. Reading a
-cached token is still ~160x cheaper than recomputing it (1/epsilon).
-What must change: every number derived from epsilon = 1.5e-3. At
-z = 5 filters, the cohorting slack 1 + z·epsilon is 1.031, not 1.008,
-and the worked example "one cached pass over a 4K document costs
-0.12 ms" becomes ~0.41 ms.
+This width dependence is also why the two derivations of t_read
+disagree. The model has one shared curve f_P for all widths, so the
+slope the fit learns is a compromise across the c = 16, 32, and 64
+cells, and it lands at 57 ns — below the 101 ns the c = 32 cells
+alone show. The fitting code computes exactly this comparison as a
+self-check and flags any disagreement beyond 20 percent; here the
+ratio is 0.56, so the flag fired. The practical reading: 57 ns is
+the right value inside the fitted model, whose other terms were
+fitted jointly with it, but it is not a physical constant of the
+hardware, and any quoted read price should carry the suffix width it
+belongs to.
 
-**Accuracy.** The reference cell c2_c32_h16384_n32 measured 67.2 ms
-against a 30 ms prediction; the miss decomposes exactly into the
-eager floor (Section 3) plus the real read price above. The scaling
-is internally consistent three ways: linear in N (86–106 ns/token
-increments), linear in h, and reproduced across two containers
-(104 vs 101 ns).
+The consequence for the draft's Proposition 2. Its guarantee has
+slack 1 + z·epsilon, where z is the number of filters and epsilon is
+the read price divided by the prefill price, t_read/a1. The draft
+assumed epsilon ≈ 1.5e-3 from datasheet arithmetic; the measured
+value at the c = 32 reference is 6.2e-3, four times larger. At z = 5
+the slack becomes 1.031 instead of 1.008 — the guarantee weakens
+from "within about 1 percent of optimal" to "within about 3
+percent," which changes no conclusion. The draft's worked example
+also moves: one cached pass over a 4,096-token document costs about
+0.41 ms, not 0.12. What does not change: reading a cached token is
+still about 160 times cheaper than recomputing it (1/epsilon), which
+is the fact the whole design rests on.
+
+**Accuracy, shown on one concrete cell.** The cell with 32 requests,
+each a 32-token suffix over a 16,384-token cached document, was
+predicted at about 30 ms before the sweep: a few milliseconds of
+per-step overhead, plus 524,288 cached tokens read at the assumed
+22 ns, plus the suffix compute. It measured 67.2 ms. The two
+corrections above account for the difference in full: the per-step
+overhead is really the ~18 ms eager launch floor of Section 3, and
+the cached read really costs about 100 ns per token, which is
+~52 ms for those tokens; 18 + 52 = 70 ms, against 67.2 measured.
+Three checks say the read price is real and not an artifact:
+doubling the cached length at a fixed request count moves the step
+time by that same per-token price; growing the request count from 1
+to 32 at fixed length moves it linearly, with increments of 86 to
+106 ns per token; and a separate run in a different container
+measured 104 ns against this container's 101.
 
 ![Cached evaluation vs P](../results/plots/calib_fp.png)
 
-## 5. Identifiability: the missing R term  (draft Prop. 4)
+## 5. Why the model has no memory-traffic term  (draft Prop. 4)
 
-The draft proves that with a shared suffix length c, the pair count
-obeys P = (c/m)·R + c(1−c)/2·N exactly, so a resident-bytes term
-theta_R cannot be identified from the designs this workload produces.
-The fitting code enforces the proposition: asked for an R term
-without C3 cells, it refuses with that equation in the error message,
-and a detector recognizes genuine C3 pairs (matched P within 2
-percent, suffix lengths 4x apart, long side ≥ 128 tokens) — the plain
-C2 grid never qualifies. C3 was skipped on purpose; the model
-therefore carries the single attention term f_P, and Section 4's
-c-dependence is the visible cost of that compression.
+This section answers a question any reader of Eq. 3 will ask: the
+model has a term for attention pairs, so where is the term for the
+bytes of KV a step holds resident? The answer is that such a term
+cannot be fitted from filter-shaped measurements, the draft proves
+it as Proposition 4, and the sweep was designed around that proof.
+
+In words: whenever every request in a cell has the same suffix
+length c — which is what filter steps look like by construction,
+since suffixes span only 16 to 64 tokens — the pair count P and the
+resident bytes R are exact linear functions of each other. Two
+quantities that always move in lockstep cannot be told apart by any
+fit: every split of the measured time between "pair work" and "byte
+work" predicts identical times for every such cell, so the data
+contains no answer to which it is. Identifying a byte term would
+need cells built to break the lockstep — long suffixes over short
+contexts against short suffixes over long contexts, at matched pair
+counts. Those cells are the draft's calibration family C3, and they
+were skipped on purpose.
+
+Two consequences worth recording. First, the fitting code enforces
+the proposition instead of silently producing a meaningless split:
+asked for a byte term without C3 cells present, it refuses, quoting
+the linear dependence in its error message. Second, the model
+carries all attention-related cost in the single term f_P — and that
+is exactly why the read price of Section 4 varies with suffix width
+instead of being one clean number. The width dependence is the
+information the missing term would have carried.
 
 ## 6. Host time: the draft's form fails, one term fixes it
 
@@ -336,27 +386,44 @@ constant is corrected accordingly.
 ## 11. End to end: predicted against measured walls
 
 The estimator prices the full query (T_in + T_quest + T_reread + c0)
-from the constants above; the measured walls come from two containers
-(the anchor run and the banked comparison). Stock's read multiplier
-is an input (the estimator does not predict prefix-cache eviction);
-rewind's token count is the model's own.
+from the constants above. Measured walls exist from two separate
+runs of the same query, in two different containers:
 
-| walls from | arm | measured mean | predicted (fleet constants) | error |
+- **This week's run** — the c0 anchor of Section 10. Its container's
+  own serving rate is known, because the probe measured it (96,804
+  tokens per second).
+- **The earlier run** — the filter comparison stored in the
+  repository from a previous session. Its container's speed was
+  never measured.
+
+Each run measured both arms three times. The predictions below use
+the fleet constants only (the 97,000 tokens-per-second anchor rate
+and the measured c0), with no knowledge of either container. The
+stock arm's read multiplier is an input taken from the measurement,
+because the estimator does not predict prefix-cache eviction; the
+rewind arm's token count is the model's own.
+
+| run | arm | measured mean | predicted | error |
 |---|---|---|---|---|
-| anchor container | rewind | 39.71 s | 41.87 s | +5.4 percent |
-| anchor container | stock | 41.22 s | 40.62 s | −1.5 percent |
-| banked container | rewind | 39.84 s | 41.87 s | +5.1 percent |
-| banked container | stock | 42.92 s | 40.62 s | −5.4 percent |
+| this week's | rewind | 39.71 s | 41.87 s | +5.4 percent |
+| this week's | stock | 41.22 s | 40.62 s | −1.5 percent |
+| earlier | rewind | 39.84 s | 41.87 s | +5.1 percent |
+| earlier | stock | 42.92 s | 40.62 s | −5.4 percent |
 
-At the anchor container's own rate and measured c0, the rewind
-prediction is 41.93 s (+5.6 percent) — so the rewind error is
-structural, not host speed: the model charges 852,889 question tokens
-(46-token stage-1 question, 13-token survival-thinned tails over a
-33-token preamble) while the step trace measured 631,171. The
-executor keeps more of the question resident than the preamble
-accounting assumes. That one over-charge is the entire rewind error;
-the banked-stock −5.4 percent is the known cross-container host
-spread.
+Two things to read off. First, the stock error flips sign between
+the runs (−1.5 against −5.4 percent) because the earlier container
+was slower and the fleet constants cannot know that; this is the
+cross-container host spread the estimator cannot remove. Second, the
+rewind error does not move between runs, and it also does not move
+when the prediction is recomputed with this week's container's own
+measured rate and c0 (41.93 s, +5.6 percent) — so it is not host
+speed and not overhead. It is one specific accounting error: the
+model charges 852,889 question tokens (a 46-token stage-1 question,
+then 13-token survival-thinned tails over a 33-token shared
+preamble), while the engine's step trace counted 631,171 question
+tokens actually prefilled. The executor keeps more of each question
+resident across rewinds than the 33-token preamble accounting
+assumes. That single over-charge is the entire rewind error.
 
 For reference, the measured comparison itself:
 
@@ -365,35 +432,6 @@ For reference, the measured comparison itself:
 ![Filter timeline](../results/plots/filter_timeline_detail.png)
 
 ![Rewind mechanism](../results/plots/rewind_schematic.png)
-
-## 12. What the measurements change in the draft
-
-1. **epsilon**: 1.5e-3 → **6.2e-3**. Every derived number moves:
-   the z=5 cohorting slack is 3.1 percent, not 0.75; the 4K cached
-   pass costs ~0.41 ms, not 0.12. The qualitative claim (reads are
-   orders cheaper than prefill) survives at 160x.
-2. **t_read is shape-dependent** (82–141 ns/token across c=16–64),
-   so epsilon is a c=32 reference, not a constant of the hardware.
-   The draft should state the reference.
-3. **T_host needs the resident-blocks term** (Section 6): the stated
-   h0 + hN·N + hA·A form fits at 528 percent error; with hR·R it
-   fits at 14.9.
-4. **b0 is boot-dependent**: 2.94 ms with CUDA graphs (production),
-   16.8 ms eager (calibration). The draft should name which engine
-   its per-step overhead describes.
-5. **Prop. 5's PCIe branch is the measured case**: a1 > m/beta for
-   pinned and unpinned PCIe, so offload dominates recomputation at
-   every length on those tiers; disk crossovers land beyond the 16K
-   envelope.
-6. **The additivity and imbalance assumptions hold** within 7.1 and
-   1.3 percent (C4, C5) — Remark 1's escape hatch is not needed at
-   this scale.
-7. **Per-query residue**: 26 ms for the planned executor, measured
-   host-controlled; the earlier 3.2 s was container variance.
-8. **Known model conservatism**: the estimator over-predicts the
-   planned arm's wall by ~5.5 percent via question-token accounting
-   (Section 11); fixing it needs either a measured keep-resident
-   fraction or a longer effective preamble.
 
 ## Reproduction
 
