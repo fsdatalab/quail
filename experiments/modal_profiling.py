@@ -546,15 +546,17 @@ if traces:
                    attention=0, other=0)
     for e in kernels:
         k = e.get("name", "").lower()
-        if "gemm" in k or "cutlass" in k or "nvjet" in k:
+        # attention before gemm: the sm90 FlashAttention mainloop is a
+        # cutlass::device_kernel, and the gemm patterns would claim it
+        if ("attn" in k or "attention" in k or "flash" in k
+                or "fmha" in k):
+            classes["attention"] += e["dur"]
+        elif "gemm" in k or "cutlass" in k or "nvjet" in k:
             classes["gemm"] += e["dur"]
         elif "quant" in k or "scale" in k or "cast" in k:
             classes["quantize"] += e["dur"]
         elif "norm" in k or "rms" in k:
             classes["norm"] += e["dur"]
-        elif ("attn" in k or "attention" in k or "flash" in k
-              or "fmha" in k):
-            classes["attention"] += e["dur"]
         elif ("silu" in k or "gelu" in k or "add" in k or "mul" in k
               or "residual" in k):
             classes["elementwise"] += e["dur"]
@@ -749,13 +751,15 @@ def ncureport() -> str:
 # 5. Attention share vs document length: profiled long-doc prefills.
 # -----------------------------------------------------------------
 
-# The torchprof runner's kernel classes, first match wins, in the
-# runner's order. Kept identical so shares compare across instruments.
+# Kernel classes, first match wins. Attention must match before the
+# gemm patterns: the sm90 FlashAttention mainloop is a
+# cutlass::device_kernel, and the old order filed it under gemm -
+# which is why the short-doc profiles undercounted attention.
 KERNEL_CLASS_RULES = (
+    ("attention", ("attn", "attention", "flash", "fmha")),
     ("gemm", ("gemm", "cutlass", "nvjet")),
     ("quantize", ("quant", "scale", "cast")),
     ("norm", ("norm", "rms")),
-    ("attention", ("attn", "attention", "flash", "fmha")),
     ("elementwise", ("silu", "gelu", "add", "mul", "residual")),
 )
 
@@ -843,10 +847,13 @@ def attnshare(lengths: str = "512,2048,4096,8192,12288,16384",
         gpu_cats = {"kernel", "gpu_memcpy", "gpu_memset"}
         classes = dict(gemm=0, quantize=0, norm=0, elementwise=0,
                        attention=0, other=0)
+        by_name = {}
         total = 0
         for e in events:
             if e.get("cat") in gpu_cats and e.get("dur", 0) > 0:
-                classes[classify_kernel(e.get("name", ""))] += e["dur"]
+                name = e.get("name", "")
+                classes[classify_kernel(name)] += e["dur"]
+                by_name[name] = by_name.get(name, 0) + e["dur"]
                 total += e["dur"]
         walls.sort()
         row = dict(h=h, reps=reps,
@@ -854,6 +861,9 @@ def attnshare(lengths: str = "512,2048,4096,8192,12288,16384",
                    kernel_us_per_prefill=round(total / reps, 1))
         for cls, us in classes.items():
             row[f"{cls}_frac"] = round(us / total, 4) if total else 0
+        row["top_kernels"] = [
+            [classify_kernel(n), round(us / reps, 1), n[:140]]
+            for n, us in sorted(by_name.items(), key=lambda kv: -kv[1])[:8]]
         rows.append(row)
         print("[attnshare] " + json.dumps(row), flush=True)
         del prof, events
