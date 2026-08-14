@@ -48,8 +48,26 @@ in-container control of 96,212 tokens per second:
   next step is one boot with VLLM_LOGGING_LEVEL=DEBUG and a graph
   dump to read the actual nodes, not more guessing.
 
+Result: neither prediction branch happened - nothing fired anywhere.
+All three cells ran the same 13,839 kernels with zero fused
+norm+quant or silu+quant time. The maybe_inplace patch applied and
+its patterns registered, but matched nothing, so at least one more
+mismatch hides behind the overload one. Means were control 95,599,
+act_fused 94,720, act_norm_fused 94,583 tokens per second, but every
+cell drifted downward across its own reps by about 2.4 percent
+(96.9k on first reps to 94.5k on last), so the 1 percent differences
+between cells are inside the container's drift and no speed effect
+is resolvable either way. The one clearly real change: the
+silu_and_mul custom op swapped the SiLU kernel implementation and
+flipped 1,768 of 10,000 answers against control (wrong moved 2,990
+to 2,954) - repeating the packed run's lesson that this workload's
+YES/NO margins flip on single-kernel rounding differences. Per the
+contingency, the graphdump function below reads the compiler's
+actual post-grad graph instead of guessing further.
+
 Run:
     modal run experiments/modal_fusion_fix.py::main
+    modal run experiments/modal_fusion_fix.py::graphdump_main
 """
 
 import os
@@ -402,6 +420,134 @@ def fix_ab(n_docs: int = 10_000, reps: int = 3,
     return report_json
 
 
+GRAPHDUMP_RUNNER = r'''
+import sys
+
+from transformers import AutoTokenizer
+from vllm import LLM, SamplingParams
+
+sys.path.insert(0, "/root")
+from workload import MODEL, build_corpus, yes_no_ids
+
+tok = AutoTokenizer.from_pretrained(MODEL)
+body_ids, q_ids, _flags = build_corpus(tok, 64)
+yes, no = yes_no_ids(tok)
+sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
+                    allowed_token_ids=sorted(yes | no))
+prompts = [{"prompt_token_ids": body_ids[i] + q_ids[0]}
+           for i in range(64)]
+llm = LLM(
+    model=MODEL,
+    kv_cache_dtype="fp8",
+    max_model_len=4608,
+    max_num_seqs=4096,
+    max_num_batched_tokens=25305,
+    gpu_memory_utilization=0.88,
+    enable_prefix_caching=False,
+    disable_log_stats=True,
+    compilation_config={"max_cudagraph_capture_size": 8192,
+                        "cudagraph_capture_sizes": [8192],
+                        "custom_ops": ["+silu_and_mul"]},
+)
+llm.generate(prompts, sp, use_tqdm=False)
+print("[graphdump] boot and generate done", flush=True)
+'''
+
+
+@app.function(image=fix_image, gpu="H100!", timeout=3600, memory=65536,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/results": results_vol})
+def graphdump() -> str:
+    """One boot at the full-fix config with vLLM's compile debug dump
+    on, so the post-grad graphs say which nodes are really there.
+
+    Prediction: the dumped graph's norm sites show the auto-
+    functionalized maybe_inplace overload (which the patched patterns
+    now trace), and the surviving mismatch is on the quant side - the
+    quant appears either as a wrapper op the patterns do not trace or
+    as _C.per_token_group_fp8_quant with argument constants that
+    differ from the pattern's. Falsifier: if both nodes look exactly
+    as the patterns trace them, the miss is in pattern normalization
+    itself, and the dumped pattern files against the dumped graph
+    lines show the literal difference either way."""
+    import glob
+    import json
+    import re
+    import subprocess
+
+    patch_note = _apply_pattern_patch()
+    print(f"[graphdump] {patch_note}", flush=True)
+    with open("/tmp/graphdump_runner.py", "w") as f:
+        f.write(GRAPHDUMP_RUNNER)
+
+    env = dict(os.environ)
+    env.update({
+        "VLLM_LOGGING_LEVEL": "DEBUG",
+        "VLLM_DEBUG_DUMP_PATH": "/tmp/gdump",
+        "QUAIL_CUSTOM_SILU": "1",
+        "QUAIL_PATTERN_MAYBE_INPLACE": "1",
+    })
+    with open("/tmp/graphdump.log", "w") as log:
+        r = subprocess.run(["python", "/tmp/graphdump_runner.py"],
+                           env=env, stdout=log, stderr=subprocess.STDOUT)
+
+    match_lines = []
+    with open("/tmp/graphdump.log") as log:
+        for line in log:
+            low = line.lower()
+            if ("replaced" in low or "match" in low) and "fusion" in low:
+                match_lines.append(line.strip()[:240])
+            elif "quail" in low or "graphdump" in low:
+                match_lines.append(line.strip()[:240])
+    match_lines = match_lines[:80]
+
+    dump_files = sorted(
+        p for p in glob.glob("/tmp/gdump/**", recursive=True)
+        if os.path.isfile(p)
+    )
+    keys = ("fused_add_rms_norm", "silu", "per_token_group", "quant_fp8")
+    samples = {k: [] for k in keys}
+    op_tokens = set()
+    op_regexes = (
+        re.compile(r"vllm_ir\.[A-Za-z_0-9]+\.[A-Za-z_0-9]+"),
+        re.compile(r"_C\.[A-Za-z_0-9]+"),
+        re.compile(r"torch\.ops\.vllm\.[A-Za-z_0-9]+"),
+    )
+    for path in dump_files:
+        base = os.path.basename(path)
+        try:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    hit = [k for k in keys if k in line]
+                    if not hit:
+                        continue
+                    for rx in op_regexes:
+                        op_tokens.update(rx.findall(line))
+                    for k in hit:
+                        if len(samples[k]) < 14:
+                            samples[k].append(f"{base}: "
+                                              + line.strip()[:240])
+        except OSError:
+            continue
+
+    result = {
+        "patch": patch_note,
+        "runner_exit": r.returncode,
+        "log_match_lines": match_lines,
+        "n_dump_files": len(dump_files),
+        "dump_files": [os.path.basename(p) for p in dump_files][:60],
+        "op_tokens": sorted(op_tokens)[:60],
+        "samples": samples,
+    }
+    outpath = "/results/fusion_graphdump.json"
+    with open(outpath, "w") as f:
+        json.dump(result, f, indent=2)
+    results_vol.commit()
+    result_json = json.dumps(result, indent=2)
+    print(result_json, flush=True)
+    return result_json
+
+
 @app.local_entrypoint()
 def main(n_docs: int = 10_000, reps: int = 3,
          batch_tokens: int = BEST_BATCH_TOKENS,
@@ -414,4 +560,15 @@ def main(n_docs: int = 10_000, reps: int = 3,
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as output:
         json.dump(report, output, indent=2)
+    print(f"saved {out}")
+
+
+@app.local_entrypoint()
+def graphdump_main(out: str = "results/engine/fusion_graphdump.json"):
+    import json
+
+    result = json.loads(graphdump.remote())
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as output:
+        json.dump(result, output, indent=2)
     print(f"saved {out}")
