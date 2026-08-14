@@ -179,12 +179,17 @@ def roofline_4b():
 
     Ss = np.logspace(1.5, 5, 300)
     B_fix = 25_305
+    # attention_time shares one S-token context across the step's B
+    # tokens, so at this B the rising segment is pair FLOPs, not KV
+    # bytes (the amortized read only binds below B ~ 74); the flat
+    # floor is the activation traffic, constant in S.
     ax2.loglog(Ss, [rf.attention_time(M, D, B_fix, int(s)) * 1e3
                     for s in Ss], color=ORANGE, lw=2,
-               label="attention (reads the KV cache)")
+               label="attention (pair work, grows with S)")
     dense_ms = rf.projection_time(M, D, B_fix) * 1e3
     ax2.axhline(dense_ms, color=BLUE, ls="--", lw=2,
-                label=f"dense projections ({dense_ms:.0f} ms)")
+                label=f"dense projections ({dense_ms:.0f} ms, "
+                      "constant in S at fixed B)")
     cross = rf.attention_crossover_S(M, D, B_fix)
     ax2.axvline(cross, color=GRAY, ls=":", lw=1)
     ax2.axvline(320, color=GREEN, lw=1.5, alpha=0.8)
@@ -195,8 +200,8 @@ def roofline_4b():
              color=GRAY)
     ax2.set_xlabel("context length S (tokens per document)", fontsize=11)
     ax2.set_ylabel("ideal time per step (ms)", fontsize=11)
-    ax2.set_title(f"At B = {B_fix:,}: when does KV reading take over?",
-                  fontsize=11)
+    ax2.set_title(f"At B = {B_fix:,}: when does attention overtake "
+                  "the dense work?", fontsize=11)
     ax2.legend(fontsize=9, loc="upper left")
 
     for ax in (ax1, ax2):
