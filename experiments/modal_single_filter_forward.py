@@ -3,18 +3,45 @@
 Both methods run the first planted filter over the same tokenized
 documents in one Modal container on one H100. The vLLM control uses the
 best corrected production setting. The packed method concatenates whole
-prompts, resets position ids at each prompt boundary, runs one model
-forward pass per token batch, and scores only the allowed YES and NO
-tokens. It does not allocate persistent KV.
+prompts, resets position ids at each prompt boundary, runs one forward
+pass per token batch with no engine and no saved KV, and scores only
+the allowed YES and NO tokens at each document's last position.
 
-Prediction: the packed method should process input tokens 5 to 10 percent
-faster because it removes paged KV writes, request handling, and the full
-vocabulary projection. The FP8 matrix multiplications, FP8 activation
-quantization, and attention remain in both methods.
+History: the first version of this file ran the packed side on eager
+HuggingFace Transformers and measured 33,295 tokens per second against
+the control's 97,637 - 0.34x, with the loss attributed to kernels, not
+the idea (banked in results/engine/single_filter_forward.json and git
+history). This version replaces that packed side with vLLM's own
+kernels, called directly: the checkpoint is loaded through vLLM's model
+loader (so the weights are merged and processed exactly as the engine
+runs them), the matrix multiplies go through the same DeepGEMM path the
+engine uses, attention is vLLM's bundled variable-length FlashAttention
+with no KV written, and the norm+quant and silu+quant steps run in two
+variants - the separate kernels the engine executes today, and the
+fused kernels vLLM ships but cannot reach for this checkpoint (the
+graph-dump experiment showed its fusion patterns have no quant node to
+match, because the quant lives inside the compiled linear op). Calling
+the kernels directly is the only route to that A/B.
 
-Result: the prediction was false. vLLM averaged 97,637 input tokens per
-second, while packed Transformers averaged 33,295. The packed path used
-6.934 GiB but reached only 34.1 percent of vLLM throughput.
+Prediction, stated before the run, against the same-container control:
+  - packed on vLLM kernels, separate quant: within 5 percent of the
+    control either side (about 93,000 to 102,000 tokens per second).
+    Removing the engine is worth roughly nothing (GPU 99.5 percent
+    busy, 2.94 ms fixed cost per ~263 ms step), skipping KV writes
+    is worth about 0.2 percent, and eager per-op launches without
+    CUDA graphs cost a few percent back.
+  - packed with the fused kernels: 4 to 8 percent faster than the
+    separate-quant variant. The fused sites are the two norm+quant
+    pairs per layer (minus the first layer, which runs unfused) and
+    the silu+quant pair; the attention-output quant has no fusion
+    partner and stays separate in both variants.
+  - wrong answers stay within a few tens of the control's 2,990 of
+    10,000. Disagreements with the control in the low thousands are
+    expected, not a failure: the fix experiment measured 1,768
+    flipped answers from swapping one silu kernel.
+  - the profiled repetition of the fused variant shows
+    rms_norm_per_block_quant and silu_and_mul_per_block_quant
+    kernels; the separate-quant variant shows neither.
 
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
@@ -47,6 +74,24 @@ forward_image = (
 
 app = modal.App("quail-single-filter-forward")
 
+# Kernel classes, first match wins; attention before gemm because the
+# sm90 FlashAttention mainloop is a cutlass::device_kernel.
+KERNEL_CLASS_RULES = (
+    ("attention", ("attn", "attention", "flash", "fmha")),
+    ("gemm", ("gemm", "cutlass", "nvjet")),
+    ("quantize", ("quant", "scale", "cast")),
+    ("norm", ("norm", "rms")),
+    ("elementwise", ("silu", "gelu", "add", "mul", "residual")),
+)
+
+
+def _classify_kernel(name):
+    k = name.lower()
+    for cls, keys in KERNEL_CLASS_RULES:
+        if any(s in k for s in keys):
+            return cls
+    return "other"
+
 
 def _whole_prompt_batches(prompts, batch_tokens):
     """Pack complete prompts without splitting any prompt."""
@@ -71,92 +116,273 @@ def _whole_prompt_batches(prompts, batch_tokens):
     return batches
 
 
-@app.function(image=forward_image, gpu="H100!", timeout=1800,
+def _load_vllm_model():
+    """The checkpoint as vLLM's processed module: merged qkv and
+    gate_up, FP8 weights and block scales laid out for DeepGEMM. No
+    engine and no KV pool - just the weights and layer modules."""
+    import torch
+    from vllm.config import set_current_vllm_config
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader import get_model
+
+    # enforce_eager keeps compilation out of it; custom ops then
+    # default on, so module calls run vLLM's CUDA kernels eagerly.
+    config = EngineArgs(model=MODEL, dtype="bfloat16",
+                        enforce_eager=True).create_engine_config()
+    with set_current_vllm_config(config):
+        model = get_model(vllm_config=config)
+    torch.cuda.synchronize()
+    return model
+
+
+class PackedPipeline:
+    """One filter as plain forward passes over packed chunks.
+
+    Calls vLLM's kernels directly: DeepGEMM for the matrix multiplies,
+    the module's own norm, QK-norm, and rotary layers, bundled varlen
+    FlashAttention with no KV, and either the engine's separate
+    per-token-group quant or the shipped fused norm+quant and
+    silu+quant kernels."""
+
+    GROUP = 128
+
+    def __init__(self, model):
+        import torch
+        from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+        self.torch = torch
+        self.model = model
+        self.layers = model.model.layers
+        self.embed = model.model.embed_tokens
+        self.final_norm = model.model.norm
+        self.rotary = self.layers[0].self_attn.rotary_emb
+        attn = self.layers[0].self_attn
+        self.num_q_heads = attn.num_heads
+        self.num_kv_heads = attn.num_kv_heads
+        self.head_dim = attn.head_dim
+        self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
+        self.fp8 = torch.float8_e4m3fn
+
+    @staticmethod
+    def weight_scale(linear):
+        for name in ("weight_scale", "weight_scale_inv"):
+            scale = getattr(linear, name, None)
+            if scale is not None:
+                return scale
+        raise AttributeError(f"no weight scale on {type(linear).__name__}")
+
+    def gemm(self, q_input, input_scale, linear):
+        # mirrors run_deepgemm in vLLM's flashinfer scaled_mm kernel
+        from vllm.utils.deep_gemm import fp8_gemm_nt
+        out = self.torch.empty(
+            (q_input.shape[0], linear.weight.shape[0]),
+            dtype=self.torch.bfloat16, device=q_input.device,
+        )
+        fp8_gemm_nt((q_input, input_scale),
+                    (linear.weight, self.weight_scale(linear)),
+                    out, is_deep_gemm_e8m0_used=self.use_ue8m0)
+        return out
+
+    def quant(self, x):
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            per_token_group_quant_fp8,
+        )
+        return per_token_group_quant_fp8(
+            x, group_size=self.GROUP, column_major_scales=True,
+            use_ue8m0=self.use_ue8m0,
+        )
+
+    def _col_major_scales(self, n_tokens, width):
+        return self.torch.empty(
+            (width // self.GROUP, n_tokens),
+            dtype=self.torch.float32, device="cuda",
+        ).permute(-1, -2)
+
+    def fused_norm_quant(self, hidden, norm, residual):
+        """rms_norm_per_block_quant: the fused kernel vLLM ships but
+        its patterns cannot reach for this checkpoint. Mutates
+        residual in place, like the engine's fused-add norm."""
+        result = self.torch.empty_like(hidden, dtype=self.fp8)
+        scales = self._col_major_scales(*hidden.shape)
+        self.torch.ops._C.rms_norm_per_block_quant(
+            result=result, input=hidden, weight=norm.weight, scale=scales,
+            epsilon=norm.variance_epsilon, scale_ub=None, residual=residual,
+            group_size=self.GROUP, is_scale_transposed=True,
+        )
+        return result, scales
+
+    def fused_silu_quant(self, gate_up):
+        n_tokens, doubled = gate_up.shape
+        result = self.torch.empty(
+            (n_tokens, doubled // 2), dtype=self.fp8, device="cuda")
+        scales = self._col_major_scales(n_tokens, doubled // 2)
+        self.torch.ops._C.silu_and_mul_per_block_quant(
+            out=result, input=gate_up, scales=scales,
+            group_size=self.GROUP, scale_ub=None, is_scale_transposed=True,
+        )
+        return result, scales
+
+    def silu_and_mul(self, gate_up):
+        n_tokens, doubled = gate_up.shape
+        out = self.torch.empty(
+            (n_tokens, doubled // 2),
+            dtype=gate_up.dtype, device=gate_up.device)
+        self.torch.ops._C.silu_and_mul(out, gate_up)
+        return out
+
+    def attention(self, q, k, v, cu_seqlens, max_seqlen):
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+        n_tokens = q.shape[0]
+        out = flash_attn_varlen_func(
+            q.view(n_tokens, self.num_q_heads, self.head_dim),
+            k.view(n_tokens, self.num_kv_heads, self.head_dim),
+            v.view(n_tokens, self.num_kv_heads, self.head_dim),
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            causal=True,
+        )
+        return out.reshape(n_tokens, self.num_q_heads * self.head_dim)
+
+    @staticmethod
+    def pack(batch):
+        import torch
+        lengths = [len(prompt) for prompt in batch]
+        flat_ids = [token for prompt in batch for token in prompt]
+        flat_positions = [position for length in lengths
+                          for position in range(length)]
+        final_indices = []
+        running = 0
+        for length in lengths:
+            running += length
+            final_indices.append(running - 1)
+        cumulative = [0]
+        for length in lengths:
+            cumulative.append(cumulative[-1] + length)
+        return (
+            torch.tensor(flat_ids, dtype=torch.long, device="cuda"),
+            torch.tensor(flat_positions, dtype=torch.long, device="cuda"),
+            torch.tensor(final_indices, dtype=torch.long, device="cuda"),
+            torch.tensor(cumulative, dtype=torch.int32, device="cuda"),
+            max(lengths),
+        )
+
+    def forward_chunk(self, packed, fused):
+        (input_ids, positions, final_indices, cu_seqlens,
+         max_seqlen) = packed
+        n_tokens = input_ids.shape[0]
+        hidden = self.embed(input_ids)
+        residual = None
+        for layer in self.layers:
+            attn = layer.self_attn
+            if residual is None:
+                # first layer: no residual to fuse, run unfused
+                residual = hidden
+                normed = layer.input_layernorm(hidden)
+                q_in, q_scale = self.quant(normed)
+            elif fused:
+                q_in, q_scale = self.fused_norm_quant(
+                    hidden, layer.input_layernorm, residual)
+            else:
+                normed, residual = layer.input_layernorm(hidden, residual)
+                q_in, q_scale = self.quant(normed)
+            qkv = self.gemm(q_in, q_scale, attn.qkv_proj)
+
+            q_width = self.num_q_heads * self.head_dim
+            kv_width = self.num_kv_heads * self.head_dim
+            q, k, v = qkv.split([q_width, kv_width, kv_width], dim=-1)
+            q = attn.q_norm(
+                q.reshape(n_tokens, self.num_q_heads, self.head_dim)
+            ).reshape(n_tokens, q_width)
+            k = attn.k_norm(
+                k.reshape(n_tokens, self.num_kv_heads, self.head_dim)
+            ).reshape(n_tokens, kv_width)
+            q, k = self.rotary(positions, q, k)
+            attn_out = self.attention(q, k, v, cu_seqlens, max_seqlen)
+
+            # the attention output quant has no fusion partner in
+            # either variant
+            o_in, o_scale = self.quant(attn_out)
+            hidden = self.gemm(o_in, o_scale, attn.o_proj)
+
+            if fused:
+                g_in, g_scale = self.fused_norm_quant(
+                    hidden, layer.post_attention_layernorm, residual)
+            else:
+                normed, residual = layer.post_attention_layernorm(
+                    hidden, residual)
+                g_in, g_scale = self.quant(normed)
+            gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
+            if fused:
+                d_in, d_scale = self.fused_silu_quant(gate_up)
+            else:
+                d_in, d_scale = self.quant(self.silu_and_mul(gate_up))
+            hidden = self.gemm(d_in, d_scale, layer.mlp.down_proj)
+
+        last_hidden = hidden.index_select(0, final_indices)
+        last_residual = residual.index_select(0, final_indices)
+        normed, _ = self.final_norm(last_hidden, last_residual)
+        return normed
+
+
+@app.function(image=forward_image, gpu="H100!", timeout=3600, memory=65536,
               volumes={"/root/.cache/huggingface": hf_cache})
-def probe() -> str:
-    """Check the direct FP8 and packed FlashAttention dependencies."""
-    import importlib.metadata
+def probe(n_docs: int = 8) -> str:
+    """Check the kernels and the loader before the timed run: op
+    schemas, module attribute names and shapes, and one packed chunk
+    through both variants with finite outputs and matching answers."""
     import json
 
     import torch
-    import transformers
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL,
-        dtype=torch.bfloat16,
-        device_map="cuda",
-        attn_implementation="flash_attention_4",
-    )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    prompt_ids = [
-        tokenizer("The flag is YES. Answer=", add_special_tokens=False)
-        ["input_ids"],
-        tokenizer("The flag is NO. Answer=", add_special_tokens=False)
-        ["input_ids"],
-    ]
-    lengths = [len(ids) for ids in prompt_ids]
-    cumulative = [0, lengths[0], sum(lengths)]
-    input_ids = torch.tensor(
-        [[token for ids in prompt_ids for token in ids]], device="cuda"
-    )
-    position_ids = torch.tensor(
-        [[position for length in lengths for position in range(length)]],
-        device="cuda",
-    )
-    cumulative_lengths = torch.tensor(
-        cumulative, dtype=torch.int32, device="cuda"
-    )
-    with torch.inference_mode():
-        hidden = model.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            use_cache=False,
-            cu_seq_lens_q=cumulative_lengths,
-            cu_seq_lens_k=cumulative_lengths,
-            max_length_q=max(lengths),
-            max_length_k=max(lengths),
-        ).last_hidden_state
-        separate_final = []
-        for ids in prompt_ids:
-            one_ids = torch.tensor([ids], device="cuda")
-            one_positions = torch.arange(len(ids), device="cuda")[None, :]
-            one_hidden = model.model(
-                input_ids=one_ids,
-                position_ids=one_positions,
-                use_cache=False,
-            ).last_hidden_state
-            separate_final.append(one_hidden[0, -1])
-        packed_final = hidden[0, torch.tensor(
-            [lengths[0] - 1, sum(lengths) - 1], device="cuda"
-        )]
-        separate_final = torch.stack(separate_final)
-        final_max_abs_difference = (
-            packed_final - separate_final
-        ).abs().max().item()
-        final_cosine_similarity = torch.nn.functional.cosine_similarity(
-            packed_final.float(), separate_final.float(), dim=1
-        ).tolist()
-    result = {
-        "model": MODEL,
-        "torch": torch.__version__,
-        "transformers": transformers.__version__,
-        "flash_attn_4": importlib.metadata.version("flash-attn-4"),
-        "cuda": torch.version.cuda,
-        "device": torch.cuda.get_device_name(),
-        "packed_cu_seqlens_call_succeeded": True,
+    from workload import build_corpus
+
+    result = {"ops": {}}
+    for op_name in ("rms_norm_per_block_quant",
+                    "silu_and_mul_per_block_quant",
+                    "silu_and_mul", "fused_add_rms_norm"):
+        op = getattr(torch.ops._C, op_name, None)
+        result["ops"][op_name] = (
+            str(op.default._schema) if op is not None else "MISSING"
+        )
+
+    model = _load_vllm_model()
+    pipeline = PackedPipeline(model)
+    layer = model.model.layers[0]
+    result["module"] = {
         "model_class": type(model).__name__,
-        "attention": model.config._attn_implementation,
-        "quantization": model.config.quantization_config.to_dict(),
-        "packed_hidden_shape": list(hidden.shape),
-        "packed_vs_separate_final_max_abs_difference": (
-            final_max_abs_difference
-        ),
-        "packed_vs_separate_final_cosine_similarity": (
-            final_cosine_similarity
-        ),
+        "num_layers": len(model.model.layers),
+        "q_heads": pipeline.num_q_heads,
+        "kv_heads": pipeline.num_kv_heads,
+        "head_dim": pipeline.head_dim,
+        "qkv_weight": [list(layer.self_attn.qkv_proj.weight.shape),
+                       str(layer.self_attn.qkv_proj.weight.dtype)],
+        "qkv_scale": [list(
+            PackedPipeline.weight_scale(layer.self_attn.qkv_proj).shape),
+            str(PackedPipeline.weight_scale(
+                layer.self_attn.qkv_proj).dtype)],
+        "gate_up_weight": list(layer.mlp.gate_up_proj.weight.shape),
+        "down_weight": list(layer.mlp.down_proj.weight.shape),
+        "lm_head": hasattr(model, "lm_head"),
+        "use_ue8m0": pipeline.use_ue8m0,
     }
-    print(result, flush=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    body_ids, question_ids, _flags = build_corpus(tokenizer, n_docs)
+    prompts = [body_ids[i] + question_ids[0] for i in range(n_docs)]
+    packed = PackedPipeline.pack(prompts)
+    with torch.inference_mode():
+        unfused = pipeline.forward_chunk(packed, fused=False)
+        fused = pipeline.forward_chunk(packed, fused=True)
+    diff = (unfused.float() - fused.float()).abs().max().item()
+    result["chunk"] = {
+        "tokens": int(packed[0].shape[0]),
+        "docs": n_docs,
+        "unfused_finite": bool(torch.isfinite(unfused).all().item()),
+        "fused_finite": bool(torch.isfinite(fused).all().item()),
+        "fused_vs_unfused_max_abs_diff": round(diff, 4),
+    }
+    print(json.dumps(result, indent=2), flush=True)
     return json.dumps(result)
 
 
@@ -164,15 +390,16 @@ def probe() -> str:
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
 def compare(n_docs: int = 10_000, reps: int = 3,
-            batch_tokens: int = BEST_BATCH_TOKENS) -> str:
+            batch_tokens: int = BEST_BATCH_TOKENS,
+            profile_docs: int = 1024) -> str:
     import gc
     import json
     import time
 
     import torch
     import torch.nn.functional as F
-    import transformers
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from torch.profiler import ProfilerActivity, profile
+    from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
     from workload import build_corpus, yes_no_ids
@@ -182,7 +409,6 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     prompts = [body_ids[i] + question_ids[0] for i in range(n_docs)]
     expected = [int(flags[i][0]) for i in range(n_docs)]
     total_prompt_tokens = sum(map(len, prompts))
-    longest_prompt = max(map(len, prompts))
     batches = _whole_prompt_batches(prompts, batch_tokens)
     yes_ids, no_ids = yes_no_ids(tokenizer)
     allowed_ids = sorted(yes_ids | no_ids)
@@ -191,23 +417,21 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         "model": MODEL,
         "device": torch.cuda.get_device_name(),
         "torch": torch.__version__,
-        "transformers": transformers.__version__,
         "n_docs": n_docs,
         "prompt_tokens": total_prompt_tokens,
-        "longest_prompt": longest_prompt,
         "batch_tokens": batch_tokens,
         "packed_batches": len(batches),
-        "allowed_tokens": {
-            str(token_id): tokenizer.decode([token_id])
-            for token_id in allowed_ids
-        },
-        "yes_no_id_overlap": sorted(yes_ids & no_ids),
-        "prediction": "packed forward should be 5 to 10 percent faster",
+        "prediction": (
+            "packed on vLLM kernels within 5 percent of control; fused "
+            "variant 4 to 8 percent over the unfused packed variant; "
+            "wrong within tens of 2,990"
+        ),
         "runs": [],
+        "profiles": {},
     }
     print(
-        f"[single filter] {n_docs:,} prompts, {total_prompt_tokens:,} tokens, "
-        f"longest {longest_prompt:,}, {len(batches)} packed batches",
+        f"[single filter] {n_docs:,} prompts, {total_prompt_tokens:,} "
+        f"tokens, {len(batches)} packed batches",
         flush=True,
     )
 
@@ -249,9 +473,6 @@ def compare(n_docs: int = 10_000, reps: int = 3,
             "wall": round(wall, 4),
             "tokens_per_second": round(total_prompt_tokens / wall, 1),
             "wrong": wrong,
-            "max_num_seqs": 4096,
-            "gpu_memory_utilization": 0.88,
-            "cudagraph_capture_sizes": [graph_tokens],
         }
         report["runs"].append(row)
         print(f"[single filter] {row}", flush=True)
@@ -262,14 +483,8 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     torch.cuda.empty_cache()
     time.sleep(5)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL,
-        dtype=torch.bfloat16,
-        device_map="cuda",
-        attn_implementation="flash_attention_4",
-    )
-    model.eval()
-    model.config.use_cache = False
+    model = _load_vllm_model()
+    pipeline = PackedPipeline(model)
     selected_ids = torch.tensor(allowed_ids, device="cuda")
     yes_columns = torch.tensor(
         [i for i, token_id in enumerate(allowed_ids) if token_id in yes_ids],
@@ -279,92 +494,95 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         [i for i, token_id in enumerate(allowed_ids) if token_id in no_ids],
         device="cuda",
     )
-    selected_weights = model.lm_head.weight.index_select(0, selected_ids)
-
-    def packed_batch(batch):
-        lengths = [len(prompt) for prompt in batch]
-        flat_ids = [token for prompt in batch for token in prompt]
-        flat_positions = [position for length in lengths
-                          for position in range(length)]
-        final_indices = []
-        running = 0
-        for length in lengths:
-            running += length
-            final_indices.append(running - 1)
-        cumulative_lengths = [0]
-        for length in lengths:
-            cumulative_lengths.append(cumulative_lengths[-1] + length)
-        return (
-            torch.tensor(flat_ids, dtype=torch.long, device="cuda")[None, :],
-            torch.tensor(flat_positions, dtype=torch.long,
-                         device="cuda")[None, :],
-            torch.tensor(final_indices, dtype=torch.long, device="cuda"),
-            torch.tensor(cumulative_lengths, dtype=torch.int32,
-                         device="cuda"),
-            max(lengths),
-        )
+    selected_weights = model.lm_head.weight.index_select(
+        0, selected_ids).to(torch.bfloat16)
+    packed_batches = [PackedPipeline.pack(batch) for batch in batches]
 
     @torch.inference_mode()
-    def run_packed(selected_batches):
-        all_predictions = []
-        for batch in selected_batches:
-            (input_ids, position_ids, final_indices, cumulative_lengths,
-             max_length) = packed_batch(batch)
-            hidden = model.model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                use_cache=False,
-                return_dict=True,
-                cu_seq_lens_q=cumulative_lengths,
-                cu_seq_lens_k=cumulative_lengths,
-                max_length_q=max_length,
-                max_length_k=max_length,
-            ).last_hidden_state[0].index_select(0, final_indices)
-            scores = F.linear(hidden, selected_weights)
+    def run_packed(selected, fused):
+        predictions = []
+        for packed in selected:
+            normed = pipeline.forward_chunk(packed, fused=fused)
+            scores = F.linear(normed, selected_weights)
             yes_scores = scores.index_select(1, yes_columns).amax(dim=1)
             no_scores = scores.index_select(1, no_columns).amax(dim=1)
-            all_predictions.extend((yes_scores > no_scores).int().cpu().tolist())
-        return all_predictions
+            predictions.extend((yes_scores > no_scores).int().cpu().tolist())
+        return predictions
 
-    run_packed(batches[:1])
-    torch.cuda.synchronize()
-    for rep in range(reps):
-        torch.cuda.reset_peak_memory_stats()
-        started = time.perf_counter()
-        predicted = run_packed(batches)
+    for fused in (False, True):
+        name = "packed_fused" if fused else "packed_separate_quant"
+        # two warmup chunks: DeepGEMM compiles its kernels on first use
+        run_packed(packed_batches[:2], fused)
         torch.cuda.synchronize()
-        wall = time.perf_counter() - started
-        wrong = sum(a != b for a, b in zip(predicted, expected))
-        disagreements = sum(
-            a != b for a, b in zip(predicted, control_predictions)
-        )
-        row = {
-            "method": "packed_forward",
-            "rep": rep,
-            "wall": round(wall, 4),
-            "tokens_per_second": round(total_prompt_tokens / wall, 1),
-            "wrong": wrong,
-            "disagrees_with_vllm": disagreements,
-            "batches": len(batches),
-            "persistent_kv": False,
-            "peak_allocated_gib": round(
-                torch.cuda.max_memory_allocated() / 2**30, 3
-            ),
+        for rep in range(reps):
+            torch.cuda.reset_peak_memory_stats()
+            started = time.perf_counter()
+            predicted = run_packed(packed_batches, fused)
+            torch.cuda.synchronize()
+            wall = time.perf_counter() - started
+            wrong = sum(a != b for a, b in zip(predicted, expected))
+            row = {
+                "method": name,
+                "rep": rep,
+                "wall": round(wall, 4),
+                "tokens_per_second": round(total_prompt_tokens / wall, 1),
+                "wrong": wrong,
+                "disagrees_with_vllm": sum(
+                    a != b for a, b in zip(predicted, control_predictions)
+                ),
+                "persistent_kv": False,
+                "peak_allocated_gib": round(
+                    torch.cuda.max_memory_allocated() / 2**30, 3
+                ),
+            }
+            report["runs"].append(row)
+            print(f"[single filter] {row}", flush=True)
+
+        profile_batches = _whole_prompt_batches(
+            prompts[:profile_docs], batch_tokens)
+        profiled = [PackedPipeline.pack(batch) for batch in profile_batches]
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            run_packed(profiled, fused)
+        classes = dict(gemm=0, quantize=0, norm=0, elementwise=0,
+                       attention=0, other=0)
+        by_name = {}
+        total = 0
+        for event in prof.events():
+            duration = getattr(event, "device_time_total", 0) or 0
+            if event.device_type is None or duration <= 0:
+                continue
+            classes[_classify_kernel(event.key)] += duration
+            by_name[event.key] = by_name.get(event.key, 0) + duration
+            total += duration
+        summary = {"total_kernel_us": round(total, 1)}
+        for cls, us in classes.items():
+            summary[f"{cls}_frac"] = round(us / total, 4) if total else 0
+        summary["fused_kernels"] = {
+            key[:100]: round(us, 1) for key, us in by_name.items()
+            if "quant" in key.lower()
+            and any(s in key.lower() for s in ("rms", "norm", "silu"))
         }
-        report["runs"].append(row)
-        print(f"[single filter] {row}", flush=True)
+        summary["top_kernels"] = [
+            [_classify_kernel(key), round(us, 1), key[:120]]
+            for key, us in sorted(by_name.items(), key=lambda kv: -kv[1])[:12]
+        ]
+        report["profiles"][name] = summary
+        print(f"[single filter] {name} profile "
+              + json.dumps({k: v for k, v in summary.items()
+                            if k != "top_kernels"}), flush=True)
 
     rates = {}
-    for method in ("vllm", "packed_forward"):
+    for method in ("vllm", "packed_separate_quant", "packed_fused"):
         values = [row["tokens_per_second"] for row in report["runs"]
                   if row["method"] == method]
         rates[method] = round(sum(values) / len(values), 1)
     report["mean_tokens_per_second"] = rates
-    report["packed_speedup"] = round(
-        rates["packed_forward"] / rates["vllm"], 4
-    )
+    report["relative_to_vllm"] = {
+        method: round(rate / rates["vllm"], 4)
+        for method, rate in rates.items()
+    }
 
-    outpath = "/results/single_filter_forward.json"
+    outpath = "/results/single_filter_forward_vllm_kernels.json"
     with open(outpath, "w") as output:
         json.dump(report, output, indent=2)
     results_vol.commit()
@@ -376,7 +594,7 @@ def compare(n_docs: int = 10_000, reps: int = 3,
 @app.local_entrypoint()
 def main(n_docs: int = 10_000, reps: int = 3,
          batch_tokens: int = BEST_BATCH_TOKENS,
-         out: str = "results/engine/single_filter_forward.json"):
+         out: str = "results/engine/single_filter_forward_vllm_kernels.json"):
     import json
     import os
 
