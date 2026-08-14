@@ -470,7 +470,30 @@ def graphdump() -> str:
     differ from the pattern's. Falsifier: if both nodes look exactly
     as the patterns trace them, the miss is in pattern normalization
     itself, and the dumped pattern files against the dumped graph
-    lines show the literal difference either way."""
+    lines show the literal difference either way.
+
+    Result: the quant side was the miss, in a stronger form than
+    either named option - the quant is not a mismatched node, it is
+    not a node at all. The pre-grad graph shows every decoder layer
+    as fused_add_rms_norm.maybe_inplace feeding one opaque
+    dynamic_flashinfer_deepgemm_blockscale_gemm op, with the SiLU
+    consuming that op's output directly. That op is the registered
+    custom linear for block-FP8 on this build (defined in vllm
+    model_executor/kernels/linear/scaled_mm/flashinfer.py, which
+    calls per_token_group_quant_fp8 inside its implementation), so
+    the quant kernel the profiles show runs from inside the linear
+    op at runtime and never exists in the compiled graph. The
+    RMSNorm+quant and SiLU+quant patterns therefore have nothing to
+    match against this backend: no flag or pattern patch can make
+    them fire, and the fusion passes and the FlashInfer-DeepGEMM
+    linear path are mutually exclusive for this checkpoint in vllm
+    0.26.0. Reaching the shipped fused kernels now means either
+    swapping the linear backend (giving up the 91-93 percent
+    efficient DeepGEMM kernels that hold 51 percent of the runtime -
+    a measurable but probably losing trade) or calling the fused
+    kernels explicitly outside the pattern machinery. The runner hit
+    its own 2,400 s timeout (dump writing is slow even without DEBUG
+    logging), and the 193 partial dump files were sufficient."""
     import glob
     import json
     import re
