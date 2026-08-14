@@ -17,18 +17,29 @@ them either.
 
 ## 0. Measurement discipline
 
-- Every engine cell submits exactly one step of work and verifies it:
-  the step trace must show one step of the requested shape, and every
-  request must report exactly the designed cached-token count. Rows
-  that fail are marked invalid; rows whose five measured repeats spread
-  past 10 percent are retried once and flagged.
+Vocabulary, used throughout. A **cell** is one measurement
+configuration: a chosen set of requests that the engine must execute
+as exactly one step. A **family** is a group of cells that vary one
+factor; the families here are the draft's Table 4 (C1, C2, C4, C5,
+C6) plus the alpha family. For every cell the engine runs seven
+repetitions: two warmups, which are discarded, then five that are
+recorded. The cell's reported time is the **median** of the five
+recorded repetitions, read from the engine's own step timer. A cell
+is **valid** if every repetition executed as exactly one step of
+exactly the requested shape and every request reported exactly the
+intended cached-token count. A cell is **stable** if its five
+recorded times spread less than 10 percent. A cell that fails either
+check is retried once and kept with its flags.
+
 - The fits read one file, `calibrate_all.json`: 100 cells plus the
   transfer probes, all from a single container. Rows from different
   containers are never mixed, because host speed varies up to 45
   percent across containers (Section 10 measures this directly).
-- The landing run came back with zero invalid and zero unstable cells,
-  and its drift pair (the same reference cell run first and last)
-  agreed within 1.05 percent.
+- The landing run came back with zero invalid and zero unstable
+  cells. The machine's speed was also checked for drift over the
+  sweep: a reference cell (one 4,096-token prefill) runs once before
+  the first cell and once again after the last, about fifty minutes
+  apart, and the two agreed within 1.05 percent.
 - Two engine-boot defaults had to be overridden before any measurement
   was honest, and both are recorded in every run's boot row:
   `async_scheduling=False` (the vllm 0.26 default moves the GPU wait
@@ -48,9 +59,16 @@ token costs kappa = 73,728 bytes at fp8 (the draft's m = 72 KiB).
 
 ## 1. Prefill: T_pre(h) = a1·h + a2·h²  (draft Eq. 6)
 
-**How measured.** The alpha family: one request of h fresh tokens per
-step, h swept 512 to 16,384 (11 cells), plus the drift pair at 4,096.
-Nonnegative least squares on the medians fits intercept, a1, a2.
+**How measured.** Each cell of this family is one request of h fresh
+tokens with nothing cached, so the step is a single document prefill.
+Eleven lengths are measured: h = 512, 1,024, 2,048, 3,072, 4,096,
+6,144, 8,192, 10,240, 12,288, 14,336, 16,384. Every repetition uses
+freshly generated token content, so no repetition is served from the
+prefix cache. The model T_pre(h) = intercept + a1·h + a2·h² is then
+fitted to the eleven medians by least squares with all three
+coefficients constrained to be nonnegative, because each coefficient
+is a physical time and measurement noise must not hand one a
+negative sign.
 
 **Constants.**
 
@@ -70,10 +88,17 @@ instrument.
 
 ## 2. Step composition: f_B(B) and beta_N  (draft Eq. 3)
 
-**How measured.** The C1 family: N requests of c fresh tokens each,
-c in {64, 256, 512}, N doubling until B = N·c reaches 32,768
-(25 cells, all valid). f_B is monotone piecewise-linear over B-knots;
-beta_N is the per-request slope.
+**How measured.** Each cell of this family is N identical requests
+of c fresh tokens each, nothing cached, executed as one step. Three
+sizes are measured, c = 64, 256, and 512, with N doubling from 1
+until the step's token total B = N·c reaches 32,768 — 25 cells, all
+valid. Two things come out of this design. First, cells with the
+same B but different N (B = 8,192 exists as 128 requests of 64
+tokens, 32 of 256, and 16 of 512) separate the per-request cost
+beta_N from the per-token cost. Second, f_B is fitted as a
+piecewise-linear curve: the B axis is divided at fixed breakpoints,
+each segment's slope is fitted with a nonnegativity constraint, so
+the curve may bend but never decreases.
 
 **Constants.** beta_N = 50.3 µs per request. Above B = 4,096 the
 series is linear at ~10.7 µs/token; below B = 2,048 every cell sits
@@ -107,12 +132,26 @@ near 283 tokens.
 
 ## 4. Cached reads: f_P(P), t_read, and epsilon
 
-**How measured.** The C2 family: N requests, each a c-token suffix
-over an h-token cached document, c in {16, 32, 64}, h to 16,384,
-N to 64 (54 cells, all valid — every request reported exactly h
-cached tokens). f_P is monotone piecewise-linear over attention
-pairs P. t_read is the fitted f_P slope between the two reference
-cells (c=32, N=32, h=8,192 vs 16,384), times c.
+**How measured.** Each cell of this family evaluates cached
+documents. First the cell's N documents of h tokens each are
+prefilled once; this warm-up is not measured. Then each measured
+repetition submits N requests, where request i is document i plus a
+fresh c-token suffix. The document is served from the cache and the
+suffix is new content, so the step computes exactly N·c fresh tokens
+against N·h cached tokens — and the engine must report exactly h
+cached tokens for every request, or the cell is invalid. The grid:
+c = 16, 32, 64; h = 2,048, 4,096, 8,192, 16,384; N = 1, 4, 16, 32,
+and 64 where memory allows — 54 cells, all valid. f_P is fitted over
+the attention-pair count P the same piecewise-linear way as f_B.
+The per-cached-token price t_read is derived two ways, and both are
+reported. The raw way: take the two reference cells c = 32, N = 32
+at h = 8,192 and h = 16,384, subtract their step times, and divide
+by the 262,144 additional cached tokens the larger cell reads. The
+fitted way: evaluate the fitted f_P curve at those two cells' pair
+counts and convert its slope to a per-token price. The two disagree
+(101 versus 57 ns per token) because the fitted curve is shared
+across all suffix widths; the disagreement is itself informative and
+is discussed below.
 
 **Constants and the draft's largest correction.**
 
@@ -162,9 +201,14 @@ c-dependence is the visible cost of that compression.
 
 ## 6. Host time: the draft's form fails, one term fixes it
 
-**How measured.** Scheduler plus bookkeeping time (`sched_ms +
-update_ms`) is recorded separately from GPU time for every cell, so
-this model's failure cannot contaminate any other constant.
+**How measured.** The engine's step loop is timed in three
+separately recorded phases: GPU execution, the scheduler's step
+preparation (`sched_ms`), and the bookkeeping after the step
+(`update_ms`). Host time here means the sum of the last two. It is
+recorded for every cell, so the host model is fitted on the same
+cells as the GPU model (90 of them carry both host phases) but from
+different clocks — a failure of this model cannot contaminate any
+GPU constant.
 
 The draft's form T_host = h0 + hN·N + hA·A fits at **528 percent**
 mean relative error. The failure is structural: at fixed N=32 and
@@ -238,9 +282,13 @@ percent of spec.
 
 ## 9. Transfers and the offload crossover  (draft Eq. 8, Prop. 5)
 
-**How measured.** The C6 probes, no engine: 4 GiB GPU-host copies
-both directions, pinned and unpinned; 16 GiB container-disk write and
-read with the page cache dropped; 4 GiB on the network volume.
+**How measured.** These are direct copy measurements with no
+inference engine involved: 4 GiB GPU-to-host and host-to-GPU copies,
+with the host buffer pinned and unpinned (five repetitions, median);
+a 16 GiB write and read on the container's disk, with the operating
+system's page cache dropped between them so the read is a real disk
+read; and a 4 GiB write and read on the network-backed results
+volume.
 
 | tier | rate | per-token m/beta | crossover h* |
 |---|---|---|---|
@@ -267,11 +315,15 @@ The draft's T_ser and the estimator's c0 absorb per-query software
 cost. The shipped value was 3.2 s, derived by subtracting predicted
 token work from measured walls across containers — and walls spread
 up to 45 percent across containers, so that derivation booked host
-variance as overhead. The anchor protocol removes the confound: in
-one container, first measure that container's own serving rate with a
-full stage-1 pass through the same submission machinery (96,804
-tokens/s; the fleet anchor is 97,000), then run the query, then
-subtract.
+variance as overhead. The anchor protocol removes the confound. In one container: first
+measure that container's own serving rate — submit every document
+once with its first question attached, through the same client code,
+the same concurrency limit, and the same engine configuration the
+stock query uses, and divide the fresh tokens processed by the wall
+time (96,804 tokens per second here; the fleet-wide anchor is
+97,000). Then run the query in the same container. Then compute, per
+repetition, c0 = wall − (tokens read) / (the rate this container
+just measured). Host speed appears in both terms and cancels.
 
 | arm | c0 reps | median |
 |---|---|---|
