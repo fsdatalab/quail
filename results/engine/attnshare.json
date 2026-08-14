@@ -2,73 +2,325 @@
   {
     "h": 512,
     "reps": 20,
-    "wall_ms_median": 27.853,
-    "kernel_us_per_prefill": 8100.7,
-    "gemm_frac": 0.6191,
-    "quantize_frac": 0.1405,
+    "wall_ms_median": 23.925,
+    "kernel_us_per_prefill": 8116.8,
+    "gemm_frac": 0.5187,
+    "quantize_frac": 0.141,
     "norm_frac": 0.1133,
-    "elementwise_frac": 0.0506,
-    "attention_frac": 0.0325,
-    "other_frac": 0.044
+    "elementwise_frac": 0.0493,
+    "attention_frac": 0.1351,
+    "other_frac": 0.0426,
+    "top_kernels": [
+      [
+        "gemm",
+        1935.0,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 112u, 128u, 128u, 128u, 32u, 3u, 128u, 256u, 2u, "
+      ],
+      [
+        "quantize",
+        1033.2,
+        "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*, float*, int, int, "
+      ],
+      [
+        "gemm",
+        958.2,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 128u, 80u, 128u, 128u, 128u, 32u, 7u, 128u, 256u, 1u, fa"
+      ],
+      [
+        "attention",
+        831.3,
+        "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+      ],
+      [
+        "norm",
+        600.0,
+        "void vllm::rms_norm_kernel<c10::BFloat16, 8, 3, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long, c10::BFloat16 cons"
+      ],
+      [
+        "gemm",
+        562.5,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 128u, 192u, 128u, 128u, 128u, 128u, 4u, 128u, 256u, 1u, "
+      ],
+      [
+        "gemm",
+        480.8,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 128u, 80u, 128u, 128u, 128u, 32u, 7u, 128u, 256u, 1u, fa"
+      ],
+      [
+        "elementwise",
+        399.8,
+        "void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162, &(c10::BFloat16 vllm::silu_kernel<c10::BFloat16>(c10::BFloat16 const&, float)),"
+      ]
+    ]
   },
   {
     "h": 2048,
     "reps": 20,
-    "wall_ms_median": 29.876,
-    "kernel_us_per_prefill": 24590.4,
-    "gemm_frac": 0.6046,
-    "quantize_frac": 0.1472,
-    "norm_frac": 0.1131,
-    "elementwise_frac": 0.0651,
-    "attention_frac": 0.0347,
-    "other_frac": 0.0352
+    "wall_ms_median": 29.011,
+    "kernel_us_per_prefill": 24735.2,
+    "gemm_frac": 0.4788,
+    "quantize_frac": 0.1463,
+    "norm_frac": 0.113,
+    "elementwise_frac": 0.0648,
+    "attention_frac": 0.1621,
+    "other_frac": 0.035,
+    "top_kernels": [
+      [
+        "gemm",
+        5653.7,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u,"
+      ],
+      [
+        "quantize",
+        3390.0,
+        "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*, float*, int, int, "
+      ],
+      [
+        "attention",
+        3147.9,
+        "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+      ],
+      [
+        "gemm",
+        2730.6,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 128u, 160u, 128u, 128u, 128u, 64u, 5u, 128u, 256u, 2u, f"
+      ],
+      [
+        "norm",
+        1941.8,
+        "void vllm::rms_norm_kernel<c10::BFloat16, 8, 3, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long, c10::BFloat16 cons"
+      ],
+      [
+        "gemm",
+        1879.3,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ],
+      [
+        "elementwise",
+        1603.5,
+        "void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162, &(c10::BFloat16 vllm::silu_kernel<c10::BFloat16>(c10::BFloat16 const&, float)),"
+      ],
+      [
+        "gemm",
+        1301.0,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 128u, 160u, 128u, 128u, 128u, 64u, 5u, 128u, 256u, 2u, f"
+      ]
+    ]
   },
   {
     "h": 4096,
     "reps": 20,
-    "wall_ms_median": 59.002,
-    "kernel_us_per_prefill": 53049.6,
-    "gemm_frac": 0.632,
-    "quantize_frac": 0.1353,
-    "norm_frac": 0.1049,
-    "elementwise_frac": 0.0579,
-    "attention_frac": 0.0322,
-    "other_frac": 0.0377
+    "wall_ms_median": 59.469,
+    "kernel_us_per_prefill": 53026.3,
+    "gemm_frac": 0.4493,
+    "quantize_frac": 0.1355,
+    "norm_frac": 0.1053,
+    "elementwise_frac": 0.058,
+    "attention_frac": 0.2141,
+    "other_frac": 0.0377,
+    "top_kernels": [
+      [
+        "gemm",
+        10738.4,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u,"
+      ],
+      [
+        "attention",
+        9635.7,
+        "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+      ],
+      [
+        "quantize",
+        6611.5,
+        "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*, float*, int, int, "
+      ],
+      [
+        "gemm",
+        6356.0,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 112u, 128u, 128u, 128u, 32u, 3u, 128u, 256u, 2u, t"
+      ],
+      [
+        "norm",
+        3736.6,
+        "void vllm::rms_norm_kernel<c10::BFloat16, 8, 3, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long, c10::BFloat16 cons"
+      ],
+      [
+        "gemm",
+        3569.7,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ],
+      [
+        "elementwise",
+        3078.1,
+        "void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162, &(c10::BFloat16 vllm::silu_kernel<c10::BFloat16>(c10::BFloat16 const&, float)),"
+      ],
+      [
+        "gemm",
+        2881.6,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 112u, 128u, 128u, 128u, 32u, 3u, 128u, 256u, 2u, t"
+      ]
+    ]
   },
   {
     "h": 8192,
     "reps": 20,
-    "wall_ms_median": 127.277,
-    "kernel_us_per_prefill": 117313.0,
-    "gemm_frac": 0.6636,
-    "quantize_frac": 0.1259,
-    "norm_frac": 0.0956,
-    "elementwise_frac": 0.0516,
-    "attention_frac": 0.0287,
-    "other_frac": 0.0346
+    "wall_ms_median": 127.108,
+    "kernel_us_per_prefill": 116936.8,
+    "gemm_frac": 0.3658,
+    "quantize_frac": 0.1261,
+    "norm_frac": 0.0961,
+    "elementwise_frac": 0.0518,
+    "attention_frac": 0.3256,
+    "other_frac": 0.0347,
+    "top_kernels": [
+      [
+        "attention",
+        34705.3,
+        "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+      ],
+      [
+        "gemm",
+        20982.9,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u,"
+      ],
+      [
+        "quantize",
+        13448.7,
+        "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*, float*, int, int, "
+      ],
+      [
+        "gemm",
+        10089.8,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ],
+      [
+        "norm",
+        7282.8,
+        "void vllm::rms_norm_kernel<c10::BFloat16, 8, 3, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long, c10::BFloat16 cons"
+      ],
+      [
+        "gemm",
+        6921.2,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ],
+      [
+        "elementwise",
+        6055.8,
+        "void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162, &(c10::BFloat16 vllm::silu_kernel<c10::BFloat16>(c10::BFloat16 const&, float)),"
+      ],
+      [
+        "gemm",
+        4499.0,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ]
+    ]
   },
   {
     "h": 12288,
     "reps": 20,
-    "wall_ms_median": 212.185,
-    "kernel_us_per_prefill": 198446.0,
-    "gemm_frac": 0.7054,
-    "quantize_frac": 0.1096,
-    "norm_frac": 0.0848,
-    "elementwise_frac": 0.0452,
-    "attention_frac": 0.0248,
-    "other_frac": 0.0302
+    "wall_ms_median": 211.602,
+    "kernel_us_per_prefill": 198230.2,
+    "gemm_frac": 0.3282,
+    "quantize_frac": 0.1101,
+    "norm_frac": 0.0849,
+    "elementwise_frac": 0.0453,
+    "attention_frac": 0.4012,
+    "other_frac": 0.0302,
+    "top_kernels": [
+      [
+        "attention",
+        74598.3,
+        "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+      ],
+      [
+        "gemm",
+        31565.3,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u,"
+      ],
+      [
+        "quantize",
+        19929.1,
+        "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*, float*, int, int, "
+      ],
+      [
+        "gemm",
+        16018.1,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ],
+      [
+        "norm",
+        10830.4,
+        "void vllm::rms_norm_kernel<c10::BFloat16, 8, 3, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long, c10::BFloat16 cons"
+      ],
+      [
+        "gemm",
+        10161.0,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ],
+      [
+        "elementwise",
+        8986.3,
+        "void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162, &(c10::BFloat16 vllm::silu_kernel<c10::BFloat16>(c10::BFloat16 const&, float)),"
+      ],
+      [
+        "gemm",
+        7028.6,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ]
+    ]
   },
   {
     "h": 16384,
     "reps": 20,
-    "wall_ms_median": 310.195,
-    "kernel_us_per_prefill": 293897.3,
-    "gemm_frac": 0.7352,
-    "quantize_frac": 0.0986,
-    "norm_frac": 0.0763,
-    "elementwise_frac": 0.0406,
-    "attention_frac": 0.0223,
-    "other_frac": 0.027
+    "wall_ms_median": 308.036,
+    "kernel_us_per_prefill": 291865.3,
+    "gemm_frac": 0.2887,
+    "quantize_frac": 0.099,
+    "norm_frac": 0.0768,
+    "elementwise_frac": 0.0409,
+    "attention_frac": 0.4675,
+    "other_frac": 0.0272,
+    "top_kernels": [
+      [
+        "attention",
+        129927.0,
+        "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+      ],
+      [
+        "gemm",
+        41614.7,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u,"
+      ],
+      [
+        "quantize",
+        26397.5,
+        "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*, float*, int, int, "
+      ],
+      [
+        "gemm",
+        20137.9,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ],
+      [
+        "norm",
+        14373.8,
+        "void vllm::rms_norm_kernel<c10::BFloat16, 8, 3, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long, c10::BFloat16 cons"
+      ],
+      [
+        "gemm",
+        13443.2,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ],
+      [
+        "elementwise",
+        11935.1,
+        "void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162, &(c10::BFloat16 vllm::silu_kernel<c10::BFloat16>(c10::BFloat16 const&, float)),"
+      ],
+      [
+        "gemm",
+        8773.9,
+        "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+      ]
+    ]
   }
 ]
