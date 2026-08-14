@@ -1,0 +1,523 @@
+{
+  "model": "Qwen/Qwen3-4B-FP8",
+  "device": "NVIDIA H100 80GB HBM3",
+  "torch": "2.11.0+cu130",
+  "vllm": "0.26.0",
+  "n_docs": 10000,
+  "prompt_tokens": 3663917,
+  "batch_tokens": 25305,
+  "cells": [
+    "control",
+    "fusion_off",
+    "fusion_on"
+  ],
+  "prediction": "control is already fused (vllm 0.26.0 resolves fuse_norm_quant and fuse_act_quant true at the default O2 for this block-FP8 checkpoint); fusion_on == control within 1 percent; fusion_off 6 to 10 percent slower; wrong stays near 2,990 of 10,000",
+  "runs": [
+    {
+      "method": "control",
+      "rep": 0,
+      "wall": 38.002,
+      "tokens_per_second": 96413.8,
+      "wrong": 2990
+    },
+    {
+      "method": "control",
+      "rep": 1,
+      "wall": 38.1351,
+      "tokens_per_second": 96077.3,
+      "wrong": 2990
+    },
+    {
+      "method": "control",
+      "rep": 2,
+      "wall": 38.1079,
+      "tokens_per_second": 96145.7,
+      "wrong": 2990
+    },
+    {
+      "method": "fusion_off",
+      "rep": 0,
+      "wall": 38.0507,
+      "tokens_per_second": 96290.5,
+      "wrong": 2990,
+      "disagrees_with_control": 0
+    },
+    {
+      "method": "fusion_off",
+      "rep": 1,
+      "wall": 38.1995,
+      "tokens_per_second": 95915.4,
+      "wrong": 2990,
+      "disagrees_with_control": 0
+    },
+    {
+      "method": "fusion_off",
+      "rep": 2,
+      "wall": 38.2859,
+      "tokens_per_second": 95698.8,
+      "wrong": 2990,
+      "disagrees_with_control": 0
+    },
+    {
+      "method": "fusion_on",
+      "rep": 0,
+      "wall": 38.043,
+      "tokens_per_second": 96309.8,
+      "wrong": 2990,
+      "disagrees_with_control": 0
+    },
+    {
+      "method": "fusion_on",
+      "rep": 1,
+      "wall": 38.2507,
+      "tokens_per_second": 95786.9,
+      "wrong": 2990,
+      "disagrees_with_control": 0
+    },
+    {
+      "method": "fusion_on",
+      "rep": 2,
+      "wall": 38.3117,
+      "tokens_per_second": 95634.5,
+      "wrong": 2990,
+      "disagrees_with_control": 0
+    }
+  ],
+  "profiles": {
+    "control": {
+      "n_kernels": 13839,
+      "total_kernel_us": 4107633.8960000095,
+      "gemm_us": 2105019.912000001,
+      "gemm_frac": 0.5125,
+      "quantize_us": 756624.7309999969,
+      "quantize_frac": 0.1842,
+      "norm_us": 498163.0810000006,
+      "norm_frac": 0.1213,
+      "elementwise_us": 271912.4890000003,
+      "elementwise_frac": 0.0662,
+      "attention_us": 473004.8949999997,
+      "attention_frac": 0.1152,
+      "other_us": 2908.7879999999836,
+      "other_frac": 0.0007,
+      "fused_norm_quant_us": 0,
+      "fused_norm_quant_frac": 0.0,
+      "fused_act_quant_us": 0,
+      "fused_act_quant_frac": 0.0,
+      "top_kernels": [
+        [
+          "gemm",
+          1052330.0659999994,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u,"
+        ],
+        [
+          "quantize",
+          687518.6209999983,
+          "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*, float*, int, int, "
+        ],
+        [
+          "gemm",
+          496171.2010000004,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+        ],
+        [
+          "gemm",
+          333933.2509999998,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+        ],
+        [
+          "attention",
+          306715.30700000003,
+          "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+        ],
+        [
+          "elementwise",
+          271912.4890000003,
+          "triton_poi_fused_mul_silu_slice_1"
+        ],
+        [
+          "norm",
+          237256.39000000028,
+          "triton_red_fused_add_cat_index_select_mul_rms_norm_split_split_with_sizes_sub_unsqueeze_view_3"
+        ],
+        [
+          "gemm",
+          217723.75699999978,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+        ],
+        [
+          "attention",
+          162811.51899999997,
+          "void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, unsigned char, (vllm::Fp8KVCacheDataType)1>(__nv_bfloat16 const*, __nv_bfloat16 con"
+        ],
+        [
+          "norm",
+          116736.96699999998,
+          "triton_red_fused_fused_add_rms_norm_2"
+        ],
+        [
+          "norm",
+          78669.05599999998,
+          "triton_red_fused_fused_add_rms_norm_0"
+        ],
+        [
+          "quantize",
+          57905.27800000001,
+          "void vllm::scaled_fp8_quant_kernel_strided_group_shape<c10::BFloat16, c10::Float8_e4m3fn, true, true>(c10::Float8_e4m3fn*, c10::BFloat16 con"
+        ],
+        [
+          "norm",
+          34362.01199999991,
+          "triton_red_fused_rms_norm_split_with_sizes_view_4"
+        ],
+        [
+          "norm",
+          20328.022000000004,
+          "triton_poi_fused_add_index_select_mul_rms_norm_split_split_with_sizes_sub_unsqueeze_view_5"
+        ],
+        [
+          "quantize",
+          11180.959999999985,
+          "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&):"
+        ],
+        [
+          "norm",
+          6793.915999999999,
+          "triton_red_fused_add_cat_index_select_mul_rms_norm_split_split_with_sizes_sub_unsqueeze_view_1"
+        ],
+        [
+          "attention",
+          2878.326,
+          "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+        ],
+        [
+          "norm",
+          2447.1869999999994,
+          "triton_red_fused__to_copy_embedding_rms_norm_0"
+        ],
+        [
+          "gemm",
+          1718.3259999999998,
+          "nvjet_sm90_tst_384x64_64x3_2x1_v_bz_coopB_TNN"
+        ],
+        [
+          "gemm",
+          1443.193,
+          "nvjet_sm90_tst_384x80_64x3_2x1_v_bz_coopA_TNT"
+        ]
+      ],
+      "profiled_docs": 1024,
+      "profiled_tokens": 381315,
+      "kernel_us_per_token": 10.772
+    },
+    "fusion_off": {
+      "n_kernels": 13839,
+      "total_kernel_us": 4115678.8350000037,
+      "gemm_us": 2110243.986000008,
+      "gemm_frac": 0.5127,
+      "quantize_us": 758137.014000001,
+      "quantize_frac": 0.1842,
+      "norm_us": 498627.4719999968,
+      "norm_frac": 0.1212,
+      "elementwise_us": 271893.8259999998,
+      "elementwise_frac": 0.0661,
+      "attention_us": 473667.83599999966,
+      "attention_frac": 0.1151,
+      "other_us": 3108.7009999999955,
+      "other_frac": 0.0008,
+      "fused_norm_quant_us": 0,
+      "fused_norm_quant_frac": 0.0,
+      "fused_act_quant_us": 0,
+      "fused_act_quant_frac": 0.0,
+      "top_kernels": [
+        [
+          "gemm",
+          1054685.0579999997,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u,"
+        ],
+        [
+          "quantize",
+          689009.5090000014,
+          "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*, float*, int, int, "
+        ],
+        [
+          "gemm",
+          497929.2479999997,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+        ],
+        [
+          "gemm",
+          334585.896,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+        ],
+        [
+          "attention",
+          307213.8439999998,
+          "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+        ],
+        [
+          "elementwise",
+          271893.8259999998,
+          "triton_poi_fused_mul_silu_slice_1"
+        ],
+        [
+          "norm",
+          237771.0300000001,
+          "triton_red_fused_add_cat_index_select_mul_rms_norm_split_split_with_sizes_sub_unsqueeze_view_3"
+        ],
+        [
+          "gemm",
+          218182.946,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+        ],
+        [
+          "attention",
+          162967.38299999997,
+          "void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, unsigned char, (vllm::Fp8KVCacheDataType)1>(__nv_bfloat16 const*, __nv_bfloat16 con"
+        ],
+        [
+          "norm",
+          116776.52400000008,
+          "triton_red_fused_fused_add_rms_norm_2"
+        ],
+        [
+          "norm",
+          78703.07300000002,
+          "triton_red_fused_fused_add_rms_norm_0"
+        ],
+        [
+          "quantize",
+          57917.28199999997,
+          "void vllm::scaled_fp8_quant_kernel_strided_group_shape<c10::BFloat16, c10::Float8_e4m3fn, true, true>(c10::Float8_e4m3fn*, c10::BFloat16 con"
+        ],
+        [
+          "norm",
+          34297.95899999995,
+          "triton_red_fused_rms_norm_split_with_sizes_view_4"
+        ],
+        [
+          "norm",
+          20323.77499999999,
+          "triton_poi_fused_add_index_select_mul_rms_norm_split_split_with_sizes_sub_unsqueeze_view_5"
+        ],
+        [
+          "quantize",
+          11191.054000000016,
+          "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&):"
+        ],
+        [
+          "norm",
+          6751.453999999999,
+          "triton_red_fused_add_cat_index_select_mul_rms_norm_split_split_with_sizes_sub_unsqueeze_view_1"
+        ],
+        [
+          "attention",
+          2885.7490000000003,
+          "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+        ],
+        [
+          "norm",
+          2439.636,
+          "triton_red_fused__to_copy_embedding_rms_norm_0"
+        ],
+        [
+          "gemm",
+          1716.5980000000002,
+          "nvjet_sm90_tst_384x64_64x3_2x1_v_bz_coopB_TNN"
+        ],
+        [
+          "gemm",
+          1445.6899999999998,
+          "nvjet_sm90_tst_384x80_64x3_2x1_v_bz_coopA_TNT"
+        ]
+      ],
+      "profiled_docs": 1024,
+      "profiled_tokens": 381315,
+      "kernel_us_per_token": 10.793
+    },
+    "fusion_on": {
+      "n_kernels": 13839,
+      "total_kernel_us": 4117399.4019999835,
+      "gemm_us": 2110639.5619999995,
+      "gemm_frac": 0.5126,
+      "quantize_us": 758944.8419999983,
+      "quantize_frac": 0.1843,
+      "norm_us": 499145.5070000004,
+      "norm_frac": 0.1212,
+      "elementwise_us": 271908.29099999985,
+      "elementwise_frac": 0.066,
+      "attention_us": 473627.6029999995,
+      "attention_frac": 0.115,
+      "other_us": 3133.596999999992,
+      "other_frac": 0.0008,
+      "fused_norm_quant_us": 0,
+      "fused_norm_quant_frac": 0.0,
+      "fused_act_quant_us": 0,
+      "fused_act_quant_frac": 0.0,
+      "top_kernels": [
+        [
+          "gemm",
+          1054841.1909999994,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u,"
+        ],
+        [
+          "quantize",
+          689815.8159999999,
+          "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*, float*, int, int, "
+        ],
+        [
+          "gemm",
+          497988.76699999947,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+        ],
+        [
+          "gemm",
+          334698.66500000015,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+        ],
+        [
+          "attention",
+          306977.328,
+          "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+        ],
+        [
+          "elementwise",
+          271908.29099999985,
+          "triton_poi_fused_mul_silu_slice_1"
+        ],
+        [
+          "norm",
+          238002.77399999995,
+          "triton_red_fused_add_cat_index_select_mul_rms_norm_split_split_with_sizes_sub_unsqueeze_view_3"
+        ],
+        [
+          "gemm",
+          218247.05799999982,
+          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, 3u, 128u, 256u, 2u, "
+        ],
+        [
+          "attention",
+          163185.13099999988,
+          "void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, unsigned char, (vllm::Fp8KVCacheDataType)1>(__nv_bfloat16 const*, __nv_bfloat16 con"
+        ],
+        [
+          "norm",
+          116835.387,
+          "triton_red_fused_fused_add_rms_norm_2"
+        ],
+        [
+          "norm",
+          78822.037,
+          "triton_red_fused_fused_add_rms_norm_0"
+        ],
+        [
+          "quantize",
+          57872.467,
+          "void vllm::scaled_fp8_quant_kernel_strided_group_shape<c10::BFloat16, c10::Float8_e4m3fn, true, true>(c10::Float8_e4m3fn*, c10::BFloat16 con"
+        ],
+        [
+          "norm",
+          34317.66299999991,
+          "triton_red_fused_rms_norm_split_with_sizes_view_4"
+        ],
+        [
+          "norm",
+          20349.12499999998,
+          "triton_poi_fused_add_index_select_mul_rms_norm_split_split_with_sizes_sub_unsqueeze_view_5"
+        ],
+        [
+          "quantize",
+          11236.849999999991,
+          "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&):"
+        ],
+        [
+          "norm",
+          6808.457000000001,
+          "triton_red_fused_add_cat_index_select_mul_rms_norm_split_split_with_sizes_sub_unsqueeze_view_1"
+        ],
+        [
+          "attention",
+          2867.658000000001,
+          "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, "
+        ],
+        [
+          "norm",
+          2444.34,
+          "triton_red_fused__to_copy_embedding_rms_norm_0"
+        ],
+        [
+          "gemm",
+          1717.0879999999997,
+          "nvjet_sm90_tst_384x64_64x3_2x1_v_bz_coopB_TNN"
+        ],
+        [
+          "gemm",
+          1448.037,
+          "nvjet_sm90_tst_384x80_64x3_2x1_v_bz_coopA_TNT"
+        ]
+      ],
+      "profiled_docs": 1024,
+      "profiled_tokens": 381315,
+      "kernel_us_per_token": 10.798
+    }
+  },
+  "resolved": {
+    "control": {
+      "optimization_level": 2,
+      "compilation_mode": 3,
+      "custom_ops": [
+        "+quant_fp8",
+        "none",
+        "+quant_fp8"
+      ],
+      "cudagraph_capture_sizes": [
+        8192
+      ],
+      "fuse_norm_quant": true,
+      "fuse_act_quant": true,
+      "fuse_attn_quant": false,
+      "eliminate_noops": true
+    },
+    "fusion_off": {
+      "optimization_level": 2,
+      "compilation_mode": 3,
+      "custom_ops": [
+        "+quant_fp8",
+        "none",
+        "+quant_fp8"
+      ],
+      "cudagraph_capture_sizes": [
+        8192
+      ],
+      "fuse_norm_quant": false,
+      "fuse_act_quant": false,
+      "fuse_attn_quant": false,
+      "eliminate_noops": true
+    },
+    "fusion_on": {
+      "optimization_level": 2,
+      "compilation_mode": 3,
+      "custom_ops": [
+        "+quant_fp8",
+        "none",
+        "+quant_fp8"
+      ],
+      "cudagraph_capture_sizes": [
+        8192
+      ],
+      "fuse_norm_quant": true,
+      "fuse_act_quant": true,
+      "fuse_attn_quant": false,
+      "eliminate_noops": true
+    }
+  },
+  "mean_tokens_per_second": {
+    "control": 96212.3,
+    "fusion_off": 95968.2,
+    "fusion_on": 95910.4
+  },
+  "relative_to_control": {
+    "control": 1.0,
+    "fusion_off": 0.9975,
+    "fusion_on": 0.9969
+  }
+}

@@ -41,6 +41,26 @@ Prediction, stated before the run:
   percent the original proposal expected, and fusion_off should equal
   control.
 
+Result: the flags are on but the passes never fire, so all three cells
+are the same engine. Every cell ran exactly 13,839 kernels in the
+profiled window with zero fused norm+quant or silu+quant kernel time,
+and the means were control 96,212, fusion_off 95,968, fusion_on 95,910
+tokens per second - a 0.3 percent spread, inside rep noise. The
+resolved config confirms control does default to fuse_norm_quant=true
+and fuse_act_quant=true at O2, so what fails is the pattern match
+against this checkpoint's per-token-group quantization graph, not the
+flag. The quantize class is the separate per_token_group_quant_8bit
+kernel (16.7 percent of kernel time on its own), and the norm class is
+inductor triton, half of it in the QK-norm+RoPE composite. Neither
+prediction branch fit: flags on (premise right), no fusion (premise's
+conclusion wrong), zero speed difference in either direction. The
+config-only lever is worth zero here; vLLM ships the fused kernels
+(rms_norm_per_block_quant, silu_and_mul_per_block_quant) but reaching
+them needs the pattern fixed, not a flag. Wrong answers were 2,990 of
+10,000 in all nine timed runs with zero disagreements against control.
+Control reproduced the committed 97,637 at 96,212, 1.5 percent low on
+a different container, against a 1 percent prediction.
+
 Run:
     modal run experiments/modal_fusion.py::bankedtrace_main
     modal run experiments/modal_fusion.py::main
@@ -160,7 +180,12 @@ def bankedtrace(pattern: str = "torchprof_*stock*/*rank0*") -> str:
     saved to the results volume. The boot that produced it used the same
     default pass flags as the single-filter control, so fused kernel
     names here mean the control is fused too. Prediction: they are
-    present."""
+    present.
+
+    Result: they are not. The only trace left on the volume was the
+    B=512 component profile; it shows zero fused kernel time, inductor
+    triton norms, and the separate group-quant kernel. The compare run
+    then confirmed the same at B=25,305."""
     import glob
     import gzip
     import json
