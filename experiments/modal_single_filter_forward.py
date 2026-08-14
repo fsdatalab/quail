@@ -134,13 +134,14 @@ def _load_vllm_model():
     # default on, so module calls run vLLM's CUDA kernels eagerly.
     config = EngineArgs(model=MODEL, dtype="bfloat16",
                         enforce_eager=True).create_engine_config()
-    # the model classes read the parallel groups even on one GPU
-    init_distributed_environment(
-        world_size=1, rank=0,
-        distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
-        local_rank=0, backend="nccl")
-    ensure_model_parallel_initialized(1, 1)
     with set_current_vllm_config(config):
+        # the model classes read the parallel groups even on one GPU,
+        # and the group setup itself reads the current config
+        init_distributed_environment(
+            world_size=1, rank=0,
+            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
+            local_rank=0, backend="nccl")
+        ensure_model_parallel_initialized(1, 1)
         model = get_model(vllm_config=config)
     torch.cuda.synchronize()
     return model
