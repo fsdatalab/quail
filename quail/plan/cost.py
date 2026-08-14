@@ -24,11 +24,16 @@ Update them here and nowhere else.
 # sustained 80,556 - and accuracy moves with the same substrate, so a
 # stack change requires re-anchoring both together.
 PHI = 97_000 / 275_000        # serving rate over spec ceiling, 4B anchor
-ENGINE_OVERHEAD_S = 3.2       # c0: per-query software residue at 10k docs.
-                              # NOT re-anchored: the flight measured up to
-                              # 45 percent wall spread across containers
-                              # (host variance), so c0 waits for a
-                              # host-controlled protocol.
+ENGINE_OVERHEAD_S = 0.026     # c0: per-query software residue at 10k docs,
+                              # planned arm. From the c0 anchor protocol
+                              # (results/engine/c0_anchor.json): wall minus
+                              # reads x corpus at the rate the same
+                              # container's probe served, so host speed
+                              # cancels out of the subtraction. Rewind
+                              # median 0.026 s (reps 0.013/0.026/0.244);
+                              # stock median 0.659. The old 3.2 was
+                              # fleet-anchored and booked host variance
+                              # as overhead.
 BOOT_POOL_FRACTION = 0.92     # gpu_memory_utilization we ship
 POOL_HEADROOM = 0.80          # admission budget stays under the pool by this
 ENGINE_SEQS_MAX = 4096        # hard bound on max_num_seqs at boot:

@@ -20,6 +20,8 @@ image read 80,556 and are not kept.
 | `cost_model_fit.json` | `quail.plan.fit` | the fitted step, host, and prefill models, with t_read, eps, and the offload-vs-recompute crossover per transfer tier |
 | `calibrate_alpha.json`, `calibrate_c1.json`, `calibrate_c2-c4-c5.json`, `calibrate_c6.json` | `modal_calibrate.py --families <fam>` | the staged gate-check runs, one container each; the fits read only `calibrate_all.json` because rows from different containers must not mix |
 | `attnshare.json` | `modal_profiling.py::attnshare` | kernel-class shares of single-document prefills by length on the calibration boot, with each length's top kernels by time; says where attention overtakes the GEMMs |
+| `c0_anchor.json` | `modal_filters.py::c0_anchor` | the filter comparison with an in-container rate probe; each cell carries c0 = wall - reads x corpus / rate, so host speed cancels |
+| `makespan_check.json` | `quail.plan.validate` | predicted against measured query walls per arm, at fleet constants and at the anchor container's own rate and c0 |
 
 ## One measurement caveat
 

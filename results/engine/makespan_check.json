@@ -1,0 +1,88 @@
+{
+  "model": "Qwen3-4B-FP8",
+  "device": "H100-SXM-80GB",
+  "rows": [
+    {
+      "source": "anchor",
+      "arm": "rewind",
+      "walls": [
+        39.861,
+        39.643,
+        39.63
+      ],
+      "wall_mean_s": 39.711,
+      "reads_measured": 1.197,
+      "tokens_predicted": 4056803,
+      "reads_basis": "model: corpus once plus thinned question tails",
+      "fleet": {
+        "rate_tok_s": 96951.0,
+        "c0_s": 0.026,
+        "predicted_s": 41.87,
+        "error": 0.0544
+      },
+      "container": {
+        "rate_tok_s": 96803.7,
+        "c0_s": 0.026,
+        "predicted_s": 41.934,
+        "error": 0.056
+      }
+    },
+    {
+      "source": "anchor",
+      "arm": "stock",
+      "walls": [
+        41.302,
+        41.03,
+        41.337
+      ],
+      "wall_mean_s": 41.223,
+      "reads_measured": 1.228,
+      "tokens_predicted": 3935478,
+      "reads_basis": "measured reads (the estimator does not predict prefix-cache eviction)",
+      "fleet": {
+        "rate_tok_s": 96951.0,
+        "c0_s": 0.026,
+        "predicted_s": 40.618,
+        "error": -0.0147
+      }
+    },
+    {
+      "source": "banked",
+      "arm": "rewind",
+      "walls": [
+        39.994,
+        39.828,
+        39.694
+      ],
+      "wall_mean_s": 39.839,
+      "reads_measured": 1.197,
+      "tokens_predicted": 4056803,
+      "reads_basis": "model: corpus once plus thinned question tails",
+      "fleet": {
+        "rate_tok_s": 96951.0,
+        "c0_s": 0.026,
+        "predicted_s": 41.87,
+        "error": 0.051
+      }
+    },
+    {
+      "source": "banked",
+      "arm": "stock",
+      "walls": [
+        42.831,
+        42.773,
+        43.161
+      ],
+      "wall_mean_s": 42.922,
+      "reads_measured": 1.228,
+      "tokens_predicted": 3935478,
+      "reads_basis": "measured reads (the estimator does not predict prefix-cache eviction)",
+      "fleet": {
+        "rate_tok_s": 96951.0,
+        "c0_s": 0.026,
+        "predicted_s": 40.618,
+        "error": -0.0537
+      }
+    }
+  ]
+}

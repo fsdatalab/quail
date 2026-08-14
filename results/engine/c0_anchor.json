@@ -1,0 +1,110 @@
+{
+  "n_docs": 10000,
+  "model": "Qwen/Qwen3-4B-FP8",
+  "corpus_tokens": 3203917,
+  "n_filters": 5,
+  "selectivity": [
+    0.9,
+    0.9,
+    0.9,
+    0.8,
+    0.8
+  ],
+  "budget_tokens": 749782,
+  "stock_semaphore": 2048,
+  "step_tokens": 25305,
+  "max_num_seqs": 4096,
+  "cells": [
+    {
+      "arm": "rewind",
+      "rep": 0,
+      "wall": 39.861,
+      "requests": 10000,
+      "reads": 1.197,
+      "reads_source": "step-trace",
+      "client_reads": 1.143,
+      "wrong": 6184,
+      "answered": 23310,
+      "survivors": 2062,
+      "token_work_s": 39.617,
+      "c0_s": 0.244
+    },
+    {
+      "arm": "rewind",
+      "rep": 1,
+      "wall": 39.643,
+      "requests": 10000,
+      "reads": 1.197,
+      "reads_source": "step-trace",
+      "client_reads": 1.143,
+      "wrong": 6184,
+      "answered": 23310,
+      "survivors": 2062,
+      "token_work_s": 39.617,
+      "c0_s": 0.026
+    },
+    {
+      "arm": "rewind",
+      "rep": 2,
+      "wall": 39.63,
+      "requests": 10000,
+      "reads": 1.197,
+      "reads_source": "step-trace",
+      "client_reads": 1.143,
+      "wrong": 6184,
+      "answered": 23310,
+      "survivors": 2062,
+      "token_work_s": 39.617,
+      "c0_s": 0.013
+    },
+    {
+      "arm": "stock",
+      "rep": 0,
+      "wall": 41.302,
+      "requests": 23315,
+      "reads": 1.228,
+      "reads_source": "client",
+      "client_reads": 1.228,
+      "wrong": 6193,
+      "answered": 23315,
+      "survivors": 2051,
+      "token_work_s": 40.643,
+      "c0_s": 0.659
+    },
+    {
+      "arm": "stock",
+      "rep": 1,
+      "wall": 41.03,
+      "requests": 23318,
+      "reads": 1.229,
+      "reads_source": "client",
+      "client_reads": 1.229,
+      "wrong": 6192,
+      "answered": 23318,
+      "survivors": 2052,
+      "token_work_s": 40.676,
+      "c0_s": 0.354
+    },
+    {
+      "arm": "stock",
+      "rep": 2,
+      "wall": 41.337,
+      "requests": 23315,
+      "reads": 1.228,
+      "reads_source": "client",
+      "client_reads": 1.228,
+      "wrong": 6193,
+      "answered": 23315,
+      "survivors": 2051,
+      "token_work_s": 40.643,
+      "c0_s": 0.694
+    }
+  ],
+  "probe": {
+    "rate_tok_s": 96803.7,
+    "probe_tokens": 3662397,
+    "probe_wall_s": 37.833,
+    "probe_docs": 10000,
+    "boot": "stock"
+  }
+}
