@@ -83,7 +83,7 @@ def _median(xs):
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
 def calibrate(families: str = "all", reps: int = 5,
-              warmups: int = 2) -> str:
+              warmups: int = 2, kvs: str = "fp8") -> str:
     # Env before any vllm import: the engine must run in this process
     # (shared clock, requests queued before the first step, trace file
     # readable per cell), and strict single-tenant mode would refuse
@@ -108,6 +108,8 @@ def calibrate(families: str = "all", reps: int = 5,
                           nonce_alphabet, sched_cfg, yes_no_ids)
 
     tag = families.replace(",", "-")
+    if kvs != "fp8":
+        tag += "_kv-" + kvs.replace(",", "-")
     outpath = f"/results/calibrate_{tag}.json"
     rows = []
 
@@ -207,7 +209,14 @@ def calibrate(families: str = "all", reps: int = 5,
             spread=round(spread, 4) if spread is not None else None,
             stable=spread is not None and spread <= SPREAD_FLAG)
 
-    if cells:
+    # One boot per requested KV format, all in this container, so a
+    # format comparison never crosses hosts. Rows carry their format.
+    mark = 0
+    for kv in [k.strip() for k in kvs.split(",") if k.strip()]:
+        if not cells:
+            break
+        if kv not in ("fp8", "bf16"):
+            raise ValueError(f"kv must be fp8 or bf16, got {kv!r}")
         # Two boot overrides the sweeps required, recorded in the boot
         # row. enforce_eager: the single 8,192-token CUDA graph padded
         # every smaller step to 8,192 tokens (alpha walls at h=512,
@@ -216,11 +225,11 @@ def calibrate(families: str = "all", reps: int = 5,
         # GPU wait outside the schedule-to-update window that exec_ms
         # measures; the step trace needs the synchronous engine.
         boot = dict(calib.BOOT, enforce_eager=True,
-                    async_scheduling=False)
+                    async_scheduling=False, kv=kv)
         print(f"[calib] boot {boot}", flush=True)
         llm = LLM(
             model=MODEL,
-            kv_cache_dtype="fp8",
+            kv_cache_dtype="fp8" if kv == "fp8" else "auto",
             max_model_len=boot["max_model_len"],
             max_num_seqs=boot["max_num_seqs"],
             max_num_batched_tokens=boot["max_num_batched_tokens"],
@@ -236,14 +245,13 @@ def calibrate(families: str = "all", reps: int = 5,
             })
         pool_tokens = kv_pool_tokens(llm) or 946_800
         kept, dropped = calib.feasible(cells, pool_tokens)
-        emit(dict(meta="boot", families=families, boot=boot,
+        emit(dict(meta="boot", families=families, kv=kv, boot=boot,
                   sched=sched_cfg(llm), pool_tokens=pool_tokens,
                   dropped=dropped, reps=reps, warmups=warmups,
                   stamp=IMAGE_STAMP, vllm=vllm.__version__))
 
         ordered = [calib.drift_cell("start")] + kept + [
             calib.drift_cell("end")]
-        mark = 0
         for cell in ordered:
             rounds, mark = run_cell_once(llm, cell, mark)
             row = summarize(cell, rounds, attempt=1)
@@ -253,6 +261,7 @@ def calibrate(families: str = "all", reps: int = 5,
                       flush=True)
                 rounds, mark = run_cell_once(llm, cell, mark)
                 row = summarize(cell, rounds, attempt=2)
+            row["kv"] = kv
             emit(row)
 
         del llm
@@ -340,10 +349,13 @@ def transport_rows(torch):
 
 @app.local_entrypoint()
 def main(families: str = "all", reps: int = 5, warmups: int = 2,
-         out: str = ""):
-    data = calibrate.remote(families=families, reps=reps, warmups=warmups)
-    out = out or ("results/engine/calibrate_"
-                  f"{families.replace(',', '-')}.json")
+         kvs: str = "fp8", out: str = ""):
+    data = calibrate.remote(families=families, reps=reps, warmups=warmups,
+                            kvs=kvs)
+    tag = families.replace(",", "-")
+    if kvs != "fp8":
+        tag += "_kv-" + kvs.replace(",", "-")
+    out = out or f"results/engine/calibrate_{tag}.json"
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
         f.write(data)
