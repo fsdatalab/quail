@@ -389,11 +389,13 @@ The estimator prices the full query from the constants above, with
 no hand-set rate: computed tokens at 1/STEP_TOKEN_S (the batch
 sweep), later stages' re-reads of resident context at the cached
 price, the per-step fixed cost amortized at the boot's step budget,
-and the 26 ms residue. (One term is knowingly omitted: the
-quadratic prefill surcharge needs the corpus's squared lengths,
-which the run reports do not carry — about half a second low at
-these document lengths.) Measured walls exist from two runs of the
-same query in two containers:
+and the 26 ms residue, plus the centered quadratic surcharge: since
+the sustained rate was measured on this very corpus, its attention
+profile (472 squared tokens per token) is already inside the rate,
+so the surcharge charges only a corpus's excess over that profile —
+and on this corpus it is zero by construction, which the check
+confirms to the millisecond. Measured walls exist from two runs of
+the same query in two containers:
 
 - **This week's run** — the c0 anchor of Section 10; its container's
   own serving rate is known (96,804 tokens per second).

@@ -30,6 +30,14 @@ Update them here and nowhere else.
 # are priced by spec-ratio scaling from it (see _scale).
 CAL_MODEL_P = 3.6e9           # Qwen3 4B dense params
 CAL_DEVICE_RD = 1.979e15      # H100 SXM fp8 dense FLOP/s
+CAL_SQ_PER_TOKEN = 472.44     # the calibration corpus's squared-length
+#                               sum over its token sum
+#                               (modal_filters.py::stats, 10k docs).
+#                               STEP_TOKEN_S was measured on that
+#                               corpus, so its rate already embeds
+#                               a2 * this much attention per token;
+#                               the quadratic surcharge must charge
+#                               only the excess or it double-counts.
 ENGINE_OVERHEAD_S = 0.026     # c0: per-query software residue at 10k docs,
                               # planned arm. From the c0 anchor protocol
                               # (results/engine/c0_anchor.json): wall minus
@@ -173,17 +181,26 @@ def stage_survivals(n_filters, selectivity):
 def t_in(model, device, shard_tokens, access="read", store_read_bw=None,
          doc_sq_tokens=0.0):
     """The input pass over the heaviest shard: compute every token
-    once at the sustained rate plus the quadratic attention surcharge
-    over the shard's documents (doc_sq_tokens = sum of squared
-    document lengths; 0 drops the surcharge for callers that cannot
-    supply it), or load the persisted KV bytes from a warm store at
+    once at the sustained rate plus the quadratic attention
+    surcharge, or load the persisted KV bytes from a warm store at
     the store's bandwidth - whichever access the plan selected (the
     restore side pays only the read, because the write was paid at
-    ingest)."""
+    ingest).
+
+    The surcharge is centered: the sustained rate was measured on the
+    calibration corpus and already embeds a2 * CAL_SQ_PER_TOKEN of
+    attention per token, so only the shard's excess squared length
+    over that profile is charged (a shorter-profile corpus gets the
+    matching discount). doc_sq_tokens = sum of squared document
+    lengths; 0 drops the surcharge entirely for callers that cannot
+    supply corpus shape."""
     if access == "restore":
         return shard_tokens * model.kappa / store_read_bw
-    return (shard_tokens * token_seconds(model, device)
-            + doc_sq_tokens * attn_seconds_per_token2(model, device))
+    linear = shard_tokens * token_seconds(model, device)
+    if not doc_sq_tokens:
+        return linear
+    excess = doc_sq_tokens - shard_tokens * CAL_SQ_PER_TOKEN
+    return linear + excess * attn_seconds_per_token2(model, device)
 
 
 def quest_token_count(n_docs, workers, n_filters, question_tokens=46,

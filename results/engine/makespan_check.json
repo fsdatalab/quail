@@ -1,7 +1,6 @@
 {
   "model": "Qwen3-4B-FP8",
   "device": "H100-SXM-80GB",
-  "note": "quadratic prefill surcharge omitted: reports carry no squared-length sum (~0.5 s low here)",
   "rows": [
     {
       "source": "anchor",
@@ -14,6 +13,7 @@
       "wall_mean_s": 39.711,
       "reads_measured": 1.197,
       "stages_per_doc": 2.331,
+      "a2_surcharge_s": -0.0,
       "reads_basis": "model: corpus once plus thinned tails",
       "designed": {
         "computed_tokens": 4056803,
@@ -43,6 +43,7 @@
       "wall_mean_s": 41.223,
       "reads_measured": 1.228,
       "stages_per_doc": 2.3316,
+      "a2_surcharge_s": -0.0,
       "reads_basis": "measured reads (the estimator does not predict prefix-cache eviction)",
       "designed": {
         "computed_tokens": 3935478,
@@ -68,6 +69,7 @@
       "wall_mean_s": 39.839,
       "reads_measured": 1.197,
       "stages_per_doc": 2.3312,
+      "a2_surcharge_s": -0.0,
       "reads_basis": "model: corpus once plus thinned tails",
       "designed": {
         "computed_tokens": 4056803,
@@ -93,6 +95,7 @@
       "wall_mean_s": 42.922,
       "reads_measured": 1.228,
       "stages_per_doc": 2.3316,
+      "a2_surcharge_s": -0.0,
       "reads_basis": "measured reads (the estimator does not predict prefix-cache eviction)",
       "designed": {
         "computed_tokens": 3935478,

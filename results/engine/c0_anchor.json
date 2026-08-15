@@ -106,5 +106,6 @@
     "probe_wall_s": 37.833,
     "probe_docs": 10000,
     "boot": "stock"
-  }
+  },
+  "corpus_sq_tokens": 1513643955
 }

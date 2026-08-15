@@ -6,11 +6,10 @@ query actually took. Since the estimator was rewired to measured
 constants, a prediction here is: computed tokens at the sustained
 per-token cost (1/STEP_TOKEN_S, the batch-sweep rate), later stages'
 re-reads of resident context at the cached-read price, the per-step
-fixed cost amortized at the boot's step budget, and the measured
-per-query residue. The quadratic prefill surcharge is omitted - the
-banked reports do not carry the corpus's squared lengths - and the
-omission is noted in the output (about half a second low at this
-corpus's document lengths).
+fixed cost amortized at the boot's step budget, the centered
+quadratic surcharge when the report carries the corpus's squared
+lengths (near zero on the calibration corpus by construction), and
+the measured per-query residue.
 
 Each prediction comes in two selectivity variants:
 
@@ -38,7 +37,8 @@ Run:
 import json
 
 from ..configs import DEVICES, MODELS
-from .cost import (ENGINE_OVERHEAD_S, STEP_FIXED_S, quest_read_tokens,
+from .cost import (CAL_SQ_PER_TOKEN, ENGINE_OVERHEAD_S, STEP_FIXED_S,
+                   attn_seconds_per_token2, quest_read_tokens,
                    quest_token_count, read_seconds_per_token,
                    token_seconds)
 
@@ -96,6 +96,14 @@ def check(anchor, banked=None, model_name="Qwen3-4B-FP8",
         step_tokens = rep.get("step_tokens", 25_305)
         mean_doc = corpus / n_docs
         probe = rep.get("probe")
+        # centered quadratic surcharge: zero when the report predates
+        # corpus_sq_tokens, and ~zero on the calibration corpus by
+        # construction (its profile is embedded in the sustained rate)
+        corpus_sq = rep.get("corpus_sq_tokens")
+        a2_s = 0.0
+        if corpus_sq:
+            a2_s = ((corpus_sq - corpus * CAL_SQ_PER_TOKEN)
+                    * attn_seconds_per_token2(model, device))
         for arm in ("rewind", "stock"):
             cells = [c for c in rep["cells"] if c["arm"] == arm]
             if not cells:
@@ -119,7 +127,8 @@ def check(anchor, banked=None, model_name="Qwen3-4B-FP8",
                     computed = reads_mean * corpus
                     basis = ("measured reads (the estimator does not "
                              "predict prefix-cache eviction)")
-                pred = price(model, device, computed, r, step_tokens)
+                pred = price(model, device, computed, r,
+                             step_tokens) + a2_s
                 variants[name] = dict(
                     computed_tokens=round(computed),
                     read_tokens=round(r),
@@ -132,7 +141,7 @@ def check(anchor, banked=None, model_name="Qwen3-4B-FP8",
                                    step_tokens,
                                    c0=c0s[len(c0s) // 2],
                                    s_per_token=1.0
-                                   / probe["rate_tok_s"])
+                                   / probe["rate_tok_s"]) + a2_s
                         variants["container_effective"] = dict(
                             predicted_s=round(pc, 3),
                             error=round((pc - wall_mean) / wall_mean,
@@ -142,11 +151,10 @@ def check(anchor, banked=None, model_name="Qwen3-4B-FP8",
                 wall_mean_s=round(wall_mean, 3),
                 reads_measured=round(reads_mean, 3),
                 stages_per_doc=round(stages_per_doc, 4),
+                a2_surcharge_s=round(a2_s, 4) if corpus_sq else
+                "omitted: report lacks corpus_sq_tokens",
                 reads_basis=basis, **variants))
-    return dict(model=model.name, device=device.name,
-                note="quadratic prefill surcharge omitted: reports "
-                     "carry no squared-length sum (~0.5 s low here)",
-                rows=rows)
+    return dict(model=model.name, device=device.name, rows=rows)
 
 
 def main(argv=None):

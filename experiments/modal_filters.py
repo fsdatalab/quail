@@ -110,6 +110,7 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
 
     report = dict(n_docs=n_docs, model=MODEL, kv=kv,
                   corpus_tokens=corpus,
+                  corpus_sq_tokens=sum(len(b) ** 2 for b in body_ids),
                   n_filters=N_FILTERS, selectivity=list(SELECTIVITY),
                   budget_tokens=budget, stock_semaphore=stock_sem,
                   step_tokens=plan.engine_step_tokens,
@@ -285,6 +286,30 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
         json.dump(report, f, indent=2)
     results_vol.commit()
     return report
+
+
+@app.function(image=filters_image, timeout=900,
+              volumes={"/root/.cache/huggingface": hf_cache})
+def corpus_stats(n_docs: int = 10000) -> dict:
+    """Corpus shape for the estimator, no GPU: token totals and the
+    squared-length sum the quadratic surcharge needs."""
+    from transformers import AutoTokenizer
+
+    from workload import build_corpus
+
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    body_ids, _q, _f = build_corpus(tok, n_docs)
+    lens = [len(b) for b in body_ids]
+    return dict(n_docs=n_docs, corpus_tokens=sum(lens),
+                corpus_sq_tokens=sum(x * x for x in lens),
+                max_doc_tokens=max(lens),
+                sq_per_token=round(sum(x * x for x in lens)
+                                   / sum(lens), 2))
+
+
+@app.local_entrypoint()
+def stats(n_docs: int = 10000):
+    print(json.dumps(corpus_stats.remote(n_docs), indent=2))
 
 
 @app.local_entrypoint()
