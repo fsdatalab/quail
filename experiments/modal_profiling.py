@@ -721,7 +721,7 @@ def ncubench() -> str:
 
 @app.function(image=prof_image, gpu="H100!", timeout=900,
               volumes={"/results": results_vol})
-def ncureport() -> str:
+def ncureport(report: str = "/results/ncu_gemm_bench.ncu-rep") -> str:
     """Render the banked ncu report's details page: the per-kernel
     Compute (SM) and DRAM throughput rows. DRAM at 28-30 percent
     against Compute at 91-93 is the expected shape for a
@@ -735,14 +735,15 @@ def ncureport() -> str:
         "cuda-nsight-compute-13-0 >/dev/null 2>&1", shell=True)
     ncu = glob.glob("/opt/nvidia/nsight-compute/*/ncu")[0]
     r = subprocess.run(
-        [ncu, "--import", "/results/ncu_gemm_bench.ncu-rep",
-         "--page", "details"], capture_output=True, text=True)
+        [ncu, "--import", report, "--page", "details"],
+        capture_output=True, text=True)
     keep = [ln for ln in r.stdout.splitlines()
-            if any(k in ln for k in ("nvjet", "Compute (SM)",
+            if any(k in ln for k in ("nvjet", "sm90_fp8", "deep_gemm",
+                                     "Compute (SM)",
                                      "Memory Throughput",
                                      "DRAM Throughput", "Duration",
                                      "Elapsed Cycles"))]
-    out = "\n".join(keep[:60]) or r.stdout[-2000:] + r.stderr[-500:]
+    out = "\n".join(keep[:400]) or r.stdout[-2000:] + r.stderr[-500:]
     print(out, flush=True)
     return out[:6000]
 
