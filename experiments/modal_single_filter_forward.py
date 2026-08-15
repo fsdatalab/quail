@@ -259,6 +259,28 @@ Round 5 prediction, stated before the run, with honest uncertainty:
   - numerics: dequantized agreement with the a path at one fp8
     rounding step; answers within tens of round 4's 2,213.
 
+Round 5 result: the negative branch, with the numbers to close it.
+Our Triton multiply alone ran the gate_up shape in 4,233 us against
+DeepGEMM's 1,877 - 2.26x off, far outside the within-15-percent
+condition - so the fused version (4,562) lost to the champion pair
+(2,479) and the pipeline keeps DeepGEMM with the separate silu
+kernel. The epilogue also underperformed its band at equal multiply
+quality: fused against plain-plus-kernel saved 4.8 percent, not 15
+to 25, because the silu and quant work in the closing phase slowed
+our multiply by 329 us - a multiply this far from optimal is not
+limited by its output writes, so deleting them buys little.
+Numerics were correct within one fp8 step at the top of the range.
+No timed run launched, per the committed rule. The hardware
+counters (results/engine/ncu_deepgemm_details.txt) give the real
+kernels' utilization for the first time: 84 to 91 percent of the
+compute ceiling in isolation (qkv 84.3, o 86.4, down 90.9; the
+gate_up render was undersampled), against about 70 percent
+effective in-pipeline by flop arithmetic - the gap is tail waves,
+not slow kernels, and the remaining multiply headroom is thoroughly
+defended. Round 4 stands as this branch's result: 119,629 tokens
+per second, 18.6 percent over the best engine configuration, more
+accurate than every engine cell, with no engine and no KV.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
