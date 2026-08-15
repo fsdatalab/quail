@@ -206,6 +206,24 @@ Round 4 prediction, stated before the run:
   partly hidden elsewhere (the profiled classes misattribute it) and
   the profiled repetition says where.
 
+Round 4 result: above the predicted band, and the probe explained
+why before the timed run. The microbenchmark showed the four-step
+path really costs 1,257 us per call - about double what the norm
+class displayed, the rest hiding in the rotate and copy steps under
+other classes - and the fused kernel runs it in 184.5 us, 6.8x.
+Means: engine bf16-KV 100,904, packed custom 102,536, packed custom
+with the qk kernel 119,629 tokens per second - 16.7 percent over
+the round-3 cell against the predicted 7 to 11, and 18.6 percent
+over the best engine configuration. In the profile the norm class
+fell from 9.1 to 3.1 percent (the remainder is the fused kernel
+itself plus the layer-0 and final norms) and the other class fell
+from 5.2 percent to almost nothing; window kernel time went from
+3.72 to 3.23 s. Wrong answers 2,213 of 10,000, within the predicted
+tens of round 3's 2,191 and still better than every engine cell.
+The pipeline is now 68 percent matrix multiplies and 8 percent
+attention; what remains fusable is about 420 ms of quant work per
+window and the epilogue idea inside the gate_up multiply.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
