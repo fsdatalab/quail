@@ -153,6 +153,31 @@ window.
   - custom-variant answers stay within about 100 disagreements of
     the separate packed variant, wrong near 2,228.
 
+Round 3 result: the central claims held and two numbers beat their
+bands. Means on this container: engine fp8-KV 95,902, engine bf16-KV
+101,518, packed separate 92,991, packed custom 103,913 tokens per
+second. The custom cell is the fastest and the most accurate
+configuration this project has measured: 8.4 percent over the
+committed engine control, 2.4 percent over the fairest engine
+configuration, with 2,191 wrong of 10,000 against the committed
+control's 2,990. The custom kernels beat the separate packed cell by
+11.7 percent end to end, above the predicted 5 to 10: the profiled
+window's kernel time fell from 4.113 to 3.679 s, the separate silu
+kernel is gone, and silu_mul_quant runs 301 ms where the pair it
+replaces cost about 722. The probe microbenchmark had already
+exceeded its gates (custom silu+quant 464 us per call against 1,078
+for the pair and 1,370 for vLLM's fused kernel; custom norm+quant
+160 against 329). The bf16-KV engine confirmed the accuracy
+mechanism exactly - 2,225 wrong against the packed pipeline's 2,228,
+so the fp8 KV cache costs the engine 765 answers on this workload -
+and broke the speed prediction in the good direction: 5.9 percent
+faster than the fp8-KV engine instead of the predicted within-1,
+because the fp8 KV path also pays conversion work on every cache
+write and attention read. For a single filter, where no KV stays
+resident, fp8 KV was the wrong setting in the committed control all
+along; bf16 KV is the correctly configured engine baseline for this
+comparison, and the custom packed cell beats it too.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare

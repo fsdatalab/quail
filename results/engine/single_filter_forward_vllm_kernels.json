@@ -11,29 +11,59 @@
     {
       "method": "vllm",
       "rep": 0,
-      "wall": 37.4318,
-      "tokens_per_second": 97882.5,
-      "wrong": 2990
+      "wall": 38.0646,
+      "tokens_per_second": 96255.3,
+      "wrong": 2990,
+      "kv_cache_dtype": "fp8"
     },
     {
       "method": "vllm",
       "rep": 1,
-      "wall": 37.3408,
-      "tokens_per_second": 98121.1,
-      "wrong": 2990
+      "wall": 38.2354,
+      "tokens_per_second": 95825.3,
+      "wrong": 2990,
+      "kv_cache_dtype": "fp8"
     },
     {
       "method": "vllm",
       "rep": 2,
-      "wall": 37.321,
-      "tokens_per_second": 98173.1,
-      "wrong": 2990
+      "wall": 38.315,
+      "tokens_per_second": 95626.2,
+      "wrong": 2990,
+      "kv_cache_dtype": "fp8"
     },
     {
-      "method": "packed_sep_fa3_eager",
+      "method": "vllm_bf16kv",
       "rep": 0,
-      "wall": 38.7219,
-      "tokens_per_second": 94621.4,
+      "wall": 36.0122,
+      "tokens_per_second": 101741.1,
+      "wrong": 2225,
+      "kv_cache_dtype": "auto",
+      "disagrees_with_vllm": 1775
+    },
+    {
+      "method": "vllm_bf16kv",
+      "rep": 1,
+      "wall": 36.0973,
+      "tokens_per_second": 101501.2,
+      "wrong": 2225,
+      "kv_cache_dtype": "auto",
+      "disagrees_with_vllm": 1775
+    },
+    {
+      "method": "vllm_bf16kv",
+      "rep": 2,
+      "wall": 36.1651,
+      "tokens_per_second": 101311.0,
+      "wrong": 2225,
+      "kv_cache_dtype": "auto",
+      "disagrees_with_vllm": 1775
+    },
+    {
+      "method": "packed_sep_fa3",
+      "rep": 0,
+      "wall": 39.3204,
+      "tokens_per_second": 93181.0,
       "wrong": 2228,
       "disagrees_with_vllm": 1802,
       "attention": "fa3",
@@ -42,10 +72,10 @@
       "peak_allocated_gib": 7.562
     },
     {
-      "method": "packed_sep_fa3_eager",
+      "method": "packed_sep_fa3",
       "rep": 1,
-      "wall": 38.7436,
-      "tokens_per_second": 94568.4,
+      "wall": 39.4247,
+      "tokens_per_second": 92934.5,
       "wrong": 2228,
       "disagrees_with_vllm": 1802,
       "attention": "fa3",
@@ -54,10 +84,10 @@
       "peak_allocated_gib": 7.562
     },
     {
-      "method": "packed_sep_fa3_eager",
+      "method": "packed_sep_fa3",
       "rep": 2,
-      "wall": 38.7254,
-      "tokens_per_second": 94612.7,
+      "wall": 39.4565,
+      "tokens_per_second": 92859.6,
       "wrong": 2228,
       "disagrees_with_vllm": 1802,
       "attention": "fa3",
@@ -66,309 +96,201 @@
       "peak_allocated_gib": 7.562
     },
     {
-      "method": "packed_sep_fa3_graphs",
+      "method": "packed_customfused_fa3",
       "rep": 0,
-      "wall": 39.3096,
-      "tokens_per_second": 93206.6,
-      "wrong": 2228,
-      "disagrees_with_vllm": 1802,
+      "wall": 35.4168,
+      "tokens_per_second": 103451.3,
+      "wrong": 2191,
+      "disagrees_with_vllm": 1779,
       "attention": "fa3",
-      "cudagraphs": true,
+      "cudagraphs": false,
       "persistent_kv": false,
-      "peak_allocated_gib": 4.547
+      "peak_allocated_gib": 7.567
     },
     {
-      "method": "packed_sep_fa3_graphs",
+      "method": "packed_customfused_fa3",
       "rep": 1,
-      "wall": 39.316,
-      "tokens_per_second": 93191.4,
-      "wrong": 2228,
-      "disagrees_with_vllm": 1802,
+      "wall": 35.1724,
+      "tokens_per_second": 104170.2,
+      "wrong": 2191,
+      "disagrees_with_vllm": 1779,
       "attention": "fa3",
-      "cudagraphs": true,
+      "cudagraphs": false,
       "persistent_kv": false,
-      "peak_allocated_gib": 4.547
+      "peak_allocated_gib": 7.567
     },
     {
-      "method": "packed_sep_fa3_graphs",
+      "method": "packed_customfused_fa3",
       "rep": 2,
-      "wall": 39.3127,
-      "tokens_per_second": 93199.3,
-      "wrong": 2228,
-      "disagrees_with_vllm": 1802,
+      "wall": 35.1904,
+      "tokens_per_second": 104117.1,
+      "wrong": 2191,
+      "disagrees_with_vllm": 1779,
       "attention": "fa3",
-      "cudagraphs": true,
+      "cudagraphs": false,
       "persistent_kv": false,
-      "peak_allocated_gib": 4.547
-    },
-    {
-      "method": "packed_fused_fa3_graphs",
-      "rep": 0,
-      "wall": 41.6044,
-      "tokens_per_second": 88065.6,
-      "wrong": 2152,
-      "disagrees_with_vllm": 1798,
-      "attention": "fa3",
-      "cudagraphs": true,
-      "persistent_kv": false,
-      "peak_allocated_gib": 4.547
-    },
-    {
-      "method": "packed_fused_fa3_graphs",
-      "rep": 1,
-      "wall": 41.6031,
-      "tokens_per_second": 88068.3,
-      "wrong": 2152,
-      "disagrees_with_vllm": 1798,
-      "attention": "fa3",
-      "cudagraphs": true,
-      "persistent_kv": false,
-      "peak_allocated_gib": 4.547
-    },
-    {
-      "method": "packed_fused_fa3_graphs",
-      "rep": 2,
-      "wall": 41.6294,
-      "tokens_per_second": 88012.6,
-      "wrong": 2152,
-      "disagrees_with_vllm": 1798,
-      "attention": "fa3",
-      "cudagraphs": true,
-      "persistent_kv": false,
-      "peak_allocated_gib": 4.547
+      "peak_allocated_gib": 7.567
     }
   ],
   "profiles": {
-    "packed_sep_fa3_eager": {
-      "total_kernel_us": 4034130.3,
-      "gemm_frac": 0.4911,
-      "quantize_frac": 0.2082,
-      "norm_frac": 0.1284,
-      "elementwise_frac": 0.0701,
-      "attention_frac": 0.0564,
-      "other_frac": 0.0458,
+    "packed_sep_fa3": {
+      "total_kernel_us": 4112826.3,
+      "gemm_frac": 0.4939,
+      "quantize_frac": 0.2085,
+      "norm_frac": 0.126,
+      "elementwise_frac": 0.0694,
+      "attention_frac": 0.0568,
+      "other_frac": 0.0454,
       "fused_kernels": {},
       "top_kernels": [
         [
           "gemm",
-          986347.7,
+          1014413.5,
           "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u,"
         ],
         [
           "quantize",
-          645851.3,
+          661030.0,
           "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*"
         ],
         [
           "gemm",
-          473246.4,
+          483014.2,
           "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, "
         ],
         [
           "norm",
-          334610.2,
+          334775.9,
           "void vllm::rms_norm_kernel<c10::BFloat16, 8, 2, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long"
         ],
         [
           "gemm",
-          313767.5,
+          322423.9,
           "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, "
         ],
         [
           "elementwise",
-          282923.8,
+          285331.5,
           "void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162, &(c10::BFloat16 vllm::silu_kernel<c10::BFloat16>(c10::BFloa"
         ],
         [
           "attention",
-          226003.9,
+          231940.2,
           "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute"
         ],
         [
           "gemm",
-          207620.3,
+          211595.5,
           "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, "
         ],
         [
           "quantize",
-          184889.1,
+          187151.7,
           "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T"
         ],
         [
-          "norm",
-          183437.4,
-          "std::enable_if<(((8)>(0)))&&vllm::_typeConvert<c10::BFloat16>::exists, void>::type vllm::fused_add_rms_norm_kernel<c10::"
-        ],
-        [
           "other",
-          183324.7,
+          185451.8,
           "void vllm::rotary_embedding_kernel<c10::BFloat16, c10::BFloat16, true>(long const*, c10::BFloat16*, c10::BFloat16*, c10:"
         ],
         [
+          "norm",
+          183498.1,
+          "std::enable_if<(((8)>(0)))&&vllm::_typeConvert<c10::BFloat16>::exists, void>::type vllm::fused_add_rms_norm_kernel<c10::"
+        ],
+        [
           "quantize",
-          9106.4,
+          9146.5,
           "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T"
         ]
       ]
     },
-    "packed_sep_fa3_graphs": {
-      "total_kernel_us": 4425267.5,
-      "gemm_frac": 0.4723,
-      "quantize_frac": 0.2023,
-      "norm_frac": 0.1243,
-      "elementwise_frac": 0.068,
-      "attention_frac": 0.0887,
-      "other_frac": 0.0445,
-      "fused_kernels": {},
-      "top_kernels": [
-        [
-          "gemm",
-          1044790.5,
-          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u,"
-        ],
-        [
-          "quantize",
-          686841.5,
-          "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*"
-        ],
-        [
-          "gemm",
-          496627.7,
-          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, "
-        ],
-        [
-          "attention",
-          391430.1,
-          "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute"
-        ],
-        [
-          "norm",
-          354784.8,
-          "void vllm::rms_norm_kernel<c10::BFloat16, 8, 2, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long"
-        ],
-        [
-          "gemm",
-          330426.2,
-          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, "
-        ],
-        [
-          "elementwise",
-          300947.8,
-          "void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bfloat162, &(c10::BFloat16 vllm::silu_kernel<c10::BFloat16>(c10::BFloa"
-        ],
-        [
-          "gemm",
-          218063.1,
-          "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, "
-        ],
-        [
-          "quantize",
-          196592.9,
-          "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T"
-        ],
-        [
-          "norm",
-          195089.5,
-          "std::enable_if<(((8)>(0)))&&vllm::_typeConvert<c10::BFloat16>::exists, void>::type vllm::fused_add_rms_norm_kernel<c10::"
-        ],
-        [
-          "other",
-          195062.6,
-          "void vllm::rotary_embedding_kernel<c10::BFloat16, c10::BFloat16, true>(long const*, c10::BFloat16*, c10::BFloat16*, c10:"
-        ],
-        [
-          "quantize",
-          11595.7,
-          "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T"
-        ]
-      ]
-    },
-    "packed_fused_fa3_graphs": {
-      "total_kernel_us": 4680331.8,
-      "gemm_frac": 0.4413,
-      "quantize_frac": 0.3626,
-      "norm_frac": 0.0757,
+    "packed_customfused_fa3": {
+      "total_kernel_us": 3679206.3,
+      "gemm_frac": 0.5671,
+      "quantize_frac": 0.2234,
+      "norm_frac": 0.0918,
       "elementwise_frac": 0.0,
-      "attention_frac": 0.0793,
-      "other_frac": 0.041,
+      "attention_frac": 0.0659,
+      "other_frac": 0.0517,
       "fused_kernels": {
-        "void vllm::rms_norm_per_block_quant_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, 128>(c10::": 454404.6,
-        "void vllm::silu_and_mul_per_block_quant_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, 128>(c10::Fl": 895866.9
+        "add_rms_norm_quant": 167680.6,
+        "silu_mul_quant": 301329.8
       },
       "top_kernels": [
         [
           "gemm",
-          1033955.0,
+          1045162.5,
           "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u,"
         ],
         [
-          "quantize",
-          895866.9,
-          "void vllm::silu_and_mul_per_block_quant_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, 128>(c10::Float8_e4m3fn*, float*"
-        ],
-        [
           "gemm",
-          494608.5,
+          491725.9,
           "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, "
         ],
         [
-          "quantize",
-          454404.6,
-          "void vllm::rms_norm_per_block_quant_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, 128>(c10::Float8_e4m3fn*, floa"
-        ],
-        [
-          "attention",
-          370034.7,
-          "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute"
-        ],
-        [
           "norm",
-          354454.5,
+          337588.4,
           "void vllm::rms_norm_kernel<c10::BFloat16, 8, 2, true>(c10::BFloat16*, c10::BFloat16 const*, long, long, long, long, long"
         ],
         [
           "gemm",
-          324277.0,
+          331709.8,
           "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, "
         ],
         [
+          "quantize",
+          301329.8,
+          "silu_mul_quant"
+        ],
+        [
+          "attention",
+          241066.1,
+          "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute"
+        ],
+        [
           "gemm",
-          212450.5,
+          217966.5,
           "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, 128u, 128u, 128u, 128u, 128u, "
         ],
         [
           "quantize",
-          191755.9,
+          190831.3,
           "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T"
         ],
         [
           "other",
-          190469.3,
+          188879.0,
           "void vllm::rotary_embedding_kernel<c10::BFloat16, c10::BFloat16, true>(long const*, c10::BFloat16*, c10::BFloat16*, c10:"
         ],
         [
           "quantize",
-          144022.3,
+          167680.6,
+          "add_rms_norm_quant"
+        ],
+        [
+          "quantize",
+          152362.1,
           "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, float>(c10::BFloat16 const*, void*"
         ],
         [
           "quantize",
-          11151.4,
+          9699.7,
           "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T"
         ]
       ]
     }
   },
   "mean_tokens_per_second": {
-    "vllm": 98058.9,
-    "packed_sep_fa3_eager": 94600.8,
-    "packed_sep_fa3_graphs": 93199.1,
-    "packed_fused_fa3_graphs": 88048.8
+    "vllm": 95902.3,
+    "vllm_bf16kv": 101517.8,
+    "packed_sep_fa3": 92991.7,
+    "packed_customfused_fa3": 103912.9
   },
   "relative_to_vllm": {
     "vllm": 1.0,
-    "packed_sep_fa3_eager": 0.9647,
-    "packed_sep_fa3_graphs": 0.9504,
-    "packed_fused_fa3_graphs": 0.8979
+    "vllm_bf16kv": 1.0586,
+    "packed_sep_fa3": 0.9697,
+    "packed_customfused_fa3": 1.0835
   }
 }
