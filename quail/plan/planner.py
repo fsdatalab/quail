@@ -206,8 +206,14 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
     # be evicted between stages
     mode = "requests" if n_filters < 2 else "chain"
 
+    # the worst shard's share of the corpus's squared lengths: the
+    # quadratic prefill surcharge, which recompute pays and restore
+    # does not
+    doc_sq = sum(float(t) * float(t) for t in doc_tokens)
+    doc_sq_worst = doc_sq * (worst_load / max(1, corpus.total_tokens))
+
     access = "read"
-    read_s = t_in(model, device, worst_load)
+    read_s = t_in(model, device, worst_load, doc_sq_tokens=doc_sq_worst)
     if store is not None and store.warm:
         restore_s = t_in(model, device, worst_load, access="restore",
                          store_read_bw=store.read_bw)
@@ -233,15 +239,6 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
         selectivity = sum(sels) / len(sels)   # scalar for pricing
     except TypeError:
         pass
-
-    predicted = predict_makespan(
-        model, device, n_docs=corpus.n_docs, workers=workers,
-        shard_tokens=worst_load, n_filters=n_filters,
-        question_tokens=question_tokens, preamble_tokens=preamble_tokens,
-        selectivity=selectivity,
-        access=access if access != "spill" else "read",
-        store_read_bw=store.read_bw if access == "restore" else None)
-    predicted += spill_s
 
     # the sequence cap must never bind before the token budget: size
     # it from the worst case, not a margin. Admission is
@@ -275,6 +272,18 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
         max(STEP_TOKENS_MIN,
             STEP_POOL_FRACTION * pool * model.kappa / act_bytes)))
     engine_step_tokens = max(step_tokens, engine_max_seqs)
+
+    predicted = predict_makespan(
+        model, device, n_docs=corpus.n_docs, workers=workers,
+        shard_tokens=worst_load, n_filters=n_filters,
+        question_tokens=question_tokens, preamble_tokens=preamble_tokens,
+        selectivity=selectivity,
+        access=access if access != "spill" else "read",
+        store_read_bw=store.read_bw if access == "restore" else None,
+        mean_doc_tokens=corpus.mean_doc_tokens,
+        doc_sq_tokens=doc_sq_worst,
+        step_tokens=engine_step_tokens)
+    predicted += spill_s
 
     return Plan(mode=mode, workers=workers, tensor_parallel=tp,
                 shards=shards, budget_tokens=budget,

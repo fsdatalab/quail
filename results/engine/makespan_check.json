@@ -1,6 +1,7 @@
 {
   "model": "Qwen3-4B-FP8",
   "device": "H100-SXM-80GB",
+  "note": "quadratic prefill surcharge omitted: reports carry no squared-length sum (~0.5 s low here)",
   "rows": [
     {
       "source": "anchor",
@@ -12,19 +13,23 @@
       ],
       "wall_mean_s": 39.711,
       "reads_measured": 1.197,
-      "tokens_predicted": 4056803,
-      "reads_basis": "model: corpus once plus thinned question tails",
-      "fleet": {
-        "rate_tok_s": 96951.0,
-        "c0_s": 0.026,
-        "predicted_s": 41.87,
-        "error": 0.0544
+      "stages_per_doc": 2.331,
+      "reads_basis": "model: corpus once plus thinned tails",
+      "designed": {
+        "computed_tokens": 4056803,
+        "read_tokens": 10680204,
+        "predicted_s": 43.283,
+        "error": 0.09
       },
-      "container": {
-        "rate_tok_s": 96803.7,
-        "c0_s": 0.026,
-        "predicted_s": 41.934,
-        "error": 0.056
+      "effective": {
+        "computed_tokens": 3836947,
+        "read_tokens": 4703644,
+        "predicted_s": 40.633,
+        "error": 0.0232
+      },
+      "container_effective": {
+        "predicted_s": 40.375,
+        "error": 0.0167
       }
     },
     {
@@ -37,13 +42,19 @@
       ],
       "wall_mean_s": 41.223,
       "reads_measured": 1.228,
-      "tokens_predicted": 3935478,
+      "stages_per_doc": 2.3316,
       "reads_basis": "measured reads (the estimator does not predict prefix-cache eviction)",
-      "fleet": {
-        "rate_tok_s": 96951.0,
-        "c0_s": 0.026,
-        "predicted_s": 40.618,
-        "error": -0.0147
+      "designed": {
+        "computed_tokens": 3935478,
+        "read_tokens": 9682878,
+        "predicted_s": 41.951,
+        "error": 0.0177
+      },
+      "effective": {
+        "computed_tokens": 3935478,
+        "read_tokens": 4266336,
+        "predicted_s": 41.644,
+        "error": 0.0102
       }
     },
     {
@@ -56,13 +67,19 @@
       ],
       "wall_mean_s": 39.839,
       "reads_measured": 1.197,
-      "tokens_predicted": 4056803,
-      "reads_basis": "model: corpus once plus thinned question tails",
-      "fleet": {
-        "rate_tok_s": 96951.0,
-        "c0_s": 0.026,
-        "predicted_s": 41.87,
-        "error": 0.051
+      "stages_per_doc": 2.3312,
+      "reads_basis": "model: corpus once plus thinned tails",
+      "designed": {
+        "computed_tokens": 4056803,
+        "read_tokens": 10680204,
+        "predicted_s": 43.283,
+        "error": 0.0865
+      },
+      "effective": {
+        "computed_tokens": 3836973,
+        "read_tokens": 4704350,
+        "predicted_s": 40.633,
+        "error": 0.0199
       }
     },
     {
@@ -75,13 +92,19 @@
       ],
       "wall_mean_s": 42.922,
       "reads_measured": 1.228,
-      "tokens_predicted": 3935478,
+      "stages_per_doc": 2.3316,
       "reads_basis": "measured reads (the estimator does not predict prefix-cache eviction)",
-      "fleet": {
-        "rate_tok_s": 96951.0,
-        "c0_s": 0.026,
-        "predicted_s": 40.618,
-        "error": -0.0537
+      "designed": {
+        "computed_tokens": 3935478,
+        "read_tokens": 9682878,
+        "predicted_s": 41.951,
+        "error": -0.0226
+      },
+      "effective": {
+        "computed_tokens": 3935478,
+        "read_tokens": 4266336,
+        "predicted_s": 41.644,
+        "error": -0.0298
       }
     }
   ]

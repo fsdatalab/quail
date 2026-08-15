@@ -21,7 +21,7 @@ image read 80,556 and are not kept.
 | `calibrate_alpha.json`, `calibrate_c1.json`, `calibrate_c2-c4-c5.json`, `calibrate_c6.json` | `modal_calibrate.py --families <fam>` | the staged gate-check runs, one container each; the fits read only `calibrate_all.json` because rows from different containers must not mix |
 | `attnshare.json` | `modal_profiling.py::attnshare` | kernel-class shares of single-document prefills by length on the calibration boot, with each length's top kernels by time; says where attention overtakes the GEMMs |
 | `c0_anchor.json` | `modal_filters.py::c0_anchor` | the filter comparison with an in-container rate probe; each cell carries c0 = wall - reads x corpus / rate, so host speed cancels |
-| `makespan_check.json` | `quail.plan.validate` | predicted against measured query walls per arm, at fleet constants and at the anchor container's own rate and c0 |
+| `makespan_check.json` | `quail.plan.validate` | predicted against measured query walls per arm, at designed and at effective (verdict-measured) selectivities, plus a container variant at the anchor's probed rate and c0 |
 | `filter_cells_bf16.json` | `modal_filters.py::main --kv bf16` | the filter comparison on a 16-bit-KV boot, admission repriced at 2 bytes per element; accuracy identical to fp8, so the KV format does not cause the answer anomaly |
 
 ## One measurement caveat

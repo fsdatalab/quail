@@ -16,14 +16,20 @@ Every calibrated constant of the estimator lives in one table here.
 Update them here and nowhere else.
 """
 
-# Anchors are from the prefill speed control on the CUDA 13 image
-# (results/engine/speed_limit.json: best cell 97,889 tok/s), and the
-# batch-size sweep reproduced 97,005 tok/s at B = 25,305 through the
-# synchronous API. Constraint the code cannot show: the achieved rate
-# is a property of the image, not the engine - the old slim image
-# sustained 80,556 - and accuracy moves with the same substrate, so a
-# stack change requires re-anchoring both together.
-PHI = 97_000 / 275_000        # serving rate over spec ceiling, 4B anchor
+# The serving rate is derived from the measured step model below
+# (STEP_TOKEN_S, the batch-size sweep on the production boot), not
+# set by hand: 1/STEP_TOKEN_S = 96,180 tokens/s at 4B on the H100,
+# 35.0 percent of the spec ceiling - matching the retired hand
+# anchor (97,000/275,000) within one percent. Cross-checks that the
+# rate is a property of the image, not the engine: the prefill speed
+# control (results/engine/speed_limit.json, best cell 97,889 tok/s);
+# the old slim image sustained 80,556, so a stack change requires
+# re-anchoring rate and accuracy together.
+#
+# Constants measured on this configuration; other models and devices
+# are priced by spec-ratio scaling from it (see _scale).
+CAL_MODEL_P = 3.6e9           # Qwen3 4B dense params
+CAL_DEVICE_RD = 1.979e15      # H100 SXM fp8 dense FLOP/s
 ENGINE_OVERHEAD_S = 0.026     # c0: per-query software residue at 10k docs,
                               # planned arm. From the c0 anchor protocol
                               # (results/engine/c0_anchor.json): wall minus
@@ -102,10 +108,17 @@ OFFLOAD_CROSSOVER_TOKENS = {'c6_d2h_unpinned': 0.0, 'c6_h2d_unpinned': 0.0, 'c6_
 
 # ------------------------------------------------------- rate primitives
 
+def _scale(model, device):
+    """Spec-ratio scaling from the calibrated configuration: a model
+    with more params costs proportionally more per token, a device
+    with a higher ceiling proportionally less. The measured efficiency
+    is assumed to travel; the absolute rates do not."""
+    return (model.P / CAL_MODEL_P) * (CAL_DEVICE_RD / device.R_D)
+
+
 def dense_seconds(model, tokens, compute_rate):
     """Seconds of dense forward-pass compute over `tokens`: 2P FLOPs
-    per token at `compute_rate` FLOP/s (the spec ceiling R_D, or
-    PHI * R_D when priced at the calibrated serving rate)."""
+    per token at `compute_rate` FLOP/s (the spec ceiling R_D)."""
     return 2.0 * model.P * tokens / compute_rate
 
 
@@ -116,11 +129,30 @@ def step_seconds(tokens):
     return STEP_TOKEN_S * tokens + STEP_FIXED_S
 
 
+def token_seconds(model, device):
+    """Seconds to compute one fresh token, sustained on the production
+    boot: the batch sweep's measured per-token cost, spec-scaled."""
+    return STEP_TOKEN_S * _scale(model, device)
+
+
 def read_rate(model, device):
-    """R, tokens per second: PHI applied to the device's spec ceiling
-    at the dense cost of 2P FLOPs per token, so reading T tokens costs
-    dense_seconds(model, T, PHI * device.R_D)."""
-    return PHI * device.R_D / (2 * model.P)
+    """R, tokens per second: the sustained fresh-token rate, the
+    reciprocal of token_seconds."""
+    return 1.0 / token_seconds(model, device)
+
+
+def read_seconds_per_token(model, device):
+    """Seconds to re-read one resident token under a filter-width
+    suffix (the calibration's c=32 reference), spec-scaled. The
+    measured price is pair work, not bytes, so it scales with the
+    compute ceiling like the fresh rate."""
+    return T_READ_S_PER_TOKEN * _scale(model, device)
+
+
+def attn_seconds_per_token2(model, device):
+    """The quadratic prefill surcharge, spec-scaled: a document of h
+    tokens costs this times h^2 on top of its linear token work."""
+    return ALPHA2_S_PER_TOKEN2 * _scale(model, device)
 
 
 # ------------------------------------------------------- the estimator
@@ -138,38 +170,73 @@ def stage_survivals(n_filters, selectivity):
     return tuple(selectivity ** j for j in range(n_filters))
 
 
-def t_in(model, device, shard_tokens, access="read", store_read_bw=None):
-    """The input pass over the heaviest shard: read every token once
-    at R, or load the persisted KV bytes from a warm store at the
-    store's bandwidth - whichever access the plan selected (the
+def t_in(model, device, shard_tokens, access="read", store_read_bw=None,
+         doc_sq_tokens=0.0):
+    """The input pass over the heaviest shard: compute every token
+    once at the sustained rate plus the quadratic attention surcharge
+    over the shard's documents (doc_sq_tokens = sum of squared
+    document lengths; 0 drops the surcharge for callers that cannot
+    supply it), or load the persisted KV bytes from a warm store at
+    the store's bandwidth - whichever access the plan selected (the
     restore side pays only the read, because the write was paid at
     ingest)."""
     if access == "restore":
         return shard_tokens * model.kappa / store_read_bw
-    return shard_tokens / read_rate(model, device)
+    return (shard_tokens * token_seconds(model, device)
+            + doc_sq_tokens * attn_seconds_per_token2(model, device))
 
 
-def t_quest(model, device, n_docs, workers, n_filters,
-            question_tokens=46, preamble_tokens=33, selectivity=1.0):
-    """Question work per worker: stage 1 pays its full question; each
-    later stage pays only the tail past the shared preamble, thinned
-    by survival. question_tokens may be one shared length or a
-    per-stage sequence. The tail is clamped at one token: a reached
-    stage always appends at least its answer cue."""
+def quest_token_count(n_docs, workers, n_filters, question_tokens=46,
+                      preamble_tokens=33, selectivity=1.0):
+    """Question tokens computed per worker: stage 1 pays its full
+    question; each later stage pays only the tail past the shared
+    preamble, thinned by survival. question_tokens may be one shared
+    length or a per-stage sequence. The tail is clamped at one token:
+    a reached stage always appends at least its answer cue. Pure
+    token arithmetic, so callers can count as well as price."""
     A = stage_survivals(n_filters, selectivity)
     lens = question_tokens if hasattr(question_tokens, "__len__") \
         else (question_tokens,) * n_filters
     q = A[0] * lens[0]
     for j in range(1, n_filters):
         q += A[j] * max(1, lens[j] - preamble_tokens)
-    return (n_docs / workers) * q / read_rate(model, device)
+    return (n_docs / workers) * q
+
+
+def quest_read_tokens(n_docs, workers, n_filters, mean_doc_tokens,
+                      preamble_tokens=33, selectivity=1.0,
+                      kept_preamble=True):
+    """Resident tokens the later stages re-read at the cached rate:
+    each stage past the first evaluates its suffix against the
+    document (plus the kept preamble in chain mode), thinned by
+    survival. Stage 1 reads nothing extra - its document is fresh in
+    the same pass and t_in already priced it."""
+    A = stage_survivals(n_filters, selectivity)
+    ctx = mean_doc_tokens + (preamble_tokens if kept_preamble else 0)
+    return (n_docs / workers) * sum(A[1:]) * ctx
+
+
+def t_quest(model, device, n_docs, workers, n_filters,
+            question_tokens=46, preamble_tokens=33, selectivity=1.0,
+            mean_doc_tokens=0.0):
+    """Question work per worker: computed question tokens at the
+    sustained fresh rate, plus the later stages' re-read of resident
+    context at the cached-read rate. mean_doc_tokens=0 drops the read
+    term for callers that cannot supply it."""
+    compute = quest_token_count(
+        n_docs, workers, n_filters, question_tokens, preamble_tokens,
+        selectivity) * token_seconds(model, device)
+    reads = quest_read_tokens(
+        n_docs, workers, n_filters, mean_doc_tokens, preamble_tokens,
+        selectivity) * read_seconds_per_token(model, device)
+    return compute + reads
 
 
 def t_reread(model, device, reread_tokens):
     """Document tokens recomputed because retention dropped their KV,
-    at R. Zero in chain mode, where the document's KV belongs to a
-    living request and admission keeps it resident."""
-    return reread_tokens / read_rate(model, device)
+    at the sustained rate. Zero in chain mode, where the document's
+    KV belongs to a living request and admission keeps it resident."""
+    return reread_tokens * token_seconds(model, device)
 
 
 def t_mem(model, device, width_docs, doc_tokens, pool_bytes,
@@ -193,18 +260,31 @@ def predict_makespan(model, device, *, n_docs, workers, shard_tokens,
                      selectivity=1.0, access="read", store_read_bw=None,
                      reread_tokens=0, width_docs=None, doc_tokens=None,
                      pool_bytes=None, store_bw=None,
+                     mean_doc_tokens=0.0, doc_sq_tokens=0.0,
+                     step_tokens=STEP_TOKENS_MAX,
                      c0=ENGINE_OVERHEAD_S):
-    """T_in + T_quest + T_reread + T_mem + c0.
+    """T_in + T_quest + T_reread + T_step_fixed + T_mem + c0.
 
+    mean_doc_tokens and doc_sq_tokens carry the composition terms
+    (later stages' cached re-reads; the quadratic prefill surcharge);
+    zero drops each for callers that cannot supply corpus shape.
+    T_step_fixed amortizes the measured per-step fixed cost over the
+    fresh tokens the query computes, at the boot's step budget.
     T_mem is optional because the shipped planner zeroes it:
     width_docs=None prices it at zero, since the admission budget
     keeps the footprint under the pool by construction. Pass
     width_docs (with doc_tokens and pool_bytes) to price the full
     form."""
-    total = t_in(model, device, shard_tokens, access, store_read_bw)
+    total = t_in(model, device, shard_tokens, access, store_read_bw,
+                 doc_sq_tokens=doc_sq_tokens)
     total += t_quest(model, device, n_docs, workers, n_filters,
-                     question_tokens, preamble_tokens, selectivity)
+                     question_tokens, preamble_tokens, selectivity,
+                     mean_doc_tokens=mean_doc_tokens)
     total += t_reread(model, device, reread_tokens)
+    fresh = (shard_tokens if access == "read" else 0) + reread_tokens \
+        + quest_token_count(n_docs, workers, n_filters, question_tokens,
+                            preamble_tokens, selectivity)
+    total += STEP_FIXED_S * fresh / max(1, step_tokens)
     if width_docs is not None:
         total += t_mem(model, device, width_docs, doc_tokens, pool_bytes,
                        store_bw)

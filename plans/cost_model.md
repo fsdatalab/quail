@@ -385,45 +385,49 @@ constant is corrected accordingly.
 
 ## 11. End to end: predicted against measured walls
 
-The estimator prices the full query (T_in + T_quest + T_reread + c0)
-from the constants above. Measured walls exist from two separate
-runs of the same query, in two different containers:
+The estimator prices the full query from the constants above, with
+no hand-set rate: computed tokens at 1/STEP_TOKEN_S (the batch
+sweep), later stages' re-reads of resident context at the cached
+price, the per-step fixed cost amortized at the boot's step budget,
+and the 26 ms residue. (One term is knowingly omitted: the
+quadratic prefill surcharge needs the corpus's squared lengths,
+which the run reports do not carry — about half a second low at
+these document lengths.) Measured walls exist from two runs of the
+same query in two containers:
 
-- **This week's run** — the c0 anchor of Section 10. Its container's
-  own serving rate is known, because the probe measured it (96,804
-  tokens per second).
-- **The earlier run** — the filter comparison stored in the
-  repository from a previous session. Its container's speed was
-  never measured.
+- **This week's run** — the c0 anchor of Section 10; its container's
+  own serving rate is known (96,804 tokens per second).
+- **The earlier run** — the banked comparison; its container's
+  speed was never measured.
 
-Each run measured both arms three times. The predictions below use
-the fleet constants only (the 97,000 tokens-per-second anchor rate
-and the measured c0), with no knowledge of either container. The
-stock arm's read multiplier is an input taken from the measurement,
-because the estimator does not predict prefix-cache eviction; the
-rewind arm's token count is the model's own.
+Each prediction comes in two selectivity variants. *Designed* uses
+the pass rates the workload planted — what a planner predicts before
+anything runs. *Effective* uses the pass rates the model's verdicts
+actually produced, read off the answered-stage count — pricing the
+query that actually ran. The stock arm's read multiplier is a
+measured input in both (the estimator does not predict prefix-cache
+eviction); the rewind arm's token count is the model's own.
 
-| run | arm | measured mean | predicted | error |
+| run | arm | measured mean | designed | effective |
 |---|---|---|---|---|
-| this week's | rewind | 39.71 s | 41.87 s | +5.4 percent |
-| this week's | stock | 41.22 s | 40.62 s | −1.5 percent |
-| earlier | rewind | 39.84 s | 41.87 s | +5.1 percent |
-| earlier | stock | 42.92 s | 40.62 s | −5.4 percent |
+| this week's | rewind | 39.71 s | 43.28 s (+9.0%) | 40.63 s (+2.3%) |
+| this week's | stock | 41.22 s | 41.95 s (+1.8%) | 41.64 s (+1.0%) |
+| earlier | rewind | 39.84 s | 43.28 s (+8.6%) | 40.63 s (+2.0%) |
+| earlier | stock | 42.92 s | 41.95 s (−2.3%) | 41.64 s (−3.0%) |
 
-Two things to read off. First, the stock error flips sign between
-the runs (−1.5 against −5.4 percent) because the earlier container
-was slower and the fleet constants cannot know that; this is the
-cross-container host spread the estimator cannot remove. Second, the
-rewind error does not move between runs, and it also does not move
-when the prediction is recomputed with this week's container's own
-measured rate and c0 (41.93 s, +5.6 percent) — so it is not host
-speed and not overhead. It is one specific accounting error: the
-model charges 852,889 question tokens (a 46-token stage-1 question,
-then 13-token survival-thinned tails over a 33-token shared
-preamble), while the engine's step trace counted 631,171 question
-tokens actually prefilled. The executor keeps more of each question
-resident across rewinds than the 33-token preamble accounting
-assumes. That single over-charge is the entire rewind error.
+At this week's container's own probed rate and measured c0, the
+rewind effective prediction is 40.38 s (+1.7 percent).
+
+What to read off. With honest inputs — the verdict rates the query
+actually produced — the estimator lands within about three percent
+everywhere, and every constant in it is measured. The designed-rate
+rewind error (+9 percent) is almost entirely the selectivity input:
+the model answers NO far more often than the workload planted
+(2.33 answered stages per document against the designed 4.02), so a
+before-the-fact prediction over-charges the later stages' question
+work. The residual spread on the stock rows (+1.0 against −3.0)
+is the cross-container host-speed difference the fleet constants
+cannot know.
 
 For reference, the measured comparison itself:
 
