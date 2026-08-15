@@ -224,6 +224,41 @@ The pipeline is now 68 percent matrix multiplies and 8 percent
 attention; what remains fusable is about 420 ms of quant work per
 window and the epilogue idea inside the gate_up multiply.
 
+Round 5: the epilogue. A Triton block-scaled fp8 multiply for the
+gate_up projection whose closing phase does the silu and the group
+quant while the finished tile is still in registers, so the 985 MB
+16-bit intermediate is never written or read. Each program owns one
+tile of the silu output and loads both its gate and up parent
+columns itself, which also reads the input tile once instead of
+twice. The risk is split in two on purpose: the probe benches (a)
+DeepGEMM plus our silu+quant kernel (the current champion), (b) our
+Triton multiply with a plain epilogue plus the same silu+quant
+kernel, and (c) our Triton multiply with the fused epilogue. c
+against b prices the epilogue at equal multiply quality; c against
+a decides whether the pipeline switches. A DeepGEMM hardware-counter
+measurement (modal_profiling.py::ncudeepgemm) sizes how much of the
+gap is even available.
+
+Round 5 prediction, stated before the run, with honest uncertainty:
+  - c beats b by 15 to 25 percent per call (the epilogue removes the
+    985 MB write and read and the second kernel's launch; the silu
+    kernel it absorbs cost 464 us against the multiply's roughly
+    2,000).
+  - whether c beats a is a coin flip that turns on our multiply
+    alone: DeepGEMM runs the gate_up shape at about 2,042 us and
+    Triton block-scaled multiplies of this shape typically land
+    between parity and 1.7x slower. If our multiply is within about
+    15 percent of DeepGEMM, c wins outright and the timed run
+    launches; if not, the epilogue verdict still stands from c
+    against b, the pipeline keeps DeepGEMM plus the separate kernel,
+    and the banked conclusion is the measured price of the missing
+    epilogue interface on DeepGEMM's side.
+  - end to end if c wins: 3 to 6 percent over round 4 (the separate
+    silu kernel's 318 ms per window vanishes and the multiply
+    absorbs part of it back), 123,000 to 127,000 tokens per second.
+  - numerics: dequantized agreement with the a path at one fp8
+    rounding step; answers within tens of round 4's 2,213.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
@@ -357,6 +392,7 @@ class PackedPipeline:
         self.fp8 = torch.float8_e4m3fn
         self.fa_version = 2
         self.fuse_qk = False
+        self.fuse_gemm = False
 
     @staticmethod
     def weight_scale(linear):
@@ -535,10 +571,118 @@ class PackedPipeline:
             tl.store(k_out_ptr + t * stride_ko + kb_offs,
                      out_b.to(k_out_ptr.dtype.element_ty))
 
+        @triton.jit
+        def gemm_silu_quant(a_ptr, b_ptr, as_ptr, bs_ptr, q_ptr, s_ptr,
+                            M, stride_am, stride_bn, stride_qm,
+                            s_stride_g, s_stride_t,
+                            as_stride_m, as_stride_k,
+                            bs_stride_n, bs_stride_k,
+                            HALF_N: tl.constexpr, K: tl.constexpr,
+                            BM: tl.constexpr, BN: tl.constexpr,
+                            BK: tl.constexpr, GROUP_M: tl.constexpr,
+                            UE8M0: tl.constexpr, FUSE: tl.constexpr):
+            # grid over (m blocks x silu-output n blocks), swizzled for
+            # L2 reuse the way the stock block-scaled kernel does it
+            pid = tl.program_id(0)
+            num_pid_m = tl.cdiv(M, BM)
+            num_pid_n = HALF_N // BN
+            group = GROUP_M * num_pid_n
+            gid = pid // group
+            first_m = gid * GROUP_M
+            size_m = tl.minimum(num_pid_m - first_m, GROUP_M)
+            pid_m = first_m + (pid % size_m)
+            pid_n = (pid % group) // size_m
+
+            offs_m = (pid_m * BM + tl.arange(0, BM)) % M
+            offs_n = pid_n * BN + tl.arange(0, BN)
+            offs_k = tl.arange(0, BK)
+            a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :]
+            # gate columns at n, up columns HALF_N further along
+            bg_ptrs = b_ptr + offs_n[:, None] * stride_bn + offs_k[None, :]
+            bu_ptrs = bg_ptrs + HALF_N * stride_bn
+            as_ptrs = as_ptr + offs_m * as_stride_m
+            bs_g = bs_ptr + (pid_n * BN // 128) * bs_stride_n
+            bs_u = bs_ptr + ((HALF_N + pid_n * BN) // 128) * bs_stride_n
+
+            acc_g = tl.zeros((BM, BN), dtype=tl.float32)
+            acc_u = tl.zeros((BM, BN), dtype=tl.float32)
+            for k in range(0, K // BK):
+                a = tl.load(a_ptrs)
+                bg = tl.load(bg_ptrs)
+                bu = tl.load(bu_ptrs)
+                a_s = tl.load(as_ptrs + k * as_stride_k)
+                g_s = tl.load(bs_g + k * bs_stride_k)
+                u_s = tl.load(bs_u + k * bs_stride_k)
+                dot_g = tl.dot(a, tl.trans(bg))
+                dot_u = tl.dot(a, tl.trans(bu))
+                acc_g += dot_g * (a_s * g_s)[:, None]
+                acc_u += dot_u * (a_s * u_s)[:, None]
+                a_ptrs += BK
+                bg_ptrs += BK
+                bu_ptrs += BK
+
+            if FUSE:
+                y = acc_g * tl.sigmoid(acc_g) * acc_u
+                amax = tl.max(tl.abs(y), axis=1)
+                scale = tl.maximum(amax, 1e-10) / 448.0
+                if UE8M0:
+                    scale = tl.math.exp2(tl.ceil(tl.math.log2(scale)))
+                q = y / scale[:, None]
+                q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+                out_m = pid_m * BM + tl.arange(0, BM)
+                mask = out_m < M
+                tl.store(q_ptr + out_m[:, None] * stride_qm + offs_n[None, :],
+                         q.to(q_ptr.dtype.element_ty), mask=mask[:, None])
+                tl.store(s_ptr + (pid_n * BN // 128) * s_stride_g
+                         + out_m * s_stride_t, scale, mask=mask)
+            else:
+                out_m = pid_m * BM + tl.arange(0, BM)
+                mask = out_m < M
+                tl.store(q_ptr + out_m[:, None] * stride_qm + offs_n[None, :],
+                         acc_g.to(q_ptr.dtype.element_ty), mask=mask[:, None])
+                tl.store(q_ptr + out_m[:, None] * stride_qm
+                         + (HALF_N + offs_n)[None, :],
+                         acc_u.to(q_ptr.dtype.element_ty), mask=mask[:, None])
+
         self._kernels = {"silu": silu_mul_quant,
                          "norm": add_rms_norm_quant,
-                         "qk": qk_norm_rope}
+                         "qk": qk_norm_rope,
+                         "gemm_silu": gemm_silu_quant}
         return self._kernels
+
+    def custom_gemm_silu_quant(self, a_q, a_scales, linear, fuse=True):
+        """The epilogue kernel: block-scaled fp8 multiply for gate_up
+        whose closing phase does the silu and group quant in
+        registers, so the 16-bit intermediate never exists. With
+        fuse off it writes the plain gate_up result instead, which
+        prices our multiply against DeepGEMM at equal epilogues."""
+        torch = self.torch
+        n_tokens = a_q.shape[0]
+        weight = linear.weight
+        w_scales = self.weight_scale(linear)
+        half_n = weight.shape[0] // 2
+        k_width = weight.shape[1]
+        if fuse:
+            out = torch.empty((n_tokens, half_n), dtype=self.fp8,
+                              device="cuda")
+            scales = self._col_major_scales(n_tokens, half_n)
+        else:
+            out = torch.empty((n_tokens, weight.shape[0]),
+                              dtype=torch.bfloat16, device="cuda")
+            scales = self._col_major_scales(n_tokens, half_n)
+        block_m = 64
+        grid = ((-(-n_tokens // block_m)) * (half_n // 128),)
+        self._triton_kernels()["gemm_silu"][grid](
+            a_q, weight, a_scales, w_scales, out, scales,
+            n_tokens, a_q.stride(0), weight.stride(0), out.stride(0),
+            scales.stride(1), scales.stride(0),
+            a_scales.stride(0), a_scales.stride(1),
+            w_scales.stride(0), w_scales.stride(1),
+            HALF_N=half_n, K=k_width, BM=block_m, BN=128, BK=128,
+            GROUP_M=8, UE8M0=self.use_ue8m0, FUSE=fuse,
+            num_warps=8, num_stages=3,
+        )
+        return out, scales
 
     def custom_qk_norm_rope(self, qkv, positions, attn):
         """Per-head norm, rotation, and layout in one kernel per
@@ -729,13 +873,17 @@ class PackedPipeline:
                 normed, residual = self.fused_add_rms_norm(
                     hidden, residual, layer.post_attention_layernorm)
                 g_in, g_scale = self.quant(normed)
-            gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
-            if fused == "custom":
-                d_in, d_scale = self.custom_silu_quant(gate_up)
-            elif fused:
-                d_in, d_scale = self.fused_silu_quant(gate_up)
+            if fused == "custom" and self.fuse_gemm:
+                d_in, d_scale = self.custom_gemm_silu_quant(
+                    g_in, g_scale, layer.mlp.gate_up_proj)
             else:
-                d_in, d_scale = self.quant(self.silu_and_mul(gate_up))
+                gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
+                if fused == "custom":
+                    d_in, d_scale = self.custom_silu_quant(gate_up)
+                elif fused:
+                    d_in, d_scale = self.fused_silu_quant(gate_up)
+                else:
+                    d_in, d_scale = self.quant(self.silu_and_mul(gate_up))
             hidden = self.gemm(d_in, d_scale, layer.mlp.down_proj)
 
         return hidden, residual
@@ -1005,7 +1153,46 @@ def probe(n_docs: int = 8) -> str:
         lambda: qk_reference(big_qkv, big_pos))
     result["microbench_us_per_call"]["qk_custom"] = bench(
         lambda: pipeline.custom_qk_norm_rope(big_qkv, big_pos, attn1))
-    del big_gate_up, big_hidden, big_residual, big_qkv
+    del big_qkv
+
+    # round 5: the epilogue multiply, decomposed so the two risks are
+    # priced separately
+    gate_up_linear = model.model.layers[1].mlp.gate_up_proj
+    with torch.inference_mode():
+        big_aq, big_as = pipeline.quant(big_hidden)
+    result["microbench_us_per_call"]["gateup_deepgemm_only"] = bench(
+        lambda: pipeline.gemm(big_aq, big_as, gate_up_linear))
+    result["microbench_us_per_call"]["gateup_ours_plain_only"] = bench(
+        lambda: pipeline.custom_gemm_silu_quant(
+            big_aq, big_as, gate_up_linear, fuse=False))
+    result["microbench_us_per_call"]["gateup_a_deepgemm_plus_silu"] = bench(
+        lambda: pipeline.custom_silu_quant(
+            pipeline.gemm(big_aq, big_as, gate_up_linear)))
+    result["microbench_us_per_call"]["gateup_b_ours_plus_silu"] = bench(
+        lambda: pipeline.custom_silu_quant(
+            pipeline.custom_gemm_silu_quant(
+                big_aq, big_as, gate_up_linear, fuse=False)[0]))
+    result["microbench_us_per_call"]["gateup_c_ours_fused"] = bench(
+        lambda: pipeline.custom_gemm_silu_quant(
+            big_aq, big_as, gate_up_linear, fuse=True))
+
+    with torch.inference_mode():
+        small_h = torch.randn(256, 2560, dtype=torch.bfloat16,
+                              device="cuda")
+        small_aq, small_as = pipeline.quant(small_h)
+        d_ref, s_ref = pipeline.custom_silu_quant(
+            pipeline.gemm(small_aq, small_as, gate_up_linear))
+        d_new, s_new = pipeline.custom_gemm_silu_quant(
+            small_aq, small_as, gate_up_linear, fuse=True)
+        deq_ref = d_ref.float().view(256, -1, 128) * s_ref.float()[:, :, None]
+        deq_new = d_new.float().view(256, -1, 128) * s_new.float()[:, :, None]
+        rel = (deq_ref - deq_new).abs().max().item()
+        span = deq_ref.abs().max().item()
+    result["egemm_check"] = {
+        "dequant_max_diff": round(rel, 5),
+        "reference_max_abs": round(span, 3),
+    }
+    del big_gate_up, big_hidden, big_residual, big_aq
 
     # capture at the full chunk size: the 8-doc chunk padded from
     # ~2,200 to 25,305 tokens is the worst-case padding path
@@ -1171,11 +1358,12 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     assert longest_prompt < max_seqlen_cap
     max_docs = max(len(batch) for batch in batches) + 1
     cells = (
-        ("packed_custom", "custom", False, False),
-        ("packed_custom_qk", "custom", False, True),
+        ("packed_custom_qk", "custom", False, True, False),
+        ("packed_custom_qk_egemm", "custom", False, True, True),
     )
-    for name, fused, graphed, fuse_qk in cells:
+    for name, fused, graphed, fuse_qk, fuse_gemm in cells:
         pipeline.fuse_qk = fuse_qk
+        pipeline.fuse_gemm = fuse_gemm
         runner = (GraphedChunkRunner(pipeline, fused, batch_tokens,
                                      max_docs, max_seqlen_cap)
                   if graphed else None)
@@ -1200,6 +1388,7 @@ def compare(n_docs: int = 10_000, reps: int = 3,
                 ),
                 "attention": f"fa{pipeline.fa_version}",
                 "fused_qk_norm_rope": fuse_qk,
+                "fused_gate_up_gemm": fuse_gemm,
                 "persistent_kv": False,
                 "peak_allocated_gib": round(
                     torch.cuda.max_memory_allocated() / 2**30, 3
@@ -1245,7 +1434,8 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         torch.cuda.empty_cache()
 
     rates = {}
-    for method in ("vllm_bf16kv", "packed_custom", "packed_custom_qk"):
+    for method in ("vllm_bf16kv", "packed_custom_qk",
+                   "packed_custom_qk_egemm"):
         values = [row["tokens_per_second"] for row in report["runs"]
                   if row["method"] == method]
         rates[method] = round(sum(values) / len(values), 1)
