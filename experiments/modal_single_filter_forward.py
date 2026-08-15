@@ -65,6 +65,32 @@ dispatched an older kernel than the engine's FlashAttention-3, worth
 about 2.4 percent) and two thirds eager per-op launch gaps that CUDA
 graphs would close. Peak memory 7.57 GiB with no KV pool.
 
+Round 2: the two mechanical fixes from that result. The attention
+call now requests FlashAttention-3 explicitly (the wrapper defaults
+to version 2), and the token-level forward is captured once as a
+CUDA graph at fixed shapes - every chunk padded to the full 25,305
+tokens with one extra padding sequence, replayed through the
+recorded kernel sequence, with the per-document tail (final norm and
+logits) outside the graph. Padding costs about 1.5 percent of chunk
+tokens.
+
+Round 2 prediction, stated before the run:
+  - separate quant, FlashAttention-3, still eager: 92,500 to 94,000
+    tokens per second (the attention kernel alone, worth about 2.4
+    percent over the banked 90,718).
+  - separate quant, FlashAttention-3, CUDA graphs: within 2 percent
+    of the engine either side (95,400 to 99,300), target at or above
+    the engine's 97,321.
+  - fused, FlashAttention-3, CUDA graphs: 4 to 5 percent below the
+    separate-quant graphs cell; the fused kernels' deficit is device
+    time and graphs do not change it.
+  - wrong answers stay near 2,229; FlashAttention-3 rounds
+    differently, so shifts of low hundreds and disagreement counts
+    near 1,800 against the engine are expected.
+  Falsifier: if the graphs cell stays 4 or more percent below the
+  engine, the gap attribution was wrong, and the profiled repetition
+  names what actually remains.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
@@ -196,6 +222,7 @@ class PackedPipeline:
         self.head_dim = attn.head_dim
         self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
         self.fp8 = torch.float8_e4m3fn
+        self.fa_version = 2
 
     @staticmethod
     def weight_scale(linear):
@@ -290,6 +317,7 @@ class PackedPipeline:
             cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
             causal=True,
+            fa_version=self.fa_version,
         )
         return out.reshape(n_tokens, self.num_q_heads * self.head_dim)
 
@@ -319,6 +347,22 @@ class PackedPipeline:
     def forward_chunk(self, packed, fused):
         (input_ids, positions, final_indices, cu_seqlens,
          max_seqlen) = packed
+        hidden, residual = self.forward_tokens(
+            input_ids, positions, cu_seqlens, max_seqlen, fused)
+        return self.select_and_norm(hidden, residual, final_indices)
+
+    def select_and_norm(self, hidden, residual, final_indices):
+        last_hidden = hidden.index_select(0, final_indices)
+        last_residual = residual.index_select(0, final_indices)
+        normed, _ = self.fused_add_rms_norm(
+            last_hidden, last_residual, self.final_norm)
+        return normed
+
+    def forward_tokens(self, input_ids, positions, cu_seqlens,
+                       max_seqlen, fused):
+        """The token-level forward: everything whose shapes depend
+        only on the token count, so it can be captured as a CUDA
+        graph at a fixed size."""
         n_tokens = input_ids.shape[0]
         hidden = self.embed(input_ids)
         residual = None
@@ -369,11 +413,66 @@ class PackedPipeline:
                 d_in, d_scale = self.quant(self.silu_and_mul(gate_up))
             hidden = self.gemm(d_in, d_scale, layer.mlp.down_proj)
 
-        last_hidden = hidden.index_select(0, final_indices)
-        last_residual = residual.index_select(0, final_indices)
-        normed, _ = self.fused_add_rms_norm(
-            last_hidden, last_residual, self.final_norm)
-        return normed
+        return hidden, residual
+
+
+class GraphedChunkRunner:
+    """The token-level forward captured once as a CUDA graph.
+
+    Every chunk is padded to capture_tokens: real prompts first, then
+    one padding sequence covering the tail, then zero-length entries
+    so the cu_seqlens tensor keeps a fixed size. Replays write into
+    the same recorded tensors; the per-document tail runs outside the
+    graph on the real, unpadded index list."""
+
+    def __init__(self, pipeline, fused, capture_tokens, max_docs,
+                 max_seqlen, warmups=3):
+        torch = pipeline.torch
+        self.pipeline = pipeline
+        self.fused = fused
+        self.capture_tokens = capture_tokens
+        self.max_docs = max_docs
+        self.ids = torch.zeros(capture_tokens, dtype=torch.long,
+                               device="cuda")
+        self.positions = torch.zeros(capture_tokens, dtype=torch.long,
+                                     device="cuda")
+        self.cu_seqlens = torch.zeros(max_docs + 2, dtype=torch.int32,
+                                      device="cuda")
+        self.pad_positions = torch.arange(capture_tokens, device="cuda")
+        self.cu_seqlens[1:].fill_(capture_tokens)
+        with torch.inference_mode():
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(warmups):
+                    pipeline.forward_tokens(
+                        self.ids, self.positions, self.cu_seqlens,
+                        max_seqlen, fused)
+            torch.cuda.current_stream().wait_stream(side)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.hidden, self.residual = pipeline.forward_tokens(
+                    self.ids, self.positions, self.cu_seqlens,
+                    max_seqlen, fused)
+
+    def run(self, packed):
+        ids, positions, final_indices, cu_seqlens, _max_len = packed
+        n_tokens = ids.shape[0]
+        n_docs = cu_seqlens.shape[0] - 1
+        if n_docs > self.max_docs:
+            raise ValueError(f"{n_docs} docs exceeds the captured "
+                             f"{self.max_docs}")
+        pad = self.capture_tokens - n_tokens
+        self.ids[:n_tokens].copy_(ids)
+        self.positions[:n_tokens].copy_(positions)
+        if pad:
+            self.ids[n_tokens:].zero_()
+            self.positions[n_tokens:].copy_(self.pad_positions[:pad])
+        self.cu_seqlens[:n_docs + 1].copy_(cu_seqlens)
+        self.cu_seqlens[n_docs + 1:].fill_(self.capture_tokens)
+        self.graph.replay()
+        return self.pipeline.select_and_norm(
+            self.hidden, self.residual, final_indices)
 
 
 @app.function(image=forward_image, gpu="H100!", timeout=3600, memory=65536,
@@ -442,6 +541,7 @@ def probe(n_docs: int = 8) -> str:
         no_scores = scores.index_select(1, no_columns).amax(dim=1)
         return (yes_scores > no_scores).int().cpu().tolist()
 
+    pipeline.fa_version = 3
     packed = PackedPipeline.pack(prompts)
     with torch.inference_mode():
         unfused = pipeline.forward_chunk(packed, fused=False)
@@ -452,6 +552,7 @@ def probe(n_docs: int = 8) -> str:
     result["chunk"] = {
         "tokens": int(packed[0].shape[0]),
         "docs": n_docs,
+        "fa_version": pipeline.fa_version,
         "unfused_finite": bool(torch.isfinite(unfused).all().item()),
         "fused_finite": bool(torch.isfinite(fused).all().item()),
         "fused_vs_unfused_max_abs_diff": round(diff, 4),
@@ -461,6 +562,22 @@ def probe(n_docs: int = 8) -> str:
             a != b for a, b in zip(fused_answers, expected)),
         "fused_vs_unfused_disagreements": sum(
             a != b for a, b in zip(fused_answers, unfused_answers)),
+    }
+
+    # capture at the full chunk size: the 8-doc chunk padded from
+    # ~2,200 to 25,305 tokens is the worst-case padding path
+    runner = GraphedChunkRunner(pipeline, False, BEST_BATCH_TOKENS,
+                                max_docs=64, max_seqlen=3072)
+    with torch.inference_mode():
+        graphed_first = answers(runner.run(packed))
+        graphed_second = answers(runner.run(packed))
+    result["graph"] = {
+        "capture_tokens": BEST_BATCH_TOKENS,
+        "graphed_vs_eager_disagreements": sum(
+            a != b for a, b in zip(graphed_first, unfused_answers)),
+        "replay_deterministic": graphed_first == graphed_second,
+        "graphed_wrong": sum(
+            a != b for a, b in zip(graphed_first, expected)),
     }
     print(json.dumps(result, indent=2), flush=True)
     return json.dumps(result)
@@ -579,25 +696,40 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     packed_batches = [PackedPipeline.pack(batch) for batch in batches]
 
     @torch.inference_mode()
-    def run_packed(selected, fused):
+    def run_packed(selected, fused, runner=None):
         predictions = []
         for packed in selected:
-            normed = pipeline.forward_chunk(packed, fused=fused)
+            if runner is None:
+                normed = pipeline.forward_chunk(packed, fused=fused)
+            else:
+                normed = runner.run(packed)
             scores = F.linear(normed, selected_weights)
             yes_scores = scores.index_select(1, yes_columns).amax(dim=1)
             no_scores = scores.index_select(1, no_columns).amax(dim=1)
             predictions.extend((yes_scores > no_scores).int().cpu().tolist())
         return predictions
 
-    for fused in (False, True):
-        name = "packed_fused" if fused else "packed_separate_quant"
+    pipeline.fa_version = 3
+    longest_prompt = max(map(len, prompts))
+    max_seqlen_cap = 3072
+    assert longest_prompt < max_seqlen_cap
+    max_docs = max(len(batch) for batch in batches) + 1
+    cells = (
+        ("packed_sep_fa3_eager", False, False),
+        ("packed_sep_fa3_graphs", False, True),
+        ("packed_fused_fa3_graphs", True, True),
+    )
+    for name, fused, graphed in cells:
+        runner = (GraphedChunkRunner(pipeline, fused, batch_tokens,
+                                     max_docs, max_seqlen_cap)
+                  if graphed else None)
         # two warmup chunks: DeepGEMM compiles its kernels on first use
-        run_packed(packed_batches[:2], fused)
+        run_packed(packed_batches[:2], fused, runner)
         torch.cuda.synchronize()
         for rep in range(reps):
             torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
-            predicted = run_packed(packed_batches, fused)
+            predicted = run_packed(packed_batches, fused, runner)
             torch.cuda.synchronize()
             wall = time.perf_counter() - started
             wrong = sum(a != b for a, b in zip(predicted, expected))
@@ -610,6 +742,8 @@ def compare(n_docs: int = 10_000, reps: int = 3,
                 "disagrees_with_vllm": sum(
                     a != b for a, b in zip(predicted, control_predictions)
                 ),
+                "attention": f"fa{pipeline.fa_version}",
+                "cudagraphs": graphed,
                 "persistent_kv": False,
                 "peak_allocated_gib": round(
                     torch.cuda.max_memory_allocated() / 2**30, 3
@@ -622,7 +756,7 @@ def compare(n_docs: int = 10_000, reps: int = 3,
             prompts[:profile_docs], batch_tokens)
         profiled = [PackedPipeline.pack(batch) for batch in profile_batches]
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            run_packed(profiled, fused)
+            run_packed(profiled, fused, runner)
         classes = dict(gemm=0, quantize=0, norm=0, elementwise=0,
                        attention=0, other=0)
         by_name = {}
@@ -650,9 +784,13 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         print(f"[single filter] {name} profile "
               + json.dumps({k: v for k, v in summary.items()
                             if k != "top_kernels"}), flush=True)
+        del runner
+        gc.collect()
+        torch.cuda.empty_cache()
 
     rates = {}
-    for method in ("vllm", "packed_separate_quant", "packed_fused"):
+    for method in ("vllm", "packed_sep_fa3_eager", "packed_sep_fa3_graphs",
+                   "packed_fused_fa3_graphs"):
         values = [row["tokens_per_second"] for row in report["runs"]
                   if row["method"] == method]
         rates[method] = round(sum(values) / len(values), 1)
