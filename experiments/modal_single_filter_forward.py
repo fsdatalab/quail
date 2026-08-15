@@ -178,6 +178,34 @@ resident, fp8 KV was the wrong setting in the committed control all
 along; bf16 KV is the correctly configured engine baseline for this
 comparison, and the custom packed cell beats it too.
 
+Round 4: the query/key norm and rotate region, the pipeline's worst
+kernel by achieved bandwidth. The round 3 profile shows the per-head
+norm running one tiny work group per 128-number head vector - about
+15 million launches per profiled window at 23 GB/s - for 338 ms,
+plus the separate rotate kernel and two layout copies around it. The
+region moves only about 8 GB per window. One Triton kernel per token
+now does all of it: loads the query and key parts of the qkv result,
+normalizes each head against its norm weight, applies the rotation
+from the position table, and writes query and key contiguously in
+the layout attention wants. The value part was always a free view
+and stays one.
+
+Round 4 prediction, stated before the run:
+  - probe microbenchmark: the fused kernel beats the four-step
+    sequence it replaces (two per-head norms, the rotate, two
+    copies) by at least 5x per call; given the 23 GB/s baseline,
+    10 to 30x is plausible.
+  - end to end: 7 to 11 percent over the round-3 custom cell,
+    111,000 to 115,000 tokens per second, further above the bf16-KV
+    engine's roughly 101,500.
+  - answers stay within tens of the round-3 custom cell's 2,191
+    wrong; the norm and rotation move from vLLM's kernels to fp32
+    arithmetic in ours, so exact agreement is not expected.
+  Falsifier: if the fused kernel wins its microbenchmark but the
+  end-to-end gain lands under 5 percent, the region's cost was
+  partly hidden elsewhere (the profiled classes misattribute it) and
+  the profiled repetition says where.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
@@ -310,6 +338,7 @@ class PackedPipeline:
         self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
         self.fp8 = torch.float8_e4m3fn
         self.fa_version = 2
+        self.fuse_qk = False
 
     @staticmethod
     def weight_scale(linear):
@@ -438,9 +467,82 @@ class PackedPipeline:
             tl.store(s_ptr + g_idx * s_stride_g + t * s_stride_t, scale,
                      mask=g_idx < NG)
 
+        @triton.jit
+        def qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, pos_ptr,
+                         qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
+                         eps, QH: tl.constexpr, KH: tl.constexpr,
+                         HD: tl.constexpr, HALF: tl.constexpr):
+            t = tl.program_id(0)
+            pos = tl.load(pos_ptr + t)
+            half_offs = tl.arange(0, HALF)
+            cos = tl.load(cs_ptr + pos * HD + half_offs).to(tl.float32)
+            sin = tl.load(cs_ptr + pos * HD + HALF + half_offs).to(tl.float32)
+            qw_a = tl.load(qw_ptr + half_offs).to(tl.float32)
+            qw_b = tl.load(qw_ptr + HALF + half_offs).to(tl.float32)
+            kw_a = tl.load(kw_ptr + half_offs).to(tl.float32)
+            kw_b = tl.load(kw_ptr + HALF + half_offs).to(tl.float32)
+
+            # query heads: each head split into its two rotation halves
+            q_heads = tl.arange(0, QH)
+            qa_offs = q_heads[:, None] * HD + half_offs[None, :]
+            qb_offs = qa_offs + HALF
+            qa = tl.load(qkv_ptr + t * stride_qkv + qa_offs).to(tl.float32)
+            qb = tl.load(qkv_ptr + t * stride_qkv + qb_offs).to(tl.float32)
+            ms = (tl.sum(qa * qa, axis=1) + tl.sum(qb * qb, axis=1)) / HD
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            qa = qa * rstd[:, None] * qw_a[None, :]
+            qb = qb * rstd[:, None] * qw_b[None, :]
+            out_a = qa * cos[None, :] - qb * sin[None, :]
+            out_b = qb * cos[None, :] + qa * sin[None, :]
+            tl.store(q_out_ptr + t * stride_qo + qa_offs,
+                     out_a.to(q_out_ptr.dtype.element_ty))
+            tl.store(q_out_ptr + t * stride_qo + qb_offs,
+                     out_b.to(q_out_ptr.dtype.element_ty))
+
+            # key heads, offset past the query width in the qkv row
+            k_heads = tl.arange(0, KH)
+            ka_offs = k_heads[:, None] * HD + half_offs[None, :]
+            kb_offs = ka_offs + HALF
+            base = qkv_ptr + t * stride_qkv + QH * HD
+            ka = tl.load(base + ka_offs).to(tl.float32)
+            kb = tl.load(base + kb_offs).to(tl.float32)
+            ms = (tl.sum(ka * ka, axis=1) + tl.sum(kb * kb, axis=1)) / HD
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            ka = ka * rstd[:, None] * kw_a[None, :]
+            kb = kb * rstd[:, None] * kw_b[None, :]
+            out_a = ka * cos[None, :] - kb * sin[None, :]
+            out_b = kb * cos[None, :] + ka * sin[None, :]
+            tl.store(k_out_ptr + t * stride_ko + ka_offs,
+                     out_a.to(k_out_ptr.dtype.element_ty))
+            tl.store(k_out_ptr + t * stride_ko + kb_offs,
+                     out_b.to(k_out_ptr.dtype.element_ty))
+
         self._kernels = {"silu": silu_mul_quant,
-                         "norm": add_rms_norm_quant}
+                         "norm": add_rms_norm_quant,
+                         "qk": qk_norm_rope}
         return self._kernels
+
+    def custom_qk_norm_rope(self, qkv, positions, attn):
+        """Per-head norm, rotation, and layout in one kernel per
+        token, replacing two per-head-row norm launches, the rotate
+        kernel, and two contiguous copies."""
+        n_tokens = qkv.shape[0]
+        q_width = self.num_q_heads * self.head_dim
+        kv_width = self.num_kv_heads * self.head_dim
+        q_out = self.torch.empty((n_tokens, q_width),
+                                 dtype=qkv.dtype, device="cuda")
+        k_out = self.torch.empty((n_tokens, kv_width),
+                                 dtype=qkv.dtype, device="cuda")
+        self._triton_kernels()["qk"][(n_tokens,)](
+            qkv, q_out, k_out, self.rotary.cos_sin_cache, positions,
+            attn.q_norm.weight, attn.k_norm.weight,
+            qkv.stride(0), q_out.stride(0), k_out.stride(0),
+            attn.q_norm.variance_epsilon,
+            QH=self.num_q_heads, KH=self.num_kv_heads,
+            HD=self.head_dim, HALF=self.head_dim // 2,
+            num_warps=8,
+        )
+        return q_out, k_out
 
     def custom_silu_quant(self, gate_up):
         n_tokens, doubled = gate_up.shape
@@ -580,14 +682,18 @@ class PackedPipeline:
 
             q_width = self.num_q_heads * self.head_dim
             kv_width = self.num_kv_heads * self.head_dim
-            q, k, v = qkv.split([q_width, kv_width, kv_width], dim=-1)
-            q = self.rms_norm(
-                q.reshape(-1, self.head_dim).contiguous(), attn.q_norm
-            ).reshape(n_tokens, q_width)
-            k = self.rms_norm(
-                k.reshape(-1, self.head_dim).contiguous(), attn.k_norm
-            ).reshape(n_tokens, kv_width)
-            q, k = self.rotary(positions, q, k)
+            if self.fuse_qk:
+                q, k = self.custom_qk_norm_rope(qkv, positions, attn)
+                v = qkv.split([q_width, kv_width, kv_width], dim=-1)[2]
+            else:
+                q, k, v = qkv.split([q_width, kv_width, kv_width], dim=-1)
+                q = self.rms_norm(
+                    q.reshape(-1, self.head_dim).contiguous(), attn.q_norm
+                ).reshape(n_tokens, q_width)
+                k = self.rms_norm(
+                    k.reshape(-1, self.head_dim).contiguous(), attn.k_norm
+                ).reshape(n_tokens, kv_width)
+                q, k = self.rotary(positions, q, k)
             attn_out = self.attention(q, k, v, cu_seqlens, max_seqlen)
 
             # the attention output quant has no fusion partner in
@@ -799,6 +905,42 @@ def probe(n_docs: int = 8) -> str:
         "norm_residual_max_diff": round(residual_diff, 5),
     }
 
+    # the fused qk kernel against the four-step path it replaces
+    attn1 = model.model.layers[1].self_attn
+    cache = pipeline.rotary.cos_sin_cache
+    result["qk_check"] = {"cos_sin_cache": [list(cache.shape),
+                                            str(cache.dtype)]}
+    with torch.inference_mode():
+        qkv_t = torch.randn(256, 6144, dtype=torch.bfloat16,
+                            device="cuda")
+        pos_t = torch.arange(256, device="cuda")
+
+        def qk_reference(qkv_in, pos):
+            q, k, _v = qkv_in.split([4096, 1024, 1024], dim=-1)
+            q = pipeline.rms_norm(
+                q.reshape(-1, 128).contiguous(), attn1.q_norm
+            ).reshape(-1, 4096)
+            k = pipeline.rms_norm(
+                k.reshape(-1, 128).contiguous(), attn1.k_norm
+            ).reshape(-1, 1024)
+            return pipeline.rotary(pos, q, k)
+
+        q_ref, k_ref = qk_reference(qkv_t.clone(), pos_t)
+        q_new, k_new = pipeline.custom_qk_norm_rope(qkv_t, pos_t, attn1)
+        result["qk_check"]["q_max_diff"] = round(
+            (q_ref.float() - q_new.float()).abs().max().item(), 5)
+        result["qk_check"]["k_max_diff"] = round(
+            (k_ref.float() - k_new.float()).abs().max().item(), 5)
+
+        pipeline.fuse_qk = True
+        custom_qk = pipeline.forward_chunk(packed, fused="custom")
+        pipeline.fuse_qk = False
+    custom_qk_answers = answers(custom_qk)
+    result["qk_check"]["chunk_wrong"] = sum(
+        a != b for a, b in zip(custom_qk_answers, expected))
+    result["qk_check"]["chunk_vs_custom_disagreements"] = sum(
+        a != b for a, b in zip(custom_qk_answers, custom_answers))
+
     # kernel-level timing at the real chunk size: the go or no-go
     # signal for the full run
     def bench(fn, iters=30, warmups=5):
@@ -838,7 +980,14 @@ def probe(n_docs: int = 8) -> str:
             lambda: pipeline.custom_norm_quant(
                 big_hidden, norm_module, big_residual)),
     }
-    del big_gate_up, big_hidden, big_residual
+    big_qkv = torch.randn(BEST_BATCH_TOKENS, 6144, dtype=torch.bfloat16,
+                          device="cuda")
+    big_pos = torch.arange(BEST_BATCH_TOKENS, device="cuda") % 3072
+    result["microbench_us_per_call"]["qk_four_step"] = bench(
+        lambda: qk_reference(big_qkv, big_pos))
+    result["microbench_us_per_call"]["qk_custom"] = bench(
+        lambda: pipeline.custom_qk_norm_rope(big_qkv, big_pos, attn1))
+    del big_gate_up, big_hidden, big_residual, big_qkv
 
     # capture at the full chunk size: the 8-doc chunk padded from
     # ~2,200 to 25,305 tokens is the worst-case padding path
@@ -920,7 +1069,9 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     # the second engine cell answers whether the packed pipeline's
     # accuracy edge comes from the engine's fp8 KV cache: same boot,
     # KV held in bf16 instead
-    for engine_name, kv_dtype in (("vllm", "fp8"), ("vllm_bf16kv", "auto")):
+    # bf16 KV is the corrected engine baseline from round 3; the fp8
+    # cell is banked in the round 3 result and not repeated
+    for engine_name, kv_dtype in (("vllm_bf16kv", "auto"),):
         llm = LLM(
             model=MODEL,
             kv_cache_dtype=kv_dtype,
@@ -1002,10 +1153,11 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     assert longest_prompt < max_seqlen_cap
     max_docs = max(len(batch) for batch in batches) + 1
     cells = (
-        ("packed_sep_fa3", False, False),
-        ("packed_customfused_fa3", "custom", False),
+        ("packed_custom", "custom", False, False),
+        ("packed_custom_qk", "custom", False, True),
     )
-    for name, fused, graphed in cells:
+    for name, fused, graphed, fuse_qk in cells:
+        pipeline.fuse_qk = fuse_qk
         runner = (GraphedChunkRunner(pipeline, fused, batch_tokens,
                                      max_docs, max_seqlen_cap)
                   if graphed else None)
@@ -1025,11 +1177,11 @@ def compare(n_docs: int = 10_000, reps: int = 3,
                 "wall": round(wall, 4),
                 "tokens_per_second": round(total_prompt_tokens / wall, 1),
                 "wrong": wrong,
-                "disagrees_with_vllm": sum(
+                "disagrees_with_engine": sum(
                     a != b for a, b in zip(predicted, control_predictions)
                 ),
                 "attention": f"fa{pipeline.fa_version}",
-                "cudagraphs": graphed,
+                "fused_qk_norm_rope": fuse_qk,
                 "persistent_kv": False,
                 "peak_allocated_gib": round(
                     torch.cuda.max_memory_allocated() / 2**30, 3
@@ -1075,14 +1227,13 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         torch.cuda.empty_cache()
 
     rates = {}
-    for method in ("vllm", "vllm_bf16kv", "packed_sep_fa3",
-                   "packed_customfused_fa3"):
+    for method in ("vllm_bf16kv", "packed_custom", "packed_custom_qk"):
         values = [row["tokens_per_second"] for row in report["runs"]
                   if row["method"] == method]
         rates[method] = round(sum(values) / len(values), 1)
     report["mean_tokens_per_second"] = rates
-    report["relative_to_vllm"] = {
-        method: round(rate / rates["vllm"], 4)
+    report["relative_to_engine"] = {
+        method: round(rate / rates["vllm_bf16kv"], 4)
         for method, rate in rates.items()
     }
 
