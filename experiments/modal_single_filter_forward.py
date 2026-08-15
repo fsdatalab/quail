@@ -119,6 +119,40 @@ compiles the QK-norm and rope region into one kernel where this
 pipeline runs separate norm, rope, and reshape kernels - plus
 per-chunk host copies, not launch overhead.
 
+Round 3: our own fused kernels, plus the control the accuracy
+finding needs. Two Triton kernels replace vLLM's fused ops in a new
+"custom" packed variant: silu+group-quant (one program per token and
+4-group block, reading gate and up once and writing fp8 and
+power-of-two scales directly) and residual-add+norm+group-quant (one
+program per token row). The scales get the same power-of-two
+rounding as the separate quant path, so DeepGEMM's internal cast is
+lossless for both and the numerics comparison is clean. The engine
+side gains a second cell with the KV cache in bf16 instead of fp8,
+identical otherwise: if the packed pipeline's accuracy edge comes
+from the engine quantizing K and V, this cell recovers it.
+
+Round 3 prediction, stated before the run. From the round 2
+profiles, the separate silu+quant pair costs about 715 ms per
+profiled window at an effective 1.7 TB/s, and vLLM's fused kernel
+845 to 896 ms at 0.8 TB/s; the fused traffic floor is 666 GB per
+window.
+  - the probe microbenchmark: custom silu+quant beats the separate
+    pair by 30 to 45 percent per call; custom norm+quant beats its
+    pair by 25 to 35 percent. If either loses instead, the full run
+    does not launch until the kernel is fixed.
+  - end to end: packed custom lands 5 to 10 percent over the
+    separate packed cell - 99,000 to 104,000 tokens per second
+    against the engine's roughly 98,000, making the packed pipeline
+    the fastest configuration measured in this project.
+  - the bf16-KV engine cell answers within a few tens of the packed
+    pipeline's 2,228 wrong (confirming the fp8 KV cache costs the
+    engine about 7.6 points of absolute accuracy on this workload),
+    at unchanged speed within 1 percent. If it stays near 2,990, the
+    accuracy edge is not the KV cache and the suspect becomes
+    attention-kernel numerics.
+  - custom-variant answers stay within about 100 disagreements of
+    the separate packed variant, wrong near 2,228.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
@@ -311,6 +345,112 @@ class PackedPipeline:
         )
         return result, scales
 
+    def _triton_kernels(self):
+        """Our own fused kernels, built lazily so the module imports
+        on machines without triton. Scales get the same power-of-two
+        rounding the separate quant path uses, so DeepGEMM's internal
+        cast is lossless for both."""
+        if hasattr(self, "_kernels"):
+            return self._kernels
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def silu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
+                           s_stride_g, s_stride_t,
+                           HALF: tl.constexpr, GROUP: tl.constexpr,
+                           GPB: tl.constexpr, UE8M0: tl.constexpr):
+            t = tl.program_id(0)
+            block = tl.program_id(1)
+            offs = block * GROUP * GPB + tl.arange(0, GROUP * GPB)
+            gate = tl.load(gu_ptr + t * stride_gu + offs).to(tl.float32)
+            up = tl.load(gu_ptr + t * stride_gu + HALF + offs).to(tl.float32)
+            y = gate * tl.sigmoid(gate) * up
+            y2 = tl.reshape(y, (GPB, GROUP))
+            amax = tl.max(tl.abs(y2), axis=1)
+            scale = tl.maximum(amax, 1e-10) / 448.0
+            if UE8M0:
+                scale = tl.math.exp2(tl.ceil(tl.math.log2(scale)))
+            q = y2 / scale[:, None]
+            q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+            tl.store(q_ptr + t * stride_q + offs,
+                     tl.reshape(q, (GROUP * GPB,)).to(q_ptr.dtype.element_ty))
+            g_idx = block * GPB + tl.arange(0, GPB)
+            tl.store(s_ptr + g_idx * s_stride_g + t * s_stride_t, scale)
+
+        @triton.jit
+        def add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
+                               stride_x, stride_res, stride_q,
+                               s_stride_g, s_stride_t, eps,
+                               H: tl.constexpr, BLOCK: tl.constexpr,
+                               GROUP: tl.constexpr, NG: tl.constexpr,
+                               UE8M0: tl.constexpr):
+            t = tl.program_id(0)
+            offs = tl.arange(0, BLOCK)
+            mask = offs < H
+            x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
+                        other=0.0).to(tl.float32)
+            r = tl.load(res_ptr + t * stride_res + offs, mask=mask,
+                        other=0.0).to(tl.float32)
+            x = x + r
+            tl.store(res_ptr + t * stride_res + offs,
+                     x.to(res_ptr.dtype.element_ty), mask=mask)
+            ms = tl.sum(x * x, axis=0) / H
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            y = x * rstd * w
+            y2 = tl.reshape(y, (BLOCK // GROUP, GROUP))
+            amax = tl.max(tl.abs(y2), axis=1)
+            scale = tl.maximum(amax, 1e-10) / 448.0
+            if UE8M0:
+                scale = tl.math.exp2(tl.ceil(tl.math.log2(scale)))
+            q = y2 / scale[:, None]
+            q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+            tl.store(q_ptr + t * stride_q + offs,
+                     tl.reshape(q, (BLOCK,)).to(q_ptr.dtype.element_ty),
+                     mask=mask)
+            g_idx = tl.arange(0, BLOCK // GROUP)
+            tl.store(s_ptr + g_idx * s_stride_g + t * s_stride_t, scale,
+                     mask=g_idx < NG)
+
+        self._kernels = {"silu": silu_mul_quant,
+                         "norm": add_rms_norm_quant}
+        return self._kernels
+
+    def custom_silu_quant(self, gate_up):
+        n_tokens, doubled = gate_up.shape
+        half = doubled // 2
+        q = self.torch.empty((n_tokens, half), dtype=self.fp8,
+                             device="cuda")
+        scales = self._col_major_scales(n_tokens, half)
+        groups_per_block = 4
+        grid = (n_tokens, half // (self.GROUP * groups_per_block))
+        self._triton_kernels()["silu"][grid](
+            gate_up, q, scales, gate_up.stride(0), q.stride(0),
+            scales.stride(1), scales.stride(0),
+            HALF=half, GROUP=self.GROUP, GPB=groups_per_block,
+            UE8M0=self.use_ue8m0, num_warps=4,
+        )
+        return q, scales
+
+    def custom_norm_quant(self, hidden, norm, residual):
+        """Residual add, norm, and group quant in one program per
+        token row. Mutates residual in place like the engine's
+        fused-add norm."""
+        n_tokens, width = hidden.shape
+        q = self.torch.empty_like(hidden, dtype=self.fp8)
+        scales = self._col_major_scales(n_tokens, width)
+        n_groups = width // self.GROUP
+        block = 1 << (width - 1).bit_length()
+        self._triton_kernels()["norm"][(n_tokens,)](
+            hidden, residual, norm.weight, q, scales,
+            hidden.stride(0), residual.stride(0), q.stride(0),
+            scales.stride(1), scales.stride(0), norm.variance_epsilon,
+            H=width, BLOCK=block, GROUP=self.GROUP, NG=n_groups,
+            UE8M0=self.use_ue8m0, num_warps=8,
+        )
+        return q, scales
+
     def silu_and_mul(self, gate_up):
         n_tokens, doubled = gate_up.shape
         out = self.torch.empty(
@@ -401,6 +541,9 @@ class PackedPipeline:
                 residual = hidden
                 q_in, q_scale = self.quant(
                     self.rms_norm(hidden, layer.input_layernorm))
+            elif fused == "custom":
+                q_in, q_scale = self.custom_norm_quant(
+                    hidden, layer.input_layernorm, residual)
             elif fused:
                 q_in, q_scale = self.fused_norm_quant(
                     hidden, layer.input_layernorm, residual)
@@ -427,7 +570,10 @@ class PackedPipeline:
             o_in, o_scale = self.quant(attn_out)
             hidden = self.gemm(o_in, o_scale, attn.o_proj)
 
-            if fused:
+            if fused == "custom":
+                g_in, g_scale = self.custom_norm_quant(
+                    hidden, layer.post_attention_layernorm, residual)
+            elif fused:
                 g_in, g_scale = self.fused_norm_quant(
                     hidden, layer.post_attention_layernorm, residual)
             else:
@@ -435,7 +581,9 @@ class PackedPipeline:
                     hidden, residual, layer.post_attention_layernorm)
                 g_in, g_scale = self.quant(normed)
             gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
-            if fused:
+            if fused == "custom":
+                d_in, d_scale = self.custom_silu_quant(gate_up)
+            elif fused:
                 d_in, d_scale = self.fused_silu_quant(gate_up)
             else:
                 d_in, d_scale = self.quant(self.silu_and_mul(gate_up))
@@ -574,8 +722,10 @@ def probe(n_docs: int = 8) -> str:
     with torch.inference_mode():
         unfused = pipeline.forward_chunk(packed, fused=False)
         fused = pipeline.forward_chunk(packed, fused=True)
+        custom = pipeline.forward_chunk(packed, fused="custom")
     unfused_answers = answers(unfused)
     fused_answers = answers(fused)
+    custom_answers = answers(custom)
     diff = (unfused.float() - fused.float()).abs().max().item()
     result["chunk"] = {
         "tokens": int(packed[0].shape[0]),
@@ -590,7 +740,80 @@ def probe(n_docs: int = 8) -> str:
             a != b for a, b in zip(fused_answers, expected)),
         "fused_vs_unfused_disagreements": sum(
             a != b for a, b in zip(fused_answers, unfused_answers)),
+        "custom_finite": bool(torch.isfinite(custom).all().item()),
+        "custom_wrong": sum(
+            a != b for a, b in zip(custom_answers, expected)),
+        "custom_vs_unfused_disagreements": sum(
+            a != b for a, b in zip(custom_answers, unfused_answers)),
     }
+
+    # dequantized agreement of the custom kernels against the
+    # separate path they replace, on fresh tensors
+    with torch.inference_mode():
+        check = torch.randn(256, 19456, dtype=torch.bfloat16,
+                            device="cuda")
+        q_ref, s_ref = pipeline.quant(pipeline.silu_and_mul(check))
+        q_new, s_new = pipeline.custom_silu_quant(check)
+        deq_ref = q_ref.float().view(256, -1, 128) * s_ref.float()[:, :, None]
+        deq_new = q_new.float().view(256, -1, 128) * s_new.float()[:, :, None]
+        silu_deq_diff = (deq_ref - deq_new).abs().max().item()
+        norm_module = model.model.layers[1].post_attention_layernorm
+        h_ref = torch.randn(256, 2560, dtype=torch.bfloat16, device="cuda")
+        r_ref = torch.randn(256, 2560, dtype=torch.bfloat16, device="cuda")
+        h_new, r_new = h_ref.clone(), r_ref.clone()
+        normed, _ = pipeline.fused_add_rms_norm(h_ref, r_ref, norm_module)
+        q_ref, s_ref = pipeline.quant(normed)
+        q_new, s_new = pipeline.custom_norm_quant(h_new, norm_module, r_new)
+        deq_ref = q_ref.float().view(256, -1, 128) * s_ref.float()[:, :, None]
+        deq_new = q_new.float().view(256, -1, 128) * s_new.float()[:, :, None]
+        norm_deq_diff = (deq_ref - deq_new).abs().max().item()
+        residual_diff = (r_ref.float() - r_new.float()).abs().max().item()
+    result["custom_kernel_check"] = {
+        "silu_dequant_max_diff": round(silu_deq_diff, 5),
+        "norm_dequant_max_diff": round(norm_deq_diff, 5),
+        "norm_residual_max_diff": round(residual_diff, 5),
+    }
+
+    # kernel-level timing at the real chunk size: the go or no-go
+    # signal for the full run
+    def bench(fn, iters=30, warmups=5):
+        with torch.inference_mode():
+            for _ in range(warmups):
+                fn()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                fn()
+            end.record()
+            torch.cuda.synchronize()
+        return round(start.elapsed_time(end) * 1000 / iters, 1)
+
+    big_gate_up = torch.randn(BEST_BATCH_TOKENS, 19456,
+                              dtype=torch.bfloat16, device="cuda")
+    big_hidden = torch.randn(BEST_BATCH_TOKENS, 2560,
+                             dtype=torch.bfloat16, device="cuda")
+    big_residual = torch.randn(BEST_BATCH_TOKENS, 2560,
+                               dtype=torch.bfloat16, device="cuda")
+    result["microbench_us_per_call"] = {
+        "silu_separate_pair": bench(
+            lambda: pipeline.quant(pipeline.silu_and_mul(big_gate_up))),
+        "silu_vllm_fused": bench(
+            lambda: pipeline.fused_silu_quant(big_gate_up)),
+        "silu_custom": bench(
+            lambda: pipeline.custom_silu_quant(big_gate_up)),
+        "norm_separate_pair": bench(
+            lambda: pipeline.quant(pipeline.fused_add_rms_norm(
+                big_hidden, big_residual, norm_module)[0])),
+        "norm_vllm_fused": bench(
+            lambda: pipeline.fused_norm_quant(
+                big_hidden, norm_module, big_residual)),
+        "norm_custom": bench(
+            lambda: pipeline.custom_norm_quant(
+                big_hidden, norm_module, big_residual)),
+    }
+    del big_gate_up, big_hidden, big_residual
 
     # capture at the full chunk size: the 8-doc chunk padded from
     # ~2,200 to 25,305 tokens is the worst-case padding path
@@ -661,20 +884,6 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     )
 
     graph_tokens = min(batch_tokens, VLLM_GRAPH_TOKENS)
-    llm = LLM(
-        model=MODEL,
-        kv_cache_dtype="fp8",
-        max_model_len=4608,
-        max_num_seqs=4096,
-        max_num_batched_tokens=batch_tokens,
-        gpu_memory_utilization=0.88,
-        enable_prefix_caching=False,
-        disable_log_stats=True,
-        compilation_config={
-            "max_cudagraph_capture_size": graph_tokens,
-            "cudagraph_capture_sizes": [graph_tokens],
-        },
-    )
     sampling = SamplingParams(
         temperature=0.0,
         max_tokens=1,
@@ -682,31 +891,56 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         allowed_token_ids=allowed_ids,
     )
     vllm_prompts = [{"prompt_token_ids": prompt} for prompt in prompts]
-    llm.generate(vllm_prompts[:64], sampling, use_tqdm=False)
-    for rep in range(reps):
-        started = time.perf_counter()
-        outputs = llm.generate(vllm_prompts, sampling, use_tqdm=False)
-        wall = time.perf_counter() - started
-        predicted = []
-        for output in outputs:
-            token_id = int(output.outputs[0].token_ids[0])
-            predicted.append(1 if token_id in yes_ids else 0)
-        wrong = sum(a != b for a, b in zip(predicted, expected))
-        row = {
-            "method": "vllm",
-            "rep": rep,
-            "wall": round(wall, 4),
-            "tokens_per_second": round(total_prompt_tokens / wall, 1),
-            "wrong": wrong,
-        }
-        report["runs"].append(row)
-        print(f"[single filter] {row}", flush=True)
-    control_predictions = list(predicted)
+    control_predictions = None
+    # the second engine cell answers whether the packed pipeline's
+    # accuracy edge comes from the engine's fp8 KV cache: same boot,
+    # KV held in bf16 instead
+    for engine_name, kv_dtype in (("vllm", "fp8"), ("vllm_bf16kv", "auto")):
+        llm = LLM(
+            model=MODEL,
+            kv_cache_dtype=kv_dtype,
+            max_model_len=4608,
+            max_num_seqs=4096,
+            max_num_batched_tokens=batch_tokens,
+            gpu_memory_utilization=0.88,
+            enable_prefix_caching=False,
+            disable_log_stats=True,
+            compilation_config={
+                "max_cudagraph_capture_size": graph_tokens,
+                "cudagraph_capture_sizes": [graph_tokens],
+            },
+        )
+        llm.generate(vllm_prompts[:64], sampling, use_tqdm=False)
+        for rep in range(reps):
+            started = time.perf_counter()
+            outputs = llm.generate(vllm_prompts, sampling, use_tqdm=False)
+            wall = time.perf_counter() - started
+            predicted = []
+            for output in outputs:
+                token_id = int(output.outputs[0].token_ids[0])
+                predicted.append(1 if token_id in yes_ids else 0)
+            wrong = sum(a != b for a, b in zip(predicted, expected))
+            row = {
+                "method": engine_name,
+                "rep": rep,
+                "wall": round(wall, 4),
+                "tokens_per_second": round(total_prompt_tokens / wall, 1),
+                "wrong": wrong,
+                "kv_cache_dtype": kv_dtype,
+            }
+            if control_predictions is not None:
+                row["disagrees_with_vllm"] = sum(
+                    a != b for a, b in zip(predicted, control_predictions)
+                )
+            report["runs"].append(row)
+            print(f"[single filter] {row}", flush=True)
+        if control_predictions is None:
+            control_predictions = list(predicted)
 
-    del outputs, llm
-    gc.collect()
-    torch.cuda.empty_cache()
-    time.sleep(5)
+        del outputs, llm
+        gc.collect()
+        torch.cuda.empty_cache()
+        time.sleep(5)
 
     model = _load_vllm_model()
     pipeline = PackedPipeline(model)
@@ -743,9 +977,8 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     assert longest_prompt < max_seqlen_cap
     max_docs = max(len(batch) for batch in batches) + 1
     cells = (
-        ("packed_sep_fa3_eager", False, False),
-        ("packed_sep_fa3_graphs", False, True),
-        ("packed_fused_fa3_graphs", True, True),
+        ("packed_sep_fa3", False, False),
+        ("packed_customfused_fa3", "custom", False),
     )
     for name, fused, graphed in cells:
         runner = (GraphedChunkRunner(pipeline, fused, batch_tokens,
@@ -817,8 +1050,8 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         torch.cuda.empty_cache()
 
     rates = {}
-    for method in ("vllm", "packed_sep_fa3_eager", "packed_sep_fa3_graphs",
-                   "packed_fused_fa3_graphs"):
+    for method in ("vllm", "vllm_bf16kv", "packed_sep_fa3",
+                   "packed_customfused_fa3"):
         values = [row["tokens_per_second"] for row in report["runs"]
                   if row["method"] == method]
         rates[method] = round(sum(values) / len(values), 1)
