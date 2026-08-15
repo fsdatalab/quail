@@ -91,6 +91,34 @@ Round 2 prediction, stated before the run:
   engine, the gap attribution was wrong, and the profiled repetition
   names what actually remains.
 
+Round 2 result: FlashAttention-3 delivered, CUDA graphs did not, and
+the falsifier fired - round 1's gap attribution was wrong. Means:
+vLLM 98,059 tokens per second, eager FlashAttention-3 94,601
+(0.965), graphed 93,199 (0.950), graphed fused 88,049 (0.898).
+FlashAttention-3 cut the attention kernel from 411 to 228 ms per
+profiled window, worth 3.5 percent end to end against the predicted
+2.4. The graphs cell ran every chunk at the full padded 25,305
+tokens and lost its 1.5 percent padding tax while recovering
+nothing, because the eager loop was already GPU-bound: its kernel
+time equals its wall time within measurement error - and rechecked,
+round 1's did too. The "two thirds launch gaps" claim came from
+comparing two different profilers and was wrong; the whole gap to
+the engine was always kernel time. The padding design also puts a
+near-empty chunk's tail into one long causal sequence whose
+attention cost grows with the square of the pad length, visible in
+the graphed profile's attention share. The fused kernels still lose
+under graphs (896 ms for the fused silu+quant against about 711 for
+the pair it replaces). Graphed replays reproduce the eager answers
+exactly: 2,228 wrong of 10,000 in both, against the engine's 2,990,
+and 2,152 for the fused variant. Reported peak memory fell to 4.55
+GiB under graphs, partly an accounting effect of the capture pool
+predating the counter reset. Best packed configuration: eager
+FlashAttention-3 at 96.5 percent of the engine with the accuracy
+win; the remaining 3.5 percent is named kernel work - the engine
+compiles the QK-norm and rope region into one kernel where this
+pipeline runs separate norm, rope, and reshape kernels - plus
+per-chunk host copies, not launch overhead.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
