@@ -62,7 +62,8 @@ filters_image = image.add_local_python_source("workload")
 async def filter_cells(n_docs: int = 10000, reps: int = 3,
                        arms: str = "rewind,stock",
                        probe_rate: bool = False,
-                       outname: str = "filter_cells.json") -> dict:
+                       outname: str = "filter_cells.json",
+                       kv: str = "fp8") -> dict:
     import time as _time
 
     from transformers import AutoTokenizer
@@ -82,8 +83,17 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
     body_ids, q_ids, flags = build_corpus(tok, n_docs)
     corpus = sum(len(b) for b in body_ids)
 
+    # KV format is a boot choice, independent of the fp8 compute path.
+    # The plan's admission budget must use the matching bytes per
+    # token, or a bf16 boot would admit twice the KV that fits.
+    if kv not in ("fp8", "bf16"):
+        raise ValueError(f"kv must be fp8 or bf16, got {kv!r}")
+    model_cfg = (MODELS[CFG_NAME] if kv == "fp8"
+                 else MODELS[CFG_NAME].with_kv_dtype(2))
+    kv_cache_dtype = "fp8" if kv == "fp8" else "auto"
+
     plan = plan_query(N_FILTERS, [len(b) for b in body_ids],
-                      MODELS[CFG_NAME], DEVICES[DEVICE_NAME],
+                      model_cfg, DEVICES[DEVICE_NAME],
                       selectivity=list(SELECTIVITY))
     budget = plan.budget_tokens
     # The concurrency a stock client should choose: the same token
@@ -98,7 +108,8 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
     sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
                         allowed_token_ids=sorted(yes_ids | no_ids))
 
-    report = dict(n_docs=n_docs, model=MODEL, corpus_tokens=corpus,
+    report = dict(n_docs=n_docs, model=MODEL, kv=kv,
+                  corpus_tokens=corpus,
                   n_filters=N_FILTERS, selectivity=list(SELECTIVITY),
                   budget_tokens=budget, stock_semaphore=stock_sem,
                   step_tokens=plan.engine_step_tokens,
@@ -161,7 +172,7 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
         # plan sizes the step budget and sequence cap that decide the
         # workspace.
         engine = Engine.from_engine_args(AsyncEngineArgs(
-            model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+            model=MODEL, kv_cache_dtype=kv_cache_dtype, max_model_len=4608,
             max_num_seqs=(plan.engine_max_seqs if planned else 4096),
             max_num_batched_tokens=plan.engine_step_tokens,
             gpu_memory_utilization=0.92 if planned else 0.88,
@@ -297,8 +308,11 @@ def c0_anchor(n_docs: int = 10000, reps: int = 3,
 
 @app.local_entrypoint()
 def main(n_docs: int = 10000, reps: int = 3, arms: str = "rewind,stock",
-         out: str = "results/engine/filter_cells.json"):
-    data = filter_cells.remote(n_docs, reps, arms)
+         kv: str = "fp8", out: str = ""):
+    tag = "filter_cells" if kv == "fp8" else f"filter_cells_{kv}"
+    out = out or f"results/engine/{tag}.json"
+    data = filter_cells.remote(n_docs, reps, arms, kv=kv,
+                               outname=f"{tag}.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
         json.dump(data, f, indent=2)
