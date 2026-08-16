@@ -202,3 +202,16 @@ def test_tiny_store_capacity_is_not_worth_restoring():
     p = plan_query(4, DOCS_10K, M4B, H100, store=store)
     assert p.access == "read"
     assert p.store_min_doc_tokens == 0
+
+
+def test_offload_crossover_is_derived_not_stored():
+    """The load-vs-recompute crossover comes from the measured
+    bandwidth and the alpha fit at call time. The measured disk
+    reproduces the previously banked ~19,898 tokens; pinned host
+    memory beats recompute at every length."""
+    from quail.plan.cost import TRANSPORT_BW_BPS, offload_crossover_tokens
+    disk = offload_crossover_tokens(
+        TRANSPORT_BW_BPS["c6_disk_read"], M4B, H100)
+    assert 19_800 < disk < 20_000
+    assert offload_crossover_tokens(
+        TRANSPORT_BW_BPS["c6_h2d_pinned"], M4B, H100) == 0.0
