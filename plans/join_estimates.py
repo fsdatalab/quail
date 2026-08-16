@@ -2,29 +2,49 @@
 
     python plans/join_estimates.py
 
-Measured constants are imported from quail/plan/cost.py (the one
-table). Three inputs are not in cost.py and carry their provenance
-here: the packed rate (plans/packed_forward.md, the round-6 ladder),
-the raw cached-read prices per suffix width (plans/cost_model.md
-Section 4), and the KV pool size (README, the shipped boot). The
-document lengths are assumptions until step 1 of the plan tokenizes
-the real data; change them here and the plan's numbers move with
-them.
+Inputs, in provenance order:
+
+  quail/plan/cost.py
+      The fitted constants (fit.py over calibrate_all.json). Imported,
+      not re-derived - that file is the canonical table.
+  results/engine/calibrate_all.json
+      Raw c2 cells -> the cached-read price per suffix width, by the
+      protocol cost_model.md Section 4 states: at width c and N = 32,
+      subtract the h=8,192 cell's engine-timer median from the
+      h=16,384 cell's and divide by the 262,144 additional cached
+      tokens. (Reproduces the documented 101 ns at c=32.) Also the
+      boot row's pool size.
+  results/engine/single_filter_forward_vllm_kernels.json
+      The packed pipeline rate (the custom-kernel ladder rung) and
+      the chunk token budget the ladder ran at.
+  results/engine/filter_cells.json
+      The shipped admission budget in tokens.
+
+One number has NO committed artifact: the default-admission thrash
+multiplier (README records 80.1 s against the fair 42.9 s, x1.87,
+but those cells were never landed in results/). It is carried here
+as prose-sourced and the plan's 5% sample run measures it fresh.
+
+The block marked ASSUMPTIONS is the only hand-typed input: dataset
+sizes from the FDJ paper's Table 1, and document/prompt lengths that
+step 1 of the plan replaces with tokenized values.
 
 Attention accounting: a prefill of h tokens costs a2*h^2 on top of
-linear work, and causal pairs(h) = h(h+1)/2 ~ h^2/2, so the price
-per attention pair is 2*a2. Both sustained rates were measured on
-the calibration corpus, whose profile is CAL_SQ_PER_TOKEN squared
-tokens per token — the rates already embed that much attention per
-token, so each estimate charges only its excess over the profile
-(the same centering rule cost.py uses).
+linear work, and causal pairs(h) ~ h^2/2, so the price per attention
+pair is 2*a2. Both sustained rates were measured on the calibration
+corpus (profile CAL_SQ_PER_TOKEN squared tokens per token), so each
+estimate charges only its excess over that profile - cost.py's
+centering rule.
 """
 
+import json
 import math
+import statistics
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from quail.plan.cost import (
     ALPHA2_S_PER_TOKEN2 as A2,
@@ -34,17 +54,36 @@ from quail.plan.cost import (
     STEP_TOKEN_S as A_ENG,
 )
 
-A_PKD = 1.0 / 121045.0        # s/token, packed pipeline (packed_forward.md)
-S = 25305                     # step/chunk token budget (batch sweep best)
-POOL = 946800                 # KV pool tokens at the shipped boot (README)
-READ_NS = {16: 82.0, 32: 104.0, 64: 141.0}   # ns per cached token at
-#                               suffix width c (cost_model.md 4, raw slopes)
-THRASH = 1.87                 # measured wall multiplier, default admission
-#                               at 3.4x pool pressure (README filter result)
+# ---------------------------------------------------------- artifacts
 
-NL, NR = 8103, 3718           # reports, terms (FDJ paper, Table 1)
-TL, TR = 1000, 8              # assumed doc tokens - step 1 replaces these
-p, q = 40, 50                 # assumed preamble / question tail
+cal = json.load(open(ROOT / "results/engine/calibrate_all.json"))
+ladder = json.load(
+    open(ROOT / "results/engine/single_filter_forward_vllm_kernels.json"))
+filters = json.load(open(ROOT / "results/engine/filter_cells.json"))
+
+POOL = next(r["pool_tokens"] for r in cal if r.get("meta") == "boot")
+BUDGET = filters["budget_tokens"]
+S = ladder["batch_tokens"]
+A_PKD = 1.0 / ladder["mean_tokens_per_second"]["packed_custom_qk"]
+
+c2 = {r["cell"]: r for r in cal if r.get("family") == "c2"}
+READ_NS = {}
+for c in (16, 32, 64):
+    lo = c2[f"c2_c{c}_h8192_n32"]["exec_ms_median"]
+    hi = c2[f"c2_c{c}_h16384_n32"]["exec_ms_median"]
+    READ_NS[c] = (hi - lo) * 1e6 / (32 * 8192)
+
+STOCK_FAIR_WALL = statistics.median(
+    c["wall"] for c in filters["cells"] if c["arm"] == "stock")
+THRASH = 80.1 / 42.9   # README prose only - no committed cells; see header
+
+# -------------------------------------------------------- ASSUMPTIONS
+
+NL, NR = 8103, 3718    # reports x terms (FDJ paper, Table 1)
+TL, TR = 1000, 8       # document tokens - step 1 tokenizes the real data
+p, q = 40, 50          # preamble / question tail - step 1 measures the prompt
+
+# --------------------------------------------------------------------
 
 P = NL * NR
 f, s = p + TL, TR + q
@@ -52,8 +91,8 @@ f, s = p + TL, TR + q
 
 def read_price(c):
     """Per-cached-token price at suffix width c, interpolated between
-    the measured widths. Outside 16..64 there is no measurement; the
-    plan flags c or h outside the calibrated grid wherever used."""
+    the measured widths. c or h outside the calibrated grid is flagged
+    where used."""
     ks = sorted(READ_NS)
     lo = max(k for k in ks if k <= c)
     hi = min(k for k in ks if k >= c)
@@ -71,14 +110,22 @@ def hrs(x):
     return x / 3600.0
 
 
-print(f"pairs P = {NL} x {NR} = {P:,}")
+print("derived from artifacts: pool "
+      f"{POOL:,} tok (calibrate boot); admission budget {BUDGET:,} tok "
+      f"(filter run); chunk budget S = {S:,}; packed rate "
+      f"{1 / A_PKD:,.0f} tok/s (ladder)")
+print("cached-read prices from c2 cells (ns/cached token): "
+      + ", ".join(f"c={c}: {v:.0f}" for c, v in READ_NS.items())
+      + f"; fair stock wall {STOCK_FAIR_WALL:.1f} s")
+
+print(f"\npairs P = {NL} x {NR} = {P:,}")
 print(f"f = {p}+{TL} = {f}; s = {TR}+{q} = {s}")
 print(f"terms side, fully resident = NR*(p+TR) = {NR * (p + TR):,} tokens "
       f"= {NR * (p + TR) / POOL:.0%} of the pool")
 
 k = (S - f) // s
 m = math.ceil(NR / k)
-print(f"\nchunk geometry: k = ({S}-{f})//{s} = {k} suffixes/chunk; "
+print(f"chunk geometry: k = ({S}-{f})//{s} = {k} suffixes/chunk; "
       f"m = ceil({NR}/{k}) = {m} chunks/report; waste bound f/S = {f / S:.1%}")
 
 # A1 - stock vLLM, one request per pair, arbitrary order: no reuse.
@@ -92,7 +139,8 @@ a1 = t_lin + t_attn + t_req + t_step
 print(f"\nA1 stock, arbitrary order: fresh = P*{h_pair} = {fresh / 1e9:.2f}B")
 print(f"  linear {hrs(t_lin):.1f} h + attn excess {hrs(t_attn):.1f} h + "
       f"requests {hrs(t_req):.2f} h + steps {hrs(t_step):.2f} h = "
-      f"{hrs(a1):.1f} h; x{THRASH} thrash = {hrs(a1 * THRASH):.0f} h")
+      f"{hrs(a1):.1f} h; x{THRASH:.2f} thrash (README-sourced, remeasured "
+      f"by the 5% sample) = {hrs(a1 * THRASH):.0f} h")
 print(f"  prefix working set NL*f = {NL * f / 1e6:.1f}M tokens = "
       f"{NL * f / POOL:.1f}x pool (why thrash applies)")
 
@@ -107,10 +155,11 @@ t_step = fresh_b / S * STEP_FIXED_S
 b = t_lin + t_attn + t_read + t_step + NL * BETA_N
 print(f"\nB engine chains: fresh = NL*f + P*s = {NL * f / 1e6:.1f}M + "
       f"{P * s / 1e9:.3f}B = {fresh_b / 1e9:.3f}B -> {hrs(t_lin):.2f} h")
-print(f"  reads P*f*{rd * 1e9:.0f}ns (interp c=32:104 / c=64:141 at c={s}) "
-      f"= {hrs(t_read):.2f} h  [c=32/c=64 endpoints: "
-      f"{hrs(P * f * READ_NS[32] * 1e-9):.2f}/{hrs(P * f * READ_NS[64] * 1e-9):.2f} h; "
-      f"h={f} is below the 2,048-min calibrated grid]")
+print(f"  reads P*f*{rd * 1e9:.0f}ns (c2 cells interpolated to c={s}) = "
+      f"{hrs(t_read):.2f} h  [c=32/c=64 cell prices: "
+      f"{hrs(P * f * READ_NS[32] * 1e-9):.2f}/"
+      f"{hrs(P * f * READ_NS[64] * 1e-9):.2f} h; h={f} is below the "
+      f"2,048-minimum calibrated grid]")
 print(f"  attn centering {t_attn:+.0f} s; steps {t_step:.0f} s")
 print(f"  B = {hrs(b):.1f} h")
 
@@ -129,13 +178,14 @@ pairs = (P * s * f
          + NL * m * f * (f + 1) // 2)
 t_non = fresh_c * (A_PKD - SQ_CAL * A2)
 t_att = 2 * pairs * A2
-c = t_non + t_att
+c_wall = t_non + t_att
 print(f"\nC packed, recompute: fresh = P*s + NL*m*f = {P * s / 1e9:.3f}B + "
       f"{NL * m * f / 1e6:.1f}M = {fresh_c / 1e9:.3f}B")
 print(f"  attention pairs {pairs / 1e12:.2f}e12 (cross {P * s * f / 1e12:.2f}e12)"
       f" -> non-attn {hrs(t_non):.2f} h + attn {hrs(t_att):.2f} h = "
-      f"{hrs(c):.2f} h; cross-attn share {t_att / c:.0%}")
-print(f"  5% pair sample (confirming cell): {c * 0.05 / 60:.0f} min")
+      f"{hrs(c_wall):.2f} h; cross-attn share {t_att / c_wall:.0%}; "
+      f"effective rate {fresh_c / c_wall:,.0f} tok/s")
+print(f"  5% pair sample (confirming cell): {c_wall * 0.05 / 60:.0f} min")
 
 # The flip - terms anchored - to show the anchor rule's stakes.
 f2, s2 = p + TR, TL + q
@@ -149,6 +199,6 @@ print(f"\nflip (terms anchored, packed): fresh {fresh_f / 1e9:.1f}B -> "
       f"{hrs(flip):.0f} h")
 
 w_sat = math.ceil(2 * S / s)
-w_mem = int(0.8 * POOL // (f + s + 1))
+w_mem = int(BUDGET // (f + s + 1))
 print(f"\nengine fallback sizing: W_sat = {w_sat}, W_mem = {w_mem} "
       f"(memory-bound below saturation -> drop step budget toward 16k)")

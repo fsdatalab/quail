@@ -138,9 +138,14 @@ that per-pair costs dominate; and one full run is affordable.
 Assumed lengths until tokenized (step 1 replaces these): reports
 1,000 tokens, terms 8, preamble 40, question tail 50. So f = 1,040,
 s = 58. **Every number below is printed, with its arithmetic, by
-`plans/join_estimates.py`** — measured constants imported from
-`quail/plan/cost.py`, assumptions declared at the top. Rerun it when
-step 1 replaces the assumptions.
+`plans/join_estimates.py`**, which derives its inputs from the
+committed sweep artifacts — `calibrate_all.json` for the raw
+cached-read cells and the boot's pool size, the kernel-ladder file
+for the packed rate and the chunk budget, `filter_cells.json` for
+the admission budget — and imports the fitted constants from
+`quail/plan/cost.py`. The only hand-typed block is the assumptions
+(FDJ table sizes; the document and prompt lengths step 1 replaces).
+Rerun it when step 1 lands.
 
 **Anchor choice, both ways** (packed, recompute):
 
@@ -164,9 +169,9 @@ from a Python loop.
 
 | plan | fresh tokens | wall |
 |---|---|---|
-| A1: stock vLLM, request per pair, arbitrary order | 33.08B | **99.9 h**; x1.87 measured thrash = 187 h — priced by 5% sample, never run full |
-| A2: stock vLLM, pairs grouped by report, admission matched | 1.756B + boundary | **7.3 h** |
-| B: engine chain mode (rewind) — fallback path | 1.756B | **6.2 h** |
+| A1: stock vLLM, request per pair, arbitrary order | 33.08B | **99.9 h**; x1.87 thrash = 186 h — priced by 5% sample, never run full |
+| A2: stock vLLM, pairs grouped by report, admission matched | 1.756B + boundary | **7.2 h** |
+| B: engine chain mode (rewind) — fallback path | 1.756B | **6.1 h** |
 | C: packed forward pass, recompute | 1.823B | **4.6 h** |
 
 Where each number comes from:
@@ -174,15 +179,20 @@ Where each number comes from:
 - **A1** = 30,126,954 pairs x 1,098 tokens = 33.08B fresh → 95.5 h
   linear, + 2.8 h quadratic attention surcharge (1,098-token prompts
   against the 472-profile the rate embeds), + 1.07 h step-fixed
-  cost, + 0.42 h request overhead. The x1.87 is the filter
-  measurement of default admission at 3.4x pool pressure; this
-  workload's prefix working set is 8.9x the pool.
+  cost, + 0.42 h request overhead. The x1.87 is the filter run of
+  default admission at 3.4x pool pressure — README-recorded only;
+  those cells were never committed to results/, so it is the one
+  input without an artifact, and the 5% sample remeasures it. This
+  workload's prefix working set is 9.0x the pool.
 - **B** = 8,103 x 1,040 + 30,126,954 x 58 = 1.756B fresh → 5.07 h,
-  + 1.17 h of cached reads: P x f x 134 ns, the measured
-  per-cached-token price interpolated to our suffix width 58 from
-  the c=32 (104 ns) and c=64 (141 ns) cells. Flag: h = 1,040 sits
-  below the calibrated grid's 2,048 minimum — this is the number a
-  C3 diagnostic would firm up.
+  + 1.09 h of cached reads: P x f x 125 ns, interpolated to our
+  suffix width 58 from the c2 cells of `calibrate_all.json` — 101
+  ns at c=32, 131 ns at c=64, by the documented two-cell
+  subtraction. (Re-deriving from the cells is why these differ from
+  the 82/104/141 trio quoted in cost_model.md, which does not
+  reproduce from the committed rows; the cells win.) Flag:
+  h = 1,040 sits below the grid's 2,048 minimum — the number a C3
+  diagnostic would firm up.
 - **A2** = B + 0.42 h per-pair request overhead + 0.70 h boundary
   blocks (the 16-token block spanning the report/term boundary
   recomputes every pair, ~8 tokens x P = 241M).
@@ -196,9 +206,9 @@ Where each number comes from:
 Baseline fairness, per house rules: the grouped-stock run gets the
 same memory budget and an admission cap derived the same way
 (max_num_seqs from the pool arithmetic; the engine rows want the
-step budget dropped toward 16k because the pool caps resident
-chains at 689 against the 873 that two step budgets of 58-token
-suffixes would need).
+step budget dropped toward 16k because the admission budget caps
+resident chains at 682 against the 873 that two step budgets of
+58-token suffixes would need).
 
 ---
 
@@ -224,9 +234,9 @@ Modal run teed to a file.
 3. **The experiment.** In order, one container: packed on a 5%
    pair sample as the confirming cell (predicted 14 min) — proceed
    only if within 10% of prediction; packed full (predicted 4.6 h);
-   grouped-stock full (predicted 7.3 h); arbitrary-order stock on a
+   grouped-stock full (predicted 7.2 h); arbitrary-order stock on a
    5% pair sample, extrapolated (predicted 99.9 h full before
-   thrash, 187 h at the filter-measured 1.87x). Sample
+   thrash, 186 h at the README-recorded 1.87x). Sample
    pairs, not reports, so the baseline's prefix working set keeps
    its real 8.9x pool pressure and the thrash multiplier is
    honestly measured. Report all four with predictions alongside.
