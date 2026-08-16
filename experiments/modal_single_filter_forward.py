@@ -407,7 +407,11 @@ def _load_vllm_model(compiled=False, kv_cache_dtype="auto"):
     args = dict(model=MODEL, dtype="bfloat16",
                 kv_cache_dtype=kv_cache_dtype)
     if compiled:
-        args["compilation_config"] = {"cudagraph_mode": 0}
+        # mirror the engine cell so the compiled token ranges cover
+        # our chunks; graphs off (measured worth nothing here)
+        args.update(max_model_len=4608, max_num_seqs=4096,
+                    max_num_batched_tokens=BEST_BATCH_TOKENS,
+                    compilation_config={"cudagraph_mode": 0})
     else:
         args["enforce_eager"] = True
     config = EngineArgs(**args).create_engine_config()
