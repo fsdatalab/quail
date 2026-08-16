@@ -194,6 +194,28 @@ The four plans priced:
   question. The read term, 4–17% of design B on BioDEX and 7–25% on
   Police, mostly disappears rather than needing calibration.
 
+  Across chunks, the no-pool claim needs a correction: one chunk
+  never holds all of an outer document's pairs (BioDEX notes span 9
+  chunks, Police records 137), so the prefix must survive between
+  chunks one of two ways. **Recompute** it at the top of every
+  chunk: waste is bounded by f/S — prefix length over chunk size —
+  no matter how big the inner relation is (a bigger inner relation
+  only brings the waste closer to that bound): 4.1% on BioDEX, 6.1%
+  on Police, 16% on untruncated Movies. The estimates above already
+  charge this. **Store** it: keep the live prefixes' K and V as
+  plain contiguous tensors in the packing loop — Police is 111 MB
+  per prefix at fp8 — with no paging, no hashing, no eviction, no
+  admission; the cross-attention call is identical whether K/V
+  comes from this chunk's activations or a tensor saved last chunk,
+  and suffix positions do not change. At these sizes the stored
+  prefixes can even be bf16, which the filter ladder measured
+  fixing 765 of 2,990 wrong answers versus the fp8 cache. Rule:
+  recompute below roughly 2k-token prefixes (waste under 8%), store
+  above — which means Movies-shaped data and the growing tuple
+  prefixes of n-way case B are the storing cases. The probe starts
+  with recompute (simplest correctness gate) and adds the stored
+  variant second.
+
 | dataset (pairs priced) | A1 stock, arbitrary order | A2 stock, ordered | B chain mode | C packed |
 |---|---|---|---|---|
 | Products (0.93M) | 34 min (no thrash: fits pool; likely ≈ B in practice) | ~20 min | 19 min | 14 min |
