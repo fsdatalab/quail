@@ -28,10 +28,12 @@ class StubEngine:
         self.flags = flags
         self.calls = []
         self.rids = []
+        self.request_params = {}
         self._queue = []
 
     def add_request(self, request_id, prompt, sampling_params, priority=0):
         self.rids.append(request_id)
+        self.request_params[request_id] = sampling_params
         _tag, i, j0 = request_id.rsplit("-", 2)
         i, j0 = int(i), int(j0)
         if j0 < len(self.flags[0]):
@@ -102,6 +104,34 @@ def test_engine_tags_protocol():
                 released.update(part[1:].split(","))
     assert "r*" in eng.rids[-1].split("|")      # flush is the last call
     assert released <= {str(i) for i in range(25)}
+
+
+class _SP:
+    """Stands in for SamplingParams: copyable, with extra_args."""
+
+    def __init__(self):
+        self.extra_args = None
+
+
+def test_short_documents_opt_out_of_a_capped_store():
+    """With a store length threshold, requests for short documents
+    carry max_offload_tokens=0 and long documents' requests keep the
+    original params untouched."""
+    flags, body_ids, q_ids = _setup(20, 2, seed=13)
+    eng = StubEngine(flags)
+    sp = _SP()
+    run_filter_chain(eng, sp, body_ids, q_ids, budget_tokens=10 ** 6,
+                     store_min_tokens=10)
+    for rid, params in eng.request_params.items():
+        _tag, i, j0 = rid.rsplit("-", 2)
+        i, j0 = int(i), int(j0)
+        if j0 >= len(flags[0]):
+            continue
+        if len(body_ids[i]) < 10:
+            kv = params.extra_args["kv_transfer_params"]
+            assert kv["max_offload_tokens"] == 0
+        else:
+            assert params is sp and sp.extra_args is None
 
 
 YES_TOK, NO_TOK = 111, 222

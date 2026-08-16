@@ -231,7 +231,8 @@ def _xfer_summary(events, windows):
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
 def persist_run(n_docs: int = 1000, stage: str = "baseline",
-                cpu_gb: int = 96, connector: str = "stock") -> dict:
+                cpu_gb: int = 96, connector: str = "stock",
+                store_gb: int = 0) -> dict:
     import time as _time
 
     trace_path = "/tmp/quail_xfer"
@@ -263,9 +264,24 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     # executor.
     pool_budget = 700_000
 
+    # a store capacity keeps the longest documents (recompute cost per
+    # byte rises with length); the client stamps max_offload_tokens=0
+    # under the threshold so short documents never occupy the cap.
+    # store_gb=0 means uncapped: everything stores.
+    store_min = 0
+    if stage == "store":
+        from quail.plan.planner import store_length_threshold
+        cap_bytes = store_gb * (1 << 30) if store_gb else None
+        store_min = store_length_threshold(
+            [len(b) for b in body_ids], cap_bytes, kappa)
+
     report = dict(n_docs=n_docs, stage=stage, model=MODEL,
                   connector=connector, corpus_tokens=corpus, kappa=kappa,
-                  kv_bytes_estimate=kv_bytes)
+                  kv_bytes_estimate=kv_bytes, store_gb=store_gb,
+                  store_min_doc_tokens=store_min,
+                  stored_docs=(sum(1 for b in body_ids
+                                   if len(b) >= store_min)
+                               if store_min else 0))
     print(f"[persist] stage {stage}: corpus {corpus:,} tokens, KV "
           f"about {kv_bytes / 1e9:.1f} GB", flush=True)
 
@@ -291,7 +307,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
 
     def one_query(engine, tag):
         return run_filter_chain(engine, sp, body_ids, q_ids,
-                                pool_budget, tag=tag)
+                                pool_budget, tag=tag,
+                                store_min_tokens=store_min)
 
     if stage == "baseline":
         engine = Engine.from_engine_args(engine_args(store=False))
@@ -361,8 +378,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
 
 @app.local_entrypoint()
 def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
-         connector: str = "stock", out: str = ""):
-    data = persist_run.remote(n_docs, stage, cpu_gb, connector)
+         connector: str = "stock", store_gb: int = 0, out: str = ""):
+    data = persist_run.remote(n_docs, stage, cpu_gb, connector, store_gb)
     events = data.pop("xfer_events", None)
     tag = "_quail" if connector == "quail" else ""
     path = out or f"results/engine/persist_{stage}{tag}.json"

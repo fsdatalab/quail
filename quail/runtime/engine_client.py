@@ -81,6 +81,24 @@ class EngineTags:
         self.pending.append(str(doc))
 
 
+def _no_store_params(sampling_params):
+    """A copy of the sampling params that tells the offload connector
+    to store nothing for this request (max_offload_tokens=0 rides in
+    extra_args["kv_transfer_params"]). Documents under a capped
+    store's length threshold carry this so they never occupy capacity
+    the plan reserved for longer ones."""
+    import copy
+    sp = (sampling_params.clone()
+          if hasattr(sampling_params, "clone")
+          else copy.copy(sampling_params))
+    extra = dict(getattr(sp, "extra_args", None) or {})
+    kv = dict(extra.get("kv_transfer_params") or {})
+    kv["max_offload_tokens"] = 0
+    extra["kv_transfer_params"] = kv
+    sp.extra_args = extra
+    return sp
+
+
 def _run_to_completion(engine, request_id, max_seconds=30):
     """Step the engine until one specific request finishes, or abort
     it at the deadline. For requests submitted outside the measured
@@ -99,7 +117,7 @@ def _run_to_completion(engine, request_id, max_seconds=30):
 
 def run_filter_chain(engine, sampling_params, body_ids, q_ids,
                      budget_tokens, tag="q", tags=None,
-                     use_priority=False):
+                     use_priority=False, store_min_tokens=0):
     """Separate requests, one per (document, stage), gated client-side:
     a document's next stage is submitted only after the previous
     answer arrives, and a failed stage drops the document. Returns
@@ -142,13 +160,18 @@ def run_filter_chain(engine, sampling_params, body_ids, q_ids,
         return tags.rid(suffix)
 
     inflight = {}                      # request id -> (doc, stage, cost)
+    no_store = (_no_store_params(sampling_params)
+                if store_min_tokens > 1 and sampling_params is not None
+                else sampling_params)
 
     def submit(i, j, cost):
         rid = rid_for(i, j)
         inflight[rid] = (i, j, cost)
         kw = {"priority": 0 if j > 0 else 1} if use_priority else {}
+        sp = (no_store if len(body_ids[i]) < store_min_tokens
+              else sampling_params)
         engine.add_request(rid, {"prompt_token_ids": body_ids[i] + q_ids[j]},
-                           sampling_params, **kw)
+                           sp, **kw)
 
     def retire(i, cost):
         if tags is not None:
@@ -229,7 +252,7 @@ def _stage_tokens(snapshots, yes_ids, no_ids):
 
 def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
                             budget_tokens, yes_ids, tag="c",
-                            no_ids=None):
+                            no_ids=None, store_min_tokens=0):
     """Chain mode: the engine itself runs each document's whole filter
     chain. The client registers the question token lists and the gate
     token ids once, then submits ONE request per document; the
@@ -259,13 +282,18 @@ def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
     raw0 = []
     q_cost = sum(len(q) for q in q_ids) + n
     inflight = {}                    # request id -> (doc, cost, snapshots)
+    no_store = (_no_store_params(sampling_params)
+                if store_min_tokens > 1 and sampling_params is not None
+                else sampling_params)
 
     def submit(i, cost):
         rid = f"de1|c|d{i}|{tag}-{i}-0"
         inflight[rid] = (i, cost, [])
+        sp = (no_store if len(body_ids[i]) < store_min_tokens
+              else sampling_params)
         engine.add_request(rid,
                            {"prompt_token_ids": body_ids[i] + q_ids[0]},
-                           sampling_params)
+                           sp)
 
     t0 = time.time()
     used, next_doc = 0, 0

@@ -51,6 +51,31 @@ class QuailOffloadingConnectorWorker(OffloadingConnectorWorker):
         # GPU blocks are the same size and merges are offset-free
         return self.worker._load_handler.src_blocks_per_chunk
 
+    def _check_pinned(self):
+        """Pinned host memory is the only intended tier: the measured
+        rates are 55 GB/s raw and 38 GB/s through batched transfers,
+        against ~11 GB/s unpinned. A failed pin still works, so it
+        must be loud - the restore break-even (7.1 GB/s at 4B) is
+        priced on the pinned rate."""
+        try:
+            cpu = self.worker._load_handler.src_tensors
+            pinned = bool(cpu) and all(t.is_pinned() for t in cpu)
+        except Exception:
+            return
+        if not pinned:
+            print("[quail-offload] WARNING: host KV pool is NOT pinned; "
+                  "transfers fall to unpinned DMA (~11 GB/s measured "
+                  "against 55 pinned) - reprice restore before trusting "
+                  "the plan", flush=True)
+
+    def register_kv_caches(self, kv_caches):
+        super().register_kv_caches(kv_caches)
+        self._check_pinned()
+
+    def register_cross_layers_kv_cache(self, kv_cache, attn_backend):
+        super().register_cross_layers_kv_cache(kv_cache, attn_backend)
+        self._check_pinned()
+
     def start_kv_transfers(self, metadata):
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:

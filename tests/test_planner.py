@@ -159,3 +159,33 @@ def test_refuses_when_the_pool_is_under_the_saturation_working_set():
 def test_normal_configs_still_return_plans():
     assert isinstance(plan_query(4, DOCS_10K, M4B, H100, selectivity=0.8),
                       Plan)
+
+
+def test_capped_store_keeps_the_longest_documents():
+    """A store capacity keeps the top of the length list: the stored
+    set fits under the cap, the plan carries the length threshold the
+    client enforces, and the capped prediction sits between the full
+    restore and the pure read."""
+    kv = sum(DOCS_10K) * M4B.kappa
+    store = StoreSpec(read_bw=38e9, warm=True, capacity_bytes=kv / 2)
+    p = plan_query(4, DOCS_10K, M4B, H100, store=store)
+    assert p.access == "restore"
+    assert p.store_min_doc_tokens > 1
+    stored = [int(h) for h in DOCS_10K if h >= p.store_min_doc_tokens]
+    assert sum(stored) * M4B.kappa <= store.capacity_bytes
+    assert any("store capped" in r for r in p.remarks)
+    p_full = plan_query(4, DOCS_10K, M4B, H100,
+                        store=StoreSpec(read_bw=38e9, warm=True))
+    p_read = plan_query(4, DOCS_10K, M4B, H100)
+    assert p_full.store_min_doc_tokens == 1
+    assert (p_full.predicted_makespan_s <= p.predicted_makespan_s
+            <= p_read.predicted_makespan_s)
+
+
+def test_tiny_store_capacity_is_not_worth_restoring():
+    """A capacity too small to hold even one document leaves the plan
+    on the read path with no threshold."""
+    store = StoreSpec(read_bw=38e9, warm=True, capacity_bytes=1024)
+    p = plan_query(4, DOCS_10K, M4B, H100, store=store)
+    assert p.access == "read"
+    assert p.store_min_doc_tokens == 0

@@ -39,9 +39,9 @@ from dataclasses import dataclass, field
 from quail.configs import DeviceConfig, ModelConfig
 
 from .cost import (ACT_BYTES_PER_HIDDEN, BOOT_POOL_FRACTION,
-                   ENGINE_SEQS_MAX, POOL_HEADROOM, STEP_POOL_FRACTION,
-                   STEP_TOKENS_MAX, STEP_TOKENS_MIN, predict_makespan,
-                   t_in)
+                   ENGINE_SEQS_MAX, POOL_HEADROOM, STEP_FIXED_S,
+                   STEP_POOL_FRACTION, STEP_TOKENS_MAX, STEP_TOKENS_MIN,
+                   predict_makespan, t_in)
 
 
 @dataclass(frozen=True)
@@ -57,9 +57,21 @@ class CorpusStats:
 
 @dataclass(frozen=True)
 class StoreSpec:
-    """A persisted-KV store: measured read bandwidth, bytes/s."""
+    """A persisted-KV store: measured read bandwidth, bytes/s.
+
+    The intended tier is pinned host memory only. Unpinned is not a
+    tier to plan for: it is what a failed pin degrades to, and the
+    connector reports it loudly at boot so read_bw can be repriced.
+
+    capacity_bytes caps how much KV the store may hold (None means
+    unbounded). Under a cap the planner keeps the LONGEST documents:
+    recompute cost per byte is a + alpha2*h per token, rising with
+    document length, so long documents are worth the most per stored
+    byte - and unlike the store's own LRU, a length threshold cannot
+    be thrashed by the scan pattern of a full-corpus query."""
     read_bw: float
     warm: bool = False        # KV for this corpus already saved
+    capacity_bytes: float = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +99,13 @@ class Plan:
     engine_max_seqs: int = 0  # boot the engine's max_num_seqs at least
     #                           this high: the worst-case admitted
     #                           document count, one live sequence each
+    store_min_doc_tokens: int = 0  # documents at or above this length
+    #                                use the KV store; below it the
+    #                                client stamps max_offload_tokens=0
+    #                                so short documents never occupy
+    #                                capped store capacity. 0 = the
+    #                                store is not used, 1 = every
+    #                                document stores
     engine_step_tokens: int = 0  # boot max_num_batched_tokens here: the
     #                              largest step budget whose activation
     #                              reservation stays under
@@ -116,6 +135,35 @@ def _pool_tokens(model: ModelConfig, device: DeviceConfig, tp: int) -> int:
     refusal gates need the sign, so it is not clamped here."""
     free = device.M * BOOT_POOL_FRACTION * tp - model.W_mem
     return int(free / model.kappa)
+
+
+def store_length_threshold(doc_tokens, capacity_bytes, kappa):
+    """The store-or-not length cutoff under a capacity: keep the
+    longest documents whose KV fits. Recompute cost per byte rises
+    with document length (a + alpha2*h per token), so the top of the
+    length list is worth the most per stored byte - and a length
+    threshold cannot be thrashed by a scanning query the way the
+    store's own LRU can.
+
+    Returns 1 when capacity_bytes is None (everything stores), 0 when
+    nothing fits. At a boundary tie the threshold moves up so the
+    stored set never exceeds the capacity."""
+    if capacity_bytes is None:
+        return 1
+    budget_tok = int(capacity_bytes / kappa)
+    lengths = sorted((int(t) for t in doc_tokens), reverse=True)
+    taken, threshold = 0, 0
+    for h in lengths:
+        if taken + h > budget_tok:
+            break
+        taken += h
+        threshold = h
+    while threshold and sum(h for h in lengths
+                            if h >= threshold) > budget_tok:
+        threshold += 1
+    if threshold and not any(h >= threshold for h in lengths):
+        return 0
+    return threshold
 
 
 def _balanced_shards(doc_tokens, workers):
@@ -222,12 +270,42 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
 
     access = "read"
     read_s = t_in(model, device, worst_load, doc_sq_tokens=doc_sq_worst)
+    store_min_doc_tokens = 0
+    stored_shard = sq_stored_worst = 0.0
     if store is not None and store.warm:
-        restore_s = t_in(model, device, worst_load, access="restore",
-                         store_read_bw=store.read_bw)
-        if restore_s < read_s:
-            access = "restore"
-            remarks.append("store beats recompute at the break-even")
+        # the client enforces the same stored set with the length
+        # threshold: store iff the document has at least this many
+        # tokens (max_offload_tokens=0 below it)
+        threshold = store_length_threshold(doc_tokens,
+                                           store.capacity_bytes,
+                                           model.kappa)
+        stored = ([int(t) for t in doc_tokens if int(t) >= threshold]
+                  if threshold else [])
+        if stored:
+            stored_tok = sum(stored)
+            frac = stored_tok / max(1, corpus.total_tokens)
+            stored_shard = frac * worst_load
+            sq_stored_worst = (sum(float(h) * float(h) for h in stored)
+                               * worst_load / max(1, corpus.total_tokens))
+            # mixed price: stored documents load at store bandwidth
+            # and skip their compute (including their share of the
+            # quadratic surcharge - the longest documents carry most
+            # of it, which is the longest-first bonus); the rest is
+            # recomputed as usual
+            load_s = stored_shard * model.kappa / store.read_bw
+            skip_s = t_in(model, device, stored_shard,
+                          doc_sq_tokens=sq_stored_worst)
+            if read_s - skip_s + load_s < read_s:
+                access = "restore"
+                store_min_doc_tokens = threshold
+                if frac < 1.0:
+                    remarks.append(
+                        f"store capped: {len(stored)} of {corpus.n_docs} "
+                        f"documents stored ({frac:.0%} of corpus tokens), "
+                        f"length threshold {threshold}")
+                else:
+                    remarks.append("store beats recompute at the "
+                                   "break-even")
     spill_s = 0.0
     if pool < working_set and store is not None:
         access = "spill"
@@ -281,16 +359,32 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
             STEP_POOL_FRACTION * pool * model.kappa / act_bytes)))
     engine_step_tokens = max(step_tokens, engine_max_seqs)
 
-    predicted = predict_makespan(
-        model, device, n_docs=corpus.n_docs, workers=workers,
-        shard_tokens=worst_load, n_filters=n_filters,
-        question_tokens=question_tokens, preamble_tokens=preamble_tokens,
-        selectivity=selectivity,
-        access=access if access != "spill" else "read",
-        store_read_bw=store.read_bw if access == "restore" else None,
-        mean_doc_tokens=corpus.mean_doc_tokens,
-        doc_sq_tokens=doc_sq_worst,
-        step_tokens=engine_step_tokens)
+    if access == "restore" and store_min_doc_tokens > 1 and stored_shard:
+        # capped store: predict a full read pass, then swap the stored
+        # slice from compute to load - its linear term, its share of
+        # the quadratic surcharge, and its per-step fixed cost
+        predicted = predict_makespan(
+            model, device, n_docs=corpus.n_docs, workers=workers,
+            shard_tokens=worst_load, n_filters=n_filters,
+            question_tokens=question_tokens,
+            preamble_tokens=preamble_tokens, selectivity=selectivity,
+            access="read", mean_doc_tokens=corpus.mean_doc_tokens,
+            doc_sq_tokens=doc_sq_worst, step_tokens=engine_step_tokens)
+        predicted -= t_in(model, device, stored_shard,
+                          doc_sq_tokens=sq_stored_worst)
+        predicted -= STEP_FIXED_S * stored_shard / max(1, engine_step_tokens)
+        predicted += stored_shard * model.kappa / store.read_bw
+    else:
+        predicted = predict_makespan(
+            model, device, n_docs=corpus.n_docs, workers=workers,
+            shard_tokens=worst_load, n_filters=n_filters,
+            question_tokens=question_tokens,
+            preamble_tokens=preamble_tokens, selectivity=selectivity,
+            access=access if access != "spill" else "read",
+            store_read_bw=store.read_bw if access == "restore" else None,
+            mean_doc_tokens=corpus.mean_doc_tokens,
+            doc_sq_tokens=doc_sq_worst,
+            step_tokens=engine_step_tokens)
     predicted += spill_s
 
     return Plan(mode=mode, workers=workers, tensor_parallel=tp,
@@ -299,6 +393,7 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
                 stage_token_window=1 if one_token_answers else 6,
                 predicted_makespan_s=round(predicted, 1),
                 operator=operator,
+                store_min_doc_tokens=store_min_doc_tokens,
                 engine_max_seqs=engine_max_seqs,
                 engine_step_tokens=engine_step_tokens,
                 remarks=tuple(remarks))
