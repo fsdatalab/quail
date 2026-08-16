@@ -309,6 +309,28 @@ Round 6 prediction, stated before the run:
   every earlier "the engine is not the cost" conclusion gets
   requalified by what the profiled repetition shows.
 
+Round 6 result: the falsifier fired, and the diagnosis changed what
+the rung is. The cache binding did not take - the attention layer
+expects a list of cache tensors indexed by virtual engine and the
+runner assigned a raw tensor - so the backend took its no-cache
+path: no reshape_and_cache kernel anywhere in the cell's profile,
+attention direct over the current bf16 values. As run, the rung is
+therefore "the engine's compiled kernels, no engine, no KV write" -
+the ablation originally asked for, which the backend's own no-cache
+fallback makes constructible after all, correcting this round's
+opening claim. The speed ladder, one container: engine fp8 96,946;
+engine bf16 102,820; engine kernels without engine or cache
+100,308; packed stock parts 93,579; packed with our kernels
+121,045, the branch's new best. Engine software again measures
+near free, and the 5.9 percent between the engine cells prices the
+fp8 cache path. This rung's accuracy column (1,064 wrong of 10,000,
+better than every other cell ever measured) is NOT validated:
+better than everything is the signature of documents leaking
+information to each other through the hand-built metadata, and
+until a one-document-per-chunk check rules that out the number
+should not be cited. The other four rungs reproduced their banked
+values within container noise.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
