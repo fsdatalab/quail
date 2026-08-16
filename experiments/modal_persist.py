@@ -231,7 +231,7 @@ def _xfer_summary(events, windows):
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
 async def persist_run(n_docs: int = 1000, stage: str = "baseline",
-                      cpu_gb: int = 96) -> dict:
+                      cpu_gb: int = 96, connector: str = "stock") -> dict:
     import inspect
     import time as _time
 
@@ -265,7 +265,7 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
     pool_budget = 700_000
 
     report = dict(n_docs=n_docs, stage=stage, model=MODEL,
-                  corpus_tokens=corpus, kappa=kappa,
+                  connector=connector, corpus_tokens=corpus, kappa=kappa,
                   kv_bytes_estimate=kv_bytes)
     print(f"[persist] stage {stage}: corpus {corpus:,} tokens, KV "
           f"about {kv_bytes / 1e9:.1f} GB", flush=True)
@@ -275,10 +275,19 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
                   gpu_memory_utilization=0.92,
                   enable_prefix_caching=True, disable_log_stats=True)
         if store:
-            kw["kv_transfer_config"] = KVTransferConfig(
-                kv_connector="OffloadingConnector", kv_role="kv_both",
-                kv_connector_extra_config=dict(
-                    cpu_bytes_to_use=cpu_gb * (1 << 30)))
+            # "quail" swaps in the coalescing worker (one transfer per
+            # step, not per request); "stock" is the measured baseline
+            tc = dict(kv_connector="OffloadingConnector",
+                      kv_role="kv_both",
+                      kv_connector_extra_config=dict(
+                          cpu_bytes_to_use=cpu_gb * (1 << 30)))
+            if connector == "quail":
+                tc["kv_connector"] = "QuailOffloadingConnector"
+                tc["kv_connector_module_path"] = "quail.engineext.offload"
+            elif connector != "stock":
+                raise ValueError(f"connector must be stock or quail, "
+                                 f"got {connector!r}")
+            kw["kv_transfer_config"] = KVTransferConfig(**tc)
         return AsyncEngineArgs(**kw)
 
     async def one_query(engine, tag):
@@ -335,7 +344,8 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
         events = _collect_xfer_events(trace_path)
         report["xfer"] = _xfer_summary(events, windows)
         report["xfer_events"] = events
-        with open("/results/persist_xfer_trace.jsonl", "w") as f:
+        suffix = "_quail" if connector == "quail" else ""
+        with open(f"/results/persist_xfer_trace{suffix}.jsonl", "w") as f:
             for e in events:
                 f.write(json.dumps(e) + "\n")
         loads = report["xfer"]["directions"].get("h2d")
@@ -348,7 +358,8 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
     except Exception:
         pass
     slim = {k: v for k, v in report.items() if k != "xfer_events"}
-    with open(f"/results/persist_{stage}.json", "w") as f:
+    tag = "_quail" if connector == "quail" else ""
+    with open(f"/results/persist_{stage}{tag}.json", "w") as f:
         json.dump(slim, f, indent=2)
     results_vol.commit()
     return report
@@ -356,17 +367,18 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
 
 @app.local_entrypoint()
 def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
-         out: str = ""):
-    data = persist_run.remote(n_docs, stage, cpu_gb)
+         connector: str = "stock", out: str = ""):
+    data = persist_run.remote(n_docs, stage, cpu_gb, connector)
     events = data.pop("xfer_events", None)
-    path = out or f"results/engine/persist_{stage}.json"
+    tag = "_quail" if connector == "quail" else ""
+    path = out or f"results/engine/persist_{stage}{tag}.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
     print(f"saved {path}")
     if events:
         import gzip
-        tp = "results/engine/persist_xfer_trace.jsonl.gz"
+        tp = f"results/engine/persist_xfer_trace{tag}.jsonl.gz"
         with gzip.open(tp, "wt") as f:
             for e in events:
                 f.write(json.dumps(e) + "\n")
