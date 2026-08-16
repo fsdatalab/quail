@@ -102,11 +102,15 @@ class QuailOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # budget (vendor scheduler: load_kv_async -> num_new_tokens =
         # 0), so the vendor would sweep the whole queue in one step
         # and duplicate every wave's bytes through per-request loads -
-        # measured 1.6x load duplication. A claimed document reads as
-        # cache-cold instead: at worst the vendor prefills it, which
-        # charges full tokens and is self-limiting at one step budget.
+        # measured 1.6x load duplication. A claimed document answers
+        # None: the vendor's own not-ready path, which sets the
+        # request aside and re-asks next step - no load, no prefill,
+        # no tokens charged. Once the wave registers, the local
+        # prefix cache serves the hit and this is only asked about
+        # the tail. The driver clears claims at drain and on driver
+        # failure, so no request can be set aside forever.
         if request.request_id in self.wave_claimed:
-            return 0, False
+            return None, False
         return super().get_num_new_matched_tokens(
             request, num_computed_tokens)
 

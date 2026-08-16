@@ -14,15 +14,21 @@ so it can sweep the whole waiting queue in one step - a skip window
 cannot contain it; measured 1.6x duplicated load bytes when it
 shared territory with waves. So the split is enforced at the store
 lookup instead: every wave document is CLAIMED, and a claimed
-request answers no-hit, leaving the vendor two choices that are both
-correct - cache-hit it after its wave registers, or prefill it at
-full token cost, which self-limits at one step budget per step and
-loads nothing. Two regions are left to the vendor's load path:
+request's lookup answers None - the vendor's own not-ready path,
+which sets the request aside and re-asks next step, charging
+nothing. After the wave registers, the request comes back through
+and cache-hits locally. Two regions are left to the vendor's load
+path:
 
-  the seam   the first 2 x step-budget tokens of the queue, never
-             claimed. The head is scheduled before any wave lands,
-             and the per-request path moves it at channel speed
-             rather than prefilling it.
+  the seam   the first 2 x step-budget tokens of the query, spent
+             once, never claimed. The head is scheduled before any
+             wave lands, and the per-request path moves it at
+             channel speed rather than prefilling it. The budget is
+             per query, not per step: requests reach the scheduler
+             over many steps (the client feeds a separate engine
+             process), and a per-step window would roll over each
+             batch of arrivals until it had handed most of the
+             corpus to the per-request path - measured 77 percent.
   the floor  max_num_seqs blocks + one step budget of blocks stay
              free so the vendor pass never starves for allocation.
 
@@ -46,8 +52,10 @@ The cycle for one wave:
   later      as wave documents get scheduled, the driver drops its
              extra block references; a fully consumed wave vanishes
 
-A document the vendor prefills before its wave registers computed
-its own KV: a wasted copy, never a wrong answer. Known limits, on
+If a claimed document is ever consumed before its wave registers
+(possible only through a duplicate-content local cache hit), it
+computed or reused its own KV and the wave's copy of it is freed
+unregistered: a wasted copy, never a wrong answer. Known limits, on
 purpose for now: wave blocks left unconsumed are evicted by the
 engine's ordinary reuse path, which single-tenant strict mode would
 refuse - run waves with QUAIL_SINGLE_TENANT=0 - and duplicate
@@ -68,6 +76,7 @@ class WaveDriver:
         self.on = os.environ.get("QUAIL_WAVES", "0") == "1"
         self.spill = os.environ.get("QUAIL_SPILL", "0") == "1"
         self._wave_tokens = None
+        self._seam_left = None     # one-time head budget, refilled at drain
         self._handled = set()      # request ids waved or rejected
         self._doc_wave = {}        # request id -> wave id
         self._pending_reg = []     # (wave_id, [(req, blocks, n_full)])
@@ -96,6 +105,12 @@ class WaveDriver:
                   f"{type(e).__name__}: {e}", flush=True)
             if self._errors >= 3:
                 self.on = False
+                # claimed requests answer None at the store lookup;
+                # with the driver dead nothing would ever release
+                # them, so release them all to the vendor's paths
+                cs = self._cs()
+                if cs is not None:
+                    cs.wave_claimed.clear()
                 print("[quail-waves] disabled after repeated errors",
                       flush=True)
 
@@ -158,12 +173,8 @@ class WaveDriver:
             print("[quail-waves] waiting queue not iterable; disabled",
                   flush=True)
             return
-        seam_ids, seam_tokens = set(), 0
-        for r in waiting:                    # the vendor's order
-            if seam_tokens >= 2 * step_budget:
-                break
-            seam_ids.add(r.request_id)
-            seam_tokens += r.num_tokens
+        if self._seam_left is None:
+            self._seam_left = 2 * step_budget
         order = waiting
         if self.spill:
             # a preempted document is mid-chain: its next visit is
@@ -180,8 +191,11 @@ class WaveDriver:
         cands, by_id = [], {}
         for r in order:
             rid = r.request_id
-            if (rid in seam_ids or rid in self._handled
-                    or r.num_computed_tokens):
+            if rid in self._handled or r.num_computed_tokens:
+                continue
+            if self._seam_left > 0:
+                self._seam_left -= r.num_tokens
+                self._handled.add(rid)
                 continue
             if not r.block_hashes:
                 self._handled.add(rid)
@@ -289,5 +303,6 @@ class WaveDriver:
         self._doc_wave = {}
         self._consumed_early = set()
         self._handled = set()
+        self._seam_left = None
         if n:
             print(f"[quail-waves] drained {n} blocks", flush=True)
