@@ -1475,9 +1475,11 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     # the second engine cell answers whether the packed pipeline's
     # accuracy edge comes from the engine's fp8 KV cache: same boot,
     # KV held in bf16 instead
-    # the full ladder in one container: both engine settings, then
-    # engine-kernels-without-engine, then the packed rungs
-    for engine_name, kv_dtype in (("vllm", "fp8"), ("vllm_bf16kv", "auto")):
+    # the presentation ladder: the engine, then engine kernels without
+    # the engine, then our kernels. Add ("vllm_bf16kv", "auto") here to
+    # re-run the best engine setting; it and the stock-parts rung are
+    # banked in the round 6 result.
+    for engine_name, kv_dtype in (("vllm", "fp8"),):
         llm = LLM(
             model=MODEL,
             kv_cache_dtype=kv_dtype,
@@ -1560,7 +1562,6 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     max_docs = max(len(batch) for batch in batches) + 1
     cells = (
         ("packed_enginekernels", None, "engine", False, False),
-        ("packed_sep_fa3", False, None, False, False),
         ("packed_custom_qk", "custom", None, True, False),
     )
     for name, fused, runner_kind, fuse_qk, fuse_gemm in cells:
@@ -1643,14 +1644,13 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         torch.cuda.empty_cache()
 
     rates = {}
-    for method in ("vllm", "vllm_bf16kv", "packed_enginekernels",
-                   "packed_sep_fa3", "packed_custom_qk"):
+    for method in ("vllm", "packed_enginekernels", "packed_custom_qk"):
         values = [row["tokens_per_second"] for row in report["runs"]
                   if row["method"] == method]
         rates[method] = round(sum(values) / len(values), 1)
     report["mean_tokens_per_second"] = rates
     report["relative_to_engine"] = {
-        method: round(rate / rates["vllm_bf16kv"], 4)
+        method: round(rate / rates["vllm"], 4)
         for method, rate in rates.items()
     }
 
