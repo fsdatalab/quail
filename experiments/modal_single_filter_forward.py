@@ -565,7 +565,6 @@ class PackedPipeline:
         self.fp8 = torch.float8_e4m3fn
         self.fa_version = 2
         self.fuse_qk = False
-        self.fuse_gemm = False
 
     @staticmethod
     def weight_scale(linear):
@@ -744,235 +743,10 @@ class PackedPipeline:
             tl.store(k_out_ptr + t * stride_ko + kb_offs,
                      out_b.to(k_out_ptr.dtype.element_ty))
 
-        @triton.jit
-        def gemm_silu_quant(a_ptr, b_ptr, as_ptr, bs_ptr, q_ptr, s_ptr,
-                            M, stride_am, stride_bn, stride_qm,
-                            s_stride_g, s_stride_t,
-                            as_stride_m, as_stride_k,
-                            bs_stride_n, bs_stride_k,
-                            HALF_N: tl.constexpr, K: tl.constexpr,
-                            BM: tl.constexpr, BN: tl.constexpr,
-                            BK: tl.constexpr, GROUP_M: tl.constexpr,
-                            UE8M0: tl.constexpr, FUSE: tl.constexpr):
-            # grid over (m blocks x silu-output n blocks), swizzled for
-            # L2 reuse the way the stock block-scaled kernel does it
-            pid = tl.program_id(0)
-            num_pid_m = tl.cdiv(M, BM)
-            num_pid_n = HALF_N // BN
-            group = GROUP_M * num_pid_n
-            gid = pid // group
-            first_m = gid * GROUP_M
-            size_m = tl.minimum(num_pid_m - first_m, GROUP_M)
-            pid_m = first_m + (pid % size_m)
-            pid_n = (pid % group) // size_m
-
-            offs_m = (pid_m * BM + tl.arange(0, BM)) % M
-            offs_n = pid_n * BN + tl.arange(0, BN)
-            offs_k = tl.arange(0, BK)
-            a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :]
-            # gate columns at n, up columns HALF_N further along
-            bg_ptrs = b_ptr + offs_n[:, None] * stride_bn + offs_k[None, :]
-            bu_ptrs = bg_ptrs + HALF_N * stride_bn
-            as_ptrs = as_ptr + offs_m * as_stride_m
-            bs_g = bs_ptr + (pid_n * BN // 128) * bs_stride_n
-            bs_u = bs_ptr + ((HALF_N + pid_n * BN) // 128) * bs_stride_n
-
-            acc_g = tl.zeros((BM, BN), dtype=tl.float32)
-            acc_u = tl.zeros((BM, BN), dtype=tl.float32)
-            for k in range(0, K // BK):
-                a = tl.load(a_ptrs)
-                bg = tl.load(bg_ptrs)
-                bu = tl.load(bu_ptrs)
-                a_s = tl.load(as_ptrs + k * as_stride_k)
-                g_s = tl.load(bs_g + k * bs_stride_k)
-                u_s = tl.load(bs_u + k * bs_stride_k)
-                dot_g = tl.dot(a, tl.trans(bg))
-                dot_u = tl.dot(a, tl.trans(bu))
-                acc_g += dot_g * (a_s * g_s)[:, None]
-                acc_u += dot_u * (a_s * u_s)[:, None]
-                a_ptrs += BK
-                bg_ptrs += BK
-                bu_ptrs += BK
-
-            if FUSE:
-                y = acc_g * tl.sigmoid(acc_g) * acc_u
-                amax = tl.max(tl.abs(y), axis=1)
-                scale = tl.maximum(amax, 1e-10) / 448.0
-                if UE8M0:
-                    scale = tl.math.exp2(tl.ceil(tl.math.log2(scale)))
-                q = y / scale[:, None]
-                q = tl.minimum(tl.maximum(q, -448.0), 448.0)
-                out_m = pid_m * BM + tl.arange(0, BM)
-                mask = out_m < M
-                tl.store(q_ptr + out_m[:, None] * stride_qm + offs_n[None, :],
-                         q.to(q_ptr.dtype.element_ty), mask=mask[:, None])
-                tl.store(s_ptr + (pid_n * BN // 128) * s_stride_g
-                         + out_m * s_stride_t, scale, mask=mask)
-            else:
-                out_m = pid_m * BM + tl.arange(0, BM)
-                mask = out_m < M
-                tl.store(q_ptr + out_m[:, None] * stride_qm + offs_n[None, :],
-                         acc_g.to(q_ptr.dtype.element_ty), mask=mask[:, None])
-                tl.store(q_ptr + out_m[:, None] * stride_qm
-                         + (HALF_N + offs_n)[None, :],
-                         acc_u.to(q_ptr.dtype.element_ty), mask=mask[:, None])
-
         self._kernels = {"silu": silu_mul_quant,
                          "norm": add_rms_norm_quant,
-                         "qk": qk_norm_rope,
-                         "gemm_silu": gemm_silu_quant}
+                         "qk": qk_norm_rope}
         return self._kernels
-
-    def custom_gemm_silu_quant(self, a_q, a_scales, linear, fuse=True):
-        """The epilogue kernel: block-scaled fp8 multiply for gate_up
-        whose closing phase does the silu and group quant in
-        registers, so the 16-bit intermediate never exists. With
-        fuse off it writes the plain gate_up result instead, which
-        prices our multiply against DeepGEMM at equal epilogues."""
-        torch = self.torch
-        n_tokens = a_q.shape[0]
-        weight = linear.weight
-        w_scales = self.weight_scale(linear)
-        half_n = weight.shape[0] // 2
-        k_width = weight.shape[1]
-        if fuse:
-            out = torch.empty((n_tokens, half_n), dtype=self.fp8,
-                              device="cuda")
-            scales = self._col_major_scales(n_tokens, half_n)
-        else:
-            out = torch.empty((n_tokens, weight.shape[0]),
-                              dtype=torch.bfloat16, device="cuda")
-            scales = self._col_major_scales(n_tokens, half_n)
-        block_m = 64
-        grid = ((-(-n_tokens // block_m)) * (half_n // 128),)
-        self._triton_kernels()["gemm_silu"][grid](
-            a_q, weight, a_scales, w_scales, out, scales,
-            n_tokens, a_q.stride(0), weight.stride(0), out.stride(0),
-            scales.stride(1), scales.stride(0),
-            a_scales.stride(0), a_scales.stride(1),
-            w_scales.stride(0), w_scales.stride(1),
-            HALF_N=half_n, K=k_width, BM=block_m, BN=128, BK=128,
-            GROUP_M=8, UE8M0=self.use_ue8m0, FUSE=fuse,
-            num_warps=8, num_stages=3,
-        )
-        return out, scales
-
-    def custom_qk_norm_rope(self, qkv, positions, attn):
-        """Per-head norm, rotation, and layout in one kernel per
-        token, replacing two per-head-row norm launches, the rotate
-        kernel, and two contiguous copies."""
-        n_tokens = qkv.shape[0]
-        q_width = self.num_q_heads * self.head_dim
-        kv_width = self.num_kv_heads * self.head_dim
-        q_out = self.torch.empty((n_tokens, q_width),
-                                 dtype=qkv.dtype, device="cuda")
-        k_out = self.torch.empty((n_tokens, kv_width),
-                                 dtype=qkv.dtype, device="cuda")
-        self._triton_kernels()["qk"][(n_tokens,)](
-            qkv, q_out, k_out, self.rotary.cos_sin_cache, positions,
-            attn.q_norm.weight, attn.k_norm.weight,
-            qkv.stride(0), q_out.stride(0), k_out.stride(0),
-            attn.q_norm.variance_epsilon,
-            QH=self.num_q_heads, KH=self.num_kv_heads,
-            HD=self.head_dim, HALF=self.head_dim // 2,
-            num_warps=8,
-        )
-        return q_out, k_out
-
-    def custom_silu_quant(self, gate_up):
-        n_tokens, doubled = gate_up.shape
-        half = doubled // 2
-        q = self.torch.empty((n_tokens, half), dtype=self.fp8,
-                             device="cuda")
-        scales = self._col_major_scales(n_tokens, half)
-        groups_per_block = 4
-        grid = (n_tokens, half // (self.GROUP * groups_per_block))
-        self._triton_kernels()["silu"][grid](
-            gate_up, q, scales, gate_up.stride(0), q.stride(0),
-            scales.stride(1), scales.stride(0),
-            HALF=half, GROUP=self.GROUP, GPB=groups_per_block,
-            UE8M0=self.use_ue8m0, num_warps=4,
-        )
-        return q, scales
-
-    def custom_norm_quant(self, hidden, norm, residual):
-        """Residual add, norm, and group quant in one program per
-        token row. Mutates residual in place like the engine's
-        fused-add norm."""
-        n_tokens, width = hidden.shape
-        q = self.torch.empty_like(hidden, dtype=self.fp8)
-        scales = self._col_major_scales(n_tokens, width)
-        n_groups = width // self.GROUP
-        block = 1 << (width - 1).bit_length()
-        self._triton_kernels()["norm"][(n_tokens,)](
-            hidden, residual, norm.weight, q, scales,
-            hidden.stride(0), residual.stride(0), q.stride(0),
-            scales.stride(1), scales.stride(0), norm.variance_epsilon,
-            H=width, BLOCK=block, GROUP=self.GROUP, NG=n_groups,
-            UE8M0=self.use_ue8m0, num_warps=8,
-        )
-        return q, scales
-
-    def silu_and_mul(self, gate_up):
-        n_tokens, doubled = gate_up.shape
-        out = self.torch.empty(
-            (n_tokens, doubled // 2),
-            dtype=gate_up.dtype, device=gate_up.device)
-        self.torch.ops._C.silu_and_mul(out, gate_up)
-        return out
-
-    def rms_norm(self, x, norm):
-        """vLLM's CUDA norm kernel directly: the eager module call
-        falls back to the native implementation and logs a priority
-        warning, which is the slow path."""
-        out = self.torch.empty_like(x)
-        self.torch.ops._C.rms_norm(out, x, norm.weight,
-                                   norm.variance_epsilon)
-        return out
-
-    def fused_add_rms_norm(self, hidden, residual, norm):
-        """Mutates in place: hidden becomes the normed value and
-        residual becomes the sum, vLLM's engine semantics."""
-        self.torch.ops._C.fused_add_rms_norm(
-            hidden, residual, norm.weight, norm.variance_epsilon)
-        return hidden, residual
-
-    def attention(self, q, k, v, cu_seqlens, max_seqlen):
-        from vllm.vllm_flash_attn import flash_attn_varlen_func
-        n_tokens = q.shape[0]
-        out = flash_attn_varlen_func(
-            q.view(n_tokens, self.num_q_heads, self.head_dim),
-            k.view(n_tokens, self.num_kv_heads, self.head_dim),
-            v.view(n_tokens, self.num_kv_heads, self.head_dim),
-            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
-            causal=True,
-            fa_version=self.fa_version,
-        )
-        return out.reshape(n_tokens, self.num_q_heads * self.head_dim)
-
-    @staticmethod
-    def pack(batch):
-        import torch
-        lengths = [len(prompt) for prompt in batch]
-        flat_ids = [token for prompt in batch for token in prompt]
-        flat_positions = [position for length in lengths
-                          for position in range(length)]
-        final_indices = []
-        running = 0
-        for length in lengths:
-            running += length
-            final_indices.append(running - 1)
-        cumulative = [0]
-        for length in lengths:
-            cumulative.append(cumulative[-1] + length)
-        return (
-            torch.tensor(flat_ids, dtype=torch.long, device="cuda"),
-            torch.tensor(flat_positions, dtype=torch.long, device="cuda"),
-            torch.tensor(final_indices, dtype=torch.long, device="cuda"),
-            torch.tensor(cumulative, dtype=torch.int32, device="cuda"),
-            max(lengths),
-        )
 
     def forward_chunk(self, packed, fused):
         (input_ids, positions, final_indices, cu_seqlens,
@@ -1006,9 +780,6 @@ class PackedPipeline:
             elif fused == "custom":
                 q_in, q_scale = self.custom_norm_quant(
                     hidden, layer.input_layernorm, residual)
-            elif fused:
-                q_in, q_scale = self.fused_norm_quant(
-                    hidden, layer.input_layernorm, residual)
             else:
                 normed, residual = self.fused_add_rms_norm(
                     hidden, residual, layer.input_layernorm)
@@ -1039,86 +810,18 @@ class PackedPipeline:
             if fused == "custom":
                 g_in, g_scale = self.custom_norm_quant(
                     hidden, layer.post_attention_layernorm, residual)
-            elif fused:
-                g_in, g_scale = self.fused_norm_quant(
-                    hidden, layer.post_attention_layernorm, residual)
             else:
                 normed, residual = self.fused_add_rms_norm(
                     hidden, residual, layer.post_attention_layernorm)
                 g_in, g_scale = self.quant(normed)
-            if fused == "custom" and self.fuse_gemm:
-                d_in, d_scale = self.custom_gemm_silu_quant(
-                    g_in, g_scale, layer.mlp.gate_up_proj)
+            gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
+            if fused == "custom":
+                d_in, d_scale = self.custom_silu_quant(gate_up)
             else:
-                gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
-                if fused == "custom":
-                    d_in, d_scale = self.custom_silu_quant(gate_up)
-                elif fused:
-                    d_in, d_scale = self.fused_silu_quant(gate_up)
-                else:
-                    d_in, d_scale = self.quant(self.silu_and_mul(gate_up))
+                d_in, d_scale = self.quant(self.silu_and_mul(gate_up))
             hidden = self.gemm(d_in, d_scale, layer.mlp.down_proj)
 
         return hidden, residual
-
-
-class GraphedChunkRunner:
-    """The token-level forward captured once as a CUDA graph.
-
-    Every chunk is padded to capture_tokens: real prompts first, then
-    one padding sequence covering the tail, then zero-length entries
-    so the cu_seqlens tensor keeps a fixed size. Replays write into
-    the same recorded tensors; the per-document tail runs outside the
-    graph on the real, unpadded index list."""
-
-    def __init__(self, pipeline, fused, capture_tokens, max_docs,
-                 max_seqlen, warmups=3):
-        torch = pipeline.torch
-        self.pipeline = pipeline
-        self.fused = fused
-        self.capture_tokens = capture_tokens
-        self.max_docs = max_docs
-        self.ids = torch.zeros(capture_tokens, dtype=torch.long,
-                               device="cuda")
-        self.positions = torch.zeros(capture_tokens, dtype=torch.long,
-                                     device="cuda")
-        self.cu_seqlens = torch.zeros(max_docs + 2, dtype=torch.int32,
-                                      device="cuda")
-        self.pad_positions = torch.arange(capture_tokens, device="cuda")
-        self.cu_seqlens[1:].fill_(capture_tokens)
-        with torch.inference_mode():
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(warmups):
-                    pipeline.forward_tokens(
-                        self.ids, self.positions, self.cu_seqlens,
-                        max_seqlen, fused)
-            torch.cuda.current_stream().wait_stream(side)
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                self.hidden, self.residual = pipeline.forward_tokens(
-                    self.ids, self.positions, self.cu_seqlens,
-                    max_seqlen, fused)
-
-    def run(self, packed):
-        ids, positions, final_indices, cu_seqlens, _max_len = packed
-        n_tokens = ids.shape[0]
-        n_docs = cu_seqlens.shape[0] - 1
-        if n_docs > self.max_docs:
-            raise ValueError(f"{n_docs} docs exceeds the captured "
-                             f"{self.max_docs}")
-        pad = self.capture_tokens - n_tokens
-        self.ids[:n_tokens].copy_(ids)
-        self.positions[:n_tokens].copy_(positions)
-        if pad:
-            self.ids[n_tokens:].zero_()
-            self.positions[n_tokens:].copy_(self.pad_positions[:pad])
-        self.cu_seqlens[:n_docs + 1].copy_(cu_seqlens)
-        self.cu_seqlens[n_docs + 1:].fill_(self.capture_tokens)
-        self.graph.replay()
-        return self.pipeline.select_and_norm(
-            self.hidden, self.residual, final_indices)
 
 
 @app.function(image=forward_image, gpu="H100!", timeout=3600, memory=65536,
@@ -1191,25 +894,16 @@ def probe(n_docs: int = 8) -> str:
     packed = PackedPipeline.pack(prompts)
     with torch.inference_mode():
         unfused = pipeline.forward_chunk(packed, fused=False)
-        fused = pipeline.forward_chunk(packed, fused=True)
         custom = pipeline.forward_chunk(packed, fused="custom")
     unfused_answers = answers(unfused)
-    fused_answers = answers(fused)
     custom_answers = answers(custom)
-    diff = (unfused.float() - fused.float()).abs().max().item()
     result["chunk"] = {
         "tokens": int(packed[0].shape[0]),
         "docs": n_docs,
         "fa_version": pipeline.fa_version,
         "unfused_finite": bool(torch.isfinite(unfused).all().item()),
-        "fused_finite": bool(torch.isfinite(fused).all().item()),
-        "fused_vs_unfused_max_abs_diff": round(diff, 4),
         "unfused_wrong": sum(
             a != b for a, b in zip(unfused_answers, expected)),
-        "fused_wrong": sum(
-            a != b for a, b in zip(fused_answers, expected)),
-        "fused_vs_unfused_disagreements": sum(
-            a != b for a, b in zip(fused_answers, unfused_answers)),
         "custom_finite": bool(torch.isfinite(custom).all().item()),
         "custom_wrong": sum(
             a != b for a, b in zip(custom_answers, expected)),
@@ -1328,45 +1022,6 @@ def probe(n_docs: int = 8) -> str:
         lambda: pipeline.custom_qk_norm_rope(big_qkv, big_pos, attn1))
     del big_qkv
 
-    # round 5: the epilogue multiply, decomposed so the two risks are
-    # priced separately
-    gate_up_linear = model.model.layers[1].mlp.gate_up_proj
-    with torch.inference_mode():
-        big_aq, big_as = pipeline.quant(big_hidden)
-    result["microbench_us_per_call"]["gateup_deepgemm_only"] = bench(
-        lambda: pipeline.gemm(big_aq, big_as, gate_up_linear))
-    result["microbench_us_per_call"]["gateup_ours_plain_only"] = bench(
-        lambda: pipeline.custom_gemm_silu_quant(
-            big_aq, big_as, gate_up_linear, fuse=False))
-    result["microbench_us_per_call"]["gateup_a_deepgemm_plus_silu"] = bench(
-        lambda: pipeline.custom_silu_quant(
-            pipeline.gemm(big_aq, big_as, gate_up_linear)))
-    result["microbench_us_per_call"]["gateup_b_ours_plus_silu"] = bench(
-        lambda: pipeline.custom_silu_quant(
-            pipeline.custom_gemm_silu_quant(
-                big_aq, big_as, gate_up_linear, fuse=False)[0]))
-    result["microbench_us_per_call"]["gateup_c_ours_fused"] = bench(
-        lambda: pipeline.custom_gemm_silu_quant(
-            big_aq, big_as, gate_up_linear, fuse=True))
-
-    with torch.inference_mode():
-        small_h = torch.randn(256, 2560, dtype=torch.bfloat16,
-                              device="cuda")
-        small_aq, small_as = pipeline.quant(small_h)
-        d_ref, s_ref = pipeline.custom_silu_quant(
-            pipeline.gemm(small_aq, small_as, gate_up_linear))
-        d_new, s_new = pipeline.custom_gemm_silu_quant(
-            small_aq, small_as, gate_up_linear, fuse=True)
-        deq_ref = d_ref.float().view(256, -1, 128) * s_ref.float()[:, :, None]
-        deq_new = d_new.float().view(256, -1, 128) * s_new.float()[:, :, None]
-        rel = (deq_ref - deq_new).abs().max().item()
-        span = deq_ref.abs().max().item()
-    result["egemm_check"] = {
-        "dequant_max_diff": round(rel, 5),
-        "reference_max_abs": round(span, 3),
-    }
-    del big_gate_up, big_hidden, big_residual, big_aq
-
     # round 6: the engine's exact kernels driven without the engine
     import time as _time
     runner = EngineKernelRunner(BEST_BATCH_TOKENS, 64,
@@ -1394,21 +1049,6 @@ def probe(n_docs: int = 8) -> str:
     gc.collect()
     torch.cuda.empty_cache()
 
-    # capture at the full chunk size: the 8-doc chunk padded from
-    # ~2,200 to 25,305 tokens is the worst-case padding path
-    runner = GraphedChunkRunner(pipeline, False, BEST_BATCH_TOKENS,
-                                max_docs=64, max_seqlen=3072)
-    with torch.inference_mode():
-        graphed_first = answers(runner.run(packed))
-        graphed_second = answers(runner.run(packed))
-    result["graph"] = {
-        "capture_tokens": BEST_BATCH_TOKENS,
-        "graphed_vs_eager_disagreements": sum(
-            a != b for a, b in zip(graphed_first, unfused_answers)),
-        "replay_deterministic": graphed_first == graphed_second,
-        "graphed_wrong": sum(
-            a != b for a, b in zip(graphed_first, expected)),
-    }
     print(json.dumps(result, indent=2), flush=True)
     return json.dumps(result)
 
@@ -1556,23 +1196,16 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         return predictions
 
     pipeline.fa_version = 3
-    longest_prompt = max(map(len, prompts))
-    max_seqlen_cap = 3072
-    assert longest_prompt < max_seqlen_cap
     max_docs = max(len(batch) for batch in batches) + 1
     cells = (
-        ("packed_enginekernels", None, "engine", False, False),
-        ("packed_custom_qk", "custom", None, True, False),
+        ("packed_enginekernels", None, "engine", False),
+        ("packed_custom_qk", "custom", None, True),
     )
-    for name, fused, runner_kind, fuse_qk, fuse_gemm in cells:
+    for name, fused, runner_kind, fuse_qk in cells:
         pipeline.fuse_qk = fuse_qk
-        pipeline.fuse_gemm = fuse_gemm
         if runner_kind == "engine":
             runner = EngineKernelRunner(batch_tokens, max_docs,
                                         kv_cache_dtype="fp8")
-        elif runner_kind == "graphs":
-            runner = GraphedChunkRunner(pipeline, fused, batch_tokens,
-                                        max_docs, max_seqlen_cap)
         else:
             runner = None
         # two warmup chunks: DeepGEMM compiles its kernels on first use
@@ -1598,7 +1231,6 @@ def compare(n_docs: int = 10_000, reps: int = 3,
                             if runner_kind == "engine" else
                             f"fa{pipeline.fa_version}, no KV"),
                 "fused_qk_norm_rope": fuse_qk,
-                "fused_gate_up_gemm": fuse_gemm,
                 "persistent_kv": False,
                 "peak_allocated_gib": round(
                     torch.cuda.max_memory_allocated() / 2**30, 3
