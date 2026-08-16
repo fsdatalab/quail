@@ -26,6 +26,7 @@ image read 80,556 and are not kept.
 | `c0_anchor.json` | `modal_filters.py::c0_anchor` | the filter comparison with an in-container rate probe; each cell carries c0 = wall - reads x corpus / rate, so host speed cancels |
 | `makespan_check.json` | `quail.plan.validate` | predicted against measured query walls per arm, at designed and at effective (verdict-measured) selectivities, plus a container variant at the anchor's probed rate and c0 |
 | `filter_cells_bf16.json` | `modal_filters.py::main --kv bf16` | the filter comparison on a 16-bit-KV boot, admission repriced at 2 bytes per element; accuracy identical to fp8, so the KV format does not cause the answer anomaly |
+| `filter_cells_syncclient.json` | `modal_filters.py::main`, synchronous client | the validation run for the asyncio removal: every counter matches `filter_cells.json` exactly (rewind reads 1.197, stock 1.229, identical request and answer counts), so the sync client computes what the async client computed. Walls ran on a slower, noisier container (rewind 40.5-42.2 s, stock 41.7-45.3 s; within-container ratio brackets the banked 1.08x), so `filter_cells.json` stays the quotable comparison |
 
 ## One measurement caveat
 
