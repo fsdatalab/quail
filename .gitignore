@@ -8,3 +8,4 @@ __pycache__/
 # and plots/make_figures.py skips the timeline figure when they are absent
 results/engine/torchprof_*rank0.pt.trace.json.gz
 logs/
+results/logs/
