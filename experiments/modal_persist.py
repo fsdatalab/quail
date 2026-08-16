@@ -232,13 +232,22 @@ def _xfer_summary(events, windows):
                        "/results": results_vol})
 def persist_run(n_docs: int = 1000, stage: str = "baseline",
                 cpu_gb: int = 96, connector: str = "stock",
-                store_gb: int = 0) -> dict:
+                store_gb: int = 0, waves: bool = False,
+                spill: bool = False, choke_util: float = 0.0) -> dict:
     import time as _time
 
     trace_path = "/tmp/quail_xfer"
     if stage == "store":
         # must precede the first vllm import in this process
         _install_xfer_trace(trace_path)
+    if waves:
+        # wave pre-loading runs in the QuailScheduler; the stock
+        # per-stage requests are untagged, so single-tenant strict
+        # mode must be off for this harness
+        os.environ["QUAIL_WAVES"] = "1"
+        os.environ["QUAIL_SINGLE_TENANT"] = "0"
+        if spill:
+            os.environ["QUAIL_SPILL"] = "1"
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
@@ -286,6 +295,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
                   budget_tokens=pool_budget,
                   step_tokens=plan.engine_step_tokens,
                   max_num_seqs=plan.engine_max_seqs,
+                  waves=waves, spill=spill, choke_util=choke_util,
                   kv_bytes_estimate=kv_bytes, store_gb=store_gb,
                   store_min_doc_tokens=store_min,
                   stored_docs=(sum(1 for b in body_ids
@@ -298,8 +308,14 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         kw = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
                   max_num_batched_tokens=plan.engine_step_tokens,
                   max_num_seqs=plan.engine_max_seqs,
-                  gpu_memory_utilization=0.92,
+                  # choke_util deliberately starves the pool below the
+                  # working set to force the spill regime; 0 keeps the
+                  # shipped setting
+                  gpu_memory_utilization=choke_util or 0.92,
                   enable_prefix_caching=True, disable_log_stats=True)
+        if waves:
+            kw["scheduler_cls"] = ("quail.engineext.scheduler."
+                                   "QuailScheduler")
         if store:
             # "quail" swaps in the coalescing worker (one transfer per
             # step, not per request); "stock" is the measured baseline
@@ -367,6 +383,10 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         report["xfer"] = _xfer_summary(events, windows)
         report["xfer_events"] = events
         suffix = "_quail" if connector == "quail" else ""
+        if waves:
+            suffix += "_waves"
+        if choke_util:
+            suffix += f"_choked{int(choke_util * 100)}"
         with open(f"/results/persist_xfer_trace{suffix}.jsonl", "w") as f:
             for e in events:
                 f.write(json.dumps(e) + "\n")
@@ -381,6 +401,10 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         pass
     slim = {k: v for k, v in report.items() if k != "xfer_events"}
     tag = "_quail" if connector == "quail" else ""
+    if waves:
+        tag += "_waves"
+    if choke_util:
+        tag += f"_choked{int(choke_util * 100)}"
     with open(f"/results/persist_{stage}{tag}.json", "w") as f:
         json.dump(slim, f, indent=2)
     results_vol.commit()
@@ -389,10 +413,17 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
 
 @app.local_entrypoint()
 def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
-         connector: str = "stock", store_gb: int = 0, out: str = ""):
-    data = persist_run.remote(n_docs, stage, cpu_gb, connector, store_gb)
+         connector: str = "stock", store_gb: int = 0,
+         waves: bool = False, spill: bool = False,
+         choke_util: float = 0.0, out: str = ""):
+    data = persist_run.remote(n_docs, stage, cpu_gb, connector, store_gb,
+                              waves, spill, choke_util)
     events = data.pop("xfer_events", None)
     tag = "_quail" if connector == "quail" else ""
+    if waves:
+        tag += "_waves"
+    if choke_util:
+        tag += f"_choked{int(choke_util * 100)}"
     path = out or f"results/engine/persist_{stage}{tag}.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:

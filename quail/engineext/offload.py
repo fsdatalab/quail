@@ -28,15 +28,123 @@ reason the scheduler subclass pins it: OffloadingConnectorWorker and
 its handlers are not public API.
 """
 
+from dataclasses import dataclass, field
+from itertools import count
+
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingConnectorMetadata,
+    OffloadingWorkerMetadata,
+    TransferJob,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    build_offloading_config,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
     OffloadingConnectorWorker,
 )
-from vllm.v1.kv_offload.base import GPULoadStoreSpec, TransferResult
+from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec,
+    LookupResult,
+    TransferResult,
+    make_offload_key,
+)
+from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 
 from .offload_logic import plan_merge, split_result, synthetic_ids
+
+
+@dataclass
+class QuailOffloadingConnectorMetadata(OffloadingConnectorMetadata):
+    """The stock metadata plus the wave channel. Wave jobs fill
+    pre-registered prefix-cache blocks and belong to no request;
+    gate_waves names the waves whose blocks a request scheduled THIS
+    step may read, so the worker makes the compute stream wait on
+    each wave's CUDA event exactly once. All ordering is stream
+    ordering - no request ever parks waiting for a transfer."""
+    wave_of_job: dict = field(default_factory=dict)   # job id -> wave id
+    gate_waves: list = field(default_factory=list)
+
+
+class QuailOffloadingConnectorScheduler(OffloadingConnectorScheduler):
+    """Adds the wave channel on the scheduler side. The QuailScheduler
+    lives in the same process and calls queue_wave/queue_gates
+    directly; the queued work rides the step's connector metadata to
+    the worker. Wave jobs are tracked here only to release their CPU
+    block pins when the worker reports the copy done."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._wave_jobs = []            # (wave_id, job_id, TransferJob)
+        self._wave_keys = {}            # job_id -> store keys to release
+        self._gate_queue = []
+        # far below the coalescing worker's synthetic range, so the
+        # three id spaces (scheduler jobs >= 0, merges < 0, waves
+        # <= -10^9) can never collide
+        self._wave_ids = count(start=-(10 ** 9), step=-1)
+
+    def wave_keys_for(self, request):
+        """The request's store keys at chunk granularity, or None if
+        any chunk misses (a partial hit is not worth a wave). Only
+        full blocks are considered; the tail recomputes."""
+        n_full = len(request.block_hashes)
+        if not n_full:
+            return None
+        keys = [make_offload_key(h, 0)
+                for h in request.block_hashes]
+        for key in keys:
+            if self.manager.lookup(key, None) != LookupResult.HIT:
+                return None
+        return keys
+
+    def prepare_wave(self, keys):
+        """Pin the CPU blocks for a wave and return the source spec."""
+        return self.manager.prepare_load(keys, None)
+
+    def queue_wave(self, wave_id, keys, src_spec, dst_spec):
+        job_id = next(self._wave_ids)
+        self._wave_jobs.append((wave_id, job_id, TransferJob(
+            req_id=f"quail-wave-{wave_id}", src_spec=src_spec,
+            dst_spec=dst_spec)))
+        self._wave_keys[job_id] = list(keys)
+        return job_id
+
+    def queue_gates(self, wave_ids):
+        self._gate_queue.extend(wave_ids)
+
+    def build_connector_meta(self, *args, **kwargs):
+        meta = super().build_connector_meta(*args, **kwargs)
+        wave_of_job = {}
+        for wave_id, job_id, job in self._wave_jobs:
+            meta.load_jobs[job_id] = job
+            wave_of_job[job_id] = wave_id
+        out = QuailOffloadingConnectorMetadata(
+            load_jobs=meta.load_jobs, store_jobs=meta.store_jobs,
+            jobs_to_flush=meta.jobs_to_flush,
+            wave_of_job=wave_of_job, gate_waves=list(self._gate_queue))
+        self._wave_jobs = []
+        self._gate_queue = []
+        return out
+
+    def update_connector_output(self, connector_output):
+        meta = connector_output.kv_connector_worker_meta
+        if (isinstance(meta, OffloadingWorkerMetadata)
+                and meta.completed_jobs):
+            for job_id in [j for j in meta.completed_jobs
+                           if j in self._wave_keys]:
+                keys = self._wave_keys.pop(job_id)
+                try:
+                    self.manager.complete_load(keys, None)
+                except Exception as e:
+                    print(f"[quail-waves] complete_load failed: {e}",
+                          flush=True)
+                del meta.completed_jobs[job_id]
+        super().update_connector_output(connector_output)
 
 
 class QuailOffloadingConnectorWorker(OffloadingConnectorWorker):
@@ -45,6 +153,29 @@ class QuailOffloadingConnectorWorker(OffloadingConnectorWorker):
         # synthetic merged-job id -> list of (job_id, n_blocks)
         self._merged: dict[int, list[tuple[int, int]]] = {}
         self._synthetic = synthetic_ids()
+        self._wave_events = {}          # wave id -> CUDA end event
+        self._wave_job_ids = set()      # job ids that were waves
+        self._gated = set()             # waves already waited on
+
+    def _newest_load_event(self):
+        try:
+            return self.worker._load_handler._transfers[-1].end_event
+        except Exception:
+            return None
+
+    def apply_gates(self, wave_ids):
+        """Make the compute stream wait on each named wave's event,
+        once. A wait on an already-signaled event is free; on a
+        pending one it orders the step after the copy - which is the
+        entire synchronization story of the wave design."""
+        import torch
+        for wave_id in wave_ids:
+            if wave_id in self._gated:
+                continue
+            self._gated.add(wave_id)
+            ev = self._wave_events.pop(wave_id, None)
+            if ev is not None:
+                torch.cuda.current_stream().wait_event(ev)
 
     def _src_blocks_per_chunk(self) -> int:
         # the load handler's CPU-side chunking; 1 means CPU chunks and
@@ -81,6 +212,21 @@ class QuailOffloadingConnectorWorker(OffloadingConnectorWorker):
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             assert self.worker.submit_store(job_id, src_spec, dst_spec)
         self._unsubmitted_store_jobs.clear()
+
+        # wave jobs first: each is already one batched copy list, so
+        # it goes straight to the handler; the transfer's end event
+        # becomes the wave's gate event
+        wave_of_job = getattr(metadata, "wave_of_job", None) or {}
+        for job_id in list(wave_of_job):
+            entry = metadata.load_jobs.pop(job_id, None)
+            if entry is None:
+                continue
+            self._wave_job_ids.add(job_id)
+            assert self.worker.submit_load(
+                job_id, entry.src_spec, entry.dst_spec)
+            ev = self._newest_load_event()
+            if ev is not None:
+                self._wave_events[wave_of_job[job_id]] = ev
 
         load_items = metadata.load_jobs
         if len(load_items) < 2:
@@ -133,7 +279,9 @@ class QuailOffloadingConnectorWorker(OffloadingConnectorWorker):
         for result in self._expand(self.worker.get_finished()):
             job_id = result.job_id
             assert result.success
-            is_load = job_id in self._load_jobs
+            is_load = (job_id in self._load_jobs
+                       or job_id in self._wave_job_ids)
+            self._wave_job_ids.discard(job_id)
             if (result.transfer_time is not None
                     and result.transfer_size is not None):
                 stats = (self._connector_worker_meta.transfer_stats.load
@@ -175,3 +323,18 @@ class QuailOffloadingConnector(OffloadingConnector):
             # only stores references, so the swap has no side effects
             self.connector_worker = QuailOffloadingConnectorWorker(
                 self.connector_worker.spec, kv_cache_config)
+        if self.connector_scheduler is not None:
+            # rebuild the scheduler side with the wave channel; the
+            # parent's instance holds no state yet at this point
+            offloading_config = build_offloading_config(
+                vllm_config, kv_cache_config)
+            spec = OffloadingSpecFactory.create_spec(offloading_config)
+            self.connector_scheduler = QuailOffloadingConnectorScheduler(
+                spec, vllm_config, kv_cache_config)
+
+    def start_load_kv(self, forward_context, **kwargs):
+        gates = getattr(self._connector_metadata, "gate_waves", None)
+        if gates:
+            assert self.connector_worker is not None
+            self.connector_worker.apply_gates(gates)
+        super().start_load_kv(forward_context, **kwargs)

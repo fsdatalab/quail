@@ -125,6 +125,11 @@ class QuailScheduler(Scheduler):
                       flush=True)
         self._de_stats = dict(pinned=0, released=0, blocks=0,
                               foreign_rejected=0, heuristic_evictions=0)
+        # wave pre-loading (QUAIL_WAVES=1): synchronous KV pre-load
+        # from the host store, decisions in waves_logic, engine
+        # surgery in waves.py; off by default and inert when off
+        from .waves import WaveDriver
+        self._de_waves = WaveDriver(self)
 
         pool = self.kv_cache_manager.block_pool
         orig_evict = pool._maybe_evict_cached_block
@@ -143,7 +148,9 @@ class QuailScheduler(Scheduler):
 
     def schedule(self, *args, **kwargs):
         t0 = time.monotonic()
+        self._de_waves.before()
         out = super().schedule(*args, **kwargs)
+        self._de_waves.after(out.num_scheduled_tokens.keys())
         if self._de_steps is not None:
             self._de_steps.append((time.monotonic(),
                                    out.total_num_scheduled_tokens))
