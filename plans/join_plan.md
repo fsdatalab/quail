@@ -45,8 +45,13 @@ question tokens; S = the 25,305-token chunk/step budget.
 
 **Planning, before anything runs.**
 
-1. Sample ~2k pairs per predicate, label them with the model
-   (minutes), giving selectivity and matches-per-document.
+1. Sample only when the plan depends on survivors. A 2-way full
+   join evaluates every pair whatever the selectivity, so it samples
+   nothing — its plan follows from token lengths and counts alone.
+   Sampling (~2k pairs per predicate, labeled by the model, minutes)
+   enters at n ≥ 3, where stage order and gating value depend on
+   selectivity and matches-per-document, and under exists semantics,
+   where expected scan length does.
 2. n is 2 to 4, so enumerate every stage order and every per-stage
    anchor choice and price them with the cost model below. No
    heuristics. What wins, almost always: anchor the longer side
@@ -132,19 +137,22 @@ that per-pair costs dominate; and one full run is affordable.
 
 Assumed lengths until tokenized (step 1 replaces these): reports
 1,000 tokens, terms 8, preamble 40, question tail 50. So f = 1,040,
-s = 58.
+s = 58. **Every number below is printed, with its arithmetic, by
+`plans/join_estimates.py`** — measured constants imported from
+`quail/plan/cost.py`, assumptions declared at the top. Rerun it when
+step 1 replaces the assumptions.
 
-**Anchor choice, both ways:**
+**Anchor choice, both ways** (packed, recompute):
 
-| | fresh tokens per pair | total fresh | wall at packed rate |
+| | fresh tokens per pair | total fresh | wall |
 |---|---|---|---|
-| reports anchored, terms streamed | 58 | 1.82B | **4.2 h** |
-| terms anchored, reports streamed | 1,050 | 31.6B | **~73 h** |
+| reports anchored, terms streamed | 58 | 1.82B | **4.6 h** |
+| terms anchored, reports streamed | 1,050 | 31.7B | **76 h** |
 
-The trap this kills: all 3,718 terms fit in KV at once (190k of
-946.8k pool tokens) and they are still the wrong side to anchor —
-anchoring is about which side gets paid per pair, not which side
-fits.
+The trap this kills: all 3,718 terms fit in KV at once (178k
+tokens, 19% of the pool) and they are still the wrong side to
+anchor — anchoring is about which side gets paid per pair, not
+which side fits.
 
 **Size rule applied:** k = (25,305 − 1,040)/58 = 418 partners per
 chunk; m = ceil(3,718/418) = 9 chunks per report; f/S = 4.1%. So:
@@ -152,16 +160,38 @@ recompute, keep nothing, the KV pool stays empty. The whole join is
 9 x 8,103 = 72,927 chunks of one prefix + ~418 suffixes each, built
 from a Python loop.
 
-**The comparison, priced** (fresh tokens x rate; engine rows carry
-the cached-read range because their reads go through the paged
-pool):
+**The comparison, derived** (walls from `plans/join_estimates.py`):
 
-| plan | total | wall |
+| plan | fresh tokens | wall |
 |---|---|---|
-| stock vLLM, request per pair, arbitrary order | 33.1B | **~96 h**, thrash risk to ~180 h — measured by 5% sample, never run full |
-| stock vLLM, pairs grouped by report, admission matched | 1.76B + reads | **~6–7 h** |
-| engine chain mode (rewind) — fallback path | 1.76B + reads | **5.8–6.7 h** |
-| packed forward pass, recompute | 1.82B | **4.2 h** |
+| A1: stock vLLM, request per pair, arbitrary order | 33.08B | **99.9 h**; x1.87 measured thrash = 187 h — priced by 5% sample, never run full |
+| A2: stock vLLM, pairs grouped by report, admission matched | 1.756B + boundary | **7.3 h** |
+| B: engine chain mode (rewind) — fallback path | 1.756B | **6.2 h** |
+| C: packed forward pass, recompute | 1.823B | **4.6 h** |
+
+Where each number comes from:
+
+- **A1** = 30,126,954 pairs x 1,098 tokens = 33.08B fresh → 95.5 h
+  linear, + 2.8 h quadratic attention surcharge (1,098-token prompts
+  against the 472-profile the rate embeds), + 1.07 h step-fixed
+  cost, + 0.42 h request overhead. The x1.87 is the filter
+  measurement of default admission at 3.4x pool pressure; this
+  workload's prefix working set is 8.9x the pool.
+- **B** = 8,103 x 1,040 + 30,126,954 x 58 = 1.756B fresh → 5.07 h,
+  + 1.17 h of cached reads: P x f x 134 ns, the measured
+  per-cached-token price interpolated to our suffix width 58 from
+  the c=32 (104 ns) and c=64 (141 ns) cells. Flag: h = 1,040 sits
+  below the calibrated grid's 2,048 minimum — this is the number a
+  C3 diagnostic would firm up.
+- **A2** = B + 0.42 h per-pair request overhead + 0.70 h boundary
+  blocks (the 16-token block spanning the report/term boundary
+  recomputes every pair, ~8 tokens x P = 241M).
+- **C** = 1.747B suffix + 75.8M prefix recompute = 1.823B at the
+  packed non-attention rate → 4.07 h, + 0.52 h attention priced
+  from pair counts (1.91e12 pairs, 95% of them suffix-to-prefix
+  cross-attention, at 2 x a2 per pair). Cross-attention is 11% of
+  C's wall — the packed filter never paid it, so C's effective rate
+  is ~110k tokens/s, not 121k, and that is what the probe gates.
 
 Baseline fairness, per house rules: the grouped-stock run gets the
 same memory budget and an admission cap derived the same way
@@ -186,15 +216,17 @@ Modal run teed to a file.
    prefix-attention call merged by softmax state; suffix positions
    identical to standalone requests. Gates, stated now: (a) answers
    identical to the same pairs run as per-pair engine requests;
-   (b) chunk throughput within 10% of the filter pass's 121,045
-   tok/s. Fail (a) or (b) → the experiment runs on engine chain
+   (b) chunk throughput within 10% of the derived effective rate,
+   ~110k tok/s — the 121,045 filter rate minus the priced
+   cross-attention. Fail (a) or (b) → the experiment runs on engine chain
    mode instead, which exists today, and C3 calibration (long-suffix
    cached reads) joins the critical path to price it.
 3. **The experiment.** In order, one container: packed on a 5%
-   pair sample as the confirming cell (predicted ~13 min) — proceed
-   only if within 10% of prediction; packed full (predicted 4.2 h);
-   grouped-stock full (predicted 6–7 h); arbitrary-order stock on a
-   5% pair sample, extrapolated (predicted ~96 h full). Sample
+   pair sample as the confirming cell (predicted 14 min) — proceed
+   only if within 10% of prediction; packed full (predicted 4.6 h);
+   grouped-stock full (predicted 7.3 h); arbitrary-order stock on a
+   5% pair sample, extrapolated (predicted 99.9 h full before
+   thrash, 187 h at the filter-measured 1.87x). Sample
    pairs, not reports, so the baseline's prefix working set keeps
    its real 8.9x pool pressure and the thrash multiplier is
    honestly measured. Report all four with predictions alongside.
@@ -217,7 +249,10 @@ measurement only, like the flag filters.
 - Report lengths are assumed and heavy-tailed; truncation moves
   cost and accuracy. Step 1 exists to kill this risk first.
 - The 121,045 tok/s packed rate was measured without the
-  prefix-attention call; the probe's rate gate covers it.
+  prefix-attention call. The estimate prices that call from the
+  fitted attention constant (2 x a2 per pair, 11% of C's wall) and
+  the probe's rate gate checks the resulting ~110k effective rate;
+  a fused or badly-shaped kernel could still miss it.
 - The arbitrary-order stock number is an extrapolation from a 5%
   sample by design; say so wherever it is reported.
 - Our answers come from Qwen3 4B, the paper's from GPT-4.1. This
