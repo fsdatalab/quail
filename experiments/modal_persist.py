@@ -385,6 +385,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         suffix = "_quail" if connector == "quail" else ""
         if waves:
             suffix += "_waves"
+        if spill:
+            suffix += "_spill"
         if choke_util:
             suffix += f"_choked{int(choke_util * 100)}"
         with open(f"/results/persist_xfer_trace{suffix}.jsonl", "w") as f:
@@ -403,6 +405,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     tag = "_quail" if connector == "quail" else ""
     if waves:
         tag += "_waves"
+    if spill:
+        tag += "_spill"
     if choke_util:
         tag += f"_choked{int(choke_util * 100)}"
     with open(f"/results/persist_{stage}{tag}.json", "w") as f:
@@ -422,6 +426,8 @@ def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
     tag = "_quail" if connector == "quail" else ""
     if waves:
         tag += "_waves"
+    if spill:
+        tag += "_spill"
     if choke_util:
         tag += f"_choked{int(choke_util * 100)}"
     path = out or f"results/engine/persist_{stage}{tag}.json"
