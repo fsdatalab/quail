@@ -37,6 +37,19 @@ mid-query. Plain CPU spec needs no workarounds.
 Run both stages, then compare:
     modal run experiments/modal_persist.py --stage baseline
     modal run experiments/modal_persist.py --stage store
+
+Transfer tracing: the store stage wraps the connector's offload
+handler so every transfer job logs one JSON line at submit and one at
+finish, the finish line carrying the CUDA-event-timed copy duration
+the handler already measures. Dividing bytes by those event-timed
+seconds gives copy-only bandwidth; dividing the same bytes by the
+query wall gives the effective number reported before. The gap
+between the two is time the channel sat idle between jobs -
+orchestration, not copying. The wrap is installed as a sitecustomize
+module on PYTHONPATH because vLLM runs the GPU worker in a spawned
+engine-core process: a patch applied only in this process would miss
+it, while a fresh interpreter imports sitecustomize before anything
+else.
 """
 
 import json
@@ -50,6 +63,169 @@ app = modal.App("quail-persist")
 persist_image = image.add_local_python_source("workload")
 
 
+# ---- transfer tracing -------------------------------------------------
+
+_TRACE_HOOK = '''\
+"""Trace vLLM CPU-offload transfers to JSONL (quail persist stage).
+
+Active only when QUAIL_XFER_TRACE is set. Wraps
+SingleDirectionOffloadingHandler so each transfer job logs a submit
+record and a finish record with the CUDA-event-timed duration, to
+QUAIL_XFER_TRACE.<pid>. Installed via an import hook so the patch
+applies in whichever process imports the handler."""
+import importlib.abc
+import importlib.util
+import json
+import os
+import sys
+import time
+
+_TARGET = "vllm.v1.kv_offload.cpu.gpu_worker"
+_PATH = os.environ.get("QUAIL_XFER_TRACE")
+
+
+def _log(rec):
+    with open(f"{_PATH}.{os.getpid()}", "a") as f:
+        f.write(json.dumps(rec) + "\\n")
+
+
+def _patch(mod):
+    cls = mod.SingleDirectionOffloadingHandler
+    orig_submit = cls.transfer_async
+    orig_finished = cls.get_finished
+
+    def transfer_async(self, job_id, src_spec, dst_spec):
+        _log(dict(ev="submit", t=time.time(),
+                  dir="d2h" if self.gpu_to_cpu else "h2d", job=job_id,
+                  src_blocks=len(getattr(src_spec, "block_ids", ()))))
+        return orig_submit(self, job_id, src_spec, dst_spec)
+
+    def get_finished(self):
+        results = orig_finished(self)
+        if results:
+            now = time.time()
+            for r in results:
+                _log(dict(ev="finish", t=now,
+                          dir="d2h" if self.gpu_to_cpu else "h2d",
+                          job=r.job_id, bytes=r.transfer_size,
+                          secs=r.transfer_time))
+        return results
+
+    cls.transfer_async = transfer_async
+    cls.get_finished = get_finished
+
+
+class _Hook(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def find_spec(self, name, path=None, target=None):
+        if name != _TARGET:
+            return None
+        sys.meta_path.remove(self)
+        try:
+            spec = importlib.util.find_spec(name)
+        finally:
+            sys.meta_path.insert(0, self)
+        if spec is None or spec.loader is None:
+            return None
+        self._orig_loader = spec.loader
+        spec.loader = self
+        return spec
+
+    def create_module(self, spec):
+        return self._orig_loader.create_module(spec)
+
+    def exec_module(self, module):
+        self._orig_loader.exec_module(module)
+        _patch(module)
+
+
+if _PATH:
+    sys.meta_path.insert(0, _Hook())
+'''
+
+
+def _install_xfer_trace(trace_path):
+    """Arm the trace for this process and every process spawned after.
+
+    Must run before anything imports vllm: the hook has to sit on
+    sys.meta_path ahead of the first gpu_worker import, and PYTHONPATH
+    has to carry it into the spawned engine-core interpreter."""
+    hook_dir = "/tmp/quail_hook"
+    os.makedirs(hook_dir, exist_ok=True)
+    with open(os.path.join(hook_dir, "sitecustomize.py"), "w") as f:
+        f.write(_TRACE_HOOK)
+    os.environ["QUAIL_XFER_TRACE"] = trace_path
+    os.environ["PYTHONPATH"] = (hook_dir + os.pathsep
+                                + os.environ.get("PYTHONPATH", ""))
+    # PYTHONPATH covers a spawned engine core (fresh interpreters
+    # import sitecustomize); exec covers this process and fork
+    # children, which never rerun interpreter startup. A cached
+    # system sitecustomize would make `import sitecustomize` a no-op,
+    # so the source is executed directly.
+    exec(compile(_TRACE_HOOK, "quail_xfer_hook", "exec"),
+         {"__name__": "quail_xfer_hook"})
+
+
+def _collect_xfer_events(trace_path):
+    import glob
+    events = []
+    for p in glob.glob(trace_path + ".*"):
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    events.append(json.loads(line))
+    events.sort(key=lambda e: e["t"])
+    return events
+
+
+def _xfer_summary(events, windows):
+    """Aggregate the traced jobs.
+
+    copy_GBps divides bytes by the event-timed busy seconds - the DMA
+    engine's own rate, valid because transfers are strictly serialized
+    on chained events. effective_GBps divides the same bytes by the
+    query wall. Their ratio is the fraction of the window the channel
+    actually spent copying. submit_to_finish latency includes waiting
+    behind earlier jobs and the polling cadence of get_finished, so it
+    is an upper bound on per-job overhead, not a pure measurement."""
+    finishes = [e for e in events if e["ev"] == "finish" and e.get("secs")]
+    submits = {(e["dir"], e["job"]): e["t"]
+               for e in events if e["ev"] == "submit"}
+    directions = {}
+    for direction in ("h2d", "d2h"):
+        rows = [e for e in finishes if e["dir"] == direction]
+        if not rows:
+            continue
+        total = sum(e["bytes"] for e in rows)
+        busy = sum(e["secs"] for e in rows)
+        rates = sorted(e["bytes"] / e["secs"] / 1e9 for e in rows)
+        lat = sorted(e["t"] - submits[(direction, e["job"])]
+                     for e in rows if (direction, e["job"]) in submits)
+        directions[direction] = dict(
+            jobs=len(rows), gb=round(total / 1e9, 3),
+            busy_s=round(busy, 3),
+            copy_GBps=round(total / busy / 1e9, 2),
+            job_GBps_p50=round(rates[len(rates) // 2], 2),
+            job_GBps_p90=round(rates[min(len(rates) - 1,
+                                         int(len(rates) * 0.9))], 2),
+            submit_to_finish_p50_s=(round(lat[len(lat) // 2], 4)
+                                    if lat else None))
+    per_window = []
+    for w in windows:
+        rows = [e for e in finishes
+                if e["dir"] == "h2d" and w["t0"] <= e["t"] <= w["t1"]]
+        span = w["t1"] - w["t0"]
+        gb = sum(e["bytes"] for e in rows) / 1e9
+        busy = sum(e["secs"] for e in rows)
+        per_window.append(dict(
+            name=w["name"], wall_s=round(span, 3), load_jobs=len(rows),
+            load_gb=round(gb, 3), load_busy_s=round(busy, 3),
+            channel_busy_frac=round(busy / span, 4) if span else None,
+            effective_GBps=round(gb / span, 2) if span else None,
+            copy_GBps=round(gb / busy, 2) if busy else None))
+    return dict(directions=directions, windows=per_window)
+
+
 @app.function(image=persist_image, gpu="H100!", timeout=3600,
               memory=131072,
               volumes={"/root/.cache/huggingface": hf_cache,
@@ -58,6 +234,11 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
                       cpu_gb: int = 96) -> dict:
     import inspect
     import time as _time
+
+    trace_path = "/tmp/quail_xfer"
+    if stage == "store":
+        # must precede the first vllm import in this process
+        _install_xfer_trace(trace_path)
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
@@ -120,13 +301,25 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
         print(f"[persist] baseline cold {base['wall']:.2f}s, "
               f"recompute after reset {base2['wall']:.2f}s", flush=True)
     else:
+        windows = []
+
+        async def timed_query(engine, tag):
+            t0 = _time.time()
+            out = await one_query(engine, tag)
+            windows.append(dict(name=tag, t0=t0, t1=_time.time()))
+            return out
+
         engine = Engine.from_engine_args(engine_args(store=True))
-        q1 = await one_query(engine, "ps1")
+        q1 = await timed_query(engine, "ps1")
         _time.sleep(8)                 # let offload writes drain
         await reset(engine)
-        q2 = await one_query(engine, "ps2")
+        print("[persist] prediction: copy-only load bandwidth far above "
+              "the ~10 GB/s wall-effective number means the loss is "
+              "between jobs (orchestration); copy-only itself ~10 means "
+              "the 32 KB descriptor granularity is the limit", flush=True)
+        q2 = await timed_query(engine, "ps2")
         await reset(engine)
-        q3 = await one_query(engine, "ps3")
+        q3 = await timed_query(engine, "ps3")
         report["store_cold_offload_s"] = round(q1["wall"], 2)
         report["store_restore_s"] = round(q2["wall"], 2)
         report["store_restore2_s"] = round(q3["wall"], 2)
@@ -139,12 +332,24 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
               f"restore {q2['wall']:.2f}s then {q3['wall']:.2f}s "
               f"({report['restore_effective_GBps']} GB/s effective)",
               flush=True)
+        events = _collect_xfer_events(trace_path)
+        report["xfer"] = _xfer_summary(events, windows)
+        report["xfer_events"] = events
+        with open("/results/persist_xfer_trace.jsonl", "w") as f:
+            for e in events:
+                f.write(json.dumps(e) + "\n")
+        loads = report["xfer"]["directions"].get("h2d")
+        if loads:
+            print(f"[persist] loads: {loads['jobs']} jobs, {loads['gb']} "
+                  f"GB, copy-only {loads['copy_GBps']} GB/s (per-job p50 "
+                  f"{loads['job_GBps_p50']} GB/s)", flush=True)
     try:
         engine.shutdown()
     except Exception:
         pass
+    slim = {k: v for k, v in report.items() if k != "xfer_events"}
     with open(f"/results/persist_{stage}.json", "w") as f:
-        json.dump(report, f, indent=2)
+        json.dump(slim, f, indent=2)
     results_vol.commit()
     return report
 
@@ -153,8 +358,16 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
 def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
          out: str = ""):
     data = persist_run.remote(n_docs, stage, cpu_gb)
+    events = data.pop("xfer_events", None)
     path = out or f"results/engine/persist_{stage}.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
     print(f"saved {path}")
+    if events:
+        import gzip
+        tp = "results/engine/persist_xfer_trace.jsonl.gz"
+        with gzip.open(tp, "wt") as f:
+            for e in events:
+                f.write(json.dumps(e) + "\n")
+        print(f"saved {tp} ({len(events)} events)")
