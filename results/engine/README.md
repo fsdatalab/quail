@@ -13,7 +13,8 @@ image read 80,556 and are not kept.
 | `torchprof_4b_filter_ours_rank0.pt.trace.json.gz` | same, rewind arm | (gitignored, 127 MB) |
 | `torchprof_4b_filter_slim.json.gz` | the same run, summarized | kernel classes and busy fraction |
 | `ncu_gemm_bench_summary.txt` | `modal_profiling.py::ncubench` | Nsight Compute speed-of-light per GEMM shape |
-| `persist_store.json` | `modal_persist.py --stage store` | restore against recompute, 1k docs |
+| `persist_store.json` | `modal_persist.py --stage store` | restore against recompute, 1k docs, now with the per-job transfer summary: loads copy at 23-28 GB/s while running but keep the channel busy only 25-29% of the restore wall, so the query sees 6.8 GB/s effective. The slowdown is between jobs, not in the DMA. Host caveat: this container's demonstrated copy rate is ~25 GB/s against the 55.4 the pinprobe host reached, so treat 25 as this host's floor, not the software ceiling |
+| `persist_xfer_trace.jsonl.gz` | the sitecustomize hook in `modal_persist.py` | one record per offload transfer job at submit and at finish (5,773 jobs, both directions), the finish record carrying the CUDA-event-timed copy duration; the summary above is computed from these |
 | `pinprobe.json` | `modal_pinprobe.py` | host-to-GPU bandwidth for three pinned-memory paths |
 | `speed_limit.json` | prefill throughput sweep | the 97,889 tok/s anchor `quail/plan/cost.py` calibrates PHI against |
 | `calibrate_all.json` | `modal_calibrate.py --families all` | the calibration sweep the fits use: 100 step cells (alpha, c1, c2, c4, c5) plus the c6 transfer probes, one container, synchronous eager boot |
