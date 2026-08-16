@@ -281,6 +281,34 @@ defended. Round 4 stands as this branch's result: 119,629 tokens
 per second, 18.6 percent over the best engine configuration, more
 accurate than every engine cell, with no engine and no KV.
 
+Round 6: the missing rung of the ablation ladder. The KV-cache
+write cannot be removed alone: in the engine's attention the read
+goes through the very pages the write just filled (the v1
+flash_attn backend runs reshape_and_cache_flash and then reads via
+block_table), so "engine kernels minus only the write" is not
+constructible. The constructible clean rung keeps KV entirely and
+removes only the engine: vLLM's model compiled exactly as the
+engine compiles it, a real paged fp8 cache, block tables and
+attention metadata built by hand for each packed chunk. Five cells
+in one container then form the whole ladder: engine fp8, engine
+bf16, engine kernels without the engine, packed stock parts with no
+KV, packed with our three kernels.
+
+Round 6 prediction, stated before the run:
+  - packed_enginekernels lands within 2 percent of the fp8 engine
+    either side. Pure engine removal has measured near zero three
+    times, and this rung shares every kernel with the engine,
+    including the cache write and paged read.
+  - its wrong count lands within 10 of the engine's 2,990, with
+    disagreements against the engine under 50: same kernels, same
+    fp8 cache rounding, only the chunk boundaries differ.
+  - the other rungs repeat their banked values within container
+    noise.
+  Falsifier: if packed_enginekernels sits 3 or more percent from
+  the fp8 engine, engine software was never actually free, and
+  every earlier "the engine is not the cost" conclusion gets
+  requalified by what the profiled repetition shows.
+
 Run:
     modal run experiments/modal_single_filter_forward.py::probe
     modal run experiments/modal_single_filter_forward.py::compare
@@ -354,10 +382,16 @@ def _whole_prompt_batches(prompts, batch_tokens):
     return batches
 
 
-def _load_vllm_model():
+def _load_vllm_model(compiled=False, kv_cache_dtype="auto"):
     """The checkpoint as vLLM's processed module: merged qkv and
     gate_up, FP8 weights and block scales laid out for DeepGEMM. No
-    engine and no KV pool - just the weights and layer modules."""
+    engine and no KV pool - just the weights and layer modules.
+
+    With compiled=True the model is built exactly as the engine
+    builds it: torch.compile on, the O2 pass defaults, so its norm,
+    silu, and rotate kernels are the engine's own compiled ones.
+    Graph capture stays off (measured worth nothing at these chunk
+    sizes)."""
     import torch
     from vllm.config import set_current_vllm_config
     from vllm.distributed.parallel_state import (
@@ -368,21 +402,112 @@ def _load_vllm_model():
     from vllm.model_executor.model_loader import get_model
     from vllm.utils.network_utils import get_open_port
 
-    # enforce_eager keeps compilation out of it; custom ops then
-    # default on, so module calls run vLLM's CUDA kernels eagerly.
-    config = EngineArgs(model=MODEL, dtype="bfloat16",
-                        enforce_eager=True).create_engine_config()
+    # enforce_eager keeps compilation out of the eager loader; custom
+    # ops then default on, so module calls run vLLM's CUDA kernels.
+    args = dict(model=MODEL, dtype="bfloat16",
+                kv_cache_dtype=kv_cache_dtype)
+    if compiled:
+        args["compilation_config"] = {"cudagraph_mode": 0}
+    else:
+        args["enforce_eager"] = True
+    config = EngineArgs(**args).create_engine_config()
     with set_current_vllm_config(config):
         # the model classes read the parallel groups even on one GPU,
         # and the group setup itself reads the current config
-        init_distributed_environment(
-            world_size=1, rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
-            local_rank=0, backend="nccl")
-        ensure_model_parallel_initialized(1, 1)
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            init_distributed_environment(
+                world_size=1, rank=0,
+                distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
+                local_rank=0, backend="nccl")
+            ensure_model_parallel_initialized(1, 1)
         model = get_model(vllm_config=config)
     torch.cuda.synchronize()
-    return model
+    return model, config
+
+
+class EngineKernelRunner:
+    """The engine's exact kernels with the engine removed. vLLM's
+    compiled model, a real paged KV cache, block tables, and
+    attention metadata built by hand per chunk - the same write and
+    paged read the engine runs, driven from the packed loop. The
+    KV-cache write cannot be removed alone: the attention read goes
+    through the pages the write just filled, so this rung keeps KV
+    entirely and isolates pure engine removal."""
+
+    BLOCK = 16
+
+    def __init__(self, tokens_cap, max_docs, kv_cache_dtype="fp8"):
+        import torch
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionBackend,
+        )
+
+        self.torch = torch
+        self.model, self.config = _load_vllm_model(
+            compiled=True, kv_cache_dtype=kv_cache_dtype)
+        ctx = self.config.compilation_config.static_forward_context
+        self.layer_names = [name for name, layer in ctx.items()
+                            if hasattr(layer, "kv_cache")]
+        num_blocks = tokens_cap // self.BLOCK + max_docs + 8
+        shape = FlashAttentionBackend.get_kv_cache_shape(
+            num_blocks, self.BLOCK, 8, 128,
+            cache_dtype_str=kv_cache_dtype)
+        cache_dtype = (torch.uint8 if kv_cache_dtype.startswith("fp8")
+                       else torch.bfloat16)
+        for name in self.layer_names:
+            ctx[name].kv_cache = torch.zeros(
+                shape, dtype=cache_dtype, device="cuda")
+
+    def metadata(self, packed):
+        import torch
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionMetadata,
+        )
+
+        input_ids, positions, _final, cu_seqlens, max_seqlen = packed
+        n_tokens = input_ids.shape[0]
+        lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+        n_seqs = lens.shape[0]
+        blocks_per_seq = (lens.to(torch.int64) + self.BLOCK - 1) // self.BLOCK
+        max_bps = int(blocks_per_seq.max())
+        starts = torch.zeros(n_seqs, dtype=torch.int64, device="cuda")
+        starts[1:] = torch.cumsum(blocks_per_seq, 0)[:-1]
+        block_table = (starts[:, None]
+                       + torch.arange(max_bps, device="cuda")[None, :])
+        block_table = block_table.to(torch.int32)
+        seq_of_token = torch.repeat_interleave(
+            torch.arange(n_seqs, device="cuda"), lens.to(torch.int64))
+        token_block = block_table[
+            seq_of_token, positions // self.BLOCK].to(torch.int64)
+        slot_mapping = token_block * self.BLOCK + positions % self.BLOCK
+        md = FlashAttentionMetadata(
+            num_actual_tokens=n_tokens,
+            max_query_len=max_seqlen,
+            query_start_loc=cu_seqlens,
+            max_seq_len=max_seqlen,
+            seq_lens=lens,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+            use_cascade=False,
+            common_prefix_len=0,
+            cu_prefix_query_lens=None,
+            prefix_kv_lens=None,
+            suffix_kv_lens=None,
+        )
+        return {name: md for name in self.layer_names}
+
+    def run(self, packed):
+        from vllm.forward_context import set_forward_context
+
+        input_ids, positions, final_indices, _cu, _max = packed
+        md = self.metadata(packed)
+        with self.torch.inference_mode():
+            with set_forward_context(md, self.config,
+                                     num_tokens=input_ids.shape[0]):
+                hidden = self.model(input_ids=input_ids,
+                                    positions=positions)
+        return hidden.index_select(0, final_indices)
 
 
 class PackedPipeline:
@@ -986,7 +1111,7 @@ def probe(n_docs: int = 8) -> str:
 
     # the model load also loads vLLM's _C extension; op checks before
     # it report every op missing
-    model = _load_vllm_model()
+    model, _model_config = _load_vllm_model()
     result = {"ops": {}}
     for op_name in ("rms_norm_per_block_quant",
                     "silu_and_mul_per_block_quant",
@@ -1216,6 +1341,33 @@ def probe(n_docs: int = 8) -> str:
     }
     del big_gate_up, big_hidden, big_residual, big_aq
 
+    # round 6: the engine's exact kernels driven without the engine
+    import time as _time
+    runner = EngineKernelRunner(BEST_BATCH_TOKENS, 64,
+                                kv_cache_dtype="fp8")
+    with torch.inference_mode():
+        t0 = _time.perf_counter()
+        first = runner.run(packed)
+        torch.cuda.synchronize()
+        first_wall = _time.perf_counter() - t0
+        t0 = _time.perf_counter()
+        second = runner.run(packed)
+        torch.cuda.synchronize()
+        second_wall = _time.perf_counter() - t0
+    ek_answers = answers(second)
+    result["enginekernels_check"] = {
+        "first_call_s": round(first_wall, 2),
+        "second_call_s": round(second_wall, 3),
+        "finite": bool(torch.isfinite(second).all().item()),
+        "wrong": sum(a != b for a, b in zip(ek_answers, expected)),
+        "vs_unfused_disagreements": sum(
+            a != b for a, b in zip(ek_answers, unfused_answers)),
+    }
+    del runner
+    gc = __import__("gc")
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # capture at the full chunk size: the 8-doc chunk padded from
     # ~2,200 to 25,305 tokens is the worst-case padding path
     runner = GraphedChunkRunner(pipeline, False, BEST_BATCH_TOKENS,
@@ -1235,7 +1387,8 @@ def probe(n_docs: int = 8) -> str:
     return json.dumps(result)
 
 
-@app.function(image=forward_image, gpu="H100!", timeout=7200, memory=65536,
+@app.function(image=forward_image, gpu="H100!", timeout=10800,
+              memory=65536,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
 def compare(n_docs: int = 10_000, reps: int = 3,
@@ -1296,9 +1449,9 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     # the second engine cell answers whether the packed pipeline's
     # accuracy edge comes from the engine's fp8 KV cache: same boot,
     # KV held in bf16 instead
-    # bf16 KV is the corrected engine baseline from round 3; the fp8
-    # cell is banked in the round 3 result and not repeated
-    for engine_name, kv_dtype in (("vllm_bf16kv", "auto"),):
+    # the full ladder in one container: both engine settings, then
+    # engine-kernels-without-engine, then the packed rungs
+    for engine_name, kv_dtype in (("vllm", "fp8"), ("vllm_bf16kv", "auto")):
         llm = LLM(
             model=MODEL,
             kv_cache_dtype=kv_dtype,
@@ -1345,7 +1498,7 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         torch.cuda.empty_cache()
         time.sleep(5)
 
-    model = _load_vllm_model()
+    model, _model_config = _load_vllm_model()
     pipeline = PackedPipeline(model)
     selected_ids = torch.tensor(allowed_ids, device="cuda")
     yes_columns = torch.tensor(
@@ -1380,15 +1533,21 @@ def compare(n_docs: int = 10_000, reps: int = 3,
     assert longest_prompt < max_seqlen_cap
     max_docs = max(len(batch) for batch in batches) + 1
     cells = (
-        ("packed_custom_qk", "custom", False, True, False),
-        ("packed_custom_qk_egemm", "custom", False, True, True),
+        ("packed_enginekernels", None, "engine", False, False),
+        ("packed_sep_fa3", False, None, False, False),
+        ("packed_custom_qk", "custom", None, True, False),
     )
-    for name, fused, graphed, fuse_qk, fuse_gemm in cells:
+    for name, fused, runner_kind, fuse_qk, fuse_gemm in cells:
         pipeline.fuse_qk = fuse_qk
         pipeline.fuse_gemm = fuse_gemm
-        runner = (GraphedChunkRunner(pipeline, fused, batch_tokens,
-                                     max_docs, max_seqlen_cap)
-                  if graphed else None)
+        if runner_kind == "engine":
+            runner = EngineKernelRunner(batch_tokens, max_docs,
+                                        kv_cache_dtype="fp8")
+        elif runner_kind == "graphs":
+            runner = GraphedChunkRunner(pipeline, fused, batch_tokens,
+                                        max_docs, max_seqlen_cap)
+        else:
+            runner = None
         # two warmup chunks: DeepGEMM compiles its kernels on first use
         run_packed(packed_batches[:2], fused, runner)
         torch.cuda.synchronize()
@@ -1408,7 +1567,9 @@ def compare(n_docs: int = 10_000, reps: int = 3,
                 "disagrees_with_engine": sum(
                     a != b for a, b in zip(predicted, control_predictions)
                 ),
-                "attention": f"fa{pipeline.fa_version}",
+                "kernels": ("engine-compiled, KV kept"
+                            if runner_kind == "engine" else
+                            f"fa{pipeline.fa_version}, no KV"),
                 "fused_qk_norm_rope": fuse_qk,
                 "fused_gate_up_gemm": fuse_gemm,
                 "persistent_kv": False,
@@ -1456,8 +1617,8 @@ def compare(n_docs: int = 10_000, reps: int = 3,
         torch.cuda.empty_cache()
 
     rates = {}
-    for method in ("vllm_bf16kv", "packed_custom_qk",
-                   "packed_custom_qk_egemm"):
+    for method in ("vllm", "vllm_bf16kv", "packed_enginekernels",
+                   "packed_sep_fa3", "packed_custom_qk"):
         values = [row["tokens_per_second"] for row in report["runs"]
                   if row["method"] == method]
         rates[method] = round(sum(values) / len(values), 1)
