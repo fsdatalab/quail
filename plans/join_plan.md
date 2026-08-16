@@ -178,6 +178,22 @@ The four plans priced:
   times. Rate assumed 121,045 tok/s as measured on the packed filter;
   the shared-prefix attention kernel is new work and could move this.
 
+  Why no pool: the pool exists to remember a prefix between engine
+  steps. The chunk runs a prefix and its pairs inside the same
+  forward pass, so there is nothing to remember between steps — the
+  prefix's K and V exist only as that chunk's per-layer activations.
+  The inner suffixes read them through a second attention call whose
+  softmax state merges with the per-segment call (the standard
+  shared-prefix structure; FlashInfer and vLLM v1's cascade attention
+  both ship versions). Each suffix keeps the same token positions it
+  would have as a separate request, so answers are directly
+  comparable to the engine path. Pricing consequence: the prefix
+  read happens at the fresh-attention price a2 = 0.49 ns per token
+  pair, already fitted at 4.9% error — not at the paged-cache read
+  price of 1.3–2.2 ns whose long-suffix value is the open C3
+  question. The read term, 4–17% of design B on BioDEX and 7–25% on
+  Police, mostly disappears rather than needing calibration.
+
 | dataset (pairs priced) | A1 stock, arbitrary order | A2 stock, ordered | B chain mode | C packed |
 |---|---|---|---|---|
 | Products (0.93M) | 34 min (no thrash: fits pool; likely ≈ B in practice) | ~20 min | 19 min | 14 min |
@@ -229,6 +245,16 @@ after the cheap check lands within ~10%.
   read against the 616 gold pairs. No performance claim expected:
   the corpus is 0.1x the pool, so even arbitrary-order stock should
   cache well. Say so before running it.
+- **Phase 1b — packed-join probe.** One chunk shape on real
+  hardware: a prefix plus k suffixes, per-segment attention plus a
+  prefix-attention call merged by softmax state. Two gates, stated
+  before the run: answers identical to the same pairs sent as
+  per-pair engine requests (the positions match, so they should be),
+  and chunk throughput within 10% of the filter pass's 121,045
+  tokens/s. About one container-hour. Pass → design C's column
+  stops being a target and becomes the plan of record for 2-way
+  joins; fail → design B is the plan and C3 calibration returns to
+  the critical path.
 - **Phase 2 — BioDEX, the headline.** Run B full (~6 h predicted).
   Do not run A1 full at 96 h; run A1 on a 5% pair sample, verify its
   tokens/s, extrapolate, and report it as an extrapolation. This is
@@ -264,7 +290,11 @@ question first), forking, speculation, the 32B model.
   accuracy. Measure first.
 - The C3 read price is the widest open uncertainty (Section 1); it
   moves long-outer estimates by up to ~5 h on Police and decides how
-  close A2/B can get to C.
+  close A2/B can get to C. Note where it sits, though: it prices the
+  engine designs (A2, B) — the packed design's prefix reads are
+  priced by the already-fitted a2. If the Phase 1b probe passes and
+  C becomes the plan of record, the C3 error bar moves off our
+  headline number and onto the baselines'.
 - The 121,045 tok/s packed rate was measured on the filter pass; the
   join needs a shared-prefix attention path that does not exist yet.
   Treat C's column as a design target until a chunk-level probe runs.
@@ -329,7 +359,12 @@ schedule. The plan has four decisions, in order of value:
 Honest accounting: cross-stage anchor sharing itself saves little
 (the anchor's prefix-once cost is seconds), and rewind-vs-ordered
 -stock stays the same 2–5% it was for binary. The n-way money is
-order, dedup, orientation, and gating.
+order, dedup, orientation, and gating. None of it is tied to the
+engine: dedup and gating are pair-list construction in Python, so
+the packed design serves n-way case A unchanged — build each
+stage's pair list from recorded answers, pack chunks from it. The
+one thing anchor chains provided that packing does not, carrying a
+prefix's KV across stages, was priced above at seconds.
 
 Worked 3-way, Police-shaped: three collections of 2,000 docs at
 1,500 tokens, chain graph, both predicates at 0.1% pair selectivity,
