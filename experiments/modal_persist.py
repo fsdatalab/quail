@@ -230,9 +230,8 @@ def _xfer_summary(events, windows):
               memory=131072,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
-async def persist_run(n_docs: int = 1000, stage: str = "baseline",
-                      cpu_gb: int = 96, connector: str = "stock") -> dict:
-    import inspect
+def persist_run(n_docs: int = 1000, stage: str = "baseline",
+                cpu_gb: int = 96, connector: str = "stock") -> dict:
     import time as _time
 
     trace_path = "/tmp/quail_xfer"
@@ -243,8 +242,8 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
     from transformers import AutoTokenizer
     from vllm import SamplingParams
     from vllm.config import KVTransferConfig
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.engine.llm_engine import LLMEngine as Engine
 
     from quail.configs import MODELS
     from quail.runtime.engine_client import run_filter_chain
@@ -288,22 +287,17 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
                 raise ValueError(f"connector must be stock or quail, "
                                  f"got {connector!r}")
             kw["kv_transfer_config"] = KVTransferConfig(**tc)
-        return AsyncEngineArgs(**kw)
+        return EngineArgs(**kw)
 
-    async def one_query(engine, tag):
-        return await run_filter_chain(engine, sp, body_ids, q_ids,
-                                      pool_budget, tag=tag)
-
-    async def reset(engine):
-        res = engine.reset_prefix_cache()
-        if inspect.isawaitable(res):
-            await res
+    def one_query(engine, tag):
+        return run_filter_chain(engine, sp, body_ids, q_ids,
+                                pool_budget, tag=tag)
 
     if stage == "baseline":
         engine = Engine.from_engine_args(engine_args(store=False))
-        base = await one_query(engine, "pb")
-        await reset(engine)
-        base2 = await one_query(engine, "pb2")
+        base = one_query(engine, "pb")
+        engine.reset_prefix_cache()
+        base2 = one_query(engine, "pb2")
         report["baseline_cold_s"] = round(base["wall"], 2)
         report["baseline_recompute_s"] = round(base2["wall"], 2)
         report["survivors"] = base["survivors"]
@@ -312,23 +306,23 @@ async def persist_run(n_docs: int = 1000, stage: str = "baseline",
     else:
         windows = []
 
-        async def timed_query(engine, tag):
+        def timed_query(engine, tag):
             t0 = _time.time()
-            out = await one_query(engine, tag)
+            out = one_query(engine, tag)
             windows.append(dict(name=tag, t0=t0, t1=_time.time()))
             return out
 
         engine = Engine.from_engine_args(engine_args(store=True))
-        q1 = await timed_query(engine, "ps1")
+        q1 = timed_query(engine, "ps1")
         _time.sleep(8)                 # let offload writes drain
-        await reset(engine)
+        engine.reset_prefix_cache()
         print("[persist] prediction: copy-only load bandwidth far above "
               "the ~10 GB/s wall-effective number means the loss is "
               "between jobs (orchestration); copy-only itself ~10 means "
               "the 32 KB descriptor granularity is the limit", flush=True)
-        q2 = await timed_query(engine, "ps2")
-        await reset(engine)
-        q3 = await timed_query(engine, "ps3")
+        q2 = timed_query(engine, "ps2")
+        engine.reset_prefix_cache()
+        q3 = timed_query(engine, "ps3")
         report["store_cold_offload_s"] = round(q1["wall"], 2)
         report["store_restore_s"] = round(q2["wall"], 2)
         report["store_restore2_s"] = round(q3["wall"], 2)

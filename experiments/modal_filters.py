@@ -1,8 +1,9 @@
 """The filter comparison: KV rewind against stock vLLM pipelining.
 
-Both arms run the same five-filter query over the same documents,
-through the same async API, in the same container. They differ in one
-thing: what happens to a document's KV between its filter stages.
+Both runs execute the same five-filter query over the same documents,
+through the same synchronous step interface, in the same container.
+They differ in one thing: what happens to a document's KV between its
+filter stages.
 
   stock       one request per (document, stage), gated client-side.
               Between stages the document's KV is whatever vLLM's
@@ -59,17 +60,17 @@ filters_image = image.add_local_python_source("workload")
 @app.function(image=filters_image, gpu="H100!", timeout=7200,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
-async def filter_cells(n_docs: int = 10000, reps: int = 3,
-                       arms: str = "rewind,stock",
-                       probe_rate: bool = False,
-                       outname: str = "filter_cells.json",
-                       kv: str = "fp8") -> dict:
+def filter_cells(n_docs: int = 10000, reps: int = 3,
+                 arms: str = "rewind,stock",
+                 probe_rate: bool = False,
+                 outname: str = "filter_cells.json",
+                 kv: str = "fp8") -> dict:
     import time as _time
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.v1.engine.async_llm import AsyncLLM as Engine
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.engine.llm_engine import LLMEngine as Engine
 
     from quail.configs import DEVICES, MODELS
     from quail.plan import plan_query
@@ -119,39 +120,46 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
           f"budget {budget:,}; stock semaphore {budget:,}/{mean_req} = "
           f"{stock_sem}", flush=True)
 
-    async def run_stock(engine, tag):
+    def run_stock(engine, tag):
         """Pipelining on the stock engine: per-document sequential
         requests, gated client-side, bounded by the token-derived
-        semaphore."""
-        import asyncio as _aio
-        sem = _aio.Semaphore(stock_sem)
+        document cap. A plain admit-step-route loop; the concurrency
+        lives in the engine's scheduler, not here."""
         counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
         answers, survivors = {}, []
+        inflight = {}                     # request id -> (doc, stage)
 
-        async def ask(ids, rid):
-            final = None
-            async for out in engine.generate({"prompt_token_ids": ids},
-                                             sp, rid):
-                final = out
-            counters["requests"] += 1
-            counters["prompt_tokens"] += len(final.prompt_token_ids)
-            counters["cached_tokens"] += (
-                getattr(final, "num_cached_tokens", 0) or 0)
-            t = final.outputs[0].text.upper()
-            iy, ino = t.find("YES"), t.find("NO")
-            return 1 if iy >= 0 and (ino < 0 or iy < ino) else 0
-
-        async def one_doc(i):
-            async with sem:
-                for j in range(N_FILTERS):
-                    got = await ask(body_ids[i] + q_ids[j], f"{tag}-{i}-{j}")
-                    answers[(i, j + 1)] = got
-                    if not got:
-                        return
-                survivors.append(i)
+        def ask(i, j):
+            rid = f"{tag}-{i}-{j}"
+            inflight[rid] = (i, j)
+            engine.add_request(
+                rid, {"prompt_token_ids": body_ids[i] + q_ids[j]}, sp)
 
         t0 = _time.time()
-        await _aio.gather(*(one_doc(i) for i in range(n_docs)))
+        live, next_doc = 0, 0
+        while next_doc < n_docs or inflight:
+            while next_doc < n_docs and live < stock_sem:
+                live += 1
+                ask(next_doc, 0)
+                next_doc += 1
+            for out in engine.step():
+                if not out.finished or out.request_id not in inflight:
+                    continue
+                i, j = inflight.pop(out.request_id)
+                counters["requests"] += 1
+                counters["prompt_tokens"] += len(out.prompt_token_ids)
+                counters["cached_tokens"] += (
+                    getattr(out, "num_cached_tokens", 0) or 0)
+                t = out.outputs[0].text.upper()
+                iy, ino = t.find("YES"), t.find("NO")
+                got = 1 if iy >= 0 and (ino < 0 or iy < ino) else 0
+                answers[(i, j + 1)] = got
+                if got and j + 1 < N_FILTERS:
+                    ask(i, j + 1)
+                else:
+                    if got:
+                        survivors.append(i)
+                    live -= 1
         return dict(wall=_time.time() - t0, answers=answers,
                     survivors=sorted(survivors), **counters)
 
@@ -172,7 +180,7 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
         # 0.92, which OOMs mid-run. Our boot fits at 0.92 because the
         # plan sizes the step budget and sequence cap that decide the
         # workspace.
-        engine = Engine.from_engine_args(AsyncEngineArgs(
+        engine = Engine.from_engine_args(EngineArgs(
             model=MODEL, kv_cache_dtype=kv_cache_dtype, max_model_len=4608,
             max_num_seqs=(plan.engine_max_seqs if planned else 4096),
             max_num_batched_tokens=plan.engine_step_tokens,
@@ -185,24 +193,26 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
                 # query. Fresh engine, so nothing is cached; the rep
                 # loop resets the cache before rep 0, so the probe
                 # warms nothing the query sees.
-                import asyncio as _aio
-                sem = _aio.Semaphore(stock_sem)
                 pc = dict(prompt=0, cached=0)
-
-                async def probe_one(i):
-                    async with sem:
-                        final = None
-                        async for out in engine.generate(
-                                {"prompt_token_ids":
-                                 body_ids[i] + q_ids[0]},
-                                sp, f"probe-{i}"):
-                            final = out
-                        pc["prompt"] += len(final.prompt_token_ids)
-                        pc["cached"] += (
-                            getattr(final, "num_cached_tokens", 0) or 0)
-
+                pending = set()
                 t0p = _time.time()
-                await _aio.gather(*(probe_one(i) for i in range(n_docs)))
+                nd = 0
+                while nd < n_docs or pending:
+                    while nd < n_docs and len(pending) < stock_sem:
+                        rid = f"probe-{nd}"
+                        pending.add(rid)
+                        engine.add_request(
+                            rid,
+                            {"prompt_token_ids": body_ids[nd] + q_ids[0]},
+                            sp)
+                        nd += 1
+                    for out in engine.step():
+                        if not out.finished or out.request_id not in pending:
+                            continue
+                        pending.discard(out.request_id)
+                        pc["prompt"] += len(out.prompt_token_ids)
+                        pc["cached"] += (
+                            getattr(out, "num_cached_tokens", 0) or 0)
                 probe_wall = _time.time() - t0p
                 rate = (pc["prompt"] - pc["cached"]) / probe_wall
                 report["probe"] = dict(
@@ -213,17 +223,15 @@ async def filter_cells(n_docs: int = 10000, reps: int = 3,
                 print(f"[filters] probe: {rate:,.0f} tok/s over "
                       f"{probe_wall:.1f}s", flush=True)
             for rep in range(reps):
-                res = engine.reset_prefix_cache()
-                if hasattr(res, "__await__"):
-                    await res
+                engine.reset_prefix_cache()
                 tag = f"{arm}-{rep}"
                 t0m = _time.monotonic()
                 if planned:
-                    r = await run_filter_chain_engine(
+                    r = run_filter_chain_engine(
                         engine, sp, body_ids, q_ids, budget, yes_ids,
                         tag=tag)
                 else:
-                    r = await run_stock(engine, tag)
+                    r = run_stock(engine, tag)
                 t1m = _time.monotonic()
                 # Two ways to count the prefill work, and only one of
                 # them is right for each arm.

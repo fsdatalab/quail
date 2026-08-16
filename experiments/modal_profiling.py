@@ -451,12 +451,12 @@ def knobgrid(n_docs: int = 10000, grid: str = "") -> str:
 # -----------------------------------------------------------------
 
 TORCHPROF_RUNNER = r'''
-import asyncio, glob, gzip, inspect, json, os, sys, time
+import glob, gzip, json, os, sys, time
 os.environ["QUAIL_SINGLE_TENANT"] = "1"
 from transformers import AutoTokenizer
 from vllm import SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.v1.engine.async_llm import AsyncLLM as Engine
+from vllm.engine.arg_utils import EngineArgs
+from vllm.v1.engine.llm_engine import LLMEngine as Engine
 sys.path.insert(0, "/root")
 from workload import MODEL, N_FILTERS, build_corpus, yes_no_ids
 
@@ -480,55 +480,81 @@ except Exception:
 
 extra = ({"scheduler_cls": "quail.engineext.scheduler.QuailScheduler"}
          if side == "rewind" else {})
-engine = Engine.from_engine_args(AsyncEngineArgs(
+engine = Engine.from_engine_args(EngineArgs(
     model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
     max_num_seqs=min(4096, B), max_num_batched_tokens=B,
     gpu_memory_utilization=0.92 if side == "rewind" else 0.88,
     enable_prefix_caching=True, disable_log_stats=True,
     profiler_config=_pc, **extra))
 
-async def maybe(x):
-    if inspect.isawaitable(x):
-        return await x
-    return x
+# The profiling window is clock-driven from the query loop: opened 15
+# seconds in (well past the ramp), closed 15 seconds later. Failures
+# print loudly instead of banking an empty directory.
+t0 = time.time()
+_win = dict(started=False, stopped=False)
 
-async def main():
-    if side == "rewind":
-        from quail.runtime.engine_client import run_filter_chain_engine
-        work = run_filter_chain_engine(engine, sp, body_ids,
-                                       q_ids[:n_filters], 750_000,
-                                       yes_ids, tag="tp")
-    else:
-        sem = asyncio.Semaphore(2048)
-        async def ask(ids, rid):
-            async for _out in engine.generate({"prompt_token_ids": ids},
-                                              sp, rid):
-                pass
-        async def one_doc(i):
-            async with sem:
-                for j in range(n_filters):
-                    await ask(body_ids[i] + q_ids[j], f"tp-{i}-{j}")
-        work = asyncio.gather(*(one_doc(i) for i in range(n_docs)))
-
-    async def window():
-        # a 15-second window well past the ramp. Failures print
-        # loudly instead of banking an empty directory.
-        try:
-            await asyncio.sleep(15)
-            await maybe(engine.start_profile())
-            await asyncio.sleep(15)
-            await maybe(engine.stop_profile())
+def window_tick():
+    now = time.time() - t0
+    try:
+        if not _win["started"] and now >= 15:
+            engine.start_profile()
+            _win["started"] = True
+        elif _win["started"] and not _win["stopped"] and now >= 30:
+            engine.stop_profile()
+            _win["stopped"] = True
             print("[torchprof] window ok", flush=True)
-        except Exception as e:
-            print(f"[torchprof] WINDOW FAILED: {type(e).__name__}: {e}",
-                  flush=True)
-
-    t0 = time.time()
-    await asyncio.gather(window(), work)
-    print(f"[torchprof] wall {time.time() - t0:.2f}s", flush=True)
+    except Exception as e:
+        _win["stopped"] = True
+        print(f"[torchprof] WINDOW FAILED: {type(e).__name__}: {e}",
+              flush=True)
 
 try:
-    asyncio.run(main())
+    if side == "rewind":
+        from quail.runtime.engine_client import _register_query
+        _register_query(engine, sp, q_ids[:n_filters], yes_ids, None,
+                        "", "tp-reg")
+        q_cost = sum(len(q) for q in q_ids[:n_filters]) + n_filters
+        inflight, used, nd = {}, 0, 0
+        while nd < n_docs or inflight:
+            window_tick()
+            while nd < n_docs:
+                cost = len(body_ids[nd]) + q_cost
+                if used + cost > 750_000 and used > 0:
+                    break
+                rid = "de1|c|d%d|tp-%d-0" % (nd, nd)
+                inflight[rid] = cost
+                used += cost
+                engine.add_request(
+                    rid, {"prompt_token_ids": body_ids[nd] + q_ids[0]}, sp)
+                nd += 1
+            for out in engine.step():
+                if out.finished and out.request_id in inflight:
+                    used -= inflight.pop(out.request_id)
+    else:
+        inflight, nd = {}, 0
+        while nd < n_docs or inflight:
+            window_tick()
+            while nd < n_docs and len(inflight) < 2048:
+                rid = "tp-%d-0" % nd
+                inflight[rid] = (nd, 0)
+                engine.add_request(
+                    rid, {"prompt_token_ids": body_ids[nd] + q_ids[0]}, sp)
+                nd += 1
+            for out in engine.step():
+                if not out.finished or out.request_id not in inflight:
+                    continue
+                i, j = inflight.pop(out.request_id)
+                if j + 1 < n_filters:
+                    rid = "tp-%d-%d" % (i, j + 1)
+                    inflight[rid] = (i, j + 1)
+                    engine.add_request(
+                        rid,
+                        {"prompt_token_ids": body_ids[i] + q_ids[j + 1]},
+                        sp)
+    if _win["started"] and not _win["stopped"]:
+        engine.stop_profile()
+        print("[torchprof] window closed at query end", flush=True)
+    print(f"[torchprof] wall {time.time() - t0:.2f}s", flush=True)
 finally:
     engine.shutdown()
 

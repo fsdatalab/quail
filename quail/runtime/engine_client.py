@@ -24,13 +24,19 @@ pool never overflows and the prefix cache is never forced to evict.
 Prompts are pre-tokenized once, so the engine never re-converts the
 same document text.
 
-The engine object must expose the vLLM AsyncLLM interface:
-`generate(prompt, sampling_params, request_id)` returning an async
-generator whose final item has `prompt_token_ids`, `num_cached_tokens`,
-and `outputs[0].text`.
+The client is a plain synchronous loop: admit documents while the
+budget allows, run one engine step, route the step's outputs, repeat.
+There is no asyncio anywhere in it. Concurrency across documents
+lives where it already had to live - inside the engine's scheduler -
+and a filter query is a batch operator, so the client has nobody else
+to serve while it waits on a step.
+
+The engine object must expose the vLLM v1 LLMEngine interface:
+`add_request(request_id, prompt, sampling_params, priority=0)` and
+`step()` returning outputs with `request_id`, `finished`,
+`prompt_token_ids`, `num_cached_tokens`, and `outputs[0]`.
 """
 
-import asyncio
 import time
 
 
@@ -75,9 +81,25 @@ class EngineTags:
         self.pending.append(str(doc))
 
 
-async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
-                           budget_tokens, tag="q", tags=None,
-                           use_priority=False):
+def _run_to_completion(engine, request_id, max_seconds=30):
+    """Step the engine until one specific request finishes, or abort
+    it at the deadline. For requests submitted outside the measured
+    loops (registration, the pin flush)."""
+    deadline = time.time() + max_seconds
+    while time.time() < deadline:
+        for out in engine.step():
+            if out.request_id == request_id and out.finished:
+                return True
+    try:
+        engine.abort_request([request_id])
+    except Exception:
+        pass
+    return False
+
+
+def run_filter_chain(engine, sampling_params, body_ids, q_ids,
+                     budget_tokens, tag="q", tags=None,
+                     use_priority=False):
     """Separate requests, one per (document, stage), gated client-side:
     a document's next stage is submitted only after the previous
     answer arrives, and a failed stage drops the document. Returns
@@ -95,24 +117,9 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
     first reads."""
     n = len(q_ids)
     q_cost = sum(len(q) for q in q_ids) + n
-    used = 0
-    cond = asyncio.Condition()
     counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
     answers = {}
     survivors = []
-
-    async def ask(ids, rid, pri=0, count=True):
-        final = None
-        kw = {"priority": pri} if use_priority else {}
-        async for out in engine.generate({"prompt_token_ids": ids},
-                                         sampling_params, rid, **kw):
-            final = out
-        if count:
-            counters["requests"] += 1
-            counters["prompt_tokens"] += len(final.prompt_token_ids)
-            counters["cached_tokens"] += (
-                getattr(final, "num_cached_tokens", 0) or 0)
-        return _yes(final)
 
     # the pin must claim everything with a future consumer: the document
     # plus the shared prefix of the stage questions (their common
@@ -134,45 +141,64 @@ async def run_filter_chain(engine, sampling_params, body_ids, q_ids,
                             pin_tokens=len(body_ids[i]) + q_common)
         return tags.rid(suffix)
 
-    async def chain(i, cost):
-        nonlocal used
-        try:
-            for j in range(n):
-                got = await ask(body_ids[i] + q_ids[j], rid_for(i, j),
-                                pri=0 if j > 0 else 1)
-                answers[(i, j + 1)] = got
-                if not got:
-                    return
-            survivors.append(i)
-        finally:
-            if tags is not None:
-                tags.release(i)
-            async with cond:
-                used -= cost
-                cond.notify_all()
+    inflight = {}                      # request id -> (doc, stage, cost)
+
+    def submit(i, j, cost):
+        rid = rid_for(i, j)
+        inflight[rid] = (i, j, cost)
+        kw = {"priority": 0 if j > 0 else 1} if use_priority else {}
+        engine.add_request(rid, {"prompt_token_ids": body_ids[i] + q_ids[j]},
+                           sampling_params, **kw)
+
+    def retire(i, cost):
+        if tags is not None:
+            tags.release(i)
+        return cost
 
     t0 = time.time()
-    tasks = []
-    for i in range(len(body_ids)):
-        cost = len(body_ids[i]) + q_cost
-        async with cond:
-            while used + cost > budget_tokens and used > 0:
-                await cond.wait()
+    used, next_doc = 0, 0
+    while next_doc < len(body_ids) or inflight:
+        # admit in workload order while the budget allows; an empty
+        # engine always admits one, so a tiny budget serializes
+        # instead of deadlocking
+        while next_doc < len(body_ids):
+            cost = len(body_ids[next_doc]) + q_cost
+            if used + cost > budget_tokens and used > 0:
+                break
             used += cost
-        tasks.append(asyncio.create_task(chain(i, cost)))
-    await asyncio.gather(*tasks)
+            submit(next_doc, 0, cost)
+            next_doc += 1
+        for out in engine.step():
+            if not out.finished or out.request_id not in inflight:
+                continue
+            i, j, cost = inflight.pop(out.request_id)
+            counters["requests"] += 1
+            counters["prompt_tokens"] += len(out.prompt_token_ids)
+            counters["cached_tokens"] += (
+                getattr(out, "num_cached_tokens", 0) or 0)
+            got = _yes(out)
+            answers[(i, j + 1)] = got
+            if got and j + 1 < n:
+                submit(i, j + 1, cost)
+            else:
+                if got:
+                    survivors.append(i)
+                used -= retire(i, cost)
     wall = time.time() - t0
     if tags is not None:
         # release every remaining pin so the engine can reset cleanly
-        await ask(q_ids[0], f"de1|r*|{tag}-0-99", pri=0, count=False)
+        flush_rid = f"de1|r*|{tag}-0-99"
+        engine.add_request(flush_rid, {"prompt_token_ids": list(q_ids[0])},
+                           sampling_params)
+        _run_to_completion(engine, flush_rid)
     return dict(wall=wall, survivors=sorted(survivors), answers=answers,
                 **counters)
 
 
-async def _register_query(engine, sampling_params, q_ids, yes_ids, no_ids,
-                          qpart, suffix):
+def _register_query(engine, sampling_params, q_ids, yes_ids, no_ids,
+                    qpart, suffix):
     """Send one query's chain-mode registration (question token lists
-    plus the yes/no token ids in the request id) and wait it out."""
+    plus the yes/no token ids in the request id) and run it out."""
     reg = [len(q_ids)]
     for q in q_ids:
         reg += [len(q)] + list(q)
@@ -180,21 +206,8 @@ async def _register_query(engine, sampling_params, q_ids, yes_ids, no_ids,
     reg_rid = (f"de1|reg|{qpart}"
                f"Y{','.join(map(str, sorted(yes_ids)))}|{npart}"
                f"{suffix}")
-
-    async def _reg():
-        async for _ in engine.generate({"prompt_token_ids": reg},
-                                       sampling_params, reg_rid):
-            pass
-
-    try:
-        await asyncio.wait_for(_reg(), timeout=30)
-    except (asyncio.TimeoutError, Exception):
-        try:
-            res = engine.abort(reg_rid)
-            if hasattr(res, "__await__"):
-                await res
-        except Exception:
-            pass
+    engine.add_request(reg_rid, {"prompt_token_ids": reg}, sampling_params)
+    _run_to_completion(engine, reg_rid)
 
 
 def _stage_tokens(snapshots, yes_ids, no_ids):
@@ -214,9 +227,9 @@ def _stage_tokens(snapshots, yes_ids, no_ids):
     return stage_toks
 
 
-async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
-                                  budget_tokens, yes_ids, tag="c",
-                                  no_ids=None):
+def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
+                            budget_tokens, yes_ids, tag="c",
+                            no_ids=None):
     """Chain mode: the engine itself runs each document's whole filter
     chain. The client registers the question token lists and the gate
     token ids once, then submits ONE request per document; the
@@ -237,35 +250,48 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
     (SamplingParams(allowed_token_ids=yes|no ids, max_tokens=1)),
     which makes every stage answer in one token by construction."""
     n = len(q_ids)
-    await _register_query(engine, sampling_params, q_ids, yes_ids, no_ids,
-                          "", f"{tag}-reg")
+    _register_query(engine, sampling_params, q_ids, yes_ids, no_ids,
+                    "", f"{tag}-reg")
 
-    used = 0
-    cond = asyncio.Condition()
     counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
     answers = {}
     survivors = []
     raw0 = []
     q_cost = sum(len(q) for q in q_ids) + n
+    inflight = {}                    # request id -> (doc, cost, snapshots)
 
-    async def chain(i, cost):
-        nonlocal used
-        toks = []
-        try:
-            final = None
-            rid = f"de1|c|d{i}|{tag}-{i}-0"
-            async for out in engine.generate(
-                    {"prompt_token_ids": body_ids[i] + q_ids[0]},
-                    sampling_params, rid):
-                final = out
-                ids = list(out.outputs[0].token_ids or ())
-                if ids:
-                    toks.append(ids)
+    def submit(i, cost):
+        rid = f"de1|c|d{i}|{tag}-{i}-0"
+        inflight[rid] = (i, cost, [])
+        engine.add_request(rid,
+                           {"prompt_token_ids": body_ids[i] + q_ids[0]},
+                           sampling_params)
+
+    t0 = time.time()
+    used, next_doc = 0, 0
+    while next_doc < len(body_ids) or inflight:
+        while next_doc < len(body_ids):
+            cost = len(body_ids[next_doc]) + q_cost
+            if used + cost > budget_tokens and used > 0:
+                break
+            used += cost
+            submit(next_doc, cost)
+            next_doc += 1
+        for out in engine.step():
+            entry = inflight.get(out.request_id)
+            if entry is None:
+                continue
+            i, cost, toks = entry
+            ids = list(out.outputs[0].token_ids or ())
+            if ids:
+                toks.append(ids)
+            if not out.finished:
+                continue
+            del inflight[out.request_id]
             counters["requests"] += 1
-            if final is not None:
-                counters["prompt_tokens"] += len(final.prompt_token_ids)
-                counters["cached_tokens"] += (
-                    getattr(final, "num_cached_tokens", 0) or 0)
+            counters["prompt_tokens"] += len(out.prompt_token_ids)
+            counters["cached_tokens"] += (
+                getattr(out, "num_cached_tokens", 0) or 0)
             stage_toks = _stage_tokens(toks, yes_ids, no_ids)
             if i == 0:
                 raw0.extend(tuple(s) for s in toks[:8])
@@ -274,21 +300,7 @@ async def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
             if len(stage_toks) >= n \
                     and all(t in yes_ids for t in stage_toks[:n]):
                 survivors.append(i)
-        finally:
-            async with cond:
-                used -= cost
-                cond.notify_all()
-
-    t0 = time.time()
-    tasks = []
-    for i in range(len(body_ids)):
-        cost = len(body_ids[i]) + q_cost
-        async with cond:
-            while used + cost > budget_tokens and used > 0:
-                await cond.wait()
-            used += cost
-        tasks.append(asyncio.create_task(chain(i, cost)))
-    await asyncio.gather(*tasks)
+            used -= cost
     wall = time.time() - t0
     return dict(wall=wall, survivors=sorted(survivors), answers=answers,
                 doc0_raw=raw0, **counters)

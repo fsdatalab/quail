@@ -1,7 +1,5 @@
-"""Checks for the blocked streaming client scheduler, against a stub
+"""Checks for the synchronous step-driven client, against a stub
 engine that answers from planted flags."""
-
-import asyncio
 
 import numpy as np
 
@@ -10,34 +8,43 @@ from quail.runtime.engine_client import (EngineTags, run_filter_chain,
 
 
 class _Out:
-    def __init__(self, ids, text):
+    def __init__(self, rid, ids, text):
+        self.request_id = rid
+        self.finished = True
         self.prompt_token_ids = list(ids)
         self.num_cached_tokens = 0
         o = type("O", (), {})()
         o.text = text
+        o.token_ids = []
         self.outputs = [o]
 
 
 class StubEngine:
-    """Answers request '...-<doc>-<stage0>' from a planted flag matrix."""
+    """Answers request '...-<doc>-<stage0>' from a planted flag matrix.
+    Every queued request finishes on the next step, so the client's
+    admit-step-route loop runs many rounds on a tiny budget."""
 
     def __init__(self, flags):
         self.flags = flags
         self.calls = []
         self.rids = []
+        self._queue = []
 
-    async def generate(self, prompt, sampling_params, request_id,
-                       priority=0):
+    def add_request(self, request_id, prompt, sampling_params, priority=0):
         self.rids.append(request_id)
         _tag, i, j0 = request_id.rsplit("-", 2)
         i, j0 = int(i), int(j0)
-        await asyncio.sleep(0)
-        if j0 >= len(self.flags[0]):        # end-of-run flush request
-            yield _Out(prompt["prompt_token_ids"], "YES")
-            return
-        self.calls.append((i, j0))
-        text = "YES" if self.flags[i][j0] else "NO"
-        yield _Out(prompt["prompt_token_ids"], text)
+        if j0 < len(self.flags[0]):
+            self.calls.append((i, j0))
+        self._queue.append((request_id, prompt, i, j0))
+
+    def step(self):
+        out, self._queue = [
+            _Out(rid, prompt["prompt_token_ids"],
+                 "YES" if j0 >= len(self.flags[0]) or self.flags[i][j0]
+                 else "NO")
+            for rid, prompt, i, j0 in self._queue], []
+        return out
 
 
 def _setup(N, n, seed=3):
@@ -51,8 +58,8 @@ def _setup(N, n, seed=3):
 def test_streaming_chain_outcomes():
     flags, body_ids, q_ids = _setup(40, 3)
     eng = StubEngine(flags)
-    res = asyncio.run(run_filter_chain(eng, None, body_ids, q_ids,
-                                       budget_tokens=10 ** 6))
+    res = run_filter_chain(eng, None, body_ids, q_ids,
+                           budget_tokens=10 ** 6)
     want = [i for i in range(40) if all(flags[i])]
     assert res["survivors"] == want
     for (i, j), a in res["answers"].items():
@@ -66,8 +73,7 @@ def test_tiny_budget_completes():
     time), not deadlock, and admission stays in workload order."""
     flags, body_ids, q_ids = _setup(12, 2, seed=5)
     eng = StubEngine(flags)
-    res = asyncio.run(run_filter_chain(eng, None, body_ids, q_ids,
-                                       budget_tokens=1))
+    res = run_filter_chain(eng, None, body_ids, q_ids, budget_tokens=1)
     assert set(res["answers"]) >= {(i, 1) for i in range(12)}
     firsts = [i for i, j0 in eng.calls if j0 == 0]
     assert firsts == sorted(firsts)
@@ -78,12 +84,11 @@ def test_engine_tags_protocol():
     directive, releases ride on later requests, outcomes are unchanged,
     and the run ends with a release-all flush."""
     flags, body_ids, q_ids = _setup(25, 3, seed=7)
-    ref = asyncio.run(run_filter_chain(StubEngine(flags), None, body_ids,
-                                       q_ids, budget_tokens=10 ** 6))
+    ref = run_filter_chain(StubEngine(flags), None, body_ids, q_ids,
+                           budget_tokens=10 ** 6)
     eng = StubEngine(flags)
-    res = asyncio.run(run_filter_chain(eng, None, body_ids, q_ids,
-                                       budget_tokens=10 ** 6,
-                                       tags=EngineTags()))
+    res = run_filter_chain(eng, None, body_ids, q_ids,
+                           budget_tokens=10 ** 6, tags=EngineTags())
     assert res["survivors"] == ref["survivors"]
     assert res["answers"] == ref["answers"]
     pins = [r for r in eng.rids if "|p" in r]
@@ -103,42 +108,57 @@ YES_TOK, NO_TOK = 111, 222
 
 
 class _ChainOut:
-    def __init__(self, prompt_ids, snapshots, cached=0):
+    def __init__(self, rid, prompt_ids, snapshot, finished):
+        self.request_id = rid
+        self.finished = finished
         self.prompt_token_ids = list(prompt_ids)
-        self.num_cached_tokens = cached
+        self.num_cached_tokens = 0
         o = type("O", (), {})()
-        o.token_ids = list(snapshots)
+        o.token_ids = list(snapshot)
         self.outputs = [o]
 
 
 class ChainStubEngine:
-    """Speaks the chain protocol: accepts the registration request,
-    then plays each document's whole chain from the planted flags as
-    one stream of growing snapshots (the engine-side rewind is
-    invisible to the client, which only sees the record grow). A
-    failed stage ends the stream, as the gate does in the engine."""
+    """Speaks the chain protocol: finishes the registration request at
+    once, then plays each document's chain one stage per step as a
+    growing snapshot (the engine-side rewind is invisible to the
+    client, which only sees the record grow). A failed stage ends the
+    chain, as the gate does in the engine."""
 
     def __init__(self, flags):
         self.flags = flags
         self.rids = []
+        self._chains = {}            # rid -> (prompt_ids, doc, stage)
 
-    async def generate(self, prompt, sampling_params, request_id,
-                       priority=0):
+    def add_request(self, request_id, prompt, sampling_params, priority=0):
         self.rids.append(request_id)
         ids = prompt["prompt_token_ids"]
-        await asyncio.sleep(0)
         if "|reg|" in request_id:
-            yield _ChainOut(ids, [NO_TOK])
+            self._chains[request_id] = (ids, None, 0)
             return
         parts = request_id.split("|")[1:-1]
         i = int(next(p[1:] for p in parts
                      if p.startswith("d") and len(p) > 1))
-        toks = []
-        for j in range(len(self.flags[0])):
-            toks.append(YES_TOK if self.flags[i][j] else NO_TOK)
-            yield _ChainOut(ids, list(toks))
-            if not self.flags[i][j]:
-                return
+        self._chains[request_id] = (ids, i, 0)
+
+    def step(self):
+        out = []
+        for rid in list(self._chains):
+            ids, i, stage = self._chains[rid]
+            if i is None:                       # registration
+                out.append(_ChainOut(rid, ids, [NO_TOK], True))
+                del self._chains[rid]
+                continue
+            n = len(self.flags[0])
+            toks = [YES_TOK if self.flags[i][j] else NO_TOK
+                    for j in range(stage + 1)]
+            done = not self.flags[i][stage] or stage + 1 == n
+            out.append(_ChainOut(rid, ids, toks, done))
+            if done:
+                del self._chains[rid]
+            else:
+                self._chains[rid] = (ids, i, stage + 1)
+        return out
 
 
 def test_chain_mode_runs_one_request_per_document():
@@ -147,9 +167,9 @@ def test_chain_mode_runs_one_request_per_document():
     the flags and no document asked past a failure."""
     flags, body_ids, q_ids = _setup(30, 3, seed=11)
     eng = ChainStubEngine(flags)
-    res = asyncio.run(run_filter_chain_engine(eng, None, body_ids, q_ids,
-                                              budget_tokens=10 ** 6,
-                                              yes_ids={YES_TOK}))
+    res = run_filter_chain_engine(eng, None, body_ids, q_ids,
+                                  budget_tokens=10 ** 6,
+                                  yes_ids={YES_TOK})
     assert res["survivors"] == [i for i in range(30) if all(flags[i])]
     assert res["requests"] == 30
     assert "|reg|" in eng.rids[0]
