@@ -258,11 +258,17 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     kv_bytes = corpus * kappa
     sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
                         allowed_token_ids=sorted(yes_ids | no_ids))
-    # This cell runs on the STOCK scheduler: the offload connector
-    # manages the KV lifecycle, and reconciling it with plan-owned
-    # memory is open work. The point here is the channel, not the
-    # executor.
-    pool_budget = 700_000
+    # Plan-configured like every other harness: the derived admission
+    # budget and step budget replace the last hand-set number in the
+    # repo (700,000, a leftover of the retired 0.8-pool rule). The
+    # stock scheduler still executes the requests; only the sizing
+    # comes from the plan.
+    from quail.configs import DEVICES
+    from quail.plan import plan_query
+    from workload import DEVICE_NAME
+    plan = plan_query(N_FILTERS, [len(b) for b in body_ids],
+                      MODELS[CFG_NAME], DEVICES[DEVICE_NAME])
+    pool_budget = plan.budget_tokens
 
     # a store capacity keeps the longest documents (recompute cost per
     # byte rises with length); the client stamps max_offload_tokens=0
@@ -277,6 +283,9 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
 
     report = dict(n_docs=n_docs, stage=stage, model=MODEL,
                   connector=connector, corpus_tokens=corpus, kappa=kappa,
+                  budget_tokens=pool_budget,
+                  step_tokens=plan.engine_step_tokens,
+                  max_num_seqs=plan.engine_max_seqs,
                   kv_bytes_estimate=kv_bytes, store_gb=store_gb,
                   store_min_doc_tokens=store_min,
                   stored_docs=(sum(1 for b in body_ids
@@ -287,6 +296,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
 
     def engine_args(store):
         kw = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
+                  max_num_batched_tokens=plan.engine_step_tokens,
+                  max_num_seqs=plan.engine_max_seqs,
                   gpu_memory_utilization=0.92,
                   enable_prefix_caching=True, disable_log_stats=True)
         if store:
