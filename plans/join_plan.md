@@ -278,3 +278,93 @@ question first), forking, speculation, the 32B model.
 - Police data may never arrive; the stand-in reproduces shape, not
   content, and carries the planted corpus's no-accuracy-claims
   caveat.
+
+---
+
+## 8. n-way joins
+
+n collections, a predicate on some pairs of them (the join graph:
+a chain R1—R2—R3, a star, sometimes a triangle). Never enumerate
+triples: evaluate binary predicates and intersect, so cost stays a
+sum of pair terms instead of a product of collection sizes. Two
+cases, by what a predicate needs in context.
+
+**Case A: each predicate reads two documents.** Every prompt still
+holds exactly one pair; the n-way-ness lives entirely in the
+schedule. The plan has four decisions, in order of value:
+
+- **Join order.** Run the stage that kills tuples cheapest first.
+  Stage j costs survivors_{j-1} x |R_j| x (T_in + q) fresh tokens,
+  so with sampled selectivities the planner just enumerates: n is 2
+  to 4 relations, so all orders and orientations can be priced
+  outright — no search heuristics needed. Selectivities come from
+  labeling ~2k random pairs per predicate with the model (minutes;
+  the same sampling FDJ does for its guarantees).
+- **Dedup between stages.** If theta_23 reads only (b, c), stage 2
+  scans distinct surviving b's, not surviving (a, b) tuples. Results
+  fan back out to tuples for free. At 2 matches per b this alone
+  halves stage 2.
+- **Anchoring.** Each predicate is assigned to one of its two sides;
+  that side's documents are the resident prefixes (chains), the
+  other side streams as per-pair suffixes. Orientation rule per
+  predicate is unchanged: anchor the longer side. New n-way rule:
+  when two predicates share a relation (R2 in R1—R2—R3), anchor both
+  on the shared side. Then one chain per R2 document serves the
+  whole query: prefill [p | b] once, stream R1 as inners for
+  theta_12, **rewind to b's boundary, switch inner streams**, and
+  stream R3 for theta_23. This is exactly the gated-filter chain
+  with candidate partner documents in place of questions; the rewind
+  arithmetic (`rewind_target`) is unchanged.
+- **Gating and semantics.** Conjunctive query: a b with zero
+  theta_12 matches skips its theta_23 scan. Value depends on matches
+  per document, lambda = sigma x |R1|: the skip rate is e^-lambda —
+  53% for key-like joins (Products: lambda 0.64), 13% at lambda 2,
+  nothing at BioDEX's lambda 2.5+. Semi-join semantics ("b's that
+  have a match") stop each scan at the first YES: expected scan
+  ~1/sigma instead of |R|, which at sigma 0.1% cuts a 2,000-wide
+  scan to ~1,100. The chain gate logic already supports
+  stop-on-answer; this is a scan-termination rule, not new
+  machinery.
+
+Honest accounting: cross-stage anchor sharing itself saves little
+(the anchor's prefix-once cost is seconds), and rewind-vs-ordered
+-stock stays the same 2–5% it was for binary. The n-way money is
+order, dedup, orientation, and gating.
+
+Worked 3-way, Police-shaped: three collections of 2,000 docs at
+1,500 tokens, chain graph, both predicates at 0.1% pair selectivity,
+full join output.
+
+| plan | stage 1 | stage 2 | total |
+|---|---|---|---|
+| naive stock: per-pair requests, arbitrary order, stage 2 per tuple | 12.36B tokens | 24.72B tokens | 37.1B → **107 h** (+ thrash risk) |
+| planned: anchor R2, chains through both stages, dedup + gate | 6.20B | 5.36B | 11.6B fresh + read → **36–44 h** |
+
+The 2.7–3.0x is: prefix reuse ~2x per stage, distinct-b dedup 2.3x
+on stage 2, gating 14% off stage 2, rewind a few percent. Semi-join
+semantics would take the planned number to ~19 h + read.
+
+**Case B: a predicate reads the whole tuple so far** ("given report
+a and court record b, is article c the same incident?"). The tuple
+is the chain: prefix [p | a | b] after stage 1, rewind to the
+*tuple* boundary between stage-2 candidates. Two consequences:
+
+- A tuple with several stage-1 matches needs several stage-2
+  chains. Without forking (removed on purpose — this is exactly
+  where it would re-enter, and re-admitting it is a decision, not a
+  default), each surviving tuple starts a fresh chain by
+  recomputing its prefix: survivors x (p + T_a + T_b) tokens. At
+  the worked example's 4,000 survivors that is 12.4M tokens, about
+  2 minutes — bounded and priced, so forking stays out.
+- Depth grows the cached prefix, which pushes reads into the
+  C3-sensitive regime (prefixes of several thousand tokens) and
+  toward the 16,384 context ceiling: three 1,500-token documents
+  fit at 4.6k; four 4,000-token documents do not. Truncation or
+  per-tuple summaries become accuracy questions before execution
+  ones.
+
+Planner impact: per-stage W uses the same formula with the tuple
+prefix as T_out; the estimator needs one new input per stage (which
+prior documents the predicate carries). A 3-way planted confirming
+cell (two group keys per review, linking 1—2 and 2—3) follows Phase
+0b once the binary cell lands.
