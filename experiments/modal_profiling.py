@@ -721,7 +721,7 @@ def ncubench() -> str:
 
 @app.function(image=prof_image, gpu="H100!", timeout=900,
               volumes={"/results": results_vol})
-def ncureport() -> str:
+def ncureport(report: str = "/results/ncu_gemm_bench.ncu-rep") -> str:
     """Render the banked ncu report's details page: the per-kernel
     Compute (SM) and DRAM throughput rows. DRAM at 28-30 percent
     against Compute at 91-93 is the expected shape for a
@@ -735,16 +735,75 @@ def ncureport() -> str:
         "cuda-nsight-compute-13-0 >/dev/null 2>&1", shell=True)
     ncu = glob.glob("/opt/nvidia/nsight-compute/*/ncu")[0]
     r = subprocess.run(
-        [ncu, "--import", "/results/ncu_gemm_bench.ncu-rep",
-         "--page", "details"], capture_output=True, text=True)
+        [ncu, "--import", report, "--page", "details"],
+        capture_output=True, text=True)
     keep = [ln for ln in r.stdout.splitlines()
-            if any(k in ln for k in ("nvjet", "Compute (SM)",
+            if any(k in ln for k in ("nvjet", "sm90_fp8", "deep_gemm",
+                                     "Compute (SM)",
                                      "Memory Throughput",
                                      "DRAM Throughput", "Duration",
                                      "Elapsed Cycles"))]
-    out = "\n".join(keep[:60]) or r.stdout[-2000:] + r.stderr[-500:]
+    out = "\n".join(keep[:400]) or r.stdout[-2000:] + r.stderr[-500:]
     print(out, flush=True)
     return out[:6000]
+
+
+@app.function(image=prof_image, gpu="H100!", timeout=1800,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/results": results_vol})
+def ncudeepgemm() -> str:
+    """Speed-of-light on the actual deep_gemm fp8 kernels at the four
+    prefill shapes of a 25,305-token step. The earlier ncubench
+    profiled cuBLAS bf16 kernels at these shapes; this measures the
+    kernels the pipeline really runs. Values are random and weight
+    scales are ones: the counters need real shapes, not real
+    numbers."""
+    import subprocess
+
+    ncu = _find_ncu()
+    if ncu is None:
+        return "ncu not found"
+    with open("/tmp/dg.py", "w") as f:
+        f.write(
+            "import torch\n"
+            "from vllm.utils.deep_gemm import fp8_gemm_nt\n"
+            "from vllm.model_executor.layers.quantization.utils."
+            "fp8_utils import per_token_group_quant_fp8\n"
+            "M = 25305\n"
+            "for N, K in ((6144, 2560), (2560, 4096), (19456, 2560),\n"
+            "             (2560, 9728)):\n"
+            "    a = torch.randn(M, K, device='cuda',"
+            " dtype=torch.bfloat16)\n"
+            "    qa, sa = per_token_group_quant_fp8(a, 128,\n"
+            "        column_major_scales=True)\n"
+            "    wq = torch.randn(N, K, device='cuda')"
+            ".clamp(-4, 4).to(torch.float8_e4m3fn)\n"
+            "    ws = torch.ones(N // 128, K // 128, device='cuda',\n"
+            "        dtype=torch.float32)\n"
+            "    out = torch.empty(M, N, device='cuda',"
+            " dtype=torch.bfloat16)\n"
+            "    for _ in range(12):\n"
+            "        fp8_gemm_nt((qa, sa), (wq, ws), out)\n"
+            "torch.cuda.synchronize(); print('bench done')\n")
+    r = subprocess.run(
+        [ncu, "--clock-control", "none", "--launch-skip", "4",
+         "--launch-count", "44",
+         "-k", "regex:deep_gemm|fp8_gemm|sm90",
+         "--section", "SpeedOfLight",
+         "--export", "/results/ncu_deepgemm", "--force-overwrite",
+         "python", "/tmp/dg.py"],
+        capture_output=True, text=True, timeout=1500)
+    with open("/results/ncu_deepgemm_summary.txt", "w") as f:
+        f.write(r.stdout)
+    results_vol.commit()
+    keep = [ln for ln in r.stdout.splitlines()
+            if any(k in ln for k in ("Profiling", "Compute (SM)",
+                                     "Memory Throughput",
+                                     "DRAM Throughput", "Duration"))]
+    tail = ("\n".join(keep[-90:]) or r.stdout[-4000:])
+    tail += "\n--- stderr ---\n" + r.stderr[-800:]
+    print(tail, flush=True)
+    return tail[:6000]
 
 
 # -----------------------------------------------------------------
