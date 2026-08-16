@@ -93,17 +93,15 @@ ax.set_title("Where each pipeline's GPU time goes",
 # ---------------- Panel B: end-to-end throughput ----------------
 bx.set_facecolor(SURFACE)
 configs = [
-    ("our packed pipeline\n(3 custom kernels)", 119629, 2213, BLUE_DARK),
-    ("stock vLLM, bf16 KV\n(best engine setting)", 100904, 2225, BLUE),
-    ("stock vLLM, fp8 KV\n(committed control)", 95902, 2990, BLUE),
+    ("packed loop, our 3 kernels\n(no engine, no KV)", 121045, BLUE_DARK),
+    ("packed loop, vLLM's kernels\n(no engine, no KV)", 100308, BLUE),
+    ("vLLM engine\n(fp8 KV cache)", 96946, BLUE),
 ]
-for y, (label, rate, wrong, color) in enumerate(configs):
+for y, (label, rate, color) in enumerate(configs):
     bx.barh(y, rate / 1000, height=0.52, color=color,
             edgecolor=SURFACE, linewidth=1.6)
-    bx.text(rate / 1000 + 1.2, y + 0.10, f"{rate:,} tokens/s",
+    bx.text(rate / 1000 + 1.2, y, f"{rate:,} tokens/s",
             va="center", fontsize=10, color=INK, fontweight="bold")
-    bx.text(rate / 1000 + 1.2, y - 0.16, f"{wrong:,} wrong of 10,000",
-            va="center", fontsize=8.6, color=INK2)
 bx.set_yticks(range(len(configs)))
 bx.set_yticklabels([c[0] for c in configs], fontsize=9.5, color=INK)
 bx.set_xlim(0, 152)
@@ -116,17 +114,19 @@ bx.spines["bottom"].set_color(GRID)
 bx.tick_params(colors=INK2, labelsize=9)
 bx.set_xlabel("thousand input tokens per second, one H100, "
               "10,000-document filter", fontsize=9.5, color=INK2)
-bx.set_title("End-to-end, same corpus", fontsize=11.5, color=INK,
+bx.set_title("End-to-end, same corpus, one container",
+             fontsize=11.5, color=INK,
              loc="left", pad=10, fontweight="bold")
 
 fig.suptitle("One filter on one H100: stock vLLM against the packed "
              "forward pass", fontsize=13.5, color=INK, x=0.055,
              y=0.97, ha="left", fontweight="bold")
 fig.text(0.055, 0.008,
-         "Kernel times from profiled 381,315-token windows; the two rows "
-         "ran on different containers (worth about ±3%). Stock profiled at "
-         "its committed fp8-KV setting. Throughputs: bf16-KV engine and "
-         "ours share one container; fp8-KV from the round-3 container.",
+         "Kernel times from profiled 381,315-token windows (containers "
+         "differ by about ±3%); stock profiled at its committed fp8-KV "
+         "setting. All three throughput rungs ran in one container "
+         "(round-6 ladder). Same kernels without the engine or cache is "
+         "+3.5%; the three custom kernels are the rest.",
          fontsize=7.8, color=INK2)
 
 fig.savefig("/home/user/quail-exploration/results/plots/"
