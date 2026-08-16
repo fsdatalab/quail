@@ -556,7 +556,7 @@ try:
         print("[torchprof] window closed at query end", flush=True)
     print(f"[torchprof] wall {time.time() - t0:.2f}s", flush=True)
 finally:
-    engine.shutdown()
+    engine.engine_core.shutdown()
 
 # summarize the trace into kernel classes on the way out
 traces = glob.glob(outdir + "/*rank0*")

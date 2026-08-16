@@ -278,8 +278,11 @@ def filter_cells(n_docs: int = 10000, reps: int = 3,
                 report["cells"].append(cell)
                 print(f"[filters] {cell}", flush=True)
         finally:
+            # the sync LLMEngine has no shutdown(); the core client
+            # does, and it owns the GPU process - without this the
+            # next boot in the same container finds the card occupied
             try:
-                engine.shutdown()
+                engine.engine_core.shutdown()
             except Exception as e:
                 print(f"[filters] shutdown: {e}", flush=True)
 

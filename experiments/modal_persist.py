@@ -348,7 +348,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
                   f"GB, copy-only {loads['copy_GBps']} GB/s (per-job p50 "
                   f"{loads['job_GBps_p50']} GB/s)", flush=True)
     try:
-        engine.shutdown()
+        engine.engine_core.shutdown()
     except Exception:
         pass
     slim = {k: v for k, v in report.items() if k != "xfer_events"}
