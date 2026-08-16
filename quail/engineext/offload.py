@@ -82,11 +82,33 @@ class QuailOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         super().__init__(*args, **kwargs)
         self._wave_jobs = []            # (wave_id, job_id, TransferJob)
         self._wave_keys = {}            # job_id -> store keys to release
+        self._job_wave = {}             # job id -> wave id, until done
         self._gate_queue = []
         # far below the coalescing worker's synthetic range, so the
         # three id spaces (scheduler jobs >= 0, merges < 0, waves
         # <= -10^9) can never collide
         self._wave_ids = count(start=-(10 ** 9), step=-1)
+        # request ids the wave driver owns: their store lookup answers
+        # no-hit, so the vendor never opens a per-request async load
+        # for a document a wave is already copying. The driver adds on
+        # claim and removes at registration.
+        self.wave_claimed = set()
+        # wave ids whose copy the worker reported finished; the driver
+        # drains this to register waves only after their bytes landed
+        self.finished_waves = set()
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        # a deferred external load charges nothing against the step
+        # budget (vendor scheduler: load_kv_async -> num_new_tokens =
+        # 0), so the vendor would sweep the whole queue in one step
+        # and duplicate every wave's bytes through per-request loads -
+        # measured 1.6x load duplication. A claimed document reads as
+        # cache-cold instead: at worst the vendor prefills it, which
+        # charges full tokens and is self-limiting at one step budget.
+        if request.request_id in self.wave_claimed:
+            return 0, False
+        return super().get_num_new_matched_tokens(
+            request, num_computed_tokens)
 
     def wave_keys_for(self, request):
         """The request's store keys at chunk granularity, or None if
@@ -112,6 +134,7 @@ class QuailOffloadingConnectorScheduler(OffloadingConnectorScheduler):
             req_id=f"quail-wave-{wave_id}", src_spec=src_spec,
             dst_spec=dst_spec)))
         self._wave_keys[job_id] = list(keys)
+        self._job_wave[job_id] = wave_id
         return job_id
 
     def queue_gates(self, wave_ids):
@@ -138,6 +161,7 @@ class QuailOffloadingConnectorScheduler(OffloadingConnectorScheduler):
             for job_id in [j for j in meta.completed_jobs
                            if j in self._wave_keys]:
                 keys = self._wave_keys.pop(job_id)
+                self.finished_waves.add(self._job_wave.pop(job_id))
                 try:
                     self.manager.complete_load(keys, None)
                 except Exception as e:

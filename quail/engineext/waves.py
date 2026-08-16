@@ -3,29 +3,54 @@
 Applies waves_logic decisions to engine state from inside
 QuailScheduler.schedule(). QUAIL_WAVES=1 enables pre-loading;
 QUAIL_SPILL=1 additionally puts preempted requests at the front of
-the candidate order, so a document evicted under a choked pool
-reloads through the same channel before it is rescheduled - spill
-reload and pre-load are one mechanism with two orderings.
+the wave order, so a document evicted under a choked pool reloads
+through the same channel before it is rescheduled - spill reload and
+pre-load are one mechanism with two orderings.
 
-The step cycle for one wave:
+Territory. The vendor's per-request load path and the wave channel
+must never load the same bytes. The vendor defers an external-hit
+request at zero token cost (load_kv_async schedules no new tokens),
+so it can sweep the whole waiting queue in one step - a skip window
+cannot contain it; measured 1.6x duplicated load bytes when it
+shared territory with waves. So the split is enforced at the store
+lookup instead: every wave document is CLAIMED, and a claimed
+request answers no-hit, leaving the vendor two choices that are both
+correct - cache-hit it after its wave registers, or prefill it at
+full token cost, which self-limits at one step budget per step and
+loads nothing. Two regions are left to the vendor's load path:
 
-  step k    pick documents from the waiting queue, allocate their GPU
-            blocks, pin the CPU blocks, hand the worker one copy list
-            (it rides step k's connector metadata; the copy starts on
-            the transfer stream at step k's start)
-  step k+1  register the blocks in the prefix cache and queue the
-            wave's gate; any later step that schedules one of the
-            wave's documents makes the compute stream wait on the
-            wave's CUDA event first, so correctness is pure stream
-            ordering - no request parking, no polling
-  later     as wave documents get scheduled, the driver drops its
-            extra block references; a fully consumed wave vanishes
+  the seam   the first 2 x step-budget tokens of the queue, never
+             claimed. The head is scheduled before any wave lands,
+             and the per-request path moves it at channel speed
+             rather than prefilling it.
+  the floor  max_num_seqs blocks + one step budget of blocks stay
+             free so the vendor pass never starves for allocation.
 
-A document scheduled before its wave registers simply prefills as if
-there were no store: a wasted copy, never a wrong answer. Known
-limits, on purpose for now: wave blocks left unconsumed are evicted
-by the engine's ordinary reuse path, which single-tenant strict mode
-would refuse - run waves with QUAIL_SINGLE_TENANT=0 - and duplicate
+Waves are planned front-first beyond the seam, all at once while
+pool headroom lasts, so registrations land in the order the vendor
+walks the queue and the copy frontier runs ahead of the sweep.
+
+The cycle for one wave:
+
+  plan       allocate GPU blocks, claim the documents, pin the CPU
+             blocks, hand the worker one copy list (it rides this
+             step's connector metadata; the copy starts on the wave
+             transfer stream immediately)
+  copy done  the worker reports the wave's job finished; the next
+             step's driver pass registers the blocks in the prefix
+             cache, releases the claims, and queues the wave's gate.
+             Registering only after the copy lands means the gate's
+             event wait is already satisfied - the compute stream
+             never stalls on it; the gate stays as insurance for
+             the report-vs-event edge
+  later      as wave documents get scheduled, the driver drops its
+             extra block references; a fully consumed wave vanishes
+
+A document the vendor prefills before its wave registers computed
+its own KV: a wasted copy, never a wrong answer. Known limits, on
+purpose for now: wave blocks left unconsumed are evicted by the
+engine's ordinary reuse path, which single-tenant strict mode would
+refuse - run waves with QUAIL_SINGLE_TENANT=0 - and duplicate
 documents could cache-hit a wave block before its copy lands, which
 distinct-document corpora cannot trigger.
 """
@@ -34,7 +59,7 @@ import os
 
 from vllm.v1.kv_offload.base import GPULoadStoreSpec
 
-from .waves_logic import plan_wave
+from .waves_logic import plan_waves
 
 
 class WaveDriver:
@@ -42,14 +67,13 @@ class WaveDriver:
         self.s = scheduler
         self.on = os.environ.get("QUAIL_WAVES", "0") == "1"
         self.spill = os.environ.get("QUAIL_SPILL", "0") == "1"
-        self.max_in_flight = 2
         self._wave_tokens = None
-        self._next_wave = 0
         self._handled = set()      # request ids waved or rejected
         self._doc_wave = {}        # request id -> wave id
         self._pending_reg = []     # (wave_id, [(req, blocks, n_full)])
         self._live = {}            # wave id -> {rid: blocks} unconsumed
-        self._consumed_early = set()   # scheduled before wave registered
+        self._consumed_early = set()   # prefilled before wave registered
+        self._next_wave = 0
         self._errors = 0
         self.stats = dict(waves=0, docs=0, blocks=0, reloads=0)
         if self.on:
@@ -81,39 +105,51 @@ class WaveDriver:
             return
         pool = self.s.kv_cache_manager.block_pool
         block_size = self.s.block_size
+        step_budget = self.s.scheduler_config.max_num_batched_tokens
         if self._wave_tokens is None:
             self._wave_tokens = (
                 int(os.environ.get("QUAIL_WAVE_TOKENS", "0"))
-                or 2 * self.s.scheduler_config.max_num_batched_tokens)
+                or 2 * step_budget)
 
-        # 1. register last step's wave; from now on its documents can
-        # cache-hit, so the gate must be queued in this same step.
-        # get_new_blocks already left one reference on each block -
-        # that allocation reference IS the driver's pin (a block with
-        # ref_cnt > 0 cannot be evicted), released in after() when the
-        # document consumes the wave. A document consumed before its
-        # wave registered computed its own KV; its blocks are freed
-        # here unregistered, because their copy may still be in
-        # flight and a duplicate cache entry must not serve a hit.
-        for wave_id, members in self._pending_reg:
-            left = {}
-            for req, blocks, n_full in members:
-                if req.request_id in self._consumed_early:
-                    self._consumed_early.discard(req.request_id)
-                    pool.free_blocks(blocks)
+        # 1. register waves whose copy the worker reported finished.
+        # From now on their documents cache-hit locally, so each gate
+        # is queued in this same step - and is already satisfied.
+        # get_new_blocks left one reference on each block at planning
+        # time; that allocation reference IS the driver's pin (a
+        # block with ref_cnt > 0 cannot be evicted), released in
+        # after() when the document consumes the wave. A document the
+        # vendor prefilled meanwhile computed its own KV; its blocks
+        # are freed here unregistered, because a duplicate cache
+        # entry must not serve a hit.
+        if self._pending_reg:
+            still = []
+            for wave_id, members in self._pending_reg:
+                if wave_id not in cs.finished_waves:
+                    still.append((wave_id, members))
                     continue
-                pool.cache_full_blocks(
-                    request=req, blocks=blocks, num_cached_blocks=0,
-                    num_full_blocks=n_full, block_size=block_size,
-                    kv_cache_group_id=0)
-                left[req.request_id] = blocks
-            if left:
-                self._live[wave_id] = left
-            cs.queue_gates([wave_id])
-        self._pending_reg = []
+                cs.finished_waves.discard(wave_id)
+                left = {}
+                for req, blocks, n_full in members:
+                    cs.wave_claimed.discard(req.request_id)
+                    if req.request_id in self._consumed_early:
+                        self._consumed_early.discard(req.request_id)
+                        pool.free_blocks(blocks)
+                        continue
+                    pool.cache_full_blocks(
+                        request=req, blocks=blocks, num_cached_blocks=0,
+                        num_full_blocks=n_full, block_size=block_size,
+                        kv_cache_group_id=0)
+                    left[req.request_id] = blocks
+                if left:
+                    self._live[wave_id] = left
+                cs.queue_gates([wave_id])
+            self._pending_reg = still
 
-        # 2. plan the next wave
-        if len(self._live) + len(self._pending_reg) >= self.max_in_flight:
+        # 2. plan waves over the stored tail of the waiting queue
+        floor_blocks = (self.s.scheduler_config.max_num_seqs
+                        + -(-step_budget // block_size))
+        budget_blocks = pool.get_num_free_blocks() - floor_blocks
+        if budget_blocks <= 0:
             return
         try:
             waiting = list(self.s.waiting)
@@ -122,30 +158,30 @@ class WaveDriver:
             print("[quail-waves] waiting queue not iterable; disabled",
                   flush=True)
             return
-        if self.spill:
-            # a preempted document is mid-chain: its next visit is the
-            # soonest, so it reloads first (the rotation order)
-            for req in waiting:
-                if (req.num_preemptions
-                        and req.request_id in self._handled
-                        and req.request_id not in self._doc_wave):
-                    self._handled.discard(req.request_id)
-                    self.stats["reloads"] += 1
-            waiting.sort(key=lambda r: 0 if r.num_preemptions else 1)
-        # the head of the queue belongs to the on-demand path: those
-        # documents get scheduled in the next step or two, and a wave
-        # for them loses the race - measured 1.8x duplicated loads
-        # when waves targeted the head. Waves own everything beyond
-        # the imminent region; the scan is bounded so a deep queue
-        # costs nothing per step.
-        head_skip = 2 * self.s.scheduler_config.max_num_batched_tokens
-        scan_budget = 3 * self._wave_tokens * self.max_in_flight
-        cands, skipped, scanned = [], 0, 0
-        for r in waiting:
-            if scanned >= scan_budget:
+        seam_ids, seam_tokens = set(), 0
+        for r in waiting:                    # the vendor's order
+            if seam_tokens >= 2 * step_budget:
                 break
+            seam_ids.add(r.request_id)
+            seam_tokens += r.num_tokens
+        order = waiting
+        if self.spill:
+            # a preempted document is mid-chain: its next visit is
+            # the soonest, so it reloads first. Preempted documents
+            # inside the seam stay the vendor's - it is about to
+            # recompute them, and a wave would duplicate that.
+            pre = [r for r in order if r.num_preemptions]
+            for r in pre:
+                rid = r.request_id
+                if rid in self._handled and rid not in self._doc_wave:
+                    self._handled.discard(rid)
+                    self.stats["reloads"] += 1
+            order = pre + [r for r in order if not r.num_preemptions]
+        cands, by_id = [], {}
+        for r in order:
             rid = r.request_id
-            if rid in self._handled or r.num_computed_tokens:
+            if (rid in seam_ids or rid in self._handled
+                    or r.num_computed_tokens):
                 continue
             if not r.block_hashes:
                 self._handled.add(rid)
@@ -157,52 +193,46 @@ class WaveDriver:
             if pool.get_cached_block(r.block_hashes[-1], [0]):
                 self._handled.add(rid)
                 continue
-            tokens = len(r.block_hashes) * block_size
-            if skipped < head_skip:
-                skipped += tokens        # not handled: on-demand's seam
-                continue
-            scanned += tokens
-            cands.append((rid, r))
-        sized = [(rid, len(r.block_hashes) * block_size)
-                 for rid, r in cands]
-        picked = set(plan_wave(
-            sized, self._wave_tokens,
-            in_flight=len(self._live) + len(self._pending_reg),
-            max_in_flight=self.max_in_flight))
-        if not picked:
-            return
-        wave_id = self._next_wave
-        members, all_keys, gpu_ids = [], [], []
-        for rid, req in cands:
-            if rid not in picked:
-                continue
-            self._handled.add(rid)
-            keys = cs.wave_keys_for(req)
-            if not keys:
-                continue
-            n_full = len(keys)
-            # leave allocation headroom for the vendor pass right after
-            if pool.get_num_free_blocks() < n_full + 64:
+            cands.append((rid, len(r.block_hashes) * block_size))
+            by_id[rid] = r
+        planned = plan_waves(cands, self._wave_tokens,
+                             budget_blocks * block_size)
+        for wave_members in planned:
+            wave_id = self._next_wave
+            members, all_keys, gpu_ids = [], [], []
+            starved = False
+            for rid in wave_members:
+                req = by_id[rid]
+                self._handled.add(rid)
+                keys = cs.wave_keys_for(req)
+                if not keys:
+                    continue
+                n_full = len(keys)
+                if pool.get_num_free_blocks() < n_full + floor_blocks:
+                    starved = True
+                    break
+                blocks = pool.get_new_blocks(n_full)
+                members.append((req, blocks, n_full))
+                all_keys.extend(keys)
+                gpu_ids.extend(b.block_id for b in blocks)
+                self._doc_wave[rid] = wave_id
+                cs.wave_claimed.add(rid)
+            if members:
+                src = cs.prepare_wave(all_keys)
+                dst = GPULoadStoreSpec(block_ids=gpu_ids,
+                                       group_sizes=[len(gpu_ids)],
+                                       block_indices=[0])
+                cs.queue_wave(wave_id, all_keys, src, dst)
+                self._pending_reg.append((wave_id, members))
+                self._next_wave += 1
+                self.stats["waves"] += 1
+                self.stats["docs"] += len(members)
+                self.stats["blocks"] += len(gpu_ids)
+                print(f"[quail-waves] wave {wave_id}: "
+                      f"{len(members)} documents, {len(gpu_ids)} blocks",
+                      flush=True)
+            if starved:
                 break
-            blocks = pool.get_new_blocks(n_full)
-            members.append((req, blocks, n_full))
-            all_keys.extend(keys)
-            gpu_ids.extend(b.block_id for b in blocks)
-            self._doc_wave[rid] = wave_id
-        if not members:
-            return
-        src = cs.prepare_wave(all_keys)
-        dst = GPULoadStoreSpec(block_ids=gpu_ids,
-                               group_sizes=[len(gpu_ids)],
-                               block_indices=[0])
-        cs.queue_wave(wave_id, all_keys, src, dst)
-        self._pending_reg.append((wave_id, members))
-        self._next_wave += 1
-        self.stats["waves"] += 1
-        self.stats["docs"] += len(members)
-        self.stats["blocks"] += len(gpu_ids)
-        print(f"[quail-waves] wave {wave_id}: {len(members)} documents, "
-              f"{len(gpu_ids)} blocks", flush=True)
 
     def after(self, scheduled_ids):
         """Runs after the vendor pass: waves whose documents got
@@ -220,8 +250,9 @@ class WaveDriver:
                 if blocks:
                     self.s.kv_cache_manager.block_pool.free_blocks(blocks)
                 elif wave_id not in self._live:
-                    # scheduled before its wave registered: the wave
-                    # frees this member's blocks at registration
+                    # the vendor prefilled it before its wave
+                    # registered: the wave frees this member's blocks
+                    # at registration
                     self._consumed_early.add(rid)
                 if left is not None and not left:
                     del self._live[wave_id]
@@ -247,6 +278,10 @@ class WaveDriver:
                 for blocks in left.values():
                     pool.free_blocks(blocks)
                     n += len(blocks)
+            cs = self._cs()
+            if cs is not None:
+                cs.wave_claimed.clear()
+                cs.finished_waves.clear()
         except Exception as e:
             print(f"[quail-waves] drain error: {e}", flush=True)
         self._pending_reg = []
