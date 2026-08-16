@@ -251,19 +251,19 @@ def _stage_tokens(snapshots, yes_ids, no_ids):
 
 
 def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
-                            budget_tokens, yes_ids, tag="c",
-                            no_ids=None, store_min_tokens=0):
+                            yes_ids, tag="c", no_ids=None,
+                            store_min_tokens=0):
     """Chain mode: the engine itself runs each document's whole filter
     chain. The client registers the question token lists and the gate
-    token ids once, then submits ONE request per document; the
-    scheduler judges each answer, rewinds to the document boundary,
-    and appends the next question. Returns the same result shape as
-    run_filter_chain.
-
-    Because the document's KV belongs to a request that stays alive
-    across every stage, it cannot be evicted between stages and is
-    never re-prefilled - the read multiplier drops to the question
-    tokens alone.
+    token ids once, then submits ONE request per document - all of
+    them, up front. Waiting requests hold no KV (measured: residency
+    self-limits at sigma*B), so there is nothing for a client gate to
+    protect; the plan's admission number is a boot-time feasibility
+    floor, not a submission valve. The scheduler judges each answer,
+    rewinds to the document boundary, and appends the next question.
+    Returns the same result shape as run_filter_chain, which keeps
+    its gate because the stock baseline's stages are conditional on
+    verdicts and its in-flight requests do pin cache footprint.
 
     With no_ids given, the gate runs in decisive-token mode for models
     that do not answer in one token: each stage may sample several
@@ -280,36 +280,26 @@ def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
     answers = {}
     survivors = []
     raw0 = []
-    q_cost = sum(len(q) for q in q_ids) + n
-    inflight = {}                    # request id -> (doc, cost, snapshots)
+    inflight = {}                    # request id -> (doc, snapshots)
     no_store = (_no_store_params(sampling_params)
                 if store_min_tokens > 1 and sampling_params is not None
                 else sampling_params)
 
-    def submit(i, cost):
+    t0 = time.time()
+    for i in range(len(body_ids)):
         rid = f"de1|c|d{i}|{tag}-{i}-0"
-        inflight[rid] = (i, cost, [])
+        inflight[rid] = (i, [])
         sp = (no_store if len(body_ids[i]) < store_min_tokens
               else sampling_params)
         engine.add_request(rid,
                            {"prompt_token_ids": body_ids[i] + q_ids[0]},
                            sp)
-
-    t0 = time.time()
-    used, next_doc = 0, 0
-    while next_doc < len(body_ids) or inflight:
-        while next_doc < len(body_ids):
-            cost = len(body_ids[next_doc]) + q_cost
-            if used + cost > budget_tokens and used > 0:
-                break
-            used += cost
-            submit(next_doc, cost)
-            next_doc += 1
+    while inflight:
         for out in engine.step():
             entry = inflight.get(out.request_id)
             if entry is None:
                 continue
-            i, cost, toks = entry
+            i, toks = entry
             ids = list(out.outputs[0].token_ids or ())
             if ids:
                 toks.append(ids)
@@ -328,7 +318,6 @@ def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
             if len(stage_toks) >= n \
                     and all(t in yes_ids for t in stage_toks[:n]):
                 survivors.append(i)
-            used -= cost
     wall = time.time() - t0
     return dict(wall=wall, survivors=sorted(survivors), answers=answers,
                 doc0_raw=raw0, **counters)

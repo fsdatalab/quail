@@ -49,6 +49,7 @@ class WaveDriver:
         self._doc_wave = {}        # request id -> wave id
         self._pending_reg = []     # (wave_id, [(req, blocks, n_full)])
         self._live = {}            # wave id -> {rid: blocks} unconsumed
+        self._consumed_early = set()   # scheduled before wave registered
         self._errors = 0
         self.stats = dict(waves=0, docs=0, blocks=0, reloads=0)
         if self.on:
@@ -86,17 +87,28 @@ class WaveDriver:
                 or 2 * self.s.scheduler_config.max_num_batched_tokens)
 
         # 1. register last step's wave; from now on its documents can
-        # cache-hit, so the gate must be queued in this same step
+        # cache-hit, so the gate must be queued in this same step.
+        # get_new_blocks already left one reference on each block -
+        # that allocation reference IS the driver's pin (a block with
+        # ref_cnt > 0 cannot be evicted), released in after() when the
+        # document consumes the wave. A document consumed before its
+        # wave registered computed its own KV; its blocks are freed
+        # here unregistered, because their copy may still be in
+        # flight and a duplicate cache entry must not serve a hit.
         for wave_id, members in self._pending_reg:
             left = {}
             for req, blocks, n_full in members:
+                if req.request_id in self._consumed_early:
+                    self._consumed_early.discard(req.request_id)
+                    pool.free_blocks(blocks)
+                    continue
                 pool.cache_full_blocks(
                     request=req, blocks=blocks, num_cached_blocks=0,
                     num_full_blocks=n_full, block_size=block_size,
                     kv_cache_group_id=0)
-                pool.touch(blocks)
                 left[req.request_id] = blocks
-            self._live[wave_id] = left
+            if left:
+                self._live[wave_id] = left
             cs.queue_gates([wave_id])
         self._pending_reg = []
 
@@ -120,9 +132,28 @@ class WaveDriver:
                     self._handled.discard(req.request_id)
                     self.stats["reloads"] += 1
             waiting.sort(key=lambda r: 0 if r.num_preemptions else 1)
-        cands = [(r.request_id, r) for r in waiting
-                 if r.request_id not in self._handled
-                 and not r.num_computed_tokens]
+        # scan only the head of the queue: enough candidates for the
+        # in-flight bound, not the whole corpus every step
+        scan_budget = 3 * self._wave_tokens * self.max_in_flight
+        cands, scanned = [], 0
+        for r in waiting:
+            if scanned >= scan_budget:
+                break
+            rid = r.request_id
+            if rid in self._handled or r.num_computed_tokens:
+                continue
+            if not r.block_hashes:
+                self._handled.add(rid)
+                continue
+            scanned += len(r.block_hashes) * block_size
+            # a document whose last full block is already in the GPU
+            # prefix cache needs no wave: the local hit wins anyway,
+            # and a wave for it is a wasted copy (the write query's
+            # documents all look like this)
+            if pool.get_cached_block(r.block_hashes[-1], [0]):
+                self._handled.add(rid)
+                continue
+            cands.append((rid, r))
         sized = [(rid, len(r.block_hashes) * block_size)
                  for rid, r in cands]
         picked = set(plan_wave(
@@ -161,6 +192,8 @@ class WaveDriver:
         self.stats["waves"] += 1
         self.stats["docs"] += len(members)
         self.stats["blocks"] += len(gpu_ids)
+        print(f"[quail-waves] wave {wave_id}: {len(members)} documents, "
+              f"{len(gpu_ids)} blocks", flush=True)
 
     def after(self, scheduled_ids):
         """Runs after the vendor pass: waves whose documents got
@@ -177,7 +210,40 @@ class WaveDriver:
                 blocks = left.pop(rid, None) if left else None
                 if blocks:
                     self.s.kv_cache_manager.block_pool.free_blocks(blocks)
+                elif wave_id not in self._live:
+                    # scheduled before its wave registered: the wave
+                    # frees this member's blocks at registration
+                    self._consumed_early.add(rid)
                 if left is not None and not left:
                     del self._live[wave_id]
         except Exception as e:
             print(f"[quail-waves] release error: {e}", flush=True)
+
+    def drain(self):
+        """Release every reference the driver still holds. Called at
+        quiesce points only (a prefix-cache reset between queries):
+        wave copies must be long finished, because freed blocks
+        rejoin the pool while an in-flight copy would still write
+        them."""
+        if not (self._live or self._pending_reg or self._doc_wave):
+            return
+        pool = self.s.kv_cache_manager.block_pool
+        n = 0
+        try:
+            for wave_id, members in self._pending_reg:
+                for _req, blocks, _n_full in members:
+                    pool.free_blocks(blocks)
+                    n += len(blocks)
+            for left in self._live.values():
+                for blocks in left.values():
+                    pool.free_blocks(blocks)
+                    n += len(blocks)
+        except Exception as e:
+            print(f"[quail-waves] drain error: {e}", flush=True)
+        self._pending_reg = []
+        self._live = {}
+        self._doc_wave = {}
+        self._consumed_early = set()
+        self._handled = set()
+        if n:
+            print(f"[quail-waves] drained {n} blocks", flush=True)

@@ -198,7 +198,6 @@ def test_chain_mode_runs_one_request_per_document():
     flags, body_ids, q_ids = _setup(30, 3, seed=11)
     eng = ChainStubEngine(flags)
     res = run_filter_chain_engine(eng, None, body_ids, q_ids,
-                                  budget_tokens=10 ** 6,
                                   yes_ids={YES_TOK})
     assert res["survivors"] == [i for i in range(30) if all(flags[i])]
     assert res["requests"] == 30

@@ -231,8 +231,7 @@ def filter_cells(n_docs: int = 10000, reps: int = 3,
                 t0m = _time.monotonic()
                 if planned:
                     r = run_filter_chain_engine(
-                        engine, sp, body_ids, q_ids, budget, yes_ids,
-                        tag=tag)
+                        engine, sp, body_ids, q_ids, yes_ids, tag=tag)
                 else:
                     r = run_stock(engine, tag)
                 t1m = _time.monotonic()

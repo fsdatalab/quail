@@ -513,23 +513,19 @@ try:
         from quail.runtime.engine_client import _register_query
         _register_query(engine, sp, q_ids[:n_filters], yes_ids, None,
                         "", "tp-reg")
-        q_cost = sum(len(q) for q in q_ids[:n_filters]) + n_filters
-        inflight, used, nd = {}, 0, 0
-        while nd < n_docs or inflight:
+        # chain mode submits everything up front, same as the client:
+        # waiting requests hold no KV, so there is nothing to gate
+        inflight = set()
+        for nd in range(n_docs):
+            rid = "de1|c|d%d|tp-%d-0" % (nd, nd)
+            inflight.add(rid)
+            engine.add_request(
+                rid, {"prompt_token_ids": body_ids[nd] + q_ids[0]}, sp)
+        while inflight:
             window_tick()
-            while nd < n_docs:
-                cost = len(body_ids[nd]) + q_cost
-                if used + cost > 750_000 and used > 0:
-                    break
-                rid = "de1|c|d%d|tp-%d-0" % (nd, nd)
-                inflight[rid] = cost
-                used += cost
-                engine.add_request(
-                    rid, {"prompt_token_ids": body_ids[nd] + q_ids[0]}, sp)
-                nd += 1
             for out in engine.step():
-                if out.finished and out.request_id in inflight:
-                    used -= inflight.pop(out.request_id)
+                if out.finished:
+                    inflight.discard(out.request_id)
     else:
         inflight, nd = {}, 0
         while nd < n_docs or inflight:

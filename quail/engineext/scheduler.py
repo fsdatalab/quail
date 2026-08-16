@@ -209,6 +209,12 @@ class QuailScheduler(Scheduler):
             self._de_trace_flush()
         return out
 
+    def reset_prefix_cache(self, *args, **kwargs):
+        # the wave driver's block references would make the reset
+        # refuse; a reset is a quiesce point, so drain them first
+        self._de_waves.drain()
+        return super().reset_prefix_cache(*args, **kwargs)
+
     def _de_trace_flush(self):
         if not self._de_trace_buf:
             return
