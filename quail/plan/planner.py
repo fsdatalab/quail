@@ -4,9 +4,11 @@ plan_query takes what the user knows (filter count, corpus statistics,
 model, device, GPU count, whether a KV store exists) and returns a
 Plan choosing everything the measurements showed to matter:
 
-- executor: chain (one living request per document, rewound between
-  filters) against separate requests; chain wins with two or more
-  filters, and a single-filter query has nothing to chain
+- executor: always chain (one living request per document, rewound
+  between filters). A single-filter query is the degenerate chain -
+  prefill, one verdict, free - so there is no separate mode for it;
+  "requests" exists only as the stock-vLLM comparison baseline in
+  the experiments
 - GPU layout: split the corpus across single-GPU workers (documents
   are independent, so every floor divides by the worker count) and
   split the model only when its weights do not fit one card
@@ -62,7 +64,9 @@ class StoreSpec:
 
 @dataclass(frozen=True)
 class Plan:
-    mode: str                 # executor internals: "chain" | "requests"
+    mode: str                 # executor internals: always "chain"; the
+    #                           "requests" executor survives only as the
+    #                           stock-vLLM baseline in the experiments
     workers: int              # data-parallel single-model workers
     tensor_parallel: int      # GPUs per worker (model split)
     shards: tuple             # doc-id tuples, one per worker
@@ -79,7 +83,7 @@ class Plan:
     predicted_makespan_s: float
     operator: str = ""        # the public operator name:
     #                           pipelined_filter (chain mode, gated,
-    #                           rewound between stages) | requests
+    #                           rewound between stages)
     engine_max_seqs: int = 0  # boot the engine's max_num_seqs at least
     #                           this high: the worst-case admitted
     #                           document count, one live sequence each
@@ -201,10 +205,14 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
     if overflow:
         remarks.append("shard overflows the KV pool; pins off")
 
-    # one filter has nothing to chain; two or more run in chain mode,
-    # where the document's KV belongs to a living request and cannot
-    # be evicted between stages
-    mode = "requests" if n_filters < 2 else "chain"
+    # every query runs in chain mode, where the document's KV belongs
+    # to a living request and cannot be evicted between stages. One
+    # filter is the degenerate chain: prefill, one verdict, free -
+    # identical work to a separate request, and the chain executor's
+    # measured per-query residue is the smaller of the two (0.026 s
+    # against 0.659 s, c0_anchor.json). "requests" survives only as
+    # the stock-vLLM baseline the experiments compare against.
+    mode = "chain"
 
     # the worst shard's share of the corpus's squared lengths: the
     # quadratic prefill surcharge, which recompute pays and restore
@@ -229,7 +237,7 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
         overflow_tokens = max(0, worst_load - pool)
         spill_s = 2 * overflow_tokens * model.kappa / store.read_bw
 
-    operator = "requests" if mode == "requests" else "pipelined_filter"
+    operator = "pipelined_filter"
 
     # per-filter selectivities when given: a skewed chain (0.9, 0.9,
     # 0.2, ...) has its survivor cliff where the selective filter

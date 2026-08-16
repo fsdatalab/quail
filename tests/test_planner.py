@@ -110,11 +110,12 @@ def test_model_bigger_than_a_card_splits_it():
     assert p.tensor_parallel == 4 and p.workers == 2
 
 
-def test_single_filter_uses_requests_without_pins():
-    """One filter has no future consumer, so there is nothing a pin
-    could buy: read, answer, free."""
+def test_single_filter_is_the_degenerate_chain():
+    """One filter runs the same chain executor as five: prefill, one
+    verdict, free. No separate mode, no branch to maintain."""
     p = plan_query(1, DOCS_10K, M4B, H100)
-    assert p.mode == "requests"
+    assert p.mode == "chain"
+    assert p.operator == "pipelined_filter"
 
 
 def test_budget_stays_under_the_pool():
