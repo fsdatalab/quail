@@ -132,10 +132,15 @@ class WaveDriver:
                     self._handled.discard(req.request_id)
                     self.stats["reloads"] += 1
             waiting.sort(key=lambda r: 0 if r.num_preemptions else 1)
-        # scan only the head of the queue: enough candidates for the
-        # in-flight bound, not the whole corpus every step
+        # the head of the queue belongs to the on-demand path: those
+        # documents get scheduled in the next step or two, and a wave
+        # for them loses the race - measured 1.8x duplicated loads
+        # when waves targeted the head. Waves own everything beyond
+        # the imminent region; the scan is bounded so a deep queue
+        # costs nothing per step.
+        head_skip = 2 * self.s.scheduler_config.max_num_batched_tokens
         scan_budget = 3 * self._wave_tokens * self.max_in_flight
-        cands, scanned = [], 0
+        cands, skipped, scanned = [], 0, 0
         for r in waiting:
             if scanned >= scan_budget:
                 break
@@ -145,7 +150,6 @@ class WaveDriver:
             if not r.block_hashes:
                 self._handled.add(rid)
                 continue
-            scanned += len(r.block_hashes) * block_size
             # a document whose last full block is already in the GPU
             # prefix cache needs no wave: the local hit wins anyway,
             # and a wave for it is a wasted copy (the write query's
@@ -153,6 +157,11 @@ class WaveDriver:
             if pool.get_cached_block(r.block_hashes[-1], [0]):
                 self._handled.add(rid)
                 continue
+            tokens = len(r.block_hashes) * block_size
+            if skipped < head_skip:
+                skipped += tokens        # not handled: on-demand's seam
+                continue
+            scanned += tokens
             cands.append((rid, r))
         sized = [(rid, len(r.block_hashes) * block_size)
                  for rid, r in cands]

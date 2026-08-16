@@ -156,12 +156,24 @@ class QuailOffloadingConnectorWorker(OffloadingConnectorWorker):
         self._wave_events = {}          # wave id -> CUDA end event
         self._wave_job_ids = set()      # job ids that were waves
         self._gated = set()             # waves already waited on
+        self._wave_handler_obj = None   # dedicated wave transfer chain
 
-    def _newest_load_event(self):
-        try:
-            return self.worker._load_handler._transfers[-1].end_event
-        except Exception:
-            return None
+    def _wave_handler(self):
+        """A dedicated transfer chain for waves, built lazily from the
+        load handler's own tensors. Transfers within one handler are
+        strictly ordered; giving waves their own keeps a wave's gate
+        from waiting behind unrelated on-demand loads."""
+        if self._wave_handler_obj is None:
+            from vllm.v1.kv_offload.cpu.gpu_worker import (
+                SingleDirectionOffloadingHandler)
+            load = self.worker._load_handler
+            self._wave_handler_obj = SingleDirectionOffloadingHandler(
+                gpu_tensors=load.dst_tensors,
+                cpu_tensors=load.src_tensors,
+                blocks_per_chunk=load.src_blocks_per_chunk,
+                kv_cache_groups_data_refs=load.kv_cache_groups_data_refs,
+                gpu_to_cpu=False)
+        return self._wave_handler_obj
 
     def apply_gates(self, wave_ids):
         """Make the compute stream wait on each named wave's event,
@@ -207,26 +219,40 @@ class QuailOffloadingConnectorWorker(OffloadingConnectorWorker):
         super().register_cross_layers_kv_cache(kv_cache, attn_backend)
         self._check_pinned()
 
+    def shutdown(self):
+        if self._wave_handler_obj is not None:
+            self._wave_handler_obj.shutdown()
+            self._wave_handler_obj = None
+        super().shutdown()
+
     def start_kv_transfers(self, metadata):
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             assert self.worker.submit_store(job_id, src_spec, dst_spec)
         self._unsubmitted_store_jobs.clear()
 
-        # wave jobs first: each is already one batched copy list, so
-        # it goes straight to the handler; the transfer's end event
-        # becomes the wave's gate event
+        # wave jobs first: each is already one batched copy list, and
+        # it runs on the wave handler's OWN chain, so a wave's gate
+        # event waits only on its own copies - waves sharing the
+        # on-demand chain leaked ~1.9 s of transfer backlog into
+        # compute (measured). The transfer's end event becomes the
+        # wave's gate event.
         wave_of_job = getattr(metadata, "wave_of_job", None) or {}
-        for job_id in list(wave_of_job):
-            entry = metadata.load_jobs.pop(job_id, None)
-            if entry is None:
-                continue
-            self._wave_job_ids.add(job_id)
-            assert self.worker.submit_load(
-                job_id, entry.src_spec, entry.dst_spec)
-            ev = self._newest_load_event()
-            if ev is not None:
-                self._wave_events[wave_of_job[job_id]] = ev
+        if wave_of_job:
+            handler = self._wave_handler()
+            for job_id in list(wave_of_job):
+                entry = metadata.load_jobs.pop(job_id, None)
+                if entry is None:
+                    continue
+                self._wave_job_ids.add(job_id)
+                assert handler.transfer_async(
+                    job_id, entry.src_spec, entry.dst_spec)
+                try:
+                    ev = handler._transfers[-1].end_event
+                except Exception:
+                    ev = None
+                if ev is not None:
+                    self._wave_events[wave_of_job[job_id]] = ev
 
         load_items = metadata.load_jobs
         if len(load_items) < 2:
@@ -275,8 +301,11 @@ class QuailOffloadingConnectorWorker(OffloadingConnectorWorker):
 
     def get_finished(self, finished_req_ids):
         assert self.worker is not None
+        results = list(self.worker.get_finished())
+        if self._wave_handler_obj is not None:
+            results.extend(self._wave_handler_obj.get_finished())
         finished_recving: set[str] = set()
-        for result in self._expand(self.worker.get_finished()):
+        for result in self._expand(results):
             job_id = result.job_id
             assert result.success
             is_load = (job_id in self._load_jobs
