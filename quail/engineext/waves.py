@@ -144,16 +144,21 @@ class WaveDriver:
                     continue
                 cs.finished_waves.discard(wave_id)
                 left = {}
-                for req, blocks, n_full in members:
+                for req, blocks, cached in members:
                     cs.wave_claimed.discard(req.request_id)
                     if req.request_id in self._consumed_early:
                         self._consumed_early.discard(req.request_id)
                         pool.free_blocks(blocks)
                         continue
+                    # cache_full_blocks reads only the
+                    # [num_cached:num_full] slice of the blocks list,
+                    # so the already-cached prefix is padded, never
+                    # touched
                     pool.cache_full_blocks(
-                        request=req, blocks=blocks, num_cached_blocks=0,
-                        num_full_blocks=n_full, block_size=block_size,
-                        kv_cache_group_id=0)
+                        request=req, blocks=[None] * cached + blocks,
+                        num_cached_blocks=cached,
+                        num_full_blocks=cached + len(blocks),
+                        block_size=block_size, kv_cache_group_id=0)
                     left[req.request_id] = blocks
                 if left:
                     self._live[wave_id] = left
@@ -200,15 +205,23 @@ class WaveDriver:
             if not r.block_hashes:
                 self._handled.add(rid)
                 continue
-            # a document whose last full block is already in the GPU
-            # prefix cache needs no wave: the local hit wins anyway,
-            # and a wave for it is a wasted copy (the write query's
-            # documents all look like this)
-            if pool.get_cached_block(r.block_hashes[-1], [0]):
+            # wave only the blocks missing past the longest locally
+            # cached prefix. A chain stage revisits its document with
+            # every earlier stage's KV already resident, and waving
+            # the whole prefix again doubled the channel bytes -
+            # measured 97 GB moved for a 48 GB job. Fully cached
+            # means no wave at all: the local hit wins (the write
+            # query's documents all look like this).
+            cached = 0
+            for h in r.block_hashes:
+                if not pool.get_cached_block(h, [0]):
+                    break
+                cached += 1
+            if cached == len(r.block_hashes):
                 self._handled.add(rid)
                 continue
-            cands.append((rid, len(r.block_hashes) * block_size))
-            by_id[rid] = r
+            cands.append((rid, (len(r.block_hashes) - cached) * block_size))
+            by_id[rid] = (r, cached)
         planned = plan_waves(cands, self._wave_tokens,
                              budget_blocks * block_size)
         for wave_members in planned:
@@ -216,17 +229,17 @@ class WaveDriver:
             members, all_keys, gpu_ids = [], [], []
             starved = False
             for rid in wave_members:
-                req = by_id[rid]
+                req, cached = by_id[rid]
                 self._handled.add(rid)
-                keys = cs.wave_keys_for(req)
+                keys = cs.wave_keys_for(req, cached)
                 if not keys:
                     continue
-                n_full = len(keys)
-                if pool.get_num_free_blocks() < n_full + floor_blocks:
+                n_miss = len(keys)
+                if pool.get_num_free_blocks() < n_miss + floor_blocks:
                     starved = True
                     break
-                blocks = pool.get_new_blocks(n_full)
-                members.append((req, blocks, n_full))
+                blocks = pool.get_new_blocks(n_miss)
+                members.append((req, blocks, cached))
                 all_keys.extend(keys)
                 gpu_ids.extend(b.block_id for b in blocks)
                 self._doc_wave[rid] = wave_id
@@ -285,7 +298,7 @@ class WaveDriver:
         n = 0
         try:
             for wave_id, members in self._pending_reg:
-                for _req, blocks, _n_full in members:
+                for _req, blocks, _cached in members:
                     pool.free_blocks(blocks)
                     n += len(blocks)
             for left in self._live.values():

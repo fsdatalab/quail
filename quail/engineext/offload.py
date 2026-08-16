@@ -114,15 +114,16 @@ class QuailOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         return super().get_num_new_matched_tokens(
             request, num_computed_tokens)
 
-    def wave_keys_for(self, request):
-        """The request's store keys at chunk granularity, or None if
-        any chunk misses (a partial hit is not worth a wave). Only
-        full blocks are considered; the tail recomputes."""
-        n_full = len(request.block_hashes)
-        if not n_full:
+    def wave_keys_for(self, request, start_block=0):
+        """The request's store keys from start_block on, or None if
+        any of those chunks miss (a partial hit is not worth a
+        wave). Blocks before start_block are already in the local
+        prefix cache; only full blocks are considered; the tail
+        recomputes."""
+        hashes = request.block_hashes[start_block:]
+        if not hashes:
             return None
-        keys = [make_offload_key(h, 0)
-                for h in request.block_hashes]
+        keys = [make_offload_key(h, 0) for h in hashes]
         for key in keys:
             if self.manager.lookup(key, None) != LookupResult.HIT:
                 return None
