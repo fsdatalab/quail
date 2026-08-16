@@ -97,11 +97,14 @@ def filter_cells(n_docs: int = 10000, reps: int = 3,
                       model_cfg, DEVICES[DEVICE_NAME],
                       selectivity=list(SELECTIVITY))
     budget = plan.budget_tokens
-    # The concurrency a stock client should choose: the same token
-    # budget the plan gives our admission, divided by what one request
-    # costs. This is the fair setting; see the module docstring.
+    # One admission rule for both sides: the saturation-derived token
+    # budget, expressed for stock as a document cap. The banked cells
+    # ran the retired 0.8-pool rule (2,048 documents at 10k docs);
+    # this setting is smaller and the next comparison run re-baselines
+    # it (prediction: unchanged walls - the cap still exceeds the
+    # ~425 concurrently live documents the step trace measured).
     mean_req = (corpus // n_docs) + max(len(q) for q in q_ids)
-    stock_sem = max(256, budget // mean_req)
+    stock_sem = max(1, budget // mean_req)
 
     # Constrain the sampler to the yes/no ids on both arms: every
     # stage then answers in exactly one token by construction, so no
@@ -117,7 +120,7 @@ def filter_cells(n_docs: int = 10000, reps: int = 3,
                   step_tokens=plan.engine_step_tokens,
                   max_num_seqs=plan.engine_max_seqs, cells=[])
     print(f"[filters] corpus {corpus:,} tokens over {n_docs} documents; "
-          f"budget {budget:,}; stock semaphore {budget:,}/{mean_req} = "
+          f"budget {budget:,}; stock cap {budget:,}/{mean_req} = "
           f"{stock_sem}", flush=True)
 
     def run_stock(engine, tag):

@@ -118,10 +118,23 @@ def test_single_filter_is_the_degenerate_chain():
     assert p.operator == "pipelined_filter"
 
 
-def test_budget_stays_under_the_pool():
+def test_admission_budget_is_the_saturation_target():
+    """Admission is derived - SATURATION_SLACK x filters x the step
+    budget - not a pool fraction. On a fat pool the target passes
+    through unclamped and sits far under the pool."""
     p = plan_query(4, DOCS_10K, M4B, H100)
+    assert p.budget_tokens == 2 * 4 * p.engine_step_tokens
     free = H100.M * 0.92 - M4B.W_mem
-    assert p.budget_tokens <= 0.8 * free / M4B.kappa + 1
+    assert p.budget_tokens < free / M4B.kappa
+
+
+def test_thin_pool_clamps_admission_and_says_so():
+    """When the pool cannot hold the saturation target, the budget
+    clamps to the pool and the plan says part-empty steps out loud
+    instead of hiding the starvation."""
+    p = plan_query(20, DOCS_10K, M4B, L40S)
+    assert p.budget_tokens < 2 * 20 * p.engine_step_tokens
+    assert any("part-empty steps" in r for r in p.remarks)
 
 
 # ------------------------------------------- the refusal path (Algorithm 2)

@@ -49,7 +49,15 @@ ENGINE_OVERHEAD_S = 0.026     # c0: per-query software residue at 10k docs,
                               # fleet-anchored and booked host variance
                               # as overhead.
 BOOT_POOL_FRACTION = 0.92     # gpu_memory_utilization we ship
-POOL_HEADROOM = 0.80          # admission budget stays under the pool by this
+SATURATION_SLACK = 2          # admission budget = this x n_filters x step
+#                               budget. sigma*B tokens are live at once
+#                               (sigma = filter count, the survival
+#                               ceiling; the step trace measured 4.1-5.1
+#                               live cohorts at five filters) and one
+#                               more sigma*B sits queued so a client
+#                               top-up stall of up to sigma steps never
+#                               starves a step. Waiting documents hold
+#                               no KV, so the queue costs no pool.
 ENGINE_SEQS_MAX = 4096        # hard bound on max_num_seqs at boot:
 #                               per-sequence engine overheads (FlashInfer
 #                               workspace, sampler buffers) live outside

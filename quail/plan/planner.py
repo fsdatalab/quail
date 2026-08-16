@@ -12,9 +12,11 @@ Plan choosing everything the measurements showed to matter:
 - GPU layout: split the corpus across single-GPU workers (documents
   are independent, so every floor divides by the worker count) and
   split the model only when its weights do not fit one card
-- admission budget: how many tokens of documents may be resident at
-  once, kept under the KV pool so the pool never overflows and the
-  prefix cache is never forced to evict. This is a TOKEN budget, not
+- admission budget: how many tokens of documents may be admitted at
+  once. Derived, not a pool fraction: SATURATION_SLACK x filters x
+  the step budget - the sigma*B working set the engine actually
+  holds (measured 4.1-5.1 live cohorts at five filters) plus a
+  top-up queue, clamped to what the pool holds. A TOKEN budget, not
   a request count: a request count cannot see document length, and
   the same 4,096-request cap that fits short documents overflows the
   pool on long ones (measured: reads 2.40x against 1.23x, wall 80.1s
@@ -39,7 +41,7 @@ from dataclasses import dataclass, field
 from quail.configs import DeviceConfig, ModelConfig
 
 from .cost import (ACT_BYTES_PER_HIDDEN, BOOT_POOL_FRACTION,
-                   ENGINE_SEQS_MAX, POOL_HEADROOM, STEP_FIXED_S,
+                   ENGINE_SEQS_MAX, SATURATION_SLACK, STEP_FIXED_S,
                    STEP_POOL_FRACTION, STEP_TOKENS_MAX, STEP_TOKENS_MIN,
                    predict_makespan, t_in)
 
@@ -82,7 +84,9 @@ class Plan:
     workers: int              # data-parallel single-model workers
     tensor_parallel: int      # GPUs per worker (model split)
     shards: tuple             # doc-id tuples, one per worker
-    budget_tokens: int        # resident-document admission cap
+    budget_tokens: int        # admission cap: the saturation target
+    #                           (SATURATION_SLACK x filters x step
+    #                           budget), clamped to what the pool holds
     access: str               # "read" | "restore" | "spill": how the
     #                           document KV is supplied. read =
     #                           compute from text; restore = load
@@ -246,9 +250,39 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
             "working set: the tiering store spills the overflow; "
             "expect the spill-bound rate, not the read floor")
 
-    budget = int(min(pool * POOL_HEADROOM,
-                     max(corpus.max_doc_tokens + question_tokens,
-                         worst_load)))
+    # the step budget (max_num_batched_tokens), derived: the dense
+    # projections are compute-bound past ~400 tokens per step, so a
+    # bigger budget buys only amortization of the per-step host cost
+    # (the measured b of T_step = a*B + b) - take it only where the
+    # activation reservation it forces at boot stays a rounding error
+    # against the KV pool. Fat pools pack large steps (~25k at 4B on
+    # the H100); thin pools keep the floor rather than trade pool for
+    # a small wall gain.
+    act_bytes = ACT_BYTES_PER_HIDDEN * model.h
+    step_tokens = int(min(
+        STEP_TOKENS_MAX,
+        max(STEP_TOKENS_MIN,
+            STEP_POOL_FRACTION * pool * model.kappa / act_bytes)))
+
+    # the admission budget, derived rather than a pool fraction: the
+    # engine's working set is sigma*B tokens (sigma live cohorts of
+    # one step each; the trace measured 4.1-5.1 at five filters), and
+    # SATURATION_SLACK adds the top-up queue on top. sigma uses the
+    # filter count, not the selectivity estimate: waiting documents
+    # hold no KV, so over-admitting is free, while trusting a wrong
+    # selectivity estimate would starve steps. The ceiling is the pool
+    # less one document's working set; a budget clamped under the
+    # saturation target is a thin-pool configuration that will run
+    # part-empty steps, and the remark says so instead of hiding it.
+    one_doc = corpus.max_doc_tokens + question_tokens
+    saturation_target = SATURATION_SLACK * n_filters * step_tokens
+    budget = int(max(one_doc, min(saturation_target, pool - one_doc)))
+    if budget < saturation_target:
+        remarks.append(
+            f"pool admits {budget} tokens against the "
+            f"{saturation_target}-token saturation target "
+            f"({SATURATION_SLACK} x {n_filters} filters x {step_tokens} "
+            "step tokens); expect part-empty steps")
     overflow = worst_load > pool
     if overflow:
         remarks.append("shard overflows the KV pool; pins off")
@@ -344,19 +378,9 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
     admitted_worst = max(1, admitted_worst)
     engine_max_seqs = min(admitted_worst + 16, ENGINE_SEQS_MAX)
 
-    # the step budget (max_num_batched_tokens), derived: the dense
-    # projections are compute-bound past ~400 tokens per step, so a
-    # bigger budget buys only amortization of the per-step host cost
-    # (the measured b of T_step = a*B + b) - take it only where the
-    # activation reservation it forces at boot stays a rounding error
-    # against the KV pool. Fat pools pack large steps (~25k at 4B on
-    # the H100); thin pools keep the floor rather than trade pool for
-    # a small wall gain.
-    act_bytes = ACT_BYTES_PER_HIDDEN * model.h
-    step_tokens = int(min(
-        STEP_TOKENS_MAX,
-        max(STEP_TOKENS_MIN,
-            STEP_POOL_FRACTION * pool * model.kappa / act_bytes)))
+    # the step budget itself was derived above, before admission,
+    # which is sized from it; the boot value must still cover the
+    # sequence cap (the engine requires it)
     engine_step_tokens = max(step_tokens, engine_max_seqs)
 
     if access == "restore" and store_min_doc_tokens > 1 and stored_shard:
