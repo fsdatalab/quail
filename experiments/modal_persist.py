@@ -233,7 +233,6 @@ def _xfer_summary(events, windows):
 def persist_run(n_docs: int = 1000, stage: str = "baseline",
                 cpu_gb: int = 96, connector: str = "stock",
                 store_gb: int = 0, waves: bool = False,
-                choke_util: float = 0.0,
                 client: str = "stages") -> dict:
     import time as _time
 
@@ -295,8 +294,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
                   budget_tokens=pool_budget,
                   step_tokens=plan.engine_step_tokens,
                   max_num_seqs=plan.engine_max_seqs,
-                  waves=waves, choke_util=choke_util,
-                  client=client,
+                  waves=waves, client=client,
                   kv_bytes_estimate=kv_bytes, store_gb=store_gb,
                   store_min_doc_tokens=store_min,
                   stored_docs=(sum(1 for b in body_ids
@@ -309,9 +307,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         kw = dict(model=MODEL, kv_cache_dtype="fp8", max_model_len=4608,
                   max_num_batched_tokens=plan.engine_step_tokens,
                   max_num_seqs=plan.engine_max_seqs,
-                  # choke_util deliberately starves the pool below the
                   # shipped setting
-                  gpu_memory_utilization=choke_util or 0.92,
+                  gpu_memory_utilization=0.92,
                   enable_prefix_caching=True, disable_log_stats=True)
         if waves or client == "chain":
             kw["scheduler_cls"] = ("quail.engineext.scheduler."
@@ -422,8 +419,6 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         suffix = "_quail" if connector == "quail" else ""
         if waves:
             suffix += "_waves"
-        if choke_util:
-            suffix += f"_choked{int(choke_util * 100)}"
         if client == "chain":
             suffix += "_chain"
         if stage != "store":
@@ -444,8 +439,6 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     tag = "_quail" if connector == "quail" else ""
     if waves:
         tag += "_waves"
-    if choke_util:
-        tag += f"_choked{int(choke_util * 100)}"
     if client == "chain":
         tag += "_chain"
     with open(f"/results/persist_{stage}{tag}.json", "w") as f:
@@ -457,16 +450,13 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
 @app.local_entrypoint()
 def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
          connector: str = "stock", store_gb: int = 0,
-         waves: bool = False,
-         choke_util: float = 0.0, client: str = "stages", out: str = ""):
+         waves: bool = False, client: str = "stages", out: str = ""):
     data = persist_run.remote(n_docs, stage, cpu_gb, connector, store_gb,
-                              waves, choke_util, client)
+                              waves, client)
     events = data.pop("xfer_events", None)
     tag = "_quail" if connector == "quail" else ""
     if waves:
         tag += "_waves"
-    if choke_util:
-        tag += f"_choked{int(choke_util * 100)}"
     if client == "chain":
         tag += "_chain"
     path = out or f"results/engine/persist_{stage}{tag}.json"
