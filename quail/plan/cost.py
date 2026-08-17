@@ -58,6 +58,7 @@ SATURATION_SLACK = 2          # admission budget = this x n_filters x step
 #                               top-up stall of up to sigma steps never
 #                               starves a step. Waiting documents hold
 #                               no KV, so the queue costs no pool.
+ENGINE_BLOCK_TOKENS = 16      # engine KV block: residency rounds up to it
 ENGINE_SEQS_MAX = 4096        # hard bound on max_num_seqs at boot:
 #                               per-sequence engine overheads (FlashInfer
 #                               workspace, sampler buffers) live outside

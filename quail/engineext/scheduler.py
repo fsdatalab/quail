@@ -75,6 +75,14 @@ class QuailScheduler(Scheduler):
         self._de_intent = {}        # request id -> (pin_tokens, doc, uses)
         self._de_queries = {}       # query id -> dict(qs, qc, yes, no)
         self._de_chain = {}         # request id -> dict(stage, d, qid)
+        # a rewound session waiting mid-chain still holds its
+        # model-runner slot; the vendor's admission bound counts only
+        # running requests, so new sessions could out-admit the slot
+        # pool (measured: 'No free indices'). The bound is shrunk
+        # each step by the rewound-waiting count so living sessions
+        # (running + rewound) can never exceed the slots.
+        self._de_base_max_reqs = self.max_num_running_reqs
+        self._de_requeued = set()
         self._de_strict = os.environ.get(
             "QUAIL_SINGLE_TENANT", "1") == "1"
         print(f"[quail-sched] init: strict {self._de_strict}, overlapped "
@@ -148,8 +156,11 @@ class QuailScheduler(Scheduler):
 
     def schedule(self, *args, **kwargs):
         t0 = time.monotonic()
+        self.max_num_running_reqs = max(
+            1, self._de_base_max_reqs - len(self._de_requeued))
         self._de_waves.before()
         out = super().schedule(*args, **kwargs)
+        self._de_requeued.difference_update(out.num_scheduled_tokens)
         self._de_waves.after(out.num_scheduled_tokens.keys())
         if self._de_steps is not None:
             self._de_steps.append((time.monotonic(),
@@ -360,6 +371,7 @@ class QuailScheduler(Scheduler):
         self._de_stats["chain_stops"] = (
             self._de_stats.get("chain_stops", 0) + 1)
         if not st.get("advance"):
+            self._de_requeued.discard(request.request_id)
             del self._de_chain[request.request_id]
             self._de_stats["chain_done"] = (
                 self._de_stats.get("chain_done", 0) + 1)
@@ -381,6 +393,7 @@ class QuailScheduler(Scheduler):
             sampling_params=request.sampling_params)
         self._update_request_as_session(request, update)
         self._enqueue_waiting_request(request)
+        self._de_requeued.add(request.request_id)
         return False
 
     def add_request(self, request):

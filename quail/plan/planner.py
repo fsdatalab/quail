@@ -41,7 +41,8 @@ from dataclasses import dataclass, field
 from quail.configs import DeviceConfig, ModelConfig
 
 from .cost import (ACT_BYTES_PER_HIDDEN, BOOT_POOL_FRACTION,
-                   ENGINE_SEQS_MAX, SATURATION_SLACK, STEP_FIXED_S,
+                   ENGINE_BLOCK_TOKENS, ENGINE_SEQS_MAX,
+                   SATURATION_SLACK, STEP_FIXED_S,
                    STEP_POOL_FRACTION, STEP_TOKENS_MAX, STEP_TOKENS_MIN,
                    predict_makespan, t_in)
 
@@ -360,23 +361,28 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
     except TypeError:
         pass
 
-    # the sequence cap must never bind before the token budget: size
-    # it from the worst case, not a margin. Admission is
-    # budget-limited and the smallest documents pack densest, so the
-    # bound is exact at the longest ascending prefix that fits under
-    # the budget - one tiny outlier no longer inflates the bound the
-    # way dividing by the single smallest document did. Gated filters
-    # hold one live sequence per document. The small constant covers
-    # the one-step overlap between a finishing document's retirement
-    # and the next admission.
-    admitted_worst, running = 0, 0
-    for t in sorted(doc_tokens):
-        running += int(t)
-        if running > budget:
+    # a chain session holds a model-runner slot and its document KV
+    # from first prefill to last verdict, including rewound waits
+    # between stages, so the slot count is living-session capacity:
+    # how many documents fit resident in the pool at once. Sized
+    # against the largest documents so any admitted set fits, with
+    # one step budget of allocation slack reserved. The admission
+    # token budget must not size slots - that was per-stage request
+    # thinking, and it under-slots living sessions (measured: 'No
+    # free indices' at 1,000 sessions against a depth-derived ~420
+    # slots). The small constant covers the one-step overlap between
+    # a finishing session's retirement and the next admission.
+    resident_budget = pool - 2 * step_tokens
+    living, used = 0, 0
+    for t in sorted((int(t) for t in doc_tokens), reverse=True):
+        need = -(-(t + question_tokens) // ENGINE_BLOCK_TOKENS)
+        need *= ENGINE_BLOCK_TOKENS
+        if used + need > resident_budget:
             break
-        admitted_worst += 1
-    admitted_worst = max(1, admitted_worst)
-    engine_max_seqs = min(admitted_worst + 16, ENGINE_SEQS_MAX)
+        used += need
+        living += 1
+    living = max(1, living)
+    engine_max_seqs = min(living + 16, ENGINE_SEQS_MAX)
 
     # the step budget itself was derived above, before admission,
     # which is sized from it; the boot value must still cover the
