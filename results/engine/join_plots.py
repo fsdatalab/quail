@@ -209,11 +209,12 @@ def nway_query_plan():
     node(3.5, 2.5, f"Packed Join\nB × A\n{n_b * n_a:,} pairs", "#2980b9")
     time_label(5.3, 2.5, f"{s1:.1f} s")
 
-    # gate + dedup
+    # filter: drop unmatched, run each survivor once
     edge(3.5, 2.95, 3.5, 3.75)
     node(3.5, 4.2,
-         f"Gate + Dedup\n{survivors}/{n_b} B survive\nkeep KV",
-         "#2c3e50", fontsize=9.5)
+         f"Drop B with 0 matches\nrun each survivor once\n"
+         f"{survivors}/{n_b} B remain, keep KV",
+         "#2c3e50", fontsize=9)
     time_label(5.3, 4.4, f"~0 s")
     time_label(5.3, 4.0,
                f"(expected {planted_expected}/{n_b})", color="#95a5a6")
