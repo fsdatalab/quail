@@ -115,9 +115,29 @@ def _patch(mod):
     cls.get_finished = get_finished
 
 
+def _patch_states(mod):
+    cls = mod.RequestStates
+    orig_add = cls.add_request
+
+    def add_request(self, req_id, *a, **k):
+        if len(self.free_indices) < 8:
+            ids = list(self.req_id_to_index)
+            from collections import Counter
+            pref = Counter(i.split("|")[0][:24] for i in ids)
+            _log(dict(ev="slots_low", t=time.time(), adding=req_id,
+                      free=len(self.free_indices), held=len(ids),
+                      prefixes=dict(pref), sample=ids[:24]))
+        return orig_add(self, req_id, *a, **k)
+
+    cls.add_request = add_request
+
+
+_PATCHES = {_TARGET: _patch, "vllm.v1.worker.gpu.states": _patch_states}
+
+
 class _Hook(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     def find_spec(self, name, path=None, target=None):
-        if name != _TARGET:
+        if name not in _PATCHES:
             return None
         sys.meta_path.remove(self)
         try:
@@ -126,16 +146,17 @@ class _Hook(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             sys.meta_path.insert(0, self)
         if spec is None or spec.loader is None:
             return None
-        self._orig_loader = spec.loader
+        self._loaders = getattr(self, "_loaders", {})
+        self._loaders[name] = spec.loader
         spec.loader = self
         return spec
 
     def create_module(self, spec):
-        return self._orig_loader.create_module(spec)
+        return self._loaders[spec.name].create_module(spec)
 
     def exec_module(self, module):
-        self._orig_loader.exec_module(module)
-        _patch(module)
+        self._loaders[module.__name__].exec_module(module)
+        _PATCHES[module.__name__](module)
 
 
 if _PATH:
