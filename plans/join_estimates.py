@@ -259,6 +259,55 @@ w_mem = int(BUDGET // (f + s + 1))
 print(f"\nengine fallback sizing at a {ENGINE_STEP:,} step budget: "
       f"W_sat = {w_sat}, W_mem = {w_mem}")
 
+# Measured-lengths predictions: once results/engine/join_lengths.json
+# exists (written by the local tokenization dry run), restate the
+# sample predictions from the real prefix and suffix sums instead of
+# the assumptions above. These are the numbers the runs are gated on.
+lengths_path = ROOT / "results/engine/join_lengths.json"
+if lengths_path.exists():
+    L = json.load(open(lengths_path))["biodex"]
+    nR, nT = L["n_reports"], L["n_terms"]
+    Pm = nR * nT
+    suf_sum_all = nR * L["suffix_sum"]          # every term per report
+    pre_sum = L["prefix_sum"]
+    # packed at B*: m = 1 (whole partner list per chunk), so prefixes
+    # are computed once; attention from pair counts
+    fresh_m = suf_sum_all + pre_sum
+    pairs_m = (nR * L["suffix_sum"] * 0 + 0)    # built up below
+    cross = L["suffix_sum"] * pre_sum           # suffix tokens x own prefix,
+    #                                             summed over reports
+    within = nR * L["suffix_sq_sum"] // 2
+    pre_self = L["prefix_sq_sum"] // 2
+    pairs_m = cross + within + pre_self
+    t_meas = fresh_m * (A_PKD - SQ_CAL * A2) + 2 * pairs_m * A2
+    # reference cell: m per report from mean geometry
+    m_ref = math.ceil(L["suffix_sum"] /
+                      (B_MEAS - L["prefix_mean"] - L["suffix_max"]))
+    fresh_ref = suf_sum_all + m_ref * pre_sum
+    t_ref = (fresh_ref * (A_PKD - SQ_CAL * A2)
+             + 2 * (pairs_m + (m_ref - 1) * pre_self) * A2)
+    # grouped stock: linear + paged reads at the measured c~32 price
+    # + boundary blocks + requests
+    rd_m = read_price(round(L["suffix_mean"]))
+    t_stock = (fresh_m * A_ENG
+               + nT * pre_sum * rd_m            # each prefix read per term
+               + Pm * 8 * A_ENG                 # boundary block per pair
+               + Pm * BETA_N
+               + fresh_m / S * STEP_FIXED_S)
+    print(f"\nMEASURED-LENGTH predictions (join_lengths.json: prefix mean "
+          f"{L['prefix_mean']}, {nT} terms, suffix mean "
+          f"{L['suffix_mean']}):")
+    print(f"  packed at B*: {fresh_m / 1e6:.2f}M fresh, "
+          f"{pairs_m / 1e9:.1f}e9 attn pairs -> {t_meas / 60:.1f} min "
+          f"(effective {fresh_m / t_meas:,.0f} tok/s)")
+    print(f"  reference cell at {B_MEAS:,}: m = {m_ref} -> "
+          f"{t_ref / 60:.1f} min")
+    print(f"  grouped stock: reads {nT * pre_sum * rd_m:.0f} s of "
+          f"{t_stock:.0f} -> {t_stock / 60:.1f} min")
+    print(f"  x{8103 / nR:.0f} report-side extrapolation: packed "
+          f"{t_meas * 8103 / nR / 3600:.1f} h, stock "
+          f"{t_stock * 8103 / nR / 3600:.1f} h")
+
 # The prototype sample: 100 reports, ALL terms - sampling only the
 # anchor side keeps the per-report chunk geometry (m stays 9), so the
 # full-scale walls are the sample walls times NL/100.

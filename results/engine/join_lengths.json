@@ -1,0 +1,33 @@
+{
+  "provenance": "local tokenization of the streamed BioDEX sample and the planted 3-way corpus; seeds in modal_join_forward.py",
+  "seed": 20260817,
+  "biodex": {
+    "n_reports": 100,
+    "n_terms": 2560,
+    "prefix_sum": 297725,
+    "prefix_sq_sum": 924851133,
+    "prefix_mean": 2977.2,
+    "prefix_max": 3529,
+    "suffix_sum": 81197,
+    "suffix_sq_sum": 2585605,
+    "suffix_mean": 31.72,
+    "suffix_max": 43,
+    "preamble_tokens": 29,
+    "max_report_tokens": 3500,
+    "truncated_reports": 45,
+    "note": "vocabulary is pool-limited to 2,560 distinct terms against the paper's 3,718; 45 of 100 reports hit the 3,500-token truncation"
+  },
+  "nway": {
+    "n_a": 100,
+    "n_b": 100,
+    "n_c": 100,
+    "b_prefix_sum": 368359,
+    "b_prefix_max": 5417,
+    "b_prefix_mean": 3683.6,
+    "a_suffix_sum": 31044,
+    "a_suffix_mean": 310.4,
+    "c_suffix_sum": 35527,
+    "c_suffix_mean": 355.3,
+    "planted_survivors": 80
+  }
+}

@@ -244,31 +244,42 @@ comparison. The full-scale walls in Section 2 stay as extrapolation
 targets (x81 on this sample), not as runs. Predictions stated
 before each run; every Modal run teed to a file.
 
-1. **Data.** Fetch BioDEX, sample **100 reports and keep all 3,718
-   terms**, write the join prompt, tokenize. Sample only the anchor
-   side, so each report keeps its full 3,718-partner stream — real
-   per-prefix group sizes, real chunk composition (about two
-   reports per brim-packed chunk, same as full scale) — and the
-   x81 extrapolation stays clean. Tokenizing replaces every
-   assumed length; reports have heavy tails, so pick and record a
-   truncation policy.
-2. **Packed join — the prototype** (371,800 pairs, predicted
-   **3.3 min** at the derived ~110k tok/s effective rate). At the
-   derived B* a report's whole partner list fits one chunk (m = 1
-   at sample and full scale alike), so nothing persists;
-   per-segment attention plus the suffix-to-prefix call merged by
-   softmax state; suffix positions identical to standalone
-   requests. One reference cell at 25,305, the largest measured
-   point, to tell a rate change at large B apart from a slow
-   kernel. Existing code carries most of it — the packed loop, the
-   three kernels, the chunk packer, and the YES/NO readout from
-   `modal_single_filter_forward.py`; the new work is that merge
-   call plus ~100 lines of pair-list Python.
-3. **One baseline: grouped stock vLLM, admission on the client**
-   (the filters' semaphore pattern), booted at the same B*, same
-   sample, predicted **5.3 min**. It doubles as the answer-parity
-   reference for the packed arm. Naive stock is cut: its 98.9 h is
-   arithmetic, not an experiment worth buying.
+1. **Data — done, run locally.** The streamed BioDEX sample is
+   tokenized and its statistics committed
+   (`results/engine/join_lengths.json`): 100 reports at **mean
+   2,977 prefix tokens** (29-token preamble included; truncation at
+   3,500, which 45 of 100 reports hit — recorded policy), and a
+   **pool-limited vocabulary of 2,560 terms** against the paper's
+   3,718, suffixes at **31.7 tokens** mean. Sample pair count:
+   256,000; full-scale equivalent 8,103 x 2,560 = 20.7M. Every
+   prediction below is restated from these measured lengths by
+   `plans/join_estimates.py`; the Section 2 table keeps the
+   assumed-length paper-scale illustration.
+2. **Packed join — the prototype** (256,000 pairs, predicted
+   **1.5 min** at ~91,500 tok/s effective). The effective rate fell
+   from the assumed-length ~110k because real prefixes are 3x
+   longer and suffixes half: cross-attention is now ~27% of the
+   wall. At the derived B* a report's whole partner list fits one
+   chunk (m = 1), so nothing persists; per-segment attention plus
+   the suffix-to-prefix call merged by softmax state; suffix
+   positions identical to standalone requests. One reference cell
+   at 25,305 (m = 4 at measured lengths, predicted **1.7 min**) to
+   tell a rate change at large B apart from a slow kernel. The
+   merge call plus the pair-list Python are the new code; the
+   packed loop, the three kernels, and the YES/NO readout carry
+   over from `modal_single_filter_forward.py`.
+3. **One baseline: grouped stock vLLM** — synchronous, one
+   generate() over the pair list in report order (the join has no
+   gating, so the filter arm's async client is unnecessary),
+   admission via max_num_seqs derived from the committed token
+   budget, bf16 KV (the fairest engine setting), zero decode.
+   Predicted **3.3 min**, of which **77 s is paged cached-reads**
+   of the 3k-token prefixes — the measured shapes make the read
+   term 39% of the stock wall, so the packed-over-stock gap widens
+   to ~2.2x from the assumed-length 1.6x. Doubles as the
+   cross-implementation answer reference. Naive stock stays
+   arithmetic-only. Report-side extrapolation x81: packed ~2.1 h,
+   stock ~4.5 h at full scale.
 4. **n-way, vLLM-free.** A planted 3-relation chain on the
    existing IMDB reviews, 100 documents per relation: every B
    document carries two planted keys (`[KEYS] X=.. Y=..`), A
@@ -289,12 +300,31 @@ before each run; every Modal run teed to a file.
    survivors x 100 exactly, proving the gate and dedup cut the
    work they claim.
 
-Gates on the packed arm, stated now: answers identical to the
-stock arm's, wall within 10% of prediction. Fail → the engine
-chain path is the fallback (exists today) and C3 calibration
-(long-suffix cached reads) joins the critical path to price it.
-If any measured wall misses its prediction by more than 10%, run
-the C3 family as the diagnostic before trusting the model further.
+Gates on the packed arm, stated now: zero disagreements between
+the shared-prefix chunk and the same pairs run one-per-chunk (and
+between kept-KV replay and in-chunk); wall within 10% of the
+measured-length prediction. Stock agreement is reported as a
+statistic, not gated — different kernels round differently, as
+every packed-vs-engine cell in this repo has shown. Fail → the
+engine chain path is the fallback (exists today) and C3
+calibration joins the critical path. If any measured wall misses
+its prediction by more than 10%, run the C3 family as the
+diagnostic before trusting the model further.
+
+**Runbook.** This session's sandbox cannot launch the runs: the
+Modal client is gRPC over HTTP/2, which the egress proxy does not
+carry (reported, not worked around — all CPU-side work ran here).
+From a machine with Modal access, on this branch:
+
+    python -m pytest tests/test_joinlogic.py -q
+    modal run experiments/modal_join_forward.py::run_probe
+    modal run experiments/modal_join_forward.py::run_join2way
+    modal run experiments/modal_join_forward.py::run_nway3
+
+Each entrypoint tees its JSON into `results/engine/` (and the
+results volume). The probe runs first and is the go/no-go; the
+other two are ~10 and ~3 minutes of GPU. Commit the three JSONs
+and the measured-versus-predicted table gets filled in from them.
 
 ---
 

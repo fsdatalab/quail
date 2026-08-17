@@ -566,47 +566,31 @@ def biodex_sample(tokenizer, n_reports=100, vocab_cap=3718,
     import numpy as np
     from datasets import load_dataset
 
-    last_err = None
-    ds = None
-    for name, split in (("BioDEX/BioDEX-Reactions", "train"),
-                        ("BioDEX/BioDEX-ICSR", "train")):
-        try:
-            ds = load_dataset(name, split=split)
-            break
-        except Exception as e:            # noqa: BLE001 - report and move on
-            last_err = e
-    if ds is None:
-        raise RuntimeError(f"BioDEX load failed: {last_err}")
-
-    cols = set(ds.column_names)
-    text_field = next(c for c in ("fulltext_processed", "fulltext",
-                                  "abstract", "text") if c in cols)
+    # Streamed: the pool is the first 2,000 usable rows in dataset
+    # order (deterministic for a pinned dataset), so the container
+    # never downloads the full corpus. The 100 reports are a seeded
+    # choice from that pool.
+    ds = load_dataset("BioDEX/BioDEX-Reactions", split="train",
+                      streaming=True)
 
     def reactions_of(row):
-        if "reactions" in cols:
-            return [t.strip() for t in str(row["reactions"]).split(",")
-                    if t.strip()]
-        target = str(row.get("target", ""))
-        marker = "reactions:"
-        i = target.find(marker)
-        if i < 0:
-            return []
-        tail = target[i + len(marker):].split("\n")[0]
-        return [t.strip() for t in tail.split(",") if t.strip()]
+        return [t.strip() for t in str(row.get("reactions", "")).split(",")
+                if t.strip()]
 
-    rng = np.random.default_rng(seed)
-    pool_idx = rng.choice(len(ds), size=min(2000, len(ds)), replace=False)
     freq = {}
     rows = []
-    for i in pool_idx:
-        row = ds[int(i)]
+    for row in ds:
         terms = reactions_of(row)
-        text = str(row[text_field])
+        text = str(row.get("fulltext_processed") or row.get("abstract"))
         if not terms or len(text) < 200:
             continue
         rows.append((text, terms))
         for t in terms:
             freq[t] = freq.get(t, 0) + 1
+        if len(rows) >= 2000:
+            break
+    rng = np.random.default_rng(seed)
+    rng.shuffle(rows)
     vocab = [t for t, _ in sorted(freq.items(),
                                   key=lambda kv: (-kv[1], kv[0]))]
     vocab = vocab[:vocab_cap]
