@@ -83,6 +83,12 @@ class QuailScheduler(Scheduler):
         # (running + rewound) can never exceed the slots.
         self._de_base_max_reqs = self.max_num_running_reqs
         self._de_requeued = set()
+        # slot accounting trace (env QUAIL_SLOTSTATS): one line per
+        # 100 steps naming every population that can hold or shadow a
+        # model-runner slot, for localizing 'No free indices'
+        self._de_slotstats = os.environ.get(
+            "QUAIL_SLOTSTATS", "0") == "1"
+        self._de_sched_i = 0
         self._de_strict = os.environ.get(
             "QUAIL_SINGLE_TENANT", "1") == "1"
         print(f"[quail-sched] init: strict {self._de_strict}, overlapped "
@@ -158,6 +164,18 @@ class QuailScheduler(Scheduler):
         t0 = time.monotonic()
         self.max_num_running_reqs = max(
             1, self._de_base_max_reqs - len(self._de_requeued))
+        self._de_sched_i += 1
+        if self._de_slotstats and self._de_sched_i % 100 == 0:
+            print(f"[quail-slots] step {self._de_sched_i}: "
+                  f"running {len(self.running)} "
+                  f"requeued {len(self._de_requeued)} "
+                  f"bound {self.max_num_running_reqs} "
+                  f"base {self._de_base_max_reqs} "
+                  f"waiting {len(self.waiting)} "
+                  f"skipped {len(self.skipped_waiting)} "
+                  f"stream {self.num_waiting_for_streaming_input} "
+                  f"finished_pending {len(self.finished_req_ids)}",
+                  flush=True)
         self._de_waves.before()
         out = super().schedule(*args, **kwargs)
         self._de_requeued.difference_update(out.num_scheduled_tokens)

@@ -248,6 +248,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         # mode must be off for this harness
         os.environ["QUAIL_WAVES"] = "1"
         os.environ["QUAIL_SINGLE_TENANT"] = "0"
+    if client == "chain":
+        os.environ["QUAIL_SLOTSTATS"] = "1"
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
