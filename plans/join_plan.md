@@ -260,7 +260,59 @@ the C3 family as the diagnostic before trusting the model further.
 
 ---
 
-## 4. Risks
+## 4. Implementation sketch
+
+Four pieces, in build order. No engine anywhere in the packed path
+— weights come through vLLM's loader exactly as the packed filter's
+experiment 3 does, nothing else of vLLM is used.
+
+1. **`quail/joinlogic.py` + tests** — pure functions, no GPU, in
+   the style of `chainlogic.py`: `orient()` (compare mean tokenized
+   lengths, return anchor side); `pack_chunks()` (given an anchor's
+   token count and its partner token lists, emit chunks under the
+   25,305 budget and the keep-vs-recompute decision by the size
+   rule); `gate_and_dedup()` (answers in, surviving anchors and the
+   next stage's pair list out); `assemble()` (recorded answers in,
+   tuples out). Unit-tested against a brute-force reference.
+2. **The merge call** — the one new GPU piece, in the packed loop's
+   per-layer body. Chunk rows are `[prefix | suffix_1 .. suffix_k]`.
+   Call A: the existing varlen self-attention over the segment
+   boundaries (prefix over itself, each suffix over itself). Call
+   B: non-causal cross-attention, queries = all suffix rows, keys
+   and values = the prefix rows of this chunk's K/V — or a kept
+   tensor from an earlier chunk. Combine A and B by their softmax
+   states (log-sum-exp merge; one small elementwise Triton kernel,
+   or FlashInfer's merge op). Positions: prefix rows 0..f-1, every
+   suffix restarts at f — the rotate kernel already takes per-token
+   positions. A kept-prefix chunk simply has no prefix segment:
+   call A covers suffixes only, call B reads the stored tensors.
+   Keeping a prefix = stashing its 36 per-layer K/V slices
+   (72 KiB/token) and freeing them when its stages finish; stage 2
+   against the same anchor is the same call B with a new suffix
+   stream — that is the rewind, as tensors.
+3. **Data prep, no GPU** — BioDEX: download, sample 100 reports,
+   keep all terms, tokenize, write the prompt. Planted: three
+   100-document collections from the IMDB reviews with key lines,
+   B's documents concatenated to ~4k tokens.
+4. **The runner + the baseline arm** — a `stage()` function (pack,
+   forward, read YES/NO logits at suffix ends, return the answer
+   matrix) and an `nway()` driver that alternates `stage()` with
+   `gate_and_dedup()`. The baseline arm reuses the filter stock
+   client: same container, stock vLLM 0.26 boot, prefix caching on,
+   one request per pair `[preamble | report | term | question]`
+   with YES/NO-constrained single-token output, submitted grouped
+   by report through the client-side token-budget semaphore the
+   filter experiments already use. Its answers are the parity
+   reference; its wall is the comparison. At sample scale the pool
+   never fills (100 prefixes = 104k tokens), so the baseline runs
+   eviction-free — its x81 extrapolation is best-case for stock,
+   and is reported as such.
+
+Build order is also the risk order: item 2's parity microprobe
+(one chunk against the same pairs run one-per-chunk) gates
+everything downstream.
+
+## 5. Risks
 
 - Report lengths are assumed and heavy-tailed; truncation moves
   cost and accuracy. Step 1 exists to kill this risk first.
