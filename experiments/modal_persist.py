@@ -115,39 +115,11 @@ def _patch(mod):
     cls.get_finished = get_finished
 
 
-def _patch_runner(mod):
-    cls = getattr(mod, "GPUModelRunner", None)
-    if cls is None:
-        print("[quail-slotdump] no GPUModelRunner in "
-              + ",".join(n for n in dir(mod) if "unner" in n), flush=True)
-        return
-    orig_add = cls.add_requests
-
-    def add_requests(self, scheduler_output):
-        st = self.req_states
-        mod = sys.modules[cls.__module__]
-        if getattr(mod, "_quail_req_states", None) is not st:
-            # publish the live pool for the scheduler's slot gate
-            # (same process under the uniproc executor)
-            mod._quail_req_states = st
-        need = len(scheduler_output.scheduled_new_reqs)
-        if need and len(st.free_indices) < need + 8:
-            ids = list(st.req_id_to_index)
-            from collections import Counter
-            pref = Counter(i.split("|")[0][:24] for i in ids)
-            print("[quail-slotdump] " + json.dumps(dict(
-                need=need, free=len(st.free_indices),
-                held=len(ids), prefixes=dict(pref),
-                adding=[r.req_id for r in
-                        scheduler_output.scheduled_new_reqs][:12],
-                sample=ids[:24])), flush=True)
-        return orig_add(self, scheduler_output)
-
-    cls.add_requests = add_requests
-
-
-_PATCHES = {_TARGET: _patch,
-            "vllm.v1.worker.gpu.model_runner": _patch_runner}
+# slot publication and the low-slot dump moved into the engine
+# extension (quail/engineext/slots.py): the scheduler installs the
+# runner wrapper itself, so the experiment no longer patches the
+# runner
+_PATCHES = {_TARGET: _patch}
 
 
 class _Hook(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -286,6 +258,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         os.environ["QUAIL_SINGLE_TENANT"] = "0"
     if client == "chain":
         os.environ["QUAIL_SLOTSTATS"] = "1"
+        os.environ["QUAIL_SLOTDUMP"] = "1"
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
@@ -374,18 +347,22 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
                                           if client == "chain"
                                           else 0.92),
                   enable_prefix_caching=True, disable_log_stats=True)
-        if waves or client == "chain":
+        if client == "chain":
+            # overlapped scheduling (engine threads, no asyncio; the
+            # client stays synchronous): the scheduler plans the next
+            # batch while the GPU runs the current one. The slot race
+            # that forced serial scheduling here is closed exactly by
+            # the runner-published snapshot (quail/engineext/slots.py)
+            # instead of by margins over a sampled count. One-token
+            # verdicts are never speculatively scheduled for a second
+            # pass: the vendor skips requests whose placeholders reach
+            # max_tokens (scheduler.py, the at-max-tokens guard).
+            kw["async_scheduling"] = True
+            kw["scheduler_cls"] = ("quail.engineext.scheduler."
+                                   "QuailAsyncScheduler")
+        elif waves:
             kw["scheduler_cls"] = ("quail.engineext.scheduler."
                                    "QuailScheduler")
-        if client == "chain":
-            # serial scheduling: with the batch queue, the runner's
-            # slot adds and frees land on a concurrent thread, and no
-            # scheduler-side arithmetic over a sampled free count
-            # survived six rounds of hardening (measured bursts of
-            # 1,236, 595, and 901 admissions against stale samples).
-            # Serial makes the sample exact and the gate airtight,
-            # and matches the project rule of no vllm async paths.
-            kw["async_scheduling"] = False
         if store:
             # "quail" swaps in the coalescing worker (one transfer per
             # step, not per request); "stock" is the measured baseline

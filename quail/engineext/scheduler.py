@@ -60,10 +60,11 @@ import os
 from collections import deque
 import time
 
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus, StreamingUpdate
 
-from . import chainlogic
+from . import chainlogic, slots
 from .chainlogic import parse_qid, parse_tag  # noqa: F401  module API
 
 
@@ -91,15 +92,18 @@ class QuailScheduler(Scheduler):
         self._de_base_max_reqs = self.max_num_running_reqs
         self._de_requeued = set()
         self._de_held = deque()
-        # completed sessions free their runner slots one to two
-        # outputs later (the batch queue holds two in flight), so
-        # admission must treat those frees as not yet available: the
-        # last two outputs' finished counts are subtracted from the
-        # slack. Measured without it: a restore step admitted 594
-        # fresh documents against 305 free slots while 289 frees were
-        # still in flight.
-        self._de_freed_lag = deque(maxlen=2)
-        self._de_admits_ring = deque(maxlen=2)
+        # slots taken by batches this scheduler has emitted, counted
+        # by the same membership rule the runner-side publisher uses
+        # (slots.py); emitted minus the snapshot's applied count is
+        # exactly the consumption still in flight
+        self._de_emitted_new = 0
+        slots.BOARD.reset()
+        try:
+            slots.install()
+        except Exception as e:
+            print(f"[quail-sched] slot publication unavailable "
+                  f"({type(e).__name__}: {e}); admission gate runs "
+                  f"on the scheduler-side estimate", flush=True)
         self._de_truth_warned = False
         # slot accounting trace (env QUAIL_SLOTSTATS): one line per
         # 100 steps naming every population that can hold or shadow a
@@ -187,7 +191,6 @@ class QuailScheduler(Scheduler):
         Held documents wait aside in arrival order and are released
         as sessions finish and free slots."""
         base = self._de_base_max_reqs
-        lag = len(self.finished_req_ids) + sum(self._de_freed_lag)
         # a wave-claimed document answers not-ready and waits in the
         # vendor's skipped queue, from which it is admitted without
         # passing this gate again; it holds no slot yet and will
@@ -198,43 +201,33 @@ class QuailScheduler(Scheduler):
             1 for r in self.skipped_waiting
             if r.num_computed_tokens == 0
             and r.request_id not in self._de_requeued)
-        slack = (base - len(self.running) - len(self._de_requeued)
-                 - pending_gated - lag)
-        # the estimate cannot see frees parked on outputs that never
-        # executed (a query boundary leaves the last outputs' frees
-        # unconsumed until the next query steps), so when the runner
-        # shares this process its pool is read directly: free slots
-        # minus the previous step's still-in-flight admissions is
-        # the truth, and the gate takes the smaller of the two.
-        # the batch queue holds two outputs in flight, so up to two
-        # steps of admissions can land after the free count was
-        # sampled: both are subtracted. A fixed release cap instead
-        # of this subtraction kept slots safe but throttled restores
-        # to quarter-full steps (10k walls 32-40 s on 7.4 s of
-        # copying); the two-deep subtraction bounds the transient
-        # exactly and lets steady state run at the completion rate.
-        try:
-            from vllm.v1.worker.gpu import model_runner as _mr
-            st = getattr(_mr, "_quail_req_states", None)
-            if st is None:
-                if not self._de_truth_warned:
-                    self._de_truth_warned = True
-                    print("[quail-sched] slot gate: runner pool not "
-                          "published; estimate only", flush=True)
-            else:
-                truth = (len(st.free_indices)
-                         - sum(self._de_admits_ring) - 8)
-                if self._de_slotstats and self._de_sched_i % 100 == 0:
-                    print(f"[quail-gate] est {slack} truth {truth} "
-                          f"free {len(st.free_indices)} "
-                          f"ring {sum(self._de_admits_ring)}",
-                          flush=True)
-                slack = min(slack, truth)
-        except Exception as e:
+        snap = slots.BOARD.snap
+        if snap is None:
+            # before the first batch applies (or if publication ever
+            # breaks): scheduler-side estimate. running is updated at
+            # schedule time, so the boot window this covers is exact;
+            # under overlapped scheduling after finishes exist it can
+            # overcount slack by frees not yet applied, which is why
+            # the snapshot replaces it the moment one exists.
             if not self._de_truth_warned:
                 self._de_truth_warned = True
-                print(f"[quail-sched] slot gate truth read failed: "
-                      f"{type(e).__name__}: {e}", flush=True)
+                print("[quail-sched] slot gate: no runner snapshot; "
+                      "estimate only", flush=True)
+            slack = (base - len(self.running) - len(self._de_requeued)
+                     - pending_gated - len(self.finished_req_ids))
+        else:
+            # exact: free slots after the last applied batch, minus
+            # slots the batches still in flight will take, minus the
+            # claimed documents that will arrive outside this gate.
+            # Frees in flight are not credited - that direction only
+            # under-admits for one step. See slots.py for why the
+            # two counters cancel exactly.
+            free, applied = snap
+            slack = free - (self._de_emitted_new - applied) - pending_gated
+            if self._de_slotstats and self._de_sched_i % 100 == 0:
+                print(f"[quail-gate] free {free} in_flight "
+                      f"{self._de_emitted_new - applied} pending "
+                      f"{pending_gated} slack {slack}", flush=True)
         keep = []
         while self.waiting:
             r = self.waiting.pop_request()
@@ -254,7 +247,6 @@ class QuailScheduler(Scheduler):
 
     def schedule(self, *args, **kwargs):
         t0 = time.monotonic()
-        riding_now = len(self.finished_req_ids)
         self._de_gate_fresh()
         self._de_sched_i += 1
         if self._de_slotstats and (
@@ -273,8 +265,13 @@ class QuailScheduler(Scheduler):
                   flush=True)
         self._de_waves.before()
         out = super().schedule(*args, **kwargs)
-        self._de_freed_lag.append(riding_now)
-        self._de_admits_ring.append(len(out.scheduled_new_reqs))
+        # count before the rewound set is cleared: a rewound stage in
+        # scheduled_new_reqs is a remove-then-add in the runner, net
+        # zero slots, and the membership rule must match the
+        # publisher's (slots.py)
+        self._de_emitted_new += sum(
+            1 for r in out.scheduled_new_reqs
+            if r.req_id not in self._de_requeued)
         self._de_requeued.difference_update(out.num_scheduled_tokens)
         self._de_waves.after(out.num_scheduled_tokens.keys())
         if self._de_steps is not None:
@@ -631,3 +628,18 @@ class QuailScheduler(Scheduler):
         super()._free_request_blocks(request)
         # the freed request's tag is never read again
         self._de_rid_tag.pop(request.request_id, None)
+
+
+class QuailAsyncScheduler(QuailScheduler, AsyncScheduler):
+    """QuailScheduler on the overlapped-scheduling base.
+
+    The MRO does all the work: every super() call in QuailScheduler
+    resolves to AsyncScheduler, so placeholder accounting, the
+    at-max-tokens skip (the vendor's guarantee that a one-token
+    verdict is never speculatively scheduled for a second pass), and
+    the one-step-late output handling all run under the quail
+    overrides. Pass this class as scheduler_cls together with
+    async_scheduling=True; the plain QuailScheduler stays the serial
+    configuration. The admission gate needs no mode switch - the
+    slot snapshot (slots.py) is exact under both."""
+
