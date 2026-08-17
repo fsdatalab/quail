@@ -202,3 +202,24 @@ w_sat = math.ceil(2 * S / s)
 w_mem = int(BUDGET // (f + s + 1))
 print(f"\nengine fallback sizing: W_sat = {w_sat}, W_mem = {w_mem} "
       f"(memory-bound below saturation -> drop step budget toward 16k)")
+
+# The prototype sample: 100 reports, ALL terms - sampling only the
+# anchor side keeps the per-report chunk geometry (m stays 9), so the
+# full-scale walls are the sample walls times NL/100.
+NLS = 100
+PS = NLS * NR
+fresh_cs = PS * s + NLS * m * f
+pairs_cs = (PS * (s * f + s * (s + 1) // 2)
+            + NLS * m * f * (f + 1) // 2)
+c_s = fresh_cs * (A_PKD - SQ_CAL * A2) + 2 * pairs_cs * A2
+fresh_as = NLS * f + PS * s
+a2_s = (fresh_as * A_ENG
+        + attn_excess_s(NLS * f, f) + attn_excess_s(PS * s, s)
+        + PS * f * rd + PS * BETA_N
+        + PS * 8 * (A_ENG + STEP_FIXED_S / S)
+        + fresh_as / S * STEP_FIXED_S)
+print(f"\nprototype sample ({NLS} reports x all {NR} terms = {PS:,} pairs; "
+      f"extrapolation x{NL / NLS:.0f}):")
+print(f"  packed: {fresh_cs / 1e6:.1f}M fresh -> {c_s / 60:.1f} min")
+print(f"  grouped stock, client-side admission: {fresh_as / 1e6:.1f}M fresh "
+      f"+ reads/requests/boundary -> {a2_s / 60:.1f} min")

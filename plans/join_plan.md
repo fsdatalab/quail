@@ -10,12 +10,15 @@ Decisions taken:
 - **One workload: BioDEX.** Everything else from the FDJ paper
   (Products, Citations, Movies, Police, Categorize) stays out unless
   BioDEX leaves a question open.
-- **The algorithm is solved for general n.** The experiment
-  exercises n = 2.
+- **The algorithm is solved for general n.** A sampled prototype
+  exercises n = 2 on BioDEX and n = 3 planted.
 - **A 2-way join runs as a packed forward pass.** No engine, no KV
-  pool.
+  pool, no batch-size choice — the only fixed size is the
+  25,305-token chunk from the sweep.
 - **n ≥ 3 checks survivors between stages and rewinds**: continue
-  from a kept anchor prefix and stream the next relation against it.
+  from a kept anchor prefix and stream the next relation against
+  it. No vLLM needed — staging is Python bookkeeping around the
+  same forward passes; vLLM appears only in the one baseline arm.
 - **Whether anchor KV is kept is a size decision**, computed by the
   planner per stage — not a design constant.
 
@@ -169,7 +172,7 @@ from a Python loop.
 
 | plan | fresh tokens | wall |
 |---|---|---|
-| A1: stock vLLM, request per pair, arbitrary order | 33.08B | **99.9 h**; x1.87 thrash = 186 h — priced by 5% sample, never run full |
+| A1: stock vLLM, request per pair, arbitrary order | 33.08B | **99.9 h**; x1.87 thrash = 186 h — arithmetic only, never run |
 | A2: stock vLLM, pairs grouped by report, admission matched | 1.756B + boundary | **7.2 h** |
 | B: engine chain mode (rewind) — fallback path | 1.756B | **6.1 h** |
 | C: packed forward pass, recompute | 1.823B | **4.6 h** |
@@ -182,8 +185,9 @@ Where each number comes from:
   cost, + 0.42 h request overhead. The x1.87 is the filter run of
   default admission at 3.4x pool pressure — README-recorded only;
   those cells were never committed to results/, so it is the one
-  input without an artifact, and the 5% sample remeasures it. This
-  workload's prefix working set is 9.0x the pool.
+  input without an artifact, and the prototype does not remeasure
+  it (naive stock is not run). This workload's prefix working set
+  is 9.0x the pool.
 - **B** = 8,103 x 1,040 + 30,126,954 x 58 = 1.756B fresh → 5.07 h,
   + 1.09 h of cached reads: P x f x 125 ns, interpolated to our
   suffix width 58 from the c2 cells of `calibrate_all.json` — 101
@@ -212,45 +216,47 @@ resident chains at 682 against the 873 that two step budgets of
 
 ---
 
-## 3. The runs
+## 3. The prototype
 
-Three steps, each with its prediction stated before it runs; every
-Modal run teed to a file.
+Sampled and small — about ten minutes of GPU for the 2-way
+comparison. The full-scale walls in Section 2 stay as extrapolation
+targets (x81 on this sample), not as runs. Predictions stated
+before each run; every Modal run teed to a file.
 
-1. **Data and prompts.** Fetch BioDEX, sample per the paper, write
-   the join prompt, tokenize. Replaces every assumed length; restate
-   the predictions with measured f, s, and length tails (reports
-   have heavy tails — pick and record a truncation policy).
-2. **Packed-join probe** (~one container-hour). One chunk shape:
-   prefix + k suffixes, per-segment attention plus a
-   prefix-attention call merged by softmax state; suffix positions
-   identical to standalone requests. Gates, stated now: (a) answers
-   identical to the same pairs run as per-pair engine requests;
-   (b) chunk throughput within 10% of the derived effective rate,
-   ~110k tok/s — the 121,045 filter rate minus the priced
-   cross-attention. Fail (a) or (b) → the experiment runs on engine chain
-   mode instead, which exists today, and C3 calibration (long-suffix
-   cached reads) joins the critical path to price it.
-3. **The experiment.** In order, one container: packed on a 5%
-   pair sample as the confirming cell (predicted 14 min) — proceed
-   only if within 10% of prediction; packed full (predicted 4.6 h);
-   grouped-stock full (predicted 7.2 h); arbitrary-order stock on a
-   5% pair sample, extrapolated (predicted 99.9 h full before
-   thrash, 186 h at the README-recorded 1.87x). Sample
-   pairs, not reports, so the baseline's prefix working set keeps
-   its real 8.9x pool pressure and the thrash multiplier is
-   honestly measured. Report all four with predictions alongside.
+1. **Data.** Fetch BioDEX, sample **100 reports and keep all 3,718
+   terms**, write the join prompt, tokenize. Sample only the anchor
+   side: with all terms kept, each report still spans 9 chunks, so
+   prefix persistence is actually exercised — a 100 x 100 sample
+   would fit each report's partners in one chunk and test nothing.
+   Tokenizing replaces every assumed length; reports have heavy
+   tails, so pick and record a truncation policy.
+2. **Packed join — the prototype** (371,800 pairs, predicted
+   **3.4 min** at the derived ~110k tok/s effective rate). Chunk =
+   prefix + ~418 suffixes; per-segment attention plus the
+   suffix-to-prefix call merged by softmax state; suffix positions
+   identical to standalone requests. Existing code carries most of
+   it — the packed loop, the three kernels, the chunk packer, and
+   the YES/NO readout from `modal_single_filter_forward.py`; the
+   new work is that merge call plus ~100 lines of pair-list Python.
+3. **One baseline: grouped stock vLLM, admission on the client**
+   (the filters' semaphore pattern), same sample, predicted
+   **5.4 min**. It doubles as the answer-parity reference for the
+   packed arm. Naive stock is cut: its 99.9 h is arithmetic, not an
+   experiment worth buying.
+4. **n-way, vLLM-free.** A planted 3-relation chain on the
+   existing IMDB reviews (100 documents per relation, two group
+   keys), run entirely as packed forward passes plus Python
+   staging: record stage-1 answers, gate and dedup survivors,
+   continue against relation 3. Plant one relation long (~4k
+   tokens) so the keep-KV branch of the size rule runs, not just
+   recompute. Predicted: about a minute of GPU per stage.
 
-If the estimator misses any measured wall by more than 10%, run the
-C3 calibration family as the diagnostic before trusting the model
-further — joins are the workload that finally makes those cells
-identifiable.
-
-**n ≥ 3 check, later.** Not scheduled until the 2-way lands: a
-planted 3-way on the existing IMDB reviews (two group keys per
-document, chain graph), small, to validate the survivor gate, the
-dedup bookkeeping, and the rewind path end to end. Execution
-measurement only, like the flag filters.
+Gates on the packed arm, stated now: answers identical to the
+stock arm's, wall within 10% of prediction. Fail → the engine
+chain path is the fallback (exists today) and C3 calibration
+(long-suffix cached reads) joins the critical path to price it.
+If any measured wall misses its prediction by more than 10%, run
+the C3 family as the diagnostic before trusting the model further.
 
 ---
 
@@ -263,8 +269,13 @@ measurement only, like the flag filters.
   fitted attention constant (2 x a2 per pair, 11% of C's wall) and
   the probe's rate gate checks the resulting ~110k effective rate;
   a fused or badly-shaped kernel could still miss it.
-- The arbitrary-order stock number is an extrapolation from a 5%
-  sample by design; say so wherever it is reported.
+- Naive stock is never run; its 99.9 h is arithmetic from the same
+  constants, and the 1.87x thrash multiplier stays README-sourced
+  and unmeasured. Say both wherever the number is quoted.
+- The prototype's sample walls extrapolate x81 to full BioDEX only
+  if report lengths are stationary across the sample; tokenizing
+  the full report list (cheap, no GPU) checks that before any
+  extrapolated claim.
 - Our answers come from Qwen3 4B, the paper's from GPT-4.1. This
   experiment claims execution speed at matched answers across
   plans (the probe's parity gate), not predicate accuracy against
