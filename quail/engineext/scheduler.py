@@ -57,6 +57,7 @@ decisions to vLLM state.
 """
 
 import os
+from collections import deque
 import time
 
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -76,13 +77,20 @@ class QuailScheduler(Scheduler):
         self._de_queries = {}       # query id -> dict(qs, qc, yes, no)
         self._de_chain = {}         # request id -> dict(stage, d, qid)
         # a rewound session waiting mid-chain still holds its
-        # model-runner slot; the vendor's admission bound counts only
-        # running requests, so new sessions could out-admit the slot
-        # pool (measured: 'No free indices'). The bound is shrunk
-        # each step by the rewound-waiting count so living sessions
-        # (running + rewound) can never exceed the slots.
+        # model-runner slot, so living sessions (running + rewound)
+        # must never exceed the slots. Two rules enforce it. Rewound
+        # sessions are prepended to the waiting queue: their KV is
+        # resident and finishing them frees pool and slots, so they
+        # must never starve behind fresh documents the pool cannot
+        # even admit (measured: running drained to zero with every
+        # slot parked rewound, then one floored admission crashed the
+        # runner). And fresh documents are held out of the queue
+        # until there is slot slack for them; shrinking the vendor's
+        # running bound instead would throttle the rewound sessions
+        # themselves, which need no new slot.
         self._de_base_max_reqs = self.max_num_running_reqs
         self._de_requeued = set()
+        self._de_held = deque()
         # slot accounting trace (env QUAIL_SLOTSTATS): one line per
         # 100 steps naming every population that can hold or shadow a
         # model-runner slot, for localizing 'No free indices'
@@ -160,10 +168,36 @@ class QuailScheduler(Scheduler):
 
         pool._maybe_evict_cached_block = guarded
 
+    def _de_gate_fresh(self):
+        """Slot gate: fresh documents may sit in the waiting queue
+        only while there is model-runner slot slack for them. A
+        request with computed tokens or a rewound continuation
+        already holds its slot and passes untouched; a preempted
+        request lost its slot at preemption and re-enters as fresh.
+        Held documents wait aside in arrival order and are released
+        as sessions finish and free slots."""
+        base = self._de_base_max_reqs
+        slack = base - len(self.running) - len(self._de_requeued)
+        keep = []
+        while self.waiting:
+            r = self.waiting.pop_request()
+            fresh = (r.num_computed_tokens == 0
+                     and r.request_id not in self._de_requeued)
+            if fresh and slack <= 0:
+                self._de_held.append(r)
+            else:
+                keep.append(r)
+                if fresh:
+                    slack -= 1
+        for r in keep:
+            self.waiting.add_request(r)
+        while self._de_held and slack > 0:
+            self.waiting.add_request(self._de_held.popleft())
+            slack -= 1
+
     def schedule(self, *args, **kwargs):
         t0 = time.monotonic()
-        self.max_num_running_reqs = max(
-            1, self._de_base_max_reqs - len(self._de_requeued))
+        self._de_gate_fresh()
         self._de_sched_i += 1
         if self._de_slotstats and (
                 self._de_sched_i % 100 == 0
@@ -413,7 +447,10 @@ class QuailScheduler(Scheduler):
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params)
         self._update_request_as_session(request, update)
-        self._enqueue_waiting_request(request)
+        # to the FRONT of the queue: the session's KV is resident and
+        # finishing it frees pool and slots, so it must never wait
+        # behind fresh documents the pool cannot admit
+        self.waiting.prepend_request(request)
         self._de_requeued.add(request.request_id)
         return False
 
