@@ -100,6 +100,7 @@ class QuailScheduler(Scheduler):
         # still in flight.
         self._de_freed_lag = deque(maxlen=2)
         self._de_admits_ring = deque(maxlen=2)
+        self._de_truth_warned = False
         # slot accounting trace (env QUAIL_SLOTSTATS): one line per
         # 100 steps naming every population that can hold or shadow a
         # model-runner slot, for localizing 'No free indices'
@@ -205,11 +206,25 @@ class QuailScheduler(Scheduler):
         try:
             from vllm.v1.worker.gpu import model_runner as _mr
             st = getattr(_mr, "_quail_req_states", None)
-            if st is not None:
-                slack = min(slack, len(st.free_indices)
-                            - sum(self._de_admits_ring) - 8)
-        except Exception:
-            pass
+            if st is None:
+                if not self._de_truth_warned:
+                    self._de_truth_warned = True
+                    print("[quail-sched] slot gate: runner pool not "
+                          "published; estimate only", flush=True)
+            else:
+                truth = (len(st.free_indices)
+                         - sum(self._de_admits_ring) - 8)
+                if self._de_slotstats and self._de_sched_i % 100 == 0:
+                    print(f"[quail-gate] est {slack} truth {truth} "
+                          f"free {len(st.free_indices)} "
+                          f"ring {sum(self._de_admits_ring)}",
+                          flush=True)
+                slack = min(slack, truth)
+        except Exception as e:
+            if not self._de_truth_warned:
+                self._de_truth_warned = True
+                print(f"[quail-sched] slot gate truth read failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
         keep = []
         while self.waiting:
             r = self.waiting.pop_request()
