@@ -413,6 +413,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
             suffix += "_spill"
         if choke_util:
             suffix += f"_choked{int(choke_util * 100)}"
+        if stage != "store":
+            suffix = f"_{stage}" + suffix
         with open(f"/results/persist_xfer_trace{suffix}.jsonl", "w") as f:
             for e in events:
                 f.write(json.dumps(e) + "\n")
@@ -461,7 +463,8 @@ def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
     print(f"saved {path}")
     if events:
         import gzip
-        tp = f"results/engine/persist_xfer_trace{tag}.jsonl.gz"
+        tstage = "" if stage == "store" else f"_{stage}"
+        tp = f"results/engine/persist_xfer_trace{tstage}{tag}.jsonl.gz"
         with gzip.open(tp, "wt") as f:
             for e in events:
                 f.write(json.dumps(e) + "\n")
