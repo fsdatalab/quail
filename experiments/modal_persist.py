@@ -115,25 +115,34 @@ def _patch(mod):
     cls.get_finished = get_finished
 
 
-def _patch_states(mod):
-    cls = mod.RequestStates
-    orig_add = cls.add_request
+def _patch_runner(mod):
+    cls = getattr(mod, "GPUModelRunner", None)
+    if cls is None:
+        print("[quail-slotdump] no GPUModelRunner in "
+              + ",".join(n for n in dir(mod) if "unner" in n), flush=True)
+        return
+    orig_add = cls.add_requests
 
-    def add_request(self, req_id, *a, **k):
-        if len(self.free_indices) < 8:
-            ids = list(self.req_id_to_index)
+    def add_requests(self, scheduler_output):
+        st = self.req_states
+        need = len(scheduler_output.scheduled_new_reqs)
+        if need and len(st.free_indices) < need + 8:
+            ids = list(st.req_id_to_index)
             from collections import Counter
             pref = Counter(i.split("|")[0][:24] for i in ids)
             print("[quail-slotdump] " + json.dumps(dict(
-                adding=req_id, free=len(self.free_indices),
+                need=need, free=len(st.free_indices),
                 held=len(ids), prefixes=dict(pref),
+                adding=[r.req_id for r in
+                        scheduler_output.scheduled_new_reqs][:12],
                 sample=ids[:24])), flush=True)
-        return orig_add(self, req_id, *a, **k)
+        return orig_add(self, scheduler_output)
 
-    cls.add_request = add_request
+    cls.add_requests = add_requests
 
 
-_PATCHES = {_TARGET: _patch, "vllm.v1.worker.gpu.states": _patch_states}
+_PATCHES = {_TARGET: _patch,
+            "vllm.v1.worker.gpu.model_runner": _patch_runner}
 
 
 class _Hook(importlib.abc.MetaPathFinder, importlib.abc.Loader):
