@@ -91,6 +91,14 @@ class QuailScheduler(Scheduler):
         self._de_base_max_reqs = self.max_num_running_reqs
         self._de_requeued = set()
         self._de_held = deque()
+        # completed sessions free their runner slots one to two
+        # outputs later (the batch queue holds two in flight), so
+        # admission must treat those frees as not yet available: the
+        # last two outputs' finished counts are subtracted from the
+        # slack. Measured without it: a restore step admitted 594
+        # fresh documents against 305 free slots while 289 frees were
+        # still in flight.
+        self._de_freed_lag = deque(maxlen=2)
         # slot accounting trace (env QUAIL_SLOTSTATS): one line per
         # 100 steps naming every population that can hold or shadow a
         # model-runner slot, for localizing 'No free indices'
@@ -177,7 +185,9 @@ class QuailScheduler(Scheduler):
         Held documents wait aside in arrival order and are released
         as sessions finish and free slots."""
         base = self._de_base_max_reqs
-        slack = base - len(self.running) - len(self._de_requeued)
+        lag = len(self.finished_req_ids) + sum(self._de_freed_lag)
+        slack = (base - len(self.running) - len(self._de_requeued)
+                 - lag)
         keep = []
         while self.waiting:
             r = self.waiting.pop_request()
@@ -197,6 +207,7 @@ class QuailScheduler(Scheduler):
 
     def schedule(self, *args, **kwargs):
         t0 = time.monotonic()
+        riding_now = len(self.finished_req_ids)
         self._de_gate_fresh()
         self._de_sched_i += 1
         if self._de_slotstats and (
@@ -215,6 +226,7 @@ class QuailScheduler(Scheduler):
                   flush=True)
         self._de_waves.before()
         out = super().schedule(*args, **kwargs)
+        self._de_freed_lag.append(riding_now)
         self._de_requeued.difference_update(out.num_scheduled_tokens)
         self._de_waves.after(out.num_scheduled_tokens.keys())
         if self._de_steps is not None:
