@@ -955,18 +955,16 @@ def join2way(n_reports: int = 100, reps_packed: int = 3,
     answerer = Answerer(torch, F, model, tokenizer)
 
     def run_arm(name, budget, reps):
-        # chunks are packed once, outside the timed loop, the same
-        # way compare() pre-packs its batches
-        chunks = []
-        for p in prefixes:
-            for start, end in plan_groups(len(p), suffix_lens, budget):
-                chunks.append(pack_join_chunk(torch, p,
-                                              suffixes[start:end]))
         packed_answers = None
         for rep in range(reps):
             answers = []
             torch.cuda.reset_peak_memory_stats()
             t0 = time.perf_counter()
+            chunks = []
+            for p in prefixes:
+                for start, end in plan_groups(len(p), suffix_lens, budget):
+                    chunks.append(pack_join_chunk(torch, p,
+                                                  suffixes[start:end]))
             with torch.inference_mode():
                 for chunk in chunks:
                     normed, _ = pipeline.forward_chunk(chunk)

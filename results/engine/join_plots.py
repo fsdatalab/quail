@@ -166,71 +166,85 @@ def predicted_vs_measured():
 
 
 def nway_chart():
-    """Pipeline diagram for the 3-way staged join."""
+    """Flow diagram for the 3-way staged join showing selectivity."""
     d = load("join_nway3.json")
     r = d["result"]
+    n_a, n_b, n_c = d["n_a"], d["n_b"], d["n_c"]
 
     s1 = r["stage1_wall_s"]
     s2 = r["stage2_wall_s"]
-    total = s1 + s2
+    survivors = r["survivors"]
+    planted_expected = r["planted_expected_survivors"]
+    triples = r["triples"]
 
-    fig, ax = plt.subplots(figsize=(10, 4.0))
+    fig, ax = plt.subplots(figsize=(10, 5.0))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 6)
+    ax.axis("off")
 
-    # horizontal bars as a timeline
-    bar_h = 0.45
-    y = 0.5
+    box_kw = dict(boxstyle="round,pad=0.4", linewidth=1.5)
+
+    def box(x, y, text, color, textcolor="white", fontsize=11):
+        ax.text(x, y, text, ha="center", va="center", fontsize=fontsize,
+                fontweight="bold", color=textcolor,
+                bbox=dict(facecolor=color, edgecolor=color, **box_kw))
+
+    def arrow(x1, y1, x2, y2, label="", color="#2c3e50"):
+        ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
+                    arrowprops=dict(arrowstyle="-|>", color=color, lw=1.8))
+        if label:
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            ax.text(mx, my + 0.22, label, ha="center", va="bottom",
+                    fontsize=9, color=color)
+
+    # relations
+    box(1.0, 5.0, f"A\n{n_a} docs", "#7f8c8d")
+    box(5.0, 5.0, f"B\n{n_b} docs", "#2980b9")
+    box(9.0, 5.0, f"C\n{n_c} docs", "#e67e22")
 
     # stage 1
-    ax.barh(y, s1, height=bar_h, left=0, color="#2980b9", edgecolor="white",
-            linewidth=0.8)
-    ax.text(s1 / 2, y, f"Stage 1: B-A prefill\n{s1:.1f} s  |  10,000 pairs",
-            ha="center", va="center", fontsize=10, color="white",
-            fontweight="bold")
+    arrow(1.0, 4.55, 3.5, 3.65)
+    arrow(5.0, 4.55, 3.5, 3.65)
+    box(3.5, 3.3, f"Stage 1: B×A\n{n_b * n_a:,} pairs\n{s1:.1f} s",
+        "#2980b9")
 
-    # gate/dedup marker
-    gate_x = s1
-    ax.axvline(gate_x, color="#2c3e50", ls="--", lw=1.2, ymin=0.15, ymax=0.85)
-    ax.text(gate_x, y + bar_h * 0.85,
-            f"gate + dedup\n{r['survivors']} of 100 survive\nprefix KV kept",
-            ha="center", va="bottom", fontsize=8.5, color="#2c3e50",
-            style="italic")
+    # gate with selectivity
+    arrow(3.5, 2.85, 3.5, 2.1, color="#c0392b")
+    ax.text(4.35, 2.65, f"gate: {survivors}/{n_b} B survive",
+            fontsize=9.5, color="#c0392b", fontweight="bold",
+            va="center")
+    ax.text(4.35, 2.35,
+            f"(planted: {planted_expected}/{n_b} expected;\n"
+            f" model too permissive — no skips)",
+            fontsize=8, color="#95a5a6", va="center")
+
+    # dedup + kept KV
+    box(3.5, 1.7, f"dedup + keep KV", "#2c3e50", fontsize=9.5)
+    ax.text(5.2, 1.7,
+            f"each surviving B runs\nonce, not per A match",
+            fontsize=8, color="#7f8c8d", va="center")
 
     # stage 2
-    ax.barh(y, s2, height=bar_h, left=s1, color="#e67e22", edgecolor="white",
-            linewidth=0.8)
-    ax.text(s1 + s2 / 2, y,
-            f"Stage 2: B-C prefill\n{s2:.1f} s  |  {r['stage2_pairs']:,} pairs"
-            f"\nkept KV reused",
-            ha="center", va="center", fontsize=10, color="white",
-            fontweight="bold")
+    arrow(3.5, 1.3, 6.5, 0.65)
+    arrow(9.0, 4.55, 6.5, 0.65)
+    box(6.5, 0.3, f"Stage 2: B×C\n{r['stage2_pairs']:,} pairs\n{s2:.1f} s",
+        "#e67e22")
 
-    # assembly marker
-    ax.annotate(
-        f"assemble\n{r['triples']:,} triples\n(Python, ~0 s)",
-        xy=(total, y), xytext=(total + 4, y - bar_h * 0.6),
-        fontsize=8.5, color="#27ae60", fontweight="bold",
-        arrowprops=dict(arrowstyle="->", color="#27ae60", lw=1.2),
-        ha="left", va="top",
-    )
+    # output
+    arrow(6.5, -0.15, 6.5, -0.8, color="#27ae60")
+    box(6.5, -1.15, f"{triples:,} triples", "#27ae60", fontsize=10)
 
-    # total
-    ax.text(total / 2, y - bar_h * 0.85,
-            f"total: {total:.1f} s", ha="center", va="top",
+    # total wall time
+    ax.text(9.2, 0.3, f"total\n{s1 + s2:.1f} s", ha="center", va="center",
             fontsize=12, fontweight="bold", color="#2c3e50")
 
-    ax.set_xlim(-2, total + 22)
-    ax.set_ylim(y - bar_h * 1.8, y + bar_h * 2.2)
-    ax.set_xlabel("Wall-clock seconds", fontsize=11)
-    ax.set_title("3-Way Chain Join: A-B-C  (100 x 100 x 100, packed, no engine)",
-                 fontsize=12, pad=10)
-    ax.set_yticks([])
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_visible(False)
+    ax.set_title("3-Way Chain Join  (A-B-C, packed, no engine)",
+                 fontsize=13, pad=8)
     fig.tight_layout()
-    fig.savefig(HERE / "join_nway3.png", dpi=180)
+    fig.savefig(HERE / "join_nway3.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
-    print(f"  join_nway3.png  ({s1:.1f} + {s2:.1f} s)")
+    print(f"  join_nway3.png  ({s1:.1f} + {s2:.1f} s, "
+          f"{survivors} survivors)")
 
 
 if __name__ == "__main__":
