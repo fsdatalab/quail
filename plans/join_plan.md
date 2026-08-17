@@ -284,10 +284,15 @@ experiment 3 does, nothing else of vLLM is used.
    the style of `chainlogic.py`: `orient()` (compare mean tokenized
    lengths, return anchor side); `pack_chunks()` (a streaming
    packer over the whole pair list: fill each chunk to the brim
-   under B*, cut wherever the budget lands, and when an anchor's
-   partner list ends mid-chunk start the next anchor's prefix in
-   the same chunk — no padding; plus the keep-vs-recompute decision
-   by the size rule); `gate_and_dedup()` (answers in, surviving
+   under B*, cutting only at suffix boundaries — a pair's suffix is
+   atomic, its tokens must attend to each other inside one chunk —
+   so per-chunk slack is bounded by one suffix, reclaimable by
+   pulling a shorter suffix forward; when an anchor's partner list
+   ends mid-chunk the next anchor's prefix starts in the same
+   chunk; plus the keep-vs-recompute decision by the size rule.
+   Answers are packing-invariant — each suffix's computation
+   depends only on its prefix and itself — so the packer can change
+   utilization but never results); `gate_and_dedup()` (answers in, surviving
    anchors and the next stage's pair list out); `assemble()`
    (recorded answers in, tuples out). Unit-tested against a
    brute-force reference. Brim packing matters most where per-
@@ -295,7 +300,19 @@ experiment 3 does, nothing else of vLLM is used.
    and candidate-list mode — where per-anchor chunks would run
    mostly empty.
 2. **The merge call** — the one new GPU piece, in the packed loop's
-   per-layer body. Chunk rows are `[prefix | suffix_1 .. suffix_k]`.
+   per-layer body. This is the Hydragen / cascade-inference
+   decomposition of shared-prefix attention (Juravsky et al. 2024):
+   suffixes attend to the shared prefix in one batched call and to
+   themselves in another, combined by softmax state. Hydragen's
+   headline wins are decode-side (one query per sequence, where
+   batching against the shared prefix turns memory-bound attention
+   into a matrix product) — we have zero decode, so what we take is
+   the decomposition itself, and their pure-PyTorch-plus-FA
+   implementation is evidence the merge needs no exotic kernel.
+   Their hierarchical variant maps to n ≥ 3 tuple prefixes later;
+   here one sharing level is enough (the 40-token preamble is
+   folded into each prefix, not given its own level). Chunk rows
+   are `[prefix | suffix_1 .. suffix_k]`.
    Call A: the existing varlen self-attention over the segment
    boundaries (prefix over itself, each suffix over itself). Call
    B: non-causal cross-attention, queries = all suffix rows, keys
@@ -310,9 +327,16 @@ experiment 3 does, nothing else of vLLM is used.
    positions. A kept-prefix chunk simply has no prefix segment:
    call A covers suffixes only, call B reads the stored tensors.
    Keeping a prefix = stashing its 36 per-layer K/V slices
-   (72 KiB/token) and freeing them when its stages finish; stage 2
-   against the same anchor is the same call B with a new suffix
-   stream — that is the rewind, as tensors.
+   (72 KiB/token) in a preallocated per-layer ring buffer, so the
+   ragged call reads slices in place with no copies, and freeing
+   the slot when the anchor's stages finish. There is no rewind
+   operation anywhere in this path: rewind exists in the engine
+   because a living sequence accumulates suffix KV that must be
+   erased back to the boundary; the packed pass never writes suffix
+   KV at all, so there is nothing to erase — keeping the immutable
+   prefix and attaching fresh suffixes computes exactly what the
+   engine's rewind computes. The rewind machinery stays the engine
+   fallback only.
 3. **Data prep, no GPU** — BioDEX: download, sample 100 reports,
    keep all terms, tokenize, write the prompt. Planted: three
    100-document collections from the IMDB reviews with key lines,
