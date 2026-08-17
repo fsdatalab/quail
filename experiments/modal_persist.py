@@ -286,6 +286,11 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         os.environ["QUAIL_SINGLE_TENANT"] = "0"
     if client == "chain":
         os.environ["QUAIL_SLOTSTATS"] = "1"
+        # full-width verdict steps (982 sessions sampling at once)
+        # fragment the torch allocator at the pool edge: a 2.87 GiB
+        # transient failed with 3.14 GiB reserved but unallocated.
+        # Expandable segments defragments without giving up capacity.
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
