@@ -203,6 +203,14 @@ class QuailScheduler(Scheduler):
                             - self._de_last_admits - 8)
         except Exception:
             pass
+        # and no bursts, ever: the batch queue holds two outputs in
+        # flight, so a burst admitted against a sampled free count
+        # can land after that count has changed (measured bursts of
+        # 595 and 1,236 fresh admissions in one output). A per-step
+        # release cap far under the pool keeps the transient demand
+        # inside any sampling error; the ramp to a full window costs
+        # a few dozen steps, immaterial against query walls.
+        slack = min(slack, max(16, self._de_base_max_reqs // 16))
         keep = []
         while self.waiting:
             r = self.waiting.pop_request()
