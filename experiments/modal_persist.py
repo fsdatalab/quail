@@ -125,6 +125,11 @@ def _patch_runner(mod):
 
     def add_requests(self, scheduler_output):
         st = self.req_states
+        mod = sys.modules[cls.__module__]
+        if getattr(mod, "_quail_req_states", None) is not st:
+            # publish the live pool for the scheduler's slot gate
+            # (same process under the uniproc executor)
+            mod._quail_req_states = st
         need = len(scheduler_output.scheduled_new_reqs)
         if need and len(st.free_indices) < need + 8:
             ids = list(st.req_id_to_index)

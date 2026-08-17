@@ -99,6 +99,7 @@ class QuailScheduler(Scheduler):
         # fresh documents against 305 free slots while 289 frees were
         # still in flight.
         self._de_freed_lag = deque(maxlen=2)
+        self._de_last_admits = 0
         # slot accounting trace (env QUAIL_SLOTSTATS): one line per
         # 100 steps naming every population that can hold or shadow a
         # model-runner slot, for localizing 'No free indices'
@@ -188,6 +189,20 @@ class QuailScheduler(Scheduler):
         lag = len(self.finished_req_ids) + sum(self._de_freed_lag)
         slack = (base - len(self.running) - len(self._de_requeued)
                  - lag)
+        # the estimate cannot see frees parked on outputs that never
+        # executed (a query boundary leaves the last outputs' frees
+        # unconsumed until the next query steps), so when the runner
+        # shares this process its pool is read directly: free slots
+        # minus the previous step's still-in-flight admissions is
+        # the truth, and the gate takes the smaller of the two.
+        try:
+            from vllm.v1.worker.gpu import model_runner as _mr
+            st = getattr(_mr, "_quail_req_states", None)
+            if st is not None:
+                slack = min(slack, len(st.free_indices)
+                            - self._de_last_admits - 8)
+        except Exception:
+            pass
         keep = []
         while self.waiting:
             r = self.waiting.pop_request()
@@ -227,6 +242,7 @@ class QuailScheduler(Scheduler):
         self._de_waves.before()
         out = super().schedule(*args, **kwargs)
         self._de_freed_lag.append(riding_now)
+        self._de_last_admits = len(out.scheduled_new_reqs)
         self._de_requeued.difference_update(out.num_scheduled_tokens)
         self._de_waves.after(out.num_scheduled_tokens.keys())
         if self._de_steps is not None:
