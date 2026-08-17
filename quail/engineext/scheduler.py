@@ -165,7 +165,9 @@ class QuailScheduler(Scheduler):
         self.max_num_running_reqs = max(
             1, self._de_base_max_reqs - len(self._de_requeued))
         self._de_sched_i += 1
-        if self._de_slotstats and self._de_sched_i % 100 == 0:
+        if self._de_slotstats and (
+                self._de_sched_i % 100 == 0
+                or len(self.running) >= (3 * self.max_num_running_reqs) // 4):
             print(f"[quail-slots] step {self._de_sched_i}: "
                   f"running {len(self.running)} "
                   f"requeued {len(self._de_requeued)} "
@@ -174,7 +176,8 @@ class QuailScheduler(Scheduler):
                   f"waiting {len(self.waiting)} "
                   f"skipped {len(self.skipped_waiting)} "
                   f"stream {self.num_waiting_for_streaming_input} "
-                  f"finished_pending {len(self.finished_req_ids)}",
+                  f"finished_pending {len(self.finished_req_ids)} "
+                  f"preempt {getattr(self, 'num_preempted_reqs', '?')}",
                   flush=True)
         self._de_waves.before()
         out = super().schedule(*args, **kwargs)
