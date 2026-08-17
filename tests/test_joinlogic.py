@@ -57,37 +57,85 @@ def test_pack_stream_every_suffix_once_in_order():
             suffixes = [rng.randrange(10, max(11, room // 2))
                         for _ in range(rng.randrange(0, 60))]
             anchors.append((prefix, suffixes))
-        chunks = pack_stream(anchors, budget)
+        chunks, capture = pack_stream(anchors, budget)
         covered = {a: [] for a in range(len(anchors))}
+        carried_count = {a: 0 for a in range(len(anchors))}
         for chunk in chunks:
+            assert chunk
             tokens = 0
-            for a, start, end in chunk:
+            for a, start, end, carried in chunk:
                 prefix, suffixes = anchors[a]
-                tokens += prefix + sum(suffixes[start:end])
+                tokens += (prefix if carried else 0) \
+                    + sum(suffixes[start:end])
                 covered[a].extend(range(start, end))
+                carried_count[a] += carried
             assert tokens <= budget
         for a, (prefix, suffixes) in enumerate(anchors):
             assert covered[a] == list(range(len(suffixes)))
+            # the computed-exactly-once invariant; an anchor with no
+            # suffixes and no keep mark is not packed at all
+            assert carried_count[a] == (1 if suffixes else 0)
 
 
 def test_pack_stream_brims_across_anchors():
     # two anchors that fit one chunk together must share it
-    chunks = pack_stream([(100, [50, 50]), (100, [50, 50])], 1000)
+    chunks, capture = pack_stream([(100, [50, 50]), (100, [50, 50])],
+                                  1000)
     assert len(chunks) == 1
     assert [g[0] for g in chunks[0]] == [0, 1]
+    assert capture == set()
 
 
-def test_pack_stream_reemits_prefix_after_cut():
-    # anchor's stream spans two chunks: it appears in both, and the
-    # second chunk pays its prefix again (the group carries it)
-    chunks = pack_stream([(100, [400, 400, 400])], 600)
-    assert len(chunks) == 3
-    assert all(chunk[0][0] == 0 for chunk in chunks)
+def test_pack_stream_cut_stream_continues_without_prefix():
+    # the stream spans three chunks: the prefix is packed once, the
+    # continuations carry nothing and the anchor is marked capture
+    chunks, capture = pack_stream([(100, [400, 400, 400])], 600)
+    assert chunks == [[(0, 0, 1, True)],
+                      [(0, 1, 2, False)],
+                      [(0, 2, 3, False)]]
+    assert capture == {0}
+
+
+def test_pack_stream_keep_marks_capture_without_cut():
+    # whole stream fits one chunk, but a later stage needs the prefix
+    chunks, capture = pack_stream([(100, [50, 50])], 1000, keep={0})
+    assert chunks == [[(0, 0, 2, True)]]
+    assert capture == {0}
+
+
+def test_pack_stream_already_kept_packs_no_prefix():
+    # stage 2 of an n-way: the prefix K/V is in the store, so groups
+    # are suffix-only and nothing is captured
+    chunks, capture = pack_stream([(100, [400, 400, 400])], 600,
+                                  already_kept={0})
+    assert chunks == [[(0, 0, 1, False)],
+                      [(0, 1, 2, False)],
+                      [(0, 2, 3, False)]]
+    assert capture == set()
+
+
+def test_pack_stream_continuation_relaxes_atomicity():
+    # a suffix wider than budget - prefix is packable once the
+    # prefix no longer rides along
+    chunks, capture = pack_stream([(300, [100, 900])], 1000)
+    assert chunks == [[(0, 0, 1, True)], [(0, 1, 2, False)]]
+    assert capture == {0}
+
+
+def test_pack_stream_capture_only_group():
+    # an anchor with no suffixes this stage, kept for a later one
+    chunks, capture = pack_stream([(100, []), (50, [20])], 1000,
+                                  keep={0})
+    assert chunks == [[(0, 0, 0, True), (1, 0, 1, True)]]
+    assert capture == {0}
 
 
 def test_pack_stream_atomicity_error():
     with pytest.raises(ValueError):
         pack_stream([(100, [950])], 1000)
+    with pytest.raises(ValueError):
+        # even without a prefix to carry, one suffix must fit a chunk
+        pack_stream([(100, [1100])], 1000, already_kept={0})
 
 
 def _random_rows(rng, n_anchors, n_partners, p):

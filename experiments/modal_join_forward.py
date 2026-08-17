@@ -20,10 +20,12 @@ Three entrypoints:
             tensor must reproduce the in-chunk answers exactly.
 
   join2way  the BioDEX sample: 100 reports x all terms. Arms: packed
-            at the derived B* (one chunk per report), and grouped
-            stock vLLM - synchronous, one generate() over the pair
-            list in report order, admission via max_num_seqs derived
-            from the filter run's token budget. The join has no
+            at the derived B* (brim-packed chunks from pack_stream,
+            several reports per chunk, next chunk built on the CPU
+            while the GPU runs the current one), and grouped stock
+            vLLM - synchronous, one generate() over the pair list in
+            report order, admission via max_num_seqs derived from
+            the filter run's token budget. The join has no
             gating, so nothing here needs the async client the
             filter experiment's stock arm used. (A packed reference
             cell at 25,305 ran in earlier revisions and was dropped:
@@ -34,11 +36,14 @@ Three entrypoints:
   nway3     the planted 3-relation chain on IMDB reviews, no vLLM:
             per B document, stage 1 packs [prefix | A suffixes] and
             keeps the prefix K/V per layer; a B with any YES runs
-            stage 2 as [C suffixes] against the kept tensors (the
-            keep-KV branch of the size rule); then the recorded
-            answers replay through a nested-loop reference and the
-            triple sets must be identical, and stage-2 pair count
-            must equal survivors x |C| exactly.
+            stage 2 as [C suffixes] against the kept tensors. The
+            loop is software-pipelined: the CPU builds the next
+            chunks and reads gate answers (event-synced pinned
+            copies) while the GPU runs, so stage walls are per-stage
+            CUDA-event sums and total_wall_s is the loop wall. The
+            recorded answers replay through a nested-loop reference
+            and the triple sets must be identical, and stage-2 pair
+            count must equal survivors x |C| exactly.
 
 Predictions, stated before the runs (plans/join_plan.md, derived by
 plans/join_estimates.py from committed artifacts; document lengths
@@ -163,8 +168,7 @@ class JoinPipeline:
         self.head_dim = attn.head_dim
         self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
         self.fp8 = torch.float8_e4m3fn
-        self.keep_store = None      # layer -> (k_prefix, v_prefix)
-        self.capture_prefix = 0     # rows to capture into keep_store
+        self.new_kept = None    # anchor -> {layer: (k, v)} during a pass
 
     # ---- weights and quant ------------------------------------------
 
@@ -398,47 +402,50 @@ class JoinPipeline:
         q3 = q.view(n, H, D)
         k3 = k.view(n, KH, D)
         v3 = v.contiguous().view(n, KH, D)
+        layer = meta["layer"]
 
-        if self.capture_prefix and self.keep_store is not None:
-            f = self.capture_prefix
-            self.keep_store[meta["layer"]] = (k3[:f].clone(),
-                                              v3[:f].clone())
+        for anchor, r0, r1 in meta["capture"]:
+            self.new_kept.setdefault(anchor, {})[layer] = (
+                k3[r0:r1].clone(), v3[r0:r1].clone())
 
         out_a, lse_a = self._fa(
             q3, k3, v3, meta["cu_a"], meta["cu_a"],
             meta["max_a"], meta["max_a"], causal=True)
 
-        f = meta["prefix_rows"]
-        if meta["kept"] is not None:
-            kp, vp = meta["kept"][meta["layer"]]
-            q_suf = q3
-            suffix_rows = n
-        else:
-            kp, vp = k3[:f], v3[:f]
-            q_suf = q3[f:]
-            suffix_rows = n - f
-        if f == 0 or suffix_rows == 0:
-            # no sharing in this chunk: a pure single-segment pair
-            # (probe reference) or a prefix-only capture pass
+        if meta["cu_b_q"] is None:
+            # no shared-prefix reads in this chunk: whole-pair
+            # segments (probe reference) or a capture-only pass
             meta["layer"] += 1
             return out_a.view(n, H * D)
-        out_b, lse_b = self._fa(
-            q_suf, kp, vp, meta["cu_b_q"], meta["cu_b_k"],
-            suffix_rows, kp.shape[0], causal=False)
 
-        la = self._lse_tokens_first(lse_a, n)
-        if meta["kept"] is None:
-            la = la[f:]
-        lb = self._lse_tokens_first(lse_b, suffix_rows)
+        # call B's keys: each group's prefix rows, fresh from this
+        # chunk or from the kept store, concatenated in group order
+        ks, vs = [], []
+        for src in meta["cross_src"]:
+            if src[0] == "chunk":
+                _, r0, r1 = src
+                ks.append(k3[r0:r1])
+                vs.append(v3[r0:r1])
+            else:
+                kp, vp = meta["stores"][src[1]][layer]
+                ks.append(kp)
+                vs.append(vp)
+        kx = ks[0] if len(ks) == 1 else torch.cat(ks)
+        vx = vs[0] if len(vs) == 1 else torch.cat(vs)
+
+        rows = meta["suffix_rows"]
+        q_suf = q3.index_select(0, rows)
+        out_b, lse_b = self._fa(
+            q_suf, kx, vx, meta["cu_b_q"], meta["cu_b_k"],
+            meta["max_b_q"], meta["max_b_k"], causal=False)
+
+        la = self._lse_tokens_first(lse_a, n).index_select(0, rows)
+        lb = self._lse_tokens_first(lse_b, rows.shape[0])
         # (wa*A + wb*B)/(wa+wb) == A + (B-A)*sigmoid(lse_b - lse_a):
         # same merge, no fp32 copies of the row tensors
         w = torch.sigmoid(lb - la).to(torch.bfloat16)[..., None]
-        suf_a = out_a[f:] if meta["kept"] is None else out_a
-        merged = torch.lerp(suf_a, out_b, w)
-        if meta["kept"] is None:
-            out = torch.cat([out_a[:f], merged], dim=0)
-        else:
-            out = merged
+        merged = torch.lerp(out_a.index_select(0, rows), out_b, w)
+        out = out_a.index_copy_(0, rows, merged)
         meta["layer"] += 1
         return out.view(n, H * D)
 
@@ -449,10 +456,7 @@ class JoinPipeline:
         meta = chunk["meta"]
         meta["layer"] = 0
         input_ids, positions = chunk["input_ids"], chunk["positions"]
-        n_tokens = input_ids.shape[0]
-        self.capture_prefix = chunk.get("capture_prefix", 0)
-        if self.capture_prefix:
-            self.keep_store = {}
+        self.new_kept = {}
         hidden = self.embed(input_ids)
         residual = None
         for layer in self.layers:
@@ -481,37 +485,73 @@ class JoinPipeline:
         last_residual = residual.index_select(0, final)
         normed, _ = self.fused_add_rms_norm(
             last_hidden, last_residual, self.final_norm)
-        kept = self.keep_store if self.capture_prefix else None
-        self.keep_store, self.capture_prefix = None, 0
+        kept = self.new_kept
+        self.new_kept = None
         return normed, kept
 
 
-def pack_join_chunk(torch, prefix_ids, suffix_id_lists, kept=None):
-    """Tensors for one chunk. With prefix_ids, rows are
-    [prefix | suffixes]; with kept (a layer->(k,v) store), rows are
-    suffixes only and call B reads the store. Suffix positions start
-    at the prefix length either way."""
-    f = len(prefix_ids) if kept is None else kept["prefix_len"]
-    ids, pos, cu_a, finals = [], [], [0], []
-    if kept is None:
-        ids.extend(prefix_ids)
-        pos.extend(range(f))
-        cu_a.append(f)
-    for suf in suffix_id_lists:
-        ids.extend(suf)
-        pos.extend(range(f, f + len(suf)))
-        cu_a.append(len(ids))
-        finals.append(len(ids) - 1)
+def pack_join_chunk(torch, groups, stores=None):
+    """Tensors for one chunk, built from groups in chunk order.
+
+    Each group is a dict:
+      anchor    id used for capture marks and kept lookups
+      prefix    fresh prefix token list, packed into the chunk - or
+                None when the anchor's K/V is already in stores
+      f         prefix length in tokens; required when prefix is
+                None (suffix positions start at f either way, so
+                answers match standalone [prefix | suffix] prompts)
+      suffixes  list of suffix token lists (may be empty for a
+                capture-only group)
+      capture   copy this group's fresh prefix K/V out per layer
+
+    stores: anchor -> {layer: (k, v)}, the kept store for groups
+    whose prefix is not in this chunk.
+    """
     dev = "cuda"
-    suffix_tokens = len(ids) - (f if kept is None else 0)
+    ids, pos, cu_a, finals = [], [], [0], []
+    suffix_rows = []
+    cross_src, cu_b_q, cu_b_k = [], [0], [0]
+    max_b_q = max_b_k = 0
+    capture = []
+    for g in groups:
+        fresh = g.get("prefix") is not None
+        f = len(g["prefix"]) if fresh else g["f"]
+        row0 = len(ids)
+        if fresh:
+            ids.extend(g["prefix"])
+            pos.extend(range(f))
+            cu_a.append(len(ids))
+            if g.get("capture"):
+                capture.append((g["anchor"], row0, row0 + f))
+        s_row0 = len(ids)
+        for suf in g["suffixes"]:
+            ids.extend(suf)
+            pos.extend(range(f, f + len(suf)))
+            cu_a.append(len(ids))
+            finals.append(len(ids) - 1)
+        s_count = len(ids) - s_row0
+        if s_count and f:
+            suffix_rows.extend(range(s_row0, len(ids)))
+            cu_b_q.append(cu_b_q[-1] + s_count)
+            cu_b_k.append(cu_b_k[-1] + f)
+            max_b_q = max(max_b_q, s_count)
+            max_b_k = max(max_b_k, f)
+            cross_src.append(("chunk", row0, row0 + f) if fresh
+                             else ("kept", g["anchor"]))
     meta = dict(
-        prefix_rows=(f if kept is None else 0),
-        kept=(kept["store"] if kept is not None else None),
+        layer=0,
+        capture=capture,
+        stores=stores,
         cu_a=torch.tensor(cu_a, dtype=torch.int32, device=dev),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)),
-        cu_b_q=torch.tensor([0, suffix_tokens], dtype=torch.int32,
-                            device=dev),
-        cu_b_k=torch.tensor([0, f], dtype=torch.int32, device=dev),
+        cu_b_q=(torch.tensor(cu_b_q, dtype=torch.int32, device=dev)
+                if cross_src else None),
+        cu_b_k=(torch.tensor(cu_b_k, dtype=torch.int32, device=dev)
+                if cross_src else None),
+        max_b_q=max_b_q, max_b_k=max_b_k,
+        suffix_rows=(torch.tensor(suffix_rows, dtype=torch.int64,
+                                  device=dev) if cross_src else None),
+        cross_src=cross_src,
     )
     return dict(
         input_ids=torch.tensor(ids, dtype=torch.int64, device=dev),
@@ -551,6 +591,162 @@ class Answerer:
         yes = scores.index_select(1, self.yes_cols).amax(dim=1)
         no = scores.index_select(1, self.no_cols).amax(dim=1)
         return (yes - no).float().cpu().tolist()
+
+
+class AsyncAnswers:
+    """YES/NO readout that does not stall the stream: submit()
+    computes the bits on GPU, enqueues a copy to pinned host memory,
+    and records an event; result() waits only for that event - ops
+    enqueued after the event (the next chunk's forward) keep the GPU
+    busy while the CPU reads the answers."""
+
+    def __init__(self, torch, answerer):
+        self.torch = torch
+        self.ans = answerer
+
+    def submit(self, normed):
+        torch, ans = self.torch, self.ans
+        scores = ans.F.linear(normed, ans.weights)
+        yes = scores.index_select(1, ans.yes_cols).amax(dim=1)
+        no = scores.index_select(1, ans.no_cols).amax(dim=1)
+        bits = (yes > no).to(torch.uint8)
+        host = torch.empty(bits.shape[0], dtype=torch.uint8,
+                           pin_memory=True)
+        host.copy_(bits, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        return event, host
+
+    @staticmethod
+    def result(handle):
+        event, host = handle
+        event.synchronize()
+        return [int(b) for b in host.tolist()]
+
+
+def run_join(torch, pipeline, async_ans, anchor_prefixes,
+             stage_suffixes, budget, group_size=None):
+    """RUN of the plan, for the star shape: every stage streams a
+    fresh partner list against the same anchor side. The 2-way is
+    the one-stage case; nothing else in this file executes joins.
+
+    anchor_prefixes: anchor id (list index) -> prefix token list.
+    stage_suffixes: per stage, the partner suffix token lists.
+    budget: the chunk token budget B.
+    group_size: anchors gated together between stages; None = all
+    anchors in one group (right for one stage, where no gate runs).
+
+    Pipelining, one rule: while the GPU runs a chunk, the CPU builds
+    the next buildable one. Within a stage that is the next chunk of
+    the plan; at a gate, whose next chunk cannot be built until the
+    group's answers arrive, it is the next group's stage-0 chunk
+    (which depends on nothing) - launched before the gate resolves,
+    so the GPU never drains. Answers travel as event-synced pinned
+    copies (AsyncAnswers); anchor prefix K/V is captured once and
+    freed when its group leaves its last stage.
+
+    Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
+    partners, present only for anchors that reached stage j; spans =
+    (stage, start_event, end_event) per forward for GPU-time sums;
+    tokens = fresh tokens packed.
+    """
+    from quail.joinlogic import pack_stream
+
+    k = len(stage_suffixes)
+    n = len(anchor_prefixes)
+    group_size = n if group_size is None else group_size
+    groups = [list(range(i, min(i + group_size, n)))
+              for i in range(0, n, group_size)]
+    suffix_lens = [[len(s) for s in sufs] for sufs in stage_suffixes]
+    ans = [dict() for _ in range(k)]
+    stores, spans = {}, []
+    tokens = 0
+
+    def plan_stage(members, j):
+        live = [a for a in members
+                if j == 0 or any(ans[j - 1].get(a, []))]
+        if not live:
+            return [], [], set()
+        spec = [(len(anchor_prefixes[a]), suffix_lens[j])
+                for a in live]
+        keep_loc = set(range(len(live))) if j + 1 < k else set()
+        already_loc = {i for i, a in enumerate(live) if a in stores}
+        plan, capture = pack_stream(spec, budget, keep=keep_loc,
+                                    already_kept=already_loc)
+        return live, plan, capture
+
+    def build(j, idx, capture, chunk_groups):
+        return pack_join_chunk(
+            torch,
+            [dict(anchor=idx[a],
+                  prefix=(anchor_prefixes[idx[a]] if carried
+                          else None),
+                  f=len(anchor_prefixes[idx[a]]),
+                  suffixes=stage_suffixes[j][start:end],
+                  capture=(carried and a in capture))
+             for a, start, end, carried in chunk_groups],
+            stores=stores)
+
+    def launch(j, chunk):
+        nonlocal tokens
+        tokens += chunk["tokens"]
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+        normed, kept = pipeline.forward_chunk(chunk)
+        e1.record()
+        spans.append((j, e0, e1))
+        stores.update(kept)
+        return async_ans.submit(normed)
+
+    def scatter(j, idx, chunk_groups, bits):
+        pos = 0
+        for a, start, end, _ in chunk_groups:
+            cnt = end - start
+            ans[j].setdefault(idx[a], []).extend(bits[pos:pos + cnt])
+            pos += cnt
+
+    prefetch = None     # (idx, plan, capture, handle0) of next group's
+                        # stage 0, chunk 0 already launched
+    for g, members in enumerate(groups):
+        for j in range(k):
+            if j == 0 and prefetch is not None:
+                idx, plan, capture, h0 = prefetch
+                prefetch = None
+            else:
+                idx, plan, capture = plan_stage(members, j)
+                h0 = launch(j, build(j, idx, capture, plan[0])) \
+                    if plan else None
+            if not plan:
+                continue
+            handles = [(h0, plan[0])]
+            if j == 0 and k > 1 and g + 1 < len(groups):
+                # the gate below cannot be planned past; keep the
+                # GPU fed with the next group's gate-free stage 0
+                nidx, nplan, ncap = plan_stage(groups[g + 1], 0)
+                if nplan:
+                    nh = launch(0, build(0, nidx, ncap, nplan[0]))
+                    prefetch = (nidx, nplan, ncap, nh)
+            for t in range(1, len(plan)):
+                c = build(j, idx, capture, plan[t])   # CPU, GPU busy
+                h = launch(j, c)
+                h_prev, pg = handles.pop(0)
+                scatter(j, idx, pg, async_ans.result(h_prev))
+                handles.append((h, plan[t]))
+            while handles:
+                h, pg = handles.pop(0)
+                scatter(j, idx, pg, async_ans.result(h))
+            # free kept prefixes that nothing later reads: after the
+            # last stage everything in the group is done; between
+            # stages, the gate's casualties are done
+            if j == k - 1:
+                for a in members:
+                    stores.pop(a, None)
+            else:
+                for a in idx:
+                    if not any(ans[j][a]):
+                        stores.pop(a, None)
+    return ans, spans, tokens
 
 
 # ------------------------------------------------------------- the data
@@ -716,13 +912,16 @@ def probe() -> str:
     cu = [0, f0]
     for s in sufs0:
         cu.append(cu[-1] + s)
-    meta0 = dict(prefix_rows=f0, kept=None, layer=0,
+    meta0 = dict(layer=0, capture=[], stores=None,
                  cu_a=torch.tensor(cu, dtype=torch.int32, device="cuda"),
                  max_a=f0,
                  cu_b_q=torch.tensor([0, n0 - f0], dtype=torch.int32,
                                      device="cuda"),
                  cu_b_k=torch.tensor([0, f0], dtype=torch.int32,
-                                     device="cuda"))
+                                     device="cuda"),
+                 max_b_q=n0 - f0, max_b_k=f0,
+                 suffix_rows=torch.arange(f0, n0, device="cuda"),
+                 cross_src=[("chunk", 0, f0)])
     with torch.inference_mode():
         shared0 = pipeline.attention(
             q0.reshape(n0, H * D), k0.reshape(n0, KH * D),
@@ -761,7 +960,8 @@ def probe() -> str:
 
     with torch.inference_mode():
         # shared: one chunk, one prefix, 64 suffixes
-        shared_chunk = pack_join_chunk(torch, prefix, sufs)
+        shared_chunk = pack_join_chunk(
+            torch, [dict(anchor=0, prefix=prefix, suffixes=sufs)])
         normed_shared, _ = pipeline.forward_chunk(shared_chunk)
         shared_answers = answerer(normed_shared)
 
@@ -769,7 +969,9 @@ def probe() -> str:
         # chunk - plain causal attention, trivially correct
         unshared_answers, unshared_rows = [], []
         for suf in sufs:
-            one = pack_join_chunk(torch, prefix + suf, [])
+            one = pack_join_chunk(
+                torch, [dict(anchor=0, prefix=prefix + suf,
+                             suffixes=[])])
             # a chunk with no suffixes has no final rows; treat the
             # whole pair as one segment whose last row answers
             one["final_indices"] = torch.tensor(
@@ -782,13 +984,41 @@ def probe() -> str:
 
         # kept-KV replay: capture the prefix in one chunk, rerun the
         # same suffixes against the stored tensors
-        cap_chunk = pack_join_chunk(torch, prefix, sufs)
-        cap_chunk["capture_prefix"] = len(prefix)
-        _, store = pipeline.forward_chunk(cap_chunk)
-        kept = dict(prefix_len=len(prefix), store=store)
-        kept_chunk = pack_join_chunk(torch, None, sufs, kept=kept)
+        cap_chunk = pack_join_chunk(
+            torch, [dict(anchor=0, prefix=prefix, suffixes=sufs,
+                         capture=True)])
+        _, kept = pipeline.forward_chunk(cap_chunk)
+        kept_chunk = pack_join_chunk(
+            torch, [dict(anchor=0, prefix=None, f=len(prefix),
+                         suffixes=sufs)],
+            stores=kept)
         normed_kept, _ = pipeline.forward_chunk(kept_chunk)
         kept_answers = answerer(normed_kept)
+
+        # multi-group gate: two reports in ONE chunk must answer
+        # exactly as each does alone (the brim-packed path)
+        p1 = data["prefixes"][1]
+        sufs2 = data["suffixes"][64:96]
+        alone0, _ = pipeline.forward_chunk(pack_join_chunk(
+            torch, [dict(anchor=0, prefix=prefix, suffixes=sufs2)]))
+        alone1, _ = pipeline.forward_chunk(pack_join_chunk(
+            torch, [dict(anchor=1, prefix=p1, suffixes=sufs2)]))
+        both, _ = pipeline.forward_chunk(pack_join_chunk(
+            torch, [dict(anchor=0, prefix=prefix, suffixes=sufs2),
+                    dict(anchor=1, prefix=p1, suffixes=sufs2)]))
+        multi_expect = answerer(alone0) + answerer(alone1)
+        multi_got = answerer(both)
+        dis_multi = sum(x != y for x, y in zip(multi_got, multi_expect))
+
+        # mixed gate: a fresh group and a kept group in ONE chunk
+        mixed, _ = pipeline.forward_chunk(pack_join_chunk(
+            torch, [dict(anchor=1, prefix=p1, suffixes=sufs2),
+                    dict(anchor=0, prefix=None, f=len(prefix),
+                         suffixes=sufs2)],
+            stores=kept))
+        mixed_expect = answerer(alone1) + answerer(alone0)
+        mixed_got = answerer(mixed)
+        dis_mixed = sum(x != y for x, y in zip(mixed_got, mixed_expect))
 
     dis_su = [i for i, (a, b) in enumerate(
         zip(shared_answers, unshared_answers)) if a != b]
@@ -810,6 +1040,8 @@ def probe() -> str:
         median_row_gap=round(row_gap.median().item(), 4),
         kept_vs_shared_disagreements=len(dis_ks),
         kept_disagreeing_pairs=dis_ks[:8],
+        multi_group_disagreements=int(dis_multi),
+        mixed_kept_fresh_disagreements=int(dis_mixed),
         finite=bool(torch.isfinite(normed_shared).all().item()),
     )
 
@@ -819,12 +1051,14 @@ def probe() -> str:
     with torch.inference_mode():
         for name, budget in (("b_star", chunk_budget()),):
             chunks = []
-            for p in data_full["prefixes"]:
+            for r, p in enumerate(data_full["prefixes"]):
                 for start, end in plan_groups(
                         len(p), [len(s) for s in data_full["suffixes"]],
                         budget):
                     chunks.append(pack_join_chunk(
-                        torch, p, data_full["suffixes"][start:end]))
+                        torch,
+                        [dict(anchor=r, prefix=p,
+                              suffixes=data_full["suffixes"][start:end])]))
             for c in chunks[:2]:
                 pipeline.forward_chunk(c)     # deepgemm + shape warmup
             torch.cuda.synchronize()
@@ -865,8 +1099,6 @@ def join2way(n_reports: int = 100, reps_packed: int = 2,
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
-    from quail.joinlogic import plan_groups
-
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     data = biodex_sample(tokenizer, n_reports=n_reports)
     prefixes, suffixes = data["prefixes"], data["suffixes"]
@@ -884,9 +1116,10 @@ def join2way(n_reports: int = 100, reps_packed: int = 2,
             suffix_mean=round(sum(suffix_lens) / n_terms, 1),
             preamble=data["preamble_tokens"],
             max_report_tokens=data["max_report_tokens"]),
-        prediction=("packed B* 3.3 min at ~110k tok/s effective; "
-                    "stock grouped 5.4 min - at assumed lengths, "
-                    "see measured"),
+        prediction=("packed B* ~96 s at measured lengths: same 8.42M "
+                    "tokens as the prior 98.7 s run, brim-packed into "
+                    "~20 chunks with builds overlapped; peak ~40 GiB; "
+                    "stock ~433 s as before"),
         runs=[])
     print(f"[join2way] {pairs:,} pairs; fresh tokens at B* "
           f"{fresh_star / 1e6:.1f}M; lengths {report['lengths']}",
@@ -945,31 +1178,28 @@ def join2way(n_reports: int = 100, reps_packed: int = 2,
     torch.cuda.empty_cache()
     time.sleep(5)
 
-    # ---- packed arms
+    # ---- packed arm
     model = _load_vllm_model()
     pipeline = JoinPipeline(model)
     answerer = Answerer(torch, F, model, tokenizer)
+    async_ans = AsyncAnswers(torch, answerer)
 
     def run_arm(name, budget, reps):
         packed_answers = None
         for rep in range(reps):
-            answers = []
             torch.cuda.reset_peak_memory_stats()
             t0 = time.perf_counter()
-            chunks = []
-            for p in prefixes:
-                for start, end in plan_groups(len(p), suffix_lens, budget):
-                    chunks.append(pack_join_chunk(torch, p,
-                                                  suffixes[start:end]))
             with torch.inference_mode():
-                for chunk in chunks:
-                    normed, _ = pipeline.forward_chunk(chunk)
-                    answers.extend(answerer(normed))
+                ans, spans, tokens = run_join(
+                    torch, pipeline, async_ans, prefixes,
+                    [suffixes], budget)
             torch.cuda.synchronize()
             wall = time.perf_counter() - t0
-            tokens = sum(c["tokens"] for c in chunks)
+            answers = []
+            for a in range(n_reports):
+                answers.extend(ans[0][a])
             row = dict(method=name, rep=rep, wall=round(wall, 2),
-                       chunks=len(chunks), fresh_tokens=tokens,
+                       chunks=len(spans), fresh_tokens=tokens,
                        tok_s=round(tokens / wall, 1),
                        yes=sum(answers),
                        agrees_with_stock=(
@@ -984,7 +1214,9 @@ def join2way(n_reports: int = 100, reps_packed: int = 2,
         return packed_answers
 
     with torch.inference_mode():
-        warm = pack_join_chunk(torch, prefixes[0], suffixes[:64])
+        warm = pack_join_chunk(
+            torch, [dict(anchor=0, prefix=prefixes[0],
+                         suffixes=suffixes[:64])])
         pipeline.forward_chunk(warm)
     packed_answers = run_arm("packed_bstar_cell", chunk_budget(),
                              reps_packed)
@@ -1040,39 +1272,30 @@ def nway3() -> str:
             b_prefix_mean=round(sum(map(len, b_prefix)) / N_B, 1),
             a_suffix_mean=round(sum(map(len, a_suffix)) / N_A, 1),
             c_suffix_mean=round(sum(map(len, c_suffix)) / N_C, 1)),
-        prediction="about a minute of GPU per stage; triples equal "
-                   "the replay reference; stage-2 pairs = survivors "
-                   "x 100")
+        prediction="stage GPU sums near the prior 48.7 + 29.7 walls "
+                   "minus the per-B stops; total wall ~70 s; triples "
+                   "equal the replay reference; stage-2 pairs = "
+                   "survivors x 100")
 
-    ans1, ans2 = {}, {}
-    stage1_s = stage2_s = 0.0
-    stage2_pairs = 0
+    async_ans = AsyncAnswers(torch, answerer)
     with torch.inference_mode():
-        warm = pack_join_chunk(torch, b_prefix[0], a_suffix[:8])
+        warm = pack_join_chunk(torch, [dict(
+            anchor=-1, prefix=b_prefix[0], suffixes=a_suffix[:8],
+            capture=True)])
         pipeline.forward_chunk(warm)
         torch.cuda.synchronize()
-        for b in range(N_B):
-            # stage 1: [prefix b | all A suffixes], prefix captured
-            t0 = time.perf_counter()
-            chunk = pack_join_chunk(torch, b_prefix[b], a_suffix)
-            chunk["capture_prefix"] = len(b_prefix[b])
-            normed, store = pipeline.forward_chunk(chunk)
-            row = answerer(normed)
-            torch.cuda.synchronize()
-            stage1_s += time.perf_counter() - t0
-            ans1[b] = row
-            if not any(row):
-                continue                     # the gate: b is finished
-            # stage 2: C suffixes against the kept prefix tensors -
-            # the keep-KV branch; one run per surviving b (the dedup)
-            t0 = time.perf_counter()
-            kept = dict(prefix_len=len(b_prefix[b]), store=store)
-            chunk2 = pack_join_chunk(torch, None, c_suffix, kept=kept)
-            normed2, _ = pipeline.forward_chunk(chunk2)
-            ans2[b] = answerer(normed2)
-            torch.cuda.synchronize()
-            stage2_s += time.perf_counter() - t0
-            stage2_pairs += N_C
+        t0 = time.perf_counter()
+        ans, spans, _ = run_join(torch, pipeline, async_ans,
+                                 b_prefix, [a_suffix, c_suffix],
+                                 chunk_budget(), group_size=1)
+        torch.cuda.synchronize()
+    total_wall = time.perf_counter() - t0
+    ans1, ans2 = ans[0], ans[1]
+    stage1_s = sum(e0.elapsed_time(e1) for s, e0, e1 in spans
+                   if s == 0) / 1e3
+    stage2_s = sum(e0.elapsed_time(e1) for s, e0, e1 in spans
+                   if s == 1) / 1e3
+    stage2_pairs = sum(len(row) for row in ans2.values())
 
     survivors = gate(ans1)
     staged = assemble(ans1, ans2)
@@ -1082,6 +1305,7 @@ def nway3() -> str:
     report["result"] = dict(
         stage1_wall_s=round(stage1_s, 1),
         stage2_wall_s=round(stage2_s, 1),
+        total_wall_s=round(total_wall, 1),
         survivors=len(survivors),
         stage2_pairs=stage2_pairs,
         stage2_pairs_expected=len(survivors) * N_C,

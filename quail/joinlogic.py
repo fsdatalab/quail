@@ -51,28 +51,60 @@ def plan_groups(prefix_tokens, suffix_tokens, budget):
     return groups
 
 
-def pack_stream(anchors, budget):
-    """Brim-pack a whole pair list into chunks.
+def pack_stream(anchors, budget, keep=(), already_kept=()):
+    """Brim-pack a whole pair list into chunks, keeping cut prefixes.
 
     anchors: list of (prefix_tokens, [suffix_tokens]) in run order.
-    Returns a list of chunks; each chunk is a list of groups
-    (anchor_index, start, end) whose token total - every group
-    costing one prefix copy plus its suffixes - fits under budget.
-    Cuts happen only at suffix boundaries. When an anchor's stream
-    ends mid-chunk, the next anchor's prefix starts in the same
-    chunk; when the budget lands mid-stream, the anchor continues in
-    the next chunk with its prefix re-emitted there.
+    keep: anchor indices whose prefix K/V a later stage needs.
+    already_kept: anchor indices whose prefix K/V is in the store
+    from an earlier stage; their groups never pack prefix tokens.
+
+    Returns (chunks, capture). Each chunk is a list of groups
+    (anchor_index, start, end, carried); carried means the group
+    packs a fresh copy of the anchor's prefix tokens ahead of
+    suffixes start..end. An anchor's prefix is packed at most once,
+    ever: when the budget cuts its stream, the anchor continues in
+    the next chunk with carried False, reading the captured prefix
+    K/V instead of re-emitting tokens. capture is the set of anchors
+    whose fresh prefix K/V must outlive its chunk - cut mid-stream,
+    or named in keep. Cuts happen only at suffix boundaries; when an
+    anchor's stream ends mid-chunk, the next anchor starts in the
+    same chunk.
     """
+    keep, already = set(keep), set(already_kept)
     chunks, chunk, used = [], [], 0
+    capture = set()
     for a, (prefix, suffixes) in enumerate(anchors):
-        i, n = 0, len(suffixes)
-        while i < n or (n == 0 and i == 0):
-            room = budget - used - prefix
-            if room <= 0:
-                if not chunk:
-                    raise ValueError(
-                        f"anchor {a}: prefix {prefix} tokens exceeds the "
-                        f"{budget}-token chunk budget")
+        n = len(suffixes)
+        placed = a in already
+        if n == 0:
+            if placed or a not in keep:
+                continue    # nothing streams against it and no later
+                            # stage needs it: computing it serves no one
+            # capture-only placement: a prefix a later stage needs,
+            # with nothing streamed against it in this one
+            if prefix > budget:
+                raise ValueError(
+                    f"anchor {a}: prefix {prefix} tokens exceeds the "
+                    f"{budget}-token chunk budget")
+            if used + prefix > budget:
+                chunks.append(chunk)
+                chunk, used = [], 0
+            chunk.append((a, 0, 0, True))
+            used += prefix
+            if a in keep:
+                capture.add(a)
+            continue
+        i = 0
+        while i < n:
+            carried = 0 if placed else prefix
+            if suffixes[i] + carried > budget:
+                raise ValueError(
+                    f"anchor {a} suffix {i} has {suffixes[i]} tokens; "
+                    f"at most {budget - carried} fit beside what its "
+                    f"group must carry (suffixes are atomic)")
+            room = budget - used - carried
+            if room < suffixes[i]:
                 chunks.append(chunk)
                 chunk, used = [], 0
                 continue
@@ -80,23 +112,17 @@ def pack_stream(anchors, budget):
             while j < n and group_tokens + suffixes[j] <= room:
                 group_tokens += suffixes[j]
                 j += 1
-            if j == i and n:
-                if suffixes[i] > budget - prefix:
-                    raise ValueError(
-                        f"anchor {a} suffix {i} has {suffixes[i]} tokens; "
-                        f"at most {budget - prefix} fit beside its prefix "
-                        f"(suffixes are atomic)")
-                chunks.append(chunk)
-                chunk, used = [], 0
-                continue
-            chunk.append((a, i, j))
-            used += prefix + group_tokens
+            chunk.append((a, i, j, not placed))
+            used += carried + group_tokens
+            placed = True
             i = j
-            if n == 0:
-                break
+            if i < n and a not in already:
+                capture.add(a)      # the stream continues elsewhere
+        if a in keep and a not in already:
+            capture.add(a)
     if chunk:
         chunks.append(chunk)
-    return chunks
+    return chunks, capture
 
 
 def gate(answer_rows):

@@ -394,6 +394,52 @@ Findings, in order of importance:
 
 ---
 
+## 3c. Executor upgrade: one RUN loop, brim packing, keep on cut,
+overlap — predictions, then results
+
+After review, the executor was rewritten to match the settled
+algorithm exactly. One function (`run_join`) now executes every
+join; the 2-way is its one-stage case, the 3-way its
+group-size-1 two-stage case. Changes:
+
+- `pack_stream` packs chunks to the brim across anchors and never
+  packs a prefix twice: when the budget cuts an anchor's stream,
+  the prefix K/V is captured (plain tensors, one anchor at a time)
+  and the continuation reads it. The recompute path is gone from
+  execution; an anchor's prefix is computed exactly once, ever.
+- Chunks may hold several groups: fresh prefixes, kept
+  continuations, or both. Cross-attention runs as one
+  variable-length call over per-group spans.
+- The loop keeps the GPU fed: while a chunk runs, the CPU builds
+  the next one; at a gate, whose next chunk cannot be built yet,
+  the next group's gate-free stage-0 chunk is launched first.
+  Answers cross to the CPU as event-synced pinned byte copies.
+- The executor control flow is validated off-GPU by a simulation
+  against a brute-force reference (120 randomized shapes, k up to
+  3, mixed group sizes).
+
+Predictions, stated before the reruns:
+
+- Probe: all parity gates stay 0 (shared vs unshared, kept vs
+  shared, and two new ones: several fresh prefixes in one chunk,
+  and a fresh + kept mix in one chunk); rate at the B* geometry
+  ~83-84k tok/s as before.
+- join2way packed at B*: fresh tokens exactly 8,417,425 (identical
+  accounting: 100 prefixes once + 256,000 suffixes once), ~21
+  chunks of up to ~421k tokens, ~20 reports cut at boundaries and
+  kept one at a time. Wall ~96 s against the prior 98.7 s (chunk
+  builds hidden, fewer per-chunk fixed costs; small new gather
+  cost). Peak memory ~40 GiB (act x 421k ~ 34.6 GB + weights).
+  Answers identical: yes = 177,830, agrees_with_stock = 213,989.
+- nway3: identical answers (survivors 100, stage-2 pairs 10,000,
+  74,600 triples, replay match). Stage GPU sums ~41 s + ~28 s;
+  total wall ~70 s against the prior 78.4 s (the per-B stops are
+  overlapped away).
+
+Results: pending the reruns below.
+
+---
+
 ## 4. Implementation sketch
 
 Four pieces, in build order. No engine anywhere in the packed path
