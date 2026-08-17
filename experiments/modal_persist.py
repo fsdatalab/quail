@@ -124,9 +124,10 @@ def _patch_states(mod):
             ids = list(self.req_id_to_index)
             from collections import Counter
             pref = Counter(i.split("|")[0][:24] for i in ids)
-            _log(dict(ev="slots_low", t=time.time(), adding=req_id,
-                      free=len(self.free_indices), held=len(ids),
-                      prefixes=dict(pref), sample=ids[:24]))
+            print("[quail-slotdump] " + json.dumps(dict(
+                adding=req_id, free=len(self.free_indices),
+                held=len(ids), prefixes=dict(pref),
+                sample=ids[:24])), flush=True)
         return orig_add(self, req_id, *a, **k)
 
     cls.add_request = add_request
