@@ -114,8 +114,9 @@ class QuailScheduler(Scheduler):
         self._de_strict = os.environ.get(
             "QUAIL_SINGLE_TENANT", "1") == "1"
         print(f"[quail-sched] init: strict {self._de_strict}, overlapped "
-              f"scheduling {self.scheduler_config.async_scheduling}",
-              flush=True)
+              f"scheduling {self.scheduler_config.async_scheduling}, "
+              f"slotstats {self._de_slotstats}, slotdump "
+              f"{os.environ.get('QUAIL_SLOTDUMP', 'unset')}", flush=True)
         self._de_plan_evicting = False
         # Core-process profiling: this object lives in the engine core,
         # the one process the client-side profiler cannot see, so the
@@ -489,7 +490,9 @@ class QuailScheduler(Scheduler):
                 self._de_stats.get("chain_done", 0) + 1)
             if not self._de_chain:
                 print("[quail-sched] chains drained: stats "
-                      f"{self._de_stats}", flush=True)
+                      f"{self._de_stats}, gate emitted "
+                      f"{self._de_emitted_new}, board "
+                      f"{slots.BOARD.snap}", flush=True)
                 self._de_dump_profile("chain-mode")
             return True
         st["advance"] = False

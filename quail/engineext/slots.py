@@ -84,6 +84,7 @@ def install():
 
     orig = GPUModelRunner.add_requests
     dump = os.environ.get("QUAIL_SLOTDUMP", "0") == "1"
+    announced = [False]
 
     def add_requests(self, scheduler_output):
         st = self.req_states
@@ -102,6 +103,13 @@ def install():
         out = orig(self, scheduler_output)
         st._quail_applied = getattr(st, "_quail_applied", 0) + taken
         BOARD.snap = (len(st.free_indices), st._quail_applied)
+        if not announced[0]:
+            # positive witness that the exact gate has its snapshot;
+            # its absence in a run log means the gate ran estimate-only
+            announced[0] = True
+            print(f"[quail-slots] snapshot publishing: free "
+                  f"{BOARD.snap[0]}, applied {BOARD.snap[1]}",
+                  flush=True)
         return out
 
     GPUModelRunner.add_requests = add_requests
