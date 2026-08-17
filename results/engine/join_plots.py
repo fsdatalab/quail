@@ -166,37 +166,71 @@ def predicted_vs_measured():
 
 
 def nway_chart():
-    """Stacked bar for 3-way staged join."""
+    """Pipeline diagram for the 3-way staged join."""
     d = load("join_nway3.json")
     r = d["result"]
 
-    fig, ax = plt.subplots(figsize=(5.5, 4.2))
-    ax.bar(["3-Way Join\n(100 x 100 x 100)"], [r["stage1_wall_s"]],
-           color="#2980b9", label="Stage 1 (A-B)", width=0.4)
-    ax.bar(["3-Way Join\n(100 x 100 x 100)"], [r["stage2_wall_s"]],
-           bottom=[r["stage1_wall_s"]], color="#e67e22",
-           label="Stage 2 (B-C)", width=0.4)
+    s1 = r["stage1_wall_s"]
+    s2 = r["stage2_wall_s"]
+    total = s1 + s2
 
-    total = r["stage1_wall_s"] + r["stage2_wall_s"]
-    ax.text(0, total + 2, f"{total:.1f} s total", ha="center", va="bottom",
-            fontsize=12, fontweight="bold")
-    ax.text(0, r["stage1_wall_s"] / 2, f"{r['stage1_wall_s']:.1f} s",
-            ha="center", va="center", fontsize=11, color="white",
+    fig, ax = plt.subplots(figsize=(10, 4.0))
+
+    # horizontal bars as a timeline
+    bar_h = 0.45
+    y = 0.5
+
+    # stage 1
+    ax.barh(y, s1, height=bar_h, left=0, color="#2980b9", edgecolor="white",
+            linewidth=0.8)
+    ax.text(s1 / 2, y, f"Stage 1: B-A prefill\n{s1:.1f} s  |  10,000 pairs",
+            ha="center", va="center", fontsize=10, color="white",
             fontweight="bold")
-    ax.text(0, r["stage1_wall_s"] + r["stage2_wall_s"] / 2,
-            f"{r['stage2_wall_s']:.1f} s", ha="center", va="center",
-            fontsize=11, color="white", fontweight="bold")
 
-    ax.set_ylabel("Wall-clock seconds", fontsize=12)
-    ax.set_title("3-Way Staged Join", fontsize=13, pad=12)
-    ax.legend(loc="upper right")
-    ax.set_ylim(0, total * 1.3)
+    # gate/dedup marker
+    gate_x = s1
+    ax.axvline(gate_x, color="#2c3e50", ls="--", lw=1.2, ymin=0.15, ymax=0.85)
+    ax.text(gate_x, y + bar_h * 0.85,
+            f"gate + dedup\n{r['survivors']} of 100 survive\nprefix KV kept",
+            ha="center", va="bottom", fontsize=8.5, color="#2c3e50",
+            style="italic")
+
+    # stage 2
+    ax.barh(y, s2, height=bar_h, left=s1, color="#e67e22", edgecolor="white",
+            linewidth=0.8)
+    ax.text(s1 + s2 / 2, y,
+            f"Stage 2: B-C prefill\n{s2:.1f} s  |  {r['stage2_pairs']:,} pairs"
+            f"\nkept KV reused",
+            ha="center", va="center", fontsize=10, color="white",
+            fontweight="bold")
+
+    # assembly marker
+    ax.annotate(
+        f"assemble\n{r['triples']:,} triples\n(Python, ~0 s)",
+        xy=(total, y), xytext=(total + 4, y - bar_h * 0.6),
+        fontsize=8.5, color="#27ae60", fontweight="bold",
+        arrowprops=dict(arrowstyle="->", color="#27ae60", lw=1.2),
+        ha="left", va="top",
+    )
+
+    # total
+    ax.text(total / 2, y - bar_h * 0.85,
+            f"total: {total:.1f} s", ha="center", va="top",
+            fontsize=12, fontweight="bold", color="#2c3e50")
+
+    ax.set_xlim(-2, total + 22)
+    ax.set_ylim(y - bar_h * 1.8, y + bar_h * 2.2)
+    ax.set_xlabel("Wall-clock seconds", fontsize=11)
+    ax.set_title("3-Way Chain Join: A-B-C  (100 x 100 x 100, packed, no engine)",
+                 fontsize=12, pad=10)
+    ax.set_yticks([])
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
     fig.tight_layout()
     fig.savefig(HERE / "join_nway3.png", dpi=180)
     plt.close(fig)
-    print(f"  join_nway3.png  ({r['stage1_wall_s']:.1f} + {r['stage2_wall_s']:.1f} s)")
+    print(f"  join_nway3.png  ({s1:.1f} + {s2:.1f} s)")
 
 
 if __name__ == "__main__":
