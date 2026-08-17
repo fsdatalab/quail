@@ -13,12 +13,15 @@ Decisions taken:
 - **The algorithm is solved for general n.** A sampled prototype
   exercises n = 2 on BioDEX and n = 3 planted.
 - **A 2-way join runs as a packed forward pass.** No engine, no KV
-  pool. The chunk budget B* is derived, not chosen: B* = (memory x
-  0.92 − weights − kept prefixes x kappa) / activation bytes per
-  token, over a declared slack of 2 that covers the unmeasured
-  activation estimate and the larger FlashInfer workspace —
+  pool. The chunk budget B* is derived from the budget formula
+  act x B + σ x kv x B + reservation ≤ M_free, at σ = 0 — suffix
+  tokens never write KV, and kept prefixes enter as the reservation
+  because they do not scale with B — over a declared slack of 2
+  (the "give some more slack" step; it carries the unmeasured
+  activation estimate and the FlashInfer 147 KB/token case):
   **421,752 tokens today**, floored at ~4,096 where throughput
-  flattens. All arms run at B*, the stock boot's
+  flattens. Activation memory is the batch-scaling term: act x B ≈
+  34.6 GB of the 69.1 GB free at this B*. All arms run at B*, the stock boot's
   max_num_batched_tokens included. B* sits far past the measured
   sweep, so walls are conditional on the rates holding there; one
   reference cell at 25,305 (the largest measured point) rides

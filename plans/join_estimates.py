@@ -87,15 +87,21 @@ def chunk_cap(kept_prefix_tokens=0):
 
 B_MEAS = ladder["batch_tokens"]             # largest measured sweep point
 
-# B* is derived, not chosen: the memory cap over a declared slack.
-# The slack covers the two soft spots in the cap - the activation
-# estimate is architectural, not measured (cost.py's own caveat),
-# and the FlashInfer path costs 147 KB/token instead of 83. All
-# arms run at B*: packed chunks and the stock boot's
-# max_num_batched_tokens alike. B* sits far past the measured
-# sweep, so every wall below is conditional on the rates holding
-# there; one reference cell at B_MEAS rides along to tell a rate
-# change at large B apart from a slow kernel.
+# The budget formula: act*B + sigma*kv*B + R <= M_free, solved for
+# B. act is per batched token, so act*B is the whole batch's
+# activation footprint - the term that scales with B. The packed
+# pass is the sigma = 0 case: suffix tokens never write KV, and the
+# only KV left (kept prefixes) does not scale with B, so it enters
+# as the reservation R rather than the denominator. The engine
+# baseline keeps sigma > 0 implicitly - vLLM sizes its pool as
+# whatever is left after the activation workspace at this same B.
+# SLACK is the "give some more slack" step (186k -> 85k on the
+# filter slide): it carries the unmeasured activation estimate
+# (cost.py's own caveat) and the FlashInfer path's 147 KB/token.
+# All arms run at B*; it sits far past the measured sweep, so every
+# wall below is conditional on the rates holding there, and one
+# reference cell at B_MEAS rides along to tell a rate change at
+# large B apart from a slow kernel.
 SLACK = 2
 S = chunk_cap(0) // SLACK
 
