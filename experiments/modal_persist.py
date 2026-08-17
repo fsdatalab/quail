@@ -362,6 +362,15 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         if waves or client == "chain":
             kw["scheduler_cls"] = ("quail.engineext.scheduler."
                                    "QuailScheduler")
+        if client == "chain":
+            # serial scheduling: with the batch queue, the runner's
+            # slot adds and frees land on a concurrent thread, and no
+            # scheduler-side arithmetic over a sampled free count
+            # survived six rounds of hardening (measured bursts of
+            # 1,236, 595, and 901 admissions against stale samples).
+            # Serial makes the sample exact and the gate airtight,
+            # and matches the project rule of no vllm async paths.
+            kw["async_scheduling"] = False
         if store:
             # "quail" swaps in the coalescing worker (one transfer per
             # step, not per request); "stock" is the measured baseline
