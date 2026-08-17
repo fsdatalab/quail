@@ -233,7 +233,7 @@ def _xfer_summary(events, windows):
 def persist_run(n_docs: int = 1000, stage: str = "baseline",
                 cpu_gb: int = 96, connector: str = "stock",
                 store_gb: int = 0, waves: bool = False,
-                spill: bool = False, choke_util: float = 0.0,
+                choke_util: float = 0.0,
                 client: str = "stages") -> dict:
     import time as _time
 
@@ -247,8 +247,6 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         # mode must be off for this harness
         os.environ["QUAIL_WAVES"] = "1"
         os.environ["QUAIL_SINGLE_TENANT"] = "0"
-        if spill:
-            os.environ["QUAIL_SPILL"] = "1"
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
@@ -297,7 +295,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
                   budget_tokens=pool_budget,
                   step_tokens=plan.engine_step_tokens,
                   max_num_seqs=plan.engine_max_seqs,
-                  waves=waves, spill=spill, choke_util=choke_util,
+                  waves=waves, choke_util=choke_util,
                   client=client,
                   kv_bytes_estimate=kv_bytes, store_gb=store_gb,
                   store_min_doc_tokens=store_min,
@@ -312,7 +310,6 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
                   max_num_batched_tokens=plan.engine_step_tokens,
                   max_num_seqs=plan.engine_max_seqs,
                   # choke_util deliberately starves the pool below the
-                  # working set to force the spill regime; 0 keeps the
                   # shipped setting
                   gpu_memory_utilization=choke_util or 0.92,
                   enable_prefix_caching=True, disable_log_stats=True)
@@ -420,8 +417,6 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         suffix = "_quail" if connector == "quail" else ""
         if waves:
             suffix += "_waves"
-        if spill:
-            suffix += "_spill"
         if choke_util:
             suffix += f"_choked{int(choke_util * 100)}"
         if client == "chain":
@@ -444,8 +439,6 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     tag = "_quail" if connector == "quail" else ""
     if waves:
         tag += "_waves"
-    if spill:
-        tag += "_spill"
     if choke_util:
         tag += f"_choked{int(choke_util * 100)}"
     if client == "chain":
@@ -459,16 +452,14 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
 @app.local_entrypoint()
 def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
          connector: str = "stock", store_gb: int = 0,
-         waves: bool = False, spill: bool = False,
+         waves: bool = False,
          choke_util: float = 0.0, client: str = "stages", out: str = ""):
     data = persist_run.remote(n_docs, stage, cpu_gb, connector, store_gb,
-                              waves, spill, choke_util, client)
+                              waves, choke_util, client)
     events = data.pop("xfer_events", None)
     tag = "_quail" if connector == "quail" else ""
     if waves:
         tag += "_waves"
-    if spill:
-        tag += "_spill"
     if choke_util:
         tag += f"_choked{int(choke_util * 100)}"
     if client == "chain":

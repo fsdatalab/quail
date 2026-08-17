@@ -1,11 +1,7 @@
 """Wave driver: synchronous pre-loading of stored KV.
 
 Applies waves_logic decisions to engine state from inside
-QuailScheduler.schedule(). QUAIL_WAVES=1 enables pre-loading;
-QUAIL_SPILL=1 additionally puts preempted requests at the front of
-the wave order, so a document evicted under a choked pool reloads
-through the same channel before it is rescheduled - spill reload and
-pre-load are one mechanism with two orderings.
+QuailScheduler.schedule(). QUAIL_WAVES=1 enables pre-loading.
 
 Territory. The vendor's per-request load path and the wave channel
 must never load the same bytes. The vendor defers an external-hit
@@ -74,7 +70,6 @@ class WaveDriver:
     def __init__(self, scheduler):
         self.s = scheduler
         self.on = os.environ.get("QUAIL_WAVES", "0") == "1"
-        self.spill = os.environ.get("QUAIL_SPILL", "0") == "1"
         self._wave_tokens = None
         self._seam_left = None     # one-time head budget, refilled at drain
         self._handled = set()      # request ids waved or rejected
@@ -84,9 +79,9 @@ class WaveDriver:
         self._consumed_early = set()   # prefilled before wave registered
         self._next_wave = 0
         self._errors = 0
-        self.stats = dict(waves=0, docs=0, blocks=0, reloads=0)
+        self.stats = dict(waves=0, docs=0, blocks=0)
         if self.on:
-            print(f"[quail-waves] on, spill {self.spill}", flush=True)
+            print("[quail-waves] on", flush=True)
 
     def _cs(self):
         c = getattr(self.s, "connector", None)
@@ -181,18 +176,6 @@ class WaveDriver:
         if self._seam_left is None:
             self._seam_left = 2 * step_budget
         order = waiting
-        if self.spill:
-            # a preempted document is mid-chain: its next visit is
-            # the soonest, so it reloads first. Preempted documents
-            # inside the seam stay the vendor's - it is about to
-            # recompute them, and a wave would duplicate that.
-            pre = [r for r in order if r.num_preemptions]
-            for r in pre:
-                rid = r.request_id
-                if rid in self._handled and rid not in self._doc_wave:
-                    self._handled.discard(rid)
-                    self.stats["reloads"] += 1
-            order = pre + [r for r in order if not r.num_preemptions]
         cands, by_id = [], {}
         for r in order:
             rid = r.request_id
