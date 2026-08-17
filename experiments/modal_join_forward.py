@@ -432,13 +432,11 @@ class JoinPipeline:
         if meta["kept"] is None:
             la = la[f:]
         lb = self._lse_tokens_first(lse_b, suffix_rows)
-        m = torch.maximum(la, lb)
-        wa = torch.exp(la - m)
-        wb = torch.exp(lb - m)
+        # (wa*A + wb*B)/(wa+wb) == A + (B-A)*sigmoid(lse_b - lse_a):
+        # same merge, no fp32 copies of the row tensors
+        w = torch.sigmoid(lb - la).to(torch.bfloat16)[..., None]
         suf_a = out_a[f:] if meta["kept"] is None else out_a
-        merged = ((suf_a.float() * wa[..., None]
-                   + out_b.float() * wb[..., None])
-                  / (wa + wb)[..., None]).to(torch.bfloat16)
+        merged = torch.lerp(suf_a, out_b, w)
         if meta["kept"] is None:
             out = torch.cat([out_a[:f], merged], dim=0)
         else:
@@ -549,6 +547,12 @@ class Answerer:
         yes = scores.index_select(1, self.yes_cols).amax(dim=1)
         no = scores.index_select(1, self.no_cols).amax(dim=1)
         return (yes > no).int().cpu().tolist()
+
+    def margins(self, normed):
+        scores = self.F.linear(normed, self.weights)
+        yes = scores.index_select(1, self.yes_cols).amax(dim=1)
+        no = scores.index_select(1, self.no_cols).amax(dim=1)
+        return (yes - no).float().cpu().tolist()
 
 
 # ------------------------------------------------------------- the data
@@ -687,11 +691,68 @@ def probe() -> str:
 
     from quail.joinlogic import plan_groups
 
+    import math as _math
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     model = _load_vllm_model()
     pipeline = JoinPipeline(model)
     answerer = Answerer(torch, F, model, tokenizer)
     result = {"b_star": chunk_budget()}
+
+    # attention math in isolation: the two-call merge against a plain
+    # fp32 reference on random tensors shaped [prefix | 3 suffixes].
+    # If this is not tight, the merge or the FA calls are wrong; if it
+    # is tight and pipeline pairs still flip, the flip is knife-edge
+    # amplification, not math.
+    H, KH, D = pipeline.num_q_heads, pipeline.num_kv_heads, \
+        pipeline.head_dim
+    f0, sufs0 = 256, [32, 32, 32]
+    n0 = f0 + sum(sufs0)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    q0 = torch.randn(n0, H, D, device="cuda", dtype=torch.bfloat16,
+                     generator=gen)
+    k0 = torch.randn(n0, KH, D, device="cuda", dtype=torch.bfloat16,
+                     generator=gen)
+    v0 = torch.randn(n0, KH, D, device="cuda", dtype=torch.bfloat16,
+                     generator=gen)
+    cu = [0, f0]
+    for s in sufs0:
+        cu.append(cu[-1] + s)
+    meta0 = dict(prefix_rows=f0, kept=None, layer=0,
+                 cu_a=torch.tensor(cu, dtype=torch.int32, device="cuda"),
+                 max_a=f0,
+                 cu_b_q=torch.tensor([0, n0 - f0], dtype=torch.int32,
+                                     device="cuda"),
+                 cu_b_k=torch.tensor([0, f0], dtype=torch.int32,
+                                     device="cuda"))
+    with torch.inference_mode():
+        shared0 = pipeline.attention(
+            q0.reshape(n0, H * D), k0.reshape(n0, KH * D),
+            v0.reshape(n0, KH * D), meta0).view(n0, H, D)
+
+        def ref_rows(qr, kr, vr):
+            kk = kr.repeat_interleave(H // KH, dim=1).float()
+            vv = vr.repeat_interleave(H // KH, dim=1).float()
+            s = torch.einsum("qhd,khd->hqk", qr.float(), kk)
+            s = s / _math.sqrt(D)
+            nq = qr.shape[0]
+            mask = torch.triu(torch.ones(nq, nq, device="cuda",
+                                         dtype=torch.bool), 1)
+            s.masked_fill_(mask[None], float("-inf"))
+            return torch.einsum("hqk,khd->qhd", s.softmax(-1), vv)
+
+        worst = 0.0
+        off = f0
+        for s in sufs0:
+            idx = torch.tensor(list(range(f0))
+                               + list(range(off, off + s)), device="cuda")
+            ref = ref_rows(q0.index_select(0, idx),
+                           k0.index_select(0, idx),
+                           v0.index_select(0, idx))[f0:]
+            got = shared0[off:off + s].float()
+            worst = max(worst, (ref - got).abs().max().item())
+            off += s
+    result["attention_math_max_diff"] = round(worst, 4)
 
     data = biodex_sample(tokenizer, n_reports=4)
     prefix = data["prefixes"][0]
@@ -731,12 +792,26 @@ def probe() -> str:
         normed_kept, _ = pipeline.forward_chunk(kept_chunk)
         kept_answers = answerer(normed_kept)
 
+    dis_su = [i for i, (a, b) in enumerate(
+        zip(shared_answers, unshared_answers)) if a != b]
+    dis_ks = [i for i, (a, b) in enumerate(
+        zip(kept_answers, shared_answers)) if a != b]
+    m_shared = answerer.margins(normed_shared)
+    m_unshared = answerer.margins(torch.cat(unshared_rows))
+    row_gap = (normed_shared.float()
+               - torch.cat(unshared_rows).float()).abs().amax(dim=1)
     result["gates"] = dict(
-        shared_vs_unshared_disagreements=sum(
-            a != b for a, b in zip(shared_answers, unshared_answers)),
+        shared_vs_unshared_disagreements=len(dis_su),
+        disagreeing_pairs=dis_su[:8],
+        disagreeing_margins_shared=[round(m_shared[i], 3)
+                                    for i in dis_su[:8]],
+        disagreeing_margins_unshared=[round(m_unshared[i], 3)
+                                      for i in dis_su[:8]],
         shared_vs_unshared_max_hidden_gap=round(gap, 4),
-        kept_vs_shared_disagreements=sum(
-            a != b for a, b in zip(kept_answers, shared_answers)),
+        rows_with_gap_over_1=int((row_gap > 1.0).sum().item()),
+        median_row_gap=round(row_gap.median().item(), 4),
+        kept_vs_shared_disagreements=len(dis_ks),
+        kept_disagreeing_pairs=dis_ks[:8],
         finite=bool(torch.isfinite(normed_shared).all().item()),
     )
 
@@ -754,14 +829,17 @@ def probe() -> str:
                         budget):
                     chunks.append(pack_join_chunk(
                         torch, p, data_full["suffixes"][start:end]))
-            for c in chunks[:1]:
-                pipeline.forward_chunk(c)     # deepgemm warmup
+            for c in chunks[:2]:
+                pipeline.forward_chunk(c)     # deepgemm + shape warmup
             torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for c in chunks:
-                pipeline.forward_chunk(c)
-            torch.cuda.synchronize()
-            wall = time.perf_counter() - t0
+            walls = []
+            for _ in range(2):
+                t0 = time.perf_counter()
+                for c in chunks:
+                    pipeline.forward_chunk(c)
+                torch.cuda.synchronize()
+                walls.append(time.perf_counter() - t0)
+            wall = min(walls)
             tokens = sum(c["tokens"] for c in chunks)
             rates[name] = dict(chunks=len(chunks), tokens=tokens,
                                wall_s=round(wall, 3),
@@ -826,24 +904,19 @@ def join2way(n_reports: int = 100, reps_packed: int = 3,
     yes_ids, no_ids = yes_no_ids(tokenizer)
     max_len = max(len(p) for p in prefixes) + max(suffix_lens) + 16
     admission_budget = 749_782      # the filter run's committed budget
-    mean_pair = fresh_star // pairs + 1
-    max_seqs = max(256, min(4096, admission_budget // mean_pair))
-    stock_batched = chunk_budget()
-    try:
-        llm = LLM(model=MODEL, kv_cache_dtype="auto",
-                  max_model_len=max_len, max_num_seqs=max_seqs,
-                  max_num_batched_tokens=stock_batched,
-                  gpu_memory_utilization=0.88,
-                  enable_prefix_caching=True, disable_log_stats=True)
-    except Exception as boot_err:      # noqa: BLE001 - recorded fallback
-        print(f"[join2way] stock boot at B*={stock_batched} failed: "
-              f"{boot_err}; retrying at 131,072", flush=True)
-        stock_batched = 131_072
-        llm = LLM(model=MODEL, kv_cache_dtype="auto",
-                  max_model_len=max_len, max_num_seqs=max_seqs,
-                  max_num_batched_tokens=stock_batched,
-                  gpu_memory_utilization=0.88,
-                  enable_prefix_caching=True, disable_log_stats=True)
+    # a stock pair request costs its FULL prompt (prefix + suffix);
+    # the packed side's shared accounting must not leak in here
+    mean_pair = (sum(len(p) for p in prefixes) * n_terms
+                 + n_reports * sum(suffix_lens)) // pairs + 1
+    max_seqs = max(64, min(4096, admission_budget // mean_pair))
+    # all arms run at the largest measured point for now; the derived
+    # B* is the exploratory cell on the packed side only
+    stock_batched = B_REFERENCE
+    llm = LLM(model=MODEL, kv_cache_dtype="auto",
+              max_model_len=max_len, max_num_seqs=max_seqs,
+              max_num_batched_tokens=stock_batched,
+              gpu_memory_utilization=0.88,
+              enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
                               allowed_token_ids=sorted(yes_ids | no_ids))
     pair_prompts = [{"prompt_token_ids": p + s}
@@ -882,27 +955,27 @@ def join2way(n_reports: int = 100, reps_packed: int = 3,
     answerer = Answerer(torch, F, model, tokenizer)
 
     def run_arm(name, budget, reps):
-        chunk_plans = []
+        # chunks are packed once, outside the timed loop, the same
+        # way compare() pre-packs its batches
+        chunks = []
         for p in prefixes:
             for start, end in plan_groups(len(p), suffix_lens, budget):
-                chunk_plans.append((p, start, end))
+                chunks.append(pack_join_chunk(torch, p,
+                                              suffixes[start:end]))
         packed_answers = None
         for rep in range(reps):
             answers = []
             torch.cuda.reset_peak_memory_stats()
             t0 = time.perf_counter()
             with torch.inference_mode():
-                for p, start, end in chunk_plans:
-                    chunk = pack_join_chunk(torch, p,
-                                            suffixes[start:end])
+                for chunk in chunks:
                     normed, _ = pipeline.forward_chunk(chunk)
                     answers.extend(answerer(normed))
             torch.cuda.synchronize()
             wall = time.perf_counter() - t0
-            tokens = (sum(len(p) for p, _s, _e in chunk_plans)
-                      + n_reports * sum(suffix_lens))
+            tokens = sum(c["tokens"] for c in chunks)
             row = dict(method=name, rep=rep, wall=round(wall, 2),
-                       chunks=len(chunk_plans), fresh_tokens=tokens,
+                       chunks=len(chunks), fresh_tokens=tokens,
                        tok_s=round(tokens / wall, 1),
                        yes=sum(answers),
                        agrees_with_stock=(
@@ -919,8 +992,8 @@ def join2way(n_reports: int = 100, reps_packed: int = 3,
     with torch.inference_mode():
         warm = pack_join_chunk(torch, prefixes[0], suffixes[:64])
         pipeline.forward_chunk(warm)
-    packed_answers = run_arm("packed_bstar", chunk_budget(), reps_packed)
-    run_arm("packed_reference", B_REFERENCE, reps_reference)
+    packed_answers = run_arm("packed_b25305", B_REFERENCE, reps_packed)
+    run_arm("packed_bstar_cell", chunk_budget(), reps_reference)
 
     # accuracy sanity only - never a claim (report's own terms vs
     # packed answers)

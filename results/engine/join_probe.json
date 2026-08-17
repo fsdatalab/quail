@@ -1,0 +1,35 @@
+{
+  "b_star": 421752,
+  "attention_math_max_diff": 0.0068,
+  "lengths": {
+    "prefix": 3529,
+    "suffix_mean": 30.6
+  },
+  "gates": {
+    "shared_vs_unshared_disagreements": 0,
+    "disagreeing_pairs": [],
+    "disagreeing_margins_shared": [],
+    "disagreeing_margins_unshared": [],
+    "shared_vs_unshared_max_hidden_gap": 4.25,
+    "rows_with_gap_over_1": 62,
+    "median_row_gap": 2.5,
+    "kept_vs_shared_disagreements": 0,
+    "kept_disagreeing_pairs": [],
+    "finite": true
+  },
+  "rates": {
+    "b_star": {
+      "chunks": 2,
+      "tokens": 169452,
+      "wall_s": 2.027,
+      "tok_s": 83594.3
+    },
+    "reference": {
+      "chunks": 8,
+      "tokens": 190626,
+      "wall_s": 2.263,
+      "tok_s": 84219.2
+    }
+  },
+  "peak_gib": 15.67
+}

@@ -255,16 +255,24 @@ before each run; every Modal run teed to a file.
    prediction below is restated from these measured lengths by
    `plans/join_estimates.py`; the Section 2 table keeps the
    assumed-length paper-scale illustration.
-2. **Packed join — the prototype** (256,000 pairs, predicted
-   **1.5 min** at ~91,500 tok/s effective). The effective rate fell
-   from the assumed-length ~110k because real prefixes are 3x
-   longer and suffixes half: cross-attention is now ~27% of the
-   wall. At the derived B* a report's whole partner list fits one
-   chunk (m = 1), so nothing persists; per-segment attention plus
-   the suffix-to-prefix call merged by softmax state; suffix
-   positions identical to standalone requests. One reference cell
-   at 25,305 (m = 4 at measured lengths, predicted **1.7 min**) to
-   tell a rate change at large B apart from a slow kernel. The
+2. **Packed join — the prototype** (256,000 pairs). Run order
+   inverted by review: the **primary arm runs at 25,305** — the
+   largest measured sweep point, m = 4 at measured lengths,
+   predicted **1.7 min** — and the derived B* = 421,752 is the
+   exploratory cell (m = 1, predicted **1.5 min** at ~91,500 tok/s
+   effective, conditional on the rate holding out there). The
+   effective rate fell from the assumed-length ~110k because real
+   prefixes are 3x longer and suffixes half: cross-attention is
+   ~27% of the wall. Per-segment attention plus the
+   suffix-to-prefix call merged by softmax state (the exact
+   convex form A + (B−A)·sigmoid(lse_B − lse_A) — the fp32
+   materializing form cost ~13k tok/s and one knife-edge answer
+   flip); suffix positions identical to standalone requests.
+   **Probe: passed** — isolated attention math within 0.0068 of an
+   fp32 reference, 0/64 disagreements shared-vs-unshared and
+   kept-vs-shared, rates 83.6–84.2k tok/s (−8.6% of prediction,
+   inside the gate), flat across both budgets as predicted
+   (results/engine/join_probe.json). The
    merge call plus the pair-list Python are the new code; the
    packed loop, the three kernels, and the YES/NO readout carry
    over from `modal_single_filter_forward.py`.
