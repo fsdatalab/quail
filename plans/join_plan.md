@@ -13,8 +13,14 @@ Decisions taken:
 - **The algorithm is solved for general n.** A sampled prototype
   exercises n = 2 on BioDEX and n = 3 planted.
 - **A 2-way join runs as a packed forward pass.** No engine, no KV
-  pool, no batch-size choice — the only fixed size is the
-  25,305-token chunk from the sweep.
+  pool. The chunk budget B* is a parameter with a derived cap, not
+  a constant: B* ≤ (memory x 0.92 − weights − kept prefixes x
+  kappa) / activation bytes per token ≈ 843k tokens, floored at
+  ~4,096 where throughput flattens. Default is 25,305, the largest
+  measured sweep point; bigger values cut prefix recomputes but
+  sit past the measured range, so they are probe cells. Chunks are
+  packed to the brim across anchors — an anchor's list ending
+  mid-chunk is followed by the next anchor's prefix, no padding.
 - **n ≥ 3 checks survivors between stages and rewinds**: continue
   from a kept anchor prefix and stream the next relation against
   it. No vLLM needed — staging is Python bookkeeping around the
@@ -44,7 +50,8 @@ other side is the **partner**: it streams through as the per-pair
 suffix, and its KV depends on the anchor in front of it, so it is
 recomputed every pair in every design — partners never store KV,
 anywhere. Sizes: f = preamble + anchor tokens; s = partner +
-question tokens; S = the 25,305-token chunk/step budget.
+question tokens; S = the chunk/step token budget B* (a derived
+parameter — see the decisions above; 25,305 by default).
 
 **Planning, before anything runs.**
 
@@ -165,8 +172,12 @@ which side fits.
 **Size rule applied:** k = (25,305 − 1,040)/58 = 418 partners per
 chunk; m = ceil(3,718/418) = 9 chunks per report; f/S = 4.1%. So:
 recompute, keep nothing, the KV pool stays empty. The whole join is
-9 x 8,103 = 72,927 chunks of one prefix + ~418 suffixes each, built
-from a Python loop.
+9 x 8,103 = 72,927 chunks of prefix groups + suffixes, packed to
+the brim, built from a Python loop. At B* = 85,000 the same rule
+gives k = 1,447, m = 3, recompute 1.4%, and 4.47 h — conditional
+on the packed rate holding at that B, which the sweep does not
+cover (per-token GEMM cost rose with B there; the README's L2 open
+problem): a probe cell, not an assumption.
 
 **The comparison, derived** (walls from `plans/join_estimates.py`):
 
@@ -232,9 +243,12 @@ before each run; every Modal run teed to a file.
    tails, so pick and record a truncation policy.
 2. **Packed join — the prototype** (371,800 pairs, predicted
    **3.4 min** at the derived ~110k tok/s effective rate). Chunk =
-   prefix + ~418 suffixes; per-segment attention plus the
-   suffix-to-prefix call merged by softmax state; suffix positions
-   identical to standalone requests. Existing code carries most of
+   brim-packed prefix groups + suffixes (~418 per prefix at the
+   default B*); per-segment attention plus the suffix-to-prefix
+   call merged by softmax state; suffix positions identical to
+   standalone requests. One extra cell at B* = 85,000 — bigger
+   chunks cut the recompute to 1.4% and predict 4.47 h at full
+   scale, conditional on the rate holding past the measured sweep. Existing code carries most of
    it — the packed loop, the three kernels, the chunk packer, and
    the YES/NO readout from `modal_single_filter_forward.py`; the
    new work is that merge call plus ~100 lines of pair-list Python.
@@ -268,21 +282,30 @@ experiment 3 does, nothing else of vLLM is used.
 
 1. **`quail/joinlogic.py` + tests** — pure functions, no GPU, in
    the style of `chainlogic.py`: `orient()` (compare mean tokenized
-   lengths, return anchor side); `pack_chunks()` (given an anchor's
-   token count and its partner token lists, emit chunks under the
-   25,305 budget and the keep-vs-recompute decision by the size
-   rule); `gate_and_dedup()` (answers in, surviving anchors and the
-   next stage's pair list out); `assemble()` (recorded answers in,
-   tuples out). Unit-tested against a brute-force reference.
+   lengths, return anchor side); `pack_chunks()` (a streaming
+   packer over the whole pair list: fill each chunk to the brim
+   under B*, cut wherever the budget lands, and when an anchor's
+   partner list ends mid-chunk start the next anchor's prefix in
+   the same chunk — no padding; plus the keep-vs-recompute decision
+   by the size rule); `gate_and_dedup()` (answers in, surviving
+   anchors and the next stage's pair list out); `assemble()`
+   (recorded answers in, tuples out). Unit-tested against a
+   brute-force reference. Brim packing matters most where per-
+   anchor lists are far shorter than a chunk — gated later stages
+   and candidate-list mode — where per-anchor chunks would run
+   mostly empty.
 2. **The merge call** — the one new GPU piece, in the packed loop's
    per-layer body. Chunk rows are `[prefix | suffix_1 .. suffix_k]`.
    Call A: the existing varlen self-attention over the segment
    boundaries (prefix over itself, each suffix over itself). Call
    B: non-causal cross-attention, queries = all suffix rows, keys
    and values = the prefix rows of this chunk's K/V — or a kept
-   tensor from an earlier chunk. Combine A and B by their softmax
-   states (log-sum-exp merge; one small elementwise Triton kernel,
-   or FlashInfer's merge op). Positions: prefix rows 0..f-1, every
+   tensor from an earlier chunk. Call B is ragged: a brim-packed
+   chunk holds several prefix groups, so queries and keys carry
+   per-group boundaries (cu_seqlens_q / cu_seqlens_k), and kept
+   tensors are concatenated into the same ragged KV buffer.
+   Combine A and B by their softmax states (log-sum-exp merge; one
+   small elementwise Triton kernel, or FlashInfer's merge op). Positions: prefix rows 0..f-1, every
    suffix restarts at f — the rotate kernel already takes per-token
    positions. A kept-prefix chunk simply has no prefix segment:
    call A covers suffixes only, call B reads the stored tensors.
@@ -300,9 +323,10 @@ experiment 3 does, nothing else of vLLM is used.
    `gate_and_dedup()`. The baseline arm reuses the filter stock
    client: same container, stock vLLM 0.26 boot, prefix caching on,
    one request per pair `[preamble | report | term | question]`
-   with YES/NO-constrained single-token output, submitted grouped
-   by report through the client-side token-budget semaphore the
-   filter experiments already use. Its answers are the parity
+   with output constrained to the YES/NO tokens at `max_tokens=1` —
+   zero decode, the identical answer protocol as the packed arm —
+   submitted grouped by report through the client-side token-budget
+   semaphore the filter experiments already use. Its answers are the parity
    reference; its wall is the comparison. At sample scale the pool
    never fills (100 prefixes = 104k tokens), so the baseline runs
    eviction-free — its x81 extrapolation is best-case for stock,
@@ -320,7 +344,9 @@ everything downstream.
   prefix-attention call. The estimate prices that call from the
   fitted attention constant (2 x a2 per pair, 11% of C's wall) and
   the probe's rate gate checks the resulting ~110k effective rate;
-  a fused or badly-shaped kernel could still miss it.
+  a fused or badly-shaped kernel could still miss it. The
+  B* = 85,000 cell additionally extends the rate past the measured
+  sweep, where per-token GEMM cost was seen rising with B.
 - Naive stock is never run; its 99.9 h is arithmetic from the same
   constants, and the 1.87x thrash multiplier stays README-sourced
   and unmeasured. Say both wherever the number is quoted.

@@ -46,8 +46,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from quail.configs import H100_SXM, QWEN3_4B_FP8
 from quail.plan.cost import (
+    ACT_BYTES_PER_HIDDEN,
     ALPHA2_S_PER_TOKEN2 as A2,
+    BOOT_POOL_FRACTION,
     CAL_SQ_PER_TOKEN as SQ_CAL,
     STEP_BETA_N_S as BETA_N,
     STEP_FIXED_S,
@@ -63,8 +66,27 @@ filters = json.load(open(ROOT / "results/engine/filter_cells.json"))
 
 POOL = next(r["pool_tokens"] for r in cal if r.get("meta") == "boot")
 BUDGET = filters["budget_tokens"]
-S = ladder["batch_tokens"]
 A_PKD = 1.0 / ladder["mean_tokens_per_second"]["packed_custom_qk"]
+
+# The chunk budget B* is a parameter, not a constant. Memory caps it
+# (the packed pass holds only activations plus any kept prefixes -
+# no KV cache), the measured flat region floors it at ~4,096, and
+# the default is the sweep's largest measured point. Bigger B cuts
+# prefix recomputes, but the sweep recorded per-token GEMM cost
+# rising with B (L2 pressure, the open problem in the README), so
+# values past the measured range are probe cells, not assumptions.
+MODEL, DEVICE = QWEN3_4B_FP8, H100_SXM
+ACT = ACT_BYTES_PER_HIDDEN * MODEL.h        # peak activation bytes/token
+
+
+def chunk_cap(kept_prefix_tokens=0):
+    free = (DEVICE.M * BOOT_POOL_FRACTION - MODEL.W_mem
+            - kept_prefix_tokens * MODEL.kappa)
+    return int(free // ACT)
+
+
+B_MEAS = ladder["batch_tokens"]             # largest measured sweep point
+S = B_MEAS                                  # default B*
 
 c2 = {r["cell"]: r for r in cal if r.get("family") == "c2"}
 READ_NS = {}
@@ -112,8 +134,10 @@ def hrs(x):
 
 print("derived from artifacts: pool "
       f"{POOL:,} tok (calibrate boot); admission budget {BUDGET:,} tok "
-      f"(filter run); chunk budget S = {S:,}; packed rate "
-      f"{1 / A_PKD:,.0f} tok/s (ladder)")
+      f"(filter run); packed rate {1 / A_PKD:,.0f} tok/s (ladder)")
+print(f"chunk budget B*: default {S:,} (largest measured); memory cap "
+      f"{chunk_cap():,} tok at {ACT / 1e3:.0f} KB/token activations, "
+      f"{chunk_cap(8 * 4040):,} with eight kept 4k prefixes")
 print("cached-read prices from c2 cells (ns/cached token): "
       + ", ".join(f"c={c}: {v:.0f}" for c, v in READ_NS.items())
       + f"; fair stock wall {STOCK_FAIR_WALL:.1f} s")
@@ -139,8 +163,8 @@ a1 = t_lin + t_attn + t_req + t_step
 print(f"\nA1 stock, arbitrary order: fresh = P*{h_pair} = {fresh / 1e9:.2f}B")
 print(f"  linear {hrs(t_lin):.1f} h + attn excess {hrs(t_attn):.1f} h + "
       f"requests {hrs(t_req):.2f} h + steps {hrs(t_step):.2f} h = "
-      f"{hrs(a1):.1f} h; x{THRASH:.2f} thrash (README-sourced, remeasured "
-      f"by the 5% sample) = {hrs(a1 * THRASH):.0f} h")
+      f"{hrs(a1):.1f} h; x{THRASH:.2f} thrash (README-sourced, not "
+      f"remeasured here) = {hrs(a1 * THRASH):.0f} h")
 print(f"  prefix working set NL*f = {NL * f / 1e6:.1f}M tokens = "
       f"{NL * f / POOL:.1f}x pool (why thrash applies)")
 
@@ -186,6 +210,19 @@ print(f"  attention pairs {pairs / 1e12:.2f}e12 (cross {P * s * f / 1e12:.2f}e12
       f"{hrs(c_wall):.2f} h; cross-attn share {t_att / c_wall:.0%}; "
       f"effective rate {fresh_c / c_wall:,.0f} tok/s")
 print(f"  5% pair sample (confirming cell): {c_wall * 0.05 / 60:.0f} min")
+
+# Larger chunk budget: fewer prefix recomputes, same suffix work.
+# Uses the 25,305-measured rate - a probe cell must confirm it holds.
+for B in (85_000,):
+    kB = (B - f) // s
+    mB = math.ceil(NR / kB)
+    fresh_v = P * s + NL * mB * f
+    pairs_v = (P * (s * f + s * (s + 1) // 2)
+               + NL * mB * (f * (f + 1) // 2))
+    w = fresh_v * (A_PKD - SQ_CAL * A2) + 2 * pairs_v * A2
+    print(f"  at B*={B:,}: k={kB:,}, m={mB}, recompute "
+          f"{NL * mB * f / fresh_v:.1%} -> {hrs(w):.2f} h "
+          f"(if the rate holds at this B - probe cell)")
 
 # The flip - terms anchored - to show the anchor rule's stakes.
 f2, s2 = p + TR, TL + q
