@@ -99,7 +99,7 @@ class QuailScheduler(Scheduler):
         # fresh documents against 305 free slots while 289 frees were
         # still in flight.
         self._de_freed_lag = deque(maxlen=2)
-        self._de_last_admits = 0
+        self._de_admits_ring = deque(maxlen=2)
         # slot accounting trace (env QUAIL_SLOTSTATS): one line per
         # 100 steps naming every population that can hold or shadow a
         # model-runner slot, for localizing 'No free indices'
@@ -195,22 +195,21 @@ class QuailScheduler(Scheduler):
         # shares this process its pool is read directly: free slots
         # minus the previous step's still-in-flight admissions is
         # the truth, and the gate takes the smaller of the two.
+        # the batch queue holds two outputs in flight, so up to two
+        # steps of admissions can land after the free count was
+        # sampled: both are subtracted. A fixed release cap instead
+        # of this subtraction kept slots safe but throttled restores
+        # to quarter-full steps (10k walls 32-40 s on 7.4 s of
+        # copying); the two-deep subtraction bounds the transient
+        # exactly and lets steady state run at the completion rate.
         try:
             from vllm.v1.worker.gpu import model_runner as _mr
             st = getattr(_mr, "_quail_req_states", None)
             if st is not None:
                 slack = min(slack, len(st.free_indices)
-                            - self._de_last_admits - 8)
+                            - sum(self._de_admits_ring) - 8)
         except Exception:
             pass
-        # and no bursts, ever: the batch queue holds two outputs in
-        # flight, so a burst admitted against a sampled free count
-        # can land after that count has changed (measured bursts of
-        # 595 and 1,236 fresh admissions in one output). A per-step
-        # release cap far under the pool keeps the transient demand
-        # inside any sampling error; the ramp to a full window costs
-        # a few dozen steps, immaterial against query walls.
-        slack = min(slack, max(16, self._de_base_max_reqs // 16))
         keep = []
         while self.waiting:
             r = self.waiting.pop_request()
@@ -250,7 +249,7 @@ class QuailScheduler(Scheduler):
         self._de_waves.before()
         out = super().schedule(*args, **kwargs)
         self._de_freed_lag.append(riding_now)
-        self._de_last_admits = len(out.scheduled_new_reqs)
+        self._de_admits_ring.append(len(out.scheduled_new_reqs))
         self._de_requeued.difference_update(out.num_scheduled_tokens)
         self._de_waves.after(out.num_scheduled_tokens.keys())
         if self._de_steps is not None:
