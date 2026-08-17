@@ -165,8 +165,8 @@ def predicted_vs_measured():
     print(f"  join_predicted_vs_measured.png")
 
 
-def nway_chart():
-    """Flow diagram for the 3-way staged join showing selectivity."""
+def nway_query_plan():
+    """Query plan tree, bottom-up like a database EXPLAIN, with time per node."""
     d = load("join_nway3.json")
     r = d["result"]
     n_a, n_b, n_c = d["n_a"], d["n_b"], d["n_c"]
@@ -176,75 +176,112 @@ def nway_chart():
     survivors = r["survivors"]
     planted_expected = r["planted_expected_survivors"]
     triples = r["triples"]
+    total = s1 + s2
 
-    fig, ax = plt.subplots(figsize=(10, 5.0))
+    fig, ax = plt.subplots(figsize=(8, 7.5))
     ax.set_xlim(0, 10)
-    ax.set_ylim(0, 6)
+    ax.set_ylim(-0.5, 8.5)
     ax.axis("off")
 
-    box_kw = dict(boxstyle="round,pad=0.4", linewidth=1.5)
+    box_kw = dict(boxstyle="round,pad=0.35", linewidth=1.5)
 
-    def box(x, y, text, color, textcolor="white", fontsize=11):
+    def node(x, y, text, color, textcolor="white", fontsize=10):
         ax.text(x, y, text, ha="center", va="center", fontsize=fontsize,
                 fontweight="bold", color=textcolor,
                 bbox=dict(facecolor=color, edgecolor=color, **box_kw))
 
-    def arrow(x1, y1, x2, y2, label="", color="#2c3e50"):
-        ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
-                    arrowprops=dict(arrowstyle="-|>", color=color, lw=1.8))
-        if label:
-            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            ax.text(mx, my + 0.22, label, ha="center", va="bottom",
-                    fontsize=9, color=color)
+    def edge(x1, y1, x2, y2):
+        ax.plot([x1, x2], [y1, y2], color="#bdc3c7", lw=1.8,
+                solid_capstyle="round")
 
-    # relations
-    box(1.0, 5.0, f"A\n{n_a} docs", "#7f8c8d")
-    box(5.0, 5.0, f"B\n{n_b} docs", "#2980b9")
-    box(9.0, 5.0, f"C\n{n_c} docs", "#e67e22")
+    def time_label(x, y, text, color="#2c3e50"):
+        ax.text(x, y, text, ha="left", va="center", fontsize=9.5,
+                color=color, style="italic")
 
-    # stage 1
-    arrow(1.0, 4.55, 3.5, 3.65)
-    arrow(5.0, 4.55, 3.5, 3.65)
-    box(3.5, 3.3, f"Stage 1: B×A\n{n_b * n_a:,} pairs\n{s1:.1f} s",
-        "#2980b9")
+    # leaves (bottom)
+    node(2.0, 0.5, f"Scan A\n{n_a} docs", "#7f8c8d")
+    node(5.0, 0.5, f"Scan B\n{n_b} docs", "#2980b9")
+    node(8.0, 0.5, f"Scan C\n{n_c} docs", "#e67e22")
 
-    # gate with selectivity
-    arrow(3.5, 2.85, 3.5, 2.1, color="#c0392b")
-    ax.text(4.35, 2.65, f"gate: {survivors}/{n_b} B survive",
-            fontsize=9.5, color="#c0392b", fontweight="bold",
-            va="center")
-    ax.text(4.35, 2.35,
-            f"(planted: {planted_expected}/{n_b} expected;\n"
-            f" model too permissive — no skips)",
-            fontsize=8, color="#95a5a6", va="center")
+    # stage 1: packed join B x A
+    edge(2.0, 0.95, 3.5, 2.05)
+    edge(5.0, 0.95, 3.5, 2.05)
+    node(3.5, 2.5, f"Packed Join\nB × A\n{n_b * n_a:,} pairs", "#2980b9")
+    time_label(5.3, 2.5, f"{s1:.1f} s")
 
-    # dedup + kept KV
-    box(3.5, 1.7, f"dedup + keep KV", "#2c3e50", fontsize=9.5)
-    ax.text(5.2, 1.7,
-            f"each surviving B runs\nonce, not per A match",
-            fontsize=8, color="#7f8c8d", va="center")
+    # gate + dedup
+    edge(3.5, 2.95, 3.5, 3.75)
+    node(3.5, 4.2,
+         f"Gate + Dedup\n{survivors}/{n_b} B survive\nkeep KV",
+         "#2c3e50", fontsize=9.5)
+    time_label(5.3, 4.4, f"~0 s")
+    time_label(5.3, 4.0,
+               f"(expected {planted_expected}/{n_b})", color="#95a5a6")
 
-    # stage 2
-    arrow(3.5, 1.3, 6.5, 0.65)
-    arrow(9.0, 4.55, 6.5, 0.65)
-    box(6.5, 0.3, f"Stage 2: B×C\n{r['stage2_pairs']:,} pairs\n{s2:.1f} s",
-        "#e67e22")
+    # stage 2: packed join B x C, reuse kept KV
+    edge(3.5, 4.65, 5.0, 5.45)
+    edge(8.0, 0.95, 5.0, 5.45)
+    node(5.0, 5.9,
+         f"Packed Join\nB × C  (reuse KV)\n{r['stage2_pairs']:,} pairs",
+         "#e67e22")
+    time_label(6.9, 5.9, f"{s2:.1f} s")
 
-    # output
-    arrow(6.5, -0.15, 6.5, -0.8, color="#27ae60")
-    box(6.5, -1.15, f"{triples:,} triples", "#27ae60", fontsize=10)
+    # assemble
+    edge(5.0, 6.4, 5.0, 6.85)
+    node(5.0, 7.3, f"Assemble\n{triples:,} triples", "#27ae60")
+    time_label(6.9, 7.3, "~0 s")
 
-    # total wall time
-    ax.text(9.2, 0.3, f"total\n{s1 + s2:.1f} s", ha="center", va="center",
-            fontsize=12, fontweight="bold", color="#2c3e50")
+    # total
+    ax.text(5.0, 8.2, f"Total: {total:.1f} s", ha="center", va="center",
+            fontsize=13, fontweight="bold", color="#2c3e50")
 
-    ax.set_title("3-Way Chain Join  (A-B-C, packed, no engine)",
-                 fontsize=13, pad=8)
+    ax.set_title("3-Way Join Query Plan", fontsize=14, pad=8)
     fig.tight_layout()
-    fig.savefig(HERE / "join_nway3.png", dpi=180, bbox_inches="tight")
+    fig.savefig(HERE / "join_nway3_plan.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
-    print(f"  join_nway3.png  ({s1:.1f} + {s2:.1f} s, "
-          f"{survivors} survivors)")
+    print(f"  join_nway3_plan.png  (query plan, {total:.1f} s total)")
+
+
+def nway_time_bar():
+    """Horizontal stacked bar: time fraction per stage."""
+    d = load("join_nway3.json")
+    r = d["result"]
+
+    s1 = r["stage1_wall_s"]
+    s2 = r["stage2_wall_s"]
+    total = s1 + s2
+
+    fig, ax = plt.subplots(figsize=(8, 2.5))
+
+    bar_h = 0.5
+    y = 0
+
+    ax.barh(y, s1, height=bar_h, left=0, color="#2980b9",
+            edgecolor="white", linewidth=0.8)
+    ax.barh(y, s2, height=bar_h, left=s1, color="#e67e22",
+            edgecolor="white", linewidth=0.8)
+
+    ax.text(s1 / 2, y, f"Stage 1: B×A\n{s1:.1f} s ({s1/total:.0%})",
+            ha="center", va="center", fontsize=11, color="white",
+            fontweight="bold")
+    ax.text(s1 + s2 / 2, y,
+            f"Stage 2: B×C\n{s2:.1f} s ({s2/total:.0%})",
+            ha="center", va="center", fontsize=11, color="white",
+            fontweight="bold")
+
+    ax.set_xlim(0, total * 1.08)
+    ax.set_ylim(-0.6, 0.6)
+    ax.set_xlabel("Wall-clock seconds", fontsize=11)
+    ax.set_title(f"3-Way Join Time Breakdown  ({total:.1f} s total)",
+                 fontsize=13, pad=8)
+    ax.set_yticks([])
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(HERE / "join_nway3_time.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  join_nway3_time.png  ({s1:.1f} + {s2:.1f} = {total:.1f} s)")
 
 
 if __name__ == "__main__":
@@ -252,5 +289,6 @@ if __name__ == "__main__":
     wall_chart()
     rate_chart()
     predicted_vs_measured()
-    nway_chart()
+    nway_query_plan()
+    nway_time_bar()
     print("Done.")
