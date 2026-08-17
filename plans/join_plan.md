@@ -337,15 +337,19 @@ All three runs completed (~40 GPU-minutes total;
 | merge math vs fp32 reference | exact | 0.0068 max diff | pass |
 | parity, shared vs one-per-chunk | 0 disagreements | 0 of 64 | pass |
 | parity, kept-KV replay vs in-chunk | 0 disagreements | 0 of 64 | pass |
-| packed at 25,305, 3 reps | 102 s | 105.8 s, spread 0.04 s | **+3.7%, pass** |
-| packed at derived B*, 2 reps | 92 s | 95.5–95.7 s | **+4.0%, pass** |
-| rate flat in B | equal rates | 88.0k tok/s at both; wall ratio 1.107 = token ratio 1.106 | **confirmed** |
-| grouped stock, 2 reps | 199 s (GPU terms) | 487–504 s | GPU terms right; see finding 1 |
-| packed over stock | 2.1x | **5.1x** | wider, for finding-1 reasons |
+| packed at 25,305, 3 reps (incl. packing) | 102 s | 108.4 s, spread 0.5 s | **+6.3%, pass** |
+| packed at derived B*, 2 reps (incl. packing) | 92 s | 98.4–99.0 s | **+7.2%, pass** |
+| rate flat in B | equal rates | 85.5k tok/s at both; wall ratio 1.099 = token ratio 1.106 | **confirmed** |
+| grouped stock, 2 reps | 199 s (GPU terms) | 418–449 s | GPU terms right; see finding 1 |
+| packed over stock | 2.1x | **4.4x** | wider, for finding-1 reasons |
 | 3-way stage 1 | 40 s, expected 8–15% over | 48.7 s | +22%, see finding 3 |
 | 3-way stage 2, per survivor | 0.43 s | 0.30 s | kept prefixes beat the recompute price |
 | 3-way triples vs nested-loop replay | identical | identical (74,600 triples) | **pass** |
 | 3-way stage-2 pair count | survivors x 100 | 10,000 = 100 x 100 | **pass** |
+
+Wall times for packed runs include end-to-end cost: chunk packing
+(building GPU tensors from raw token lists) plus forward passes
+plus answer readout.
 
 Findings, in order of importance:
 
@@ -353,7 +357,7 @@ Findings, in order of importance:
    GPU-side prices were right (reads, linear, boundary ≈ 199 s of
    its wall), but one-request-per-pair means the engine ingests,
    hashes, and bookkeeps 770M prompt tokens across 256,000 request
-   objects even though 99% are cache hits — about 290 s of host
+   objects even though 99% are cache hits — about 234 s of host
    work at these shapes. The per-request constant (50.3 us,
    measured at 10k filter requests) has no per-prompt-token
    ingestion term. The packed side has no analog: its "requests"
@@ -364,13 +368,13 @@ Findings, in order of importance:
    2-way: YES on 60% of pairs (recall 584/587, precision 0.33%).
    3-way: 9,763 of 10,000 stage-1 answers wrong against the
    planted keys — it answers YES to almost every candidate, so all
-   100 B documents survived and the gate executed zero skips on
-   GPU (planted design expected 80). Gating and dedup logic remain
-   covered by the unit tests and the replay check, which passed
-   identically. Follow-up: a planted predicate this model can
-   actually read (the filters' single-flag lookup worked; two-key
-   comparison across 4k tokens does not), or a stronger model as
-   the instrument.
+   100 B documents survived and the filter executed zero skips on
+   GPU (planted design expected 80). Filtering and deduplication
+   logic remain covered by the unit tests and the replay check,
+   which passed identically. Follow-up: a planted predicate this
+   model can actually read (the filters' single-flag lookup worked;
+   two-key comparison across 4k tokens does not), or a stronger
+   model as the instrument.
 3. **Stage-1 3-way ran +22% over** (48.7 s vs the 40 s estimate
    whose stated tolerance was 8–15%): ~41k-token chunks amortize
    the per-chunk host work (pack, answer, capture) worse than the

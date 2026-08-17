@@ -17,26 +17,26 @@
     {
       "method": "stock_grouped",
       "rep": 0,
-      "wall": 503.95,
+      "wall": 449.27,
       "fresh_tokens": 7359876,
-      "tok_s": 14604.5,
+      "tok_s": 16381.7,
       "yes": 154731
     },
     {
       "method": "stock_grouped",
       "rep": 1,
-      "wall": 486.66,
+      "wall": 417.56,
       "fresh_tokens": 7359876,
-      "tok_s": 15123.2,
+      "tok_s": 17625.7,
       "yes": 154731
     },
     {
       "method": "packed_b25305",
       "rep": 0,
-      "wall": 105.82,
+      "wall": 108.7,
       "chunks": 400,
       "fresh_tokens": 9310600,
-      "tok_s": 87983.6,
+      "tok_s": 85655.5,
       "yes": 177830,
       "agrees_with_stock": 213989,
       "peak_gib": 7.65
@@ -44,10 +44,10 @@
     {
       "method": "packed_b25305",
       "rep": 1,
-      "wall": 105.78,
+      "wall": 108.35,
       "chunks": 400,
       "fresh_tokens": 9310600,
-      "tok_s": 88020.6,
+      "tok_s": 85926.9,
       "yes": 177830,
       "agrees_with_stock": 213989,
       "peak_gib": 7.65
@@ -55,10 +55,10 @@
     {
       "method": "packed_b25305",
       "rep": 2,
-      "wall": 105.82,
+      "wall": 108.24,
       "chunks": 400,
       "fresh_tokens": 9310600,
-      "tok_s": 87983.1,
+      "tok_s": 86019.5,
       "yes": 177830,
       "agrees_with_stock": 213989,
       "peak_gib": 7.65
@@ -66,10 +66,10 @@
     {
       "method": "packed_bstar_cell",
       "rep": 0,
-      "wall": 95.73,
+      "wall": 98.35,
       "chunks": 100,
       "fresh_tokens": 8417425,
-      "tok_s": 87926.1,
+      "tok_s": 85588.7,
       "yes": 177830,
       "agrees_with_stock": 213989,
       "peak_gib": 15.31
@@ -77,10 +77,10 @@
     {
       "method": "packed_bstar_cell",
       "rep": 1,
-      "wall": 95.54,
+      "wall": 98.95,
       "chunks": 100,
       "fresh_tokens": 8417425,
-      "tok_s": 88104.6,
+      "tok_s": 85070.0,
       "yes": 177830,
       "agrees_with_stock": 213989,
       "peak_gib": 15.31

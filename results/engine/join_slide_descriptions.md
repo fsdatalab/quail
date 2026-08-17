@@ -1,7 +1,7 @@
 # Slide descriptions for join experiment
 
 Each section describes one method/baseline: what it is, how it is
-configured, what it measures.
+configured, what it measured.
 
 ---
 
@@ -17,7 +17,7 @@ derived from the same token budget formula as the packed runs.
 max_num_batched_tokens = 25,305. This is the best-case stock
 configuration: grouped submission order, admission tuned, zero
 decode, eviction-free at this sample size (100 report prefixes fit
-the pool). Measured: **495 s** for 256,000 pairs. About 200 s of
+the pool). Measured: **433 s** for 256,000 pairs. About 199 s of
 that is GPU computation; the rest is host-side overhead from
 processing 256,000 individual request objects.
 
@@ -41,8 +41,9 @@ logits at each suffix's last token position. At this B, each
 report's 2,560 terms span about 4 chunks (m = 4), so each report
 prefix is computed 4 times. 25,305 is the largest point from the
 measured throughput sweep, included as a reference to separate rate
-changes at large B from kernel issues. Measured: **105.8 s** at
-88,000 tokens/s.
+changes at large B from kernel issues. Wall time includes chunk
+packing (building GPU tensors from token lists). Measured:
+**108.4 s** at 85,900 tokens/s.
 
 ---
 
@@ -52,11 +53,11 @@ Same mechanism as above, but chunks are 421,752 tokens — the
 derived budget B* from the formula act x B + reservation <= M_free,
 with a slack of 2. At this B, each report's full partner list fits
 one chunk (m = 1), so each prefix is computed exactly once. 256,000
-pairs pack into 100 chunks. The rate is the same 88,000 tokens/s
+pairs pack into 100 chunks. The rate is the same ~85,500 tokens/s
 (flat in B), but fewer prefix recomputations mean fewer total
-tokens (8.42M vs 9.31M), saving 10 s. This run confirms the budget
-formula and the rate plateau. Measured: **95.6 s**, **5.2x faster
-than stock**.
+tokens (8.42M vs 9.31M), saving ~10 s. This run confirms the
+budget formula and the rate plateau. Wall time includes chunk
+packing. Measured: **98.7 s**, **4.4x faster than stock**.
 
 ---
 
@@ -70,9 +71,9 @@ known by construction. Executed as two packed forward passes with
 Python staging between them:
 
 - **Stage 1**: B anchors, A streams as suffixes. Record all YES/NO
-  answers. Gate: skip B documents with zero YES answers. Dedup:
-  each surviving B document enters stage 2 once, regardless of how
-  many A documents matched it.
+  answers. Drop B documents with zero YES answers. Each surviving B
+  document enters stage 2 once, regardless of how many A documents
+  matched it.
 - **Stage 2**: surviving B anchors, C streams as suffixes. B's
   prefix KV is kept from stage 1 (stored as plain tensors, not in
   any engine cache) and reused — no recomputation.
@@ -82,6 +83,6 @@ Python staging between them:
 Two correctness checks: (1) the triple set matches a nested-loop
 replay of the recorded answers identically (74,600 triples), so
 any staging or bookkeeping bug would show as a difference. (2)
-Stage-2 pair count = survivors x 100, confirming dedup reduced the
-work. Measured: **48.7 s** (stage 1) + **29.7 s** (stage 2) =
-**78.4 s** total.
+Stage-2 pair count = survivors x 100, confirming deduplication
+reduced the work. Measured: **48.7 s** (stage 1) + **29.7 s**
+(stage 2) = **78.4 s** total.
