@@ -1,0 +1,81 @@
+{
+  "n_docs": 1000,
+  "stage": "split",
+  "model": "Qwen/Qwen3-4B-FP8",
+  "connector": "quail",
+  "corpus_tokens": 327474,
+  "kappa": 73728,
+  "budget_tokens": 253050,
+  "step_tokens": 25305,
+  "max_num_seqs": 931,
+  "waves": false,
+  "spill": false,
+  "choke_util": 0.0,
+  "kv_bytes_estimate": 24144003072,
+  "store_gb": 0,
+  "store_min_doc_tokens": 1,
+  "stored_docs": 1000,
+  "store_cold_offload_s": 5.45,
+  "store_restore_s": 2.05,
+  "store_restore2_s": 2.07,
+  "restore_effective_GBps": 11.75,
+  "survivors_per_query": [
+    193,
+    662,
+    552
+  ],
+  "xfer": {
+    "directions": {
+      "h2d": {
+        "jobs": 17,
+        "gb": 52.018,
+        "busy_s": 1.253,
+        "copy_GBps": 41.51,
+        "job_GBps_p50": 32.11,
+        "job_GBps_p90": 48.81,
+        "submit_to_finish_p50_s": 0.1356
+      },
+      "d2h": {
+        "jobs": 3252,
+        "gb": 29.625,
+        "busy_s": 0.915,
+        "copy_GBps": 32.38,
+        "job_GBps_p50": 18.41,
+        "job_GBps_p90": 48.28,
+        "submit_to_finish_p50_s": 0.0999
+      }
+    },
+    "windows": [
+      {
+        "name": "ps1",
+        "wall_s": 5.453,
+        "load_jobs": 0,
+        "load_gb": 0.0,
+        "load_busy_s": 0,
+        "channel_busy_frac": 0.0,
+        "effective_GBps": 0.0,
+        "copy_GBps": null
+      },
+      {
+        "name": "ps2",
+        "wall_s": 2.055,
+        "load_jobs": 9,
+        "load_gb": 26.009,
+        "load_busy_s": 0.627,
+        "channel_busy_frac": 0.305,
+        "effective_GBps": 12.66,
+        "copy_GBps": 41.51
+      },
+      {
+        "name": "ps3",
+        "wall_s": 2.074,
+        "load_jobs": 8,
+        "load_gb": 26.009,
+        "load_busy_s": 0.627,
+        "channel_busy_frac": 0.3021,
+        "effective_GBps": 12.54,
+        "copy_GBps": 41.51
+      }
+    ]
+  }
+}
