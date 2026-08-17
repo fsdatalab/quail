@@ -275,10 +275,15 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     from quail.configs import DEVICES
     from quail.plan import plan_query
     from workload import DEVICE_NAME
-    # admission and step budget derive from the deepest query the
-    # engine will serve: three stages in the split protocols
-    plan_depth = 3 if stage in ("split", "split7") else N_FILTERS
-    plan = plan_query(plan_depth, [len(b) for b in body_ids],
+    # sized by the full filter count, not the deepest single query:
+    # a chain session holds its model-runner slot from first prefill
+    # to its last verdict, including while it waits rewound between
+    # stages, so max_num_seqs must cover living sessions. Deriving
+    # from stage depth shrank the slots to ~420 for 1,000 living
+    # sessions and the runner ran out (No free indices). A
+    # scheduler-enforced session bound is the durable fix; until
+    # then the N_FILTERS sizing is the measured-safe one.
+    plan = plan_query(N_FILTERS, [len(b) for b in body_ids],
                       MODELS[CFG_NAME], DEVICES[DEVICE_NAME])
     pool_budget = plan.budget_tokens
 
