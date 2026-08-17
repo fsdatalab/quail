@@ -233,7 +233,8 @@ def _xfer_summary(events, windows):
 def persist_run(n_docs: int = 1000, stage: str = "baseline",
                 cpu_gb: int = 96, connector: str = "stock",
                 store_gb: int = 0, waves: bool = False,
-                spill: bool = False, choke_util: float = 0.0) -> dict:
+                spill: bool = False, choke_util: float = 0.0,
+                client: str = "stages") -> dict:
     import time as _time
 
     trace_path = "/tmp/quail_xfer"
@@ -256,7 +257,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     from vllm.v1.engine.llm_engine import LLMEngine as Engine
 
     from quail.configs import MODELS
-    from quail.runtime.engine_client import run_filter_chain
+    from quail.runtime.engine_client import (run_filter_chain,
+                                             run_filter_chain_engine)
     from workload import CFG_NAME, build_corpus, yes_no_ids
 
     tok = AutoTokenizer.from_pretrained(MODEL)
@@ -296,6 +298,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
                   step_tokens=plan.engine_step_tokens,
                   max_num_seqs=plan.engine_max_seqs,
                   waves=waves, spill=spill, choke_util=choke_util,
+                  client=client,
                   kv_bytes_estimate=kv_bytes, store_gb=store_gb,
                   store_min_doc_tokens=store_min,
                   stored_docs=(sum(1 for b in body_ids
@@ -313,7 +316,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
                   # shipped setting
                   gpu_memory_utilization=choke_util or 0.92,
                   enable_prefix_caching=True, disable_log_stats=True)
-        if waves:
+        if waves or client == "chain":
             kw["scheduler_cls"] = ("quail.engineext.scheduler."
                                    "QuailScheduler")
         if store:
@@ -333,8 +336,16 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         return EngineArgs(**kw)
 
     def one_query(engine, tag, qs=None):
-        return run_filter_chain(engine, sp, body_ids,
-                                q_ids if qs is None else qs,
+        use_qs = q_ids if qs is None else qs
+        if client == "chain":
+            # rewind mode: one living request per document, the
+            # engine runs the whole filter chain and rewinds KV to
+            # the document between stages
+            return run_filter_chain_engine(engine, sp, body_ids,
+                                           use_qs, yes_ids, tag=tag,
+                                           no_ids=no_ids,
+                                           store_min_tokens=store_min)
+        return run_filter_chain(engine, sp, body_ids, use_qs,
                                 pool_budget, tag=tag,
                                 store_min_tokens=store_min)
 
@@ -413,6 +424,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
             suffix += "_spill"
         if choke_util:
             suffix += f"_choked{int(choke_util * 100)}"
+        if client == "chain":
+            suffix += "_chain"
         if stage != "store":
             suffix = f"_{stage}" + suffix
         with open(f"/results/persist_xfer_trace{suffix}.jsonl", "w") as f:
@@ -435,6 +448,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         tag += "_spill"
     if choke_util:
         tag += f"_choked{int(choke_util * 100)}"
+    if client == "chain":
+        tag += "_chain"
     with open(f"/results/persist_{stage}{tag}.json", "w") as f:
         json.dump(slim, f, indent=2)
     results_vol.commit()
@@ -445,9 +460,9 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
 def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
          connector: str = "stock", store_gb: int = 0,
          waves: bool = False, spill: bool = False,
-         choke_util: float = 0.0, out: str = ""):
+         choke_util: float = 0.0, client: str = "stages", out: str = ""):
     data = persist_run.remote(n_docs, stage, cpu_gb, connector, store_gb,
-                              waves, spill, choke_util)
+                              waves, spill, choke_util, client)
     events = data.pop("xfer_events", None)
     tag = "_quail" if connector == "quail" else ""
     if waves:
@@ -456,6 +471,8 @@ def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
         tag += "_spill"
     if choke_util:
         tag += f"_choked{int(choke_util * 100)}"
+    if client == "chain":
+        tag += "_chain"
     path = out or f"results/engine/persist_{stage}{tag}.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
