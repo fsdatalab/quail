@@ -20,14 +20,16 @@ Three entrypoints:
             tensor must reproduce the in-chunk answers exactly.
 
   join2way  the BioDEX sample: 100 reports x all terms. Arms: packed
-            at the derived B* (one chunk per report), packed at the
-            25,305 reference cell (the largest measured sweep point,
-            m chunks per report, prefix recomputed per chunk), and
-            grouped stock vLLM - synchronous, one generate() over the
-            pair list in report order, admission via max_num_seqs
-            derived from the filter run's token budget. The join has
-            no gating, so nothing here needs the async client the
-            filter experiment's stock arm used.
+            at the derived B* (one chunk per report), and grouped
+            stock vLLM - synchronous, one generate() over the pair
+            list in report order, admission via max_num_seqs derived
+            from the filter run's token budget. The join has no
+            gating, so nothing here needs the async client the
+            filter experiment's stock arm used. (A packed reference
+            cell at 25,305 ran in earlier revisions and was dropped:
+            its prefix recompute changes the prefix/suffix token
+            mix, so it was not a single-variable chunk-size
+            control.)
 
   nway3     the planted 3-relation chain on IMDB reviews, no vLLM:
             per B document, stage 1 packs [prefix | A suffixes] and
@@ -43,7 +45,6 @@ plans/join_estimates.py from committed artifacts; document lengths
 were assumed - this file measures them and prints both):
   - packed 2-way sample at B*: 3.3 min at ~110k tok/s effective
     (121,045 measured packed rate minus priced cross-attention).
-  - reference cell at 25,305: same tokens + ~4% recompute.
   - grouped stock: 5.4 min.
   - nway3: about a minute of GPU per stage.
 
@@ -99,9 +100,6 @@ def chunk_budget():
     act = ACT_BYTES_PER_HIDDEN * QWEN3_4B_FP8.h
     free = H100_SXM.M * BOOT_POOL_FRACTION - QWEN3_4B_FP8.W_mem
     return int(free // act) // SLACK
-
-
-B_REFERENCE = 25_305   # largest measured sweep point: the rate cross-check
 
 
 # ------------------------------------------------------------ the model
@@ -815,13 +813,11 @@ def probe() -> str:
         finite=bool(torch.isfinite(normed_shared).all().item()),
     )
 
-    # rate gate: a full report x all terms at B* (one chunk), and the
-    # reference geometry at 25,305
+    # rate gate: a full report x all terms at B* (one chunk each)
     data_full = biodex_sample(tokenizer, n_reports=2)
     rates = {}
     with torch.inference_mode():
-        for name, budget in (("b_star", chunk_budget()),
-                             ("reference", B_REFERENCE)):
+        for name, budget in (("b_star", chunk_budget()),):
             chunks = []
             for p in data_full["prefixes"]:
                 for start, end in plan_groups(
@@ -860,8 +856,8 @@ def probe() -> str:
 @app.function(image=join_image, gpu="H100!", timeout=10800, memory=65536,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
-def join2way(n_reports: int = 100, reps_packed: int = 3,
-             reps_reference: int = 2, reps_stock: int = 2) -> str:
+def join2way(n_reports: int = 100, reps_packed: int = 2,
+             reps_stock: int = 2) -> str:
     import gc
     import time
 
@@ -881,7 +877,7 @@ def join2way(n_reports: int = 100, reps_packed: int = 3,
 
     report = dict(
         model=MODEL, n_reports=n_reports, n_terms=n_terms, pairs=pairs,
-        b_star=chunk_budget(), b_reference=B_REFERENCE,
+        b_star=chunk_budget(),
         lengths=dict(
             prefix_mean=round(sum(map(len, prefixes)) / n_reports, 1),
             prefix_max=max(map(len, prefixes)),
@@ -889,8 +885,8 @@ def join2way(n_reports: int = 100, reps_packed: int = 3,
             preamble=data["preamble_tokens"],
             max_report_tokens=data["max_report_tokens"]),
         prediction=("packed B* 3.3 min at ~110k tok/s effective; "
-                    "reference cell ~4% more tokens; stock grouped "
-                    "5.4 min - all at assumed lengths, see measured"),
+                    "stock grouped 5.4 min - at assumed lengths, "
+                    "see measured"),
         runs=[])
     print(f"[join2way] {pairs:,} pairs; fresh tokens at B* "
           f"{fresh_star / 1e6:.1f}M; lengths {report['lengths']}",
@@ -909,9 +905,9 @@ def join2way(n_reports: int = 100, reps_packed: int = 3,
     mean_pair = (sum(len(p) for p in prefixes) * n_terms
                  + n_reports * sum(suffix_lens)) // pairs + 1
     max_seqs = max(64, min(4096, admission_budget // mean_pair))
-    # all arms run at the largest measured point for now; the derived
-    # B* is the exploratory cell on the packed side only
-    stock_batched = B_REFERENCE
+    # stock's step-token cap: the largest measured point of the filter
+    # sweep - the setting the committed stock run used
+    stock_batched = 25_305
     llm = LLM(model=MODEL, kv_cache_dtype="auto",
               max_model_len=max_len, max_num_seqs=max_seqs,
               max_num_batched_tokens=stock_batched,
@@ -990,8 +986,8 @@ def join2way(n_reports: int = 100, reps_packed: int = 3,
     with torch.inference_mode():
         warm = pack_join_chunk(torch, prefixes[0], suffixes[:64])
         pipeline.forward_chunk(warm)
-    packed_answers = run_arm("packed_b25305", B_REFERENCE, reps_packed)
-    run_arm("packed_bstar_cell", chunk_budget(), reps_reference)
+    packed_answers = run_arm("packed_bstar_cell", chunk_budget(),
+                             reps_packed)
 
     # accuracy sanity only - never a claim (report's own terms vs
     # packed answers)

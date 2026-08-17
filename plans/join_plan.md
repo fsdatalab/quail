@@ -21,11 +21,13 @@ Decisions taken:
   activation estimate and the FlashInfer 147 KB/token case):
   **421,752 tokens today**, floored at ~4,096 where throughput
   flattens. Activation memory is the batch-scaling term: act x B ≈
-  34.6 GB of the 69.1 GB free at this B*. All arms run at B*, the stock boot's
-  max_num_batched_tokens included. B* sits far past the measured
-  sweep, so walls are conditional on the rates holding there; one
-  reference cell at 25,305 (the largest measured point) rides
-  along to tell a rate change at large B apart from a slow kernel.
+  34.6 GB of the 69.1 GB free at this B*. The packed arm runs at
+  B*; the stock boot keeps its measured step budget (25,305). B*
+  sits far past the measured sweep, so walls are conditional on
+  the rates holding there. (A packed reference cell at 25,305 ran
+  as a rate control and was dropped from the reported results
+  after review: its prefix recompute changes the prefix/suffix
+  token mix, so it could not isolate chunk size — see 3b.)
   Chunks are packed to the brim across anchors — an anchor's list
   ending mid-chunk is followed by the next anchor's prefix, no
   padding.
@@ -182,11 +184,9 @@ whole partner list fits one chunk — 7,253 suffix slots against
 3,718 partners, so m = 1. No recompute beyond the one unavoidable
 prefix, nothing kept, no persistence question at all for this
 2-way: the join is ~4,200 brim-packed chunks (about 1.9 reports
-each) from a Python loop. The reference cell at 25,305 (the
-largest measured point) has k = 418, m = 9, recompute 4.2%,
-predicting 4.59 h — it exists because B* sits far past the
-measured sweep, where per-token GEMM cost was seen rising with B
-(the README's L2 open problem).
+each) from a Python loop. (An earlier reference cell at 25,305 —
+k = 418, m = 9, recompute 4.2%, predicting 4.59 h — was dropped
+from the prototype's reported results after review; see 3b.)
 
 **The comparison, derived** (walls from `plans/join_estimates.py`):
 
@@ -255,12 +255,12 @@ before each run; every Modal run teed to a file.
    prediction below is restated from these measured lengths by
    `plans/join_estimates.py`; the Section 2 table keeps the
    assumed-length paper-scale illustration.
-2. **Packed join — the prototype** (256,000 pairs). Run order
-   inverted by review: the **primary arm runs at 25,305** — the
-   largest measured sweep point, m = 4 at measured lengths,
-   predicted **1.7 min** — and the derived B* = 421,752 is the
-   exploratory cell (m = 1, predicted **1.5 min** at ~91,500 tok/s
-   effective, conditional on the rate holding out there). The
+2. **Packed join — the prototype** (256,000 pairs). The reported
+   arm runs at the derived **B* = 421,752** (m = 1, predicted
+   **1.5 min** at ~91,500 tok/s effective, conditional on the rate
+   holding out there). A second cell at 25,305 (m = 4) ran as a
+   rate control and was dropped from the reported results — its
+   recompute changes the token mix; see 3b. The
    effective rate fell from the assumed-length ~110k because real
    prefixes are 3x longer and suffixes half: cross-attention is
    ~27% of the wall. Per-segment attention plus the
@@ -270,8 +270,8 @@ before each run; every Modal run teed to a file.
    flip); suffix positions identical to standalone requests.
    **Probe: passed** — isolated attention math within 0.0068 of an
    fp32 reference, 0/64 disagreements shared-vs-unshared and
-   kept-vs-shared, rates 83.6–84.2k tok/s (−8.6% of prediction,
-   inside the gate), flat across both budgets as predicted
+   kept-vs-shared, rate 83.6k tok/s at the B* geometry (−8.6% of
+   prediction, inside the gate)
    (results/engine/join_probe.json). The
    merge call plus the pair-list Python are the new code; the
    packed loop, the three kernels, and the YES/NO readout carry
@@ -337,9 +337,7 @@ All three runs completed (~40 GPU-minutes total;
 | merge math vs fp32 reference | exact | 0.0068 max diff | pass |
 | parity, shared vs one-per-chunk | 0 disagreements | 0 of 64 | pass |
 | parity, kept-KV replay vs in-chunk | 0 disagreements | 0 of 64 | pass |
-| packed at 25,305, 3 reps (incl. packing) | 102 s | 108.4 s, spread 0.5 s | **+6.3%, pass** |
 | packed at derived B*, 2 reps (incl. packing) | 92 s | 98.4–99.0 s | **+7.2%, pass** |
-| rate flat in B | equal rates | 85.5k tok/s at both; wall ratio 1.099 = token ratio 1.106 | **confirmed** |
 | grouped stock, 2 reps | 199 s (GPU terms) | 418–449 s | GPU terms right; see finding 1 |
 | packed over stock | 2.1x | **4.4x** | wider, for finding-1 reasons |
 | 3-way stage 1 | 40 s, expected 8–15% over | 48.7 s | +22%, see finding 3 |
@@ -351,6 +349,15 @@ Wall times for packed runs include end-to-end cost: chunk packing
 (building GPU tensors from raw token lists) plus forward passes
 plus answer readout.
 
+A packed cell at 25,305 (m = 4, recompute) also ran: 108.4 s over
+3 reps, spread 0.5 s. It was dropped from the reported results
+after review — its recompute raises the prefix-token share from
+3.6% to 12.9%, and a prefix token costs about half a suffix
+token's attention work, so its near-equal rate (85.9k vs 85.3k)
+does not isolate chunk size. A clean chunk-size control would hold
+m fixed across two budgets (44,000 vs 84,000, both m = 2); not
+run. The rows remain in git history.
+
 Findings, in order of importance:
 
 1. **The cost model is missing a stock host term.** The stock arm's
@@ -361,7 +368,7 @@ Findings, in order of importance:
    work at these shapes. The per-request constant (50.3 us,
    measured at 10k filter requests) has no per-prompt-token
    ingestion term. The packed side has no analog: its "requests"
-   are 100–400 chunks. Follow-up: add the term to cost.py from
+   are 100 chunks. Follow-up: add the term to cost.py from
    this run's residual before any full-scale stock prediction.
 2. **The checkpoint is a near-unusable judge of both predicates,
    which breaks the planted instrument but no execution claim.**
@@ -381,9 +388,9 @@ Findings, in order of importance:
    84k-token 2-way chunks, and the per-layer kept-KV clones add
    copies the estimate did not price. Both are named, bounded
    costs; neither changes a conclusion.
-4. Peak memory: 7.7 GiB (25,305 chunks), 15.3 GiB (B* chunks)
+4. Peak memory: 15.3 GiB (one-report B* chunks, ~84k tokens)
    against the 80 GB card — consistent with act x B at the real
-   chunk sizes, nowhere near binding.
+   chunk size, nowhere near binding.
 
 ---
 
@@ -481,11 +488,13 @@ everything downstream.
   prefix-attention call. The estimate prices that call from the
   fitted attention constant (2 x a2 per pair, 11% of C's wall) and
   the probe's rate gate checks the resulting ~110k effective rate;
-  a fused or badly-shaped kernel could still miss it. All arms run
-  at the derived B*, far past the measured sweep where per-token
-  GEMM cost was seen rising with B; the 25,305 reference cell
-  exists to tell a rate change at large B apart from a slow
-  kernel.
+  a fused or badly-shaped kernel could still miss it. The packed
+  arm runs at the derived B*, far past the measured sweep where
+  per-token GEMM cost was seen rising with B. (The 25,305
+  reference cell meant to separate a rate change at large B from a
+  slow kernel was dropped after review — recompute changes the
+  token mix, so it was not a single-variable control; the clean
+  design is two budgets at equal m, e.g. 44,000 vs 84,000.)
 - Naive stock is never run; its 99.9 h is arithmetic from the same
   constants, and the 1.87x thrash multiplier stays README-sourced
   and unmeasured. Say both wherever the number is quoted.

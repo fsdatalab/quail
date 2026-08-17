@@ -15,27 +15,27 @@ readout.
 | Method | Wall (s) | Tokens/s | Fresh tokens | Chunks |
 |---|---|---|---|---|
 | Stock vLLM (grouped) | 433 (mean of 449, 418) | 17,000 | 7.36M | — |
-| Packed, B = 25,305 | 108.4 (3 reps, spread 0.5 s) | 85,900 | 9.31M | 400 |
 | Packed, B = B* = 421,752 | 98.7 (mean of 98.4, 99.0) | 85,300 | 8.42M | 100 |
 
-The packed pass is **4.4x faster** than stock vLLM at the derived B*.
+The packed pass is **4.4x faster** than stock vLLM.
 
-Packed processes more fresh tokens (9.31M vs 7.36M at B = 25,305)
-because each anchor prefix is recomputed at the head of each chunk
-group. At B*, each report fits one chunk (m = 1), so tokens drop to
-8.42M. The 9.7 s gap between the two packed runs is entirely from
-different token counts, not a rate difference — the rate is ~85,500
-tokens/s at both batch sizes.
+At B*, each report's full term list fits beside its prefix in one
+chunk (m = 1), so each prefix is computed exactly once: 100 chunks,
+8.42M fresh tokens, nothing kept and nothing recomputed. The packed
+prediction was 92 s; measured 98.7 s (+7%).
 
 Stock's effective rate is 17,000 tokens/s. Its 7.36M tokens take
 only ~199 s at GPU speed. The remaining ~234 s is host-side work:
 ingesting, hashing, and scheduling 256,000 request objects. This is
 the missing cost-model term (finding 1 below).
 
-Predictions landed within 6% for both packed runs (predicted 102 s
-and 92 s). The stock prediction (199 s) captured only the GPU
-terms; the full measured wall is 2.2x higher because of the host
-ingestion overhead.
+A second packed configuration at B = 25,305 ran as a rate control
+and was dropped from the reported results: its prefix recomputation
+changes the prefix/suffix token mix (12.9% prefix tokens vs 3.6% at
+B*), and prefix tokens cost about half a suffix token's attention
+work, so equal rates would not isolate chunk size. A clean control
+would compare two budgets with the same m — for example 44,000 and
+84,000, both m = 2, identical tokens and mix. Not run.
 
 ---
 
@@ -67,7 +67,7 @@ replay check.
   reference
 - Shared vs unshared disagreements: 0 of 64
 - Kept-KV vs shared disagreements: 0 of 64
-- Rates: 83.6k tokens/s (B*), 84.2k tokens/s (25,305) — flat
+- Rate at the B* geometry: 83.6k tokens/s
 
 ---
 
@@ -77,26 +77,19 @@ replay check.
 vLLM.** Predicted stock wall was 199 s (GPU-side computation only).
 Measured was 433 s. The difference (~234 s) is host-side work:
 ingesting 770M prompt tokens across 256,000 request objects. The
-packed side submits 100–400 pre-built chunks and has no analog.
-This term must be added to cost.py before any full-scale stock
+packed side submits 100 pre-built chunks and has no analog. This
+term must be added to cost.py before any full-scale stock
 prediction.
 
-**2. Throughput is flat in B from 25,305 to 421,752.** Rate was
-~85,500 tokens/s at both batch sizes. The 9.7 s wall difference is
-entirely from token count (B* has fewer chunks, therefore fewer
-prefix recomputations). This confirms the budget formula's
-prediction that larger B reduces chunks without changing per-token
-cost, at least out to B* on this hardware.
-
-**3. The cross-attention call is roughly 30% of the packed wall at
-these shapes.** The effective rate (85.5k tokens/s) is lower than
+**2. The cross-attention call is roughly 30% of the packed wall at
+these shapes.** The effective rate (85.3k tokens/s) is lower than
 the pure-packed filter rate (121k tokens/s) because BioDEX prefixes
 are 3,000 tokens — every suffix attends to all of them via the
 cross-attention call. At the filter's shape (270-token prefixes),
 cross-attention was 12% of the wall. The cost comes from the pair
 count in the suffix-to-prefix attention, not the batch size.
 
-**4. The 4B checkpoint is a near-unusable judge for both
+**3. The 4B checkpoint is a near-unusable judge for both
 predicates.** 2-way: precision 0.33% (YES on 60% of pairs). 3-way:
 9,763 of 10,000 wrong. This breaks the planted instrument (no
 filtering exercised) but no execution claim — filtering and

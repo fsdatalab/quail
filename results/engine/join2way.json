@@ -4,7 +4,6 @@
   "n_terms": 2560,
   "pairs": 256000,
   "b_star": 421752,
-  "b_reference": 25305,
   "lengths": {
     "prefix_mean": 2977.2,
     "prefix_max": 3529,
@@ -29,39 +28,6 @@
       "fresh_tokens": 7359876,
       "tok_s": 17625.7,
       "yes": 154731
-    },
-    {
-      "method": "packed_b25305",
-      "rep": 0,
-      "wall": 108.7,
-      "chunks": 400,
-      "fresh_tokens": 9310600,
-      "tok_s": 85655.5,
-      "yes": 177830,
-      "agrees_with_stock": 213989,
-      "peak_gib": 7.65
-    },
-    {
-      "method": "packed_b25305",
-      "rep": 1,
-      "wall": 108.35,
-      "chunks": 400,
-      "fresh_tokens": 9310600,
-      "tok_s": 85926.9,
-      "yes": 177830,
-      "agrees_with_stock": 213989,
-      "peak_gib": 7.65
-    },
-    {
-      "method": "packed_b25305",
-      "rep": 2,
-      "wall": 108.24,
-      "chunks": 400,
-      "fresh_tokens": 9310600,
-      "tok_s": 86019.5,
-      "yes": 177830,
-      "agrees_with_stock": 213989,
-      "peak_gib": 7.65
     },
     {
       "method": "packed_bstar_cell",
