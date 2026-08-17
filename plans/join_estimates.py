@@ -86,7 +86,18 @@ def chunk_cap(kept_prefix_tokens=0):
 
 
 B_MEAS = ladder["batch_tokens"]             # largest measured sweep point
-S = B_MEAS                                  # default B*
+
+# B* is derived, not chosen: the memory cap over a declared slack.
+# The slack covers the two soft spots in the cap - the activation
+# estimate is architectural, not measured (cost.py's own caveat),
+# and the FlashInfer path costs 147 KB/token instead of 83. All
+# arms run at B*: packed chunks and the stock boot's
+# max_num_batched_tokens alike. B* sits far past the measured
+# sweep, so every wall below is conditional on the rates holding
+# there; one reference cell at B_MEAS rides along to tell a rate
+# change at large B apart from a slow kernel.
+SLACK = 2
+S = chunk_cap(0) // SLACK
 
 c2 = {r["cell"]: r for r in cal if r.get("family") == "c2"}
 READ_NS = {}
@@ -135,9 +146,9 @@ def hrs(x):
 print("derived from artifacts: pool "
       f"{POOL:,} tok (calibrate boot); admission budget {BUDGET:,} tok "
       f"(filter run); packed rate {1 / A_PKD:,.0f} tok/s (ladder)")
-print(f"chunk budget B*: default {S:,} (largest measured); memory cap "
-      f"{chunk_cap():,} tok at {ACT / 1e3:.0f} KB/token activations, "
-      f"{chunk_cap(8 * 4040):,} with eight kept 4k prefixes")
+print(f"chunk budget B* = cap/{SLACK} = {S:,} tok, all arms (cap "
+      f"{chunk_cap():,} at {ACT / 1e3:.0f} KB/token activations; largest "
+      f"measured point {B_MEAS:,}, kept as the reference cell)")
 print("cached-read prices from c2 cells (ns/cached token): "
       + ", ".join(f"c={c}: {v:.0f}" for c, v in READ_NS.items())
       + f"; fair stock wall {STOCK_FAIR_WALL:.1f} s")
@@ -211,18 +222,18 @@ print(f"  attention pairs {pairs / 1e12:.2f}e12 (cross {P * s * f / 1e12:.2f}e12
       f"effective rate {fresh_c / c_wall:,.0f} tok/s")
 print(f"  5% pair sample (confirming cell): {c_wall * 0.05 / 60:.0f} min")
 
-# Larger chunk budget: fewer prefix recomputes, same suffix work.
-# Uses the 25,305-measured rate - a probe cell must confirm it holds.
-for B in (85_000,):
+# Reference cell at the largest measured point: same math at B_MEAS,
+# to separate "rate fell at 85k" from "our kernel is slow" if the
+# main arm misses its prediction.
+for B in (B_MEAS,):
     kB = (B - f) // s
     mB = math.ceil(NR / kB)
     fresh_v = P * s + NL * mB * f
     pairs_v = (P * (s * f + s * (s + 1) // 2)
                + NL * mB * (f * (f + 1) // 2))
     w = fresh_v * (A_PKD - SQ_CAL * A2) + 2 * pairs_v * A2
-    print(f"  at B*={B:,}: k={kB:,}, m={mB}, recompute "
-          f"{NL * mB * f / fresh_v:.1%} -> {hrs(w):.2f} h "
-          f"(if the rate holds at this B - probe cell)")
+    print(f"  reference cell at B*={B:,} (largest measured): k={kB:,}, "
+          f"m={mB}, recompute {NL * mB * f / fresh_v:.1%} -> {hrs(w):.2f} h")
 
 # The flip - terms anchored - to show the anchor rule's stakes.
 f2, s2 = p + TR, TL + q
@@ -235,10 +246,12 @@ flip = fresh_f * (A_PKD - SQ_CAL * A2) + 2 * pairs_f * A2
 print(f"\nflip (terms anchored, packed): fresh {fresh_f / 1e9:.1f}B -> "
       f"{hrs(flip):.0f} h")
 
-w_sat = math.ceil(2 * S / s)
+ENGINE_STEP = 16_384   # the engine fallback's own step budget (flat
+#                        region; the 85k chunk budget is a packed setting)
+w_sat = math.ceil(2 * ENGINE_STEP / s)
 w_mem = int(BUDGET // (f + s + 1))
-print(f"\nengine fallback sizing: W_sat = {w_sat}, W_mem = {w_mem} "
-      f"(memory-bound below saturation -> drop step budget toward 16k)")
+print(f"\nengine fallback sizing at a {ENGINE_STEP:,} step budget: "
+      f"W_sat = {w_sat}, W_mem = {w_mem}")
 
 # The prototype sample: 100 reports, ALL terms - sampling only the
 # anchor side keeps the per-report chunk geometry (m stays 9), so the

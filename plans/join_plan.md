@@ -13,14 +13,19 @@ Decisions taken:
 - **The algorithm is solved for general n.** A sampled prototype
   exercises n = 2 on BioDEX and n = 3 planted.
 - **A 2-way join runs as a packed forward pass.** No engine, no KV
-  pool. The chunk budget B* is a parameter with a derived cap, not
-  a constant: B* ≤ (memory x 0.92 − weights − kept prefixes x
-  kappa) / activation bytes per token ≈ 843k tokens, floored at
-  ~4,096 where throughput flattens. Default is 25,305, the largest
-  measured sweep point; bigger values cut prefix recomputes but
-  sit past the measured range, so they are probe cells. Chunks are
-  packed to the brim across anchors — an anchor's list ending
-  mid-chunk is followed by the next anchor's prefix, no padding.
+  pool. The chunk budget B* is derived, not chosen: B* = (memory x
+  0.92 − weights − kept prefixes x kappa) / activation bytes per
+  token, over a declared slack of 2 that covers the unmeasured
+  activation estimate and the larger FlashInfer workspace —
+  **421,752 tokens today**, floored at ~4,096 where throughput
+  flattens. All arms run at B*, the stock boot's
+  max_num_batched_tokens included. B* sits far past the measured
+  sweep, so walls are conditional on the rates holding there; one
+  reference cell at 25,305 (the largest measured point) rides
+  along to tell a rate change at large B apart from a slow kernel.
+  Chunks are packed to the brim across anchors — an anchor's list
+  ending mid-chunk is followed by the next anchor's prefix, no
+  padding.
 - **n ≥ 3 checks survivors between stages and rewinds**: continue
   from a kept anchor prefix and stream the next relation against
   it. No vLLM needed — staging is Python bookkeeping around the
@@ -50,8 +55,8 @@ other side is the **partner**: it streams through as the per-pair
 suffix, and its KV depends on the anchor in front of it, so it is
 recomputed every pair in every design — partners never store KV,
 anywhere. Sizes: f = preamble + anchor tokens; s = partner +
-question tokens; S = the chunk/step token budget B* (a derived
-parameter — see the decisions above; 25,305 by default).
+question tokens; S = the chunk/step token budget B* (derived — see
+the decisions above; 421,752 today).
 
 **Planning, before anything runs.**
 
@@ -169,30 +174,31 @@ tokens, 19% of the pool) and they are still the wrong side to
 anchor — anchoring is about which side gets paid per pair, not
 which side fits.
 
-**Size rule applied:** k = (25,305 − 1,040)/58 = 418 partners per
-chunk; m = ceil(3,718/418) = 9 chunks per report; f/S = 4.1%. So:
-recompute, keep nothing, the KV pool stays empty. The whole join is
-9 x 8,103 = 72,927 chunks of prefix groups + suffixes, packed to
-the brim, built from a Python loop. At B* = 85,000 the same rule
-gives k = 1,447, m = 3, recompute 1.4%, and 4.47 h — conditional
-on the packed rate holding at that B, which the sweep does not
-cover (per-token GEMM cost rose with B there; the README's L2 open
-problem): a probe cell, not an assumption.
+**Size rule applied:** at the derived B* = 421,752, a report's
+whole partner list fits one chunk — 7,253 suffix slots against
+3,718 partners, so m = 1. No recompute beyond the one unavoidable
+prefix, nothing kept, no persistence question at all for this
+2-way: the join is ~4,200 brim-packed chunks (about 1.9 reports
+each) from a Python loop. The reference cell at 25,305 (the
+largest measured point) has k = 418, m = 9, recompute 4.2%,
+predicting 4.59 h — it exists because B* sits far past the
+measured sweep, where per-token GEMM cost was seen rising with B
+(the README's L2 open problem).
 
 **The comparison, derived** (walls from `plans/join_estimates.py`):
 
 | plan | fresh tokens | wall |
 |---|---|---|
-| A1: stock vLLM, request per pair, arbitrary order | 33.08B | **99.9 h**; x1.87 thrash = 186 h — arithmetic only, never run |
+| A1: stock vLLM, request per pair, arbitrary order | 33.08B | **98.9 h**; x1.87 thrash = 185 h — arithmetic only, never run |
 | A2: stock vLLM, pairs grouped by report, admission matched | 1.756B + boundary | **7.2 h** |
 | B: engine chain mode (rewind) — fallback path | 1.756B | **6.1 h** |
-| C: packed forward pass, recompute | 1.823B | **4.6 h** |
+| C: packed forward pass, m = 1 at the derived B* | 1.756B | **4.4 h** |
 
 Where each number comes from:
 
 - **A1** = 30,126,954 pairs x 1,098 tokens = 33.08B fresh → 95.5 h
   linear, + 2.8 h quadratic attention surcharge (1,098-token prompts
-  against the 472-profile the rate embeds), + 1.07 h step-fixed
+  against the 472-profile the rate embeds), + 0.06 h step-fixed
   cost, + 0.42 h request overhead. The x1.87 is the filter run of
   default admission at 3.4x pool pressure — README-recorded only;
   those cells were never committed to results/, so it is the one
@@ -211,19 +217,20 @@ Where each number comes from:
 - **A2** = B + 0.42 h per-pair request overhead + 0.70 h boundary
   blocks (the 16-token block spanning the report/term boundary
   recomputes every pair, ~8 tokens x P = 241M).
-- **C** = 1.747B suffix + 75.8M prefix recompute = 1.823B at the
-  packed non-attention rate → 4.07 h, + 0.52 h attention priced
-  from pair counts (1.91e12 pairs, 95% of them suffix-to-prefix
-  cross-attention, at 2 x a2 per pair). Cross-attention is 11% of
-  C's wall — the packed filter never paid it, so C's effective rate
-  is ~110k tokens/s, not 121k, and that is what the probe gates.
+- **C** = 1.747B suffix + 8.4M prefix (each report once — m = 1 at
+  the derived B*) = 1.756B at the packed non-attention rate →
+  3.92 h, + 0.51 h attention priced from pair counts (1.87e12
+  pairs, 97% of them suffix-to-prefix cross-attention, at 2 x a2
+  per pair). Cross-attention is 12% of C's wall — the packed filter
+  never paid it, so C's effective rate is ~110k tokens/s, not
+  121k, and that is what the probe gates.
 
 Baseline fairness, per house rules: the grouped-stock run gets the
-same memory budget and an admission cap derived the same way
-(max_num_seqs from the pool arithmetic; the engine rows want the
-step budget dropped toward 16k because the admission budget caps
-resident chains at 682 against the 873 that two step budgets of
-58-token suffixes would need).
+same B* at boot and an admission cap derived the same way
+(max_num_seqs from the pool arithmetic). The engine fallback, if
+ever needed, runs at its own 16,384 step budget, where saturation
+needs 565 resident chains against the 682 the admission budget
+allows.
 
 ---
 
@@ -236,34 +243,48 @@ before each run; every Modal run teed to a file.
 
 1. **Data.** Fetch BioDEX, sample **100 reports and keep all 3,718
    terms**, write the join prompt, tokenize. Sample only the anchor
-   side: with all terms kept, each report still spans 9 chunks, so
-   prefix persistence is actually exercised — a 100 x 100 sample
-   would fit each report's partners in one chunk and test nothing.
-   Tokenizing replaces every assumed length; reports have heavy
-   tails, so pick and record a truncation policy.
+   side, so each report keeps its full 3,718-partner stream — real
+   per-prefix group sizes, real chunk composition (about two
+   reports per brim-packed chunk, same as full scale) — and the
+   x81 extrapolation stays clean. Tokenizing replaces every
+   assumed length; reports have heavy tails, so pick and record a
+   truncation policy.
 2. **Packed join — the prototype** (371,800 pairs, predicted
-   **3.4 min** at the derived ~110k tok/s effective rate). Chunk =
-   brim-packed prefix groups + suffixes (~418 per prefix at the
-   default B*); per-segment attention plus the suffix-to-prefix
-   call merged by softmax state; suffix positions identical to
-   standalone requests. One extra cell at B* = 85,000 — bigger
-   chunks cut the recompute to 1.4% and predict 4.47 h at full
-   scale, conditional on the rate holding past the measured sweep. Existing code carries most of
-   it — the packed loop, the three kernels, the chunk packer, and
-   the YES/NO readout from `modal_single_filter_forward.py`; the
-   new work is that merge call plus ~100 lines of pair-list Python.
+   **3.3 min** at the derived ~110k tok/s effective rate). At the
+   derived B* a report's whole partner list fits one chunk (m = 1
+   at sample and full scale alike), so nothing persists;
+   per-segment attention plus the suffix-to-prefix call merged by
+   softmax state; suffix positions identical to standalone
+   requests. One reference cell at 25,305, the largest measured
+   point, to tell a rate change at large B apart from a slow
+   kernel. Existing code carries most of it — the packed loop, the
+   three kernels, the chunk packer, and the YES/NO readout from
+   `modal_single_filter_forward.py`; the new work is that merge
+   call plus ~100 lines of pair-list Python.
 3. **One baseline: grouped stock vLLM, admission on the client**
-   (the filters' semaphore pattern), same sample, predicted
-   **5.4 min**. It doubles as the answer-parity reference for the
-   packed arm. Naive stock is cut: its 99.9 h is arithmetic, not an
-   experiment worth buying.
+   (the filters' semaphore pattern), booted at the same B*, same
+   sample, predicted **5.3 min**. It doubles as the answer-parity
+   reference for the packed arm. Naive stock is cut: its 98.9 h is
+   arithmetic, not an experiment worth buying.
 4. **n-way, vLLM-free.** A planted 3-relation chain on the
-   existing IMDB reviews (100 documents per relation, two group
-   keys), run entirely as packed forward passes plus Python
-   staging: record stage-1 answers, gate and dedup survivors,
-   continue against relation 3. Plant one relation long (~4k
-   tokens) so the keep-KV branch of the size rule runs, not just
-   recompute. Predicted: about a minute of GPU per stage.
+   existing IMDB reviews, 100 documents per relation: every B
+   document carries two planted keys (`[KEYS] X=.. Y=..`), A
+   documents carry an X key, C documents a Y key, and the query is
+   the triples where a.X = b.X and b.Y = c.Y — the true output is
+   known by construction. Run entirely as packed forward passes
+   plus Python staging: record stage-1 answers, gate and dedup
+   survivors, continue against relation 3. Plant B's documents
+   long (~4k tokens): the keep-KV branch is exercised by the
+   cross-stage rule — B's prefixes are kept from stage 1 and
+   reused in stage 2 instead of recomputed. Predicted: about a
+   minute of GPU per stage. Two checks at the end: (a) replay the
+   recorded yes/no answers through a nested-loop reference — no
+   model calls, no gating, no dedup, literally `if answer1[a,b]
+   and answer2[b,c]: emit (a,b,c)` — and require the identical
+   triple set, so any difference is a bookkeeping bug and can
+   never be model noise; (b) the stage-2 pair count must equal
+   survivors x 100 exactly, proving the gate and dedup cut the
+   work they claim.
 
 Gates on the packed arm, stated now: answers identical to the
 stock arm's, wall within 10% of prediction. Fail → the engine
@@ -368,9 +389,11 @@ everything downstream.
   prefix-attention call. The estimate prices that call from the
   fitted attention constant (2 x a2 per pair, 11% of C's wall) and
   the probe's rate gate checks the resulting ~110k effective rate;
-  a fused or badly-shaped kernel could still miss it. The
-  B* = 85,000 cell additionally extends the rate past the measured
-  sweep, where per-token GEMM cost was seen rising with B.
+  a fused or badly-shaped kernel could still miss it. All arms run
+  at the derived B*, far past the measured sweep where per-token
+  GEMM cost was seen rising with B; the 25,305 reference cell
+  exists to tell a rate change at large B apart from a slow
+  kernel.
 - Naive stock is never run; its 99.9 h is arithmetic from the same
   constants, and the 1.87x thrash multiplier stays README-sourced
   and unmeasured. Say both wherever the number is quoted.
