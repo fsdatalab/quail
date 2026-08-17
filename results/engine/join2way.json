@@ -1,0 +1,100 @@
+{
+  "model": "Qwen/Qwen3-4B-FP8",
+  "n_reports": 100,
+  "n_terms": 2560,
+  "pairs": 256000,
+  "b_star": 421752,
+  "b_reference": 25305,
+  "lengths": {
+    "prefix_mean": 2977.2,
+    "prefix_max": 3529,
+    "suffix_mean": 31.7,
+    "preamble": 29,
+    "max_report_tokens": 3500
+  },
+  "prediction": "packed B* 3.3 min at ~110k tok/s effective; reference cell ~4% more tokens; stock grouped 5.4 min - all at assumed lengths, see measured",
+  "runs": [
+    {
+      "method": "stock_grouped",
+      "rep": 0,
+      "wall": 503.95,
+      "fresh_tokens": 7359876,
+      "tok_s": 14604.5,
+      "yes": 154731
+    },
+    {
+      "method": "stock_grouped",
+      "rep": 1,
+      "wall": 486.66,
+      "fresh_tokens": 7359876,
+      "tok_s": 15123.2,
+      "yes": 154731
+    },
+    {
+      "method": "packed_b25305",
+      "rep": 0,
+      "wall": 105.82,
+      "chunks": 400,
+      "fresh_tokens": 9310600,
+      "tok_s": 87983.6,
+      "yes": 177830,
+      "agrees_with_stock": 213989,
+      "peak_gib": 7.65
+    },
+    {
+      "method": "packed_b25305",
+      "rep": 1,
+      "wall": 105.78,
+      "chunks": 400,
+      "fresh_tokens": 9310600,
+      "tok_s": 88020.6,
+      "yes": 177830,
+      "agrees_with_stock": 213989,
+      "peak_gib": 7.65
+    },
+    {
+      "method": "packed_b25305",
+      "rep": 2,
+      "wall": 105.82,
+      "chunks": 400,
+      "fresh_tokens": 9310600,
+      "tok_s": 87983.1,
+      "yes": 177830,
+      "agrees_with_stock": 213989,
+      "peak_gib": 7.65
+    },
+    {
+      "method": "packed_bstar_cell",
+      "rep": 0,
+      "wall": 95.73,
+      "chunks": 100,
+      "fresh_tokens": 8417425,
+      "tok_s": 87926.1,
+      "yes": 177830,
+      "agrees_with_stock": 213989,
+      "peak_gib": 15.31
+    },
+    {
+      "method": "packed_bstar_cell",
+      "rep": 1,
+      "wall": 95.54,
+      "chunks": 100,
+      "fresh_tokens": 8417425,
+      "tok_s": 88104.6,
+      "yes": 177830,
+      "agrees_with_stock": 213989,
+      "peak_gib": 15.31
+    }
+  ],
+  "stock": {
+    "max_num_seqs": 249,
+    "kv_cache_dtype": "bf16",
+    "max_num_batched_tokens": 25305,
+    "admission_budget": 749782
+  },
+  "accuracy_sanity": {
+    "tp": 584,
+    "fp": 177246,
+    "fn": 3
+  }
+}
