@@ -308,23 +308,27 @@ if lengths_path.exists():
           f"{t_meas * 8103 / nR / 3600:.1f} h, stock "
           f"{t_stock * 8103 / nR / 3600:.1f} h")
 
-# The prototype sample: 100 reports, ALL terms - sampling only the
-# anchor side keeps the per-report chunk geometry (m stays 9), so the
-# full-scale walls are the sample walls times NL/100.
-NLS = 100
-PS = NLS * NR
-fresh_cs = PS * s + NLS * m * f
-pairs_cs = (PS * (s * f + s * (s + 1) // 2)
-            + NLS * m * f * (f + 1) // 2)
-c_s = fresh_cs * (A_PKD - SQ_CAL * A2) + 2 * pairs_cs * A2
-fresh_as = NLS * f + PS * s
-a2_s = (fresh_as * A_ENG
-        + attn_excess_s(NLS * f, f) + attn_excess_s(PS * s, s)
-        + PS * f * rd + PS * BETA_N
-        + PS * 8 * (A_ENG + STEP_FIXED_S / S)
-        + fresh_as / S * STEP_FIXED_S)
-print(f"\nprototype sample ({NLS} reports x all {NR} terms = {PS:,} pairs; "
-      f"extrapolation x{NL / NLS:.0f}):")
-print(f"  packed: {fresh_cs / 1e6:.1f}M fresh -> {c_s / 60:.1f} min")
-print(f"  grouped stock, client-side admission: {fresh_as / 1e6:.1f}M fresh "
-      f"+ reads/requests/boundary -> {a2_s / 60:.1f} min")
+if lengths_path.exists():
+    NW = json.load(open(lengths_path))["nway"]
+    a_tok, c_tok = NW["a_suffix_sum"], NW["c_suffix_sum"]
+    fb_sum = NW["b_prefix_sum"]
+    surv = NW["planted_survivors"]
+    fresh1 = fb_sum + NW["n_b"] * a_tok
+    pairs1 = (a_tok * fb_sum                       # cross, summed over b
+              + NW["n_b"] * NW["n_a"]
+              * (a_tok / NW["n_a"]) ** 2 / 2       # within-suffix, mean approx
+              + NW["n_b"] * (fb_sum / NW["n_b"]) ** 2 / 2)
+    t1 = fresh1 * (A_PKD - SQ_CAL * A2) + 2 * pairs1 * A2
+    fresh2 = surv * c_tok                          # kept prefixes: no recompute
+    pairs2 = (c_tok * (fb_sum / NW["n_b"]) * surv
+              + surv * NW["n_c"] * (c_tok / NW["n_c"]) ** 2 / 2)
+    t2 = fresh2 * (A_PKD - SQ_CAL * A2) + 2 * pairs2 * A2
+    print(f"\n3-way planted, measured lengths: stage 1 {t1:.0f} s "
+          f"({fresh1 / 1e6:.2f}M fresh), stage 2 {t2:.0f} s over "
+          f"{surv} survivors ({fresh2 / 1e6:.2f}M fresh; prefixes kept, "
+          f"not recomputed). Probe measured ~8% under the estimator "
+          f"rate; expect walls ~8-15% over these.")
+
+# (The assumed-length sample block that lived here is superseded
+# by the measured-lengths section above once join_lengths.json
+# exists.)
