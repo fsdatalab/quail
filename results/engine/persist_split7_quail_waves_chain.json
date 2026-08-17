@@ -5,8 +5,8 @@
   "connector": "quail",
   "corpus_tokens": 335856,
   "kappa": 73728,
-  "budget_tokens": 253050,
-  "step_tokens": 25305,
+  "budget_tokens": 247190,
+  "step_tokens": 24719,
   "max_num_seqs": 1016,
   "waves": true,
   "client": "chain",
@@ -14,13 +14,13 @@
   "store_gb": 0,
   "store_min_doc_tokens": 1,
   "stored_docs": 1000,
-  "store_cold_offload_s": 4.55,
-  "store_restore_s": 1.76,
-  "store_restore2_s": 1.34,
-  "restore_effective_GBps": 18.51,
+  "store_cold_offload_s": 5.03,
+  "store_restore_s": 2.3,
+  "store_restore2_s": 1.95,
+  "restore_effective_GBps": 12.71,
   "survivors_per_query": [
-    113,
-    238,
+    112,
+    239,
     385
   ],
   "xfer": {
@@ -28,26 +28,26 @@
       "h2d": {
         "jobs": 22,
         "gb": 53.334,
-        "busy_s": 1.166,
-        "copy_GBps": 45.76,
-        "job_GBps_p50": 47.13,
-        "job_GBps_p90": 55.41,
-        "submit_to_finish_p50_s": 0.1585
+        "busy_s": 2.089,
+        "copy_GBps": 25.53,
+        "job_GBps_p50": 26.63,
+        "job_GBps_p90": 27.64,
+        "submit_to_finish_p50_s": 0.3377
       },
       "d2h": {
         "jobs": 2608,
         "gb": 29.498,
-        "busy_s": 0.683,
-        "copy_GBps": 43.21,
-        "job_GBps_p50": 20.38,
-        "job_GBps_p90": 53.32,
-        "submit_to_finish_p50_s": 0.1583
+        "busy_s": 1.131,
+        "copy_GBps": 26.08,
+        "job_GBps_p50": 18.89,
+        "job_GBps_p90": 28.31,
+        "submit_to_finish_p50_s": 0.2122
       }
     },
     "windows": [
       {
         "name": "ps1",
-        "wall_s": 4.616,
+        "wall_s": 5.096,
         "load_jobs": 0,
         "load_gb": 0.0,
         "load_busy_s": 0,
@@ -57,23 +57,23 @@
       },
       {
         "name": "ps2",
-        "wall_s": 1.769,
+        "wall_s": 2.314,
         "load_jobs": 10,
         "load_gb": 26.666,
-        "load_busy_s": 0.63,
-        "channel_busy_frac": 0.3561,
-        "effective_GBps": 15.07,
-        "copy_GBps": 42.32
+        "load_busy_s": 1.091,
+        "channel_busy_frac": 0.4714,
+        "effective_GBps": 11.52,
+        "copy_GBps": 24.44
       },
       {
         "name": "ps3",
-        "wall_s": 1.356,
+        "wall_s": 1.97,
         "load_jobs": 12,
         "load_gb": 26.668,
-        "load_busy_s": 0.536,
-        "channel_busy_frac": 0.3949,
-        "effective_GBps": 19.66,
-        "copy_GBps": 49.8
+        "load_busy_s": 0.998,
+        "channel_busy_frac": 0.5065,
+        "effective_GBps": 13.54,
+        "copy_GBps": 26.72
       }
     ]
   }
