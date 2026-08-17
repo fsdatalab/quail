@@ -188,8 +188,18 @@ class QuailScheduler(Scheduler):
         as sessions finish and free slots."""
         base = self._de_base_max_reqs
         lag = len(self.finished_req_ids) + sum(self._de_freed_lag)
+        # a wave-claimed document answers not-ready and waits in the
+        # vendor's skipped queue, from which it is admitted without
+        # passing this gate again; it holds no slot yet and will
+        # need one, so it is budgeted here while pending. Unbudgeted,
+        # claimed documents accumulated invisibly and flooded 982
+        # fresh admissions - the full slot base - into one output.
+        pending_gated = sum(
+            1 for r in self.skipped_waiting
+            if r.num_computed_tokens == 0
+            and r.request_id not in self._de_requeued)
         slack = (base - len(self.running) - len(self._de_requeued)
-                 - lag)
+                 - pending_gated - lag)
         # the estimate cannot see frees parked on outputs that never
         # executed (a query boundary leaves the last outputs' frees
         # unconsumed until the next query steps), so when the runner
