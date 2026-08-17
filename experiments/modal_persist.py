@@ -237,7 +237,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     import time as _time
 
     trace_path = "/tmp/quail_xfer"
-    if stage in ("store", "split"):
+    if stage in ("store", "split", "split7"):
         # must precede the first vllm import in this process
         _install_xfer_trace(trace_path)
     if waves:
@@ -260,7 +260,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
 
     tok = AutoTokenizer.from_pretrained(MODEL)
     yes_ids, no_ids = yes_no_ids(tok)
-    body_ids, q_ids, _flags = build_corpus(tok, n_docs)
+    body_ids, q_ids, _flags = build_corpus(
+        tok, n_docs, n_filters=7 if stage == "split7" else None)
     corpus = sum(len(b) for b in body_ids)
     kappa = MODELS[CFG_NAME].kappa
     kv_bytes = corpus * kappa
@@ -274,7 +275,10 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     from quail.configs import DEVICES
     from quail.plan import plan_query
     from workload import DEVICE_NAME
-    plan = plan_query(N_FILTERS, [len(b) for b in body_ids],
+    # admission and step budget derive from the deepest query the
+    # engine will serve: three stages in the split protocols
+    plan_depth = 3 if stage in ("split", "split7") else N_FILTERS
+    plan = plan_query(plan_depth, [len(b) for b in body_ids],
                       MODELS[CFG_NAME], DEVICES[DEVICE_NAME])
     pool_budget = plan.budget_tokens
 
@@ -283,7 +287,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     # under the threshold so short documents never occupy the cap.
     # store_gb=0 means uncapped: everything stores.
     store_min = 0
-    if stage in ("store", "split"):
+    if stage in ("store", "split", "split7"):
         from quail.plan.planner import store_length_threshold
         cap_bytes = store_gb * (1 << 30) if store_gb else None
         store_min = store_length_threshold(
@@ -375,12 +379,18 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         splits = (None, None, None)
         if stage == "split":
             splits = (q_ids[:3], q_ids[3:4], q_ids[4:5])
+        elif stage == "split7":
+            # seven distinct filters, no overlap: write under 1-3,
+            # restore under 4-5 and 6-7 - two stages per restore, so
+            # rewind has real work while the document KV part stays a
+            # repeat measurement between q2 and q3
+            splits = (q_ids[:3], q_ids[3:5], q_ids[5:7])
         engine = Engine.from_engine_args(engine_args(store=True))
         q1 = timed_query(engine, "ps1", splits[0])
         _time.sleep(8)                 # let offload writes drain
         engine.reset_prefix_cache()
-        if stage == "split":
-            print("[persist] prediction: q2/q3 ask a filter unseen at "
+        if stage in ("split", "split7"):
+            print("[persist] prediction: q2/q3 ask filters unseen at "
                   "write time, so only stored document KV restores and "
                   "the question computes fresh on every mechanism; "
                   "waves must show near-full document coverage",
@@ -399,7 +409,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         report["store_restore2_s"] = round(q3["wall"], 2)
         best = min(q2["wall"], q3["wall"])
         report["restore_effective_GBps"] = round(kv_bytes / best / 1e9, 2)
-        if stage == "split":
+        if stage in ("split", "split7"):
             # different filters per query: identity across queries is
             # undefined, per-query counts are the record
             report["survivors_per_query"] = [
