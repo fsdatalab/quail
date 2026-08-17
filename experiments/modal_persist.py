@@ -286,11 +286,6 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         os.environ["QUAIL_SINGLE_TENANT"] = "0"
     if client == "chain":
         os.environ["QUAIL_SLOTSTATS"] = "1"
-        # full-width verdict steps (982 sessions sampling at once)
-        # fragment the torch allocator at the pool edge: a 2.87 GiB
-        # transient failed with 3.14 GiB reserved but unallocated.
-        # Expandable segments defragments without giving up capacity.
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
@@ -320,6 +315,14 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     from quail.configs import DEVICES
     from quail.plan import plan_query
     from workload import DEVICE_NAME
+    # chain runs boot at a slightly lower memory utilization:
+    # full-width verdict steps fragment the allocator at the 0.92
+    # edge (a 2.87 GiB transient failed with 3.14 GiB reserved but
+    # unallocated), and expandable segments is rejected with a KV
+    # connector because remapped virtual addresses would corrupt
+    # pinned KV. The planner sees the same number, scaled into the
+    # device memory, so slot sizing and the boot agree.
+    CHAIN_UTIL = 0.90
     # sized by the full filter count, not the deepest single query:
     # a chain session holds its model-runner slot from first prefill
     # to its last verdict, including while it waits rewound between
@@ -328,8 +331,13 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     # sessions and the runner ran out (No free indices). A
     # scheduler-enforced session bound is the durable fix; until
     # then the N_FILTERS sizing is the measured-safe one.
+    plan_device = DEVICES[DEVICE_NAME]
+    if client == "chain":
+        import dataclasses
+        plan_device = dataclasses.replace(
+            plan_device, M=plan_device.M * CHAIN_UTIL / 0.92)
     plan = plan_query(N_FILTERS, [len(b) for b in body_ids],
-                      MODELS[CFG_NAME], DEVICES[DEVICE_NAME])
+                      MODELS[CFG_NAME], plan_device)
     pool_budget = plan.budget_tokens
 
     # a store capacity keeps the longest documents (recompute cost per
@@ -362,7 +370,9 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
                   max_num_batched_tokens=plan.engine_step_tokens,
                   max_num_seqs=plan.engine_max_seqs,
                   # shipped setting
-                  gpu_memory_utilization=0.92,
+                  gpu_memory_utilization=(CHAIN_UTIL
+                                          if client == "chain"
+                                          else 0.92),
                   enable_prefix_caching=True, disable_log_stats=True)
         if waves or client == "chain":
             kw["scheduler_cls"] = ("quail.engineext.scheduler."
