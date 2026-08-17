@@ -338,9 +338,14 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
             # rewind mode: one living request per document, the
             # engine runs the whole filter chain and rewinds KV to
             # the document between stages
+            # single-token verdicts: the yes/no ids are known, the
+            # sampler is constrained to them, and the token comes out
+            # of the same forward pass that processes the question -
+            # a verdict must never cost a decode round. The
+            # decisive-token mode (no_ids) is for models that ramble
+            # before answering; this one does not.
             return run_filter_chain_engine(engine, sp, body_ids,
                                            use_qs, yes_ids, tag=tag,
-                                           no_ids=no_ids,
                                            store_min_tokens=store_min)
         return run_filter_chain(engine, sp, body_ids, use_qs,
                                 pool_budget, tag=tag,
