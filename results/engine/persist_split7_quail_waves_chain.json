@@ -14,40 +14,40 @@
   "store_gb": 0,
   "store_min_doc_tokens": 1,
   "stored_docs": 1000,
-  "store_cold_offload_s": 5.07,
-  "store_restore_s": 2.26,
-  "store_restore2_s": 2.21,
-  "restore_effective_GBps": 11.22,
+  "store_cold_offload_s": 4.75,
+  "store_restore_s": 1.58,
+  "store_restore2_s": 1.41,
+  "restore_effective_GBps": 17.52,
   "survivors_per_query": [
     112,
-    239,
-    384
+    244,
+    385
   ],
   "xfer": {
     "directions": {
       "h2d": {
-        "jobs": 21,
+        "jobs": 23,
         "gb": 53.334,
-        "busy_s": 2.135,
-        "copy_GBps": 24.98,
-        "job_GBps_p50": 25.58,
-        "job_GBps_p90": 27.63,
-        "submit_to_finish_p50_s": 0.3459
+        "busy_s": 1.18,
+        "copy_GBps": 45.21,
+        "job_GBps_p50": 50.02,
+        "job_GBps_p90": 55.41,
+        "submit_to_finish_p50_s": 0.1891
       },
       "d2h": {
-        "jobs": 2608,
+        "jobs": 2607,
         "gb": 29.498,
-        "busy_s": 1.133,
-        "copy_GBps": 26.03,
-        "job_GBps_p50": 14.22,
-        "job_GBps_p90": 28.36,
-        "submit_to_finish_p50_s": 0.2164
+        "busy_s": 0.681,
+        "copy_GBps": 43.3,
+        "job_GBps_p50": 27.37,
+        "job_GBps_p90": 53.19,
+        "submit_to_finish_p50_s": 0.1411
       }
     },
     "windows": [
       {
         "name": "ps1",
-        "wall_s": 5.122,
+        "wall_s": 4.795,
         "load_jobs": 0,
         "load_gb": 0.0,
         "load_busy_s": 0,
@@ -57,23 +57,23 @@
       },
       {
         "name": "ps2",
-        "wall_s": 2.273,
+        "wall_s": 1.594,
         "load_jobs": 10,
         "load_gb": 26.666,
-        "load_busy_s": 1.08,
-        "channel_busy_frac": 0.4752,
-        "effective_GBps": 11.73,
-        "copy_GBps": 24.69
+        "load_busy_s": 0.628,
+        "channel_busy_frac": 0.3942,
+        "effective_GBps": 16.73,
+        "copy_GBps": 42.44
       },
       {
         "name": "ps3",
-        "wall_s": 2.229,
-        "load_jobs": 11,
+        "wall_s": 1.431,
+        "load_jobs": 13,
         "load_gb": 26.668,
-        "load_busy_s": 1.055,
-        "channel_busy_frac": 0.4731,
-        "effective_GBps": 11.96,
-        "copy_GBps": 25.28
+        "load_busy_s": 0.551,
+        "channel_busy_frac": 0.3853,
+        "effective_GBps": 18.64,
+        "copy_GBps": 48.37
       }
     ]
   }
