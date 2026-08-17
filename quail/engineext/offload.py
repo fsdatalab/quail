@@ -115,19 +115,22 @@ class QuailOffloadingConnectorScheduler(OffloadingConnectorScheduler):
             request, num_computed_tokens)
 
     def wave_keys_for(self, request, start_block=0):
-        """The request's store keys from start_block on, or None if
-        any of those chunks miss (a partial hit is not worth a
-        wave). Blocks before start_block are already in the local
-        prefix cache; only full blocks are considered; the tail
-        recomputes."""
-        hashes = request.block_hashes[start_block:]
-        if not hashes:
-            return None
-        keys = [make_offload_key(h, 0) for h in hashes]
-        for key in keys:
+        """Store keys for the longest run of consecutive hits in the
+        request's full blocks from start_block on, or None if the
+        first of them misses. Blocks before start_block are already
+        in the local prefix cache. Under a question never seen at
+        write time, the stored document prefix hits and the
+        question's own blocks miss - the wave loads the prefix and
+        the question computes. Requiring the whole suffix to hit
+        would reject every document the moment queries stop
+        repeating."""
+        keys = []
+        for h in request.block_hashes[start_block:]:
+            key = make_offload_key(h, 0)
             if self.manager.lookup(key, None) != LookupResult.HIT:
-                return None
-        return keys
+                break
+            keys.append(key)
+        return keys or None
 
     def prepare_wave(self, keys):
         """Pin the CPU blocks for a wave and return the source spec."""

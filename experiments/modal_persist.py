@@ -237,7 +237,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     import time as _time
 
     trace_path = "/tmp/quail_xfer"
-    if stage == "store":
+    if stage in ("store", "split"):
         # must precede the first vllm import in this process
         _install_xfer_trace(trace_path)
     if waves:
@@ -284,7 +284,7 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     # under the threshold so short documents never occupy the cap.
     # store_gb=0 means uncapped: everything stores.
     store_min = 0
-    if stage == "store":
+    if stage in ("store", "split"):
         from quail.plan.planner import store_length_threshold
         cap_bytes = store_gb * (1 << 30) if store_gb else None
         store_min = store_length_threshold(
@@ -332,8 +332,9 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
             kw["kv_transfer_config"] = KVTransferConfig(**tc)
         return EngineArgs(**kw)
 
-    def one_query(engine, tag):
-        return run_filter_chain(engine, sp, body_ids, q_ids,
+    def one_query(engine, tag, qs=None):
+        return run_filter_chain(engine, sp, body_ids,
+                                q_ids if qs is None else qs,
                                 pool_budget, tag=tag,
                                 store_min_tokens=store_min)
 
@@ -350,31 +351,54 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     else:
         windows = []
 
-        def timed_query(engine, tag):
+        def timed_query(engine, tag, qs=None):
             t0 = _time.time()
-            out = one_query(engine, tag)
+            out = one_query(engine, tag, qs)
             windows.append(dict(name=tag, t0=t0, t1=_time.time()))
             return out
 
+        # stage "store" repeats the identical five-filter query, which
+        # isolates the copy-back mechanism; stage "split" writes with
+        # filters 1-3 and then restores under filters 4 and 5, which
+        # the store has never seen - only document KV can restore, the
+        # new question computes, the realistic reuse case.
+        splits = (None, None, None)
+        if stage == "split":
+            splits = (q_ids[:3], q_ids[3:4], q_ids[4:5])
         engine = Engine.from_engine_args(engine_args(store=True))
-        q1 = timed_query(engine, "ps1")
+        q1 = timed_query(engine, "ps1", splits[0])
         _time.sleep(8)                 # let offload writes drain
         engine.reset_prefix_cache()
-        print("[persist] prediction: copy-only load bandwidth far above "
-              "the ~10 GB/s wall-effective number means the loss is "
-              "between jobs (orchestration); copy-only itself ~10 means "
-              "the 32 KB descriptor granularity is the limit", flush=True)
-        q2 = timed_query(engine, "ps2")
+        if stage == "split":
+            print("[persist] prediction: q2/q3 ask a filter unseen at "
+                  "write time, so only stored document KV restores and "
+                  "the question computes fresh on every mechanism; "
+                  "waves must show near-full document coverage",
+                  flush=True)
+        else:
+            print("[persist] prediction: copy-only load bandwidth far "
+                  "above the ~10 GB/s wall-effective number means the "
+                  "loss is between jobs (orchestration); copy-only "
+                  "itself ~10 means the 32 KB descriptor granularity "
+                  "is the limit", flush=True)
+        q2 = timed_query(engine, "ps2", splits[1])
         engine.reset_prefix_cache()
-        q3 = timed_query(engine, "ps3")
+        q3 = timed_query(engine, "ps3", splits[2])
         report["store_cold_offload_s"] = round(q1["wall"], 2)
         report["store_restore_s"] = round(q2["wall"], 2)
         report["store_restore2_s"] = round(q3["wall"], 2)
         best = min(q2["wall"], q3["wall"])
         report["restore_effective_GBps"] = round(kv_bytes / best / 1e9, 2)
-        report["outcomes_identical_within_store"] = (
-            q1["survivors"] == q2["survivors"] == q3["survivors"])
-        report["survivors"] = q1["survivors"]
+        if stage == "split":
+            # different filters per query: identity across queries is
+            # undefined, per-query counts are the record
+            report["survivors_per_query"] = [
+                len(q1["survivors"]), len(q2["survivors"]),
+                len(q3["survivors"])]
+        else:
+            report["outcomes_identical_within_store"] = (
+                q1["survivors"] == q2["survivors"] == q3["survivors"])
+            report["survivors"] = q1["survivors"]
         print(f"[persist] with store: cold+offload {q1['wall']:.2f}s, "
               f"restore {q2['wall']:.2f}s then {q3['wall']:.2f}s "
               f"({report['restore_effective_GBps']} GB/s effective)",
