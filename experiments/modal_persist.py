@@ -227,7 +227,9 @@ def _xfer_summary(events, windows):
 
 
 @app.function(image=persist_image, gpu="H100!", timeout=3600,
-              memory=131072,
+              # the 10k corpus pins ~241 GB of KV in host memory plus
+              # engine overhead; 320 GB is the provisioned ceiling
+              memory=327680,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
 def persist_run(n_docs: int = 1000, stage: str = "baseline",
@@ -456,6 +458,8 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
         tag += "_waves"
     if client == "chain":
         tag += "_chain"
+    if n_docs != 1000:
+        tag += f"_{n_docs // 1000}k"
     with open(f"/results/persist_{stage}{tag}.json", "w") as f:
         json.dump(slim, f, indent=2)
     results_vol.commit()
@@ -474,6 +478,8 @@ def main(n_docs: int = 1000, stage: str = "baseline", cpu_gb: int = 96,
         tag += "_waves"
     if client == "chain":
         tag += "_chain"
+    if n_docs != 1000:
+        tag += f"_{n_docs // 1000}k"
     path = out or f"results/engine/persist_{stage}{tag}.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
