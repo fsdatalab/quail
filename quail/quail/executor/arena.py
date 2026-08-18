@@ -86,7 +86,12 @@ class KVArena:
                   for _ in range(n_layers)]
         self.v = [torch.empty(shape, dtype=dtype, device=device)
                   for _ in range(n_layers)]
-        self._rows = {}       # key -> row-index tensor on device
+        # row indices stay on the host: a fresh document used to pay
+        # one small pageable H2D copy here, and pageable copies block
+        # the CPU behind whatever the stream is running - with ~200
+        # admissions per chunk that was the loop's dominant CPU cost
+        self._rows = {}       # key -> row-index tensor on CPU
+        self._rows_dev = {}   # key -> device copy, built on first use
         self.device = device
 
     def alloc(self, key, tokens: int):
@@ -94,13 +99,21 @@ class KVArena:
         if pages is None:
             return None
         self._rows[key] = self.torch.tensor(
-            self.accounting.row_indices(key), dtype=self.torch.int64,
-            device=self.device)
+            self.accounting.row_indices(key), dtype=self.torch.int64)
         return pages
 
     def free_key(self, key):
         self._rows.pop(key)
+        self._rows_dev.pop(key, None)
         return self.accounting.free_key(key)
+
+    def rows_gpu(self, key):
+        """The document's row indices on device, cached per residency."""
+        r = self._rows_dev.get(key)
+        if r is None:
+            r = self._rows[key].to(self.device)
+            self._rows_dev[key] = r
+        return r
 
     def paged_kv(self, layer: int):
         """The pools viewed as (n_pages, page_tokens, n_kv, d_head)
@@ -111,25 +124,31 @@ class KVArena:
 
     def block_table(self, keys, pad_to=None):
         """(block_table int32 (len(keys), max_pages), seqused_k int32)
-        for the groups reading these documents' KV, in order."""
+        for the groups reading these documents' KV, in order.
+
+        Built flat on the host and staged through pinned memory: the
+        old per-key loop issued one tiny pageable H2D copy per key,
+        which blocked the CPU behind the running chunk."""
+        torch = self.torch
         pages = [self.accounting.owned[k] for k in keys]
         width = max(len(p) for p in pages)
         if pad_to:
             width = max(width, pad_to)
-        table = self.torch.zeros((len(keys), width),
-                                 dtype=self.torch.int32,
-                                 device=self.device)
-        for i, p in enumerate(pages):
-            table[i, :len(p)] = self.torch.tensor(
-                p, dtype=self.torch.int32, device=self.device)
-        used = self.torch.tensor(
-            [self.accounting.tokens[k] for k in keys],
-            dtype=self.torch.int32, device=self.device)
+        flat = []
+        for p in pages:
+            flat.extend(p)
+            flat.extend([0] * (width - len(p)))
+        table = torch.tensor(flat, dtype=torch.int32,
+                             pin_memory=True).view(len(keys), width) \
+            .to(self.device, non_blocking=True)
+        used = torch.tensor([self.accounting.tokens[k] for k in keys],
+                            dtype=torch.int32, pin_memory=True) \
+            .to(self.device, non_blocking=True)
         return table, used
 
     def gather(self, layer: int, key):
         """A document's (K, V) rows, contiguous - the copy fallback if
         the paged kernel path fails a parity gate."""
-        rows = self._rows[key]
+        rows = self.rows_gpu(key)
         return (self.k[layer].index_select(0, rows),
                 self.v[layer].index_select(0, rows))

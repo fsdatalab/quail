@@ -161,7 +161,7 @@ def probe() -> str:
     meta0 = dict(
         layer=0, paged=True,
         kv_src=torch.arange(f0, dtype=torch.int64, device="cuda"),
-        kv_dst=arena._rows["m0"][:f0],
+        kv_dst=arena.rows_gpu("m0")[:f0],
         cu_a=torch.tensor(cu, dtype=torch.int32, device="cuda"),
         max_a=f0,
         cross=dict(

@@ -1,0 +1,116 @@
+{
+  "cell": "m1_filter",
+  "n_docs": 3000,
+  "corpus_tokens": 968500,
+  "n_filters": 5,
+  "exec_budget": 110376,
+  "arena_tokens": 345974,
+  "kv": "bf16",
+  "prediction": "~3.84M fresh tokens at the 121k tok/s packed rate -> ~32 s; committed bf16 chain reference 38.0 s, survivors 1873, answered 23381",
+  "reference": {
+    "artifact": "filter_cells_bf16.json",
+    "wall_s": 38.0,
+    "survivors": 1873,
+    "answered": 23381,
+    "wrong": 6229
+  },
+  "runs": [
+    {
+      "rep": 0,
+      "wall": 11.06,
+      "fresh_tokens": 1149933,
+      "tok_s": 103992.6,
+      "answered": 6341,
+      "survivors": 417,
+      "wrong": 2027,
+      "chunks": 21,
+      "gpu_s": 10.46,
+      "chunk_ms_first8": [
+        956.6,
+        958.0,
+        968.1,
+        968.6,
+        825.0,
+        789.8,
+        726.8,
+        819.1
+      ],
+      "slow_chunks": [
+        {
+          "idx": 3,
+          "ms": 968.6,
+          "tokens": 110123,
+          "groups": 454,
+          "fresh": 283
+        },
+        {
+          "idx": 2,
+          "ms": 968.1,
+          "tokens": 110375,
+          "groups": 457,
+          "fresh": 288
+        },
+        {
+          "idx": 1,
+          "ms": 958.0,
+          "tokens": 110279,
+          "groups": 291,
+          "fresh": 291
+        },
+        {
+          "idx": 0,
+          "ms": 956.6,
+          "tokens": 110362,
+          "groups": 302,
+          "fresh": 302
+        },
+        {
+          "idx": 4,
+          "ms": 825.0,
+          "tokens": 95665,
+          "groups": 464,
+          "fresh": 266
+        },
+        {
+          "idx": 7,
+          "ms": 819.1,
+          "tokens": 93729,
+          "groups": 475,
+          "fresh": 263
+        },
+        {
+          "idx": 5,
+          "ms": 789.8,
+          "tokens": 89637,
+          "groups": 448,
+          "fresh": 215
+        },
+        {
+          "idx": 11,
+          "ms": 781.2,
+          "tokens": 88906,
+          "groups": 468,
+          "fresh": 230
+        }
+      ],
+      "peak_gib": 65.93,
+      "cpu_phase_s": {
+        "alloc": 8.621,
+        "drain_saves": 0.0,
+        "forward_launch": 1.821,
+        "n_chunks": 21,
+        "next_chunk": 0.005,
+        "pack": 0.562,
+        "pack_blocktable": 0.236,
+        "pack_cross": 0.014,
+        "pack_h2d": 0.159,
+        "pack_kv": 0.096,
+        "pack_py": 0.035,
+        "report_rest": 0.012,
+        "report_wait": 0.001,
+        "submit": 0.034
+      }
+    }
+  ],
+  "warmup_s": 2.31
+}
