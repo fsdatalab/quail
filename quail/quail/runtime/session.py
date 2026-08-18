@@ -325,15 +325,20 @@ class Query:
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
-        if plan.workers != 1:
+        if plan.workers > 8:
             raise NotImplementedError(
-                "multi-GPU dispatch is a later step; run with gpus "
-                "sized for one worker")
+                "more than 8 GPUs means multiple containers; the "
+                "multi-container coordinator is a later step")
         scans, filters, joins = _collect(self.logical)
         payload = self._payload(plan, scans, filters, joins)
         t0 = time.time()
         if _execute is None:
-            out = self.session.worker().execute.remote(payload)
+            worker = self.session.worker()
+            k = plan.workers
+            fn = (worker.execute if k == 1 else
+                  worker.execute_2 if k == 2 else
+                  worker.execute_4 if k <= 4 else worker.execute_8)
+            out = fn.remote(payload)
         else:
             out = _execute(payload)
         coordinator_wall = time.time() - t0
@@ -384,10 +389,14 @@ class Query:
                          min_doc_tokens=max(1,
                                             plan.store_min_doc_tokens),
                          hashes=dict(self._hashes))
+        shards = {op["alias"]: op["shards"] for op in plan.operators
+                  if op["op"] == "DocScan"}
         return dict(
             model=sess.model.name,
             kv_dtype=plan.kv_dtype,
             chunk_tokens=plan.chunk_tokens,
+            workers=plan.workers,
+            shards=shards,
             yes_ids=yes_ids, no_ids=no_ids,
             docs=docs,
             filters=filter_qids,

@@ -416,7 +416,8 @@ def _shared_preamble_tokens(question_ids):
 
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, trace=None, store=None,
-               store_hash=None, store_min_tokens=1, stats=None):
+               store_hash=None, store_min_tokens=1, stats=None,
+               store_ids=None):
     """The filter chain on the packed executor: continuous admission,
     survivor priority, pages freed on NO or after the last stage.
 
@@ -432,7 +433,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     document leaving its last stage is copied out on the side stream
     when it is at least store_min_tokens long, its pages returned
     only after the copy lands. stats, when given, is filled with
-    restored/stored counts.
+    restored/stored counts. store_ids maps local document positions
+    to stable store key ids (a sharded worker keys by global index,
+    so its store slice survives across queries).
 
     Returns (answers, spans, tokens): answers[d] = 0/1 list up to the
     first NO (gated); spans and tokens as in run_join.
@@ -441,10 +444,13 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     stage_tokens = [len(question_ids[0])] \
         + [len(q) - p for q in question_ids[1:]]
     tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
+    def skey(d):
+        return (store_hash, store_ids[d] if store_ids else d)
+
     restored = set()
     if store is not None:
         restored = {d for d in range(len(doc_ids))
-                    if (store_hash, d) in store}
+                    if skey(d) in store}
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
         arena_pages=arena.accounting.n_pages,
@@ -494,9 +500,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             leaving = (not yes) or last
             save = (leaving and store is not None
                     and len(doc_ids[doc]) >= store_min_tokens
-                    and (store_hash, doc) not in store)
+                    and skey(doc) not in store)
             if save:
-                ev = store.save((store_hash, doc), arena, doc,
+                ev = store.save(skey(doc), arena, doc,
                                 len(doc_ids[doc]),
                                 after_event=handle[0])
                 if ev is not None:
@@ -529,8 +535,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                 assert got is not None, \
                     "scheduler admitted a doc the arena cannot hold"
                 if doc in restored:
-                    load_events[doc] = store.load(
-                        (store_hash, doc), arena, doc)
+                    load_events[doc] = store.load(skey(doc), arena,
+                                                  doc)
         chunk = pack_chunk(torch, arena, [to_spec(*g) for g in groups])
         tokens += chunk["tokens"]
         if trace is not None:
