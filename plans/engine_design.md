@@ -561,23 +561,44 @@ thousands of small allocations and frees boring.) At 4B with bf16
 KV the arena holds ~400k tokens — roughly 1,000 mean-length
 documents resident at once.
 
-**KV dtype: bf16 default, fp8 only for the store's sake.** The
-dtype is a quality/capacity trade with no speed term at these
-shapes, chosen per session and kept identical in the arena and
-the store:
+**KV dtype: the time half is solved analytically, the quality
+half is a measurement, and the decision is a constrained
+minimum.** One dtype per session, identical in the arena and the
+store.
 
-- **bf16 default.** The accuracy case is measured: the filter
-  ladder saw bf16 KV fix 765 of 2,990 wrong answers against fp8.
-  The speed case against it does not exist here: attention is 4%
-  of step time, so halving KV bytes cannot move the wall, and the
-  executor never recomputes for lack of arena space at either
-  dtype — compute is the binding resource, not the arena.
-- **fp8 when the CPU store is the constraint.** Halving kappa
-  doubles how many documents fit in `cpu_memory_gb` and halves
-  restore bytes. The one workload with a real argument for fp8 is
-  a warm suite whose document sets outgrow the store; `explain()`
-  states the store capacity needed vs available so the trade is
-  visible before the run.
+The dtype enters wall time in exactly three places, and the
+planner prices all three per dtype from the specs — no defaults,
+no taste:
+
+- store transfers: kappa(dtype) x tokens / channel bandwidth —
+  bf16 doubles the bytes of every restore and spill;
+- store overflow: documents past cpu_memory_gb / kappa(dtype)
+  lose their store slot and are recomputed on later queries at
+  the serving rate;
+- attention reads of kept KV: bounded by attention's measured 4%
+  share of step time — priced, never decisive.
+
+`explain()` prints both walls. For a cold query the gap is ~0
+(the arena is not the binding resource at either dtype — compute
+is, and nothing is ever recomputed for lack of arena space). The
+gap is real only when a warm suite's stored KV outgrows the store
+or restore traffic is a large share of the wall.
+
+What no formula gives is the other half: how many answers flip
+when KV quantizes to fp8. That is an empirical property of the
+checkpoint and the task — measured at 4B (bf16 fixed 765 of the
+2,990 answers fp8 KV got wrong on the filter ladder) — and it
+lives in the model's calibration overlay as a measured constant,
+next to the efficiency factor (§8).
+
+So the rule is: minimize the priced wall subject to the quality
+constraint, and the quality constraint is on unless the user
+drops it. Flips cannot be converted to seconds, so quality enters
+as a constraint, not as a term in the objective. With the
+constraint on, bf16 is the only feasible dtype at 4B, because the
+measured flip count is material. Dropping it
+(`kv_dtype="fp8"`) is an informed override: `explain()` has
+already shown the seconds fp8 buys and the flip count it costs.
 
 **Continuous admission — bin packing by tokens, twice.** There is
 a pending queue of documents and a resident set; nothing runs in
@@ -740,8 +761,13 @@ Default for an uncalibrated model: carry the efficiency over via
 spec-ratio scaling (the existing `_scale`), and say so in
 `explain()`. An optional calibration overlay per (model, device) —
 the batch sweep plus the parity probe, ~10 GPU-minutes — replaces
-the assumption with a measurement. Plans never require calibration;
-they only get sharper predictions from it.
+the assumption with a measurement. The overlay is also where
+measured quality constants live, because they have no formula: the
+fp8-KV answer-flip count that gates the dtype choice (§6), and the
+answer-accuracy caveats of the checkpoint. An uncalibrated model
+keeps the quality constraint conservative (bf16) until its flips
+are measured. Plans never require calibration; they only get
+sharper predictions and looser constraints from it.
 
 On "make B* as big as possible because everything is prefill
 dominated": right in substance, with two caps and one caveat. Right
