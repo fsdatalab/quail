@@ -513,6 +513,37 @@ it. What is never stored, by anyone including stock vLLM, is the
 per-pair, per-question suffix KV: a question tail or a streamed
 partner lives only inside its chunk's forward pass.
 
+**Two token budgets, and why neither makes the GPU faster.** The
+chunk budget is the batch size: how many tokens enter one forward
+pass (the analogue of `max_num_batched_tokens`). The admission
+budget is KV residency: how many tokens of document KV may sit in
+the arena. They cap different resources — chunk tokens cost
+activation memory and kernel index range; resident documents cost
+KV bytes — and neither is a speed knob, because the workload is
+compute bound: wall = fresh tokens / rate, and the rate is flat in
+chunk size past the ~400-token knee. What each budget actually
+protects:
+
+- The chunk budget keeps the per-chunk fixed cost amortized. Any
+  value well past the knee does that; we run at the kernel cap
+  because bigger is free (the measured rate was the same at 84k
+  and 110k-token chunks), not because it is needed. It is not
+  limited by KV at all.
+- The admission budget guarantees no document token is ever
+  computed twice: a document's KV must live from its first stage
+  to its last, and a preallocated, never-oversubscribed arena
+  turns "computed once" from a cache policy into a certainty.
+  Memory here is a rework-avoidance resource, not a performance
+  resource. The measured cost of getting it wrong: unbounded
+  admission at 3.4x pool pressure recomputed 2.40x the corpus and
+  took 80.1 s against 42.9 s.
+
+The arena takes all the HBM left after weights and activations
+not because the executor needs it to run fast — it would run at
+the same rate with a quarter of it — but because idle HBM buys
+nothing, and more resident documents means the packer always has
+work and the pending queue drains sooner.
+
 Two pieces replace the engine's paged pool:
 
 **The KV arena.** One preallocated GPU buffer per layer, sized to
@@ -528,9 +559,25 @@ one or two anchors at a time; a filter scan holds a thousand
 documents of varying lengths, and fixed pages are what makes
 thousands of small allocations and frees boring.) At 4B with bf16
 KV the arena holds ~400k tokens — roughly 1,000 mean-length
-documents resident at once. KV dtype is bf16 by default (the
-filter ladder measured bf16 fixing 765 of 2,990 wrong answers
-against fp8); fp8 is a config option that doubles the arena.
+documents resident at once.
+
+**KV dtype: bf16 default, fp8 only for the store's sake.** The
+dtype is a quality/capacity trade with no speed term at these
+shapes, chosen per session and kept identical in the arena and
+the store:
+
+- **bf16 default.** The accuracy case is measured: the filter
+  ladder saw bf16 KV fix 765 of 2,990 wrong answers against fp8.
+  The speed case against it does not exist here: attention is 4%
+  of step time, so halving KV bytes cannot move the wall, and the
+  executor never recomputes for lack of arena space at either
+  dtype — compute is the binding resource, not the arena.
+- **fp8 when the CPU store is the constraint.** Halving kappa
+  doubles how many documents fit in `cpu_memory_gb` and halves
+  restore bytes. The one workload with a real argument for fp8 is
+  a warm suite whose document sets outgrow the store; `explain()`
+  states the store capacity needed vs available so the trade is
+  visible before the run.
 
 **Continuous admission — bin packing by tokens, twice.** There is
 a pending queue of documents and a resident set; nothing runs in
