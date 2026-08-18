@@ -426,6 +426,13 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
         if timers is not None:
             row["cpu_phase_s"] = {k: round(v, 3)
                                   for k, v in sorted(timers.items())}
+            # the full per-chunk series: the drain curve for the
+            # GEMM-efficiency question (issue #9 item 1)
+            row["chunk_series"] = [
+                dict(tokens=chunk_trace[i]["tokens"],
+                     groups=chunk_trace[i]["groups"],
+                     fresh=chunk_trace[i]["fresh"],
+                     ms=chunk_ms[i]) for i in range(len(chunk_ms))]
         report["runs"].append(row)
         print(f"[m1_filter] {row}", flush=True)
     return _write(report, "filter")
