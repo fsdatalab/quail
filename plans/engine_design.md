@@ -802,6 +802,24 @@ H2D/D2H ~55 GB/s, unpinned ~11, disk ~2.6-3.9, volume ~0.9-3.2),
 consumed by the read/restore/spill decision, the byte side of the
 dtype inequality, and spill pricing.
 
+Not all five steer the plan, and the distinction matters:
+
+- **Zero constants** decide filter order, join stage order, and
+  anchor choice. Every candidate runs at the same rate, so a
+  cancels out of the comparison — those decisions are token
+  counting plus the provided selectivities, and they survive any
+  miscalibration untouched.
+- **a, q_kv, and the bandwidths** decide the two choices that
+  compare compute against bytes: read-vs-restore-vs-spill
+  (restore wins iff kappa/bandwidth < a) and the KV dtype
+  argmin. a2 sharpens both when documents are long — it moves the
+  restore crossover and prices the LF=4 regime — and is inert at
+  ordinary lengths.
+- **b and c0 steer nothing.** They exist so predicted walls match
+  measured walls (small-chunk regimes; the per-query floor),
+  which is what lets every run double as a cost-model check. A
+  wrong b or c0 dulls a prediction and changes no plan.
+
 Deliberately absent, against the exploration's `cost.py`: the
 engine-only constants die with the engine — the per-request host
 model (HOST_HN/HA/HR), the eager-boot step floor (STEP_B0_S), the
