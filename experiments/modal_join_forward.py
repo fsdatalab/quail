@@ -1141,57 +1141,68 @@ def join2way(n_reports: int = 100, reps_packed: int = 2,
           flush=True)
 
     # ---- stock arm first (its answers are the cross-implementation
-    # reference), then it is torn down before the packed arms
-    from vllm import LLM, SamplingParams
-    from workload import yes_no_ids
-
-    yes_ids, no_ids = yes_no_ids(tokenizer)
-    max_len = max(len(p) for p in prefixes) + max(suffix_lens) + 16
-    admission_budget = 749_782      # the filter run's committed budget
-    # a stock pair request costs its FULL prompt (prefix + suffix);
-    # the packed side's shared accounting must not leak in here
-    mean_pair = (sum(len(p) for p in prefixes) * n_terms
-                 + n_reports * sum(suffix_lens)) // pairs + 1
-    max_seqs = max(64, min(4096, admission_budget // mean_pair))
-    # stock's step-token cap: the largest measured point of the filter
-    # sweep - the setting the committed stock run used
-    stock_batched = 25_305
-    llm = LLM(model=MODEL, kv_cache_dtype="auto",
-              max_model_len=max_len, max_num_seqs=max_seqs,
-              max_num_batched_tokens=stock_batched,
-              gpu_memory_utilization=0.88,
-              enable_prefix_caching=True, disable_log_stats=True)
-    sampling = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
-                              allowed_token_ids=sorted(yes_ids | no_ids))
-    pair_prompts = [{"prompt_token_ids": p + s}
-                    for p in prefixes for s in suffixes]
-    report["stock"] = dict(max_num_seqs=max_seqs,
-                           kv_cache_dtype="bf16",
-                           max_num_batched_tokens=stock_batched,
-                           admission_budget=admission_budget)
-    llm.generate(pair_prompts[:64], sampling, use_tqdm=False)
+    # reference), then it is torn down before the packed arm.
+    # reps_stock=0 skips the boot entirely - a packed-only rerun;
+    # its rows then carry agrees_with_stock=None and the comparison
+    # rests on the committed stock artifact (the stock path does not
+    # change when the packed executor does)
     stock_answers = None
-    for rep in range(reps_stock):
-        llm.reset_prefix_cache()
-        t0 = time.perf_counter()
-        outputs = llm.generate(pair_prompts, sampling, use_tqdm=False)
-        wall = time.perf_counter() - t0
-        answers = [1 if int(o.outputs[0].token_ids[0]) in yes_ids else 0
-                   for o in outputs]
-        cached = sum(getattr(o, "num_cached_tokens", 0) or 0
-                     for o in outputs)
-        prompt_tokens = sum(len(o.prompt_token_ids) for o in outputs)
-        row = dict(method="stock_grouped", rep=rep, wall=round(wall, 2),
-                   fresh_tokens=prompt_tokens - cached,
-                   tok_s=round((prompt_tokens - cached) / wall, 1),
-                   yes=sum(answers))
-        report["runs"].append(row)
-        print(f"[join2way] {row}", flush=True)
-        stock_answers = answers
-    del outputs, llm
-    gc.collect()
-    torch.cuda.empty_cache()
-    time.sleep(5)
+    if reps_stock:
+        from vllm import LLM, SamplingParams
+        from workload import yes_no_ids
+
+        yes_ids, no_ids = yes_no_ids(tokenizer)
+        max_len = max(len(p) for p in prefixes) + max(suffix_lens) + 16
+        admission_budget = 749_782  # the filter run's committed budget
+        # a stock pair request costs its FULL prompt (prefix +
+        # suffix); the packed side's shared accounting must not leak
+        # in here
+        mean_pair = (sum(len(p) for p in prefixes) * n_terms
+                     + n_reports * sum(suffix_lens)) // pairs + 1
+        max_seqs = max(64, min(4096, admission_budget // mean_pair))
+        # stock's step-token cap: the largest measured point of the
+        # filter sweep - the setting the committed stock run used
+        stock_batched = 25_305
+        llm = LLM(model=MODEL, kv_cache_dtype="auto",
+                  max_model_len=max_len, max_num_seqs=max_seqs,
+                  max_num_batched_tokens=stock_batched,
+                  gpu_memory_utilization=0.88,
+                  enable_prefix_caching=True, disable_log_stats=True)
+        sampling = SamplingParams(temperature=0.0, max_tokens=1,
+                                  min_tokens=1,
+                                  allowed_token_ids=sorted(
+                                      yes_ids | no_ids))
+        pair_prompts = [{"prompt_token_ids": p + s}
+                        for p in prefixes for s in suffixes]
+        report["stock"] = dict(max_num_seqs=max_seqs,
+                               kv_cache_dtype="bf16",
+                               max_num_batched_tokens=stock_batched,
+                               admission_budget=admission_budget)
+        llm.generate(pair_prompts[:64], sampling, use_tqdm=False)
+        for rep in range(reps_stock):
+            llm.reset_prefix_cache()
+            t0 = time.perf_counter()
+            outputs = llm.generate(pair_prompts, sampling,
+                                   use_tqdm=False)
+            wall = time.perf_counter() - t0
+            answers = [1 if int(o.outputs[0].token_ids[0]) in yes_ids
+                       else 0 for o in outputs]
+            cached = sum(getattr(o, "num_cached_tokens", 0) or 0
+                         for o in outputs)
+            prompt_tokens = sum(len(o.prompt_token_ids)
+                                for o in outputs)
+            row = dict(method="stock_grouped", rep=rep,
+                       wall=round(wall, 2),
+                       fresh_tokens=prompt_tokens - cached,
+                       tok_s=round((prompt_tokens - cached) / wall, 1),
+                       yes=sum(answers))
+            report["runs"].append(row)
+            print(f"[join2way] {row}", flush=True)
+            stock_answers = answers
+        del outputs, llm
+        gc.collect()
+        torch.cuda.empty_cache()
+        time.sleep(5)
 
     # ---- packed arm
     model = _load_vllm_model()
@@ -1354,9 +1365,9 @@ def run_probe(out: str = "results/engine/join_probe.json"):
 
 
 @app.local_entrypoint()
-def run_join2way(n_reports: int = 100,
+def run_join2way(n_reports: int = 100, reps_stock: int = 2,
                  out: str = "results/engine/join2way.json"):
-    _save(join2way.remote(n_reports), out)
+    _save(join2way.remote(n_reports, reps_stock=reps_stock), out)
 
 
 @app.local_entrypoint()
