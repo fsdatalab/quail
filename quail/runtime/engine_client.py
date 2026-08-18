@@ -6,9 +6,7 @@ Two executors, both under a plan-derived token budget:
                            stage), gated client-side. The document's
                            KV is whatever the engine's prefix cache
                            still holds when the next stage arrives.
-                           This is the stock-engine baseline; with
-                           `tags` it also carries pin and release
-                           directives for the Quail scheduler.
+                           This is the stock-engine baseline.
 
   run_filter_chain_engine  chain mode: ONE living request per
                            document. The client registers the
@@ -32,9 +30,9 @@ and a filter query is a batch operator, so the client has nobody else
 to serve while it waits on a step.
 
 The engine object must expose the vLLM v1 LLMEngine interface:
-`add_request(request_id, prompt, sampling_params, priority=0)` and
-`step()` returning outputs with `request_id`, `finished`,
-`prompt_token_ids`, `num_cached_tokens`, and `outputs[0]`.
+`add_request(request_id, prompt, sampling_params)` and `step()`
+returning outputs with `request_id`, `finished`, `prompt_token_ids`,
+`num_cached_tokens`, and `outputs[0]`.
 """
 
 import time
@@ -49,36 +47,6 @@ def _yes(out):
         return 0
     ino = t.find("NO")
     return 1 if ino < 0 or iy < ino else 0
-
-
-class EngineTags:
-    """Builds the de1| request ids for the in-engine scheduler: a pin
-    directive on each document's first request, releases piggybacked on
-    later submissions, and the end-of-run flush that releases every
-    remaining pin."""
-
-    def __init__(self, batch=40):
-        self.pending = []
-        self.batch = batch
-
-    def rid(self, suffix, doc=None, pin_tokens=0, uses=1, extra=()):
-        parts = ["de1", *extra]
-        if pin_tokens and doc is not None:
-            parts.append(f"p{pin_tokens}")
-            parts.append(f"d{doc}")
-            if uses > 1:
-                parts.append(f"u{uses}")
-        elif doc is not None:
-            parts.append(f"d{doc}")
-        if self.pending:
-            take, self.pending = (self.pending[:self.batch],
-                                  self.pending[self.batch:])
-            parts.append("r" + ",".join(take))
-        parts.append(suffix)
-        return "|".join(parts)
-
-    def release(self, doc):
-        self.pending.append(str(doc))
 
 
 def _no_store_params(sampling_params):
@@ -102,7 +70,7 @@ def _no_store_params(sampling_params):
 def _run_to_completion(engine, request_id, max_seconds=30):
     """Step the engine until one specific request finishes, or abort
     it at the deadline. For requests submitted outside the measured
-    loops (registration, the pin flush)."""
+    loops (the chain registration)."""
     deadline = time.time() + max_seconds
     while time.time() < deadline:
         for out in engine.step():
@@ -116,67 +84,34 @@ def _run_to_completion(engine, request_id, max_seconds=30):
 
 
 def run_filter_chain(engine, sampling_params, body_ids, q_ids,
-                     budget_tokens, tag="q", tags=None,
-                     use_priority=False, store_min_tokens=0):
+                     budget_tokens, tag="q", store_min_tokens=0):
     """Separate requests, one per (document, stage), gated client-side:
     a document's next stage is submitted only after the previous
-    answer arrives, and a failed stage drops the document. Returns
-    timings, counters, per-call answers keyed (doc, stage) with stages
-    1-indexed, and the surviving document ids.
+    answer arrives, and a failed stage drops the document. This is
+    the stock-engine baseline. Returns timings, counters, per-call
+    answers keyed (doc, stage) with stages 1-indexed, and the
+    surviving document ids.
 
     Between a document's stages the engine serves other documents, so
     whether the document's KV is still resident is up to the prefix
-    cache. That is the baseline this project's chain mode replaces.
-
-    With `tags` set (an EngineTags), request ids carry pin and release
-    directives for the in-engine scheduler and a flush request releases
-    all pins at the end. With `use_priority`, resident-consumer requests
-    (stage two onward) are submitted at a higher engine priority than
-    first reads."""
+    cache. That is the baseline this project's chain mode replaces."""
     n = len(q_ids)
     q_cost = sum(len(q) for q in q_ids) + n
     counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
     answers = {}
     survivors = []
-
-    # the pin must claim everything with a future consumer: the document
-    # plus the shared prefix of the stage questions (their common
-    # preamble straddles the boundary block and is reused by every
-    # later stage)
-    q_common = 0
-    if len(q_ids) > 1:
-        for col in zip(*q_ids):
-            if len(set(col)) != 1:
-                break
-            q_common += 1
-
-    def rid_for(i, j0):
-        suffix = f"{tag}-{i}-{j0}"
-        if tags is None:
-            return suffix
-        if j0 == 0:
-            return tags.rid(suffix, doc=i,
-                            pin_tokens=len(body_ids[i]) + q_common)
-        return tags.rid(suffix)
-
     inflight = {}                      # request id -> (doc, stage, cost)
     no_store = (_no_store_params(sampling_params)
                 if store_min_tokens > 1 and sampling_params is not None
                 else sampling_params)
 
     def submit(i, j, cost):
-        rid = rid_for(i, j)
+        rid = f"{tag}-{i}-{j}"
         inflight[rid] = (i, j, cost)
-        kw = {"priority": 0 if j > 0 else 1} if use_priority else {}
         sp = (no_store if len(body_ids[i]) < store_min_tokens
               else sampling_params)
         engine.add_request(rid, {"prompt_token_ids": body_ids[i] + q_ids[j]},
-                           sp, **kw)
-
-    def retire(i, cost):
-        if tags is not None:
-            tags.release(i)
-        return cost
+                           sp)
 
     t0 = time.time()
     used, next_doc = 0, 0
@@ -206,14 +141,8 @@ def run_filter_chain(engine, sampling_params, body_ids, q_ids,
             else:
                 if got:
                     survivors.append(i)
-                used -= retire(i, cost)
+                used -= cost                    # retire: budget returns
     wall = time.time() - t0
-    if tags is not None:
-        # release every remaining pin so the engine can reset cleanly
-        flush_rid = f"de1|r*|{tag}-0-99"
-        engine.add_request(flush_rid, {"prompt_token_ids": list(q_ids[0])},
-                           sampling_params)
-        _run_to_completion(engine, flush_rid)
     return dict(wall=wall, survivors=sorted(survivors), answers=answers,
                 **counters)
 
@@ -263,7 +192,7 @@ def run_filter_chain_engine(engine, sampling_params, body_ids, q_ids,
     rewinds to the document boundary, and appends the next question.
     Returns the same result shape as run_filter_chain, which keeps
     its gate because the stock baseline's stages are conditional on
-    verdicts and its in-flight requests do pin cache footprint.
+    verdicts and its in-flight requests do occupy pool space.
 
     With no_ids given, the gate runs in decisive-token mode for models
     that do not answer in one token: each stage may sample several

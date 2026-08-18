@@ -250,10 +250,14 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
     if stage in ("store", "split", "split7"):
         # must precede the first vllm import in this process
         _install_xfer_trace(trace_path)
+    if waves and client != "chain":
+        # the per-stage request mode on the Quail boot was removed;
+        # the two operators are the stock stages client and the chain
+        raise ValueError("waves require the chain client")
     if waves:
-        # wave pre-loading runs in the QuailScheduler; the stock
-        # per-stage requests are untagged, so single-tenant strict
-        # mode must be off for this harness
+        # wave pre-loading runs in the QuailScheduler; strict
+        # single-tenant mode must be off because wave blocks left
+        # unconsumed are evicted by the engine's ordinary reuse path
         os.environ["QUAIL_WAVES"] = "1"
         os.environ["QUAIL_SINGLE_TENANT"] = "0"
     if client == "chain":
@@ -360,9 +364,6 @@ def persist_run(n_docs: int = 1000, stage: str = "baseline",
             kw["async_scheduling"] = True
             kw["scheduler_cls"] = ("quail.engineext.scheduler."
                                    "QuailAsyncScheduler")
-        elif waves:
-            kw["scheduler_cls"] = ("quail.engineext.scheduler."
-                                   "QuailScheduler")
         if store:
             # "quail" swaps in the coalescing worker (one transfer per
             # step, not per request); "stock" is the measured baseline

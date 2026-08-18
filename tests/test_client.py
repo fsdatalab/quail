@@ -3,7 +3,7 @@ engine that answers from planted flags."""
 
 import numpy as np
 
-from quail.runtime.engine_client import (EngineTags, run_filter_chain,
+from quail.runtime.engine_client import (run_filter_chain,
                                          run_filter_chain_engine)
 
 
@@ -31,7 +31,7 @@ class StubEngine:
         self.request_params = {}
         self._queue = []
 
-    def add_request(self, request_id, prompt, sampling_params, priority=0):
+    def add_request(self, request_id, prompt, sampling_params):
         self.rids.append(request_id)
         self.request_params[request_id] = sampling_params
         _tag, i, j0 = request_id.rsplit("-", 2)
@@ -79,31 +79,6 @@ def test_tiny_budget_completes():
     assert set(res["answers"]) >= {(i, 1) for i in range(12)}
     firsts = [i for i, j0 in eng.calls if j0 == 0]
     assert firsts == sorted(firsts)
-
-
-def test_engine_tags_protocol():
-    """With tags on, each document's first request carries a pin
-    directive, releases ride on later requests, outcomes are unchanged,
-    and the run ends with a release-all flush."""
-    flags, body_ids, q_ids = _setup(25, 3, seed=7)
-    ref = run_filter_chain(StubEngine(flags), None, body_ids, q_ids,
-                           budget_tokens=10 ** 6)
-    eng = StubEngine(flags)
-    res = run_filter_chain(eng, None, body_ids, q_ids,
-                           budget_tokens=10 ** 6, tags=EngineTags())
-    assert res["survivors"] == ref["survivors"]
-    assert res["answers"] == ref["answers"]
-    pins = [r for r in eng.rids if "|p" in r]
-    assert len(pins) == 25                      # one pin per document
-    for r in pins:
-        assert r.startswith("de1|p") and "|d" in r
-    released = set()
-    for r in eng.rids:
-        for part in r.split("|"):
-            if part.startswith("r") and len(part) > 1 and part != "r*":
-                released.update(part[1:].split(","))
-    assert "r*" in eng.rids[-1].split("|")      # flush is the last call
-    assert released <= {str(i) for i in range(25)}
 
 
 class _SP:
@@ -160,7 +135,7 @@ class ChainStubEngine:
         self.rids = []
         self._chains = {}            # rid -> (prompt_ids, doc, stage)
 
-    def add_request(self, request_id, prompt, sampling_params, priority=0):
+    def add_request(self, request_id, prompt, sampling_params):
         self.rids.append(request_id)
         ids = prompt["prompt_token_ids"]
         if "|reg|" in request_id:

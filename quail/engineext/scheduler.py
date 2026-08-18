@@ -1,12 +1,11 @@
 """Query-aware scheduler extension for vLLM v1.
 
 Subclasses vLLM's scheduler so the query plan, not the engine's
-heuristics, governs memory. Live documents' prefix blocks are pinned
-by holding an extra block-pool reference, dead documents' blocks are
-stripped and freed the instant the plan learns of the death, and every
-block a planned request leaves behind that is not pinned has its cache
-entry removed on free. Everything uses the block pool's public
-interface; vendor code is not modified.
+heuristics, governs memory. A rewind strips and frees the erased
+question KV the instant a stage is judged, and every block a finished
+request leaves behind has its cache entry removed on free - the plan
+knows nothing will read it again. Everything uses the block pool's
+public interface; vendor code is not modified.
 
 Chain mode is the reason this class exists: one living request runs a
 document's whole filter chain. The client registers the question token
@@ -17,8 +16,8 @@ appended through the engine's own session mechanism. The document is
 prefilled exactly once no matter how many filters it survives.
 
 Single tenant mode (env QUAIL_SINGLE_TENANT, default on) is the
-shipping configuration: requests that do not carry a plan tag are
-refused, so unplanned memory cannot exist, and the engine's
+shipping configuration: requests that do not carry the plan's id
+prefix are refused, so unplanned memory cannot exist, and the engine's
 keep-the-most-recent eviction rule becomes unreachable by
 construction. If it ever fires anyway, that means memory escaped the
 plan's accounting, and the scheduler raises instead of silently
@@ -26,32 +25,26 @@ falling back to heuristic behavior. Set the env var to 0 for shared
 card experiments, where foreign traffic is legitimate and the recency
 rule is its default policy.
 
-The scheduler lives in the engine core process, so client directives
-ride inside request ids. Protocol, fields separated by "|" ("de1" is
-the wire-format version tag, not a product name):
+The scheduler lives in the engine core process, so the client speaks
+to it through request ids. Protocol, fields separated by "|" ("de1"
+is the wire-format version tag, not a product name):
 
-    de1|p<tokens>|d<doc>|u<count>|r<doc,doc,...>|<suffix>
+    de1|reg|Y<ids>|N<ids>|Q<qid>|<suffix>   registration
+    de1|c|d<doc>|Q<qid>|<suffix>            chain request
 
-  p<tokens>  pin the document prefix covering the first <tokens> tokens
-             when this request's blocks are freed
-  d<doc>     document key that owns the pin
-  u<count>   the pin expects <count> release mentions before it frees
-             (shared scans: one per query reading the document);
-             missing means one, the single-query behavior
-  r<...>     release one mention of each listed document key's pin;
-             a pin frees when its mention count reaches zero.
-             "*" frees every pin outright regardless of counts
+  reg        a registration request: its prompt carries the question
+             token lists, its id the gate token ids (Y, and
+             optionally N for decisive-token mode)
   c          a chain request: this request runs a document's whole
              filter chain through in-engine rewinds
-  reg        a registration request: its prompt carries the question
-             token lists, its id the gate token ids
-  Q<qid>     on registration and chain requests: the query these
-             questions or this chain belong to; missing means the
-             default query id "0", the single-query protocol
+  d<doc>     the document key the chain works for (step-trace label)
+  Q<qid>     the query these questions or this chain belong to;
+             missing means the default query id "0", the single-query
+             protocol
 
-Every decision - id parsing, pin refcounts, rewind arithmetic, the
-answer gate, the strict-mode predicate - is computed in chainlogic.py,
-which imports no vLLM and is unit-tested without an engine
+Every decision - id parsing, rewind arithmetic, the answer gate, the
+strict-mode predicate - is computed in chainlogic.py, which imports no
+vLLM and is unit-tested without an engine
 (tests/test_engineext_logic.py). This class only applies those
 decisions to vLLM state.
 """
@@ -65,16 +58,12 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus, StreamingUpdate
 
 from . import chainlogic, slots
-from .chainlogic import parse_qid, parse_tag  # noqa: F401  module API
 
 
 class QuailScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._de_pins = chainlogic.PinLedger()  # doc key -> blocks, uses
-        self._de_rid_tag = {}       # request id -> parsed tag (once)
-        self._de_pinned_ids = set()  # block ids currently pinned
-        self._de_intent = {}        # request id -> (pin_tokens, doc, uses)
+        self._de_rid_doc = {}       # request id -> doc key (parsed once)
         self._de_queries = {}       # query id -> dict(qs, qc, yes, no)
         self._de_chain = {}         # request id -> dict(stage, d, qid)
         # a rewound session waiting mid-chain still holds its
@@ -160,8 +149,7 @@ class QuailScheduler(Scheduler):
                 open(self._de_trace, "w").close()
                 print(f"[quail-trace] step trace -> {self._de_trace}",
                       flush=True)
-        self._de_stats = dict(pinned=0, released=0, blocks=0,
-                              foreign_rejected=0, heuristic_evictions=0)
+        self._de_stats = dict(foreign_rejected=0, heuristic_evictions=0)
         # wave pre-loading (QUAIL_WAVES=1): synchronous KV pre-load
         # from the host store, decisions in waves_logic, engine
         # surgery in waves.py; off by default and inert when off
@@ -299,8 +287,7 @@ class QuailScheduler(Scheduler):
                           if (req := self.requests.get(rid)) is not None]
             rec = chainlogic.step_record(
                 now, now - t0, toks,
-                [t[1] if (t := self._de_tag(rid)) else None
-                 for rid in toks],
+                [self._de_doc(rid) for rid in toks],
                 pool.get_num_free_blocks(), pool.num_gpu_blocks,
                 self.block_size, decoding=decoding, shapes=shapes)
             rec["waiting"] = len(self.waiting)
@@ -524,7 +511,7 @@ class QuailScheduler(Scheduler):
         # parse the id ONCE per request. The step trace and the free
         # path used to re-parse every scheduled request every step -
         # 1.85 million parses in 900 steps, 2.6 percent of core CPU
-        self._de_rid_tag[rid] = chainlogic.parse_tag(rid)
+        self._de_rid_doc[rid] = chainlogic.doc_key(rid)
         if chainlogic.is_registration(rid):
             self._de_register(request)
             return
@@ -536,101 +523,44 @@ class QuailScheduler(Scheduler):
                 stage=1, qid=qid,
                 d=chainlogic.document_boundary(
                     request.num_prompt_tokens, len(q["qs"][0])))
-            request.priority = 0
-            # Shared scans pin the document under its chains: the pin
-            # (taken by whichever of the document's chains frees first)
-            # keeps the document's cache entries alive for sibling
-            # queries' chains that have not computed yet, and releases
-            # ride on later chain submissions like in request mode.
-            tag = self._de_rid_tag[rid]
-            if tag is not None:
-                pin, doc, rel, uses = tag
-                if rel:
-                    self._de_release(rel)
-                if chainlogic.new_pin_intent(pin, doc, self._de_pins):
-                    self._de_intent[rid] = (pin, doc, uses)
             super().add_request(request)
             return
-        tag = self._de_rid_tag[rid]
-        if tag is None and self._de_strict:
+        if self._de_strict and not chainlogic.is_planned(rid):
             # a single tenant appliance serves only planned work
             super().add_request(request)
             self._de_stats["foreign_rejected"] += 1
             self.finish_requests(rid, RequestStatus.FINISHED_ABORTED)
             return
-        # Ordering is the plan's decision, not the client's: rank is
-        # assigned here from the verified tag, and whatever priority a
-        # client requested is overridden. Consumers of resident KV run
-        # first, new document reads next, unplanned traffic (only
-        # possible outside strict mode) last.
-        request.priority = chainlogic.plan_priority(tag)
-        if tag is not None:
-            pin, doc, rel, uses = tag
-            if rel:
-                self._de_release(rel)
-            if chainlogic.new_pin_intent(pin, doc, self._de_pins):
-                self._de_intent[rid] = (pin, doc, uses)
         super().add_request(request)
 
-    def _de_release(self, docs):
-        for _key, blocks in self._de_pins.to_free(docs):
-            if not blocks:
-                continue
-            # dead by the plan's decree: strip cache entries, then
-            # drop the pin references; hashless blocks join the head
-            # of the free queue and are reusable immediately
-            self._de_evict({b.block_id for b in blocks})
-            self._de_pinned_ids.difference_update(
-                b.block_id for b in blocks)
-            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
-            self._de_stats["released"] += 1
-        if chainlogic.is_release_all(docs):
-            print(f"[quail-sched] release-all: stats {self._de_stats}",
-                  flush=True)
-            self._de_dump_profile("request-mode")
-
-    def _de_tag(self, rid):
-        """The parsed tag for a request id, from the once-per-request
+    def _de_doc(self, rid):
+        """The document key for a request id, from the once-per-request
         cache; falls back to parsing for ids that never passed
         add_request."""
         try:
-            return self._de_rid_tag[rid]
+            return self._de_rid_doc[rid]
         except KeyError:
-            tag = chainlogic.parse_tag(rid)
-            self._de_rid_tag[rid] = tag
-            return tag
+            doc = chainlogic.doc_key(rid)
+            self._de_rid_doc[rid] = doc
+            return doc
 
     def _free_request_blocks(self, request):
-        if self._de_tag(request.request_id) is not None:
+        if chainlogic.is_planned(request.request_id):
             groups = self.kv_cache_manager.coordinator.get_blocks(
                 request.request_id)
             blocks = groups[0] if groups else []
-            intent = self._de_intent.pop(request.request_id, None)
-            if chainlogic.pin_ready(intent, request.num_computed_tokens,
-                                    self._de_pins):
-                pin_tokens, doc, uses = intent
-                keep = [b for b in blocks[:chainlogic.full_blocks(
-                            pin_tokens, self.block_size)]
-                        if not b.is_null]
-                if keep:
-                    self.kv_cache_manager.block_pool.touch(keep)
-                    self._de_pins.add(doc, keep, uses)
-                    self._de_pinned_ids.update(b.block_id for b in keep)
-                    self._de_stats["pinned"] += 1
-                    self._de_stats["blocks"] += len(keep)
             # the plan owns its memory: whatever this request leaves
-            # behind unpinned has no future consumer, so strip its
-            # cache entries rather than leave them to the recency rule.
+            # behind has no future consumer, so strip its cache
+            # entries rather than leave them to the recency rule.
             # Blocks other live requests still hold are not dead, so
             # only the last holder strips them (ref_cnt <= 1).
             tail = {b.block_id for b in blocks
                     if not b.is_null
-                    and b.block_id not in self._de_pinned_ids
                     and getattr(b, "ref_cnt", 1) <= 1}
             self._de_evict(tail)
         super()._free_request_blocks(request)
-        # the freed request's tag is never read again
-        self._de_rid_tag.pop(request.request_id, None)
+        # the freed request's doc key is never read again
+        self._de_rid_doc.pop(request.request_id, None)
 
 
 class QuailAsyncScheduler(QuailScheduler, AsyncScheduler):
