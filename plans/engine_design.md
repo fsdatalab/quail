@@ -561,40 +561,51 @@ thousands of small allocations and frees boring.) At 4B with bf16
 KV the arena holds ~400k tokens — roughly 1,000 mean-length
 documents resident at once.
 
-**KV dtype: the planner picks the latency argmin.** One dtype per
-session, identical in the arena and the store. The planner prices
-the wall once per dtype and takes the minimum — no default, no
-constraint, no taste. Every place the dtype enters time is a
-priced term:
+**KV dtype: the planner picks the latency argmin, and the
+conversion overhead is already measured, twice.** One dtype per
+session, identical in the arena and the store.
 
-- KV quantization on write: fp8 pays a quantize per fresh
-  document token as its KV lands in the arena (and the store
-  path pays nothing extra — bytes are copied as stored). Small —
-  the measured kernel mix puts all fp8 quant/scale work at 19% of
-  step time, and KV quant is a sliver of that — but priced, not
-  waved away;
-- attention reads of kept KV: fp8 halves the bytes read and adds
-  the dequant; bounded either way by attention's measured 4%
-  share of step time;
-- store transfers: kappa(dtype) x tokens / channel bandwidth —
-  bf16 doubles the bytes of every restore and spill;
-- store overflow: documents past cpu_memory_gb / kappa(dtype)
-  lose their store slot and are recomputed on later queries at
-  the serving rate.
+fp8 KV is not free speed; it is a conversion tax. Storing KV in
+fp8 costs a quantize on every write and a dequant on every read,
+and buys nothing back on the GPU, because attention — the only
+consumer of KV bytes — is 4% of step time. Both committed
+measurements agree on the size of the tax:
 
-`explain()` prints both walls and the pick. For a cold query the
-terms nearly cancel and the argmin lands on fp8 by the byte
-counts; a warm suite with store pressure widens fp8's win through
-the transfer and overflow terms. bf16 wins only if a measurement
-ever shows a real fp8 read/quant penalty at some shape — which is
-exactly what the pricing would then reflect.
+- The kernel ladder ran the same engine boot both ways: 96,946
+  tok/s with fp8 KV, 102,820 with bf16 — a 5.9% rate cost, i.e.
+  **q_kv = 0.59 µs per fresh token** at 4B/H100
+  (`plans/packed_forward.md`, the ladder run).
+- End to end, the identical 10k-document five-filter query
+  measured 38.1 s with bf16 KV against 39.8 s with fp8
+  (`filter_cells_bf16.json` vs `filter_cells.json`): 0.46 µs per
+  fresh token over the 3.84M fresh tokens — the ladder number,
+  inside the run-to-run band.
 
-Answer quality is reported, not enforced: the measured flip count
-(bf16 fixed 765 of the 2,990 answers fp8 KV got wrong on the
-filter ladder) lives in the calibration overlay and appears in
-the run report next to the dtype pick, so the cost of the fast
-choice stays visible. `kv_dtype` in the config forces either
-dtype for users who want the call made differently.
+What fp8 buys is bytes, and bytes are priced by the same
+arithmetic: store transfers move kappa(dtype) x tokens over a
+known channel (halving kappa returns 1.34 µs per restored token
+at pinned 55 GB/s), and store capacity doubles (documents past
+cpu_memory_gb / kappa lose their slot and are recomputed on later
+queries at the serving rate). So the pick is one inequality,
+evaluated per query from numbers the plan already has:
+
+    fp8 wins  iff  q_kv x fresh_tokens
+                   <  (kappa_bf16 − kappa_fp8) / bw_channel
+                        x restored_tokens
+                      + overflow recompute saved by the 2x store
+
+q_kv generalizes without re-measuring: an elementwise conversion
+is bandwidth work, so it scales with KV elements per token (the
+same 2 x L x n_kv x d_h that makes kappa) and inversely with
+device memory bandwidth — spec arithmetic, like everything else
+in §8, with the 4B/H100 measurement as the anchor.
+
+Where the inequality lands: a cold query has zero restored tokens,
+so bf16 wins it by the full 5.9%. fp8 wins only when a warm
+suite's restore and overflow traffic outweighs a ~0.6 µs tax on
+every fresh token — heavy store pressure and comparatively little
+fresh compute. `explain()` prints both walls and the pick;
+`kv_dtype` in the config forces either.
 
 **Continuous admission — bin packing by tokens, twice.** There is
 a pending queue of documents and a resident set; nothing runs in
@@ -755,15 +766,14 @@ efficiency factor (measured 0.35 on 4B/H100 — 91–93% of peak inside
 the GEMMs, the rest lost to the memory-bound work between them).
 Default for an uncalibrated model: carry the efficiency over via
 spec-ratio scaling (the existing `_scale`), and say so in
-`explain()`. An optional calibration overlay per (model, device) —
-the batch sweep plus the parity probe, ~10 GPU-minutes — replaces
-the assumption with a measurement. The overlay is also where
-measured quality constants live, because they have no formula: the
-fp8-KV answer-flip count reported next to the dtype pick (§6), and
-the answer-accuracy caveats of the checkpoint. For an uncalibrated
-model the report says the flip count is unmeasured, and the pick
-stays what the pricing says. Plans never require calibration; they
-only get sharper predictions from it.
+`explain()`. The fp8-KV conversion tax q_kv (§6) is the same kind
+of constant: anchored by one measurement (0.59 µs/token at
+4B/H100), scaled to other models by KV elements per token and to
+other devices by memory bandwidth. An optional calibration overlay
+per (model, device) — the batch sweep plus the parity probe, ~10
+GPU-minutes — replaces both assumptions with measurements. Plans
+never require calibration; they only get sharper predictions from
+it.
 
 On "make B* as big as possible because everything is prefill
 dominated": right in substance, with two caps and one caveat. Right
