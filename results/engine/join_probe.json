@@ -15,15 +15,17 @@
     "median_row_gap": 2.5,
     "kept_vs_shared_disagreements": 0,
     "kept_disagreeing_pairs": [],
+    "multi_group_disagreements": 0,
+    "mixed_kept_fresh_disagreements": 0,
     "finite": true
   },
   "rates": {
     "b_star": {
       "chunks": 2,
       "tokens": 169452,
-      "wall_s": 2.027,
-      "tok_s": 83594.3
+      "wall_s": 2.064,
+      "tok_s": 82094.8
     }
   },
-  "peak_gib": 15.67
+  "peak_gib": 15.92
 }
