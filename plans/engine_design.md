@@ -561,44 +561,40 @@ thousands of small allocations and frees boring.) At 4B with bf16
 KV the arena holds ~400k tokens — roughly 1,000 mean-length
 documents resident at once.
 
-**KV dtype: the time half is solved analytically, the quality
-half is a measurement, and the decision is a constrained
-minimum.** One dtype per session, identical in the arena and the
-store.
+**KV dtype: the planner picks the latency argmin.** One dtype per
+session, identical in the arena and the store. The planner prices
+the wall once per dtype and takes the minimum — no default, no
+constraint, no taste. Every place the dtype enters time is a
+priced term:
 
-The dtype enters wall time in exactly three places, and the
-planner prices all three per dtype from the specs — no defaults,
-no taste:
-
+- KV quantization on write: fp8 pays a quantize per fresh
+  document token as its KV lands in the arena (and the store
+  path pays nothing extra — bytes are copied as stored). Small —
+  the measured kernel mix puts all fp8 quant/scale work at 19% of
+  step time, and KV quant is a sliver of that — but priced, not
+  waved away;
+- attention reads of kept KV: fp8 halves the bytes read and adds
+  the dequant; bounded either way by attention's measured 4%
+  share of step time;
 - store transfers: kappa(dtype) x tokens / channel bandwidth —
   bf16 doubles the bytes of every restore and spill;
 - store overflow: documents past cpu_memory_gb / kappa(dtype)
   lose their store slot and are recomputed on later queries at
-  the serving rate;
-- attention reads of kept KV: bounded by attention's measured 4%
-  share of step time — priced, never decisive.
+  the serving rate.
 
-`explain()` prints both walls. For a cold query the gap is ~0
-(the arena is not the binding resource at either dtype — compute
-is, and nothing is ever recomputed for lack of arena space). The
-gap is real only when a warm suite's stored KV outgrows the store
-or restore traffic is a large share of the wall.
+`explain()` prints both walls and the pick. For a cold query the
+terms nearly cancel and the argmin lands on fp8 by the byte
+counts; a warm suite with store pressure widens fp8's win through
+the transfer and overflow terms. bf16 wins only if a measurement
+ever shows a real fp8 read/quant penalty at some shape — which is
+exactly what the pricing would then reflect.
 
-What no formula gives is the other half: how many answers flip
-when KV quantizes to fp8. That is an empirical property of the
-checkpoint and the task — measured at 4B (bf16 fixed 765 of the
-2,990 answers fp8 KV got wrong on the filter ladder) — and it
-lives in the model's calibration overlay as a measured constant,
-next to the efficiency factor (§8).
-
-So the rule is: minimize the priced wall subject to the quality
-constraint, and the quality constraint is on unless the user
-drops it. Flips cannot be converted to seconds, so quality enters
-as a constraint, not as a term in the objective. With the
-constraint on, bf16 is the only feasible dtype at 4B, because the
-measured flip count is material. Dropping it
-(`kv_dtype="fp8"`) is an informed override: `explain()` has
-already shown the seconds fp8 buys and the flip count it costs.
+Answer quality is reported, not enforced: the measured flip count
+(bf16 fixed 765 of the 2,990 answers fp8 KV got wrong on the
+filter ladder) lives in the calibration overlay and appears in
+the run report next to the dtype pick, so the cost of the fast
+choice stays visible. `kv_dtype` in the config forces either
+dtype for users who want the call made differently.
 
 **Continuous admission — bin packing by tokens, twice.** There is
 a pending queue of documents and a resident set; nothing runs in
@@ -763,11 +759,11 @@ spec-ratio scaling (the existing `_scale`), and say so in
 the batch sweep plus the parity probe, ~10 GPU-minutes — replaces
 the assumption with a measurement. The overlay is also where
 measured quality constants live, because they have no formula: the
-fp8-KV answer-flip count that gates the dtype choice (§6), and the
-answer-accuracy caveats of the checkpoint. An uncalibrated model
-keeps the quality constraint conservative (bf16) until its flips
-are measured. Plans never require calibration; they only get
-sharper predictions and looser constraints from it.
+fp8-KV answer-flip count reported next to the dtype pick (§6), and
+the answer-accuracy caveats of the checkpoint. For an uncalibrated
+model the report says the flip count is unmeasured, and the pick
+stays what the pricing says. Plans never require calibration; they
+only get sharper predictions from it.
 
 On "make B* as big as possible because everything is prefill
 dominated": right in substance, with two caps and one caveat. Right
