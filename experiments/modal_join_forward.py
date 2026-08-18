@@ -168,7 +168,7 @@ class JoinPipeline:
         self.head_dim = attn.head_dim
         self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
         self.fp8 = torch.float8_e4m3fn
-        self.new_kept = None    # anchor -> {layer: (k, v)} during a pass
+        self.new_kv = None    # anchor -> {layer: (K, V)} written this pass
 
     # ---- weights and quant ------------------------------------------
 
@@ -404,8 +404,8 @@ class JoinPipeline:
         v3 = v.contiguous().view(n, KH, D)
         layer = meta["layer"]
 
-        for anchor, r0, r1 in meta["capture"]:
-            self.new_kept.setdefault(anchor, {})[layer] = (
+        for anchor, r0, r1 in meta["kv_writes"]:
+            self.new_kv.setdefault(anchor, {})[layer] = (
                 k3[r0:r1].clone(), v3[r0:r1].clone())
 
         out_a, lse_a = self._fa(
@@ -414,7 +414,7 @@ class JoinPipeline:
 
         if meta["cu_b_q"] is None:
             # no shared-prefix reads in this chunk: whole-pair
-            # segments (probe reference) or a capture-only pass
+            # segments (probe reference) or a cache-only pass
             meta["layer"] += 1
             return out_a.view(n, H * D)
 
@@ -427,7 +427,7 @@ class JoinPipeline:
                 ks.append(k3[r0:r1])
                 vs.append(v3[r0:r1])
             else:
-                kp, vp = meta["stores"][src[1]][layer]
+                kp, vp = meta["kv_cache"][src[1]][layer]
                 ks.append(kp)
                 vs.append(vp)
         kx = ks[0] if len(ks) == 1 else torch.cat(ks)
@@ -456,7 +456,7 @@ class JoinPipeline:
         meta = chunk["meta"]
         meta["layer"] = 0
         input_ids, positions = chunk["input_ids"], chunk["positions"]
-        self.new_kept = {}
+        self.new_kv = {}
         hidden = self.embed(input_ids)
         residual = None
         for layer in self.layers:
@@ -485,34 +485,35 @@ class JoinPipeline:
         last_residual = residual.index_select(0, final)
         normed, _ = self.fused_add_rms_norm(
             last_hidden, last_residual, self.final_norm)
-        kept = self.new_kept
-        self.new_kept = None
-        return normed, kept
+        new_kv = self.new_kv
+        self.new_kv = None
+        return normed, new_kv
 
 
-def pack_join_chunk(torch, groups, stores=None):
+def pack_join_chunk(torch, groups, kv_cache=None):
     """Tensors for one chunk, built from groups in chunk order.
 
     Each group is a dict:
-      anchor    id used for capture marks and kept lookups
+      anchor    id used for KV-cache writes and lookups
       prefix    fresh prefix token list, packed into the chunk - or
-                None when the anchor's K/V is already in stores
+                None when the anchor's KV is already in kv_cache
       f         prefix length in tokens; required when prefix is
                 None (suffix positions start at f either way, so
                 answers match standalone [prefix | suffix] prompts)
       suffixes  list of suffix token lists (may be empty for a
-                capture-only group)
-      capture   copy this group's fresh prefix K/V out per layer
+                cache-only group)
+      cache_kv  write this group's fresh prefix KV per layer
+                into the cache returned by forward_chunk
 
-    stores: anchor -> {layer: (k, v)}, the kept store for groups
-    whose prefix is not in this chunk.
+    kv_cache: anchor -> {layer: (K, V)}, the KV cache read by
+    groups whose prefix is not in this chunk.
     """
     dev = "cuda"
     ids, pos, cu_a, finals = [], [], [0], []
     suffix_rows = []
     cross_src, cu_b_q, cu_b_k = [], [0], [0]
     max_b_q = max_b_k = 0
-    capture = []
+    kv_writes = []
     for g in groups:
         fresh = g.get("prefix") is not None
         f = len(g["prefix"]) if fresh else g["f"]
@@ -521,8 +522,8 @@ def pack_join_chunk(torch, groups, stores=None):
             ids.extend(g["prefix"])
             pos.extend(range(f))
             cu_a.append(len(ids))
-            if g.get("capture"):
-                capture.append((g["anchor"], row0, row0 + f))
+            if g.get("cache_kv"):
+                kv_writes.append((g["anchor"], row0, row0 + f))
         s_row0 = len(ids)
         for suf in g["suffixes"]:
             ids.extend(suf)
@@ -540,8 +541,8 @@ def pack_join_chunk(torch, groups, stores=None):
                              else ("kept", g["anchor"]))
     meta = dict(
         layer=0,
-        capture=capture,
-        stores=stores,
+        kv_writes=kv_writes,
+        kv_cache=kv_cache,
         cu_a=torch.tensor(cu_a, dtype=torch.int32, device=dev),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)),
         cu_b_q=(torch.tensor(cu_b_q, dtype=torch.int32, device=dev)
@@ -642,8 +643,9 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
     group's answers arrive, it is the next group's stage-0 chunk
     (which depends on nothing) - launched before the gate resolves,
     so the GPU never drains. Answers travel as event-synced pinned
-    copies (AsyncAnswers); anchor prefix K/V is captured once and
-    freed when its group leaves its last stage.
+    copies (AsyncAnswers); an anchor's prefix KV is written to
+    the executor's KV cache at most once and freed when its group
+    leaves its last stage. Suffix KV is never cached.
 
     Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
     partners, present only for anchors that reached stage j; spans =
@@ -659,7 +661,7 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
               for i in range(0, n, group_size)]
     suffix_lens = [[len(s) for s in sufs] for sufs in stage_suffixes]
     ans = [dict() for _ in range(k)]
-    stores, spans = {}, []
+    kv_cache, spans = {}, []
     tokens = 0
 
     def plan_stage(members, j):
@@ -670,12 +672,13 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
         spec = [(len(anchor_prefixes[a]), suffix_lens[j])
                 for a in live]
         keep_loc = set(range(len(live))) if j + 1 < k else set()
-        already_loc = {i for i, a in enumerate(live) if a in stores}
-        plan, capture = pack_stream(spec, budget, keep=keep_loc,
-                                    already_kept=already_loc)
-        return live, plan, capture
+        already_loc = {i for i, a in enumerate(live)
+                       if a in kv_cache}
+        plan, to_cache = pack_stream(spec, budget, keep=keep_loc,
+                                     already_kept=already_loc)
+        return live, plan, to_cache
 
-    def build(j, idx, capture, chunk_groups):
+    def build(j, idx, to_cache, chunk_groups):
         return pack_join_chunk(
             torch,
             [dict(anchor=idx[a],
@@ -683,9 +686,9 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
                           else None),
                   f=len(anchor_prefixes[idx[a]]),
                   suffixes=stage_suffixes[j][start:end],
-                  capture=(carried and a in capture))
+                  cache_kv=(carried and a in to_cache))
              for a, start, end, carried in chunk_groups],
-            stores=stores)
+            kv_cache=kv_cache)
 
     def launch(j, chunk):
         nonlocal tokens
@@ -693,10 +696,10 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
-        normed, kept = pipeline.forward_chunk(chunk)
+        normed, new_kv = pipeline.forward_chunk(chunk)
         e1.record()
         spans.append((j, e0, e1))
-        stores.update(kept)
+        kv_cache.update(new_kv)
         return async_ans.submit(normed)
 
     def scatter(j, idx, chunk_groups, bits):
@@ -706,16 +709,16 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
             ans[j].setdefault(idx[a], []).extend(bits[pos:pos + cnt])
             pos += cnt
 
-    prefetch = None     # (idx, plan, capture, handle0) of next group's
+    prefetch = None     # (idx, plan, to_cache, handle0) of next group's
                         # stage 0, chunk 0 already launched
     for g, members in enumerate(groups):
         for j in range(k):
             if j == 0 and prefetch is not None:
-                idx, plan, capture, h0 = prefetch
+                idx, plan, to_cache, h0 = prefetch
                 prefetch = None
             else:
-                idx, plan, capture = plan_stage(members, j)
-                h0 = launch(j, build(j, idx, capture, plan[0])) \
+                idx, plan, to_cache = plan_stage(members, j)
+                h0 = launch(j, build(j, idx, to_cache, plan[0])) \
                     if plan else None
             if not plan:
                 continue
@@ -723,12 +726,12 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
             if j == 0 and k > 1 and g + 1 < len(groups):
                 # the gate below cannot be planned past; keep the
                 # GPU fed with the next group's gate-free stage 0
-                nidx, nplan, ncap = plan_stage(groups[g + 1], 0)
+                nidx, nplan, ncache = plan_stage(groups[g + 1], 0)
                 if nplan:
-                    nh = launch(0, build(0, nidx, ncap, nplan[0]))
-                    prefetch = (nidx, nplan, ncap, nh)
+                    nh = launch(0, build(0, nidx, ncache, nplan[0]))
+                    prefetch = (nidx, nplan, ncache, nh)
             for t in range(1, len(plan)):
-                c = build(j, idx, capture, plan[t])   # CPU, GPU busy
+                c = build(j, idx, to_cache, plan[t])  # CPU, GPU busy
                 h = launch(j, c)
                 h_prev, pg = handles.pop(0)
                 scatter(j, idx, pg, async_ans.result(h_prev))
@@ -736,16 +739,16 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
             while handles:
                 h, pg = handles.pop(0)
                 scatter(j, idx, pg, async_ans.result(h))
-            # free kept prefixes that nothing later reads: after the
+            # free cached KV that nothing later reads: after the
             # last stage everything in the group is done; between
             # stages, the gate's casualties are done
             if j == k - 1:
                 for a in members:
-                    stores.pop(a, None)
+                    kv_cache.pop(a, None)
             else:
                 for a in idx:
                     if not any(ans[j][a]):
-                        stores.pop(a, None)
+                        kv_cache.pop(a, None)
     return ans, spans, tokens
 
 
@@ -912,7 +915,7 @@ def probe() -> str:
     cu = [0, f0]
     for s in sufs0:
         cu.append(cu[-1] + s)
-    meta0 = dict(layer=0, capture=[], stores=None,
+    meta0 = dict(layer=0, kv_writes=[], kv_cache=None,
                  cu_a=torch.tensor(cu, dtype=torch.int32, device="cuda"),
                  max_a=f0,
                  cu_b_q=torch.tensor([0, n0 - f0], dtype=torch.int32,
@@ -982,16 +985,16 @@ def probe() -> str:
         gap = (normed_shared.float()
                - torch.cat(unshared_rows).float()).abs().max().item()
 
-        # kept-KV replay: capture the prefix in one chunk, rerun the
+        # kept-KV replay: write the prefix KV in one chunk, rerun the
         # same suffixes against the stored tensors
-        cap_chunk = pack_join_chunk(
+        cache_chunk = pack_join_chunk(
             torch, [dict(anchor=0, prefix=prefix, suffixes=sufs,
-                         capture=True)])
-        _, kept = pipeline.forward_chunk(cap_chunk)
+                         cache_kv=True)])
+        _, kv = pipeline.forward_chunk(cache_chunk)
         kept_chunk = pack_join_chunk(
             torch, [dict(anchor=0, prefix=None, f=len(prefix),
                          suffixes=sufs)],
-            stores=kept)
+            kv_cache=kv)
         normed_kept, _ = pipeline.forward_chunk(kept_chunk)
         kept_answers = answerer(normed_kept)
 
@@ -1015,7 +1018,7 @@ def probe() -> str:
             torch, [dict(anchor=1, prefix=p1, suffixes=sufs2),
                     dict(anchor=0, prefix=None, f=len(prefix),
                          suffixes=sufs2)],
-            stores=kept))
+            kv_cache=kv))
         mixed_expect = answerer(alone1) + answerer(alone0)
         mixed_got = answerer(mixed)
         dis_mixed = sum(x != y for x, y in zip(mixed_got, mixed_expect))
@@ -1281,7 +1284,7 @@ def nway3() -> str:
     with torch.inference_mode():
         warm = pack_join_chunk(torch, [dict(
             anchor=-1, prefix=b_prefix[0], suffixes=a_suffix[:8],
-            capture=True)])
+            cache_kv=True)])
         pipeline.forward_chunk(warm)
         torch.cuda.synchronize()
         t0 = time.perf_counter()

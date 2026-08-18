@@ -59,21 +59,22 @@ def pack_stream(anchors, budget, keep=(), already_kept=()):
     already_kept: anchor indices whose prefix K/V is in the store
     from an earlier stage; their groups never pack prefix tokens.
 
-    Returns (chunks, capture). Each chunk is a list of groups
+    Returns (chunks, kv_to_cache). Each chunk is a list of groups
     (anchor_index, start, end, carried); carried means the group
     packs a fresh copy of the anchor's prefix tokens ahead of
     suffixes start..end. An anchor's prefix is packed at most once,
     ever: when the budget cuts its stream, the anchor continues in
-    the next chunk with carried False, reading the captured prefix
-    K/V instead of re-emitting tokens. capture is the set of anchors
-    whose fresh prefix K/V must outlive its chunk - cut mid-stream,
-    or named in keep. Cuts happen only at suffix boundaries; when an
-    anchor's stream ends mid-chunk, the next anchor starts in the
-    same chunk.
+    the next chunk with carried False, and its suffixes read the
+    prefix KV from the executor's KV cache instead. kv_to_cache is
+    the set of anchors whose prefix KV must be written to that cache
+    - their stream is cut mid-chunk, or a later stage needs them
+    (keep). Suffix KV is never cached anywhere. Cuts happen only at
+    suffix boundaries; when an anchor's stream ends mid-chunk, the
+    next anchor starts in the same chunk.
     """
     keep, already = set(keep), set(already_kept)
     chunks, chunk, used = [], [], 0
-    capture = set()
+    kv_to_cache = set()
     for a, (prefix, suffixes) in enumerate(anchors):
         n = len(suffixes)
         placed = a in already
@@ -81,7 +82,7 @@ def pack_stream(anchors, budget, keep=(), already_kept=()):
             if placed or a not in keep:
                 continue    # nothing streams against it and no later
                             # stage needs it: computing it serves no one
-            # capture-only placement: a prefix a later stage needs,
+            # cache-only placement: a prefix a later stage needs,
             # with nothing streamed against it in this one
             if prefix > budget:
                 raise ValueError(
@@ -93,7 +94,7 @@ def pack_stream(anchors, budget, keep=(), already_kept=()):
             chunk.append((a, 0, 0, True))
             used += prefix
             if a in keep:
-                capture.add(a)
+                kv_to_cache.add(a)
             continue
         i = 0
         while i < n:
@@ -117,12 +118,12 @@ def pack_stream(anchors, budget, keep=(), already_kept=()):
             placed = True
             i = j
             if i < n and a not in already:
-                capture.add(a)      # the stream continues elsewhere
+                kv_to_cache.add(a)  # a later chunk reads this KV
         if a in keep and a not in already:
-            capture.add(a)
+            kv_to_cache.add(a)
     if chunk:
         chunks.append(chunk)
-    return chunks, capture
+    return chunks, kv_to_cache
 
 
 def gate(answer_rows):

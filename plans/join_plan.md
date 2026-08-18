@@ -404,9 +404,12 @@ group-size-1 two-stage case. Changes:
 
 - `pack_stream` packs chunks to the brim across anchors and never
   packs a prefix twice: when the budget cuts an anchor's stream,
-  the prefix K/V is captured (plain tensors, one anchor at a time)
-  and the continuation reads it. The recompute path is gone from
-  execution; an anchor's prefix is computed exactly once, ever.
+  the prefix KV is written once into an explicit KV cache (plain
+  per-anchor tensors — no paged pool, no block tables, no
+  eviction; one to two anchors resident at a time) and the
+  continuation's cross-attention reads it. Suffix KV is never
+  cached. The recompute path is gone from execution; an anchor's
+  prefix is computed exactly once, ever.
 - Chunks may hold several groups: fresh prefixes, kept
   continuations, or both. Cross-attention runs as one
   variable-length call over per-group spans.
@@ -436,7 +439,34 @@ Predictions, stated before the reruns:
   total wall ~70 s against the prior 78.4 s (the per-B stops are
   overlapped away).
 
-Results: pending the reruns below.
+Results:
+
+- Probe: all gates green, including the two new ones (0
+  disagreements everywhere). Rate at the B* geometry 82.1k tok/s
+  (was 83.6k; ~2% is the generalized attention's gather cost).
+- nway3: **the prediction missed, and the miss exposed a bug in
+  the old executor.** Measured: stage GPU sums 48.4 s + 45.5 s,
+  total wall 95.6 s; survivors 100; stage-2 pairs 10,000; 991,911
+  triples, replay-consistent. Stage-1 answers are identical to the
+  old run (9,763 wrong vs planted — same number), but stage-2
+  answers changed wholesale. Cause, confirmed in the old code: the
+  old chunk builder set `prefix_rows = 0` for kept chunks, and the
+  old attention's no-sharing early-return (`if f == 0: return
+  out_a`) caught every kept chunk — **the old stage 2 never ran
+  the cross-attention call and never read the cached prefix KV.**
+  Old stage-2 answers were computed blind to the anchor document;
+  the old 78.4 s / 74,600-triple result is invalid (stage 2 was
+  also ~35% cheaper than the real computation, which is why it
+  looked fast at 119.6k tok/s). The old probe's kept gate passed
+  on the broken path because it compared answers only, on 64
+  short term suffixes where the near-always-YES judge answers the
+  same with or without the report — instrument too weak. The new
+  probe's mixed gate cross-checks kept against fresh inside one
+  chunk and passes on the fixed path. The new numbers are
+  internally coherent with the judge's known behavior: ~99% YES on
+  both stages, so nearly all of 100 x 100 x 100 planted triples
+  survive the model's answers.
+- join2way: pending.
 
 ---
 

@@ -57,7 +57,7 @@ def test_pack_stream_every_suffix_once_in_order():
             suffixes = [rng.randrange(10, max(11, room // 2))
                         for _ in range(rng.randrange(0, 60))]
             anchors.append((prefix, suffixes))
-        chunks, capture = pack_stream(anchors, budget)
+        chunks, kv_to_cache = pack_stream(anchors, budget)
         covered = {a: [] for a in range(len(anchors))}
         carried_count = {a: 0 for a in range(len(anchors))}
         for chunk in chunks:
@@ -79,55 +79,57 @@ def test_pack_stream_every_suffix_once_in_order():
 
 def test_pack_stream_brims_across_anchors():
     # two anchors that fit one chunk together must share it
-    chunks, capture = pack_stream([(100, [50, 50]), (100, [50, 50])],
-                                  1000)
+    chunks, kv_to_cache = pack_stream(
+        [(100, [50, 50]), (100, [50, 50])], 1000)
     assert len(chunks) == 1
     assert [g[0] for g in chunks[0]] == [0, 1]
-    assert capture == set()
+    assert kv_to_cache == set()
 
 
 def test_pack_stream_cut_stream_continues_without_prefix():
     # the stream spans three chunks: the prefix is packed once, the
-    # continuations carry nothing and the anchor is marked capture
-    chunks, capture = pack_stream([(100, [400, 400, 400])], 600)
+    # continuations carry nothing, and the prefix KV is marked for
+    # caching so later chunks can read it
+    chunks, kv_to_cache = pack_stream([(100, [400, 400, 400])], 600)
     assert chunks == [[(0, 0, 1, True)],
                       [(0, 1, 2, False)],
                       [(0, 2, 3, False)]]
-    assert capture == {0}
+    assert kv_to_cache == {0}
 
 
-def test_pack_stream_keep_marks_capture_without_cut():
+def test_pack_stream_keep_marks_kv_cache_without_cut():
     # whole stream fits one chunk, but a later stage needs the prefix
-    chunks, capture = pack_stream([(100, [50, 50])], 1000, keep={0})
+    chunks, kv_to_cache = pack_stream([(100, [50, 50])], 1000,
+                                      keep={0})
     assert chunks == [[(0, 0, 2, True)]]
-    assert capture == {0}
+    assert kv_to_cache == {0}
 
 
 def test_pack_stream_already_kept_packs_no_prefix():
-    # stage 2 of an n-way: the prefix K/V is in the store, so groups
-    # are suffix-only and nothing is captured
-    chunks, capture = pack_stream([(100, [400, 400, 400])], 600,
-                                  already_kept={0})
+    # stage 2 of an n-way: the prefix KV is already cached, so groups
+    # are suffix-only and no new KV writes are marked
+    chunks, kv_to_cache = pack_stream([(100, [400, 400, 400])], 600,
+                                      already_kept={0})
     assert chunks == [[(0, 0, 1, False)],
                       [(0, 1, 2, False)],
                       [(0, 2, 3, False)]]
-    assert capture == set()
+    assert kv_to_cache == set()
 
 
 def test_pack_stream_continuation_relaxes_atomicity():
     # a suffix wider than budget - prefix is packable once the
     # prefix no longer rides along
-    chunks, capture = pack_stream([(300, [100, 900])], 1000)
+    chunks, kv_to_cache = pack_stream([(300, [100, 900])], 1000)
     assert chunks == [[(0, 0, 1, True)], [(0, 1, 2, False)]]
-    assert capture == {0}
+    assert kv_to_cache == {0}
 
 
-def test_pack_stream_capture_only_group():
+def test_pack_stream_cache_only_group():
     # an anchor with no suffixes this stage, kept for a later one
-    chunks, capture = pack_stream([(100, []), (50, [20])], 1000,
-                                  keep={0})
+    chunks, kv_to_cache = pack_stream([(100, []), (50, [20])], 1000,
+                                      keep={0})
     assert chunks == [[(0, 0, 0, True), (1, 0, 1, True)]]
-    assert capture == {0}
+    assert kv_to_cache == {0}
 
 
 def test_pack_stream_atomicity_error():
