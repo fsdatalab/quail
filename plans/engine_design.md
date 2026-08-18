@@ -403,49 +403,67 @@ not decisions at all:
   observed selectivity per stage, so a wrong estimate is visible;
   reacting to it mid-query is future work.
 
-What the planner actually decides:
+The planner is built around exactly its decisions and exactly
+their inputs — plan building consumes token counts, provided
+selectivities, the two spec structs, and three measured numbers,
+and nothing else. Grouped by input:
 
-1. **Order** (only under `by_cost`): filters ordered by cost per
-   killed document — (question tokens) / (1 − selectivity) — pure
-   arithmetic on provided numbers. Join stage order over the join
-   graph: enumerate (2–4 relations, trivial), price stages with the
-   pair-count formulas from `join_plan.md`, survivor-thinned by the
-   provided selectivities.
-2. **Anchor per join stage**: the longer side anchors (anchor
-   tokens are paid once per document, partner tokens once per
-   pair); enumeration confirms it since it costs nothing;
-   `{'anchor': ...}` overrides it.
-3. **Admission budget**: how many tokens of document KV may be
-   resident at once, from the spec-derived arena arithmetic (§8).
-   Token-based, never a document count, for the measured reason (a
-   count cannot see length; the 4,096-seq default thrashed at
-   2.40x reads). How the budget is consumed at run time —
-   continuous bin packing with survivor priority — is executor
-   behavior, §6.
-4. **Chunk budget**: `min(memory bound, kernel index cap)`, both
-   derived from the specs (§8), never typed in.
-5. **Access per scan**: read (compute KV fresh), restore (the
-   pinned store is warm for this content hash and its bandwidth
-   beats kappa x prefill rate — the measured 7.2 GB/s break-even
-   at 4B, and pinned host memory measured 55 GB/s), or spill (the
-   working set exceeds the pool and the store absorbs overflow).
-6. **Sharding**: filters split documents by token count across
+**Decisions from token arithmetic alone** (no measured constants —
+the rate cancels out of every comparison, so these survive any
+miscalibration):
+
+1. **Order** (only under `by_cost`): filters sorted by cost per
+   killed document — (question tokens) / (1 − selectivity). Join
+   stage order over the join graph: enumerate (2–4 relations,
+   trivial), compare candidate orders by their survivor-thinned
+   pair-token totals, the formulas from `join_plan.md`.
+2. **Anchor per join stage**: the side whose pair-token total is
+   smaller when the other side streams — in practice the longer
+   side anchors (anchor tokens are paid once per document,
+   partner tokens once per pair). `{'anchor': ...}` overrides.
+3. **Sharding**: filters split documents by token count across
    GPUs (`_balanced_shards`); joins split by anchor document.
-   Every pair belongs to exactly one anchor, so gating, dedup, and
-   the next stage's pair list for that anchor are local to the GPU
-   that holds it — workers never talk to each other. The
-   coordinator steps in between stages only when the next stage
-   anchors on a different relation (answers must regroup under the
-   new anchor set), and to merge final answers across shards.
+   Every pair belongs to exactly one anchor, so gating, dedup,
+   and the next stage's pair list stay local to the GPU holding
+   the anchor; the coordinator re-shards only when the next stage
+   anchors on a different relation, and merges final answers.
 
-Infeasible configurations — weights don't fit the cards, pool
-cannot hold one working set, a suffix exceeds the chunk budget —
-return the existing `Refusal` with the violated constraint named.
+**Settings from the spec structs alone** (§8):
 
-The output `PhysicalPlan` is a JSON tree; each node carries its
-settings and its predicted tokens and wall. `explain()` prints it;
-the result stores prediction next to measurement, so every run
-doubles as a cost-model check.
+4. **Admission budget**: tokens of document KV resident at once,
+   from the arena arithmetic. Token-based, never a document
+   count, for the measured reason (a count cannot see length; the
+   4,096-seq default thrashed at 2.40x reads). Runtime
+   consumption — continuous bin packing with survivor priority —
+   is executor behavior, §6.
+5. **Chunk budget**: `min(memory bound, kernel index cap)`,
+   derived, never typed in.
+
+**Decisions that compare compute against bytes** (the only
+consumers of measured constants: a, q_kv, and the host channel
+bandwidths — plus a2 to refine both at long document lengths):
+
+6. **Access per scan**: read, restore, or spill. Restore wins
+   when the warm store's bandwidth beats kappa x the serving rate
+   (the measured 7.2 GB/s break-even at 4B against pinned host
+   memory's 55 GB/s); a2 moves the crossover for long documents.
+7. **KV dtype**: the argmin inequality of §6 — q_kv x fresh
+   tokens against the transfer and overflow savings.
+
+Infeasible configurations — weights don't fit the cards, the
+arena cannot hold one working set, a suffix exceeds the chunk
+budget — return the existing `Refusal` with the violated
+constraint named.
+
+**Prediction is not planning.** The output `PhysicalPlan` is a
+JSON tree of settings plus per-operator token counts — counts are
+arithmetic the plan already did, so they are always present. The
+wall estimator is a separate module (`predict.py`), the only
+consumer of b, c0, and a2-as-pricing: `explain()` and the
+benchmark call it to state predictions before runs, per house
+rule, and the result stores prediction next to measurement so
+every run doubles as a cost-model check. A missing or stale
+prediction constant dulls that report and cannot change a plan.
 
 ---
 
@@ -984,7 +1002,12 @@ quail/                        (new repository)
     planner/
       plan.py                 # PhysicalPlan, Refusal
       budgets.py              # spec-derived arena/chunk arithmetic
-      cost.py                 # the estimator; reads the per-(model, device) calibration file if present
+      decide.py               # order, anchor, sharding, access, dtype:
+                              # token arithmetic plus the two break-evens
+    predict.py                # the wall estimator, OUTSIDE the planner:
+                              # sole consumer of b, c0, and a2-as-pricing;
+                              # reads the per-(model, device) calibration
+                              # file; serves explain() and the bench
     executor/
       pack.py                 # brim packing, admission queue (from joinlogic.py)
       arena.py                # the paged KV arena: pages, free list, per-doc page lists
@@ -1014,7 +1037,8 @@ Build order, each step landing with CPU tests:
    executor within the cost model's band. This gate is what retires
    the engine fork.
 3. **sqlfront + logical + planner** — the parse/bind/validate
-   pipeline, ordering policy, pushdown, refusals.
+   pipeline, ordering policy, pushdown, refusals; `predict.py`
+   beside it so `explain()` states walls from day one.
 4. **runtime** — Session, coordinator, Modal app, snapshot
    lifecycle, the KV store.
 5. **bench** — QUAIL-B; first full grid run publishes the
