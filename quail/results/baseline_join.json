@@ -1,0 +1,26 @@
+{
+  "cell": "baseline_join",
+  "n_reports": 60,
+  "n_cands": 1200,
+  "pairs": 72000,
+  "submission": "one request per pair, anchor-major, prefix caching on",
+  "max_num_seqs": 366,
+  "step_tokens": 25305,
+  "prediction": "~2.5-3 min per rep vs the packed 31.1 s",
+  "runs": [
+    {
+      "rep": 0,
+      "wall": 92.72,
+      "fresh_tokens": 1010672,
+      "tok_s": 10900.7,
+      "yes": 72000
+    },
+    {
+      "rep": 1,
+      "wall": 90.26,
+      "fresh_tokens": 1010672,
+      "tok_s": 11197.4,
+      "yes": 72000
+    }
+  ]
+}

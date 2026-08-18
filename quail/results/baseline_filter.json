@@ -1,0 +1,24 @@
+{
+  "cell": "baseline_filter",
+  "n_docs": 10000,
+  "submission": "separate requests per (document, stage), pipelined, token-budget admission",
+  "budget_tokens": 749782,
+  "step_tokens": 25305,
+  "prediction": "committed stock band 39.2-43.2 s",
+  "runs": [
+    {
+      "rep": 0,
+      "wall": 48.74,
+      "requests": 23381,
+      "fresh_tokens": 4904680,
+      "survivors": 1873
+    },
+    {
+      "rep": 1,
+      "wall": 49.03,
+      "requests": 23381,
+      "fresh_tokens": 4944040,
+      "survivors": 1873
+    }
+  ]
+}

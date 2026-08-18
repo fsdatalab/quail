@@ -26,6 +26,38 @@ where torch and a GPU exist.
 import bisect
 
 
+def alloc_with_reclaim(allocs, extents, tokens, keep_hash):
+    """An extent for a new document, reclaiming idle datasets' space
+    when the pool is full. Pure accounting, CPU-tested.
+
+    The rule that keeps the store scan-proof: the running query's own
+    corpus (keep_hash) is NEVER evicted - that is where LRU-style
+    thrash lives. Other datasets' extents are dead capital while this
+    dataset queries; they yield, shortest documents first (least
+    recompute value lost), and re-store if their dataset returns.
+
+    Returns (slab, offset) or None."""
+    def try_alloc():
+        for slab, alloc in enumerate(allocs):
+            off = alloc.alloc(tokens)
+            if off is not None:
+                return slab, off
+        return None
+
+    got = try_alloc()
+    if got is not None:
+        return got
+    victims = sorted((k for k in extents if k[0] != keep_hash),
+                     key=lambda k: extents[k][2])
+    for k in victims:
+        slab, off, tk = extents.pop(k)
+        allocs[slab].free(off, tk)
+        got = try_alloc()
+        if got is not None:
+            return got
+    return None
+
+
 class ExtentAllocator:
     """First-fit contiguous extents with free-list coalescing."""
 
@@ -115,14 +147,6 @@ class PinnedStore:
     def stored_tokens(self) -> int:
         return sum(a.used for a in self.allocs)
 
-    def _alloc_extent(self, tokens: int):
-        if tokens > self.slab_tokens:
-            return None
-        for slab, alloc in enumerate(self.allocs):
-            off = alloc.alloc(tokens)
-            if off is not None:
-                return slab, off
-        return None
 
     def _slot(self):
         i = self._next_slot
@@ -149,7 +173,10 @@ class PinnedStore:
         torch = self.torch
         if key in self.extents or tokens > self._staging[0].shape[0]:
             return None
-        got = self._alloc_extent(tokens)
+        if tokens > self.slab_tokens:
+            return None
+        got = alloc_with_reclaim(self.allocs, self.extents, tokens,
+                                 keep_hash=key[0])
         if got is None:
             return None
         slab, off = got

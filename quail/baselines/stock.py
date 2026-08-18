@@ -19,9 +19,16 @@ asyncio anywhere.
 import time
 
 
-def _yes(out):
-    """First decisive word wins: some models restate the flag line
-    (the answer lands mid-text) or append chatter after it."""
+def _yes(out, yes_ids=None):
+    """The answer bit. Under the one-token constrained sampler
+    (allowed_token_ids = YES|NO ids, max_tokens=1) this is a token-id
+    check, identical to the packed executor's answerer. The text scan
+    below is the fallback for unconstrained models that restate the
+    flag line or chatter - first decisive word wins."""
+    if yes_ids is not None:
+        toks = out.outputs[0].token_ids
+        if toks:
+            return 1 if int(toks[0]) in yes_ids else 0
     t = out.outputs[0].text.upper()
     iy = t.find("YES")
     if iy < 0:
@@ -31,57 +38,59 @@ def _yes(out):
 
 
 def run_filter_chain(engine, sampling_params, body_ids, q_ids,
-                     budget_tokens, tag="q"):
-    """The stock filter baseline. Between a document's stages the
-    engine serves other documents, so whether the document's KV is
-    still resident is up to the prefix cache - that is the baseline
-    the packed executor's kept KV replaces.
+                     budget_tokens, tag="q", yes_ids=None):
+    """The stock filter baseline, the committed client's admission
+    exactly: the token budget expressed as a DOCUMENT cap of
+    budget // (mean document + longest question), and a document
+    holds its slot from first stage to last verdict. Between a
+    document's stages the engine serves other documents, so whether
+    its KV is still resident is up to the prefix cache - that is the
+    baseline the packed executor's kept KV replaces.
 
     Returns wall, per-(doc, stage) answers (stages 1-indexed),
     survivors, and the request/token counters."""
     n = len(q_ids)
-    q_cost = sum(len(q) for q in q_ids) + n
-    counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
+    mean_req = (sum(len(b) for b in body_ids) // max(1, len(body_ids))
+                + max(len(q) for q in q_ids))
+    cap = max(1, budget_tokens // mean_req)
+    counters = dict(requests=0, prompt_tokens=0, cached_tokens=0,
+                    doc_cap=cap)
     answers = {}
     survivors = []
-    inflight = {}                      # request id -> (doc, stage, cost)
+    inflight = {}                      # request id -> (doc, stage)
 
-    def submit(i, j, cost):
+    def submit(i, j):
         rid = f"{tag}-{i}-{j}"
-        inflight[rid] = (i, j, cost)
+        inflight[rid] = (i, j)
         engine.add_request(
             rid, {"prompt_token_ids": body_ids[i] + q_ids[j]},
             sampling_params)
 
     t0 = time.time()
-    used, next_doc = 0, 0
+    live, next_doc = 0, 0
     while next_doc < len(body_ids) or inflight:
-        # admit in workload order while the budget allows; an empty
-        # engine always admits one, so a tiny budget serializes
-        # instead of deadlocking
-        while next_doc < len(body_ids):
-            cost = len(body_ids[next_doc]) + q_cost
-            if used + cost > budget_tokens and used > 0:
-                break
-            used += cost
-            submit(next_doc, 0, cost)
+        # admit in workload order while live documents stay under
+        # the cap
+        while next_doc < len(body_ids) and live < cap:
+            submit(next_doc, 0)
+            live += 1
             next_doc += 1
         for out in engine.step():
             if not out.finished or out.request_id not in inflight:
                 continue
-            i, j, cost = inflight.pop(out.request_id)
+            i, j = inflight.pop(out.request_id)
             counters["requests"] += 1
             counters["prompt_tokens"] += len(out.prompt_token_ids)
             counters["cached_tokens"] += (
                 getattr(out, "num_cached_tokens", 0) or 0)
-            got = _yes(out)
+            got = _yes(out, yes_ids)
             answers[(i, j + 1)] = got
             if got and j + 1 < n:
-                submit(i, j + 1, cost)
+                submit(i, j + 1)      # the document keeps its slot
             else:
                 if got:
                     survivors.append(i)
-                used -= cost                    # retire: budget returns
+                live -= 1             # retire: the slot returns
     wall = time.time() - t0
     return dict(wall=wall, survivors=sorted(survivors),
                 answers=answers, **counters)

@@ -7,7 +7,7 @@ import random
 
 import pytest
 
-from quail.executor.kvstore import ExtentAllocator
+from quail.executor.kvstore import ExtentAllocator, alloc_with_reclaim
 from quail.executor.pack import FilterAdmission
 from quail.planner.decide import store_length_threshold
 
@@ -59,6 +59,46 @@ def test_allocator_random_invariants():
         a.free(off, n)
     assert a.free_rows == 1000
     assert a.free_list == [(0, 1000)]
+
+
+# --------------------------------------- cross-dataset reclamation
+
+def test_reclaim_evicts_idle_dataset_not_own():
+    # pool of 100 rows, dataset A fills it; dataset B's query must
+    # claim space from A (shortest A doc first), never from B itself
+    allocs = [ExtentAllocator(100)]
+    extents = {}
+    for i, tk in enumerate((40, 35, 25)):       # A: 100 rows total
+        slab, off = alloc_with_reclaim(allocs, extents, tk, "A")
+        extents[("A", i)] = (slab, off, tk)
+    assert allocs[0].free_rows == 0
+
+    got = alloc_with_reclaim(allocs, extents, 20, keep_hash="B")
+    assert got is not None
+    # the shortest A extent (25) was evicted, nothing else
+    assert ("A", 2) not in extents
+    assert ("A", 0) in extents and ("A", 1) in extents
+
+
+def test_reclaim_never_evicts_current_dataset():
+    allocs = [ExtentAllocator(50)]
+    extents = {}
+    slab, off = alloc_with_reclaim(allocs, extents, 50, "B")
+    extents[("B", 0)] = (slab, off, 50)
+    # B's own query cannot evict B: pool full, same hash -> None
+    assert alloc_with_reclaim(allocs, extents, 10, "B") is None
+    assert ("B", 0) in extents
+
+
+def test_reclaim_frees_multiple_until_fit():
+    allocs = [ExtentAllocator(90)]
+    extents = {}
+    for i in range(3):
+        slab, off = alloc_with_reclaim(allocs, extents, 30, "A")
+        extents[("A", i)] = (slab, off, 30)
+    got = alloc_with_reclaim(allocs, extents, 60, keep_hash="B")
+    assert got is not None
+    assert len([k for k in extents if k[0] == "A"]) == 1
 
 
 # ------------------------------------------------- length threshold

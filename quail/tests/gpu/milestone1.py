@@ -30,12 +30,8 @@ Run from the quail/ directory (tee to a file per house rule):
 
 import json
 import os
-import sys
-from pathlib import Path
 
 import modal
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from corpus import MODEL
 
@@ -641,10 +637,6 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
     PREDICTION: the committed stock band, 39.2-43.2 s per rep
     (bf16 40.8/39.2/39.5; fp8 42.8-43.2), against the packed
     executor's measured 39.4-39.9 s."""
-    import sys
-    import time
-
-    sys.path.insert(0, "/root")
     from baselines.stock import run_filter_chain
     from corpus import MODEL, build_corpus
     from vllm import LLM, SamplingParams
@@ -656,27 +648,30 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
     yes, no = yes_no_ids(tokenizer)
 
-    # the committed stock knobs: 25,305 step tokens, the plan's
-    # 749,782-token admission budget, prefix caching on
+    # the committed BF16-KV stock knobs (our engine's KV is bf16, so
+    # the fp8 config's 749,782 budget oversubscribes the ~473k-token
+    # pool 1.6x - measured tonight at 47-79 s of thrash): budget
+    # 374,891, 2,648 sequences, 25,305 step tokens, prefix caching on
     llm = LLM(model=MODEL, max_num_batched_tokens=25_305,
-              max_num_seqs=4096, gpu_memory_utilization=0.92,
+              max_num_seqs=2648, gpu_memory_utilization=0.92,
               enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
                               allowed_token_ids=sorted(yes | no))
     engine = llm.llm_engine
+    budget = 374_891     # the committed bf16-KV admission budget
     report = dict(cell="baseline_filter", n_docs=n_docs,
                   submission="separate requests per (document, stage), "
-                             "pipelined, token-budget admission",
-                  budget_tokens=749_782, step_tokens=25_305,
-                  prediction="committed stock band 39.2-43.2 s",
+                             "pipelined, document-cap admission",
+                  budget_tokens=budget, step_tokens=25_305,
+                  prediction="committed bf16 stock band 39.2-40.8 s",
                   runs=[])
     # warm the engine (kernel compile, allocator)
-    run_filter_chain(engine, sampling, body_ids[:64], q_ids, 749_782,
-                     tag="w")
+    run_filter_chain(engine, sampling, body_ids[:64], q_ids, budget,
+                     tag="w", yes_ids=yes)
     for rep in range(reps):
         r = run_filter_chain(engine, sampling, body_ids, q_ids,
-                             749_782, tag=f"r{rep}")
+                             budget, tag=f"r{rep}", yes_ids=yes)
         row = dict(rep=rep, wall=round(r["wall"], 2),
                    requests=r["requests"],
                    fresh_tokens=r["prompt_tokens"] - r["cached_tokens"],
@@ -696,10 +691,6 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
     rate (~17k tok/s) -> 2.5-3 min per rep, against the packed
     executor's measured 31.1 s on one GPU (the committed BioDEX
     shape measured 4.1x)."""
-    import sys
-    import time
-
-    sys.path.insert(0, "/root")
     from baselines.stock import run_join_grouped
     from corpus import MODEL
     from vllm import LLM, SamplingParams
@@ -731,8 +722,11 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                  + n_reports * sum(map(len, suffixes))) \
         // (n_reports * n_cands) + 1
     max_seqs = max(64, min(4096, 749_782 // mean_pair))
+    # 0.92, same as quail's pool fraction. The committed join2way
+    # stock arm ran 0.88 only because its container booted two
+    # executors back to back; standalone, stock gets the full pool.
     llm = LLM(model=MODEL, max_num_batched_tokens=25_305,
-              max_num_seqs=max_seqs, gpu_memory_utilization=0.88,
+              max_num_seqs=max_seqs, gpu_memory_utilization=0.92,
               enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,

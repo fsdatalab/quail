@@ -57,7 +57,7 @@ _STORE = None     # one PinnedStore per container, shared
 
 
 @app.function(image=image, gpu="H100!", timeout=7200, memory=98304,
-              scaledown_window=300,
+              scaledown_window=300, max_containers=1,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})
@@ -493,7 +493,7 @@ def _execute_multi(payload: dict) -> dict:
 
 
 @app.function(image=image, gpu="H100!:2", timeout=7200, memory=131072,
-              scaledown_window=300,
+              scaledown_window=300, max_containers=1,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})
@@ -502,7 +502,7 @@ def execute_2(payload: dict) -> dict:
 
 
 @app.function(image=image, gpu="H100!:4", timeout=7200, memory=196608,
-              scaledown_window=300,
+              scaledown_window=300, max_containers=1,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})
@@ -511,7 +511,7 @@ def execute_4(payload: dict) -> dict:
 
 
 @app.function(image=image, gpu="H100!:8", timeout=7200, memory=262144,
-              scaledown_window=300,
+              scaledown_window=300, max_containers=1,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})

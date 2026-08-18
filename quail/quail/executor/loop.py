@@ -377,13 +377,18 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
         | {m for m in range(4096, 32769, 1024)}
         | {m for m in range(32768, budget + 1, 2048)}
         | {budget})
+    work = [(m, lin) for m in sizes for lin in linears]
+    try:
+        from tqdm import tqdm
+        work = tqdm(work, desc="quail kernel warmup", unit="gemm")
+    except ImportError:
+        pass
     with torch.inference_mode():
-        for m in sizes:
-            for lin in linears:
-                x = torch.randn(m, lin.weight.shape[1], device="cuda",
-                                dtype=torch.bfloat16)
-                q, s = pipeline.quant(x)
-                pipeline.gemm(q, s, lin)
+        for m, lin in work:
+            x = torch.randn(m, lin.weight.shape[1], device="cuda",
+                            dtype=torch.bfloat16)
+            q, s = pipeline.quant(x)
+            pipeline.gemm(q, s, lin)
         torch.cuda.synchronize()
 
     q_max = max(len(q) for q in question_ids)
