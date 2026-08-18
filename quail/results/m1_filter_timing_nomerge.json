@@ -1,0 +1,448 @@
+{
+  "cell": "m1_filter",
+  "n_docs": 10000,
+  "corpus_tokens": 3203917,
+  "n_filters": 5,
+  "exec_budget": 110376,
+  "arena_tokens": 345974,
+  "kv": "bf16",
+  "prediction": "~3.84M fresh tokens at the 121k tok/s packed rate -> ~32 s; committed bf16 chain reference 38.0 s, survivors 1873, answered 23381",
+  "reference": {
+    "artifact": "filter_cells_bf16.json",
+    "wall_s": 38.0,
+    "survivors": 1873,
+    "answered": 23381,
+    "wrong": 6229
+  },
+  "runs": [
+    {
+      "rep": 0,
+      "wall": 33.91,
+      "fresh_tokens": 3834386,
+      "tok_s": 113068.9,
+      "answered": 23113,
+      "survivors": 1807,
+      "wrong": 6294,
+      "chunks": 55,
+      "gpu_s": 33.83,
+      "chunk_ms_first8": [
+        940.4,
+        954.5,
+        962.3,
+        959.1,
+        835.9,
+        792.3,
+        728.6,
+        819.3
+      ],
+      "slow_chunks": [
+        {
+          "idx": 2,
+          "ms": 962.3,
+          "tokens": 110375,
+          "groups": 457,
+          "fresh": 288
+        },
+        {
+          "idx": 3,
+          "ms": 959.1,
+          "tokens": 110136,
+          "groups": 455,
+          "fresh": 283
+        },
+        {
+          "idx": 1,
+          "ms": 954.5,
+          "tokens": 110374,
+          "groups": 292,
+          "fresh": 292
+        },
+        {
+          "idx": 0,
+          "ms": 940.4,
+          "tokens": 110362,
+          "groups": 302,
+          "fresh": 302
+        },
+        {
+          "idx": 4,
+          "ms": 835.9,
+          "tokens": 95665,
+          "groups": 464,
+          "fresh": 266
+        },
+        {
+          "idx": 7,
+          "ms": 819.3,
+          "tokens": 93729,
+          "groups": 475,
+          "fresh": 263
+        },
+        {
+          "idx": 27,
+          "ms": 813.2,
+          "tokens": 93061,
+          "groups": 496,
+          "fresh": 257
+        },
+        {
+          "idx": 31,
+          "ms": 802.6,
+          "tokens": 91414,
+          "groups": 463,
+          "fresh": 230
+        }
+      ],
+      "peak_gib": 65.93,
+      "cpu_phase_s": {
+        "alloc": 0.442,
+        "drain_saves": 0.0,
+        "forward_launch": 31.768,
+        "n_chunks": 55,
+        "next_chunk": 0.023,
+        "pack": 1.386,
+        "pack_blocktable": 0.185,
+        "pack_cross": 0.063,
+        "pack_h2d": 0.523,
+        "pack_kv": 0.372,
+        "pack_py": 0.151,
+        "report_rest": 0.054,
+        "report_wait": 0.004,
+        "submit": 0.226
+      },
+      "chunk_series": [
+        {
+          "tokens": 110362,
+          "groups": 302,
+          "fresh": 302,
+          "ms": 940.4
+        },
+        {
+          "tokens": 110374,
+          "groups": 292,
+          "fresh": 292,
+          "ms": 954.5
+        },
+        {
+          "tokens": 110375,
+          "groups": 457,
+          "fresh": 288,
+          "ms": 962.3
+        },
+        {
+          "tokens": 110136,
+          "groups": 455,
+          "fresh": 283,
+          "ms": 959.1
+        },
+        {
+          "tokens": 95665,
+          "groups": 464,
+          "fresh": 266,
+          "ms": 835.9
+        },
+        {
+          "tokens": 89637,
+          "groups": 448,
+          "fresh": 215,
+          "ms": 792.3
+        },
+        {
+          "tokens": 83163,
+          "groups": 472,
+          "fresh": 218,
+          "ms": 728.6
+        },
+        {
+          "tokens": 93729,
+          "groups": 475,
+          "fresh": 263,
+          "ms": 819.3
+        },
+        {
+          "tokens": 79595,
+          "groups": 460,
+          "fresh": 210,
+          "ms": 702.5
+        },
+        {
+          "tokens": 76586,
+          "groups": 482,
+          "fresh": 206,
+          "ms": 681.0
+        },
+        {
+          "tokens": 82313,
+          "groups": 459,
+          "fresh": 216,
+          "ms": 732.7
+        },
+        {
+          "tokens": 88906,
+          "groups": 468,
+          "fresh": 230,
+          "ms": 777.0
+        },
+        {
+          "tokens": 81905,
+          "groups": 468,
+          "fresh": 225,
+          "ms": 721.8
+        },
+        {
+          "tokens": 71807,
+          "groups": 469,
+          "fresh": 185,
+          "ms": 635.4
+        },
+        {
+          "tokens": 75508,
+          "groups": 462,
+          "fresh": 189,
+          "ms": 666.4
+        },
+        {
+          "tokens": 72860,
+          "groups": 476,
+          "fresh": 185,
+          "ms": 641.3
+        },
+        {
+          "tokens": 73648,
+          "groups": 444,
+          "fresh": 174,
+          "ms": 650.5
+        },
+        {
+          "tokens": 71405,
+          "groups": 471,
+          "fresh": 181,
+          "ms": 633.0
+        },
+        {
+          "tokens": 71117,
+          "groups": 477,
+          "fresh": 194,
+          "ms": 627.3
+        },
+        {
+          "tokens": 71143,
+          "groups": 474,
+          "fresh": 169,
+          "ms": 635.1
+        },
+        {
+          "tokens": 74116,
+          "groups": 493,
+          "fresh": 200,
+          "ms": 652.0
+        },
+        {
+          "tokens": 78444,
+          "groups": 462,
+          "fresh": 192,
+          "ms": 689.9
+        },
+        {
+          "tokens": 69278,
+          "groups": 488,
+          "fresh": 186,
+          "ms": 615.5
+        },
+        {
+          "tokens": 77021,
+          "groups": 488,
+          "fresh": 205,
+          "ms": 681.1
+        },
+        {
+          "tokens": 77617,
+          "groups": 482,
+          "fresh": 193,
+          "ms": 686.6
+        },
+        {
+          "tokens": 84429,
+          "groups": 488,
+          "fresh": 228,
+          "ms": 728.8
+        },
+        {
+          "tokens": 74496,
+          "groups": 485,
+          "fresh": 206,
+          "ms": 657.7
+        },
+        {
+          "tokens": 93061,
+          "groups": 496,
+          "fresh": 257,
+          "ms": 813.2
+        },
+        {
+          "tokens": 87632,
+          "groups": 494,
+          "fresh": 234,
+          "ms": 757.5
+        },
+        {
+          "tokens": 79765,
+          "groups": 477,
+          "fresh": 211,
+          "ms": 706.8
+        },
+        {
+          "tokens": 87889,
+          "groups": 478,
+          "fresh": 235,
+          "ms": 768.8
+        },
+        {
+          "tokens": 91414,
+          "groups": 463,
+          "fresh": 230,
+          "ms": 802.6
+        },
+        {
+          "tokens": 89420,
+          "groups": 470,
+          "fresh": 231,
+          "ms": 778.8
+        },
+        {
+          "tokens": 79851,
+          "groups": 474,
+          "fresh": 218,
+          "ms": 704.6
+        },
+        {
+          "tokens": 88866,
+          "groups": 470,
+          "fresh": 230,
+          "ms": 777.1
+        },
+        {
+          "tokens": 90245,
+          "groups": 485,
+          "fresh": 238,
+          "ms": 789.9
+        },
+        {
+          "tokens": 75293,
+          "groups": 464,
+          "fresh": 198,
+          "ms": 664.5
+        },
+        {
+          "tokens": 72946,
+          "groups": 487,
+          "fresh": 191,
+          "ms": 641.0
+        },
+        {
+          "tokens": 82561,
+          "groups": 453,
+          "fresh": 194,
+          "ms": 731.0
+        },
+        {
+          "tokens": 73866,
+          "groups": 481,
+          "fresh": 188,
+          "ms": 650.6
+        },
+        {
+          "tokens": 56405,
+          "groups": 468,
+          "fresh": 164,
+          "ms": 503.1
+        },
+        {
+          "tokens": 66659,
+          "groups": 493,
+          "fresh": 187,
+          "ms": 588.9
+        },
+        {
+          "tokens": 78914,
+          "groups": 481,
+          "fresh": 193,
+          "ms": 697.4
+        },
+        {
+          "tokens": 70559,
+          "groups": 487,
+          "fresh": 184,
+          "ms": 623.8
+        },
+        {
+          "tokens": 64307,
+          "groups": 471,
+          "fresh": 166,
+          "ms": 572.7
+        },
+        {
+          "tokens": 73874,
+          "groups": 491,
+          "fresh": 186,
+          "ms": 649.5
+        },
+        {
+          "tokens": 59286,
+          "groups": 443,
+          "fresh": 164,
+          "ms": 524.2
+        },
+        {
+          "tokens": 4030,
+          "groups": 310,
+          "fresh": 0,
+          "ms": 53.0
+        },
+        {
+          "tokens": 3627,
+          "groups": 279,
+          "fresh": 0,
+          "ms": 47.3
+        },
+        {
+          "tokens": 2275,
+          "groups": 175,
+          "fresh": 0,
+          "ms": 29.4
+        },
+        {
+          "tokens": 1976,
+          "groups": 152,
+          "fresh": 0,
+          "ms": 25.0
+        },
+        {
+          "tokens": 1378,
+          "groups": 106,
+          "fresh": 0,
+          "ms": 19.3
+        },
+        {
+          "tokens": 1287,
+          "groups": 99,
+          "fresh": 0,
+          "ms": 18.6
+        },
+        {
+          "tokens": 767,
+          "groups": 59,
+          "fresh": 0,
+          "ms": 29.6
+        },
+        {
+          "tokens": 598,
+          "groups": 46,
+          "fresh": 0,
+          "ms": 56.9
+        }
+      ]
+    }
+  ],
+  "warmup_s": 2.43
+}

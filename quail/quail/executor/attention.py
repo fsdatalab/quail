@@ -215,27 +215,34 @@ class Pipeline:
             tl.store(k_out_ptr + t * stride_ko + kb_offs,
                      out_b.to(k_out_ptr.dtype.element_ty))
 
-        @triton.jit
+        # the LSE strides vary with the chunk's token count; without
+        # do_not_specialize every div-by-16 stride re-JITs inside a
+        # measured run (a 0.6 s lump on the first such chunk)
+        @triton.jit(do_not_specialize=["stride_lah", "stride_lat",
+                                       "stride_lbh", "stride_lbt"])
         def lse_merge(rows_ptr, la_ptr, lb_ptr, a_ptr, b_ptr,
                       stride_lah, stride_lat, stride_lbh, stride_lbt,
                       H: tl.constexpr, D: tl.constexpr):
-            # one program per (suffix row, head): out_a[src] =
+            # one program per suffix row: out_a[src] =
             # lerp(out_a[src], out_b[r], sigmoid(lse_b - lse_a[src])).
-            # Matches the unfused chain's rounding: sigmoid in fp32,
-            # the weight rounded to bf16, the lerp in fp32 (torch's
-            # opmath for bf16 lerp), stored as bf16.
+            # Matches the unfused chain's rounding exactly: fp32
+            # sigmoid, the weight rounded to bf16, then torch's bf16
+            # lerp in fp32 opmath INCLUDING its branch - small weights
+            # use a + w*(b-a), large ones b - (b-a)*(1-w).
             r = tl.program_id(0)
-            h = tl.program_id(1)
             src = tl.load(rows_ptr + r)
-            la = tl.load(la_ptr + h * stride_lah + src * stride_lat)
-            lb = tl.load(lb_ptr + h * stride_lbh + r * stride_lbt)
+            hs = tl.arange(0, H)
+            la = tl.load(la_ptr + hs * stride_lah + src * stride_lat)
+            lb = tl.load(lb_ptr + hs * stride_lbh + r * stride_lbt)
             w = tl.sigmoid(lb - la).to(tl.bfloat16).to(tl.float32)
             offs = tl.arange(0, D)
-            pa = a_ptr + src * H * D + h * D + offs
-            pb = b_ptr + r * H * D + h * D + offs
+            pa = a_ptr + src * H * D + hs[:, None] * D + offs[None, :]
+            pb = b_ptr + r * H * D + hs[:, None] * D + offs[None, :]
             a = tl.load(pa).to(tl.float32)
             b = tl.load(pb).to(tl.float32)
-            tl.store(pa, (a + w * (b - a)).to(a_ptr.dtype.element_ty))
+            res = tl.where(w[:, None] < 0.5, a + w[:, None] * (b - a),
+                           b - (b - a) * (1.0 - w[:, None]))
+            tl.store(pa, res.to(a_ptr.dtype.element_ty))
 
         self._kernels = {"silu": silu_mul_quant,
                          "norm": add_rms_norm_quant,
@@ -318,7 +325,7 @@ class Pipeline:
 
         sah, sat = ht_strides(lse_a, n)
         sbh, sbt = ht_strides(lse_b, n_suf)
-        self._triton_kernels()["merge"][(n_suf, H)](
+        self._triton_kernels()["merge"][(n_suf,)](
             rows, lse_a, lse_b, out_a, out_b, sah, sat, sbh, sbt,
             H=H, D=D)
         return out_a

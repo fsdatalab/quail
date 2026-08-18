@@ -21,21 +21,21 @@
   "runs": [
     {
       "rep": 0,
-      "wall": 105.56,
+      "wall": 97.1,
       "chunks": 77,
       "fresh_tokens": 8417425,
-      "tok_s": 79740.3,
-      "yes": 177346,
-      "peak_gib": 66.34
+      "tok_s": 86692.6,
+      "yes": 177406,
+      "peak_gib": 65.92
     },
     {
       "rep": 1,
-      "wall": 105.29,
+      "wall": 97.1,
       "chunks": 77,
       "fresh_tokens": 8417425,
-      "tok_s": 79943.5,
-      "yes": 177346,
-      "peak_gib": 66.34
+      "tok_s": 86691.5,
+      "yes": 177406,
+      "peak_gib": 65.92
     }
   ]
 }
