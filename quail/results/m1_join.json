@@ -1,0 +1,41 @@
+{
+  "cell": "m1_join",
+  "n_reports": 100,
+  "n_terms": 2560,
+  "pairs": 256000,
+  "exec_budget": 110376,
+  "arena_tokens": 345974,
+  "kv": "bf16",
+  "prediction": "within 10% of the committed packed 103.6 s; ~8.42M fresh tokens, ~77 chunks, yes near 177,831",
+  "reference": {
+    "artifact": "join2way.json",
+    "wall_s": 103.6,
+    "fresh_tokens": 8417425,
+    "chunks": 77,
+    "yes": 177831
+  },
+  "lengths": {
+    "prefix_mean": 2977.2,
+    "suffix_mean": 31.7
+  },
+  "runs": [
+    {
+      "rep": 0,
+      "wall": 108.09,
+      "chunks": 77,
+      "fresh_tokens": 8417425,
+      "tok_s": 77877.4,
+      "yes": 177346,
+      "peak_gib": 66.34
+    },
+    {
+      "rep": 1,
+      "wall": 107.54,
+      "chunks": 77,
+      "fresh_tokens": 8417425,
+      "tok_s": 78275.8,
+      "yes": 177346,
+      "peak_gib": 66.34
+    }
+  ]
+}

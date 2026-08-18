@@ -1,0 +1,20 @@
+{
+  "cell": "m1_join3",
+  "prediction": "triples equal the nested-loop replay reference; stage-2 pairs = survivors x 100; total wall near the committed ~70 s",
+  "reference": {
+    "artifact": "join_nway3.json"
+  },
+  "result": {
+    "total_wall_s": 101.4,
+    "fresh_tokens": 7025459,
+    "chunks": 200,
+    "survivors": 100,
+    "stage2_pairs": 10000,
+    "stage2_pairs_expected": 10000,
+    "triples": 991427,
+    "triples_match_replay": true,
+    "stage1_model_vs_planted_wrong": 9760,
+    "planted_expected_survivors": 80,
+    "peak_gib": 56.43
+  }
+}

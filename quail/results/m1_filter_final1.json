@@ -1,0 +1,180 @@
+{
+  "cell": "m1_filter",
+  "n_docs": 10000,
+  "corpus_tokens": 3203917,
+  "n_filters": 5,
+  "exec_budget": 110376,
+  "arena_tokens": 345974,
+  "kv": "bf16",
+  "prediction": "~3.84M fresh tokens at the 121k tok/s packed rate -> ~32 s; committed bf16 chain reference 38.0 s, survivors 1873, answered 23381",
+  "reference": {
+    "artifact": "filter_cells_bf16.json",
+    "wall_s": 38.0,
+    "survivors": 1873,
+    "answered": 23381,
+    "wrong": 6229
+  },
+  "runs": [
+    {
+      "rep": 0,
+      "wall": 39.4,
+      "fresh_tokens": 3834386,
+      "tok_s": 97319.1,
+      "answered": 23113,
+      "survivors": 1807,
+      "wrong": 6294,
+      "chunks": 55,
+      "gpu_s": 37.6,
+      "chunk_ms_first8": [
+        1082.9,
+        1078.1,
+        1083.7,
+        1071.3,
+        943.7,
+        865.3,
+        812.2,
+        926.2
+      ],
+      "slow_chunks": [
+        {
+          "idx": 2,
+          "ms": 1083.7,
+          "tokens": 110375,
+          "groups": 457,
+          "fresh": 288
+        },
+        {
+          "idx": 0,
+          "ms": 1082.9,
+          "tokens": 110362,
+          "groups": 302,
+          "fresh": 302
+        },
+        {
+          "idx": 1,
+          "ms": 1078.1,
+          "tokens": 110374,
+          "groups": 292,
+          "fresh": 292
+        },
+        {
+          "idx": 3,
+          "ms": 1071.3,
+          "tokens": 110136,
+          "groups": 455,
+          "fresh": 283
+        },
+        {
+          "idx": 4,
+          "ms": 943.7,
+          "tokens": 95665,
+          "groups": 464,
+          "fresh": 266
+        },
+        {
+          "idx": 7,
+          "ms": 926.2,
+          "tokens": 93729,
+          "groups": 475,
+          "fresh": 263
+        },
+        {
+          "idx": 27,
+          "ms": 918.7,
+          "tokens": 93061,
+          "groups": 496,
+          "fresh": 257
+        },
+        {
+          "idx": 31,
+          "ms": 891.4,
+          "tokens": 91414,
+          "groups": 463,
+          "fresh": 230
+        }
+      ],
+      "peak_gib": 65.93
+    },
+    {
+      "rep": 1,
+      "wall": 39.41,
+      "fresh_tokens": 3834386,
+      "tok_s": 97297.2,
+      "answered": 23113,
+      "survivors": 1807,
+      "wrong": 6294,
+      "chunks": 55,
+      "gpu_s": 37.63,
+      "chunk_ms_first8": [
+        1085.5,
+        1080.5,
+        1082.4,
+        1078.3,
+        943.5,
+        863.2,
+        813.4,
+        927.2
+      ],
+      "slow_chunks": [
+        {
+          "idx": 0,
+          "ms": 1085.5,
+          "tokens": 110362,
+          "groups": 302,
+          "fresh": 302
+        },
+        {
+          "idx": 2,
+          "ms": 1082.4,
+          "tokens": 110375,
+          "groups": 457,
+          "fresh": 288
+        },
+        {
+          "idx": 1,
+          "ms": 1080.5,
+          "tokens": 110374,
+          "groups": 292,
+          "fresh": 292
+        },
+        {
+          "idx": 3,
+          "ms": 1078.3,
+          "tokens": 110136,
+          "groups": 455,
+          "fresh": 283
+        },
+        {
+          "idx": 4,
+          "ms": 943.5,
+          "tokens": 95665,
+          "groups": 464,
+          "fresh": 266
+        },
+        {
+          "idx": 7,
+          "ms": 927.2,
+          "tokens": 93729,
+          "groups": 475,
+          "fresh": 263
+        },
+        {
+          "idx": 27,
+          "ms": 919.2,
+          "tokens": 93061,
+          "groups": 496,
+          "fresh": 257
+        },
+        {
+          "idx": 31,
+          "ms": 887.6,
+          "tokens": 91414,
+          "groups": 463,
+          "fresh": 230
+        }
+      ],
+      "peak_gib": 65.93
+    }
+  ],
+  "warmup_s": 35.66
+}

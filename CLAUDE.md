@@ -46,6 +46,9 @@ needs one of them, say so instead of quietly adding it back.
 # Experiments
 
 - Every engine run goes through Modal; there is no local GPU.
+- Never create new Modal app names; caches and warm state ride on
+ the app. New GPU cells attach to an existing app
+ ("quail-milestone1" for cells, "quail-engine" for the worker).
 - Tee every Modal run to a file. The CLI drops old log lines.
 - State the prediction before the run, then report what happened
   against it.

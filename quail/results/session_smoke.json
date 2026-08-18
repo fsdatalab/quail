@@ -1,0 +1,63 @@
+{
+  "filter": {
+    "report": {
+      "wall_s": 28.59,
+      "boot_s": 35.08,
+      "coordinator_wall_s": 73.49,
+      "fresh_tokens": 41955,
+      "stages": [
+        {
+          "op": "filter",
+          "alias": "d",
+          "stage": 0,
+          "provided_selectivity": 0.5,
+          "observed_selectivity": 0.535,
+          "evaluated": 200
+        },
+        {
+          "op": "filter",
+          "alias": "d",
+          "stage": 1,
+          "provided_selectivity": 0.6,
+          "observed_selectivity": 0.7103,
+          "evaluated": 107
+        }
+      ],
+      "order_rule": "by_cost",
+      "calibration": "calibrated",
+      "remarks": [
+        "kv_dtype=bf16 (argmin: fp8 tax 0.03 s vs byte saving 0.00 s)"
+      ]
+    },
+    "rows": 76,
+    "planted_survivors": 76,
+    "agree_with_planted": 76
+  },
+  "join": {
+    "report": {
+      "wall_s": 27.82,
+      "boot_s": 55.96,
+      "coordinator_wall_s": 95.17,
+      "fresh_tokens": 21984,
+      "stages": [
+        {
+          "op": "join",
+          "anchor": "r",
+          "partner": "c",
+          "semantics": "full",
+          "provided_selectivity": 0.16666666666666666,
+          "observed_selectivity": 1.0,
+          "pairs": 432
+        }
+      ],
+      "order_rule": "as_written",
+      "calibration": "calibrated",
+      "remarks": [
+        "kv_dtype=bf16 (argmin: fp8 tax 0.02 s vs byte saving 0.00 s)"
+      ]
+    },
+    "pairs_returned": 432,
+    "planted_pairs": 72,
+    "agree_with_planted": 72
+  }
+}

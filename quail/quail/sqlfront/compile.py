@@ -1,0 +1,348 @@
+"""The AI SQL front end: sqlglot (Snowflake dialect), a validator, a
+binder.
+
+sqlglot parses AI_FILTER(...) and PROMPT(...) as generic function
+nodes (exp.Anonymous). We match them by name in the two legal
+positions - WHERE conjuncts and JOIN ON - plus the [NOT] EXISTS form,
+and reject everything else by node class: the rejection list below is
+literally a list of forbidden sqlglot classes, so new SQL surface
+cannot creep in silently.
+"""
+
+import sqlglot
+from sqlglot import exp
+
+from quail.catalog import Catalog
+from quail.logical import (ColumnRef, CompileError, FilterPredicate,
+                           JoinSpec, LogicalPlan, QueryDesc,
+                           assemble_plan, bind_prompt)
+
+# Every relational operator except the projection, named and refused.
+# OR is rejected separately with its own message.
+FORBIDDEN = (
+    (exp.Group, "GROUP BY"),
+    (exp.Order, "ORDER BY"),
+    (exp.Limit, "LIMIT"),
+    (exp.Distinct, "DISTINCT"),
+    (exp.Having, "HAVING"),
+    (exp.Qualify, "QUALIFY"),
+    (exp.Window, "window functions"),
+    (exp.Union, "UNION"),
+    (exp.Except, "EXCEPT"),
+    (exp.Intersect, "INTERSECT"),
+)
+
+FILTER_OPTION_KEYS = {"selectivity"}
+JOIN_OPTION_KEYS = {"selectivity", "anchor"}
+
+
+def _is_call(node, name: str) -> bool:
+    return (isinstance(node, exp.Anonymous)
+            and str(node.this).upper() == name)
+
+
+def _reject_forbidden(tree) -> None:
+    for cls, name in FORBIDDEN:
+        if list(tree.find_all(cls)):
+            raise CompileError(
+                f"{name} is outside the language: Quail runs the "
+                f"semantic part; do the relational part in the "
+                f"database the ids came from")
+    if list(tree.find_all(exp.Or)):
+        raise CompileError(
+            "OR between AI predicates is not supported: a disjunction "
+            "belongs inside one prompt's text, where the model "
+            "evaluates it")
+    for fn in tree.find_all(exp.Anonymous):
+        name = str(fn.this).upper()
+        if name.startswith("AI_") and name != "AI_FILTER":
+            raise CompileError(f"{name} is not supported; AI_FILTER "
+                               f"is the only AI function")
+    # subqueries are legal only as the EXISTS form, checked
+    # structurally; any other subquery is refused here
+    for sub in tree.find_all(exp.Subquery):
+        raise CompileError("subqueries other than "
+                           "[NOT] EXISTS (SELECT 1 ...) are not "
+                           "supported")
+
+
+class _Binder:
+    def __init__(self, catalog: Catalog, tokenizer):
+        self.catalog = catalog
+        self.tokenizer = tokenizer
+        self.tables = []          # (alias, provider) in appearance order
+        self.doc_columns = {}     # alias -> document column
+        self.filters = {}         # alias -> [FilterPredicate]
+        self.joins = []           # [JoinSpec]
+
+    # ---- scope ------------------------------------------------------
+
+    def add_table(self, table: exp.Table) -> str:
+        name = table.name
+        alias = table.alias or name
+        self.catalog.get(name)    # unknown provider -> CompileError
+        if alias in dict(self.tables):
+            raise CompileError(f"duplicate table alias {alias!r}")
+        self.tables.append((alias, name))
+        return alias
+
+    def resolve_column(self, col: exp.Column, scope=None) -> ColumnRef:
+        scope = dict(self.tables) if scope is None else dict(scope)
+        column = col.name
+        if col.table:
+            if col.table not in scope:
+                raise CompileError(f"unknown table alias {col.table!r} "
+                                   f"in column {col.sql()}")
+            provider = scope[col.table]
+            if column not in self.catalog.get(provider).columns:
+                raise CompileError(
+                    f"column {column!r} not in provider {provider!r} "
+                    f"(schema: {self.catalog.get(provider).columns})")
+            return ColumnRef(alias=col.table, provider=provider,
+                             column=column)
+        owners = [(a, p) for a, p in scope.items()
+                  if column in self.catalog.get(p).columns]
+        if len(owners) != 1:
+            raise CompileError(
+                f"column {column!r} is {'ambiguous' if owners else 'unknown'};"
+                f" qualify it with a table alias")
+        return ColumnRef(alias=owners[0][0], provider=owners[0][1],
+                         column=column)
+
+    def note_doc_column(self, ref: ColumnRef) -> None:
+        seen = self.doc_columns.get(ref.alias)
+        if seen and seen != ref.column:
+            raise CompileError(
+                f"alias {ref.alias!r} is referenced through two "
+                f"columns ({seen!r}, {ref.column!r}); predicates over "
+                f"one table must share one document column so its KV "
+                f"is computed once")
+        self.doc_columns[ref.alias] = ref.column
+
+    # ---- AI_FILTER parsing -------------------------------------------
+
+    def parse_options(self, node, allowed: set) -> dict:
+        if node is None:
+            return {}
+        if not isinstance(node, exp.Struct):
+            raise CompileError(
+                f"the second argument to AI_FILTER must be an option "
+                f"object like {{'selectivity': 0.3}}, got {node.sql()}")
+        out = {}
+        for prop in node.expressions:
+            if not isinstance(prop, exp.PropertyEQ):
+                raise CompileError(f"malformed option {prop.sql()}")
+            key = str(prop.this.name)
+            if key not in allowed:
+                raise CompileError(
+                    f"unknown option key {key!r}; allowed: "
+                    f"{sorted(allowed)}")
+            value = prop.expression
+            if key == "selectivity":
+                if not (isinstance(value, exp.Literal)
+                        and not value.is_string):
+                    raise CompileError("selectivity must be a number")
+                out[key] = float(value.this)
+            else:   # anchor
+                if not (isinstance(value, exp.Literal)
+                        and value.is_string):
+                    raise CompileError("anchor must be a table alias "
+                                       "string")
+                out[key] = str(value.this)
+        return out
+
+    def parse_ai_filter(self, node, allowed: set, scope=None):
+        """(prompt, options, provider aliases referenced)."""
+        if not _is_call(node, "AI_FILTER"):
+            raise CompileError(
+                f"only AI_FILTER(PROMPT(...)) predicates are "
+                f"supported here, got: {node.sql()}")
+        args = node.expressions
+        if not args or not _is_call(args[0], "PROMPT"):
+            raise CompileError("AI_FILTER's first argument must be "
+                               "PROMPT('template', columns...)")
+        if len(args) > 2:
+            raise CompileError("AI_FILTER takes PROMPT and at most one "
+                               "option object")
+        options = self.parse_options(args[1] if len(args) == 2 else None,
+                                     allowed)
+        p_args = args[0].expressions
+        if not p_args or not (isinstance(p_args[0], exp.Literal)
+                              and p_args[0].is_string):
+            raise CompileError("PROMPT's first argument must be a "
+                               "string template")
+        template = str(p_args[0].this)
+        refs = []
+        for a in p_args[1:]:
+            if not isinstance(a, exp.Column):
+                raise CompileError(f"PROMPT arguments must be column "
+                                   f"references, got {a.sql()}")
+            refs.append(self.resolve_column(a, scope))
+        prompt = bind_prompt(template, tuple(refs), self.tokenizer)
+        for r in refs:
+            self.note_doc_column(r)
+        aliases = []
+        for r in refs:
+            if r.alias not in aliases:
+                aliases.append(r.alias)
+        return prompt, options, aliases
+
+
+def _from_clause(select):
+    # sqlglot renamed the arg key "from" to "from_" across versions
+    return select.args.get("from_") or select.args.get("from")
+
+
+def _where_terms(where) -> list:
+    """Flatten the WHERE conjunction; anything not reachable through
+    AND alone is rejected by the term handlers."""
+    if where is None:
+        return []
+    terms, stack = [], [where.this]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, exp.And):
+            stack.append(n.expression)
+            stack.append(n.this)
+        else:
+            terms.append(n)
+    return terms       # the pop order above yields written order
+
+
+def compile_sql(sql: str, catalog: Catalog,
+                tokenizer=None) -> LogicalPlan:
+    """AI SQL text -> LogicalPlan, or CompileError. `tokenizer` is any
+    callable text -> token list, used once at bind time to split and
+    count each prompt's preamble and tail."""
+    try:
+        tree = sqlglot.parse_one(sql, dialect="snowflake")
+    except sqlglot.errors.ParseError as e:
+        raise CompileError(f"parse error: {e}") from e
+    if not isinstance(tree, exp.Select):
+        raise CompileError("the query must be a single SELECT")
+    _reject_forbidden(tree)
+
+    b = _Binder(catalog, tokenizer)
+
+    from_ = _from_clause(tree)
+    if from_ is None or not isinstance(from_.this, exp.Table):
+        raise CompileError("FROM must name one registered provider")
+    b.add_table(from_.this)
+
+    for join in tree.args.get("joins") or []:
+        if join.side or (join.kind and join.kind.upper() != "INNER"):
+            raise CompileError(
+                f"only plain JOIN is supported, got "
+                f"{join.side or ''} {join.kind or ''} JOIN".strip())
+        if not isinstance(join.this, exp.Table):
+            raise CompileError("JOIN must name one registered provider")
+        alias = b.add_table(join.this)
+        on = join.args.get("on")
+        if on is None:
+            raise CompileError("JOIN needs ON AI_FILTER(PROMPT(...))")
+        prompt, options, aliases = b.parse_ai_filter(on, JOIN_OPTION_KEYS)
+        if len(aliases) != 2:
+            raise CompileError(
+                f"a join predicate must reference exactly two "
+                f"providers, got {aliases}")
+        if alias not in aliases:
+            raise CompileError(
+                f"the ON predicate of JOIN {alias} must reference "
+                f"{alias}")
+        anchor = options.get("anchor")
+        if anchor is not None and anchor not in aliases:
+            raise CompileError(
+                f"anchor {anchor!r} is not a side of this join "
+                f"({aliases})")
+        b.joins.append(JoinSpec(alias=alias, prompt=prompt,
+                                semantics="full",
+                                selectivity=options.get("selectivity"),
+                                anchor=anchor))
+
+    for term in _where_terms(tree.args.get("where")):
+        anti = False
+        node = term
+        if isinstance(node, exp.Not):
+            node, anti = node.this, True
+        if isinstance(node, exp.Exists):
+            _compile_exists(b, node, anti)
+            continue
+        if anti:
+            raise CompileError(f"NOT is only supported as NOT EXISTS, "
+                               f"got NOT {node.sql()}")
+        prompt, options, aliases = b.parse_ai_filter(
+            term, FILTER_OPTION_KEYS)
+        if len(aliases) != 1:
+            raise CompileError(
+                f"a WHERE filter must reference exactly one provider, "
+                f"got {aliases}; a two-provider predicate is a join "
+                f"and belongs in JOIN ... ON")
+        b.filters.setdefault(aliases[0], []).append(
+            FilterPredicate(prompt=prompt,
+                            selectivity=options.get("selectivity")))
+
+    columns = _compile_projection(b, tree.expressions)
+
+    if not b.joins and not b.filters:
+        raise CompileError("the query has no AI predicate; a plain "
+                           "scan belongs in the database the ids came "
+                           "from")
+
+    desc = QueryDesc(
+        tables=tuple(b.tables),
+        doc_columns=dict(b.doc_columns),
+        filters={a: tuple(v) for a, v in b.filters.items()},
+        joins=tuple(b.joins),
+        columns=tuple(columns))
+    return assemble_plan(desc)
+
+
+def _compile_exists(b: _Binder, node: exp.Exists, anti: bool) -> None:
+    inner = node.this
+    if not isinstance(inner, exp.Select):
+        raise CompileError("EXISTS must wrap SELECT 1 FROM provider "
+                           "WHERE AI_FILTER(...)")
+    inner_from = _from_clause(inner)
+    if inner_from is None or not isinstance(inner_from.this, exp.Table):
+        raise CompileError("the EXISTS subquery must scan one "
+                           "registered provider")
+    if (inner.args.get("joins") or inner.args.get("group")
+            or len(inner.expressions) != 1):
+        raise CompileError("the EXISTS subquery must be exactly "
+                           "SELECT 1 FROM provider WHERE AI_FILTER(...)")
+    alias = b.add_table(inner_from.this)
+    terms = _where_terms(inner.args.get("where"))
+    if len(terms) != 1:
+        raise CompileError("the EXISTS subquery takes exactly one "
+                           "AI_FILTER predicate")
+    prompt, options, aliases = b.parse_ai_filter(terms[0],
+                                                 JOIN_OPTION_KEYS)
+    if len(aliases) != 2 or alias not in aliases:
+        raise CompileError(
+            "the EXISTS predicate must reference the inner provider "
+            "and exactly one outer provider")
+    b.joins.append(JoinSpec(alias=alias, prompt=prompt,
+                            semantics="anti" if anti else "exists",
+                            selectivity=options.get("selectivity"),
+                            anchor=options.get("anchor")))
+
+
+def _compile_projection(b: _Binder, expressions) -> list:
+    columns = []
+    for e in expressions:
+        if isinstance(e, exp.Star):
+            for alias, provider in b.tables:
+                for c in b.catalog.get(provider).columns:
+                    columns.append(ColumnRef(alias=alias,
+                                             provider=provider,
+                                             column=c))
+            continue
+        if isinstance(e, exp.Alias):
+            e = e.this
+        if not isinstance(e, exp.Column):
+            raise CompileError(
+                f"the SELECT list is column selection only, got "
+                f"{e.sql()}: nothing computed, per the projection "
+                f"contract")
+        columns.append(b.resolve_column(e))
+    return columns

@@ -4,8 +4,17 @@ __pycache__/
 *.egg-info/
 .env
 .DS_Store
+.venv/
 # raw torch-profiler pulls (127 MB each); the Modal volume holds them,
 # and plots/make_figures.py skips the timeline figure when they are absent
 results/engine/torchprof_*rank0.pt.trace.json.gz
 logs/
 results/logs/
+# teed run logs are local artifacts; the result JSONs carry the numbers
+quail/results/*.log
+# exploration scratch and bulk outputs stay out of git
+exploration/tmp/
+exploration/output/
+exploration/results/*.log
+exploration/results/engine/torchprof_*
+

@@ -1,0 +1,84 @@
+{
+  "cell": "m1_filter",
+  "n_docs": 10000,
+  "corpus_tokens": 3203917,
+  "n_filters": 5,
+  "exec_budget": 110376,
+  "arena_tokens": 345974,
+  "kv": "bf16",
+  "prediction": "~3.84M fresh tokens at the 121k tok/s packed rate -> ~32 s; committed bf16 chain reference 38.0 s, survivors 1873, answered 23381",
+  "reference": {
+    "artifact": "filter_cells_bf16.json",
+    "wall_s": 38.0,
+    "survivors": 1873,
+    "answered": 23381,
+    "wrong": 6229
+  },
+  "runs": [
+    {
+      "rep": 0,
+      "wall": 41.29,
+      "fresh_tokens": 3834386,
+      "tok_s": 92871.7,
+      "answered": 23113,
+      "survivors": 1807,
+      "wrong": 6294,
+      "chunks": 55,
+      "gpu_s": 39.52,
+      "chunk_ms_first8": [
+        1091.4,
+        1083.3,
+        1087.3,
+        1081.3,
+        956.7,
+        875.8,
+        823.3,
+        939.0
+      ],
+      "chunk_ms_top8": [
+        1091.4,
+        1087.3,
+        1083.3,
+        1081.3,
+        956.7,
+        939.0,
+        932.0,
+        899.9
+      ],
+      "peak_gib": 65.93
+    },
+    {
+      "rep": 1,
+      "wall": 39.88,
+      "fresh_tokens": 3834386,
+      "tok_s": 96143.4,
+      "answered": 23113,
+      "survivors": 1807,
+      "wrong": 6294,
+      "chunks": 55,
+      "gpu_s": 38.1,
+      "chunk_ms_first8": [
+        1088.5,
+        1085.9,
+        1093.5,
+        1083.7,
+        957.6,
+        876.6,
+        823.8,
+        940.2
+      ],
+      "chunk_ms_top8": [
+        1093.5,
+        1088.5,
+        1085.9,
+        1083.7,
+        957.6,
+        940.2,
+        931.8,
+        898.7
+      ],
+      "peak_gib": 65.93
+    }
+  ],
+  "warmup_s": 5.31
+}
