@@ -776,8 +776,7 @@ important to say when that file is made: offline, once per
 (model, device) pair, by an explicit command —
 `quail calibrate <model> <device>` — that runs the batch sweep and
 the parity probe (~10 GPU-minutes) and writes the measured
-constants (serving rate, q_kv, the attention coefficient) to a
-JSON checked into the repo, exactly what
+constants to a JSON checked into the repo, exactly what
 `results/engine/cost_model_fit.json` is in the exploration repo
 today. Nothing is ever measured at plan time or at query time: the
 planner reads constants from the file when one exists for this
@@ -786,6 +785,32 @@ pair and from the spec-scaled defaults when it does not, and
 onboarded or the software stack changes, and never otherwise;
 plans never require it — they only get sharper predictions from
 it.
+
+The file holds exactly five numbers per (model, device):
+
+| constant | meaning | consumed by | 4B/H100 today |
+|---|---|---|---|
+| a | seconds per fresh token in the packed loop (1/rate; embeds the efficiency factor) | every wall prediction; filter ordering; anchor choice; the fresh side of the dtype inequality | 8.26 µs (121,045 tok/s, kernel ladder) |
+| b | seconds per chunk: pack, launch, answer readout | the knee, so the chunk budget floor; predictions for gated late stages, where chunks run small and b amortizes worst (measured: +22% at 41k-token chunks in the 3-way run) | ~2.9 ms on the engine; re-measured on the packed loop at milestone 1 |
+| a2 | seconds per token-pair of attention (the quadratic coefficient) | long-document surcharge (the LF grid); join cross-attention priced from pair counts (that pricing landed +7% on the B5 shape); the attention-crossover check | 4.93e-10 |
+| q_kv | the fp8-KV conversion tax per fresh token | the dtype argmin (§6) | 0.59 µs |
+| c0 | fixed per-query residue: dispatch, first chunk, result return | the per-query floor (benchmark B1) | 0.026 s on the engine executor; re-measured at milestone 1 |
+
+Plus one table per host configuration, model-independent, measured
+once by the pinprobe protocol: the channel bandwidths (pinned
+H2D/D2H ~55 GB/s, unpinned ~11, disk ~2.6-3.9, volume ~0.9-3.2),
+consumed by the read/restore/spill decision, the byte side of the
+dtype inequality, and spill pricing.
+
+Deliberately absent, against the exploration's `cost.py`: the
+engine-only constants die with the engine — the per-request host
+model (HOST_HN/HA/HR), the eager-boot step floor (STEP_B0_S), the
+engine sequence and block bounds, and the cached-read slope
+(T_READ_S_PER_TOKEN). In the packed executor, reading kept
+document KV IS the cross-attention call, so it is priced by a2 and
+pair counts rather than by a separate read constant — which is
+exactly how the join predictions were priced, and they landed
+within their band.
 
 On "make B* as big as possible because everything is prefill
 dominated": right in substance, with two caps and one caveat. Right
