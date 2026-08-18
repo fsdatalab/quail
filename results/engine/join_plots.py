@@ -138,30 +138,33 @@ def nway_time_bar():
 
 
 def nway_vs_stock():
-    """Measured staged join against two stock-vLLM estimates.
+    """Measured staged join against estimated grouped stock vLLM.
 
-    Both stock numbers are arithmetic from committed measurements -
-    never run. Submission strategy for both: one request per
-    (anchor, partner) pair, grouped by B document.
+    The stock bar is arithmetic from committed measurements - never
+    run. Its configuration mirrors the 2-way stock arm exactly: one
+    synchronous request per (anchor, partner) pair, submitted
+    grouped by B document so the engine's prefix cache hits, prefix
+    caching on, admission from the same budget formula. All 100 B
+    prefixes (368k tokens) fit the ~978k-token pool, so each prefix
+    computes once and nothing is evicted - grouping gives stock the
+    same computed-once token accounting we have.
 
-    Estimate 1 - prefix caching on (all 100 B prefixes fit the
-    ~978k-token pool, so every prefix computes once):
-      fresh   7.025M tokens (368k prefix + 3.104M A + 3.553M C)
-              at 70.8k tok/s               -> 99.2 s
-              (70.8k = the 2-way stock's measured fresh rate:
-               433 s wall - 234 s host - 95 s reads over 7.36M)
-      reads   20,000 requests x 3,684 cached tokens x 125 ns -> 9.2 s
-      host    80.33M prompt tokens x (234 s / 770M)          -> 24.4 s
-      fixed   20,000 requests x 50.3 us                      -> 1.0 s
-                                                       total ~ 134 s
-
-    Estimate 2 - no prefix reuse (every request prefills its full
-    ~4k-token prompt):
-      fresh   80.33M tokens; per request T_pre(4,016) =
-              9.2 us/tok x 4,016 + 4.93e-10 x 4,016^2 = 44.9 ms
-              x 20,000                                  -> 898 s
-      host + fixed                                      -> 25.4 s
-                                                       total ~ 923 s
+    The four components, each anchored to a measurement:
+      fresh   7.025M tokens (368k B prefixes once + 3.104M A
+              suffixes + 3.553M C suffixes) at 70.8k tok/s -> 99.2 s
+              [the rate is the 2-way stock arm's own measured
+               fresh-compute rate: 433 s wall - 234 s host - 95 s
+               reads = 104 s over 7.36M fresh tokens]
+      reads   every request's suffix attends over B's 3,684 cached
+              prefix tokens through the paged pool: 20,000 x 3,684
+              x 125 ns/cached-token                         -> 9.2 s
+              [125 ns from the c2 calibration cells]
+      host    the engine ingests each request's FULL prompt: 80.33M
+              prompt tokens x (234 s / 770M)               -> 24.4 s
+              [finding 1's measured host term, scaled by tokens
+               ingested; scaling by requests instead gives 18 s]
+      fixed   20,000 requests x 50.3 us                    -> 1.0 s
+                                               total       ~ 134 s
     """
     d = load("join_nway3.json")
     r = d["result"]
@@ -169,49 +172,58 @@ def nway_vs_stock():
     total = r["total_wall_s"]
     tails = round(total - s1 - s2, 1)
 
-    est_cached = 134
-    est_naive = 923
+    comps = [("fresh compute\n99 s", 99.2, "#95a5a6"),
+             ("reads", 9.2, "#b8c2c6"),
+             ("host\n24 s", 24.4, "#7f8c8d"),
+             ("", 1.0, "#ccd4d7")]
+    est_total = round(sum(v for _, v, _ in comps))
 
-    fig, ax = plt.subplots(figsize=(9, 3.8))
-    ink, muted = "#2c3e50", "#7f8c8d"
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+    ink = "#2c3e50"
 
     labels = [
         "Quail staged join\n(measured)",
-        "Stock vLLM, prefix caching\n(estimated — never run)",
-        "Stock vLLM, no prefix reuse\n(estimated — never run)",
+        "Stock vLLM, grouped\n(estimated — never run)",
     ]
-    y = [0, 1, 2]
 
     # measured bar: stage segments + readout tail, 2px white gaps
-    ax.barh(0, s1, height=0.55, left=0, color="#2980b9",
+    ax.barh(0, s1, height=0.5, left=0, color="#2980b9",
             edgecolor="white", linewidth=2)
-    ax.barh(0, s2, height=0.55, left=s1, color="#e67e22",
+    ax.barh(0, s2, height=0.5, left=s1, color="#e67e22",
             edgecolor="white", linewidth=2)
-    ax.barh(0, tails, height=0.55, left=s1 + s2, color=ink,
+    ax.barh(0, tails, height=0.5, left=s1 + s2, color=ink,
             edgecolor="white", linewidth=2)
+    ax.text(s1 / 2, 0, f"stage 1\n{s1:.1f} s", ha="center",
+            va="center", fontsize=9.5, color="white",
+            fontweight="bold")
+    ax.text(s1 + s2 / 2, 0, f"stage 2\n{s2:.1f} s", ha="center",
+            va="center", fontsize=9.5, color="white",
+            fontweight="bold")
+    ax.text(total + 3, 0, f"{total:.1f} s", ha="left", va="center",
+            fontsize=11, color=ink, fontweight="bold")
 
-    # estimated bars: neutral gray + texture = "not a measurement"
-    ax.barh(1, est_cached, height=0.55, color="#aab4b8",
-            edgecolor="white", linewidth=2, hatch="//")
-    ax.barh(2, est_naive, height=0.55, color="#cdd4d6",
-            edgecolor="white", linewidth=2, hatch="//")
+    # estimated bar: component segments, gray + texture =
+    # arithmetic, not a measurement
+    left = 0.0
+    for name, val, color in comps:
+        ax.barh(1, val, height=0.5, left=left, color=color,
+                edgecolor="white", linewidth=2, hatch="//")
+        if name:
+            ax.text(left + val / 2, 1, name, ha="center",
+                    va="center", fontsize=9, color=ink)
+        left += val
+    ax.text(left + 3, 1,
+            f"~{est_total} s = 99 fresh + 9 reads + 24 host + 1 fixed",
+            ha="left", va="center", fontsize=10.5, color=ink,
+            fontweight="bold")
 
-    for yi, val, note in [
-            (0, total,
-             f"{total:.1f} s   (stage 1: {s1:.1f}  +  stage 2: {s2:.1f})"),
-            (1, est_cached, f"~{est_cached} s"),
-            (2, est_naive,
-             f"~{est_naive} s  ({est_naive/total:.0f}x)")]:
-        ax.text(val + 12, yi, note, ha="left", va="center",
-                fontsize=11, color=ink, fontweight="bold")
-
-    ax.set_yticks(y)
+    ax.set_yticks([0, 1])
     ax.set_yticklabels(labels, fontsize=10)
     ax.invert_yaxis()
     ax.set_xlabel("Seconds (10,000 + 10,000 pairs)", fontsize=11)
-    ax.set_xlim(0, est_naive * 1.14)
-    ax.set_title("3-Way Join: measured against estimated stock vLLM",
-                 fontsize=13, pad=10)
+    ax.set_xlim(0, 240)
+    ax.set_title("3-Way Join: measured vs grouped stock vLLM "
+                 "(estimated)", fontsize=13, pad=10)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.spines["left"].set_visible(False)
@@ -221,7 +233,7 @@ def nway_vs_stock():
                 bbox_inches="tight")
     plt.close(fig)
     print(f"  join_nway3_vs_stock.png  ({total:.1f} s measured vs "
-          f"~{est_cached} / ~{est_naive} s estimated)")
+          f"~{est_total} s estimated grouped stock)")
 
 
 if __name__ == "__main__":
