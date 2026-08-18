@@ -1,85 +1,80 @@
 {
   "n_docs": 3000,
-  "fresh_tokens": 1149946,
+  "fresh_tokens": 1149933,
   "chunks": 21,
-  "region_wall_s": 11.15,
-  "cuda_busy_s": 14.1,
-  "gap_wall_minus_busy_s": -2.95,
-  "us_per_token": 9.7,
+  "region_wall_s": 29.04,
+  "cuda_busy_s": 14.59,
+  "gap_wall_minus_busy_s": 14.45,
+  "us_per_token": 25.25,
   "category_s": {
-    "gemm": 6.5,
-    "attention": 1.02,
-    "triton_fused": 1.72,
-    "quant": 0.95,
-    "copies": 0.86,
-    "other": 3.05
+    "gemm": 5.96,
+    "attention": 0.89,
+    "triton_fused": 1.61,
+    "quant": 0.83,
+    "copies": 4.04,
+    "other": 1.26
   },
   "ideal_gemm_s": 4.18,
   "top_kernels": [
     {
-      "s": 3.26,
-      "n": 684,
+      "s": 2.957,
+      "n": 648,
       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u,"
     },
     {
-      "s": 1.545,
-      "n": 5074,
-      "name": "Command Buffer Full"
+      "s": 1.858,
+      "n": 432756,
+      "name": "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::n"
     },
     {
-      "s": 1.511,
-      "n": 432,
+      "s": 1.858,
+      "n": 432756,
+      "name": "aten::index_copy_"
+    },
+    {
+      "s": 1.43,
+      "n": 468,
       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, "
     },
     {
-      "s": 1.018,
+      "s": 0.925,
       "n": 540,
       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, "
     },
     {
-      "s": 1.016,
+      "s": 0.889,
       "n": 1512,
       "name": "_vllm_fa3_C::fwd"
     },
     {
-      "s": 0.941,
+      "s": 0.835,
       "n": 756,
       "name": "silu_mul_quant"
     },
     {
-      "s": 0.726,
+      "s": 0.628,
       "n": 468,
       "name": "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::Col"
     },
     {
-      "s": 0.662,
-      "n": 432,
+      "s": 0.606,
+      "n": 468,
       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, "
     },
     {
-      "s": 0.494,
+      "s": 0.491,
       "n": 1491,
       "name": "add_rms_norm_quant"
     },
     {
-      "s": 0.475,
+      "s": 0.416,
       "n": 777,
       "name": "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, floa"
     },
     {
-      "s": 0.475,
+      "s": 0.416,
       "n": 777,
       "name": "_C::per_token_group_fp8_quant"
-    },
-    {
-      "s": 0.292,
-      "n": 936,
-      "name": "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::n"
-    },
-    {
-      "s": 0.292,
-      "n": 936,
-      "name": "aten::index_copy_"
     },
     {
       "s": 0.284,
@@ -87,57 +82,62 @@
       "name": "qk_norm_rope"
     },
     {
-      "s": 0.202,
+      "s": 0.182,
       "n": 468,
       "name": "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::Col"
     },
     {
-      "s": 0.153,
-      "n": 1716,
-      "name": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, "
-    },
-    {
-      "s": 0.153,
-      "n": 1716,
-      "name": "aten::gather"
-    },
-    {
-      "s": 0.14,
-      "n": 3063,
+      "s": 0.16,
+      "n": 21241,
       "name": "aten::copy_"
     },
     {
-      "s": 0.137,
-      "n": 756,
-      "name": "lse_merge"
-    },
-    {
-      "s": 0.119,
+      "s": 0.11,
       "n": 756,
       "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native:"
     },
     {
-      "s": 0.049,
-      "n": 720,
+      "s": 0.087,
+      "n": 756,
+      "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native:"
+    },
+    {
+      "s": 0.087,
+      "n": 756,
+      "name": "aten::lerp"
+    },
+    {
+      "s": 0.085,
+      "n": 2329,
+      "name": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, "
+    },
+    {
+      "s": 0.085,
+      "n": 2329,
+      "name": "aten::gather"
+    },
+    {
+      "s": 0.044,
+      "n": 756,
       "name": "void cutlass::device_kernel<flash::FlashAttnFwdCombine<cute::tuple<cute::C<8>, cute::C<128"
     },
     {
-      "s": 0.036,
-      "n": 6783,
-      "name": "cuLaunchKernelEx"
-    },
-    {
-      "s": 0.022,
-      "n": 252,
-      "name": "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::Col"
-    },
-    {
-      "s": 0.019,
-      "n": 2016,
+      "s": 0.034,
+      "n": 3816,
       "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native:"
     },
     {
-      "s": 0.011,
+      "s": 0.022,
+      "n": 288,
+      "name": "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::Col"
+    },
+    {
+      "s": 0.012,
+      "n": 2820,
+      "name": "Command Buffer Full"
+    },
+    {
+      "s": 0.009,
       "n": 288,
       "name": "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::Col"
     }

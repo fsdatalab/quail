@@ -3,7 +3,7 @@
   "arena_tokens": 345974,
   "gates": {
     "attention_math_max_diff": 0.0068,
-    "shared_vs_unshared_max_hidden_gap": 4.1562,
+    "shared_vs_unshared_max_hidden_gap": 4.9688,
     "shared_vs_unshared_disagreements": 0,
     "kept_vs_shared_disagreements": 0,
     "paged_vs_gather_disagreements": 0,
@@ -17,9 +17,9 @@
   "rate": {
     "chunks": 2,
     "tokens": 169452,
-    "wall_s": 2.01,
-    "tok_s": 84309.9
+    "wall_s": 2.158,
+    "tok_s": 78517.5
   },
-  "peak_gib": 62.63,
+  "peak_gib": 62.88,
   "pass": true
 }

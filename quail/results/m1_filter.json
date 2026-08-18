@@ -17,164 +17,164 @@
   "runs": [
     {
       "rep": 0,
-      "wall": 33.13,
-      "fresh_tokens": 3834893,
-      "tok_s": 115762.4,
-      "answered": 23152,
-      "survivors": 1811,
-      "wrong": 6276,
+      "wall": 34.02,
+      "fresh_tokens": 3834386,
+      "tok_s": 112694.0,
+      "answered": 23113,
+      "survivors": 1807,
+      "wrong": 6294,
       "chunks": 55,
-      "gpu_s": 33.06,
+      "gpu_s": 33.94,
       "chunk_ms_first8": [
-        929.6,
-        933.1,
-        944.6,
-        943.2,
-        819.9,
-        771.1,
-        715.4,
-        806.4
+        940.4,
+        959.0,
+        961.3,
+        958.4,
+        836.3,
+        788.8,
+        733.7,
+        818.9
       ],
       "slow_chunks": [
         {
           "idx": 2,
-          "ms": 944.6,
-          "tokens": 110374,
-          "groups": 458,
+          "ms": 961.3,
+          "tokens": 110375,
+          "groups": 457,
           "fresh": 288
         },
         {
-          "idx": 3,
-          "ms": 943.2,
-          "tokens": 110254,
-          "groups": 457,
-          "fresh": 284
-        },
-        {
           "idx": 1,
-          "ms": 933.1,
+          "ms": 959.0,
           "tokens": 110374,
           "groups": 292,
           "fresh": 292
         },
         {
+          "idx": 3,
+          "ms": 958.4,
+          "tokens": 110136,
+          "groups": 455,
+          "fresh": 283
+        },
+        {
           "idx": 0,
-          "ms": 929.6,
+          "ms": 940.4,
           "tokens": 110362,
           "groups": 302,
           "fresh": 302
         },
         {
           "idx": 4,
-          "ms": 819.9,
-          "tokens": 95298,
+          "ms": 836.3,
+          "tokens": 95665,
           "groups": 464,
-          "fresh": 265
-        },
-        {
-          "idx": 7,
-          "ms": 806.4,
-          "tokens": 94643,
-          "groups": 480,
           "fresh": 266
         },
         {
-          "idx": 35,
-          "ms": 804.5,
-          "tokens": 93409,
-          "groups": 489,
-          "fresh": 245
+          "idx": 7,
+          "ms": 818.9,
+          "tokens": 93729,
+          "groups": 475,
+          "fresh": 263
         },
         {
           "idx": 27,
-          "ms": 796.8,
-          "tokens": 92819,
-          "groups": 500,
-          "fresh": 256
+          "ms": 815.8,
+          "tokens": 93061,
+          "groups": 496,
+          "fresh": 257
+        },
+        {
+          "idx": 31,
+          "ms": 800.7,
+          "tokens": 91414,
+          "groups": 463,
+          "fresh": 230
         }
       ],
       "peak_gib": 65.93
     },
     {
       "rep": 1,
-      "wall": 33.1,
-      "fresh_tokens": 3834893,
-      "tok_s": 115841.3,
-      "answered": 23152,
-      "survivors": 1811,
-      "wrong": 6276,
+      "wall": 34.03,
+      "fresh_tokens": 3834386,
+      "tok_s": 112689.8,
+      "answered": 23113,
+      "survivors": 1807,
+      "wrong": 6294,
       "chunks": 55,
-      "gpu_s": 33.05,
+      "gpu_s": 33.95,
       "chunk_ms_first8": [
-        924.3,
-        941.2,
-        944.2,
-        944.9,
-        820.0,
-        777.3,
-        718.3,
-        808.2
+        949.7,
+        961.5,
+        963.7,
+        960.8,
+        834.9,
+        789.3,
+        722.1,
+        827.2
       ],
       "slow_chunks": [
         {
-          "idx": 3,
-          "ms": 944.9,
-          "tokens": 110254,
-          "groups": 457,
-          "fresh": 284
-        },
-        {
           "idx": 2,
-          "ms": 944.2,
-          "tokens": 110374,
-          "groups": 458,
+          "ms": 963.7,
+          "tokens": 110375,
+          "groups": 457,
           "fresh": 288
         },
         {
           "idx": 1,
-          "ms": 941.2,
+          "ms": 961.5,
           "tokens": 110374,
           "groups": 292,
           "fresh": 292
         },
         {
+          "idx": 3,
+          "ms": 960.8,
+          "tokens": 110136,
+          "groups": 455,
+          "fresh": 283
+        },
+        {
           "idx": 0,
-          "ms": 924.3,
+          "ms": 949.7,
           "tokens": 110362,
           "groups": 302,
           "fresh": 302
         },
         {
           "idx": 4,
-          "ms": 820.0,
-          "tokens": 95298,
+          "ms": 834.9,
+          "tokens": 95665,
           "groups": 464,
-          "fresh": 265
-        },
-        {
-          "idx": 7,
-          "ms": 808.2,
-          "tokens": 94643,
-          "groups": 480,
           "fresh": 266
         },
         {
-          "idx": 35,
-          "ms": 803.6,
-          "tokens": 93409,
-          "groups": 489,
-          "fresh": 245
+          "idx": 7,
+          "ms": 827.2,
+          "tokens": 93729,
+          "groups": 475,
+          "fresh": 263
         },
         {
           "idx": 27,
-          "ms": 792.6,
-          "tokens": 92819,
-          "groups": 500,
-          "fresh": 256
+          "ms": 820.0,
+          "tokens": 93061,
+          "groups": 496,
+          "fresh": 257
+        },
+        {
+          "idx": 31,
+          "ms": 805.1,
+          "tokens": 91414,
+          "groups": 463,
+          "fresh": 230
         }
       ],
       "peak_gib": 65.93
     }
   ],
-  "warmup_s": 2.29
+  "warmup_s": 2.72
 }

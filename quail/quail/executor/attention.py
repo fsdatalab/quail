@@ -215,39 +215,9 @@ class Pipeline:
             tl.store(k_out_ptr + t * stride_ko + kb_offs,
                      out_b.to(k_out_ptr.dtype.element_ty))
 
-        # the LSE strides vary with the chunk's token count; without
-        # do_not_specialize every div-by-16 stride re-JITs inside a
-        # measured run (a 0.6 s lump on the first such chunk)
-        @triton.jit(do_not_specialize=["stride_lah", "stride_lat",
-                                       "stride_lbh", "stride_lbt"])
-        def lse_merge(rows_ptr, la_ptr, lb_ptr, a_ptr, b_ptr,
-                      stride_lah, stride_lat, stride_lbh, stride_lbt,
-                      H: tl.constexpr, D: tl.constexpr):
-            # one program per suffix row: out_a[src] =
-            # lerp(out_a[src], out_b[r], sigmoid(lse_b - lse_a[src])).
-            # Matches the unfused chain's rounding exactly: fp32
-            # sigmoid, the weight rounded to bf16, then torch's bf16
-            # lerp in fp32 opmath INCLUDING its branch - small weights
-            # use a + w*(b-a), large ones b - (b-a)*(1-w).
-            r = tl.program_id(0)
-            src = tl.load(rows_ptr + r)
-            hs = tl.arange(0, H)
-            la = tl.load(la_ptr + hs * stride_lah + src * stride_lat)
-            lb = tl.load(lb_ptr + hs * stride_lbh + r * stride_lbt)
-            w = tl.sigmoid(lb - la).to(tl.bfloat16).to(tl.float32)
-            offs = tl.arange(0, D)
-            pa = a_ptr + src * H * D + hs[:, None] * D + offs[None, :]
-            pb = b_ptr + r * H * D + hs[:, None] * D + offs[None, :]
-            a = tl.load(pa).to(tl.float32)
-            b = tl.load(pb).to(tl.float32)
-            res = tl.where(w[:, None] < 0.5, a + w[:, None] * (b - a),
-                           b - (b - a) * (1.0 - w[:, None]))
-            tl.store(pa, res.to(a_ptr.dtype.element_ty))
-
         self._kernels = {"silu": silu_mul_quant,
                          "norm": add_rms_norm_quant,
-                         "qk": qk_norm_rope,
-                         "merge": lse_merge}
+                         "qk": qk_norm_rope}
         return self._kernels
 
     def custom_silu_quant(self, gate_up):
@@ -303,32 +273,13 @@ class Pipeline:
             block_table=block_table, seqused_k=seqused_k,
             causal=causal, fa_version=3, return_softmax_lse=True)
 
-    def _merge_lse(self, out_a, lse_a, out_b, lse_b, rows, n):
-        """The softmax-state merge of the two attention calls, fused
-        into one kernel: out_a[rows] = lerp(out_a[rows], out_b,
-        sigmoid(lse_b - lse_a[rows])).
-
-        Replaces ~9 launches per layer (two LSE transposes, three
-        index_selects, sub, sigmoid, cast, lerp, index_copy_) and two
-        extra passes over the merged rows; the LSE tensors are read in
-        their native layout through strides, so the transposing copies
-        are gone too."""
-        n_suf = rows.shape[0]
-        H, D = self.num_q_heads, self.head_dim
-
-        def ht_strides(lse, n_tok):
-            # the varlen wrapper returns (heads, tokens); accept
-            # (tokens, heads) without a transposing copy
-            if lse.shape[0] == n_tok:
-                return lse.stride(1), lse.stride(0)
-            return lse.stride(0), lse.stride(1)
-
-        sah, sat = ht_strides(lse_a, n)
-        sbh, sbt = ht_strides(lse_b, n_suf)
-        self._triton_kernels()["merge"][(n_suf,)](
-            rows, lse_a, lse_b, out_a, out_b, sah, sat, sbh, sbt,
-            H=H, D=D)
-        return out_a
+    @staticmethod
+    def _lse_tokens_first(lse, n_tokens):
+        # normalize to (tokens, heads); the wrapper returns
+        # (heads, tokens) for varlen
+        if lse.shape[0] != n_tokens:
+            return lse.transpose(0, 1).contiguous()
+        return lse
 
     def attention(self, q, k, v, meta):
         """meta carries the chunk layout; see pack_chunk in loop.py."""
@@ -382,9 +333,13 @@ class Pipeline:
                 q_suf, kx, vx, cross["cu_q"], cross["cu_k"],
                 cross["max_q"], cross["max_used"], causal=False)
 
+        la = self._lse_tokens_first(lse_a, n).index_select(0, rows)
+        lb = self._lse_tokens_first(lse_b, rows.shape[0])
         # (wa*A + wb*B)/(wa+wb) == A + (B-A)*sigmoid(lse_b - lse_a):
-        # one fused kernel instead of the elementwise chain
-        out = self._merge_lse(out_a, lse_a, out_b, lse_b, rows, n)
+        # same merge, no fp32 copies of the row tensors
+        w = torch.sigmoid(lb - la).to(torch.bfloat16)[..., None]
+        merged = torch.lerp(out_a.index_select(0, rows), out_b, w)
+        out = out_a.index_copy_(0, rows, merged)
         meta["layer"] += 1
         return out.view(n, H * D)
 
