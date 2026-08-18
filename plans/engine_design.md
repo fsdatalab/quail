@@ -968,11 +968,34 @@ equivalent configuration, and the submission strategy is named):
 stock vLLM, same container class, prefix caching on, no store —
 and the same session discipline: its engine boots once and stays
 up across all fifteen queries and both passes, so vLLM's own
-prefix cache carries whatever it can hold between queries.
-Filters submit separate requests per stage under the same
-token-budget admission; joins submit grouped requests per pair in
-anchor order with admission matched from the same pool arithmetic.
-Both baseline protocols are the committed ones from this repo.
+prefix cache carries whatever it can hold between queries. This is
+not a naive baseline; it is the strongest stock client the
+exploration built, given every plan-derived setting in its
+analytically equivalent form:
+
+- **Filters: the committed pipelined async client.** One request
+  per (document, stage); the moment stage j answers YES, stage
+  j+1's request is submitted, so a document never waits for its
+  cohort — the same pipelining Quail's executor does, done from
+  the client side. Admission is the same token budget Quail's
+  plan derived, enforced as the client-side semaphore
+  (`run_filter_chain`); filters run in the same order Quail's
+  `by_cost` chose. This client measured 42.9 s against rewind's
+  39.8 s — the gap is the block-boundary recompute and the
+  request-count overhead, not a handicapped client.
+- **Joins: one request per pair, ordered anchor-major.** All of
+  an anchor's pairs are submitted consecutively, so vLLM's prefix
+  cache re-serves the anchor document's KV across its whole
+  partner stream instead of evicting it between scattered hits —
+  the reordering is exactly what makes stock benefit from prefix
+  caching at all (the arbitrary-order variant, priced at 1.87x
+  worse in the exploration, is never run). Stock also gets
+  Quail's stage order and anchor orientation, and between stages
+  the same gating and dedup applied as client bookkeeping, so an
+  n-way join's stock pair lists shrink identically to Quail's.
+  Admission is matched from the same pool arithmetic. This is the
+  committed grouped protocol behind the 429 s side of the 4.1x
+  result.
 Expectations, from the committed measurements: at (1, 1) the join
 queries carry
 the gap (measured 4.1x on the B5 shape), the filter queries are
