@@ -1,0 +1,55 @@
+{
+  "cell": "m1_filter_store",
+  "n_docs": 5000,
+  "corpus_tokens": 1620045,
+  "store_capacity_gb": 250,
+  "store_kv_gb": 238.9,
+  "store_init_s": 41.28,
+  "warmup_s": 15.86,
+  "prediction": "cold ~20 s plus offload tail; warm passes near half the cold wall (committed persist: 1.9-2.1x)",
+  "runs": [
+    {
+      "rep": 0,
+      "kind": "cold",
+      "wall": 31.28,
+      "fresh_tokens": 1933895,
+      "tok_s": 61833.8,
+      "survivors": 882,
+      "chunks": 31,
+      "peak_gib": 66.83,
+      "restored_docs": 0,
+      "restored_tokens": 0,
+      "stored_docs": 5000,
+      "stored_tokens": 1620045
+    },
+    {
+      "rep": 1,
+      "kind": "warm",
+      "wall": 11.7,
+      "fresh_tokens": 314045,
+      "tok_s": 26851.2,
+      "survivors": 887,
+      "chunks": 15,
+      "peak_gib": 62.32,
+      "restored_docs": 5000,
+      "restored_tokens": 1620045,
+      "stored_docs": 0,
+      "stored_tokens": 0
+    },
+    {
+      "rep": 2,
+      "kind": "warm",
+      "wall": 11.77,
+      "fresh_tokens": 314045,
+      "tok_s": 26678.7,
+      "survivors": 887,
+      "chunks": 15,
+      "peak_gib": 62.32,
+      "restored_docs": 5000,
+      "restored_tokens": 1620045,
+      "stored_docs": 0,
+      "stored_tokens": 0
+    }
+  ],
+  "warm_speedup": 2.67
+}

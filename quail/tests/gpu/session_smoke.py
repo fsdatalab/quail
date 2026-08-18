@@ -131,6 +131,21 @@ def main():
         agree_with_planted=agree)
     print(json.dumps(summary["filter"], indent=2), flush=True)
 
+    # the same query again: if the worker container stayed warm, the
+    # second run restores every document from the container's store
+    # (the session now plans access=restore) and skips the boot
+    res2 = fq2 = sess.sql(f"""
+        SELECT d.id FROM docs d
+        WHERE AI_FILTER(PROMPT('{{0}}{q1_text}', d.body),
+                        {{'selectivity': 0.6}})
+          AND AI_FILTER(PROMPT('{{0}}{q2_text}', d.body),
+                        {{'selectivity': 0.5}})
+    """).run()
+    summary["filter_warm"] = dict(
+        report=res2.report, rows=len(res2.rows),
+        rows_match_first_run=sorted(res2.rows) == sorted(res.rows))
+    print(json.dumps(summary["filter_warm"], indent=2), flush=True)
+
     # ---- the join query, builder entry point
     jq = (sess.docs("reports").alias("r")
           .ai_join(sess.docs("cands").alias("c"),
@@ -156,6 +171,7 @@ def main():
         agree_with_planted=len(got_pairs & planted_pairs))
     print(json.dumps(summary["join"], indent=2), flush=True)
 
+    sess.close()
     Path("results").mkdir(exist_ok=True)
     with open("results/session_smoke.json", "w") as f:
         json.dump(summary, f, indent=2)

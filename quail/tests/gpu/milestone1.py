@@ -30,8 +30,12 @@ Run from the quail/ directory (tee to a file per house rule):
 
 import json
 import os
+import sys
+from pathlib import Path
 
 import modal
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from corpus import MODEL
 
@@ -57,7 +61,7 @@ image = (
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail", "corpus")
+    .add_local_python_source("quail", "corpus", "baselines")
 )
 
 # House rule: never create new Modal app names - caches and warm state
@@ -533,6 +537,226 @@ def join3_run() -> str:
     return _write(report, "join3")
 
 
+# ---------------------------------------------------------- the store
+
+@app.function(timeout=5400, image=image, gpu="H100!", memory=327680,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/root/.cache/kernels": kernel_cache,
+                       "/results": results_vol})
+def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
+                     warm_reps: int = 2) -> str:
+    """The store gate: the five-filter workload cold (with offload),
+    then warm (restore instead of recompute).
+
+    PREDICTION, from the committed persist result (chain 10k: 44.3 s
+    cold offload pass, 16.3 s per warm pass, 1.9-2.1x): at 5,000
+    documents (~1.6M corpus tokens, ~236 GB of bf16 KV) the cold pass
+    lands near half the 10k wall (~20 s) plus the offload tail, and
+    the warm passes land near half the cold wall - restore streams on
+    the side channel while the question chunks compute.
+
+    bf16 at 10k docs needs ~472 GB of pinned host memory, past this
+    container's 320 GB, so the gate runs at 5,000 documents - the
+    same per-token economics, a corpus the pool holds whole."""
+    import time
+
+    from corpus import build_corpus
+    from quail.executor.kvstore import PinnedStore
+    from quail.executor.loop import run_filter
+    from quail.specs import QWEN3_4B_FP8
+
+    (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
+     exec_budget, arena_tok) = _boot()
+    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
+    corpus_tokens = sum(len(b) for b in body_ids)
+    kappa = QWEN3_4B_FP8.kappa
+
+    t_store = time.perf_counter()
+    store = PinnedStore(
+        capacity_tokens=int(capacity_gb * 1e9) // int(kappa),
+        n_layers=QWEN3_4B_FP8.layers, n_kv=QWEN3_4B_FP8.n_kv,
+        d_head=QWEN3_4B_FP8.d_head,
+        max_doc_tokens=max(len(b) for b in body_ids))
+    store_init_s = round(time.perf_counter() - t_store, 2)
+
+    from quail.executor.loop import warm_kernels
+    t_warm = time.perf_counter()
+    with torch.inference_mode():
+        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
+                     q_ids, exec_budget)
+    torch.cuda.synchronize()
+    kernel_cache.commit()
+
+    report = dict(
+        cell="m1_filter_store", n_docs=n_docs,
+        corpus_tokens=corpus_tokens,
+        store_capacity_gb=capacity_gb,
+        store_kv_gb=round(corpus_tokens * kappa / 1e9, 1),
+        store_init_s=store_init_s,
+        warmup_s=round(time.perf_counter() - t_warm, 2),
+        prediction=("cold ~20 s plus offload tail; warm passes near "
+                    "half the cold wall (committed persist: 1.9-2.1x)"),
+        runs=[])
+    print(f"[m1_store] init {store_init_s} s; "
+          f"{report['store_kv_gb']} GB of KV into a {capacity_gb} GB "
+          f"pool; {report['prediction']}", flush=True)
+
+    for rep in range(1 + warm_reps):
+        stats = {}
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            answers, spans, tokens = run_filter(
+                torch, arena, pipeline, async_ans, body_ids, q_ids,
+                exec_budget, store=store, store_hash="m1",
+                store_min_tokens=1, stats=stats)
+        torch.cuda.synchronize()
+        wall = time.perf_counter() - t0
+        survivors = [d for d, row in answers.items()
+                     if len(row) == len(q_ids) and all(row)]
+        row = dict(rep=rep, kind="cold" if rep == 0 else "warm",
+                   wall=round(wall, 2), fresh_tokens=tokens,
+                   tok_s=round(tokens / wall, 1),
+                   survivors=len(survivors), chunks=len(spans),
+                   peak_gib=round(
+                       torch.cuda.max_memory_allocated() / 2**30, 2),
+                   **stats)
+        report["runs"].append(row)
+        print(f"[m1_store] {row}", flush=True)
+    cold = report["runs"][0]["wall"]
+    warm = min(r["wall"] for r in report["runs"][1:])
+    report["warm_speedup"] = round(cold / warm, 2)
+    return _write(report, "filter_store")
+
+
+# ----------------------------------------------------------- baselines
+
+@app.function(timeout=5400, **GPU_KW)
+def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
+    """Stock vLLM on the committed five-filter workload: the
+    pipelined per-(document, stage) client under the plan's token
+    budget, prefix caching on - the strongest stock client the
+    exploration built.
+
+    PREDICTION: the committed stock band, 39.2-43.2 s per rep
+    (bf16 40.8/39.2/39.5; fp8 42.8-43.2), against the packed
+    executor's measured 39.4-39.9 s."""
+    import sys
+    import time
+
+    sys.path.insert(0, "/root")
+    from baselines.stock import run_filter_chain
+    from corpus import MODEL, build_corpus
+    from vllm import LLM, SamplingParams
+    from quail.executor.loop import yes_no_ids
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
+    yes, no = yes_no_ids(tokenizer)
+
+    # the committed stock knobs: 25,305 step tokens, the plan's
+    # 749,782-token admission budget, prefix caching on
+    llm = LLM(model=MODEL, max_num_batched_tokens=25_305,
+              max_num_seqs=4096, gpu_memory_utilization=0.92,
+              enable_prefix_caching=True, disable_log_stats=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1,
+                              min_tokens=1,
+                              allowed_token_ids=sorted(yes | no))
+    engine = llm.llm_engine
+    report = dict(cell="baseline_filter", n_docs=n_docs,
+                  submission="separate requests per (document, stage), "
+                             "pipelined, token-budget admission",
+                  budget_tokens=749_782, step_tokens=25_305,
+                  prediction="committed stock band 39.2-43.2 s",
+                  runs=[])
+    # warm the engine (kernel compile, allocator)
+    run_filter_chain(engine, sampling, body_ids[:64], q_ids, 749_782,
+                     tag="w")
+    for rep in range(reps):
+        r = run_filter_chain(engine, sampling, body_ids, q_ids,
+                             749_782, tag=f"r{rep}")
+        row = dict(rep=rep, wall=round(r["wall"], 2),
+                   requests=r["requests"],
+                   fresh_tokens=r["prompt_tokens"] - r["cached_tokens"],
+                   survivors=len(r["survivors"]))
+        report["runs"].append(row)
+        print(f"[baseline_filter] {row}", flush=True)
+    return _write(report, "baseline_filter")
+
+
+@app.function(timeout=5400, **GPU_KW)
+def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
+                      reps: int = 2) -> str:
+    """Stock vLLM on the dispatch gate's 72k-pair synthetic join:
+    one request per pair, anchor-major, prefix caching on.
+
+    PREDICTION: fresh ~2.7M tokens at the committed stock effective
+    rate (~17k tok/s) -> 2.5-3 min per rep, against the packed
+    executor's measured 31.1 s on one GPU (the committed BioDEX
+    shape measured 4.1x)."""
+    import sys
+    import time
+
+    sys.path.insert(0, "/root")
+    from baselines.stock import run_join_grouped
+    from corpus import MODEL
+    from vllm import LLM, SamplingParams
+    from quail.executor.loop import yes_no_ids
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    filler = ("The projector hummed while the reel changed and nobody "
+              "in the back row noticed the splice. ")
+    colors = ("blue", "red", "green", "yellow", "purple", "orange")
+
+    def tok(t):
+        return tokenizer(t, add_special_tokens=False)["input_ids"]
+
+    pre = tok("You will be shown a scene report and one candidate "
+              "color. Decide from the report's own words.\n\nREPORT:\n")
+    prefixes = [pre + tok(filler * 110
+                          + f"\n\nThe dominant color in this scene is "
+                            f"{colors[i % 6]}.")
+                for i in range(n_reports)]
+    suffixes = [tok(f"\n\nCANDIDATE:\nThe candidate color is "
+                    f"{colors[j % 6]}.\nInstruction: answer YES if "
+                    f"the report says its dominant color is the "
+                    f"candidate color, NO otherwise.\nANSWER=")
+                for j in range(n_cands)]
+    yes, no = yes_no_ids(tokenizer)
+    mean_pair = (sum(map(len, prefixes)) * n_cands
+                 + n_reports * sum(map(len, suffixes))) \
+        // (n_reports * n_cands) + 1
+    max_seqs = max(64, min(4096, 749_782 // mean_pair))
+    llm = LLM(model=MODEL, max_num_batched_tokens=25_305,
+              max_num_seqs=max_seqs, gpu_memory_utilization=0.88,
+              enable_prefix_caching=True, disable_log_stats=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1,
+                              min_tokens=1,
+                              allowed_token_ids=sorted(yes | no))
+    report = dict(cell="baseline_join", n_reports=n_reports,
+                  n_cands=n_cands, pairs=n_reports * n_cands,
+                  submission="one request per pair, anchor-major, "
+                             "prefix caching on",
+                  max_num_seqs=max_seqs, step_tokens=25_305,
+                  prediction="~2.5-3 min per rep vs the packed 31.1 s",
+                  runs=[])
+    run_join_grouped(llm, sampling, prefixes[:2], suffixes[:32], yes)
+    for rep in range(reps):
+        llm.reset_prefix_cache()
+        r = run_join_grouped(llm, sampling, prefixes, suffixes, yes)
+        row = dict(rep=rep, wall=round(r["wall"], 2),
+                   fresh_tokens=r["fresh_tokens"],
+                   tok_s=round(r["fresh_tokens"] / r["wall"], 1),
+                   yes=sum(r["answers"]))
+        report["runs"].append(row)
+        print(f"[baseline_join] {row}", flush=True)
+    return _write(report, "baseline_join")
+
+
 # ----------------------------------------------------- join diagnostics
 
 @app.function(timeout=1800, **GPU_KW)
@@ -655,3 +879,21 @@ def run_join3(out: str = "results/m1_join3.json"):
 @app.local_entrypoint()
 def run_debug_join(out: str = "results/debug_join.json"):
     _save(debug_join.remote(), out)
+
+
+@app.local_entrypoint()
+def run_filter_store(n_docs: int = 5000, capacity_gb: int = 250,
+                     warm_reps: int = 2,
+                     out: str = "results/m1_filter_store.json"):
+    _save(filter_store_run.remote(n_docs, capacity_gb, warm_reps), out)
+
+
+@app.local_entrypoint()
+def run_baseline_filter(n_docs: int = 10000, reps: int = 2,
+                        out: str = "results/baseline_filter.json"):
+    _save(baseline_filter_run.remote(n_docs, reps), out)
+
+
+@app.local_entrypoint()
+def run_baseline_join(out: str = "results/baseline_join.json"):
+    _save(baseline_join_run.remote(), out)

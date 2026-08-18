@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=2.0",
     "modal>=1.0",
     "bpe-qwen>=0.1.5",
+    "datasets>=5.0.1",
 ]
 
 [dependency-groups]
