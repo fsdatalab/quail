@@ -1,80 +1,85 @@
 # Quail engine: a declarative query engine for AI_FILTER and AI_JOIN
 
-Status: design proposal, nothing implemented. This is the "actual
-system" the README promised once the exploration settled. It settles
-now: the exploration measured three mechanisms (pipelining,
-token-based admission, KV rewind), a packed join executor, a KV
-store for cross-query reuse, and a calibrated cost model. This
-document proposes the engine that puts them behind one declarative
-interface.
+Status: design for the new repo. This exploration repo stays as the
+evidence base; the engine gets its own repository (working name:
+`quail`), built clean from this design. Nothing in the new repo may
+depend on experiment scripts here — the constants, the executor
+loop, and the pure-logic modules move over; the rest is history.
 
-Scope is unchanged: AI_FILTER and AI_JOIN only, Qwen3 4B fp8 only,
-H100 workers on Modal only. No maps, no classification, no
-aggregation, no cascades. The same discipline applies to relational
-algebra: this engine is not a SQL engine that happens to call a
-model, it is a semantic-operator engine with a SQL front end. The
-only relational operator it supports is projection, because a
-result has to name which columns come back. No non-AI predicates,
-no equality joins, no GROUP BY, no ORDER BY, no LIMIT, no DISTINCT,
-no expressions. A query that needs those runs Quail for the
-semantic part and does the relational part in whatever database the
-ids came from. If a design decision below seems to need any of
-this, the decision is wrong, not the scope.
+Scope: AI_FILTER and AI_JOIN only. Qwen3 4B fp8 is the first model,
+H100 workers on Modal the first device — but the optimizer is built
+against model/device structs from day one (§8), not against our
+profiled numbers. No maps, no classification, no aggregation, no
+cascades. The same discipline applies to relational algebra: the
+only relational operator is projection, because a result has to
+name its columns. No non-AI predicates, no equality joins, no
+GROUP BY, no ORDER BY, no LIMIT, no DISTINCT, no expressions. A
+query that needs those runs Quail for the semantic part and does
+the relational part in whatever database the ids came from.
 
-What the numbers below rest on (all committed in this repo):
+What the design rests on (all committed in this repo):
 
 | result | where |
 |---|---|
-| 5-filter chain, 10k docs: KV rewind 39.8 s vs stock vLLM (separate requests per stage, matched token budget) 42.9 s | `results/engine/filter_cells.json` |
-| 2-way join, 256k pairs: packed executor 103.6 s vs stock vLLM (grouped requests per pair) 429 s — 4.1x | `results/engine/join2way.json` |
-| 3-way join, gated and deduped between stages: 95.6 s, replay-consistent | `results/engine/join_nway3.json` |
-| Cross-query KV restore from a pinned CPU store: 1.9–2.1x faster than recompute | `results/engine/persist_split7_quail_waves_chain_10k.json` |
-| Cost model: makespan predictions within ~2–3% on filters, +7% on the packed join | `results/engine/makespan_check.json`, `join_findings.md` |
+| Packed executor, 2-way join, 256k pairs: 103.6 s vs 429 s for stock vLLM submitting grouped requests per pair — 4.1x | `results/engine/join2way.json` |
+| Packed executor, 3-way join, gated and deduped between stages, replay-consistent | `results/engine/join_nway3.json` |
+| Packed single filter: 121,045 tok/s vs 96,946 on the engine — the packed loop is the faster substrate for filters too | `plans/packed_forward.md`, `single_filter_forward_vllm_kernels.json` |
+| Chain semantics (keep document KV, attach question suffixes) beat per-stage requests: 39.8 s vs 42.9 s at 10k docs | `results/engine/filter_cells.json` |
+| Cross-query KV restore from a pinned CPU store: 1.9–2.1x over recompute | `results/engine/persist_split7_quail_waves_chain_10k.json` |
+| Attention-merge parity: 0 disagreements across all gates; rate 82.1k tok/s at the large-chunk geometry | `results/engine/join_probe.json` |
+| Cost model: predictions within ~2–3% on filters, +7% on the packed join | `results/engine/makespan_check.json`, `join_findings.md` |
 
 ---
 
 ## 1. Shape of the system
 
 Four layers, in the style of DataFusion: a session that owns a
-catalog, a SQL front end that compiles to a logical plan, an
-optimizer that prices physical alternatives with the calibrated cost
-model, and executors that run the physical plan on Modal GPUs.
+catalog of document providers, a SQL front end that compiles the
+Snowflake AISQL syntax to a logical plan, a planner that prices the
+plan with a spec-derived cost model, and one executor that runs it
+on Modal GPUs.
 
-    SQL text or builder calls
+    AI SQL text or builder calls
             |
             v
     +------------------+
-    |  compiler        |  parse (sqlglot), bind names against the
-    |                  |  catalog, emit a LogicalPlan tree
+    |  compiler        |  sqlglot (Snowflake dialect), bind columns
+    |                  |  against the catalog, emit a LogicalPlan
     +------------------+
             |
             v
     +------------------+
-    |  optimizer       |  enumerate filter orders, filter placement,
-    |                  |  join stage orders, anchor choices; price
-    |                  |  each with quail/plan/cost.py; emit a
-    |                  |  PhysicalPlan or a Refusal
+    |  planner         |  pushdown (always), ordering (user-given or
+    |                  |  from provided selectivities), anchor
+    |                  |  choice, budgets and caps from the model/
+    |                  |  device specs; emit PhysicalPlan or Refusal
     +------------------+
             |
             v
     +------------------+
     |  coordinator     |  local process: ships per-worker plans,
-    |                  |  collects answers, runs the CPU relational
-    |                  |  steps (gate, dedup, assemble)
+    |                  |  collects answer matrices, runs gate/dedup/
+    |                  |  assemble, applies the projection
     +------------------+
             |
             v
     +------------------+
-    |  Modal workers   |  one container per GPU. Each hosts BOTH
-    |  (N x H100)      |  executors: the vLLM engine with
-    |                  |  QuailScheduler (filter chains), and the
-    |                  |  packed forward executor (join stages).
-    |                  |  Plus the pinned CPU KV store.
+    |  Modal workers   |  one container per GPU, restored from a
+    |  (N x H100)      |  GPU memory snapshot. ONE executor: the
+    |                  |  packed forward loop, for filters and
+    |                  |  joins alike. Pinned CPU KV store beside it.
     +------------------+
 
+There is exactly one execution substrate (§6). vLLM appears nowhere
+in the execution path: it remains a library for weight loading and
+kernels (public surface only — the version pin existed for
+scheduler internals, which are gone), and as the stock baseline in
+the benchmark. The engine-scheduler fork (`QuailScheduler`, chain
+mode) stays in this exploration repo as evidence and fallback; it
+does not move.
+
 Everything above the workers is CPU-only Python and unit-testable
-without a GPU, which keeps the repo's testing discipline: the 45
-existing CPU tests grow, and GPU runs stay confirmation cells.
+without a GPU.
 
 ---
 
@@ -85,502 +90,671 @@ existing CPU tests grow, and GPU runs stay confirmation cells.
 ```python
 @dataclass(frozen=True)
 class EngineConfig:
-    gpus: int = 1               # data-parallel H100 workers. tp=1
-                                # always: 4B fp8 weights fit one card
-                                # (plan_query already refuses if not)
-    cpu_memory_gb: int = 64     # per-worker cap on host memory. The
+    gpus: int = 1               # data-parallel H100 workers, one
+                                # container each. tensor_parallel
+                                # derives from the ModelSpec (1 for
+                                # 4B); gpus must be a multiple of it
+    cpu_memory_gb: int = 64     # per-worker host memory cap. The
                                 # pinned KV store gets this minus a
                                 # fixed working headroom; 0 disables
-                                # the store entirely (access="read")
-    model: str = "qwen3-4b-fp8" # the only accepted value today; any
-                                # other string is a Refusal, not a
-                                # fallback
+                                # the store
+    model: str = "qwen3-4b-fp8" # must name a registered ModelSpec
+                                # (§8); an unknown name is a Refusal
 ```
 
-These three knobs map one-to-one onto Modal resources: `gpus` is the
+The three knobs map one-to-one onto Modal resources: `gpus` is the
 worker container count (`gpu="H100!"` each), `cpu_memory_gb` is the
-container `memory=` request, `model` selects the weights baked into
-the image volume.
+container `memory=` request, `model` selects the weights volume and
+the spec struct.
 
-### 2.2 Session and catalog
+### 2.2 DocumentProvider and the catalog
+
+`DocumentProvider` is the analogue of DataFusion's `TableProvider`:
+a named source of rows, where each row has an id and one or more
+text columns.
 
 ```python
 sess = quail.Session(EngineConfig(gpus=1, cpu_memory_gb=256))
 
-sess.register("reviews",  DocumentSet.from_parquet("imdb.parquet", text_col="review"))
-sess.register("products", DocumentSet.from_hf("...", text_col="description"))
+sess.register("reviews",  DocumentProvider.from_parquet("imdb.parquet", id_col="id"))
+sess.register("products", DocumentProvider.from_hf("...", id_col="asin"))
 ```
 
-A `DocumentSet` is the catalog entry — the analogue of a DataFusion
-`TableProvider`. Registration is cheap and lazy: tokenization runs
-on first scan and is cached (token ids plus the `CorpusStats` the
-planner needs: count, total, mean, max, sum of squared lengths).
-Each set gets a content hash; the KV store and the tokenization
-cache key on it, so re-registering identical data reuses both.
+There is no `text_col` at registration, because the provider does
+not decide which column is "the document" — the query does. A
+provider exposes a schema (its column names); the PROMPT in the
+query references a column (`r.review`, `p.description`), and the
+binder resolves that reference to the provider's column. One
+provider can serve different queries through different columns.
 
-### 2.3 Two equivalent query entry points
+`register` does two things, both cheap: binds the name into the
+session catalog, and reads the schema (parquet metadata / dataset
+features — no data scan). Tokenization is not registration work; it
+happens at the first `DocScan` of a column and is cached under a
+content hash of (provider data, column, tokenizer), so
+re-registering identical data reuses the cache, and so does the KV
+store.
 
-SQL, the AISQL subset (Snowflake Cortex AISQL syntax, arXiv
-2511.07663 — filters and joins only):
+### 2.3 The SQL entry point
+
+The syntax is Snowflake's Cortex AISQL (arXiv 2511.07663), filters
+and joins only:
 
 ```python
 q = sess.sql("""
     SELECT r.id, p.id
     FROM reviews r
     JOIN products p
-      ON AI_FILTER(PROMPT('Review {0} discusses product {1}', r.text, p.text))
-    WHERE AI_FILTER(PROMPT('This review is negative: {0}', r.text))
+      ON AI_FILTER(PROMPT('Review {0} discusses product {1}',
+                          r.review, p.description),
+                   {'selectivity': 0.05})
+    WHERE AI_FILTER(PROMPT('This review is negative: {0}', r.review),
+                    {'selectivity': 0.3})
 """)
 ```
 
-Builder, for programmatic use (the DataFrame-style API):
+The second argument to AI_FILTER is Snowflake's option object (the
+paper uses it for `{'model': ...}`); we use it for per-predicate
+options: `selectivity` (a rough number, used only for ordering —
+§4), and `anchor: 'left'|'right'` to override the join anchor
+choice.
+
+### 2.4 The builder entry point
+
+The builder mirrors AI SQL construct for construct — same PROMPT
+semantics, same column references, same options — so a query
+translates line by line between the two:
 
 ```python
-q = (sess.docs("reviews")
-         .ai_filter("This review is negative: {doc}")
-         .ai_join(sess.docs("products"),
-                  "Review {left} discusses product {right}")
-         .select("reviews.id", "products.id"))
+from quail import col, prompt
+
+q = (sess.docs("reviews").alias("r")
+     .ai_filter(prompt("This review is negative: {0}", col("r.review")),
+                selectivity=0.3)
+     .ai_join(sess.docs("products").alias("p"),
+              prompt("Review {0} discusses product {1}",
+                     col("r.review"), col("p.description")),
+              selectivity=0.05)
+     .select("r.id", "p.id"))
 ```
 
-Both produce the same `LogicalPlan`. Then:
+Exists and anti semantics are the same call with a flag —
+`ai_join(..., semantics="exists")` / `semantics="anti"` — matching
+the SQL `WHERE [NOT] EXISTS` form (§3.1).
+
+Both entry points produce the same `LogicalPlan`. Then:
 
 ```python
-q.explain()   # logical tree, chosen physical plan, per-operator
-              # predicted wall and token counts — the prediction is
-              # printed BEFORE any run, per house rule
-res = q.run() # executes; result carries measured walls next to the
-              # predictions, plus tokens computed, KV bytes restored,
-              # pairs evaluated per stage
+q.explain()   # logical tree, physical plan, per-operator predicted
+              # wall and token counts — printed BEFORE any run
+res = q.run() # measured walls next to the predictions, plus tokens
+              # computed, KV bytes restored, pairs per stage
 ```
 
-`run()` on an infeasible configuration raises the `Refusal` the
-planner produced (existing behavior: named constraint, needed vs
-available, unit). The engine never silently degrades.
+`run()` on an infeasible configuration raises the planner's
+`Refusal` (named constraint, needed vs available, unit). The engine
+never silently degrades.
 
-### 2.4 What a result is
+### 2.5 Controlling filter order and join order
 
-Filters return surviving document ids. Joins return id tuples.
-Projection is the one relational operator, and it is column
-selection only: pick which of the ids and pass-through text columns
-come back, nothing computed, nothing renamed beyond aliases. It
-exists because a result has to have a shape, not because the engine
-does relational work. Results also carry the per-stage answer
-matrices, so the nested-loop replay check from the join work
-(`joinlogic.brute_force_triples`) stays available as a correctness
-gate on every run.
+The user controls order the same way DataFusion users do, plus one
+SQL-level knob DataFusion lacks. For reference: DataFusion's SQL
+has no join-order hints — you control order by building the plan
+through the DataFrame/LogicalPlanBuilder API, where the order you
+build is the order you get, and by disabling reordering rules.
+Quail does the analogous thing:
+
+- **Builder**: the call order is the plan order, always. What you
+  chain is what runs.
+- **SQL**: `sess.sql(text, order="as_written")` takes the WHERE
+  conjunct order as the filter order and the JOIN clause order as
+  the stage order. `order="by_cost"` lets the planner order using
+  the provided selectivities.
+- **Default**: `by_cost` when every gated predicate carries a
+  selectivity option, `as_written` otherwise; `explain()` states
+  which applied and why. There is no third source of ordering — no
+  sampling, no runtime adaptation (§4).
+
+### 2.6 What a result is
+
+Filters return surviving document ids; joins return id tuples.
+Projection — the SELECT list, the one relational operator — is
+column selection only: ids and pass-through text, nothing computed.
+Results carry the per-stage answer matrices, so the nested-loop
+replay check (`joinlogic.brute_force_triples`) stays available as a
+correctness gate on every run.
 
 ---
 
-## 3. The SQL subset and the compiler
+## 3. Parsing AI SQL
 
-### 3.1 Grammar
+### 3.1 The accepted grammar
 
-Accepted, and nothing else:
+Snowflake AISQL syntax, and only this subset of it:
 
-- `SELECT <plain columns> FROM <set> [alias]` — the SELECT list is
-  the projection, and projection is the only relational operator in
-  the language: bare column references (ids, pass-through text),
-  optionally aliased. No expressions, no `*`-expansion surprises
-  (`*` is allowed and means every column of every named set)
-- zero or more `JOIN <set> [alias] ON AI_FILTER(PROMPT('...', a.col, b.col))`
-- `WHERE` as a conjunction (`AND`) of `AI_FILTER(PROMPT('...', x.col))`
-  terms, each referencing exactly one table
-- `WHERE EXISTS (SELECT 1 FROM <set> s WHERE AI_FILTER(PROMPT('...', outer.col, s.col)))`
-  — the exists-semantics join (keep a document if some partner
-  matches; the executor stops each partner stream at the first YES)
+- `SELECT <plain columns> FROM <provider> [alias]` — the SELECT
+  list is the projection: bare column references, optionally
+  aliased. `*` means every column of every named provider.
+- zero or more
+  `JOIN <provider> [alias] ON AI_FILTER(PROMPT('...', a.col, b.col) [, {options}])`
+- `WHERE` as a conjunction (`AND`) of
+  `AI_FILTER(PROMPT('...', x.col) [, {options}])` terms, each
+  referencing exactly one provider
+- `WHERE [NOT] EXISTS (SELECT 1 FROM <provider> s WHERE AI_FILTER(PROMPT('...', outer.col, s.col)))`
+  — exists semantics (keep a document if some partner matches; the
+  executor stops the partner stream at the first YES) and anti
+  semantics (keep it if none does; the executor stops at the first
+  YES and drops the document — same early stop, inverted keep)
 
 Rejected with a named error, not worked around: every relational
 operator except the projection above — non-AI predicates (including
 equality join conditions), GROUP BY, ORDER BY, LIMIT, DISTINCT,
-expressions or function calls in the SELECT list, set operations,
-subqueries other than the EXISTS form. Also OR between AI
-predicates, AI_FILTER over more than two tables, and any other AI_*
-function. Rejection at parse time is the same honesty as `Refusal`
-at plan time.
+expressions in the SELECT list, set operations, subqueries other
+than the EXISTS form. Also OR between AI predicates (a disjunction
+belongs inside one prompt's text, where the model evaluates it),
+AI_FILTER over more than two providers, and any other AI_*
+function.
 
-### 3.2 Compile pipeline
+### 3.2 How the parse works
 
-1. **Parse.** `sqlglot` (CPU-only dependency) parses the text; a
-   walker checks the tree against the subset above.
-2. **Bind.** Table names resolve against the session catalog;
-   PROMPT placeholders resolve to document sets. A prompt that
-   references one set is a filter predicate; two sets, a join
-   predicate. The prompt template is tokenized once here, split
-   into the shared preamble and the per-document tail (the 33-token
-   shared-preamble split that rewind and pricing both use).
-3. **Logical plan.** Four logical operators only — three semantic,
-   one relational:
+`sqlglot` with `dialect="snowflake"`, not a hand-rolled grammar.
+What that buys: Snowflake quoting, aliasing, precedence, and the
+option-object literal all parse correctly for free, and sqlglot is
+pure Python with no native dependencies. What we add is a
+validator and a binder over its tree:
 
-   | operator | fields |
-   |---|---|
-   | `Scan(set)` | document set id |
-   | `SemanticFilter(input, predicates)` | ordered list of (prompt, selectivity estimate) — conjunctions collapse into one node |
-   | `SemanticJoin(left, right, predicate, semantics)` | semantics: `full` (all matching pairs) or `exists` |
-   | `Project(input, columns)` | the SELECT list; always the root of the tree, never anywhere else |
+1. sqlglot parses `AI_FILTER(...)` and `PROMPT(...)` as generic
+   function nodes (`exp.Anonymous`). A walker matches them by name
+   in the two legal positions (WHERE conjuncts, JOIN ON) and
+   rejects everything else in the tree by node type — the
+   rejection list in §3.1 is literally a list of forbidden sqlglot
+   node classes, so new SQL surface cannot creep in silently.
+2. The PROMPT template's `{0}`, `{1}` placeholders must match its
+   column arguments in count and order. Column references resolve
+   through the alias table to (provider, column); a predicate whose
+   columns span one provider is a filter, two providers a join,
+   three or more an error.
+3. The option object parses as a Snowflake object literal; unknown
+   keys are errors (again: no silent surface).
+4. The prompt text is tokenized once at bind time and split into
+   the shared preamble and the per-document tail — the split that
+   both the executor's KV reuse and the cost model price.
 
-   `Project` never participates in optimization: it costs nothing
-   the model runs, so the optimizer prices the tree below it and
-   the coordinator applies it at the sink. N-way joins appear as a
-   left-deep tree of `SemanticJoin` nodes;
-   the optimizer flattens them into the join graph before pricing,
-   so the SQL join order carries no meaning — same as the filter
-   order in WHERE.
+Output: a `LogicalPlan` of four operators — three semantic, one
+relational:
 
-Selectivity estimates come from a sample pass, exactly as
-`join_plan.md` decided: ~2k sampled documents or pairs per
-predicate, labeled by the model itself during planning, only when
-the plan actually depends on survivors (gated filter chains, n ≥ 3
-joins, exists semantics). A 2-way full join samples nothing.
+| operator | fields |
+|---|---|
+| `Scan(provider, column)` | which column of which provider supplies the document text |
+| `SemanticFilter(input, predicates)` | ordered list of (prompt, selectivity or None) |
+| `SemanticJoin(left, right, predicate, semantics, selectivity, anchor)` | semantics: `full` / `exists` / `anti` |
+| `Project(columns)` | always the root, never anywhere else |
 
----
-
-## 4. The optimizer
-
-The optimizer turns one logical plan into one physical plan by
-enumerating alternatives and pricing each with
-`quail/plan/cost.py`. Query graphs here are tiny — at most ~5
-filters per set and 2–4 relations — so it enumerates exhaustively.
-No heuristics, per the join plan's decision; what the cost model
-prices best, runs.
-
-Decisions, in the order they are taken:
-
-1. **Filter placement against joins.** A filter that reads one side
-   of a join can run before it (shrinking the pair list) or after
-   it (on surviving tuples). Both placements are priced: pushdown
-   costs (docs x filter tokens) and saves (killed docs x partner
-   count x pair tokens); pull-up is the reverse. This is the
-   AI-aware placement result from the Cortex AISQL paper, done here
-   with a calibrated token cost model instead of call counts. At
-   our costs pushdown nearly always wins — a pair costs a whole
-   partner-suffix prefill and a filter costs one question — but the
-   pricing keeps it honest for explosive cases.
-2. **Filter order within a chain.** Per-stage cost is
-   survivors x (question tail tokens + cached re-read of the
-   resident document), so cheap-and-selective filters run first.
-   All orders of ≤5 filters are priced (≤120 permutations of pure
-   arithmetic).
-3. **Join stage order and per-stage anchor.** For the join graph,
-   every stage order and anchor choice is enumerated and priced
-   (the `join_plan.md` formulas: prefix computations x f + |pairs|
-   x s, survivor-thinned). Anchoring the longer side wins almost
-   always; the enumeration is cheap enough that "almost" never has
-   to be trusted.
-4. **Executor assignment.** A fixed mapping today, chosen by the
-   measurements, revisable when a measurement says otherwise:
-
-   | logical operator | executor | why |
-   |---|---|---|
-   | SemanticFilter chain | vLLM engine, chain mode (KV rewind + token admission + in-engine pipelining) | measured 39.8 s vs 42.9 s stock; gating needs per-document decisions the engine makes at zero client latency |
-   | SemanticJoin stages | packed forward executor (brim packing, shared-prefix attention merge, kept anchor KV) | measured 4.1x over grouped stock; no pool, no admission, chunk cap = min(B*, kernel cap) derived at load |
-   | gate / dedup / assemble | CPU (`quail/joinlogic.py`) | pair-list construction is bookkeeping, measured negligible |
-
-   The engine chain path remains the join fallback (it exists and
-   was priced at 6.1 h vs packed 4.4 h at BioDEX scale) — used only
-   if a packed-path parity gate fails on some future shape.
-5. **Budgets and caps** — all reused, not redesigned:
-   - admission budget: `SATURATION_SLACK x n_filters x step budget`,
-     clamped to the pool (`plan_query`, unchanged)
-   - engine boot: `engine_max_seqs`, `engine_step_tokens` as today
-   - packed chunk budget: `min(B*_memory, kernel index cap)` — the
-     cap computed from the loaded weights (110,375 tokens today),
-     the lesson of the join2way crash
-   - keep-vs-recompute per anchor: the size rule (m, f/S ~8%,
-     feeds-later-stage), from `join_plan.md`
-6. **Access per scan: read, restore, or spill.** Decided per
-   document set from store state and the measured break-even
-   (channel > kappa x prefill rate = 7.2 GB/s at 4B; pinned host
-   memory measured 55 GB/s, so restore wins whenever the KV is
-   warm). `store_length_threshold` decides which documents' KV is
-   worth the capped capacity, as today.
-7. **Sharding across workers.** Filters: balanced document shards
-   by token count (`_balanced_shards`, unchanged). Joins: shard by
-   anchor document — pair lists partition cleanly because every
-   pair belongs to exactly one anchor. Workers never talk to each
-   other; the coordinator merges answers.
-
-The output is a `PhysicalPlan`: a JSON-serializable tree of
-physical operators, each carrying its settings and its predicted
-tokens and wall. `explain()` prints it. The per-operator prediction
-is stored in the result next to the measurement, so every
-production run doubles as a cost-model check — the
-prediction-before-run rule enforced by the tool rather than by
-discipline.
+`Project` never participates in planning: it costs nothing the
+model runs; the coordinator applies it at the sink.
 
 ---
 
-## 5. Physical operators and executors
+## 4. The planner
 
-### 5.1 Operator set
+Simpler than a database optimizer, on purpose. Three decisions are
+not decisions at all:
+
+- **Pushdown is unconditional.** A filter on one side of a join
+  always runs before that join. Under true pairwise join semantics
+  this cannot lose: evaluating the filter costs one question per
+  document either way (the join neither duplicates nor drops the
+  documents the filter must judge — it only pairs them), and
+  running it first deletes every pair the failed documents would
+  have generated. There is no Cortex-style pull-up case to price,
+  because we never rewrite a join into anything else — AI_JOIN is
+  evaluated as the pairwise predicate it declares.
+- **No selectivity estimation.** Selectivities are provided by the
+  user (rough numbers; only ordering consumes them) or absent.
+  Absent means as-written order. A sampling pass at plan time is a
+  named future extension, not a phase-1 behavior — it buys ordering
+  quality at the cost of GPU time and plan-time complexity, and the
+  interface already gives the user the cheaper path.
+- **No runtime re-ordering.** The run report prints provided vs
+  observed selectivity per stage, so a wrong estimate is visible;
+  reacting to it mid-query is future work.
+
+What the planner actually decides:
+
+1. **Order** (only under `by_cost`): filters ordered by cost per
+   killed document — (question tokens) / (1 − selectivity) — pure
+   arithmetic on provided numbers. Join stage order over the join
+   graph: enumerate (2–4 relations, trivial), price stages with the
+   pair-count formulas from `join_plan.md`, survivor-thinned by the
+   provided selectivities.
+2. **Anchor per join stage**: the longer side anchors (anchor
+   tokens are paid once per document, partner tokens once per
+   pair); enumeration confirms it since it costs nothing;
+   `{'anchor': ...}` overrides it.
+3. **Admission (cohort size)**: how many documents' KV may be
+   resident at once — the KV budget divided by mean document
+   tokens, from the spec-derived pool arithmetic (§8). Token-based,
+   never a document count, for the measured reason (a count cannot
+   see length; the 4,096-seq default thrashed at 2.40x reads).
+4. **Chunk budget**: `min(memory bound, kernel index cap)`, both
+   derived from the specs (§8), never typed in.
+5. **Access per scan**: read (compute KV fresh), restore (the
+   pinned store is warm for this content hash and its bandwidth
+   beats kappa x prefill rate — the measured 7.2 GB/s break-even
+   at 4B, and pinned host memory measured 55 GB/s), or spill (the
+   working set exceeds the pool and the store absorbs overflow).
+6. **Sharding**: filters split documents by token count across
+   workers (`_balanced_shards`); joins split by anchor document —
+   every pair belongs to exactly one anchor, so workers never
+   communicate; the coordinator merges answer matrices.
+
+Infeasible configurations — weights don't fit the cards, pool
+cannot hold one working set, a suffix exceeds the chunk budget —
+return the existing `Refusal` with the violated constraint named.
+
+The output `PhysicalPlan` is a JSON tree; each node carries its
+settings and its predicted tokens and wall. `explain()` prints it;
+the result stores prediction next to measurement, so every run
+doubles as a cost-model check.
+
+---
+
+## 5. Physical operators
 
 | operator | runs on | what it does |
 |---|---|---|
-| `DocScan` | worker CPU + store | resolve the document set to token arrays (cached tokenization); execute the planned access: read (compute KV fresh), restore (batched loads from the pinned store via the offloading connector), spill (store absorbs pool overflow) |
-| `FilterChain` | vLLM engine + QuailScheduler | one living request per document; token-budget admission; rewind to the document boundary between stages; gated stage advance inside the scheduler |
-| `JoinStage` | packed executor | brim-packed chunks over the stage's pair list; anchor prefix computed once ever (kept KV on cut); shared-prefix attention merged by softmax state; YES/NO logits read at suffix ends; exists semantics stop a partner stream at the first YES |
-| `Gate` / `Dedup` / `Assemble` | coordinator CPU | between join stages: survivors, distinct anchors, tuple reassembly from recorded answers |
-| `Sink` | coordinator CPU | applies the `Project` (column selection, the only relational step in the system); ids/tuples out, plus the run report (predicted vs measured, token and byte counters) |
+| `DocScan` | worker CPU + store | resolve (provider, column) to token arrays (cached tokenization); execute the planned access: read, restore (batched pinned-memory loads), spill |
+| `FilterChain` | the executor | gated stages over admitted cohorts: documents are anchors, each stage's question tail is a one-suffix stream, survivors advance (§6) |
+| `JoinStage` | the executor | brim-packed chunks over the stage's pair list; exists/anti streams stop early |
+| `Gate` / `Dedup` / `Assemble` | coordinator CPU | between stages: survivors, distinct anchors, tuple reassembly from recorded answers (`joinlogic.py`, moved over as is) |
+| `Sink` | coordinator CPU | applies the `Project`; returns ids/tuples plus the run report |
 
-`DocScan` is explicit in the plan tree — it is where tokenization,
-corpus statistics, and the store decision live, and it is the unit
-the end-to-end workload reuses across queries.
+`DocScan` is an explicit plan node because it is where
+tokenization, corpus statistics, and the store decision live — and
+it is the unit the benchmark's warm suite reuses across queries.
 
-### 5.2 One worker, two executors
+---
 
-Each worker container hosts both executors, serialized (never
-concurrent):
+## 6. One executor
 
-- the vLLM 0.26 engine booted with `QuailScheduler`, fp8 KV, the
-  planned `max_num_seqs` / `max_num_batched_tokens`, prefix caching
-  on — exactly the `modal_filters.py` boot;
-- the packed executor with its own weight copy through vLLM's
-  loader (as `modal_join_forward.py` does), bf16 KV for kept
-  anchors.
+The exploration ran filters on a modified vLLM engine and joins on
+a packed forward loop. The engine is gone from this design. One
+substrate — the packed executor — runs both operators, because a
+filter chain is the degenerate join:
 
-Two weight copies cost ~8 GB of the 80 GB card. That is the price
-of not sharing mutable GPU state between an engine that owns its
-memory pool and a loop that owns plain tensors. The engine boots
-with `gpu_memory_utilization` lowered to leave the packed
-executor's ceiling (activations at the chunk cap ~9 GB, kept
-anchor KV bounded by the ring buffer): 0.92 today becomes ~0.75,
-shrinking the filter pool from ~947k to ~770k tokens — the corpus
-goes from 3.4x to 4.2x pool, which the admission budget already
-handles by design. If a measured filter regression says the shared
-boot is too expensive, the fallback is per-query executor boot,
-priced as boot time in the plan.
+- **Join stage**: anchor = one side's document; suffixes = partner
+  document + question tail, one per pair.
+- **Filter stage**: anchor = the document; suffix = the question
+  tail, exactly one per stage. Stage j+1 attaches a fresh suffix to
+  the same kept anchor KV.
 
-### 5.3 The KV store
+This is not a workaround; it is the same computation KV rewind
+performed, minus the machinery. Rewind existed because an engine
+sequence accumulates question KV that must be erased back to the
+document boundary. The packed loop never writes suffix KV, so
+there is nothing to erase — keeping the immutable document KV and
+attaching the next question computes bit-for-bit what rewind
+computed (`join_plan.md` §4; the parity gates in
+`join_probe.json`). The measured support for moving filters onto
+this substrate: the packed loop ran a single filter at 121k tok/s
+against the engine's 96.9k.
 
-One pinned-host-memory store per worker, capacity =
-`cpu_memory_gb` minus headroom, keyed by
-(model hash, document set hash, document id).
+What this deletes from the system:
 
-- **Writers/readers, phase 1: the engine path only.** Filter
-  queries write document KV at first scan through the
-  `QuailOffloadingConnector` and restore it in planned waves on
-  later queries — the measured 1.9–2.1x restore path, unchanged.
-- **Phase 2: join anchor restore.** The packed executor reads
-  anchor prefix KV directly from the pinned store (no paged pool
-  in the way, so this is a plain batched H2D copy at the measured
-  55 GB/s, far above the 7.2 GB/s break-even). Phase 2 because it
-  needs a dtype decision — the store holds fp8 (engine format);
-  the packed path prefers bf16 for kept anchors — and the honest
-  resolution is a measured parity cell, not a design assertion.
-- Eviction is the length threshold, not LRU, for the reason in
-  `planner.py`: a scanning query thrashes LRU and cannot thrash a
-  length cutoff.
+- the second weight copy and the shared-boot memory split;
+- the "one worker, two executors" arrangement and its serialization;
+- the `QuailScheduler` fork and with it every private-API reach
+  into vLLM — the `vllm==0.26.0` pin dies here;
+- the keep-vs-recompute size rule (the "f/S below ~8%" threshold).
+  That rule chose between recomputing an anchor's prefix per chunk
+  and keeping its KV. The rewritten executor already removed the
+  recompute path — an anchor's prefix is computed exactly once,
+  ever, kept in plain per-anchor tensors, and freed at its last
+  use. With one executor and always-keep, the threshold has
+  nothing left to decide.
 
-The store is what makes the 15-query suite an end-to-end story:
-query 1 pays the write, queries 2..15 restore whatever documents
-they share with earlier queries.
+What replaces the engine's memory management — deliberately less
+than a paged pool:
 
-### 5.4 Modal wiring
+- **Cohort admission.** Documents are admitted in cohorts whose
+  total KV fits the budget (pool tokens from the spec arithmetic,
+  §8). A cohort runs all its stages — stage 0 suffixes for every
+  member, then stage 1 for survivors, and so on — then frees its
+  KV and the next cohort starts. Within a cohort the chunks are
+  dense, and chunk construction overlaps the previous chunk's
+  forward pass (the existing loop), so the GPU stays fed without
+  cross-stage pipelining: pipelining was the engine's answer to
+  keeping mixed-stage steps full, and dense packed chunks make the
+  question moot. At 4B with bf16 KV, a cohort is ~400k tokens —
+  about 1,000 mean-length documents; a 50k-document scan is ~50
+  cohorts.
+- **Plain per-anchor KV tensors** in a preallocated ring buffer;
+  no block tables, no eviction (admission guarantees fit), freed
+  at the anchor's last scheduled use. KV dtype bf16 by default —
+  the filter ladder measured bf16 fixing 765 of 2,990 wrong
+  answers against fp8 — with fp8 as a config option that doubles
+  cohort size.
 
-- One `modal.App`; the existing image (CUDA 13.0.1, pinned
-  `vllm==0.26.0`, weights in the `quail-hf-cache` volume).
+The engine chain path is not deleted from the world: it exists in
+this exploration repo, measured, as the documented fallback if a
+packed-path parity gate ever fails on a new shape. It just is not
+part of the new system.
+
+Risk, stated: a full gated multi-stage filter chain on the packed
+executor is unmeasured (single filter and gated join stages are).
+Milestone 1 in §10 runs exactly the committed 10k-document
+five-filter workload on the new executor; prediction from the
+measured constants: ~32 s against the engine's 39.8 s, tolerance
+the cost model's demonstrated ±10%. A miss past the band reopens
+this section.
+
+---
+
+## 7. The Modal runtime
+
+- One `modal.App`; image with CUDA, torch, FlashInfer/FlashAttention
+  and vLLM as a kernel-and-loader library; weights in a volume.
 - Workers are a `modal.Cls` with `gpu="H100!"`,
-  `memory=cpu_memory_gb x 1024`, kept warm for the session's
-  lifetime (`min_containers=gpus` while a session is open); a
-  session maps to a set of warm containers, which is what lets the
-  store persist across the suite's queries.
-- The coordinator is the user's local process (or any CPU box):
-  compile and plan are pure Python; per-worker physical plans ship
-  as JSON; answers come back as compact answer matrices.
+  `memory=cpu_memory_gb x 1024`, kept warm while a session is open.
+  The coordinator is the user's local process; per-worker plans
+  ship as JSON, answers return as compact matrices.
+- **GPU memory snapshots** (Modal's cuda-checkpoint based
+  snapshot/restore) are a first-class part of the design, not an
+  optimization bolted on later:
+  - The worker image is snapshotted once per model after weight
+    load, allocator warmup, and kernel compilation. Session start
+    restores the snapshot in seconds instead of a minute-scale
+    boot; `gpus=N` restores N copies of the same snapshot, so
+    scale-out costs no per-worker boot.
+  - The single-executor design is what makes the snapshot surface
+    small and safe: no engine state, no scheduler queues, no paged
+    pool — just weights, the empty ring buffer, and compiled
+    kernels. Snapshots are taken only in this quiescent state,
+    never mid-query.
+  - The benchmark's cold protocol (§9.4) restores the snapshot
+    before every query, making "cold" mean something exact and
+    cheap to measure.
 - Every worker run is teed to a file in the results volume, per
-  house rule; the coordinator collects the logs next to the run
-  report.
+  house rule; the coordinator collects logs next to the run report.
+
+The pinned CPU KV store rides in the worker: capacity =
+`cpu_memory_gb` minus headroom, keyed by (model, content hash,
+document id), holding document-prefix KV only (suffix KV never
+exists anywhere). The executor reads it with plain batched H2D
+copies — no connector indirection, which is where stock vLLM lost
+five sixths of the link (10.2 of 55.4 GB/s). Store dtype matches
+the executor's KV dtype, so the phase-2 dtype question from the
+earlier draft disappears with the second executor. Eviction is the
+length threshold, not LRU (a scanning query thrashes LRU; it
+cannot thrash a length cutoff).
 
 ---
 
-## 6. One query, end to end
+## 8. Supporting other models: specs in, budgets out
 
-The Q6-shaped query from §2.3: filter reviews, join survivors to
-products.
+Every planner input derives from two structs. One file per model
+under `quail/specs/`; adding a model is adding a file.
 
-1. `sess.sql(...)` parses and binds: one `SemanticFilter` on
-   `reviews`, one `SemanticJoin(reviews, products, full)`.
-2. Planning samples the filter's selectivity (~2k reviews labeled
-   by the model, seconds of GPU) because the join's pair count
-   depends on it; measures nothing for the join predicate.
-3. The optimizer prices both placements. Pushdown: 1,000 reviews x
-   ~50 question tokens plus the killed documents' pair savings.
-   Pull-up: 1,000 x 100 pairs x ~160 suffix tokens, filtered
-   after. Pushdown wins by ~20x here; the plan records both prices.
-4. Anchor choice: reviews (mean 320 tokens) anchor, products
-   (~160-token suffix) stream — enumerated, not assumed.
-5. `explain()` prints the tree with per-operator predicted tokens
-   and wall; `run()` ships the plan.
-6. The worker runs `DocScan(reviews)` (restore if warm),
-   `FilterChain` on the engine, then hands survivor ids back; the
-   coordinator builds the pair list; the worker runs one
-   `JoinStage` on the packed executor; `Sink` returns pairs with
-   predicted-vs-measured attached.
+```python
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str            # "qwen3-4b-fp8"
+    params: float        # P, dense parameter count
+    layers: int          # L
+    hidden: int          # h
+    n_q: int             # query heads
+    n_kv: int            # KV heads
+    d_head: int          # head dim
+    ffn_width: int       # widest projection's output columns
+                         # (gate_up: 2 x intermediate at Qwen3)
+    w_bytes: float       # weight bytes/param (fp8 = 1)
+    kv_bytes: float      # KV bytes/element (bf16 = 2 default)
+    # derived properties, never typed in:
+    # kappa   = 2 * layers * n_kv * d_head * kv_bytes   (KV bytes/token)
+    # W_mem   = params * w_bytes
+    # act_per_token ≈ ACT_BYTES_PER_HIDDEN * hidden
+
+@dataclass(frozen=True)
+class DeviceSpec:
+    name: str            # "h100-sxm"
+    mem_bytes: float     # M
+    hbm_bw: float        # BW
+    peak_flops: float    # R_D at the executor's compute dtype
+```
+
+What the planner computes from the structs alone:
+
+| quantity | formula | at 4B/H100 |
+|---|---|---|
+| tensor parallel | smallest tp with W_mem < M x pool fraction | 1 |
+| KV pool tokens | (M x fraction − W_mem − act reservation) / kappa | ~400k at bf16 |
+| chunk memory bound | free memory / act_per_token | ~420k |
+| kernel index cap | (2^31 − 1) // ffn_width | 110,375 |
+| chunk budget | min(memory bound, index cap), floored at the knee | 110,375 |
+| compute knee | per-chunk fixed cost / per-token cost; roofline ridge R_D/BW says the same (~400 tokens) | ~300–400 |
+| attention crossover | document length where pair work overtakes the dense projections | ~12,300 |
+| store break-even | kappa x serving rate | 7.2 GB/s |
+| serving rate | 2P/R_D x 1/efficiency | 96–121k tok/s |
+
+The serving rate is the one row that is not pure spec: it needs an
+efficiency factor (measured 0.35 on 4B/H100 — 91–93% of peak inside
+the GEMMs, the rest lost to the memory-bound work between them).
+Default for an uncalibrated model: carry the efficiency over via
+spec-ratio scaling (the existing `_scale`), and say so in
+`explain()`. An optional calibration overlay per (model, device) —
+the batch sweep plus the parity probe, ~10 GPU-minutes — replaces
+the assumption with a measurement. Plans never require calibration;
+they only get sharper predictions from it.
+
+On "make B* as big as possible because everything is prefill
+dominated": right in substance, with two caps and one caveat. Right
+because answers are constrained to one token — zero decode by
+design — and because the measured rate is flat in chunk size past
+the knee, so a big chunk budget costs nothing and buys per-chunk
+fixed-cost amortization. The caps: activation memory, and the
+32-bit kernel indexing bound — which binds far earlier (110,375 vs
+~420k at 4B) and is model-dependent through `ffn_width`, which is
+why it lives in the spec and is never hardcoded (the join2way crash
+is the tuition already paid). The caveat: "prefill dominated"
+means the dense projections dominate, which holds while documents
+sit far below the attention crossover; the benchmark's document-
+length scale factor (§9) deliberately pushes toward that regime,
+and the quadratic term in the cost model is what prices it.
 
 ---
 
-## 7. The benchmark: QUAIL-B
+## 9. The benchmark: QUAIL-B
 
-Fifteen queries over five document sets, shaped like TPC-H in the
-only sense that transfers: a big fact-like set most queries touch,
-smaller dimension-like sets, and a fixed query list that mixes
-selective scans, joins of different shapes, and semi-joins, run
-both per-query and as a suite. Only filters and joins, per scope.
+### 9.1 Scale factors
 
-### 7.1 Document sets (scale factor 1)
+Two knobs, both explicit in every reported result:
 
-| set | source | docs | mean tokens | total tokens | role |
+- **SF** scales document counts (linearly, per the table below).
+- **LF** scales mean document length: documents are built by
+  concatenating source texts to the target length, so LF=4 means
+  4x the tokens per document with real text throughout.
+
+Filter cost scales as SF x LF. Join cost scales as SF x LF_partner
+per fixed partner list, and as SF^2 where both sides scale — true
+pairwise joins are quadratic, and the benchmark does not hide it:
+each join query's table row states its pair-count formula. The
+reference grid: (SF, LF) in {(0.1, 1), (1, 1), (1, 4)}; SF=0.1 is
+the development scale, (1, 4) pushes long documents toward the
+attention crossover on purpose.
+
+### 9.2 Document sets (at SF=1, LF=1)
+
+| set | source text | docs | mean tokens | total | role |
 |---|---|---|---|---|---|
-| `reviews` | IMDB (the existing corpus, same seed) | 10,000 | 320 | 3.20M | the fact set; filter chains run here |
-| `rsample` | seeded 1,000-review subset of `reviews` | 1,000 | 320 | 0.32M | join-sized review side |
-| `reports` | BioDEX patient reports (existing sample protocol) | 100 | ~2,977 | 0.30M | long documents; anchor and keep-KV stress |
-| `terms` | BioDEX reaction terms | 2,560 | ~32 | 0.08M | short partner stream |
-| `products` | ABT-BUY product descriptions | 100 | ~120 | 0.01M | mid-length dimension set |
+| `reviews` | IMDB | 50,000 | 400 | 20.0M | the fact set (lineitem) |
+| `threads` | stacked IMDB (multi-review threads) | 10,000 | 1,200 | 12.0M | mid-size, mid-length (orders) |
+| `reports` | BioDEX patient reports | 2,000 | 3,000 | 6.0M | long documents (the wide table) |
+| `products` | ABT-BUY descriptions | 1,000 | 150 | 0.15M | small dimension (part) |
+| `terms` | BioDEX reaction terms | 2,560 fixed | 32 | 0.08M | tiny fixed dimension (nation/region — does not scale, like TPC-H's fixed tables) |
 
-A scale factor multiplies document counts; SF=1 is sized so the
-whole suite fits one Modal session comfortably (see 7.4).
+~38M corpus tokens at (1, 1); ~150M at (1, 4).
 
-### 7.2 Predicates the instrument can read
+### 9.3 Predicates and provided selectivities
 
-The join findings showed the 4B checkpoint answers YES to almost
-everything when a predicate requires comparing two planted keys
-across a long context (9,763 of 10,000 stage-1 answers wrong), while
-single-flag lookup in the filter workload worked. So every
-benchmark predicate with a designed selectivity is a single lookup:
+Same instrument discipline as the exploration. Every predicate with
+a designed selectivity is a single lookup, because the join
+findings showed the 4B checkpoint cannot compare two planted keys
+across a long context but reads a single planted line reliably:
 
-- **Filters**: the existing planted `[FLAGS]` line; filter j asks
-  what flag j says. Selectivity = the planted rate.
-- **Joins**: the anchor document carries a planted `[KEYS] X=<k>`
-  line; the partner's key is printed in the question tail
-  ("Does the KEYS line above contain X=k7?"), so the model
-  compares a value in context against a value in the question —
-  the same single-lookup difficulty as the filters. Pair
-  selectivity = the key collision rate, set per query.
+- **Filters**: the planted `[FLAGS]` line; filter j asks what flag
+  j says. Selectivity = the planted rate.
+- **Joins**: the anchor carries `[KEYS] X=<k>`; the partner's key
+  is printed in the question tail, so the model checks one value in
+  context against one value in the question. Pair selectivity = the
+  key collision rate.
 
-Ground truth is known by construction; each run reports answer
-accuracy as an instrument check, and the replay check (recorded
-answers through the nested-loop reference) gates every join query.
-Timing claims never depend on the model answering correctly;
-gating claims depend only on it answering consistently with the
-planted rates, which this predicate design is built to give.
+Because rates are planted, the benchmark supplies exact
+selectivities through the interface — which is the interface
+contract (§2.5) exercised as designed, and it makes provided-vs-
+observed selectivity a per-query instrument check. Ground truth is
+known by construction; the replay check gates every join query.
+Timing claims never depend on the model answering correctly.
 
-### 7.3 The queries
+### 9.4 The queries
 
-F = filter stage, J = join stage. Selectivities are the planted
-rates. Predicted walls are cost-model arithmetic at the packed
-82k tok/s and engine 96k tok/s rates, stated now per house rule
-and re-derived by `explain()` when the planner lands; treat them
-as targets with the model's demonstrated ±10% band.
+Building the query set: take each TPC-H query, strip everything
+Quail refuses (aggregation, grouping, ordering, arithmetic, outer
+joins), and keep the filter/join skeleton. The 22 queries collapse
+into eight skeleton families — filter-only scans (Q1, Q6), plain
+2-way joins (Q12, Q14, Q17, Q19), filtered 2-way joins (Q3's core,
+Q16), 3-way-and-deeper chains (Q3, Q10, Q18), stars (Q2, Q5, Q8,
+Q9, Q11), exists (Q4, Q20), anti (Q16, Q22), exists+anti combined
+(Q21) — plus Q13, which is an outer join and has no analogue here.
+Fifteen queries cover all eight families with variants that isolate
+one engine mechanism each. F = filter stage, J = join stage.
 
-| id | shape | sets | selectivity design | what it isolates | TPC-H analogue | predicted wall |
+| id | TPC-H skeleton | shape | sets | pair/doc volume at SF=1 | what it isolates | predicted wall (SF=1, LF=1) |
 |---|---|---|---|---|---|---|
-| Q1 | 1F | reviews | 0.5 | the degenerate chain; per-query floor (c0, boot amortization) | Q6 selective scan | ~35 s |
-| Q2 | 5F | reviews | 0.9/0.9/0.9/0.8/0.8 | the headline rewind workload, unchanged as the regression anchor | Q1 heavy scan | ~40 s |
-| Q3 | 5F | reviews | 0.9/0.9/0.2/0.9/0.9 with the 0.2 written LAST in SQL | filter reordering: planner must move the selective filter early | Q1 + optimizer twist | ~34 s |
-| Q4 | 2F | reports | 0.8/0.5 | long documents: quadratic surcharge, admission with fat docs | Q1 on wide rows | ~10 s |
-| Q5 | 1J | reports x terms | pair 0.08 | the measured BioDEX join shape; packed executor anchor orientation | Q12 two-table join | ~104 s |
-| Q6 | 1F + 1J | rsample x products | F 0.25, pair 0.05 | filter pushdown below a join (paper's placement result, priced not asserted) | Q3 filtered join | ~55 s |
-| Q7 | 1J | rsample(400) x products | pair 0.05, predicate reads both texts | pure pair predicate: nothing can push; upper bound on pair cost | Q19 predicate join | ~195 s |
-| Q8 | 1J exists | rsample x products | match 0.05 | exists semantics: early-stop streams; expected-scan pricing | Q4 / Q21 semi-join | ~45 s |
-| Q9 | 2J chain | rsample(100) x reports(100 planted keys) x terms(100) | stage sels 0.2 / 0.1 | 3-way gating and dedup; stage-2 pair count must equal survivors x partners exactly | Q3 three-table | ~96 s |
-| Q10 | 2J chain | rsample(200) x reports x terms | stage sels 0.3 / 0.1 | middle anchor is long (reports): the keep-KV branch of the size rule across stages | Q9 deep join | ~120 s |
-| Q11 | 2F + 1J | rsample, products | F 0.3 and 0.5, pair 0.05 | pushdown on BOTH sides; pair list shrinks multiplicatively | Q16 two-sided filters | ~35 s |
-| Q12 | 5F | reviews (new flags) | 0.9…0.8 | warm-store restore for a filter query: R1 of the persist result inside the engine proper | repeated Q1 | ~22 s warm |
-| Q13 | 1J | reports x products (new keys) | pair 0.1 | warm anchor restore (phase 2): prefix share 16%, so restore is visible in the wall | repeated Q12-analogue | ~23 s cold, ~19 s warm |
-| Q14 | 2J star | reports x terms, reports x products | pair 0.08 / 0.1 | star shape: one anchor set feeds two predicates; anchor KV computed once, read twice | Q9 star | ~130 s |
-| Q15 | 2F + 1J + 1J exists | rsample, reports, terms | F 0.3/0.5, pairs 0.1, exists 0.05 | everything at once: placement + ordering + gating + exists; the optimizer's full search space | Q21 kitchen sink | ~90 s |
+| B1 | Q6 | 1F | reviews | 50k docs | the degenerate chain; per-query floor and snapshot-restore overhead | ~3.8 min |
+| B2 | Q1 | 5F | reviews | 50k docs, sels .9/.9/.9/.8/.8 | the filter-chain regression anchor (the committed 10k result is this at SF=0.2) | ~4.4 min |
+| B3 | Q1 + ordering | 5F | reviews | sels .9/.9/.2/.9/.9, selective one written third | run twice: `as_written` vs `by_cost` — the ordering interface measured, not asserted | ~4.2 / ~3.7 min |
+| B4 | Q1 on wide rows | 2F | reports | 2k long docs | quadratic surcharge; long-doc admission | ~1.3 min |
+| B5 | Q14 | 1J full | reports x terms | 5.12M pairs | the plain 2-way join; anchor orientation (the BioDEX shape, scaled 20x) | ~55 min |
+| B6 | Q3 core | 1F + 1J | threads x products | F .05 -> 500 x 1,000 = 0.5M pairs | pushdown: the filter deletes 95% of the pair list | ~19 min |
+| B7 | Q19 | 1J full | reviews(5k slice) x products | 5M pairs | pure pair predicate, no gating anywhere (Q19's OR lives inside the one prompt) | ~29 min |
+| B8 | Q4 | 1J exists | threads x products | 10k anchors, early-stop streams | exists semantics; expected-scan pricing vs measured | ~7 min |
+| B9 | Q21 | 1J exists + 1J anti | threads x products, threads x terms | two early-stop passes | anti semantics; the combined semi/anti family | ~11 min |
+| B10 | Q3 | 2J chain | reviews(2k) x threads(2k) x products | stage sels .2/.1; stage-2 pairs must equal survivors x partners exactly | 3-way gating and dedup at scale | ~16 min |
+| B11 | Q9 | 2J star | reports x terms, reports x products | anchor KV computed once, read by both stages | star shape; kept-anchor reuse across stages | ~60 min |
+| B12 | Q16 | 2F + 1J | threads, products | both sides filtered (.3, .5) before joining | two-sided pushdown; multiplicative pair shrink | ~9 min |
+| B13 | Q1 rerun | 5F | reviews, new flags | 50k docs, warm store | cross-query restore for a scan (the persist result inside the engine) | ~2.5 min warm |
+| B14 | Q14 rerun | 1J | reports x products, new keys | 2M pairs, warm anchors | cross-query restore for join anchors (prefix share ~19%) | ~13 min cold / ~11 warm |
+| B15 | Q21 extended | 2F + 2J (one exists) | threads, reports, terms | the full planner path in one query | everything at once | ~25 min |
 
-Suite total, predicted: ~17 GPU-minutes warm, plus one engine boot.
-Q2 and Q5 reproduce committed results inside the new engine — if
-either moves more than the known band, the engine added overhead
-the exploration didn't have, and that is a finding.
+Suite totals, predicted (cost-model arithmetic at the measured
+rates, stated now per house rule; the planner re-derives them in
+`explain()` when it lands): ~4.5 h at (1, 1); ~30 min at (0.1, 1) —
+the development scale, where B2 reproduces the committed filter
+result and B5 reproduces the committed join result as regression
+gates.
 
-### 7.4 Protocol and metrics
+### 9.5 Protocol and metrics
 
-Two suite runs, same session, same container, fixed query order
-Q1→Q15 (the order above deliberately re-touches `reviews`,
-`reports`, and `products` so later queries can restore):
+Two suite runs, fixed order B1→B15 (the order re-touches `reviews`,
+`reports`, `products` so later queries can restore):
 
-- **cold**: store disabled (`cpu_memory_gb` headroom only), engine
-  prefix cache reset between queries. Measures each query alone.
-- **warm**: store enabled, no resets. Measures the suite as a
-  workload: per-query walls again, plus the end-to-end wall.
+- **cold**: snapshot restore before every query, store disabled.
+  Each query measured alone, from an exact, cheap-to-reproduce
+  state (§7).
+- **warm**: one session, store enabled, no restores between
+  queries. Per-query walls again, plus the end-to-end wall — the
+  number that shows what cross-query KV reuse is worth.
 
-Reported per query: predicted wall, measured wall, fresh tokens,
-cached-read tokens, KV bytes restored, pairs per stage, answer
-accuracy vs planted truth, replay-check verdict. Reported per
-suite: end-to-end wall (cold and warm), warm/cold ratio per query
-and total, store hit tokens.
+Per query: predicted vs measured wall, fresh tokens, KV bytes
+restored, pairs per stage, provided vs observed selectivity, answer
+accuracy vs planted truth, replay verdict. Per suite: end-to-end
+wall cold and warm, warm/cold per query and total, store hit
+tokens.
 
-Baseline, per house rule (a baseline gets the analytically
+Baseline, per house rule (the baseline gets the analytically
 equivalent configuration, and the submission strategy is named):
-stock vLLM 0.26 in the same container, prefix caching on, no
-store. Filters run as separate requests per stage under the same
-token-budget admission (the committed `run_stock` protocol). Joins
-run as grouped requests per pair, one request per pair in anchor
-order, admission matched from the same pool arithmetic (the
-committed grouped-stock protocol). Stock runs both cold and warm
-suites; its warm benefit is whatever vLLM's own prefix cache holds
-across queries, which is the honest comparison for the store.
-
-Predictions to state before the first full run, from the measured
-constants: cold suite ~19 min Quail vs ~45–60 min stock (the join
-queries dominate the gap at the measured 4.1x; filter queries at
-1.08x); warm suite ~15 min Quail, stock nearly unchanged from cold
-(its pool cannot hold 3.5M tokens of corpus KV across queries, so
-its prefix cache re-serves little).
+stock vLLM, same container class, prefix caching on, no store.
+Filters submit separate requests per stage under the same
+token-budget admission; joins submit grouped requests per pair in
+anchor order with admission matched from the same pool arithmetic.
+Both baseline protocols are the committed ones from this repo.
+Predictions to beat, stated now: at (1, 1) the join queries carry
+the gap (measured 4.1x on the B5 shape), the filter queries are
+modest (measured 1.08x for chain semantics, plus whatever the
+packed substrate's 121k-vs-97k rate adds); warm-suite gains accrue
+almost entirely to Quail, because stock's pool cannot hold 38M
+corpus tokens across queries and its per-document connector reads
+run at a fifth of the link.
 
 ---
 
-## 8. What gets built, in order
+## 10. The new repo
 
-Each step lands with CPU tests; GPU cells only confirm.
+```
+quail/                        (new repository)
+  quail/
+    specs/                    # ModelSpec per file + DeviceSpec; qwen3_4b.py first
+    catalog.py                # DocumentProvider, Session catalog
+    sqlfront/                 # sqlglot subset validator + binder
+    logical.py                # the four logical operators
+    planner/
+      plan.py                 # PhysicalPlan, Refusal
+      budgets.py              # spec-derived pool/cohort/chunk arithmetic
+      cost.py                 # the estimator; calibration overlay loading
+    executor/
+      pack.py                 # brim packing, cohorts   (from joinlogic.py)
+      attention.py            # varlen self + ragged cross + LSE merge
+      loop.py                 # the overlapped chunk loop (from run_join)
+      kvstore.py              # pinned host store, batched H2D
+    runtime/
+      session.py              # Session, EngineConfig, explain/run
+      coordinator.py          # gate/dedup/assemble, projection, reports
+      modal_app.py            # worker Cls, snapshots, volumes
+    bench/
+      quailb.py               # sets, planted predicates, B1-B15, both suites
+  baselines/                  # stock vLLM runners (dev dependency only)
+  tests/                      # CPU tests; GPU cells are confirmation only
+```
 
-1. **`quail/logical.py` + `quail/sqlfront.py`** — logical operators,
-   the sqlglot subset parser, the builder API, binding against a
-   catalog. Pure Python. (New code; nothing carries over.)
-2. **`quail/plan/optimizer.py`** — the enumerating optimizer over
-   logical plans, wrapping the existing `plan_query` budget
-   derivations and the `join_plan.md` stage pricing into one
-   `PhysicalPlan`. (Mostly rearrangement: `cost.py` and
-   `planner.py` carry over intact; the join pricing moves from
-   `plans/join_estimates.py` prose into code.)
-3. **`quail/runtime/worker.py` + Modal app** — the worker class
-   hosting both executors behind one RPC surface; `Session` and
-   the coordinator. (The executors exist: `engine_client.py`,
-   `QuailScheduler`, the `run_join` loop from
-   `modal_join_forward.py` promoted out of experiment code. The
-   shared-boot memory split is the one new GPU-facing decision.)
-4. **`quail/bench/quailb.py`** — document set builders (planted
-   flags and keys per 7.2), the 15 queries as code, the two-suite
-   runner, the report. (The corpus builders and planted-flag
-   machinery carry over from `experiments/workload.py`.)
-5. **Phase 2, after the suite runs end to end**: packed-path anchor
-   restore from the store (the dtype parity cell first), and the
-   stock host-ingestion term the join findings showed missing from
-   `cost.py`.
+Build order, each step landing with CPU tests:
+
+1. **specs + budgets** — the structs and every derived quantity in
+   the §8 table, tested against the numbers this repo measured.
+2. **executor** — port `pack_stream`, the attention merge, and the
+   overlapped loop out of `modal_join_forward.py`; add cohort
+   admission and the filter-as-degenerate-join stage form.
+   **Gate: milestone 1** — the committed 10k-doc five-filter
+   workload and the committed 256k-pair join, reproduced on the new
+   executor within the cost model's band. This gate is what retires
+   the engine fork.
+3. **sqlfront + logical + planner** — the parse/bind/validate
+   pipeline, ordering policy, pushdown, refusals.
+4. **runtime** — Session, coordinator, Modal app, snapshot
+   lifecycle, the KV store.
+5. **bench** — QUAIL-B; first full grid run publishes the
+   prediction-vs-measurement table.
+
+Deferred, named: selectivity estimation by sampling (the interface
+already reserves the option object key); runtime re-ordering;
+larger models beyond spec-scaled predictions until their ~10-minute
+calibration is run; multi-GPU tensor parallel (the spec arithmetic
+already computes tp, but nothing above 1 is exercised until a model
+needs it).
 
 Risks, named:
 
-- **The shared boot.** Engine pool shrinks to make room for the
-  packed executor. The admission budget is designed for corpora
-  bigger than the pool, so the prediction is a small filter
-  slowdown at most; Q2's regression gate catches it if the
-  prediction is wrong.
-- **Serialized executors idle the GPU between operators.** Within
-  one query the handoff is one pair-list construction (CPU,
-  milliseconds at these sizes). Across the suite it is real only
-  if boot-per-executor were chosen; the shared boot avoids that.
-- **Sampling cost is on the critical path** for gated plans. ~2k
-  labels at ~350 tokens each is ~7 s of GPU per sampled predicate;
-  the planner charges it in the predicted wall rather than hiding
-  it.
-- **The optimizer trusts sampled selectivities.** A wrong sample
-  mis-orders filters or mis-orders join stages; the run report
-  prints planned vs observed selectivity per stage so the miss is
-  visible. Runtime re-ordering (the paper's adaptive path) is out
-  of scope until a measured miss shows it is needed.
-- **The 27% flag-misread rate** of this checkpoint bounds how
-  precisely planted selectivities control gating. Same instrument
-  caveat as every result in this repo; comparisons hold, accuracy
-  claims stay off the table.
+- **The unified executor's filter path is unmeasured** end to end;
+  milestone 1 exists to measure it before anything is built on top.
+- **Cohort admission changes the filter execution order** from the
+  engine's mixed-stage steps to per-cohort stage waves. Predicted
+  neutral (chunks are dense either way; total tokens identical);
+  the milestone-1 gate would catch a real regression.
+- **GPU snapshots are young.** If restore proves flaky, the
+  fallback is the boring one — cold boots and warm containers —
+  and only the cold-protocol convenience is lost.
+- **Provided selectivities can be wrong.** By design the planner
+  believes them; the report prints provided vs observed so misses
+  are visible, and `as_written` is always available.
+- **The 27% flag-misread rate** of the 4B checkpoint bounds how
+  precisely planted rates control gating; comparisons hold,
+  accuracy claims stay off the table.
