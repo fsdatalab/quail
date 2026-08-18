@@ -57,18 +57,34 @@ on Modal GPUs.
             |
             v
     +------------------+
-    |  coordinator     |  local process: ships per-worker plans,
-    |                  |  collects answer matrices, runs gate/dedup/
-    |                  |  assemble, applies the projection
+    |  coordinator     |  local process, deliberately thin:
+    |                  |  compile, plan, ship one shard plan per
+    |                  |  GPU, re-shard between join stages only
+    |                  |  when the anchor relation changes, merge
+    |                  |  final answers, apply the projection
     +------------------+
             |
             v
     +------------------+
-    |  Modal workers   |  one container per GPU, restored from a
-    |  (N x H100)      |  GPU memory snapshot. ONE executor: the
-    |                  |  packed forward loop, for filters and
-    |                  |  joins alike. Pinned CPU KV store beside it.
+    |  Modal workers   |  containers of up to 8 H100s, restored
+    |                  |  from a GPU memory snapshot. ONE executor
+    |                  |  per GPU: the packed forward loop, for
+    |                  |  filters and joins alike. Gating, dedup,
+    |                  |  pair-list construction, and chunk packing
+    |                  |  run HERE, next to the GPU. One pinned CPU
+    |                  |  KV store per container, shared by its GPUs.
     +------------------+
+
+The coordinator/worker split is a latency rule, not a layering
+preference: anything consulted per chunk or per stage — gate the
+answers that just landed, dedup survivors, build the next pair
+list, pack the next chunk — runs on the worker, in the same
+process as the GPU loop, exactly where the exploration's `run_join`
+ran it. Put any of that a network hop away and the GPU idles at
+every stage boundary. The coordinator exists only for what one
+worker cannot see: splitting work across GPUs, re-sharding answers
+between join stages when the next stage anchors on a different
+relation, merging shard results, and the projection.
 
 There is exactly one execution substrate (§6). vLLM appears nowhere
 in the execution path: it remains a library for weight loading and
@@ -90,22 +106,28 @@ without a GPU.
 ```python
 @dataclass(frozen=True)
 class EngineConfig:
-    gpus: int = 1               # data-parallel H100 workers, one
-                                # container each. tensor_parallel
-                                # derives from the ModelSpec (1 for
-                                # 4B); gpus must be a multiple of it
-    cpu_memory_gb: int = 64     # per-worker host memory cap. The
-                                # pinned KV store gets this minus a
-                                # fixed working headroom; 0 disables
-                                # the store
+    gpus: int = 1               # total H100 count. Packed into as
+                                # few containers as possible, up to
+                                # 8 GPUs each (gpu="H100!:8"):
+                                # fewer containers means one
+                                # snapshot restore, one shared KV
+                                # store, and stage re-sharding that
+                                # stays on one host.
+                                # tensor_parallel derives from the
+                                # ModelSpec (1 at 4B)
+    cpu_memory_gb: int = 64     # per-container host memory cap.
+                                # The pinned KV store gets this
+                                # minus a fixed working headroom
+                                # and is shared by the container's
+                                # GPUs; 0 disables the store
     model: str = "qwen3-4b-fp8" # must name a registered ModelSpec
                                 # (§8); an unknown name is a Refusal
 ```
 
-The three knobs map one-to-one onto Modal resources: `gpus` is the
-worker container count (`gpu="H100!"` each), `cpu_memory_gb` is the
-container `memory=` request, `model` selects the weights volume and
-the spec struct.
+The three knobs map directly onto Modal resources: `gpus` becomes
+`ceil(gpus/8)` containers with `gpu="H100!:k"`, `cpu_memory_gb` is
+the container `memory=` request, `model` selects the weights volume
+and the spec struct.
 
 ### 2.2 DocumentProvider and the catalog
 
@@ -155,9 +177,41 @@ q = sess.sql("""
 
 The second argument to AI_FILTER is Snowflake's option object (the
 paper uses it for `{'model': ...}`); we use it for per-predicate
-options: `selectivity` (a rough number, used only for ordering —
-§4), and `anchor: 'left'|'right'` to override the join anchor
-choice.
+options. Options attach to one predicate, not to the query, so
+there are never lists to line up: each AI_FILTER call carries its
+own object. A filter predicate takes `selectivity` (one rough
+number — the fraction of documents that pass; used only for
+ordering, §2.5). A join predicate takes `selectivity` (the
+fraction of pairs that pass) and `anchor`, which names the table
+alias whose documents anchor that stage — one value, because one
+predicate is one join stage. Omitted options mean: no selectivity
+(that predicate keeps its written position) and planner-chosen
+anchor (the longer side).
+
+An n-way join is written the way Snowflake writes it: one JOIN
+clause per edge of the join graph, each edge with its own
+predicate and its own options. A 3-way chain:
+
+```sql
+SELECT a.id, b.id, c.id
+FROM reviews a
+JOIN threads b
+  ON AI_FILTER(PROMPT('Does review {0} praise this thread? {1}',
+                      a.review, b.thread),
+               {'selectivity': 0.2, 'anchor': 'b'})
+JOIN products c
+  ON AI_FILTER(PROMPT('Does thread {0} recommend product {1}?',
+                      b.thread, c.description),
+               {'selectivity': 0.1, 'anchor': 'b'})
+```
+
+Two predicates give two edges (a–b, b–c), which the planner runs
+as two stages. Here `b` anchors both, so each surviving thread's
+document KV is computed in stage 1 and read again in stage 2 —
+the cross-stage reuse the executor's kept KV exists for. Writing
+`{'anchor': 'a'}` on the first edge instead would force reviews to
+anchor stage 1; the planner would then warn in `explain()` if that
+choice prices worse.
 
 ### 2.4 The builder entry point
 
@@ -191,29 +245,59 @@ res = q.run() # measured walls next to the predictions, plus tokens
               # computed, KV bytes restored, pairs per stage
 ```
 
-`run()` on an infeasible configuration raises the planner's
-`Refusal` (named constraint, needed vs available, unit). The engine
-never silently degrades.
+Failures come in three kinds, at three times, and only one of them
+is a `Refusal`:
+
+- **Compile errors, at `sess.sql()` / builder time.** The query
+  itself is malformed or outside the language: unsupported syntax
+  (a GROUP BY, an OR between predicates — rejected by node class,
+  §3.2), an unknown provider or column, a PROMPT whose
+  placeholders do not match its arguments, an unknown option key.
+  Raised immediately; nothing is planned, nothing runs.
+- **`Refusal`, at plan time.** The query is valid but this
+  configuration cannot execute it, and the planner says which
+  constraint failed, what was needed, and what was available,
+  instead of running something degraded. Concrete cases: the
+  model's weights need more cards than `gpus` provides; one
+  document plus its question tail exceeds the chunk budget
+  (suffixes are atomic — no chunk can ever hold it); the working
+  set needs the store to spill but `cpu_memory_gb` is 0; `model`
+  names no registered spec.
+- **Runtime errors.** Not a category the design plans for:
+  admission and the chunk budget guarantee memory fits by
+  construction, so an OOM at run time is a bug to fix, not a
+  condition to handle.
 
 ### 2.5 Controlling filter order and join order
 
-The user controls order the same way DataFusion users do, plus one
-SQL-level knob DataFusion lacks. For reference: DataFusion's SQL
-has no join-order hints — you control order by building the plan
-through the DataFrame/LogicalPlanBuilder API, where the order you
-build is the order you get, and by disabling reordering rules.
-Quail does the analogous thing:
+Every physical plan has a filter order and a join stage order.
+Each comes from exactly one of two places:
 
-- **Builder**: the call order is the plan order, always. What you
-  chain is what runs.
-- **SQL**: `sess.sql(text, order="as_written")` takes the WHERE
-  conjunct order as the filter order and the JOIN clause order as
-  the stage order. `order="by_cost"` lets the planner order using
-  the provided selectivities.
-- **Default**: `by_cost` when every gated predicate carries a
-  selectivity option, `as_written` otherwise; `explain()` states
-  which applied and why. There is no third source of ordering — no
-  sampling, no runtime adaptation (§4).
+- **You set it.** In the builder, the order you chain calls is the
+  order that runs — nothing is ever reordered behind your back. In
+  SQL, `sess.sql(text, order="as_written")` runs the WHERE
+  conjuncts in written order and the JOIN clauses in written
+  order.
+- **The planner sets it from your selectivities.**
+  `sess.sql(text, order="by_cost")` sorts filters by cost per
+  killed document and picks the join stage order by the priced
+  enumeration (§4). Both use only the selectivity numbers you
+  provided in the option objects — there is no other input.
+
+When `order` is not passed, the default is `by_cost` if every
+gated predicate carries a selectivity, `as_written` otherwise, and
+`explain()` prints the chosen order and which rule chose it.
+
+A concrete example of the difference: benchmark query B3 writes a
+0.2-selectivity filter third among five. Under `as_written` it
+runs third; under `by_cost` it runs first, so the other four
+filters only see the 20% of documents it passes. Same answers
+either way — order changes cost, never results.
+
+There is no third source of ordering: no sampling at plan time, no
+reordering at run time (both deferred, §4). For comparison,
+DataFusion offers the same two sources — its DataFrame/plan-builder
+API runs what you build — but no SQL-level order flag.
 
 ### 2.6 What a result is
 
@@ -331,11 +415,13 @@ What the planner actually decides:
    tokens are paid once per document, partner tokens once per
    pair); enumeration confirms it since it costs nothing;
    `{'anchor': ...}` overrides it.
-3. **Admission (cohort size)**: how many documents' KV may be
-   resident at once — the KV budget divided by mean document
-   tokens, from the spec-derived pool arithmetic (§8). Token-based,
-   never a document count, for the measured reason (a count cannot
-   see length; the 4,096-seq default thrashed at 2.40x reads).
+3. **Admission budget**: how many tokens of document KV may be
+   resident at once, from the spec-derived arena arithmetic (§8).
+   Token-based, never a document count, for the measured reason (a
+   count cannot see length; the 4,096-seq default thrashed at
+   2.40x reads). How the budget is consumed at run time —
+   continuous bin packing with survivor priority — is executor
+   behavior, §6.
 4. **Chunk budget**: `min(memory bound, kernel index cap)`, both
    derived from the specs (§8), never typed in.
 5. **Access per scan**: read (compute KV fresh), restore (the
@@ -344,9 +430,13 @@ What the planner actually decides:
    at 4B, and pinned host memory measured 55 GB/s), or spill (the
    working set exceeds the pool and the store absorbs overflow).
 6. **Sharding**: filters split documents by token count across
-   workers (`_balanced_shards`); joins split by anchor document —
-   every pair belongs to exactly one anchor, so workers never
-   communicate; the coordinator merges answer matrices.
+   GPUs (`_balanced_shards`); joins split by anchor document.
+   Every pair belongs to exactly one anchor, so gating, dedup, and
+   the next stage's pair list for that anchor are local to the GPU
+   that holds it — workers never talk to each other. The
+   coordinator steps in between stages only when the next stage
+   anchors on a different relation (answers must regroup under the
+   new anchor set), and to merge final answers across shards.
 
 Infeasible configurations — weights don't fit the cards, pool
 cannot hold one working set, a suffix exceeds the chunk budget —
@@ -364,9 +454,10 @@ doubles as a cost-model check.
 | operator | runs on | what it does |
 |---|---|---|
 | `DocScan` | worker CPU + store | resolve (provider, column) to token arrays (cached tokenization); execute the planned access: read, restore (batched pinned-memory loads), spill |
-| `FilterChain` | the executor | gated stages over admitted cohorts: documents are anchors, each stage's question tail is a one-suffix stream, survivors advance (§6) |
+| `FilterChain` | the executor | gated stages over continuously admitted documents: documents are anchors, each stage's question tail is a one-suffix stream, survivors advance (§6) |
 | `JoinStage` | the executor | brim-packed chunks over the stage's pair list; exists/anti streams stop early |
-| `Gate` / `Dedup` / `Assemble` | coordinator CPU | between stages: survivors, distinct anchors, tuple reassembly from recorded answers (`joinlogic.py`, moved over as is) |
+| `Gate` / `Dedup` | worker CPU, inside the chunk loop | survivors and distinct anchors, decided the moment a chunk's answers land — the next chunk's contents depend on them, so they cannot live a network hop away |
+| `Assemble` | worker CPU per shard, coordinator merges | tuple reassembly from recorded answers (`joinlogic.py`, moved over as is); the coordinator only concatenates shard outputs |
 | `Sink` | coordinator CPU | applies the `Project`; returns ids/tuples plus the run report |
 
 `DocScan` is an explicit plan node because it is where
@@ -413,27 +504,80 @@ What this deletes from the system:
   use. With one executor and always-keep, the threshold has
   nothing left to decide.
 
-What replaces the engine's memory management — deliberately less
-than a paged pool:
+To be precise about what is and is not kept, because it is the
+heart of the design: **document KV is kept, suffix KV never
+exists.** A document's KV is written once, stays resident across
+every stage that still needs it — all five filters, or both join
+stages it anchors — and is freed the moment nothing later can read
+it. What is never stored, by anyone including stock vLLM, is the
+per-pair, per-question suffix KV: a question tail or a streamed
+partner lives only inside its chunk's forward pass.
 
-- **Cohort admission.** Documents are admitted in cohorts whose
-  total KV fits the budget (pool tokens from the spec arithmetic,
-  §8). A cohort runs all its stages — stage 0 suffixes for every
-  member, then stage 1 for survivors, and so on — then frees its
-  KV and the next cohort starts. Within a cohort the chunks are
-  dense, and chunk construction overlaps the previous chunk's
-  forward pass (the existing loop), so the GPU stays fed without
-  cross-stage pipelining: pipelining was the engine's answer to
-  keeping mixed-stage steps full, and dense packed chunks make the
-  question moot. At 4B with bf16 KV, a cohort is ~400k tokens —
-  about 1,000 mean-length documents; a 50k-document scan is ~50
-  cohorts.
-- **Plain per-anchor KV tensors** in a preallocated ring buffer;
-  no block tables, no eviction (admission guarantees fit), freed
-  at the anchor's last scheduled use. KV dtype bf16 by default —
-  the filter ladder measured bf16 fixing 765 of 2,990 wrong
-  answers against fp8 — with fp8 as a config option that doubles
-  cohort size.
+Two pieces replace the engine's paged pool:
+
+**The KV arena.** One preallocated GPU buffer per layer, sized to
+the admission budget, divided into fixed 16-token pages with a
+free list. A resident document owns a list of pages; the pages
+return to the free list the instant the document fails a stage or
+answers its last one. FlashInfer's paged attention kernels read
+this layout natively, so there are no copies and no compaction,
+and since admission never lets page-rounded resident tokens exceed
+the arena, allocation cannot fail. (The exploration's join
+executor got away with plain per-anchor tensors because it held
+one or two anchors at a time; a filter scan holds a thousand
+documents of varying lengths, and fixed pages are what makes
+thousands of small allocations and frees boring.) At 4B with bf16
+KV the arena holds ~400k tokens — roughly 1,000 mean-length
+documents resident at once. KV dtype is bf16 by default (the
+filter ladder measured bf16 fixing 765 of 2,990 wrong answers
+against fp8); fp8 is a config option that doubles the arena.
+
+**Continuous admission — bin packing by tokens, twice.** There is
+a pending queue of documents and a resident set; nothing runs in
+lockstep and there are no barriers. Each chunk is packed to the
+brim (the chunk budget is one bin) from two sources, in priority
+order:
+
+1. next-stage suffixes of resident survivors — small (a question
+   tail, or the continuation of a partner stream), and every one
+   completed moves a document toward freeing its pages;
+2. fresh documents from the pending queue, admitted whenever
+   their page-rounded tokens fit the free list (the admission
+   budget is the other bin).
+
+Survivor priority makes residency drain monotonically, which is
+the answer to the straggler question: a long pending document that
+does not fit right now waits in the queue while chunks stay full
+of survivor suffixes and smaller admissions — the GPU never idles
+waiting for memory, the document is admitted as soon as enough
+pages free, and the wait is bounded because pages only ever flow
+back. A document that could not fit even into an empty arena was
+refused at plan time, so there is no deadlock case. Chunks mixing
+fresh document prefixes with kept-KV continuations are the
+measured normal, not an edge case — the probe's mixed-group parity
+gate covers exactly that shape. Chunk construction overlaps the
+previous chunk's forward pass (the existing loop), so this
+scheduling runs on CPU time the GPU never sees.
+
+**What a multi-filter run does to one document.** Document D, 400
+tokens, three filters:
+
+1. D reaches the head of the pending queue and 400 tokens of pages
+   are free: some chunk packs the group
+   `[D's 400 tokens | q1's 25 tokens]`. Self-attention runs within
+   each segment; D's KV is written to its pages; q1's KV is
+   written nowhere. The YES/NO logits at q1's last position are
+   stage 1's answer.
+2. On YES, a later chunk packs just the 25-token group `q2`, no
+   prefix segment: its cross-attention reads D's pages, its
+   positions start at 400. This computes exactly what the engine's
+   KV rewind computed — with nothing to rewind, because no
+   question KV was ever written. On NO, D's pages free
+   immediately and D never appears again.
+3. After q3 (or the first NO), D's pages free — unless the plan
+   marked D for the store (a later query over this set, or a later
+   join stage anchored on it), in which case its KV is copied out
+   to pinned host memory first, overlapped with the next chunk.
 
 The engine chain path is not deleted from the world: it exists in
 this exploration repo, measured, as the documented fallback if a
@@ -454,21 +598,26 @@ this section.
 
 - One `modal.App`; image with CUDA, torch, FlashInfer/FlashAttention
   and vLLM as a kernel-and-loader library; weights in a volume.
-- Workers are a `modal.Cls` with `gpu="H100!"`,
-  `memory=cpu_memory_gb x 1024`, kept warm while a session is open.
-  The coordinator is the user's local process; per-worker plans
-  ship as JSON, answers return as compact matrices.
+- Workers are a `modal.Cls` with `gpu="H100!:k"`, k up to 8 GPUs
+  per container before a second container starts, and
+  `memory=cpu_memory_gb x 1024`, kept warm while a session is
+  open. Packing GPUs into one container is not just cost hygiene:
+  one container means one snapshot restore, one shared pinned KV
+  store serving all k GPUs, and stage re-sharding that is a
+  host-memory shuffle instead of a network transfer. The
+  coordinator is the user's local process; per-shard plans ship as
+  JSON, answers return as compact matrices.
 - **GPU memory snapshots** (Modal's cuda-checkpoint based
   snapshot/restore) are a first-class part of the design, not an
   optimization bolted on later:
   - The worker image is snapshotted once per model after weight
     load, allocator warmup, and kernel compilation. Session start
     restores the snapshot in seconds instead of a minute-scale
-    boot; `gpus=N` restores N copies of the same snapshot, so
-    scale-out costs no per-worker boot.
+    boot; every container restores from the same per-model
+    snapshot, so scale-out costs no extra boots.
   - The single-executor design is what makes the snapshot surface
-    small and safe: no engine state, no scheduler queues, no paged
-    pool — just weights, the empty ring buffer, and compiled
+    small and safe: no engine state, no scheduler queues — just
+    weights, the empty KV arena, and compiled
     kernels. Snapshots are taken only in this quiescent state,
     never mid-query.
   - The benchmark's cold protocol (§9.4) restores the snapshot
@@ -477,7 +626,8 @@ this section.
 - Every worker run is teed to a file in the results volume, per
   house rule; the coordinator collects logs next to the run report.
 
-The pinned CPU KV store rides in the worker: capacity =
+The pinned CPU KV store rides in the container, one per container
+shared by its GPUs: capacity =
 `cpu_memory_gb` minus headroom, keyed by (model, content hash,
 document id), holding document-prefix KV only (suffix KV never
 exists anywhere). The executor reads it with plain batched H2D
@@ -527,7 +677,7 @@ What the planner computes from the structs alone:
 | quantity | formula | at 4B/H100 |
 |---|---|---|
 | tensor parallel | smallest tp with W_mem < M x pool fraction | 1 |
-| KV pool tokens | (M x fraction − W_mem − act reservation) / kappa | ~400k at bf16 |
+| KV arena tokens (admission budget) | (M x fraction − W_mem − act reservation) / kappa | ~400k at bf16 |
 | chunk memory bound | free memory / act_per_token | ~420k |
 | kernel index cap | (2^31 − 1) // ffn_width | 110,375 |
 | chunk budget | min(memory bound, index cap), floored at the knee | 110,375 |
@@ -699,16 +849,17 @@ quail/                        (new repository)
     logical.py                # the four logical operators
     planner/
       plan.py                 # PhysicalPlan, Refusal
-      budgets.py              # spec-derived pool/cohort/chunk arithmetic
+      budgets.py              # spec-derived arena/chunk arithmetic
       cost.py                 # the estimator; calibration overlay loading
     executor/
-      pack.py                 # brim packing, cohorts   (from joinlogic.py)
-      attention.py            # varlen self + ragged cross + LSE merge
-      loop.py                 # the overlapped chunk loop (from run_join)
+      pack.py                 # brim packing, admission queue (from joinlogic.py)
+      arena.py                # the paged KV arena: pages, free list, per-doc page lists
+      attention.py            # varlen self + ragged paged cross + LSE merge
+      loop.py                 # the overlapped chunk loop with gate/dedup inline (from run_join)
       kvstore.py              # pinned host store, batched H2D
     runtime/
       session.py              # Session, EngineConfig, explain/run
-      coordinator.py          # gate/dedup/assemble, projection, reports
+      coordinator.py          # shard dispatch, stage re-sharding, final merge, projection, reports
       modal_app.py            # worker Cls, snapshots, volumes
     bench/
       quailb.py               # sets, planted predicates, B1-B15, both suites
@@ -721,8 +872,9 @@ Build order, each step landing with CPU tests:
 1. **specs + budgets** — the structs and every derived quantity in
    the §8 table, tested against the numbers this repo measured.
 2. **executor** — port `pack_stream`, the attention merge, and the
-   overlapped loop out of `modal_join_forward.py`; add cohort
-   admission and the filter-as-degenerate-join stage form.
+   overlapped loop out of `modal_join_forward.py`; add the paged
+   KV arena, continuous admission, and the
+   filter-as-degenerate-join stage form.
    **Gate: milestone 1** — the committed 10k-doc five-filter
    workload and the committed 256k-pair join, reproduced on the new
    executor within the cost model's band. This gate is what retires
@@ -745,10 +897,12 @@ Risks, named:
 
 - **The unified executor's filter path is unmeasured** end to end;
   milestone 1 exists to measure it before anything is built on top.
-- **Cohort admission changes the filter execution order** from the
-  engine's mixed-stage steps to per-cohort stage waves. Predicted
-  neutral (chunks are dense either way; total tokens identical);
-  the milestone-1 gate would catch a real regression.
+- **Continuous admission is new scheduling code.** The engine's
+  scheduler solved the same problem (mixed-stage work, admission,
+  no starvation) with far more machinery; the packed version is a
+  priority rule and a page free list, validated off-GPU against a
+  brute-force simulator the way the executor rewrite was — but it
+  is new. Milestone 1 gates it.
 - **GPU snapshots are young.** If restore proves flaky, the
   fallback is the boring one — cold boots and warm containers —
   and only the cold-protocol convenience is lost.
