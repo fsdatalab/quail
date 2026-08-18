@@ -10,8 +10,16 @@ interface.
 
 Scope is unchanged: AI_FILTER and AI_JOIN only, Qwen3 4B fp8 only,
 H100 workers on Modal only. No maps, no classification, no
-aggregation, no cascades. If a design decision below seems to need
-one of those, the decision is wrong, not the scope.
+aggregation, no cascades. The same discipline applies to relational
+algebra: this engine is not a SQL engine that happens to call a
+model, it is a semantic-operator engine with a SQL front end. The
+only relational operator it supports is projection, because a
+result has to name which columns come back. No non-AI predicates,
+no equality joins, no GROUP BY, no ORDER BY, no LIMIT, no DISTINCT,
+no expressions. A query that needs those runs Quail for the
+semantic part and does the relational part in whatever database the
+ids came from. If a design decision below seems to need any of
+this, the decision is wrong, not the scope.
 
 What the numbers below rest on (all committed in this repo):
 
@@ -131,7 +139,8 @@ Builder, for programmatic use (the DataFrame-style API):
 q = (sess.docs("reviews")
          .ai_filter("This review is negative: {doc}")
          .ai_join(sess.docs("products"),
-                  "Review {left} discusses product {right}"))
+                  "Review {left} discusses product {right}")
+         .select("reviews.id", "products.id"))
 ```
 
 Both produce the same `LogicalPlan`. Then:
@@ -152,11 +161,14 @@ available, unit). The engine never silently degrades.
 ### 2.4 What a result is
 
 Filters return surviving document ids. Joins return id tuples.
-Projection is only ever id columns plus pass-through text — there is
-no expression evaluation, no aggregation. Results also carry the
-per-stage answer matrices, so the nested-loop replay check from the
-join work (`joinlogic.brute_force_triples`) stays available as a
-correctness gate on every run.
+Projection is the one relational operator, and it is column
+selection only: pick which of the ids and pass-through text columns
+come back, nothing computed, nothing renamed beyond aliases. It
+exists because a result has to have a shape, not because the engine
+does relational work. Results also carry the per-stage answer
+matrices, so the nested-loop replay check from the join work
+(`joinlogic.brute_force_triples`) stays available as a correctness
+gate on every run.
 
 ---
 
@@ -166,7 +178,11 @@ correctness gate on every run.
 
 Accepted, and nothing else:
 
-- `SELECT <id/text columns> FROM <set> [alias]`
+- `SELECT <plain columns> FROM <set> [alias]` — the SELECT list is
+  the projection, and projection is the only relational operator in
+  the language: bare column references (ids, pass-through text),
+  optionally aliased. No expressions, no `*`-expansion surprises
+  (`*` is allowed and means every column of every named set)
 - zero or more `JOIN <set> [alias] ON AI_FILTER(PROMPT('...', a.col, b.col))`
 - `WHERE` as a conjunction (`AND`) of `AI_FILTER(PROMPT('...', x.col))`
   terms, each referencing exactly one table
@@ -174,11 +190,14 @@ Accepted, and nothing else:
   — the exists-semantics join (keep a document if some partner
   matches; the executor stops each partner stream at the first YES)
 
-Rejected with a named error, not worked around: OR between AI
-predicates, non-AI predicates, AI_FILTER over more than two tables,
-subqueries other than the EXISTS form, any other AI_* function.
-Rejection at parse time is the same honesty as `Refusal` at plan
-time.
+Rejected with a named error, not worked around: every relational
+operator except the projection above — non-AI predicates (including
+equality join conditions), GROUP BY, ORDER BY, LIMIT, DISTINCT,
+expressions or function calls in the SELECT list, set operations,
+subqueries other than the EXISTS form. Also OR between AI
+predicates, AI_FILTER over more than two tables, and any other AI_*
+function. Rejection at parse time is the same honesty as `Refusal`
+at plan time.
 
 ### 3.2 Compile pipeline
 
@@ -190,15 +209,20 @@ time.
    predicate. The prompt template is tokenized once here, split
    into the shared preamble and the per-document tail (the 33-token
    shared-preamble split that rewind and pricing both use).
-3. **Logical plan.** Three logical operators only:
+3. **Logical plan.** Four logical operators only — three semantic,
+   one relational:
 
    | operator | fields |
    |---|---|
    | `Scan(set)` | document set id |
    | `SemanticFilter(input, predicates)` | ordered list of (prompt, selectivity estimate) — conjunctions collapse into one node |
    | `SemanticJoin(left, right, predicate, semantics)` | semantics: `full` (all matching pairs) or `exists` |
+   | `Project(input, columns)` | the SELECT list; always the root of the tree, never anywhere else |
 
-   N-way joins appear as a left-deep tree of `SemanticJoin` nodes;
+   `Project` never participates in optimization: it costs nothing
+   the model runs, so the optimizer prices the tree below it and
+   the coordinator applies it at the sink. N-way joins appear as a
+   left-deep tree of `SemanticJoin` nodes;
    the optimizer flattens them into the join graph before pricing,
    so the SQL join order carries no meaning — same as the filter
    order in WHERE.
@@ -296,7 +320,7 @@ discipline.
 | `FilterChain` | vLLM engine + QuailScheduler | one living request per document; token-budget admission; rewind to the document boundary between stages; gated stage advance inside the scheduler |
 | `JoinStage` | packed executor | brim-packed chunks over the stage's pair list; anchor prefix computed once ever (kept KV on cut); shared-prefix attention merged by softmax state; YES/NO logits read at suffix ends; exists semantics stop a partner stream at the first YES |
 | `Gate` / `Dedup` / `Assemble` | coordinator CPU | between join stages: survivors, distinct anchors, tuple reassembly from recorded answers |
-| `Sink` | coordinator CPU | ids/tuples out, plus the run report (predicted vs measured, token and byte counters) |
+| `Sink` | coordinator CPU | applies the `Project` (column selection, the only relational step in the system); ids/tuples out, plus the run report (predicted vs measured, token and byte counters) |
 
 `DocScan` is explicit in the plan tree — it is where tokenization,
 corpus statistics, and the store decision live, and it is the unit
