@@ -4,9 +4,14 @@ Qwen3 4B fp8, one H100. BioDEX 2-way (100 reports x 2,560 terms =
 256,000 pairs) and a planted 3-way chain (100 x 100 x 100). All
 numbers from `join2way.json`, `join_nway3.json`, `join_probe.json`.
 
-Wall times include end-to-end cost: chunk packing (building GPU
-tensors from raw token lists) plus forward passes plus answer
-readout.
+One executor (`run_join`) runs every join: brim-packed chunks,
+each anchor's prefix computed exactly once (a stream cut at a
+chunk boundary writes the prefix KV to an explicit per-anchor
+cache and the continuation reads it), the next chunk built on the
+CPU while the GPU runs, answers crossing as event-synced byte
+copies. The 2-way is its one-stage case; the 3-way its two-stage,
+gate-per-anchor case. Wall times are end to end: chunk building,
+forward passes, answer readout.
 
 ---
 
@@ -14,50 +19,71 @@ readout.
 
 | Method | Wall (s) | Tokens/s | Fresh tokens | Chunks |
 |---|---|---|---|---|
-| Stock vLLM (grouped) | 433 (mean of 449, 418) | 17,000 | 7.36M | — |
-| Packed, B = B* = 421,752 | 98.7 (mean of 98.4, 99.0) | 85,300 | 8.42M | 100 |
+| Stock vLLM (grouped) | 429 (mean of 442, 415) | 17,200 | 7.36M | — |
+| Packed, B = 110,376 (kernel cap) | 103.6 (2 reps, spread 0.1 s) | 81,300 | 8.42M | 77 |
 
-The packed pass is **4.4x faster** than stock vLLM.
+The packed pass is **4.1x faster** than stock vLLM.
 
-At B*, each report's full term list fits beside its prefix in one
-chunk (m = 1), so each prefix is computed exactly once: 100 chunks,
-8.42M fresh tokens, nothing kept and nothing recomputed. The packed
-prediction was 92 s; measured 98.7 s (+7%).
+The packed budget is min(B*, kernel cap): the memory bound B* =
+421,752 is not executable (finding 2), so chunks run at 110,376.
+Each report's prefix is computed exactly once — 76 of 100 reports
+are cut at a chunk boundary and their continuations read the
+cached prefix KV. Fresh tokens are exactly the computed-once
+count, 8,417,425.
 
-Stock's effective rate is 17,000 tokens/s. Its 7.36M tokens take
-only ~199 s at GPU speed. The remaining ~234 s is host-side work:
-ingesting, hashing, and scheduling 256,000 request objects. This is
-the missing cost-model term (finding 1 below).
+Against the pre-rewrite executor's 98.7 s (one report per chunk,
+~84k tokens, no cache path): +5%. About 2 points are the
+generalized attention's gather cost (the probe's rate gate moved
+83.6k -> 82.1k tokens/s); the rest is unattributed — candidates
+are the 76 cache-read continuations and allocator pressure at the
+48.3 GiB peak. That peak was itself a bug the run exposed: the
+executor freed cut anchors' cached KV only at stage end, holding
+~76 x 0.54 GB at once. Fixed after the run (each anchor's KV is
+freed at its last chunk); expected peak ~12-16 GiB, unmeasured.
 
-A second packed configuration at B = 25,305 ran as a rate control
-and was dropped from the reported results: its prefix recomputation
-changes the prefix/suffix token mix (12.9% prefix tokens vs 3.6% at
-B*), and prefix tokens cost about half a suffix token's attention
-work, so equal rates would not isolate chunk size. A clean control
-would compare two budgets with the same m — for example 44,000 and
-84,000, both m = 2, identical tokens and mix. Not run.
+Answers: yes = 177,831 (was 177,830), agreement with stock 213,976
+of 256,000 (was 213,989) — knife-edge flips from prefixes now
+computed at different chunk shapes, within the predicted "tens."
+Stock itself is not bit-stable: its two reps disagree with each
+other on 12 pairs (yes = 154,731 vs 154,719), so packed-vs-stock
+agreement sits on top of that noise floor.
+
+Stock's effective rate is ~17,200 tokens/s. Its 7.36M fresh tokens
+take only ~199 s at GPU speed; the remaining ~230 s is host-side
+work ingesting 256,000 request objects (finding 1). Four stock
+walls measured across two containers: 449, 418, 442, 415 s.
 
 ---
 
 ## 3-way results
 
-| Stage | Wall (s) | Pairs | Survivors |
+| Stage | GPU (s) | Pairs | Survivors |
 |---|---|---|---|
-| Stage 1 (A-B) | 48.7 | 10,000 | 100 (all) |
-| Stage 2 (B-C) | 29.7 | 10,000 | — |
-| **Total** | **78.4** | — | 74,600 triples |
+| Stage 1 (B x A, prefix KV written) | 48.4 | 10,000 | 100 (all) |
+| Stage 2 (B x C, reads cached KV) | 45.5 | 10,000 | — |
+| **Total wall** | **95.6** | — | 991,911 triples |
 
-Stage-2 pair count is exactly survivors x 100 = 10,000, confirming
-that each surviving B document runs once against all C documents,
-not once per matching A document. The triple set from staged
-execution matches the nested-loop replay of the recorded answers
-identically (74,600 triples).
+Stage times are CUDA-event sums per stage; the loop is
+software-pipelined, so the wall (95.6 s) is slightly more than
+their sum. The stages are near-equal because both are dominated by
+per-pair suffix work — C suffixes are even slightly longer than A
+(355 vs 310 tokens). The cached KV removes only the once-per-
+document prefix term (~10% of stage 2); every suffix still pays
+its cross-attention read over B's 3,684 positions.
 
-All 100 B documents survived because the 4B checkpoint answers YES
-to nearly everything (9,763 of 10,000 stage-1 answers wrong against
-the planted keys). The filter executed zero skips on GPU. The
-filtering and deduplication logic is covered by unit tests and the
-replay check.
+**These numbers replace the earlier 78.4 s / 74,600-triple result,
+which was invalid** — see finding 4. Checks: the triple set equals
+a nested-loop replay of the recorded answers exactly; stage-2
+pairs = survivors x 100 = 10,000. All 100 B documents survived
+(planted design expected 80) because of finding 5.
+
+An estimated grouped-stock baseline for this workload — same
+submission strategy as the 2-way stock arm, arithmetic from
+measured constants, never run — is ~134 s
+(`join_nway3_vs_stock.png` shows the four components). The gap
+(1.4x) is smaller than the 2-way's 4.1x because 310-355-token
+suffixes amortize stock's per-request costs ~10x better than
+32-token suffixes.
 
 ---
 
@@ -65,34 +91,59 @@ replay check.
 
 - Shared-prefix attention math: max diff 0.0068 against an fp32
   reference
-- Shared vs unshared disagreements: 0 of 64
-- Kept-KV vs shared disagreements: 0 of 64
-- Rate at the B* geometry: 83.6k tokens/s
+- Shared vs unshared answers: 0 of 64 disagree
+- Cached-KV replay vs in-chunk: 0 of 64
+- Several fresh prefixes in one chunk vs each alone: 0 of 64
+- Fresh + cached prefix mixed in one chunk: 0 of 64
+- Rate at the executor's chunk geometry: 82.1k tokens/s
 
 ---
 
 ## Findings
 
 **1. The cost model is missing a host ingestion term for stock
-vLLM.** Predicted stock wall was 199 s (GPU-side computation only).
-Measured was 433 s. The difference (~234 s) is host-side work:
+vLLM.** Predicted stock wall was 199 s (GPU-side computation
+only). Measured is ~429 s. The difference is host-side work:
 ingesting 770M prompt tokens across 256,000 request objects. The
-packed side submits 100 pre-built chunks and has no analog. This
-term must be added to cost.py before any full-scale stock
-prediction.
+packed side submits 77 pre-built chunks and has no analog. Add the
+term to cost.py before any full-scale stock prediction.
 
-**2. The cross-attention call is roughly 30% of the packed wall at
-these shapes.** The effective rate (85.3k tokens/s) is lower than
-the pure-packed filter rate (121k tokens/s) because BioDEX prefixes
-are 3,000 tokens — every suffix attends to all of them via the
-cross-attention call. At the filter's shape (270-token prefixes),
-cross-attention was 12% of the wall. The cost comes from the pair
-count in the suffix-to-prefix attention, not the batch size.
+**2. The chunk budget has two ceilings, and the kernel one binds.**
+The memory formula gives B* = 421,752, but the fused kernels
+compute element offsets in 32-bit ints, so a chunk needs rows x
+widest-projection-width < 2^31 — at most 110,375 tokens here
+(gate_up is 19,456 wide). A 421,750-token chunk dies with an
+illegal memory address. The cap is derived from the loaded weights
+at runtime; rate is flat in chunk size, so it costs nothing. No
+earlier run hit this because one-report chunks (84k tokens) sat
+24% under the bound by accident.
 
-**3. The 4B checkpoint is a near-unusable judge for both
-predicates.** 2-way: precision 0.33% (YES on 60% of pairs). 3-way:
-9,763 of 10,000 wrong. This breaks the planted instrument (no
-filtering exercised) but no execution claim — filtering and
-deduplication are validated by the replay check and unit tests.
-Follow-up: use a single-flag lookup predicate the model can handle,
-or a stronger model.
+**3. The cross-attention call is roughly 30% of the packed wall at
+these shapes.** The effective rate (81.3k tokens/s) is far below
+the pure-packed filter rate (121k) because BioDEX prefixes are
+3,000 tokens — every suffix attends to all of them. At the
+filter's 270-token prefixes, cross-attention was 12% of the wall.
+The cost scales with the suffix-to-prefix pair count, not the
+batch size.
+
+**4. The original kept-KV path never read the cached KV — and an
+answers-only gate missed it.** The old chunk builder set
+`prefix_rows = 0` for cached-KV chunks, which triggered the
+no-sharing early-return in attention: 3-way stage 2 ran without
+the anchor document visible at all. The old probe's kept gate
+passed anyway, because it compared answers only, on 64 short term
+suffixes where this near-always-YES judge answers the same with or
+without the report. The rewritten probe cross-checks cached
+against fresh inside one chunk (structurally independent of the
+judge) and caught the fix. Lesson: with a degenerate judge,
+validation must never lean on answer agreement alone.
+
+**5. The 4B checkpoint is a near-unusable judge for both
+predicates.** 2-way: precision 0.33% (YES on ~70% of pairs).
+3-way: ~99% YES on both stages, so all 100 B documents survive
+(planted: 80) and the model's 991,911 triples dwarf the planted
+640. This saturates the planted instrument but breaks no execution
+claim — execution correctness rests on the replay check, the
+pair-count identity, and the judge-independent probe gates.
+Follow-up: a single-flag lookup predicate this model can read, or
+a stronger judge.

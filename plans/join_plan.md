@@ -489,6 +489,20 @@ Results:
   (cut continuations read bit-identical cached K/V, but their
   prefixes are computed at different chunk shapes than before, so
   a few knife-edge pairs may flip).
+- join2way, measured (rows transcribed from the container's
+  output; the client was interrupted after the container finished,
+  so the local save was redone by hand — `join2way.json` carries
+  the note): stock 442.25 / 415.31 s (yes 154,731 / 154,719 — 12
+  answers of stock-vs-stock drift); packed 103.62 / 103.49 s, 77
+  chunks, 8,417,425 tokens, 81.3k tok/s, yes 177,831,
+  agrees_with_stock 213,976, peak 48.3 GiB. Scorecard: chunks,
+  tokens, and answers hit the prediction; the wall missed high
+  (+3.6% past the band — ~2 points are the probe-measured gather
+  cost, the rest unattributed), and the peak missed big: run_join
+  freed cut anchors' cached KV only at stage end, holding ~76 x
+  0.54 GB ≈ 41 GB. Fixed after the run (each anchor's KV freed at
+  its last chunk); expected peak ~12-16 GiB, unmeasured. Headline:
+  **4.1x over stock (429 s / 103.6 s)** at the capped executor.
 
 ---
 

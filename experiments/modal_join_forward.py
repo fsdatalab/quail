@@ -733,7 +733,23 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
                     if plan else None
             if not plan:
                 continue
-            handles = [(h0, plan[0])]
+            last_chunk = {}
+            for t, cg in enumerate(plan):
+                for a_l, _, _, _ in cg:
+                    last_chunk[a_l] = t
+
+            def finish(handle, t):
+                scatter(j, idx, plan[t], async_ans.result(handle))
+                if j == k - 1:
+                    # a cut anchor's cached KV has no reader past
+                    # its last chunk of its final stage; freeing at
+                    # stage end instead held ~76 anchors x 0.54 GB
+                    # (the measured 48.3 GiB peak)
+                    for a_l, _, _, _ in plan[t]:
+                        if last_chunk[a_l] == t:
+                            kv_cache.pop(idx[a_l], None)
+
+            handles = [(h0, 0)]
             if j == 0 and k > 1 and g + 1 < len(groups):
                 # the gate below cannot be planned past; keep the
                 # GPU fed with the next group's gate-free stage 0
@@ -744,12 +760,12 @@ def run_join(torch, pipeline, async_ans, anchor_prefixes,
             for t in range(1, len(plan)):
                 c = build(j, idx, to_cache, plan[t])  # CPU, GPU busy
                 h = launch(j, c)
-                h_prev, pg = handles.pop(0)
-                scatter(j, idx, pg, async_ans.result(h_prev))
-                handles.append((h, plan[t]))
+                h_prev, t_prev = handles.pop(0)
+                finish(h_prev, t_prev)
+                handles.append((h, t))
             while handles:
-                h, pg = handles.pop(0)
-                scatter(j, idx, pg, async_ans.result(h))
+                h, t = handles.pop(0)
+                finish(h, t)
             # free cached KV that nothing later reads: after the
             # last stage everything in the group is done; between
             # stages, the gate's casualties are done
