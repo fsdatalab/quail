@@ -26,7 +26,7 @@ def nway_query_plan():
     survivors = r["survivors"]
     planted_expected = r["planted_expected_survivors"]
     triples = r["triples"]
-    total = s1 + s2
+    total = r.get("total_wall_s", s1 + s2)
 
     fig, ax = plt.subplots(figsize=(8, 7.5))
     ax.set_xlim(0, 10)
@@ -100,7 +100,7 @@ def nway_time_bar():
 
     s1 = r["stage1_wall_s"]
     s2 = r["stage2_wall_s"]
-    total = s1 + s2
+    total = r.get("total_wall_s", s1 + s2)
 
     fig, ax = plt.subplots(figsize=(8, 2.5))
 
@@ -112,17 +112,18 @@ def nway_time_bar():
     ax.barh(y, s2, height=bar_h, left=s1, color="#e67e22",
             edgecolor="white", linewidth=0.8)
 
-    ax.text(s1 / 2, y, f"Stage 1: B×A\n{s1:.1f} s ({s1/total:.0%})",
+    gpu = s1 + s2
+    ax.text(s1 / 2, y, f"Stage 1: B×A\n{s1:.1f} s ({s1/gpu:.0%})",
             ha="center", va="center", fontsize=11, color="white",
             fontweight="bold")
     ax.text(s1 + s2 / 2, y,
-            f"Stage 2: B×C\n{s2:.1f} s ({s2/total:.0%})",
+            f"Stage 2: B×C\n{s2:.1f} s ({s2/gpu:.0%})",
             ha="center", va="center", fontsize=11, color="white",
             fontweight="bold")
 
-    ax.set_xlim(0, total * 1.08)
+    ax.set_xlim(0, max(total, gpu) * 1.08)
     ax.set_ylim(-0.6, 0.6)
-    ax.set_xlabel("Wall-clock seconds", fontsize=11)
+    ax.set_xlabel("GPU seconds per stage", fontsize=11)
     ax.set_title(f"3-Way Join Time Breakdown  ({total:.1f} s total)",
                  fontsize=13, pad=8)
     ax.set_yticks([])
