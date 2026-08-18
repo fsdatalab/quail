@@ -18,3 +18,5 @@ exploration/output/
 exploration/results/*.log
 exploration/results/engine/torchprof_*
 
+# generated benchmark corpora are rebuilt from seeds, never versioned
+quail/results/quailb_data/
