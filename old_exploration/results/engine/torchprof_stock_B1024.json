@@ -1,0 +1,22 @@
+{
+  "B": 1024,
+  "side": "stock",
+  "n_docs": 10000,
+  "n_filters": 1,
+  "n_kernels": 199837,
+  "total_kernel_us": 3655548.954,
+  "window_s": 15.02,
+  "gpu_busy_frac": 0.2434,
+  "gemm_us": 2339014.8410000233,
+  "gemm_frac": 0.6399,
+  "quantize_us": 607714.9730000704,
+  "quantize_frac": 0.1662,
+  "norm_us": 196028.4370000049,
+  "norm_frac": 0.0536,
+  "elementwise_us": 197953.75999999835,
+  "elementwise_frac": 0.0542,
+  "attention_us": 135122.07200000106,
+  "attention_frac": 0.037,
+  "other_us": 179714.87100000042,
+  "other_frac": 0.0492
+}

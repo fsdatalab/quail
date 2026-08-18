@@ -1,0 +1,527 @@
+✓ Initialized. View run at 
+https://modal.com/apps/fsdatalab/main/ap-zFbtMAW3pDZuGQIj5yAmsl
+Building image im-kzOt9iKzfwoNYLryRBhd4T
+
+=> Step 0: FROM base
+
+=> Step 1: RUN python -m pip install 'torch==2.9.1' --index-url https://download.pytorch.org/whl/cu130
+Looking in indexes: https://download.pytorch.org/whl/cu130
+Collecting torch==2.9.1
+  Downloading https://download-r2.pytorch.org/whl/cu130/torch-2.9.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl.metadata (30 kB)
+Collecting filelock (from torch==2.9.1)
+  Downloading filelock-3.29.0-py3-none-any.whl.metadata (2.0 kB)
+Collecting typing-extensions>=4.10.0 (from torch==2.9.1)
+  Downloading typing_extensions-4.15.0-py3-none-any.whl.metadata (3.3 kB)
+Requirement already satisfied: setuptools in /usr/local/lib/python3.12/site-packages (from torch==2.9.1) (69.0.3)
+Collecting sympy>=1.13.3 (from torch==2.9.1)
+  Downloading sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+Collecting networkx>=2.5.1 (from torch==2.9.1)
+  Downloading networkx-3.6.1-py3-none-any.whl.metadata (6.8 kB)
+Collecting jinja2 (from torch==2.9.1)
+  Downloading https://download.pytorch.org/whl/jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch==2.9.1)
+  Downloading fsspec-2026.4.0-py3-none-any.whl.metadata (10 kB)
+Collecting nvidia-cuda-nvrtc==13.0.48 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cuda-nvrtc/nvidia_cuda_nvrtc-13.0.48-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (90.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 90.2/90.2 MB 141.9 MB/s eta 0:00:00
+Collecting nvidia-cuda-runtime==13.0.48 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cuda-runtime/nvidia_cuda_runtime-13.0.48-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (2.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.2/2.2 MB 138.9 MB/s eta 0:00:00
+Collecting nvidia-cuda-cupti==13.0.48 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cuda-cupti/nvidia_cuda_cupti-13.0.48-py3-none-manylinux_2_25_x86_64.whl (10.7 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.7/10.7 MB 143.6 MB/s eta 0:00:00
+Collecting nvidia-cudnn-cu13==9.13.0.50 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cudnn-cu13/nvidia_cudnn_cu13-9.13.0.50-py3-none-manylinux_2_27_x86_64.whl (348.6 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 348.6/348.6 MB 141.7 MB/s eta 0:00:00
+Collecting nvidia-cublas==13.0.0.19 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cublas/nvidia_cublas-13.0.0.19-py3-none-manylinux_2_27_x86_64.whl (419.4 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 419.4/419.4 MB 136.0 MB/s eta 0:00:00
+Collecting nvidia-cufft==12.0.0.15 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cufft/nvidia_cufft-12.0.0.15-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (214.1 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 214.1/214.1 MB 133.2 MB/s eta 0:00:00
+Collecting nvidia-curand==10.4.0.35 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-curand/nvidia_curand-10.4.0.35-py3-none-manylinux_2_27_x86_64.whl (59.5 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 59.5/59.5 MB 124.4 MB/s eta 0:00:00
+Collecting nvidia-cusolver==12.0.3.29 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cusolver/nvidia_cusolver-12.0.3.29-py3-none-manylinux_2_27_x86_64.whl (193.5 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 193.5/193.5 MB 120.4 MB/s eta 0:00:00
+Collecting nvidia-cusparse==12.6.2.49 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cusparse/nvidia_cusparse-12.6.2.49-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (140.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 140.2/140.2 MB 141.1 MB/s eta 0:00:00
+Collecting nvidia-cusparselt-cu13==0.8.0 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cusparselt-cu13/nvidia_cusparselt_cu13-0.8.0-py3-none-manylinux2014_x86_64.whl (169.9 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 169.9/169.9 MB 116.7 MB/s eta 0:00:00
+Collecting nvidia-nccl-cu13==2.27.7 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-nccl-cu13/nvidia_nccl_cu13-2.27.7-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (193.9 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 193.9/193.9 MB 123.3 MB/s eta 0:00:00
+Collecting nvidia-nvshmem-cu13==3.3.24 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-nvshmem-cu13/nvidia_nvshmem_cu13-3.3.24-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (60.4 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 60.4/60.4 MB 135.0 MB/s eta 0:00:00
+Collecting nvidia-nvtx==13.0.39 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-nvtx/nvidia_nvtx-13.0.39-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl (147 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 147.2/147.2 kB 125.9 MB/s eta 0:00:00
+Collecting nvidia-nvjitlink==13.0.39 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-nvjitlink/nvidia_nvjitlink-13.0.39-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (40.7 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40.7/40.7 MB 115.7 MB/s eta 0:00:00
+Collecting nvidia-cufile==1.15.0.42 (from torch==2.9.1)
+  Downloading https://pypi.nvidia.com/nvidia-cufile/nvidia_cufile-1.15.0.42-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (1.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.2/1.2 MB 178.7 MB/s eta 0:00:00
+Collecting triton==3.5.1 (from torch==2.9.1)
+  Downloading https://download-r2.pytorch.org/whl/triton-3.5.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (1.7 kB)
+Collecting mpmath<1.4,>=1.1.0 (from sympy>=1.13.3->torch==2.9.1)
+  Downloading mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+Collecting MarkupSafe>=2.0 (from jinja2->torch==2.9.1)
+  Downloading https://download.pytorch.org/whl/markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.7 kB)
+Downloading https://download-r2.pytorch.org/whl/cu130/torch-2.9.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl (612.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 612.6/612.6 MB 121.1 MB/s eta 0:00:00
+Downloading https://download-r2.pytorch.org/whl/triton-3.5.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (170.5 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 170.5/170.5 MB 157.2 MB/s eta 0:00:00
+Downloading fsspec-2026.4.0-py3-none-any.whl (203 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 203.4/203.4 kB 126.4 MB/s eta 0:00:00
+Downloading networkx-3.6.1-py3-none-any.whl (2.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 126.7 MB/s eta 0:00:00
+Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 124.0 MB/s eta 0:00:00
+Downloading typing_extensions-4.15.0-py3-none-any.whl (44 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 44.6/44.6 kB 258.0 MB/s eta 0:00:00
+Downloading filelock-3.29.0-py3-none-any.whl (39 kB)
+Downloading https://download.pytorch.org/whl/jinja2-3.1.6-py3-none-any.whl (134 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 134.9/134.9 kB 155.0 MB/s eta 0:00:00
+Downloading https://download.pytorch.org/whl/markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (22 kB)
+Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 536.2/536.2 kB 165.3 MB/s eta 0:00:00
+Installing collected packages: nvidia-cusparselt-cu13, mpmath, typing-extensions, triton, sympy, nvidia-nvtx, nvidia-nvshmem-cu13, nvidia-nvjitlink, nvidia-nccl-cu13, nvidia-curand, nvidia-cufile, nvidia-cuda-runtime, nvidia-cuda-nvrtc, nvidia-cuda-cupti, nvidia-cublas, networkx, MarkupSafe, fsspec, filelock, nvidia-cusparse, nvidia-cufft, nvidia-cudnn-cu13, jinja2, nvidia-cusolver, torch
+Successfully installed MarkupSafe-3.0.3 filelock-3.29.0 fsspec-2026.4.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 nvidia-cublas-13.0.0.19 nvidia-cuda-cupti-13.0.48 nvidia-cuda-nvrtc-13.0.48 nvidia-cuda-runtime-13.0.48 nvidia-cudnn-cu13-9.13.0.50 nvidia-cufft-12.0.0.15 nvidia-cufile-1.15.0.42 nvidia-curand-10.4.0.35 nvidia-cusolver-12.0.3.29 nvidia-cusparse-12.6.2.49 nvidia-cusparselt-cu13-0.8.0 nvidia-nccl-cu13-2.27.7 nvidia-nvjitlink-13.0.39 nvidia-nvshmem-cu13-3.3.24 nvidia-nvtx-13.0.39 sympy-1.14.0 torch-2.9.1+cu130 triton-3.5.1 typing-extensions-4.15.0
+Saving image...
+Image saved, took 3.46s
+
+Built image im-kzOt9iKzfwoNYLryRBhd4T in 67.22s
+
+
+Building image im-emq7kcPaL0xt60gWqHbySF
+
+=> Step 0: FROM base
+
+=> Step 1: RUN python -m pip install einops huggingface_hub numpy pandas pyarrow 'transformers>=4.51.0' xxhash
+Looking in indexes: http://pypi-mirror.modal.local:5555/simple
+Collecting einops
+  Downloading http://pypi-mirror.modal.local:5555/simple/einops/einops-0.8.2-py3-none-any.whl.metadata (13 kB)
+Collecting huggingface_hub
+  Downloading http://pypi-mirror.modal.local:5555/simple/huggingface-hub/huggingface_hub-1.27.0-py3-none-any.whl.metadata (16 kB)
+Collecting numpy
+  Downloading http://pypi-mirror.modal.local:5555/simple/numpy/numpy-2.5.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (6.6 kB)
+Collecting pandas
+  Downloading http://pypi-mirror.modal.local:5555/simple/pandas/pandas-3.0.5-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (79 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 79.5/79.5 kB 242.9 MB/s eta 0:00:00
+Collecting pyarrow
+  Downloading http://pypi-mirror.modal.local:5555/simple/pyarrow/pyarrow-25.0.1-cp312-cp312-manylinux_2_28_x86_64.whl.metadata (3.0 kB)
+Collecting transformers>=4.51.0
+  Downloading http://pypi-mirror.modal.local:5555/simple/transformers/transformers-5.15.0-py3-none-any.whl.metadata (32 kB)
+Collecting xxhash
+  Downloading http://pypi-mirror.modal.local:5555/simple/xxhash/xxhash-4.0.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (17 kB)
+Collecting click<9.0.0,>=8.4.2 (from huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/click/click-8.4.2-py3-none-any.whl.metadata (2.6 kB)
+Requirement already satisfied: filelock>=3.10.0 in /usr/local/lib/python3.12/site-packages (from huggingface_hub) (3.29.0)
+Requirement already satisfied: fsspec>=2023.5.0 in /usr/local/lib/python3.12/site-packages (from huggingface_hub) (2026.4.0)
+Collecting hf-xet<2.0.0,>=1.5.2 (from huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/hf-xet/hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (4.9 kB)
+Collecting httpx<1,>=0.23.0 (from huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/httpx/httpx-0.28.1-py3-none-any.whl.metadata (7.1 kB)
+Collecting packaging>=20.9 (from huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/packaging/packaging-26.3-py3-none-any.whl.metadata (3.5 kB)
+Collecting pyyaml>=5.1 (from huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/pyyaml/pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.4 kB)
+Collecting tqdm>=4.42.1 (from huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/tqdm/tqdm-4.70.0-py3-none-any.whl.metadata (57 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 57.3/57.3 kB 305.0 MB/s eta 0:00:00
+Requirement already satisfied: typing-extensions>=4.1.0 in /usr/local/lib/python3.12/site-packages (from huggingface_hub) (4.15.0)
+Collecting python-dateutil>=2.8.2 (from pandas)
+  Downloading http://pypi-mirror.modal.local:5555/simple/python-dateutil/python_dateutil-2.9.0.post0-py2.py3-none-any.whl.metadata (8.4 kB)
+Collecting regex>=2025.10.22 (from transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/regex/regex-2026.7.19-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (40 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40.5/40.5 kB 189.1 MB/s eta 0:00:00
+Collecting tokenizers<=0.23.0,>=0.22.0 (from transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/tokenizers/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (7.3 kB)
+Collecting typer (from transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/typer/typer-0.27.1-py3-none-any.whl.metadata (16 kB)
+Collecting safetensors>=0.8.0 (from transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/safetensors/safetensors-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (4.2 kB)
+Collecting anyio (from httpx<1,>=0.23.0->huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/anyio/anyio-4.14.2-py3-none-any.whl.metadata (4.6 kB)
+Collecting certifi (from httpx<1,>=0.23.0->huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/certifi/certifi-2026.7.22-py3-none-any.whl.metadata (2.5 kB)
+Collecting httpcore==1.* (from httpx<1,>=0.23.0->huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/httpcore/httpcore-1.0.9-py3-none-any.whl.metadata (21 kB)
+Collecting idna (from httpx<1,>=0.23.0->huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/idna/idna-3.18-py3-none-any.whl.metadata (6.1 kB)
+Collecting h11>=0.16 (from httpcore==1.*->httpx<1,>=0.23.0->huggingface_hub)
+  Downloading http://pypi-mirror.modal.local:5555/simple/h11/h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
+Collecting six>=1.5 (from python-dateutil>=2.8.2->pandas)
+  Downloading http://pypi-mirror.modal.local:5555/simple/six/six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
+Collecting shellingham>=1.3.0 (from typer->transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/shellingham/shellingham-1.5.4-py2.py3-none-any.whl.metadata (3.5 kB)
+Collecting rich>=13.8.0 (from typer->transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/rich/rich-15.0.0-py3-none-any.whl.metadata (18 kB)
+Collecting annotated-doc>=0.0.2 (from typer->transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/annotated-doc/annotated_doc-0.0.5-py3-none-any.whl.metadata (6.5 kB)
+Collecting markdown-it-py>=2.2.0 (from rich>=13.8.0->typer->transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/markdown-it-py/markdown_it_py-4.2.0-py3-none-any.whl.metadata (7.4 kB)
+Collecting pygments<3.0.0,>=2.13.0 (from rich>=13.8.0->typer->transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/pygments/pygments-2.20.0-py3-none-any.whl.metadata (2.5 kB)
+Collecting mdurl~=0.1 (from markdown-it-py>=2.2.0->rich>=13.8.0->typer->transformers>=4.51.0)
+  Downloading http://pypi-mirror.modal.local:5555/simple/mdurl/mdurl-0.1.2-py3-none-any.whl.metadata (1.6 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/einops/einops-0.8.2-py3-none-any.whl (65 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 65.6/65.6 kB 76.5 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/huggingface-hub/huggingface_hub-1.27.0-py3-none-any.whl (784 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 784.9/784.9 kB 380.4 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/numpy/numpy-2.5.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (16.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 16.7/16.7 MB 393.1 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/pandas/pandas-3.0.5-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (11.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 11.0/11.0 MB 387.3 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/pyarrow/pyarrow-25.0.1-cp312-cp312-manylinux_2_28_x86_64.whl (50.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 50.1/50.1 MB 399.7 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/transformers/transformers-5.15.0-py3-none-any.whl (11.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 11.7/11.7 MB 380.8 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/xxhash/xxhash-4.0.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (261 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 261.5/261.5 kB 71.8 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/click/click-8.4.2-py3-none-any.whl (119 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 119.2/119.2 kB 358.0 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/hf-xet/hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (4.5 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.5/4.5 MB 368.6 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/httpx/httpx-0.28.1-py3-none-any.whl (73 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 73.5/73.5 kB 345.5 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/httpcore/httpcore-1.0.9-py3-none-any.whl (78 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 78.8/78.8 kB 340.8 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/packaging/packaging-26.3-py3-none-any.whl (129 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 130.0/130.0 kB 379.2 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/python-dateutil/python_dateutil-2.9.0.post0-py2.py3-none-any.whl (229 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 229.9/229.9 kB 354.8 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/pyyaml/pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (807 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 807.9/807.9 kB 368.7 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/regex/regex-2026.7.19-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (801 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 801.8/801.8 kB 416.5 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/safetensors/safetensors-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (516 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 516.0/516.0 kB 379.8 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/tokenizers/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (3.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.3/3.3 MB 368.2 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/tqdm/tqdm-4.70.0-py3-none-any.whl (80 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 80.2/80.2 kB 369.7 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/typer/typer-0.27.1-py3-none-any.whl (122 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 122.9/122.9 kB 378.6 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/annotated-doc/annotated_doc-0.0.5-py3-none-any.whl (5.3 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/rich/rich-15.0.0-py3-none-any.whl (310 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 310.7/310.7 kB 332.3 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/shellingham/shellingham-1.5.4-py2.py3-none-any.whl (9.8 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/six/six-1.17.0-py2.py3-none-any.whl (11 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/anyio/anyio-4.14.2-py3-none-any.whl (125 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 125.8/125.8 kB 368.5 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/idna/idna-3.18-py3-none-any.whl (65 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 65.5/65.5 kB 371.8 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/certifi/certifi-2026.7.22-py3-none-any.whl (136 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 137.0/137.0 kB 276.5 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/h11/h11-0.16.0-py3-none-any.whl (37 kB)
+Downloading http://pypi-mirror.modal.local:5555/simple/markdown-it-py/markdown_it_py-4.2.0-py3-none-any.whl (91 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 91.7/91.7 kB 379.3 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/pygments/pygments-2.20.0-py3-none-any.whl (1.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.2/1.2 MB 373.5 MB/s eta 0:00:00
+Downloading http://pypi-mirror.modal.local:5555/simple/mdurl/mdurl-0.1.2-py3-none-any.whl (10.0 kB)
+Installing collected packages: xxhash, tqdm, six, shellingham, safetensors, regex, pyyaml, pygments, pyarrow, packaging, numpy, mdurl, idna, hf-xet, h11, einops, click, certifi, annotated-doc, python-dateutil, markdown-it-py, httpcore, anyio, rich, pandas, httpx, typer, huggingface_hub, tokenizers, transformers
+Successfully installed annotated-doc-0.0.5 anyio-4.14.2 certifi-2026.7.22 click-8.4.2 einops-0.8.2 h11-0.16.0 hf-xet-1.6.0 httpcore-1.0.9 httpx-0.28.1 huggingface_hub-1.27.0 idna-3.18 markdown-it-py-4.2.0 mdurl-0.1.2 numpy-2.5.2 packaging-26.3 pandas-3.0.5 pyarrow-25.0.1 pygments-2.20.0 python-dateutil-2.9.0.post0 pyyaml-6.0.3 regex-2026.7.19 rich-15.0.0 safetensors-0.8.0 shellingham-1.5.4 six-1.17.0 tokenizers-0.22.2 tqdm-4.70.0 transformers-5.15.0 typer-0.27.1 xxhash-4.0.0
+
+[notice] A new release of pip is available: 23.3.2 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+Saving image...
+Image saved, took 2.16s
+
+Built image im-emq7kcPaL0xt60gWqHbySF in 22.63s
+
+
+Building image im-ZcwulgRHEj7o82whvMuXnr
+
+=> Step 0: FROM base
+
+=> Step 1: RUN python -m pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3%2Bcu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+Looking in indexes: http://pypi-mirror.modal.local:5555/simple
+Collecting flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE
+  Downloading https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3%2Bcu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl (244.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 244.2/244.2 MB 36.9 MB/s eta 0:00:00
+Requirement already satisfied: torch in /usr/local/lib/python3.12/site-packages (from flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (2.9.1+cu130)
+Requirement already satisfied: einops in /usr/local/lib/python3.12/site-packages (from flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (0.8.2)
+Requirement already satisfied: filelock in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (3.29.0)
+Requirement already satisfied: typing-extensions>=4.10.0 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (4.15.0)
+Requirement already satisfied: setuptools in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (69.0.3)
+Requirement already satisfied: sympy>=1.13.3 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (3.6.1)
+Requirement already satisfied: jinja2 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (2026.4.0)
+Requirement already satisfied: nvidia-cuda-nvrtc==13.0.48 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (13.0.48)
+Requirement already satisfied: nvidia-cuda-runtime==13.0.48 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (13.0.48)
+Requirement already satisfied: nvidia-cuda-cupti==13.0.48 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (13.0.48)
+Requirement already satisfied: nvidia-cudnn-cu13==9.13.0.50 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (9.13.0.50)
+Requirement already satisfied: nvidia-cublas==13.0.0.19 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (13.0.0.19)
+Requirement already satisfied: nvidia-cufft==12.0.0.15 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (12.0.0.15)
+Requirement already satisfied: nvidia-curand==10.4.0.35 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (10.4.0.35)
+Requirement already satisfied: nvidia-cusolver==12.0.3.29 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (12.0.3.29)
+Requirement already satisfied: nvidia-cusparse==12.6.2.49 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (12.6.2.49)
+Requirement already satisfied: nvidia-cusparselt-cu13==0.8.0 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (0.8.0)
+Requirement already satisfied: nvidia-nccl-cu13==2.27.7 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (2.27.7)
+Requirement already satisfied: nvidia-nvshmem-cu13==3.3.24 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (3.3.24)
+Requirement already satisfied: nvidia-nvtx==13.0.39 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (13.0.39)
+Requirement already satisfied: nvidia-nvjitlink==13.0.39 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (13.0.39)
+Requirement already satisfied: nvidia-cufile==1.15.0.42 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (1.15.0.42)
+Requirement already satisfied: triton==3.5.1 in /usr/local/lib/python3.12/site-packages (from torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (3.5.1)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /usr/local/lib/python3.12/site-packages (from sympy>=1.13.3->torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in /usr/local/lib/python3.12/site-packages (from jinja2->torch->flash-attn==2.8.3+cu13torch2.9cxx11abiTRUE) (3.0.3)
+Installing collected packages: flash-attn
+Successfully installed flash-attn-2.8.3
+
+[notice] A new release of pip is available: 23.3.2 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+Saving image...
+Image saved, took 2.09s
+
+Built image im-ZcwulgRHEj7o82whvMuXnr in 17.46s
+
+
+Building image im-uZ3L0oEtd79do0LfWXzYpm
+
+=> Step 0: FROM base
+
+=> Step 1: RUN python -m pip install git+https://github.com/GeeeekExplorer/nano-vllm.git@bb823b3e06983d71485a8e1f23715ebd87d98ef8 --no-deps
+Looking in indexes: http://pypi-mirror.modal.local:5555/simple
+Collecting git+https://github.com/GeeeekExplorer/nano-vllm.git@bb823b3e06983d71485a8e1f23715ebd87d98ef8
+  Cloning https://github.com/GeeeekExplorer/nano-vllm.git (to revision bb823b3e06983d71485a8e1f23715ebd87d98ef8) to /tmp/pip-req-build-lezqjmy3
+  Running command git clone --filter=blob:none --quiet https://github.com/GeeeekExplorer/nano-vllm.git /tmp/pip-req-build-lezqjmy3
+  Running command git rev-parse -q --verify 'sha^bb823b3e06983d71485a8e1f23715ebd87d98ef8'
+  Running command git fetch -q https://github.com/GeeeekExplorer/nano-vllm.git bb823b3e06983d71485a8e1f23715ebd87d98ef8
+  Resolved https://github.com/GeeeekExplorer/nano-vllm.git to commit bb823b3e06983d71485a8e1f23715ebd87d98ef8
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: nano-vllm
+  Building wheel for nano-vllm (pyproject.toml): started
+  Building wheel for nano-vllm (pyproject.toml): finished with status 'done'
+  Created wheel for nano-vllm: filename=nano_vllm-0.2.0-py3-none-any.whl size=20062 sha256=f6d8e31587f0dc511a212c35ca77d587b394800d149683b5fa8845463e380ce3
+  Stored in directory: /tmp/pip-ephem-wheel-cache-e6hqn_ox/wheels/13/16/b9/6156afa390591ec0d8f8a48e45f7c90cc530beb9dd92a36f9d
+Successfully built nano-vllm
+Installing collected packages: nano-vllm
+Successfully installed nano-vllm-0.2.0
+
+[notice] A new release of pip is available: 23.3.2 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+Saving image...
+Image saved, took 1.39s
+
+Built image im-uZ3L0oEtd79do0LfWXzYpm in 8.24s
+
+
+✓ Created objects.
+├── 🔨 Created mount 
+│   /Users/shreyashankar/Documents/projects/quail-exploration/experiments/modal_
+│   nanovllm.py
+├── 🔨 Created mount PythonPackage:workload
+└── 🔨 Created function batchsweep.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/site-packages/httpx/_transports/default.py", line 101, in map_httpcore_exceptions
+    yield
+  File "/usr/local/lib/python3.12/site-packages/httpx/_transports/default.py", line 250, in handle_request
+    resp = self._pool.handle_request(req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpcore/_sync/connection_pool.py", line 256, in handle_request
+    raise exc from None
+  File "/usr/local/lib/python3.12/site-packages/httpcore/_sync/connection_pool.py", line 236, in handle_request
+    response = connection.handle_request(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpcore/_sync/connection.py", line 101, in handle_request
+    raise exc
+  File "/usr/local/lib/python3.12/site-packages/httpcore/_sync/connection.py", line 78, in handle_request
+    stream = self._connect(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpcore/_sync/connection.py", line 156, in _connect
+    stream = stream.start_tls(**kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpcore/_backends/sync.py", line 154, in start_tls
+    with map_exceptions(exc_map):
+  File "/usr/local/lib/python3.12/contextlib.py", line 158, in __exit__
+    self.gen.throw(value)
+  File "/usr/local/lib/python3.12/site-packages/httpcore/_exceptions.py", line 14, in map_exceptions
+    raise to_exc(exc) from exc
+httpcore.ConnectError: [Errno 104] Connection reset by peer
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/site-packages/huggingface_hub/_snapshot_download.py", line 268, in snapshot_download
+    repo_info = api.repo_info(repo_id=repo_id, repo_type=repo_type, revision=revision)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 88, in _inner_fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/huggingface_hub/hf_api.py", line 3648, in repo_info
+    return method(
+           ^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 88, in _inner_fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/huggingface_hub/hf_api.py", line 3327, in model_info
+    r = get_session().get(path, headers=headers, timeout=timeout, params=params)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpx/_client.py", line 1053, in get
+    return self.request(
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpx/_client.py", line 825, in request
+    return self.send(request, auth=auth, follow_redirects=follow_redirects)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpx/_client.py", line 914, in send
+    response = self._send_handling_auth(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpx/_client.py", line 942, in _send_handling_auth
+    response = self._send_handling_redirects(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpx/_client.py", line 979, in _send_handling_redirects
+    response = self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpx/_client.py", line 1014, in _send_single_request
+    response = transport.handle_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/httpx/_transports/default.py", line 249, in handle_request
+    with map_httpcore_exceptions():
+  File "/usr/local/lib/python3.12/contextlib.py", line 158, in __exit__
+    self.gen.throw(value)
+  File "/usr/local/lib/python3.12/site-packages/httpx/_transports/default.py", line 118, in map_httpcore_exceptions
+    raise mapped_exc(message) from exc
+httpx.ConnectError: [Errno 104] Connection reset by peer
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/pkg/modal/_runtime/container_io_manager.py", line 947, in handle_input_exception
+    yield
+  File "/pkg/modal/_container_entrypoint.py", line 172, in run_input_sync
+    values = io_context.call_function_sync()
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/pkg/modal/_runtime/container_io_manager.py", line 225, in call_function_sync
+    expected_value_or_values = self.finalized_function.callable(*args, **kwargs)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/modal_nanovllm.py", line 64, in batchsweep
+    model_path = snapshot_download(NANO_MODEL)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 88, in _inner_fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/huggingface_hub/_snapshot_download.py", line 372, in snapshot_download
+    raise LocalEntryNotFoundError(
+huggingface_hub.errors.LocalEntryNotFoundError: Got: ConnectError: [Errno 104] Connection reset by peer
+An error happened while trying to locate the files on the Hub, and we cannot find the appropriate snapshot folder for the specified revision on the local disk. Please check your internet connection and try again.
+Stopping app - uncaught exception raised in remote container: LocalEntryNotFoundError('Got: ConnectError: [Errno 104] Connection reset by peer\nAn error happened while trying to locate the files on the Hub, and we cannot find the appropriate snapshot folder for the specified revision on the local disk. Please check your internet connection and try again.').
+╭─ Error ──────────────────────────────────────────────────────────────────────╮
+│ Got: ConnectError: [Errno 104] Connection reset by peer                      │
+│ An error happened while trying to locate the files on the Hub, and we cannot │
+│ find the appropriate snapshot folder for the specified revision on the local │
+│ disk. Please check your internet connection and try again.                   │
+╰──────────────────────────────────────────────────────────────────────────────╯
+✓ Initialized. View run at 
+https://modal.com/apps/fsdatalab/main/ap-rQ6IzatoO2U0WFUY1ElCgz
+✓ Created objects.
+├── 🔨 Created mount 
+│   /Users/shreyashankar/Documents/projects/quail-exploration/experiments/modal_
+│   nanovllm.py
+├── 🔨 Created mount PythonPackage:workload
+└── 🔨 Created function batchsweep.
+
+[1AFetching 13 files:   0%|          | 0/13 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+
+[1AFetching 13 files:  15%|█▌        | 2/13 [00:00<00:00, 16.59it/s]
+[1AFetching 13 files:  69%|██████▉   | 9/13 [00:00<00:00, 34.26it/s]
+[1AFetching 13 files:  85%|████████▍ | 11/13 [00:19<00:00, 34.26it/s]
+[1AFetching 13 files:  92%|█████████▏| 12/13 [00:29<00:03,  3.30s/it]
+[1AFetching 13 files: 100%|██████████| 13/13 [00:31<00:00,  3.08s/it]Fetching 13 files: 100%|██████████| 13/13 [00:31<00:00,  2.39s/it]
+
+[nano sweep] B=512, max_num_seqs=512
+[nano sweep B=512] wall 341.43s, rate 10,731 tok/s
+
+[nano sweep] B=1024, max_num_seqs=1024
+[nano sweep B=1024] wall 161.77s, rate 22,649 tok/s
+
+[nano sweep] B=2048, max_num_seqs=2048
+[nano sweep B=2048] wall 74.70s, rate 49,048 tok/s
+
+[nano sweep] B=4096, max_num_seqs=4096
+[nano sweep B=4096] wall 52.30s, rate 70,058 tok/s
+
+[nano sweep] B=8192, max_num_seqs=4096
+[nano sweep B=8192] wall 50.96s, rate 71,903 tok/s
+
+[nano sweep] B=16384, max_num_seqs=4096
+[nano sweep B=16384] wall 49.79s, rate 73,583 tok/s
+
+[nano sweep] B=25305, max_num_seqs=4096
+[nano sweep B=25305] wall 48.99s, rate 74,796 tok/s
+{
+  "engine": "nano-vllm",
+  "nano_commit": "bb823b3e06983d71485a8e1f23715ebd87d98ef8",
+  "model": "Qwen/Qwen3-4B",
+  "dtype": "bfloat16",
+  "n_docs": 10000,
+  "image": {
+    "base": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
+    "toolchain": "cuda13-devel"
+  },
+  "results": [
+    {
+      "B": 512,
+      "max_num_seqs": 512,
+      "wall": 341.426,
+      "prompt_tokens": 3663917,
+      "rate": 10731.2
+    },
+    {
+      "B": 1024,
+      "max_num_seqs": 1024,
+      "wall": 161.767,
+      "prompt_tokens": 3663917,
+      "rate": 22649.4
+    },
+    {
+      "B": 2048,
+      "max_num_seqs": 2048,
+      "wall": 74.7,
+      "prompt_tokens": 3663917,
+      "rate": 49048.4
+    },
+    {
+      "B": 4096,
+      "max_num_seqs": 4096,
+      "wall": 52.298,
+      "prompt_tokens": 3663917,
+      "rate": 70058.3
+    },
+    {
+      "B": 8192,
+      "max_num_seqs": 4096,
+      "wall": 50.956,
+      "prompt_tokens": 3663917,
+      "rate": 71902.9
+    },
+    {
+      "B": 16384,
+      "max_num_seqs": 4096,
+      "wall": 49.793,
+      "prompt_tokens": 3663917,
+      "rate": 73583.4
+    },
+    {
+      "B": 25305,
+      "max_num_seqs": 4096,
+      "wall": 48.985,
+      "prompt_tokens": 3663917,
+      "rate": 74796.1
+    }
+  ]
+}
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/fsdatalab/main/ap-rQ6IzatoO2U0WFUY1ElCgz

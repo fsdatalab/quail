@@ -1,0 +1,93 @@
+✓ Initialized. View run at 
+https://modal.com/apps/fsdatalab/main/ap-kRj46NsQU9gPnyaqkMye0x
+✓ Created objects.
+├── 🔨 Created mount 
+│   /Users/shreyashankar/Documents/projects/quail-exploration/experiments/modal_
+│   profiling.py
+├── 🔨 Created mount PythonPackage:workload
+├── 🔨 Created mount PythonPackage:quail
+├── 🔨 Created function batchsweep.
+├── 🔨 Created function deepgemm_choice_probe.
+├── 🔨 Created function cudagraph_cap_probe.
+├── 🔨 Created function knobgrid.
+├── 🔨 Created function torchprof.
+├── 🔨 Created function component_profile.
+├── 🔨 Created function component_profile_512_1024.
+├── 🔨 Created function ncubench.
+├── 🔨 Created function ncureport.
+└── 🔨 Created function attnshare.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+
+[bsweep] B=65000, max_num_seqs=4096, capture_sizes=[8192]
+(EngineCore pid=62) Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+(EngineCore pid=62) Loading safetensors checkpoint shards:  50% Completed | 1/2 [00:01<00:01,  1.53s/it]
+(EngineCore pid=62) Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:01<00:00,  1.30it/s]
+(EngineCore pid=62) 
+(EngineCore pid=62) WARNING 08-16 03:27:09 [kv_cache.py:134] Checkpoint does not provide a q scaling factor. Setting it to k_scale. This only matters for FP8 Attention backends (flash-attn or flashinfer).
+(EngineCore pid=62) WARNING 08-16 03:27:09 [kv_cache.py:151] Using KV cache scaling factor 1.0 for fp8_e4m3. If this is unintended, verify that k/v_scale scaling factors are properly set in the checkpoint.
+(EngineCore pid=62) WARNING 08-16 03:27:09 [kv_cache.py:190] Using uncalibrated q_scale 1.0 and/or prob_scale 1.0 with fp8 attention. This may cause accuracy issues. Please make sure q/prob scaling factors are available in the fp8 checkpoint.
+(EngineCore pid=62) 
+[1ADeepGEMM warmup:   0%|          | 0/4743 [00:00<?, ?it/s]
+[1ADeepGEMM warmup:   0%|          | 1/4743 [00:02<3:01:25,  2.30s/it]
+[1ADeepGEMM warmup:   0%|          | 6/4743 [00:04<46:09,  1.71it/s]  
+[1ADeepGEMM warmup:   0%|          | 9/4743 [00:05<45:56,  1.72it/s]
+[1ADeepGEMM warmup:   0%|          | 14/4743 [00:08<43:33,  1.81it/s]
+[1ADeepGEMM warmup:   0%|          | 19/4743 [00:10<38:34,  2.04it/s]
+[1ADeepGEMM warmup:   1%|          | 24/4743 [00:13<39:56,  1.97it/s]
+[1ADeepGEMM warmup:   1%|          | 31/4743 [00:15<32:24,  2.42it/s]
+[1ADeepGEMM warmup:   1%|          | 42/4743 [00:18<28:39,  2.73it/s]
+[1ADeepGEMM warmup:   1%|          | 52/4743 [00:20<23:19,  3.35it/s]
+[1ADeepGEMM warmup:   1%|▏         | 62/4743 [00:22<20:37,  3.78it/s]
+[1ADeepGEMM warmup:   1%|▏         | 68/4743 [00:26<26:29,  2.94it/s]
+[1ADeepGEMM warmup:   2%|▏         | 111/4743 [00:28<10:34,  7.30it/s]
+[1ADeepGEMM warmup:  22%|██▏       | 1060/4743 [00:28<00:22, 166.84it/s]
+[1ADeepGEMM warmup:  26%|██▌       | 1216/4743 [00:41<00:21, 166.84it/s]
+[1ADeepGEMM warmup:  26%|██▌       | 1217/4743 [00:41<01:11, 49.24it/s] 
+[1ADeepGEMM warmup:  26%|██▌       | 1221/4743 [00:43<01:22, 42.70it/s]
+[1ADeepGEMM warmup:  26%|██▌       | 1245/4743 [01:02<01:21, 42.70it/s]
+[1ADeepGEMM warmup:  26%|██▋       | 1246/4743 [01:02<03:49, 15.23it/s]
+[1ADeepGEMM warmup:  26%|██▋       | 1250/4743 [01:06<04:29, 12.95it/s]
+[1ADeepGEMM warmup:  27%|██▋       | 1285/4743 [01:24<04:26, 12.95it/s]
+[1ADeepGEMM warmup:  27%|██▋       | 1286/4743 [01:24<07:41,  7.49it/s]
+[1ADeepGEMM warmup:  27%|██▋       | 1293/4743 [01:26<08:09,  7.04it/s]
+[1ADeepGEMM warmup:  48%|████▊     | 2293/4743 [01:26<00:40, 60.59it/s]
+[1ADeepGEMM warmup:  56%|█████▌    | 2662/4743 [01:46<00:58, 35.53it/s]
+[1ADeepGEMM warmup:  69%|██████▉   | 3283/4743 [01:46<00:23, 62.42it/s]
+[1ADeepGEMM warmup:  76%|███████▌  | 3590/4743 [01:56<00:18, 62.42it/s]
+[1ADeepGEMM warmup:  76%|███████▌  | 3591/4743 [01:56<00:23, 49.55it/s]
+[1ADeepGEMM warmup:  76%|███████▌  | 3594/4743 [01:58<00:25, 45.43it/s]
+[1ADeepGEMM warmup:  76%|███████▌  | 3607/4743 [02:08<00:25, 45.43it/s]
+[1ADeepGEMM warmup:  76%|███████▌  | 3608/4743 [02:08<00:41, 27.19it/s]
+[1ADeepGEMM warmup:  76%|███████▌  | 3611/4743 [02:10<00:45, 24.72it/s]
+[1ADeepGEMM warmup:  77%|███████▋  | 3651/4743 [02:31<00:44, 24.72it/s]
+[1ADeepGEMM warmup:  77%|███████▋  | 3652/4743 [02:31<01:42, 10.63it/s]
+[1ADeepGEMM warmup:  77%|███████▋  | 3655/4743 [02:35<01:59,  9.12it/s]
+[1ADeepGEMM warmup:  80%|████████  | 3807/4743 [02:41<01:11, 13.03it/s]
+[1ADeepGEMM warmup:  95%|█████████▌| 4512/4743 [02:41<00:04, 52.11it/s]DeepGEMM warmup: 100%|██████████| 4743/4743 [02:41<00:00, 29.30it/s]
+(EngineCore pid=62) 2026-08-16 03:30:44,211 - INFO - autotuner.py:651 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(EngineCore pid=62) 2026-08-16 03:30:45,088 - INFO - autotuner.py:674 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(EngineCore pid=62) WARNING 08-16 03:30:45 [kernel_warmup.py:258] No FlashInfer autotune cache entries found.Falling back to default tactics.
+(EngineCore pid=62) 
+[1ACapturing CUDA graphs (PIECEWISE):   0%|          | 0/1 [00:00<?, ?it/s]
+[1ACapturing CUDA graphs (PIECEWISE): 100%|██████████| 1/1 [00:00<00:00,  6.19it/s]
+[1ACapturing CUDA graphs (PIECEWISE): 100%|██████████| 1/1 [00:00<00:00,  6.18it/s]
+{"B": 65000, "max_num_seqs": 4096, "cudagraph_capture_sizes": [8192], "gpu_memory_utilization": 0.88, "n_docs": 10000, "wall": 37.46, "prompt_tokens": 3663917, "cached_tokens": 0, "uncached_tokens": 3663917, "rate": 97809.7}
+[
+  {
+    "B": 65000,
+    "max_num_seqs": 4096,
+    "cudagraph_capture_sizes": [
+      8192
+    ],
+    "gpu_memory_utilization": 0.88,
+    "n_docs": 10000,
+    "wall": 37.46,
+    "prompt_tokens": 3663917,
+    "cached_tokens": 0,
+    "uncached_tokens": 3663917,
+    "rate": 97809.7
+  }
+]
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/fsdatalab/main/ap-kRj46NsQU9gPnyaqkMye0x
