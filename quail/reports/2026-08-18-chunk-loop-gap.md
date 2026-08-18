@@ -5,9 +5,9 @@ in `results/`.
 
 This report covers issue #9 (the 4-to-6-second overhead budget for
 the 10k five-filter run) item by item: the wall-minus-GPU gap (item
-4), the block_table build (item 2), the attention merge chain (item
-3), and the drain-chunk GEMM question (item 1, measured and rejected
-below).
+4) and the block_table build (item 2), which landed as one change;
+the attention merge chain (item 3) and the drain-chunk GEMM question
+(item 1), both measured and rejected below.
 
 ## Baseline
 
@@ -60,59 +60,71 @@ No arithmetic, launch order, or chunk composition changed.
 
 ## Results
 
-Two changes landed: the staged-packing fix (items 2 and 4) and the
-fused merge kernel (item 3). The staging fix is bit-identical; the
-merge kernel carries the near-tie drift described above.
+One change landed: the staged-packing fix (items 2 and 4). The merge
+fusion (item 3) was implemented and measured but rejected — see its
+section. All numbers below are the packing fix alone, answers
+bit-identical everywhere.
 
-| Gate | Before | After staging | After staging + merge | Answers |
-|---|---|---|---|---|
-| Filter, 10k docs, 5 filters | 36.01 / 36.08 s | 34.02 / 34.03 s | 33.13 / 33.10 s (−8.1%) | staging: bit-identical; +merge: 1,811 / 23,152 / 6,276 |
-| Filter + store, cold | 31.28 s | 27.05 s | 24.21 s (−22.6%) | 887 survivors, 5,000 stored |
-| Filter + store, warm | 11.70 s | 9.98 / 10.00 s | 9.58 / 9.57 s (−18.2%) | 889 survivors, 5,000 restored |
-| Join, 256k pairs | 108.09 / 107.54 s | 105.56 / 105.29 s | 97.10 / 97.10 s (−9.9%) | 177,406 yes (near-tie drift), 77 chunks |
-| Probe parity gates | 0 disagreements | 0 disagreements | 0 disagreements | — |
+| Gate | Before | After | Answers |
+|---|---|---|---|
+| Filter, 10k docs, 5 filters | 36.01 / 36.08 s | 33.9-34.7 s across the day's runs (−4 to −6%) | bit-identical (1,807 / 23,113 / 6,294) |
+| Filter + store, cold | 31.28 s | 27.05 s (−13%) | identical (882 survivors, 5,000 stored) |
+| Filter + store, warm | 11.70 s | 9.98 / 10.00 s (−15%) | identical (887 survivors, 5,000 restored) |
+| Join, 256k pairs | 108.09 / 107.54 s | 105.56 / 105.29 s (−2.1%) | identical (177,346 yes, 77 chunks) |
+| Probe parity gates | 0 disagreements | 0 disagreements | — |
 
 The filter wall-minus-GPU gap fell from 2.05 s to 0.05-0.08 s — the
 drain tail, which is the irreducible part. Filter throughput rose
-from 106.3k to 115.8k tokens/s. The merge kernel is worth more on
-the join than on the filter (the join is cross-attention-heavy, so
-the merge chain was a bigger share of its GPU time). Peak memory is
-unchanged everywhere (65.93 GiB filter, 66.83 cold store).
+from about 106k to about 111k tokens/s. The store cells gained more
+because their chunks are smaller (62k tokens per chunk on the cold
+run against 70-110k on the filter gate), so the fixed per-chunk CPU
+cost weighed more against less GPU time. Peak memory is unchanged
+everywhere (65.93 GiB filter, 66.83 cold store).
+
+One honesty note on the filter number: the same code measured
+34.02 / 34.03 s on the morning's Modal instance and 34.57 / 34.66 s
+on the afternoon's (GPU time itself moved 33.9 to 34.5 s). The
+baseline moved less (36.0 s was measured on the morning instance).
+The gap closure — the actual claim — is instance-independent: wall
+minus GPU is 0.05-0.08 s on every run after the fix, against 2.0-2.1
+s before it.
 
 Against the issue's 4-to-6 s budget for the 10k filter: the gap
-closure gave 2.0 s (the issue estimated 1 to 1.5), the merge gave
-about 0.9 s of wall (the issue estimated 0.5 to 1), and item 1's
+closure gave about 2 s (the issue estimated 1 to 1.5), item 1's
 drain-chunk estimate did not hold up (about 0.1 s exists, not 2 to
-3). Net: 36.0 to 33.1 s. The remaining distance to the ~28 s floor
-is GEMM per-shape efficiency, uniform across chunk sizes.
+3), and item 3's 0.5-1 s was real but rejected. Net landed: 36.0 to
+about 34.3 s. The remaining distance to the ~28 s floor is GEMM
+per-shape efficiency, uniform across chunk sizes.
 
-## Item 3: the attention merge chain, fused
+## Item 3: the attention merge chain — implemented, measured, rejected
 
-The two-call attention path merged its partial outputs with about 9
+The two-call attention path merges its partial outputs with about 9
 launches per layer (two LSE transposes, three index_selects, sub,
 sigmoid, cast, lerp, index_copy_) — launch-bound tiny kernels, about
-1.2 s per 10k run. `lse_merge` (one Triton program per suffix row,
-each handling all heads) does the whole merge in one launch per
-layer, reading the LSE tensors in their native layout.
+1.2 s per 10k run. We built the fusion: `lse_merge`, one Triton
+program per suffix row handling all heads, reading the LSE tensors
+in their native layout, replicating torch's lerp branch and rounding.
 
-Two pitfalls found and fixed during gating:
+Measured with the fusion on top of the packing fix: filter 33.1 s
+(0.9 s better than the packing fix alone), join 97.1 s (8.4 s
+better), probe parity gates all zero disagreements.
 
-- The merge is not idempotent — a 2D grid merged every row 32 times
-  (survivors collapsed to 1). The launch grid is now (n_suffix_rows,).
+Rejected anyway, on a team call. The kernel's fp32 sigmoid
+(`tl.sigmoid`) differs from `torch.sigmoid` at the 1-ulp level,
+which flips a few near-tie answers downstream: survivors 1,811
+against 1,807, wrong rate 27.1% against 27.2%. That is the near-tie
+drift class the milestone 1 report documents, and the probe gates
+pass — but the team prefers bit-identical answers over the 0.9 s.
+The kernel is not in the tree; it is preserved in git history
+(commits `fef38aa`, `1ac4fe9`) with the pitfalls found along the
+way, in case the trade-off is ever revisited:
+
+- The merge is not idempotent: an early version's stale 2D launch
+  grid merged every row 32 times (survivors collapsed to 1).
 - The LSE strides vary with the chunk's token count, and Triton
-  specializes integer arguments on div-by-16: the first chunk whose
-  stride hit a new key paid a 0.6 s JIT compile inside the measured
-  run. The stride arguments are now `do_not_specialize`.
-
-The kernel replicates the unfused chain's rounding (fp32 sigmoid,
-bf16 weight, fp32 lerp with torch's |w| < 0.5 branch). The residual
-difference against the unfused chain is the fp32 sigmoid itself
-(`tl.sigmoid` vs `torch.sigmoid` at the 1-ulp level), which flips a
-few near-tie answers downstream: survivors 1,811 against 1,807,
-answered 23,152 against 23,113, wrong 6,276 against 6,294 (27.1%
-against 27.2%). The probe's parity gates all pass with zero
-disagreements. This is the near-tie drift class the milestone 1
-report documents between engines; it is not a correctness bug.
+  re-specializes integer arguments on div-by-16: the first such
+  chunk paid a 0.6 s JIT compile inside a measured run. The fix was
+  `do_not_specialize` on the stride arguments.
 
 ## Item 1: drain-chunk GEMMs, measured and rejected
 
@@ -143,18 +155,21 @@ sizes — not drain-driven, and not a scheduling fix.
 
 ## Data files
 
-- `results/m1_filter.json` / `m1_filter_final.log`: the filter gate
-  after both fixes. Baselines: commit `ad3f9be`'s `m1_filter.json`
-  (pre-fix) and `m1_filter_staged.log` (staging only).
-- `results/m1_filter_timing.json` / `m1_filter_timing_v2b.log`: the
-  instrumented 10k run with the full per-chunk series.
-  `m1_filter_timing_nomerge.json` isolates the staging fix at the
-  same scale.
-- `results/m1_filter_store.json` / `m1_filter_store_final.log`:
-  store gate after both fixes.
-- `results/m1_join.json` / `m1_join_final.log`: join gate after both
-  fixes.
-- `results/m1_probe.json` / `m1_probe_merge2.log`: probe after both
-  fixes.
-- `results/profile_filter.json` / `profile_merge.log`: the 3k
-  torch-profiler run with the merge kernel.
+Final state (packing fix only):
+
+- `results/m1_filter.json` / `m1_filter_final2.log`: the filter gate
+  on the final tree. The pre-fix baseline is commit `ad3f9be`'s
+  `m1_filter.json` (plus `m1_filter_gap_baseline.log`).
+- `results/m1_filter_timing.json` / `m1_filter_timing_final.log`:
+  the instrumented 10k run with per-phase CPU times and the full
+  per-chunk series.
+- `results/m1_filter_store.json` and `results/m1_join.json`: store
+  and join gates, measured on executor code byte-identical to the
+  final tree (`m1_filter_store_staged.log`, `m1_join_staged.log`).
+- `results/m1_probe.json` / `m1_probe_final.log`: probe on the final
+  tree.
+
+Merge-fusion evidence (rejected item 3): `m1_filter_timing_v2b.log`
+(filter 33.1 s with the kernel), `m1_join_final.log` (join 97.1 s),
+`m1_probe_merge2.log` (probe passing), and the kernel itself in
+commits `fef38aa` and `1ac4fe9`.
