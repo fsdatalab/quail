@@ -70,7 +70,7 @@ engine must return the same answers as before the change.
 
 | Workload | Wall before | Wall after | Time saved | Answers unchanged? |
 |---|---|---|---|---|
-| Filter, 10k docs, 5 filters | 36.0 s | ~34.3 s (33.9-34.7 across the day's runs) | ~2 s (−4 to −6%) | yes, bit-identical (1,807 survivors / 23,113 answered / 6,294 wrong) |
+| Filter, 10k docs, 5 filters | 36.01 / 36.08 s | 34.02 / 34.03 s (morning instance); 34.57 / 34.66 s (afternoon instance, identical code) | ~2 s (−4 to −6%) | yes, bit-identical (1,807 survivors / 23,113 answered / 6,294 wrong) |
 | Filter + store, cold pass | 31.3 s | 27.1 s | 4.2 s (−13%) | yes (882 survivors, 5,000 stored) |
 | Filter + store, warm pass | 11.7 s | 10.0 s | 1.7 s (−15%) | yes (887 survivors, 5,000 restored) |
 | Join, 256k pairs | 107.5-108.1 s | 105.3-105.6 s | ~2.3 s (−2.1%) | yes (177,346 yes, 77 chunks) |
@@ -84,13 +84,11 @@ run against 70-110k on the filter gate), so the fixed per-chunk CPU
 cost weighed more against less GPU time. Peak memory is unchanged
 everywhere (65.93 GiB filter, 66.83 cold store).
 
-One honesty note on the filter number: the same code measured
-34.02 / 34.03 s on the morning's Modal instance and 34.57 / 34.66 s
-on the afternoon's (GPU time itself moved 33.9 to 34.5 s). The
-baseline moved less (36.0 s was measured on the morning instance).
-The gap closure — the actual claim — is instance-independent: wall
-minus GPU is 0.05-0.08 s on every run after the fix, against 2.0-2.1
-s before it.
+Why the filter has two after-numbers: the same code ran on two
+different Modal H100 instances, which differ by about 0.5 s of GPU
+time for identical work (33.9 s against 34.5 s). The
+instance-independent claim is the gap closure: wall minus GPU is
+0.05-0.08 s on every run after the fix, against 2.0-2.1 s before it.
 
 Against the issue's 4-to-6 s budget for the 10k filter: the gap
 closure gave about 2 s (the issue estimated 1 to 1.5), item 1's
