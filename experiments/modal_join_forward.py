@@ -82,6 +82,15 @@ GROUP = 128            # fp8 quant group size, matches the engine
 SLACK = 2              # the budget formula's declared slack
 DATA_SEED = 20260817
 
+# The widest activation row is gate_up's 19,456 columns, and the
+# fused kernels compute element offsets in 32-bit ints, so a chunk
+# needs rows x 19,456 < 2^31 - the exact bound is 110,375 tokens.
+# The memory budget B* = 421,752 exceeds it: a 421,750-token chunk
+# dies with an illegal address in the MLP. The executor therefore
+# runs at min(B*, this cap); rate is flat in chunk size, so the cap
+# costs nothing measurable.
+KERNEL_CHUNK_CAP = 110_000
+
 PREAMBLE = ("You will be shown a patient report and one candidate "
             "medical reaction term. Decide whether the report "
             "describes that reaction as something the patient "
@@ -1110,18 +1119,20 @@ def join2way(n_reports: int = 100, reps_packed: int = 2,
     suffix_lens = [len(s) for s in suffixes]
     fresh_star = sum(len(p) for p in prefixes) + n_reports * sum(suffix_lens)
 
+    exec_budget = min(chunk_budget(), KERNEL_CHUNK_CAP)
     report = dict(
         model=MODEL, n_reports=n_reports, n_terms=n_terms, pairs=pairs,
-        b_star=chunk_budget(),
+        b_star=chunk_budget(), exec_budget=exec_budget,
         lengths=dict(
             prefix_mean=round(sum(map(len, prefixes)) / n_reports, 1),
             prefix_max=max(map(len, prefixes)),
             suffix_mean=round(sum(suffix_lens) / n_terms, 1),
             preamble=data["preamble_tokens"],
             max_report_tokens=data["max_report_tokens"]),
-        prediction=("packed B* ~96 s at measured lengths: same 8.42M "
-                    "tokens as the prior 98.7 s run, brim-packed into "
-                    "~20 chunks with builds overlapped; peak ~40 GiB; "
+        prediction=("packed at the 110k kernel cap: same 8.42M tokens "
+                    "as the prior 98.7 s run, ~77 brim chunks, ~76 cut "
+                    "anchors served from the KV cache, wall 96-100 s, "
+                    "peak ~16 GiB, answers within tens of 177,830 YES; "
                     "stock ~433 s as before"),
         runs=[])
     print(f"[join2way] {pairs:,} pairs; fresh tokens at B* "
@@ -1221,8 +1232,7 @@ def join2way(n_reports: int = 100, reps_packed: int = 2,
             torch, [dict(anchor=0, prefix=prefixes[0],
                          suffixes=suffixes[:64])])
         pipeline.forward_chunk(warm)
-    packed_answers = run_arm("packed_bstar_cell", chunk_budget(),
-                             reps_packed)
+    packed_answers = run_arm("packed", exec_budget, reps_packed)
 
     # accuracy sanity only - never a claim (report's own terms vs
     # packed answers)
@@ -1290,7 +1300,8 @@ def nway3() -> str:
         t0 = time.perf_counter()
         ans, spans, _ = run_join(torch, pipeline, async_ans,
                                  b_prefix, [a_suffix, c_suffix],
-                                 chunk_budget(), group_size=1)
+                                 min(chunk_budget(), KERNEL_CHUNK_CAP),
+                                 group_size=1)
         torch.cuda.synchronize()
     total_wall = time.perf_counter() - t0
     ans1, ans2 = ans[0], ans[1]

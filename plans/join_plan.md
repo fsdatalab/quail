@@ -466,7 +466,27 @@ Results:
   internally coherent with the judge's known behavior: ~99% YES on
   both stages, so nearly all of 100 x 100 x 100 planted triples
   survive the model's answers.
-- join2way: pending.
+- join2way, first attempt: **the packed arm crashed on its first
+  chunk — and the crash is a finding about B*.** A 421,750-token
+  chunk died with an illegal memory address in the MLP. Cause: the
+  widest activation row is gate_up's 19,456 columns, and the fused
+  kernels compute element offsets in 32-bit ints, so a chunk needs
+  rows x 19,456 < 2^31 — at most 110,375 tokens. The memory budget
+  B* = 421,752 is 3.8x past that. B* therefore has two ceilings:
+  memory (421,752) and kernel indexing (110,375), and the tighter
+  one binds. No earlier run hit this because the old executor's
+  largest chunk was one report group, 84,155 tokens — 24% under
+  the bound. The executor now runs at min(B*, 110,000); rate is
+  flat in chunk size, so the cap costs nothing measurable. (The
+  stock arm completed before the crash: rep 0 was 462.0 s with
+  yes = 154,731, identical answers to the committed run.)
+- join2way, relaunched at the capped budget. Revised prediction:
+  same 8,417,425 fresh tokens, 78 brim chunks of up to 110k
+  tokens, 73 cut anchors served from the KV cache, wall 96-100 s,
+  peak ~16 GiB, answers within tens of the previous 177,830 YES
+  (cut continuations read bit-identical cached K/V, but their
+  prefixes are computed at different chunk shapes than before, so
+  a few knife-edge pairs may flip).
 
 ---
 
