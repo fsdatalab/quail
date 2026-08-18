@@ -62,16 +62,19 @@ No arithmetic, launch order, or chunk composition changed.
 
 One change landed: the staged-packing fix (items 2 and 4). The merge
 fusion (item 3) was implemented and measured but rejected — see its
-section. All numbers below are the packing fix alone, answers
-bit-identical everywhere.
+section. All numbers below are the packing fix alone.
 
-| Gate | Before | After | Answers |
-|---|---|---|---|
-| Filter, 10k docs, 5 filters | 36.01 / 36.08 s | 33.9-34.7 s across the day's runs (−4 to −6%) | bit-identical (1,807 / 23,113 / 6,294) |
-| Filter + store, cold | 31.28 s | 27.05 s (−13%) | identical (882 survivors, 5,000 stored) |
-| Filter + store, warm | 11.70 s | 9.98 / 10.00 s (−15%) | identical (887 survivors, 5,000 restored) |
-| Join, 256k pairs | 108.09 / 107.54 s | 105.56 / 105.29 s (−2.1%) | identical (177,346 yes, 77 chunks) |
-| Probe parity gates | 0 disagreements | 0 disagreements | — |
+Before/After are wall-clock seconds for the same workload on one
+H100; lower is better. The last column is the correctness check: the
+engine must return the same answers as before the change.
+
+| Workload | Wall before | Wall after | Time saved | Answers unchanged? |
+|---|---|---|---|---|
+| Filter, 10k docs, 5 filters | 36.0 s | ~34.3 s (33.9-34.7 across the day's runs) | ~2 s (−4 to −6%) | yes, bit-identical (1,807 survivors / 23,113 answered / 6,294 wrong) |
+| Filter + store, cold pass | 31.3 s | 27.1 s | 4.2 s (−13%) | yes (882 survivors, 5,000 stored) |
+| Filter + store, warm pass | 11.7 s | 10.0 s | 1.7 s (−15%) | yes (887 survivors, 5,000 restored) |
+| Join, 256k pairs | 107.5-108.1 s | 105.3-105.6 s | ~2.3 s (−2.1%) | yes (177,346 yes, 77 chunks) |
+| Probe parity gates | 0 disagreements | 0 disagreements | — | — |
 
 The filter wall-minus-GPU gap fell from 2.05 s to 0.05-0.08 s — the
 drain tail, which is the irreducible part. Filter throughput rose
