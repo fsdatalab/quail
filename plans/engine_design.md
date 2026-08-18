@@ -769,10 +769,22 @@ spec-ratio scaling (the existing `_scale`), and say so in
 `explain()`. The fp8-KV conversion tax q_kv (§6) is the same kind
 of constant: anchored by one measurement (0.59 µs/token at
 4B/H100), scaled to other models by KV elements per token and to
-other devices by memory bandwidth. An optional calibration overlay
-per (model, device) — the batch sweep plus the parity probe, ~10
-GPU-minutes — replaces both assumptions with measurements. Plans
-never require calibration; they only get sharper predictions from
+other devices by memory bandwidth.
+
+Sharper constants come from a **calibration file**, and it is
+important to say when that file is made: offline, once per
+(model, device) pair, by an explicit command —
+`quail calibrate <model> <device>` — that runs the batch sweep and
+the parity probe (~10 GPU-minutes) and writes the measured
+constants (serving rate, q_kv, the attention coefficient) to a
+JSON checked into the repo, exactly what
+`results/engine/cost_model_fit.json` is in the exploration repo
+today. Nothing is ever measured at plan time or at query time: the
+planner reads constants from the file when one exists for this
+pair and from the spec-scaled defaults when it does not, and
+`explain()` names the source. Calibration is run when a model is
+onboarded or the software stack changes, and never otherwise;
+plans never require it — they only get sharper predictions from
 it.
 
 On "make B* as big as possible because everything is prefill
@@ -929,7 +941,7 @@ quail/                        (new repository)
     planner/
       plan.py                 # PhysicalPlan, Refusal
       budgets.py              # spec-derived arena/chunk arithmetic
-      cost.py                 # the estimator; calibration overlay loading
+      cost.py                 # the estimator; reads the per-(model, device) calibration file if present
     executor/
       pack.py                 # brim packing, admission queue (from joinlogic.py)
       arena.py                # the paged KV arena: pages, free list, per-doc page lists
