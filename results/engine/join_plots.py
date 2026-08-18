@@ -236,9 +236,89 @@ def nway_vs_stock():
           f"~{est_total} s estimated grouped stock)")
 
 
+def two_way_vs_stock():
+    """Both bars measured, same model, same prompts, same pairs.
+
+    Stock's GPU/host split: the cost model's GPU-side terms (fresh
+    compute + paged reads) total ~199 s and were validated by the
+    residual analysis (finding 1); host = measured wall - 199.
+    """
+    d = load("join2way.json")
+    stock = [r["wall"] for r in d["runs"]
+             if r["method"] == "stock_grouped"]
+    packed = [r["wall"] for r in d["runs"] if r["method"] == "packed"]
+    chunks = next(r["chunks"] for r in d["runs"]
+                  if r["method"] == "packed")
+    rate = sum(r["tok_s"] for r in d["runs"]
+               if r["method"] == "packed") / len(packed)
+    s_mean = sum(stock) / len(stock)
+    p_mean = sum(packed) / len(packed)
+    gpu = 199.0
+    host = s_mean - gpu
+
+    ink, muted = "#2c3e50", "#7f8c8d"
+    fig, ax = plt.subplots(figsize=(9.5, 4.0))
+
+    # ours: one measured bar
+    ax.barh(0, p_mean, height=0.42, color="#2980b9",
+            edgecolor="white", linewidth=2)
+    ax.text(p_mean + 6, 0, f"{p_mean:.0f} s", ha="left", va="center",
+            fontsize=12, color=ink, fontweight="bold")
+    ax.text(p_mean + 62, 0, f"{s_mean / p_mean:.1f}x", ha="left",
+            va="center", fontsize=13, color="#2980b9",
+            fontweight="bold")
+    ax.text(0, 0.42,
+            f"{chunks} brim-packed chunks; each report prefix computed "
+            f"once, its terms share it in-chunk; {rate / 1000:.0f}k "
+            f"tokens/s",
+            ha="left", va="center", fontsize=8.5, color=muted)
+
+    # stock: measured wall, split into its GPU and host parts
+    ax.barh(1, gpu, height=0.42, color="#7f8c8d",
+            edgecolor="white", linewidth=2)
+    ax.barh(1, host, height=0.42, left=gpu, color="#b8c2c6",
+            edgecolor="white", linewidth=2)
+    ax.text(gpu / 2, 1, f"GPU compute\n≈{gpu:.0f} s", ha="center",
+            va="center", fontsize=9.5, color="white",
+            fontweight="bold")
+    ax.text(gpu + host / 2, 1,
+            f"host: ingest 256k requests\n≈{host:.0f} s", ha="center",
+            va="center", fontsize=9.5, color=ink)
+    ax.text(s_mean + 6, 1, f"{s_mean:.0f} s", ha="left", va="center",
+            fontsize=12, color=ink, fontweight="bold")
+    ax.text(0, 1.42,
+            "one request per pair, submitted grouped by report so the "
+            "prefix cache reuses each report's KV; admission tuned; "
+            "bf16 KV; no eviction",
+            ha="left", va="center", fontsize=8.5, color=muted)
+
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["Quail packed\n(measured)",
+                        "Stock vLLM, grouped\n(measured)"], fontsize=10)
+    ax.invert_yaxis()
+    ax.set_xlim(0, s_mean * 1.22)
+    ax.set_ylim(1.75, -0.55)
+    ax.set_xlabel("Seconds", fontsize=11)
+    ax.set_title(
+        "2-Way Join: 256,000 pairs (100 BioDEX reports × 2,560 "
+        "reaction terms)\none YES/NO per pair, zero decode — same "
+        "model, same prompts, one H100", fontsize=11.5, pad=10)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.tick_params(left=False)
+    fig.tight_layout()
+    fig.savefig(HERE / "join_2way_vs_stock.png", dpi=180,
+                bbox_inches="tight")
+    plt.close(fig)
+    print(f"  join_2way_vs_stock.png  ({p_mean:.1f} s vs "
+          f"{s_mean:.0f} s, {s_mean / p_mean:.1f}x)")
+
+
 if __name__ == "__main__":
     print("Generating join plots...")
     nway_query_plan()
     nway_time_bar()
     nway_vs_stock()
+    two_way_vs_stock()
     print("Done.")
