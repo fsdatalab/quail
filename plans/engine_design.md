@@ -21,12 +21,12 @@ What the design rests on (all committed in this repo):
 
 | result | where |
 |---|---|
-| Packed executor, 2-way join, 256k pairs: 103.6 s vs 429 s for stock vLLM submitting grouped requests per pair — 4.1x | `results/engine/join2way.json` |
-| Packed executor, 3-way join, gated and deduped between stages, replay-consistent | `results/engine/join_nway3.json` |
-| Packed single filter: 121,045 tok/s vs 96,946 on the engine — the packed loop is the faster substrate for filters too | `plans/packed_forward.md`, `single_filter_forward_vllm_kernels.json` |
-| Chain semantics (keep document KV, attach question suffixes) beat per-stage requests: 39.8 s vs 42.9 s at 10k docs | `results/engine/filter_cells.json` |
-| Cross-query KV restore from a pinned CPU store: 1.9–2.1x over recompute | `results/engine/persist_split7_quail_waves_chain_10k.json` |
-| Attention-merge parity: 0 disagreements across all gates; rate 82.1k tok/s at the large-chunk geometry | `results/engine/join_probe.json` |
+| Packed executor, 2-way join, 256k pairs: 103.6 s vs 429 s for stock vLLM submitting grouped requests per pair — 4.1x | `exploration/results/engine/join2way.json` |
+| Packed executor, 3-way join, gated and deduped between stages, replay-consistent | `exploration/results/engine/join_nway3.json` |
+| Packed single filter: 121,045 tok/s vs 96,946 on the engine — the packed loop is the faster substrate for filters too | `exploration/plans/packed_forward.md`, `single_filter_forward_vllm_kernels.json` |
+| Chain semantics (keep document KV, attach question suffixes) beat per-stage requests: 39.8 s vs 42.9 s at 10k docs | `exploration/results/engine/filter_cells.json` |
+| Cross-query KV restore from a pinned CPU store: 1.9–2.1x over recompute | `exploration/results/engine/persist_split7_quail_waves_chain_10k.json` |
+| Attention-merge parity: 0 disagreements across all gates; rate 82.1k tok/s at the large-chunk geometry | `exploration/results/engine/join_probe.json` |
 ---
 
 ## 1. Shape of the system
@@ -588,7 +588,7 @@ measurements agree on the size of the tax:
 - The kernel ladder ran the same engine boot both ways: 96,946
   tok/s with fp8 KV, 102,820 with bf16 — a 5.9% rate cost, i.e.
   **q_kv = 0.59 µs per fresh token** at 4B/H100
-  (`plans/packed_forward.md`, the ladder run).
+  (`exploration/plans/packed_forward.md`, the ladder run).
 - End to end, the identical 10k-document five-filter query
   measured 38.1 s with bf16 KV against 39.8 s with fp8
   (`filter_cells_bf16.json` vs `filter_cells.json`): 0.46 µs per
@@ -791,7 +791,7 @@ important to say when that file is made: offline, once per
 `quail calibrate <model> <device>` — that runs the batch sweep and
 the parity probe (~10 GPU-minutes) and writes the measured
 constants to a JSON checked into the repo, exactly what
-`results/engine/cost_model_fit.json` is in the exploration repo
+`exploration/results/engine/cost_model_fit.json` is in the exploration repo
 today. Nothing is ever measured at plan time or at query time: the
 planner reads constants from the file when one exists for this
 pair and from the spec-scaled defaults when it does not, and
