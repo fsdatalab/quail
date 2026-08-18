@@ -125,16 +125,54 @@ def execute(payload: dict) -> dict:
         kernel_cache.commit()   # keep the compiles even if the run dies
         booted["warmed"] = True
 
+    boot_s = time.perf_counter() - t_boot   # load + compile
+    state = dict(model=model, arena=arena, pipeline=pipeline,
+                 spec=spec, chunk=chunk, torch=torch, F=F,
+                 store=_STORE)
+    report = _execute_single(state, payload)
+    _STORE = state["store"]
+    report["boot_s"] = round(boot_s, 2)
+    os.makedirs("/results/runs", exist_ok=True)
+    with open(f"/results/runs/run_{int(time.time())}.json", "w") as f:
+        json.dump(dict(wall_s=report["wall_s"], boot_s=report["boot_s"],
+                       fresh_tokens=report["fresh_tokens"]), f)
+    results_vol.commit()
+    kernel_cache.commit()    # persist any JIT artifacts this run built
+    return report
+
+
+def _execute_single(state, payload: dict) -> dict:
+    """The single-GPU execution core, shared by the ephemeral
+    function (module-global state) and the snapshot worker class
+    (instance state). state: model, arena, pipeline, spec, chunk,
+    store, torch, F."""
+    import torch.nn.functional as F  # noqa: F401 (state carries it)
+
+    from quail.executor.kvstore import PinnedStore
+    from quail.executor.loop import AsyncAnswers, run_filter, run_join
+
+    torch = state["torch"]
+    spec = state["spec"]
+    arena, pipeline = state["arena"], state["pipeline"]
+    docs = payload["docs"]
+    answerer = _PayloadAnswerer(torch, state["F"], state["model"],
+                                payload["yes_ids"], payload["no_ids"])
+    async_ans = AsyncAnswers(torch, answerer)
+    budget = min(state["chunk"], pipeline.max_chunk_tokens,
+                 payload["chunk_tokens"])
+
     store_cfg = payload.get("store")
-    if store_cfg is not None and _STORE is None:
+    if store_cfg is not None and state.get("store") is None:
         max_doc = max((len(d) for ds in docs.values() for d in ds),
                       default=0)
-        _STORE = PinnedStore(
+        state["store"] = PinnedStore(
             capacity_tokens=int(store_cfg["capacity_bytes"]
                                 // spec.kappa),
             n_layers=spec.layers, n_kv=spec.n_kv, d_head=spec.d_head,
             max_doc_tokens=max(max_doc, 4096), dtype=torch.bfloat16)
-    boot_s = time.perf_counter() - t_boot   # load + compile + store
+    store = state.get("store")
+    if payload.get("store_flush") and store is not None:
+        store.flush()
 
     total_tokens = 0
     out_filters = {}
@@ -148,7 +186,7 @@ def execute(payload: dict) -> dict:
             answers, _, tokens = run_filter(
                 torch, arena, pipeline, async_ans, docs[alias], qids,
                 budget,
-                store=_STORE if store_cfg else None,
+                store=store if store_cfg else None,
                 store_hash=(store_cfg["hashes"][alias]
                             if store_cfg else None),
                 store_min_tokens=(store_cfg["min_doc_tokens"]
@@ -198,20 +236,20 @@ def execute(payload: dict) -> dict:
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
 
-    report = dict(filters=out_filters, joins=out_joins,
-                  wall_s=round(wall, 2), boot_s=round(boot_s, 2),
-                  fresh_tokens=total_tokens,
-                  store=(store_stats if store_cfg else None),
-                  peak_gib=round(
-                      torch.cuda.max_memory_allocated() / 2**30, 2))
-    os.makedirs("/results/runs", exist_ok=True)
-    with open(f"/results/runs/run_{int(time.time())}.json", "w") as f:
-        json.dump(dict(wall_s=report["wall_s"], boot_s=report["boot_s"],
-                       fresh_tokens=total_tokens), f)
-    results_vol.commit()
-    kernel_cache.commit()    # persist any JIT artifacts this run built
-    return report
+    return dict(filters=out_filters, joins=out_joins,
+                wall_s=round(wall, 2),
+                fresh_tokens=total_tokens,
+                store=(store_stats if store_cfg else None),
+                peak_gib=round(
+                    torch.cuda.max_memory_allocated() / 2**30, 2))
 
+
+# GPU memory snapshots were tried here and removed: the measured
+# restore segfaulted in a background thread (exit 139) and the
+# full-arena snapshot took ~6 minutes to write. The design's named
+# fallback - cold boots and warm containers - is what runs, and only
+# the session-start convenience is lost. Revisit when Modal's GPU
+# snapshots harden; results/snapshot_gate.log holds the evidence.
 
 # ------------------------------------------------- multi-GPU dispatch
 #
@@ -316,6 +354,8 @@ def _child_filters(state, sub):
     boot_s = _time.perf_counter() - t0
     torch = state["torch"]
     store_cfg = sub.get("store")
+    if sub.get("store_flush") and state.get("store") is not None:
+        state["store"].flush()
     out = dict(filters={}, survivors={}, fresh_tokens=0, store={},
                boot_s=round(boot_s, 2))
     t0 = _time.perf_counter()
@@ -340,9 +380,6 @@ def _child_filters(state, sub):
             out["survivors"][alias] = sorted(
                 index[d] for d, row in answers.items()
                 if len(row) == len(qids) and all(row))
-        # an alias with no filters survives whole
-        for alias, index in sub["doc_index"].items():
-            out["survivors"].setdefault(alias, sorted(index))
     torch.cuda.synchronize()
     out["wall_s"] = round(_time.perf_counter() - t0, 2)
     out["peak_gib"] = round(

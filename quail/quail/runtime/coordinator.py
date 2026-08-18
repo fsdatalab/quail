@@ -24,11 +24,18 @@ COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "yes_ids",
 
 def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
     """Per-worker sub-payloads for the filter round. shards:
-    alias -> one tuple of global document indices per worker."""
+    alias -> one tuple of global document indices per worker.
+
+    Only aliases WITH filters ship documents in this round: an
+    unfiltered partner's documents would otherwise cross the parent-
+    child pipe twice (sharded here, replicated in the join round) for
+    no work at all. Its survivors default to everything at the join
+    round."""
     subs = []
     for w in range(k):
         docs, index = {}, {}
-        for alias, toks in payload["docs"].items():
+        for alias in payload["filters"]:
+            toks = payload["docs"][alias]
             idx = list(shards[alias][w]) if alias in shards \
                 else list(range(len(toks)))
             docs[alias] = [toks[i] for i in idx]
@@ -36,7 +43,9 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
         sub = {key: payload[key] for key in COMMON_KEYS}
         sub.update(docs=docs, doc_index=index,
                    filters=payload["filters"],
-                   store=payload.get("store"), worker=w, workers=k)
+                   store=payload.get("store"),
+                   store_flush=payload.get("store_flush", False),
+                   worker=w, workers=k)
         subs.append(sub)
     return subs
 
@@ -78,14 +87,21 @@ def join_round_payloads(payload: dict, shards: dict, k: int,
         raise NotImplementedError(
             "join stages anchored on different aliases need the "
             "between-stage re-shard, which is not built yet")
+
+    def surv(alias):
+        # an alias with no filters survives whole
+        if alias in survivors:
+            return list(survivors[alias])
+        return list(range(len(payload["docs"][alias])))
+
     anchor_shards = shards.get(anchor_alias)
     partner_aliases = sorted({j["partner"] for j in joins})
-    partners = {alias: dict(index=list(survivors[alias]),
+    partners = {alias: dict(index=surv(alias),
                             docs=[payload["docs"][alias][g]
-                                  for g in survivors[alias]])
+                                  for g in surv(alias)])
                 for alias in partner_aliases}
     subs = []
-    anchor_live = set(survivors[anchor_alias])
+    anchor_live = set(surv(anchor_alias))
     for w in range(k):
         shard = anchor_shards[w] if anchor_shards \
             else range(len(payload["docs"][anchor_alias]))

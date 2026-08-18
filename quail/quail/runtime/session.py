@@ -97,6 +97,18 @@ class Session:
         #                            session, so the worker container
         #                            (its booted model and its store)
         #                            survives between run() calls
+        self.store_enabled = True  # the benchmark's cold pass runs
+        #                            with the store disabled
+        self._flush_next = False
+
+    def set_store(self, enabled: bool) -> None:
+        self.store_enabled = enabled
+
+    def flush_store(self) -> None:
+        """The next run tells the worker to flush its store first -
+        the benchmark's cold pass is a store flush, not a restart."""
+        self._flush_next = True
+        self._warm_hashes.clear()
 
     def worker(self):
         """The worker module, inside this session's long-lived app
@@ -126,6 +138,8 @@ class Session:
         """The planner's view of the KV store: pinned bandwidth,
         capacity from the config, warm when every scanned content
         hash was stored by an earlier run of this session."""
+        if not self.store_enabled:
+            return None
         if self.config.cpu_memory_gb <= STORE_HEADROOM_GB:
             return None
         capacity = (self.config.cpu_memory_gb
@@ -391,7 +405,10 @@ class Query:
                          hashes=dict(self._hashes))
         shards = {op["alias"]: op["shards"] for op in plan.operators
                   if op["op"] == "DocScan"}
+        flush = sess._flush_next
+        sess._flush_next = False
         return dict(
+            store_flush=flush,
             model=sess.model.name,
             kv_dtype=plan.kv_dtype,
             chunk_tokens=plan.chunk_tokens,
@@ -412,6 +429,7 @@ class Query:
 
         report = dict(
             wall_s=out["wall_s"], boot_s=out.get("boot_s"),
+            boot_kind=out.get("boot_kind"),
             coordinator_wall_s=round(coordinator_wall, 2),
             fresh_tokens=out["fresh_tokens"], stages=[],
             store=out.get("store"),
