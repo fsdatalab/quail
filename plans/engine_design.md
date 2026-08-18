@@ -713,9 +713,10 @@ this section.
     weights, the empty KV arena, and compiled
     kernels. Snapshots are taken only in this quiescent state,
     never mid-query.
-  - The benchmark's cold protocol (§9.4) restores the snapshot
-    before every query, making "cold" mean something exact and
-    cheap to measure.
+  - Snapshots are a session-start mechanism only. The benchmark
+    boots its containers once and keeps them up across every
+    query and both passes (§9.5); its cold pass is a store flush,
+    not a restart.
 - Every worker run is teed to a file in the results volume, per
   house rule; the coordinator collects logs next to the run report.
 
@@ -932,7 +933,7 @@ one engine mechanism each. F = filter stage, J = join stage.
 
 | id | TPC-H skeleton | shape | sets | pair/doc volume at SF=1 | what it isolates | predicted wall (SF=1, LF=1) |
 |---|---|---|---|---|---|---|
-| B1 | Q6 | 1F | reviews | 50k docs | the degenerate chain; per-query floor and snapshot-restore overhead | ~3.8 min |
+| B1 | Q6 | 1F | reviews | 50k docs | the degenerate chain; the per-query floor (c0) in a warm container | ~3.8 min |
 | B2 | Q1 | 5F | reviews | 50k docs, sels .9/.9/.9/.8/.8 | the filter-chain regression anchor (the committed 10k result is this at SF=0.2) | ~4.4 min |
 | B3 | Q1 + ordering | 5F | reviews | sels .9/.9/.2/.9/.9, selective one written third | run twice: `as_written` vs `by_cost` — the ordering interface measured, not asserted | ~4.2 / ~3.7 min |
 | B4 | Q1 on wide rows | 2F | reports | 2k long docs | quadratic surcharge; long-doc admission | ~1.3 min |
@@ -957,15 +958,24 @@ gates.
 
 ### 9.5 Protocol and metrics
 
-Two suite runs, fixed order B1→B15 (the order re-touches `reviews`,
-`reports`, `products` so later queries can restore):
+One session for the whole benchmark: the containers boot once
+(snapshot restore at session start, reported separately as boot
+time) and stay up until the last query finishes — they are never
+torn down or restarted between queries or between passes. The
+suite runs B1→B15 in order, twice, in that one session (the order
+re-touches `reviews`, `reports`, `products` so later queries can
+restore):
 
-- **cold**: snapshot restore before every query, store disabled.
-  Each query measured alone, from an exact, cheap-to-reproduce
-  state (§7).
-- **warm**: one session, store enabled, no restores between
-  queries. Per-query walls again, plus the end-to-end wall — the
-  number that shows what cross-query KV reuse is worth.
+- **cold pass**: store disabled and flushed. Each query is
+  measured with everything warm except cross-query KV — model
+  loaded, kernels compiled, tokenization cached — so the walls
+  isolate query work, not boot work. Nothing else in the executor
+  carries state between queries (the arena empties when a query's
+  documents finish), so a store flush is all that "cold" requires.
+- **warm pass**: store enabled, nothing flushed. Per-query walls
+  again, plus the end-to-end wall — the number that shows what
+  cross-query KV reuse is worth. This is the pass the benchmark
+  exists for.
 
 Per query: predicted vs measured wall, fresh tokens, KV bytes
 restored, pairs per stage, provided vs observed selectivity, answer
@@ -975,7 +985,10 @@ tokens.
 
 Baseline, per house rule (the baseline gets the analytically
 equivalent configuration, and the submission strategy is named):
-stock vLLM, same container class, prefix caching on, no store.
+stock vLLM, same container class, prefix caching on, no store —
+and the same session discipline: its engine boots once and stays
+up across all fifteen queries and both passes, so vLLM's own
+prefix cache carries whatever it can hold between queries.
 Filters submit separate requests per stage under the same
 token-budget admission; joins submit grouped requests per pair in
 anchor order with admission matched from the same pool arithmetic.
