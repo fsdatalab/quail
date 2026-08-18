@@ -504,10 +504,11 @@ Key operations:
 | `PageArena.alloc` | `arena.py:29` | Claim pages for a document from the free list |
 | `PageArena.free_key` | `arena.py:42` | Return a document's pages to the free list |
 | `PageArena.row_indices` | `arena.py:49` | Flat row positions of a document's tokens in the pool |
-| `KVArena.alloc` | `arena.py:92` | Claim pages and build the GPU row-index tensor |
-| `KVArena.block_table` | `arena.py:112` | Build the block table for paged attention |
-| `KVArena.paged_kv` | `arena.py:105` | Reshape the flat pool for FlashAttention's block input |
-| `KVArena.gather` | `arena.py:130` | Extract a document's contiguous K, V rows (fallback path) |
+| `KVArena.alloc` | `arena.py:97` | Claim pages and record the row indices (host-side; the device copy is built lazily) |
+| `KVArena.rows_gpu` | `arena.py:110` | The document's row indices on device, cached per residency |
+| `KVArena.block_table` | `arena.py:125` | Build the block table for paged attention (flat on the host, one staged copy) |
+| `KVArena.paged_kv` | `arena.py:118` | Reshape the flat pool for FlashAttention's block input |
+| `KVArena.gather` | `arena.py:149` | Extract a document's contiguous K, V rows (fallback path) |
 
 ### 5.3 The two-call attention pattern
 
@@ -602,13 +603,13 @@ RMS-normalized. These are the inputs to the answer readout.
 
 ### 5.5 Answer readout
 
-The `Answerer` (`loop.py:38`) scores the final hidden states against
+The `Answerer` (`loop.py:60`) scores the final hidden states against
 only the YES and NO token embeddings (not the full vocabulary). It
 projects the normed hidden state through a sub-selected `lm_head`
 weight matrix (only the rows for YES/NO token ids), takes the argmax
 within the YES set and within the NO set, and compares.
 
-`AsyncAnswers` (`loop.py:70`) makes the readout non-blocking: it
+`AsyncAnswers` (`loop.py:92`) makes the readout non-blocking: it
 computes the answer bits on GPU, copies them to pinned host memory
 with a non-blocking copy, and records a CUDA event. The next chunk's
 forward pass can begin while the CPU waits on the event to read the
@@ -625,14 +626,14 @@ answers. This overlaps GPU compute with answer readback.
 | `Pipeline.custom_silu_quant` | `attention.py:223` | Fused SiLU + multiply + fp8 quant (Triton) |
 | `Pipeline.custom_norm_quant` | `attention.py:235` | Fused residual-add + RMSNorm + fp8 quant (Triton) |
 | `Pipeline.custom_qk_norm_rope` | `attention.py:248` | Fused QK-norm + RoPE (Triton) |
-| `pack_chunk` | `loop.py:103` | Build GPU tensors for one chunk from group specs |
+| `pack_chunk` | `loop.py:125` | Build GPU tensors for one chunk from group specs (all index tensors staged through pinned memory) |
 | `pack_stream` | `pack.py:57` | Brim-pack a pair list into chunks (join path) |
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
-| `run_filter` | `loop.py:437` | The filter chain execution loop |
-| `run_join` | `loop.py:216` | The join execution loop with gating between stages |
-| `warm_kernels` | `loop.py:347` | Pre-compile all DeepGEMM and Triton kernel configs |
-| `Answerer` | `loop.py:38` | YES/NO scoring from final hidden states |
-| `AsyncAnswers` | `loop.py:70` | Non-blocking answer readout with pinned-memory copy |
+| `run_filter` | `loop.py:462` | The filter chain execution loop |
+| `run_join` | `loop.py:241` | The join execution loop with gating between stages |
+| `warm_kernels` | `loop.py:387` | Pre-compile all DeepGEMM and Triton kernel configs |
+| `Answerer` | `loop.py:60` | YES/NO scoring from final hidden states |
+| `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
 
 ### 5.6 The overlapped execution loop
 

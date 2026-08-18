@@ -4,16 +4,16 @@
   "corpus_tokens": 1620045,
   "store_capacity_gb": 250,
   "store_kv_gb": 238.9,
-  "store_init_s": 41.28,
-  "warmup_s": 15.86,
+  "store_init_s": 41.34,
+  "warmup_s": 2.23,
   "prediction": "cold ~20 s plus offload tail; warm passes near half the cold wall (committed persist: 1.9-2.1x)",
   "runs": [
     {
       "rep": 0,
       "kind": "cold",
-      "wall": 31.28,
+      "wall": 27.05,
       "fresh_tokens": 1933895,
-      "tok_s": 61833.8,
+      "tok_s": 71487.8,
       "survivors": 882,
       "chunks": 31,
       "peak_gib": 66.83,
@@ -25,9 +25,9 @@
     {
       "rep": 1,
       "kind": "warm",
-      "wall": 11.7,
+      "wall": 9.98,
       "fresh_tokens": 314045,
-      "tok_s": 26851.2,
+      "tok_s": 31470.7,
       "survivors": 887,
       "chunks": 15,
       "peak_gib": 62.32,
@@ -39,9 +39,9 @@
     {
       "rep": 2,
       "kind": "warm",
-      "wall": 11.77,
+      "wall": 10.0,
       "fresh_tokens": 314045,
-      "tok_s": 26678.7,
+      "tok_s": 31391.1,
       "survivors": 887,
       "chunks": 15,
       "peak_gib": 62.32,
@@ -51,5 +51,5 @@
       "stored_tokens": 0
     }
   ],
-  "warm_speedup": 2.67
+  "warm_speedup": 2.71
 }
