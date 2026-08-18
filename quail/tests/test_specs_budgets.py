@@ -7,8 +7,21 @@ import pytest
 
 from quail.planner import budgets
 from quail.planner.calibration import (channel_bandwidths,
-                                       load_calibration)
+                                       fit_affine, load_calibration)
 from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+
+def test_fit_affine_recovers_the_line():
+    a, a2 = 8.6e-6, 4.9e-10
+    points = [(h, a + a2 * h) for h in (256, 1024, 4096, 8192)]
+    got_a, got_a2 = fit_affine(points)
+    assert got_a == pytest.approx(a, rel=1e-9)
+    assert got_a2 == pytest.approx(a2, rel=1e-9)
+
+
+def test_fit_affine_needs_two_lengths():
+    with pytest.raises(ValueError):
+        fit_affine([(4096, 1e-5), (4096, 1.1e-5)])
 
 
 def test_kappa_and_widths():

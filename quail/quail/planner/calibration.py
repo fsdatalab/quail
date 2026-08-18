@@ -45,6 +45,23 @@ def channel_bandwidths() -> dict:
         return json.load(f)["bandwidth_bytes_per_s"]
 
 
+def fit_affine(points) -> tuple[float, float]:
+    """Least-squares (a, a2) for t = a + a2*h over (h, t) points -
+    the calibrate cell's fit, kept here so it is CPU-testable. Needs
+    at least two distinct lengths."""
+    n = len(points)
+    sx = sum(h for h, _ in points)
+    sy = sum(t for _, t in points)
+    sxx = sum(h * h for h, _ in points)
+    sxy = sum(h * t for h, t in points)
+    denom = n * sxx - sx * sx
+    if denom <= 0:
+        raise ValueError("need at least two distinct lengths")
+    a2 = (n * sxy - sx * sy) / denom
+    a = (sy - a2 * sx) / n
+    return a, a2
+
+
 def _load_file(path: Path) -> dict:
     with open(path) as f:
         return json.load(f)
