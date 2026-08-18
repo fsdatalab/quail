@@ -1,6 +1,6 @@
 {
   "exec_budget": 110376,
-  "arena_tokens": 407294,
+  "arena_tokens": 345974,
   "gates": {
     "attention_math_max_diff": 0.0068,
     "shared_vs_unshared_max_hidden_gap": 4.9688,
@@ -17,9 +17,9 @@
   "rate": {
     "chunks": 2,
     "tokens": 169452,
-    "wall_s": 2.176,
-    "tok_s": 77883.8
+    "wall_s": 2.159,
+    "tok_s": 78484.9
   },
-  "peak_gib": 71.4,
+  "peak_gib": 62.88,
   "pass": true
 }

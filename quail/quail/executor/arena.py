@@ -102,14 +102,6 @@ class KVArena:
         self._rows.pop(key)
         return self.accounting.free_key(key)
 
-    def write(self, layer: int, key, k_rows, v_rows, offset: int = 0):
-        """Scatter fresh K/V rows into the document's pages, starting
-        `offset` tokens into its allocation (the shared question
-        preamble lands after the document's own rows)."""
-        rows = self._rows[key][offset:offset + k_rows.shape[0]]
-        self.k[layer].index_copy_(0, rows, k_rows)
-        self.v[layer].index_copy_(0, rows, v_rows)
-
     def paged_kv(self, layer: int):
         """The pools viewed as (n_pages, page_tokens, n_kv, d_head)
         for the paged attention call."""

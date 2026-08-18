@@ -155,7 +155,8 @@ def probe() -> str:
     table, _ = arena.block_table(["m0"])
     meta0 = dict(
         layer=0, paged=True,
-        kv_writes=[("m0", 0, f0, 0)],
+        kv_src=torch.arange(f0, dtype=torch.int64, device="cuda"),
+        kv_dst=arena._rows["m0"][:f0],
         cu_a=torch.tensor(cu, dtype=torch.int32, device="cuda"),
         max_a=f0,
         cross=dict(
@@ -623,6 +624,86 @@ def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
     warm = min(r["wall"] for r in report["runs"][1:])
     report["warm_speedup"] = round(cold / warm, 2)
     return _write(report, "filter_store")
+
+
+# ----------------------------------------------------------- profiling
+
+@app.function(timeout=3600, **GPU_KW)
+def profile_filter_run(n_docs: int = 3000) -> str:
+    """Torch-profile a steady-state filter run to name the ~1.3
+    us/token gap between the executor (9.9 us/token measured) and the
+    no-KV ladder ceiling (8.26). KV writes, paged reads, and the LSE
+    merge only account for ~0.2 of it; this trace decides among:
+    GEMMs under peak at our shapes, oversized elementwise chains, or
+    scheduling gaps (kernel sum well under region wall)."""
+    import time
+
+    from corpus import build_corpus
+    from quail.executor.loop import run_filter, warm_kernels
+
+    (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
+     exec_budget, arena_tok) = _boot()
+    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
+    with torch.inference_mode():
+        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
+                     q_ids, exec_budget)
+        run_filter(torch, arena, pipeline, async_ans, body_ids, q_ids,
+                   exec_budget)      # unprofiled reference pass
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA]) as prof:
+        with torch.inference_mode():
+            answers, spans, tokens = run_filter(
+                torch, arena, pipeline, async_ans, body_ids, q_ids,
+                exec_budget)
+        torch.cuda.synchronize()
+    region_wall = time.perf_counter() - t0
+
+    cats = dict(gemm=0.0, attention=0.0, triton_fused=0.0, quant=0.0,
+                copies=0.0, other=0.0)
+    rows = []
+    for ev in prof.key_averages():
+        cuda_us = getattr(ev, "self_device_time_total", 0) or \
+            getattr(ev, "self_cuda_time_total", 0)
+        if not cuda_us:
+            continue
+        name = ev.key
+        low = name.lower()
+        if "deep_gemm" in low or "sm90_fp8" in low or "gemm" in low:
+            cats["gemm"] += cuda_us
+        elif "flash" in low or "attn" in low:
+            cats["attention"] += cuda_us
+        elif any(k in low for k in ("silu_mul", "add_rms", "qk_norm")):
+            cats["triton_fused"] += cuda_us
+        elif "quant" in low:
+            cats["quant"] += cuda_us
+        elif "memcpy" in low or "copy" in low:
+            cats["copies"] += cuda_us
+        else:
+            cats["other"] += cuda_us
+        rows.append((round(cuda_us / 1e6, 3), ev.count, name[:90]))
+    rows.sort(reverse=True)
+    busy_s = sum(cats.values()) / 1e6
+    result = dict(
+        n_docs=n_docs, fresh_tokens=tokens, chunks=len(spans),
+        region_wall_s=round(region_wall, 2),
+        cuda_busy_s=round(busy_s, 2),
+        gap_wall_minus_busy_s=round(region_wall - busy_s, 2),
+        us_per_token=round(region_wall * 1e6 / tokens, 2),
+        category_s={k: round(v / 1e6, 2) for k, v in cats.items()},
+        ideal_gemm_s=round(2 * 3.6e9 * tokens / 1.979e15, 2),
+        top_kernels=[dict(s=s, n=n, name=k) for s, n, k in rows[:25]])
+    prof.export_chrome_trace("/results/m1/torchprof_filter.json.gz")
+    return _write(result, "profile_filter")
+
+
+@app.local_entrypoint()
+def run_profile_filter(n_docs: int = 3000,
+                       out: str = "results/profile_filter.json"):
+    _save(profile_filter_run.remote(n_docs), out)
 
 
 # ----------------------------------------------------------- baselines

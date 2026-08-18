@@ -140,7 +140,8 @@ def pack_chunk(torch, arena, groups):
             pos.extend(range(len(g["prefix"])))
             cu_a.append(len(ids))
             if paged:
-                kv_writes.append((key, row0, row0 + len(g["prefix"]), 0))
+                kv_writes.append((key, row0, row0 + len(g["prefix"]),
+                                  0))
         s_row0 = len(ids)
         for si, suf in enumerate(g["suffixes"]):
             srow = len(ids)
@@ -177,8 +178,22 @@ def pack_chunk(torch, arena, groups):
             cu_q=torch.tensor(cu_q, dtype=torch.int32, device=dev),
             max_q=max_q, keys=cross_keys, used=used,
             max_used=max(cross_used), table=table, cu_k=cu_k)
+
+    # all of the chunk's KV writes as ONE gather + scatter per layer:
+    # the profiled per-document index_copy_ path issued ~20,000 tiny
+    # launches per chunk (432,756 calls, 1.86 s GPU in the trace);
+    # batched, it is 4 launches per layer for the same bytes
+    kv_src = kv_dst = None
+    if kv_writes:
+        src = []
+        for _, r0, r1, _ in kv_writes:
+            src.extend(range(r0, r1))
+        kv_src = torch.tensor(src, dtype=torch.int64, device=dev)
+        kv_dst = torch.cat(
+            [arena._rows[key][dest:dest + (r1 - r0)]
+             for key, r0, r1, dest in kv_writes])
     meta = dict(
-        layer=0, kv_writes=kv_writes, cross=cross, paged=True,
+        layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross, paged=True,
         cu_a=torch.tensor(cu_a, dtype=torch.int32, device=dev),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     return dict(

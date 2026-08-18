@@ -291,10 +291,14 @@ class Pipeline:
         v3 = v.contiguous().view(n, KH, D)
         layer = meta["layer"]
 
-        # fresh KV into the arena's pages, before call B reads them
-        for key, r0, r1, dest in meta["kv_writes"]:
-            self.arena.write(layer, key, k3[r0:r1], v3[r0:r1],
-                             offset=dest)
+        # fresh KV into the arena's pages, before call B reads them:
+        # one gather + one scatter per layer for the whole chunk
+        if meta["kv_src"] is not None:
+            src, dst = meta["kv_src"], meta["kv_dst"]
+            self.arena.k[layer].index_copy_(0, dst,
+                                            k3.index_select(0, src))
+            self.arena.v[layer].index_copy_(0, dst,
+                                            v3.index_select(0, src))
 
         out_a, lse_a = self._fa(
             q3, k3, v3, meta["cu_a"], meta["cu_a"],

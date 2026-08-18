@@ -1,0 +1,989 @@
+{
+  "sf": 0.1,
+  "lf": 1,
+  "gpus": 1,
+  "passes": {
+    "cold": {
+      "queries": [
+        {
+          "query": "B1",
+          "desc": "1F reviews: the per-query floor",
+          "wall_s": 32.85,
+          "boot_s": 44.48,
+          "fresh_tokens": 3483475,
+          "rows": 1989,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.3978,
+              "evaluated": 5000
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B2",
+          "desc": "5F reviews: the filter-chain anchor",
+          "wall_s": 49.96,
+          "boot_s": 0.0,
+          "fresh_tokens": 3541637,
+          "rows": 167,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.577,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.3088,
+              "evaluated": 2885
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.5903,
+              "evaluated": 891
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 3,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.327,
+              "evaluated": 526
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 4,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9709,
+              "evaluated": 172
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B3w",
+          "desc": "5F ordering, as written",
+          "wall_s": 35.39,
+          "boot_s": 0.0,
+          "fresh_tokens": 3516950,
+          "rows": 98,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.3962,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.1989,
+              "evaluated": 1981
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": 0.2,
+              "observed_selectivity": 0.2563,
+              "evaluated": 394
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 3,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9802,
+              "evaluated": 101
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 4,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9899,
+              "evaluated": 99
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B3c",
+          "desc": "5F ordering, by cost",
+          "wall_s": 42.45,
+          "boot_s": 0.0,
+          "fresh_tokens": 3493277,
+          "rows": 95,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.2,
+              "observed_selectivity": 0.0696,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.6121,
+              "evaluated": 348
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.4554,
+              "evaluated": 213
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 3,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9897,
+              "evaluated": 97
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 4,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9896,
+              "evaluated": 96
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B4",
+          "desc": "2F reports: long documents",
+          "wall_s": 14.03,
+          "boot_s": 0.0,
+          "fresh_tokens": 1184803,
+          "rows": 42,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.4,
+              "observed_selectivity": 0.385,
+              "evaluated": 200
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.5,
+              "observed_selectivity": 0.5455,
+              "evaluated": 77
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B5",
+          "desc": "1J reports x terms: the BioDEX shape",
+          "wall_s": 280.87,
+          "boot_s": 0.0,
+          "fresh_tokens": 18050202,
+          "rows": 146819,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.2868,
+              "pairs": 512000
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B6",
+          "desc": "1F + 1J: pushdown deletes the pair list",
+          "wall_s": 17.59,
+          "boot_s": 0.0,
+          "fresh_tokens": 1803525,
+          "rows": 7,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "a",
+              "stage": 0,
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.041,
+              "evaluated": 1000
+            },
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.0017,
+              "pairs": 4100
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B7",
+          "desc": "1J pure pair predicate",
+          "wall_s": 43.57,
+          "boot_s": 0.0,
+          "fresh_tokens": 4178738,
+          "rows": 3,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.1,
+              "observed_selectivity": 0.0001,
+              "pairs": 50000
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B8",
+          "desc": "1J exists",
+          "wall_s": 99.85,
+          "boot_s": 0.0,
+          "fresh_tokens": 9099020,
+          "rows": 98,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "t",
+              "partner": "s",
+              "semantics": "exists",
+              "provided_selectivity": 0.3,
+              "observed_selectivity": 0.0025,
+              "pairs": 100000
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B10",
+          "desc": "2J chain, gating + dedup + replay",
+          "wall_s": 340.15,
+          "boot_s": 0.0,
+          "fresh_tokens": 29581874,
+          "rows": 149262,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "b",
+              "partner": "a",
+              "semantics": "full",
+              "provided_selectivity": 0.2,
+              "observed_selectivity": 0.1749,
+              "pairs": 40000
+            },
+            {
+              "op": "join",
+              "anchor": "b",
+              "partner": "c",
+              "semantics": "full",
+              "provided_selectivity": 0.1,
+              "observed_selectivity": 0.1159,
+              "pairs": 19600
+            }
+          ],
+          "store": null,
+          "replay": true
+        },
+        {
+          "query": "B11",
+          "desc": "2J star: kept anchors read twice",
+          "wall_s": 318.54,
+          "boot_s": 0.0,
+          "fresh_tokens": 20767604,
+          "rows": 2122694,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "r",
+              "partner": "m",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.2868,
+              "pairs": 512000
+            },
+            {
+              "op": "join",
+              "anchor": "r",
+              "partner": "p",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.0935,
+              "pairs": 20000
+            }
+          ],
+          "store": null,
+          "replay": true
+        },
+        {
+          "query": "B12",
+          "desc": "2F + 1J: two-sided pushdown",
+          "wall_s": 42.61,
+          "boot_s": 41.11,
+          "fresh_tokens": 4061369,
+          "rows": 125,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "a",
+              "stage": 0,
+              "provided_selectivity": 0.3,
+              "observed_selectivity": 0.289,
+              "evaluated": 1000
+            },
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.1,
+              "observed_selectivity": 0.0043,
+              "pairs": 28900
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B13",
+          "desc": "B2 rerun, new questions: the scan restore",
+          "wall_s": 35.56,
+          "boot_s": 0.0,
+          "fresh_tokens": 3550997,
+          "rows": 628,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.5768,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.3076,
+              "evaluated": 2884
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.8354,
+              "evaluated": 887
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 3,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9204,
+              "evaluated": 741
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 4,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9208,
+              "evaluated": 682
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B14",
+          "desc": "B5 rerun, new question: the anchor restore",
+          "wall_s": 281.83,
+          "boot_s": 0.0,
+          "fresh_tokens": 18050402,
+          "rows": 143547,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.2804,
+              "pairs": 512000
+            }
+          ],
+          "store": null,
+          "replay": null
+        }
+      ],
+      "pass_wall_s": 1805.8
+    },
+    "warm": {
+      "queries": [
+        {
+          "query": "B1",
+          "desc": "1F reviews: the per-query floor",
+          "wall_s": 38.66,
+          "boot_s": 0.0,
+          "fresh_tokens": 3483475,
+          "rows": 1989,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.3978,
+              "evaluated": 5000
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 342,
+              "stored_tokens": 432525
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B2",
+          "desc": "5F reviews: the filter-chain anchor",
+          "wall_s": 37.64,
+          "boot_s": 31.6,
+          "fresh_tokens": 3541572,
+          "rows": 168,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.5766,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.3084,
+              "evaluated": 2883
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.5894,
+              "evaluated": 889
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 3,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.3302,
+              "evaluated": 524
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 4,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9711,
+              "evaluated": 173
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 342,
+              "stored_tokens": 432525
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B3w",
+          "desc": "5F ordering, as written",
+          "wall_s": 31.78,
+          "boot_s": 0.0,
+          "fresh_tokens": 3084477,
+          "rows": 97,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.3972,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.1989,
+              "evaluated": 1986
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": 0.2,
+              "observed_selectivity": 0.2532,
+              "evaluated": 395
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 3,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.98,
+              "evaluated": 100
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 4,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9898,
+              "evaluated": 98
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 342,
+              "restored_tokens": 432525,
+              "stored_docs": 0,
+              "stored_tokens": 0
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B3c",
+          "desc": "5F ordering, by cost",
+          "wall_s": 31.02,
+          "boot_s": 0.0,
+          "fresh_tokens": 3060843,
+          "rows": 98,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.2,
+              "observed_selectivity": 0.0694,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.6167,
+              "evaluated": 347
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.472,
+              "evaluated": 214
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 3,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9802,
+              "evaluated": 101
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 4,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9899,
+              "evaluated": 99
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 342,
+              "restored_tokens": 432525,
+              "stored_docs": 0,
+              "stored_tokens": 0
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B4",
+          "desc": "2F reports: long documents",
+          "wall_s": 13.96,
+          "boot_s": 0.0,
+          "fresh_tokens": 1184803,
+          "rows": 42,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.4,
+              "observed_selectivity": 0.385,
+              "evaluated": 200
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.5,
+              "observed_selectivity": 0.5455,
+              "evaluated": 77
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 0,
+              "stored_tokens": 0
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B5",
+          "desc": "1J reports x terms: the BioDEX shape",
+          "wall_s": 279.08,
+          "boot_s": 0.0,
+          "fresh_tokens": 18050202,
+          "rows": 146819,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.2868,
+              "pairs": 512000
+            }
+          ],
+          "store": {},
+          "replay": null
+        },
+        {
+          "query": "B6",
+          "desc": "1F + 1J: pushdown deletes the pair list",
+          "wall_s": 17.53,
+          "boot_s": 0.0,
+          "fresh_tokens": 1803525,
+          "rows": 7,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "a",
+              "stage": 0,
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.041,
+              "evaluated": 1000
+            },
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.0017,
+              "pairs": 4100
+            }
+          ],
+          "store": {
+            "a": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 18,
+              "stored_tokens": 28418
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B7",
+          "desc": "1J pure pair predicate",
+          "wall_s": 43.14,
+          "boot_s": 0.0,
+          "fresh_tokens": 4178738,
+          "rows": 3,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.1,
+              "observed_selectivity": 0.0001,
+              "pairs": 50000
+            }
+          ],
+          "store": {},
+          "replay": null
+        },
+        {
+          "query": "B8",
+          "desc": "1J exists",
+          "wall_s": 98.91,
+          "boot_s": 0.0,
+          "fresh_tokens": 9099020,
+          "rows": 98,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "t",
+              "partner": "s",
+              "semantics": "exists",
+              "provided_selectivity": 0.3,
+              "observed_selectivity": 0.0025,
+              "pairs": 100000
+            }
+          ],
+          "store": {},
+          "replay": null
+        },
+        {
+          "query": "B10",
+          "desc": "2J chain, gating + dedup + replay",
+          "wall_s": 338.14,
+          "boot_s": 0.0,
+          "fresh_tokens": 29581874,
+          "rows": 149262,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "b",
+              "partner": "a",
+              "semantics": "full",
+              "provided_selectivity": 0.2,
+              "observed_selectivity": 0.1749,
+              "pairs": 40000
+            },
+            {
+              "op": "join",
+              "anchor": "b",
+              "partner": "c",
+              "semantics": "full",
+              "provided_selectivity": 0.1,
+              "observed_selectivity": 0.1159,
+              "pairs": 19600
+            }
+          ],
+          "store": {},
+          "replay": true
+        },
+        {
+          "query": "B11",
+          "desc": "2J star: kept anchors read twice",
+          "wall_s": 317.18,
+          "boot_s": 0.01,
+          "fresh_tokens": 20767604,
+          "rows": 2122694,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "r",
+              "partner": "m",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.2868,
+              "pairs": 512000
+            },
+            {
+              "op": "join",
+              "anchor": "r",
+              "partner": "p",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.0935,
+              "pairs": 20000
+            }
+          ],
+          "store": {},
+          "replay": true
+        },
+        {
+          "query": "B12",
+          "desc": "2F + 1J: two-sided pushdown",
+          "wall_s": 41.8,
+          "boot_s": 0.0,
+          "fresh_tokens": 4032951,
+          "rows": 125,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "a",
+              "stage": 0,
+              "provided_selectivity": 0.3,
+              "observed_selectivity": 0.289,
+              "evaluated": 1000
+            },
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.1,
+              "observed_selectivity": 0.0043,
+              "pairs": 28900
+            }
+          ],
+          "store": {
+            "a": {
+              "restored_docs": 18,
+              "restored_tokens": 28418,
+              "stored_docs": 0,
+              "stored_tokens": 0
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B13",
+          "desc": "B2 rerun, new questions: the scan restore",
+          "wall_s": 31.84,
+          "boot_s": 0.0,
+          "fresh_tokens": 3118498,
+          "rows": 629,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.5774,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.3076,
+              "evaluated": 2887
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": 0.8,
+              "observed_selectivity": 0.8333,
+              "evaluated": 888
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 3,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9203,
+              "evaluated": 740
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 4,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.9236,
+              "evaluated": 681
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 342,
+              "restored_tokens": 432525,
+              "stored_docs": 0,
+              "stored_tokens": 0
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B14",
+          "desc": "B5 rerun, new question: the anchor restore",
+          "wall_s": 279.3,
+          "boot_s": 0.0,
+          "fresh_tokens": 18050402,
+          "rows": 143547,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.2804,
+              "pairs": 512000
+            }
+          ],
+          "store": {},
+          "replay": null
+        }
+      ],
+      "pass_wall_s": 1717.8
+    }
+  }
+}

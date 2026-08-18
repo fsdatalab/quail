@@ -17,27 +17,164 @@
   "runs": [
     {
       "rep": 0,
-      "wall": 91.72,
+      "wall": 35.76,
       "fresh_tokens": 3834386,
-      "tok_s": 41803.2,
+      "tok_s": 107226.6,
       "answered": 23113,
       "survivors": 1807,
       "wrong": 6294,
       "chunks": 55,
-      "gpu_s": 89.85,
+      "gpu_s": 33.4,
+      "chunk_ms_first8": [
+        946.6,
+        945.9,
+        962.0,
+        945.6,
+        811.9,
+        777.0,
+        724.1,
+        799.5
+      ],
+      "slow_chunks": [
+        {
+          "idx": 2,
+          "ms": 962.0,
+          "tokens": 110375,
+          "groups": 457,
+          "fresh": 288
+        },
+        {
+          "idx": 0,
+          "ms": 946.6,
+          "tokens": 110362,
+          "groups": 302,
+          "fresh": 302
+        },
+        {
+          "idx": 1,
+          "ms": 945.9,
+          "tokens": 110374,
+          "groups": 292,
+          "fresh": 292
+        },
+        {
+          "idx": 3,
+          "ms": 945.6,
+          "tokens": 110136,
+          "groups": 455,
+          "fresh": 283
+        },
+        {
+          "idx": 4,
+          "ms": 811.9,
+          "tokens": 95665,
+          "groups": 464,
+          "fresh": 266
+        },
+        {
+          "idx": 27,
+          "ms": 805.6,
+          "tokens": 93061,
+          "groups": 496,
+          "fresh": 257
+        },
+        {
+          "idx": 7,
+          "ms": 799.5,
+          "tokens": 93729,
+          "groups": 475,
+          "fresh": 263
+        },
+        {
+          "idx": 31,
+          "ms": 792.6,
+          "tokens": 91414,
+          "groups": 463,
+          "fresh": 230
+        }
+      ],
       "peak_gib": 65.93
     },
     {
       "rep": 1,
-      "wall": 39.9,
+      "wall": 35.85,
       "fresh_tokens": 3834386,
-      "tok_s": 96092.7,
+      "tok_s": 106960.3,
       "answered": 23113,
       "survivors": 1807,
       "wrong": 6294,
       "chunks": 55,
-      "gpu_s": 38.12,
+      "gpu_s": 33.49,
+      "chunk_ms_first8": [
+        951.5,
+        950.4,
+        966.1,
+        953.4,
+        820.1,
+        771.5,
+        722.1,
+        811.3
+      ],
+      "slow_chunks": [
+        {
+          "idx": 2,
+          "ms": 966.1,
+          "tokens": 110375,
+          "groups": 457,
+          "fresh": 288
+        },
+        {
+          "idx": 3,
+          "ms": 953.4,
+          "tokens": 110136,
+          "groups": 455,
+          "fresh": 283
+        },
+        {
+          "idx": 0,
+          "ms": 951.5,
+          "tokens": 110362,
+          "groups": 302,
+          "fresh": 302
+        },
+        {
+          "idx": 1,
+          "ms": 950.4,
+          "tokens": 110374,
+          "groups": 292,
+          "fresh": 292
+        },
+        {
+          "idx": 4,
+          "ms": 820.1,
+          "tokens": 95665,
+          "groups": 464,
+          "fresh": 266
+        },
+        {
+          "idx": 7,
+          "ms": 811.3,
+          "tokens": 93729,
+          "groups": 475,
+          "fresh": 263
+        },
+        {
+          "idx": 27,
+          "ms": 809.3,
+          "tokens": 93061,
+          "groups": 496,
+          "fresh": 257
+        },
+        {
+          "idx": 31,
+          "ms": 795.9,
+          "tokens": 91414,
+          "groups": 463,
+          "fresh": 230
+        }
+      ],
       "peak_gib": 65.93
     }
-  ]
+  ],
+  "warmup_s": 2.32
 }
