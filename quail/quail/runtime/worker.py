@@ -48,16 +48,27 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
                                       create_if_missing=True)
 
 
-@app.function(image=image, gpu="H100!", timeout=7200, memory=65536,
+# Process-global state: the container IS the session-side cache. A
+# warm container keeps the loaded model, the arena, and the pinned KV
+# store across execute() calls, which is what makes a session's later
+# queries boot in milliseconds and restore instead of recompute.
+_BOOTED = {}      # model name -> dict(model, arena, pipeline, budget)
+_STORE = None     # one PinnedStore per container, shared
+
+
+@app.function(image=image, gpu="H100!", timeout=7200, memory=98304,
+              scaledown_window=300,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})
 def execute(payload: dict) -> dict:
+    global _STORE
     import torch
     import torch.nn.functional as F
 
     from quail.executor.arena import KVArena
     from quail.executor.attention import Pipeline
+    from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
                                      run_join, warm_kernels)
     from quail.planner import budgets
@@ -66,23 +77,32 @@ def execute(payload: dict) -> dict:
     if payload["kv_dtype"] != "bf16":
         raise NotImplementedError(
             "the fp8 KV arena is not built yet; the planner only "
-            "picks fp8 under warm-store pressure, which needs the "
-            "store (a later step)")
+            "picks fp8 under warm-store pressure at scales the store "
+            "cannot hold in bf16")
 
     spec = MODELS[payload["model"]]
     device = DEVICES["h100-sxm"]
+    docs = payload["docs"]
 
     t_boot = time.perf_counter()
-    from quail.executor.model import load_model
-    model = load_model(spec.hf_name)
+    booted = _BOOTED.get(spec.name)
+    if booted is None:
+        from quail.executor.model import load_model
+        model = load_model(spec.hf_name)
+        chunk = budgets.chunk_budget(spec, device)
+        arena_tok = budgets.arena_tokens(spec, device, chunk)
+        arena = KVArena(n_layers=spec.layers,
+                        n_pages=arena_tok // budgets.PAGE_TOKENS,
+                        page_tokens=budgets.PAGE_TOKENS,
+                        n_kv=spec.n_kv, d_head=spec.d_head,
+                        dtype=torch.bfloat16)
+        pipeline = Pipeline(model, arena)
+        booted = dict(model=model, arena=arena, pipeline=pipeline,
+                      warmed=False)
+        _BOOTED[spec.name] = booted
+    model, arena, pipeline = (booted["model"], booted["arena"],
+                              booted["pipeline"])
     chunk = budgets.chunk_budget(spec, device)
-    arena_tok = budgets.arena_tokens(spec, device, chunk)
-    arena = KVArena(n_layers=spec.layers,
-                    n_pages=arena_tok // budgets.PAGE_TOKENS,
-                    page_tokens=budgets.PAGE_TOKENS,
-                    n_kv=spec.n_kv, d_head=spec.d_head,
-                    dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena)
     # the worker has no tokenizer: the YES/NO token ids ride in the
     # payload
     answerer = _PayloadAnswerer(torch, F, model, payload["yes_ids"],
@@ -91,31 +111,50 @@ def execute(payload: dict) -> dict:
     budget = min(chunk, pipeline.max_chunk_tokens,
                  payload["chunk_tokens"])
 
-    docs = payload["docs"]
+    if not booted["warmed"]:
+        with torch.inference_mode():
+            # boot-side warmup: the dense token sweep plus one
+            # budget-sized chunk, so every kernel configuration
+            # compiles outside measured walls
+            first_alias = next(iter(docs))
+            warm_q = (next(iter(payload["filters"].values()))[0]
+                      if payload["filters"] else [1, 2, 3])
+            warm_kernels(torch, arena, pipeline, async_ans,
+                         docs[first_alias], [warm_q], budget)
+        torch.cuda.synchronize()
+        kernel_cache.commit()   # keep the compiles even if the run dies
+        booted["warmed"] = True
+
+    store_cfg = payload.get("store")
+    if store_cfg is not None and _STORE is None:
+        max_doc = max((len(d) for ds in docs.values() for d in ds),
+                      default=0)
+        _STORE = PinnedStore(
+            capacity_tokens=int(store_cfg["capacity_bytes"]
+                                // spec.kappa),
+            n_layers=spec.layers, n_kv=spec.n_kv, d_head=spec.d_head,
+            max_doc_tokens=max(max_doc, 4096), dtype=torch.bfloat16)
+    boot_s = time.perf_counter() - t_boot   # load + compile + store
+
     total_tokens = 0
     out_filters = {}
+    store_stats = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
-
-    with torch.inference_mode():
-        # boot-side warmup: one budget-sized chunk compiles the
-        # kernels' full-size configurations outside the measured wall
-        # (a tiny warmup chunk compiles the wrong DeepGEMM configs and
-        # leaves ~50 s of JIT inside the first query)
-        first_alias = next(iter(docs))
-        warm_q = (next(iter(payload["filters"].values()))[0]
-                  if payload["filters"] else [1, 2, 3])
-        warm_kernels(torch, arena, pipeline, async_ans,
-                     docs[first_alias], [warm_q], budget)
-    torch.cuda.synchronize()
-    kernel_cache.commit()    # keep the compiles even if the run dies
-    boot_s = time.perf_counter() - t_boot   # load + compile, together
 
     t0 = time.perf_counter()
     with torch.inference_mode():
         for alias, qids in payload["filters"].items():
+            stats = {}
             answers, _, tokens = run_filter(
                 torch, arena, pipeline, async_ans, docs[alias], qids,
-                budget)
+                budget,
+                store=_STORE if store_cfg else None,
+                store_hash=(store_cfg["hashes"][alias]
+                            if store_cfg else None),
+                store_min_tokens=(store_cfg["min_doc_tokens"]
+                                  if store_cfg else 1),
+                stats=stats)
+            store_stats[alias] = stats
             total_tokens += tokens
             out_filters[alias] = {int(d): row
                                   for d, row in answers.items()}
@@ -162,6 +201,7 @@ def execute(payload: dict) -> dict:
     report = dict(filters=out_filters, joins=out_joins,
                   wall_s=round(wall, 2), boot_s=round(boot_s, 2),
                   fresh_tokens=total_tokens,
+                  store=(store_stats if store_cfg else None),
                   peak_gib=round(
                       torch.cuda.max_memory_allocated() / 2**30, 2))
     os.makedirs("/results/runs", exist_ok=True)

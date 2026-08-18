@@ -64,6 +64,9 @@ class PhysicalPlan:
     order_rule: str            # "as_written" | "by_cost"
     order_source: str          # which rule chose it, for explain()
     calibration_source: str    # "calibrated" | "spec-scaled from ..."
+    store_min_doc_tokens: int = 0    # documents at or above this
+    #                                  length use the KV store; 0 =
+    #                                  no store, 1 = everything stores
     operators: tuple = ()      # ordered operator dicts, JSON-able
     remarks: tuple = ()
 

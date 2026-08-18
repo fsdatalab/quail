@@ -219,6 +219,36 @@ def restore_crossover_tokens(model: ModelSpec, cal: Calibration,
     return (per_token_load - cal.a_s_per_token) / cal.a2_s_per_token2
 
 
+def store_length_threshold(doc_tokens, capacity_bytes, kappa) -> int:
+    """The store-or-not length cutoff under a capacity: keep the
+    LONGEST documents whose KV fits. Recompute cost per byte rises
+    with document length, so the top of the length list is worth the
+    most per stored byte - and a length threshold cannot be thrashed
+    by a scanning query the way LRU can.
+
+    Returns 1 when capacity holds everything, 0 when nothing fits.
+    At a boundary tie the threshold moves up so the stored set never
+    exceeds the capacity."""
+    if capacity_bytes is None:
+        return 1
+    budget_tok = int(capacity_bytes / kappa)
+    lengths = sorted((int(t) for t in doc_tokens), reverse=True)
+    if sum(lengths) <= budget_tok:
+        return 1
+    taken, threshold = 0, 0
+    for h in lengths:
+        if taken + h > budget_tok:
+            break
+        taken += h
+        threshold = h
+    while threshold and sum(h for h in lengths
+                            if h >= threshold) > budget_tok:
+        threshold += 1
+    if threshold and not any(h >= threshold for h in lengths):
+        return 0
+    return threshold
+
+
 def access_for_scan(stats: CorpusStats, model: ModelSpec,
                     cal: Calibration, store) -> str:
     """read | restore. Restore wins when the warm store's bandwidth
@@ -359,10 +389,28 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             store.read_bw if store else None)
         source_dtype = (f"argmin: fp8 tax {tax:.2f} s vs byte saving "
                         f"{saving:.2f} s")
+        if dtype == "fp8":
+            # the fp8 arena's conversion kernels are not built yet;
+            # the argmin's preference is recorded, not executed
+            source_dtype += ("; fp8 priced lower but its arena is "
+                             "not built - running bf16")
+            dtype = "bf16"
     remarks.append(f"kv_dtype={dtype} ({source_dtype})")
     kv_bytes = 1.0 if dtype == "fp8" else 2.0
     admission = budgets.arena_tokens(model.with_kv_bytes(kv_bytes),
                                      device, chunk)
+
+    store_min = 0
+    if store is not None:
+        all_lengths = [t for toks in doc_tokens.values() for t in toks]
+        store_min = store_length_threshold(
+            all_lengths, store.capacity_bytes,
+            model.with_kv_bytes(kv_bytes).kappa)
+        if store_min > 1:
+            stored = [t for t in all_lengths if t >= store_min]
+            remarks.append(
+                f"store capped: {len(stored)} of {len(all_lengths)} "
+                f"documents stored, length threshold {store_min}")
 
     # ---- operators, in execution order
     operators = []
@@ -407,8 +455,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         model=model.name, device=device.name, workers=workers,
         tensor_parallel=tp, kv_dtype=dtype, chunk_tokens=chunk,
         admission_tokens=admission, order_rule=rule, order_source=source,
-        calibration_source=cal.source, operators=tuple(operators),
-        remarks=tuple(remarks))
+        calibration_source=cal.source,
+        store_min_doc_tokens=store_min,
+        operators=tuple(operators), remarks=tuple(remarks))
 
 
 def _filter_alias(pred_or_list):

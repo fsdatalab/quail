@@ -18,15 +18,23 @@ n-way merge lands. The KV store and GPU snapshots are later steps;
 cpu_memory_gb is carried but not yet consumed.
 """
 
+import hashlib
+import os
 import re
 import time
 from dataclasses import dataclass, field
 
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import CompileError, LogicalPlan
+from quail.planner.calibration import channel_bandwidths
 from quail.planner.decide import _collect, _join_sides, explain, plan_query
-from quail.planner.plan import EngineConfig, Refusal, resolve_model
+from quail.planner.plan import (EngineConfig, Refusal, StoreSpec,
+                                resolve_model)
 from quail.specs import DEVICES
+
+STORE_HEADROOM_GB = 16    # container memory the store must leave for
+#                           weights loading, activations paging, and
+#                           the Python process itself
 
 
 class RefusalError(RuntimeError):
@@ -83,6 +91,62 @@ class Session:
         self._fast_tried = False
         self.notes = []            # tokenizer picks etc., for reports
         self._scan_cache = {}      # (source, column) -> token lists
+        self._warm_hashes = set()  # content hashes stored by earlier
+        #                            runs in this session
+        self._app_ctx = None       # the Modal app held open for the
+        #                            session, so the worker container
+        #                            (its booted model and its store)
+        #                            survives between run() calls
+
+    def worker(self):
+        """The worker module, inside this session's long-lived app
+        context. One app per session is what keeps the container -
+        and with it the loaded model and the pinned store - warm
+        across queries."""
+        from quail.runtime import worker
+        if self._app_ctx is None:
+            self._app_ctx = worker.app.run()
+            self._app_ctx.__enter__()
+        return worker
+
+    def close(self):
+        """End the session: the app stops, the container scales down,
+        the store is gone. A new session starts cold."""
+        if self._app_ctx is not None:
+            self._app_ctx.__exit__(None, None, None)
+            self._app_ctx = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def store_spec(self, hashes=()) -> StoreSpec | None:
+        """The planner's view of the KV store: pinned bandwidth,
+        capacity from the config, warm when every scanned content
+        hash was stored by an earlier run of this session."""
+        if self.config.cpu_memory_gb <= STORE_HEADROOM_GB:
+            return None
+        capacity = (self.config.cpu_memory_gb
+                    - STORE_HEADROOM_GB) * 1e9
+        warm = bool(hashes) and all(h in self._warm_hashes
+                                    for h in hashes)
+        return StoreSpec(read_bw=channel_bandwidths()["pinned_h2d"],
+                         warm=warm, capacity_bytes=capacity)
+
+    def content_hash(self, provider_name: str, column: str) -> str:
+        """The store key prefix for one scanned column: provenance of
+        (provider data, column, tokenizer). File identity is
+        (path, size, mtime) - cheaper than hashing the bytes, and a
+        rewritten file changes it."""
+        provider = self.catalog.get(provider_name)
+        ident = [provider.kind, provider.source, column,
+                 self.model.name]
+        if provider.kind == "parquet" and os.path.exists(provider.source):
+            st = os.stat(provider.source)
+            ident += [str(st.st_size), str(int(st.st_mtime))]
+        return hashlib.sha256(":".join(ident).encode()).hexdigest()[:16]
 
     def register(self, name: str, provider: DocumentProvider) -> None:
         self.catalog.register(name, provider)
@@ -233,14 +297,18 @@ class Query:
         if self._plan is None:
             scans, _, _ = _collect(self.logical)
             self._doc_tokens = {}
+            self._hashes = {}
             for s in scans:
                 _, _, toks = self.session.scan(s.provider, s.column)
                 self._doc_tokens[s.alias] = [len(t) for t in toks]
+                self._hashes[s.alias] = self.session.content_hash(
+                    s.provider, s.column)
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
                 doc_tokens=self._doc_tokens,
                 gpus=self.session.config.gpus,
+                store=self.session.store_spec(self._hashes.values()),
                 kv_dtype=self.session.config.kv_dtype,
                 order=self.order)
         return self._plan
@@ -265,9 +333,7 @@ class Query:
         payload = self._payload(plan, scans, filters, joins)
         t0 = time.time()
         if _execute is None:
-            from quail.runtime import worker
-            with worker.app.run():
-                out = worker.execute.remote(payload)
+            out = self.session.worker().execute.remote(payload)
         else:
             out = _execute(payload)
         coordinator_wall = time.time() - t0
@@ -311,6 +377,13 @@ class Query:
                 swapped=op["anchor"] != a1,
                 pre=pre, mid=mid, tail=tail))
         yes_ids, no_ids = _yes_no_ids(sess.tokenizer)
+        store = None
+        spec = sess.store_spec(self._hashes.values())
+        if spec is not None:
+            store = dict(capacity_bytes=spec.capacity_bytes,
+                         min_doc_tokens=max(1,
+                                            plan.store_min_doc_tokens),
+                         hashes=dict(self._hashes))
         return dict(
             model=sess.model.name,
             kv_dtype=plan.kv_dtype,
@@ -318,7 +391,8 @@ class Query:
             yes_ids=yes_ids, no_ids=no_ids,
             docs=docs,
             filters=filter_qids,
-            joins=join_specs)
+            joins=join_specs,
+            store=store)
 
     # ---- sink: gate, replay-check, project ------------------------------
 
@@ -331,9 +405,13 @@ class Query:
             wall_s=out["wall_s"], boot_s=out.get("boot_s"),
             coordinator_wall_s=round(coordinator_wall, 2),
             fresh_tokens=out["fresh_tokens"], stages=[],
+            store=out.get("store"),
             order_rule=plan.order_rule,
             calibration=plan.calibration_source,
             remarks=list(plan.remarks) + list(self.session.notes))
+        if getattr(self, "_hashes", None) and out.get("store"):
+            # later runs of this session may now plan access=restore
+            self.session._warm_hashes.update(self._hashes.values())
         answer_rows = dict(filters=out["filters"], joins=out["joins"])
 
         # filter survivors + observed selectivities

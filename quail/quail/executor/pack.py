@@ -206,7 +206,8 @@ class FilterAdmission:
     """
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
-                 arena_pages, page_tokens, kept_extra_tokens=0):
+                 arena_pages, page_tokens, kept_extra_tokens=0,
+                 restored=()):
         self.doc_tokens = list(doc_tokens)
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
@@ -216,6 +217,10 @@ class FilterAdmission:
         # the document's kept KV after stage 1 (chain mode kept it
         # resident; so do we), so pages must cover it
         self.kept_extra = kept_extra_tokens
+        # restored: documents whose KV loads from the store instead of
+        # computing - their admission claims the same pages but their
+        # chunk cost is the first question only
+        self.restored = set(restored)
         for d, t in enumerate(self.doc_tokens):
             need = t + max(stage_tokens)
             if need > chunk_budget:
@@ -263,7 +268,8 @@ class FilterAdmission:
                 self.pending.appendleft(doc)
                 blocked_pages = True
                 break
-            cost = self.doc_tokens[doc] + self.stage_tokens[0]
+            cost = self.stage_tokens[0] + (
+                0 if doc in self.restored else self.doc_tokens[doc])
             if cost > room:
                 skipped.append(doc)   # chunk room only; retry next chunk
                 continue
@@ -278,15 +284,24 @@ class FilterAdmission:
 
     # ---- gating --------------------------------------------------------
 
-    def report(self, doc, stage, yes):
+    def report(self, doc, stage, yes, release=True):
         """One landed answer. Frees pages on NO or on the last stage;
-        otherwise the next-stage suffix becomes ready."""
+        otherwise the next-stage suffix becomes ready.
+
+        release=False keeps a leaving document's pages held (the store
+        is copying them out); the caller returns them with release()
+        when the copy completes."""
         self.in_flight.discard(doc)
         self.answers.setdefault(doc, []).append(1 if yes else 0)
         last = stage == len(self.stage_tokens) - 1
         if yes and not last:
             self.ready.append((doc, stage + 1))
             return
+        if release:
+            self.free_pages += self.resident.pop(doc)
+
+    def release(self, doc):
+        """Return a document's pages after a deferred store save."""
         self.free_pages += self.resident.pop(doc)
 
     # ---- progress ------------------------------------------------------
