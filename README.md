@@ -74,18 +74,22 @@ of a request's KV or to keep a request alive across answers.
   three operators that differ by 30% in wall time. Chain-mode numbers
   here come from the scheduler's step trace, which sees every prefill
 
-**Cross-query reuse** — 1k docs (315k tokens), second query over the
-same documents:
+**Cross-query reuse** — write one query through the CPU store, then
+run two more queries over the same documents under filters the store
+never saw. Per-query walls (figure:
+`results/plots/persist_per_query.png`):
 
-| | time |
-|---|---|
-| recompute | 4.54 s |
-| restore from CPU memory | 2.33 s |
+| docs | KV | stock write | stock R1 | stock R2 | Quail write | Quail R1 | Quail R2 |
+|---|---|---|---|---|---|---|---|
+| 1,000 | 25 GB | 5.37 s | 3.30 s | 3.02 s | 4.75 s | 1.58 s | 1.41 s |
+| 10,000 | 242 GB | 47.44 s | 32.35 s | 30.42 s | 44.33 s | 16.27 s | 16.26 s |
 
-- **2.0x.** Restore wins when the channel beats `kappa x prefill_rate`
-  = 7.2 GB/s at 4B
-- Larger models make it easier: they read text more slowly, the
-  transfer does not
+- Restores run **1.9–2.1x faster** than stock, moving identical bytes
+  (10k: 522.5 GB each, zero duplication; 20,002 per-document copies
+  on stock against 23 planned batches on Quail)
+- Restore wins when the channel beats `kappa x prefill_rate`
+  = 7.2 GB/s at 4B; larger models make it easier: they read text more
+  slowly, the transfer does not
 
 ---
 
