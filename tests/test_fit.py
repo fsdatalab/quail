@@ -170,4 +170,6 @@ def test_fit_all_assembles_and_prints_constants():
     assert out["eps"] > 0
     block = fit.constants_block(out)
     assert "ALPHA2_S_PER_TOKEN2" in block
-    assert "OFFLOAD_CROSSOVER_TOKENS" in block
+    # crossovers are derived at call time (cost.offload_crossover_
+    # tokens), never emitted as constants
+    assert "OFFLOAD_CROSSOVER_TOKENS" not in block

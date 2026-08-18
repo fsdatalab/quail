@@ -8,11 +8,10 @@ import re
 
 from quail.engineext import chainlogic
 from quail.engineext.chainlogic import (
-    FAILED, KEEP_DECODING, PASSED, UNDECIDED, PinLedger,
-    continuation_tail, document_boundary, full_blocks, gate_decision,
-    is_chain, is_heuristic_eviction, is_registration, is_release_all,
-    new_pin_intent, parse_qid, parse_registration, parse_tag,
-    parse_yes_no, partial_boundary, pin_ready, plan_priority,
+    FAILED, KEEP_DECODING, PASSED, UNDECIDED, continuation_tail,
+    doc_key, document_boundary, full_blocks, gate_decision, is_chain,
+    is_heuristic_eviction, is_planned, is_registration, parse_qid,
+    parse_registration, parse_yes_no, partial_boundary,
     retained_blocks, rewind_target, shared_preamble, stage_advances,
     strict_violation)
 
@@ -24,41 +23,28 @@ YES_TOK, NO_TOK = 111, 222
 
 # ---- request-id protocol ----------------------------------------------
 
-def test_tag_parses_all_directives():
-    """The shared-scan chain id shape: pin, doc, uses, releases."""
-    assert parse_tag("de1|c|Q1|p345|d7|u2|r3,4|s-7-1") == (
-        345, "7", ["3", "4"], 2)
-    assert parse_tag("de1|c|d7|q-7-0") == (0, "7", [], 1)   # uses defaults
-    assert parse_tag("de1|r*|q-flz") == (0, None, ["*"], 1)
-    assert parse_tag("plain-id") is None
-    assert parse_tag("q|p345|d7|x") is None
+def test_doc_key_and_suffix_trap():
+    """The document key comes from the d part; the free-text suffix is
+    the last field and must never be read as a directive, even when it
+    starts with d."""
+    assert doc_key("de1|c|d7|q-7-0") == "7"
+    assert doc_key("de1|c|Q1|d7|s-7-1") == "7"
+    assert doc_key("de1|reg|Y111|s-reg") is None    # no document
+    assert doc_key("foreign-42") is None
+    assert doc_key("de1|c|d7|d9") == "7"            # suffix "d9" is text
+    assert doc_key("de1|c|dog-run") is None         # suffix never read
 
 
-def test_tag_suffix_never_read_as_directive():
-    """The r/p/d trap: a run tag starting with r, p, d (or u) makes
-    every suffix look like a directive. The suffix is the last field
-    and must never shadow one - a tag named "rm" once swallowed every
-    release, including the end-of-run flush."""
-    pin, doc, rel, uses = parse_tag("de1|p345|d7|r0,1|rm-0-99")
-    assert rel == ["0", "1"]           # not ["m-0-99"], not swallowed
-    assert (pin, doc) == (345, "7")
-    assert parse_tag("de1|d3|rm-7-0")[2] == []      # no phantom release
-    assert parse_tag("de1|p100|d2|p999")[0] == 100  # pin not overridden
-    assert parse_tag("de1|p100|d2|d9")[1] == "2"    # doc not overridden
-    assert parse_tag("de1|p10|d1|u7")[3] == 1       # uses not overridden
-    # the flush still works under a hostile tag: the real r* directive
-    # sits before the suffix
-    assert parse_tag("de1|r*|rm-flz")[2] == ["*"]
-
-
-def test_release_all_is_star_only():
-    assert is_release_all(["*"])
-    assert not is_release_all(["3", "4"])
-    assert not is_release_all([])
+def test_is_planned_is_the_prefix():
+    """Single-tenant mode admits exactly the de1|-prefixed ids."""
+    assert is_planned("de1|c|d7|q-7-0")
+    assert is_planned("de1|reg|Y111|s-reg")
+    assert not is_planned("probe-3")
+    assert not is_planned("q-7-0")
 
 
 def test_qid_defaults_and_ignores_suffix():
-    assert parse_qid("de1|c|Q1|p345|d7|u2|s-7-1") == "1"
+    assert parse_qid("de1|c|Q1|d7|s-7-1") == "1"
     assert parse_qid("de1|c|d7|q-7-0") == "0"       # single-query default
     assert parse_qid("de1|c|d1|Q9-x") == "0"        # suffix never read
 
@@ -75,18 +61,10 @@ def test_yes_no_sets_and_suffix_trap():
 def test_request_classification():
     assert is_registration("de1|reg|Q1|Y111|N222|s-reg")
     assert is_chain("de1|c|d7|q-7-0")
-    assert is_chain("de1|c|Q1|p345|d7|u2|s-7-1")
-    assert not is_chain("de1|p345|d7|q-7-0")        # request mode
+    assert is_chain("de1|c|Q1|d7|s-7-1")
+    assert not is_chain("de1|d7|q-7-0")             # no c part
     assert not is_registration("de1|c|d7|q-7-0")
     assert not is_chain("foreign-42")
-
-
-def test_plan_priority_ranks():
-    """Consumers of resident KV first, new reads next, unplanned
-    last."""
-    assert plan_priority((0, "7", ["3"], 1)) == 0   # no pin: consumer
-    assert plan_priority((345, "7", [], 1)) == 1    # pin: new read
-    assert plan_priority(None) == 2                 # foreign
 
 
 # ---- registration payload ---------------------------------------------
@@ -272,81 +250,6 @@ def test_strict_mode_predicates():
     assert not strict_violation(True, True, True)
     assert not strict_violation(True, False, False)  # shared card mode
     assert not strict_violation(False, False, True)
-
-
-# ---- pin refcount bookkeeping -----------------------------------------
-
-def test_pin_frees_exactly_once():
-    """A pin with uses=2 survives the first release mention, frees on
-    the second, and later mentions are ignored - one free event
-    total."""
-    ledger = PinLedger()
-    ledger.add("7", ["blockA", "blockB"], 2)
-    events = []
-    for _ in range(4):
-        events += ledger.to_free(["7"])
-    assert events == [("7", ["blockA", "blockB"])]
-    assert "7" not in ledger
-    # a fresh pin on the same key starts a fresh count
-    ledger.add("7", ["blockC"], 1)
-    assert ledger.to_free(["7"]) == [("7", ["blockC"])]
-
-
-def test_release_all_ignores_counts():
-    """The end-of-run flush frees every pin outright, whatever its
-    remaining mention count, and a second flush finds nothing."""
-    ledger = PinLedger()
-    ledger.add("1", ["a"], 5)
-    ledger.add("2", ["b"], 5)
-    ledger.add("3", ["c"], 1)
-    assert ledger.to_free(["2"]) == []      # 4 mentions still owed
-    freed = dict(ledger.to_free(["*"]))
-    assert freed == {"1": ["a"], "2": ["b"], "3": ["c"]}
-    assert ledger.to_free(["*"]) == []
-
-
-def test_shared_scan_release_balance():
-    """Two queries over five documents: after each query releases
-    every document once, every pin freed exactly once and the flush
-    finds nothing left."""
-    ledger = PinLedger()
-    docs = [str(i) for i in range(5)]
-    for key in docs:
-        ledger.add(key, [f"blk{key}"], 2)
-    assert ledger.to_free(docs) == []                     # query 0
-    assert [k for k, _ in ledger.to_free(docs)] == docs   # query 1
-    assert ledger.to_free(["*"]) == []
-
-
-def test_unknown_and_batched_releases():
-    """Releases for absent documents are ignored (a release can
-    outlive its pin), and one batched mention list decrements each
-    listed pin once."""
-    ledger = PinLedger()
-    assert ledger.to_free(["9"]) == []
-    ledger.add("1", ["a"], 1)
-    ledger.add("2", ["b"], 2)
-    freed = ledger.to_free(["1", "2", "9"])
-    assert freed == [("1", ["a"])]
-    assert "2" in ledger
-
-
-def test_pin_intent_predicates():
-    """An intent needs a positive pin span and a document key not yet
-    pinned; the pin is taken at free time only if the request computed
-    past the span and no sibling pinned first."""
-    ledger = PinLedger()
-    assert new_pin_intent(345, "7", ledger)
-    assert not new_pin_intent(0, "7", ledger)
-    assert not new_pin_intent(345, None, ledger)
-    ledger.add("7", ["a"], 1)
-    assert not new_pin_intent(345, "7", ledger)     # already pinned
-    intent = (345, "3", 2)
-    assert pin_ready(intent, 345, ledger)
-    assert not pin_ready(intent, 344, ledger)       # never computed span
-    assert not pin_ready(None, 10 ** 9, ledger)
-    ledger.add("3", ["b"], 1)
-    assert not pin_ready(intent, 345, ledger)       # sibling won
 
 
 # ---- the step trace ---------------------------------------------------

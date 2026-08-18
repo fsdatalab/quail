@@ -49,7 +49,16 @@ ENGINE_OVERHEAD_S = 0.026     # c0: per-query software residue at 10k docs,
                               # fleet-anchored and booked host variance
                               # as overhead.
 BOOT_POOL_FRACTION = 0.92     # gpu_memory_utilization we ship
-POOL_HEADROOM = 0.80          # admission budget stays under the pool by this
+SATURATION_SLACK = 2          # admission budget = this x n_filters x step
+#                               budget. sigma*B tokens are live at once
+#                               (sigma = filter count, the survival
+#                               ceiling; the step trace measured 4.1-5.1
+#                               live cohorts at five filters) and one
+#                               more sigma*B sits queued so a client
+#                               top-up stall of up to sigma steps never
+#                               starves a step. Waiting documents hold
+#                               no KV, so the queue costs no pool.
+ENGINE_BLOCK_TOKENS = 16      # engine KV block: residency rounds up to it
 ENGINE_SEQS_MAX = 4096        # hard bound on max_num_seqs at boot:
 #                               per-sequence engine overheads (FlashInfer
 #                               workspace, sampler buffers) live outside
@@ -111,7 +120,6 @@ HOST_HN_S = 2.4330984797175877e-05
 HOST_HA_S = 4.886350071536961e-07
 HOST_HR_S = 1.1169313206227985e-06
 TRANSPORT_BW_BPS = {'c6_d2h_unpinned': 11856448657.0, 'c6_h2d_unpinned': 10916219696.0, 'c6_d2h_pinned': 55339616543.0, 'c6_h2d_pinned': 55472110922.0, 'c6_disk_write': 2605516808.0, 'c6_disk_read': 3877713374.0, 'c6_volume_write': 856544232.0, 'c6_volume_read': 3242050855.0}
-OFFLOAD_CROSSOVER_TOKENS = {'c6_d2h_unpinned': 0.0, 'c6_h2d_unpinned': 0.0, 'c6_d2h_pinned': 0.0, 'c6_h2d_pinned': 0.0, 'c6_disk_write': 38714.5770760633, 'c6_disk_read': 19897.590958957873, 'c6_volume_write': 155827.48237132592, 'c6_volume_read': 27453.67024434094}
 
 
 # ------------------------------------------------------- rate primitives
@@ -161,6 +169,27 @@ def attn_seconds_per_token2(model, device):
     """The quadratic prefill surcharge, spec-scaled: a document of h
     tokens costs this times h^2 on top of its linear token work."""
     return ALPHA2_S_PER_TOKEN2 * _scale(model, device)
+
+
+def offload_crossover_tokens(read_bw, model, device):
+    """The document length past which loading KV from a tier beats
+    recomputing it: solve kappa/BW = alpha1 + alpha2*h for h.
+
+    Derived at call time from the measured bandwidth and the fitted
+    single-document prefill model - never stored, because it goes
+    stale with either input: a faster disk moves it down, a
+    re-anchored alpha fit moves it too. Returns 0 when the tier beats
+    recompute at every length (bandwidth above kappa/alpha1, about
+    8 GB/s at 4B on the H100). Every slower tier crosses eventually,
+    because recompute grows with length and loading does not.
+    Caveat: the alpha sweep measured to 16,384 tokens, so crossovers
+    beyond that are extrapolation."""
+    a1 = ALPHA1_S_PER_TOKEN * _scale(model, device)
+    a2 = ALPHA2_S_PER_TOKEN2 * _scale(model, device)
+    per_token_load = model.kappa / read_bw
+    if per_token_load <= a1:
+        return 0.0
+    return (per_token_load - a1) / a2
 
 
 # ------------------------------------------------------- the estimator
