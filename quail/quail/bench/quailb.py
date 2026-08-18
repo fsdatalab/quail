@@ -125,13 +125,21 @@ def _biodex_rows(n=2000):
 
 
 def _abtbuy_products():
-    from datasets import load_dataset
-    ds = load_dataset("matchbench/Abt-Buy", "source", split="train")
+    # the matchbench repo is a legacy script dataset; its
+    # auto-converted parquet lives on the convert branch
+    from huggingface_hub import hf_hub_download
+    f = hf_hub_download("matchbench/Abt-Buy",
+                        "source/source/0000.parquet",
+                        repo_type="dataset",
+                        revision="refs/convert/parquet")
+    table = pq.read_table(f)
+    cols = {c.lower(): c for c in table.column_names}
+    names = table.column(cols.get("name", "name")).to_pylist()
+    descs = (table.column(cols["description"]).to_pylist()
+             if "description" in cols else [""] * len(names))
     out = []
-    for row in ds:
-        name = str(row.get("name") or "")
-        desc = str(row.get("description") or "")
-        text = (name + ". " + desc).strip(". ")
+    for name, desc in zip(names, descs):
+        text = f"{name or ''}. {desc or ''}".strip(". ")
         if text:
             out.append(text)
     return out
@@ -418,12 +426,17 @@ def queries(sess):
 # ----------------------------------------------------------- driver
 
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
-              out_path=None):
+              out_path=None, cpu_memory_gb=80):
+    """cpu_memory_gb defaults to what the 96 GB worker container
+    holds: a 64 GB store (8 slabs). The corpus KV usually exceeds it,
+    so the length threshold keeps the longest documents - partial
+    restores are the capacity arithmetic working, not a bug."""
     import quail
     from quail.planner.plan import EngineConfig
 
     d = build_sets(data_dir, sf, lf)
-    sess = quail.Session(EngineConfig(gpus=gpus, cpu_memory_gb=64))
+    sess = quail.Session(EngineConfig(gpus=gpus,
+                                      cpu_memory_gb=cpu_memory_gb))
     register_sets(sess, d)
     qdefs = queries(sess)
     ids = [i for i in qdefs if only is None or i in only]
