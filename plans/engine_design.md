@@ -27,8 +27,6 @@ What the design rests on (all committed in this repo):
 | Chain semantics (keep document KV, attach question suffixes) beat per-stage requests: 39.8 s vs 42.9 s at 10k docs | `results/engine/filter_cells.json` |
 | Cross-query KV restore from a pinned CPU store: 1.9–2.1x over recompute | `results/engine/persist_split7_quail_waves_chain_10k.json` |
 | Attention-merge parity: 0 disagreements across all gates; rate 82.1k tok/s at the large-chunk geometry | `results/engine/join_probe.json` |
-| Cost model: predictions within ~2–3% on filters, +7% on the packed join | `results/engine/makespan_check.json`, `join_findings.md` |
-
 ---
 
 ## 1. Shape of the system
@@ -239,10 +237,10 @@ the SQL `WHERE [NOT] EXISTS` form (§3.1).
 Both entry points produce the same `LogicalPlan`. Then:
 
 ```python
-q.explain()   # logical tree, physical plan, per-operator predicted
-              # wall and token counts — printed BEFORE any run
-res = q.run() # measured walls next to the predictions, plus tokens
-              # computed, KV bytes restored, pairs per stage
+q.explain()   # logical tree, chosen physical plan, per-operator
+              # settings and token counts — no run needed
+res = q.run() # measured walls, tokens computed, KV bytes restored,
+              # pairs per stage
 ```
 
 Failures come in three kinds, at three times, and only one of them
@@ -455,15 +453,13 @@ arena cannot hold one working set, a suffix exceeds the chunk
 budget — return the existing `Refusal` with the violated
 constraint named.
 
-**Prediction is not planning.** The output `PhysicalPlan` is a
+**There is no wall prediction.** The output `PhysicalPlan` is a
 JSON tree of settings plus per-operator token counts — counts are
-arithmetic the plan already did, so they are always present. The
-wall estimator is a separate module (`predict.py`), the only
-consumer of b, c0, and a2-as-pricing: `explain()` and the
-benchmark call it to state predictions before runs, per house
-rule, and the result stores prediction next to measurement so
-every run doubles as a cost-model check. A missing or stale
-prediction constant dulls that report and cannot change a plan.
+arithmetic the decisions already produced, so they come free.
+`explain()` prints the tree; `run()` measures. The engine never
+estimates how long a query will take: every decision above either
+needs no constants at all or reduces to a break-even inequality,
+and nothing in the system consumes an estimated wall.
 
 ---
 
@@ -680,10 +676,9 @@ part of the new system.
 Risk, stated: a full gated multi-stage filter chain on the packed
 executor is unmeasured (single filter and gated join stages are).
 Milestone 1 in §10 runs exactly the committed 10k-document
-five-filter workload on the new executor; prediction from the
-measured constants: ~32 s against the engine's 39.8 s, tolerance
-the cost model's demonstrated ±10%. A miss past the band reopens
-this section.
+five-filter workload on the new executor; the measured rates say
+to expect ~32 s against the engine's 39.8 s. A result far off
+that reopens this section.
 
 ---
 
@@ -775,7 +770,7 @@ What the planner computes from the structs alone:
 | chunk memory bound | free memory / act_per_token | ~420k |
 | kernel index cap | (2^31 − 1) // ffn_width | 110,375 |
 | chunk budget | min(memory bound, index cap), floored at the knee | 110,375 |
-| compute knee | per-chunk fixed cost / per-token cost; roofline ridge R_D/BW says the same (~400 tokens) | ~300–400 |
+| compute knee | roofline ridge R_D/BW (where the dense projections go compute-bound) | ~400 |
 | attention crossover | document length where pair work overtakes the dense projections | ~12,300 |
 | store break-even | kappa x serving rate | 7.2 GB/s |
 | serving rate | 2P/R_D x 1/efficiency | 96–121k tok/s |
@@ -802,52 +797,38 @@ planner reads constants from the file when one exists for this
 pair and from the spec-scaled defaults when it does not, and
 `explain()` names the source. Calibration is run when a model is
 onboarded or the software stack changes, and never otherwise;
-plans never require it — they only get sharper predictions from
-it.
+plans never require it — only the two break-even decisions get
+sharper from it.
 
-The file holds exactly five numbers per (model, device):
+The file holds exactly three numbers per (model, device), because
+only the byte-vs-compute decisions consume constants at all:
 
-| constant | meaning | consumed by | 4B/H100 today |
+| constant | meaning | decides | 4B/H100 today |
 |---|---|---|---|
-| a | seconds per fresh token in the packed loop (1/rate; embeds the efficiency factor) | every wall prediction; filter ordering; anchor choice; the fresh side of the dtype inequality | 8.26 µs (121,045 tok/s, kernel ladder) |
-| b | seconds per chunk: pack, launch, answer readout | the knee, so the chunk budget floor; predictions for gated late stages, where chunks run small and b amortizes worst (measured: +22% at 41k-token chunks in the 3-way run) | ~2.9 ms on the engine; re-measured on the packed loop at milestone 1 |
-| a2 | seconds per token-pair of attention (the quadratic coefficient) | long-document surcharge (the LF grid); join cross-attention priced from pair counts (that pricing landed +7% on the B5 shape); the attention-crossover check | 4.93e-10 |
+| a | seconds per fresh token in the packed loop (1/rate; embeds the efficiency factor) | the restore break-even (restore wins iff kappa/bandwidth < a) and the fresh side of the dtype inequality | 8.26 µs (121,045 tok/s, kernel ladder) |
+| a2 | seconds per token-pair of attention (the quadratic coefficient) | refines both break-evens at long document lengths: moves the restore crossover, matters in the LF=4 regime, inert at ordinary lengths | 4.93e-10 |
 | q_kv | the fp8-KV conversion tax per fresh token | the dtype argmin (§6) | 0.59 µs |
-| c0 | fixed per-query residue: dispatch, first chunk, result return | the per-query floor (benchmark B1) | 0.026 s on the engine executor; re-measured at milestone 1 |
 
 Plus one table per host configuration, model-independent, measured
 once by the pinprobe protocol: the channel bandwidths (pinned
-H2D/D2H ~55 GB/s, unpinned ~11, disk ~2.6-3.9, volume ~0.9-3.2),
-consumed by the read/restore/spill decision, the byte side of the
-dtype inequality, and spill pricing.
+H2D/D2H ~55 GB/s, unpinned ~11, disk ~2.6-3.9, volume ~0.9-3.2) —
+the byte side of both break-evens.
 
-Not all five steer the plan, and the distinction matters:
-
-- **Zero constants** decide filter order, join stage order, and
-  anchor choice. Every candidate runs at the same rate, so a
-  cancels out of the comparison — those decisions are token
-  counting plus the provided selectivities, and they survive any
-  miscalibration untouched.
-- **a, q_kv, and the bandwidths** decide the two choices that
-  compare compute against bytes: read-vs-restore-vs-spill
-  (restore wins iff kappa/bandwidth < a) and the KV dtype
-  argmin. a2 sharpens both when documents are long — it moves the
-  restore crossover and prices the LF=4 regime — and is inert at
-  ordinary lengths.
-- **b and c0 steer nothing.** They exist so predicted walls match
-  measured walls (small-chunk regimes; the per-query floor),
-  which is what lets every run double as a cost-model check. A
-  wrong b or c0 dulls a prediction and changes no plan.
+Everything else the planner does consumes no constants: filter
+order, join stage order, and anchor choice compare candidates that
+all run at the same rate, so a cancels and the comparison is token
+counting plus the provided selectivities; the budgets are spec
+arithmetic. Those decisions survive any miscalibration untouched.
 
 Deliberately absent, against the exploration's `cost.py`: the
 engine-only constants die with the engine — the per-request host
 model (HOST_HN/HA/HR), the eager-boot step floor (STEP_B0_S), the
 engine sequence and block bounds, and the cached-read slope
-(T_READ_S_PER_TOKEN). In the packed executor, reading kept
-document KV IS the cross-attention call, so it is priced by a2 and
-pair counts rather than by a separate read constant — which is
-exactly how the join predictions were priced, and they landed
-within their band.
+(T_READ_S_PER_TOKEN; in the packed executor, reading kept document
+KV IS the cross-attention call, priced by a2 and pair counts when
+pricing is needed at all). The per-chunk fixed cost and the
+per-query residue are gone too: they only ever fed wall
+prediction, and the engine does not predict walls.
 
 On "make B* as big as possible because everything is prefill
 dominated": right in substance, with two caps and one caveat. Right
@@ -931,9 +912,9 @@ Q9, Q11), exists (Q4, Q20), anti (Q16, Q22), exists+anti combined
 Fifteen queries cover all eight families with variants that isolate
 one engine mechanism each. F = filter stage, J = join stage.
 
-| id | TPC-H skeleton | shape | sets | pair/doc volume at SF=1 | what it isolates | predicted wall (SF=1, LF=1) |
+| id | TPC-H skeleton | shape | sets | pair/doc volume at SF=1 | what it isolates | sizing estimate (SF=1, LF=1) |
 |---|---|---|---|---|---|---|
-| B1 | Q6 | 1F | reviews | 50k docs | the degenerate chain; the per-query floor (c0) in a warm container | ~3.8 min |
+| B1 | Q6 | 1F | reviews | 50k docs | the degenerate chain; the per-query overhead floor in a warm container | ~3.8 min |
 | B2 | Q1 | 5F | reviews | 50k docs, sels .9/.9/.9/.8/.8 | the filter-chain regression anchor (the committed 10k result is this at SF=0.2) | ~4.4 min |
 | B3 | Q1 + ordering | 5F | reviews | sels .9/.9/.2/.9/.9, selective one written third | run twice: `as_written` vs `by_cost` — the ordering interface measured, not asserted | ~4.2 / ~3.7 min |
 | B4 | Q1 on wide rows | 2F | reports | 2k long docs | quadratic surcharge; long-doc admission | ~1.3 min |
@@ -949,12 +930,11 @@ one engine mechanism each. F = filter stage, J = join stage.
 | B14 | Q14 rerun | 1J | reports x products, new keys | 2M pairs, warm anchors | cross-query restore for join anchors (prefix share ~19%) | ~13 min cold / ~11 warm |
 | B15 | Q21 extended | 2F + 2J (one exists) | threads, reports, terms | the full planner path in one query | everything at once | ~25 min |
 
-Suite totals, predicted (cost-model arithmetic at the measured
-rates, stated now per house rule; the planner re-derives them in
-`explain()` when it lands): ~4.5 h at (1, 1); ~30 min at (0.1, 1) —
-the development scale, where B2 reproduces the committed filter
-result and B5 reproduces the committed join result as regression
-gates.
+Suite totals, sized the same way — hand arithmetic at the measured
+rates, for GPU budgeting only; the engine itself predicts nothing:
+~4.5 h at (1, 1); ~30 min at (0.1, 1) — the development scale,
+where B2 reproduces the committed filter result and B5 reproduces
+the committed join result as regression gates.
 
 ### 9.5 Protocol and metrics
 
@@ -977,7 +957,7 @@ restore):
   cross-query KV reuse is worth. This is the pass the benchmark
   exists for.
 
-Per query: predicted vs measured wall, fresh tokens, KV bytes
+Per query: measured wall, fresh tokens, KV bytes
 restored, pairs per stage, provided vs observed selectivity, answer
 accuracy vs planted truth, replay verdict. Per suite: end-to-end
 wall cold and warm, warm/cold per query and total, store hit
@@ -993,7 +973,8 @@ Filters submit separate requests per stage under the same
 token-budget admission; joins submit grouped requests per pair in
 anchor order with admission matched from the same pool arithmetic.
 Both baseline protocols are the committed ones from this repo.
-Predictions to beat, stated now: at (1, 1) the join queries carry
+Expectations, from the committed measurements: at (1, 1) the join
+queries carry
 the gap (measured 4.1x on the B5 shape), the filter queries are
 modest (measured 1.08x for chain semantics, plus whatever the
 packed substrate's 121k-vs-97k rate adds); warm-suite gains accrue
@@ -1017,10 +998,7 @@ quail/                        (new repository)
       budgets.py              # spec-derived arena/chunk arithmetic
       decide.py               # order, anchor, sharding, access, dtype:
                               # token arithmetic plus the two break-evens
-    predict.py                # the wall estimator, OUTSIDE the planner:
-                              # sole consumer of b, c0, and a2-as-pricing;
-                              # reads the per-(model, device) calibration
-                              # file; serves explain() and the bench
+                              # (reads the calibration file if present)
     executor/
       pack.py                 # brim packing, admission queue (from joinlogic.py)
       arena.py                # the paged KV arena: pages, free list, per-doc page lists
@@ -1047,20 +1025,21 @@ Build order, each step landing with CPU tests:
    filter-as-degenerate-join stage form.
    **Gate: milestone 1** — the committed 10k-doc five-filter
    workload and the committed 256k-pair join, reproduced on the new
-   executor within the cost model's band. This gate is what retires
-   the engine fork.
+   executor within 10% of the committed walls, answers identical
+   under the replay check. This gate is what retires the engine
+   fork.
 3. **sqlfront + logical + planner** — the parse/bind/validate
-   pipeline, ordering policy, pushdown, refusals; `predict.py`
-   beside it so `explain()` states walls from day one.
+   pipeline, ordering policy, pushdown, refusals.
 4. **runtime** — Session, coordinator, Modal app, snapshot
    lifecycle, the KV store.
-5. **bench** — QUAIL-B; first full grid run publishes the
-   prediction-vs-measurement table.
+5. **bench** — QUAIL-B; first full grid run publishes the measured
+   suite table.
 
 Deferred, named: selectivity estimation by sampling (the interface
 already reserves the option object key); runtime re-ordering;
-larger models beyond spec-scaled predictions until their ~10-minute
-calibration is run; multi-GPU tensor parallel (the spec arithmetic
+larger models run on spec-scaled break-evens until their
+~10-minute calibration is run; multi-GPU tensor parallel (the spec
+arithmetic
 already computes tp, but nothing above 1 is exercised until a model
 needs it).
 
