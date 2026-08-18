@@ -14,28 +14,25 @@ docstring.
 
 # ---- request-id protocol ----------------------------------------------
 
-def parse_tag(request_id):
-    """Return (pin_tokens, doc_key, releases, uses) for a tagged id,
-    else None. `uses` is the number of release mentions the pin waits
-    for before freeing; one when absent.
+def is_planned(request_id):
+    """A planned request: carries the de1| wire-format prefix. In
+    single-tenant mode everything else is refused."""
+    return request_id.startswith("de1|")
+
+
+def doc_key(request_id):
+    """The document key (the d part) a request works for; None when
+    the id carries none (registrations, foreign traffic).
 
     The last field is the free-text suffix and is never read as a
-    directive: a suffix that happens to start with p, d, or r must not
-    shadow a real directive (a tag like "rm" once swallowed every
-    release, including the end-of-run flush)."""
+    directive: a suffix that happens to start with d must not shadow
+    a real directive."""
     if not request_id.startswith("de1|"):
         return None
-    pin, doc, rel, uses = 0, None, [], 1
     for part in request_id.split("|")[1:-1]:
-        if part.startswith("p") and part[1:].isdigit():
-            pin = int(part[1:])
-        elif part.startswith("d") and len(part) > 1:
-            doc = part[1:]
-        elif part.startswith("r") and len(part) > 1:
-            rel = ["*"] if part[1:] == "*" else part[1:].split(",")
-        elif part.startswith("u") and part[1:].isdigit():
-            uses = int(part[1:])
-    return pin, doc, rel, uses
+        if part.startswith("d") and len(part) > 1:
+            return part[1:]
+    return None
 
 
 def parse_qid(request_id):
@@ -70,23 +67,6 @@ def is_chain(request_id):
     """A chain request: one living request runs a document's whole
     filter chain."""
     return request_id.startswith("de1|") and "|c|" in request_id
-
-
-def is_release_all(releases):
-    """The "*" release frees every pin outright, regardless of
-    counts."""
-    return releases == ["*"]
-
-
-def plan_priority(tag):
-    """Scheduling rank from the verified tag; lower runs first.
-    Consumers of resident KV run first (0), new document reads next
-    (1), unplanned traffic - only possible outside strict mode - last
-    (2)."""
-    if tag is None:
-        return 2
-    pin = tag[0]
-    return 1 if pin > 0 else 0
 
 
 # ---- registration payload ---------------------------------------------
@@ -215,13 +195,6 @@ def stage_advances(decision, stage, n_stages):
 
 # ---- the step trace -----------------------------------------------------
 
-def doc_key(request_id):
-    """The document key (the d part) a request works for; None when
-    the id carries none (registrations, flushes, foreign traffic)."""
-    tag = parse_tag(request_id)
-    return tag[1] if tag else None
-
-
 def step_record(now_s, sched_cpu_s, tokens_by_request, doc_keys,
                 free_blocks, total_blocks, block_size, decoding=None,
                 shapes=None):
@@ -305,65 +278,3 @@ def strict_violation(evicted, plan_evicting, strict):
     """Whether an eviction must raise: in strict (single-tenant) mode
     any heuristic eviction is an error, never a policy."""
     return bool(strict and is_heuristic_eviction(evicted, plan_evicting))
-
-
-# ---- pin refcount bookkeeping -----------------------------------------
-
-def new_pin_intent(pin_tokens, doc, pins):
-    """Record a pin intent only for a real pin: a positive token
-    count, a document key, and a document not already pinned."""
-    return pin_tokens > 0 and doc is not None and doc not in pins
-
-
-def pin_ready(intent, computed_tokens, pins):
-    """Take the pin when its request's blocks are freed, but only if
-    the request actually computed past the pin span (a preempted or
-    aborted request may not have) and no sibling pinned the document
-    first."""
-    return (intent is not None
-            and computed_tokens >= intent[0]
-            and intent[1] not in pins)
-
-
-class PinLedger:
-    """Pin refcount bookkeeping for shared scans: a pin waits for
-    `uses` release mentions - one per query reading the document - and
-    frees exactly once, when the mentions run out. Payloads (the
-    scheduler stores its pinned block lists here) are opaque to this
-    module."""
-
-    def __init__(self):
-        self.pins = {}   # doc key -> payload
-        self.refs = {}   # doc key -> release mentions left
-
-    def __contains__(self, key):
-        return key in self.pins
-
-    def add(self, key, payload, uses):
-        self.pins[key] = payload
-        self.refs[key] = uses
-
-    def pop(self, key):
-        """Drop the pin and its mention count; returns the payload,
-        None when the key holds no pin."""
-        self.refs.pop(key, None)
-        return self.pins.pop(key, None)
-
-    def to_free(self, releases):
-        """Apply release mentions; drop and return the (key, payload)
-        pairs whose pins free now, so each pin is returned exactly
-        once. "*" frees every pin outright, regardless of counts.
-        Unknown keys are ignored: a release can arrive for a pin that
-        was already freed or was never taken."""
-        if is_release_all(releases):
-            return [(key, self.pop(key)) for key in list(self.pins)]
-        freed = []
-        for key in releases:
-            if key not in self.pins:
-                continue
-            left = self.refs.get(key, 1) - 1
-            if left > 0:
-                self.refs[key] = left
-            else:
-                freed.append((key, self.pop(key)))
-        return freed

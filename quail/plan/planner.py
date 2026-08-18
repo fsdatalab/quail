@@ -4,15 +4,19 @@ plan_query takes what the user knows (filter count, corpus statistics,
 model, device, GPU count, whether a KV store exists) and returns a
 Plan choosing everything the measurements showed to matter:
 
-- executor: chain (one living request per document, rewound between
-  filters) against separate requests; chain wins with two or more
-  filters, and a single-filter query has nothing to chain
+- executor: always chain (one living request per document, rewound
+  between filters). A single-filter query is the degenerate chain -
+  prefill, one verdict, free - so there is no separate mode for it;
+  "requests" exists only as the stock-vLLM comparison baseline in
+  the experiments
 - GPU layout: split the corpus across single-GPU workers (documents
   are independent, so every floor divides by the worker count) and
   split the model only when its weights do not fit one card
-- admission budget: how many tokens of documents may be resident at
-  once, kept under the KV pool so the pool never overflows and the
-  prefix cache is never forced to evict. This is a TOKEN budget, not
+- admission budget: how many tokens of documents may be admitted at
+  once. Derived, not a pool fraction: SATURATION_SLACK x filters x
+  the step budget - the sigma*B working set the engine actually
+  holds (measured 4.1-5.1 live cohorts at five filters) plus a
+  top-up queue, clamped to what the pool holds. A TOKEN budget, not
   a request count: a request count cannot see document length, and
   the same 4,096-request cap that fits short documents overflows the
   pool on long ones (measured: reads 2.40x against 1.23x, wall 80.1s
@@ -37,9 +41,10 @@ from dataclasses import dataclass, field
 from quail.configs import DeviceConfig, ModelConfig
 
 from .cost import (ACT_BYTES_PER_HIDDEN, BOOT_POOL_FRACTION,
-                   ENGINE_SEQS_MAX, POOL_HEADROOM, STEP_POOL_FRACTION,
-                   STEP_TOKENS_MAX, STEP_TOKENS_MIN, predict_makespan,
-                   t_in)
+                   ENGINE_BLOCK_TOKENS, ENGINE_SEQS_MAX,
+                   SATURATION_SLACK, STEP_FIXED_S,
+                   STEP_POOL_FRACTION, STEP_TOKENS_MAX, STEP_TOKENS_MIN,
+                   predict_makespan, t_in)
 
 
 @dataclass(frozen=True)
@@ -55,18 +60,34 @@ class CorpusStats:
 
 @dataclass(frozen=True)
 class StoreSpec:
-    """A persisted-KV store: measured read bandwidth, bytes/s."""
+    """A persisted-KV store: measured read bandwidth, bytes/s.
+
+    The intended tier is pinned host memory only. Unpinned is not a
+    tier to plan for: it is what a failed pin degrades to, and the
+    connector reports it loudly at boot so read_bw can be repriced.
+
+    capacity_bytes caps how much KV the store may hold (None means
+    unbounded). Under a cap the planner keeps the LONGEST documents:
+    recompute cost per byte is a + alpha2*h per token, rising with
+    document length, so long documents are worth the most per stored
+    byte - and unlike the store's own LRU, a length threshold cannot
+    be thrashed by the scan pattern of a full-corpus query."""
     read_bw: float
     warm: bool = False        # KV for this corpus already saved
+    capacity_bytes: float = None
 
 
 @dataclass(frozen=True)
 class Plan:
-    mode: str                 # executor internals: "chain" | "requests"
+    mode: str                 # executor internals: always "chain"; the
+    #                           "requests" executor survives only as the
+    #                           stock-vLLM baseline in the experiments
     workers: int              # data-parallel single-model workers
     tensor_parallel: int      # GPUs per worker (model split)
     shards: tuple             # doc-id tuples, one per worker
-    budget_tokens: int        # resident-document admission cap
+    budget_tokens: int        # admission cap: the saturation target
+    #                           (SATURATION_SLACK x filters x step
+    #                           budget), clamped to what the pool holds
     access: str               # "read" | "restore" | "spill": how the
     #                           document KV is supplied. read =
     #                           compute from text; restore = load
@@ -79,10 +100,17 @@ class Plan:
     predicted_makespan_s: float
     operator: str = ""        # the public operator name:
     #                           pipelined_filter (chain mode, gated,
-    #                           rewound between stages) | requests
+    #                           rewound between stages)
     engine_max_seqs: int = 0  # boot the engine's max_num_seqs at least
     #                           this high: the worst-case admitted
     #                           document count, one live sequence each
+    store_min_doc_tokens: int = 0  # documents at or above this length
+    #                                use the KV store; below it the
+    #                                client stamps max_offload_tokens=0
+    #                                so short documents never occupy
+    #                                capped store capacity. 0 = the
+    #                                store is not used, 1 = every
+    #                                document stores
     engine_step_tokens: int = 0  # boot max_num_batched_tokens here: the
     #                              largest step budget whose activation
     #                              reservation stays under
@@ -112,6 +140,35 @@ def _pool_tokens(model: ModelConfig, device: DeviceConfig, tp: int) -> int:
     refusal gates need the sign, so it is not clamped here."""
     free = device.M * BOOT_POOL_FRACTION * tp - model.W_mem
     return int(free / model.kappa)
+
+
+def store_length_threshold(doc_tokens, capacity_bytes, kappa):
+    """The store-or-not length cutoff under a capacity: keep the
+    longest documents whose KV fits. Recompute cost per byte rises
+    with document length (a + alpha2*h per token), so the top of the
+    length list is worth the most per stored byte - and a length
+    threshold cannot be thrashed by a scanning query the way the
+    store's own LRU can.
+
+    Returns 1 when capacity_bytes is None (everything stores), 0 when
+    nothing fits. At a boundary tie the threshold moves up so the
+    stored set never exceeds the capacity."""
+    if capacity_bytes is None:
+        return 1
+    budget_tok = int(capacity_bytes / kappa)
+    lengths = sorted((int(t) for t in doc_tokens), reverse=True)
+    taken, threshold = 0, 0
+    for h in lengths:
+        if taken + h > budget_tok:
+            break
+        taken += h
+        threshold = h
+    while threshold and sum(h for h in lengths
+                            if h >= threshold) > budget_tok:
+        threshold += 1
+    if threshold and not any(h >= threshold for h in lengths):
+        return 0
+    return threshold
 
 
 def _balanced_shards(doc_tokens, workers):
@@ -194,70 +251,6 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
             "working set: the tiering store spills the overflow; "
             "expect the spill-bound rate, not the read floor")
 
-    budget = int(min(pool * POOL_HEADROOM,
-                     max(corpus.max_doc_tokens + question_tokens,
-                         worst_load)))
-    overflow = worst_load > pool
-    if overflow:
-        remarks.append("shard overflows the KV pool; pins off")
-
-    # one filter has nothing to chain; two or more run in chain mode,
-    # where the document's KV belongs to a living request and cannot
-    # be evicted between stages
-    mode = "requests" if n_filters < 2 else "chain"
-
-    # the worst shard's share of the corpus's squared lengths: the
-    # quadratic prefill surcharge, which recompute pays and restore
-    # does not
-    doc_sq = sum(float(t) * float(t) for t in doc_tokens)
-    doc_sq_worst = doc_sq * (worst_load / max(1, corpus.total_tokens))
-
-    access = "read"
-    read_s = t_in(model, device, worst_load, doc_sq_tokens=doc_sq_worst)
-    if store is not None and store.warm:
-        restore_s = t_in(model, device, worst_load, access="restore",
-                         store_read_bw=store.read_bw)
-        if restore_s < read_s:
-            access = "restore"
-            remarks.append("store beats recompute at the break-even")
-    spill_s = 0.0
-    if pool < working_set and store is not None:
-        access = "spill"
-        # pessimistic spill traffic: every token past the pool moves
-        # out and back once at store bandwidth (StoreSpec carries the
-        # measured read rate; writes are priced at the same rate)
-        overflow_tokens = max(0, worst_load - pool)
-        spill_s = 2 * overflow_tokens * model.kappa / store.read_bw
-
-    operator = "requests" if mode == "requests" else "pipelined_filter"
-
-    # per-filter selectivities when given: a skewed chain (0.9, 0.9,
-    # 0.2, ...) has its survivor cliff where the selective filter
-    # sits, which a mean smears away
-    try:
-        sels = [float(x) for x in selectivity]
-        selectivity = sum(sels) / len(sels)   # scalar for pricing
-    except TypeError:
-        pass
-
-    # the sequence cap must never bind before the token budget: size
-    # it from the worst case, not a margin. Admission is
-    # budget-limited and the smallest documents pack densest, so the
-    # bound is exact at the longest ascending prefix that fits under
-    # the budget - one tiny outlier no longer inflates the bound the
-    # way dividing by the single smallest document did. Gated filters
-    # hold one live sequence per document. The small constant covers
-    # the one-step overlap between a finishing document's retirement
-    # and the next admission.
-    admitted_worst, running = 0, 0
-    for t in sorted(doc_tokens):
-        running += int(t)
-        if running > budget:
-            break
-        admitted_worst += 1
-    admitted_worst = max(1, admitted_worst)
-    engine_max_seqs = min(admitted_worst + 16, ENGINE_SEQS_MAX)
-
     # the step budget (max_num_batched_tokens), derived: the dense
     # projections are compute-bound past ~400 tokens per step, so a
     # bigger budget buys only amortization of the per-step host cost
@@ -271,18 +264,157 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
         STEP_TOKENS_MAX,
         max(STEP_TOKENS_MIN,
             STEP_POOL_FRACTION * pool * model.kappa / act_bytes)))
+
+    # the admission budget, derived rather than a pool fraction: the
+    # engine's working set is sigma*B tokens (sigma live cohorts of
+    # one step each; the trace measured 4.1-5.1 at five filters), and
+    # SATURATION_SLACK adds the top-up queue on top. sigma uses the
+    # filter count, not the selectivity estimate: waiting documents
+    # hold no KV, so over-admitting is free, while trusting a wrong
+    # selectivity estimate would starve steps. The ceiling is the pool
+    # less one document's working set; a budget clamped under the
+    # saturation target is a thin-pool configuration that will run
+    # part-empty steps, and the remark says so instead of hiding it.
+    one_doc = corpus.max_doc_tokens + question_tokens
+    saturation_target = SATURATION_SLACK * n_filters * step_tokens
+    budget = int(max(one_doc, min(saturation_target, pool - one_doc)))
+    if budget < saturation_target:
+        remarks.append(
+            f"pool admits {budget} tokens against the "
+            f"{saturation_target}-token saturation target "
+            f"({SATURATION_SLACK} x {n_filters} filters x {step_tokens} "
+            "step tokens); expect part-empty steps")
+    overflow = worst_load > pool
+    if overflow:
+        remarks.append("shard overflows the KV pool; pins off")
+
+    # every query runs in chain mode, where the document's KV belongs
+    # to a living request and cannot be evicted between stages. One
+    # filter is the degenerate chain: prefill, one verdict, free -
+    # identical work to a separate request, and the chain executor's
+    # measured per-query residue is the smaller of the two (0.026 s
+    # against 0.659 s, c0_anchor.json). "requests" survives only as
+    # the stock-vLLM baseline the experiments compare against.
+    mode = "chain"
+
+    # the worst shard's share of the corpus's squared lengths: the
+    # quadratic prefill surcharge, which recompute pays and restore
+    # does not
+    doc_sq = sum(float(t) * float(t) for t in doc_tokens)
+    doc_sq_worst = doc_sq * (worst_load / max(1, corpus.total_tokens))
+
+    access = "read"
+    read_s = t_in(model, device, worst_load, doc_sq_tokens=doc_sq_worst)
+    store_min_doc_tokens = 0
+    stored_shard = sq_stored_worst = 0.0
+    if store is not None and store.warm:
+        # the client enforces the same stored set with the length
+        # threshold: store iff the document has at least this many
+        # tokens (max_offload_tokens=0 below it)
+        threshold = store_length_threshold(doc_tokens,
+                                           store.capacity_bytes,
+                                           model.kappa)
+        stored = ([int(t) for t in doc_tokens if int(t) >= threshold]
+                  if threshold else [])
+        if stored:
+            stored_tok = sum(stored)
+            frac = stored_tok / max(1, corpus.total_tokens)
+            stored_shard = frac * worst_load
+            sq_stored_worst = (sum(float(h) * float(h) for h in stored)
+                               * worst_load / max(1, corpus.total_tokens))
+            # mixed price: stored documents load at store bandwidth
+            # and skip their compute (including their share of the
+            # quadratic surcharge - the longest documents carry most
+            # of it, which is the longest-first bonus); the rest is
+            # recomputed as usual
+            load_s = stored_shard * model.kappa / store.read_bw
+            skip_s = t_in(model, device, stored_shard,
+                          doc_sq_tokens=sq_stored_worst)
+            if read_s - skip_s + load_s < read_s:
+                access = "restore"
+                store_min_doc_tokens = threshold
+                if frac < 1.0:
+                    remarks.append(
+                        f"store capped: {len(stored)} of {corpus.n_docs} "
+                        f"documents stored ({frac:.0%} of corpus tokens), "
+                        f"length threshold {threshold}")
+                else:
+                    remarks.append("store beats recompute at the "
+                                   "break-even")
+    spill_s = 0.0
+    if pool < working_set and store is not None:
+        access = "spill"
+        # pessimistic spill traffic: every token past the pool moves
+        # out and back once at store bandwidth (StoreSpec carries the
+        # measured read rate; writes are priced at the same rate)
+        overflow_tokens = max(0, worst_load - pool)
+        spill_s = 2 * overflow_tokens * model.kappa / store.read_bw
+
+    operator = "pipelined_filter"
+
+    # per-filter selectivities when given: a skewed chain (0.9, 0.9,
+    # 0.2, ...) has its survivor cliff where the selective filter
+    # sits, which a mean smears away
+    try:
+        sels = [float(x) for x in selectivity]
+        selectivity = sum(sels) / len(sels)   # scalar for pricing
+    except TypeError:
+        pass
+
+    # a chain session holds a model-runner slot and its document KV
+    # from first prefill to last verdict, including rewound waits
+    # between stages, so the slot count is living-session capacity:
+    # how many documents fit resident in the pool at once. Sized
+    # against the largest documents so any admitted set fits, with
+    # one step budget of allocation slack reserved. The admission
+    # token budget must not size slots - that was per-stage request
+    # thinking, and it under-slots living sessions (measured: 'No
+    # free indices' at 1,000 sessions against a depth-derived ~420
+    # slots). The small constant covers the one-step overlap between
+    # a finishing session's retirement and the next admission.
+    resident_budget = pool - 2 * step_tokens
+    living, used = 0, 0
+    for t in sorted((int(t) for t in doc_tokens), reverse=True):
+        need = -(-(t + question_tokens) // ENGINE_BLOCK_TOKENS)
+        need *= ENGINE_BLOCK_TOKENS
+        if used + need > resident_budget:
+            break
+        used += need
+        living += 1
+    living = max(1, living)
+    engine_max_seqs = min(living + 16, ENGINE_SEQS_MAX)
+
+    # the step budget itself was derived above, before admission,
+    # which is sized from it; the boot value must still cover the
+    # sequence cap (the engine requires it)
     engine_step_tokens = max(step_tokens, engine_max_seqs)
 
-    predicted = predict_makespan(
-        model, device, n_docs=corpus.n_docs, workers=workers,
-        shard_tokens=worst_load, n_filters=n_filters,
-        question_tokens=question_tokens, preamble_tokens=preamble_tokens,
-        selectivity=selectivity,
-        access=access if access != "spill" else "read",
-        store_read_bw=store.read_bw if access == "restore" else None,
-        mean_doc_tokens=corpus.mean_doc_tokens,
-        doc_sq_tokens=doc_sq_worst,
-        step_tokens=engine_step_tokens)
+    if access == "restore" and store_min_doc_tokens > 1 and stored_shard:
+        # capped store: predict a full read pass, then swap the stored
+        # slice from compute to load - its linear term, its share of
+        # the quadratic surcharge, and its per-step fixed cost
+        predicted = predict_makespan(
+            model, device, n_docs=corpus.n_docs, workers=workers,
+            shard_tokens=worst_load, n_filters=n_filters,
+            question_tokens=question_tokens,
+            preamble_tokens=preamble_tokens, selectivity=selectivity,
+            access="read", mean_doc_tokens=corpus.mean_doc_tokens,
+            doc_sq_tokens=doc_sq_worst, step_tokens=engine_step_tokens)
+        predicted -= t_in(model, device, stored_shard,
+                          doc_sq_tokens=sq_stored_worst)
+        predicted -= STEP_FIXED_S * stored_shard / max(1, engine_step_tokens)
+        predicted += stored_shard * model.kappa / store.read_bw
+    else:
+        predicted = predict_makespan(
+            model, device, n_docs=corpus.n_docs, workers=workers,
+            shard_tokens=worst_load, n_filters=n_filters,
+            question_tokens=question_tokens,
+            preamble_tokens=preamble_tokens, selectivity=selectivity,
+            access=access if access != "spill" else "read",
+            store_read_bw=store.read_bw if access == "restore" else None,
+            mean_doc_tokens=corpus.mean_doc_tokens,
+            doc_sq_tokens=doc_sq_worst,
+            step_tokens=engine_step_tokens)
     predicted += spill_s
 
     return Plan(mode=mode, workers=workers, tensor_parallel=tp,
@@ -291,6 +423,7 @@ def plan_query(n_filters, doc_tokens, model: ModelConfig,
                 stage_token_window=1 if one_token_answers else 6,
                 predicted_makespan_s=round(predicted, 1),
                 operator=operator,
+                store_min_doc_tokens=store_min_doc_tokens,
                 engine_max_seqs=engine_max_seqs,
                 engine_step_tokens=engine_step_tokens,
                 remarks=tuple(remarks))

@@ -50,7 +50,7 @@ WORKLOAD_SEED = 20260731
 FLAG_SEED = 424242
 CEIL = 275_000            # dense FP8 prefill ceiling, tokens per second
 N_FILTERS = 5
-SELECTIVITY = (0.9, 0.9, 0.9, 0.8, 0.8)
+SELECTIVITY = (0.9, 0.9, 0.9, 0.8, 0.8, 0.8, 0.8)
 
 
 def build_pool(n_docs):
@@ -88,21 +88,25 @@ def question(j):
             f"from the [FLAGS] line above.\nFLAG_{j}=")
 
 
-def build_corpus(tok, n_docs, seed_offset=100):
+def build_corpus(tok, n_docs, seed_offset=100, n_filters=None):
     """Tokenized documents with their planted flag lines, the
-    tokenized questions, and the flag truth table.
+    tokenized questions, and the flag truth table. n_filters defaults
+    to N_FILTERS; the draw shape depends on it, so the default keeps
+    every 5-filter corpus byte-identical to what the banked cells
+    measured.
 
     Returns (body_ids, q_ids, flags)."""
     import numpy as np
 
+    n = n_filters or N_FILTERS
     rng = np.random.default_rng(FLAG_SEED + seed_offset)
-    flags = (rng.random((n_docs, N_FILTERS))
-             < np.array(SELECTIVITY)[None, :]).astype(int)
+    flags = (rng.random((n_docs, n))
+             < np.array(SELECTIVITY[:n])[None, :]).astype(int)
     docs = build_pool(n_docs)
     bodies = [d + flags_line(f) for d, f in zip(docs, flags)]
     body_ids = tok(bodies, add_special_tokens=False)["input_ids"]
     q_ids = [tok(question(j + 1), add_special_tokens=False)["input_ids"]
-             for j in range(N_FILTERS)]
+             for j in range(n)]
     return body_ids, q_ids, flags
 
 

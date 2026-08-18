@@ -110,17 +110,31 @@ def test_model_bigger_than_a_card_splits_it():
     assert p.tensor_parallel == 4 and p.workers == 2
 
 
-def test_single_filter_uses_requests_without_pins():
-    """One filter has no future consumer, so there is nothing a pin
-    could buy: read, answer, free."""
+def test_single_filter_is_the_degenerate_chain():
+    """One filter runs the same chain executor as five: prefill, one
+    verdict, free. No separate mode, no branch to maintain."""
     p = plan_query(1, DOCS_10K, M4B, H100)
-    assert p.mode == "requests"
+    assert p.mode == "chain"
+    assert p.operator == "pipelined_filter"
 
 
-def test_budget_stays_under_the_pool():
+def test_admission_budget_is_the_saturation_target():
+    """Admission is derived - SATURATION_SLACK x filters x the step
+    budget - not a pool fraction. On a fat pool the target passes
+    through unclamped and sits far under the pool."""
     p = plan_query(4, DOCS_10K, M4B, H100)
+    assert p.budget_tokens == 2 * 4 * p.engine_step_tokens
     free = H100.M * 0.92 - M4B.W_mem
-    assert p.budget_tokens <= 0.8 * free / M4B.kappa + 1
+    assert p.budget_tokens < free / M4B.kappa
+
+
+def test_thin_pool_clamps_admission_and_says_so():
+    """When the pool cannot hold the saturation target, the budget
+    clamps to the pool and the plan says part-empty steps out loud
+    instead of hiding the starvation."""
+    p = plan_query(20, DOCS_10K, M4B, L40S)
+    assert p.budget_tokens < 2 * 20 * p.engine_step_tokens
+    assert any("part-empty steps" in r for r in p.remarks)
 
 
 # ------------------------------------------- the refusal path (Algorithm 2)
@@ -158,3 +172,46 @@ def test_refuses_when_the_pool_is_under_the_saturation_working_set():
 def test_normal_configs_still_return_plans():
     assert isinstance(plan_query(4, DOCS_10K, M4B, H100, selectivity=0.8),
                       Plan)
+
+
+def test_capped_store_keeps_the_longest_documents():
+    """A store capacity keeps the top of the length list: the stored
+    set fits under the cap, the plan carries the length threshold the
+    client enforces, and the capped prediction sits between the full
+    restore and the pure read."""
+    kv = sum(DOCS_10K) * M4B.kappa
+    store = StoreSpec(read_bw=38e9, warm=True, capacity_bytes=kv / 2)
+    p = plan_query(4, DOCS_10K, M4B, H100, store=store)
+    assert p.access == "restore"
+    assert p.store_min_doc_tokens > 1
+    stored = [int(h) for h in DOCS_10K if h >= p.store_min_doc_tokens]
+    assert sum(stored) * M4B.kappa <= store.capacity_bytes
+    assert any("store capped" in r for r in p.remarks)
+    p_full = plan_query(4, DOCS_10K, M4B, H100,
+                        store=StoreSpec(read_bw=38e9, warm=True))
+    p_read = plan_query(4, DOCS_10K, M4B, H100)
+    assert p_full.store_min_doc_tokens == 1
+    assert (p_full.predicted_makespan_s <= p.predicted_makespan_s
+            <= p_read.predicted_makespan_s)
+
+
+def test_tiny_store_capacity_is_not_worth_restoring():
+    """A capacity too small to hold even one document leaves the plan
+    on the read path with no threshold."""
+    store = StoreSpec(read_bw=38e9, warm=True, capacity_bytes=1024)
+    p = plan_query(4, DOCS_10K, M4B, H100, store=store)
+    assert p.access == "read"
+    assert p.store_min_doc_tokens == 0
+
+
+def test_offload_crossover_is_derived_not_stored():
+    """The load-vs-recompute crossover comes from the measured
+    bandwidth and the alpha fit at call time. The measured disk
+    reproduces the previously banked ~19,898 tokens; pinned host
+    memory beats recompute at every length."""
+    from quail.plan.cost import TRANSPORT_BW_BPS, offload_crossover_tokens
+    disk = offload_crossover_tokens(
+        TRANSPORT_BW_BPS["c6_disk_read"], M4B, H100)
+    assert 19_800 < disk < 20_000
+    assert offload_crossover_tokens(
+        TRANSPORT_BW_BPS["c6_h2d_pinned"], M4B, H100) == 0.0

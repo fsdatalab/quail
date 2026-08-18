@@ -1,12 +1,11 @@
 """Query-aware scheduler extension for vLLM v1.
 
 Subclasses vLLM's scheduler so the query plan, not the engine's
-heuristics, governs memory. Live documents' prefix blocks are pinned
-by holding an extra block-pool reference, dead documents' blocks are
-stripped and freed the instant the plan learns of the death, and every
-block a planned request leaves behind that is not pinned has its cache
-entry removed on free. Everything uses the block pool's public
-interface; vendor code is not modified.
+heuristics, governs memory. A rewind strips and frees the erased
+question KV the instant a stage is judged, and every block a finished
+request leaves behind has its cache entry removed on free - the plan
+knows nothing will read it again. Everything uses the block pool's
+public interface; vendor code is not modified.
 
 Chain mode is the reason this class exists: one living request runs a
 document's whole filter chain. The client registers the question token
@@ -17,8 +16,8 @@ appended through the engine's own session mechanism. The document is
 prefilled exactly once no matter how many filters it survives.
 
 Single tenant mode (env QUAIL_SINGLE_TENANT, default on) is the
-shipping configuration: requests that do not carry a plan tag are
-refused, so unplanned memory cannot exist, and the engine's
+shipping configuration: requests that do not carry the plan's id
+prefix are refused, so unplanned memory cannot exist, and the engine's
 keep-the-most-recent eviction rule becomes unreachable by
 construction. If it ever fires anyway, that means memory escaped the
 plan's accounting, and the scheduler raises instead of silently
@@ -26,60 +25,87 @@ falling back to heuristic behavior. Set the env var to 0 for shared
 card experiments, where foreign traffic is legitimate and the recency
 rule is its default policy.
 
-The scheduler lives in the engine core process, so client directives
-ride inside request ids. Protocol, fields separated by "|" ("de1" is
-the wire-format version tag, not a product name):
+The scheduler lives in the engine core process, so the client speaks
+to it through request ids. Protocol, fields separated by "|" ("de1"
+is the wire-format version tag, not a product name):
 
-    de1|p<tokens>|d<doc>|u<count>|r<doc,doc,...>|<suffix>
+    de1|reg|Y<ids>|N<ids>|Q<qid>|<suffix>   registration
+    de1|c|d<doc>|Q<qid>|<suffix>            chain request
 
-  p<tokens>  pin the document prefix covering the first <tokens> tokens
-             when this request's blocks are freed
-  d<doc>     document key that owns the pin
-  u<count>   the pin expects <count> release mentions before it frees
-             (shared scans: one per query reading the document);
-             missing means one, the single-query behavior
-  r<...>     release one mention of each listed document key's pin;
-             a pin frees when its mention count reaches zero.
-             "*" frees every pin outright regardless of counts
+  reg        a registration request: its prompt carries the question
+             token lists, its id the gate token ids (Y, and
+             optionally N for decisive-token mode)
   c          a chain request: this request runs a document's whole
              filter chain through in-engine rewinds
-  reg        a registration request: its prompt carries the question
-             token lists, its id the gate token ids
-  Q<qid>     on registration and chain requests: the query these
-             questions or this chain belong to; missing means the
-             default query id "0", the single-query protocol
+  d<doc>     the document key the chain works for (step-trace label)
+  Q<qid>     the query these questions or this chain belong to;
+             missing means the default query id "0", the single-query
+             protocol
 
-Every decision - id parsing, pin refcounts, rewind arithmetic, the
-answer gate, the strict-mode predicate - is computed in chainlogic.py,
-which imports no vLLM and is unit-tested without an engine
+Every decision - id parsing, rewind arithmetic, the answer gate, the
+strict-mode predicate - is computed in chainlogic.py, which imports no
+vLLM and is unit-tested without an engine
 (tests/test_engineext_logic.py). This class only applies those
 decisions to vLLM state.
 """
 
 import os
+from collections import deque
 import time
 
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus, StreamingUpdate
 
-from . import chainlogic
-from .chainlogic import parse_qid, parse_tag  # noqa: F401  module API
+from . import chainlogic, slots
 
 
 class QuailScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._de_pins = chainlogic.PinLedger()  # doc key -> blocks, uses
-        self._de_rid_tag = {}       # request id -> parsed tag (once)
-        self._de_pinned_ids = set()  # block ids currently pinned
-        self._de_intent = {}        # request id -> (pin_tokens, doc, uses)
+        self._de_rid_doc = {}       # request id -> doc key (parsed once)
         self._de_queries = {}       # query id -> dict(qs, qc, yes, no)
         self._de_chain = {}         # request id -> dict(stage, d, qid)
+        # a rewound session waiting mid-chain still holds its
+        # model-runner slot, so living sessions (running + rewound)
+        # must never exceed the slots. Two rules enforce it. Rewound
+        # sessions are prepended to the waiting queue: their KV is
+        # resident and finishing them frees pool and slots, so they
+        # must never starve behind fresh documents the pool cannot
+        # even admit (measured: running drained to zero with every
+        # slot parked rewound, then one floored admission crashed the
+        # runner). And fresh documents are held out of the queue
+        # until there is slot slack for them; shrinking the vendor's
+        # running bound instead would throttle the rewound sessions
+        # themselves, which need no new slot.
+        self._de_base_max_reqs = self.max_num_running_reqs
+        self._de_requeued = set()
+        self._de_held = deque()
+        # slots taken by batches this scheduler has emitted, counted
+        # by the same membership rule the runner-side publisher uses
+        # (slots.py); emitted minus the snapshot's applied count is
+        # exactly the consumption still in flight
+        self._de_emitted_new = 0
+        slots.BOARD.reset()
+        try:
+            slots.install()
+        except Exception as e:
+            print(f"[quail-sched] slot publication unavailable "
+                  f"({type(e).__name__}: {e}); admission gate runs "
+                  f"on the scheduler-side estimate", flush=True)
+        self._de_truth_warned = False
+        # slot accounting trace (env QUAIL_SLOTSTATS): one line per
+        # 100 steps naming every population that can hold or shadow a
+        # model-runner slot, for localizing 'No free indices'
+        self._de_slotstats = os.environ.get(
+            "QUAIL_SLOTSTATS", "0") == "1"
+        self._de_sched_i = 0
         self._de_strict = os.environ.get(
             "QUAIL_SINGLE_TENANT", "1") == "1"
         print(f"[quail-sched] init: strict {self._de_strict}, overlapped "
-              f"scheduling {self.scheduler_config.async_scheduling}",
-              flush=True)
+              f"scheduling {self.scheduler_config.async_scheduling}, "
+              f"slotstats {self._de_slotstats}, slotdump "
+              f"{os.environ.get('QUAIL_SLOTDUMP', 'unset')}", flush=True)
         self._de_plan_evicting = False
         # Core-process profiling: this object lives in the engine core,
         # the one process the client-side profiler cannot see, so the
@@ -123,8 +149,12 @@ class QuailScheduler(Scheduler):
                 open(self._de_trace, "w").close()
                 print(f"[quail-trace] step trace -> {self._de_trace}",
                       flush=True)
-        self._de_stats = dict(pinned=0, released=0, blocks=0,
-                              foreign_rejected=0, heuristic_evictions=0)
+        self._de_stats = dict(foreign_rejected=0, heuristic_evictions=0)
+        # wave pre-loading (QUAIL_WAVES=1): synchronous KV pre-load
+        # from the host store, decisions in waves_logic, engine
+        # surgery in waves.py; off by default and inert when off
+        from .waves import WaveDriver
+        self._de_waves = WaveDriver(self)
 
         pool = self.kv_cache_manager.block_pool
         orig_evict = pool._maybe_evict_cached_block
@@ -141,9 +171,98 @@ class QuailScheduler(Scheduler):
 
         pool._maybe_evict_cached_block = guarded
 
+    def _de_gate_fresh(self):
+        """Slot gate: fresh documents may sit in the waiting queue
+        only while there is model-runner slot slack for them. A
+        request with computed tokens or a rewound continuation
+        already holds its slot and passes untouched; a preempted
+        request lost its slot at preemption and re-enters as fresh.
+        Held documents wait aside in arrival order and are released
+        as sessions finish and free slots."""
+        base = self._de_base_max_reqs
+        # a wave-claimed document answers not-ready and waits in the
+        # vendor's skipped queue, from which it is admitted without
+        # passing this gate again; it holds no slot yet and will
+        # need one, so it is budgeted here while pending. Unbudgeted,
+        # claimed documents accumulated invisibly and flooded 982
+        # fresh admissions - the full slot base - into one output.
+        pending_gated = sum(
+            1 for r in self.skipped_waiting
+            if r.num_computed_tokens == 0
+            and r.request_id not in self._de_requeued)
+        snap = slots.BOARD.snap
+        if snap is None:
+            # before the first batch applies (or if publication ever
+            # breaks): scheduler-side estimate. running is updated at
+            # schedule time, so the boot window this covers is exact;
+            # under overlapped scheduling after finishes exist it can
+            # overcount slack by frees not yet applied, which is why
+            # the snapshot replaces it the moment one exists.
+            if not self._de_truth_warned:
+                self._de_truth_warned = True
+                print("[quail-sched] slot gate: no runner snapshot; "
+                      "estimate only", flush=True)
+            slack = (base - len(self.running) - len(self._de_requeued)
+                     - pending_gated - len(self.finished_req_ids))
+        else:
+            # exact: free slots after the last applied batch, minus
+            # slots the batches still in flight will take, minus the
+            # claimed documents that will arrive outside this gate.
+            # Frees in flight are not credited - that direction only
+            # under-admits for one step. See slots.py for why the
+            # two counters cancel exactly.
+            free, applied = snap
+            slack = free - (self._de_emitted_new - applied) - pending_gated
+            if self._de_slotstats and self._de_sched_i % 100 == 0:
+                print(f"[quail-gate] free {free} in_flight "
+                      f"{self._de_emitted_new - applied} pending "
+                      f"{pending_gated} slack {slack}", flush=True)
+        keep = []
+        while self.waiting:
+            r = self.waiting.pop_request()
+            fresh = (r.num_computed_tokens == 0
+                     and r.request_id not in self._de_requeued)
+            if fresh and slack <= 0:
+                self._de_held.append(r)
+            else:
+                keep.append(r)
+                if fresh:
+                    slack -= 1
+        for r in keep:
+            self.waiting.add_request(r)
+        while self._de_held and slack > 0:
+            self.waiting.add_request(self._de_held.popleft())
+            slack -= 1
+
     def schedule(self, *args, **kwargs):
         t0 = time.monotonic()
+        self._de_gate_fresh()
+        self._de_sched_i += 1
+        if self._de_slotstats and (
+                self._de_sched_i % 100 == 0
+                or len(self.running) >= (3 * self.max_num_running_reqs) // 4):
+            print(f"[quail-slots] step {self._de_sched_i}: "
+                  f"running {len(self.running)} "
+                  f"requeued {len(self._de_requeued)} "
+                  f"bound {self.max_num_running_reqs} "
+                  f"base {self._de_base_max_reqs} "
+                  f"waiting {len(self.waiting)} "
+                  f"skipped {len(self.skipped_waiting)} "
+                  f"stream {self.num_waiting_for_streaming_input} "
+                  f"finished_pending {len(self.finished_req_ids)} "
+                  f"preempt {getattr(self, 'num_preempted_reqs', '?')}",
+                  flush=True)
+        self._de_waves.before()
         out = super().schedule(*args, **kwargs)
+        # count before the rewound set is cleared: a rewound stage in
+        # scheduled_new_reqs is a remove-then-add in the runner, net
+        # zero slots, and the membership rule must match the
+        # publisher's (slots.py)
+        self._de_emitted_new += sum(
+            1 for r in out.scheduled_new_reqs
+            if r.req_id not in self._de_requeued)
+        self._de_requeued.difference_update(out.num_scheduled_tokens)
+        self._de_waves.after(out.num_scheduled_tokens.keys())
         if self._de_steps is not None:
             self._de_steps.append((time.monotonic(),
                                    out.total_num_scheduled_tokens))
@@ -168,8 +287,7 @@ class QuailScheduler(Scheduler):
                           if (req := self.requests.get(rid)) is not None]
             rec = chainlogic.step_record(
                 now, now - t0, toks,
-                [t[1] if (t := self._de_tag(rid)) else None
-                 for rid in toks],
+                [self._de_doc(rid) for rid in toks],
                 pool.get_num_free_blocks(), pool.num_gpu_blocks,
                 self.block_size, decoding=decoding, shapes=shapes)
             rec["waiting"] = len(self.waiting)
@@ -201,6 +319,12 @@ class QuailScheduler(Scheduler):
         if self._de_flush_every:
             self._de_trace_flush()
         return out
+
+    def reset_prefix_cache(self, *args, **kwargs):
+        # the wave driver's block references would make the reset
+        # refuse; a reset is a quiesce point, so drain them first
+        self._de_waves.drain()
+        return super().reset_prefix_cache(*args, **kwargs)
 
     def _de_trace_flush(self):
         if not self._de_trace_buf:
@@ -347,12 +471,15 @@ class QuailScheduler(Scheduler):
         self._de_stats["chain_stops"] = (
             self._de_stats.get("chain_stops", 0) + 1)
         if not st.get("advance"):
+            self._de_requeued.discard(request.request_id)
             del self._de_chain[request.request_id]
             self._de_stats["chain_done"] = (
                 self._de_stats.get("chain_done", 0) + 1)
             if not self._de_chain:
                 print("[quail-sched] chains drained: stats "
-                      f"{self._de_stats}", flush=True)
+                      f"{self._de_stats}, gate emitted "
+                      f"{self._de_emitted_new}, board "
+                      f"{slots.BOARD.snap}", flush=True)
                 self._de_dump_profile("chain-mode")
             return True
         st["advance"] = False
@@ -367,7 +494,11 @@ class QuailScheduler(Scheduler):
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params)
         self._update_request_as_session(request, update)
-        self._enqueue_waiting_request(request)
+        # to the FRONT of the queue: the session's KV is resident and
+        # finishing it frees pool and slots, so it must never wait
+        # behind fresh documents the pool cannot admit
+        self.waiting.prepend_request(request)
+        self._de_requeued.add(request.request_id)
         return False
 
     def add_request(self, request):
@@ -380,7 +511,7 @@ class QuailScheduler(Scheduler):
         # parse the id ONCE per request. The step trace and the free
         # path used to re-parse every scheduled request every step -
         # 1.85 million parses in 900 steps, 2.6 percent of core CPU
-        self._de_rid_tag[rid] = chainlogic.parse_tag(rid)
+        self._de_rid_doc[rid] = chainlogic.doc_key(rid)
         if chainlogic.is_registration(rid):
             self._de_register(request)
             return
@@ -392,98 +523,56 @@ class QuailScheduler(Scheduler):
                 stage=1, qid=qid,
                 d=chainlogic.document_boundary(
                     request.num_prompt_tokens, len(q["qs"][0])))
-            request.priority = 0
-            # Shared scans pin the document under its chains: the pin
-            # (taken by whichever of the document's chains frees first)
-            # keeps the document's cache entries alive for sibling
-            # queries' chains that have not computed yet, and releases
-            # ride on later chain submissions like in request mode.
-            tag = self._de_rid_tag[rid]
-            if tag is not None:
-                pin, doc, rel, uses = tag
-                if rel:
-                    self._de_release(rel)
-                if chainlogic.new_pin_intent(pin, doc, self._de_pins):
-                    self._de_intent[rid] = (pin, doc, uses)
             super().add_request(request)
             return
-        tag = self._de_rid_tag[rid]
-        if tag is None and self._de_strict:
+        if self._de_strict and not chainlogic.is_planned(rid):
             # a single tenant appliance serves only planned work
             super().add_request(request)
             self._de_stats["foreign_rejected"] += 1
             self.finish_requests(rid, RequestStatus.FINISHED_ABORTED)
             return
-        # Ordering is the plan's decision, not the client's: rank is
-        # assigned here from the verified tag, and whatever priority a
-        # client requested is overridden. Consumers of resident KV run
-        # first, new document reads next, unplanned traffic (only
-        # possible outside strict mode) last.
-        request.priority = chainlogic.plan_priority(tag)
-        if tag is not None:
-            pin, doc, rel, uses = tag
-            if rel:
-                self._de_release(rel)
-            if chainlogic.new_pin_intent(pin, doc, self._de_pins):
-                self._de_intent[rid] = (pin, doc, uses)
         super().add_request(request)
 
-    def _de_release(self, docs):
-        for _key, blocks in self._de_pins.to_free(docs):
-            if not blocks:
-                continue
-            # dead by the plan's decree: strip cache entries, then
-            # drop the pin references; hashless blocks join the head
-            # of the free queue and are reusable immediately
-            self._de_evict({b.block_id for b in blocks})
-            self._de_pinned_ids.difference_update(
-                b.block_id for b in blocks)
-            self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
-            self._de_stats["released"] += 1
-        if chainlogic.is_release_all(docs):
-            print(f"[quail-sched] release-all: stats {self._de_stats}",
-                  flush=True)
-            self._de_dump_profile("request-mode")
-
-    def _de_tag(self, rid):
-        """The parsed tag for a request id, from the once-per-request
+    def _de_doc(self, rid):
+        """The document key for a request id, from the once-per-request
         cache; falls back to parsing for ids that never passed
         add_request."""
         try:
-            return self._de_rid_tag[rid]
+            return self._de_rid_doc[rid]
         except KeyError:
-            tag = chainlogic.parse_tag(rid)
-            self._de_rid_tag[rid] = tag
-            return tag
+            doc = chainlogic.doc_key(rid)
+            self._de_rid_doc[rid] = doc
+            return doc
 
     def _free_request_blocks(self, request):
-        if self._de_tag(request.request_id) is not None:
+        if chainlogic.is_planned(request.request_id):
             groups = self.kv_cache_manager.coordinator.get_blocks(
                 request.request_id)
             blocks = groups[0] if groups else []
-            intent = self._de_intent.pop(request.request_id, None)
-            if chainlogic.pin_ready(intent, request.num_computed_tokens,
-                                    self._de_pins):
-                pin_tokens, doc, uses = intent
-                keep = [b for b in blocks[:chainlogic.full_blocks(
-                            pin_tokens, self.block_size)]
-                        if not b.is_null]
-                if keep:
-                    self.kv_cache_manager.block_pool.touch(keep)
-                    self._de_pins.add(doc, keep, uses)
-                    self._de_pinned_ids.update(b.block_id for b in keep)
-                    self._de_stats["pinned"] += 1
-                    self._de_stats["blocks"] += len(keep)
             # the plan owns its memory: whatever this request leaves
-            # behind unpinned has no future consumer, so strip its
-            # cache entries rather than leave them to the recency rule.
+            # behind has no future consumer, so strip its cache
+            # entries rather than leave them to the recency rule.
             # Blocks other live requests still hold are not dead, so
             # only the last holder strips them (ref_cnt <= 1).
             tail = {b.block_id for b in blocks
                     if not b.is_null
-                    and b.block_id not in self._de_pinned_ids
                     and getattr(b, "ref_cnt", 1) <= 1}
             self._de_evict(tail)
         super()._free_request_blocks(request)
-        # the freed request's tag is never read again
-        self._de_rid_tag.pop(request.request_id, None)
+        # the freed request's doc key is never read again
+        self._de_rid_doc.pop(request.request_id, None)
+
+
+class QuailAsyncScheduler(QuailScheduler, AsyncScheduler):
+    """QuailScheduler on the overlapped-scheduling base.
+
+    The MRO does all the work: every super() call in QuailScheduler
+    resolves to AsyncScheduler, so placeholder accounting, the
+    at-max-tokens skip (the vendor's guarantee that a one-token
+    verdict is never speculatively scheduled for a second pass), and
+    the one-step-late output handling all run under the quail
+    overrides. Pass this class as scheduler_cls together with
+    async_scheduling=True; the plain QuailScheduler stays the serial
+    configuration. The admission gate needs no mode switch - the
+    slot snapshot (slots.py) is exact under both."""
+

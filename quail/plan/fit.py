@@ -397,7 +397,9 @@ def fit_all(rows):
 
 def constants_block(fit):
     """The ready-to-paste block for quail/plan/cost.py."""
-    xo = {k: v["crossover_tokens"] for k, v in fit["crossovers"].items()}
+    # crossovers stay in the JSON record but not in the constants
+    # block: they are derived from bandwidth and the alpha fit, and
+    # cost.offload_crossover_tokens computes them at call time
     bw = {k: v["bytes_per_s"] for k, v in fit["crossovers"].items()}
     lines = [
         "# --- calibration fits (results/engine/cost_model_fit.json) ---",
@@ -412,7 +414,6 @@ def constants_block(fit):
         f"HOST_HA_S = {fit['host']['h_a_s']!r}",
         f"HOST_HR_S = {fit['host']['h_r_s']!r}",
         f"TRANSPORT_BW_BPS = {bw!r}",
-        f"OFFLOAD_CROSSOVER_TOKENS = {xo!r}",
     ]
     return "\n".join(lines)
 

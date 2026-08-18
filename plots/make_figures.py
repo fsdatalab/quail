@@ -565,6 +565,99 @@ def restore_vs_recompute():
     _save(fig, "restore_vs_recompute")
 
 
+# -------------------------------------------------------------- 9.5
+
+PERSIST_CELLS = [
+    # (scale label, stock file, quail chain file)
+    ("1,000 docs", "results/engine/persist_split7.json",
+     "results/engine/persist_split7_quail_waves_chain.json"),
+    ("10,000 docs", "results/engine/persist_split7_10k.json",
+     "results/engine/persist_split7_quail_waves_chain_10k.json"),
+]
+
+
+@figure("persist_per_query")
+def persist_per_query():
+    """Every persistence cell, one bar per query: the write query
+    (cold, storing KV through filters 1-3) and the two restore
+    queries (filters 4-5 and 6-7, which the store never saw). Stock
+    vLLM against chain mode, read straight from the banked JSONs."""
+    plt = _plt()
+
+    def load(path):
+        if path is None or not os.path.exists(path):
+            if path is not None:
+                print(f"skip persist_per_query: {path} not on disk")
+            return None
+        with open(path) as f:
+            d = json.load(f)
+        return dict(kv_gb=d["kv_bytes_estimate"] / 1e9,
+                    walls=[d["store_cold_offload_s"],
+                           d["store_restore_s"],
+                           d["store_restore2_s"]])
+
+    cells = [(label, load(sp), load(qp)) for label, sp, qp in PERSIST_CELLS]
+    if all(q is None for _label, _s, q in cells):
+        return
+
+    queries = ["write", "restore 1", "restore 2"]
+    x = np.arange(3)
+    fig, axes = plt.subplots(1, len(cells),
+                             figsize=(5.5 * len(cells), 5))
+    fig.suptitle(
+        "One store, three queries - per-query wall time at each scale\n"
+        "write stores KV through filters 1-3; restores run filters 4-5 "
+        "and 6-7, unseen at write time", fontsize=12)
+
+    handles = None
+    for ax, (label, stock, quail) in zip(axes, cells):
+        kv = (quail or stock)["kv_gb"]
+        ax.set_title(f"{label} - {kv:.0f} GB KV", fontsize=11)
+        if stock:
+            ax.bar(x - 0.19, stock["walls"], width=0.36, color=BLUE,
+                   edgecolor="white", lw=1, label="stock vLLM")
+        if quail:
+            ax.bar(x + 0.19 if stock else x, quail["walls"],
+                   width=0.36, color=ORANGE, edgecolor="white", lw=1,
+                   label="Quail (chain + waves)")
+        if stock and quail and handles is None:
+            handles = ax.get_legend_handles_labels()
+        top = max((stock or quail)["walls"] + (quail or stock)["walls"])
+        for xi, w in zip(x, (stock or {}).get("walls", [])):
+            ax.text(xi - 0.19, w + top * 0.02, f"{w:.2f}", ha="center",
+                    fontsize=8.5, color="#333333")
+        for xi, w in zip(x, (quail or {}).get("walls", [])):
+            ax.text(xi + (0.19 if stock else 0), w + top * 0.02,
+                    f"{w:.2f}", ha="center", fontsize=8.5,
+                    color="#333333")
+        if stock and quail:
+            # the speedup sits above the taller bar of its own pair,
+            # clear of both value labels
+            for xi, sw, qw in zip(x, stock["walls"], quail["walls"]):
+                ax.text(xi, max(sw, qw) + top * 0.10,
+                        f"{sw / qw:.1f}x", ha="center", fontsize=10.5,
+                        weight="bold", color=ORANGE)
+        else:
+            ax.text(1, top * 0.85, "stock not measured at this scale",
+                    ha="center", fontsize=9, color=GRAY)
+        ax.set_ylim(0, top * 1.24)
+        ax.set_xticks(x)
+        ax.set_xticklabels(queries, fontsize=10)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+    axes[0].set_ylabel("wall time (seconds)", fontsize=11)
+    if handles:
+        fig.legend(*handles, ncol=2, loc="upper center",
+                   bbox_to_anchor=(0.5, 0.87), fontsize=9.5,
+                   frameon=False)
+    fig.text(0.5, 0.015,
+             "Panels have independent y scales. Restores are copy-bound; "
+             "each container's copy rate ran 25-50 GB/s across the pool.",
+             ha="center", fontsize=8.5, color="#666666")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.84))
+    _save(fig, "persist_per_query")
+
+
 # --------------------------------------------------------------- 10
 
 @figure("rewind_schematic")
