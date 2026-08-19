@@ -22,10 +22,11 @@ milestone and reopens the design's executor section.
 
 Run from the quail/ directory (tee to a file per house rule):
 
-    uv run modal run tests/gpu/milestone1.py::run_probe  2>&1 | tee results/m1_probe.log
-    uv run modal run tests/gpu/milestone1.py::run_filter 2>&1 | tee results/m1_filter.log
-    uv run modal run tests/gpu/milestone1.py::run_join   2>&1 | tee results/m1_join.log
-    uv run modal run tests/gpu/milestone1.py::run_join3  2>&1 | tee results/m1_join3.log
+    uv run modal run tests/gpu/milestone1.py::run_probe   2>&1 | tee results/m1_probe.log
+    uv run modal run tests/gpu/milestone1.py::run_filter  2>&1 | tee results/m1_filter.log
+    uv run modal run tests/gpu/milestone1.py::run_filter1 2>&1 | tee results/m1_filter1.log
+    uv run modal run tests/gpu/milestone1.py::run_join    2>&1 | tee results/m1_join.log
+    uv run modal run tests/gpu/milestone1.py::run_join3   2>&1 | tee results/m1_join3.log
 """
 
 import json
@@ -281,6 +282,22 @@ def probe() -> str:
         mixed_expect = answerer(alone1) + answerer(alone0)
         mixed_got = answerer(mixed)
         dis_mixed = sum(x != y for x, y in zip(mixed_got, mixed_expect))
+
+        # 8. the single-stage fast path: fresh groups whose keys own
+        # no arena pages pack [prefix | suffix] as ONE causal segment
+        # - no scatter, no call B - and must answer as the paged path
+        fast_chunk = pack_chunk(torch, arena,
+                                [fresh_group("np", prefix, sufs)])
+        assert fast_chunk["meta"]["kv_src"] is None
+        assert fast_chunk["meta"]["cross"] is None
+        fast_answers = answerer(pipeline.forward_chunk(fast_chunk))
+        dis_fast = sum(a != b for a, b in zip(fast_answers,
+                                              shared_answers))
+        both_fast = pipeline.forward_chunk(pack_chunk(
+            torch, arena, [fresh_group("np0", prefix, sufs2),
+                           fresh_group("np1", p1, sufs2)]))
+        dis_fast_multi = sum(x != y for x, y in
+                             zip(answerer(both_fast), multi_expect))
     arena.free_key("r0")
 
     gap = (normed_shared.float()
@@ -296,6 +313,8 @@ def probe() -> str:
         paged_vs_gather_disagreements=int(dis_pg),
         multi_group_disagreements=int(dis_multi),
         mixed_kept_fresh_disagreements=int(dis_mixed),
+        fast_path_disagreements=int(dis_fast),
+        fast_path_multi_group_disagreements=int(dis_fast_multi),
     )
 
     # ---- 7. rate at the large-chunk geometry: 2 reports x all terms
@@ -340,7 +359,8 @@ def probe() -> str:
         torch.cuda.max_memory_allocated() / 2**30, 2)
     result["pass"] = (worst < 0.05 and dis_su == 0 and dis_ks == 0
                       and dis_pg == 0 and dis_multi == 0
-                      and dis_mixed == 0)
+                      and dis_mixed == 0 and dis_fast == 0
+                      and dis_fast_multi == 0)
     return _write(result, "probe")
 
 
@@ -436,6 +456,101 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
         report["runs"].append(row)
         print(f"[m1_filter] {row}", flush=True)
     return _write(report, "filter")
+
+
+# ------------------------------------------- single-stage fast path
+
+@app.function(timeout=3600, **GPU_KW)
+def filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
+    """Issue #6: the single-stage fast path. One boolean question, no
+    store: no later stage reads any document's KV, so the arena
+    alloc, the per-layer scatter, and the paged cross-read are
+    skipped - [document | question] packs as one causal segment and
+    admission runs on the token budget alone.
+
+    A/B in one cell: arena_writes=True is the configured baseline
+    (the same loop through the arena), arena_writes=False the fast
+    path. Same corpus, same budget, both paths warmed.
+
+    PREDICTION, from measured constants: ~3.6M fresh tokens (3.20M
+    corpus + 10k questions). The arena path's extra GPU work is the
+    batched scatter (~1.9 TB moved: 3.2M document tokens x 590 KB of
+    gather-plus-scatter at kappa = 288 KB/token, 0.6-0.9 s at 2-3
+    TB/s) and the second FA3 call plus the LSE merge per layer
+    (~0.6-1.0 s at the profiled per-call rates). The ~0.7 s of CPU
+    packing it also skips is mostly hidden (the timing run's
+    wall-minus-GPU gap was 0.08 s). The page bin never binds at this
+    geometry (346k arena tokens vs ~220k in flight), so admission
+    changes nothing here. Net: the fast path lands ~1.2-1.9 s under
+    the arena path's ~33 s - a 4-6% cut, with identical answers.
+    """
+    import time
+
+    from corpus import build_corpus
+    from quail.executor.loop import run_filter, warm_kernels
+
+    (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
+     exec_budget, arena_tok) = _boot()
+    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs,
+                                          n_filters=1)
+    corpus_tokens = sum(len(b) for b in body_ids)
+    report = dict(
+        cell="m1_filter1", n_docs=n_docs, corpus_tokens=corpus_tokens,
+        exec_budget=exec_budget, arena_tokens=arena_tok, kv="bf16",
+        prediction=("arena path ~33 s; fast path ~1.2-1.9 s under it "
+                    "(4-6%); identical answers"),
+        runs=[])
+    print(f"[m1_filter1] {report['prediction']}", flush=True)
+
+    t_warm = time.perf_counter()
+    with torch.inference_mode():
+        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
+                     q_ids, exec_budget)
+        # both paths run once small, so neither pays a first-use cost
+        # inside a measured rep
+        for aw in (True, False):
+            run_filter(torch, arena, pipeline, async_ans,
+                       body_ids[:64], q_ids, exec_budget,
+                       arena_writes=aw)
+    torch.cuda.synchronize()
+    kernel_cache.commit()
+    report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
+    print(f"[m1_filter1] warmup {report['warmup_s']} s", flush=True)
+
+    last = {}
+    for rep in range(reps):
+        for mode, aw in (("arena", True), ("no_arena", False)):
+            torch.cuda.reset_peak_memory_stats()
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                answers, spans, tokens = run_filter(
+                    torch, arena, pipeline, async_ans, body_ids,
+                    q_ids, exec_budget, arena_writes=aw)
+            torch.cuda.synchronize()
+            wall = time.perf_counter() - t0
+            last[mode] = answers
+            row = dict(
+                rep=rep, mode=mode, wall=round(wall, 2),
+                fresh_tokens=tokens, tok_s=round(tokens / wall, 1),
+                answered=sum(map(len, answers.values())),
+                yes=sum(bit for r in answers.values() for bit in r),
+                wrong=sum(bit != int(flags[d][0])
+                          for d, r in answers.items() for bit in r),
+                chunks=len(spans),
+                gpu_s=round(sum(e0.elapsed_time(e1)
+                                for _, e0, e1 in spans) / 1e3, 2),
+                peak_gib=round(
+                    torch.cuda.max_memory_allocated() / 2**30, 2))
+            report["runs"].append(row)
+            print(f"[m1_filter1] {row}", flush=True)
+    best = {mode: min(r["wall"] for r in report["runs"]
+                      if r["mode"] == mode)
+            for mode in ("arena", "no_arena")}
+    report["best_wall"] = best
+    report["saved_s"] = round(best["arena"] - best["no_arena"], 2)
+    report["answers_equal"] = last["arena"] == last["no_arena"]
+    report["pass"] = report["answers_equal"]
+    return _write(report, "filter1")
 
 
 # --------------------------------------------------------------- join
@@ -1077,6 +1192,12 @@ def run_probe(out: str = "results/m1_probe.json"):
 def run_filter(n_docs: int = 10000, reps: int = 2, budget: int = 0,
                out: str = "results/m1_filter.json"):
     _save(filter_run.remote(n_docs, reps, budget), out)
+
+
+@app.local_entrypoint()
+def run_filter1(n_docs: int = 10000, reps: int = 2,
+                out: str = "results/m1_filter1.json"):
+    _save(filter1_run.remote(n_docs, reps), out)
 
 
 @app.local_entrypoint()

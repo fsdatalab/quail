@@ -142,8 +142,14 @@ def pack_chunk(torch, arena, groups, timing=None):
                 anchor KV after stage 1
 
     A fresh prefix is scattered into its pages when the key owns pages
-    (allocated by the caller before packing); a fresh group without
-    pages runs self-attention only (the probe's unpacked reference).
+    (allocated by the caller before packing). A fresh group WITHOUT
+    pages touches no arena state at all: its [prefix | suffix] packs
+    as ONE causal segment, so the suffix reads the prefix through
+    call A alone - no scatter, no call B (the single-stage filter's
+    fast path; the probe's unpacked reference is the zero-suffix case
+    of it). That only works with at most one suffix: two suffixes in
+    one segment would attend to each other, and per-suffix prefix
+    copies are the unshared reference this path exists to avoid.
     """
     t = time.perf_counter() if timing is not None else 0.0
     ids, pos, cu_a, finals = [], [], [0], []
@@ -158,9 +164,16 @@ def pack_chunk(torch, arena, groups, timing=None):
         paged = key in arena.accounting.owned
         row0 = len(ids)
         if fresh:
+            if not paged and len(g["suffixes"]) > 1:
+                raise ValueError(
+                    f"group {key!r}: an unpaged fresh group packs "
+                    f"[prefix | suffix] as one causal segment, which "
+                    f"only one suffix may join - allocate pages or "
+                    f"split the group")
             ids.extend(g["prefix"])
             pos.extend(range(len(g["prefix"])))
-            cu_a.append(len(ids))
+            if paged or not g["suffixes"]:
+                cu_a.append(len(ids))
             if paged:
                 kv_writes.append((key, row0, row0 + len(g["prefix"]),
                                   0))
@@ -462,7 +475,7 @@ def _shared_preamble_tokens(question_ids):
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, trace=None, store=None,
                store_hash=None, store_min_tokens=1, stats=None,
-               store_ids=None, timing=None):
+               store_ids=None, timing=None, arena_writes=None):
     """The filter chain on the packed executor: continuous admission,
     survivor priority, pages freed on NO or after the last stage.
 
@@ -487,6 +500,14 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     submit, report wait/scatter, drain_saves) accumulate into it.
     Timing is host-side only and does not change what runs.
 
+    arena_writes: None picks per query shape. A single-stage query
+    with no store has no later reader of any document's KV, so the
+    arena alloc, the per-layer scatter, and the paged cross-read are
+    skipped: [document | question] packs as one causal segment and
+    admission runs on the token budget alone. True forces the arena
+    path (the before/after measurement); False is only legal where
+    None would pick it.
+
     Returns (answers, spans, tokens): answers[d] = 0/1 list up to the
     first NO (gated); spans and tokens as in run_join.
     """
@@ -497,13 +518,22 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     def skey(d):
         return (store_hash, store_ids[d] if store_ids else d)
 
+    if arena_writes is None:
+        arena_writes = len(question_ids) > 1 or store is not None
+    elif not arena_writes and (len(question_ids) > 1
+                               or store is not None):
+        # a later stage re-reads the KV; store.save copies it out of
+        # the arena - both need the pages this switch skips
+        raise ValueError("arena_writes=False needs a single stage and "
+                         "no store")
     restored = set()
     if store is not None:
         restored = {d for d in range(len(doc_ids))
                     if skey(d) in store}
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
-        arena_pages=arena.accounting.n_pages,
+        arena_pages=(arena.accounting.n_pages if arena_writes
+                     else None),
         page_tokens=arena.accounting.page_tokens,
         kept_extra_tokens=p, restored=restored)
     spans, tokens = [], 0
@@ -587,7 +617,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                 drain_saves(block=True)
             continue
         for doc, stage, fresh in groups:
-            if fresh:
+            if fresh and arena_writes:
                 got = arena.alloc(doc, len(doc_ids[doc]) + p)
                 assert got is not None, \
                     "scheduler admitted a doc the arena cannot hold"

@@ -216,3 +216,54 @@ def test_admission_refuses_impossible_shapes():
         FilterAdmission([1000], [10], 500, 100, 16)     # over chunk
     with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 2000, 2, 16)      # over arena
+
+
+# ----------------------------- no page bin (single-stage, no store) --
+
+def test_admission_no_page_bin_fills_by_tokens_only():
+    # the same shape under a tight arena admits one document per
+    # chunk; with no page bin the chunk fills to its token budget
+    sched = FilterAdmission([160] * 4, [10], 680, None, 16)
+    assert sched.next_chunk() == [(d, 0, True) for d in range(4)]
+    tight = FilterAdmission([160] * 4, [10], 680, 10, 16)
+    assert tight.next_chunk() == [(0, 0, True)]
+
+
+def test_admission_no_page_bin_validation():
+    # a document too big for any arena is admitted when there is no
+    # page bin; a document too big for the chunk is still refused
+    sched = FilterAdmission([1000], [10], 2000, None, 16)
+    assert sched.next_chunk() == [(0, 0, True)]
+    with pytest.raises(ValueError):
+        FilterAdmission([1000], [10], 500, None, 16)
+
+
+def test_admission_no_page_bin_random_shapes():
+    rng = random.Random(29)
+    for _ in range(20):
+        n_docs = rng.randrange(5, 60)
+        doc_tokens = [rng.randrange(20, 900) for _ in range(n_docs)]
+        stage_tokens = [rng.randrange(10, 60)]
+        budget = max(doc_tokens) + stage_tokens[0] \
+            + rng.randrange(0, 2000)
+        truth = [[1 if rng.random() < 0.7 else 0]
+                 for _ in range(n_docs)]
+        sched = FilterAdmission(doc_tokens, stage_tokens, budget,
+                                None, 16)
+        chunks = _drive(sched, truth, deliver_lag=rng.choice((0, 1)))
+        fresh_count = {}
+        for groups in chunks:
+            tokens = 0
+            for doc, stage, fresh in groups:
+                assert fresh and stage == 0
+                tokens += stage_tokens[0] + doc_tokens[doc]
+                fresh_count[doc] = fresh_count.get(doc, 0) + 1
+            assert tokens <= budget, "over-budget chunk"
+        # every document admitted exactly once, no page accounting
+        assert fresh_count == {d: 1 for d in range(n_docs)}
+        assert sched.free_pages is None
+        assert not sched.resident
+        for d, row in enumerate(truth):
+            assert sched.answers[d] == row
+        assert sched.survivors() == [d for d, row in enumerate(truth)
+                                     if all(row)]
