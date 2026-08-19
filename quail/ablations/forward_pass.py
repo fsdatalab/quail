@@ -33,11 +33,14 @@ Predictions, stated before the run (house rule), from banked numbers:
       cache and reverts only the staging copies.
   A4  34.6 s (banked: results/m1_filter.json)
 
-Stock rungs and packed rungs run in separate containers of one app:
-the engine's KV pool and the arena cannot share one 80 GB card
-without changing each other's sizing. Within each group the rungs
-share one boot, so inside-group differences carry no container drift;
-the cross-group comparison (A1 vs A2) carries the +/-3% band.
+Container discipline: the packed rungs (A2-A4) share one boot, so
+their differences carry no container drift. Each stock rung gets its
+own container - the v1 engine core is a separate process that holds
+the GPU until it exits, so two engine boots in one container fail
+(the second boot sees the first engine's memory; measured: 1.34 GiB
+free at the A1 boot). Stock-to-stock and stock-to-packed comparisons
+therefore carry the +/-3% container band; the fp8/bf16 dtype tax does
+not rest on this cell (it is banked from the kernel ladder).
 
 Gates: A3 and A4 run identical kernels, so their answers must be
 identical (staging changes copy mechanics, not values) - 0
@@ -124,18 +127,24 @@ def _wrong_count(answers_by_doc, flags):
 
 # --------------------------------------------------------- stock rungs
 
+STOCK_PREDICTIONS = {
+    "A0": "42.8-43.2 s (exploration fp8 band)",
+    "A1": "38.7-39.0 s (banked baseline_filter4.json)",
+}
+
+
 @app.function(timeout=5400, **GPU_KW)
-def stock_rungs(n_docs: int = 10000, reps: int = 2) -> str:
-    """A0 and A1 in one container: the pipelined stock client over the
-    five-filter workload, fp8 KV then bf16 KV. Two engine boots, one
-    per dtype; nothing else differs."""
-    import gc
+def stock_rung(rung: str, kv_dtype: str, n_docs: int = 10000,
+               reps: int = 2) -> str:
+    """One stock rung in its own container: the pipelined stock client
+    over the five-filter workload. kv_dtype is "fp8" for A0 and "auto"
+    for A1 - "auto" follows the model dtype, which is bf16 KV for this
+    checkpoint (vLLM has no literal "bf16" kv_cache_dtype value).
+    Everything else is identical between the two."""
     import sys
-    import time
 
     sys.path.insert(0, "/root/gpu_tests")
 
-    import torch
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
@@ -148,66 +157,48 @@ def stock_rungs(n_docs: int = 10000, reps: int = 2) -> str:
     yes, no = yes_no_ids(tokenizer)
 
     report = dict(
-        cell="ablation_stock", n_docs=n_docs,
+        cell="ablation_stock", rung=rung, kv=kv_dtype, n_docs=n_docs,
         workload="committed 10k five-filter, pipelined "
                  "per-(document, stage) client, prefix caching on",
         budget_tokens=STOCK_BUDGET, step_tokens=STOCK_STEP_TOKENS,
         max_num_seqs=STOCK_MAX_SEQS,
-        rungs={
-            "A0": dict(change="stock vLLM, fp8 KV (committed "
-                              "production setting)",
-                       prediction="42.8-43.2 s (exploration fp8 "
-                                  "band)"),
-            "A1": dict(change="KV dtype fp8 -> bf16",
-                       prediction="38.7-39.0 s (banked "
-                                  "baseline_filter4.json)"),
-        },
-        runs={})
-    print(f"[ablation_stock] predictions: "
-          f"{json.dumps({k: v['prediction'] for k, v in report['rungs'].items()})}",
-          flush=True)
+        prediction=STOCK_PREDICTIONS[rung],
+        runs=[])
+    print(f"[ablation_stock] {rung} prediction: "
+          f"{STOCK_PREDICTIONS[rung]}", flush=True)
 
-    # "auto" follows the model dtype, which is bf16 KV for this
-    # checkpoint - vLLM has no literal "bf16" kv_cache_dtype value
-    for rung, kv_dtype in (("A0", "fp8"), ("A1", "auto")):
-        llm = LLM(model=MODEL, kv_cache_dtype=kv_dtype,
-                  max_num_batched_tokens=STOCK_STEP_TOKENS,
-                  max_num_seqs=STOCK_MAX_SEQS,
-                  gpu_memory_utilization=0.92,
-                  enable_prefix_caching=True, disable_log_stats=True)
-        sampling = SamplingParams(temperature=0.0, max_tokens=1,
-                                  min_tokens=1,
-                                  allowed_token_ids=sorted(yes | no))
-        engine = llm.llm_engine
-        # warm the engine (kernel compile, allocator) outside the
-        # measured reps
-        run_filter_chain(engine, sampling, body_ids[:64], q_ids,
-                         STOCK_BUDGET, tag="w", yes_ids=yes)
-        rows = []
-        for rep in range(reps):
-            r = run_filter_chain(engine, sampling, body_ids, q_ids,
-                                 STOCK_BUDGET, tag=f"{rung}{rep}",
-                                 yes_ids=yes)
-            by_doc = {}
-            for (i, j), bit in r["answers"].items():
-                by_doc.setdefault(i, {})[j] = bit
-            by_doc = {i: [stages[j] for j in sorted(stages)]
-                      for i, stages in by_doc.items()}
-            row = dict(rung=rung, kv=kv_dtype, rep=rep,
-                       wall=round(r["wall"], 2),
-                       requests=r["requests"],
-                       fresh_tokens=r["prompt_tokens"] - r["cached_tokens"],
-                       cached_tokens=r["cached_tokens"],
-                       survivors=len(r["survivors"]),
-                       wrong=_wrong_count(by_doc, flags))
-            rows.append(row)
-            print(f"[ablation_stock] {row}", flush=True)
-        report["runs"][rung] = rows
-        del llm
-        gc.collect()
-        torch.cuda.empty_cache()
-        time.sleep(5)
-    return _write(report, "stock")
+    llm = LLM(model=MODEL, kv_cache_dtype=kv_dtype,
+              max_num_batched_tokens=STOCK_STEP_TOKENS,
+              max_num_seqs=STOCK_MAX_SEQS,
+              gpu_memory_utilization=0.92,
+              enable_prefix_caching=True, disable_log_stats=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1,
+                              min_tokens=1,
+                              allowed_token_ids=sorted(yes | no))
+    engine = llm.llm_engine
+    # warm the engine (kernel compile, allocator) outside the
+    # measured reps
+    run_filter_chain(engine, sampling, body_ids[:64], q_ids,
+                     STOCK_BUDGET, tag="w", yes_ids=yes)
+    for rep in range(reps):
+        r = run_filter_chain(engine, sampling, body_ids, q_ids,
+                             STOCK_BUDGET, tag=f"{rung}{rep}",
+                             yes_ids=yes)
+        by_doc = {}
+        for (i, j), bit in r["answers"].items():
+            by_doc.setdefault(i, {})[j] = bit
+        by_doc = {i: [stages[j] for j in sorted(stages)]
+                  for i, stages in by_doc.items()}
+        row = dict(rung=rung, kv=kv_dtype, rep=rep,
+                   wall=round(r["wall"], 2),
+                   requests=r["requests"],
+                   fresh_tokens=r["prompt_tokens"] - r["cached_tokens"],
+                   cached_tokens=r["cached_tokens"],
+                   survivors=len(r["survivors"]),
+                   wrong=_wrong_count(by_doc, flags))
+        report["runs"].append(row)
+        print(f"[ablation_stock] {row}", flush=True)
+    return _write(report, f"stock_{rung.lower()}")
 
 
 # -------------------------------------------------------- packed rungs
@@ -359,9 +350,11 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
 @app.local_entrypoint()
 def run_all(n_docs: int = 10000, reps: int = 2,
             out: str = "results/ablation_forward.json"):
-    stock_h = stock_rungs.spawn(n_docs, reps)
+    a0_h = stock_rung.spawn("A0", "fp8", n_docs, reps)
+    a1_h = stock_rung.spawn("A1", "auto", n_docs, reps)
     packed_h = packed_rungs.spawn(n_docs, reps)
-    merged = dict(stock=json.loads(stock_h.get()),
+    merged = dict(stock={"A0": json.loads(a0_h.get()),
+                         "A1": json.loads(a1_h.get())},
                   packed=json.loads(packed_h.get()))
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
