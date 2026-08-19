@@ -225,9 +225,24 @@ class Pipeline:
             tl.store(k_out_ptr + t * stride_ko + kb_offs,
                      out_b.to(k_out_ptr.dtype.element_ty))
 
+        @triton.jit
+        def kv_row_scatter(k_src_ptr, v_src_ptr, k_dst_ptr, v_dst_ptr,
+                           src_rows_ptr, dst_rows_ptr,
+                           ROW: tl.constexpr, ROW_POW2: tl.constexpr):
+            i = tl.program_id(0)
+            s = tl.load(src_rows_ptr + i)
+            d = tl.load(dst_rows_ptr + i)
+            offs = tl.arange(0, ROW_POW2)
+            mask = offs < ROW
+            k = tl.load(k_src_ptr + s * ROW + offs, mask=mask)
+            tl.store(k_dst_ptr + d * ROW + offs, k, mask=mask)
+            v = tl.load(v_src_ptr + s * ROW + offs, mask=mask)
+            tl.store(v_dst_ptr + d * ROW + offs, v, mask=mask)
+
         self._kernels = {"silu": silu_mul_quant,
                          "norm": add_rms_norm_quant,
-                         "qk": qk_norm_rope}
+                         "qk": qk_norm_rope,
+                         "kv_scatter": kv_row_scatter}
         return self._kernels
 
     def custom_silu_quant(self, gate_up):
@@ -307,6 +322,18 @@ class Pipeline:
                           attn.k_norm).reshape(n, kw)
         return self.rotary(positions, q, k)
 
+    def kv_row_scatter(self, k3, v3, src, dst, layer):
+        """Fresh KV rows into the arena's pages: one kernel per layer
+        for the whole chunk. Replaces gather + index_copy_ (4 launches
+        per layer, two passes over the bytes); the profile measured
+        that pair at 0.50 us/token, launch-bound."""
+        assert k3.is_contiguous() and v3.is_contiguous()
+        n = src.shape[0]
+        row = self.num_kv_heads * self.head_dim
+        self._triton_kernels()["kv_scatter"][(n,)](
+            k3, v3, self.arena.k[layer], self.arena.v[layer], src, dst,
+            ROW=row, ROW_POW2=1 << (row - 1).bit_length())
+
     # ---- attention: two calls, one merge ----------------------------
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
@@ -337,13 +364,10 @@ class Pipeline:
         layer = meta["layer"]
 
         # fresh KV into the arena's pages, before call B reads them:
-        # one gather + one scatter per layer for the whole chunk
+        # one scatter kernel per layer for the whole chunk
         if meta["kv_src"] is not None:
-            src, dst = meta["kv_src"], meta["kv_dst"]
-            self.arena.k[layer].index_copy_(0, dst,
-                                            k3.index_select(0, src))
-            self.arena.v[layer].index_copy_(0, dst,
-                                            v3.index_select(0, src))
+            self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"],
+                                layer)
 
         out_a, lse_a = self._fa(
             q3, k3, v3, meta["cu_a"], meta["cu_a"],

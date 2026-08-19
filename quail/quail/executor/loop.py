@@ -210,10 +210,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True):
             max_used=max(cross_used), table=table, cu_k=cu_k)
     t = _tick(timing, "pack_cross", t)
 
-    # all of the chunk's KV writes as ONE gather + scatter per layer:
-    # the profiled per-document index_copy_ path issued ~20,000 tiny
-    # launches per chunk (432,756 calls, 1.86 s GPU in the trace);
-    # batched, it is 4 launches per layer for the same bytes
+    # all of the chunk's KV writes as one list of (source, destination)
+    # row pairs: the attention pass scatters them with a single kernel
+    # launch per layer (kv_row_scatter)
     kv_src = kv_dst = None
     if kv_writes:
         src = []
