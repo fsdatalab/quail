@@ -7,7 +7,9 @@ Qwen3 4B fp8 weights, bf16 KV on both sides. All data files are in
 Related reports:
 - `2026-08-18-filter-profiling.md` covers the KV-write fix that
   produced the current filter numbers.
-- `2026-08-18-quailb-sf0.1.md` covers the full benchmark suite.
+- `2026-08-19-quailb-sf0.1.md` covers the full benchmark suite
+  (rerun after the KV-write fix). The pre-fix numbers are in
+  `2026-08-18-quailb-sf0.1.md`.
 
 ## How we set up the comparison
 

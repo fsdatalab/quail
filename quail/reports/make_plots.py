@@ -1,4 +1,5 @@
-"""Plots for the 2026-08-18 reports (filter profiling, QUAIL-B).
+"""Plots for the 2026-08-18 and 2026-08-19 reports (filter
+profiling, QUAIL-B).
 
 Reads the measured JSON artifacts in results/ and writes PNGs into
 reports/plots/. Run from the quail/ directory:
@@ -108,43 +109,42 @@ fig.tight_layout()
 fig.savefig(OUT / "profile_busy_idle.png", dpi=150)
 plt.close(fig)
 
-# ---- figure 2: quail vs stock vLLM, before and after fix ------------
+# ---- figure 2: quail vs stock vLLM ------------------------------------
 
-pre1 = load("m1_filter_final1.json")["runs"]
-pre2 = load("m1_filter_final2.json")["runs"]
 post = load("m1_filter.json")["runs"]
 stockf = load("baseline_filter4.json")["runs"]
-pre_wall = sum(r["wall"] for r in pre1 + pre2) / 4
-post_wall = sum(r["wall"] for r in post) / 2
-stock_wall = sum(r["wall"] for r in stockf) / 2
+quail_filter = sum(r["wall"] for r in post) / len(post)
+stock_filter = sum(r["wall"] for r in stockf) / len(stockf)
 
-joinb = load("baseline_join.json")["runs"]
-gate = load("dispatch_gate.json")
-stockj = sum(r["wall"] for r in joinb) / 2
-packedj = gate["gpus1"]["join"]["wall_s"]
+with open(ROOT.parent / "old_exploration" / "results" / "engine" / "join2way.json") as _f:
+    join2way = json.load(_f)["runs"]
+stockj = sum(r["wall"] for r in join2way if r["method"] == "stock_grouped") / 2
+packedj = sum(r["wall"] for r in join2way if r["method"] == "packed") / 2
 
 fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4.2))
-labels = ["Stock vLLM\n(tuned)", "Quail\nbefore fix", "Quail\nafter fix"]
-vals = [stock_wall, pre_wall, post_wall]
-cols = [GRAY, ACCENT, GREEN]
-bars = a1.bar(labels, vals, color=cols, width=0.55)
+labels = ["Stock vLLM\n(tuned)", "Quail"]
+vals = [stock_filter, quail_filter]
+cols = [GRAY, GREEN]
+bars = a1.bar(labels, vals, color=cols, width=0.5)
 for b, v in zip(bars, vals):
     a1.text(b.get_x() + b.get_width() / 2, v + 0.4, f"{v:.1f} s",
             ha="center", fontsize=10)
 a1.set_ylabel("wall time (seconds, lower is better)")
 a1.set_title("5-filter chain, 10,000 documents", fontsize=11)
 a1.set_ylim(0, 46)
+a1.text(1, quail_filter + 4, f"{stock_filter / quail_filter:.2f}x faster",
+        ha="center", fontsize=10, color=GREEN)
 a1.spines[["top", "right"]].set_visible(False)
 
-labels = ["Stock vLLM\n(prefix caching)", "Quail packed"]
+labels = ["Stock vLLM\n(grouped)", "Quail"]
 vals = [stockj, packedj]
 bars = a2.bar(labels, vals, color=[GRAY, GREEN], width=0.5)
 for b, v in zip(bars, [stockj, packedj]):
     a2.text(b.get_x() + b.get_width() / 2, v + 1, f"{v:.1f} s",
             ha="center", fontsize=10)
-a2.set_title("72,000-pair join", fontsize=11)
+a2.set_title("256,000-pair join (BioDEX)", fontsize=11)
 a2.set_ylabel("wall time (seconds, lower is better)")
-a2.set_ylim(0, 103)
+a2.set_ylim(0, 500)
 a2.text(1, packedj + 12, f"{stockj / packedj:.1f}x faster",
         ha="center", fontsize=10, color=GREEN)
 a2.spines[["top", "right"]].set_visible(False)
@@ -154,7 +154,7 @@ plt.close(fig)
 
 # ---- figure 3: QUAIL-B SF=0.1, cold vs warm -------------------------
 
-suite = load("quailb_sf0.1.json")
+suite = load("quailb_sf0.1_kvwrite.json")
 cold = {q["query"]: q for q in suite["passes"]["cold"]["queries"]}
 warm = {q["query"]: q for q in suite["passes"]["warm"]["queries"]}
 qids = list(cold)
