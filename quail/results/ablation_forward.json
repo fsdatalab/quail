@@ -1,0 +1,297 @@
+{
+  "stock": {
+    "A0": {
+      "cell": "ablation_stock",
+      "rung": "A0",
+      "kv": "fp8",
+      "n_docs": 10000,
+      "workload": "committed 10k five-filter, pipelined per-(document, stage) client, prefix caching on",
+      "budget_tokens": 374891,
+      "step_tokens": 25305,
+      "max_num_seqs": 2648,
+      "prediction": "42.8-43.2 s (exploration fp8 band)",
+      "runs": [
+        {
+          "rung": "A0",
+          "kv": "fp8",
+          "rep": 0,
+          "wall": 40.87,
+          "requests": 23314,
+          "fresh_tokens": 3914543,
+          "cached_tokens": 4678304,
+          "survivors": 2049,
+          "wrong": 6195
+        },
+        {
+          "rung": "A0",
+          "kv": "fp8",
+          "rep": 1,
+          "wall": 41.02,
+          "requests": 23315,
+          "fresh_tokens": 3936024,
+          "cached_tokens": 4657872,
+          "survivors": 2050,
+          "wrong": 6194
+        }
+      ]
+    },
+    "A1": {
+      "cell": "ablation_stock",
+      "rung": "A1",
+      "kv": "auto",
+      "n_docs": 10000,
+      "workload": "committed 10k five-filter, pipelined per-(document, stage) client, prefix caching on",
+      "budget_tokens": 374891,
+      "step_tokens": 25305,
+      "max_num_seqs": 2648,
+      "prediction": "38.7-39.0 s (banked baseline_filter4.json)",
+      "runs": [
+        {
+          "rung": "A1",
+          "kv": "auto",
+          "rep": 0,
+          "wall": 39.53,
+          "requests": 23381,
+          "fresh_tokens": 3915976,
+          "cached_tokens": 4715696,
+          "survivors": 1873,
+          "wrong": 6229
+        },
+        {
+          "rung": "A1",
+          "kv": "auto",
+          "rep": 1,
+          "wall": 39.47,
+          "requests": 23381,
+          "fresh_tokens": 3937208,
+          "cached_tokens": 4694464,
+          "survivors": 1873,
+          "wrong": 6229
+        }
+      ]
+    }
+  },
+  "packed": {
+    "cell": "ablation_packed",
+    "n_docs": 10000,
+    "corpus_tokens": 3203917,
+    "n_filters": 5,
+    "exec_budget": 110376,
+    "arena_tokens": 345974,
+    "kv": "bf16",
+    "rungs": {
+      "A2": {
+        "change": "packed executor, vLLM's between-GEMM kernels, kept KV, 110,376-token chunks",
+        "prediction": "~41 s (9.0 us/token full executor + the ladder's 1.7 us/token kernel worth); never measured"
+      },
+      "A3": {
+        "change": "+ our three Triton kernels",
+        "prediction": "39.4-39.9 s banked (m1_filter_final1/2), possibly slightly under (the #12 arena host-index cache stays)"
+      },
+      "A4": {
+        "change": "+ pinned-memory staging (the current executor)",
+        "prediction": "34.6 s banked (m1_filter.json)"
+      }
+    },
+    "runs": {
+      "A2": [
+        {
+          "rung": "A2",
+          "kernels": "vllm",
+          "pinned": false,
+          "rep": 0,
+          "wall": 44.66,
+          "fresh_tokens": 3838806,
+          "tok_s": 85964.3,
+          "answered": 23453,
+          "survivors": 1900,
+          "wrong": 6200,
+          "chunks": 56,
+          "gpu_s": 43.42,
+          "peak_gib": 65.92,
+          "cpu_phase_s": {
+            "alloc": 0.493,
+            "drain_saves": 0.0,
+            "forward_launch": 11.674,
+            "n_chunks": 56,
+            "next_chunk": 0.026,
+            "pack": 32.227,
+            "pack_blocktable": 0.205,
+            "pack_cross": 30.735,
+            "pack_h2d": 0.577,
+            "pack_kv": 0.43,
+            "pack_py": 0.157,
+            "report_rest": 0.06,
+            "report_wait": 0.003,
+            "submit": 0.165
+          }
+        },
+        {
+          "rung": "A2",
+          "kernels": "vllm",
+          "pinned": false,
+          "rep": 1,
+          "wall": 44.65,
+          "fresh_tokens": 3838806,
+          "tok_s": 85975.0,
+          "answered": 23453,
+          "survivors": 1900,
+          "wrong": 6200,
+          "chunks": 56,
+          "gpu_s": 43.4,
+          "peak_gib": 65.92,
+          "cpu_phase_s": {
+            "alloc": 0.477,
+            "drain_saves": 0.0,
+            "forward_launch": 11.608,
+            "n_chunks": 56,
+            "next_chunk": 0.022,
+            "pack": 32.305,
+            "pack_blocktable": 0.207,
+            "pack_cross": 30.812,
+            "pack_h2d": 0.58,
+            "pack_kv": 0.435,
+            "pack_py": 0.16,
+            "report_rest": 0.062,
+            "report_wait": 0.004,
+            "submit": 0.164
+          }
+        }
+      ],
+      "A3": [
+        {
+          "rung": "A3",
+          "kernels": "quail",
+          "pinned": false,
+          "rep": 0,
+          "wall": 35.32,
+          "fresh_tokens": 3834386,
+          "tok_s": 108568.4,
+          "answered": 23113,
+          "survivors": 1807,
+          "wrong": 6294,
+          "chunks": 55,
+          "gpu_s": 34.05,
+          "peak_gib": 65.93,
+          "cpu_phase_s": {
+            "alloc": 0.521,
+            "drain_saves": 0.0,
+            "forward_launch": 4.285,
+            "n_chunks": 55,
+            "next_chunk": 0.025,
+            "pack": 30.318,
+            "pack_blocktable": 0.207,
+            "pack_cross": 28.817,
+            "pack_h2d": 0.585,
+            "pack_kv": 0.439,
+            "pack_py": 0.154,
+            "report_rest": 0.06,
+            "report_wait": 0.003,
+            "submit": 0.098
+          }
+        },
+        {
+          "rung": "A3",
+          "kernels": "quail",
+          "pinned": false,
+          "rep": 1,
+          "wall": 35.82,
+          "fresh_tokens": 3834386,
+          "tok_s": 107040.4,
+          "answered": 23113,
+          "survivors": 1807,
+          "wrong": 6294,
+          "chunks": 55,
+          "gpu_s": 34.0,
+          "peak_gib": 65.93,
+          "cpu_phase_s": {
+            "alloc": 0.478,
+            "drain_saves": 0.0,
+            "forward_launch": 4.25,
+            "n_chunks": 55,
+            "next_chunk": 0.02,
+            "pack": 30.909,
+            "pack_blocktable": 0.205,
+            "pack_cross": 28.868,
+            "pack_h2d": 0.573,
+            "pack_kv": 1.026,
+            "pack_py": 0.13,
+            "report_rest": 0.053,
+            "report_wait": 0.003,
+            "submit": 0.099
+          }
+        }
+      ],
+      "A4": [
+        {
+          "rung": "A4",
+          "kernels": "quail",
+          "pinned": true,
+          "rep": 0,
+          "wall": 34.24,
+          "fresh_tokens": 3834386,
+          "tok_s": 111990.0,
+          "answered": 23113,
+          "survivors": 1807,
+          "wrong": 6294,
+          "chunks": 55,
+          "gpu_s": 34.16,
+          "peak_gib": 65.93,
+          "cpu_phase_s": {
+            "alloc": 0.528,
+            "drain_saves": 0.0,
+            "forward_launch": 31.806,
+            "n_chunks": 55,
+            "next_chunk": 0.024,
+            "pack": 1.58,
+            "pack_blocktable": 0.211,
+            "pack_cross": 0.077,
+            "pack_h2d": 0.571,
+            "pack_kv": 0.442,
+            "pack_py": 0.167,
+            "report_rest": 0.06,
+            "report_wait": 0.004,
+            "submit": 0.228
+          }
+        },
+        {
+          "rung": "A4",
+          "kernels": "quail",
+          "pinned": true,
+          "rep": 1,
+          "wall": 34.17,
+          "fresh_tokens": 3834386,
+          "tok_s": 112200.1,
+          "answered": 23113,
+          "survivors": 1807,
+          "wrong": 6294,
+          "chunks": 55,
+          "gpu_s": 34.1,
+          "peak_gib": 65.93,
+          "cpu_phase_s": {
+            "alloc": 0.475,
+            "drain_saves": 0.0,
+            "forward_launch": 31.858,
+            "n_chunks": 55,
+            "next_chunk": 0.02,
+            "pack": 1.525,
+            "pack_blocktable": 0.21,
+            "pack_cross": 0.071,
+            "pack_h2d": 0.559,
+            "pack_kv": 0.435,
+            "pack_py": 0.149,
+            "report_rest": 0.056,
+            "report_wait": 0.003,
+            "submit": 0.226
+          }
+        }
+      ]
+    },
+    "warmup_s": 2.45,
+    "gates": {
+      "a3_vs_a4_disagreements": 0,
+      "a2_vs_a3_disagreements": 2273
+    },
+    "pass": true
+  }
+}
