@@ -7,14 +7,18 @@ five-filter workload (~3.83M fresh tokens).
       25,305 step tokens, constrained YES/NO sampler
   A1  stock vLLM, bf16 KV - isolates the fp8 KV conversion tax
       (the ladder measured 96,946 -> 102,820 tok/s from dtype alone)
-  A2  packed executor with vLLM's own between-GEMM kernels, kept KV,
-      110,376-token chunks - "no engine" and the kept-KV machinery
-      (arena, paged cross-attention, LSE merge, 12-row YES/NO readout)
-      land together, per the study design
+  A2  packed executor with vLLM's own between-GEMM kernels: "no
+      engine" and the kept-KV machinery (arena with the host-index
+      cache, paged cross-attention, LSE merge, 12-row YES/NO
+      readout), 110,376-token chunks, pinned-memory staging - the
+      current executor in every respect except the kernels
   A3  A2 + our three Triton kernels (norm+add+quantize,
-      silu+mul+quantize, qk-norm+rope)
-  A4  A3 + pinned-memory staging for chunk packing - the current
-      executor (issue #9)
+      silu+mul+quantize, qk-norm+rope) - the current executor
+
+Pinned staging is part of the packed base configuration, not a rung:
+issue #12 already banked its worth (39.6 s pre-#12 to 34.6 s after,
+split ~4 s arena host-index cache + ~1.4 s staging; see the 2026-08-19
+report).
 
 Predictions, stated before the run (house rule), from banked numbers:
 
@@ -25,26 +29,21 @@ Predictions, stated before the run (house rule), from banked numbers:
       ~473k-token fp8 pool 1.6x and thrashes (47-79 s, banked in
       baseline_filter3.json).
   A1  38.7-39.0 s (banked: results/baseline_filter4.json)
-  A2  ~41 s: the full executor's 9.0 us/token plus the ladder's 1.7
-      us/token kernel worth. Never measured; this rung is the new
-      information in the study.
-  A3  39.4-39.9 s (banked: results/m1_filter_final1/2.json), possibly
-      slightly under: this rung keeps the issue-#12 arena host-index
-      cache and reverts only the staging copies.
-  A4  34.6 s (banked: results/m1_filter.json)
+  A2  ~43.5 s: the pageable-staging version of this rung measured
+      44.7 s wall against 43.4 s GPU-busy; pinned staging closes the
+      1.3 s wall-minus-GPU gap, so the wall lands on the GPU time.
+  A3  34.6 s (banked: results/m1_filter.json)
 
-Container discipline: the packed rungs (A2-A4) share one boot, so
-their differences carry no container drift. Each stock rung gets its
-own container - the v1 engine core is a separate process that holds
-the GPU until it exits, so two engine boots in one container fail
-(the second boot sees the first engine's memory; measured: 1.34 GiB
-free at the A1 boot). Stock-to-stock and stock-to-packed comparisons
-therefore carry the +/-3% container band; the fp8/bf16 dtype tax does
-not rest on this cell (it is banked from the kernel ladder).
+Container discipline: the packed rungs share one boot, so their
+difference carries no container drift. Each stock rung has its own
+container - the v1 engine core is a separate process that holds the
+GPU until it exits, so two engine boots in one container fail
+(measured: 1.34 GiB free at the second boot). Stock-to-packed
+comparisons carry the +/-3% container band.
 
-Gates: A3 and A4 run identical kernels, so their answers must be
-identical (staging changes copy mechanics, not values) - 0
-disagreements required. A2 runs different quant kernels, so its
+Gates: A3 must reproduce the banked current-executor counts exactly
+(1,807 survivors, 6,294 wrong of 23,113 answered; banked in
+results/m1_filter.json). A2 runs different quant kernels, so its
 answers are reported against A3's, not gated to zero: this
 checkpoint's YES/NO margins are thin, and the exploration measured
 1,768 flipped answers per 10,000 from one silu-kernel swap, so
@@ -203,31 +202,35 @@ def stock_rung(rung: str, kv_dtype: str, n_docs: int = 10000,
 
 # -------------------------------------------------------- packed rungs
 
-# name, Pipeline kernels, pinned staging, the change the rung adds
+# name, Pipeline kernels, pinned staging, the change the rung adds.
+# Pinned staging is on in both rungs: it is part of the packed base
+# configuration (issue #12 banked its worth), not a rung.
 PACKED_RUNGS = (
-    ("A2", "vllm", False,
+    ("A2", "vllm", True,
      "packed executor, vLLM's between-GEMM kernels, kept KV, "
-     "110,376-token chunks"),
-    ("A3", "quail", False,
-     "+ our three Triton kernels"),
-    ("A4", "quail", True,
-     "+ pinned-memory staging (the current executor)"),
+     "110,376-token chunks, pinned staging"),
+    ("A3", "quail", True,
+     "+ our three Triton kernels (the current executor)"),
 )
 
 PACKED_PREDICTIONS = {
-    "A2": "~41 s (9.0 us/token full executor + the ladder's 1.7 "
-          "us/token kernel worth); never measured",
-    "A3": "39.4-39.9 s banked (m1_filter_final1/2), possibly "
-          "slightly under (the #12 arena host-index cache stays)",
-    "A4": "34.6 s banked (m1_filter.json)",
+    "A2": "~43.5 s: this rung with pageable staging measured 44.7 s "
+          "wall against 43.4 s GPU-busy; pinned staging closes the "
+          "1.3 s wall-minus-GPU gap",
+    "A3": "34.6 s banked (m1_filter.json); 34.2 s in this study's "
+          "five-rung version",
 }
+
+# banked current-executor counts (results/m1_filter.json); A3 must
+# reproduce them exactly
+BANKED_A3 = dict(survivors=1807, wrong=6294, answered=23113)
 
 
 @app.function(timeout=5400, **GPU_KW)
 def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
-    """A2, A3, A4 in one container, one boot: same loop, same arena,
-    same attention path; only the kernel set and the staging switch
-    move between rungs."""
+    """A2 and A3 in one container, one boot: same loop, same arena,
+    same attention path, same pinned staging; only the kernel set
+    moves between rungs."""
     import sys
     import time
 
@@ -329,19 +332,22 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
         answers_by_rung[name] = answers
         report["runs"][name] = rows
 
-    # gates: A3 vs A4 must be identical (same kernels; staging changes
-    # copy mechanics, not values). A2 runs different quant kernels, so
-    # its answers are reported against A3, not gated to zero.
+    # gates: A3 is the current executor, so its counts must equal the
+    # banked ones exactly. A2 runs different quant kernels, so its
+    # answers are reported against A3, not gated to zero.
     def disagreements(x, y):
         return sum(bit_x != bit_y
                    for d in x for bit_x, bit_y in zip(x[d], y[d]))
 
-    a2, a3, a4 = (answers_by_rung[n] for n in ("A2", "A3", "A4"))
+    a2, a3 = answers_by_rung["A2"], answers_by_rung["A3"]
+    last_a3 = report["runs"]["A3"][-1]
     report["gates"] = dict(
-        a3_vs_a4_disagreements=disagreements(a3, a4),
         a2_vs_a3_disagreements=disagreements(a2, a3),
+        a3_vs_banked=dict(
+            measured={k: last_a3[k] for k in BANKED_A3},
+            banked=BANKED_A3),
     )
-    report["pass"] = report["gates"]["a3_vs_a4_disagreements"] == 0
+    report["pass"] = all(last_a3[k] == v for k, v in BANKED_A3.items())
     return _write(report, "packed")
 
 
