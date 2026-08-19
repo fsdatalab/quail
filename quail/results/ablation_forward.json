@@ -1,0 +1,240 @@
+{
+  "stock": {
+    "A0": {
+      "cell": "ablation_stock",
+      "rung": "A0",
+      "kv": "fp8",
+      "n_docs": 10000,
+      "workload": "committed 10k five-filter, pipelined per-(document, stage) client, prefix caching on",
+      "budget_tokens": 374891,
+      "step_tokens": 25305,
+      "max_num_seqs": 2648,
+      "prediction": "42.8-43.2 s (exploration fp8 band)",
+      "runs": [
+        {
+          "rung": "A0",
+          "kv": "fp8",
+          "rep": 0,
+          "wall": 40.87,
+          "requests": 23314,
+          "fresh_tokens": 3914543,
+          "cached_tokens": 4678304,
+          "survivors": 2049,
+          "wrong": 6195
+        },
+        {
+          "rung": "A0",
+          "kv": "fp8",
+          "rep": 1,
+          "wall": 41.02,
+          "requests": 23315,
+          "fresh_tokens": 3936024,
+          "cached_tokens": 4657872,
+          "survivors": 2050,
+          "wrong": 6194
+        }
+      ]
+    },
+    "A1": {
+      "cell": "ablation_stock",
+      "rung": "A1",
+      "kv": "auto",
+      "n_docs": 10000,
+      "workload": "committed 10k five-filter, pipelined per-(document, stage) client, prefix caching on",
+      "budget_tokens": 374891,
+      "step_tokens": 25305,
+      "max_num_seqs": 2648,
+      "prediction": "38.7-39.0 s (banked baseline_filter4.json)",
+      "runs": [
+        {
+          "rung": "A1",
+          "kv": "auto",
+          "rep": 0,
+          "wall": 39.53,
+          "requests": 23381,
+          "fresh_tokens": 3915976,
+          "cached_tokens": 4715696,
+          "survivors": 1873,
+          "wrong": 6229
+        },
+        {
+          "rung": "A1",
+          "kv": "auto",
+          "rep": 1,
+          "wall": 39.47,
+          "requests": 23381,
+          "fresh_tokens": 3937208,
+          "cached_tokens": 4694464,
+          "survivors": 1873,
+          "wrong": 6229
+        }
+      ]
+    }
+  },
+  "packed": {
+    "cell": "ablation_packed",
+    "n_docs": 10000,
+    "corpus_tokens": 3203917,
+    "n_filters": 5,
+    "exec_budget": 110376,
+    "arena_tokens": 345974,
+    "kv": "bf16",
+    "rungs": {
+      "A2": {
+        "change": "packed executor, vLLM's between-GEMM kernels, kept KV, 110,376-token chunks, pinned staging",
+        "prediction": "~42.9 s: this rung measured 43.9 s before the direct KV write (kv_row_scatter); the write fix is worth ~1.0 s"
+      },
+      "A3": {
+        "change": "+ our three Triton kernels (the current executor)",
+        "prediction": "~33.5 s: 34.5 s before the KV write fix; the filter gate with the fix already measured 33.5/33.6 s (m1_filter_kvscatter.json)"
+      }
+    },
+    "runs": {
+      "A2": [
+        {
+          "rung": "A2",
+          "kernels": "vllm",
+          "pinned": true,
+          "rep": 0,
+          "wall": 42.22,
+          "fresh_tokens": 3838806,
+          "tok_s": 90919.6,
+          "answered": 23453,
+          "survivors": 1900,
+          "wrong": 6200,
+          "chunks": 56,
+          "gpu_s": 42.16,
+          "peak_gib": 65.92,
+          "cpu_phase_s": {
+            "alloc": 0.377,
+            "drain_saves": 0.0,
+            "forward_launch": 40.546,
+            "n_chunks": 56,
+            "next_chunk": 0.02,
+            "pack": 1.161,
+            "pack_blocktable": 0.153,
+            "pack_cross": 0.045,
+            "pack_h2d": 0.437,
+            "pack_kv": 0.313,
+            "pack_py": 0.13,
+            "report_rest": 0.048,
+            "report_wait": 0.003,
+            "submit": 0.06
+          }
+        },
+        {
+          "rung": "A2",
+          "kernels": "vllm",
+          "pinned": true,
+          "rep": 1,
+          "wall": 42.29,
+          "fresh_tokens": 3838806,
+          "tok_s": 90773.7,
+          "answered": 23453,
+          "survivors": 1900,
+          "wrong": 6200,
+          "chunks": 56,
+          "gpu_s": 42.22,
+          "peak_gib": 65.92,
+          "cpu_phase_s": {
+            "alloc": 0.369,
+            "drain_saves": 0.0,
+            "forward_launch": 40.62,
+            "n_chunks": 56,
+            "next_chunk": 0.021,
+            "pack": 1.158,
+            "pack_blocktable": 0.156,
+            "pack_cross": 0.047,
+            "pack_h2d": 0.439,
+            "pack_kv": 0.316,
+            "pack_py": 0.126,
+            "report_rest": 0.047,
+            "report_wait": 0.005,
+            "submit": 0.061
+          }
+        }
+      ],
+      "A3": [
+        {
+          "rung": "A3",
+          "kernels": "quail",
+          "pinned": true,
+          "rep": 0,
+          "wall": 32.99,
+          "fresh_tokens": 3834386,
+          "tok_s": 116217.1,
+          "answered": 23113,
+          "survivors": 1807,
+          "wrong": 6294,
+          "chunks": 55,
+          "gpu_s": 32.93,
+          "peak_gib": 65.93,
+          "cpu_phase_s": {
+            "alloc": 0.393,
+            "drain_saves": 0.0,
+            "forward_launch": 30.394,
+            "n_chunks": 55,
+            "next_chunk": 0.019,
+            "pack": 1.484,
+            "pack_blocktable": 0.151,
+            "pack_cross": 0.047,
+            "pack_h2d": 0.42,
+            "pack_kv": 0.302,
+            "pack_py": 0.112,
+            "report_rest": 0.043,
+            "report_wait": 0.398,
+            "submit": 0.255
+          }
+        },
+        {
+          "rung": "A3",
+          "kernels": "quail",
+          "pinned": true,
+          "rep": 1,
+          "wall": 32.99,
+          "fresh_tokens": 3834386,
+          "tok_s": 116239.3,
+          "answered": 23113,
+          "survivors": 1807,
+          "wrong": 6294,
+          "chunks": 55,
+          "gpu_s": 32.93,
+          "peak_gib": 65.93,
+          "cpu_phase_s": {
+            "alloc": 0.36,
+            "drain_saves": 0.0,
+            "forward_launch": 30.815,
+            "n_chunks": 55,
+            "next_chunk": 0.016,
+            "pack": 1.089,
+            "pack_blocktable": 0.153,
+            "pack_cross": 0.045,
+            "pack_h2d": 0.422,
+            "pack_kv": 0.303,
+            "pack_py": 0.102,
+            "report_rest": 0.042,
+            "report_wait": 0.404,
+            "submit": 0.255
+          }
+        }
+      ]
+    },
+    "warmup_s": 4.85,
+    "gates": {
+      "a2_vs_a3_disagreements": 2273,
+      "a3_vs_banked": {
+        "measured": {
+          "survivors": 1807,
+          "wrong": 6294,
+          "answered": 23113
+        },
+        "banked": {
+          "survivors": 1807,
+          "wrong": 6294,
+          "answered": 23113
+        }
+      }
+    },
+    "pass": true
+  }
+}
