@@ -167,7 +167,9 @@ def stock_rungs(n_docs: int = 10000, reps: int = 2) -> str:
           f"{json.dumps({k: v['prediction'] for k, v in report['rungs'].items()})}",
           flush=True)
 
-    for rung, kv_dtype in (("A0", "fp8"), ("A1", "bf16")):
+    # "auto" follows the model dtype, which is bf16 KV for this
+    # checkpoint - vLLM has no literal "bf16" kv_cache_dtype value
+    for rung, kv_dtype in (("A0", "fp8"), ("A1", "auto")):
         llm = LLM(model=MODEL, kv_cache_dtype=kv_dtype,
                   max_num_batched_tokens=STOCK_STEP_TOKENS,
                   max_num_seqs=STOCK_MAX_SEQS,
