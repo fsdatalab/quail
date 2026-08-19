@@ -56,14 +56,28 @@ def _collect(plan: LogicalPlan):
 
 
 def _question_tokens(prompt) -> int:
-    """The token count of everything in the prompt except the
-    document text: preamble plus tail. This is what a stage's question
-    suffix costs per evaluation."""
+    """The token count of a stage's question suffix per evaluation:
+    the template text after the document placeholder. The engine
+    preamble (before the placeholder) is paid once per KV-owning
+    document, not per evaluation - see _preamble_tokens."""
     if prompt.tail_tokens is None or prompt.preamble_tokens is None:
         raise ValueError(
             "prompts were bound without a tokenizer; the planner "
             "needs token counts (pass one to compile_sql / docs)")
-    return prompt.preamble_tokens + prompt.tail_tokens
+    return prompt.tail_tokens
+
+
+def _preamble_tokens(filters, joins) -> int:
+    """The engine preamble's token count. The canonical layout makes
+    it identical on every prompt, so any bound prompt supplies it."""
+    for fs in filters.values():
+        for p in fs:
+            if p.prompt.preamble_tokens is not None:
+                return p.prompt.preamble_tokens
+    for j in joins:
+        if j.predicate.preamble_tokens is not None:
+            return j.predicate.preamble_tokens
+    return 0
 
 
 # ------------------------------------------------ order (token arithmetic)
@@ -112,15 +126,20 @@ def _surviving_docs(n_docs: float, n_partners: float,
     return n_docs * (1.0 - (1.0 - pair_selectivity) ** max(1, n_partners))
 
 
-def _stage_tokens(join, live: dict, stats: dict, anchor: str) -> float:
+def _stage_tokens(join, live: dict, stats: dict, anchor: str,
+                  pre_tokens: int = 0) -> float:
     """Pair-token total of one stage at the current live counts: the
-    anchor prefixes once each, the partner document plus question tail
-    once per pair."""
+    anchor prefixes (engine preamble, document, and the stage's frame
+    written into kept KV) once each, the partner document plus
+    question tail once per pair. The frame is per anchor, never per
+    pair - that is the point of writing it into kept KV."""
     a1, a2 = _join_sides(join)
     partner = a2 if anchor == a1 else a1
     pairs = live[anchor] * live[partner]
-    tail = _question_tokens(join.predicate)
-    return (live[anchor] * stats[anchor].mean_doc_tokens
+    frame = join.predicate.frame_tokens or 0
+    tail = _question_tokens(join.predicate) - frame
+    return (live[anchor] * (stats[anchor].mean_doc_tokens + pre_tokens
+                            + frame)
             + pairs * (stats[partner].mean_doc_tokens + tail))
 
 
@@ -133,7 +152,7 @@ def _join_sides(join) -> tuple[str, str]:
 
 
 def order_joins(joins, rule: str, stats: dict, first_alias: str,
-                anchors: dict):
+                anchors: dict, pre_tokens: int = 0):
     """Join stage order over the join graph: enumerate the connected
     permutations (2-4 relations, trivial) and compare survivor-thinned
     pair-token totals. All candidates run at the same rate, so the
@@ -151,7 +170,7 @@ def order_joins(joins, rule: str, stats: dict, first_alias: str,
                 return None    # disconnected: not a runnable order
             scope.update((a1, a2))
             anchor = anchors[id(j)]
-            tokens += _stage_tokens(j, live, stats, anchor)
+            tokens += _stage_tokens(j, live, stats, anchor, pre_tokens)
             partner = a2 if anchor == a1 else a1
             n_a, n_p = live[anchor], live[partner]
             live[anchor] = _surviving_docs(n_a, n_p, j.selectivity)
@@ -168,14 +187,16 @@ def order_joins(joins, rule: str, stats: dict, first_alias: str,
 
 # ---------------------------------------------- anchor (token arithmetic)
 
-def choose_anchor(join, stats: dict) -> tuple[str, list]:
+def choose_anchor(join, stats: dict,
+                  pre_tokens: int = 0) -> tuple[str, list]:
     """The side whose pair-token total is smaller when the other side
     streams - in practice the longer side anchors (anchor tokens are
     paid once per document, partner tokens once per pair). A user
     override wins, with a remark when it prices worse."""
     a1, a2 = _join_sides(join)
     live = {a1: float(stats[a1].n_docs), a2: float(stats[a2].n_docs)}
-    cost = {a: _stage_tokens(join, live, stats, a) for a in (a1, a2)}
+    cost = {a: _stage_tokens(join, live, stats, a, pre_tokens)
+            for a in (a1, a2)}
     planner_pick = a1 if cost[a1] <= cost[a2] else a2
     remarks = []
     if join.anchor is not None:
@@ -312,25 +333,28 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     workers = max(1, gpus // tp)
 
     chunk = budgets.chunk_budget(model, device)
+    pre = _preamble_tokens(filters, joins)
     max_tail = max((_question_tokens(p.prompt)
                     for fs in filters.values() for p in fs),
                    default=0)
     max_tail = max([max_tail] + [_question_tokens(j.predicate)
                                  for j in joins])
     for s in scans:
-        need = stats[s.alias].max_doc_tokens + max_tail
+        need = pre + stats[s.alias].max_doc_tokens + max_tail
         if need > chunk:
             return Refusal(
-                reasons=(f"a document of {s.alias!r} plus its question "
-                         f"tail needs {need} tokens; the chunk budget "
-                         f"is {chunk} and suffixes are atomic - no "
-                         f"chunk can ever hold it",),
+                reasons=(f"a document of {s.alias!r} plus the engine "
+                         f"preamble and its question tail needs {need} "
+                         f"tokens; the chunk budget is {chunk} and "
+                         f"suffixes are atomic - no chunk can ever "
+                         f"hold it",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
 
     admission_bf16 = budgets.arena_tokens(model.with_kv_bytes(2.0),
                                           device, chunk)
-    working_set = max(stats[s.alias].max_doc_tokens for s in scans) \
+    working_set = pre \
+        + max(stats[s.alias].max_doc_tokens for s in scans) \
         + max_tail
     if admission_bf16 < working_set and store is None:
         return Refusal(
@@ -346,19 +370,23 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
     anchors = {}
     for j in joins:
-        anchor, notes = choose_anchor(j, stats)
+        anchor, notes = choose_anchor(j, stats, pre)
         anchors[id(j)] = anchor
         remarks.extend(notes)
     first_alias = scans[0].alias
-    ordered_joins = order_joins(joins, rule, stats, first_alias, anchors)
+    ordered_joins = order_joins(joins, rule, stats, first_alias,
+                                anchors, pre)
 
     # ---- KV dtype: the argmin over this query's fresh and restored
-    # tokens (unless forced)
+    # tokens (unless forced). Every KV-owning document pays the
+    # engine preamble once, so scans count pre per document.
     accesses = {s.alias: access_for_scan(stats[s.alias], model, cal,
                                          store) for s in scans}
-    fresh = sum(stats[s.alias].total_tokens for s in scans
+    fresh = sum(stats[s.alias].total_tokens
+                + stats[s.alias].n_docs * pre for s in scans
                 if accesses[s.alias] == "read")
-    restored = sum(stats[s.alias].total_tokens for s in scans
+    restored = sum(stats[s.alias].total_tokens
+                   + stats[s.alias].n_docs * pre for s in scans
                    if accesses[s.alias] == "restore")
     live = {a: float(st.n_docs) for a, st in stats.items()}
     for fs in filters.values():
@@ -374,9 +402,11 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         a1, a2 = _join_sides(j)
         partner = a2 if anchor == a1 else a1
         pairs = live[anchor] * live[partner]
-        tokens = _stage_tokens(j, live, stats, anchor)
+        tokens = _stage_tokens(j, live, stats, anchor, pre)
         join_token_counts.append((pairs, tokens))
-        fresh += tokens - live[anchor] * stats[anchor].mean_doc_tokens
+        # the anchor prefix term is already in the scan totals above
+        fresh += tokens - live[anchor] * (stats[anchor].mean_doc_tokens
+                                          + pre)
         n_a, n_p = live[anchor], live[partner]
         live[anchor] = _surviving_docs(n_a, n_p, j.selectivity)
         live[partner] = _surviving_docs(n_p, n_a, j.selectivity)
@@ -402,7 +432,10 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
     store_min = 0
     if store is not None:
-        all_lengths = [t for toks in doc_tokens.values() for t in toks]
+        # stored extents are [engine preamble + document] rows, so the
+        # capacity arithmetic and the threshold are in those units
+        all_lengths = [t + pre
+                       for toks in doc_tokens.values() for t in toks]
         store_min = store_length_threshold(
             all_lengths, store.capacity_bytes,
             model.with_kv_bytes(kv_bytes).kappa)
@@ -410,7 +443,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             stored = [t for t in all_lengths if t >= store_min]
             remarks.append(
                 f"store capped: {len(stored)} of {len(all_lengths)} "
-                f"documents stored, length threshold {store_min}")
+                f"documents stored, length threshold {store_min} "
+                f"(preamble included)")
 
     # ---- operators, in execution order
     operators = []
@@ -506,6 +540,9 @@ def explain(logical: LogicalPlan, physical) -> str:
                  f"kv_dtype={physical.kv_dtype}")
     lines.append(f"  chunk_tokens={physical.chunk_tokens} "
                  f"admission_tokens={physical.admission_tokens}")
+    lines.append("  prompt layout: engine preamble + document + "
+                 "suffix (preamble_tokens per stage below count the "
+                 "shared preamble)")
     lines.append(f"  order={physical.order_rule} ({physical.order_source})")
     lines.append(f"  calibration: {physical.calibration_source}")
     for op in physical.operators:

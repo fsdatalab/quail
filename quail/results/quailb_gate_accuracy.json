@@ -1,0 +1,176 @@
+{
+  "sf": 0.1,
+  "lf": 1,
+  "gpus": 1,
+  "passes": {
+    "cold": {
+      "queries": [
+        {
+          "query": "B1",
+          "desc": "1F reviews: the per-query floor",
+          "wall_s": 30.96,
+          "boot_s": 35.16,
+          "fresh_tokens": 3538475,
+          "rows": 369,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.0738,
+              "evaluated": 5000
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B4",
+          "desc": "2F reports: long documents",
+          "wall_s": 13.51,
+          "boot_s": 0.0,
+          "fresh_tokens": 1187016,
+          "rows": 43,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.4,
+              "observed_selectivity": 0.39,
+              "evaluated": 200
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.5,
+              "observed_selectivity": 0.5513,
+              "evaluated": 78
+            }
+          ],
+          "store": null,
+          "replay": null
+        },
+        {
+          "query": "B5",
+          "desc": "1J reports x terms: the BioDEX shape",
+          "wall_s": 369.69,
+          "boot_s": 0.0,
+          "fresh_tokens": 24190602,
+          "rows": 113506,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.2217,
+              "pairs": 512000
+            }
+          ],
+          "store": null,
+          "replay": null
+        }
+      ],
+      "pass_wall_s": 477.5
+    },
+    "warm": {
+      "queries": [
+        {
+          "query": "B1",
+          "desc": "1F reviews: the per-query floor",
+          "wall_s": 32.21,
+          "boot_s": 0.0,
+          "fresh_tokens": 3538475,
+          "rows": 369,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.0738,
+              "evaluated": 5000
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 339,
+              "stored_tokens": 433105
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B4",
+          "desc": "2F reports: long documents",
+          "wall_s": 13.47,
+          "boot_s": 0.0,
+          "fresh_tokens": 1187016,
+          "rows": 43,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.4,
+              "observed_selectivity": 0.39,
+              "evaluated": 200
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": 0.5,
+              "observed_selectivity": 0.5513,
+              "evaluated": 78
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 0,
+              "stored_tokens": 0
+            }
+          },
+          "replay": null
+        },
+        {
+          "query": "B5",
+          "desc": "1J reports x terms: the BioDEX shape",
+          "wall_s": 369.78,
+          "boot_s": 0.0,
+          "fresh_tokens": 24190602,
+          "rows": 113506,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "a",
+              "partner": "b",
+              "semantics": "full",
+              "provided_selectivity": 0.05,
+              "observed_selectivity": 0.2217,
+              "pairs": 512000
+            }
+          ],
+          "store": {
+            "a": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 0,
+              "stored_tokens": 0
+            }
+          },
+          "replay": null
+        }
+      ],
+      "pass_wall_s": 441.6
+    }
+  }
+}

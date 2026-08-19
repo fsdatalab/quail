@@ -117,28 +117,22 @@ class PinnedStore:
                  d_head: int, max_doc_tokens: int, dtype=None):
         import torch
         self.torch = torch
-        dtype = dtype or torch.bfloat16
+        self._dtype = dtype or torch.bfloat16
         self.n_layers = n_layers
         self.kv_width = n_kv * d_head
         self.row_width = n_layers * 2 * self.kv_width
-        row_bytes = self.row_width * torch.tensor([], dtype=dtype).element_size()
+        row_bytes = self.row_width * torch.tensor(
+            [], dtype=self._dtype).element_size()
         self.slab_tokens = self.SLAB_BYTES // row_bytes
         n_slabs = max(1, -(-capacity_tokens // self.slab_tokens))
         self.pools = [torch.empty((self.slab_tokens, self.row_width),
-                                  dtype=dtype, pin_memory=True)
+                                  dtype=self._dtype, pin_memory=True)
                       for _ in range(n_slabs)]
         self.allocs = [ExtentAllocator(self.slab_tokens)
                        for _ in range(n_slabs)]
         self.extents = {}       # key -> (slab, offset, tokens)
         self.stream = torch.cuda.Stream()
-        self._staging = [torch.empty((max_doc_tokens, self.row_width),
-                                     dtype=dtype, device="cuda")
-                         for _ in range(self.STAGING_SLOTS)]
-        self._staging_events = [torch.cuda.Event()
-                                for _ in range(self.STAGING_SLOTS)]
-        for e in self._staging_events:
-            e.record()          # all slots start available
-        self._next_slot = 0
+        self._alloc_staging(max_doc_tokens)
 
     def __contains__(self, key) -> bool:
         return key in self.extents
@@ -148,11 +142,42 @@ class PinnedStore:
         return sum(a.used for a in self.allocs)
 
 
+    def _alloc_staging(self, tokens):
+        """The device staging ring: STAGING_SLOTS slots for small
+        documents, 2 for large ones. Staging is device memory that
+        competes with the arena - four maximum-document slots at the
+        SF=0.1 report length cost ~11 GB and slowed every warm query
+        (measured: warm B5 ran 2.8x its cold wall); two keep the
+        copy overlap at a fraction of the price."""
+        torch = self.torch
+        tokens = max(tokens, 4096)
+        n = 2 if tokens > 8192 else self.STAGING_SLOTS
+        self._staging = [torch.empty((tokens, self.row_width),
+                                     dtype=self._dtype, device="cuda")
+                         for _ in range(n)]
+        self._staging_events = [torch.cuda.Event() for _ in range(n)]
+        for e in self._staging_events:
+            e.record()          # all slots start available
+        self._next_slot = 0
+
     def _slot(self):
         i = self._next_slot
-        self._next_slot = (i + 1) % self.STAGING_SLOTS
+        self._next_slot = (i + 1) % len(self._staging)
         self._staging_events[i].synchronize()   # previous use finished
         return i
+
+    def _ensure_staging(self, tokens):
+        """Grow the staging buffers to hold `tokens` rows. The store
+        is created at the session's first store-carrying query, which
+        may not scan the longest corpus - a fixed size silently
+        skipped every save of a longer document (measured: no report
+        was ever stored because staging was sized from the reviews)."""
+        if tokens <= self._staging[0].shape[0]:
+            return
+        for e in self._staging_events:
+            e.synchronize()
+        self._staging = []      # free the old ring before growing
+        self._alloc_staging(tokens)
 
     def _k_cols(self, layer):
         a = layer * 2 * self.kv_width
@@ -166,15 +191,24 @@ class PinnedStore:
         """Copy a document's first `tokens` arena rows to the pool.
 
         Runs on the side stream after `after_event` (the compute that
-        wrote the pages). Returns the completion event - the caller
-        must not free the document's pages before it fires - or None
-        when the pool has no room (the cache skips, never evicts a
-        longer document for a shorter one)."""
+        wrote the pages). Returns the event after which the caller
+        may free the document's pages, or None when the pool has no
+        room even after reclaiming other datasets' extents (the cache
+        skips, correctness never depends on it).
+
+        The returned event fires after the on-device gather into the
+        staging buffer, NOT after the copy to host memory: the pages
+        are only read by the gather, and holding them through the
+        slow host copy stalled admission (measured: warm B6 paid
+        10.5 s to store 256 threads). The staging slot's own event
+        still covers the host copy, so slot reuse and later loads of
+        the same extent stay ordered on the side stream."""
         torch = self.torch
-        if key in self.extents or tokens > self._staging[0].shape[0]:
+        if key in self.extents:
             return None
         if tokens > self.slab_tokens:
             return None
+        self._ensure_staging(tokens)
         got = alloc_with_reclaim(self.allocs, self.extents, tokens,
                                  keep_hash=key[0])
         if got is None:
@@ -195,12 +229,12 @@ class PinnedStore:
                 stage[:tokens, v0:v1].copy_(
                     arena.v[layer].index_select(0, rows)
                     .view(tokens, self.kv_width))
+            pages_free = torch.cuda.Event()
+            pages_free.record(self.stream)
             self.pools[slab][off:off + tokens].copy_(stage[:tokens],
                                                      non_blocking=True)
-            done = torch.cuda.Event()
-            done.record(self.stream)
             self._staging_events[slot].record(self.stream)
-        return done
+        return pages_free
 
     def load(self, key, arena, arena_key):
         """Copy a stored document into its (already allocated) arena

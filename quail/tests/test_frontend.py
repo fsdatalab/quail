@@ -6,8 +6,8 @@ import pytest
 
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
-from quail.logical import (CompileError, Project, Scan, SemanticFilter,
-                           SemanticJoin)
+from quail.logical import (SHARED_PRE, CompileError, Project, Scan,
+                           SemanticFilter, SemanticJoin)
 from quail.sqlfront import compile_sql
 
 
@@ -143,17 +143,60 @@ def test_where_conjuncts_keep_written_order(catalog):
     plan = compile_sql(sql, catalog, tok)
     templates = [p.prompt.template
                  for p in plan.root.input.predicates]
-    assert templates == ["first: {0}", "second: {0}", "third: {0}"]
+    # canonical layout: the engine preamble sits before the document
+    # and the user's pre-document text is relocated after it
+    assert templates == [SHARED_PRE + "{0}\n\nfirst:",
+                         SHARED_PRE + "{0}\n\nsecond:",
+                         SHARED_PRE + "{0}\n\nthird:"]
+
+
+def test_canonicalize_template():
+    from quail.logical import canonicalize_template, split_frame
+    # no user text before the document: the preamble is prepended
+    assert canonicalize_template("{0}\nQ: is it good?") == \
+        SHARED_PRE + "{0}\nQ: is it good?"
+    # user text before the document relocates after it, so the fixed
+    # preamble is the only thing ahead of the document's KV
+    assert canonicalize_template("negative review: {0}") == \
+        SHARED_PRE + "{0}\n\nnegative review:"
+    # two placeholders: only the first (the KV-owning document) moves
+    # behind the preamble
+    assert canonicalize_template("Does {0} match {1}?") == \
+        SHARED_PRE + "{0}\n\nDoes match {1}?"
+    # no placeholder: no document to own, unchanged
+    assert canonicalize_template("no placeholders") == "no placeholders"
+    # the relocated text is recorded as the frame
+    assert split_frame("Does {0} match {1}?")[0] == "Does"
+    assert split_frame("{0} then {1}")[0] == ""
+
+
+def test_frame_split_and_counts(catalog):
+    plan = compile_sql("""
+        SELECT r.id FROM reviews r
+        JOIN products p
+          ON AI_FILTER(PROMPT('Judge the pair. {0} against {1}. Done.',
+                              r.review, p.description),
+                       {'selectivity': 0.5})
+    """, catalog, tok)
+    pred = plan.root.input.predicate
+    assert pred.frame == "Judge the pair."
+    # frame tokens counted with the separating blank line
+    assert pred.frame_tokens == len(tok("\n\nJudge the pair."))
+    # the canonical template carries the frame at the head of the mid
+    assert pred.template == (SHARED_PRE + "{0}\n\nJudge the pair. "
+                             "against {1}. Done.")
 
 
 def test_prompt_split_and_counts(catalog):
     plan = compile_sql(FILTER_JOIN_SQL, catalog, tok)
     pred = plan.root.input.left.predicates[0]
-    assert pred.prompt.preamble == "This review is negative: "
-    assert pred.prompt.tail == "{0}"
-    assert pred.prompt.preamble_tokens == len(tok("This review is "
-                                                  "negative: "))
-    assert pred.prompt.tail_tokens == 0
+    # the preamble is always the engine's; the user's pre-document
+    # text ("This review is negative:") moves into the tail
+    assert pred.prompt.preamble == SHARED_PRE
+    assert pred.prompt.tail == "{0}\n\nThis review is negative:"
+    assert pred.prompt.preamble_tokens == len(tok(SHARED_PRE))
+    assert pred.prompt.tail_tokens == len(tok("This review is "
+                                              "negative:"))
 
 
 def test_star_projection(catalog):

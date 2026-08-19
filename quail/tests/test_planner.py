@@ -165,6 +165,63 @@ def test_refusal_weights_need_more_cards(catalog):
     assert r.needed > r.available
 
 
+def test_preamble_counted_once_per_document(catalog):
+    from quail.logical import SHARED_PRE
+    logical = _five_filter_plan(catalog, (0.5,))
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [400] * 10})
+    chain = next(op for op in plan.operators
+                 if op["op"] == "FilterChain")
+    st = chain["stages"][0]
+    # the shared preamble is per document (stage 0), never per stage
+    assert st["preamble_tokens"] == len(tok(SHARED_PRE))
+    assert st["question_tokens"] == len(tok("flag 0 of:"))
+
+
+def test_store_threshold_includes_preamble(catalog):
+    # stored extents are [preamble + document] rows; a capacity that
+    # holds exactly the two longest documents plus their preambles
+    # yields a pre-inclusive threshold
+    from quail.logical import SHARED_PRE
+    logical = _five_filter_plan(catalog, (0.5,))
+    pre = len(tok(SHARED_PRE))
+    kappa = QWEN3_4B_FP8.with_kv_bytes(2.0).kappa
+    cap = (700 + 2 * pre + 0.25) * kappa
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [100, 200, 300, 400]},
+                      store=StoreSpec(read_bw=55e9, warm=False,
+                                      capacity_bytes=cap))
+    assert plan.store_min_doc_tokens == 300 + pre
+
+
+def test_join_frame_priced_per_anchor_not_per_pair(catalog):
+    # two identical joins, one with a 5-token frame: the frame must
+    # add anchor-count x 5 to the stage's pair tokens, never
+    # pairs x 5 (the frame is written into kept KV once per anchor)
+    def make(template):
+        q = docs(catalog, "reviews", tok).alias("r")
+        return (q.ai_join(
+            docs(catalog, "products", tok).alias("p"),
+            prompt(template, col("r.review"), col("p.description")),
+            selectivity=0.5).select("r.id"))
+
+    toks = {"r": [100] * 4, "p": [10] * 3}
+    framed = plan_query(make("FRAME WORDS HERE FIVE TOKENS\n\n{0}\n\n"
+                             "CAND: {1}\nANSWER="),
+                        model=QWEN3_4B_FP8, device=H100_SXM,
+                        doc_tokens=toks)
+    plain = plan_query(make("{0}\n\nCAND: {1}\nANSWER="),
+                       model=QWEN3_4B_FP8, device=H100_SXM,
+                       doc_tokens=toks)
+    stage_f = next(op for op in framed.operators
+                   if op["op"] == "JoinStage")
+    stage_p = next(op for op in plain.operators
+                   if op["op"] == "JoinStage")
+    n_anchor_docs = 4
+    assert stage_f["pair_tokens"] - stage_p["pair_tokens"] == \
+        pytest.approx(n_anchor_docs * 5)
+
+
 def test_refusal_suffix_over_chunk(catalog):
     logical = _five_filter_plan(catalog, (0.9,))
     r = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,

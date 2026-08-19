@@ -246,7 +246,9 @@ def _cumsum(xs):
 # ------------------------------------------------------------ the join
 
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
-             stage_suffixes, budget, group_size=None):
+             stage_suffixes, budget, group_size=None, store=None,
+             store_hash=None, store_min_tokens=1, store_ids=None,
+             stats=None, stage_frames=None):
     """The join driver: every stage streams a partner list against the
     anchor side; gated anchors advance between stages.
 
@@ -255,6 +257,15 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     budget: the chunk token budget.
     group_size: anchors gated together between stages; None = all
     anchors in one group (right for one stage, where no gate runs).
+    stage_frames: per stage, the task framing token list, written
+    into each anchor's kept KV right after the document rows (the
+    filter's shared-question-preamble mechanism). Every pair suffix
+    of that stage reads the frame from KV instead of carrying its
+    tokens, so framing costs tokens per anchor, not per pair. A
+    later stage's frame overwrites the earlier one's rows - each
+    stage's pairs attend only their own frame. The frame rows are
+    NOT part of the stored prefix, so the store stays
+    query-independent.
 
     Pipelining, one rule: while the GPU runs a chunk, the CPU builds
     the next buildable one. Within a stage that is the next chunk of
@@ -265,6 +276,17 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     copies (AsyncAnswers); an anchor's prefix KV is written to its
     arena pages exactly once and the pages free when its group leaves
     its last stage. Suffix KV is never written anywhere.
+
+    store / store_hash / store_min_tokens / store_ids: the pinned KV
+    store, exactly run_filter's contract. An anchor whose prefix is
+    already stored restores into its pages instead of computing (its
+    chunks carry only partner suffixes); an anchor leaving its last
+    stage - gated out or finished - is copied out on the side stream
+    when its prefix is at least store_min_tokens long, its pages
+    returned only after the copy lands. store_ids maps anchor list
+    positions to stable store key ids (the anchor's global document
+    index, the same key a filter scan of the same corpus uses).
+    stats, when given, is filled with restored/stored counts.
 
     Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
     partners, present only for anchors that reached stage j; spans =
@@ -277,64 +299,155 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     groups = [list(range(i, min(i + group_size, n)))
               for i in range(0, n, group_size)]
     suffix_lens = [[len(s) for s in sufs] for sufs in stage_suffixes]
+    frames = stage_frames or [[] for _ in range(k)]
+    frame_max = max(len(f) for f in frames)
     ans = [dict() for _ in range(k)]
     spans = []
     tokens = 0
+
+    def skey(a):
+        return (store_hash, store_ids[a] if store_ids else a)
+
+    restored = set()
+    if store is not None:
+        restored = {a for a in range(n) if skey(a) in store}
+    load_events = {}     # anchor -> store load event, awaited pre-launch
+    pending_saves = []   # (anchor, event): pages held until the copy lands
+    saving = set()       # anchors with an in-flight save: drain frees them
+    save_after = None    # an event recorded after the newest forward;
+    #                      any such event orders a save behind the
+    #                      compute that wrote the anchor's pages
+    if stats is not None:
+        stats.update(restored_docs=len(restored),
+                     restored_tokens=sum(len(anchor_prefixes[a])
+                                         for a in restored),
+                     stored_docs=0, stored_tokens=0)
 
     def plan_stage(members, j):
         live = [a for a in members
                 if j == 0 or any(ans[j - 1].get(a, []))]
         if not live:
             return [], [], set()
-        spec = [(len(anchor_prefixes[a]), suffix_lens[j])
-                for a in live]
+        # each anchor's FIRST group of the stage carries the frame at
+        # the head of its first suffix (written into kept KV there),
+        # so the first suffix length is inflated by the frame
+        lens = suffix_lens[j]
+        if frames[j] and lens:
+            lens = [len(frames[j]) + lens[0]] + lens[1:]
+        spec = [(len(anchor_prefixes[a]), lens) for a in live]
         keep_loc = set(range(len(live))) if j + 1 < k else set()
+        # restored anchors never pack prefix tokens: their KV loads
+        # from the store when their pages allocate
         already_loc = {i for i, a in enumerate(live)
-                       if a in arena.accounting.owned}
+                       if a in arena.accounting.owned or a in restored}
         plan, to_cache = pack_stream(spec, budget, keep=keep_loc,
                                      already_kept=already_loc)
         return live, plan, to_cache
 
+    def drain_saves(block=False):
+        rest = []
+        for a, ev in pending_saves:
+            if block:
+                ev.synchronize()
+            if ev.query():
+                arena.free_key(a)
+                saving.discard(a)
+            else:
+                rest.append((a, ev))
+        pending_saves[:] = rest
+
     def build(j, idx, chunk_groups):
+        frame = frames[j]
         specs = []
         for a, start, end, carried in chunk_groups:
             key = idx[a]
             f = len(anchor_prefixes[key])
-            if carried and key not in arena.accounting.owned:
-                got = arena.alloc(key, f)
+            if key not in arena.accounting.owned \
+                    and (carried or key in restored):
+                got = arena.alloc(key, f + frame_max)
+                if got is None and pending_saves:
+                    # pages held only by in-flight store saves
+                    drain_saves(block=True)
+                    got = arena.alloc(key, f + frame_max)
                 assert got is not None, "arena underprovisioned"
-            specs.append(dict(
-                key=key,
-                prefix=anchor_prefixes[key] if carried else None,
-                f=f, suffixes=stage_suffixes[j][start:end]))
+                if not carried:
+                    load_events[key] = store.load(skey(key), arena, key)
+            sufs = stage_suffixes[j][start:end]
+            if frame and start == 0 and sufs:
+                # the anchor's first group of this stage: the frame
+                # gets its own entry whose rows are written after the
+                # document (dest = f, overwriting any earlier stage's
+                # frame), and the pair entry in the same chunk reads
+                # doc + frame - the same write-then-read the fresh
+                # document + question path already does. The frame
+                # entry's answer bit is skipped by scatter().
+                specs.append(dict(
+                    key=key,
+                    prefix=anchor_prefixes[key] if carried else None,
+                    f=f, suffixes=[frame],
+                    write_suffix_tokens=len(frame)))
+                specs.append(dict(
+                    key=key, prefix=None, f=f + len(frame),
+                    suffixes=sufs))
+            else:
+                specs.append(dict(
+                    key=key,
+                    prefix=anchor_prefixes[key] if carried else None,
+                    f=f + (len(frame) if frame else 0),
+                    suffixes=sufs))
         return pack_chunk(torch, arena, specs)
 
     def launch(j, chunk):
-        nonlocal tokens
+        nonlocal tokens, save_after
         tokens += chunk["tokens"]
+        for key, _ in chunk["layout"]:
+            ev = load_events.pop(key, None)
+            if ev is not None:
+                torch.cuda.current_stream().wait_event(ev)
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
         normed = pipeline.forward_chunk(chunk)
         e1.record()
         spans.append((j, e0, e1))
+        save_after = e1
         return async_ans.submit(normed)
 
     def scatter(j, idx, chunk_groups, bits):
         pos = 0
         for a, start, end, _ in chunk_groups:
+            if frames[j] and start == 0 and end > start:
+                pos += 1        # the frame entry's bit means nothing
             cnt = end - start
             ans[j].setdefault(idx[a], []).extend(bits[pos:pos + cnt])
             pos += cnt
 
     def free_if_owned(key):
-        if key in arena.accounting.owned:
-            arena.free_key(key)
+        """Free an anchor's pages - after copying them to the store
+        when it qualifies (long enough, not already stored). Pages
+        with an in-flight save are freed by drain_saves instead."""
+        if key not in arena.accounting.owned or key in saving:
+            return
+        if (store is not None and save_after is not None
+                and len(anchor_prefixes[key]) >= store_min_tokens
+                and skey(key) not in store):
+            ev = store.save(skey(key), arena, key,
+                            len(anchor_prefixes[key]),
+                            after_event=save_after)
+            if ev is not None:
+                saving.add(key)
+                pending_saves.append((key, ev))
+                if stats is not None:
+                    stats["stored_docs"] += 1
+                    stats["stored_tokens"] += len(anchor_prefixes[key])
+                return
+        arena.free_key(key)
 
     prefetch = None     # (idx, plan, handle0) of the next group's
     #                     stage 0, chunk 0 already launched
     for g, members in enumerate(groups):
         for j in range(k):
+            drain_saves()
             if j == 0 and prefetch is not None:
                 idx, plan, h0 = prefetch
                 prefetch = None
@@ -386,6 +499,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 for a in idx:
                     if not any(ans[j][a]):
                         free_if_owned(a)
+    drain_saves(block=True)
     return ans, spans, tokens
 
 
