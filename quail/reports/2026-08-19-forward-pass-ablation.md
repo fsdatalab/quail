@@ -15,16 +15,17 @@ Each rung adds exactly one change to the previous one.
 |---|---|---|
 | A0 | stock vLLM, fp8 KV, pipelined per-(document, stage) client, prefix caching on | the committed production setting |
 | A1 | stock vLLM, bf16 KV, same client | the fp8 KV conversion tax |
-| A2 | packed executor, vLLM's own between-GEMM kernels, kept KV (arena, paged cross-attention, LSE merge), 110,376-token chunks | engine removal and the kept-KV machinery, landing together |
-| A3 | A2 + our three Triton kernels (norm+add+quantize, silu+mul+quantize, qk-norm+rope) | the custom kernels |
-| A4 | A3 + pinned-memory staging for chunk packing | issue #9/#12 staging; the current executor |
+| A2 | packed executor, vLLM's own between-GEMM kernels: kept KV (arena, paged cross-attention, LSE merge), 110,376-token chunks, pinned-memory staging | engine removal and the kept-KV machinery, landing together |
+| A3 | A2 + our three Triton kernels (norm+add+quantize, silu+mul+quantize, qk-norm+rope) | the custom kernels; this is the current executor |
 
-A2 runs the current arena code, including the issue-#12 host-index
-cache; no rung in this study turns that cache off. Its contribution
-is attributed from the banked pre-#12 runs (see below).
+Pinned staging is part of the packed base configuration, not a rung.
+Issue #12 already banked its worth: the pre-#12 code ran 39.4-39.9 s,
+the code after it 34.6 s, and the five-rung version of this study
+split that into ~4 s for the arena host-index cache and ~1.4 s for
+the staging copies.
 
 Container discipline: the packed rungs share one boot, so their
-differences carry no container drift. Each stock rung has its own
+difference carries no container drift. Each stock rung has its own
 container - the v1 engine core process holds the GPU until exit, so
 two engine boots in one container fail (measured: 1.34 GiB free at
 the second boot). Stock-to-packed comparisons carry the +/-3%
@@ -38,63 +39,56 @@ Walls are means of 2 reps; the reps agreed within 0.5 s everywhere.
 |---|---|---|---|---|
 | A0 | 40.9 s | ~95.8k | 42.8-43.2 s (exploration fp8 band) | slightly better than the band |
 | A1 | 39.5 s | ~99.4k | 38.7-39.0 s (banked baseline_filter4) | within 1.5% |
-| A2 | 44.7 s | 86.0k | ~41 s (ladder arithmetic) | missed by 9% - see below |
-| A3 | 35.6 s | 107.8k | 39.4-39.9 s (banked pre-#12) | beat by ~4 s - see below |
-| A4 | 34.2 s | 112.1k | 34.6 s (banked m1_filter) | matches |
+| A2 | 43.9 s | 87.4k | ~43.5 s (pageable-staging version measured 44.7 s wall against 43.4 s GPU-busy) | within 1% |
+| A3 | 34.5 s | 111.1k | 34.6 s (banked m1_filter) | matches |
 
-Per-step deltas: A0 to A1 is -1.4 s (bf16 KV); A1 to A2 is **+5.2 s**
-(engine removed, stock kernels); A2 to A3 is -9.1 s (our kernels);
-A3 to A4 is -1.4 s (pinned staging).
+Per-step deltas: A0 to A1 is -1.4 s (bf16 KV); A1 to A2 is **+4.4 s**
+(engine removed, kept KV our way, still vLLM's kernels); A2 to A3 is
+-9.4 s (our three kernels).
 
 ## What the numbers mean
 
-- **Removing the engine alone loses.** A2 (44.7 s) is slower than
+- **Removing the engine alone loses.** A2 (43.9 s) is slower than
   stock bf16 (39.5 s). With vLLM's own kernels between the GEMMs, the
-  packed loop plus kept-KV machinery does not beat the engine. The
-  forward-pass win comes from the custom kernels and the staging, not
-  from deleting machinery. This is the exploration ladder's headline
-  ("almost none of that comes from removing the engine") reproduced
-  on the chain workload with kept KV on.
-- **The three Triton kernels are worth 9.1 s here** - 2.4 us per
+  packed loop plus kept-KV machinery does not beat the engine - even
+  though A2 never re-serves a document prefix and the stock client
+  re-reads 4.7M cached tokens through attention. The forward-pass win
+  comes from the custom kernels, not from deleting machinery. This is
+  the exploration ladder's headline ("almost none of that comes from
+  removing the engine") reproduced on the chain workload with kept KV
+  on.
+- **The three Triton kernels are worth 9.4 s here** - 2.5 us per
   token at 110,376-token chunks, against the 1.71 us/token the ladder
   measured at 25,305-token chunks. The kernel worth grows with chunk
-  size, which is why A2's prediction (built from the small-chunk
-  number) missed by 9%. GPU-busy time confirms it: 43.4 s in A2 to
-  34.0 s in A3.
-- **Issue #12's gain decomposes.** The banked pre-#12 code (our
-  kernels, old arena, pageable staging) ran 39.4-39.9 s. A3 keeps the
-  new arena host-index cache but reverts the staging: 35.6 s. So the
-  host-index cache is worth ~4 s and pinned staging the last ~1.4 s
-  (A3 to A4). Caveat: the pre-#12 point came from a different
-  container, so the ~4 s carries the +/-3% band (~1.2 s); it is still
-  clearly the larger of the two #12 changes.
+  size. GPU-busy time confirms it: 43.9 s in A2 to 34.4 s in A3, and
+  both rungs sit on their GPU time (the wall-minus-GPU gap is under
+  0.1 s), so the kernels are the whole difference.
 - **The fp8 KV tax on the stock side is 1.4 s** (A0 to A1, ~3.5%),
   consistent with the ladder's 5.9% rate measurement.
-- **End to end: 39.5 to 34.2 s = 1.16x** over the strongest stock
-  client (bf16, pipelined); 41.0 to 34.2 = 1.20x over fp8 stock.
+- **End to end: 39.5 to 34.5 s = 1.15x** over the strongest stock
+  client (bf16, pipelined); 40.9 to 34.5 = 1.19x over fp8 stock.
 
 ## Gates and consistency checks
 
-- A3 and A4 answers are identical (0 disagreements), as required:
-  staging changes copy mechanics, not values.
+- A3 reproduces the banked current-executor counts exactly: 1,807
+  survivors, 6,294 wrong of 23,113 answered (results/m1_filter.json).
 - A2 vs A3: 2,273 of 23,113 answers flipped (9.8%). Different quant
   kernels flip thin YES/NO margins; the exploration measured 1,768
   flips per 10,000 answers from one silu-kernel swap, so this is the
-  expected band. A2 computes 4,420 more fresh tokens than A3/A4
-  because the flips change gating (1,900 vs 1,807 survivors) - table
-  readers should not read the token difference as overhead.
+  expected band. A2 computes 4,420 more fresh tokens than A3 because
+  the flips change gating (1,900 vs 1,807 survivors) - table readers
+  should not read the token difference as overhead.
 - A1 reproduces the committed bf16 chain reference exactly: 1,873
   survivors, 6,229 wrong answers. The stock baseline is calibrated.
 - Wrong-answer rates against the planted flags are in the same band
-  on every rung (6,194-6,294 of 23,113-23,453): no rung is more
-  correct than another.
+  on every rung (6,194-6,294): no rung is more correct than another.
 
 ## Data files
 
 - `results/ablation_forward.json`: the full run (config, predictions,
   per-rep walls, CPU phase timings, gates).
-- `results/m1_filter_final1.json`, `results/m1_filter_final2.json`:
-  the banked pre-#12 reference point.
-- Logs: `results/ablation_forward.log` (packed + first stock
-  attempt), `results/ablation_stock_a0.log`,
-  `results/ablation_stock_a1.log`.
+- Logs: `results/ablation_packed4.log` (A2/A3),
+  `results/ablation_stock_a0.log`, `results/ablation_stock_a1.log`.
+- The five-rung version of this study (pinned staging as its own
+  rung, A4) is superseded by this one; its data remains in git
+  history at the parent of this report's commit.
