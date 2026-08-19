@@ -15,7 +15,7 @@ def load_model(model_name: str, backend: str = "nccl"):
     from vllm.model_executor.model_loader import get_model
     from vllm.utils.network_utils import get_open_port
 
-    config = EngineArgs(model=model_name, dtype="bfloat16",
+    config = EngineArgs(model=model_name, dtype="auto",
                         enforce_eager=True).create_engine_config()
     with set_current_vllm_config(config):
         import torch.distributed as dist
