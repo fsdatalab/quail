@@ -859,7 +859,7 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
     executor's measured 39.4-39.9 s."""
     from baselines.stock import run_filter_chain
     from corpus import MODEL, build_corpus
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
     from quail.executor.loop import yes_no_ids
 
     from transformers import AutoTokenizer
@@ -872,9 +872,11 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
     # the fp8 config's 749,782 budget oversubscribes the ~473k-token
     # pool 1.6x - measured tonight at 47-79 s of thrash): budget
     # 374,891, 2,648 sequences, 25,305 step tokens, prefix caching on
-    llm = LLM(model=MODEL, max_num_batched_tokens=25_305,
-              max_num_seqs=2648, gpu_memory_utilization=0.92,
-              enable_prefix_caching=True, disable_log_stats=True)
+    from baselines.stock_boot import time_llm_boot
+    llm, boot = time_llm_boot(
+        model=MODEL, max_num_batched_tokens=25_305,
+        max_num_seqs=2648, gpu_memory_utilization=0.92,
+        enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
                               allowed_token_ids=sorted(yes | no))
@@ -885,7 +887,9 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
                              "pipelined, document-cap admission",
                   budget_tokens=budget, step_tokens=25_305,
                   prediction="committed bf16 stock band 39.2-40.8 s",
+                  boot=boot, boot_s=boot["boot_s"],
                   runs=[])
+    print(f"[baseline_filter] boot {boot}", flush=True)
     # warm the engine (kernel compile, allocator)
     run_filter_chain(engine, sampling, body_ids[:64], q_ids, budget,
                      tag="w", yes_ids=yes)
@@ -913,7 +917,7 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
     shape measured 4.1x)."""
     from baselines.stock import run_join_grouped
     from corpus import MODEL
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
     from quail.executor.loop import yes_no_ids
 
     from transformers import AutoTokenizer
@@ -945,9 +949,11 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
     # 0.92, same as quail's pool fraction. The committed join2way
     # stock arm ran 0.88 only because its container booted two
     # executors back to back; standalone, stock gets the full pool.
-    llm = LLM(model=MODEL, max_num_batched_tokens=25_305,
-              max_num_seqs=max_seqs, gpu_memory_utilization=0.92,
-              enable_prefix_caching=True, disable_log_stats=True)
+    from baselines.stock_boot import time_llm_boot
+    llm, boot = time_llm_boot(
+        model=MODEL, max_num_batched_tokens=25_305,
+        max_num_seqs=max_seqs, gpu_memory_utilization=0.92,
+        enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
                               allowed_token_ids=sorted(yes | no))
@@ -957,7 +963,9 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                              "prefix caching on",
                   max_num_seqs=max_seqs, step_tokens=25_305,
                   prediction="~2.5-3 min per rep vs the packed 31.1 s",
+                  boot=boot, boot_s=boot["boot_s"],
                   runs=[])
+    print(f"[baseline_join] boot {boot}", flush=True)
     run_join_grouped(llm, sampling, prefixes[:2], suffixes[:32], yes)
     for rep in range(reps):
         llm.reset_prefix_cache()
