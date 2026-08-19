@@ -85,21 +85,30 @@ def execute(payload: dict) -> dict:
     docs = payload["docs"]
 
     t_boot = time.perf_counter()
+    boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
+                pipeline_s=0.0, warm_kernels_s=0.0)
     booted = _BOOTED.get(spec.name)
     if booted is None:
         from quail.executor.model import load_model
+        t0 = time.perf_counter()
         model = load_model(spec.hf_name)
+        boot["load_model_s"] = time.perf_counter() - t0
         chunk = budgets.chunk_budget(spec, device)
         arena_tok = budgets.arena_tokens(spec, device, chunk)
+        t0 = time.perf_counter()
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
                         n_kv=spec.n_kv, d_head=spec.d_head,
                         dtype=torch.bfloat16)
+        boot["arena_s"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         pipeline = Pipeline(model, arena)
+        boot["pipeline_s"] = time.perf_counter() - t0
         booted = dict(model=model, arena=arena, pipeline=pipeline,
                       warmed=False)
         _BOOTED[spec.name] = booted
+        boot["kind"] = "cold"
     model, arena, pipeline = (booted["model"], booted["arena"],
                               booted["pipeline"])
     chunk = budgets.chunk_budget(spec, device)
@@ -112,6 +121,7 @@ def execute(payload: dict) -> dict:
                  payload["chunk_tokens"])
 
     if not booted["warmed"]:
+        t0 = time.perf_counter()
         with torch.inference_mode():
             # boot-side warmup: the dense token sweep plus one
             # budget-sized chunk, so every kernel configuration
@@ -123,18 +133,27 @@ def execute(payload: dict) -> dict:
                          docs[first_alias], [warm_q], budget)
         torch.cuda.synchronize()
         kernel_cache.commit()   # keep the compiles even if the run dies
+        boot["warm_kernels_s"] = time.perf_counter() - t0
         booted["warmed"] = True
+        boot["kind"] = "cold"
 
     boot_s = time.perf_counter() - t_boot   # load + compile
+    for k in ("load_model_s", "arena_s", "pipeline_s",
+              "warm_kernels_s"):
+        boot[k] = round(boot[k], 2)
+    boot["boot_s"] = round(boot_s, 2)
     state = dict(model=model, arena=arena, pipeline=pipeline,
                  spec=spec, chunk=chunk, torch=torch, F=F,
                  store=_STORE)
     report = _execute_single(state, payload)
     _STORE = state["store"]
-    report["boot_s"] = round(boot_s, 2)
+    report["boot_s"] = boot["boot_s"]
+    report["boot_kind"] = boot["kind"]
+    report["boot"] = boot
     os.makedirs("/results/runs", exist_ok=True)
     with open(f"/results/runs/run_{int(time.time())}.json", "w") as f:
         json.dump(dict(wall_s=report["wall_s"], boot_s=report["boot_s"],
+                       boot_kind=report["boot_kind"], boot=boot,
                        fresh_tokens=report["fresh_tokens"]), f)
     results_vol.commit()
     kernel_cache.commit()    # persist any JIT artifacts this run built
@@ -299,18 +318,29 @@ def _child_boot(state, sub):
 
     spec = MODELS[sub["model"]]
     device = DEVICES["h100-sxm"]
+    boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
+                pipeline_s=0.0, warm_kernels_s=0.0)
+    t_boot = time.perf_counter()
     if "pipeline" not in state:
+        t0 = time.perf_counter()
         model = load_model(spec.hf_name)
+        boot["load_model_s"] = time.perf_counter() - t0
         chunk = budgets.chunk_budget(spec, device)
         arena_tok = budgets.arena_tokens(spec, device, chunk)
+        t0 = time.perf_counter()
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
                         n_kv=spec.n_kv, d_head=spec.d_head,
                         dtype=torch.bfloat16)
+        boot["arena_s"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        pipeline = Pipeline(model, arena)
+        boot["pipeline_s"] = time.perf_counter() - t0
         state.update(torch=torch, F=F, model=model, arena=arena,
-                     pipeline=Pipeline(model, arena), spec=spec,
+                     pipeline=pipeline, spec=spec,
                      chunk=chunk, warmed=False, store=None)
+        boot["kind"] = "cold"
     answerer = _PayloadAnswerer(torch, F, state["model"],
                                 sub["yes_ids"], sub["no_ids"])
     state["async_ans"] = AsyncAnswers(torch, answerer)
@@ -324,13 +354,21 @@ def _child_boot(state, sub):
             docs = sub.get("anchor_docs") or [[1, 2, 3]]
         warm_q = (next(iter(sub["filters"].values()))[0]
                   if sub.get("filters") else [1, 2, 3])
+        t0 = time.perf_counter()
         with torch.inference_mode():
             warm_kernels(torch, state["arena"], state["pipeline"],
                          state["async_ans"], docs, [warm_q],
                          state["budget"])
         torch.cuda.synchronize()
         kernel_cache.commit()
+        boot["warm_kernels_s"] = time.perf_counter() - t0
         state["warmed"] = True
+        boot["kind"] = "cold"
+    for k in ("load_model_s", "arena_s", "pipeline_s",
+              "warm_kernels_s"):
+        boot[k] = round(boot[k], 2)
+    boot["boot_s"] = round(time.perf_counter() - t_boot, 2)
+    state["boot"] = boot
     store_cfg = sub.get("store")
     if store_cfg is not None and state.get("store") is None:
         max_doc = max((len(d) for ds in sub.get("docs", {}).values()
@@ -349,15 +387,15 @@ def _child_filters(state, sub):
 
     from quail.executor.loop import run_filter
 
-    t0 = _time.perf_counter()
     _child_boot(state, sub)
-    boot_s = _time.perf_counter() - t0
+    boot = state["boot"]
     torch = state["torch"]
     store_cfg = sub.get("store")
     if sub.get("store_flush") and state.get("store") is not None:
         state["store"].flush()
     out = dict(filters={}, survivors={}, fresh_tokens=0, store={},
-               boot_s=round(boot_s, 2))
+               boot_s=boot["boot_s"], boot_kind=boot["kind"],
+               boot=boot)
     t0 = _time.perf_counter()
     with torch.inference_mode():
         for alias, qids in sub["filters"].items():
@@ -481,9 +519,13 @@ def _execute_multi(payload: dict) -> dict:
         merged["fresh_tokens"] += sum(o["fresh_tokens"] for o in jouts)
     wall = _time.perf_counter() - t0
     boot_s = max(o["boot_s"] for o in fouts)
+    # forward the breakdown from the child that owned the max boot
+    slowest = max(fouts, key=lambda o: o["boot_s"])
     report = dict(filters=merged["filters"], joins=out_joins,
                   wall_s=round(wall - boot_s, 2),
                   boot_s=round(boot_s, 2),
+                  boot_kind=slowest.get("boot_kind"),
+                  boot=slowest.get("boot"),
                   fresh_tokens=merged["fresh_tokens"],
                   store=merged["store"] or None,
                   peak_gib=max(o["peak_gib"] for o in fouts))

@@ -430,6 +430,7 @@ class Query:
         report = dict(
             wall_s=out["wall_s"], boot_s=out.get("boot_s"),
             boot_kind=out.get("boot_kind"),
+            boot=out.get("boot"),
             coordinator_wall_s=round(coordinator_wall, 2),
             fresh_tokens=out["fresh_tokens"], stages=[],
             store=out.get("store"),
