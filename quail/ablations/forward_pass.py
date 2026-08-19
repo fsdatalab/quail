@@ -29,10 +29,10 @@ Predictions, stated before the run (house rule), from banked numbers:
       ~473k-token fp8 pool 1.6x and thrashes (47-79 s, banked in
       baseline_filter3.json).
   A1  38.7-39.0 s (banked: results/baseline_filter4.json)
-  A2  ~43.5 s: the pageable-staging version of this rung measured
-      44.7 s wall against 43.4 s GPU-busy; pinned staging closes the
-      1.3 s wall-minus-GPU gap, so the wall lands on the GPU time.
-  A3  34.6 s (banked: results/m1_filter.json)
+  A2  ~42.9 s: 43.9 s measured before the direct KV write
+      (kv_row_scatter); the write fix is worth ~1.0 s.
+  A3  ~33.5 s: 34.5 s before the fix; the filter gate with the fix
+      measured 33.5/33.6 s (results/m1_filter_kvscatter.json).
 
 Container discipline: the packed rungs share one boot, so their
 difference carries no container drift. Each stock rung has its own
@@ -214,11 +214,11 @@ PACKED_RUNGS = (
 )
 
 PACKED_PREDICTIONS = {
-    "A2": "~43.5 s: this rung with pageable staging measured 44.7 s "
-          "wall against 43.4 s GPU-busy; pinned staging closes the "
-          "1.3 s wall-minus-GPU gap",
-    "A3": "34.6 s banked (m1_filter.json); 34.2 s in this study's "
-          "five-rung version",
+    "A2": "~42.9 s: this rung measured 43.9 s before the direct KV "
+          "write (kv_row_scatter); the write fix is worth ~1.0 s",
+    "A3": "~33.5 s: 34.5 s before the KV write fix; the filter gate "
+          "with the fix already measured 33.5/33.6 s "
+          "(m1_filter_kvscatter.json)",
 }
 
 # banked current-executor counts (results/m1_filter.json); A3 must
