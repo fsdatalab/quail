@@ -17,8 +17,8 @@
   "rate": {
     "chunks": 2,
     "tokens": 169452,
-    "wall_s": 2.159,
-    "tok_s": 78484.9
+    "wall_s": 2.183,
+    "tok_s": 77609.0
   },
   "peak_gib": 62.88,
   "pass": true

@@ -161,7 +161,7 @@ def probe() -> str:
     meta0 = dict(
         layer=0, paged=True,
         kv_src=torch.arange(f0, dtype=torch.int64, device="cuda"),
-        kv_dst=arena._rows["m0"][:f0],
+        kv_dst=arena.rows_gpu("m0")[:f0],
         cu_a=torch.tensor(cu, dtype=torch.int32, device="cuda"),
         max_a=f0,
         cross=dict(
@@ -348,10 +348,11 @@ def probe() -> str:
 
 @app.function(timeout=3600, **GPU_KW)
 def filter_run(n_docs: int = 10000, reps: int = 2,
-               budget: int = 0) -> str:
+               budget: int = 0, timing: bool = False) -> str:
     """budget overrides the chunk budget: the reference cell at the
     ladder's largest measured point (25,305) tells a rate change at
-    large chunks apart from a slow loop."""
+    large chunks apart from a slow loop. timing adds a per-phase CPU
+    breakdown of run_filter to each rep (host-side timers only)."""
     import time
 
     from corpus import build_corpus
@@ -393,11 +394,12 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
     for rep in range(reps):
         torch.cuda.reset_peak_memory_stats()
         chunk_trace = []
+        timers = {} if timing else None
         t0 = time.perf_counter()
         with torch.inference_mode():
             answers, spans, tokens = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
-                exec_budget, trace=chunk_trace)
+                exec_budget, trace=chunk_trace, timing=timers)
         torch.cuda.synchronize()
         wall = time.perf_counter() - t0
         answered = sum(len(v) for v in answers.values())
@@ -421,6 +423,16 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
                                 for i in slow[:8]],
                    peak_gib=round(
                        torch.cuda.max_memory_allocated() / 2**30, 2))
+        if timers is not None:
+            row["cpu_phase_s"] = {k: round(v, 3)
+                                  for k, v in sorted(timers.items())}
+            # the full per-chunk series: the drain curve for the
+            # GEMM-efficiency question (issue #9 item 1)
+            row["chunk_series"] = [
+                dict(tokens=chunk_trace[i]["tokens"],
+                     groups=chunk_trace[i]["groups"],
+                     fresh=chunk_trace[i]["fresh"],
+                     ms=chunk_ms[i]) for i in range(len(chunk_ms))]
         report["runs"].append(row)
         print(f"[m1_filter] {row}", flush=True)
     return _write(report, "filter")
@@ -1065,6 +1077,12 @@ def run_probe(out: str = "results/m1_probe.json"):
 def run_filter(n_docs: int = 10000, reps: int = 2, budget: int = 0,
                out: str = "results/m1_filter.json"):
     _save(filter_run.remote(n_docs, reps, budget), out)
+
+
+@app.local_entrypoint()
+def run_filter_timing(n_docs: int = 3000, reps: int = 1,
+                      out: str = "results/m1_filter_timing.json"):
+    _save(filter_run.remote(n_docs, reps, 0, True), out)
 
 
 @app.local_entrypoint()

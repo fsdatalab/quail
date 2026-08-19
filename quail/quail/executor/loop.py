@@ -15,7 +15,29 @@ torch is imported lazily; this module runs only inside the Modal
 image.
 """
 
+import time
+
 from quail.executor.pack import FilterAdmission, pack_stream
+
+
+def _tick(timing, key, t0):
+    if timing is not None:
+        timing[key] = timing.get(key, 0.0) + time.perf_counter() - t0
+    return time.perf_counter()
+
+
+def _staged(torch, data, dtype):
+    """Host data -> device through pinned memory, non-blocking.
+
+    torch.tensor(list, device='cuda') from pageable memory blocks the
+    CPU until the stream drains the chunk still running; the pinned
+    stage never does. The pinned tensor may be dropped right away:
+    the caching host allocator defers its reuse until the copy's
+    stream event fires."""
+    if torch.is_tensor(data):
+        return data.pin_memory().to("cuda", non_blocking=True)
+    return torch.tensor(data, dtype=dtype, pin_memory=True).to(
+        "cuda", non_blocking=True)
 
 
 def yes_no_ids(tok):
@@ -100,7 +122,7 @@ class AsyncAnswers:
 
 # ------------------------------------------------------- chunk packing
 
-def pack_chunk(torch, arena, groups):
+def pack_chunk(torch, arena, groups, timing=None):
     """Tensors for one chunk, built from groups in chunk order.
 
     Each group is a dict:
@@ -123,7 +145,7 @@ def pack_chunk(torch, arena, groups):
     (allocated by the caller before packing); a fresh group without
     pages runs self-attention only (the probe's unpacked reference).
     """
-    dev = "cuda"
+    t = time.perf_counter() if timing is not None else 0.0
     ids, pos, cu_a, finals = [], [], [0], []
     suffix_rows = []
     kv_writes, layout = [], []
@@ -165,19 +187,20 @@ def pack_chunk(torch, arena, groups):
             cross_used.append(f)
             max_q = max(max_q, s_count)
 
+    t = _tick(timing, "pack_py", t)
     cross = None
     if cross_keys:
         table, _ = arena.block_table(cross_keys)
-        used = torch.tensor(cross_used, dtype=torch.int32, device=dev)
-        cu_k = torch.tensor(
-            [0] + list(_cumsum(cross_used)), dtype=torch.int32,
-            device=dev)
+        t = _tick(timing, "pack_blocktable", t)
+        used = _staged(torch, cross_used, torch.int32)
+        cu_k = _staged(torch, [0] + list(_cumsum(cross_used)),
+                       torch.int32)
         cross = dict(
-            rows=torch.tensor(suffix_rows, dtype=torch.int64,
-                              device=dev),
-            cu_q=torch.tensor(cu_q, dtype=torch.int32, device=dev),
+            rows=_staged(torch, suffix_rows, torch.int64),
+            cu_q=_staged(torch, cu_q, torch.int32),
             max_q=max_q, keys=cross_keys, used=used,
             max_used=max(cross_used), table=table, cu_k=cu_k)
+    t = _tick(timing, "pack_cross", t)
 
     # all of the chunk's KV writes as ONE gather + scatter per layer:
     # the profiled per-document index_copy_ path issued ~20,000 tiny
@@ -188,20 +211,22 @@ def pack_chunk(torch, arena, groups):
         src = []
         for _, r0, r1, _ in kv_writes:
             src.extend(range(r0, r1))
-        kv_src = torch.tensor(src, dtype=torch.int64, device=dev)
-        kv_dst = torch.cat(
+        kv_src = _staged(torch, src, torch.int64)
+        kv_dst = _staged(torch, torch.cat(
             [arena._rows[key][dest:dest + (r1 - r0)]
-             for key, r0, r1, dest in kv_writes])
+             for key, r0, r1, dest in kv_writes]), torch.int64)
+    t = _tick(timing, "pack_kv", t)
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross, paged=True,
-        cu_a=torch.tensor(cu_a, dtype=torch.int32, device=dev),
+        cu_a=_staged(torch, cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
-    return dict(
-        input_ids=torch.tensor(ids, dtype=torch.int64, device=dev),
-        positions=torch.tensor(pos, dtype=torch.int64, device=dev),
-        final_indices=torch.tensor(finals, dtype=torch.int64,
-                                   device=dev),
+    out = dict(
+        input_ids=_staged(torch, ids, torch.int64),
+        positions=_staged(torch, pos, torch.int64),
+        final_indices=_staged(torch, finals, torch.int64),
         meta=meta, tokens=len(ids), layout=layout)
+    _tick(timing, "pack_h2d", t)
+    return out
 
 
 def _cumsum(xs):
@@ -437,7 +462,7 @@ def _shared_preamble_tokens(question_ids):
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, trace=None, store=None,
                store_hash=None, store_min_tokens=1, stats=None,
-               store_ids=None):
+               store_ids=None, timing=None):
     """The filter chain on the packed executor: continuous admission,
     survivor priority, pages freed on NO or after the last stage.
 
@@ -456,6 +481,11 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     restored/stored counts. store_ids maps local document positions
     to stable store key ids (a sharded worker keys by global index,
     so its store slice survives across queries).
+
+    timing: optional dict; when given, CPU seconds per loop phase
+    (next_chunk, alloc, pack and its sub-phases, forward launch,
+    submit, report wait/scatter, drain_saves) accumulate into it.
+    Timing is host-side only and does not change what runs.
 
     Returns (answers, spans, tokens): answers[d] = 0/1 list up to the
     first NO (gated); spans and tokens as in run_join.
@@ -500,6 +530,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                     suffixes=[tails[stage]])
 
     def drain_saves(block=False):
+        t = time.perf_counter() if timing is not None else 0.0
         rest = []
         for doc, ev in pending_saves:
             if block:
@@ -510,10 +541,13 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             else:
                 rest.append((doc, ev))
         pending_saves[:] = rest
+        _tick(timing, "drain_saves", t)
 
     def report(entry):
+        t = time.perf_counter() if timing is not None else 0.0
         groups, handle = entry
         bits = async_ans.result(handle)
+        t = _tick(timing, "report_wait", t)
         for (doc, stage, _fresh), bit in zip(groups, bits):
             yes = bool(bit)
             last = stage == len(stage_tokens) - 1
@@ -536,10 +570,13 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             if doc not in sched.resident \
                     and doc in arena.accounting.owned:
                 arena.free_key(doc)
+        _tick(timing, "report_rest", t)
 
     while not sched.done():
         drain_saves()
+        t = time.perf_counter() if timing is not None else 0.0
         groups = sched.next_chunk()
+        t = _tick(timing, "next_chunk", t)
         if not groups:
             if outstanding:
                 report(outstanding.pop(0))
@@ -557,7 +594,10 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                 if doc in restored:
                     load_events[doc] = store.load(skey(doc), arena,
                                                   doc)
-        chunk = pack_chunk(torch, arena, [to_spec(*g) for g in groups])
+        t = _tick(timing, "alloc", t)
+        chunk = pack_chunk(torch, arena, [to_spec(*g) for g in groups],
+                           timing=timing)
+        t = _tick(timing, "pack", t)
         tokens += chunk["tokens"]
         if trace is not None:
             trace.append(dict(
@@ -572,8 +612,12 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         e0.record()
         normed = pipeline.forward_chunk(chunk)
         e1.record()
+        t = _tick(timing, "forward_launch", t)
         spans.append((0, e0, e1))
         outstanding.append((groups, async_ans.submit(normed)))
+        t = _tick(timing, "submit", t)
+        if timing is not None:
+            timing["n_chunks"] = timing.get("n_chunks", 0) + 1
         # read the previous chunk's answers while this one runs
         while len(outstanding) > 1:
             report(outstanding.pop(0))

@@ -181,7 +181,7 @@ class PinnedStore:
             return None
         slab, off = got
         self.extents[key] = (slab, off, tokens)
-        rows = arena._rows[arena_key][:tokens]
+        rows = arena.rows_gpu(arena_key)[:tokens]
         slot = self._slot()
         stage = self._staging[slot]
         with torch.cuda.stream(self.stream):
@@ -208,7 +208,7 @@ class PinnedStore:
         pages must wait on it."""
         torch = self.torch
         slab, off, tokens = self.extents[key]
-        rows = arena._rows[arena_key][:tokens]
+        rows = arena.rows_gpu(arena_key)[:tokens]
         slot = self._slot()
         stage = self._staging[slot]
         n_kv = arena.k[0].shape[-2]
