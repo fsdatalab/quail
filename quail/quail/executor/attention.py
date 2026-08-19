@@ -284,12 +284,13 @@ class Pipeline:
         return self.quant(normed)
 
     def vllm_silu_quant(self, gate_up):
-        """silu_and_mul, then a separate quantize."""
-        from vllm import _custom_ops as ops
+        """silu_and_mul, then a separate quantize. The op call is what
+        the engine's SiluAndMul module dispatches to (0.26.0 moved it
+        off vllm._custom_ops)."""
         out = self.torch.empty(
             (gate_up.shape[0], gate_up.shape[1] // 2),
             dtype=gate_up.dtype, device=gate_up.device)
-        ops.silu_and_mul(out, gate_up)
+        self.torch.ops._C.silu_and_mul(out, gate_up)
         return self.quant(out)
 
     def vllm_qk_norm_rope(self, qkv, positions, attn):

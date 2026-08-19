@@ -42,9 +42,11 @@ the cross-group comparison (A1 vs A2) carries the +/-3% band.
 Gates: A3 and A4 run identical kernels, so their answers must be
 identical (staging changes copy mechanics, not values) - 0
 disagreements required. A2 runs different quant kernels, so its
-answers are reported against A3's with the exploration's tolerance
-language (small flips at the YES/NO margin are expected, low tens at
-most). Every rung reports wrong answers against the planted flags.
+answers are reported against A3's, not gated to zero: this
+checkpoint's YES/NO margins are thin, and the exploration measured
+1,768 flipped answers per 10,000 from one silu-kernel swap, so
+low-thousands disagreement at 10k documents is the expected band.
+Every rung reports wrong answers against the planted flags.
 
 Run from the quail/ directory (tee to a file per house rule):
 
