@@ -351,7 +351,151 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
     return _write(report, "packed")
 
 
+# ---------------------------------------------------------- profiling
+
+def _categorize(name):
+    """Kernel name -> time bucket. Order matters: our Triton kernel
+    names contain substrings ("add_rms", "quant") that also appear in
+    vLLM's op names, so the Triton names are checked first."""
+    low = name.lower()
+    if "deep_gemm" in low or "sm90_fp8" in low or "gemm" in low:
+        return "gemm"
+    if "flash" in low or "attn" in low:
+        return "attention"
+    if any(k in low for k in ("silu_mul_quant", "add_rms_norm_quant",
+                              "qk_norm_rope")):
+        return "triton_fused"
+    if any(k in low for k in ("rms_norm", "rotary", "silu_and_mul")):
+        return "vllm_elementwise"
+    if "quant" in low:
+        return "quant"
+    if any(k in low for k in ("memcpy", "copy", "index", "cat",
+                              "gather", "scatter")):
+        return "copies"
+    return "other"
+
+
+@app.function(timeout=3600, **GPU_KW)
+def profile_packed(n_docs: int = 3000) -> str:
+    """Per-kernel-category GPU time for A2 and A3 in one container,
+    at the 110k-chunk geometry. Answers why A2 (vLLM's small kernels)
+    is slower than A1 (stock engine): the stock kernel composition is
+    banked (10.77 us/token at 25,305-token steps: 5.52 GEMM, 0.81
+    attention, 0.43 KV write, 4.00 the small kernels); this profile
+    measures the same buckets for our loop at 110,376-token chunks.
+
+    Prediction: A2's small-kernel buckets (vllm_elementwise + quant)
+    exceed the stock 4.00 us/token; GEMM and attention match A3.
+    """
+    import sys
+    import time
+
+    sys.path.insert(0, "/root/gpu_tests")
+
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoTokenizer
+
+    from corpus import MODEL, build_corpus
+    from quail.executor.arena import KVArena
+    from quail.executor.attention import Pipeline
+    from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
+                                     warm_kernels)
+    from quail.executor.model import load_model
+    from quail.planner import budgets
+    from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model = load_model(MODEL)
+    chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
+    arena_tok = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, chunk)
+    spec = QWEN3_4B_FP8
+    arena = KVArena(n_layers=spec.layers,
+                    n_pages=arena_tok // budgets.PAGE_TOKENS,
+                    page_tokens=budgets.PAGE_TOKENS,
+                    n_kv=spec.n_kv, d_head=spec.d_head,
+                    dtype=torch.bfloat16)
+    pipeline = Pipeline(model, arena)
+    answerer = Answerer(torch, F, model, tokenizer)
+    async_ans = AsyncAnswers(torch, answerer)
+    exec_budget = min(chunk, pipeline.max_chunk_tokens)
+    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
+
+    with torch.inference_mode():
+        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
+                     q_ids, exec_budget)
+    torch.cuda.synchronize()
+    kernel_cache.commit()
+
+    result = {"n_docs": n_docs, "exec_budget": exec_budget,
+          "stock_reference_us_per_token": dict(
+              gemm=5.521, attention=0.813, kv_write_fp8=0.427,
+              small_kernels=4.004, total=10.77,
+              note="banked engine profile at 25,305-token steps, "
+                   "fp8 KV (fusion_ab.json control cell)"),
+          "rungs": {}}
+    for name, kernels, pinned, _ in PACKED_RUNGS:
+        pipeline.kernels = kernels
+        with torch.inference_mode():
+            # unprofiled reference: the true rate
+            _, _, tokens = run_filter(torch, arena, pipeline,
+                                      async_ans, body_ids, q_ids,
+                                      exec_budget, pinned=pinned)
+            torch.cuda.synchronize()
+            with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA]
+            ) as prof:
+                run_filter(torch, arena, pipeline, async_ans, body_ids,
+                           q_ids, exec_budget, pinned=pinned)
+                torch.cuda.synchronize()
+
+        cats, counts = {}, {}
+        rows = []
+        for ev in prof.key_averages():
+            cuda_us = getattr(ev, "self_device_time_total", 0) or \
+                getattr(ev, "self_cuda_time_total", 0)
+            if not cuda_us:
+                continue
+            cat = _categorize(ev.key)
+            cats[cat] = cats.get(cat, 0.0) + cuda_us
+            counts[cat] = counts.get(cat, 0) + ev.count
+            rows.append((round(cuda_us / 1e6, 3), ev.count,
+                         ev.key[:90]))
+        rows.sort(reverse=True)
+        busy = sum(cats.values())
+        result["rungs"][name] = dict(
+            fresh_tokens=tokens,
+            cuda_busy_s=round(busy / 1e6, 2),
+            us_per_token=round(busy / tokens, 2),
+            category_s={k: round(v / 1e6, 2) for k, v
+                        in sorted(cats.items())},
+            category_us_per_token={k: round(v / tokens, 2)
+                                   for k, v in sorted(cats.items())},
+            category_launches={k: counts[k] for k in sorted(counts)},
+            top_kernels=[dict(s=s, n=n, name=k) for s, n, k
+                         in rows[:25]])
+        prof.export_chrome_trace(
+            f"/results/ablations/profile_{name.lower()}.json.gz")
+        print(f"[profile_packed] {name}: "
+              f"{json.dumps(result['rungs'][name]['category_us_per_token'])}",
+              flush=True)
+    return _write(result, "profile_packed")
+
+
 # ---------------------------------------------------------- entrypoint
+
+def _save(payload, out):
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(json.loads(payload), f, indent=2)
+    print(f"saved {out}")
+
+
+@app.local_entrypoint()
+def run_profile(out: str = "results/ablation_profile.json"):
+    _save(profile_packed.remote(), out)
+
 
 @app.local_entrypoint()
 def run_all(n_docs: int = 10000, reps: int = 2,
