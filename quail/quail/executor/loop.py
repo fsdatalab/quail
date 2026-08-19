@@ -26,18 +26,26 @@ def _tick(timing, key, t0):
     return time.perf_counter()
 
 
-def _staged(torch, data, dtype):
+def _staged(torch, data, dtype, pinned=True):
     """Host data -> device through pinned memory, non-blocking.
 
     torch.tensor(list, device='cuda') from pageable memory blocks the
     CPU until the stream drains the chunk still running; the pinned
     stage never does. The pinned tensor may be dropped right away:
     the caching host allocator defers its reuse until the copy's
-    stream event fires."""
+    stream event fires.
+
+    pinned=False reverts to the pageable blocking copies - the
+    ablation ladder's pre-#12 rung (issue #9 measured what the pinned
+    stage is worth)."""
     if torch.is_tensor(data):
-        return data.pin_memory().to("cuda", non_blocking=True)
-    return torch.tensor(data, dtype=dtype, pin_memory=True).to(
-        "cuda", non_blocking=True)
+        if pinned:
+            return data.pin_memory().to("cuda", non_blocking=True)
+        return data.to("cuda")
+    if pinned:
+        return torch.tensor(data, dtype=dtype, pin_memory=True).to(
+            "cuda", non_blocking=True)
+    return torch.tensor(data, dtype=dtype, device="cuda")
 
 
 def yes_no_ids(tok):
@@ -122,7 +130,7 @@ class AsyncAnswers:
 
 # ------------------------------------------------------- chunk packing
 
-def pack_chunk(torch, arena, groups, timing=None):
+def pack_chunk(torch, arena, groups, timing=None, pinned=True):
     """Tensors for one chunk, built from groups in chunk order.
 
     Each group is a dict:
@@ -192,12 +200,12 @@ def pack_chunk(torch, arena, groups, timing=None):
     if cross_keys:
         table, _ = arena.block_table(cross_keys)
         t = _tick(timing, "pack_blocktable", t)
-        used = _staged(torch, cross_used, torch.int32)
+        used = _staged(torch, cross_used, torch.int32, pinned)
         cu_k = _staged(torch, [0] + list(_cumsum(cross_used)),
-                       torch.int32)
+                       torch.int32, pinned)
         cross = dict(
-            rows=_staged(torch, suffix_rows, torch.int64),
-            cu_q=_staged(torch, cu_q, torch.int32),
+            rows=_staged(torch, suffix_rows, torch.int64, pinned),
+            cu_q=_staged(torch, cu_q, torch.int32, pinned),
             max_q=max_q, keys=cross_keys, used=used,
             max_used=max(cross_used), table=table, cu_k=cu_k)
     t = _tick(timing, "pack_cross", t)
@@ -211,19 +219,19 @@ def pack_chunk(torch, arena, groups, timing=None):
         src = []
         for _, r0, r1, _ in kv_writes:
             src.extend(range(r0, r1))
-        kv_src = _staged(torch, src, torch.int64)
+        kv_src = _staged(torch, src, torch.int64, pinned)
         kv_dst = _staged(torch, torch.cat(
             [arena._rows[key][dest:dest + (r1 - r0)]
-             for key, r0, r1, dest in kv_writes]), torch.int64)
+             for key, r0, r1, dest in kv_writes]), torch.int64, pinned)
     t = _tick(timing, "pack_kv", t)
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross, paged=True,
-        cu_a=_staged(torch, cu_a, torch.int32),
+        cu_a=_staged(torch, cu_a, torch.int32, pinned),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = dict(
-        input_ids=_staged(torch, ids, torch.int64),
-        positions=_staged(torch, pos, torch.int64),
-        final_indices=_staged(torch, finals, torch.int64),
+        input_ids=_staged(torch, ids, torch.int64, pinned),
+        positions=_staged(torch, pos, torch.int64, pinned),
+        final_indices=_staged(torch, finals, torch.int64, pinned),
         meta=meta, tokens=len(ids), layout=layout)
     _tick(timing, "pack_h2d", t)
     return out
@@ -462,7 +470,7 @@ def _shared_preamble_tokens(question_ids):
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, trace=None, store=None,
                store_hash=None, store_min_tokens=1, stats=None,
-               store_ids=None, timing=None):
+               store_ids=None, timing=None, pinned=True):
     """The filter chain on the packed executor: continuous admission,
     survivor priority, pages freed on NO or after the last stage.
 
@@ -486,6 +494,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     (next_chunk, alloc, pack and its sub-phases, forward launch,
     submit, report wait/scatter, drain_saves) accumulate into it.
     Timing is host-side only and does not change what runs.
+
+    pinned: pass False to build chunk tensors with pageable blocking
+    copies (the pre-#12 path; the ablation ladder's staging rung).
 
     Returns (answers, spans, tokens): answers[d] = 0/1 list up to the
     first NO (gated); spans and tokens as in run_join.
@@ -596,7 +607,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                                                   doc)
         t = _tick(timing, "alloc", t)
         chunk = pack_chunk(torch, arena, [to_spec(*g) for g in groups],
-                           timing=timing)
+                           timing=timing, pinned=pinned)
         t = _tick(timing, "pack", t)
         tokens += chunk["tokens"]
         if trace is not None:

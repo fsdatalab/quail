@@ -18,6 +18,11 @@ chunk-slice/kept-tensor concatenation. meta["paged"]=False switches to
 the gather fallback (contiguous copies) if the paged kernel ever fails
 a parity gate.
 
+Pipeline(kernels="vllm") swaps the three Triton kernels for the engine's
+own ops (fused-add rms_norm + separate quantize, silu_and_mul +
+separate quantize, per-head norms + rotary module) - the ablation
+ladder's A2 rung. Everything else in the pass is identical.
+
 Everything here imports torch lazily: the module only runs inside the
 Modal image.
 """
@@ -29,9 +34,14 @@ class Pipeline:
     """Packed forward passes with shared-prefix attention over the
     paged arena."""
 
-    def __init__(self, model, arena):
+    def __init__(self, model, arena, kernels="quail"):
         import torch
         from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+        if kernels not in ("quail", "vllm"):
+            raise ValueError(f"kernels must be 'quail' or 'vllm', "
+                             f"got {kernels!r}")
+        self.kernels = kernels
 
         self.torch = torch
         self.model = model
@@ -262,6 +272,40 @@ class Pipeline:
             HD=self.head_dim, HALF=self.head_dim // 2)
         return q, k
 
+    # ---- the vLLM-kernel path (kernels="vllm", ablation rung A2) -----
+    # the same ops the engine's compiled graph runs, called eagerly;
+    # the exploration's experiment 2 ran exactly this sequence
+
+    def vllm_norm_quant(self, hidden, norm, residual):
+        """fused-add rms_norm, then a separate quantize: two kernels
+        where custom_norm_quant is one."""
+        normed, residual = self.fused_add_rms_norm(hidden, residual,
+                                                   norm)
+        return self.quant(normed)
+
+    def vllm_silu_quant(self, gate_up):
+        """silu_and_mul, then a separate quantize."""
+        from vllm import _custom_ops as ops
+        out = self.torch.empty(
+            (gate_up.shape[0], gate_up.shape[1] // 2),
+            dtype=gate_up.dtype, device=gate_up.device)
+        ops.silu_and_mul(out, gate_up)
+        return self.quant(out)
+
+    def vllm_qk_norm_rope(self, qkv, positions, attn):
+        """Per-head q/k norms plus rotary as the attention module runs
+        them: two contiguous copies, two rms_norm calls, one rotary -
+        five kernels where custom_qk_norm_rope is one."""
+        n = qkv.shape[0]
+        qw = self.num_q_heads * self.head_dim
+        kw = self.num_kv_heads * self.head_dim
+        q, k, _ = qkv.split([qw, kw, kw], dim=-1)
+        q = self.rms_norm(q.reshape(-1, self.head_dim).contiguous(),
+                          attn.q_norm).reshape(n, qw)
+        k = self.rms_norm(k.reshape(-1, self.head_dim).contiguous(),
+                          attn.k_norm).reshape(n, kw)
+        return self.rotary(positions, q, k)
+
     # ---- attention: two calls, one merge ----------------------------
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
@@ -357,20 +401,33 @@ class Pipeline:
                 residual = hidden
                 q_in, q_scale = self.quant(
                     self.rms_norm(hidden, layer.input_layernorm))
-            else:
+            elif self.kernels == "quail":
                 q_in, q_scale = self.custom_norm_quant(
                     hidden, layer.input_layernorm, residual)
+            else:
+                q_in, q_scale = self.vllm_norm_quant(
+                    hidden, layer.input_layernorm, residual)
             qkv = self.gemm(q_in, q_scale, attn.qkv_proj)
-            q, k = self.custom_qk_norm_rope(qkv, positions, attn)
+            if self.kernels == "quail":
+                q, k = self.custom_qk_norm_rope(qkv, positions, attn)
+            else:
+                q, k = self.vllm_qk_norm_rope(qkv, positions, attn)
             v = qkv[:, (self.num_q_heads + self.num_kv_heads)
                     * self.head_dim:]
             attn_out = self.attention(q, k, v, meta)
             o_in, o_scale = self.quant(attn_out)
             hidden = self.gemm(o_in, o_scale, attn.o_proj)
-            g_in, g_scale = self.custom_norm_quant(
-                hidden, layer.post_attention_layernorm, residual)
+            if self.kernels == "quail":
+                g_in, g_scale = self.custom_norm_quant(
+                    hidden, layer.post_attention_layernorm, residual)
+            else:
+                g_in, g_scale = self.vllm_norm_quant(
+                    hidden, layer.post_attention_layernorm, residual)
             gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
-            d_in, d_scale = self.custom_silu_quant(gate_up)
+            if self.kernels == "quail":
+                d_in, d_scale = self.custom_silu_quant(gate_up)
+            else:
+                d_in, d_scale = self.vllm_silu_quant(gate_up)
             hidden = self.gemm(d_in, d_scale, layer.mlp.down_proj)
         final = chunk["final_indices"]
         last_hidden = hidden.index_select(0, final)
