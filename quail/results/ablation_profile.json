@@ -12,27 +12,27 @@
   "rungs": {
     "A2": {
       "fresh_tokens": 1151259,
-      "cuda_busy_s": 13.06,
-      "us_per_token": 11.35,
+      "cuda_busy_s": 12.67,
+      "us_per_token": 11.01,
       "category_s": {
         "attention": 0.91,
-        "copies": 1.24,
-        "gemm": 5.96,
+        "copies": 0.97,
+        "gemm": 5.85,
         "other": 0.09,
-        "quant": 1.91,
+        "quant": 1.9,
         "vllm_elementwise": 2.95
       },
       "category_us_per_token": {
         "attention": 0.79,
-        "copies": 1.08,
-        "gemm": 5.18,
+        "copies": 0.84,
+        "gemm": 5.08,
         "other": 0.08,
-        "quant": 1.66,
+        "quant": 1.65,
         "vllm_elementwise": 2.56
       },
       "category_launches": {
         "attention": 3780,
-        "copies": 11574,
+        "copies": 10170,
         "gemm": 3045,
         "other": 2352,
         "quant": 3024,
@@ -40,23 +40,23 @@
       },
       "top_kernels": [
         {
-          "s": 2.948,
+          "s": 2.909,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u,"
         },
         {
-          "s": 1.906,
+          "s": 1.902,
           "name": "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, floa"
         },
         {
-          "s": 1.431,
+          "s": 1.382,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, "
         },
         {
-          "s": 1.005,
+          "s": 1.006,
           "name": "void vllm::rms_norm_kernel<c10::BFloat16, 8, 2, true>(c10::BFloat16*, c10::BFloat16 const*"
         },
         {
-          "s": 0.924,
+          "s": 0.91,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, "
         },
         {
@@ -68,11 +68,11 @@
           "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native:"
         },
         {
-          "s": 0.642,
+          "s": 0.64,
           "name": "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::Col"
         },
         {
-          "s": 0.607,
+          "s": 0.597,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, "
         },
         {
@@ -84,23 +84,27 @@
           "name": "void vllm::rotary_embedding_kernel<c10::BFloat16, c10::BFloat16, true>(long const*, c10::B"
         },
         {
-          "s": 0.359,
-          "name": "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::n"
-        },
-        {
-          "s": 0.195,
-          "name": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, "
-        },
-        {
           "s": 0.185,
           "name": "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::Col"
         },
         {
-          "s": 0.089,
+          "s": 0.107,
+          "name": "kv_row_scatter"
+        },
+        {
+          "s": 0.091,
+          "name": "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::n"
+        },
+        {
+          "s": 0.088,
           "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native:"
         },
         {
-          "s": 0.046,
+          "s": 0.086,
+          "name": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, "
+        },
+        {
+          "s": 0.045,
           "name": "void cutlass::device_kernel<flash::FlashAttnFwdCombine<cute::tuple<cute::C<8>, cute::C<128"
         },
         {
@@ -134,31 +138,27 @@
         {
           "s": 0.004,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, "
-        },
-        {
-          "s": 0.003,
-          "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 128u, "
         }
       ],
       "accounting": "kernel events only, from the chrome trace; op wrappers and runtime events excluded"
     },
     "A3": {
       "fresh_tokens": 1149933,
-      "cuda_busy_s": 10.25,
-      "us_per_token": 8.91,
+      "cuda_busy_s": 9.89,
+      "us_per_token": 8.6,
       "category_s": {
-        "attention": 0.98,
-        "copies": 0.73,
-        "gemm": 6.28,
+        "attention": 0.97,
+        "copies": 0.44,
+        "gemm": 6.23,
         "other": 0.1,
         "quant": 0.46,
-        "triton_fused": 1.69,
+        "triton_fused": 1.68,
         "vllm_elementwise": 0.0
       },
       "category_us_per_token": {
         "attention": 0.85,
-        "copies": 0.63,
-        "gemm": 5.46,
+        "copies": 0.38,
+        "gemm": 5.42,
         "other": 0.08,
         "quant": 0.4,
         "triton_fused": 1.47,
@@ -166,7 +166,7 @@
       },
       "category_launches": {
         "attention": 3780,
-        "copies": 10350,
+        "copies": 8946,
         "gemm": 3045,
         "other": 2352,
         "quant": 777,
@@ -175,27 +175,27 @@
       },
       "top_kernels": [
         {
-          "s": 3.149,
+          "s": 3.122,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u,"
         },
         {
-          "s": 1.465,
+          "s": 1.45,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 9728u, 1u, 256u, "
         },
         {
-          "s": 0.986,
+          "s": 0.979,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 6144u, 2560u, 1u, 256u, "
         },
         {
-          "s": 0.915,
+          "s": 0.908,
           "name": "silu_mul_quant"
         },
         {
-          "s": 0.699,
+          "s": 0.694,
           "name": "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::Col"
         },
         {
-          "s": 0.641,
+          "s": 0.636,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 2560u, 4096u, 1u, 256u, "
         },
         {
@@ -203,32 +203,36 @@
           "name": "add_rms_norm_quant"
         },
         {
-          "s": 0.461,
+          "s": 0.456,
           "name": "void per_token_group_quant_8bit_kernel<c10::BFloat16, c10::Float8_e4m3fn, true, true, floa"
-        },
-        {
-          "s": 0.381,
-          "name": "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::n"
         },
         {
           "s": 0.284,
           "name": "qk_norm_rope"
         },
         {
-          "s": 0.197,
+          "s": 0.196,
           "name": "void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::Col"
         },
         {
-          "s": 0.196,
-          "name": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, "
+          "s": 0.116,
+          "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native:"
         },
         {
-          "s": 0.117,
-          "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native:"
+          "s": 0.108,
+          "name": "kv_row_scatter"
+        },
+        {
+          "s": 0.096,
+          "name": "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::n"
         },
         {
           "s": 0.092,
           "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native:"
+        },
+        {
+          "s": 0.086,
+          "name": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, "
         },
         {
           "s": 0.048,
@@ -269,14 +273,10 @@
         {
           "s": 0.003,
           "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 128u,"
-        },
-        {
-          "s": 0.003,
-          "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<(cute::UMMA::Major)0, 0u, 19456u, 2560u, 1u, 256u,"
         }
       ],
       "accounting": "kernel events only, from the chrome trace; op wrappers and runtime events excluded"
     }
   },
-  "provenance": "recomputed locally from the chrome traces banked at modal volume quail-results:/ablations/profile_a2.json.gz and profile_a3.json.gz (themselves produced by the profile_packed cell on 2026-08-19)"
+  "provenance": "recomputed locally from the chrome traces banked at modal volume quail-results:/ablations/profile_a2.json.gz and profile_a3.json.gz (profile_packed cell, post kv_row_scatter fix, 2026-08-19)"
 }

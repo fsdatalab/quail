@@ -457,10 +457,11 @@ def profile_packed(n_docs: int = 3000) -> str:
                 getattr(ev, "self_cuda_time_total", 0)
             if not cuda_us:
                 continue
-            # skip op wrappers ("_C::...") and runtime events: they
-            # carry the same device time as the kernel they launched
-            # and would double-count it
-            if ev.key.startswith("_C::") or "Command Buffer" in ev.key:
+            # skip op wrappers ("_C::...", "aten::...") and runtime
+            # events: they carry the same device time as the kernel
+            # they launched and would double-count it
+            if (ev.key.startswith(("_C::", "aten::"))
+                    or "Command Buffer" in ev.key):
                 continue
             cat = _categorize(ev.key)
             cats[cat] = cats.get(cat, 0.0) + cuda_us
