@@ -8,7 +8,10 @@
     "kept_vs_shared_disagreements": 0,
     "paged_vs_gather_disagreements": 0,
     "multi_group_disagreements": 0,
-    "mixed_kept_fresh_disagreements": 0
+    "mixed_kept_fresh_disagreements": 0,
+    "fast_path_disagreements": 0,
+    "fast_path_multi_group_disagreements": 0,
+    "fast_path_multi_suffix_raises": true
   },
   "lengths": {
     "prefix": 3529,
@@ -17,8 +20,8 @@
   "rate": {
     "chunks": 2,
     "tokens": 169452,
-    "wall_s": 2.183,
-    "tok_s": 77609.0
+    "wall_s": 2.161,
+    "tok_s": 78427.6
   },
   "peak_gib": 62.88,
   "pass": true

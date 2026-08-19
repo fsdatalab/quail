@@ -283,21 +283,35 @@ def probe() -> str:
         mixed_got = answerer(mixed)
         dis_mixed = sum(x != y for x, y in zip(mixed_got, mixed_expect))
 
-        # 8. the single-stage fast path: fresh groups whose keys own
-        # no arena pages pack [prefix | suffix] as ONE causal segment
-        # - no scatter, no call B - and must answer as the paged path
-        fast_chunk = pack_chunk(torch, arena,
-                                [fresh_group("np", prefix, sufs)])
-        assert fast_chunk["meta"]["kv_src"] is None
-        assert fast_chunk["meta"]["cross"] is None
-        fast_answers = answerer(pipeline.forward_chunk(fast_chunk))
+        # 8. the single-stage fast path: a fresh group whose key owns
+        # no arena pages packs [prefix | suffix] as ONE causal
+        # segment - no scatter, no call B - and must answer as the
+        # paged path. One suffix per group (the driver's shape); a
+        # multi-suffix unpaged group raises by construction.
+        fast_answers = []
+        for suf in sufs:
+            fc = pack_chunk(torch, arena,
+                            [fresh_group("np", prefix, [suf])])
+            assert fc["meta"]["kv_src"] is None
+            assert fc["meta"]["cross"] is None
+            fast_answers.extend(
+                answerer(pipeline.forward_chunk(fc)))
         dis_fast = sum(a != b for a, b in zip(fast_answers,
                                               shared_answers))
+        try:
+            pack_chunk(torch, arena,
+                       [fresh_group("np", prefix, sufs[:2])])
+            raised = False
+        except ValueError:
+            raised = True
+        # two merged groups in ONE chunk: segments must not bleed
         both_fast = pipeline.forward_chunk(pack_chunk(
-            torch, arena, [fresh_group("np0", prefix, sufs2),
-                           fresh_group("np1", p1, sufs2)]))
-        dis_fast_multi = sum(x != y for x, y in
-                             zip(answerer(both_fast), multi_expect))
+            torch, arena, [fresh_group("np0", prefix, [sufs2[0]]),
+                           fresh_group("np1", p1, [sufs2[0]])]))
+        dis_fast_multi = sum(
+            x != y for x, y in
+            zip(answerer(both_fast),
+                [multi_expect[0], multi_expect[len(sufs2)]]))
     arena.free_key("r0")
 
     gap = (normed_shared.float()
@@ -315,6 +329,7 @@ def probe() -> str:
         mixed_kept_fresh_disagreements=int(dis_mixed),
         fast_path_disagreements=int(dis_fast),
         fast_path_multi_group_disagreements=int(dis_fast_multi),
+        fast_path_multi_suffix_raises=bool(raised),
     )
 
     # ---- 7. rate at the large-chunk geometry: 2 reports x all terms
@@ -360,7 +375,7 @@ def probe() -> str:
     result["pass"] = (worst < 0.05 and dis_su == 0 and dis_ks == 0
                       and dis_pg == 0 and dis_multi == 0
                       and dis_mixed == 0 and dis_fast == 0
-                      and dis_fast_multi == 0)
+                      and dis_fast_multi == 0 and raised)
     return _write(result, "probe")
 
 
