@@ -83,3 +83,47 @@ ax.set_title("Forward-pass ablation", fontsize=12, fontweight="bold",
 fig.tight_layout()
 fig.savefig(OUT / "ablation_ladder.png", bbox_inches="tight")
 print("wrote", OUT / "ablation_ladder.png")
+
+# ---------------- profile: where A2's time goes vs A3 -----------------
+# Per-token GPU kernel time by bucket, from the chrome traces banked
+# in results/ablation_profile.json (kernel events only).
+
+prof = load("ablation_profile.json")
+buckets = ["gemm", "attention", "small kernels", "KV/copies", "other"]
+
+
+def bucketed(rung):
+    cats = prof["rungs"][rung]["category_us_per_token"]
+    small = cats.get("vllm_elementwise", 0) + cats.get("quant", 0) \
+        + cats.get("triton_fused", 0)
+    return [cats.get("gemm", 0), cats.get("attention", 0), small,
+            cats.get("copies", 0), cats.get("other", 0)]
+
+
+a2 = bucketed("A2")
+a3 = bucketed("A3")
+
+fig, ax = plt.subplots(figsize=(9, 3.2), dpi=150)
+y = list(range(len(buckets)))
+h = 0.34
+ax.barh([i - h / 2 for i in y], a2, height=h, color=BLUE,
+        label="A2: our executor, vLLM kernels")
+ax.barh([i + h / 2 for i in y], a3, height=h, color=GREEN,
+        label="A3: our executor, our kernels")
+for i, (v2, v3) in enumerate(zip(a2, a3)):
+    ax.text(v2 + 0.06, i - h / 2, f"{v2:.2f}", va="center", fontsize=8.5,
+            color=DARK)
+    ax.text(v3 + 0.06, i + h / 2, f"{v3:.2f}", va="center", fontsize=8.5,
+            color=DARK)
+ax.set_yticks(y)
+ax.set_yticklabels(buckets, fontsize=9.5)
+ax.invert_yaxis()
+ax.set_xlabel("microseconds per token (GPU kernel time)", fontsize=9)
+ax.set_xlim(0, 6.6)
+ax.legend(fontsize=8.5, frameon=False, loc="lower right")
+ax.spines[["top", "right"]].set_visible(False)
+ax.set_title("Where the time goes per token: the fused kernels remove "
+             "2.4 µs/token", fontsize=12, fontweight="bold", loc="left")
+fig.tight_layout()
+fig.savefig(OUT / "ablation_profile.png", bbox_inches="tight")
+print("wrote", OUT / "ablation_profile.png")
