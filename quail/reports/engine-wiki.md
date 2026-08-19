@@ -25,6 +25,7 @@ payload to the worker, which calls the executor.
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
 | `planner/calibration.py` | Measured constants (a, a2, q_kv) and scaling | specs |
+| `planner/calibrate.py` | Length-sweep measure of a and a2 | calibration, executor |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
 | `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, calibration, plan |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
@@ -36,6 +37,7 @@ payload to the worker, which calls the executor.
 | `runtime/session.py` | Session, Query, tokenization, payload assembly | catalog, logical, planner, sqlfront, builder |
 | `runtime/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `runtime/worker.py` | Modal worker (boot, execute, multi-GPU dispatch) | executor, planner, coordinator |
+| `runtime/calibrate.py` | Modal entry for measure, on quail-engine | planner, worker |
 | `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
 
 ### Data flow
@@ -348,11 +350,11 @@ model with more parameters costs proportionally more per token, a
 device with a higher FLOP ceiling costs proportionally less
 (`calibration.py:70-77`).
 
-The calibration cell (`tests/gpu/milestone1.py::run_calibrate`)
-sweeps document length through the packed filter and fits
-`t(h) = a + a2 * h` by least squares. It also probes the host copy
-channels (pinned and unpinned, both directions) for the store
-break-even.
+`quail.planner.calibrate.measure` (Modal entry:
+`quail/runtime/calibrate.py`) sweeps document length through the
+packed filter and fits `t(h) = a + a2 * h` by least squares. It
+also probes the host copy channels (pinned and unpinned, both
+directions) for the store break-even.
 
 Additionally, `calibration/channels.json` stores host-memory
 bandwidth measurements (pinned device-to-host, host-to-device, etc.)
@@ -380,6 +382,8 @@ single forward pass, sharing KV across them through a paged arena.
 | `chunk_budget` | `budgets.py:62` | Tokens per forward pass (min of memory and kernel bounds) |
 | `arena_tokens` | `budgets.py:69` | KV residency budget (device memory minus weights and activations) |
 | `load_calibration` | `calibration.py:80` | Load or spec-scale the calibration constants |
+| `measure` | `calibrate.py` | Length sweep + affine fit of a, a2 (GPU) |
+| `commit_calibration` | `calibration.py` | Write the three constants to the pair file |
 
 ### 5.1 Chunk packing
 

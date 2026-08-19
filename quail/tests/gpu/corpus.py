@@ -79,19 +79,6 @@ def build_corpus(tok, n_docs, seed_offset=100, n_filters=None):
     return body_ids, q_ids, flags
 
 
-def token_stream(tok, n_tokens):
-    """A flat stream of at least n_tokens real-text token ids from the
-    IMDB pool, for the calibration cell's exact-length documents. The
-    text only needs to be realistic; nothing grades the answers."""
-    ids = []
-    for text in build_pool(10_000):
-        ids.extend(tok(text, add_special_tokens=False)["input_ids"])
-        if len(ids) >= n_tokens:
-            return ids
-    reps = -(-n_tokens // len(ids))
-    return (ids * reps)[:n_tokens]
-
-
 # -------------------------------------------------------- the join set
 
 NWAY_PREAMBLE = ("You will be shown a report document and a candidate "
