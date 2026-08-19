@@ -652,6 +652,21 @@ that runs until `FilterAdmission.done()`:
 5. Documents leaving their last stage (or failing) are saved to the
    KV store if they meet the length threshold.
 
+Single-stage queries (one question, no store) skip the arena
+entirely: no later stage reads any document's KV, so the alloc, the
+per-layer scatter, and the paged cross-read serve no one. Each
+[document | question] packs as ONE causal segment - the suffix reads
+the prefix through call A alone, the same computation stock vLLM
+runs per request - and admission runs on the token budget alone
+(`FilterAdmission` with `arena_pages=None`). Measured on the
+10,000-document single-question workload (`results/m1_filter1.json`):
+28.1 s vs 30.0 s with the arena (1.9 s saved, 6.3%; 121k vs 114k
+tokens/s). Answer equivalence against stock vLLM: the fast path
+differs from stock on 691 of 10,000 near-tie answers, the arena path
+on 712 - the reordering moves both packed paths symmetrically around
+the reference (the arena path re-chunked at a smaller budget is
+bit-identical, so chunk scheduling contributes nothing).
+
 **`run_join`** (`loop.py:216`): the join driver. The pair list is
 pre-planned by `pack_stream`, then chunks are launched in order.
 Between stages, answers are gated: anchors with no surviving pairs

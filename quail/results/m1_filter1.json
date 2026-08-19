@@ -1,0 +1,104 @@
+{
+  "cell": "m1_filter1",
+  "n_docs": 10000,
+  "corpus_tokens": 3037952,
+  "exec_budget": 110376,
+  "arena_tokens": 345974,
+  "kv": "bf16",
+  "prediction": "arena ~30.6-30.9 s, fast ~28.7-28.9 s (saved ~1.8 s); path flips ~629 with scheduling floor 0; fast vs stock within 1.5x of arena vs stock",
+  "runs": [
+    {
+      "rep": 0,
+      "mode": "arena",
+      "wall": 30.06,
+      "fresh_tokens": 3497952,
+      "tok_s": 116350.6,
+      "answered": 10000,
+      "yes": 8060,
+      "wrong": 883,
+      "chunks": 32,
+      "gpu_s": 29.99,
+      "peak_gib": 65.93
+    },
+    {
+      "rep": 0,
+      "mode": "no_arena",
+      "wall": 28.14,
+      "fresh_tokens": 3497952,
+      "tok_s": 124307.8,
+      "answered": 10000,
+      "yes": 8033,
+      "wrong": 910,
+      "chunks": 32,
+      "gpu_s": 28.11,
+      "peak_gib": 65.92
+    },
+    {
+      "rep": 0,
+      "mode": "arena_rechunked",
+      "wall": 30.04,
+      "fresh_tokens": 3497952,
+      "tok_s": 116448.2,
+      "answered": 10000,
+      "yes": 8060,
+      "wrong": 883,
+      "chunks": 33,
+      "gpu_s": 29.98,
+      "peak_gib": 65.66
+    },
+    {
+      "rep": 1,
+      "mode": "arena",
+      "wall": 30.03,
+      "fresh_tokens": 3497952,
+      "tok_s": 116478.2,
+      "answered": 10000,
+      "yes": 8060,
+      "wrong": 883,
+      "chunks": 32,
+      "gpu_s": 29.97,
+      "peak_gib": 65.93
+    },
+    {
+      "rep": 1,
+      "mode": "no_arena",
+      "wall": 28.15,
+      "fresh_tokens": 3497952,
+      "tok_s": 124264.2,
+      "answered": 10000,
+      "yes": 8033,
+      "wrong": 910,
+      "chunks": 32,
+      "gpu_s": 28.11,
+      "peak_gib": 65.92
+    },
+    {
+      "rep": 1,
+      "mode": "arena_rechunked",
+      "wall": 30.06,
+      "fresh_tokens": 3497952,
+      "tok_s": 116359.0,
+      "answered": 10000,
+      "yes": 8060,
+      "wrong": 883,
+      "chunks": 33,
+      "gpu_s": 29.99,
+      "peak_gib": 65.66
+    }
+  ],
+  "warmup_s": 2.58,
+  "best_wall": {
+    "arena": 30.03,
+    "no_arena": 28.14
+  },
+  "saved_s": 1.89,
+  "flips": {
+    "path_vs_arena": 629,
+    "arena_vs_rechunked": 0,
+    "path_yes_to_no": 328,
+    "arena_vs_stock": 712,
+    "fast_vs_stock": 691,
+    "stock_wrong": 967
+  },
+  "pass": true
+}
