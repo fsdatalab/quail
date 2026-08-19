@@ -104,9 +104,9 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
         t0 = time.perf_counter()
         model = load_model(MODEL)
         boot["load_model_s"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         chunk = budgets.chunk_budget(spec, device)
         arena_tok = budgets.arena_tokens(spec, device, chunk)
-        t0 = time.perf_counter()
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
@@ -189,11 +189,13 @@ def stock_boot_trial(trial: int = 0) -> dict:
 @app.function(timeout=600, image=image, memory=4096,
               volumes={"/results": results_vol})
 def write_boot_report(report: dict) -> str:
-    """Persist the merged compare JSON on the results volume."""
+    """Persist per-side and merged compare JSON on the results volume."""
     os.makedirs("/results/boot", exist_ok=True)
-    path = "/results/boot/compare.json"
-    with open(path, "w") as f:
-        json.dump(report, f, indent=2)
+    for name, key in (("quail", "quail"), ("stock", "stock"),
+                      ("compare", None)):
+        payload = report if key is None else report[key]
+        with open(f"/results/boot/{name}.json", "w") as f:
+            json.dump(payload, f, indent=2)
     results_vol.commit()
     return json.dumps(report, indent=2)
 

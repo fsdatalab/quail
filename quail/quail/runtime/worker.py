@@ -93,9 +93,11 @@ def execute(payload: dict) -> dict:
         t0 = time.perf_counter()
         model = load_model(spec.hf_name)
         boot["load_model_s"] = time.perf_counter() - t0
+        # budgets.* is tiny CPU; fold into arena_s so the four phases
+        # cover the cold-load span without a leftover residual
+        t0 = time.perf_counter()
         chunk = budgets.chunk_budget(spec, device)
         arena_tok = budgets.arena_tokens(spec, device, chunk)
-        t0 = time.perf_counter()
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
@@ -325,9 +327,9 @@ def _child_boot(state, sub):
         t0 = time.perf_counter()
         model = load_model(spec.hf_name)
         boot["load_model_s"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         chunk = budgets.chunk_budget(spec, device)
         arena_tok = budgets.arena_tokens(spec, device, chunk)
-        t0 = time.perf_counter()
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
