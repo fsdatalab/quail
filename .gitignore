@@ -17,6 +17,12 @@ exploration/tmp/
 exploration/output/
 exploration/results/*.log
 exploration/results/engine/torchprof_*
+old_exploration/tmp/
+old_exploration/output/
+old_exploration/results/engine/torchprof_*
 
 # generated benchmark corpora are rebuilt from seeds, never versioned
 quail/results/quailb_data/
+# process ID files and profiler traces are local artifacts
+quail/results/*.pid
+quail/results/torchprof_*.json.gz
