@@ -212,24 +212,27 @@ WHERE AI_FILTER(PROMPT('...same prompt...', a.review, b.thread,
 ```
 
 At run time each tuple renders as labeled document blocks followed
-by the template as the question, its placeholders replaced by
-block references — the template is never inlined:
+by the template as the question, appended verbatim — the {0}, {1},
+{2} markers stay in it and nothing is ever filled in. Each partner
+block is labeled with its own marker, and the anchor's naming line
+maps the top block to its marker, so a marker in the question
+resolves to its block:
 
 ```
 DOCUMENT:                              <- the anchor block: the bare
 <thread b17>                              engine preamble + document,
                                           KV kept once per anchor and
-(The document above is document b.)       byte-identical to a filter
+(The document above is {1}.)              byte-identical to a filter
                                           scan's stored prefix; the
-DOCUMENT a:                               naming line written into
+DOCUMENT {0}:                             naming line written into
 <review a3>                               kept KV once per anchor
 
-DOCUMENT c:                            <- each partner block + the
+DOCUMENT {2}:                          <- each partner block + the
 <product c9>                              question: one suffix, paid
                                           once per tuple
-Review document a praises the thread
-in document b and that thread
-recommends the product in document c.
+Review {0} praises the thread in {1}
+and that thread recommends the
+product in {2}.
 ```
 
 The anchor's document KV is computed once and every tuple of the

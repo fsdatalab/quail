@@ -135,7 +135,7 @@ def test_three_way_forms_compile_equal(catalog):
     assert on_plan == where_plan == built
 
 
-def test_join_prompt_renders_labeled_references():
+def test_join_prompt_keeps_markers_and_labels_blocks():
     from quail.logical import (bind_join_prompt, join_anchor_note,
                                join_label, render_join_question)
     from quail.logical import ColumnRef
@@ -144,15 +144,16 @@ def test_join_prompt_renders_labeled_references():
     p = bind_join_prompt("Does {0} praise {1}?", args, tok)
     assert p.template == "Does {0} praise {1}?"
     assert p.preamble == SHARED_PRE
-    # the rendered question references the blocks, never inlines them
-    assert p.tail == "\n\nDoes document a praise document b?"
+    # the question is the template verbatim - markers kept, nothing
+    # filled in; the blocks above carry the matching labels
+    assert p.tail == "\n\nDoes {0} praise {1}?"
     assert p.tail_tokens == len(tok(p.tail))
-    assert join_label("b") == "\n\nDOCUMENT b:\n"
-    assert "document b" in join_anchor_note("b")
+    assert join_label(1) == "\n\nDOCUMENT {1}:\n"
+    assert "{0}" in join_anchor_note(0)
     assert [a for a, _, _ in p.labels] == ["a", "b"]
-    assert p.labels[1][1] == len(tok(join_label("b")))
-    assert p.labels[0][2] == len(tok(join_anchor_note("a")))
-    assert render_join_question(p.template, p.args) == p.tail
+    assert p.labels[1][1] == len(tok(join_label(1)))
+    assert p.labels[0][2] == len(tok(join_anchor_note(0)))
+    assert render_join_question(p.template) == p.tail
 
 
 def test_join_rejects_second_predicate_and_repeat_alias(catalog):
@@ -284,12 +285,11 @@ def test_join_prompt_binding_counts(catalog):
                        {'selectivity': 0.5})
     """, catalog, tok)
     pred = plan.root.input.predicate
-    # the whole template is the per-tuple question - no text is
-    # relocated into the anchor's kept KV
+    # the whole template is the per-tuple question, verbatim - no
+    # substitution, no text relocated into the anchor's kept KV
     assert pred.frame == "" and pred.frame_tokens == 0
     assert pred.preamble == SHARED_PRE
-    assert pred.tail == ("\n\nJudge the pair: document r against "
-                         "document p. Done.")
+    assert pred.tail == "\n\nJudge the pair: {0} against {1}. Done."
     assert pred.tail_tokens == len(tok(pred.tail))
 
 

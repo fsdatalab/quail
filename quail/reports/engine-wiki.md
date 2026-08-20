@@ -151,8 +151,8 @@ and a join renders each tuple as the anchor block, its naming line,
 then one labeled block per partner and the question:
 
 ```
-[SHARED_PRE] [anchor document] [naming line]
-[DOCUMENT b:] [partner document] ... [question with references]
+[SHARED_PRE] [anchor document] [naming line: (The document above is {0}.)]
+[DOCUMENT {1}:] [partner document] ... [question with {0},{1},... markers kept]
 ```
 
 `SHARED_PRE` is `"DOCUMENT:\n"`, defined once in `logical.py`. It is
@@ -184,13 +184,17 @@ A filter carries the frame at the head of each stage's question
 suffix. A join prompt is bound differently (`bind_join_prompt`):
 the template is never inlined - each tuple renders as labeled
 document blocks (the anchor first, under the bare `SHARED_PRE`
-label) followed by the template as the question, its placeholders
-replaced by "document {alias}" references. The anchor's naming
-line - "(The document above is document b.)" - is written into its
-kept KV once per anchor (`write_suffix_tokens`, the same mechanism
-the old frame used), so the question can call the anchor by alias
-without paying those tokens per tuple. Partner block labels and
-the question ride in every tuple's suffix.
+label) followed by the template as the question, appended verbatim
+with its `{0}`, `{1}`, ... placeholder markers kept as written.
+Each partner block is labeled with its own marker
+(`DOCUMENT {1}:`, `DOCUMENT {2}:`, etc.), so a marker in the
+question resolves to its block. The anchor's naming line -
+"(The document above is {0}.)" - is written into its kept KV
+once per anchor (`write_suffix_tokens`, the same mechanism the
+old frame used), mapping the top block to its marker so the
+question can reference it without paying those tokens per tuple.
+Partner block labels and the question ride in every tuple's
+suffix.
 
 The planner prices the preamble once per document, the naming line
 once per join anchor, and labels + question once per tuple. See

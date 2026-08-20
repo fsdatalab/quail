@@ -36,36 +36,38 @@ SHARED_PRE = "DOCUMENT:\n"
 
 # The join prompt's fixed strings. A join renders each tuple as
 # labeled document blocks followed by the user's template as the
-# question; the template is never inlined - each placeholder becomes
-# a reference to its block. The anchor's block keeps the bare
-# SHARED_PRE label (so its KV is byte-identical to a filter scan of
-# the same document and the store serves both); the naming line
-# written right after it - into kept KV, once per anchor, never per
-# tuple - is what lets the question call it by alias anyway. Like
-# SHARED_PRE these are formatting labels, not instructions.
+# question, appended VERBATIM - the placeholders stay in it as
+# written ({0}, {1}, ...) and nothing is ever substituted into it.
+# Each partner block is labeled with the same marker ("DOCUMENT
+# {1}:"), so a marker in the question resolves to its block. The
+# anchor's block keeps the bare SHARED_PRE label (so its KV is
+# byte-identical to a filter scan of the same document and the store
+# serves both); the naming line written right after it - into kept
+# KV, once per anchor, never per tuple - maps the top block to its
+# marker. Like SHARED_PRE these are formatting labels, not
+# instructions.
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
-JOIN_ANCHOR_NOTE = "\n\n(The document above is document {}.)"
-JOIN_DOC_REF = "document {}"               # placeholder rendering
+JOIN_ANCHOR_NOTE = "\n\n(The document above is {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # blocks -> question
 
 
-def join_label(alias: str) -> str:
-    return JOIN_DOC_LABEL.format(alias)
+def _marker(placeholder: int) -> str:
+    return "{%d}" % placeholder
 
 
-def join_anchor_note(alias: str) -> str:
-    return JOIN_ANCHOR_NOTE.format(alias)
+def join_label(placeholder: int) -> str:
+    return JOIN_DOC_LABEL.format(_marker(placeholder))
 
 
-def render_join_question(template: str, args: tuple) -> str:
-    """The per-tuple question text: the user's template with every
-    placeholder replaced by a reference to its document block, behind
-    the separator that ends the block list."""
-    import re
-    refs = {i: JOIN_DOC_REF.format(r.alias) for i, r in enumerate(args)}
-    body = re.sub(r"\{(\d+)\}", lambda m: refs[int(m.group(1))],
-                  template)
-    return JOIN_QUESTION_SEP + body
+def join_anchor_note(placeholder: int) -> str:
+    return JOIN_ANCHOR_NOTE.format(_marker(placeholder))
+
+
+def render_join_question(template: str) -> str:
+    """The per-tuple question text: the user's template exactly as
+    written - braces kept, nothing filled in - behind the separator
+    that ends the block list."""
+    return JOIN_QUESTION_SEP + template
 
 
 @dataclass(frozen=True)
@@ -86,12 +88,13 @@ class Prompt:
     and `frame` is the user's pre-document text, relocated after the
     document and carried at the head of each stage's question.
 
-    Joins (bind_join_prompt): the template is never inlined - it is
-    the per-tuple question, appended after the labeled document
-    blocks with each placeholder rendered as a block reference.
-    `preamble` is still SHARED_PRE (the anchor block's label), `tail`
-    is the rendered question, `labels` carries the per-alias block
-    label and naming-line token counts, and `frame` is empty.
+    Joins (bind_join_prompt): the template is never filled in - it is
+    the per-tuple question, appended verbatim after the labeled
+    document blocks; its {0}, {1}, ... markers stay in it and refer
+    to the blocks. `preamble` is still SHARED_PRE (the anchor block's
+    label), `tail` is the question, `labels` carries each
+    placeholder's block-label and naming-line token counts, and
+    `frame` is empty.
 
     Token counts are filled at bind time when a tokenizer is
     available; None means the planner must be given counts."""
@@ -103,11 +106,11 @@ class Prompt:
     tail_tokens: Optional[int] = None
     frame: str = ""
     frame_tokens: Optional[int] = None
-    # join prompts only: per referenced alias, in placeholder order,
+    # join prompts only: per placeholder, in order,
     # (alias, label_tokens, note_tokens) - the partner block label
-    # "\n\nDOCUMENT {alias}:\n" and the anchor naming line, counted at
-    # bind time so the planner prices any anchor choice without a
-    # tokenizer. Empty for filter prompts.
+    # "\n\nDOCUMENT {i}:\n" and the anchor naming line for that
+    # placeholder, counted at bind time so the planner prices any
+    # anchor choice without a tokenizer. Empty for filter prompts.
     labels: tuple = ()
 
 
@@ -301,21 +304,23 @@ def bind_join_prompt(template: str, args: tuple,
     """Build a join Prompt: one prompt over the whole tuple, one
     placeholder per table, evaluated on the cross product.
 
-    The template is kept as written and is never inlined: at run time
-    each tuple renders as labeled document blocks (the anchor's block
-    first, under the bare SHARED_PRE label plus its naming line; each
-    partner under "DOCUMENT {alias}:") followed by this template as
-    the question, with every placeholder replaced by "document
-    {alias}". So:
+    The template is never filled in: at run time each tuple renders
+    as labeled document blocks (the anchor's block first, under the
+    bare SHARED_PRE label plus its naming line; each partner under
+    "DOCUMENT {i}:", its own placeholder marker) followed by this
+    template as the question, verbatim - the {0}, {1}, ... markers
+    stay in it and refer to the blocks. So:
 
         preamble      SHARED_PRE - the anchor block's label, paid
                       once per anchor document (and byte-identical to
                       a filter scan's stored prefix, which is what
                       lets the store serve both)
-        tail          the rendered question, paid once per tuple
-        labels        (alias, label_tokens, note_tokens) per table:
-                      a partner block's label is paid once per tuple,
-                      the anchor's naming line once per anchor
+        tail          the question (separator + raw template), paid
+                      once per tuple
+        labels        (alias, label_tokens, note_tokens) per
+                      placeholder, in order: a partner block's label
+                      is paid once per tuple, the anchor's naming
+                      line once per anchor
 
     Each placeholder must name a distinct table (one block per
     table)."""
@@ -328,18 +333,18 @@ def bind_join_prompt(template: str, args: tuple,
         raise CompileError(
             f"each join placeholder must name a distinct table (one "
             f"document block per table), got aliases {aliases}; refer "
-            f"to a table's document again in the question text "
-            f"instead of adding a second placeholder")
-    question = render_join_question(template, tuple(args))
+            f"to a table's document again in the question text with "
+            f"its marker instead of adding a second placeholder")
+    question = render_join_question(template)
     pre_tok = tail_tok = frame_tok = None
     labels = tuple((a, None, None) for a in aliases)
     if tokenizer is not None:
         pre_tok = len(tokenizer(SHARED_PRE))
         tail_tok = len(tokenizer(question))
         frame_tok = 0
-        labels = tuple((a, len(tokenizer(join_label(a))),
-                        len(tokenizer(join_anchor_note(a))))
-                       for a in aliases)
+        labels = tuple((a, len(tokenizer(join_label(i))),
+                        len(tokenizer(join_anchor_note(i))))
+                       for i, a in enumerate(aliases))
     return Prompt(template=template, args=tuple(args),
                   preamble=SHARED_PRE, tail=question,
                   preamble_tokens=pre_tok, tail_tokens=tail_tok,

@@ -295,16 +295,15 @@ def test_payload_carries_yes_no_and_join_spec(sess):
     assert "pre" not in j
     assert j["anchor"] == "r" and j["partners"] == ["p"]
     # the naming line goes into the anchor's kept KV once per anchor;
-    # each partner's block label and the rendered question (the whole
-    # template, placeholders as block references) ride per tuple
-    assert j["frame"] == fake_tok(join_anchor_note("r"))
-    assert j["labels"] == {"p": fake_tok(join_label("p"))}
-    assert j["tail"] == fake_tok(
-        "\n\nDoes document r match document p? Answer.")
+    # each partner's block label (its own placeholder marker) and the
+    # question (the raw template, markers kept - never filled in)
+    # ride per tuple. r is placeholder 0, p is placeholder 1.
+    assert j["frame"] == fake_tok(join_anchor_note(0))
+    assert j["labels"] == {"p": fake_tok(join_label(1))}
+    assert j["tail"] == fake_tok("\n\nDoes {0} match {1}? Answer.")
     logical = sess.sql(sql).logical
     pred = logical.root.input.predicate
-    assert j["tail"] == fake_tok(
-        render_join_question(pred.template, pred.args))
+    assert j["tail"] == fake_tok(render_join_question(pred.template))
 
 
 def test_three_way_join_tuples_and_gate(sess, tmp_path):

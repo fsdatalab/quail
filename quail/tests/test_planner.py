@@ -234,10 +234,12 @@ def test_join_tokens_note_per_anchor_labels_per_tuple(catalog):
                       doc_tokens=toks)
     stage = next(op for op in plan.operators if op["op"] == "JoinStage")
     pre = len(tok(SHARED_PRE))
-    note = len(tok(join_anchor_note("r")))
-    label = len(tok(join_label("p")))
+    # r is placeholder 0 (the anchor's naming line), p is placeholder
+    # 1 (its block label)
+    note = len(tok(join_anchor_note(0)))
+    label = len(tok(join_label(1)))
     pred = logical.root.input.predicate
-    question = len(tok(render_join_question(pred.template, pred.args)))
+    question = len(tok(render_join_question(pred.template)))
     expect = 4 * (100 + pre + note) + 12 * (10 + label + question)
     assert stage["tuple_tokens"] == pytest.approx(expect)
     assert stage["expected_tuples"] == 12

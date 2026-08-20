@@ -281,17 +281,19 @@ def queries(sess):
                 selectivity=sel).select("a.id", "b.id")
         return make
 
-    # Join templates are the per-tuple question only: the engine
-    # renders every tuple as labeled document blocks (the anchor
-    # first under the bare DOCUMENT label plus its naming line, each
-    # partner under "DOCUMENT {alias}:"), then this text with every
-    # placeholder replaced by "document {alias}". The whole question
-    # is paid once per tuple, so it stays short; the naming line is
-    # paid once per anchor. Wording here is measured territory (the
-    # old close-range framing "Decide whether the report describes
-    # that reaction..." read as a YES prior: observed selectivity
-    # 0.76 vs 0.287) - the per-stage observed selectivity in the
-    # report is the instrument for the new wording.
+    # Join templates are the per-tuple question only, and they are
+    # appended VERBATIM - the {0}/{1}/{2} markers stay in the text,
+    # nothing is filled in. The engine renders every tuple as labeled
+    # document blocks first (the anchor under the bare DOCUMENT label
+    # plus a naming line mapping it to its marker, each partner under
+    # "DOCUMENT {i}:" with its own marker), so a marker in the
+    # question resolves to its block. The whole question is paid once
+    # per tuple, so it stays short; the naming line is paid once per
+    # anchor. Wording here is measured territory (the old close-range
+    # framing "Decide whether the report describes that reaction..."
+    # read as a YES prior: observed selectivity 0.76 vs 0.287) - the
+    # per-stage observed selectivity in the report is the instrument
+    # for the new wording.
     REACTION = ("Judge strictly from {0} whether it describes the "
                 "reaction named in {1} as something the patient "
                 "experienced. Answer YES if it does, NO otherwise."

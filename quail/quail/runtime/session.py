@@ -295,18 +295,20 @@ def _question_ids(session: Session, prompt) -> list:
 
 def _join_spec(session: Session, prompt, anchor: str,
                partners: list) -> dict:
-    """The executor's view of one join: per-alias block labels (paid
-    once per tuple, ahead of each partner document), the anchor's
-    naming line (written into kept KV once per anchor, so the
-    question can call it by alias), and the rendered question (paid
-    once per tuple, after the last block). The engine preamble ships
-    once as the payload's pre_ids."""
+    """The executor's view of one join: per-partner block labels
+    (paid once per tuple, ahead of each partner document), the
+    anchor's naming line (written into kept KV once per anchor, so
+    the question's marker for it resolves), and the question (the
+    raw template, markers kept - paid once per tuple, after the last
+    block). Labels carry each table's own placeholder marker. The
+    engine preamble ships once as the payload's pre_ids."""
     tok = session.tokenizer
+    slot = {r.alias: i for i, r in enumerate(prompt.args)}
     return dict(
         anchor=anchor, partners=list(partners),
-        frame=tok(join_anchor_note(anchor)),
-        labels={p: tok(join_label(p)) for p in partners},
-        tail=tok(render_join_question(prompt.template, prompt.args)))
+        frame=tok(join_anchor_note(slot[anchor])),
+        labels={p: tok(join_label(slot[p])) for p in partners},
+        tail=tok(render_join_question(prompt.template)))
 
 
 class Query:
