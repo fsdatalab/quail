@@ -47,13 +47,15 @@ SHARED_PRE = "DOCUMENT:\n"
 # marker. Like SHARED_PRE the block labels are formatting labels,
 # not instructions.
 #
-# Every question (filter and join) gets a fixed answer cue from
-# the engine; the user's template is a question, appended before
-# the cue:
-#   "<template>\nANSWER:"
+# Every question (filter and join) gets a fixed instruction and
+# answer cue from the engine; the user's template is always a
+# question, never a statement:
+#   "Evaluate TRUE or FALSE for the following question: <template>"
+#   "\nANSWER:"
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # blocks -> question
+TASK_INSTRUCTION = "Evaluate TRUE or FALSE for the following question: "
 ANSWER_CUE = "\nANSWER:"
 
 
@@ -70,21 +72,23 @@ def join_anchor_note(placeholder: int) -> str:
 
 
 def render_join_question(template: str) -> str:
-    """The per-tuple question text: the user's template exactly as
-    written - braces kept, nothing filled in - behind the separator
-    that ends the block list, with the answer cue at the end."""
-    return JOIN_QUESTION_SEP + template + ANSWER_CUE
+    """The per-tuple question text: a fixed TRUE/FALSE instruction
+    followed by the user's template exactly as written - braces kept,
+    nothing filled in - behind the separator that ends the block
+    list, with the answer cue at the end."""
+    return (JOIN_QUESTION_SEP + TASK_INSTRUCTION + template
+            + ANSWER_CUE)
 
 
 def render_filter_question(tail: str) -> str:
-    """Append the answer cue to a filter tail (placeholder-stripped
-    question text). The tail typically starts with a separator
-    (\\n\\n); the cue is appended after the content."""
+    """Wrap a filter tail (placeholder-stripped question text) with
+    the task instruction and answer cue. The tail typically starts
+    with a separator (\\n\\n); the instruction is inserted after it."""
     content = tail.lstrip("\n")
     sep = tail[:len(tail) - len(content)]
     if not sep:
         sep = "\n\n"
-    return sep + content + ANSWER_CUE
+    return sep + TASK_INSTRUCTION + content + ANSWER_CUE
 
 
 @dataclass(frozen=True)
