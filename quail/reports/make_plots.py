@@ -116,10 +116,9 @@ stockf = load("baseline_filter4.json")["runs"]
 quail_filter = sum(r["wall"] for r in post) / len(post)
 stock_filter = sum(r["wall"] for r in stockf) / len(stockf)
 
-with open(ROOT.parent / "old_exploration" / "results" / "engine" / "join2way.json") as _f:
-    join2way = json.load(_f)["runs"]
-stockj = sum(r["wall"] for r in join2way if r["method"] == "stock_grouped") / 2
-packedj = sum(r["wall"] for r in join2way if r["method"] == "packed") / 2
+stockj_data = load("baseline_join.json")["runs"]
+stockj = sum(r["wall"] for r in stockj_data) / len(stockj_data)
+quail_join = load("dispatch_gate.json")["gpus1"]["join"]["wall_s"]
 
 fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4.2))
 labels = ["Stock vLLM\n(tuned)", "Quail"]
@@ -137,15 +136,15 @@ a1.text(1, quail_filter + 4, f"{stock_filter / quail_filter:.2f}x faster",
 a1.spines[["top", "right"]].set_visible(False)
 
 labels = ["Stock vLLM\n(grouped)", "Quail"]
-vals = [stockj, packedj]
+vals = [stockj, quail_join]
 bars = a2.bar(labels, vals, color=[GRAY, GREEN], width=0.5)
-for b, v in zip(bars, [stockj, packedj]):
+for b, v in zip(bars, vals):
     a2.text(b.get_x() + b.get_width() / 2, v + 1, f"{v:.1f} s",
             ha="center", fontsize=10)
-a2.set_title("256,000-pair join (BioDEX)", fontsize=11)
+a2.set_title("72,000-pair join", fontsize=11)
 a2.set_ylabel("wall time (seconds, lower is better)")
-a2.set_ylim(0, 500)
-a2.text(1, packedj + 12, f"{stockj / packedj:.1f}x faster",
+a2.set_ylim(0, 85)
+a2.text(1, quail_join + 3, f"{stockj / quail_join:.1f}x faster",
         ha="center", fontsize=10, color=GREEN)
 a2.spines[["top", "right"]].set_visible(False)
 fig.tight_layout()

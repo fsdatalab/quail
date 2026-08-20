@@ -102,7 +102,7 @@ both milestone workloads.
 | Workload | Stock vLLM (tuned) | Quail (after fix) | Speedup |
 |---|---|---|---|
 | 5-filter chain, 10k docs | 38.7 to 39.0 s | 35.8 s | 1.08x |
-| 72k-pair join | 90.3 to 92.7 s | 31.1 s | 2.9x |
+| 72k-pair join | 69.8 to 70.6 s | 31.1 s | 2.3x |
 
 The stock filter baseline used separate requests per (document,
 stage), pipelined submission, document-cap admission, and a token

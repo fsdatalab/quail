@@ -782,12 +782,16 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
 def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                       reps: int = 2) -> str:
     """Stock vLLM on the dispatch gate's 72k-pair synthetic join:
-    one request per pair, anchor-major, prefix caching on.
+    one request per pair, anchor-major, prefix caching on,
+    max_num_seqs=4096.
 
-    PREDICTION: fresh ~2.7M tokens at the committed stock effective
-    rate (~17k tok/s) -> 2.5-3 min per rep, against the packed
-    executor's measured 31.1 s on one GPU (the committed BioDEX
-    shape measured 4.1x)."""
+    PREDICTION: the previous run used max_num_seqs=366 (derived from
+    the KV budget divided by full pair length, ignoring prefix cache
+    sharing). That throttled the GPU to ~4,400 fresh tokens per step
+    (17% of the 25,305 budget). With 4,096 the scheduler can fill
+    steps properly. Expect a faster wall than the previous 90-93 s;
+    fresh tokens should stay ~1.01M (same pairs, same prefix caching).
+    Quail's measured wall on this shape is 31.1 s."""
     from baselines.stock import run_join_grouped
     from corpus import MODEL
     from vllm import SamplingParams
@@ -815,10 +819,7 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                     f"candidate color, NO otherwise.\nANSWER=")
                 for j in range(n_cands)]
     yes, no = yes_no_ids(tokenizer)
-    mean_pair = (sum(map(len, prefixes)) * n_cands
-                 + n_reports * sum(map(len, suffixes))) \
-        // (n_reports * n_cands) + 1
-    max_seqs = max(64, min(4096, 749_782 // mean_pair))
+    max_seqs = 4096
     # 0.92, same as quail's pool fraction. The committed join2way
     # stock arm ran 0.88 only because its container booted two
     # executors back to back; standalone, stock gets the full pool.
@@ -835,7 +836,8 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                   submission="one request per pair, anchor-major, "
                              "prefix caching on",
                   max_num_seqs=max_seqs, step_tokens=25_305,
-                  prediction="~2.5-3 min per rep vs the packed 31.1 s",
+                  prediction="previous 90-93 s used max_num_seqs=366; "
+                             "now 4096, expect faster; Quail is 31.1 s",
                   boot=boot, boot_s=boot["boot_s"],
                   runs=[])
     print(f"[baseline_join] boot {boot}", flush=True)

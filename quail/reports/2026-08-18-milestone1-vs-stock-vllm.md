@@ -34,7 +34,7 @@ The plot `plots/vs_stock.png` shows the comparison on both workloads.
 | Workload | Stock vLLM | Quail | Speedup |
 |---|---|---|---|
 | 5-filter chain, 10k docs | 38.7 to 39.0 s | 35.8 s | 1.08x |
-| 72k-pair join | 90.3 to 92.7 s | 31.1 s | 2.9x |
+| 72k-pair join | 69.8 to 70.6 s | 31.1 s | 2.3x |
 
 ## Filter chain details
 
@@ -79,21 +79,30 @@ the anchor's KV pages across all pairs in that chunk.
 
 | | Stock vLLM | Quail |
 |---|---|---|
-| Wall time | 92.7 / 90.3 s | 31.1 s |
+| Wall time | 70.6 / 69.8 s | 31.1 s |
 | Fresh tokens computed | 1.01M | 2.64M |
 | Pairs answered | 72,000 | 72,000 |
 
 The interesting number is the fresh token column. Stock vLLM computed
 2.6x fewer fresh tokens because prefix caching avoids recomputing
-each anchor. But stock still took 2.9x longer. The reason is that
+each anchor. But stock still took 2.3x longer. The reason is that
 every pair is still its own request: the engine re-reads the anchor's
 cached KV through attention for each pair, and pays per-request
 scheduling overhead at every step. Quail makes the anchor's pages a
 shared operand, so 32 pair-suffixes attend to one anchor's KV inside
 a single packed chunk.
 
+The stock baseline uses max_num_seqs=4096, the same cap as the filter
+baseline, so the scheduler can fill steps properly. An earlier run
+used max_num_seqs=366 (derived from the KV budget divided by the full
+pair length, ignoring prefix-cache sharing) and measured 90-93 s; the
+fix to 4096 cut 22 s. Raising max_num_batched_tokens from 25,305 to
+100,000 did not help further (75-77 s), confirming that the remaining
+overhead is per-request scheduling inside vLLM, not step
+underutilization.
+
 The committed exploration measured 4.1x on the BioDEX shape (longer
-anchors, so more re-read cost per pair). The 2.9x here is on a
+anchors, so more re-read cost per pair). The 2.3x here is on a
 synthetic shape with shorter anchors.
 
 ## Two-GPU scaling
