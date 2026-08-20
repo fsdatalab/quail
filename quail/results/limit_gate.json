@@ -1,0 +1,17 @@
+{
+  "unlimited": {
+    "rows": 500,
+    "fresh_tokens": 106192,
+    "wall_s": 1.75
+  },
+  "limited": {
+    "limit": 10,
+    "rows": 10,
+    "fresh_tokens": 29000,
+    "wall_s": 0.89
+  },
+  "reduction": {
+    "token_ratio": 0.2730902516197077,
+    "wall_ratio": 0.5085714285714286
+  }
+}
