@@ -12,12 +12,12 @@ from quail.runtime.coordinator import (filter_round_payloads,
 def payload():
     return dict(
         model="qwen3-4b-fp8", kv_dtype="bf16", chunk_tokens=1000,
-        yes_ids=[1], no_ids=[2],
+        yes_ids=[1], no_ids=[2], pre_ids=[9],
         docs={"r": [[i] * (10 + i) for i in range(6)],
               "p": [[i] * 5 for i in range(4)]},
         filters={"r": [[7, 7]]},
         joins=[dict(anchor="r", partner="p", semantics="full",
-                    pre=[1], mid=[2], tail=[3], swapped=False)],
+                    mid=[2], tail=[3], swapped=False)],
         store=None, workers=2,
         shards={"r": ((0, 2, 4), (1, 3, 5)), "p": ((0, 1), (2, 3))})
 
@@ -68,10 +68,23 @@ def test_join_round_anchors_follow_shards():
     assert subs[0]["anchor_docs"][1] == [4] * 14
 
 
+def test_join_round_carries_pre_and_store():
+    # the join round needs the engine preamble (anchor prefixes are
+    # pre + doc) and the store config (anchors restore and save)
+    p = payload()
+    p["store"] = dict(capacity_bytes=1e9, min_doc_tokens=5,
+                      hashes={"r": "h"})
+    subs = join_round_payloads(p, p["shards"], 2, {"r": [0, 1, 3, 4]})
+    for s in subs:
+        assert s["pre_ids"] == [9]
+        assert s["store"]["hashes"]["r"] == "h"
+        assert s["anchor_alias"] == "r"
+
+
 def test_join_round_refuses_mixed_anchors():
     p = payload()
     p["joins"].append(dict(anchor="p", partner="r", semantics="full",
-                           pre=[], mid=[], tail=[], swapped=False))
+                           mid=[], tail=[], swapped=False))
     with pytest.raises(NotImplementedError):
         join_round_payloads(p, p["shards"], 2,
                             {"r": [0], "p": [0]})

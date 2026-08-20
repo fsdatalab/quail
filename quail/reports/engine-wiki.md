@@ -25,6 +25,7 @@ payload to the worker, which calls the executor.
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
 | `planner/calibration.py` | Measured constants (a, a2, q_kv) and scaling | specs |
+| `planner/calibrate.py` | Length-sweep measure of a and a2 | calibration, executor |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
 | `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, calibration, plan |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
@@ -36,6 +37,7 @@ payload to the worker, which calls the executor.
 | `runtime/session.py` | Session, Query, tokenization, payload assembly | catalog, logical, planner, sqlfront, builder |
 | `runtime/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `runtime/worker.py` | Modal worker (boot, execute, multi-GPU dispatch) | executor, planner, coordinator |
+| `runtime/calibrate.py` | Modal entry for measure, on quail-engine | planner, worker |
 | `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
 
 ### Data flow
@@ -129,17 +131,49 @@ There are four operators, defined in `logical.py`:
     anti-join).
 - **Project**: column selection at the root. No computed columns.
 
-### Prompt binding
+### Prompt layout
 
-A `PROMPT('template {0} more text {1}', col_a, col_b)` call is split
-at bind time into a preamble (everything before the first
-placeholder) and a tail (everything from the first placeholder
-onward). The preamble and tail are tokenized once at compile time so
-the planner never needs a tokenizer. This split feeds the executor's
-KV reuse: the preamble is the shared question text that can be
-computed once across all documents.
+Every operator's prompt is rewritten to one layout before it runs:
 
-See `logical.py:150` (`bind_prompt`).
+```
+[SHARED_PRE] [document] [frame] [suffix]
+```
+
+`SHARED_PRE` is `"DOCUMENT:\n"`, defined once in `logical.py`. It is
+engine-owned and identical for every operator, every query, and
+every document. Because it is one fixed string, the KV of
+`[SHARED_PRE + document]` is the same wherever that document
+appears. The KV store keys extents by (content hash, document
+index) and folds `SHARED_PRE` into the hash, so a filter-scanned
+document can be restored as a join anchor and the other way around.
+Changing the preamble text invalidates every stored extent.
+
+The wording is a formatting label, not an instruction. Measured on
+B1 (short reviews): "Evaluate whether the following is true or
+false." dropped observed selectivity from 0.398 to 0.074, and "You
+will read a document and answer a yes-or-no question about it."
+dropped it to 0.0014. `"DOCUMENT:\n"` left it at 0.397. Long
+documents (B4) were immune to all three. Task text therefore lives
+after the document, in the frame and the suffix.
+
+A user's `PROMPT('template {0} ...', cols...)` is canonicalized at
+bind time (`split_frame` in `logical.py`). Any user text before the
+first placeholder is stripped out and becomes the frame. The
+canonical template is `SHARED_PRE`, then `{0}` (the document the
+engine owns), then the frame, then the rest. The stored KV extent
+is document-only: `[SHARED_PRE + document]`. The frame is not
+stored.
+
+A filter carries the frame at the head of each stage's question
+suffix. A join writes the frame into the anchor's kept KV once per
+anchor (`write_suffix_tokens`), so pairs read it from KV instead of
+paying its tokens per pair. On B5, putting that frame in the
+per-pair suffix added 6.1M fresh tokens and 95 s.
+
+The planner prices the preamble once per document and the frame
+once per filter document or once per join anchor, never per pair.
+See `logical.py` (`SHARED_PRE`, `split_frame`, `bind_prompt`) and
+the suite writeup `2026-08-19-shared-preamble-join-store.md`.
 
 ### AI SQL front end
 
@@ -168,8 +202,10 @@ same `assemble_plan`, so the plans are structurally identical.
 |---|---|---|
 | `compile_sql` | `sqlfront/compile.py:212` | AI SQL text -> LogicalPlan |
 | `assemble_plan` | `logical.py:117` | QueryDesc -> LogicalPlan tree |
-| `bind_prompt` | `logical.py:150` | Split template, bind column refs, count tokens |
-| `split_template` | `logical.py:141` | Split at the first placeholder into preamble and tail |
+| `bind_prompt` | `logical.py:207` | Canonicalize, bind column refs, count tokens |
+| `split_template` | `logical.py:168` | Split at the first placeholder into preamble and tail |
+| `split_frame` | `logical.py:177` | Relocate user pre-document text; emit canonical template |
+| `canonicalize_template` | `logical.py:203` | `split_frame` without returning the frame |
 | `DocumentProvider.from_parquet` | `catalog.py:29` | Register a parquet file (metadata only) |
 | `DocumentProvider.read_column` | `catalog.py:53` | Read one column's ids and texts (at scan time) |
 
@@ -348,11 +384,11 @@ model with more parameters costs proportionally more per token, a
 device with a higher FLOP ceiling costs proportionally less
 (`calibration.py:70-77`).
 
-The calibration cell (`tests/gpu/milestone1.py::run_calibrate`)
-sweeps document length through the packed filter and fits
-`t(h) = a + a2 * h` by least squares. It also probes the host copy
-channels (pinned and unpinned, both directions) for the store
-break-even.
+`quail.planner.calibrate.measure` (Modal entry:
+`quail/runtime/calibrate.py`) sweeps document length through the
+packed filter and fits `t(h) = a + a2 * h` by least squares. It
+also probes the host copy channels (pinned and unpinned, both
+directions) for the store break-even.
 
 Additionally, `calibration/channels.json` stores host-memory
 bandwidth measurements (pinned device-to-host, host-to-device, etc.)
@@ -380,6 +416,8 @@ single forward pass, sharing KV across them through a paged arena.
 | `chunk_budget` | `budgets.py:62` | Tokens per forward pass (min of memory and kernel bounds) |
 | `arena_tokens` | `budgets.py:69` | KV residency budget (device memory minus weights and activations) |
 | `load_calibration` | `calibration.py:80` | Load or spec-scale the calibration constants |
+| `measure` | `calibrate.py` | Length sweep + affine fit of a, a2 (GPU) |
+| `commit_calibration` | `calibration.py` | Write the three constants to the pair file |
 
 ### 5.1 Chunk packing
 
@@ -658,7 +696,11 @@ Between stages, answers are gated: anchors with no surviving pairs
 are dropped, and their pages are freed. The driver also prefetches
 the next group's stage-0 chunk while waiting on the current group's
 gate (which cannot be planned past until answers arrive), keeping the
-GPU fed across gate boundaries.
+GPU fed across gate boundaries. Anchors already in the KV store
+restore instead of recomputing. Anchors leaving their last stage
+are saved if they meet the length threshold. A per-stage frame, if
+present, is written into the anchor's kept KV once after the
+document rows.
 
 ### 5.7 KV rewind (chain mode)
 
@@ -831,11 +873,14 @@ document is a contiguous extent of rows within one slab.
 
 ### Save and load protocol
 
-**Save** (`kvstore.py:165`): runs on a CUDA side stream after the
+**Save** (`kvstore.py`): runs on a CUDA side stream after the
 compute event that wrote the document's arena pages. For each layer,
 it gathers the document's K and V rows from the arena into a GPU
 staging buffer, then copies the staging buffer to the pinned host
-slab. Four staging slots rotate to keep the pipeline full.
+slab. The event the caller waits on fires after the gather, so
+arena pages can be freed while the host copy continues. Staging
+buffers grow on demand; large documents get 2 slots so the buffers
+do not claim tens of gigabytes next to the arena.
 
 **Load** (`kvstore.py:205`): copies from the host slab to the GPU
 staging buffer, then scatters into the document's arena pages. The
@@ -875,7 +920,7 @@ for each layer:
     gather document's V rows from arena pages into staging buffer
 copy staging buffer to pinned host slab (non-blocking)
 record completion event
-# caller holds the document's arena pages until the event fires
+# caller frees arena pages after the gather; the host copy continues
 
 # load (runs on side CUDA stream, before the chunk's forward):
 copy from pinned host slab to staging buffer (non-blocking)

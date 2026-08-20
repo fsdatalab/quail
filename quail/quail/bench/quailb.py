@@ -338,27 +338,47 @@ def queries(sess):
                 selectivity=sel).select("a.id", "b.id")
         return make
 
-    REACTION = ("You will be shown a patient report and one candidate "
-                "medical reaction term. Decide whether the report "
-                "describes that reaction as something the patient "
-                "experienced.\n\nREPORT:\n{0}\n\nCANDIDATE REACTION: "
-                "{1}\nInstruction: answer YES if the report above "
-                "describes this reaction, NO otherwise.\nANSWER=")
-    DISCUSS = ("You will be shown a text and one product description."
-               "\n\nTEXT:\n{0}\n\nPRODUCT:\n{1}\nInstruction: answer "
-               "YES if the text discusses this product, NO otherwise."
-               "\nANSWER=")
-    MENTION = ("You will be shown a text and one medical term.\n\n"
-               "TEXT:\n{0}\n\nTERM: {1}\nInstruction: answer YES if "
-               "the text mentions this term, NO otherwise.\nANSWER=")
-    SUPPORT = ("You will be shown a factual claim and a passage from "
-               "Wikipedia. Decide whether the passage supports the "
-               "claim.\n\nCLAIM:\n{0}\n\nPASSAGE:\n{1}\nInstruction: "
-               "answer YES if the passage supports the claim, NO "
+    # Template text before {0} becomes the per-anchor frame: the
+    # engine relocates it after the document and writes it into the
+    # anchor's kept KV once per anchor, so the framing costs tokens
+    # per anchor, not per pair (folding it into the per-pair tail
+    # cost 6.1M extra tokens / +95 s on B5's 512k pairs, measured).
+    # The suffix after the partner stays short - it is paid per pair.
+    # The frame sits right before the candidates (after the document),
+    # where the 4B is far more sensitive to its wording than it was
+    # to the same text far before the document: "Decide whether the
+    # report describes that reaction..." at close range read as a YES
+    # prior (observed selectivity 0.76 vs the original 0.287).
+    # Judgment-neutral wording, measured below.
+    REACTION = ("Candidate medical reaction terms follow, one at a "
+                "time. For each, judge strictly from the report "
+                "above whether it describes that reaction as "
+                "something the patient experienced.\n\n{0}\n\n"
+                "CANDIDATE REACTION: {1}\nInstruction: answer YES if "
+                "the report above describes this reaction, NO "
+                "otherwise.\nANSWER=")
+    DISCUSS = ("Product descriptions follow, one at a time. For "
+               "each, judge strictly from the text above whether it "
+               "discusses that product.\n\n{0}\n\nPRODUCT:\n{1}\n"
+               "Instruction: answer YES if the text above discusses "
+               "this product, NO otherwise.\nANSWER=")
+    MENTION = ("Medical terms follow, one at a time. For each, judge "
+               "strictly from the text above whether it mentions "
+               "that term.\n\n{0}\n\nTERM: {1}\nInstruction: answer "
+               "YES if the text above mentions this term, NO "
                "otherwise.\nANSWER=")
-    KEYEQ = ("You will be shown a report document carrying a [KEYS] "
-             "line and a candidate document.\n\nREPORT:\n{0}\n\n"
-             "CANDIDATE:\n{1}\nInstruction: answer YES if the "
+    # Same fix applied here: frame after the claim, neutral wording -
+    # the old "You will be shown a factual claim..." framing is the
+    # exact shape measured to bias REACTION toward YES above.
+    SUPPORT = ("Wikipedia passages follow, one at a time. For each, "
+               "judge strictly from the claim above whether it "
+               "supports that claim.\n\n{0}\n\nPASSAGE:\n{1}\n"
+               "Instruction: answer YES if the passage above "
+               "supports this claim, NO otherwise.\nANSWER=")
+    KEYEQ = ("Candidate documents follow, one at a time. For each, "
+             "judge strictly whether its [FLAGS] or key value "
+             "matches the [KEYS] X value in the report above.\n\n"
+             "{0}\n\nCANDIDATE:\n{1}\nInstruction: answer YES if the "
              "candidate's [FLAGS] or key value matches the report's "
              "[KEYS] X value, NO otherwise.\nANSWER=")
 
@@ -457,8 +477,8 @@ def queries(sess):
     q["B14"] = ("B5 rerun, new question: the anchor restore",
                 content_join("reports", "report", "terms", "term",
                              REACTION.replace(
-                                 "describes that reaction",
-                                 "explicitly reports that reaction"),
+                                 "describes this reaction",
+                                 "explicitly reports this reaction"),
                              0.05))
 
     def b15():
@@ -473,11 +493,13 @@ def queries(sess):
                          selectivity=0.1, semantics="exists")
                 .ai_join(sess.docs("reports").alias("r"),
                          _q.prompt(
-                             "You will be shown a discussion thread "
-                             "and a patient report.\n\nTHREAD:\n{0}"
-                             "\n\nREPORT:\n{1}\nInstruction: answer "
-                             "YES if both texts discuss medicine, NO "
-                             "otherwise.\nANSWER=",
+                             "Patient reports follow, one at a time. "
+                             "For each, judge strictly whether both "
+                             "it and the thread above discuss "
+                             "medicine.\n\n{0}\n\nREPORT:\n{1}\n"
+                             "Instruction: answer YES if both texts "
+                             "discuss medicine, NO otherwise.\n"
+                             "ANSWER=",
                              _q.col("t.thread"), _q.col("r.report")),
                          selectivity=0.2)
                 .select("t.id", "r.id"))
@@ -526,6 +548,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                                boot=res.report.get("boot"),
                                fresh_tokens=res.report["fresh_tokens"],
                                rows=len(res.rows),
+                               peak_gib=res.report.get("peak_gib"),
                                stages=res.report["stages"],
                                store=res.report.get("store"),
                                replay=res.report.get("replay_check"))

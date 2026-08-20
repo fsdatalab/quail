@@ -6,8 +6,10 @@ from dataclasses import replace
 import pytest
 
 from quail.planner import budgets
-from quail.planner.calibration import (channel_bandwidths,
-                                       fit_affine, load_calibration)
+from quail.planner.calibrate import resolve_pair
+from quail.planner.calibration import (Calibration, channel_bandwidths,
+                                       commit_calibration, fit_affine,
+                                       load_calibration, make_record)
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
@@ -128,3 +130,36 @@ def test_derived_table_complete():
     assert table["chunk_budget"] == 110_376
     assert table["serving_rate_tokens_per_s"] == pytest.approx(121_045,
                                                                rel=1e-3)
+
+
+def test_resolve_pair_known():
+    spec, device = resolve_pair("qwen3-4b-fp8", "h100-sxm")
+    assert spec is QWEN3_4B_FP8
+    assert device is H100_SXM
+
+
+def test_resolve_pair_unknown():
+    with pytest.raises(ValueError, match="unknown model"):
+        resolve_pair("not-a-model", "h100-sxm")
+    with pytest.raises(ValueError, match="unknown device"):
+        resolve_pair("qwen3-4b-fp8", "not-a-device")
+
+
+def test_make_record_and_commit(tmp_path):
+    loaded = Calibration(a_s_per_token=8e-6, a2_s_per_token2=5e-10,
+                         q_kv_s_per_token=5.9e-7, source="calibrated")
+    rec = make_record(QWEN3_4B_FP8, H100_SXM, 9e-6, 6e-10,
+                      loaded.q_kv_s_per_token,
+                      points=[{"doc_tokens": 256}],
+                      channels={"pinned_h2d": 1.0},
+                      loaded=loaded, lengths=(256, 1024),
+                      tokens_per_point=1000)
+    assert rec["model"] == "qwen3-4b-fp8"
+    assert rec["device"] == "h100-sxm"
+    assert rec["loaded_before"]["a"] == 8e-6
+    assert "not measured" in rec["provenance"]["q_kv"]
+    dest = commit_calibration(rec, dest=tmp_path / "pair.json")
+    written = dest.read_text()
+    assert "a_s_per_token" in written
+    assert "points" not in written
+    assert "channels_measured_bytes_per_s" not in written

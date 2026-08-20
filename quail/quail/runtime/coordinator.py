@@ -19,7 +19,7 @@ Two rounds per query:
 """
 
 COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "yes_ids",
-               "no_ids")
+               "no_ids", "pre_ids")
 
 
 def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
@@ -112,7 +112,9 @@ def join_round_payloads(payload: dict, shards: dict, k: int,
                    anchor_index=anchors,
                    anchor_docs=[payload["docs"][anchor_alias][g]
                                 for g in anchors],
-                   partners=partners, worker=w, workers=k)
+                   partners=partners,
+                   store=payload.get("store"),
+                   worker=w, workers=k)
         subs.append(sub)
     return subs
 

@@ -30,7 +30,6 @@ Run from the quail/ directory (tee to a file per house rule):
 
 import json
 import os
-from pathlib import Path
 
 import modal
 
@@ -59,10 +58,6 @@ image = (
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
     .add_local_python_source("quail", "corpus", "baselines")
-    # the package's data files: add_local_python_source ships only
-    # .py, and the calibrate cell reads the anchor JSON in-container
-    .add_local_dir("quail/calibration",
-                   remote_path="/root/quail/calibration")
 )
 
 # House rule: never create new Modal app names - caches and warm state
@@ -723,128 +718,6 @@ def run_profile_filter(n_docs: int = 3000,
     _save(profile_filter_run.remote(n_docs), out)
 
 
-# ---------------------------------------------------------- calibrate
-
-@app.function(timeout=3600, **GPU_KW)
-def calibrate_run(tokens_per_point: int = 1_500_000) -> str:
-    """Measure the planner's calibration constants for this
-    (model, device) pair - the `quail calibrate` step the calibration
-    module's docstring names.
-
-    a and a2 come from a document-length sweep: run the packed filter
-    at fixed lengths, take seconds per fresh token at each, and fit
-    t(h) = a + a2*h - exactly the form restore_crossover_tokens and
-    the store break-even consume. The channel probes re-measure
-    pinned copy bandwidth. q_kv is NOT measured: the fp8 arena path
-    is not implemented, so the value carried through is the loaded
-    (anchor or spec-scaled) one, and the provenance says so.
-    """
-    import time
-
-    from corpus import question, token_stream
-    from quail.executor.loop import run_filter, warm_kernels
-    from quail.planner.calibration import fit_affine, load_calibration
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
-
-    spec, device = QWEN3_4B_FP8, H100_SXM
-    lengths = (256, 1024, 4096, 8192)
-
-    (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
-     exec_budget, arena_tok) = _boot()
-    q_ids = [tokenizer(question(1),
-                       add_special_tokens=False)["input_ids"]]
-    stream = token_stream(tokenizer, max(lengths) + tokens_per_point)
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans,
-                     [stream[:512]] * 64, q_ids, exec_budget)
-    torch.cuda.synchronize()
-
-    points, rows = [], []
-    for h in lengths:
-        n_docs = max(8, tokens_per_point // h)
-        body_ids = [stream[i * h:(i + 1) * h] for i in range(n_docs)]
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            _, spans, tokens = run_filter(
-                torch, arena, pipeline, async_ans, body_ids, q_ids,
-                exec_budget)
-        torch.cuda.synchronize()
-        wall = time.perf_counter() - t0
-        gpu_s = sum(e0.elapsed_time(e1) for _, e0, e1 in spans) / 1e3
-        t_wall = wall / tokens
-        points.append((h, t_wall))
-        rows.append(dict(doc_tokens=h, n_docs=n_docs,
-                         fresh_tokens=tokens, wall_s=round(wall, 2),
-                         gpu_s=round(gpu_s, 2),
-                         us_per_token_wall=round(t_wall * 1e6, 3),
-                         us_per_token_gpu=round(gpu_s / tokens * 1e6,
-                                                3)))
-        print(f"[calibrate] {rows[-1]}", flush=True)
-
-    a, a2 = fit_affine(points)
-    a2 = max(a2, 0.0)    # a noisy flat sweep must not go negative
-
-    # channel probes: 2 GiB timed copies, pinned and unpinned
-    channels = {}
-    buf_bytes = 2 << 30
-    dev_buf = torch.empty(buf_bytes, dtype=torch.uint8, device="cuda")
-    for pinned in (True, False):
-        host = torch.empty(buf_bytes, dtype=torch.uint8,
-                           pin_memory=pinned)
-        name = "pinned" if pinned else "unpinned"
-        for tag, src, dst in ((f"{name}_h2d", host, dev_buf),
-                              (f"{name}_d2h", dev_buf, host)):
-            dst.copy_(src)                       # first-touch warmup
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(3):
-                dst.copy_(src)
-            torch.cuda.synchronize()
-            channels[tag] = round(
-                3 * buf_bytes / (time.perf_counter() - t0), 0)
-        del host
-    del dev_buf
-
-    loaded = load_calibration(spec, device)
-    result = dict(
-        model=spec.name, device=device.name,
-        a_s_per_token=a, a2_s_per_token2=a2,
-        q_kv_s_per_token=loaded.q_kv_s_per_token,
-        provenance=dict(
-            a=("wall seconds per fresh token, length sweep "
-               f"{list(lengths)} at ~{tokens_per_point} tokens per "
-               "point, affine fit intercept"),
-            a2="affine fit slope of the same sweep",
-            q_kv=("not measured: fp8 arena not implemented; carried "
-                  f"from '{loaded.source}'")),
-        points=rows,
-        channels_measured_bytes_per_s=channels,
-        loaded_before=dict(a=loaded.a_s_per_token,
-                           a2=loaded.a2_s_per_token2,
-                           source=loaded.source))
-    return _write(result, "calibrate")
-
-
-@app.local_entrypoint()
-def run_calibrate(out: str = "results/calibrate.json",
-                  commit: bool = False):
-    """--commit writes the three constants into
-    quail/calibration/{model}_{device}.json, where load_calibration
-    reads them; without it the measurement only lands in results/."""
-    payload = calibrate_run.remote()
-    _save(payload, out)
-    if commit:
-        d = json.loads(payload)
-        keep = {k: d[k] for k in
-                ("model", "device", "a_s_per_token",
-                 "a2_s_per_token2", "q_kv_s_per_token", "provenance")}
-        dest = (Path(__file__).resolve().parents[2] / "quail"
-                / "calibration" / f"{d['model']}_{d['device']}.json")
-        with open(dest, "w") as f:
-            json.dump(keep, f, indent=2)
-        print(f"committed {dest}")
-
-
 # ----------------------------------------------------------- baselines
 
 @app.function(timeout=5400, **GPU_KW)
@@ -909,12 +782,16 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
 def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                       reps: int = 2) -> str:
     """Stock vLLM on the dispatch gate's 72k-pair synthetic join:
-    one request per pair, anchor-major, prefix caching on.
+    one request per pair, anchor-major, prefix caching on,
+    max_num_seqs=4096.
 
-    PREDICTION: fresh ~2.7M tokens at the committed stock effective
-    rate (~17k tok/s) -> 2.5-3 min per rep, against the packed
-    executor's measured 31.1 s on one GPU (the committed BioDEX
-    shape measured 4.1x)."""
+    PREDICTION: the previous run used max_num_seqs=366 (derived from
+    the KV budget divided by full pair length, ignoring prefix cache
+    sharing). That throttled the GPU to ~4,400 fresh tokens per step
+    (17% of the 25,305 budget). With 4,096 the scheduler can fill
+    steps properly. Expect a faster wall than the previous 90-93 s;
+    fresh tokens should stay ~1.01M (same pairs, same prefix caching).
+    Quail's measured wall on this shape is 31.1 s."""
     from baselines.stock import run_join_grouped
     from corpus import MODEL
     from vllm import SamplingParams
@@ -942,10 +819,7 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                     f"candidate color, NO otherwise.\nANSWER=")
                 for j in range(n_cands)]
     yes, no = yes_no_ids(tokenizer)
-    mean_pair = (sum(map(len, prefixes)) * n_cands
-                 + n_reports * sum(map(len, suffixes))) \
-        // (n_reports * n_cands) + 1
-    max_seqs = max(64, min(4096, 749_782 // mean_pair))
+    max_seqs = 4096
     # 0.92, same as quail's pool fraction. The committed join2way
     # stock arm ran 0.88 only because its container booted two
     # executors back to back; standalone, stock gets the full pool.
@@ -962,7 +836,8 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                   submission="one request per pair, anchor-major, "
                              "prefix caching on",
                   max_num_seqs=max_seqs, step_tokens=25_305,
-                  prediction="~2.5-3 min per rep vs the packed 31.1 s",
+                  prediction="previous 90-93 s used max_num_seqs=366; "
+                             "now 4096, expect faster; Quail is 31.1 s",
                   boot=boot, boot_s=boot["boot_s"],
                   runs=[])
     print(f"[baseline_join] boot {boot}", flush=True)

@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 
 from quail.catalog import Catalog, DocumentProvider
-from quail.logical import CompileError, LogicalPlan
+from quail.logical import SHARED_PRE, CompileError, LogicalPlan
 from quail.planner.calibration import channel_bandwidths
 from quail.planner.decide import _collect, _join_sides, explain, plan_query
 from quail.planner.plan import (EngineConfig, Refusal, StoreSpec,
@@ -151,12 +151,14 @@ class Session:
 
     def content_hash(self, provider_name: str, column: str) -> str:
         """The store key prefix for one scanned column: provenance of
-        (provider data, column, tokenizer). File identity is
-        (path, size, mtime) - cheaper than hashing the bytes, and a
-        rewritten file changes it."""
+        (provider data, column, tokenizer, engine preamble). File
+        identity is (path, size, mtime) - cheaper than hashing the
+        bytes, and a rewritten file changes it. The preamble is part
+        of every stored prefix, so changing its text must invalidate
+        every stored extent."""
         provider = self.catalog.get(provider_name)
         ident = [provider.kind, provider.source, column,
-                 self.model.name]
+                 self.model.name, SHARED_PRE]
         if provider.kind == "parquet" and os.path.exists(provider.source):
             st = os.stat(provider.source)
             ident += [str(st.st_size), str(int(st.st_mtime))]
@@ -280,20 +282,29 @@ def _yes_no_ids(tok):
 
 def _question_ids(session: Session, prompt) -> list:
     """The question suffix the executor attaches after the document:
-    every part of the template except the document placeholders."""
-    text = re.sub(r"\{\d+\}", "", prompt.template)
+    the template text from the first placeholder on, placeholders
+    excluded. The engine preamble (before the placeholder) ships once
+    as the payload's pre_ids, never inside a question."""
+    text = re.sub(r"\{\d+\}", "", prompt.tail)
     return session.tokenizer(text)
 
 
 def _join_segments(session: Session, prompt):
-    """(pre_ids, mid_ids, tail_ids): the template text before the
-    first placeholder, between the two, and after the second."""
+    """(frame_ids, mid_ids, tail_ids): the user's relocated frame
+    text (written once into each anchor's kept KV, right after the
+    document), the per-pair text between the two placeholders, and
+    the per-pair text after the second. The engine preamble ships
+    once as the payload's pre_ids."""
     m = list(re.finditer(r"\{\d+\}", prompt.template))
-    pre = prompt.template[:m[0].start()]
     mid = prompt.template[m[0].end():m[1].start()]
     tail = prompt.template[m[1].end():]
+    frame = f"\n\n{prompt.frame}" if prompt.frame else ""
+    if frame:
+        # canonicalization placed the frame at the head of the mid
+        assert mid.startswith(frame), (frame, mid)
+        mid = mid[len(frame):]
     tok = session.tokenizer
-    return tok(pre), tok(mid), tok(tail)
+    return tok(frame) if frame else [], tok(mid), tok(tail)
 
 
 class Query:
@@ -385,7 +396,7 @@ class Query:
                 raise NotImplementedError(
                     "join prompts with more than two placeholders are "
                     "not executable yet")
-            pre, mid, tail = _join_segments(sess, j.predicate)
+            frame, mid, tail = _join_segments(sess, j.predicate)
             a1, _ = _join_sides(j)
             join_specs.append(dict(
                 anchor=op["anchor"], partner=op["partner"],
@@ -394,7 +405,7 @@ class Query:
                 # pair-independent; when the anchor is the template's
                 # second placeholder the two documents swap slots
                 swapped=op["anchor"] != a1,
-                pre=pre, mid=mid, tail=tail))
+                frame=frame, mid=mid, tail=tail))
         yes_ids, no_ids = _yes_no_ids(sess.tokenizer)
         store = None
         spec = sess.store_spec(self._hashes.values())
@@ -415,6 +426,9 @@ class Query:
             workers=plan.workers,
             shards=shards,
             yes_ids=yes_ids, no_ids=no_ids,
+            # the engine preamble, once: the worker prepends it to
+            # every KV-owning document (filter scans, join anchors)
+            pre_ids=sess.tokenizer(SHARED_PRE),
             docs=docs,
             filters=filter_qids,
             joins=join_specs,
@@ -433,6 +447,7 @@ class Query:
             boot=out.get("boot"),
             coordinator_wall_s=round(coordinator_wall, 2),
             fresh_tokens=out["fresh_tokens"], stages=[],
+            peak_gib=out.get("peak_gib"),
             store=out.get("store"),
             order_rule=plan.order_rule,
             calibration=plan.calibration_source,

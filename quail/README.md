@@ -8,9 +8,10 @@ workers run on H100 GPUs through Modal.
 
 - `quail/specs/` has the model and device structs. Every planner
   input comes from them.
-- `quail/planner/` has the budget arithmetic, calibration loading,
-  the physical plan, and the planner decisions (stage order, anchor
-  choice, sharding, access method, KV data type).
+- `quail/planner/` has the budget arithmetic, calibration loading
+  and measurement, the physical plan, and the planner decisions
+  (stage order, anchor choice, sharding, access method, KV data
+  type).
 - `quail/calibration/` has the measured constants per (model, device)
   pair: `a`, `a2`, `q_kv`, and the host channel bandwidth table.
 - `quail/catalog.py`, `quail/logical.py`, `quail/sqlfront/`, and
@@ -55,13 +56,13 @@ A pair without a calibration file gets defaults scaled from the anchor
 measurement (Qwen3 4B on H100) using spec ratios. The plan's
 `calibration_source` field says where the values came from.
 
-To measure a pair, run the calibrate cell:
+To measure a pair, run the calibrate entry on the engine app:
 
 ```
-uv run modal run tests/gpu/milestone1.py::run_calibrate 2>&1 | tee results/calibrate.log
+uv run modal run quail/runtime/calibrate.py --model qwen3-4b-fp8 --device h100-sxm 2>&1 | tee results/calibrate.log
 ```
 
-The calibrate cell does the following:
+The measure step (`quail.planner.calibrate.measure`) does the following:
 
 - It sweeps document length (256, 1,024, 4,096, and 8,192 tokens,
   about 1.5M fresh tokens per point) through the packed filter and
@@ -78,7 +79,7 @@ The result goes to `results/calibrate.json` only. To write it where
 the planner reads it, pass `--commit`:
 
 ```
-uv run modal run tests/gpu/milestone1.py::run_calibrate --commit 2>&1 | tee results/calibrate.log
+uv run modal run quail/runtime/calibrate.py --model qwen3-4b-fp8 --device h100-sxm --commit 2>&1 | tee results/calibrate.log
 ```
 
 ## Adding a new model
@@ -89,9 +90,11 @@ First, add a spec struct in `quail/specs/` (about 15 lines). Every
 field except `params` and `w_mem_bytes` comes from the model's HF
 `config.json`. Register the spec in `quail/specs/__init__.py`.
 
-Second, point the calibrate cell at the new model and run it with
-`--commit`. One run measures `a` and `a2` and writes the calibration
-file.
+Second, run the calibrate entry with `--model` set to the new spec
+name and `--commit`. One run measures `a` and `a2` and writes the
+calibration file. The Modal function is wired to H100 today; a new
+device needs a `gpu=` mapping in `quail/runtime/calibrate.py` as
+well as a device spec.
 
 Third, know that the executor's fused kernels assume the Qwen3
 architecture: QK-norm before rope, gated SiLU MLP, and fp8
@@ -100,5 +103,5 @@ without changes. A different model family needs kernel-path changes
 first.
 
 State the prediction before the run and compare after, per the house
-rule. The calibrate cell prints the previously loaded constants
+rule. The calibrate entry prints the previously loaded constants
 (`loaded_before`) next to the fresh fit for exactly that comparison.

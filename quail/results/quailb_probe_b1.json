@@ -1,0 +1,64 @@
+{
+  "sf": 0.1,
+  "lf": 1,
+  "gpus": 1,
+  "passes": {
+    "cold": {
+      "queries": [
+        {
+          "query": "B1",
+          "desc": "1F reviews: the per-query floor",
+          "wall_s": 29.92,
+          "boot_s": 33.59,
+          "fresh_tokens": 3493475,
+          "rows": 1984,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.3968,
+              "evaluated": 5000
+            }
+          ],
+          "store": null,
+          "replay": null
+        }
+      ],
+      "pass_wall_s": 83.4
+    },
+    "warm": {
+      "queries": [
+        {
+          "query": "B1",
+          "desc": "1F reviews: the per-query floor",
+          "wall_s": 31.79,
+          "boot_s": 0.0,
+          "fresh_tokens": 3493475,
+          "rows": 1984,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": 0.9,
+              "observed_selectivity": 0.3968,
+              "evaluated": 5000
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 342,
+              "stored_tokens": 433209
+            }
+          },
+          "replay": null
+        }
+      ],
+      "pass_wall_s": 51.1
+    }
+  }
+}

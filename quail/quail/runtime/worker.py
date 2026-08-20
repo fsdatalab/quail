@@ -176,6 +176,10 @@ def _execute_single(state, payload: dict) -> dict:
     spec = state["spec"]
     arena, pipeline = state["arena"], state["pipeline"]
     docs = payload["docs"]
+    # the engine preamble: prepended to every KV-owning document
+    # (filter scans, join anchors) so their stored KV is identical
+    # across operators; a partner document rides in the suffix raw
+    pre = payload.get("pre_ids") or []
     answerer = _PayloadAnswerer(torch, state["F"], state["model"],
                                 payload["yes_ids"], payload["no_ids"])
     async_ans = AsyncAnswers(torch, answerer)
@@ -190,7 +194,8 @@ def _execute_single(state, payload: dict) -> dict:
             capacity_tokens=int(store_cfg["capacity_bytes"]
                                 // spec.kappa),
             n_layers=spec.layers, n_kv=spec.n_kv, d_head=spec.d_head,
-            max_doc_tokens=max(max_doc, 4096), dtype=torch.bfloat16)
+            max_doc_tokens=max(max_doc + len(pre), 4096),
+            dtype=torch.bfloat16)
     store = state.get("store")
     if payload.get("store_flush") and store is not None:
         store.flush()
@@ -205,7 +210,8 @@ def _execute_single(state, payload: dict) -> dict:
         for alias, qids in payload["filters"].items():
             stats = {}
             answers, _, tokens = run_filter(
-                torch, arena, pipeline, async_ans, docs[alias], qids,
+                torch, arena, pipeline, async_ans,
+                [pre + d for d in docs[alias]], qids,
                 budget,
                 store=store if store_cfg else None,
                 store_hash=(store_cfg["hashes"][alias]
@@ -233,12 +239,25 @@ def _execute_single(state, payload: dict) -> dict:
                 stage_suffixes.append(
                     [j["mid"] + docs[j["partner"]][p] + j["tail"]
                      for p in partners])
-            prefixes = [group[0]["pre"] + docs[anchor_alias][a]
+            prefixes = [pre + docs[anchor_alias][a]
                         for a in anchors_glob]
+            jstats = {}
             ans, _, tokens = run_join(
                 torch, arena, pipeline, async_ans, prefixes,
                 stage_suffixes, budget,
-                group_size=1 if len(group) > 1 else None)
+                stage_frames=[j.get("frame") or [] for j in group],
+                group_size=1 if len(group) > 1 else None,
+                store=store if store_cfg else None,
+                store_hash=(store_cfg["hashes"][anchor_alias]
+                            if store_cfg else None),
+                store_min_tokens=(store_cfg["min_doc_tokens"]
+                                  if store_cfg else 1),
+                store_ids=anchors_glob,
+                stats=jstats)
+            if store_cfg:
+                agg = store_stats.setdefault(anchor_alias, {})
+                for key, v in jstats.items():
+                    agg[key] = agg.get(key, 0) + v
             total_tokens += tokens
             for si, j in enumerate(group):
                 out_joins.append(dict(
@@ -373,15 +392,18 @@ def _child_boot(state, sub):
     state["boot"] = boot
     store_cfg = sub.get("store")
     if store_cfg is not None and state.get("store") is None:
-        max_doc = max((len(d) for ds in sub.get("docs", {}).values()
-                       for d in ds), default=0)
+        pre_len = len(sub.get("pre_ids") or [])
+        max_doc = max(
+            [len(d) for ds in sub.get("docs", {}).values() for d in ds]
+            + [len(d) for d in sub.get("anchor_docs", [])] + [0])
         state["store"] = PinnedStore(
             capacity_tokens=int(store_cfg["capacity_bytes"]
                                 // state["spec"].kappa
                                 // sub.get("workers", 1)),
             n_layers=state["spec"].layers, n_kv=state["spec"].n_kv,
             d_head=state["spec"].d_head,
-            max_doc_tokens=max(max_doc, 4096), dtype=torch.bfloat16)
+            max_doc_tokens=max(max_doc + pre_len, 4096),
+            dtype=torch.bfloat16)
 
 
 def _child_filters(state, sub):
@@ -398,6 +420,7 @@ def _child_filters(state, sub):
     out = dict(filters={}, survivors={}, fresh_tokens=0, store={},
                boot_s=boot["boot_s"], boot_kind=boot["kind"],
                boot=boot)
+    pre = sub.get("pre_ids") or []
     t0 = _time.perf_counter()
     with torch.inference_mode():
         for alias, qids in sub["filters"].items():
@@ -405,7 +428,8 @@ def _child_filters(state, sub):
             index = sub["doc_index"][alias]
             answers, _, tokens = run_filter(
                 torch, state["arena"], state["pipeline"],
-                state["async_ans"], sub["docs"][alias], qids,
+                state["async_ans"],
+                [pre + d for d in sub["docs"][alias]], qids,
                 state["budget"],
                 store=state["store"] if store_cfg else None,
                 store_hash=(store_cfg["hashes"][alias]
@@ -434,10 +458,14 @@ def _child_joins(state, sub):
 
     _child_boot(state, sub)
     torch = state["torch"]
+    store_cfg = sub.get("store")
+    anchor_alias = sub["anchor_alias"]
+    pre = sub.get("pre_ids") or []
     anchors_glob = list(sub["anchor_index"])
     anchor_docs = sub["anchor_docs"]
     live = list(range(len(anchors_glob)))     # local anchor positions
     out_joins, tokens_total = [], 0
+    store_stats = {}
     t0 = _time.perf_counter()
     with torch.inference_mode():
         for group in _stage_groups(sub["joins"]):
@@ -448,12 +476,26 @@ def _child_joins(state, sub):
                 stage_suffixes.append(
                     [j["mid"] + doc + j["tail"]
                      for doc in partner["docs"]])
-            prefixes = [group[0]["pre"] + anchor_docs[a] for a in live]
+            prefixes = [pre + anchor_docs[a] for a in live]
+            jstats = {}
             ans, _, tokens = run_join(
                 torch, state["arena"], state["pipeline"],
                 state["async_ans"], prefixes, stage_suffixes,
                 state["budget"],
-                group_size=1 if len(group) > 1 else None)
+                stage_frames=[j.get("frame") or [] for j in group],
+                group_size=1 if len(group) > 1 else None,
+                store=state["store"] if store_cfg else None,
+                store_hash=(store_cfg["hashes"][anchor_alias]
+                            if store_cfg else None),
+                store_min_tokens=(store_cfg["min_doc_tokens"]
+                                  if store_cfg else 1),
+                store_ids=[anchors_glob[live[a]]
+                           for a in range(len(live))],
+                stats=jstats)
+            if store_cfg:
+                agg = store_stats.setdefault(anchor_alias, {})
+                for key, v in jstats.items():
+                    agg[key] = agg.get(key, 0) + v
             tokens_total += tokens
             for si, j in enumerate(group):
                 out_joins.append(dict(
@@ -470,6 +512,7 @@ def _child_joins(state, sub):
                 live = [live[a] for a in sorted(kept)]
     torch.cuda.synchronize()
     return dict(joins=out_joins, fresh_tokens=tokens_total,
+                store=store_stats,
                 wall_s=round(_time.perf_counter() - t0, 2))
 
 
@@ -519,6 +562,11 @@ def _execute_multi(payload: dict) -> dict:
         jouts = _round("joins", jsubs)
         out_joins = coordinator.merge_join_round(jouts)
         merged["fresh_tokens"] += sum(o["fresh_tokens"] for o in jouts)
+        for o in jouts:
+            for alias, st in (o.get("store") or {}).items():
+                agg = merged["store"].setdefault(alias, {})
+                for key, v in st.items():
+                    agg[key] = agg.get(key, 0) + v
     wall = _time.perf_counter() - t0
     boot_s = max(o["boot_s"] for o in fouts)
     # forward the breakdown from the child that owned the max boot
@@ -565,13 +613,15 @@ def execute_8(payload: dict) -> dict:
 
 def _stage_groups(joins):
     """Consecutive full stages sharing an anchor run as one gated
-    multi-stage call; everything else runs alone."""
+    multi-stage call; everything else runs alone. The anchor prefix
+    is [engine preamble + document] regardless of the stage's prompt
+    (task text rides in the suffix), so stages with different prompts
+    still share the anchor's KV."""
     groups, current = [], []
     for j in joins:
         if (current and j["semantics"] == "full"
                 and current[-1]["semantics"] == "full"
-                and current[0]["anchor"] == j["anchor"]
-                and current[0]["pre"] == j["pre"]):
+                and current[0]["anchor"] == j["anchor"]):
             current.append(j)
         else:
             if current:

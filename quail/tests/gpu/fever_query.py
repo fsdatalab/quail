@@ -53,3 +53,14 @@ def run_fever() -> str:
                       only={"B16"}, out_path="/results/fever_b16.json")
     results_vol.commit()
     return str(suite)
+
+
+@app.local_entrypoint()
+def main():
+    # House rule: print the function call id and keep it in the tee
+    # file before waiting on the result, so a dropped connection
+    # doesn't lose the run - re-fetch with
+    # modal.FunctionCall.from_id("<id>").get().
+    fc = run_fever.spawn()
+    print(f"function call id: {fc.object_id}")
+    print(fc.get())

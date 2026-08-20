@@ -283,8 +283,15 @@ def test_payload_carries_yes_no_and_join_segments(sess):
     sess.sql(sql).run(_execute=make_executor({}, join, seen=seen))
     payload = seen["payload"]
     assert payload["yes_ids"] and payload["no_ids"]
+    # the engine preamble ships once, not inside any join segment
+    from quail.logical import SHARED_PRE
+    assert payload["pre_ids"] == fake_tok(SHARED_PRE)
     j = payload["joins"][0]
-    assert j["pre"] == ["Does"]
+    assert "pre" not in j
+    # the user's pre-document text ("Does") is the frame, written
+    # into the anchor's kept KV once per anchor - never in the
+    # per-pair mid
+    assert j["frame"] == ["Does"]
     assert j["mid"] == ["match"]
     assert j["tail"] == ["?", "Answer."]
     assert j["anchor"] == "r" and not j["swapped"]
