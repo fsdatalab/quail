@@ -146,7 +146,8 @@ def test_join_prompt_keeps_markers_and_labels_blocks():
     assert p.preamble == SHARED_PRE
     # the question is the template verbatim - markers kept, nothing
     # filled in; the blocks above carry the matching labels
-    assert p.tail == "\n\nDoes {0} praise {1}?"
+    assert p.tail == ("\n\nEvaluate YES or NO for the following "
+                      "statement: Does {0} praise {1}?")
     assert p.tail_tokens == len(tok(p.tail))
     assert join_label(1) == "\n\nDOCUMENT {1}:\n"
     assert "{0}" in join_anchor_note(0)
@@ -289,7 +290,9 @@ def test_join_prompt_binding_counts(catalog):
     # substitution, no text relocated into the anchor's kept KV
     assert pred.frame == "" and pred.frame_tokens == 0
     assert pred.preamble == SHARED_PRE
-    assert pred.tail == "\n\nJudge the pair: {0} against {1}. Done."
+    assert pred.tail == ("\n\nEvaluate YES or NO for the following "
+                         "statement: Judge the pair: {0} against "
+                         "{1}. Done.")
     assert pred.tail_tokens == len(tok(pred.tail))
 
 

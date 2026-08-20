@@ -44,11 +44,14 @@ SHARED_PRE = "DOCUMENT:\n"
 # byte-identical to a filter scan of the same document and the store
 # serves both); the naming line written right after it - into kept
 # KV, once per anchor, never per tuple - maps the top block to its
-# marker. Like SHARED_PRE these are formatting labels, not
-# instructions.
+# marker. The question carries a fixed YES/NO instruction
+# ("Evaluate YES or NO for the following statement:") before the
+# user's template, so the model knows the task. Like SHARED_PRE
+# the block labels are formatting labels, not instructions.
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # blocks -> question
+JOIN_INSTRUCTION = "Evaluate YES or NO for the following statement: "
 
 
 def _marker(placeholder: int) -> str:
@@ -64,10 +67,11 @@ def join_anchor_note(placeholder: int) -> str:
 
 
 def render_join_question(template: str) -> str:
-    """The per-tuple question text: the user's template exactly as
-    written - braces kept, nothing filled in - behind the separator
-    that ends the block list."""
-    return JOIN_QUESTION_SEP + template
+    """The per-tuple question text: a fixed YES/NO instruction
+    followed by the user's template exactly as written - braces kept,
+    nothing filled in - behind the separator that ends the block
+    list."""
+    return JOIN_QUESTION_SEP + JOIN_INSTRUCTION + template
 
 
 @dataclass(frozen=True)

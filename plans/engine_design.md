@@ -228,11 +228,12 @@ DOCUMENT {0}:                             naming line written into
 <review a3>                               kept KV once per anchor
 
 DOCUMENT {2}:                          <- each partner block + the
-<product c9>                              question: one suffix, paid
-                                          once per tuple
-Review {0} praises the thread in {1}
-and that thread recommends the
-product in {2}.
+<product c9>                              instruction + question: one
+                                          suffix, paid once per tuple
+Evaluate YES or NO for the following
+statement: Review {0} praises the
+thread in {1} and that thread
+recommends the product in {2}.
 ```
 
 The anchor's document KV is computed once and every tuple of the
