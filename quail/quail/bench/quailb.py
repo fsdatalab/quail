@@ -344,6 +344,7 @@ def queries(sess):
     REACTION_DISCUSS = ("Does {0} describe the reaction named in {1} "
                         "as something the patient experienced and also "
                         "discuss the product described in {2}?")
+    SUPPORT = "Does {1} support the claim made in {0}?"
 
     q = {}
     q["B1"] = ("1F reviews: the per-query floor", lambda: sess.sql(
