@@ -26,12 +26,15 @@ class PageArena:
     def pages_needed(self, tokens: int) -> int:
         return -(-tokens // self.page_tokens)
 
-    def alloc(self, key, tokens: int):
+    def alloc(self, key, tokens: int, capacity_tokens: int | None = None):
         """The document's pages, or None when the free list is short
         (the admission scheduler treats None as "wait")."""
         if key in self.owned:
             raise KeyError(f"{key!r} already resident")
-        need = self.pages_needed(tokens)
+        capacity_tokens = tokens if capacity_tokens is None else capacity_tokens
+        if capacity_tokens < tokens:
+            raise ValueError("capacity_tokens must cover logical tokens")
+        need = self.pages_needed(capacity_tokens)
         if need > len(self.free):
             return None
         pages = [self.free.pop() for _ in range(need)]
@@ -46,12 +49,12 @@ class PageArena:
         self.free.extend(pages)
         return len(pages)
 
-    def row_indices(self, key):
+    def row_indices(self, key, tokens=None):
         """Flat row positions of the document's tokens inside a pool
         viewed as (n_pages * page_tokens, ...): page p holds rows
         p*page_tokens .. p*page_tokens + page_tokens."""
         rows = []
-        left = self.tokens[key]
+        left = self.tokens[key] if tokens is None else tokens
         for p in self.owned[key]:
             take = min(left, self.page_tokens)
             base = p * self.page_tokens
@@ -91,19 +94,25 @@ class KVArena:
         # the CPU behind whatever the stream is running - with ~200
         # admissions per chunk that was the loop's dominant CPU cost
         self._rows = {}       # key -> row-index tensor on CPU
+        self._capacity_rows = {}  # key -> every row in the claimed pages
         self._rows_dev = {}   # key -> device copy, built on first use
         self.device = device
 
-    def alloc(self, key, tokens: int):
-        pages = self.accounting.alloc(key, tokens)
+    def alloc(self, key, tokens: int, capacity_tokens: int | None = None):
+        capacity_tokens = tokens if capacity_tokens is None else capacity_tokens
+        pages = self.accounting.alloc(key, tokens, capacity_tokens)
         if pages is None:
             return None
         self._rows[key] = self.torch.tensor(
             self.accounting.row_indices(key), dtype=self.torch.int64)
+        self._capacity_rows[key] = self.torch.tensor(
+            self.accounting.row_indices(key, capacity_tokens),
+            dtype=self.torch.int64)
         return pages
 
     def free_key(self, key):
         self._rows.pop(key)
+        self._capacity_rows.pop(key)
         self._rows_dev.pop(key, None)
         return self.accounting.free_key(key)
 

@@ -351,6 +351,554 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
     return _write(report, "packed")
 
 
+# ---------------------------------------------------- attention paths
+
+ATTENTION_PATHS = (
+    ("split", "current two-call attention, BF16 merge, separate quant"),
+    ("merge_quant", "two-call attention, fused merge and FP8 quant"),
+    ("unified", "one causal paged attention call, separate quant"),
+)
+
+
+@app.function(timeout=1200, **GPU_KW)
+def attention_parity() -> str:
+    """Compare split and unified attention with a contiguous reference.
+
+    The cases cover fresh and retained prefixes, page boundaries, several
+    groups in one call, and noncontiguous physical pages. The contiguous
+    reference uses the same FlashAttention call without a block table, so a
+    unified versus reference difference isolates the paged mapping and mask.
+    """
+    import math
+    import sys
+    from types import SimpleNamespace
+
+    sys.path.insert(0, "/root/gpu_tests")
+
+    import torch
+
+    from quail.executor.arena import KVArena
+    from quail.executor.attention import Pipeline
+    from quail.executor.loop import pack_chunk
+
+    heads = 32
+    kv_heads = 8
+    head_dim = 128
+    page_tokens = 16
+
+    weight = SimpleNamespace(shape=(4096, 4096))
+    attn = SimpleNamespace(
+        num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+        rotary_emb=None, qkv_proj=SimpleNamespace(weight=weight))
+    layer = SimpleNamespace(
+        self_attn=attn,
+        mlp=SimpleNamespace(gate_up_proj=SimpleNamespace(weight=weight)))
+    model = SimpleNamespace(model=SimpleNamespace(
+        layers=[layer], embed_tokens=None, norm=None))
+
+    def fragmented_arena(pages_needed):
+        n_pages = pages_needed * 2 + 8
+        arena = KVArena(
+            n_layers=1, n_pages=n_pages, page_tokens=page_tokens,
+            n_kv=kv_heads, d_head=head_dim, dtype=torch.bfloat16)
+        for i in range(n_pages):
+            assert arena.alloc(("filler", i), 1) is not None
+        free_keys = list(range(0, n_pages, 2))[:pages_needed]
+        for i in free_keys:
+            arena.free_key(("filler", i))
+        return arena
+
+    def cuda_i32(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    def error(left, right):
+        delta = (left.float() - right.float()).abs()
+        return dict(
+            max_abs=float(delta.max().item()),
+            mean_abs=float(delta.mean().item()),
+            p99_abs=float(torch.quantile(delta.flatten(), 0.99).item()),
+            fraction_over_1e_2=float((delta > 1e-2).float().mean().item()),
+            fraction_over_5e_2=float((delta > 5e-2).float().mean().item()))
+
+    def pytorch_reference(q_parts, k_parts, v_parts, prefix_lengths):
+        outputs = []
+        group = heads // kv_heads
+        scale = 1.0 / math.sqrt(head_dim)
+        for q, k, v, prefix in zip(
+                q_parts, k_parts, v_parts, prefix_lengths):
+            q_len = q.shape[0]
+            k_len = k.shape[0]
+            k_gqa = k.repeat_interleave(group, dim=1)
+            v_gqa = v.repeat_interleave(group, dim=1)
+            scores = torch.einsum(
+                "qhd,khd->hqk", q.float(), k_gqa.float()) * scale
+            q_pos = prefix + torch.arange(q_len, device="cuda")
+            k_pos = torch.arange(k_len, device="cuda")
+            mask = k_pos[None, :] <= q_pos[:, None]
+            scores.masked_fill_(~mask[None, :, :], float("-inf"))
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.einsum("hqk,khd->qhd", probs, v_gqa.float())
+            outputs.append(out.to(torch.bfloat16))
+        return torch.cat(outputs)
+
+    def run_case(name, specs, fresh):
+        needed = sum(math.ceil((f + s) / page_tokens)
+                     for f, s in specs)
+        arena = fragmented_arena(needed)
+        pipeline = Pipeline(model, arena, kernels="quail")
+        groups = []
+        q_parts = []
+        k_parts = []
+        v_parts = []
+        prefix_lengths = []
+        q_packed = []
+        k_packed = []
+        v_packed = []
+
+        for i, (prefix_len, suffix_len) in enumerate(specs):
+            key = (name, i)
+            assert arena.alloc(
+                key, prefix_len,
+                capacity_tokens=prefix_len + suffix_len) is not None
+            if fresh:
+                count = prefix_len + suffix_len
+                q = torch.randn(
+                    count, heads, head_dim, device="cuda",
+                    dtype=torch.bfloat16)
+                k = torch.randn(
+                    count, kv_heads, head_dim, device="cuda",
+                    dtype=torch.bfloat16)
+                v = torch.randn_like(k)
+                groups.append(dict(
+                    key=key, prefix=[1] * prefix_len, f=prefix_len,
+                    suffixes=[[2] * suffix_len]))
+                q_parts.append(q)
+                k_parts.append(k)
+                v_parts.append(v)
+                prefix_lengths.append(0)
+                q_packed.append(q)
+                k_packed.append(k)
+                v_packed.append(v)
+            else:
+                q = torch.randn(
+                    suffix_len, heads, head_dim, device="cuda",
+                    dtype=torch.bfloat16)
+                current_k = torch.randn(
+                    suffix_len, kv_heads, head_dim, device="cuda",
+                    dtype=torch.bfloat16)
+                current_v = torch.randn_like(current_k)
+                cached_k = torch.randn(
+                    prefix_len, kv_heads, head_dim, device="cuda",
+                    dtype=torch.bfloat16)
+                cached_v = torch.randn_like(cached_k)
+                rows = arena.rows_gpu(key)
+                arena.k[0].index_copy_(0, rows, cached_k)
+                arena.v[0].index_copy_(0, rows, cached_v)
+                groups.append(dict(
+                    key=key, prefix=None, f=prefix_len,
+                    suffixes=[[2] * suffix_len]))
+                q_parts.append(q)
+                k_parts.append(torch.cat((cached_k, current_k)))
+                v_parts.append(torch.cat((cached_v, current_v)))
+                prefix_lengths.append(prefix_len)
+                q_packed.append(q)
+                k_packed.append(current_k)
+                v_packed.append(current_v)
+
+        q = torch.cat(q_packed).contiguous()
+        k = torch.cat(k_packed).contiguous()
+        v = torch.cat(v_packed).contiguous()
+        q_flat = q.view(q.shape[0], -1)
+        k_flat = k.view(k.shape[0], -1)
+        v_flat = v.view(v.shape[0], -1)
+
+        split_chunk = pack_chunk(
+            torch, arena, groups, pinned=True, attention_mode="split")
+        unified_chunk = pack_chunk(
+            torch, arena, groups, pinned=True, attention_mode="unified")
+        split_chunk["meta"]["layer"] = 0
+        split = pipeline.attention(
+            q_flat, k_flat, v_flat, split_chunk["meta"])
+        unified_chunk["meta"]["layer"] = 0
+        unified = pipeline.attention_unified(
+            q_flat, k_flat, v_flat, unified_chunk["meta"])
+
+        cu_q = [0]
+        cu_k = [0]
+        for qp, kp in zip(q_parts, k_parts):
+            cu_q.append(cu_q[-1] + qp.shape[0])
+            cu_k.append(cu_k[-1] + kp.shape[0])
+        contiguous, _ = pipeline._fa(
+            torch.cat(q_parts), torch.cat(k_parts), torch.cat(v_parts),
+            cuda_i32(cu_q), cuda_i32(cu_k),
+            max(qp.shape[0] for qp in q_parts),
+            max(kp.shape[0] for kp in k_parts), causal=True)
+        reference = pytorch_reference(
+            q_parts, k_parts, v_parts, prefix_lengths)
+        unified = unified.view_as(contiguous)
+        split = split.view_as(contiguous)
+
+        physical_pages = [arena.accounting.owned[(name, i)]
+                          for i in range(len(specs))]
+        return dict(
+            name=name, fresh=fresh, specs=specs,
+            physical_pages=physical_pages,
+            unified_vs_contiguous=error(unified, contiguous),
+            unified_vs_pytorch=error(unified, reference),
+            contiguous_vs_pytorch=error(contiguous, reference),
+            split_vs_contiguous=error(split, contiguous),
+            split_vs_unified=error(split, unified))
+
+    torch.manual_seed(12345)
+    cases = [
+        run_case("fresh_page_edges", [(15, 1), (16, 7), (17, 11)], True),
+        run_case("cached_page_edges", [(15, 1), (16, 7), (17, 11)], False),
+        run_case("cached_long", [(63, 32), (129, 13), (511, 7)], False),
+    ]
+    torch.cuda.synchronize()
+    report = dict(
+        cell="attention_parity", seed=12345,
+        interpretation=(
+            "Unified versus contiguous checks the paged mask and row mapping. "
+            "Both FlashAttention paths are also compared with an explicit "
+            "float32 causal attention reference."),
+        cases=cases)
+    return _write(report, "attention_parity")
+
+
+@app.function(timeout=2400, **GPU_KW)
+def attention_end_to_end_parity(n_docs: int = 256) -> str:
+    """Compare filter answers with full prompt recomputation."""
+    import sys
+
+    sys.path.insert(0, "/root/gpu_tests")
+
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoTokenizer
+
+    from corpus import MODEL, build_corpus
+    from quail.executor.arena import KVArena
+    from quail.executor.attention import Pipeline
+    from quail.executor.loop import (Answerer, AsyncAnswers, pack_chunk,
+                                     run_filter)
+    from quail.executor.model import load_model
+    from quail.planner import budgets
+    from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model = load_model(MODEL)
+    spec = QWEN3_4B_FP8
+    chunk_budget = budgets.chunk_budget(spec, H100_SXM)
+    arena_tokens = budgets.arena_tokens(spec, H100_SXM, chunk_budget)
+    arena = KVArena(
+        n_layers=spec.layers,
+        n_pages=arena_tokens // budgets.PAGE_TOKENS,
+        page_tokens=budgets.PAGE_TOKENS,
+        n_kv=spec.n_kv, d_head=spec.d_head, dtype=torch.bfloat16)
+    pipeline = Pipeline(model, arena, kernels="quail")
+    answerer = Answerer(torch, F, model, tokenizer)
+    async_answers = AsyncAnswers(torch, answerer)
+    budget = min(chunk_budget, pipeline.max_chunk_tokens)
+    body_ids, question_ids, flags = build_corpus(tokenizer, n_docs)
+
+    def full_prompt_reference():
+        answers = {d: [] for d in range(n_docs)}
+        live = list(range(n_docs))
+        pipeline.attention_mode = "split"
+        for stage, question in enumerate(question_ids):
+            stage_bits = {}
+            start = 0
+            while start < len(live):
+                end = start
+                tokens = 0
+                while end < len(live):
+                    size = len(body_ids[live[end]]) + len(question)
+                    if end > start and tokens + size > budget:
+                        break
+                    tokens += size
+                    end += 1
+                docs = live[start:end]
+                prompts = [body_ids[d] + question for d in docs]
+                groups = [dict(
+                    key=("reference", stage, d), prefix=prompt,
+                    f=len(prompt), suffixes=[])
+                    for d, prompt in zip(docs, prompts)]
+                packed = pack_chunk(
+                    torch, arena, groups, pinned=True,
+                    attention_mode="split")
+                final_rows = []
+                row = 0
+                for prompt in prompts:
+                    row += len(prompt)
+                    final_rows.append(row - 1)
+                packed["final_indices"] = torch.tensor(
+                    final_rows, dtype=torch.int64, device="cuda")
+                bits = answerer(pipeline.forward_chunk(packed))
+                for d, bit in zip(docs, bits):
+                    answers[d].append(bit)
+                    stage_bits[d] = bit
+                start = end
+            live = [d for d in live if stage_bits[d]]
+        return answers
+
+    def disagreements(left, right):
+        count = 0
+        by_stage = [0] * len(question_ids)
+        for d in range(n_docs):
+            a = left.get(d, [])
+            b = right.get(d, [])
+            for stage, (x, y) in enumerate(zip(a, b)):
+                if x != y:
+                    count += 1
+                    by_stage[stage] += 1
+            count += abs(len(a) - len(b))
+        return count, by_stage
+
+    outputs = {}
+    with torch.inference_mode():
+        for mode in ("split", "unified"):
+            pipeline.attention_mode = mode
+            outputs[mode], _, _ = run_filter(
+                torch, arena, pipeline, async_answers,
+                body_ids, question_ids, budget)
+        outputs["full_prompt"] = full_prompt_reference()
+    torch.cuda.synchronize()
+
+    comparisons = {}
+    reference = outputs["full_prompt"]
+    for mode in ("split", "unified"):
+        count, by_stage = disagreements(outputs[mode], reference)
+        comparisons[mode] = dict(
+            disagreements=count, disagreements_by_stage=by_stage,
+            answered=sum(len(row) for row in outputs[mode].values()),
+            wrong=_wrong_count(outputs[mode], flags))
+    split_unified, split_unified_by_stage = disagreements(
+        outputs["split"], outputs["unified"])
+    comparisons["split_vs_unified"] = dict(
+        disagreements=split_unified,
+        disagreements_by_stage=split_unified_by_stage)
+    report = dict(
+        cell="attention_end_to_end_parity", n_docs=n_docs,
+        reference=(
+            "Every document and stage recomputes the complete document plus "
+            "question as one causal sequence without paging or an LSE merge."),
+        comparisons=comparisons,
+        pass_unified=comparisons["unified"]["disagreements"] == 0)
+    return _write(report, "attention_end_to_end_parity")
+
+
+@app.function(timeout=3600, **GPU_KW)
+def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
+                         reps: int = 1) -> str:
+    """Compare split and fused merge attention on the join workload."""
+    import sys
+    import time
+
+    sys.path.insert(0, "/root/gpu_tests")
+
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoTokenizer
+
+    from corpus import MODEL, biodex_sample
+    from quail.executor.arena import KVArena
+    from quail.executor.attention import Pipeline
+    from quail.executor.loop import Answerer, AsyncAnswers, run_join
+    from quail.executor.model import load_model
+    from quail.planner import budgets
+    from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model = load_model(MODEL)
+    spec = QWEN3_4B_FP8
+    chunk_budget = budgets.chunk_budget(spec, H100_SXM)
+    arena_tokens = budgets.arena_tokens(spec, H100_SXM, chunk_budget)
+    arena = KVArena(
+        n_layers=spec.layers,
+        n_pages=arena_tokens // budgets.PAGE_TOKENS,
+        page_tokens=budgets.PAGE_TOKENS,
+        n_kv=spec.n_kv, d_head=spec.d_head, dtype=torch.bfloat16)
+    pipeline = Pipeline(model, arena, kernels="quail")
+    answerer = Answerer(torch, F, model, tokenizer)
+    async_answers = AsyncAnswers(torch, answerer)
+    budget = min(chunk_budget, pipeline.max_chunk_tokens)
+    data = biodex_sample(tokenizer, n_reports=n_reports)
+    prefixes = data["prefixes"]
+    suffixes = data["suffixes"][:n_terms]
+    modes = ("split", "merge_quant")
+    report = dict(
+        cell="join_attention_paths", n_reports=n_reports,
+        n_terms=n_terms, pairs=n_reports * n_terms, reps=reps,
+        budget=budget, arena_tokens=arena_tokens,
+        prediction=(
+            "Fusing the attention merge with FP8 quantization should make "
+            "merge_quant faster than split."),
+        runs={}, comparisons={})
+    print(f"[join_attention_paths] {report['prediction']}", flush=True)
+
+    outputs = {}
+    for mode in modes:
+        pipeline.attention_mode = mode
+        with torch.inference_mode():
+            # Warm the exact measured shape. This covers FlashAttention,
+            # DeepGEMM, quantization, scatter, and boundary-copy kernels.
+            run_join(
+                torch, arena, pipeline, async_answers, prefixes,
+                [suffixes], budget)
+            torch.cuda.synchronize()
+            rows = []
+            for rep in range(reps):
+                torch.cuda.reset_peak_memory_stats()
+                start = time.perf_counter()
+                answers, spans, tokens = run_join(
+                    torch, arena, pipeline, async_answers, prefixes,
+                    [suffixes], budget)
+                torch.cuda.synchronize()
+                wall = time.perf_counter() - start
+                flat = [bit for anchor in range(n_reports)
+                        for bit in answers[0][anchor]]
+                row = dict(
+                    mode=mode, rep=rep, wall=round(wall, 3),
+                    fresh_tokens=tokens,
+                    us_per_token=round(wall * 1e6 / tokens, 3),
+                    chunks=len(spans), yes=sum(flat),
+                    peak_gib=round(
+                        torch.cuda.max_memory_allocated() / 2**30, 2))
+                rows.append(row)
+                print(f"[join_attention_paths] {row}", flush=True)
+        report["runs"][mode] = rows
+        outputs[mode] = flat
+
+    baseline = outputs["split"]
+    for mode in modes[1:]:
+        report["comparisons"][mode] = dict(
+            disagreements=sum(a != b for a, b
+                              in zip(baseline, outputs[mode])),
+            wall_delta_s=round(
+                report["runs"][mode][-1]["wall"]
+                - report["runs"]["split"][-1]["wall"], 3))
+    return _write(report, "join_attention_paths")
+
+
+@app.function(timeout=5400, **GPU_KW)
+def attention_paths(n_docs: int = 10000, reps: int = 2) -> str:
+    """Compare the current A3 attention path with both proposed paths.
+
+    All paths share one model, one arena, one container, and the current
+    Quail kernels. Each path gets an unmeasured warmup before its measured
+    repetitions.
+    """
+    import sys
+    import time
+
+    sys.path.insert(0, "/root/gpu_tests")
+
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoTokenizer
+
+    from corpus import MODEL, build_corpus
+    from quail.executor.arena import KVArena
+    from quail.executor.attention import Pipeline
+    from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
+                                     warm_kernels)
+    from quail.executor.model import load_model
+    from quail.planner import budgets
+    from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model = load_model(MODEL)
+    chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
+    arena_tok = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, chunk)
+    spec = QWEN3_4B_FP8
+    arena = KVArena(n_layers=spec.layers,
+                    n_pages=arena_tok // budgets.PAGE_TOKENS,
+                    page_tokens=budgets.PAGE_TOKENS,
+                    n_kv=spec.n_kv, d_head=spec.d_head,
+                    dtype=torch.bfloat16)
+    pipeline = Pipeline(model, arena, kernels="quail")
+    answerer = Answerer(torch, F, model, tokenizer)
+    async_ans = AsyncAnswers(torch, answerer)
+    exec_budget = min(chunk, pipeline.max_chunk_tokens)
+    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
+
+    predictions = {
+        "split": "the committed A3 rate",
+        "merge_quant": "0.3 to 0.5 us/token faster than split",
+        "unified": "0.3 to 0.7 us/token faster than split",
+    }
+    report = dict(
+        cell="attention_paths", n_docs=n_docs, reps=reps,
+        exec_budget=exec_budget, arena_tokens=arena_tok,
+        paths={name: description for name, description in ATTENTION_PATHS},
+        predictions=predictions, runs={}, comparisons={})
+    print(f"[attention_paths] predictions: {json.dumps(predictions)}",
+          flush=True)
+
+    with torch.inference_mode():
+        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
+                     q_ids, exec_budget)
+    torch.cuda.synchronize()
+    kernel_cache.commit()
+
+    answers_by_path = {}
+    for mode, _ in ATTENTION_PATHS:
+        pipeline.attention_mode = mode
+        with torch.inference_mode():
+            run_filter(torch, arena, pipeline, async_ans,
+                       body_ids[:min(256, n_docs)], q_ids, exec_budget)
+            torch.cuda.synchronize()
+            rows = []
+            for rep in range(reps):
+                timers = {}
+                torch.cuda.reset_peak_memory_stats()
+                t0 = time.perf_counter()
+                answers, spans, tokens = run_filter(
+                    torch, arena, pipeline, async_ans, body_ids,
+                    q_ids, exec_budget, timing=timers)
+                torch.cuda.synchronize()
+                wall = time.perf_counter() - t0
+                answered = sum(len(v) for v in answers.values())
+                survivors = sum(len(row) == len(q_ids) and all(row)
+                                for row in answers.values())
+                row = dict(
+                    mode=mode, rep=rep, wall=round(wall, 3),
+                    fresh_tokens=tokens,
+                    us_per_token=round(wall * 1e6 / tokens, 3),
+                    answered=answered, survivors=survivors,
+                    wrong=_wrong_count(answers, flags),
+                    chunks=len(spans),
+                    gpu_s=round(sum(e0.elapsed_time(e1)
+                                    for _, e0, e1 in spans) / 1e3, 3),
+                    peak_gib=round(
+                        torch.cuda.max_memory_allocated() / 2**30, 2),
+                    cpu_phase_s={k: round(v, 3) for k, v
+                                 in sorted(timers.items())})
+                rows.append(row)
+                print(f"[attention_paths] {row}", flush=True)
+        report["runs"][mode] = rows
+        answers_by_path[mode] = answers
+
+    def disagreements(left, right):
+        total = 0
+        for doc in set(left) | set(right):
+            a = left.get(doc, [])
+            b = right.get(doc, [])
+            total += sum(x != y for x, y in zip(a, b))
+            total += abs(len(a) - len(b))
+        return total
+
+    baseline = answers_by_path["split"]
+    for mode in ("merge_quant", "unified"):
+        report["comparisons"][mode] = dict(
+            disagreements=disagreements(baseline, answers_by_path[mode]),
+            wall_delta_s=round(
+                report["runs"][mode][-1]["wall"]
+                - report["runs"]["split"][-1]["wall"], 3))
+    return _write(report, "attention_paths")
+
+
 # ---------------------------------------------------------- profiling
 
 def _categorize(name):
@@ -501,6 +1049,77 @@ def _save(payload, out):
 @app.local_entrypoint()
 def run_profile(out: str = "results/ablation_profile.json"):
     _save(profile_packed.remote(), out)
+
+
+@app.function(timeout=900, **GPU_KW)
+def probe_attention_api() -> str:
+    """Report the cache-attention entry points in the exact vLLM image.
+
+    The upstream FlashAttention API changes often.  Inspect the package in
+    the measurement container before the attention-path ablation depends on
+    a particular Python wrapper or operator schema.
+    """
+    import importlib
+    import inspect
+
+    modules = (
+        "vllm.vllm_flash_attn",
+        "vllm.vllm_flash_attn.flash_attn_interface",
+        "vllm.vllm_flash_attn.flash_attn_interface_fa3",
+    )
+    report = {}
+    for module_name in modules:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            report[module_name] = {"error": repr(exc)}
+            continue
+        names = sorted(name for name in dir(module)
+                       if "cache" in name.lower() or "flash_attn" in name)
+        entries = {}
+        for name in names:
+            value = getattr(module, name)
+            try:
+                signature = str(inspect.signature(value))
+            except (TypeError, ValueError):
+                signature = None
+            entries[name] = signature
+        report[module_name] = {
+            "file": getattr(module, "__file__", None),
+            "entries": entries,
+        }
+    print(json.dumps(report, indent=2), flush=True)
+    return json.dumps(report)
+
+
+@app.local_entrypoint()
+def probe_api():
+    print(probe_attention_api.remote())
+
+
+@app.local_entrypoint()
+def run_attention_paths(n_docs: int = 10000, reps: int = 2,
+                        out: str = "results/attention_paths.json"):
+    _save(attention_paths.remote(n_docs, reps), out)
+
+
+@app.local_entrypoint()
+def run_attention_parity():
+    result = attention_parity.remote()
+    print(result)
+
+
+@app.local_entrypoint()
+def run_attention_end_to_end_parity(n_docs: int = 256):
+    result = attention_end_to_end_parity.remote(n_docs)
+    print(result)
+
+
+@app.local_entrypoint()
+def run_join_attention_paths(n_reports: int = 10, n_terms: int = 256,
+                             reps: int = 1):
+    result = join_attention_paths.remote(n_reports, n_terms, reps)
+    print(result)
 
 
 @app.local_entrypoint()

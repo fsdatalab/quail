@@ -130,7 +130,8 @@ class AsyncAnswers:
 
 # ------------------------------------------------------- chunk packing
 
-def pack_chunk(torch, arena, groups, timing=None, pinned=True):
+def pack_chunk(torch, arena, groups, timing=None, pinned=True,
+               attention_mode="split"):
     """Tensors for one chunk, built from groups in chunk order.
 
     Each group is a dict:
@@ -159,6 +160,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True):
     kv_writes, layout = [], []
     cross_keys, cross_used, cu_q = [], [], [0]
     max_q = 0
+    unified_specs = []
     for g in groups:
         fresh = g.get("prefix") is not None
         f = g["f"]
@@ -194,10 +196,17 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True):
             cross_keys.append(key)
             cross_used.append(f)
             max_q = max(max_q, s_count)
+        if attention_mode == "unified":
+            if len(g["suffixes"]) != 1 or not paged:
+                raise ValueError(
+                    "unified attention requires one paged suffix per group")
+            logical_start = 0 if fresh else f
+            unified_specs.append(
+                (key, row0, len(ids), logical_start, f + s_count))
 
     t = _tick(timing, "pack_py", t)
     cross = None
-    if cross_keys:
+    if cross_keys and attention_mode != "unified":
         table, _ = arena.block_table(cross_keys)
         t = _tick(timing, "pack_blocktable", t)
         used = _staged(torch, cross_used, torch.int32, pinned)
@@ -208,23 +217,61 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True):
             cu_q=_staged(torch, cu_q, torch.int32, pinned),
             max_q=max_q, keys=cross_keys, used=used,
             max_used=max(cross_used), table=table, cu_k=cu_k)
+        if attention_mode == "merge_quant":
+            source = [-1] * len(ids)
+            for i, row in enumerate(suffix_rows):
+                source[row] = i
+            cross["source"] = _staged(
+                torch, source, torch.int32, pinned)
     t = _tick(timing, "pack_cross", t)
 
     # all of the chunk's KV writes as one list of (source, destination)
     # row pairs: the attention pass scatters them with a single kernel
     # launch per layer (kv_row_scatter)
-    kv_src = kv_dst = None
-    if kv_writes:
+    unified = None
+    if attention_mode == "unified":
+        keys = []
+        used = []
+        cu_full = [0]
         src = []
-        for _, r0, r1, _ in kv_writes:
+        dst = []
+        max_full_q = 0
+        for key, r0, r1, logical_start, full_used in unified_specs:
+            count = r1 - r0
+            rows = arena._capacity_rows[key]
+            selected = rows[logical_start:logical_start + count]
+            if selected.numel() != count:
+                raise RuntimeError("unified attention cache capacity is short")
+            keys.append(key)
+            used.append(full_used)
             src.extend(range(r0, r1))
+            dst.append(selected)
+            cu_full.append(cu_full[-1] + count)
+            max_full_q = max(max_full_q, count)
+        table, _ = arena.block_table(keys)
+        unified = dict(
+            src=_staged(torch, src, torch.int64, pinned),
+            dst=_staged(torch, torch.cat(dst), torch.int64, pinned),
+            cu_q=_staged(torch, cu_full, torch.int32, pinned),
+            used=_staged(torch, used, torch.int32, pinned),
+            table=table, max_q=max_full_q, max_used=max(used))
+
+    # All current KV writes use one scatter.
+    kv_src = kv_dst = None
+    if kv_writes and attention_mode != "unified":
+        src = []
+        dst_parts = []
+        for key, r0, r1, dest in kv_writes:
+            src.extend(range(r0, r1))
+            dst_parts.extend(
+                arena._rows[key][dest:dest + (r1 - r0)].tolist())
         kv_src = _staged(torch, src, torch.int64, pinned)
-        kv_dst = _staged(torch, torch.cat(
-            [arena._rows[key][dest:dest + (r1 - r0)]
-             for key, r0, r1, dest in kv_writes]), torch.int64, pinned)
+        kv_dst = _staged(torch, dst_parts, torch.int64, pinned)
     t = _tick(timing, "pack_kv", t)
+
     meta = dict(
-        layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross, paged=True,
+        layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
+        unified=unified, paged=True,
         cu_a=_staged(torch, cu_a, torch.int32, pinned),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = dict(
@@ -395,7 +442,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     prefix=anchor_prefixes[key] if carried else None,
                     f=f + (len(frame) if frame else 0),
                     suffixes=sufs))
-        return pack_chunk(torch, arena, specs)
+        return pack_chunk(torch, arena, specs,
+                          attention_mode=pipeline.attention_mode)
 
     def launch(j, chunk):
         nonlocal tokens, save_after
@@ -562,8 +610,12 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
         warm_docs.append(d)
         used += len(d) + q_max
         i += 1
-    run_filter(torch, arena, pipeline, async_ans, warm_docs,
-               question_ids, budget)
+    original_mode = pipeline.attention_mode
+    for mode in ("unified", "merge_quant"):
+        pipeline.attention_mode = mode
+        run_filter(torch, arena, pipeline, async_ans, warm_docs,
+                   question_ids, budget)
+    pipeline.attention_mode = original_mode
 
 
 # ---------------------------------------------------------- the filter
@@ -626,11 +678,14 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     if store is not None:
         restored = {d for d in range(len(doc_ids))
                     if skey(d) in store}
+    unified = pipeline.attention_mode == "unified"
+    temp_tail = max(len(question_ids[0]) - p,
+                    *(len(t) for t in tails[1:])) if unified else 0
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
         arena_pages=arena.accounting.n_pages,
         page_tokens=arena.accounting.page_tokens,
-        kept_extra_tokens=p, restored=restored, limit=limit)
+        kept_extra_tokens=p + temp_tail, restored=restored, limit=limit)
     spans, tokens = [], 0
     outstanding = []     # (groups, handle) in launch order
     load_events = {}     # doc -> store load event, awaited pre-launch
@@ -713,7 +768,10 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             continue
         for doc, stage, fresh in groups:
             if fresh:
-                got = arena.alloc(doc, len(doc_ids[doc]) + p)
+                logical = len(doc_ids[doc]) + p
+                got = arena.alloc(
+                    doc, logical,
+                    capacity_tokens=logical + temp_tail)
                 assert got is not None, \
                     "scheduler admitted a doc the arena cannot hold"
                 if doc in restored:
@@ -721,7 +779,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                                                   doc)
         t = _tick(timing, "alloc", t)
         chunk = pack_chunk(torch, arena, [to_spec(*g) for g in groups],
-                           timing=timing, pinned=pinned)
+                           timing=timing, pinned=pinned,
+                           attention_mode=pipeline.attention_mode)
         t = _tick(timing, "pack", t)
         tokens += chunk["tokens"]
         if trace is not None:
