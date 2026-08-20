@@ -12,7 +12,7 @@ from quail.runtime.coordinator import (filter_round_payloads,
 def payload():
     return dict(
         model="qwen3-4b-fp8", kv_dtype="bf16", chunk_tokens=1000,
-        yes_ids=[1], no_ids=[2], pre_ids=[9],
+        true_ids=[1], false_ids=[2], pre_ids=[9],
         docs={"r": [[i] * (10 + i) for i in range(6)],
               "p": [[i] * 5 for i in range(4)]},
         filters={"r": [[7, 7]]},

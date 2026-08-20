@@ -118,8 +118,8 @@ def execute(payload: dict) -> dict:
     chunk = budgets.chunk_budget(spec, device)
     # the worker has no tokenizer: the YES/NO token ids ride in the
     # payload
-    answerer = _PayloadAnswerer(torch, F, model, payload["yes_ids"],
-                                payload["no_ids"])
+    answerer = _PayloadAnswerer(torch, F, model, payload["true_ids"],
+                                payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
     budget = min(chunk, pipeline.max_chunk_tokens,
                  payload["chunk_tokens"])
@@ -365,7 +365,7 @@ def _child_boot(state, sub):
                      chunk=chunk, warmed=False, store=None)
         boot["kind"] = "cold"
     answerer = _PayloadAnswerer(torch, F, state["model"],
-                                sub["yes_ids"], sub["no_ids"])
+                                sub["true_ids"], sub["false_ids"])
     state["async_ans"] = AsyncAnswers(torch, answerer)
     state["budget"] = min(state["chunk"],
                           state["pipeline"].max_chunk_tokens,
@@ -656,24 +656,24 @@ def _stage_groups(joins):
 
 
 class _PayloadAnswerer:
-    """The Answerer, built from YES/NO token ids shipped in the
+    """The Answerer, built from TRUE/FALSE token ids shipped in the
     payload instead of a tokenizer."""
 
-    def __init__(self, torch, F, model, yes_ids, no_ids):
+    def __init__(self, torch, F, model, true_ids, false_ids):
         self.F = F
-        self.allowed = sorted(set(yes_ids) | set(no_ids))
+        self.allowed = sorted(set(true_ids) | set(false_ids))
         sel = torch.tensor(self.allowed, device="cuda")
         self.weights = model.lm_head.weight.index_select(0, sel).to(
             torch.bfloat16)
-        self.yes_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed) if t in set(yes_ids)],
-            device="cuda")
-        self.no_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed) if t in set(no_ids)],
-            device="cuda")
+        self.true_cols = torch.tensor(
+            [i for i, t in enumerate(self.allowed)
+             if t in set(true_ids)], device="cuda")
+        self.false_cols = torch.tensor(
+            [i for i, t in enumerate(self.allowed)
+             if t in set(false_ids)], device="cuda")
 
     def __call__(self, normed):
         scores = self.F.linear(normed, self.weights)
-        yes = scores.index_select(1, self.yes_cols).amax(dim=1)
-        no = scores.index_select(1, self.no_cols).amax(dim=1)
-        return (yes > no).int().cpu().tolist()
+        t = scores.index_select(1, self.true_cols).amax(dim=1)
+        f = scores.index_select(1, self.false_cols).amax(dim=1)
+        return (t > f).int().cpu().tolist()

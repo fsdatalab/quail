@@ -77,7 +77,7 @@ operators over document collections: `AI_FILTER` (does this document
 satisfy a yes/no predicate?) and `AI_JOIN` (does this tuple of
 documents - two or more, all in one prompt - satisfy a yes/no
 predicate?). The model answers each predicate in a single token
-(YES or NO), constrained at decode time so no autoregressive
+(TRUE or FALSE), constrained at decode time so no autoregressive
 generation ever runs.
 
 The current scope is filter queries and joins, Qwen3 4B fp8 weights,
@@ -677,10 +677,10 @@ RMS-normalized. These are the inputs to the answer readout.
 ### 5.5 Answer readout
 
 The `Answerer` (`loop.py:60`) scores the final hidden states against
-only the YES and NO token embeddings (not the full vocabulary). It
+only the TRUE and FALSE token embeddings (not the full vocabulary). It
 projects the normed hidden state through a sub-selected `lm_head`
-weight matrix (only the rows for YES/NO token ids), takes the argmax
-within the YES set and within the NO set, and compares.
+weight matrix (only the rows for TRUE/FALSE token ids), takes the argmax
+within the TRUE set and within the FALSE set, and compares.
 
 `AsyncAnswers` (`loop.py:92`) makes the readout non-blocking: it
 computes the answer bits on GPU, copies them to pinned host memory
@@ -705,7 +705,7 @@ answers. This overlaps GPU compute with answer readback.
 | `run_filter` | `loop.py:462` | The filter chain execution loop |
 | `run_join` | `loop.py:241` | The join execution loop (one cross-product stage per join; multi-stage gating stays available to GPU cells) |
 | `warm_kernels` | `loop.py:387` | Pre-compile all DeepGEMM and Triton kernel configs |
-| `Answerer` | `loop.py:60` | YES/NO scoring from final hidden states |
+| `Answerer` | `loop.py:60` | TRUE/FALSE scoring from final hidden states |
 | `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
 
 ### 5.6 The overlapped execution loop

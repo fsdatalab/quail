@@ -61,7 +61,7 @@ SETS = {
 
 def flags_line(bits, prefix="FLAG"):
     return ("\n\n[FLAGS] "
-            + " ".join(f"{prefix}_{j+1}={'YES' if b else 'NO'}"
+            + " ".join(f"{prefix}_{j+1}={'TRUE' if b else 'FALSE'}"
                        for j, b in enumerate(bits)))
 
 
@@ -85,10 +85,7 @@ def concat_to_chars(pool, target_chars, start):
 
 
 def flag_question(prefix, j):
-    return (f"\n\nExample: if the line said [FLAGS] {prefix}_9=NO, "
-            f"then {prefix}_9 has value NO.\nInstruction: output only "
-            f"the value of {prefix}_{j} from the [FLAGS] line above."
-            f"\n{prefix}_{j}=")
+    return f"\n\n{prefix}_{j} in the [FLAGS] line is TRUE."
 
 
 # ------------------------------------------------------- set builders
@@ -289,30 +286,18 @@ def queries(sess):
     # "DOCUMENT {i}:" with its own marker), so a marker in the
     # question resolves to its block. The whole question is paid once
     # per tuple, so it stays short; the naming line is paid once per
-    # anchor. Wording here is measured territory (the old close-range
-    # framing "Decide whether the report describes that reaction..."
-    # read as a YES prior: observed selectivity 0.76 vs 0.287) - the
-    # per-stage observed selectivity in the report is the instrument
-    # for the new wording.
-    REACTION = ("Judge strictly from {0} whether it describes the "
-                "reaction named in {1} as something the patient "
-                "experienced. Answer YES if it does, NO otherwise."
-                "\nANSWER=")
-    DISCUSS = ("Judge strictly from {0} whether it discusses the "
-               "product described in {1}. Answer YES if it does, NO "
-               "otherwise.\nANSWER=")
-    MENTION = ("Judge strictly from {0} whether it mentions the "
-               "medical term in {1}. Answer YES if it does, NO "
-               "otherwise.\nANSWER=")
-    KEYEQ3 = ("Judge strictly whether the [FLAGS] or key values in "
-              "{1} and in {2} both match the [KEYS] X value in {0}. "
-              "Answer YES only if both match, NO otherwise.\nANSWER=")
-    REACTION_DISCUSS = ("Judge strictly from {0} whether it "
-                        "describes the reaction named in {1} as "
+    # anchor. The engine wraps every template with a fixed instruction
+    # ("Evaluate TRUE or FALSE...") and answer cue ("\nANSWER:"), so
+    # templates here are plain statements only.
+    REACTION = ("{0} describes the reaction named in {1} as "
+                "something the patient experienced.")
+    DISCUSS = "{0} discusses the product described in {1}."
+    MENTION = "{0} mentions the medical term in {1}."
+    KEYEQ3 = ("The [FLAGS] or key values in {1} and in {2} both "
+              "match the [KEYS] X value in {0}.")
+    REACTION_DISCUSS = ("{0} describes the reaction named in {1} as "
                         "something the patient experienced and also "
-                        "discusses the product described in {2}. "
-                        "Answer YES only if both hold, NO otherwise."
-                        "\nANSWER=")
+                        "discusses the product described in {2}.")
 
     q = {}
     q["B1"] = ("1F reviews: the per-query floor", lambda: sess.sql(
@@ -426,9 +411,7 @@ def queries(sess):
                          selectivity=0.1, semantics="exists")
                 .ai_join(sess.docs("reports").alias("r"),
                          _q.prompt(
-                             "Judge strictly whether {0} and {1} "
-                             "both discuss medicine. Answer YES if "
-                             "both do, NO otherwise.\nANSWER=",
+                             "{0} and {1} both discuss medicine.",
                              _q.col("t.thread"), _q.col("r.report")),
                          selectivity=0.2)
                 .select("t.id", "r.id"))

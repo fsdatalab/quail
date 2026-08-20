@@ -44,14 +44,19 @@ SHARED_PRE = "DOCUMENT:\n"
 # byte-identical to a filter scan of the same document and the store
 # serves both); the naming line written right after it - into kept
 # KV, once per anchor, never per tuple - maps the top block to its
-# marker. The question carries a fixed YES/NO instruction
-# ("Evaluate YES or NO for the following statement:") before the
-# user's template, so the model knows the task. Like SHARED_PRE
-# the block labels are formatting labels, not instructions.
+# marker. Like SHARED_PRE the block labels are formatting labels,
+# not instructions.
+#
+# Every question (filter and join) gets a fixed instruction and
+# answer cue from the engine - the user's template is always a
+# plain statement, never an instruction:
+#   "Evaluate TRUE or FALSE for the following statement: <template>"
+#   "\nANSWER:"
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # blocks -> question
-JOIN_INSTRUCTION = "Evaluate YES or NO for the following statement: "
+TASK_INSTRUCTION = "Evaluate TRUE or FALSE for the following statement: "
+ANSWER_CUE = "\nANSWER:"
 
 
 def _marker(placeholder: int) -> str:
@@ -67,11 +72,23 @@ def join_anchor_note(placeholder: int) -> str:
 
 
 def render_join_question(template: str) -> str:
-    """The per-tuple question text: a fixed YES/NO instruction
+    """The per-tuple question text: a fixed TRUE/FALSE instruction
     followed by the user's template exactly as written - braces kept,
     nothing filled in - behind the separator that ends the block
-    list."""
-    return JOIN_QUESTION_SEP + JOIN_INSTRUCTION + template
+    list, with the answer cue at the end."""
+    return (JOIN_QUESTION_SEP + TASK_INSTRUCTION + template
+            + ANSWER_CUE)
+
+
+def render_filter_question(tail: str) -> str:
+    """Wrap a filter tail (placeholder-stripped question text) with
+    the task instruction and answer cue. The tail typically starts
+    with a separator (\\n\\n); the instruction is inserted after it."""
+    content = tail.lstrip("\n")
+    sep = tail[:len(tail) - len(content)]
+    if not sep:
+        sep = "\n\n"
+    return sep + TASK_INSTRUCTION + content + ANSWER_CUE
 
 
 @dataclass(frozen=True)
@@ -284,7 +301,10 @@ def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
 
     Placeholders must be {0}, {1}, ... matching the argument count and
     order. The template is canonicalized to the engine layout
-    (SHARED_PRE + document + frame + suffix) before splitting.
+    (SHARED_PRE + document + frame + instruction + suffix + cue)
+    before splitting. The task instruction and answer cue are baked
+    into the tail so the planner prices them and the executor gets
+    them automatically.
     `tokenizer` is any callable text -> token list; when given, the
     preamble, tail (question text, placeholders excluded), and frame
     are counted once here so the planner never tokenizes."""
@@ -292,6 +312,12 @@ def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
     _check_placeholders(template, len(args))
     frame, template = split_frame(template)
     preamble, tail = split_template(template)
+    # Wrap the question text (after the placeholder) with the task
+    # instruction and answer cue.
+    m = re.match(r"(\{\d+\})(.*)", tail, re.DOTALL)
+    if m:
+        ph, question = m.group(1), m.group(2)
+        tail = ph + render_filter_question(question)
     pre_tok = tail_tok = frame_tok = None
     if tokenizer is not None:
         pre_tok = len(tokenizer(preamble))

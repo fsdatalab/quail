@@ -146,8 +146,8 @@ def test_join_prompt_keeps_markers_and_labels_blocks():
     assert p.preamble == SHARED_PRE
     # the question is the template verbatim - markers kept, nothing
     # filled in; the blocks above carry the matching labels
-    assert p.tail == ("\n\nEvaluate YES or NO for the following "
-                      "statement: Does {0} praise {1}?")
+    assert p.tail == ("\n\nEvaluate TRUE or FALSE for the following "
+                      "statement: Does {0} praise {1}?\nANSWER:")
     assert p.tail_tokens == len(tok(p.tail))
     assert join_label(1) == "\n\nDOCUMENT {1}:\n"
     assert "{0}" in join_anchor_note(0)
@@ -290,9 +290,9 @@ def test_join_prompt_binding_counts(catalog):
     # substitution, no text relocated into the anchor's kept KV
     assert pred.frame == "" and pred.frame_tokens == 0
     assert pred.preamble == SHARED_PRE
-    assert pred.tail == ("\n\nEvaluate YES or NO for the following "
+    assert pred.tail == ("\n\nEvaluate TRUE or FALSE for the following "
                          "statement: Judge the pair: {0} against "
-                         "{1}. Done.")
+                         "{1}. Done.\nANSWER:")
     assert pred.tail_tokens == len(tok(pred.tail))
 
 
@@ -302,10 +302,13 @@ def test_prompt_split_and_counts(catalog):
     # the preamble is always the engine's; the user's pre-document
     # text ("This review is negative:") moves into the tail
     assert pred.prompt.preamble == SHARED_PRE
-    assert pred.prompt.tail == "{0}\n\nThis review is negative:"
+    assert pred.prompt.tail == ("{0}\n\nEvaluate TRUE or FALSE for the "
+                                "following statement: This review is "
+                                "negative:\nANSWER:")
     assert pred.prompt.preamble_tokens == len(tok(SHARED_PRE))
-    assert pred.prompt.tail_tokens == len(tok("This review is "
-                                              "negative:"))
+    assert pred.prompt.tail_tokens == len(tok(
+        "Evaluate TRUE or FALSE for the following statement: "
+        "This review is negative: ANSWER:"))
 
 
 def test_star_projection(catalog):

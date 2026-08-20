@@ -230,10 +230,11 @@ DOCUMENT {0}:                             naming line written into
 DOCUMENT {2}:                          <- each partner block + the
 <product c9>                              instruction + question: one
                                           suffix, paid once per tuple
-Evaluate YES or NO for the following
+Evaluate TRUE or FALSE for the following
 statement: Review {0} praises the
 thread in {1} and that thread
 recommends the product in {2}.
+ANSWER:
 ```
 
 The anchor's document KV is computed once and every tuple of the
@@ -691,7 +692,7 @@ tokens, three filters:
    are free: some chunk packs the group
    `[D's 400 tokens | q1's 25 tokens]`. Self-attention runs within
    each segment; D's KV is written to its pages; q1's KV is
-   written nowhere. The YES/NO logits at q1's last position are
+   written nowhere. The TRUE/FALSE logits at q1's last position are
    stage 1's answer.
 2. On YES, a later chunk packs just the 25-token group `q2`, no
    prefix segment: its cross-attention reads D's pages, its

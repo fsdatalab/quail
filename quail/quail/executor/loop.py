@@ -48,53 +48,53 @@ def _staged(torch, data, dtype, pinned=True):
     return torch.tensor(data, dtype=dtype, device="cuda")
 
 
-def yes_no_ids(tok):
-    """The token ids that mean YES and NO. Constraining the answer to
-    their union makes every stage answer in exactly one token: the
+def true_false_ids(tok):
+    """The token ids that mean TRUE and FALSE. Constraining the answer
+    to their union makes every stage answer in exactly one token: the
     answer is read from the prefill pass and no decode step ever
     runs."""
-    yes, no = set(), set()
-    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+    true, false = set(), set()
+    for w in ("TRUE", " TRUE", "True", " True"):
         ids = tok(w, add_special_tokens=False)["input_ids"]
         if ids:
-            yes.add(ids[0])
-    for w in ("NO", " NO", "No", " No", "N", " N"):
+            true.add(ids[0])
+    for w in ("FALSE", " FALSE", "False", " False"):
         ids = tok(w, add_special_tokens=False)["input_ids"]
         if ids:
-            no.add(ids[0])
-    return yes, no
+            false.add(ids[0])
+    return true, false
 
 
 class Answerer:
-    """YES/NO from final-position hidden states, scored against only
-    the allowed token rows - no full-vocabulary logits."""
+    """TRUE/FALSE from final-position hidden states, scored against
+    only the allowed token rows - no full-vocabulary logits."""
 
     def __init__(self, torch, F, model, tokenizer):
-        yes_ids, no_ids = yes_no_ids(tokenizer)
+        t_ids, f_ids = true_false_ids(tokenizer)
         self.F = F
-        self.allowed = sorted(yes_ids | no_ids)
-        self.yes_ids = yes_ids
+        self.allowed = sorted(t_ids | f_ids)
+        self.true_ids = t_ids
         sel = torch.tensor(self.allowed, device="cuda")
         self.weights = model.lm_head.weight.index_select(0, sel).to(
             torch.bfloat16)
-        self.yes_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed) if t in yes_ids],
+        self.true_cols = torch.tensor(
+            [i for i, t in enumerate(self.allowed) if t in t_ids],
             device="cuda")
-        self.no_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed) if t in no_ids],
+        self.false_cols = torch.tensor(
+            [i for i, t in enumerate(self.allowed) if t in f_ids],
             device="cuda")
 
     def __call__(self, normed):
         scores = self.F.linear(normed, self.weights)
-        yes = scores.index_select(1, self.yes_cols).amax(dim=1)
-        no = scores.index_select(1, self.no_cols).amax(dim=1)
-        return (yes > no).int().cpu().tolist()
+        t = scores.index_select(1, self.true_cols).amax(dim=1)
+        f = scores.index_select(1, self.false_cols).amax(dim=1)
+        return (t > f).int().cpu().tolist()
 
     def margins(self, normed):
         scores = self.F.linear(normed, self.weights)
-        yes = scores.index_select(1, self.yes_cols).amax(dim=1)
-        no = scores.index_select(1, self.no_cols).amax(dim=1)
-        return (yes - no).float().cpu().tolist()
+        t = scores.index_select(1, self.true_cols).amax(dim=1)
+        f = scores.index_select(1, self.false_cols).amax(dim=1)
+        return (t - f).float().cpu().tolist()
 
 
 class AsyncAnswers:

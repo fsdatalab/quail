@@ -269,19 +269,19 @@ class BoundBuilder:
                      order="as_written")
 
 
-def _yes_no_ids(tok):
-    """First-token ids of the YES/NO spellings, from the session's
-    tokenizer callable (same rule as the executor's yes_no_ids)."""
-    yes, no = set(), set()
-    for w in ("YES", " YES", "Yes", " Yes", "Y", " Y"):
+def _true_false_ids(tok):
+    """First-token ids of the TRUE/FALSE spellings, from the session's
+    tokenizer callable (same rule as the executor's true_false_ids)."""
+    true, false = set(), set()
+    for w in ("TRUE", " TRUE", "True", " True"):
         ids = tok(w)
         if ids:
-            yes.add(ids[0])
-    for w in ("NO", " NO", "No", " No", "N", " N"):
+            true.add(ids[0])
+    for w in ("FALSE", " FALSE", "False", " False"):
         ids = tok(w)
         if ids:
-            no.add(ids[0])
-    return sorted(yes), sorted(no)
+            false.add(ids[0])
+    return sorted(true), sorted(false)
 
 
 def _question_ids(session: Session, prompt) -> list:
@@ -400,7 +400,7 @@ class Query:
                               op["partners"])
             spec["semantics"] = op["semantics"]
             join_specs.append(spec)
-        yes_ids, no_ids = _yes_no_ids(sess.tokenizer)
+        true_ids, false_ids = _true_false_ids(sess.tokenizer)
         store = None
         spec = sess.store_spec(self._hashes.values())
         if spec is not None:
@@ -419,7 +419,7 @@ class Query:
             chunk_tokens=plan.chunk_tokens,
             workers=plan.workers,
             shards=shards,
-            yes_ids=yes_ids, no_ids=no_ids,
+            true_ids=true_ids, false_ids=false_ids,
             # the engine preamble, once: the worker prepends it to
             # every KV-owning document (filter scans, join anchors)
             pre_ids=sess.tokenizer(SHARED_PRE),

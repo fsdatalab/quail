@@ -197,7 +197,9 @@ def test_preamble_counted_once_per_document(catalog):
     st = chain["stages"][0]
     # the shared preamble is per document (stage 0), never per stage
     assert st["preamble_tokens"] == len(tok(SHARED_PRE))
-    assert st["question_tokens"] == len(tok("flag 0 of:"))
+    assert st["question_tokens"] == len(tok(
+        "Evaluate TRUE or FALSE for the following statement: "
+        "flag 0 of: ANSWER:"))
 
 
 def test_store_threshold_includes_preamble(catalog):

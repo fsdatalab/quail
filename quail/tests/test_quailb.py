@@ -23,7 +23,7 @@ def test_plant_flags_rates_and_determinism():
 
 
 def test_flags_line_format():
-    assert flags_line([1, 0], "T") == "\n\n[FLAGS] T_1=YES T_2=NO"
+    assert flags_line([1, 0], "T") == "\n\n[FLAGS] T_1=TRUE T_2=FALSE"
 
 
 def test_concat_to_chars_reaches_target_and_cycles():

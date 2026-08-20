@@ -37,12 +37,20 @@ def sess(tmp_path):
 
 
 def make_executor(filter_truth, join_truth=None, seen=None):
-    """filter_truth: alias -> {question first-token -> [bit per doc]}.
-    join_truth: (anchor alias, *partner aliases) ->
-    f(anchor_idx, *partner_idxs) -> bit, one call per cross-product
+    """filter_truth: alias -> {question keyword -> [bit per doc]}.
+    The keyword is matched against the question token list (any token
+    that starts with it). join_truth: (anchor alias, *partner aliases)
+    -> f(anchor_idx, *partner_idxs) -> bit, one call per cross-product
     tuple - the worker contract. seen: dict to capture the payload
     for order assertions."""
     import itertools
+
+    def _match_key(alias, q):
+        for key in filter_truth[alias]:
+            if any(t.startswith(key) for t in q):
+                return key
+        raise KeyError(f"no filter_truth key for alias {alias!r} "
+                       f"matches tokens {q[:5]}")
 
     def _exec(payload):
         if seen is not None:
@@ -56,7 +64,7 @@ def make_executor(filter_truth, join_truth=None, seen=None):
             for d in range(len(payload["docs"][alias])):
                 row = []
                 for q in qids:
-                    bit = filter_truth[alias][q[0]][d]
+                    bit = filter_truth[alias][_match_key(alias, q)][d]
                     row.append(bit)
                     if not bit:
                         break
@@ -171,11 +179,11 @@ def test_order_by_cost_reorders_payload(sess):
     # by_cost (the default: every predicate has a selectivity) runs
     # the 0.1 filter first
     first_q = seen["payload"]["filters"]["r"][0]
-    assert first_q[0] == "q2:"
+    assert "q2:" in first_q
     seen2 = {}
     sess.sql(sql, order="as_written").run(
         _execute=make_executor(truth, seen=seen2))
-    assert seen2["payload"]["filters"]["r"][0][0] == "q1:"
+    assert "q1:" in seen2["payload"]["filters"]["r"][0]
 
 
 def test_refusal_raises_on_run_prints_in_explain(sess, tmp_path):
@@ -275,7 +283,7 @@ def test_payload_carries_workers_and_shards(tmp_path):
     assert covered == list(range(6))
 
 
-def test_payload_carries_yes_no_and_join_spec(sess):
+def test_payload_carries_true_false_and_join_spec(sess):
     sql = """
         SELECT r.id, p.asin FROM reviews r
         JOIN products p
@@ -286,7 +294,7 @@ def test_payload_carries_yes_no_and_join_spec(sess):
     join = {("r", "p"): lambda a, p: 0}
     sess.sql(sql).run(_execute=make_executor({}, join, seen=seen))
     payload = seen["payload"]
-    assert payload["yes_ids"] and payload["no_ids"]
+    assert payload["true_ids"] and payload["false_ids"]
     # the engine preamble ships once, not inside any join segment
     from quail.logical import (SHARED_PRE, join_anchor_note,
                                join_label, render_join_question)
@@ -301,8 +309,8 @@ def test_payload_carries_yes_no_and_join_spec(sess):
     assert j["frame"] == fake_tok(join_anchor_note(0))
     assert j["labels"] == {"p": fake_tok(join_label(1))}
     assert j["tail"] == fake_tok(
-        "\n\nEvaluate YES or NO for the following statement: "
-        "Does {0} match {1}? Answer.")
+        "\n\nEvaluate TRUE or FALSE for the following statement: "
+        "Does {0} match {1}? Answer.\nANSWER:")
     logical = sess.sql(sql).logical
     pred = logical.root.input.predicate
     assert j["tail"] == fake_tok(render_join_question(pred.template))

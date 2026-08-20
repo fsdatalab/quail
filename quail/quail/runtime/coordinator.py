@@ -18,8 +18,8 @@ Two rounds per query:
   that is refused plainly until the benchmark needs it.
 """
 
-COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "yes_ids",
-               "no_ids", "pre_ids")
+COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "true_ids",
+               "false_ids", "pre_ids")
 
 
 def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
