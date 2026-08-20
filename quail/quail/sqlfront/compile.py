@@ -241,10 +241,10 @@ def _parse_limit(tree) -> int | None:
         return None
     expr = limit_node.expression
     if not isinstance(expr, exp.Literal) or expr.is_string:
-        raise CompileError("LIMIT must be a positive integer literal")
+        raise CompileError("LIMIT must be a positive integer")
     value = int(expr.this)
     if value <= 0:
-        raise CompileError("LIMIT must be a positive integer literal")
+        raise CompileError("LIMIT must be a positive integer")
     return value
 
 

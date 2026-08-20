@@ -247,6 +247,8 @@ class FilterAdmission:
         meaning the document's tokens ride along and its KV is written
         to its pages. Empty list means nothing is buildable right now
         (answers are still in flight)."""
+        if self._limit_reached():
+            return []
         room = self.chunk_budget
         groups = []
         # 1) survivor suffixes, oldest first; one live stage per doc
@@ -261,8 +263,6 @@ class FilterAdmission:
             self.in_flight.add(doc)
             room -= cost
         # 2) fresh admissions: pages in queue order, chunk room may skip
-        if self._limit_reached():
-            return groups
         blocked_pages = False
         skipped = deque()
         while self.pending and not blocked_pages:

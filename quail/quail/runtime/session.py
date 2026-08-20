@@ -546,6 +546,8 @@ class Query:
                 vals = self.session.column_values(c.provider, c.column)
                 row.append(vals[pos[c.alias]])
             proj_rows.append(tuple(row))
+        # upstream caps filter survivors, not output rows; join fan-out
+        # can produce more rows than survivors, so truncate here
         if plan.limit is not None:
             proj_rows = proj_rows[:plan.limit]
         return Result(columns=cols, rows=proj_rows, report=report,

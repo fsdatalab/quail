@@ -53,7 +53,10 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
 def merge_filter_round(outs: list, limit: int | None = None) -> dict:
     """Merge the workers' filter answers (global-keyed), survivors,
     token counts, and store stats. When limit is set, each alias's
-    merged survivor list is truncated to that count."""
+    merged survivor list is truncated to that count.
+    NOTE: this truncation is correct for filter-only queries; for
+    joins, truncating anchor survivors here can under-produce output
+    rows. The session's _assemble is the final output-row cap."""
     filters, survivors, store = {}, {}, {}
     tokens = 0
     for out in outs:
