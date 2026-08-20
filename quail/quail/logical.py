@@ -34,6 +34,39 @@ class CompileError(ValueError):
 # lives in the suffix, after the document.
 SHARED_PRE = "DOCUMENT:\n"
 
+# The join prompt's fixed strings. A join renders each tuple as
+# labeled document blocks followed by the user's template as the
+# question; the template is never inlined - each placeholder becomes
+# a reference to its block. The anchor's block keeps the bare
+# SHARED_PRE label (so its KV is byte-identical to a filter scan of
+# the same document and the store serves both); the naming line
+# written right after it - into kept KV, once per anchor, never per
+# tuple - is what lets the question call it by alias anyway. Like
+# SHARED_PRE these are formatting labels, not instructions.
+JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
+JOIN_ANCHOR_NOTE = "\n\n(The document above is document {}.)"
+JOIN_DOC_REF = "document {}"               # placeholder rendering
+JOIN_QUESTION_SEP = "\n\n"                 # blocks -> question
+
+
+def join_label(alias: str) -> str:
+    return JOIN_DOC_LABEL.format(alias)
+
+
+def join_anchor_note(alias: str) -> str:
+    return JOIN_ANCHOR_NOTE.format(alias)
+
+
+def render_join_question(template: str, args: tuple) -> str:
+    """The per-tuple question text: the user's template with every
+    placeholder replaced by a reference to its document block, behind
+    the separator that ends the block list."""
+    import re
+    refs = {i: JOIN_DOC_REF.format(r.alias) for i, r in enumerate(args)}
+    body = re.sub(r"\{(\d+)\}", lambda m: refs[int(m.group(1))],
+                  template)
+    return JOIN_QUESTION_SEP + body
+
 
 @dataclass(frozen=True)
 class ColumnRef:
@@ -46,17 +79,22 @@ class ColumnRef:
 class Prompt:
     """A PROMPT('template {0} ...', cols...) call, bound and split.
 
-    The split feeds both the executor's KV reuse and the token
-    arithmetic: `preamble` is the engine's fixed text before the
-    first placeholder (shared across every document, computed once);
-    `tail` is everything after it, with the placeholders still in
-    place; `frame` is the user's pre-document text, relocated after
-    the document by canonicalization. A filter carries the frame at
-    the head of each stage's question. A join writes it into the
-    anchor's kept KV once per anchor, so pairs read it from KV
-    instead of paying its tokens per pair. Token counts are filled
-    at bind time when a tokenizer is available; None means the
-    planner must be given counts."""
+    Filters (bind_prompt): the template is canonicalized so the
+    document is inlined at its placeholder - `preamble` is the
+    engine's fixed text before it (shared across every document,
+    computed once), `tail` is everything from the placeholder on,
+    and `frame` is the user's pre-document text, relocated after the
+    document and carried at the head of each stage's question.
+
+    Joins (bind_join_prompt): the template is never inlined - it is
+    the per-tuple question, appended after the labeled document
+    blocks with each placeholder rendered as a block reference.
+    `preamble` is still SHARED_PRE (the anchor block's label), `tail`
+    is the rendered question, `labels` carries the per-alias block
+    label and naming-line token counts, and `frame` is empty.
+
+    Token counts are filled at bind time when a tokenizer is
+    available; None means the planner must be given counts."""
     template: str
     args: tuple    # tuple[ColumnRef, ...] in placeholder order
     preamble: str
@@ -65,6 +103,12 @@ class Prompt:
     tail_tokens: Optional[int] = None
     frame: str = ""
     frame_tokens: Optional[int] = None
+    # join prompts only: per referenced alias, in placeholder order,
+    # (alias, label_tokens, note_tokens) - the partner block label
+    # "\n\nDOCUMENT {alias}:\n" and the anchor naming line, counted at
+    # bind time so the planner prices any anchor choice without a
+    # tokenizer. Empty for filter prompts.
+    labels: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -90,14 +134,24 @@ class SemanticFilter:
 
 @dataclass(frozen=True)
 class SemanticJoin:
-    left: "Operator"
-    right: "Operator"
+    """One n-way join: the cross product of its tables, filtered by a
+    single prompt that holds every document at once (the BigQuery /
+    Snowflake AI-join shape - never a chain of pairwise stages). One
+    placeholder per table; each tuple is one model call. exists/anti
+    are the two-table gate form: anchor documents are kept (exists)
+    or dropped (anti) on whether any partner answers YES."""
+    inputs: tuple    # tuple[Operator]: the accumulated tree first,
+    #                  then one (optionally filtered) scan per newly
+    #                  joined table, joined order
     predicate: Prompt
     semantics: str = "full"            # full | exists | anti
-    selectivity: Optional[float] = None    # fraction of pairs that pass
+    selectivity: Optional[float] = None    # fraction of tuples that pass
     anchor: Optional[str] = None       # table alias whose documents
-    #                                    anchor this stage; None =
-    #                                    planner picks the longer side
+    #                                    anchor (KV kept, partners
+    #                                    stream); None = planner picks
+    #                                    the cheaper side. exists/anti
+    #                                    always anchor on the outer
+    #                                    table - the gate applies to it
 
 
 @dataclass(frozen=True)
@@ -121,8 +175,10 @@ class LogicalPlan:
 
 @dataclass(frozen=True)
 class JoinSpec:
-    """One JOIN clause (or EXISTS/anti term), pre-assembly."""
-    alias: str                 # the newly joined (or inner) table alias
+    """The join predicate (or one EXISTS/anti term), pre-assembly."""
+    aliases: tuple             # newly joined table aliases, joined
+    #                            order (one entry: the inner table,
+    #                            for exists/anti)
     prompt: Prompt
     semantics: str = "full"
     selectivity: Optional[float] = None
@@ -144,8 +200,9 @@ class QueryDesc:
 def assemble_plan(desc: QueryDesc) -> LogicalPlan:
     """The deterministic tree: scans (with their filters attached
     directly above - filters always run before joins, section 4's
-    unconditional pushdown), folded left to right by the join specs,
-    Project at the root."""
+    unconditional pushdown), folded in written order by the join
+    specs (each spec brings every table it joins), Project at the
+    root."""
     def subtree(alias: str):
         provider = dict(desc.tables)[alias]
         node = Scan(provider=provider, alias=alias,
@@ -158,9 +215,10 @@ def assemble_plan(desc: QueryDesc) -> LogicalPlan:
     first = desc.tables[0][0]
     tree = subtree(first)
     for j in desc.joins:
-        tree = SemanticJoin(left=tree, right=subtree(j.alias),
-                            predicate=j.prompt, semantics=j.semantics,
-                            selectivity=j.selectivity, anchor=j.anchor)
+        tree = SemanticJoin(
+            inputs=(tree,) + tuple(subtree(a) for a in j.aliases),
+            predicate=j.prompt, semantics=j.semantics,
+            selectivity=j.selectivity, anchor=j.anchor)
     return LogicalPlan(root=Project(input=tree,
                                     columns=tuple(desc.columns)))
 
@@ -204,8 +262,18 @@ def canonicalize_template(template: str) -> str:
     return split_frame(template)[1]
 
 
+def _check_placeholders(template: str, n_args: int) -> None:
+    import re
+    slots = [int(m) for m in re.findall(r"\{(\d+)\}", template)]
+    if sorted(set(slots)) != list(range(n_args)):
+        raise CompileError(
+            f"PROMPT placeholders {sorted(set(slots))} do not match "
+            f"{n_args} argument(s): expected {{0}}..{{{n_args - 1}}} "
+            f"each used at least once")
+
+
 def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
-    """Build a Prompt, checking placeholders against arguments.
+    """Build a filter Prompt, checking placeholders against arguments.
 
     Placeholders must be {0}, {1}, ... matching the argument count and
     order. The template is canonicalized to the engine layout
@@ -214,12 +282,7 @@ def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
     preamble, tail (question text, placeholders excluded), and frame
     are counted once here so the planner never tokenizes."""
     import re
-    slots = [int(m) for m in re.findall(r"\{(\d+)\}", template)]
-    if sorted(set(slots)) != list(range(len(args))):
-        raise CompileError(
-            f"PROMPT placeholders {sorted(set(slots))} do not match "
-            f"{len(args)} argument(s): expected {{0}}..{{{len(args) - 1}}} "
-            f"each used at least once")
+    _check_placeholders(template, len(args))
     frame, template = split_frame(template)
     preamble, tail = split_template(template)
     pre_tok = tail_tok = frame_tok = None
@@ -231,3 +294,53 @@ def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
     return Prompt(template=template, args=tuple(args), preamble=preamble,
                   tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
                   frame=frame, frame_tokens=frame_tok)
+
+
+def bind_join_prompt(template: str, args: tuple,
+                     tokenizer=None) -> Prompt:
+    """Build a join Prompt: one prompt over the whole tuple, one
+    placeholder per table, evaluated on the cross product.
+
+    The template is kept as written and is never inlined: at run time
+    each tuple renders as labeled document blocks (the anchor's block
+    first, under the bare SHARED_PRE label plus its naming line; each
+    partner under "DOCUMENT {alias}:") followed by this template as
+    the question, with every placeholder replaced by "document
+    {alias}". So:
+
+        preamble      SHARED_PRE - the anchor block's label, paid
+                      once per anchor document (and byte-identical to
+                      a filter scan's stored prefix, which is what
+                      lets the store serve both)
+        tail          the rendered question, paid once per tuple
+        labels        (alias, label_tokens, note_tokens) per table:
+                      a partner block's label is paid once per tuple,
+                      the anchor's naming line once per anchor
+
+    Each placeholder must name a distinct table (one block per
+    table)."""
+    _check_placeholders(template, len(args))
+    if len(args) < 2:
+        raise CompileError("a join prompt needs at least two "
+                           "placeholders, one per joined table")
+    aliases = [r.alias for r in args]
+    if len(set(aliases)) != len(aliases):
+        raise CompileError(
+            f"each join placeholder must name a distinct table (one "
+            f"document block per table), got aliases {aliases}; refer "
+            f"to a table's document again in the question text "
+            f"instead of adding a second placeholder")
+    question = render_join_question(template, tuple(args))
+    pre_tok = tail_tok = frame_tok = None
+    labels = tuple((a, None, None) for a in aliases)
+    if tokenizer is not None:
+        pre_tok = len(tokenizer(SHARED_PRE))
+        tail_tok = len(tokenizer(question))
+        frame_tok = 0
+        labels = tuple((a, len(tokenizer(join_label(a))),
+                        len(tokenizer(join_anchor_note(a))))
+                       for a in aliases)
+    return Prompt(template=template, args=tuple(args),
+                  preamble=SHARED_PRE, tail=question,
+                  preamble_tokens=pre_tok, tail_tokens=tail_tok,
+                  frame="", frame_tokens=frame_tok, labels=labels)

@@ -4,8 +4,8 @@ torch, CPU-tested - the worker's parent process calls it between its
 children, so the split and the merge never cross a network hop.
 
 The sharding contract, from the design: filters split documents by
-token count; joins split by anchor document, so gating, dedup, and
-the next stage's pair list stay local to the GPU holding the anchor.
+token count; joins split by anchor document, so gating and each
+anchor's tuple stream stay local to the GPU holding the anchor.
 Shards are deterministic for a given corpus, which is what lets each
 GPU's store slice serve the same documents query after query.
 
@@ -95,7 +95,7 @@ def join_round_payloads(payload: dict, shards: dict, k: int,
         return list(range(len(payload["docs"][alias])))
 
     anchor_shards = shards.get(anchor_alias)
-    partner_aliases = sorted({j["partner"] for j in joins})
+    partner_aliases = sorted({p for j in joins for p in j["partners"]})
     partners = {alias: dict(index=surv(alias),
                             docs=[payload["docs"][alias][g]
                                   for g in surv(alias)])

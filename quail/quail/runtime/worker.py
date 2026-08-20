@@ -1,19 +1,21 @@
 """The Modal worker: one container, one H100, one executor.
 
 Takes the coordinator's payload (token ids and the planned settings,
-nothing else), runs the filter chains and join stages on the packed
-executor, gates between stages next to the GPU, and returns the raw
-answer rows. The coordinator assembles tuples, replay-checks, and
-projects - it never sees a tensor.
+nothing else), runs the filter chains and the join stages on the
+packed executor, gates between stages next to the GPU, and returns
+the raw answer rows. The coordinator assembles tuples and projects -
+it never sees a tensor.
 
-Consecutive full-join stages sharing one anchor run as a single
-multi-stage run_join call, so the anchor's KV is computed in stage 1
-and read again in stage 2 - the cross-stage reuse the executor's kept
-KV exists for. exists/anti stages run alone; their early-stop
-optimization is not built yet, so they stream the full partner list
-and the keep rule is applied to the answers.
+A join stage is the cross product under one prompt: each anchor
+document's KV is computed once (kept, with the naming line written
+after it), and every tuple of the partner tables streams against it
+as one suffix - every partner document behind its block label, then
+the question. exists/anti gates run the same way over one partner
+table and apply the keep rule to the answers; their early-stop
+optimization is not built yet, so they stream the full list.
 """
 
+import itertools
 import json
 import os
 import time
@@ -232,13 +234,13 @@ def _execute_single(state, payload: dict) -> dict:
             anchor_alias = group[0]["anchor"]
             anchors_glob = list(survivors[anchor_alias])
             stage_suffixes = []
-            partner_globs = []
+            tuple_globs = []
             for j in group:
-                partners = list(survivors[j["partner"]])
-                partner_globs.append(partners)
+                tuples = [list(t) for t in itertools.product(
+                    *[survivors[p] for p in j["partners"]])]
+                tuple_globs.append(tuples)
                 stage_suffixes.append(
-                    [j["mid"] + docs[j["partner"]][p] + j["tail"]
-                     for p in partners])
+                    [_tuple_suffix(j, docs, t) for t in tuples])
             prefixes = [pre + docs[anchor_alias][a]
                         for a in anchors_glob]
             jstats = {}
@@ -263,7 +265,7 @@ def _execute_single(state, payload: dict) -> dict:
                 out_joins.append(dict(
                     rows={int(a): row for a, row in ans[si].items()},
                     anchor_index=anchors_glob,
-                    partner_index=partner_globs[si]))
+                    partner_index=tuple_globs[si]))
             # gate the anchor set for stages after this group
             last = ans[len(group) - 1]
             kept = {anchors_glob[a] for a, row in last.items()
@@ -469,13 +471,22 @@ def _child_joins(state, sub):
     t0 = _time.perf_counter()
     with torch.inference_mode():
         for group in _stage_groups(sub["joins"]):
-            stage_suffixes, partner_globs = [], []
+            stage_suffixes, tuple_globs = [], []
             for j in group:
-                partner = sub["partners"][j["partner"]]
-                partner_globs.append(list(partner["index"]))
+                # partner docs ride keyed by local position; tuples
+                # combine one local position per partner alias
+                locals_ = [range(len(sub["partners"][p]["index"]))
+                           for p in j["partners"]]
+                combos = list(itertools.product(*locals_))
+                tuple_globs.append(
+                    [[sub["partners"][p]["index"][c]
+                      for p, c in zip(j["partners"], combo)]
+                     for combo in combos])
+                part_docs = {p: sub["partners"][p]["docs"]
+                             for p in j["partners"]}
                 stage_suffixes.append(
-                    [j["mid"] + doc + j["tail"]
-                     for doc in partner["docs"]])
+                    [_tuple_suffix(j, part_docs, combo)
+                     for combo in combos])
             prefixes = [pre + anchor_docs[a] for a in live]
             jstats = {}
             ans, _, tokens = run_join(
@@ -502,7 +513,7 @@ def _child_joins(state, sub):
                     rows={int(a): row for a, row in ans[si].items()},
                     anchor_index=[anchors_glob[live[a]]
                                   for a in range(len(live))],
-                    partner_index=partner_globs[si]))
+                    partner_index=tuple_globs[si]))
             last = ans[len(group) - 1]
             kept = {a for a, row in last.items() if any(row)}
             if group[-1]["semantics"] == "anti":
@@ -609,6 +620,18 @@ def execute_4(payload: dict) -> dict:
                        "/results": results_vol})
 def execute_8(payload: dict) -> dict:
     return _execute_multi(payload)
+
+
+def _tuple_suffix(join, docs, member) -> list:
+    """One tuple's stream: every partner document behind its block
+    label, then the rendered question. `member` holds one document
+    index per partner alias, in the join's partner order."""
+    out = []
+    for alias, g in zip(join["partners"], member):
+        out += join["labels"][alias]
+        out += docs[alias][g]
+    out += join["tail"]
+    return out
 
 
 def _stage_groups(joins):

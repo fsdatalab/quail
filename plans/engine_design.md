@@ -180,36 +180,64 @@ there are never lists to line up: each AI_FILTER call carries its
 own object. A filter predicate takes `selectivity` (one rough
 number — the fraction of documents that pass; used only for
 ordering, §2.5). A join predicate takes `selectivity` (the
-fraction of pairs that pass) and `anchor`, which names the table
-alias whose documents anchor that stage — one value, because one
-predicate is one join stage. Omitted options mean: no selectivity
-(that predicate keeps its written position) and planner-chosen
-anchor (the longer side).
+fraction of tuples that pass) and `anchor`, which names the table
+alias whose documents anchor the join. Omitted options mean: no
+selectivity (that predicate keeps its written position) and
+planner-chosen anchor (the cheaper side, in practice the longer
+one).
 
-An n-way join is written the way Snowflake writes it: one JOIN
-clause per edge of the join graph, each edge with its own
-predicate and its own options. A 3-way chain:
+An n-way join is ONE predicate, however many tables it spans —
+the BigQuery/Snowflake AI-join shape: the cross product of the
+tables, filtered by a single prompt that holds every document at
+once. One placeholder per table; each tuple is one model call.
+It is never a chain of pairwise stages. Two spellings compile to
+the same plan — the predicate on the last JOIN's ON (earlier
+JOINs bare), or comma-joined tables with the predicate as a WHERE
+term:
 
 ```sql
 SELECT a.id, b.id, c.id
 FROM reviews a
 JOIN threads b
-  ON AI_FILTER(PROMPT('Does review {0} praise this thread? {1}',
-                      a.review, b.thread),
-               {'selectivity': 0.2, 'anchor': 'b'})
 JOIN products c
-  ON AI_FILTER(PROMPT('Does thread {0} recommend product {1}?',
-                      b.thread, c.description),
-               {'selectivity': 0.1, 'anchor': 'b'})
+  ON AI_FILTER(PROMPT('Review {0} praises the thread in {1} and
+                       that thread recommends the product in {2}.',
+                      a.review, b.thread, c.description),
+               {'selectivity': 0.02, 'anchor': 'b'})
+
+SELECT a.id, b.id, c.id
+FROM reviews a, threads b, products c
+WHERE AI_FILTER(PROMPT('...same prompt...', a.review, b.thread,
+                       c.description), {'selectivity': 0.02})
 ```
 
-Two predicates give two edges (a–b, b–c), which the planner runs
-as two stages. Here `b` anchors both, so each surviving thread's
-document KV is computed in stage 1 and read again in stage 2 —
-the cross-stage reuse the executor's kept KV exists for. Writing
-`{'anchor': 'a'}` on the first edge instead would force reviews to
-anchor stage 1; the planner would then warn in `explain()` if that
-choice prices worse.
+At run time each tuple renders as labeled document blocks followed
+by the template as the question, its placeholders replaced by
+block references — the template is never inlined:
+
+```
+DOCUMENT:                              <- the anchor block: the bare
+<thread b17>                              engine preamble + document,
+                                          KV kept once per anchor and
+(The document above is document b.)       byte-identical to a filter
+                                          scan's stored prefix; the
+DOCUMENT a:                               naming line written into
+<review a3>                               kept KV once per anchor
+
+DOCUMENT c:                            <- each partner block + the
+<product c9>                              question: one suffix, paid
+                                          once per tuple
+Review document a praises the thread
+in document b and that thread
+recommends the product in document c.
+```
+
+The anchor's document KV is computed once and every tuple of the
+partner tables streams against it. There is exactly one join
+predicate per query (a conjunction over three tables belongs
+inside the one prompt's text, the same rule OR already follows);
+`[NOT] EXISTS` gates stay separate terms. A forced `anchor` that
+prices worse gets a warning in `explain()`.
 
 ### 2.4 The builder entry point
 
@@ -382,15 +410,16 @@ model runs; the coordinator applies it at the sink.
 Simpler than a database optimizer, on purpose. Three decisions are
 not decisions at all:
 
-- **Pushdown is unconditional.** A filter on one side of a join
-  always runs before that join. Under true pairwise join semantics
+- **Pushdown is unconditional.** A filter on one table of a join
+  always runs before that join. Under cross-product join semantics
   this cannot lose: evaluating the filter costs one question per
   document either way (the join neither duplicates nor drops the
-  documents the filter must judge — it only pairs them), and
-  running it first deletes every pair the failed documents would
-  have generated. There is no Cortex-style pull-up case to price,
-  because we never rewrite a join into anything else — AI_JOIN is
-  evaluated as the pairwise predicate it declares.
+  documents the filter must judge — it only combines them into
+  tuples), and running it first deletes every tuple the failed
+  documents would have generated. There is no Cortex-style
+  pull-up case to price, because we never rewrite a join into
+  anything else — AI_JOIN is evaluated as the tuple predicate it
+  declares.
 - **No selectivity estimation.** Selectivities are provided by the
   user (rough numbers; only ordering consumes them) or absent.
   Absent means as-written order. A sampling pass at plan time is a
@@ -411,19 +440,21 @@ the rate cancels out of every comparison, so these survive any
 miscalibration):
 
 1. **Order** (only under `by_cost`): filters sorted by cost per
-   killed document — (question tokens) / (1 − selectivity). Join
-   stage order over the join graph: enumerate (2–4 relations,
-   trivial), compare candidate orders by their survivor-thinned
-   pair-token totals, the formulas from `join_plan.md`.
-2. **Anchor per join stage**: the side whose pair-token total is
-   smaller when the other side streams — in practice the longer
-   side anchors (anchor tokens are paid once per document,
-   partner tokens once per pair). `{'anchor': ...}` overrides.
+   killed document — (question tokens) / (1 − selectivity). The
+   join specs (the exists/anti gates and the one full join):
+   enumerate the permutations (2–4 specs, trivial), compare
+   candidate orders by their survivor-thinned tuple-token totals.
+2. **Anchor per join**: the table whose tuple-token total is
+   smallest when the others stream — in practice the side with
+   the most document tokens anchors (anchor tokens are paid once
+   per document, partner tokens once per tuple). `{'anchor': ...}`
+   overrides; an exists/anti gate always anchors on the outer
+   table, because the gate applies to its documents.
 3. **Sharding**: filters split documents by token count across
    GPUs (`_balanced_shards`); joins split by anchor document.
-   Every pair belongs to exactly one anchor, so gating, dedup,
-   and the next stage's pair list stay local to the GPU holding
-   the anchor; the coordinator re-shards only when the next stage
+   Every tuple belongs to exactly one anchor, so gating and each
+   anchor's tuple stream stay local to the GPU holding the
+   anchor; the coordinator re-shards only when another spec
    anchors on a different relation, and merges final answers.
 
 **Settings from the spec structs alone** (§8):
@@ -469,9 +500,9 @@ and nothing in the system consumes an estimated wall.
 |---|---|---|
 | `DocScan` | worker CPU + store | resolve (provider, column) to token arrays (cached tokenization); execute the planned access: read, restore (batched pinned-memory loads), spill |
 | `FilterChain` | the executor | gated stages over continuously admitted documents: documents are anchors, each stage's question tail is a one-suffix stream, survivors advance (§6) |
-| `JoinStage` | the executor | brim-packed chunks over the stage's pair list; exists/anti streams stop early |
+| `JoinStage` | the executor | brim-packed chunks over the join's tuple list (the cross product of the surviving tables); exists/anti streams stop early |
 | `Gate` / `Dedup` | worker CPU, inside the chunk loop | survivors and distinct anchors, decided the moment a chunk's answers land — the next chunk's contents depend on them, so they cannot live a network hop away |
-| `Assemble` | worker CPU per shard, coordinator merges | tuple reassembly from recorded answers (`joinlogic.py`, moved over as is); the coordinator only concatenates shard outputs |
+| `Assemble` | worker CPU per shard, coordinator merges | output tuples read off the one full join's YES rows, each member checked against its table's final survivor set; the coordinator only concatenates shard outputs |
 | `Sink` | coordinator CPU | applies the `Project`; returns ids/tuples plus the run report |
 
 `DocScan` is an explicit plan node because it is where
@@ -487,8 +518,9 @@ a packed forward loop. The engine is gone from this design. One
 substrate — the packed executor — runs both operators, because a
 filter chain is the degenerate join:
 
-- **Join stage**: anchor = one side's document; suffixes = partner
-  document + question tail, one per pair.
+- **Join stage**: anchor = one table's document; suffixes = one per
+  tuple of the other tables' cross product — every partner document
+  behind its block label, then the question.
 - **Filter stage**: anchor = the document; suffix = the question
   tail, exactly one per stage. Stage j+1 attaches a fresh suffix to
   the same kept anchor KV.
@@ -859,9 +891,10 @@ Two knobs, both explicit in every reported result:
   4x the tokens per document with real text throughout.
 
 Filter cost scales as SF x LF. Join cost scales as SF x LF_partner
-per fixed partner list, and as SF^2 where both sides scale — true
-pairwise joins are quadratic, and the benchmark does not hide it:
-each join query's table row states its pair-count formula. The
+per fixed partner list, and as SF^n where n scaling tables cross —
+a cross-product join multiplies its table sizes, and the benchmark
+does not hide it: each join query's table row states its
+tuple-count formula. The
 reference grid: (SF, LF) in {(0.1, 1), (1, 1), (1, 4)}; SF=0.1 is
 the development scale, (1, 4) pushes long documents toward the
 attention crossover on purpose.
@@ -906,11 +939,13 @@ Quail refuses (aggregation, grouping, ordering, arithmetic, outer
 joins), and keep the filter/join skeleton. The 22 queries collapse
 into eight skeleton families — filter-only scans (Q1, Q6), plain
 2-way joins (Q12, Q14, Q17, Q19), filtered 2-way joins (Q3's core,
-Q16), 3-way-and-deeper chains (Q3, Q10, Q18), stars (Q2, Q5, Q8,
-Q9, Q11), exists (Q4, Q20), anti (Q16, Q22), exists+anti combined
-(Q21) — plus Q13, which is an outer join and has no analogue here.
-Fifteen queries cover all eight families with variants that isolate
-one engine mechanism each. F = filter stage, J = join stage.
+Q16), 3-way-and-deeper joins (Q3, Q10, Q18; chains and stars alike
+become one n-way cross-product join here, so Q2, Q5, Q8, Q9, Q11
+land in the same family), exists (Q4, Q20), anti (Q16, Q22),
+exists+anti combined (Q21) — plus Q13, which is an outer join and
+has no analogue here. Fifteen queries cover the families with
+variants that isolate one engine mechanism each. F = filter stage,
+J = join.
 
 | id | TPC-H skeleton | shape | sets | pair/doc volume at SF=1 | what it isolates | sizing estimate (SF=1, LF=1) |
 |---|---|---|---|---|---|---|
@@ -923,8 +958,8 @@ one engine mechanism each. F = filter stage, J = join stage.
 | B7 | Q19 | 1J full | reviews(5k slice) x products | 5M pairs | pure pair predicate, no gating anywhere (Q19's OR lives inside the one prompt) | ~29 min |
 | B8 | Q4 | 1J exists | threads x products | 10k anchors, early-stop streams | exists semantics; expected-scan pricing vs measured | ~7 min |
 | B9 | Q21 | 1J exists + 1J anti | threads x products, threads x terms | two early-stop passes | anti semantics; the combined semi/anti family | ~11 min |
-| B10 | Q3 | 2J chain | reviews(2k) x threads(2k) x products | stage sels .2/.1; stage-2 pairs must equal survivors x partners exactly | 3-way gating and dedup at scale | ~16 min |
-| B11 | Q9 | 2J star | reports x terms, reports x products | anchor KV computed once, read by both stages | star shape; kept-anchor reuse across stages | ~60 min |
+| B10 | Q3 | 3-way join | threads(2k) x reviews(2k) x products | one prompt per (b, a, c) triple over the full cross product | the n-way join: every document of a tuple in one model call | grows with the triple count |
+| B11 | Q9 | 3-way join | reports x terms x products | long anchors kept, both partners stream per triple | the n-way join on long anchor documents | grows with the triple count |
 | B12 | Q16 | 2F + 1J | threads, products | both sides filtered (.3, .5) before joining | two-sided pushdown; multiplicative pair shrink | ~9 min |
 | B13 | Q1 rerun | 5F | reviews, new flags | 50k docs, warm store | cross-query restore for a scan (the persist result inside the engine) | ~2.5 min warm |
 | B14 | Q14 rerun | 1J | reports x products, new keys | 2M pairs, warm anchors | cross-query restore for join anchors (prefix share ~19%) | ~13 min cold / ~11 warm |
@@ -983,19 +1018,18 @@ analytically equivalent form:
   `by_cost` chose. This client measured 42.9 s against rewind's
   39.8 s — the gap is the block-boundary recompute and the
   request-count overhead, not a handicapped client.
-- **Joins: one request per pair, ordered anchor-major.** All of
-  an anchor's pairs are submitted consecutively, so vLLM's prefix
+- **Joins: one request per tuple, ordered anchor-major.** All of
+  an anchor's tuples are submitted consecutively, so vLLM's prefix
   cache re-serves the anchor document's KV across its whole
-  partner stream instead of evicting it between scattered hits —
+  tuple stream instead of evicting it between scattered hits —
   the reordering is exactly what makes stock benefit from prefix
   caching at all (the arbitrary-order variant, priced at 1.87x
-  worse in the exploration, is never run). Stock also gets
-  Quail's stage order and anchor orientation, and between stages
-  the same gating and dedup applied as client bookkeeping, so an
-  n-way join's stock pair lists shrink identically to Quail's.
-  Admission is matched from the same pool arithmetic. This is the
-  committed grouped protocol behind the 429 s side of the 4.1x
-  result.
+  worse in the exploration, is never run). Stock gets the same
+  rendered prompts (labeled blocks + question), Quail's anchor
+  orientation, and the same gate bookkeeping client-side, so its
+  tuple lists shrink identically to Quail's. Admission is matched
+  from the same pool arithmetic. This is the committed grouped
+  protocol behind the 429 s side of the 4.1x result.
 Expectations, from the committed measurements: at (1, 1) the join
 queries carry
 the gap (measured 4.1x on the B5 shape), the filter queries are
