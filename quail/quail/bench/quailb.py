@@ -54,6 +54,7 @@ SETS = {
     "reports": (2_000, 3_000, True),
     "products": (1_000, 150, True),
     "terms": (2_560, 32, False),
+    "claims": (1_000, 20, True),
 }
 
 
@@ -119,6 +120,44 @@ def _biodex_rows(n=2000):
         if len(rows) >= n:
             break
     return rows
+
+
+def _fever_data(n_claims):
+    """FEVER claims (SUPPORTS/REFUTES only - those carry a real
+    annotated evidence page) and the small pool of Wikipedia pages
+    those claims actually reference. The evidence pool is bounded by
+    the sampled claims, the same way the terms table bounds BioDEX's
+    join - a full join against all 5M wiki pages is not the query
+    under test."""
+    from huggingface_hub import hf_hub_download
+    f = hf_hub_download("fever/fever", "v1.0/labelled_dev/0000.parquet",
+                        repo_type="dataset",
+                        revision="refs/convert/parquet")
+    rows = pq.read_table(f).to_pylist()
+    seen, claims = set(), []
+    for r in rows:
+        if (r["id"] in seen or r["label"] not in ("SUPPORTS", "REFUTES")
+                or not r["evidence_wiki_url"]):
+            continue
+        seen.add(r["id"])
+        claims.append(r)
+        if len(claims) >= n_claims:
+            break
+    pages_needed = {r["evidence_wiki_url"] for r in claims}
+    page_text = {}
+    for shard in range(10):
+        if len(page_text) >= len(pages_needed):
+            break
+        fw = hf_hub_download(
+            "fever/fever",
+            f"wiki_pages/partial-wikipedia_pages/{shard:04d}.parquet",
+            repo_type="dataset", revision="refs/convert/parquet")
+        t = pq.read_table(fw, columns=["id", "text"])
+        for pid, txt in zip(t.column("id").to_pylist(),
+                            t.column("text").to_pylist()):
+            if pid in pages_needed and pid not in page_text:
+                page_text[pid] = txt
+    return claims, page_text
 
 
 def _abtbuy_products():
@@ -217,6 +256,23 @@ def build_sets(data_dir, sf, lf):
     write("terms", [f"tm{i}" for i in range(len(vocab))], vocab,
           col="term")
 
+    # claims + evidence: real FEVER claims and only the Wikipedia
+    # pages those claims reference - a bounded real join, no planted
+    # keys, ground truth is the FEVER label
+    n_claims = _n_docs("claims", sf)
+    claims, page_text = _fever_data(n_claims)
+    pq.write_table(pa.table({
+        "id": [f"cl{i}" for i in range(len(claims))],
+        "claim": [c["claim"] for c in claims],
+        "label": [c["label"] for c in claims],
+        "evidence_wiki_url": [c["evidence_wiki_url"] for c in claims],
+    }), d / "claims.parquet")
+    ev_ids = list(page_text.keys())
+    pq.write_table(pa.table({
+        "id": ev_ids,
+        "text": [page_text[p] for p in ev_ids],
+    }), d / "evidence.parquet")
+
     # slices for B7 and B10
     rv = pq.read_table(d / "reviews.parquet")
     n7 = max(4, int(5_000 * sf))
@@ -237,7 +293,8 @@ def register_sets(sess, data_dir):
     for name, id_col in (("reviews", "id"), ("threads", "id"),
                          ("reports", "id"), ("products", "id"),
                          ("terms", "id"), ("reviews5k", "id"),
-                         ("reviews2k", "id"), ("threads2k", "id")):
+                         ("reviews2k", "id"), ("threads2k", "id"),
+                         ("claims", "id"), ("evidence", "id")):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col=id_col))
 
@@ -405,6 +462,9 @@ def queries(sess):
                          selectivity=0.2)
                 .select("t.id", "r.id"))
     q["B15"] = ("everything at once", b15)
+    q["B16"] = ("1J claims x evidence: FEVER, real labels not planted",
+                content_join("claims", "claim", "evidence", "text",
+                             SUPPORT, 0.00108))
     return q
 
 
