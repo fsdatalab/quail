@@ -62,7 +62,7 @@ SETS = {
 
 def flags_line(bits, prefix="FLAG"):
     return ("\n\n[FLAGS] "
-            + " ".join(f"{prefix}_{j+1}={'YES' if b else 'NO'}"
+            + " ".join(f"{prefix}_{j+1}={'TRUE' if b else 'FALSE'}"
                        for j, b in enumerate(bits)))
 
 
@@ -86,10 +86,7 @@ def concat_to_chars(pool, target_chars, start):
 
 
 def flag_question(prefix, j):
-    return (f"\n\nExample: if the line said [FLAGS] {prefix}_9=NO, "
-            f"then {prefix}_9 has value NO.\nInstruction: output only "
-            f"the value of {prefix}_{j} from the [FLAGS] line above."
-            f"\n{prefix}_{j}=")
+    return f"\n\nIs {prefix}_{j} in the [FLAGS] line TRUE?"
 
 
 # ------------------------------------------------------- set builders
@@ -338,49 +335,16 @@ def queries(sess):
                 selectivity=sel).select("a.id", "b.id")
         return make
 
-    # Template text before {0} becomes the per-anchor frame: the
-    # engine relocates it after the document and writes it into the
-    # anchor's kept KV once per anchor, so the framing costs tokens
-    # per anchor, not per pair (folding it into the per-pair tail
-    # cost 6.1M extra tokens / +95 s on B5's 512k pairs, measured).
-    # The suffix after the partner stays short - it is paid per pair.
-    # The frame sits right before the candidates (after the document),
-    # where the 4B is far more sensitive to its wording than it was
-    # to the same text far before the document: "Decide whether the
-    # report describes that reaction..." at close range read as a YES
-    # prior (observed selectivity 0.76 vs the original 0.287).
-    # Judgment-neutral wording, measured below.
-    REACTION = ("Candidate medical reaction terms follow, one at a "
-                "time. For each, judge strictly from the report "
-                "above whether it describes that reaction as "
-                "something the patient experienced.\n\n{0}\n\n"
-                "CANDIDATE REACTION: {1}\nInstruction: answer YES if "
-                "the report above describes this reaction, NO "
-                "otherwise.\nANSWER=")
-    DISCUSS = ("Product descriptions follow, one at a time. For "
-               "each, judge strictly from the text above whether it "
-               "discusses that product.\n\n{0}\n\nPRODUCT:\n{1}\n"
-               "Instruction: answer YES if the text above discusses "
-               "this product, NO otherwise.\nANSWER=")
-    MENTION = ("Medical terms follow, one at a time. For each, judge "
-               "strictly from the text above whether it mentions "
-               "that term.\n\n{0}\n\nTERM: {1}\nInstruction: answer "
-               "YES if the text above mentions this term, NO "
-               "otherwise.\nANSWER=")
-    # Same fix applied here: frame after the claim, neutral wording -
-    # the old "You will be shown a factual claim..." framing is the
-    # exact shape measured to bias REACTION toward YES above.
-    SUPPORT = ("Wikipedia passages follow, one at a time. For each, "
-               "judge strictly from the claim above whether it "
-               "supports that claim.\n\n{0}\n\nPASSAGE:\n{1}\n"
-               "Instruction: answer YES if the passage above "
-               "supports this claim, NO otherwise.\nANSWER=")
-    KEYEQ = ("Candidate documents follow, one at a time. For each, "
-             "judge strictly whether its [FLAGS] or key value "
-             "matches the [KEYS] X value in the report above.\n\n"
-             "{0}\n\nCANDIDATE:\n{1}\nInstruction: answer YES if the "
-             "candidate's [FLAGS] or key value matches the report's "
-             "[KEYS] X value, NO otherwise.\nANSWER=")
+    REACTION = ("Does {0} describe the reaction named in {1} as "
+                "something the patient experienced?")
+    DISCUSS = "Does {0} discuss the product described in {1}?"
+    MENTION = "Does {0} mention the medical term in {1}?"
+    KEYEQ3 = ("Do the [FLAGS] or key values in {1} and in {2} both "
+              "match the [KEYS] X value in {0}?")
+    REACTION_DISCUSS = ("Does {0} describe the reaction named in {1} "
+                        "as something the patient experienced and also "
+                        "discuss the product described in {2}?")
+    SUPPORT = "Does {1} support the claim made in {0}?"
 
     q = {}
     q["B1"] = ("1F reviews: the per-query floor", lambda: sess.sql(
@@ -438,31 +402,32 @@ def queries(sess):
 
     def b10():
         import quail as _q
+        # the 3-way join: one prompt holds all three documents; every
+        # (b, a, c) tuple of the cross product is one model call. The
+        # provided selectivity is per tuple (the old two stages at .2
+        # and .1 pass together for about .02 of the triples).
         return (sess.docs("threads2k").alias("b")
-                .ai_join(sess.docs("reviews2k").alias("a"),
-                         _q.prompt(KEYEQ, _q.col("b.thread"),
-                                   _q.col("a.body")),
-                         selectivity=0.2, anchor="b")
-                .ai_join(sess.docs("products").alias("c"),
-                         _q.prompt(KEYEQ, _q.col("b.thread"),
+                .ai_join([sess.docs("reviews2k").alias("a"),
+                          sess.docs("products").alias("c")],
+                         _q.prompt(KEYEQ3, _q.col("b.thread"),
+                                   _q.col("a.body"),
                                    _q.col("c.description")),
-                         selectivity=0.1, anchor="b")
+                         selectivity=0.02, anchor="b")
                 .select("a.id", "b.id", "c.id"))
-    q["B10"] = ("2J chain, gating + dedup + replay", b10)
+    q["B10"] = ("3-way join, planted keys: one prompt per triple", b10)
 
     def b11():
         import quail as _q
         return (sess.docs("reports").alias("r")
-                .ai_join(sess.docs("terms").alias("m"),
-                         _q.prompt(REACTION, _q.col("r.report"),
-                                   _q.col("m.term")),
-                         selectivity=0.05, anchor="r")
-                .ai_join(sess.docs("products").alias("p"),
-                         _q.prompt(DISCUSS, _q.col("r.report"),
+                .ai_join([sess.docs("terms").alias("m"),
+                          sess.docs("products").alias("p")],
+                         _q.prompt(REACTION_DISCUSS,
+                                   _q.col("r.report"),
+                                   _q.col("m.term"),
                                    _q.col("p.description")),
-                         selectivity=0.05, anchor="r")
+                         selectivity=0.0025, anchor="r")
                 .select("m.id", "r.id", "p.id"))
-    q["B11"] = ("2J star: kept anchors read twice", b11)
+    q["B11"] = ("3-way join, long anchors: one prompt per triple", b11)
     q["B12"] = ("2F + 1J: two-sided pushdown",
                 content_join("threads", "thread", "products",
                              "description", DISCUSS, 0.1,
@@ -477,8 +442,8 @@ def queries(sess):
     q["B14"] = ("B5 rerun, new question: the anchor restore",
                 content_join("reports", "report", "terms", "term",
                              REACTION.replace(
-                                 "describes this reaction",
-                                 "explicitly reports this reaction"),
+                                 "describe the reaction",
+                                 "explicitly report the reaction"),
                              0.05))
 
     def b15():
@@ -493,13 +458,7 @@ def queries(sess):
                          selectivity=0.1, semantics="exists")
                 .ai_join(sess.docs("reports").alias("r"),
                          _q.prompt(
-                             "Patient reports follow, one at a time. "
-                             "For each, judge strictly whether both "
-                             "it and the thread above discuss "
-                             "medicine.\n\n{0}\n\nREPORT:\n{1}\n"
-                             "Instruction: answer YES if both texts "
-                             "discuss medicine, NO otherwise.\n"
-                             "ANSWER=",
+                             "Do {0} and {1} both discuss medicine?",
                              _q.col("t.thread"), _q.col("r.report")),
                          selectivity=0.2)
                 .select("t.id", "r.id"))
@@ -550,8 +509,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                                rows=len(res.rows),
                                peak_gib=res.report.get("peak_gib"),
                                stages=res.report["stages"],
-                               store=res.report.get("store"),
-                               replay=res.report.get("replay_check"))
+                               store=res.report.get("store"))
                 except Exception as e:            # noqa: BLE001
                     row = dict(query=qid, desc=desc,
                                error=f"{type(e).__name__}: {e}")

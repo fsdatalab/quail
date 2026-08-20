@@ -106,12 +106,10 @@ def run_pair(tmp, gpus):
     jq = (sess.docs("reports").alias("r")
           .ai_join(sess.docs("cands").alias("c"),
                    quail.prompt(
-                       "You will be shown a scene report and one "
-                       "candidate color. Decide from the report's own "
-                       "words.\n\nREPORT:\n{0}\n\nCANDIDATE:\n{1}"
-                       "\nInstruction: answer YES if the report says "
-                       "its dominant color is the candidate color, NO "
-                       "otherwise.\nANSWER=",
+                       "Judge strictly from {0} whether it says its "
+                       "dominant color is the color named in {1}. "
+                       "Answer YES if it does, NO otherwise."
+                       "\nANSWER=",
                        quail.col("r.report"), quail.col("c.body")),
                    selectivity=1 / 6)
           .select("r.id", "c.id"))

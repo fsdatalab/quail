@@ -113,18 +113,40 @@ def test_anchor_longer_side_and_override(catalog):
                       doc_tokens=toks)
     stage = next(op for op in plan.operators if op["op"] == "JoinStage")
     assert stage["anchor"] == "r"      # the longer side anchors
+    assert stage["partners"] == ["p"]
 
     forced = plan_query(joined("p"), model=QWEN3_4B_FP8,
                         device=H100_SXM, doc_tokens=toks)
     stage = next(op for op in forced.operators
                  if op["op"] == "JoinStage")
     assert stage["anchor"] == "p"
+    assert stage["partners"] == ["r"]
     assert any("prices lower" in r for r in forced.remarks)
 
 
-def test_join_order_runs_selective_stage_first(catalog):
-    # chain r-p (sel .9, expensive) then r-t (sel .01, cheap): by_cost
-    # must run the .01 stage first so stage two sees few survivors
+def test_three_way_anchor_and_tuple_count(catalog):
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join([docs(catalog, "products", tok).alias("p"),
+                         docs(catalog, "threads", tok).alias("t")],
+                        prompt("m {0} {1} {2}", col("r.review"),
+                               col("p.description"), col("t.thread")),
+                        selectivity=0.02)
+               .select("r.id"))
+    toks = {"r": [3000] * 20, "p": [100] * 30, "t": [50] * 40}
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks)
+    stage = next(op for op in plan.operators if op["op"] == "JoinStage")
+    # every tuple of the cross product is one evaluation
+    assert stage["expected_tuples"] == 20 * 30 * 40
+    # the longest side anchors; partners keep placeholder order
+    assert stage["anchor"] == "r"
+    assert stage["partners"] == ["p", "t"]
+
+
+def test_join_order_runs_selective_gate_first(catalog):
+    # an expensive .9 full join and a cheap .01 exists gate on the
+    # same table: by_cost runs the gate first so the join sees few
+    # surviving anchors; as_written keeps the written order
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "products", tok).alias("p"),
                         prompt("m {0} {1}", col("r.review"),
@@ -133,7 +155,7 @@ def test_join_order_runs_selective_stage_first(catalog):
                .ai_join(docs(catalog, "threads", tok).alias("t"),
                         prompt("m {0} {1}", col("r.review"),
                                col("t.thread")),
-                        selectivity=0.01)
+                        selectivity=0.01, semantics="exists")
                .select("r.id"))
     toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
@@ -175,7 +197,9 @@ def test_preamble_counted_once_per_document(catalog):
     st = chain["stages"][0]
     # the shared preamble is per document (stage 0), never per stage
     assert st["preamble_tokens"] == len(tok(SHARED_PRE))
-    assert st["question_tokens"] == len(tok("flag 0 of:"))
+    assert st["question_tokens"] == len(tok(
+        "Evaluate TRUE or FALSE for the following question: "
+        "flag 0 of: ANSWER:"))
 
 
 def test_store_threshold_includes_preamble(catalog):
@@ -194,32 +218,33 @@ def test_store_threshold_includes_preamble(catalog):
     assert plan.store_min_doc_tokens == 300 + pre
 
 
-def test_join_frame_priced_per_anchor_not_per_pair(catalog):
-    # two identical joins, one with a 5-token frame: the frame must
-    # add anchor-count x 5 to the stage's pair tokens, never
-    # pairs x 5 (the frame is written into kept KV once per anchor)
-    def make(template):
-        q = docs(catalog, "reviews", tok).alias("r")
-        return (q.ai_join(
-            docs(catalog, "products", tok).alias("p"),
-            prompt(template, col("r.review"), col("p.description")),
-            selectivity=0.5).select("r.id"))
+def test_join_tokens_note_per_anchor_labels_per_tuple(catalog):
+    # the anchor's naming line is written into kept KV once per
+    # anchor document; a partner's block label and the rendered
+    # question ride in every tuple's suffix
+    from quail.logical import (SHARED_PRE, join_anchor_note,
+                               join_label, render_join_question)
 
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.5, anchor="r")
+               .select("r.id"))
     toks = {"r": [100] * 4, "p": [10] * 3}
-    framed = plan_query(make("FRAME WORDS HERE FIVE TOKENS\n\n{0}\n\n"
-                             "CAND: {1}\nANSWER="),
-                        model=QWEN3_4B_FP8, device=H100_SXM,
-                        doc_tokens=toks)
-    plain = plan_query(make("{0}\n\nCAND: {1}\nANSWER="),
-                       model=QWEN3_4B_FP8, device=H100_SXM,
-                       doc_tokens=toks)
-    stage_f = next(op for op in framed.operators
-                   if op["op"] == "JoinStage")
-    stage_p = next(op for op in plain.operators
-                   if op["op"] == "JoinStage")
-    n_anchor_docs = 4
-    assert stage_f["pair_tokens"] - stage_p["pair_tokens"] == \
-        pytest.approx(n_anchor_docs * 5)
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks)
+    stage = next(op for op in plan.operators if op["op"] == "JoinStage")
+    pre = len(tok(SHARED_PRE))
+    # r is placeholder 0 (the anchor's naming line), p is placeholder
+    # 1 (its block label)
+    note = len(tok(join_anchor_note(0)))
+    label = len(tok(join_label(1)))
+    pred = logical.root.input.predicate
+    question = len(tok(render_join_question(pred.template)))
+    expect = 4 * (100 + pre + note) + 12 * (10 + label + question)
+    assert stage["tuple_tokens"] == pytest.approx(expect)
+    assert stage["expected_tuples"] == 12
 
 
 def test_refusal_suffix_over_chunk(catalog):

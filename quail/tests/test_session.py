@@ -37,9 +37,20 @@ def sess(tmp_path):
 
 
 def make_executor(filter_truth, join_truth=None, seen=None):
-    """filter_truth: alias -> {question first-token -> [bit per doc]}.
-    join_truth: (anchor alias, partner alias) -> f(a_idx, p_idx) -> bit.
-    seen: dict to capture the payload for order assertions."""
+    """filter_truth: alias -> {question keyword -> [bit per doc]}.
+    The keyword is matched against the question token list (any token
+    that starts with it). join_truth: (anchor alias, *partner aliases)
+    -> f(anchor_idx, *partner_idxs) -> bit, one call per cross-product
+    tuple - the worker contract. seen: dict to capture the payload
+    for order assertions."""
+    import itertools
+
+    def _match_key(alias, q):
+        for key in filter_truth[alias]:
+            if any(t.startswith(key) for t in q):
+                return key
+        raise KeyError(f"no filter_truth key for alias {alias!r} "
+                       f"matches tokens {q[:5]}")
 
     def _exec(payload):
         if seen is not None:
@@ -53,7 +64,7 @@ def make_executor(filter_truth, join_truth=None, seen=None):
             for d in range(len(payload["docs"][alias])):
                 row = []
                 for q in qids:
-                    bit = filter_truth[alias][q[0]][d]
+                    bit = filter_truth[alias][_match_key(alias, q)][d]
                     row.append(bit)
                     if not bit:
                         break
@@ -63,12 +74,13 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                                 if len(r) == len(qids) and all(r)]
         for j in payload["joins"]:
             anchors = list(survivors[j["anchor"]])
-            partners = list(survivors[j["partner"]])
-            rule = join_truth[(j["anchor"], j["partner"])]
-            rows = {ai: [rule(a, p) for p in partners]
+            tuples = [list(t) for t in itertools.product(
+                *[survivors[p] for p in j["partners"]])]
+            rule = join_truth[(j["anchor"], *j["partners"])]
+            rows = {ai: [rule(a, *t) for t in tuples]
                     for ai, a in enumerate(anchors)}
             out["joins"].append(dict(rows=rows, anchor_index=anchors,
-                                     partner_index=partners))
+                                     partner_index=tuples))
             kept = {anchors[ai] for ai, r in rows.items() if any(r)}
             if j["semantics"] == "anti":
                 survivors[j["anchor"]] = [a for a in anchors
@@ -137,7 +149,7 @@ def test_join_query_pairs(sess):
                     if (a + p) % 4 == 0)
     assert sorted(res.rows) == expect
     jstage = [s for s in res.report["stages"] if s["op"] == "join"][0]
-    assert jstage["pairs"] == 12
+    assert jstage["tuples"] == 12
     assert jstage["provided_selectivity"] == 0.25
 
 
@@ -167,11 +179,11 @@ def test_order_by_cost_reorders_payload(sess):
     # by_cost (the default: every predicate has a selectivity) runs
     # the 0.1 filter first
     first_q = seen["payload"]["filters"]["r"][0]
-    assert first_q[0] == "q2:"
+    assert "q2:" in first_q
     seen2 = {}
     sess.sql(sql, order="as_written").run(
         _execute=make_executor(truth, seen=seen2))
-    assert seen2["payload"]["filters"]["r"][0][0] == "q1:"
+    assert "q1:" in seen2["payload"]["filters"]["r"][0]
 
 
 def test_refusal_raises_on_run_prints_in_explain(sess, tmp_path):
@@ -271,7 +283,7 @@ def test_payload_carries_workers_and_shards(tmp_path):
     assert covered == list(range(6))
 
 
-def test_payload_carries_yes_no_and_join_segments(sess):
+def test_payload_carries_true_false_and_join_spec(sess):
     sql = """
         SELECT r.id, p.asin FROM reviews r
         JOIN products p
@@ -282,16 +294,72 @@ def test_payload_carries_yes_no_and_join_segments(sess):
     join = {("r", "p"): lambda a, p: 0}
     sess.sql(sql).run(_execute=make_executor({}, join, seen=seen))
     payload = seen["payload"]
-    assert payload["yes_ids"] and payload["no_ids"]
+    assert payload["true_ids"] and payload["false_ids"]
     # the engine preamble ships once, not inside any join segment
-    from quail.logical import SHARED_PRE
+    from quail.logical import (SHARED_PRE, join_anchor_note,
+                               join_label, render_join_question)
     assert payload["pre_ids"] == fake_tok(SHARED_PRE)
     j = payload["joins"][0]
     assert "pre" not in j
-    # the user's pre-document text ("Does") is the frame, written
-    # into the anchor's kept KV once per anchor - never in the
-    # per-pair mid
-    assert j["frame"] == ["Does"]
-    assert j["mid"] == ["match"]
-    assert j["tail"] == ["?", "Answer."]
-    assert j["anchor"] == "r" and not j["swapped"]
+    assert j["anchor"] == "r" and j["partners"] == ["p"]
+    # the naming line goes into the anchor's kept KV once per anchor;
+    # each partner's block label (its own placeholder marker) and the
+    # question (the raw template, markers kept - never filled in)
+    # ride per tuple. r is placeholder 0, p is placeholder 1.
+    assert j["frame"] == fake_tok(join_anchor_note(0))
+    assert j["labels"] == {"p": fake_tok(join_label(1))}
+    assert j["tail"] == fake_tok(
+        "\n\nEvaluate TRUE or FALSE for the following question: "
+        "Does {0} match {1}? Answer.\nANSWER:")
+    logical = sess.sql(sql).logical
+    pred = logical.root.input.predicate
+    assert j["tail"] == fake_tok(render_join_question(pred.template))
+
+
+def test_three_way_join_tuples_and_gate(sess, tmp_path):
+    sess.register("tags", quail.DocumentProvider.from_parquet(
+        _parquet(tmp_path / "g.parquet", {
+            "id": [f"g{i}" for i in range(3)],
+            "tag": [f"tag {i}" for i in range(3)],
+        }), id_col="id"))
+    q = (sess.docs("reviews").alias("r")
+         .ai_join([sess.docs("products").alias("p"),
+                   sess.docs("tags").alias("g")],
+                  quail.prompt("Do {0}, {1} and {2} agree?",
+                               quail.col("r.review"),
+                               quail.col("p.description"),
+                               quail.col("g.tag")),
+                  selectivity=0.1)
+         .select("r.id", "p.asin", "g.id"))
+    join = {("r", "p", "g"):
+            lambda a, p, g: 1 if (a + p + g) % 5 == 0 else 0}
+    res = q.run(_execute=make_executor({}, join))
+    expect = sorted((f"r{a}", f"p{p}", f"g{g}")
+                    for a in range(6) for p in range(4)
+                    for g in range(3) if (a + p + g) % 5 == 0)
+    assert sorted(res.rows) == expect
+    jstage = [s for s in res.report["stages"] if s["op"] == "join"][0]
+    assert jstage["tuples"] == 6 * 4 * 3
+    assert jstage["partners"] == ["p", "g"]
+
+
+def test_gate_after_full_join_filters_partner_tuples(sess, tmp_path):
+    # an anti gate on the join's partner table, written after the
+    # join: its casualties must not appear in output tuples (order
+    # changes cost, never results)
+    q = (sess.docs("reviews").alias("r")
+         .ai_join(sess.docs("products").alias("p"),
+                  quail.prompt("m {0} {1}", quail.col("r.review"),
+                               quail.col("p.description")),
+                  selectivity=0.5)
+         .ai_join(sess.docs("reviews").alias("x"),
+                  quail.prompt("m {0} {1}", quail.col("p.description"),
+                               quail.col("x.review")),
+                  semantics="anti")
+         .select("r.id", "p.asin"))
+    join = {("r", "p"): lambda a, p: 1,
+            ("p", "x"): lambda p, x: 1 if p == 1 else 0}
+    res = q.run(_execute=make_executor({}, join))
+    # p1 is matched by the anti gate and drops; every (r, p!=1) stays
+    assert sorted(res.rows) == sorted(
+        (f"r{a}", f"p{p}") for a in range(6) for p in (0, 2, 3))
