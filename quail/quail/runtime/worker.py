@@ -204,6 +204,7 @@ def _execute_single(state, payload: dict) -> dict:
     out_filters = {}
     store_stats = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
+    limit = payload.get("limit")
 
     t0 = time.perf_counter()
     with torch.inference_mode():
@@ -218,7 +219,7 @@ def _execute_single(state, payload: dict) -> dict:
                             if store_cfg else None),
                 store_min_tokens=(store_cfg["min_doc_tokens"]
                                   if store_cfg else 1),
-                stats=stats)
+                stats=stats, limit=limit)
             store_stats[alias] = stats
             total_tokens += tokens
             out_filters[alias] = {int(d): row
@@ -421,6 +422,7 @@ def _child_filters(state, sub):
                boot_s=boot["boot_s"], boot_kind=boot["kind"],
                boot=boot)
     pre = sub.get("pre_ids") or []
+    limit = sub.get("limit")
     t0 = _time.perf_counter()
     with torch.inference_mode():
         for alias, qids in sub["filters"].items():
@@ -436,7 +438,7 @@ def _child_filters(state, sub):
                             if store_cfg else None),
                 store_min_tokens=(store_cfg["min_doc_tokens"]
                                   if store_cfg else 1),
-                stats=stats, store_ids=index)
+                stats=stats, store_ids=index, limit=limit)
             out["store"][alias] = stats
             out["fresh_tokens"] += tokens
             out["filters"][alias] = {index[d]: row
@@ -560,10 +562,11 @@ def _execute_multi(payload: dict) -> dict:
     k = payload["workers"]
     shards = payload.get("shards", {})
     _ensure_children(k)
+    limit = payload.get("limit")
     t0 = _time.perf_counter()
     fouts = _round("filters",
                    coordinator.filter_round_payloads(payload, shards, k))
-    merged = coordinator.merge_filter_round(fouts)
+    merged = coordinator.merge_filter_round(fouts, limit=limit)
     out_joins = []
     if payload["joins"]:
         jsubs = coordinator.join_round_payloads(

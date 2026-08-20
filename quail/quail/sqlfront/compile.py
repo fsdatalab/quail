@@ -38,7 +38,6 @@ from quail.logical import (ColumnRef, CompileError, FilterPredicate,
 FORBIDDEN = (
     (exp.Group, "GROUP BY"),
     (exp.Order, "ORDER BY"),
-    (exp.Limit, "LIMIT"),
     (exp.Distinct, "DISTINCT"),
     (exp.Having, "HAVING"),
     (exp.Qualify, "QUALIFY"),
@@ -233,6 +232,22 @@ def _where_terms(where) -> list:
     return terms       # the pop order above yields written order
 
 
+def _parse_limit(tree) -> int | None:
+    """Extract a plain LIMIT N from the parse tree. ORDER BY ... LIMIT
+    is rejected by the FORBIDDEN list (ORDER BY is still forbidden), so
+    this only handles the early-termination case."""
+    limit_node = tree.args.get("limit")
+    if limit_node is None:
+        return None
+    expr = limit_node.expression
+    if not isinstance(expr, exp.Literal) or expr.is_string:
+        raise CompileError("LIMIT must be a positive integer literal")
+    value = int(expr.this)
+    if value <= 0:
+        raise CompileError("LIMIT must be a positive integer literal")
+    return value
+
+
 def compile_sql(sql: str, catalog: Catalog,
                 tokenizer=None) -> LogicalPlan:
     """AI SQL text -> LogicalPlan, or CompileError. `tokenizer` is any
@@ -245,6 +260,8 @@ def compile_sql(sql: str, catalog: Catalog,
     if not isinstance(tree, exp.Select):
         raise CompileError("the query must be a single SELECT")
     _reject_forbidden(tree)
+
+    limit = _parse_limit(tree)
 
     b = _Binder(catalog, tokenizer)
 
@@ -352,7 +369,8 @@ def compile_sql(sql: str, catalog: Catalog,
         doc_columns=dict(b.doc_columns),
         filters={a: tuple(v) for a, v in b.filters.items()},
         joins=tuple(b.joins),
-        columns=tuple(columns))
+        columns=tuple(columns),
+        limit=limit)
     return assemble_plan(desc)
 
 

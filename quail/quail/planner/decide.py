@@ -494,6 +494,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         admission_tokens=admission, order_rule=rule, order_source=source,
         calibration_source=cal.source,
         store_min_doc_tokens=store_min,
+        limit=plan.root.limit,
         operators=tuple(operators), remarks=tuple(remarks))
 
 
@@ -513,7 +514,8 @@ def explain(logical: LogicalPlan, physical) -> str:
         pad = "  " * (depth + 1)
         if isinstance(node, Project):
             cols = ", ".join(f"{c.alias}.{c.column}" for c in node.columns)
-            lines.append(f"{pad}Project [{cols}]")
+            lim = f" LIMIT {node.limit}" if node.limit is not None else ""
+            lines.append(f"{pad}Project [{cols}]{lim}")
             render(node.input, depth + 1)
         elif isinstance(node, SemanticJoin):
             lines.append(f"{pad}SemanticJoin ({node.semantics}, "
@@ -544,6 +546,8 @@ def explain(logical: LogicalPlan, physical) -> str:
                  f"kv_dtype={physical.kv_dtype}")
     lines.append(f"  chunk_tokens={physical.chunk_tokens} "
                  f"admission_tokens={physical.admission_tokens}")
+    if physical.limit is not None:
+        lines.append(f"  limit={physical.limit}")
     lines.append("  prompt layout: engine preamble + document + "
                  "suffix (preamble_tokens per stage below count the "
                  "shared preamble)")

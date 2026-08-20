@@ -184,6 +184,7 @@ class Project:
     ids and pass-through text, nothing computed."""
     input: "Operator"
     columns: tuple    # tuple[ColumnRef, ...]
+    limit: Optional[int] = None
 
 
 Operator = Union[Scan, SemanticFilter, SemanticJoin, Project]
@@ -219,6 +220,7 @@ class QueryDesc:
     filters: dict               # alias -> tuple[FilterPredicate], written order
     joins: tuple                # tuple[JoinSpec], written order
     columns: tuple              # tuple[ColumnRef], the projection
+    limit: Optional[int] = None
 
 
 def assemble_plan(desc: QueryDesc) -> LogicalPlan:
@@ -244,7 +246,8 @@ def assemble_plan(desc: QueryDesc) -> LogicalPlan:
             predicate=j.prompt, semantics=j.semantics,
             selectivity=j.selectivity, anchor=j.anchor)
     return LogicalPlan(root=Project(input=tree,
-                                    columns=tuple(desc.columns)))
+                                    columns=tuple(desc.columns),
+                                    limit=desc.limit))
 
 
 def split_template(template: str) -> tuple[str, str]:

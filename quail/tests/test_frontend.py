@@ -324,8 +324,6 @@ REJECTED = [
      "r.review)) GROUP BY r.id", "GROUP BY"),
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
      "r.review)) ORDER BY r.id", "ORDER BY"),
-    ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
-     "r.review)) LIMIT 5", "LIMIT"),
     ("SELECT DISTINCT r.id FROM reviews r WHERE AI_FILTER("
      "PROMPT('x {0}', r.review))", "DISTINCT"),
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
@@ -376,6 +374,44 @@ def test_second_join_predicate_in_where_rejected(catalog):
     with pytest.raises(CompileError) as e:
         compile_sql(sql, catalog, tok)
     assert "one join predicate" in str(e.value)
+
+
+def test_limit_parses_and_threads(catalog):
+    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
+           "PROMPT('x: {0}', r.review)) LIMIT 5")
+    plan = compile_sql(sql, catalog, tok)
+    assert plan.root.limit == 5
+
+
+def test_limit_zero_and_negative_rejected(catalog):
+    for n in ("0", "-1"):
+        with pytest.raises(CompileError) as e:
+            compile_sql(f"SELECT r.id FROM reviews r WHERE AI_FILTER("
+                        f"PROMPT('x: {{0}}', r.review)) LIMIT {n}",
+                        catalog, tok)
+        assert "positive integer" in str(e.value)
+
+
+def test_limit_string_rejected(catalog):
+    with pytest.raises(CompileError):
+        compile_sql("SELECT r.id FROM reviews r WHERE AI_FILTER("
+                    "PROMPT('x: {0}', r.review)) LIMIT 'five'",
+                    catalog, tok)
+
+
+def test_no_limit_gives_none(catalog):
+    plan = compile_sql(
+        "SELECT r.id FROM reviews r WHERE AI_FILTER("
+        "PROMPT('x: {0}', r.review))", catalog, tok)
+    assert plan.root.limit is None
+
+
+def test_builder_limit(catalog):
+    plan = (docs(catalog, "reviews", tok).alias("r")
+            .ai_filter(prompt("x: {0}", col("r.review")))
+            .limit(3)
+            .select("r.id"))
+    assert plan.root.limit == 3
 
 
 def test_builder_rejects_same_shapes(catalog):

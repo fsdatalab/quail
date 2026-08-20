@@ -67,6 +67,7 @@ class PhysicalPlan:
     store_min_doc_tokens: int = 0    # documents at or above this
     #                                  length use the KV store; 0 =
     #                                  no store, 1 = everything stores
+    limit: int | None = None   # output row cap; None = no limit
     operators: tuple = ()      # ordered operator dicts, JSON-able
     remarks: tuple = ()
 

@@ -210,12 +210,14 @@ class FilterAdmission:
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
                  arena_pages, page_tokens, kept_extra_tokens=0,
-                 restored=()):
+                 restored=(), limit=None):
         self.doc_tokens = list(doc_tokens)
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
         self.page_tokens = page_tokens
         self.free_pages = arena_pages
+        self.limit = limit
+        self._survivor_count = 0
         # kept_extra_tokens: the shared question preamble that joins
         # the document's kept KV after stage 1 (chain mode kept it
         # resident; so do we), so pages must cover it
@@ -259,6 +261,8 @@ class FilterAdmission:
             self.in_flight.add(doc)
             room -= cost
         # 2) fresh admissions: pages in queue order, chunk room may skip
+        if self._limit_reached():
+            return groups
         blocked_pages = False
         skipped = deque()
         while self.pending and not blocked_pages:
@@ -297,6 +301,8 @@ class FilterAdmission:
         self.in_flight.discard(doc)
         self.answers.setdefault(doc, []).append(1 if yes else 0)
         last = stage == len(self.stage_tokens) - 1
+        if yes and last:
+            self._survivor_count += 1
         if yes and not last:
             self.ready.append((doc, stage + 1))
             return
@@ -309,7 +315,13 @@ class FilterAdmission:
 
     # ---- progress ------------------------------------------------------
 
+    def _limit_reached(self):
+        return (self.limit is not None
+                and self._survivor_count >= self.limit)
+
     def done(self):
+        if self._limit_reached():
+            return not self.in_flight
         return (not self.pending and not self.ready
                 and not self.in_flight)
 

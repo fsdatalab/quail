@@ -583,7 +583,8 @@ def _shared_preamble_tokens(question_ids):
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, trace=None, store=None,
                store_hash=None, store_min_tokens=1, stats=None,
-               store_ids=None, timing=None, pinned=True):
+               store_ids=None, timing=None, pinned=True,
+               limit=None):
     """The filter chain on the packed executor: continuous admission,
     survivor priority, pages freed on NO or after the last stage.
 
@@ -629,7 +630,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         [len(d) for d in doc_ids], stage_tokens, budget,
         arena_pages=arena.accounting.n_pages,
         page_tokens=arena.accounting.page_tokens,
-        kept_extra_tokens=p, restored=restored)
+        kept_extra_tokens=p, restored=restored, limit=limit)
     spans, tokens = [], 0
     outstanding = []     # (groups, handle) in launch order
     load_events = {}     # doc -> store load event, awaited pre-launch
