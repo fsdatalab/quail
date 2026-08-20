@@ -474,15 +474,18 @@ miscalibration):
    derived, never typed in.
 
 **Decisions that compare compute against bytes** (the only
-consumers of measured constants: a, q_kv, and the host channel
-bandwidths — plus a2 to refine both at long document lengths):
+consumers of measured constants: a and the host channel
+bandwidths — plus a2 to refine the restore break-even at long
+document lengths):
 
 6. **Access per scan**: read, restore, or spill. Restore wins
    when the warm store's bandwidth beats kappa x the serving rate
-   (the measured 7.2 GB/s break-even at 4B against pinned host
-   memory's 55 GB/s); a2 moves the crossover for long documents.
-7. **KV dtype**: the argmin inequality of §6 — q_kv x fresh
-   tokens against the transfer and overflow savings.
+   (about 18 GB/s at 4B bf16 KV and the packed rate, against
+   pinned host memory's 55 GB/s); a2 moves the crossover for
+   long documents.
+
+KV is always bf16. The planner does not choose a KV dtype and
+does not model a conversion tax.
 
 Infeasible configurations — weights don't fit the cards, the
 arena cannot hold one working set, a suffix exceeds the chunk
@@ -612,51 +615,12 @@ thousands of small allocations and frees boring.) At 4B with bf16
 KV the arena holds ~400k tokens — roughly 1,000 mean-length
 documents resident at once.
 
-**KV dtype: the planner picks the latency argmin, and the
-conversion overhead is already measured, twice.** One dtype per
-session, identical in the arena and the store.
-
-fp8 KV is not free speed; it is a conversion tax. Storing KV in
-fp8 costs a quantize on every write and a dequant on every read,
-and buys nothing back on the GPU, because attention — the only
-consumer of KV bytes — is 4% of step time. Both committed
-measurements agree on the size of the tax:
-
-- The kernel ladder ran the same engine boot both ways: 96,946
-  tok/s with fp8 KV, 102,820 with bf16 — a 5.9% rate cost, i.e.
-  **q_kv = 0.59 µs per fresh token** at 4B/H100
-  (`exploration/plans/packed_forward.md`, the ladder run).
-- End to end, the identical 10k-document five-filter query
-  measured 38.1 s with bf16 KV against 39.8 s with fp8
-  (`filter_cells_bf16.json` vs `filter_cells.json`): 0.46 µs per
-  fresh token over the 3.84M fresh tokens — the ladder number,
-  inside the run-to-run band.
-
-What fp8 buys is bytes, and bytes are priced by the same
-arithmetic: store transfers move kappa(dtype) x tokens over a
-known channel (halving kappa returns 1.34 µs per restored token
-at pinned 55 GB/s), and store capacity doubles (documents past
-cpu_memory_gb / kappa lose their slot and are recomputed on later
-queries at the serving rate). So the pick is one inequality,
-evaluated per query from numbers the plan already has:
-
-    fp8 wins  iff  q_kv x fresh_tokens
-                   <  (kappa_bf16 − kappa_fp8) / bw_channel
-                        x restored_tokens
-                      + overflow recompute saved by the 2x store
-
-q_kv generalizes without re-measuring: an elementwise conversion
-is bandwidth work, so it scales with KV elements per token (the
-same 2 x L x n_kv x d_h that makes kappa) and inversely with
-device memory bandwidth — spec arithmetic, like everything else
-in §8, with the 4B/H100 measurement as the anchor.
-
-Where the inequality lands: a cold query has zero restored tokens,
-so bf16 wins it by the full 5.9%. fp8 wins only when a warm
-suite's restore and overflow traffic outweighs a ~0.6 µs tax on
-every fresh token — heavy store pressure and comparatively little
-fresh compute. `explain()` prints both walls and the pick;
-`kv_dtype` in the config forces either.
+**KV is always bf16.** One dtype per session, identical in the
+arena and the store. The planner does not pick fp8 and does not
+price a conversion tax. fp8 KV would cost a quantize on every
+write and a dequant on every read; attention is a small share of
+step time, so those conversions buy no GPU speed. The arena and
+the store both use 2-byte elements (`kv_bytes = 2`).
 
 **Continuous admission — bin packing by tokens, twice.** There is
 a pending queue of documents and a resident set; nothing runs in
@@ -758,9 +722,8 @@ shared by its GPUs: capacity =
 document id), holding document-prefix KV only (suffix KV never
 exists anywhere). The executor reads it with plain batched H2D
 copies — no connector indirection, which is where stock vLLM lost
-five sixths of the link (10.2 of 55.4 GB/s). Store dtype matches
-the executor's KV dtype, so the phase-2 dtype question from the
-earlier draft disappears with the second executor. Eviction is the
+five sixths of the link (10.2 of 55.4 GB/s). Store dtype is bf16,
+matching the executor. Eviction is the
 length threshold, not LRU (a scanning query thrashes LRU; it
 cannot thrash a length cutoff).
 
@@ -817,10 +780,7 @@ efficiency factor (measured 0.35 on 4B/H100 — 91–93% of peak inside
 the GEMMs, the rest lost to the memory-bound work between them).
 Default for an uncalibrated model: carry the efficiency over via
 spec-ratio scaling (the existing `_scale`), and say so in
-`explain()`. The fp8-KV conversion tax q_kv (§6) is the same kind
-of constant: anchored by one measurement (0.59 µs/token at
-4B/H100), scaled to other models by KV elements per token and to
-other devices by memory bandwidth.
+`explain()`.
 
 Sharper constants come from a **calibration file**, and it is
 important to say when that file is made: offline, once per
@@ -834,22 +794,21 @@ planner reads constants from the file when one exists for this
 pair and from the spec-scaled defaults when it does not, and
 `explain()` names the source. Calibration is run when a model is
 onboarded or the software stack changes, and never otherwise;
-plans never require it — only the two break-even decisions get
+plans never require it — only the restore break-even gets
 sharper from it.
 
-The file holds exactly three numbers per (model, device), because
-only the byte-vs-compute decisions consume constants at all:
+The file holds exactly two numbers per (model, device), because
+only the restore decision consumes constants at all:
 
 | constant | meaning | decides | 4B/H100 today |
 |---|---|---|---|
-| a | seconds per fresh token in the packed loop (1/rate; embeds the efficiency factor) | the restore break-even (restore wins iff kappa/bandwidth < a) and the fresh side of the dtype inequality | 8.26 µs (121,045 tok/s, kernel ladder) |
-| a2 | seconds per token-pair of attention (the quadratic coefficient) | refines both break-evens at long document lengths: moves the restore crossover, matters in the LF=4 regime, inert at ordinary lengths | 4.93e-10 |
-| q_kv | the fp8-KV conversion tax per fresh token | the dtype argmin (§6) | 0.59 µs |
+| a | seconds per fresh token in the packed loop (1/rate; embeds the efficiency factor) | the restore break-even (restore wins iff kappa/bandwidth < a) | 8.26 µs (121,045 tok/s, kernel ladder) |
+| a2 | seconds per token-pair of attention (the quadratic coefficient) | refines the restore break-even at long document lengths: moves the restore crossover, matters in the LF=4 regime, inert at ordinary lengths | 4.93e-10 |
 
 Plus one table per host configuration, model-independent, measured
 once by the pinprobe protocol: the channel bandwidths (pinned
 H2D/D2H ~55 GB/s, unpinned ~11, disk ~2.6-3.9, volume ~0.9-3.2) —
-the byte side of both break-evens.
+the byte side of the restore break-even.
 
 Everything else the planner does consumes no constants: filter
 order, join stage order, and anchor choice compare candidates that
@@ -1058,8 +1017,8 @@ quail/                        (new repository)
     planner/
       plan.py                 # PhysicalPlan, Refusal
       budgets.py              # spec-derived arena/chunk arithmetic
-      decide.py               # order, anchor, sharding, access, dtype:
-                              # token arithmetic plus the two break-evens
+      decide.py               # order, anchor, sharding, access:
+                              # token arithmetic plus the restore break-even
                               # (reads the calibration file if present)
     executor/
       pack.py                 # brim packing, admission queue (from joinlogic.py)

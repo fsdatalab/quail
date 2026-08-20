@@ -10,7 +10,7 @@ Grouped by input:
 - Settings from the spec structs alone: the admission budget and the
   chunk budget (quail.planner.budgets).
 - Decisions that compare compute against bytes (the only consumers of
-  measured constants): access per scan, and the KV dtype argmin.
+  measured constants): access per scan. KV is always bf16.
 
 Pushdown is not a decision at all: filters attach above their scans in
 the logical plan, so a filter always runs before the joins its
@@ -267,7 +267,7 @@ def balanced_shards(doc_tokens, workers: int):
     return tuple(tuple(sorted(s)) for s in shards), loads
 
 
-# ------------------------------------- access and dtype (the break-evens)
+# ------------------------------------- access (the one break-even)
 
 def restore_crossover_tokens(model: ModelSpec, cal: Calibration,
                              read_bw: float) -> float:
@@ -322,32 +322,11 @@ def access_for_scan(stats: CorpusStats, model: ModelSpec,
     return "restore" if stats.mean_doc_tokens >= crossover else "read"
 
 
-def choose_kv_dtype(model: ModelSpec, cal: Calibration,
-                    fresh_tokens: float, restored_tokens: float,
-                    store_bw: float | None,
-                    overflow_recompute_saved_s: float = 0.0):
-    """The section-6 argmin, one inequality per query:
-
-        fp8 wins  iff  q_kv x fresh_tokens
-                       <  (kappa_bf16 - kappa_fp8) / bw x restored_tokens
-                          + overflow recompute saved by the 2x store
-
-    A cold query has zero restored tokens, so bf16 wins it by the full
-    conversion tax. Returns (dtype, fp8_cost_s, fp8_saving_s)."""
-    tax = cal.q_kv_s_per_token * fresh_tokens
-    saving = overflow_recompute_saved_s
-    if store_bw and restored_tokens:
-        elems = model.kv_elements_per_token
-        saving += (2.0 - 1.0) * elems * restored_tokens / store_bw
-    return ("fp8" if tax < saving else "bf16", tax, saving)
-
-
 # ---------------------------------------------------------- the planner
 
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                store: StoreSpec | None = None,
-               kv_dtype: str | None = None,
                order: str | None = None,
                calibration: Calibration | None = None):
     """LogicalPlan + corpus token counts -> PhysicalPlan | Refusal.
@@ -423,39 +402,27 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 needed=need, available=chunk, unit="tokens")
         needs.append(need)
 
-    admission_bf16 = budgets.arena_tokens(model.with_kv_bytes(2.0),
-                                          device, chunk)
+    admission = budgets.arena_tokens(model, device, chunk)
     working_set = max(needs)
-    if admission_bf16 < working_set and store is None:
+    if admission < working_set and store is None:
         return Refusal(
-            reasons=(f"the arena holds {admission_bf16} tokens against "
+            reasons=(f"the arena holds {admission} tokens against "
                      f"a {working_set}-token working set and there is "
                      f"no store to spill to (cpu_memory_gb is 0)",),
             constraint="store_needed_but_disabled",
-            needed=working_set, available=admission_bf16, unit="tokens")
+            needed=working_set, available=admission, unit="tokens")
 
     # ---- order
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(filters, joins)
     ordered_joins = order_joins(joins, rule, stats, anchors, pre)
 
-    # ---- KV dtype: the argmin over this query's fresh and restored
-    # tokens (unless forced). Every KV-owning document pays the
-    # engine preamble once, so scans count pre per document.
     accesses = {s.alias: access_for_scan(stats[s.alias], model, cal,
                                          store) for s in scans}
-    fresh = sum(stats[s.alias].total_tokens
-                + stats[s.alias].n_docs * pre for s in scans
-                if accesses[s.alias] == "read")
-    restored = sum(stats[s.alias].total_tokens
-                   + stats[s.alias].n_docs * pre for s in scans
-                   if accesses[s.alias] == "restore")
     live = {a: float(st.n_docs) for a, st in stats.items()}
     for fs in filters.values():
         surv = 1.0
         for p in order_filters(fs, rule):
-            n = live[_filter_alias(p)]
-            fresh += n * surv * _question_tokens(p.prompt)
             surv *= p.selectivity if p.selectivity is not None else 1.0
         live[_filter_alias(fs[0])] *= surv
     join_token_counts = []
@@ -464,29 +431,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         tuples = _cross_tuples(j, live, anchor)
         tokens = _stage_tokens(j, live, stats, anchor, pre)
         join_token_counts.append((tuples, tokens))
-        # the anchor prefix term is already in the scan totals above
-        fresh += tokens - live[anchor] * (stats[anchor].mean_doc_tokens
-                                          + pre)
         _thin(live, j, anchor)
 
-    if kv_dtype is not None:
-        dtype, source_dtype = kv_dtype, f"forced kv_dtype={kv_dtype!r}"
-    else:
-        dtype, tax, saving = choose_kv_dtype(
-            model, cal, fresh, restored,
-            store.read_bw if store else None)
-        source_dtype = (f"argmin: fp8 tax {tax:.2f} s vs byte saving "
-                        f"{saving:.2f} s")
-        if dtype == "fp8":
-            # the fp8 arena's conversion kernels are not built yet;
-            # the argmin's preference is recorded, not executed
-            source_dtype += ("; fp8 priced lower but its arena is "
-                             "not built - running bf16")
-            dtype = "bf16"
-    remarks.append(f"kv_dtype={dtype} ({source_dtype})")
-    kv_bytes = 1.0 if dtype == "fp8" else 2.0
-    admission = budgets.arena_tokens(model.with_kv_bytes(kv_bytes),
-                                     device, chunk)
+    remarks.append("kv_dtype=bf16 (always)")
 
     store_min = 0
     if store is not None:
@@ -495,8 +442,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         all_lengths = [t + pre
                        for toks in doc_tokens.values() for t in toks]
         store_min = store_length_threshold(
-            all_lengths, store.capacity_bytes,
-            model.with_kv_bytes(kv_bytes).kappa)
+            all_lengths, store.capacity_bytes, model.kappa)
         if store_min > 1:
             stored = [t for t in all_lengths if t >= store_min]
             remarks.append(
@@ -544,7 +490,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
     return PhysicalPlan(
         model=model.name, device=device.name, workers=workers,
-        tensor_parallel=tp, kv_dtype=dtype, chunk_tokens=chunk,
+        tensor_parallel=tp, kv_dtype="bf16", chunk_tokens=chunk,
         admission_tokens=admission, order_rule=rule, order_source=source,
         calibration_source=cal.source,
         store_min_doc_tokens=store_min,

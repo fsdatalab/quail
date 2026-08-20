@@ -77,10 +77,8 @@ def execute(payload: dict) -> dict:
     from quail.specs import DEVICES, MODELS
 
     if payload["kv_dtype"] != "bf16":
-        raise NotImplementedError(
-            "the fp8 KV arena is not built yet; the planner only "
-            "picks fp8 under warm-store pressure at scales the store "
-            "cannot hold in bf16")
+        raise ValueError(
+            f"KV is always bf16; got {payload['kv_dtype']!r}")
 
     spec = MODELS[payload["model"]]
     device = DEVICES["h100-sxm"]

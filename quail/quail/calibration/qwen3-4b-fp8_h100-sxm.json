@@ -3,10 +3,8 @@
   "device": "h100-sxm",
   "a_s_per_token": 8.261391217315875e-06,
   "a2_s_per_token2": 4.933635085554017e-10,
-  "q_kv_s_per_token": 5.9e-07,
   "provenance": {
     "a": "1 / 121,045 tok/s: the packed custom-kernel ladder rung (exploration single_filter_forward_vllm_kernels.json)",
-    "a2": "quadratic prefill coefficient from the alpha sweep fit (exploration cost_model_fit.json)",
-    "q_kv": "fp8-KV conversion tax: 96,946 vs 102,820 tok/s on the same boot (exploration packed_forward.md ladder), confirmed end to end at 0.46 us/token (filter_cells_bf16 vs filter_cells)"
+    "a2": "quadratic prefill coefficient from the alpha sweep fit (exploration cost_model_fit.json)"
   }
 }

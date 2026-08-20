@@ -1,7 +1,7 @@
 """Every derived quantity in the design's spec table (engine_design.md
 section 8). Pure arithmetic over the two spec structs; the only
-measured inputs are the calibration constants, and only the two
-break-even rows consume them.
+measured inputs are the calibration constants, and only the
+restore break-even row consumes them.
 
 The two token budgets, and why neither makes the GPU faster:
 
@@ -160,8 +160,8 @@ def attention_crossover(model: ModelSpec, device: DeviceSpec,
 def store_break_even_bytes_per_s(model: ModelSpec,
                                  a_s_per_token: float) -> float:
     """The bandwidth a KV store must beat for restore to win over
-    recompute: kappa x the serving rate. 7-9 GB/s at 4B/H100
-    depending on KV dtype and rate; pinned host memory's 55 GB/s
+    recompute: kappa x the serving rate. About 18 GB/s at 4B/H100
+    bf16 KV and the packed rate; pinned host memory's 55 GB/s
     clears it, disk and volumes do not."""
     return model.kappa / a_s_per_token
 

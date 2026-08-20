@@ -43,7 +43,6 @@ def calibrate_run(model: str, device: str, loaded_before: dict,
     spec, dev = resolve_pair(model, device)
     loaded = Calibration(a_s_per_token=loaded_before["a"],
                          a2_s_per_token2=loaded_before["a2"],
-                         q_kv_s_per_token=loaded_before["q_kv"],
                          source=loaded_before["source"])
     result = measure(spec, dev, tokens_per_point=tokens_per_point,
                      loaded=loaded)
@@ -68,7 +67,7 @@ def run(model: str = "qwen3-4b-fp8", device: str = "h100-sxm",
     payload = calibrate_run.remote(
         model, device,
         dict(a=loaded.a_s_per_token, a2=loaded.a2_s_per_token2,
-             q_kv=loaded.q_kv_s_per_token, source=loaded.source))
+             source=loaded.source))
     result = json.loads(payload)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w") as f:

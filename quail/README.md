@@ -10,10 +10,10 @@ workers run on H100 GPUs through Modal.
   input comes from them.
 - `quail/planner/` has the budget arithmetic, calibration loading
   and measurement, the physical plan, and the planner decisions
-  (stage order, anchor choice, sharding, access method, KV data
-  type).
+  (stage order, anchor choice, sharding, access method). KV is
+  always bf16.
 - `quail/calibration/` has the measured constants per (model, device)
-  pair: `a`, `a2`, `q_kv`, and the host channel bandwidth table.
+  pair: `a`, `a2`, and the host channel bandwidth table.
 - `quail/catalog.py`, `quail/logical.py`, `quail/sqlfront/`, and
   `quail/builder.py` are the providers, logical operators, and the
   two query entry points (AI SQL and the builder API).
@@ -42,15 +42,14 @@ quail-results Modal volume under `m1/`.
 
 ## Calibration
 
-The planner's break-even decisions use three measured constants per
+The planner's restore break-even uses two measured constants per
 (model, device) pair. The constants are stored in
 `quail/calibration/{model}_{device}.json`:
 
 - `a_s_per_token`: wall seconds per fresh token in the packed loop
   (the serving rate, with all overhead included).
 - `a2_s_per_token2`: the quadratic attention coefficient. It bends
-  the restore and store break-evens for long documents.
-- `q_kv_s_per_token`: the fp8 KV conversion tax per fresh token.
+  the restore break-even for long documents.
 
 A pair without a calibration file gets defaults scaled from the anchor
 measurement (Qwen3 4B on H100) using spec ratios. The plan's
@@ -71,9 +70,6 @@ The measure step (`quail.planner.calibrate.measure`) does the following:
 - It re-probes the host copy channels (pinned and unpinned, both
   directions, 2 GiB timed copies) for comparison against
   `quail/calibration/channels.json`.
-- It does not measure `q_kv`, because the fp8 arena is not built yet
-  (see issue #5). The loaded value (anchor or spec-scaled) is carried
-  through, and the provenance field says so.
 
 The result goes to `results/calibrate.json` only. To write it where
 the planner reads it, pass `--commit`:

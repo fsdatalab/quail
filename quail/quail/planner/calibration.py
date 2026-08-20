@@ -1,14 +1,14 @@
-"""The measured constants the planner's break-even decisions consume.
+"""The measured constants the planner's break-even decision consumes.
 
-Exactly three numbers per (model, device) pair, written offline by
+Exactly two numbers per (model, device) pair, written offline by
 `quail.planner.calibrate.measure` (Modal entry: quail/runtime/calibrate.py)
 and checked into quail/calibration/:
 
     a      seconds per fresh token in the packed loop (1/rate; embeds
            the measured efficiency factor)
     a2     seconds per token-pair of attention (the quadratic
-           coefficient; refines both break-evens at long documents)
-    q_kv   the fp8-KV conversion tax per fresh token
+           coefficient; refines the restore break-even at long
+           documents)
 
 Plus one host table, model-independent: the channel bandwidths from
 the pinprobe protocol.
@@ -32,7 +32,6 @@ ANCHOR_FILE = "qwen3-4b-fp8_h100-sxm.json"
 class Calibration:
     a_s_per_token: float
     a2_s_per_token2: float
-    q_kv_s_per_token: float
     source: str            # "calibrated" | "spec-scaled from <anchor>"
 
     @property
@@ -84,42 +83,31 @@ def load_calibration(model: ModelSpec, device: DeviceSpec) -> Calibration:
         d = _load_file(path)
         return Calibration(a_s_per_token=d["a_s_per_token"],
                            a2_s_per_token2=d["a2_s_per_token2"],
-                           q_kv_s_per_token=d["q_kv_s_per_token"],
                            source="calibrated")
 
     anchor = _load_file(CALIBRATION_DIR / ANCHOR_FILE)
     anchor_model = MODELS[anchor["model"]]
     anchor_device = DEVICES[anchor["device"]]
     s = _scale(model, device, anchor_model, anchor_device)
-    # q_kv is an elementwise conversion: bandwidth work, so it scales
-    # with KV elements per token and inversely with device memory
-    # bandwidth.
-    q_scale = ((model.kv_elements_per_token
-                / anchor_model.kv_elements_per_token)
-               * (anchor_device.hbm_bw / device.hbm_bw))
     return Calibration(
         a_s_per_token=anchor["a_s_per_token"] * s,
         a2_s_per_token2=anchor["a2_s_per_token2"] * s,
-        q_kv_s_per_token=anchor["q_kv_s_per_token"] * q_scale,
         source=f"spec-scaled from {anchor['model']}/{anchor['device']}")
 
 
 def make_record(model: ModelSpec, device: DeviceSpec,
-                a: float, a2: float, q_kv: float,
+                a: float, a2: float,
                 points: list, channels: dict, loaded: Calibration,
                 lengths, tokens_per_point: int) -> dict:
     """The JSON the measure step returns and --commit writes from."""
     return dict(
         model=model.name, device=device.name,
         a_s_per_token=a, a2_s_per_token2=a2,
-        q_kv_s_per_token=q_kv,
         provenance=dict(
             a=("wall seconds per fresh token, length sweep "
                f"{list(lengths)} at ~{tokens_per_point} tokens per "
                "point, affine fit intercept"),
-            a2="affine fit slope of the same sweep",
-            q_kv=("not measured: fp8 arena not implemented; carried "
-                  f"from '{loaded.source}'")),
+            a2="affine fit slope of the same sweep"),
         points=points,
         channels_measured_bytes_per_s=channels,
         loaded_before=dict(a=loaded.a_s_per_token,
@@ -128,12 +116,12 @@ def make_record(model: ModelSpec, device: DeviceSpec,
 
 
 def commit_calibration(record: dict, dest: Path | None = None) -> Path:
-    """Write the three constants where load_calibration reads them."""
+    """Write the two constants where load_calibration reads them."""
     dest = dest or (CALIBRATION_DIR
                     / f"{record['model']}_{record['device']}.json")
     keep = {k: record[k] for k in
             ("model", "device", "a_s_per_token",
-             "a2_s_per_token2", "q_kv_s_per_token", "provenance")}
+             "a2_s_per_token2", "provenance")}
     dest.parent.mkdir(parents=True, exist_ok=True)
     with open(dest, "w") as f:
         json.dump(keep, f, indent=2)

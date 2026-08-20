@@ -338,7 +338,6 @@ class Query:
                 doc_tokens=self._doc_tokens,
                 gpus=self.session.config.gpus,
                 store=self.session.store_spec(self._hashes.values()),
-                kv_dtype=self.session.config.kv_dtype,
                 order=self.order)
         return self._plan
 

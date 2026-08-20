@@ -1,10 +1,8 @@
 """The two structs every planner input derives from.
 
 All byte quantities are decimal. `kv_bytes` is bytes per stored KV
-element (2 = bf16, 1 = fp8). The fp8 conversion tax is a calibration
-constant (q_kv in quail/calibration/), not a spec field: the
-exploration repo used the name q_kv for the element width, this repo
-does not.
+element. KV is always bf16 (2 bytes). `with_kv_bytes` is only for
+kappa arithmetic in tests.
 """
 
 from dataclasses import dataclass, replace
