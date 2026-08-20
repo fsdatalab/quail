@@ -1,5 +1,5 @@
-"""Plots for the 2026-08-18 and 2026-08-19 reports (filter
-profiling, QUAIL-B).
+"""Plots for the 2026-08-18 and 2026-08-19 reports (QUAIL-B, vs
+stock).
 
 Reads the measured JSON artifacts in results/ and writes PNGs into
 reports/plots/. Run from the quail/ directory:
@@ -21,7 +21,6 @@ OUT.mkdir(exist_ok=True)
 
 ACCENT = "#2979FF"
 GRAY = "#9E9E9E"
-RED = "#E53935"
 GREEN = "#43A047"
 DARK = "#424242"
 
@@ -30,84 +29,6 @@ def load(name):
     with open(RESULTS / name) as f:
         return json.load(f)
 
-
-# ---- figure 1: GPU time breakdown (profiled 3k-doc filter) -----------
-
-prof = load("profile_filter.json")
-cat = prof["category_s"]
-
-# The profiler's "copies" bucket counted the aten::index_copy_ op AND
-# its kernel (1.86 s each); the true KV-write scatter cost is 1.86 s,
-# and the rest of the copies bucket is ordinary memcpy.
-kv_write = 1.86
-other_copies = round(cat["copies"] - 2 * kv_write, 2)
-
-rows = [
-    ("GEMM\n(DeepGEMM fp8)", cat["gemm"], ACCENT),
-    ("KV scatter\n(index_copy_)", kv_write, RED),
-    ("Fused Triton\n(silu/norm)", cat["triton_fused"], ACCENT),
-    ("Attention\n(flash_attn)", cat["attention"], ACCENT),
-    ("fp8 quant", cat["quant"], ACCENT),
-    ("Other copies", other_copies, GRAY),
-    ("Other", cat["other"], GRAY),
-]
-fig, ax = plt.subplots(figsize=(8, 4.5))
-names = [r[0] for r in rows][::-1]
-vals = [r[1] for r in rows][::-1]
-cols = [r[2] for r in rows][::-1]
-bars = ax.barh(names, vals, color=cols, height=0.62)
-ax.axvline(prof["ideal_gemm_s"], color="black", ls="--", lw=1,
-           label=f"GEMM at peak ({prof['ideal_gemm_s']:.1f} s)")
-for b, v in zip(bars, vals):
-    ax.text(b.get_width() + 0.06, b.get_y() + b.get_height() / 2,
-            f"{v:.2f} s", va="center", fontsize=9)
-ax.set_xlabel("GPU self-time (seconds)")
-ax.set_title("Where GPU time went, before KV scatter fix\n"
-             "(3,000-doc filter, 1.15M tokens)",
-             fontsize=11)
-ax.set_xlim(0, 7.2)
-ax.legend(loc="lower right", fontsize=9)
-ax.spines[["top", "right"]].set_visible(False)
-fig.tight_layout()
-fig.savefig(OUT / "profile_categories.png", dpi=150)
-plt.close(fig)
-
-# ---- figure 1b: full wall time breakdown (stacked bar) ---------------
-# One horizontal stacked bar showing where the entire 29 s went:
-# each kernel category from the GPU busy time, plus the idle time.
-
-gpu_idle = prof["gap_wall_minus_busy_s"]
-attn_quant = cat["attention"] + cat["quant"]
-segments = [
-    ("GEMM", cat["gemm"], ACCENT),
-    ("KV scatter", kv_write, RED),
-    ("Fused Triton", cat["triton_fused"], "#42A5F5"),
-    ("Attn + quant", attn_quant, "#66BB6A"),
-    ("Other GPU", other_copies + cat["other"], "#78909C"),
-    ("GPU idle\n(CPU scheduling)", gpu_idle, "#E0E0E0"),
-]
-fig, ax = plt.subplots(figsize=(10, 3.8))
-left = 0
-for label, val, color in segments:
-    ax.barh(0, val, left=left, height=0.55, color=color,
-            edgecolor="white", linewidth=0.5,
-            label=f"{label} ({val:.1f} s)")
-    left += val
-ax.set_xlim(0, prof["region_wall_s"] * 1.01)
-ax.set_xlabel("seconds")
-ax.set_yticks([])
-ax.set_ylim(-0.5, 0.8)
-ax.set_title(
-    f"Full wall time breakdown (before KV scatter fix): "
-    f"{prof['region_wall_s']:.0f} s total, "
-    f"{gpu_idle:.0f} s idle ({gpu_idle / prof['region_wall_s']:.0%})",
-    fontsize=11, pad=10)
-ax.legend(loc="upper right", fontsize=8.5, ncol=3,
-          framealpha=0.9)
-ax.spines[["top", "right", "left"]].set_visible(False)
-fig.tight_layout()
-fig.savefig(OUT / "profile_busy_idle.png", dpi=150)
-plt.close(fig)
 
 # ---- figure 2: quail vs stock vLLM ------------------------------------
 
