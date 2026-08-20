@@ -24,7 +24,7 @@ payload to the worker, which calls the executor.
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
-| `planner/calibration.py` | Measured constants (a, a2, q_kv) and scaling | specs |
+| `planner/calibration.py` | Measured constants (a, a2) and scaling | specs |
 | `planner/calibrate.py` | Length-sweep measure of a and a2 | calibration, executor |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
 | `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, calibration, plan |
@@ -94,8 +94,9 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
 4. The `Session` tokenizes each scanned column (cached per session)
    and calls the planner with the token counts.
 5. The planner produces a `PhysicalPlan`: stage order, anchor
-   choices, KV dtype, chunk budget, admission budget, sharding, and
-   a store length threshold. No wall-time prediction is produced.
+   choices, chunk budget, admission budget, sharding, and a store
+   length threshold. KV is always bf16. No wall-time prediction is
+   produced.
 6. The session builds a payload (token id lists and planned settings)
    and ships it to a Modal worker over RPC.
 7. The worker runs the packed executor on the GPU: filter chains,
@@ -324,19 +325,6 @@ for each table of the join:
 pick the table with the fewest tuple_tokens as anchor
 ```
 
-### Pseudocode: KV dtype argmin
-
-```
-tax = q_kv * fresh_tokens
-saving = 0
-if store exists and restored_tokens > 0:
-    saving += (kappa_bf16 - kappa_fp8) / store_bandwidth * restored_tokens
-if tax < saving:
-    pick fp8
-else:
-    pick bf16
-```
-
 ### Settings from the spec structs
 
 The spec structs (`specs/base.py`) hold model and device parameters.
@@ -372,10 +360,10 @@ attention term dominates.
 
 ### Decisions that use calibration constants
 
-Two decisions compare compute cost against byte-transfer cost and
-therefore need measured constants.
+One decision compares compute cost against byte-transfer cost and
+therefore needs measured constants.
 
-**Access per scan** (`decide.py:252`): `read` (compute the
+**Access per scan** (`decide.py:314`): `read` (compute the
 document's KV from scratch) or `restore` (load KV from the pinned
 host store). Restore wins when the store's bandwidth beats
 `kappa / a` (the serving rate expressed as KV bytes per second), or
@@ -386,32 +374,18 @@ The crossover is: solve `kappa / bw = a + a2 * h` for `h`, where
 bandwidth of 55 GB/s, restore wins at every document length for the
 4B model.
 
-**KV dtype selection** (`decide.py:263`): bf16 or fp8 for the KV
-arena. The argmin is one inequality per query:
-
-    fp8 wins iff q_kv * fresh_tokens
-                 < (kappa_bf16 - kappa_fp8) / bw * restored_tokens
-
-`q_kv` is the measured per-token cost of converting bf16 KV to fp8.
-A cold query (no restored tokens) always picks bf16, because fp8
-saves nothing on fresh tokens and pays the conversion tax. A warm
-query with many restored tokens can pick fp8, because the halved KV
-size lets the store transfer twice as fast.
-
-Note: the fp8 KV arena is not built yet (issue #5), so the planner
-currently overrides the argmin to bf16 when it would pick fp8
-(`decide.py:392-397`).
+KV is always bf16. The planner does not choose a KV dtype and does
+not model a conversion tax.
 
 ## 4. Calibration
 
-The planner's break-even decisions use three measured constants per
+The planner's restore break-even uses two measured constants per
 (model, device) pair, stored as JSON in `calibration/`:
 
 | Constant | Meaning |
 |---|---|
 | `a` (s/token) | Wall seconds per fresh token in the packed loop, efficiency included |
-| `a2` (s/token^2) | The quadratic attention coefficient; bends the break-evens for long documents |
-| `q_kv` (s/token) | The fp8 KV conversion tax per fresh token |
+| `a2` (s/token^2) | The quadratic attention coefficient; bends the restore break-even for long documents |
 
 A model/device pair without a calibration file gets defaults scaled
 from the anchor measurement (Qwen3 4B on H100) using spec ratios: a
@@ -440,19 +414,18 @@ single forward pass, sharing KV across them through a paged arena.
 
 | Function | File | What it does |
 |---|---|---|
-| `plan_query` | `decide.py:285` | Top-level: logical plan + token counts -> physical plan or refusal |
-| `order_filters_indexed` | `decide.py:81` | Sort filter stages by cost-per-killed-document |
+| `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
+| `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
 | `order_joins` | `decide.py` | Order the join specs (gates + the one full join) by total tuple tokens |
 | `choose_anchor` | `decide.py` | Pick the cheapest anchor table for a join |
-| `choose_kv_dtype` | `decide.py:263` | The fp8 vs bf16 argmin over fresh and restored tokens |
-| `balanced_shards` | `decide.py:193` | Greedy-balance documents across workers by token count |
-| `access_for_scan` | `decide.py:252` | Decide read vs restore for a scanned corpus |
-| `store_length_threshold` | `decide.py:222` | Length cutoff for which documents to store |
-| `chunk_budget` | `budgets.py:62` | Tokens per forward pass (min of memory and kernel bounds) |
-| `arena_tokens` | `budgets.py:69` | KV residency budget (device memory minus weights and activations) |
-| `load_calibration` | `calibration.py:80` | Load or spec-scale the calibration constants |
+| `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
+| `access_for_scan` | `decide.py` | Decide read vs restore for a scanned corpus |
+| `store_length_threshold` | `decide.py` | Length cutoff for which documents to store |
+| `chunk_budget` | `budgets.py` | Tokens per forward pass (min of memory and kernel bounds) |
+| `arena_tokens` | `budgets.py` | KV residency budget (device memory minus weights and activations) |
+| `load_calibration` | `calibration.py` | Load or spec-scale the calibration constants |
 | `measure` | `calibrate.py` | Length sweep + affine fit of a, a2 (GPU) |
-| `commit_calibration` | `calibration.py` | Write the three constants to the pair file |
+| `commit_calibration` | `calibration.py` | Write the two constants to the pair file |
 
 ### 5.1 Chunk packing
 

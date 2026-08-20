@@ -2,8 +2,7 @@
 
 This is the onboard step for a new model or device: run the packed
 filter at a few document lengths, fit t(h) = a + a2*h, and probe
-the host copy channels. q_kv is not measured (the fp8 arena is not
-built); the loaded or spec-scaled value is carried through.
+the host copy channels.
 
 Nothing here talks to Modal. The GPU entry that calls measure() is
 quail/runtime/calibrate.py, attached to the quail-engine app.
@@ -145,6 +144,5 @@ def measure(model: ModelSpec, device: DeviceSpec,
     a, a2 = fit_affine(points)
     a2 = max(a2, 0.0)
     channels = _probe_channels(torch)
-    return make_record(model, device, a, a2, loaded.q_kv_s_per_token,
-                       rows, channels, loaded, lengths,
-                       tokens_per_point)
+    return make_record(model, device, a, a2, rows, channels, loaded,
+                       lengths, tokens_per_point)

@@ -10,8 +10,8 @@ import pytest
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.planner.calibration import load_calibration
-from quail.planner.decide import (balanced_shards, choose_kv_dtype,
-                                  explain, order_filters, plan_query,
+from quail.planner.decide import (balanced_shards, explain,
+                                  order_filters, plan_query,
                                   restore_crossover_tokens)
 from quail.planner.plan import (EngineConfig, PhysicalPlan, Refusal,
                                 StoreSpec, resolve_model)
@@ -294,28 +294,19 @@ def test_restore_crossover_zero_for_pinned():
     assert restore_crossover_tokens(QWEN3_4B_FP8, CAL, 3e9) > 10_000
 
 
-def test_kv_dtype_cold_is_bf16_heavy_restore_is_fp8():
-    dtype, tax, saving = choose_kv_dtype(QWEN3_4B_FP8, CAL,
-                                         fresh_tokens=4e6,
-                                         restored_tokens=0,
-                                         store_bw=55e9)
-    assert dtype == "bf16" and saving == 0.0
-    dtype, tax, saving = choose_kv_dtype(QWEN3_4B_FP8, CAL,
-                                         fresh_tokens=1e5,
-                                         restored_tokens=50e6,
-                                         store_bw=55e9)
-    assert dtype == "fp8" and saving > tax
-
-
-def test_admission_uses_chosen_dtype(catalog):
+def test_kv_is_always_bf16(catalog):
     logical = _five_filter_plan(catalog, (0.9,))
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [400] * 100}, kv_dtype="fp8")
-    bf16 = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [400] * 100}, kv_dtype="bf16")
-    assert plan.kv_dtype == "fp8"
-    assert plan.admission_tokens == pytest.approx(
-        2 * bf16.admission_tokens, rel=0.01)
+    cold = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [400] * 100})
+    warm = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [400] * 100},
+                      store=StoreSpec(read_bw=55e9, warm=True))
+    assert cold.kv_dtype == "bf16"
+    assert warm.kv_dtype == "bf16"
+    assert any("kv_dtype=bf16 (always)" in r for r in cold.remarks)
+    from quail.planner import budgets
+    assert cold.admission_tokens == budgets.arena_tokens(
+        QWEN3_4B_FP8, H100_SXM, cold.chunk_tokens)
 
 
 def test_explain_prints_tree_settings_and_source(catalog):
