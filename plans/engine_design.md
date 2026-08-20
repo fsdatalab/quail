@@ -228,12 +228,11 @@ DOCUMENT {0}:                             naming line written into
 <review a3>                               kept KV once per anchor
 
 DOCUMENT {2}:                          <- each partner block + the
-<product c9>                              instruction + question: one
+<product c9>                              question + answer cue: one
                                           suffix, paid once per tuple
-Evaluate TRUE or FALSE for the following
-statement: Review {0} praises the
-thread in {1} and that thread
-recommends the product in {2}.
+Does {0} praise the thread in {1}
+and does that thread recommend
+the product in {2}?
 ANSWER:
 ```
 

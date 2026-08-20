@@ -309,8 +309,7 @@ def test_payload_carries_true_false_and_join_spec(sess):
     assert j["frame"] == fake_tok(join_anchor_note(0))
     assert j["labels"] == {"p": fake_tok(join_label(1))}
     assert j["tail"] == fake_tok(
-        "\n\nEvaluate TRUE or FALSE for the following statement: "
-        "Does {0} match {1}? Answer.\nANSWER:")
+        "\n\nDoes {0} match {1}? Answer.\nANSWER:")
     logical = sess.sql(sql).logical
     pred = logical.root.input.predicate
     assert j["tail"] == fake_tok(render_join_question(pred.template))

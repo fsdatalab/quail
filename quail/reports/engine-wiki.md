@@ -152,7 +152,7 @@ then one labeled block per partner and the question:
 
 ```
 [SHARED_PRE] [anchor document] [naming line: (The document above is {0}.)]
-[DOCUMENT {1}:] [partner document] ... [instruction + question with {0},{1},... markers kept]
+[DOCUMENT {1}:] [partner document] ... [question with {0},{1},... markers kept] [ANSWER:]
 ```
 
 `SHARED_PRE` is `"DOCUMENT:\n"`, defined once in `logical.py`. It is

@@ -85,7 +85,7 @@ def concat_to_chars(pool, target_chars, start):
 
 
 def flag_question(prefix, j):
-    return f"\n\n{prefix}_{j} in the [FLAGS] line is TRUE."
+    return f"\n\nIs {prefix}_{j} in the [FLAGS] line TRUE?"
 
 
 # ------------------------------------------------------- set builders
@@ -278,26 +278,15 @@ def queries(sess):
                 selectivity=sel).select("a.id", "b.id")
         return make
 
-    # Join templates are the per-tuple question only, and they are
-    # appended VERBATIM - the {0}/{1}/{2} markers stay in the text,
-    # nothing is filled in. The engine renders every tuple as labeled
-    # document blocks first (the anchor under the bare DOCUMENT label
-    # plus a naming line mapping it to its marker, each partner under
-    # "DOCUMENT {i}:" with its own marker), so a marker in the
-    # question resolves to its block. The whole question is paid once
-    # per tuple, so it stays short; the naming line is paid once per
-    # anchor. The engine wraps every template with a fixed instruction
-    # ("Evaluate TRUE or FALSE...") and answer cue ("\nANSWER:"), so
-    # templates here are plain statements only.
-    REACTION = ("{0} describes the reaction named in {1} as "
-                "something the patient experienced.")
-    DISCUSS = "{0} discusses the product described in {1}."
-    MENTION = "{0} mentions the medical term in {1}."
-    KEYEQ3 = ("The [FLAGS] or key values in {1} and in {2} both "
-              "match the [KEYS] X value in {0}.")
-    REACTION_DISCUSS = ("{0} describes the reaction named in {1} as "
-                        "something the patient experienced and also "
-                        "discusses the product described in {2}.")
+    REACTION = ("Does {0} describe the reaction named in {1} as "
+                "something the patient experienced?")
+    DISCUSS = "Does {0} discuss the product described in {1}?"
+    MENTION = "Does {0} mention the medical term in {1}?"
+    KEYEQ3 = ("Do the [FLAGS] or key values in {1} and in {2} both "
+              "match the [KEYS] X value in {0}?")
+    REACTION_DISCUSS = ("Does {0} describe the reaction named in {1} "
+                        "as something the patient experienced and also "
+                        "discuss the product described in {2}?")
 
     q = {}
     q["B1"] = ("1F reviews: the per-query floor", lambda: sess.sql(
@@ -395,8 +384,8 @@ def queries(sess):
     q["B14"] = ("B5 rerun, new question: the anchor restore",
                 content_join("reports", "report", "terms", "term",
                              REACTION.replace(
-                                 "describes the reaction",
-                                 "explicitly reports the reaction"),
+                                 "describe the reaction",
+                                 "explicitly report the reaction"),
                              0.05))
 
     def b15():
@@ -411,7 +400,7 @@ def queries(sess):
                          selectivity=0.1, semantics="exists")
                 .ai_join(sess.docs("reports").alias("r"),
                          _q.prompt(
-                             "{0} and {1} both discuss medicine.",
+                             "Do {0} and {1} both discuss medicine?",
                              _q.col("t.thread"), _q.col("r.report")),
                          selectivity=0.2)
                 .select("t.id", "r.id"))
