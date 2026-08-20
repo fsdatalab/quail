@@ -207,6 +207,7 @@ def _execute_single(state, payload: dict) -> dict:
 
     t0 = time.perf_counter()
     with torch.inference_mode():
+        pipeline.attention_mode = "unified"
         for alias, qids in payload["filters"].items():
             stats = {}
             answers, _, tokens = run_filter(
@@ -228,6 +229,7 @@ def _execute_single(state, payload: dict) -> dict:
                 if len(row) == len(qids) and all(row))
 
         out_joins = []
+        pipeline.attention_mode = "merge_quant"
         for group in _stage_groups(payload["joins"]):
             anchor_alias = group[0]["anchor"]
             anchors_glob = list(survivors[anchor_alias])
@@ -423,6 +425,7 @@ def _child_filters(state, sub):
     pre = sub.get("pre_ids") or []
     t0 = _time.perf_counter()
     with torch.inference_mode():
+        state["pipeline"].attention_mode = "unified"
         for alias, qids in sub["filters"].items():
             stats = {}
             index = sub["doc_index"][alias]
@@ -468,6 +471,7 @@ def _child_joins(state, sub):
     store_stats = {}
     t0 = _time.perf_counter()
     with torch.inference_mode():
+        state["pipeline"].attention_mode = "merge_quant"
         for group in _stage_groups(sub["joins"]):
             stage_suffixes, partner_globs = [], []
             for j in group:
