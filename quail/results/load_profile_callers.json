@@ -1,0 +1,54 @@
+{
+  "model": "Qwen/Qwen3-4B-FP8",
+  "prediction": "cProfile variant: engine_config's ~13.5 s is platform/device probing plus transformers config/tokenizer setup; get_model's ~8 s residual past the 2 s weight read is CUDA context and kernel-module loading plus fp8 post-processing.",
+  "phases": {
+    "import_torch_s": 11.84,
+    "import_vllm_s": 64.83,
+    "engine_config_s": 27.59,
+    "dist_init_s": 0.11,
+    "get_model_s": 25.04,
+    "cuda_sync_s": 0.0,
+    "sum_s": 129.41
+  },
+  "raw_weight_read": {
+    "files": [
+      "model-00001-of-00002.safetensors",
+      "model-00002-of-00002.safetensors"
+    ],
+    "gib": 4.83,
+    "read_s": 2.38,
+    "gib_per_s": 2.03
+  },
+  "vllm_log": [
+    {
+      "t": 27.0,
+      "msg": "Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none"
+    },
+    {
+      "t": 27.0,
+      "msg": "Cudagraph is disabled under eager mode"
+    },
+    {
+      "t": 31.59,
+      "msg": "Selected FlashInferFp8DeepGEMMDynamicBlockScaledKernel for Fp8LinearMethod"
+    },
+    {
+      "t": 31.59,
+      "msg": "deep_gemm not found in site-packages, trying vendored vllm.third_party.deep_gemm"
+    },
+    {
+      "t": 31.6,
+      "msg": "DeepGEMM PDL enabled on vllm.third_party.deep_gemm."
+    },
+    {
+      "t": 31.6,
+      "msg": "DeepGEMM E8M0 enabled on current platform."
+    },
+    {
+      "t": 35.1,
+      "msg": "Loading weights took 2.45 seconds"
+    }
+  ],
+  "cprofile_config": "         755115 function calls (743972 primitive calls) in 27.174 seconds\n\n   Ordered by: internal time\n   List reduced from 3935 to 20 due to restriction <20>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n       10   14.997    1.500   14.997    1.500 {method 'poll' of 'select.epoll' objects}\n        3    9.802    3.267    9.802    3.267 {method 'poll' of 'select.poll' objects}\n     2801    0.313    0.000    0.314    0.000 {built-in method posix.stat}\n      516    0.183    0.000    0.183    0.000 {built-in method _io.open_code}\n      508    0.161    0.000    0.161    0.000 {method 'read' of '_io.BufferedReader' objects}\n     5024    0.118    0.000    0.118    0.000 {built-in method posix.lstat}\n      703    0.105    0.000    0.126    0.000 {built-in method _io.open}\n   363/27    0.065    0.000    0.112    0.004 /usr/local/lib/python3.12/site-packages/jinja2/nodes.py:195(find_all)\n      494    0.054    0.000    0.054    0.000 {built-in method marshal.loads}\n     1529    0.047    0.000    0.050    0.000 /usr/local/lib/python3.12/site-packages/jinja2/nodes.py:169(iter_child_nodes)\n       96    0.047    0.000    0.047    0.000 {built-in method posix.listdir}\n       94    0.046    0.000    0.046    0.000 {built-in method builtins.compile}\n    762/7    0.043    0.000    0.011    0.002 {built-in method builtins.exec}\n      732    0.037    0.000    0.037    0.000 {method '__exit__' of '_io._IOBase' objects}\n      524    0.033    0.000    0.335    0.001 <frozen importlib._bootstrap>:1240(_find_spec)\n    518/5    0.029    0.000    0.019    0.004 <frozen importlib._bootstrap>:1304(_find_and_load_unlocked)\n27561/27270    0.028    0.000    0.034    0.000 {built-in method __new__ of type object at 0x2b09b07c14a0}\n        9    0.025    0.003    0.025    0.003 {built-in method _imp.create_dynamic}\n88562/88561    0.024    0.000    0.027    0.000 {built-in method builtins.getattr}\n       22    0.023    0.001    0.024    0.001 /usr/local/lib/python3.12/site-packages/humming/ops/utils.py:41(_shield_lazy_modules)\n\n\n",
+  "cprofile_model": "         13643080 function calls (12506715 primitive calls) in 29.949 seconds\n\n   Ordered by: internal time\n   List reduced from 13824 to 20 due to restriction <20>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n   1758/0    4.283    0.002    0.000          {method 'to' of 'torch._C.TensorBase' objects}\n     1012    2.025    0.002    2.027    0.002 {method 'copy_' of 'torch._C.TensorBase' objects}\n    12064    1.117    0.000    1.120    0.000 {built-in method posix.stat}\n     3512    1.032    0.000    1.032    0.000 {method 'read' of '_io.BufferedReader' objects}\n        4    0.635    0.159    0.635    0.159 /usr/local/lib/python3.12/site-packages/torch/_library/custom_ops.py:607(_register_to_dispatcher)\n5136/4776    0.497    0.000    1.073    0.000 /usr/local/lib/python3.12/contextlib.py:132(__enter__)\n     1256    0.457    0.000    0.457    0.000 {built-in method posix.listdir}\n  609/320    0.450    0.001    0.554    0.002 {built-in method torch.empty}\n        1    0.418    0.418    0.463    0.463 /usr/local/lib/python3.12/site-packages/z3/z3.py:1(<module>)\n1781105/1719810    0.400    0.000    0.512    0.000 {built-in method builtins.isinstance}\n10043/1989    0.397    0.000    2.891    0.001 /usr/local/lib/python3.12/site-packages/sympy/core/assumptions.py:509(_ask)\n    11627    0.383    0.000    0.699    0.000 /usr/local/lib/python3.12/site-packages/sympy/core/facts.py:599(deduce_all_facts)\n       13    0.379    0.029    0.449    0.035 /usr/local/lib/python3.12/asyncio/events.py:82(_run)\n     2583    0.370    0.000    0.384    0.000 {built-in method _io.open}\n     4702    0.347    0.000    0.347    0.000 {method 'update' of '_hashlib.HASH' objects}\n      881    0.320    0.000    0.320    0.000 {built-in method _io.open_code}\n   725380    0.277    0.000    0.298    0.000 {method 'get' of 'dict' objects}\n    499/5    0.258    0.001    2.643    0.529 /usr/local/lib/python3.12/site-packages/torch/_subclasses/fake_tensor.py:1505(_cached_dispatch_impl)\n188513/128466    0.257    0.000    2.463    0.000 /usr/local/lib/python3.12/site-packages/sympy/core/cache.py:69(wrapper)\n 4478/435    0.248    0.000    2.454    0.006 /usr/local/lib/python3.12/site-packages/vllm/model_executor/models/utils.py:317(_load_module)\n\n\n"
+}

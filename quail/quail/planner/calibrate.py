@@ -54,7 +54,7 @@ def _boot(spec: ModelSpec, device: DeviceSpec):
     from quail.executor.model import load_model
 
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    model = load_model(spec.hf_name)
+    model = load_model(spec.hf_name, revision=spec.revision)
     chunk = budgets.chunk_budget(spec, device)
     arena_tok = budgets.arena_tokens(spec, device, chunk)
     arena = KVArena(n_layers=spec.layers,

@@ -1,0 +1,52 @@
+{
+  "model": "Qwen/Qwen3-4B-FP8",
+  "prediction": "HF_HUB_OFFLINE=1 variant: engine_config_s drops from ~13 s (warm-cache online run) to ~2-3 s; get_model_s drops a little (it also made hub calls); import phases unchanged; in-timer total ~22-26 s versus the measured 37.3 s online.",
+  "phases": {
+    "import_torch_s": 2.58,
+    "import_vllm_s": 11.46,
+    "engine_config_s": 13.56,
+    "dist_init_s": 0.07,
+    "get_model_s": 9.92,
+    "cuda_sync_s": 0.0,
+    "sum_s": 37.59
+  },
+  "raw_weight_read": {
+    "files": [
+      "model-00001-of-00002.safetensors",
+      "model-00002-of-00002.safetensors"
+    ],
+    "gib": 4.83,
+    "read_s": 2.09,
+    "gib_per_s": 2.31
+  },
+  "vllm_log": [
+    {
+      "t": 13.52,
+      "msg": "Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none"
+    },
+    {
+      "t": 13.52,
+      "msg": "Cudagraph is disabled under eager mode"
+    },
+    {
+      "t": 15.69,
+      "msg": "Selected FlashInferFp8DeepGEMMDynamicBlockScaledKernel for Fp8LinearMethod"
+    },
+    {
+      "t": 15.69,
+      "msg": "deep_gemm not found in site-packages, trying vendored vllm.third_party.deep_gemm"
+    },
+    {
+      "t": 15.76,
+      "msg": "DeepGEMM PDL enabled on vllm.third_party.deep_gemm."
+    },
+    {
+      "t": 15.76,
+      "msg": "DeepGEMM E8M0 enabled on current platform."
+    },
+    {
+      "t": 18.23,
+      "msg": "Loading weights took 1.96 seconds"
+    }
+  ]
+}

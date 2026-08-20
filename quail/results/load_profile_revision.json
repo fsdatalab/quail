@@ -1,0 +1,62 @@
+{
+  "model": "Qwen/Qwen3-4B-FP8",
+  "prediction": "revision pinned to a commit hash, hub online: get_model_s matches the offline run's ~9.9 s (commit hash resolves from the local HF cache without API calls, branch names cannot); engine_config_s ~1-2 s with modelinfos warm; in-timer total ~21-25 s versus ~37 s unpinned online. Cold-cache downloads still work.",
+  "phases": {
+    "import_torch_s": 2.45,
+    "import_vllm_s": 11.65,
+    "engine_config_s": 0.39,
+    "dist_init_s": 0.19,
+    "get_model_s": 15.37,
+    "cuda_sync_s": 0.0,
+    "sum_s": 32.03
+  },
+  "raw_weight_read": {
+    "files": [
+      "model-00001-of-00002.safetensors",
+      "model-00002-of-00002.safetensors"
+    ],
+    "gib": 4.83,
+    "read_s": 2.74,
+    "gib_per_s": 1.77
+  },
+  "vllm_log": [
+    {
+      "t": 1.94,
+      "msg": "Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none"
+    },
+    {
+      "t": 1.94,
+      "msg": "Cudagraph is disabled under eager mode"
+    },
+    {
+      "t": 2.28,
+      "msg": "Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none"
+    },
+    {
+      "t": 2.28,
+      "msg": "Cudagraph is disabled under eager mode"
+    },
+    {
+      "t": 4.56,
+      "msg": "Selected FlashInferFp8DeepGEMMDynamicBlockScaledKernel for Fp8LinearMethod"
+    },
+    {
+      "t": 4.56,
+      "msg": "deep_gemm not found in site-packages, trying vendored vllm.third_party.deep_gemm"
+    },
+    {
+      "t": 4.57,
+      "msg": "DeepGEMM PDL enabled on vllm.third_party.deep_gemm."
+    },
+    {
+      "t": 4.57,
+      "msg": "DeepGEMM E8M0 enabled on current platform."
+    },
+    {
+      "t": 8.3,
+      "msg": "Loading weights took 2.28 seconds"
+    }
+  ],
+  "cprofile_config": "         141817 function calls (140275 primitive calls) in 0.376 seconds\n\n   Ordered by: internal time\n   List reduced from 1083 to 20 due to restriction <20>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n        2    0.254    0.127    0.254    0.127 {method 'read' of '_ssl._SSLSocket' objects}\n      446    0.022    0.000    0.031    0.000 {built-in method _io.open}\n      107    0.010    0.000    0.010    0.000 {built-in method posix.stat}\n48670/48669    0.008    0.000    0.008    0.000 {built-in method builtins.getattr}\n      462    0.007    0.000    0.014    0.000 /usr/local/lib/python3.12/importlib/metadata/__init__.py:347(__new__)\n      117    0.006    0.000    0.006    0.000 {method 'read' of '_io.TextIOWrapper' objects}\n      117    0.002    0.000    0.002    0.000 {method '__exit__' of '_io._IOBase' objects}\n      434    0.002    0.000    0.045    0.000 /usr/local/lib/python3.12/importlib/metadata/__init__.py:810(read_text)\n      477    0.002    0.000    0.004    0.000 /usr/local/lib/python3.12/pathlib.py:387(_parse_path)\n11023/10983    0.002    0.000    0.002    0.000 {built-in method builtins.isinstance}\n      436    0.002    0.000    0.028    0.000 /usr/local/lib/python3.12/importlib/metadata/_itertools.py:4(unique_everseen)\n      558    0.002    0.000    0.002    0.000 <frozen posixpath>:71(join)\n1662/1616    0.001    0.000    0.002    0.000 /usr/local/lib/python3.12/site-packages/transformers/integrations/heterogeneity/configuration_utils.py:291(__getattribute__)\n      462    0.001    0.000    0.011    0.000 /usr/local/lib/python3.12/importlib/metadata/__init__.py:825(_normalized_name)\n      462    0.001    0.000    0.003    0.000 /usr/local/lib/python3.12/functools.py:35(update_wrapper)\n      939    0.001    0.000    0.009    0.000 /usr/local/lib/python3.12/pathlib.py:437(__str__)\n      736    0.001    0.000    0.002    0.000 /usr/local/lib/python3.12/importlib/metadata/__init__.py:109(read)\n       35    0.001    0.000    0.001    0.000 {built-in method posix.lstat}\n      493    0.001    0.000    0.002    0.000 /usr/local/lib/python3.12/pathlib.py:358(__init__)\n        6    0.001    0.000    0.001    0.000 {built-in method posix.listdir}\n\n\n",
+  "cprofile_model": "         13865141 function calls (12730847 primitive calls) in 15.154 seconds\n\n   Ordered by: internal time\n   List reduced from 14391 to 20 due to restriction <20>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n     1012    2.048    0.002    2.049    0.002 {method 'copy_' of 'torch._C.TensorBase' objects}\n     3528    0.464    0.000    0.464    0.000 {method 'read' of '_io.BufferedReader' objects}\n29244/7282    0.379    0.000    0.382    0.000 /usr/local/lib/python3.12/site-packages/torch/nn/modules/module.py:2837(named_modules)\n  609/320    0.347    0.001    0.406    0.001 {built-in method torch.empty}\n        5    0.330    0.066    0.330    0.066 {method 'read' of '_ssl._SSLSocket' objects}\n     4702    0.318    0.000    0.318    0.000 {method 'update' of '_hashlib.HASH' objects}\n        4    0.313    0.078    0.313    0.078 /usr/local/lib/python3.12/site-packages/torch/_library/custom_ops.py:607(_register_to_dispatcher)\n12252/12251    0.303    0.000    0.304    0.000 {built-in method posix.stat}\n1784073/1722281    0.280    0.000    0.359    0.000 {built-in method builtins.isinstance}\n10067/1991    0.247    0.000    1.889    0.001 /usr/local/lib/python3.12/site-packages/sympy/core/assumptions.py:509(_ask)\n    11506    0.225    0.000    0.475    0.000 /usr/local/lib/python3.12/site-packages/sympy/core/facts.py:599(deduce_all_facts)\n     1260    0.173    0.000    0.173    0.000 {built-in method posix.listdir}\n      897    0.169    0.000    0.169    0.000 {built-in method marshal.loads}\n188815/128707    0.159    0.000    1.662    0.000 /usr/local/lib/python3.12/site-packages/sympy/core/cache.py:69(wrapper)\n      2/1    0.157    0.079    2.169    2.169 {built-in method torch.cat}\n   803403    0.143    0.000    0.156    0.000 {method 'get' of 'dict' objects}\n523471/522898    0.141    0.000    0.180    0.000 {built-in method builtins.getattr}\n134004/133824    0.136    0.000    0.395    0.000 /usr/local/lib/python3.12/site-packages/sympy/core/sympify.py:124(sympify)\n73637/11771    0.133    0.000    0.238    0.000 /usr/local/lib/python3.12/site-packages/sympy/core/basic.py:677(free_symbols)\n 2204/114    0.121    0.000    4.523    0.040 {built-in method builtins.exec}\n\n\n"
+}

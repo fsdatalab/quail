@@ -70,7 +70,10 @@ image = (
     .entrypoint([])
     .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
                  "numpy", "datasets")
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+    .env({# vLLM's architecture-inspection subprocess caches under
+          # VLLM_CACHE_ROOT/modelinfos; the volume makes it once ever
+          "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+          "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
@@ -250,7 +253,7 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = load_model(MODEL)
+    model = load_model(MODEL, revision=QWEN3_4B_FP8.revision)
     chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
     arena_tok = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, chunk)
     spec = QWEN3_4B_FP8
@@ -406,7 +409,7 @@ def profile_packed(n_docs: int = 3000) -> str:
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = load_model(MODEL)
+    model = load_model(MODEL, revision=QWEN3_4B_FP8.revision)
     chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
     arena_tok = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, chunk)
     spec = QWEN3_4B_FP8

@@ -39,7 +39,11 @@ image = (
     .entrypoint([])
     .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
                  "numpy", "datasets")
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+    .env({# vLLM's architecture-inspection subprocess caches under
+          # VLLM_CACHE_ROOT/modelinfos; the volume makes it once ever,
+          # not once per container (~11-13 s saved per cold boot)
+          "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+          "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
@@ -102,7 +106,7 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
     if reuse is None:
         tokenizer = AutoTokenizer.from_pretrained(MODEL)
         t0 = time.perf_counter()
-        model = load_model(MODEL)
+        model = load_model(MODEL, revision=spec.revision)
         boot["load_model_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
         chunk = budgets.chunk_budget(spec, device)

@@ -4,7 +4,8 @@ block scales laid out for DeepGEMM. No engine, no scheduler, no KV
 pool. vLLM is a library here (loader and kernels), nothing more."""
 
 
-def load_model(model_name: str, backend: str = "nccl"):
+def load_model(model_name: str, revision: str | None = None,
+               backend: str = "nccl"):
     import torch
     from vllm.config import set_current_vllm_config
     from vllm.distributed.parallel_state import (
@@ -16,6 +17,7 @@ def load_model(model_name: str, backend: str = "nccl"):
     from vllm.utils.network_utils import get_open_port
 
     config = EngineArgs(model=model_name, dtype="bfloat16",
+                        revision=revision or None,
                         enforce_eager=True).create_engine_config()
     with set_current_vllm_config(config):
         import torch.distributed as dist
