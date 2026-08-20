@@ -98,7 +98,7 @@ class Answerer:
 
 
 class AsyncAnswers:
-    """YES/NO readout that does not stall the stream: submit()
+    """TRUE/FALSE readout that does not stall the stream: submit()
     computes the bits on GPU, enqueues a copy to pinned host memory,
     and records an event; result() waits only for that event - ops
     enqueued after the event (the next chunk's forward) keep the GPU
@@ -111,9 +111,9 @@ class AsyncAnswers:
     def submit(self, normed):
         torch, ans = self.torch, self.ans
         scores = ans.F.linear(normed, ans.weights)
-        yes = scores.index_select(1, ans.yes_cols).amax(dim=1)
-        no = scores.index_select(1, ans.no_cols).amax(dim=1)
-        bits = (yes > no).to(torch.uint8)
+        t = scores.index_select(1, ans.true_cols).amax(dim=1)
+        f = scores.index_select(1, ans.false_cols).amax(dim=1)
+        bits = (t > f).to(torch.uint8)
         host = torch.empty(bits.shape[0], dtype=torch.uint8,
                            pin_memory=True)
         host.copy_(bits, non_blocking=True)

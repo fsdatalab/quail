@@ -116,7 +116,7 @@ def execute(payload: dict) -> dict:
     model, arena, pipeline = (booted["model"], booted["arena"],
                               booted["pipeline"])
     chunk = budgets.chunk_budget(spec, device)
-    # the worker has no tokenizer: the YES/NO token ids ride in the
+    # the worker has no tokenizer: the TRUE/FALSE token ids ride in the
     # payload
     answerer = _PayloadAnswerer(torch, F, model, payload["true_ids"],
                                 payload["false_ids"])
@@ -183,7 +183,7 @@ def _execute_single(state, payload: dict) -> dict:
     # across operators; a partner document rides in the suffix raw
     pre = payload.get("pre_ids") or []
     answerer = _PayloadAnswerer(torch, state["F"], state["model"],
-                                payload["yes_ids"], payload["no_ids"])
+                                payload["true_ids"], payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
     budget = min(state["chunk"], pipeline.max_chunk_tokens,
                  payload["chunk_tokens"])
