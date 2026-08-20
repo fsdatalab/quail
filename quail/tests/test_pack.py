@@ -258,3 +258,43 @@ def test_admission_limit_none_processes_all():
                             arena_pages=100, page_tokens=16, limit=None)
     _drive(sched, truth)
     assert len(sched.survivors()) == 5
+
+
+def test_admission_limit_reduces_work():
+    """Run the same corpus with and without a limit. The limited run
+    should admit fewer documents and build fewer chunks."""
+    rng = random.Random(42)
+    n_docs = 80
+    n_stages = 3
+    doc_tokens = [rng.randrange(30, 200) for _ in range(n_docs)]
+    stage_tokens = [rng.randrange(10, 40) for _ in range(n_stages)]
+    budget = max(doc_tokens) + sum(stage_tokens) + 300
+    arena_pages = max(pages_for(max(doc_tokens), 16), 60)
+    truth = [[1 if rng.random() < 0.8 else 0
+              for _ in range(n_stages)] for _ in range(n_docs)]
+    limit = 5
+
+    # unlimited run
+    sched_all = FilterAdmission(doc_tokens, stage_tokens, budget,
+                                arena_pages, 16, limit=None)
+    chunks_all = _drive(sched_all, truth, deliver_lag=0)
+    admitted_all = len(sched_all.answers)
+
+    # limited run (same truth table, same parameters)
+    sched_lim = FilterAdmission(doc_tokens, stage_tokens, budget,
+                                arena_pages, 16, limit=limit)
+    chunks_lim = _drive(sched_lim, truth, deliver_lag=0)
+    admitted_lim = len(sched_lim.answers)
+
+    # the limited run must have found enough survivors
+    assert len(sched_lim.survivors()) >= limit
+
+    # the limited run admitted strictly fewer documents
+    assert admitted_lim < admitted_all, (
+        f"limit={limit} admitted {admitted_lim}, unlimited admitted "
+        f"{admitted_all}; early termination did not reduce work")
+
+    # the limited run built fewer chunks
+    assert len(chunks_lim) < len(chunks_all), (
+        f"limit={limit} built {len(chunks_lim)} chunks, unlimited "
+        f"built {len(chunks_all)}; expected fewer chunks")
