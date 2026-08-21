@@ -63,3 +63,21 @@ change needs one of them, say so instead of quietly adding it back.
   with. If our side gets a plan-derived setting, the baseline gets the
   analytically equivalent one. Report the setting alongside the
   result.
+
+# Reports
+
+All experiment and feature reports live under `quail/reports/`.
+
+- Every PR that includes an experiment must produce a report in
+  `quail/reports/`. Name the file `YYYY-MM-DD-<short-slug>.md`.
+  The report states the setup, the prediction, the measured result,
+  and what the numbers mean. Reference data files in `results/`
+  by path.
+- When a report is superseded or its numbers are no longer current,
+  move it to `quail/reports/old/`. Do not delete old reports.
+- When a PR ships a new feature (a code change that lands on main),
+  add a short description in `quail/reports/shipped_features/`.
+  Name the file `YYYY-MM-DD-<short-slug>.md`. It should say what
+  changed, why, and the before/after numbers if applicable.
+- `quail/reports/engine-wiki.md` is a living reference doc, not a
+  per-PR report. Update it in place when the engine's design changes.
