@@ -11,29 +11,25 @@ reports/plots/.
 """
 
 import json
+import sys
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-ROOT = Path(__file__).resolve().parents[1]
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[0]
 RESULTS = ROOT / "results"
-OUT = Path(__file__).resolve().parent / "plots"
+OUT = HERE / "plots"
 OUT.mkdir(exist_ok=True)
 
-# one fixed color per entity, the same in every figure
-C_SPLIT = "#2a78d6"        # blue
-C_MERGE_QUANT = "#eb6834"  # orange
-C_UNIFIED = "#1baf7a"      # aqua
-C_STOCK = "#8a8a85"        # neutral gray: the baseline system
-C_FI = "#eda100"           # yellow: FlashInfer paged causal
-C_FI2 = "#e87ba4"          # magenta: FlashInfer two-call + merge
-C_FI3 = "#008300"          # green: FlashInfer cascade
-DARK = "#333333"
+plt.style.use(HERE / "quail.mplstyle")
+sys.path.insert(0, str(HERE))
+from plot_colors import BLUE, GRAY, GREEN, RED, DARK, ORANGE, TEAL
 
-PATH_COLOR = {"split": C_SPLIT, "merge_quant": C_MERGE_QUANT,
-              "unified": C_UNIFIED, "unified_waves": C_UNIFIED}
+PATH_COLOR = {"split": BLUE, "merge_quant": ORANGE,
+              "unified": GREEN, "unified_waves": GREEN}
 PATH_LABEL = {"split": "split", "merge_quant": "merge_quant",
               "unified": "unified", "unified_waves": "unified (waves)"}
 
@@ -55,7 +51,7 @@ def fig_paths(tag="", model_label="Qwen3 4B fp8"):
              for label in ("10x256", "1x2560", "100x256")}
 
     fig, (ax1, ax2) = plt.subplots(
-        1, 2, figsize=(11.5, 3.8), dpi=150,
+        1, 2, figsize=(11.5, 3.8),
         gridspec_kw={"width_ratios": [1, 1.35]})
 
     # left: the filter workload
@@ -70,15 +66,13 @@ def fig_paths(tag="", model_label="Qwen3 4B fp8"):
                  f"{u:.2f} us/token   {w:.1f} s wall",
                  va="center", fontsize=9, color=DARK)
     ax1.set_yticks(list(y))
-    ax1.set_yticklabels([PATH_LABEL[m] for m in modes], fontsize=9.5)
+    ax1.set_yticklabels([PATH_LABEL[m] for m in modes])
     ax1.invert_yaxis()
     ax1.set_xlim(0, max(us) * 1.6)
-    ax1.set_xlabel("us per fresh token (lower is better)", fontsize=9)
-    ax1.spines[["top", "right"]].set_visible(False)
+    ax1.set_xlabel("us per fresh token (lower is better)")
     ax1.set_title(
         f"Filters: {ap['n_docs']:,} documents, 5 stages\n"
-        f"assignment: unified", fontsize=10.5, fontweight="bold",
-        loc="left")
+        f"assignment: unified", loc="left")
 
     # right: the join workload across fan-out shapes
     shapes = ["10x256", "1x2560", "100x256"]
@@ -102,7 +96,7 @@ def fig_paths(tag="", model_label="Qwen3 4B fp8"):
                      color=PATH_COLOR[m], edgecolor="white")
             if u > clip:
                 label = (f"{u:.0f} us/token "
-                         f"({u / mq:.0f}x merge_quant) →")
+                         f"({u / mq:.0f}x merge_quant)")
                 ax2.text(clip * 0.99, ypos, label, va="center",
                          ha="right", fontsize=8.5, color="white",
                          fontweight="bold")
@@ -112,25 +106,22 @@ def fig_paths(tag="", model_label="Qwen3 4B fp8"):
         yticks.append(base + bar_h)
         ylabels.append(shape_note[shape])
     ax2.set_yticks(yticks)
-    ax2.set_yticklabels(ylabels, fontsize=9)
+    ax2.set_yticklabels(ylabels)
     ax2.invert_yaxis()
     ax2.set_xlim(0, clip)
-    ax2.set_xlabel("us per fresh token (lower is better)", fontsize=9)
-    ax2.spines[["top", "right"]].set_visible(False)
+    ax2.set_xlabel("us per fresh token (lower is better)")
     ax2.set_title("Joins: BioDEX reports x terms\n"
-                  "assignment: merge_quant", fontsize=10.5,
-                  fontweight="bold", loc="left")
+                  "assignment: merge_quant", loc="left")
     handles = [plt.Rectangle((0, 0), 1, 1, color=PATH_COLOR[m])
                for m in jmodes]
     ax2.legend(handles, [PATH_LABEL[m] for m in jmodes],
-               loc="lower right", fontsize=8.5, frameon=False)
+               loc="lower right")
 
     fig.suptitle(
         f"Attention paths by workload ({model_label}, one H100)",
-        fontsize=12, fontweight="bold", x=0.01, ha="left")
+        x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.94))
-    fig.savefig(OUT / f"attention_paths{tag}.png",
-                bbox_inches="tight")
+    fig.savefig(OUT / f"attention_paths{tag}.png")
     print("wrote", OUT / f"attention_paths{tag}.png")
 
 
@@ -139,11 +130,11 @@ def fig_paths(tag="", model_label="Qwen3 4B fp8"):
 def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
     acc = load(f"accuracy_vs_stock{tag}.json")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 3.9), dpi=150)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 3.9))
 
     # left: planted-truth accuracy, filters and the join task
-    entities = [("stock vLLM", C_STOCK), ("split", C_SPLIT),
-                ("merge_quant", C_MERGE_QUANT), ("unified", C_UNIFIED)]
+    entities = [("stock vLLM", GRAY), ("split", BLUE),
+                ("merge_quant", ORANGE), ("unified", GREEN)]
     flag_acc = {
         "stock vLLM": (sum(acc["stock_flag_accuracy"].values())
                        / len(acc["stock_flag_accuracy"])),
@@ -153,7 +144,7 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
         "stock vLLM": acc["join"]["split"]["key_accuracy_stock"],
         "split": acc["join"]["split"]["key_accuracy_quail"],
         "merge_quant": acc["join"]["merge_quant"]["key_accuracy_quail"],
-        "unified": None}   # unified never runs joins
+        "unified": None}
 
     bar_h = 0.19
     yticks, ylabels = [], []
@@ -173,30 +164,26 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
         yticks.append(base + 1.5 * bar_h)
         ylabels.append(gname)
     ax1.set_yticks(yticks)
-    ax1.set_yticklabels(ylabels, fontsize=9)
+    ax1.set_yticklabels(ylabels)
     ax1.invert_yaxis()
     ax1.set_xlim(0, 112)
     ax1.set_xticks([0, 25, 50, 75, 100])
-    ax1.set_xlabel("accuracy against planted ground truth (%)",
-                   fontsize=9)
-    ax1.spines[["top", "right"]].set_visible(False)
-    ax1.set_title("Answer accuracy, both systems", fontsize=10.5,
-                  fontweight="bold", loc="left")
+    ax1.set_xlabel("accuracy against planted ground truth (%)")
+    ax1.set_title("Answer accuracy, both systems", loc="left")
     handles = [plt.Rectangle((0, 0), 1, 1, color=c)
                for _, c in entities]
     ax1.legend(handles, [e for e, _ in entities], ncol=4,
-               loc="upper center", bbox_to_anchor=(0.5, -0.22),
-               fontsize=8.5, frameon=False)
+               loc="upper center", bbox_to_anchor=(0.5, -0.22))
 
     # right: disagreement with stock, with the margin context
     rows = [
-        ("filters\nsplit", acc["filters"]["split"], C_SPLIT),
+        ("filters\nsplit", acc["filters"]["split"], BLUE),
         ("filters\nmerge_quant", acc["filters"]["merge_quant"],
-         C_MERGE_QUANT),
-        ("filters\nunified", acc["filters"]["unified"], C_UNIFIED),
-        ("join\nsplit", acc["join"]["split"], C_SPLIT),
+         ORANGE),
+        ("filters\nunified", acc["filters"]["unified"], GREEN),
+        ("join\nsplit", acc["join"]["split"], BLUE),
         ("join\nmerge_quant", acc["join"]["merge_quant"],
-         C_MERGE_QUANT),
+         ORANGE),
     ]
     y = range(len(rows))
     for i, (label, d, color) in enumerate(rows):
@@ -211,17 +198,15 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
                  f"decisive margin",
                  va="center", fontsize=8.5, color=DARK)
     ax2.set_yticks(list(y))
-    ax2.set_yticklabels([r[0] for r in rows], fontsize=9)
+    ax2.set_yticklabels([r[0] for r in rows])
     ax2.invert_yaxis()
     max_rate = max(100.0 * d["disagreements"] / d["compared"]
                    for _, d, _ in rows)
     ax2.set_xlim(0, max(max_rate * 2.6, 3.0))
-    ax2.set_xlabel("answers that differ from stock vLLM (%)",
-                   fontsize=9)
-    ax2.spines[["top", "right"]].set_visible(False)
+    ax2.set_xlabel("answers that differ from stock vLLM (%)")
     ax2.set_title(
         "Disagreement with stock (solid = at |margin| > 1)",
-        fontsize=10.5, fontweight="bold", loc="left")
+        loc="left")
     ctrl = acc["stock_self_control"]
     fm = acc["stock_filter_margins"]
     jm = acc["stock_join_margins"]
@@ -250,10 +235,9 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
     fig.suptitle(
         f"Accuracy against stock vLLM ({model_label}): identical "
         f"token streams, TRUE/FALSE constrained, temperature 0",
-        fontsize=12, fontweight="bold", x=0.01, ha="left")
+        x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0.03, 1, 0.93))
-    fig.savefig(OUT / f"accuracy_vs_stock{tag}.png",
-                bbox_inches="tight")
+    fig.savefig(OUT / f"accuracy_vs_stock{tag}.png")
     print("wrote", OUT / f"accuracy_vs_stock{tag}.png")
 
 
@@ -268,17 +252,17 @@ def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
         ("join_fanout", "join, 1 anchor\nx 256 suffixes"),
     ]
     variants = [
-        ("fa3_split_plus_quant", "FA3 split + quant", C_SPLIT),
-        ("fa3_merge_quant", "FA3 merge_quant", C_MERGE_QUANT),
-        ("fa3_unified_plus_quant", "FA3 unified + quant", C_UNIFIED),
+        ("fa3_split_plus_quant", "FA3 split + quant", BLUE),
+        ("fa3_merge_quant", "FA3 merge_quant", ORANGE),
+        ("fa3_unified_plus_quant", "FA3 unified + quant", GREEN),
         ("fi_paged_causal_plus_quant", "FlashInfer paged causal",
-         C_FI),
+         RED),
         ("fi_two_call_merge_plus_quant",
-         "FlashInfer two-call + merge_state", C_FI2),
-        ("fi_cascade_plus_quant", "FlashInfer cascade", C_FI3),
+         "FlashInfer two-call + merge_state", TEAL),
+        ("fi_cascade_plus_quant", "FlashInfer cascade", GRAY),
     ]
 
-    fig, ax = plt.subplots(figsize=(10.5, 4.6), dpi=150)
+    fig, ax = plt.subplots(figsize=(10.5, 4.6))
     bar_h = 0.15
     yticks, ylabels = [], []
     for si, (skey, slabel) in enumerate(shapes):
@@ -296,22 +280,20 @@ def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
         yticks.append(base + (len(present) - 1) * bar_h / 2)
         ylabels.append(slabel)
     ax.set_yticks(yticks)
-    ax.set_yticklabels(ylabels, fontsize=9)
+    ax.set_yticklabels(ylabels)
     ax.invert_yaxis()
-    ax.set_xlabel("per-layer attention milliseconds, including KV "
+    ax.set_xlabel("per-layer attention ms, including KV "
                   "scatter, merge, and FP8 quantization "
-                  "(lower is better)", fontsize=9)
-    ax.spines[["top", "right"]].set_visible(False)
+                  "(lower is better)")
     ax.set_title(f"FlashInfer 0.6.14 against FlashAttention-3 on "
                  f"the real chunk shapes ({geom_label})",
-                 fontsize=12, fontweight="bold", loc="left")
+                 loc="left")
     handles = [plt.Rectangle((0, 0), 1, 1, color=c)
                for _, _, c in variants]
     ax.legend(handles, [lab for _, lab, _ in variants],
-              loc="lower right", fontsize=8.5, frameon=False)
+              loc="lower right")
     fig.tight_layout()
-    fig.savefig(OUT / f"flashinfer_compare{tag}.png",
-                bbox_inches="tight")
+    fig.savefig(OUT / f"flashinfer_compare{tag}.png")
     print("wrote", OUT / f"flashinfer_compare{tag}.png")
 
 
