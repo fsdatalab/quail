@@ -3,6 +3,15 @@
 Issue #24. Branch: `claude/attention-paths-issue-24-n8rojj` (carries
 the `attention-path-selection` work forward).
 
+2026-08-21, second pass: every remaining YES/NO planted value and
+answer instruction in the corpora and cells was converted to
+TRUE/FALSE to match the engine's constrained readout, and the
+numbers below were re-measured on the converted corpora. The
+conversion matters for answers, not for the path ranking: with the
+framing matched to the readout, flag margins widen and all three
+paths reproduce full-prompt recompute exactly on the 256-document
+parity corpus.
+
 ## The decision
 
 - Filters run the `unified` path: one causal FlashAttention-3 paged
@@ -18,9 +27,15 @@ the `attention-path-selection` work forward).
 ## Why filters get `unified`
 
 - Speed, measured on the 10,000-document five-filter workload
-  (`results/attention_paths.json`): unified 8.24 us/token, against
-  8.35 for merge_quant and 8.57 for split. Walls 31.6 / 32.0 /
-  32.9 s.
+  (`results/attention_paths.json`, TRUE/FALSE corpus, 4.10M fresh
+  tokens): unified 8.45 us/token, against 8.68 for merge_quant and
+  8.99 for split. Walls 34.6 / 35.6 / 36.9 s. (The pre-conversion
+  YES/NO corpus gave the same ranking: 8.24 / 8.35 / 8.57.)
+- Answers at scale: on the converted corpus all three paths return
+  identical answers on all 40,052 (doc, stage) pairs, all 100%
+  correct against the planted flags, same 4,645 survivors. The
+  path choice does not move filter answers at all once the task is
+  framed the way the readout is constrained.
 - Exactness: the unified call is bit-identical to a contiguous
   causal FlashAttention call on every kernel-parity case, including
   the edge cases (`results/attention_parity.json`, max_abs 0.0 on
@@ -31,11 +46,12 @@ the `attention-path-selection` work forward).
   magnitude as the contiguous call's own distance from a float32
   reference.
 - End to end (`results/attention_end_to_end_parity.json`, 256
-  documents, 5 stages): unified reproduced full-prompt recompute
-  answers exactly (0 disagreements in 1,101 answers). split and
-  merge_quant each flipped 5 answers (plus the gating cascade from
-  those flips: 22 total row differences), all attributable to the
-  merge's bf16 rounding on near-zero margins.
+  documents, 5 stages, TRUE/FALSE corpus): all three paths
+  reproduce full-prompt recompute exactly - 0 disagreements in 997
+  answers each, and 0 wrong against the planted flags. (On the
+  pre-conversion YES/NO corpus, whose margins sat near zero, split
+  and merge_quant flipped 5 answers each; unified was exact there
+  too.)
 - KV rewind and the store: a save-then-restore pass under unified
   reproduced the no-store answers exactly (0 differences, 64 of 64
   documents restored). The question preamble written after the
@@ -52,32 +68,29 @@ partner per anchor per chunk ("waves"), which re-reads the anchor's
 full KV once per pair instead of once per suffix group.
 
 Measured (`results/join_attention_paths_*.json`, BioDEX
-reports x reaction terms, us per fresh token):
+reports x reaction terms, TRUE/FALSE-framed corpus, us per fresh
+token):
 
 | Shape | split | merge_quant | unified (waves) |
 |---|---|---|---|
-| 10 x 256 | 11.64 | 11.01 | 30.34 (257 chunks) |
-| 1 x 2560 (high fan-out) | 13.01 | 12.09 | 344.66 (2,561 chunks) |
-| 100 x 256 (multi-chunk) | 11.50 | 10.74 | 13.02 (259 chunks) |
+| 10 x 256 | 11.95 | 11.29 | 31.00 (257 chunks) |
+| 1 x 2560 (high fan-out) | 12.87 | 12.05 | 373.76 (2,561 chunks) |
+| 100 x 256 (multi-chunk) | 11.59 | 10.83 | 13.16 (259 chunks) |
 
-merge_quant beats split by 5-8% on every shape (the fused merge).
+merge_quant beats split by 5-7% on every shape (the fused merge).
 The unified waves match the prediction's direction and show how the
 penalty scales with the shape: at one anchor the wave is a 42-token
 chunk far below the 416-token compute knee and the anchor's KV is
-re-read 2,560 times, so the path collapses (28x slower); at 100
+re-read 2,560 times, so the path collapses (29x slower); at 100
 anchors a wave is ~4,200 tokens and the penalty shrinks to 21% -
 still never ahead, and the answer-correctness constraint (one pair
 per anchor per causal call) is what forces the wave shape in the
-first place.
-
-Note on this cell's answer counts: the BioDEX suffix text still asks
-for YES/NO while the engine now constrains answers to TRUE/FALSE
-(the framing changed with the n-way join work), so the model answers
-TRUE for essentially every pair and the cell's yes-counts are not
-informative. The performance comparison is unaffected (all paths see
-identical token streams). Answer-level join validation lives in the
-accuracy cell below, whose join corpus uses the engine's real
-framing with planted key ground truth.
+first place. Path answer disagreements on this corpus are tiny (0-8
+between the two-call paths per shape). The cell's TRUE counts sit
+near saturation (~2,554 of 2,560) because the 4B checkpoint answers
+TRUE to nearly every BioDEX reaction pair - the known model caveat,
+not an executor property; the planted-key join in the accuracy cell
+below is where join answers are graded against ground truth.
 
 ## Accuracy against stock vLLM
 

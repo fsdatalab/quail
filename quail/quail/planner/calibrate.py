@@ -19,9 +19,9 @@ from quail.specs import DEVICES, MODELS, DeviceSpec, ModelSpec
 LENGTHS = (256, 1024, 4096, 8192)
 TOKENS_PER_POINT = 1_500_000
 
-# Any short YES/NO suffix works; the answers are not graded.
+# Any short TRUE/FALSE suffix works; the answers are not graded.
 _QUESTION = ("\n\nDoes the document mention a finding? "
-             "Answer YES or NO.\nAnswer=")
+             "Answer TRUE or FALSE.\nANSWER:")
 _FILLER = "The document discusses a clinical finding. "
 
 

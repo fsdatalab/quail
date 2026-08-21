@@ -149,7 +149,7 @@ def _check_invariants(sched, chunks, truth, doc_tokens, stage_tokens,
         assert tokens <= budget, "over-budget chunk"
     # every document was admitted exactly once (computed once, ever)
     assert fresh_count == {d: 1 for d in range(len(doc_tokens))}
-    # answers match the planted truth up to the first NO
+    # answers match the planted truth up to the first FALSE
     for d, row in enumerate(truth):
         expect = []
         for j, v in enumerate(row):
@@ -207,7 +207,7 @@ def test_admission_pages_block_in_order():
     first = sched.next_chunk()
     assert first == [(0, 0, True)]
     assert sched.next_chunk() == []    # pages blocked, answer in flight
-    sched.report(0, 0, False)          # NO frees the pages
+    sched.report(0, 0, False)          # FALSE frees the pages
     assert sched.next_chunk() == [(1, 0, True)]
 
 

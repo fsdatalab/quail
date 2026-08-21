@@ -12,21 +12,21 @@
       {
         "mode": "split",
         "rep": 0,
-        "wall": 1.26,
+        "wall": 1.294,
         "fresh_tokens": 107854,
-        "us_per_token": 11.686,
+        "us_per_token": 11.994,
         "chunks": 1,
-        "yes": 2560,
+        "yes": 2554,
         "peak_gib": 61.1
       },
       {
         "mode": "split",
         "rep": 1,
-        "wall": 1.255,
+        "wall": 1.289,
         "fresh_tokens": 107854,
-        "us_per_token": 11.638,
+        "us_per_token": 11.953,
         "chunks": 1,
-        "yes": 2560,
+        "yes": 2554,
         "peak_gib": 61.1
       }
     ],
@@ -34,21 +34,21 @@
       {
         "mode": "merge_quant",
         "rep": 0,
-        "wall": 1.189,
+        "wall": 1.217,
         "fresh_tokens": 107854,
-        "us_per_token": 11.023,
+        "us_per_token": 11.281,
         "chunks": 1,
-        "yes": 2560,
+        "yes": 2553,
         "peak_gib": 60.28
       },
       {
         "mode": "merge_quant",
         "rep": 1,
-        "wall": 1.188,
+        "wall": 1.217,
         "fresh_tokens": 107854,
-        "us_per_token": 11.011,
+        "us_per_token": 11.287,
         "chunks": 1,
-        "yes": 2560,
+        "yes": 2553,
         "peak_gib": 60.28
       }
     ],
@@ -56,33 +56,33 @@
       {
         "mode": "unified_waves",
         "rep": 0,
-        "wall": 3.257,
+        "wall": 3.397,
         "fresh_tokens": 107854,
-        "us_per_token": 30.194,
+        "us_per_token": 31.5,
         "chunks": 257,
-        "yes": 2560,
+        "yes": 2558,
         "peak_gib": 50.9
       },
       {
         "mode": "unified_waves",
         "rep": 1,
-        "wall": 3.273,
+        "wall": 3.343,
         "fresh_tokens": 107854,
-        "us_per_token": 30.342,
+        "us_per_token": 30.996,
         "chunks": 257,
-        "yes": 2560,
+        "yes": 2558,
         "peak_gib": 50.9
       }
     ]
   },
   "comparisons": {
     "merge_quant": {
-      "disagreements": 0,
-      "wall_delta_s": -0.067
+      "disagreements": 1,
+      "wall_delta_s": -0.072
     },
     "unified_waves": {
-      "disagreements": 0,
-      "wall_delta_s": 2.018
+      "disagreements": 6,
+      "wall_delta_s": 2.054
     }
   }
 }

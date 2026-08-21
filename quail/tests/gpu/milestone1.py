@@ -17,7 +17,7 @@ milestone and reopens the design's executor section.
 
   join     the committed 256k-pair 2-way BioDEX join
            (join2way.json: packed wall 103.5-103.6 s, 8,417,425
-           fresh tokens, 77 chunks, 177,831 YES).
+           fresh tokens, 77 chunks, 177,831 TRUE).
            PREDICTION: within 10% of 103.6 s, yes count near 177,831.
 
 Run from the quail/ directory (tee to a file per house rule):
@@ -733,13 +733,13 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
     from baselines.stock import run_filter_chain
     from corpus import MODEL, build_corpus
     from vllm import SamplingParams
-    from quail.executor.loop import yes_no_ids
+    from quail.executor.loop import true_false_ids
 
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
-    yes, no = yes_no_ids(tokenizer)
+    true, false = true_false_ids(tokenizer)
 
     # the committed BF16-KV stock knobs (our engine's KV is bf16, so
     # the fp8 config's 749,782 budget oversubscribes the ~473k-token
@@ -752,7 +752,7 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
         enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
-                              allowed_token_ids=sorted(yes | no))
+                              allowed_token_ids=sorted(true | false))
     engine = llm.llm_engine
     budget = 374_891     # the committed bf16-KV admission budget
     report = dict(cell="baseline_filter", n_docs=n_docs,
@@ -765,10 +765,10 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
     print(f"[baseline_filter] boot {boot}", flush=True)
     # warm the engine (kernel compile, allocator)
     run_filter_chain(engine, sampling, body_ids[:64], q_ids, budget,
-                     tag="w", yes_ids=yes)
+                     tag="w", true_ids=true)
     for rep in range(reps):
         r = run_filter_chain(engine, sampling, body_ids, q_ids,
-                             budget, tag=f"r{rep}", yes_ids=yes)
+                             budget, tag=f"r{rep}", true_ids=true)
         row = dict(rep=rep, wall=round(r["wall"], 2),
                    requests=r["requests"],
                    fresh_tokens=r["prompt_tokens"] - r["cached_tokens"],
@@ -795,7 +795,7 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
     from baselines.stock import run_join_grouped
     from corpus import MODEL
     from vllm import SamplingParams
-    from quail.executor.loop import yes_no_ids
+    from quail.executor.loop import true_false_ids
 
     from transformers import AutoTokenizer
 
@@ -814,11 +814,11 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                             f"{colors[i % 6]}.")
                 for i in range(n_reports)]
     suffixes = [tok(f"\n\nCANDIDATE:\nThe candidate color is "
-                    f"{colors[j % 6]}.\nInstruction: answer YES if "
+                    f"{colors[j % 6]}.\nInstruction: answer TRUE if "
                     f"the report says its dominant color is the "
-                    f"candidate color, NO otherwise.\nANSWER=")
+                    f"candidate color, FALSE otherwise.\nANSWER=")
                 for j in range(n_cands)]
-    yes, no = yes_no_ids(tokenizer)
+    true, false = true_false_ids(tokenizer)
     max_seqs = 4096
     # 0.92, same as quail's pool fraction. The committed join2way
     # stock arm ran 0.88 only because its container booted two
@@ -830,7 +830,7 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
         enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
-                              allowed_token_ids=sorted(yes | no))
+                              allowed_token_ids=sorted(true | false))
     report = dict(cell="baseline_join", n_reports=n_reports,
                   n_cands=n_cands, pairs=n_reports * n_cands,
                   submission="one request per pair, anchor-major, "
@@ -841,10 +841,12 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                   boot=boot, boot_s=boot["boot_s"],
                   runs=[])
     print(f"[baseline_join] boot {boot}", flush=True)
-    run_join_grouped(llm, sampling, prefixes[:2], suffixes[:32], yes)
+    run_join_grouped(llm, sampling, prefixes[:2], suffixes[:32],
+                     true)
     for rep in range(reps):
         llm.reset_prefix_cache()
-        r = run_join_grouped(llm, sampling, prefixes, suffixes, yes)
+        r = run_join_grouped(llm, sampling, prefixes, suffixes,
+                             true)
         row = dict(rep=rep, wall=round(r["wall"], 2),
                    fresh_tokens=r["fresh_tokens"],
                    tok_s=round(r["fresh_tokens"] / r["wall"], 1),
@@ -864,7 +866,7 @@ def debug_join() -> str:
     shape; agreement means the answers are the model's.
 
     Measured twice (plain question and few-shot example): the 4B
-    answers YES to every constrained one-token equality judgment on
+    answers TRUE to every constrained one-token equality judgment on
     BOTH paths, 0 disagreements - the executor is exonerated, the
     checkpoint cannot judge symbolic equality. Content-style
     predicates (the BioDEX shape) discriminate."""
@@ -883,10 +885,10 @@ def debug_join() -> str:
     mid_t = "\n\nCANDIDATE:\n"
     tail_t = ("\nExample: if the report says the dominant color is "
               "green and the candidate color is green, the answer is "
-              "YES. If the report says green and the candidate color "
-              "is blue, the answer is NO.\nInstruction: answer YES if "
-              "the report says its dominant color is the candidate "
-              "color, NO otherwise.\nANSWER=")
+              "TRUE. If the report says green and the candidate color "
+              "is blue, the answer is FALSE.\nInstruction: answer "
+              "TRUE if the report says its dominant color is the "
+              "candidate color, FALSE otherwise.\nANSWER=")
 
     def tok(t):
         return tokenizer(t, add_special_tokens=False)["input_ids"]

@@ -163,7 +163,7 @@ class SemanticJoin:
     Snowflake AI-join shape - never a chain of pairwise stages). One
     placeholder per table; each tuple is one model call. exists/anti
     are the two-table gate form: anchor documents are kept (exists)
-    or dropped (anti) on whether any partner answers YES."""
+    or dropped (anti) on whether any partner answers TRUE."""
     inputs: tuple    # tuple[Operator]: the accumulated tree first,
     #                  then one (optionally filtered) scan per newly
     #                  joined table, joined order

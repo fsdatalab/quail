@@ -4,12 +4,12 @@ five-filter workload (~3.83M fresh tokens).
 
   A0  stock vLLM, fp8 KV - the committed production setting:
       pipelined per-(document, stage) client, prefix caching on,
-      25,305 step tokens, constrained YES/NO sampler
+      25,305 step tokens, constrained TRUE/FALSE sampler
   A1  stock vLLM, bf16 KV - isolates the fp8 KV conversion tax
       (the ladder measured 96,946 -> 102,820 tok/s from dtype alone)
   A2  packed executor with vLLM's own between-GEMM kernels: "no
       engine" and the kept-KV machinery (arena with the host-index
-      cache, paged cross-attention, LSE merge, 12-row YES/NO
+      cache, paged cross-attention, LSE merge, 12-row TRUE/FALSE
       readout), 110,376-token chunks, pinned-memory staging - the
       current executor in every respect except the kernels
   A3  A2 + our three Triton kernels (norm+add+quantize,
@@ -42,12 +42,15 @@ GPU until it exits, so two engine boots in one container fail
 comparisons carry the +/-3% container band.
 
 Gates: A3 must reproduce the banked current-executor counts exactly
-(1,807 survivors, 6,294 wrong of 23,113 answered; banked in
-results/m1_filter.json). A2 runs different quant kernels, so its
+(4,645 survivors, 0 wrong of 40,052 answered on the TRUE/FALSE
+corpus; results/attention_paths.json split rows). A2 runs different quant kernels, so its
 answers are reported against A3's, not gated to zero: this
-checkpoint's YES/NO margins are thin, and the exploration measured
-1,768 flipped answers per 10,000 from one silu-kernel swap, so
-low-thousands disagreement at 10k documents is the expected band.
+checkpoint's TRUE/FALSE margins are thin, and the exploration
+measured 1,768 flipped answers per 10,000 from one silu-kernel swap,
+so low-thousands disagreement at 10k documents is the expected band.
+(The banked bands predate the 2026-08-21 YES/NO to TRUE/FALSE corpus
+conversion; A3's gate counts were re-banked on the converted
+corpus.)
 Every rung reports wrong answers against the planted flags.
 
 Run from the quail/ directory (tee to a file per house rule):
@@ -153,7 +156,7 @@ def stock_rung(rung: str, kv_dtype: str, n_docs: int = 10000,
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
-    yes, no = true_false_ids(tokenizer)
+    true, false = true_false_ids(tokenizer)
 
     report = dict(
         cell="ablation_stock", rung=rung, kv=kv_dtype, n_docs=n_docs,
@@ -173,16 +176,16 @@ def stock_rung(rung: str, kv_dtype: str, n_docs: int = 10000,
               enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
-                              allowed_token_ids=sorted(yes | no))
+                              allowed_token_ids=sorted(true | false))
     engine = llm.llm_engine
     # warm the engine (kernel compile, allocator) outside the
     # measured reps
     run_filter_chain(engine, sampling, body_ids[:64], q_ids,
-                     STOCK_BUDGET, tag="w", yes_ids=yes)
+                     STOCK_BUDGET, tag="w", true_ids=true)
     for rep in range(reps):
         r = run_filter_chain(engine, sampling, body_ids, q_ids,
                              STOCK_BUDGET, tag=f"{rung}{rep}",
-                             yes_ids=yes)
+                             true_ids=true)
         by_doc = {}
         for (i, j), bit in r["answers"].items():
             by_doc.setdefault(i, {})[j] = bit
@@ -223,7 +226,7 @@ PACKED_PREDICTIONS = {
 
 # banked current-executor counts (results/m1_filter.json); A3 must
 # reproduce them exactly
-BANKED_A3 = dict(survivors=1807, wrong=6294, answered=23113)
+BANKED_A3 = dict(survivors=4645, wrong=0, answered=40052)
 
 
 @app.function(timeout=5400, **GPU_KW)

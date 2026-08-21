@@ -130,14 +130,14 @@ def pack_stream(anchors, budget, keep=(), already_kept=()):
 
 
 def gate(answer_rows):
-    """Anchors that survive a conjunctive stage: any YES in the row.
+    """Anchors that survive a conjunctive stage: any TRUE in the row.
     answer_rows: dict anchor_index -> iterable of 0/1 answers.
     Returns the sorted surviving anchor indices."""
     return sorted(a for a, row in answer_rows.items() if any(row))
 
 
 def matches(answer_rows):
-    """anchor_index -> sorted list of partner indices answered YES."""
+    """anchor_index -> sorted list of partner indices answered TRUE."""
     return {a: sorted(i for i, v in enumerate(row) if v)
             for a, row in answer_rows.items()}
 
@@ -165,7 +165,7 @@ def brute_force_triples(ans1_rows, ans2_rows):
     """The nested-loop reference over the same recorded answers: no
     gating, no dedup. Short-circuit order means a gated b - whose
     stage-2 row was never recorded - is never looked up, because its
-    stage-1 row has no YES."""
+    stage-1 row has no TRUE."""
     out = []
     for b, row1 in sorted(ans1_rows.items()):
         for a, v1 in enumerate(row1):
@@ -235,7 +235,7 @@ class FilterAdmission:
                 raise ValueError(f"document {d} needs more pages than "
                                  f"the arena holds")
         self.pending = deque(range(len(self.doc_tokens)))
-        self.ready = deque()       # (doc, stage) gated YES, next suffix
+        self.ready = deque()       # (doc, stage) gated TRUE, next suffix
         self.in_flight = set()     # docs inside a launched chunk
         self.resident = {}         # doc -> pages held
         self.answers = {}          # doc -> [0/1 per answered stage]
@@ -291,19 +291,19 @@ class FilterAdmission:
 
     # ---- gating --------------------------------------------------------
 
-    def report(self, doc, stage, yes, release=True):
-        """One landed answer. Frees pages on NO or on the last stage;
-        otherwise the next-stage suffix becomes ready.
+    def report(self, doc, stage, passed, release=True):
+        """One landed answer. Frees pages on FALSE or on the last
+        stage; otherwise the next-stage suffix becomes ready.
 
         release=False keeps a leaving document's pages held (the store
         is copying them out); the caller returns them with release()
         when the copy completes."""
         self.in_flight.discard(doc)
-        self.answers.setdefault(doc, []).append(1 if yes else 0)
+        self.answers.setdefault(doc, []).append(1 if passed else 0)
         last = stage == len(self.stage_tokens) - 1
-        if yes and last:
+        if passed and last:
             self._survivor_count += 1
-        if yes and not last:
+        if passed and not last:
             self.ready.append((doc, stage + 1))
             return
         if release:
@@ -326,7 +326,7 @@ class FilterAdmission:
                 and not self.in_flight)
 
     def survivors(self):
-        """Documents that answered YES at every stage."""
+        """Documents that answered TRUE at every stage."""
         n = len(self.stage_tokens)
         return sorted(d for d, row in self.answers.items()
                       if len(row) == n and all(row))

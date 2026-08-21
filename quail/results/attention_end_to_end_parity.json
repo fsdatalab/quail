@@ -4,28 +4,28 @@
   "reference": "Every document and stage recomputes the complete document plus question as one causal sequence without paging or an LSE merge.",
   "comparisons": {
     "split": {
-      "disagreements": 22,
+      "disagreements": 0,
       "disagreements_by_stage": [
-        4,
-        1,
+        0,
+        0,
         0,
         0,
         0
       ],
-      "answered": 1110,
-      "wrong": 36
+      "answered": 997,
+      "wrong": 0
     },
     "merge_quant": {
-      "disagreements": 22,
+      "disagreements": 0,
       "disagreements_by_stage": [
-        4,
-        1,
+        0,
+        0,
         0,
         0,
         0
       ],
-      "answered": 1110,
-      "wrong": 36
+      "answered": 997,
+      "wrong": 0
     },
     "unified": {
       "disagreements": 0,
@@ -36,14 +36,14 @@
         0,
         0
       ],
-      "answered": 1101,
-      "wrong": 33
+      "answered": 997,
+      "wrong": 0
     },
     "split_vs_unified": {
-      "disagreements": 22,
+      "disagreements": 0,
       "disagreements_by_stage": [
-        4,
-        1,
+        0,
+        0,
         0,
         0,
         0

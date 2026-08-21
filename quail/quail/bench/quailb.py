@@ -8,7 +8,7 @@ session - cold (store disabled, flushed) then warm (store enabled).
 Provided vs observed selectivity is printed per stage, which is the
 instrument check.
 
-Measured caveat, stated up front: the 4B checkpoint answers YES to
+Measured caveat, stated up front: the 4B checkpoint answers TRUE to
 essentially every constrained one-token equality judgment (measured
 twice through a trivially-correct reference path). Content-style
 predicates (the BioDEX shape) discriminate. So the join predicates

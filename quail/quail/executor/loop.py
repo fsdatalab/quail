@@ -639,7 +639,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                store_ids=None, timing=None, pinned=True,
                limit=None):
     """The filter chain on the packed executor: continuous admission,
-    survivor priority, pages freed on NO or after the last stage.
+    survivor priority, pages freed on FALSE or after the last stage.
 
     doc_ids: per-document token lists (the planted flag line included).
     question_ids: per-stage question token lists, planner order.
@@ -666,7 +666,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     copies (the pre-#12 path; the ablation ladder's staging rung).
 
     Returns (answers, spans, tokens): answers[d] = 0/1 list up to the
-    first NO (gated); spans and tokens as in run_join.
+    first FALSE (gated); spans and tokens as in run_join.
     """
     p = _shared_preamble_tokens(question_ids)
     stage_tokens = [len(question_ids[0])] \
@@ -730,9 +730,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         bits = async_ans.result(handle)
         t = _tick(timing, "report_wait", t)
         for (doc, stage, _fresh), bit in zip(groups, bits):
-            yes = bool(bit)
+            passed = bool(bit)
             last = stage == len(stage_tokens) - 1
-            leaving = (not yes) or last
+            leaving = (not passed) or last
             save = (leaving and store is not None
                     and len(doc_ids[doc]) >= store_min_tokens
                     and skey(doc) not in store)
@@ -741,13 +741,13 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                                 len(doc_ids[doc]),
                                 after_event=handle[0])
                 if ev is not None:
-                    sched.report(doc, stage, yes, release=False)
+                    sched.report(doc, stage, passed, release=False)
                     pending_saves.append((doc, ev))
                     if stats is not None:
                         stats["stored_docs"] += 1
                         stats["stored_tokens"] += len(doc_ids[doc])
                     continue
-            sched.report(doc, stage, yes)
+            sched.report(doc, stage, passed)
             if doc not in sched.resident \
                     and doc in arena.accounting.owned:
                 arena.free_key(doc)

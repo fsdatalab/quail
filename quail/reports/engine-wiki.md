@@ -74,8 +74,8 @@ _assemble (runtime/session.py)
 
 Quail (QUery-Aware Inference Layer) is a query engine for two
 operators over document collections: `AI_FILTER` (does this document
-satisfy a yes/no predicate?) and `AI_JOIN` (does this tuple of
-documents - two or more, all in one prompt - satisfy a yes/no
+satisfy a true/false predicate?) and `AI_JOIN` (does this tuple of
+documents - two or more, all in one prompt - satisfy a true/false
 predicate?). The model answers each predicate in a single token
 (TRUE or FALSE), constrained at decode time so no autoregressive
 generation ever runs.
@@ -103,7 +103,7 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    exists/anti gates, and the one full join (a single cross-product
    stage, however many tables it spans).
 8. The worker returns raw answer rows. The session assembles output
-   tuples from the full join's YES rows (each member checked against
+   tuples from the full join's TRUE rows (each member checked against
    its table's final survivor set), applies the projection, and
    returns a `Result`.
 
@@ -122,11 +122,11 @@ There are four operators, defined in `logical.py`:
 
 - **Scan**: reads one column of one registered provider (e.g.,
   `reviews.body`).
-- **SemanticFilter**: a conjunction of yes/no predicates over a
+- **SemanticFilter**: a conjunction of true/false predicates over a
   single scanned column. Each predicate has a prompt template, column
   references, and an optional selectivity (the fraction of documents
   expected to pass).
-- **SemanticJoin**: one yes/no predicate over a whole tuple of
+- **SemanticJoin**: one true/false predicate over a whole tuple of
   documents, one per table - the cross product of its tables
   filtered by a single prompt that holds every document at once
   (the BigQuery/Snowflake AI-join shape; never a chain of pairwise
@@ -491,7 +491,7 @@ while not done:
 When answers arrive:
 ```
 for each (doc, stage, answer):
-    if answer = NO or stage is the last stage:
+    if answer = FALSE or stage is the last stage:
         free the document's pages
     else:
         add (doc, stage+1) to the ready queue
@@ -590,8 +590,10 @@ The assignment, fixed in `attention.py` as `FILTER_ATTENTION =
 worker:
 
 - **Filters run `unified`.** Fastest measured on the 10k-document
-  five-filter workload (8.24 us/token vs 8.35 merge_quant and 8.57
-  split; `results/attention_paths.json`), and bit-identical to a
+  five-filter workload (8.45 us/token vs 8.68 merge_quant and 8.99
+  split on the TRUE/FALSE corpus; `results/attention_paths.json` -
+  where all three paths return identical, 100%-correct answers on
+  all 40,052 planted-flag questions), and bit-identical to a
   contiguous causal FlashAttention call
   (`results/attention_parity.json`, max_abs 0.0), so filter answers
   match full-prompt recompute exactly
@@ -796,7 +798,7 @@ while scheduler is not done:
     groups = scheduler.next_chunk()
     if no groups:
         wait for the oldest in-flight chunk's answers
-        gate those answers (free pages for NO, enqueue next stage for YES)
+        gate those answers (free pages for FALSE, enqueue next stage for TRUE)
         continue
 
     for each fresh document in groups:
@@ -875,7 +877,7 @@ one anchor's KV in a single forward pass.
 
 Between join stages, gating drops anchors that had no surviving
 pairs. `gate()` (`pack.py:132`) returns anchor indices where any
-answer was YES. Dropped anchors' pages are freed immediately.
+answer was TRUE. Dropped anchors' pages are freed immediately.
 
 ### Dedup
 
@@ -910,8 +912,8 @@ for each chunk in plan:
 # an exists/anti gate is the two-table case of the same stage,
 # with the keep rule applied to the anchor's answers
 
-# assemble output: for each anchor B with YES rows,
-#   for each YES tuple (A, C) whose members survive their tables'
+# assemble output: for each anchor B with TRUE rows,
+#   for each TRUE tuple (A, C) whose members survive their tables'
 #   final gates, emit (B, A, C)
 ```
 

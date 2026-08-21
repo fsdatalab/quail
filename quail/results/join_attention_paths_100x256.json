@@ -12,11 +12,11 @@
       {
         "mode": "split",
         "rep": 0,
-        "wall": 12.519,
+        "wall": 12.617,
         "fresh_tokens": 1088725,
-        "us_per_token": 11.498,
+        "us_per_token": 11.589,
         "chunks": 10,
-        "yes": 25600,
+        "yes": 25544,
         "peak_gib": 61.42
       }
     ],
@@ -24,11 +24,11 @@
       {
         "mode": "merge_quant",
         "rep": 0,
-        "wall": 11.696,
+        "wall": 11.796,
         "fresh_tokens": 1088725,
-        "us_per_token": 10.743,
+        "us_per_token": 10.834,
         "chunks": 10,
-        "yes": 25600,
+        "yes": 25546,
         "peak_gib": 60.58
       }
     ],
@@ -36,23 +36,23 @@
       {
         "mode": "unified_waves",
         "rep": 0,
-        "wall": 14.17,
+        "wall": 14.322,
         "fresh_tokens": 1088725,
-        "us_per_token": 13.015,
+        "us_per_token": 13.155,
         "chunks": 259,
-        "yes": 25600,
+        "yes": 25564,
         "peak_gib": 61.18
       }
     ]
   },
   "comparisons": {
     "merge_quant": {
-      "disagreements": 0,
-      "wall_delta_s": -0.823
+      "disagreements": 8,
+      "wall_delta_s": -0.821
     },
     "unified_waves": {
-      "disagreements": 0,
-      "wall_delta_s": 1.651
+      "disagreements": 58,
+      "wall_delta_s": 1.705
     }
   }
 }
