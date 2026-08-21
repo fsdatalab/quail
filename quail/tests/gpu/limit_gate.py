@@ -7,7 +7,7 @@ so both runs are cold (access=read) and the comparison is fair.
 
 Prediction:
 - 3000 IMDB reviews, one filter: "Is this review negative?"
-- IMDB is ~50/50 positive/negative; the model's YES rate will be in
+- IMDB is ~50/50 positive/negative; the model's TRUE rate will be in
   the 40-60% range.
 - chunk_tokens budget is ~110k; each doc is ~200-400 tokens + 30 tokens
   of suffix, so maybe 300-400 docs per chunk.
@@ -53,8 +53,7 @@ def run_query(sess, limit=None):
     lim = f" LIMIT {limit}" if limit else ""
     sql = (f"SELECT d.id FROM docs d "
            f"WHERE AI_FILTER(PROMPT("
-           f"'{{0}}\\n\\nIs this movie review negative? "
-           f"Answer only YES or NO.\\nANSWER=', d.body), "
+           f"'{{0}}\\n\\nIs this movie review negative?', d.body), "
            f"{{'selectivity': {SELECTIVITY}}}){lim}")
     q = sess.sql(sql)
     print(q.explain(), flush=True)
