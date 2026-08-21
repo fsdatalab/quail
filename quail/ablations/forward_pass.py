@@ -149,11 +149,11 @@ def stock_rung(rung: str, kv_dtype: str, n_docs: int = 10000,
 
     from baselines.stock import run_filter_chain
     from corpus import MODEL, build_corpus
-    from quail.executor.loop import yes_no_ids
+    from quail.executor.loop import true_false_ids
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
-    yes, no = yes_no_ids(tokenizer)
+    yes, no = true_false_ids(tokenizer)
 
     report = dict(
         cell="ablation_stock", rung=rung, kv=kv_dtype, n_docs=n_docs,
@@ -549,11 +549,33 @@ def attention_parity() -> str:
             split_vs_contiguous=error(split, contiguous),
             split_vs_unified=error(split, unified))
 
+    def safe_case(name, specs, fresh):
+        """One case, or its error: an edge case that crashes must not
+        take the rest of the sweep with it."""
+        try:
+            out = run_case(name, specs, fresh)
+            torch.cuda.synchronize()
+            return out
+        except Exception as exc:
+            return dict(name=name, fresh=fresh, specs=specs,
+                        error=repr(exc))
+
     torch.manual_seed(12345)
     cases = [
-        run_case("fresh_page_edges", [(15, 1), (16, 7), (17, 11)], True),
-        run_case("cached_page_edges", [(15, 1), (16, 7), (17, 11)], False),
-        run_case("cached_long", [(63, 32), (129, 13), (511, 7)], False),
+        safe_case("fresh_page_edges", [(15, 1), (16, 7), (17, 11)], True),
+        safe_case("cached_page_edges", [(15, 1), (16, 7), (17, 11)], False),
+        safe_case("cached_long", [(63, 32), (129, 13), (511, 7)], False),
+        # issue #24 edge cases: documents spanning hundreds of pages,
+        # documents shorter than the suffix, one-token documents, a
+        # wide chunk of small groups, and (last: it may legitimately
+        # be refused) the empty document
+        safe_case("cached_many_pages", [(2049, 37), (4097, 15)], False),
+        safe_case("fresh_many_pages", [(2049, 37)], True),
+        safe_case("tiny_docs", [(1, 5), (2, 30), (3, 3)], False),
+        safe_case("fresh_tiny_docs", [(1, 5), (2, 30), (3, 3)], True),
+        safe_case("suffix_dominates", [(7, 300), (5, 111)], False),
+        safe_case("many_groups", [(15, 2), (16, 3), (17, 2)] * 16, False),
+        safe_case("fresh_empty_doc", [(0, 9)], True),
     ]
     torch.cuda.synchronize()
     report = dict(
@@ -657,17 +679,44 @@ def attention_end_to_end_parity(n_docs: int = 256) -> str:
 
     outputs = {}
     with torch.inference_mode():
-        for mode in ("split", "unified"):
+        for mode in ("split", "merge_quant", "unified"):
             pipeline.attention_mode = mode
             outputs[mode], _, _ = run_filter(
                 torch, arena, pipeline, async_answers,
                 body_ids, question_ids, budget)
         outputs["full_prompt"] = full_prompt_reference()
+
+        # store round trip under the filter assignment: pass 1 saves
+        # every document's KV, pass 2 restores instead of computing.
+        # Restored KV is a byte copy of computed KV, so pass 2 must
+        # reproduce the no-store answers exactly - this covers the
+        # restore path's interaction with unified scattering and the
+        # preamble rewind.
+        from quail.executor.kvstore import PinnedStore
+        n_store = min(64, n_docs)
+        store_docs = body_ids[:n_store]
+        store = PinnedStore(
+            capacity_tokens=sum(len(d) for d in store_docs) + 4096,
+            n_layers=spec.layers, n_kv=spec.n_kv, d_head=spec.d_head,
+            max_doc_tokens=max(len(d) for d in store_docs) + 256,
+            dtype=torch.bfloat16)
+        pipeline.attention_mode = "unified"
+        baseline_store, _, _ = run_filter(
+            torch, arena, pipeline, async_answers, store_docs,
+            question_ids, budget)
+        run_filter(torch, arena, pipeline, async_answers, store_docs,
+                   question_ids, budget, store=store, store_hash="p",
+                   store_min_tokens=1)
+        stats = {}
+        restored_answers, _, _ = run_filter(
+            torch, arena, pipeline, async_answers, store_docs,
+            question_ids, budget, store=store, store_hash="p",
+            store_min_tokens=1, stats=stats)
     torch.cuda.synchronize()
 
     comparisons = {}
     reference = outputs["full_prompt"]
-    for mode in ("split", "unified"):
+    for mode in ("split", "merge_quant", "unified"):
         count, by_stage = disagreements(outputs[mode], reference)
         comparisons[mode] = dict(
             disagreements=count, disagreements_by_stage=by_stage,
@@ -678,20 +727,132 @@ def attention_end_to_end_parity(n_docs: int = 256) -> str:
     comparisons["split_vs_unified"] = dict(
         disagreements=split_unified,
         disagreements_by_stage=split_unified_by_stage)
+    store_diff, _ = disagreements(restored_answers, baseline_store)
+    comparisons["unified_store_restore"] = dict(
+        disagreements=store_diff, restored_docs=stats["restored_docs"],
+        of_docs=n_store)
     report = dict(
         cell="attention_end_to_end_parity", n_docs=n_docs,
         reference=(
             "Every document and stage recomputes the complete document plus "
             "question as one causal sequence without paging or an LSE merge."),
         comparisons=comparisons,
-        pass_unified=comparisons["unified"]["disagreements"] == 0)
+        pass_unified=comparisons["unified"]["disagreements"] == 0,
+        pass_store=(store_diff == 0
+                    and stats["restored_docs"] == n_store))
     return _write(report, "attention_end_to_end_parity")
+
+
+def _unified_join_waves(torch, arena, pipeline, async_ans, prefixes,
+                        suffixes, budget):
+    """The unified path on a join, in the only packing under which it
+    is correct: one partner suffix per anchor per chunk. Two pairs of
+    one anchor cannot share a causal call - the later pair's tokens
+    would read the earlier pair's scattered KV - so the fan-out that
+    the two-call pattern shares within one chunk becomes one wave of
+    chunks per partner index here.
+
+    Phase 1 per cohort: cache-only split-mode chunks write the
+    anchors' prefix KV into pages sized for prefix + longest suffix.
+    Phase 2: for each partner index, one unified chunk carrying that
+    suffix for every anchor in the cohort. Readback is pipelined the
+    same way run_filter pipelines it.
+
+    Returns (answers, chunks, fresh_tokens): answers[a] = the 0/1 row
+    over partners, matching run_join's ans[0]."""
+    from quail.executor.loop import pack_chunk
+
+    n = len(prefixes)
+    n_terms = len(suffixes)
+    max_s = max(len(s) for s in suffixes)
+    page_tokens = arena.accounting.page_tokens
+    total_pages = arena.accounting.n_pages
+    answers = {a: [] for a in range(n)}
+    chunks = tokens = 0
+
+    def pages_for(a):
+        return -(-(len(prefixes[a]) + max_s) // page_tokens)
+
+    cohorts, cur, cur_pages = [], [], 0
+    for a in range(n):
+        need = pages_for(a)
+        if cur and cur_pages + need > total_pages - 8:
+            cohorts.append(cur)
+            cur, cur_pages = [], 0
+        cur.append(a)
+        cur_pages += need
+    if cur:
+        cohorts.append(cur)
+
+    for cohort in cohorts:
+        for a in cohort:
+            got = arena.alloc(a, len(prefixes[a]),
+                              capacity_tokens=len(prefixes[a]) + max_s)
+            assert got is not None, "cohort exceeds the arena"
+        # phase 1: write prefix KV. Each group rides a 1-token dummy
+        # suffix (its bit is discarded, its KV never written) so the
+        # chunk has answer rows - a zero-final chunk would hand the
+        # final-norm kernel an empty launch.
+        pipeline.attention_mode = "split"
+        dummy = [suffixes[0][0]]
+        start = 0
+        while start < len(cohort):
+            end, used = start, 0
+            while end < len(cohort) \
+                    and used + len(prefixes[cohort[end]]) + 1 <= budget:
+                used += len(prefixes[cohort[end]]) + 1
+                end += 1
+            groups = [dict(key=a, prefix=prefixes[a],
+                           f=len(prefixes[a]), suffixes=[dummy])
+                      for a in cohort[start:end]]
+            chunk = pack_chunk(torch, arena, groups, pinned=True,
+                               attention_mode="split")
+            pipeline.forward_chunk(chunk)
+            chunks += 1
+            tokens += chunk["tokens"] - len(groups)
+            start = end
+        # phase 2: one wave per partner index
+        pipeline.attention_mode = "unified"
+        outstanding = []
+
+        def collect(entry):
+            members, handle = entry
+            for a, bit in zip(members, async_ans.result(handle)):
+                answers[a].append(bit)
+
+        for t in range(n_terms):
+            groups = [dict(key=a, prefix=None, f=len(prefixes[a]),
+                           suffixes=[suffixes[t]]) for a in cohort]
+            chunk = pack_chunk(torch, arena, groups, pinned=True,
+                               attention_mode="unified")
+            normed = pipeline.forward_chunk(chunk)
+            chunks += 1
+            tokens += chunk["tokens"]
+            outstanding.append((cohort, async_ans.submit(normed)))
+            while len(outstanding) > 1:
+                collect(outstanding.pop(0))
+        while outstanding:
+            collect(outstanding.pop(0))
+        for a in cohort:
+            arena.free_key(a)
+    return answers, chunks, tokens
 
 
 @app.function(timeout=3600, **GPU_KW)
 def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
                          reps: int = 1) -> str:
-    """Compare split and fused merge attention on the join workload."""
+    """All three attention paths on the join workload.
+
+    split and merge_quant run the production join loop (run_join).
+    unified runs as waves (_unified_join_waves), the only packing
+    under which one causal call per pair is correct.
+
+    Prediction, stated before the run: merge_quant beats split by its
+    fused merge; unified is several-fold slower - each anchor's KV is
+    re-read once per partner instead of once per ~26-partner group
+    (about 26x the arena read traffic at 10x256), in n_terms small
+    launches instead of a few budget-sized chunks.
+    """
     import sys
     import time
 
@@ -726,43 +887,51 @@ def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
     data = biodex_sample(tokenizer, n_reports=n_reports)
     prefixes = data["prefixes"]
     suffixes = data["suffixes"][:n_terms]
-    modes = ("split", "merge_quant")
+    modes = ("split", "merge_quant", "unified_waves")
     report = dict(
         cell="join_attention_paths", n_reports=n_reports,
         n_terms=n_terms, pairs=n_reports * n_terms, reps=reps,
         budget=budget, arena_tokens=arena_tokens,
         prediction=(
-            "Fusing the attention merge with FP8 quantization should make "
-            "merge_quant faster than split."),
+            "merge_quant fastest (fused merge); unified several-fold "
+            "slower: anchor KV re-read once per partner instead of "
+            "once per suffix group, in n_terms small launches."),
         runs={}, comparisons={})
     print(f"[join_attention_paths] {report['prediction']}", flush=True)
 
+    def run_mode(mode):
+        if mode == "unified_waves":
+            answers, n_chunks, tokens = _unified_join_waves(
+                torch, arena, pipeline, async_answers, prefixes,
+                suffixes, budget)
+            return answers, n_chunks, tokens
+        pipeline.attention_mode = mode
+        answers, spans, tokens = run_join(
+            torch, arena, pipeline, async_answers, prefixes,
+            [suffixes], budget)
+        return answers[0], len(spans), tokens
+
     outputs = {}
     for mode in modes:
-        pipeline.attention_mode = mode
         with torch.inference_mode():
             # Warm the exact measured shape. This covers FlashAttention,
             # DeepGEMM, quantization, scatter, and boundary-copy kernels.
-            run_join(
-                torch, arena, pipeline, async_answers, prefixes,
-                [suffixes], budget)
+            run_mode(mode)
             torch.cuda.synchronize()
             rows = []
             for rep in range(reps):
                 torch.cuda.reset_peak_memory_stats()
                 start = time.perf_counter()
-                answers, spans, tokens = run_join(
-                    torch, arena, pipeline, async_answers, prefixes,
-                    [suffixes], budget)
+                answers, n_chunks, tokens = run_mode(mode)
                 torch.cuda.synchronize()
                 wall = time.perf_counter() - start
                 flat = [bit for anchor in range(n_reports)
-                        for bit in answers[0][anchor]]
+                        for bit in answers[anchor]]
                 row = dict(
                     mode=mode, rep=rep, wall=round(wall, 3),
                     fresh_tokens=tokens,
                     us_per_token=round(wall * 1e6 / tokens, 3),
-                    chunks=len(spans), yes=sum(flat),
+                    chunks=n_chunks, yes=sum(flat),
                     peak_gib=round(
                         torch.cuda.max_memory_allocated() / 2**30, 2))
                 rows.append(row)
@@ -778,7 +947,7 @@ def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
             wall_delta_s=round(
                 report["runs"][mode][-1]["wall"]
                 - report["runs"]["split"][-1]["wall"], 3))
-    return _write(report, "join_attention_paths")
+    return _write(report, f"join_attention_paths_{n_reports}x{n_terms}")
 
 
 @app.function(timeout=5400, **GPU_KW)
@@ -1120,6 +1289,21 @@ def run_join_attention_paths(n_reports: int = 10, n_terms: int = 256,
                              reps: int = 1):
     result = join_attention_paths.remote(n_reports, n_terms, reps)
     print(result)
+
+
+@app.local_entrypoint()
+def run_join_paths_sweep():
+    """The three fan-out shapes of the join ablation: the committed
+    10x256 sample, one anchor at full fan-out, and the 100-anchor
+    multi-chunk scale. The sweep is the point here - the join
+    assignment must hold across fan-out, not at one shape."""
+    handles = [(n_r, n_t, join_attention_paths.spawn(n_r, n_t, reps))
+               for n_r, n_t, reps in
+               ((10, 256, 2), (1, 2560, 1), (100, 256, 1))]
+    for n_r, n_t, h in handles:
+        print(f"join {n_r}x{n_t} fc: {h.object_id}", flush=True)
+    for n_r, n_t, h in handles:
+        print(h.get())
 
 
 @app.local_entrypoint()

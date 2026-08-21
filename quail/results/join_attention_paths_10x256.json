@@ -1,0 +1,88 @@
+{
+  "cell": "join_attention_paths",
+  "n_reports": 10,
+  "n_terms": 256,
+  "pairs": 2560,
+  "reps": 2,
+  "budget": 110376,
+  "arena_tokens": 313206,
+  "prediction": "merge_quant fastest (fused merge); unified several-fold slower: anchor KV re-read once per partner instead of once per suffix group, in n_terms small launches.",
+  "runs": {
+    "split": [
+      {
+        "mode": "split",
+        "rep": 0,
+        "wall": 1.26,
+        "fresh_tokens": 107854,
+        "us_per_token": 11.686,
+        "chunks": 1,
+        "yes": 2560,
+        "peak_gib": 61.1
+      },
+      {
+        "mode": "split",
+        "rep": 1,
+        "wall": 1.255,
+        "fresh_tokens": 107854,
+        "us_per_token": 11.638,
+        "chunks": 1,
+        "yes": 2560,
+        "peak_gib": 61.1
+      }
+    ],
+    "merge_quant": [
+      {
+        "mode": "merge_quant",
+        "rep": 0,
+        "wall": 1.189,
+        "fresh_tokens": 107854,
+        "us_per_token": 11.023,
+        "chunks": 1,
+        "yes": 2560,
+        "peak_gib": 60.28
+      },
+      {
+        "mode": "merge_quant",
+        "rep": 1,
+        "wall": 1.188,
+        "fresh_tokens": 107854,
+        "us_per_token": 11.011,
+        "chunks": 1,
+        "yes": 2560,
+        "peak_gib": 60.28
+      }
+    ],
+    "unified_waves": [
+      {
+        "mode": "unified_waves",
+        "rep": 0,
+        "wall": 3.257,
+        "fresh_tokens": 107854,
+        "us_per_token": 30.194,
+        "chunks": 257,
+        "yes": 2560,
+        "peak_gib": 50.9
+      },
+      {
+        "mode": "unified_waves",
+        "rep": 1,
+        "wall": 3.273,
+        "fresh_tokens": 107854,
+        "us_per_token": 30.342,
+        "chunks": 257,
+        "yes": 2560,
+        "peak_gib": 50.9
+      }
+    ]
+  },
+  "comparisons": {
+    "merge_quant": {
+      "disagreements": 0,
+      "wall_delta_s": -0.067
+    },
+    "unified_waves": {
+      "disagreements": 0,
+      "wall_delta_s": 2.018
+    }
+  }
+}
