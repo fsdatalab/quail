@@ -7,14 +7,15 @@ this benchmark) rather than by planted flags. IMDB and BioDEX each get
 filter alone, join alone, then a filter chain of depth 1, 2, and 3
 feeding a single join (a document survives every filter, then joins
 against the partner table) - five queries per dataset. FEVER stops
-that chain at depth 2 (FEV-5, the depth-3 chain, hit 0 rows at both
-sf=0.1 and sf=0.2 - real FEVER claims are single-fact sentences, so
-"about a person" + "has a date" essentially never also names a place;
-see git history for the predicate that tried to fix this before the
-query was cut instead) and gets two more queries in its place: FEV-6,
-a two-sided filter -> join (one filter on each table before the join
-runs, not just the anchor side), and FEV-7, the same shape one filter
-deeper on the claims side. The primary goal of this benchmark is
+that chain at depth 2 (FEV-1..FEV-4). A depth-3 chain (person -> date
+-> place, before joining) hit 0 rows at both sf=0.1 and sf=0.2 - real
+FEVER claims are single-fact sentences, so "about a person" + "has a
+date" essentially never also names a place; see git history for the
+predicate that tried to fix this before the query was cut instead.
+FEVER gets two more queries in its place: FEV-5, a two-sided filter ->
+join (one filter on each table before the join runs, not just the
+anchor side), and FEV-6, the same shape one filter deeper on the
+claims side. The primary goal of this benchmark is
 exercising joins, not stacking filters, so the two-sided shape - both
 tables filtered independently before the join runs - is the more
 useful FEVER-specific query to keep. Only claims/evidence carry real
@@ -247,9 +248,9 @@ def register_sets(sess, data_dir):
 # change once that pass runs and some predicate misses the 90%
 # agreement floor or clusters selectivity with another predicate.
 
-F1 = ("Judge strictly from the review above whether it expresses an "
-      "overall positive opinion of the movie.\n\n{0}\n\nInstruction: "
-      "answer YES if the review expresses an overall positive opinion "
+F1 = ("Judge strictly from the review above whether it mentions at "
+      "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
+      "answer YES if the review mentions at least one positive aspect "
       "of the movie, NO otherwise.\nANSWER=")
 
 F4 = ("Judge strictly from the review above whether it discusses the "
@@ -318,7 +319,7 @@ SUPPORT = ("Wikipedia passages follow, one at a time. For each, judge "
            "the passage above supports this claim, NO otherwise.\n"
            "ANSWER=")
 
-# FEV-6 only: filters the evidence side of a join, not just the
+# FEV-5 only: filters the evidence side of a join, not just the
 # anchor. Mirrors F11's "about a person" judgment so the join pairs
 # claim and passage on the same axis, independently filtered.
 F13 = ("Judge strictly from the Wikipedia passage above whether it "
@@ -357,7 +358,7 @@ def queries(sess):
 
     # IMDB: filter alone, join alone, then filter-chain depth 1/2/3
     # feeding the one join (reviews x aspects).
-    q["IMDB-1"] = ("filter: F1 (positive opinion)", make(
+    q["IMDB-1"] = ("filter: F1 (at least one positive aspect)", make(
         "reviews", "r", "body", [F1], [], ["r.id"]))
     q["IMDB-2"] = ("join: J1 (reviews x aspects)", make(
         "reviews", "r", "body", [],
@@ -390,7 +391,7 @@ def queries(sess):
 
     # FEVER: filter alone, join alone, then a filter chain to depth 2
     # only (depth 3 hit 0 rows - see the module docstring), plus the
-    # two-sided FEV-6/FEV-7 pushdown, the shape that actually tests
+    # two-sided FEV-5/FEV-6 pushdown, the shape that actually tests
     # joins under independent filtering on both sides.
     q["FEV-1"] = ("filter: F11 (about a person)", make(
         "claims", "c", "claim", [F11], [], ["c.id"]))
@@ -404,7 +405,7 @@ def queries(sess):
         "claims", "c", "claim", [F11, F12],
         [("evidence", "e", "text", SUPPORT)], ["c.id", "e.id"]))
 
-    def fev6():
+    def fev5():
         cq = (sess.docs("claims").alias("c")
               .ai_filter(quail.prompt(F11, quail.col("c.claim"))))
         eq = (sess.docs("evidence").alias("e")
@@ -412,10 +413,10 @@ def queries(sess):
         return (cq.ai_join(eq, quail.prompt(SUPPORT, quail.col("c.claim"),
                                             quail.col("e.text")))
                 .select("c.id", "e.id"))
-    q["FEV-6"] = ("2F + 1J: two-sided pushdown - F11 on claims, F13 on "
-                  "evidence, each filtered before J3", fev6)
+    q["FEV-5"] = ("2F + 1J: two-sided pushdown - F11 on claims, F13 on "
+                  "evidence, each filtered before J3", fev5)
 
-    def fev7():
+    def fev6():
         cq = (sess.docs("claims").alias("c")
               .ai_filter(quail.prompt(F11, quail.col("c.claim")))
               .ai_filter(quail.prompt(F12, quail.col("c.claim"))))
@@ -424,9 +425,9 @@ def queries(sess):
         return (cq.ai_join(eq, quail.prompt(SUPPORT, quail.col("c.claim"),
                                             quail.col("e.text")))
                 .select("c.id", "e.id"))
-    q["FEV-7"] = ("3F + 1J: two-sided pushdown, deeper - F11 -> F12 on "
+    q["FEV-6"] = ("3F + 1J: two-sided pushdown, deeper - F11 -> F12 on "
                   "claims, F13 on evidence, each filtered before J3",
-                  fev7)
+                  fev6)
 
     return q
 
