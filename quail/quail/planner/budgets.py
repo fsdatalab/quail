@@ -38,17 +38,6 @@ STORE_KV_BYTES = 2.0    # the pinned store's staging tensors are always
 #                         (kept only for the arena's synthetic-fp8
 #                         test): PinnedStore._alloc_staging never asks
 #                         the model, it hardcodes torch.bfloat16.
-STORE_STAGING_TOKENS = PinnedStore.STAGING_LARGE_THRESHOLD
-#                         reserved as if every document were exactly
-#                         at the large/small crossover, at the small
-#                         side's slot count - both sides of the
-#                         crossover cost about the same (n * tokens is
-#                         flat there) and it is the worst case for any
-#                         document at or under this length. A store
-#                         holding longer documents than this needs more
-#                         device memory than reserved here; this
-#                         project's corpora (reviews/reports/claims)
-#                         do not, at lf=1.
 
 
 def tensor_parallel(model: ModelSpec, device: DeviceSpec) -> int:
@@ -85,14 +74,13 @@ def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
 
 def store_staging_bytes(model: ModelSpec) -> float:
     """Device memory the pinned KV store's staging ring can hold at
-    once: STAGING_SLOTS copies of a STORE_STAGING_TOKENS-token
-    document, in bf16 - see STORE_STAGING_TOKENS. Reserved
+    once: STAGING_BUDGET_TOKENS total token-rows, in bf16. Reserved
     unconditionally (not just when a query's payload asks for a
     store): the arena is built once per warm container and outlives
     any single query, so a later query turning the store on must not
     be able to blow past what the first query's boot already
     committed."""
-    return (PinnedStore.STAGING_SLOTS * STORE_STAGING_TOKENS
+    return (PinnedStore.STAGING_BUDGET_TOKENS
             * model.kv_elements_per_token * STORE_KV_BYTES)
 
 
