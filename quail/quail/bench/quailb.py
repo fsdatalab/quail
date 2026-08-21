@@ -250,40 +250,40 @@ def register_sets(sess, data_dir):
 
 F1 = ("Judge strictly from the review above whether it mentions at "
       "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
-      "answer YES if the review mentions at least one positive aspect "
-      "of the movie, NO otherwise.\nANSWER=")
+      "answer TRUE if the review mentions at least one positive aspect "
+      "of the movie, FALSE otherwise.\nANSWER=")
 
 F4 = ("Judge strictly from the review above whether it discusses the "
-      "ending of the movie.\n\n{0}\n\nInstruction: answer YES if the "
-      "review discusses the ending of the movie, NO otherwise.\n"
+      "ending of the movie.\n\n{0}\n\nInstruction: answer TRUE if the "
+      "review discusses the ending of the movie, FALSE otherwise.\n"
       "ANSWER=")
 
 F5 = ("Judge strictly from the review above whether it mentions any "
       "specific actor or actress by name.\n\n{0}\n\nInstruction: "
-      "answer YES if the review mentions a specific actor or actress "
-      "by name, NO otherwise.\nANSWER=")
+      "answer TRUE if the review mentions a specific actor or actress "
+      "by name, FALSE otherwise.\nANSWER=")
 
 DISCUSS_ASPECT = ("Candidate movie aspects follow, one at a time. For "
                    "each, judge strictly from the review above whether "
                    "it discusses that aspect of the movie.\n\n{0}\n\n"
-                   "ASPECT: {1}\nInstruction: answer YES if the review "
-                   "above discusses this aspect, NO otherwise.\n"
+                   "ASPECT: {1}\nInstruction: answer TRUE if the review "
+                   "above discusses this aspect, FALSE otherwise.\n"
                    "ANSWER=")
 
 F7 = ("Judge strictly from the report above whether it describes a "
       "case involving a female patient.\n\n{0}\n\nInstruction: answer "
-      "YES if the report describes a case involving a female patient, "
-      "NO otherwise.\nANSWER=")
+      "TRUE if the report describes a case involving a female patient, "
+      "FALSE otherwise.\nANSWER=")
 
 F8 = ("Judge strictly from the report above whether it describes "
-      "combination drug therapy.\n\n{0}\n\nInstruction: answer YES if "
-      "the report describes combination drug therapy, NO otherwise.\n"
+      "combination drug therapy.\n\n{0}\n\nInstruction: answer TRUE if "
+      "the report describes combination drug therapy, FALSE otherwise.\n"
       "ANSWER=")
 
 F9 = ("Judge strictly from the report above whether it describes a "
       "serious or life-threatening adverse event.\n\n{0}\n\n"
-      "Instruction: answer YES if the report describes a serious or "
-      "life-threatening adverse event, NO otherwise.\nANSWER=")
+      "Instruction: answer TRUE if the report describes a serious or "
+      "life-threatening adverse event, FALSE otherwise.\nANSWER=")
 
 # Unchanged from the earlier design: after-document frame, neutral
 # wording. An earlier version with similar framing before the report
@@ -293,30 +293,30 @@ REACTION = ("Candidate medical reaction terms follow, one at a time. "
             "For each, judge strictly from the report above whether it "
             "describes that reaction as something the patient "
             "experienced.\n\n{0}\n\nCANDIDATE REACTION: {1}\n"
-            "Instruction: answer YES if the report above describes "
-            "this reaction, NO otherwise.\nANSWER=")
+            "Instruction: answer TRUE if the report above describes "
+            "this reaction, FALSE otherwise.\nANSWER=")
 
 F11 = ("Judge strictly from the claim above whether it asserts "
        "something about a person, rather than an organization, place, "
-       "or event.\n\n{0}\n\nInstruction: answer YES if the claim "
-       "asserts something about a person, NO otherwise.\nANSWER=")
+       "or event.\n\n{0}\n\nInstruction: answer TRUE if the claim "
+       "asserts something about a person, FALSE otherwise.\nANSWER=")
 
 F12 = ("Judge strictly from the claim above whether it contains a "
-       "specific date or year.\n\n{0}\n\nInstruction: answer YES if "
-       "the claim contains a specific date or year, NO otherwise.\n"
+       "specific date or year.\n\n{0}\n\nInstruction: answer TRUE if "
+       "the claim contains a specific date or year, FALSE otherwise.\n"
        "ANSWER=")
 
 F14 = ("Judge strictly from the claim above whether it references a "
        "specific place (a city, country, or other named location).\n\n"
-       "{0}\n\nInstruction: answer YES if the claim references a "
-       "specific place, NO otherwise.\nANSWER=")
+       "{0}\n\nInstruction: answer TRUE if the claim references a "
+       "specific place, FALSE otherwise.\nANSWER=")
 
 # Unchanged from the earlier design: same after-document fix as
 # REACTION, for the same reason.
 SUPPORT = ("Wikipedia passages follow, one at a time. For each, judge "
            "strictly from the claim above whether it supports that "
-           "claim.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer YES if "
-           "the passage above supports this claim, NO otherwise.\n"
+           "claim.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer TRUE if "
+           "the passage above supports this claim, FALSE otherwise.\n"
            "ANSWER=")
 
 # FEV-5 only: filters the evidence side of a join, not just the
@@ -325,8 +325,8 @@ SUPPORT = ("Wikipedia passages follow, one at a time. For each, judge "
 F13 = ("Judge strictly from the Wikipedia passage above whether it "
        "primarily describes a specific person (their life, actions, "
        "or role), rather than an organization, place, or event.\n\n"
-       "{0}\n\nInstruction: answer YES if the passage primarily "
-       "describes a specific person, NO otherwise.\nANSWER=")
+       "{0}\n\nInstruction: answer TRUE if the passage primarily "
+       "describes a specific person, FALSE otherwise.\nANSWER=")
 
 
 # ---------------------------------------------------------- queries
