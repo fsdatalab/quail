@@ -240,7 +240,61 @@ Predictions, stated before the runs:
   drops well below the 4B's ~9%.
 - FlashInfer at 64 heads: FA3 stays ahead; adopt only if within 5%.
 
-Measured: RESULTS_PENDING_32B
+Measured (all in `results/*_32b.json` / `*_64h.json`):
+
+- Filters, 10,000 documents (`attention_paths_32b.json`): unified
+  59.94 us/token, merge_quant 60.35, split 61.60 - same order, and
+  the relative gap shrank as predicted (unified is 2.7% ahead of
+  split at 32B against 6.0% at 4B). All three paths return
+  identical answers (0 disagreements on all 40,053), 4,645
+  survivors, and 1 planted-flag miss out of 40,053 - the model's
+  one genuine error, identical on every path.
+- Joins (`join_attention_paths_32b_*.json`, us per fresh token):
+
+  | Shape | split | merge_quant | unified (waves) |
+  |---|---|---|---|
+  | 10 x 256 | 68.82 | 66.08 | 108.02 |
+  | 1 x 2560 | 73.27 | 69.70 | 710.77 |
+  | 100 x 256 | 69.61 | 66.87 | 83.69 |
+
+  merge_quant wins every shape by 4-5%. The waves penalty shrinks
+  in relative terms (1.6x at 10 x 256 against 2.8x at 4B - the
+  launch overhead is a smaller share of the 8x-larger per-token
+  work) but stays decisive, and high fan-out still collapses it
+  (10x). Worth noting: the 32B model answers the BioDEX task
+  selectively (52 TRUE of 2,560; the 4B saturated at ~2,554), so
+  this cell's answer counts are meaningful again at 32B.
+- Kernel parity at 64 query heads
+  (`attention_parity_64h.json`): unified bit-identical to the
+  contiguous causal call on all 10 edge cases (max_abs 0.0).
+- End to end (`attention_end_to_end_parity_32b.json`): all three
+  paths exact against full-prompt recompute (0 of 997, 0 wrong),
+  store round trip exact (64/64).
+- Accuracy vs stock (`accuracy_vs_stock_32b.json`): flag accuracy
+  100% for stock and every path; join key accuracy ~99% for both
+  systems (stock 98.87%, Quail 98.78-99.05% - the 32B model clears
+  the 4B's 16-18% floor, as predicted). Stock's shuffle controls: 0
+  flips on both workloads. Disagreements with stock: 2-3 of ~3,544
+  filter answers per path (0.06-0.08%) - every one on the
+  no-planted-truth sentiment stage, zero on any flag question - and
+  8-15 of 1,152 join pairs (0.7-1.3%), landing on the ~13 pairs
+  stock itself gets wrong (graded against planted truth, the
+  disagreements split evenly: Quail right on 5 of 8 for split, 7 of
+  15 for merge_quant). The mode-switch check is clean. One
+  instrument note: at 32B the losing answer token usually falls
+  outside vLLM's returned top-k logprobs, so the TRUE-FALSE margin
+  reads 0.0 for 98% of filter answers (85% join) and the margin
+  analysis carries less weight than at 4B; the planted-truth
+  grading above replaces it.
+- FlashInfer at the 64-head geometry
+  (`flashinfer_bench_64h.json`): still nothing within the 5% bar -
+  paged causal 31% behind the single FA3 call on the fresh filter
+  chunk (3.0x on the rewind chunk), two-call + merge_state 46%
+  behind merge_quant on joins, cascade 21% behind on the fan-out
+  shape.
+
+The assignment (filters unified, joins merge_quant) holds unchanged
+on both in-scope models.
 
 ## Edge cases covered
 

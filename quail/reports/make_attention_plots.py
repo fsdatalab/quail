@@ -184,7 +184,8 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
                   fontweight="bold", loc="left")
     handles = [plt.Rectangle((0, 0), 1, 1, color=c)
                for _, c in entities]
-    ax1.legend(handles, [e for e, _ in entities], loc="lower right",
+    ax1.legend(handles, [e for e, _ in entities], ncol=4,
+               loc="upper center", bbox_to_anchor=(0.5, -0.22),
                fontsize=8.5, frameon=False)
 
     # right: disagreement with stock, with the margin context
@@ -224,15 +225,25 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
     ctrl = acc["stock_self_control"]
     fm = acc["stock_filter_margins"]
     jm = acc["stock_join_margins"]
+    if fm["p50"] == 0.0:
+        margin_note = (
+            "stock margins saturate at this model's confidence (the "
+            "losing token drops out of vLLM's returned top-k "
+            "logprobs), so disagreements are graded against planted "
+            "truth instead - see the report.")
+    else:
+        margin_note = (
+            f"stock margin medians: filters {fm['p50']:.2f} "
+            f"({fm['under_1'] * 100:.0f}% under 1), join "
+            f"{jm['p50']:.2f} ({jm['under_1'] * 100:.0f}% under 1): "
+            f"join answers are barely decided, so numeric noise "
+            f"flips more of them.")
     ax2.text(0.995, -0.32,
              f"stock's own order-shuffle control: {ctrl['flips']} flips "
              f"in {ctrl['of']} (filters) and "
              f"{acc['stock_join_control']['flips']} in "
              f"{acc['stock_join_control']['of']} (join).\n"
-             f"stock margin medians: filters {fm['p50']:.2f} "
-             f"({fm['under_1'] * 100:.0f}% under 1), join {jm['p50']:.2f} "
-             f"({jm['under_1'] * 100:.0f}% under 1): join answers are "
-             f"barely decided, so numeric noise flips more of them.",
+             + margin_note,
              transform=ax2.transAxes, fontsize=7.8, color="#6b6b66",
              ha="right", va="top")
 

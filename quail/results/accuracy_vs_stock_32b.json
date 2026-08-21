@@ -1,0 +1,151 @@
+{
+  "cell": "accuracy_vs_stock",
+  "model": "qwen3-32b-fp8",
+  "n_docs": 1000,
+  "stock_config": {
+    "kv": "auto (bf16)",
+    "prefix_caching": true,
+    "step_tokens": 25305,
+    "max_num_seqs": 2648,
+    "sampler": "temperature 0, 1 token, TRUE/FALSE ids"
+  },
+  "stock_self_control": {
+    "flips": 0,
+    "of": 5000,
+    "rate": 0.0,
+    "flip_margin_max": 0.0,
+    "flip_margin_p50": 0.0
+  },
+  "stock_join_control": {
+    "flips": 0,
+    "of": 1152,
+    "rate": 0.0,
+    "flip_margin_max": 0.0,
+    "flip_margin_p50": 0.0
+  },
+  "stock_flag_accuracy": {
+    "stage_0": 1.0,
+    "stage_1": 1.0,
+    "stage_2": 1.0,
+    "stage_4": 1.0
+  },
+  "stock_filter_margins": {
+    "p25": 0.0,
+    "p50": 0.0,
+    "p75": 0.0,
+    "under_1": 0.9806
+  },
+  "stock_join_margins": {
+    "p25": 0.0,
+    "p50": 0.0,
+    "p75": 0.0,
+    "under_1": 0.9297
+  },
+  "mode_switch_clean": true,
+  "walls": {
+    "stock": {
+      "filters1": 28.48,
+      "filters2": 80.62,
+      "join": 32.43,
+      "join2": 30.51
+    },
+    "quail": {
+      "filter_split": 26.81,
+      "filter_merge_quant": 24.98,
+      "filter_unified": 24.96,
+      "join_split": 32.1,
+      "join_merge_quant": 30.48
+    }
+  },
+  "filters": {
+    "split": {
+      "compared": 3544,
+      "disagreements": 2,
+      "rate": 0.00056,
+      "by_stage": [
+        0,
+        0,
+        0,
+        2,
+        0
+      ],
+      "by_kind": {
+        "short": 1,
+        "plain": 1
+      },
+      "disagreement_margin_max": 0.0625,
+      "disagreement_margin_p50": 0.0625,
+      "decisive_disagreements": 0,
+      "flag_accuracy": 1.0,
+      "survivors": 43,
+      "survivors_stock": 43,
+      "survivor_overlap": 42
+    },
+    "merge_quant": {
+      "compared": 3544,
+      "disagreements": 2,
+      "rate": 0.00056,
+      "by_stage": [
+        0,
+        0,
+        0,
+        2,
+        0
+      ],
+      "by_kind": {
+        "short": 1,
+        "plain": 1
+      },
+      "disagreement_margin_max": 0.0625,
+      "disagreement_margin_p50": 0.0625,
+      "decisive_disagreements": 0,
+      "flag_accuracy": 1.0,
+      "survivors": 43,
+      "survivors_stock": 43,
+      "survivor_overlap": 42
+    },
+    "unified": {
+      "compared": 3545,
+      "disagreements": 3,
+      "rate": 0.00085,
+      "by_stage": [
+        0,
+        0,
+        0,
+        3,
+        0
+      ],
+      "by_kind": {
+        "short": 1,
+        "plain": 2
+      },
+      "disagreement_margin_max": 0.0625,
+      "disagreement_margin_p50": 0.0,
+      "decisive_disagreements": 0,
+      "flag_accuracy": 1.0,
+      "survivors": 44,
+      "survivors_stock": 43,
+      "survivor_overlap": 42
+    }
+  },
+  "join": {
+    "split": {
+      "compared": 1152,
+      "disagreements": 8,
+      "rate": 0.00694,
+      "disagreement_margin_max": 0.1875,
+      "decisive_disagreements": 0,
+      "key_accuracy_quail": 0.9905,
+      "key_accuracy_stock": 0.9887
+    },
+    "merge_quant": {
+      "compared": 1152,
+      "disagreements": 15,
+      "rate": 0.01302,
+      "disagreement_margin_max": 0.375,
+      "decisive_disagreements": 0,
+      "key_accuracy_quail": 0.9878,
+      "key_accuracy_stock": 0.9887
+    }
+  }
+}

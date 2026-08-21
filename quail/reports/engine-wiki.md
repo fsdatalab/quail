@@ -615,6 +615,14 @@ worker:
   a corpus median margin of 3.25); on joins, zero disagreements at
   decisive margins. The residual is the kernel stack (fp8 GEMMs,
   fused norms), not the attention path.
+- **The assignment holds on both in-scope models.** The same battery
+  on Qwen3 32B fp8 (`results/*_32b.json`, `results/*_64h.json`):
+  unified 59.94 us/token vs merge_quant 60.35 and split 61.60 on the
+  10k filter workload with identical answers across paths;
+  merge_quant ahead 4-5% on every join shape; kernel parity
+  bit-identical at 64 query heads; all paths exact against full
+  recompute; ~99% planted-key join accuracy for stock and Quail
+  alike.
 - **FlashInfer (0.6.14, in the image) was evaluated and not
   adopted**: its paged causal kernel is 27% slower than the FA3
   unified call on the fresh filter chunk (2.4x on the cached
