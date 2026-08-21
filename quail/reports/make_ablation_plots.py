@@ -46,10 +46,9 @@ labels = [r[0] for r in rungs]
 walls = [mean(r[1], "wall") for r in rungs]
 colors = [r[2] for r in rungs]
 
-fig, ax = plt.subplots(figsize=(9, 4.2))
+fig, ax = plt.subplots(figsize=(9, 3.6))
 y = list(range(len(rungs)))
-ax.barh(y, walls, height=0.48, color=colors, edgecolor="white",
-        linewidth=0.8)
+ax.barh(y, walls, height=0.42, color=colors)
 
 for i, w in enumerate(walls):
     rows = rungs[i][1]
@@ -76,12 +75,14 @@ for i, label in deltas:
     )
 
 ax.set_yticks(y)
-ax.set_yticklabels(labels, fontsize=9.5)
+ax.set_yticklabels(labels, fontsize=9.5, color="#555555")
 ax.invert_yaxis()
 ax.set_xlim(0, 52)
-ax.set_xlabel("seconds  (10k docs, 5 filters, one H100)")
+ax.set_xticks([])
 ax.set_title("Forward-pass ablation", loc="left")
-ax.grid(axis="x", alpha=0.3)
+ax.text(0.5, -0.12, "10k docs, 5 filters, one H100",
+        transform=ax.transAxes, ha="center", fontsize=8.5,
+        color="#999999")
 
 fig.savefig(OUT / "ablation_ladder.png")
 print("wrote", OUT / "ablation_ladder.png")

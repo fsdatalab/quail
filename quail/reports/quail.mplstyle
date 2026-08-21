@@ -1,35 +1,26 @@
 axes.spines.top: False
 axes.spines.right: False
-axes.spines.left: True
-axes.spines.bottom: True
-axes.linewidth: 0.6
-axes.edgecolor: 999999
-axes.labelsize: 10
-axes.labelcolor: 333333
+axes.spines.left: False
+axes.spines.bottom: False
+axes.linewidth: 0.4
+axes.edgecolor: cccccc
+axes.labelsize: 9.5
+axes.labelcolor: 555555
 axes.titlesize: 12
 axes.titleweight: bold
-axes.titlepad: 12
-axes.grid: True
-axes.grid.axis: y
-axes.axisbelow: True
+axes.titlepad: 14
+axes.grid: False
 axes.facecolor: white
 
-grid.color: E0E0E0
-grid.linewidth: 0.5
-grid.linestyle: -
-grid.alpha: 0.7
-
 xtick.labelsize: 9
-xtick.color: 555555
-xtick.major.width: 0.5
+xtick.color: 888888
+xtick.major.width: 0
 xtick.major.size: 0
-xtick.direction: out
 
 ytick.labelsize: 9
-ytick.color: 555555
-ytick.major.width: 0.5
+ytick.color: 888888
+ytick.major.width: 0
 ytick.major.size: 0
-ytick.direction: out
 
 figure.dpi: 180
 figure.facecolor: white
