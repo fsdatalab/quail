@@ -19,7 +19,7 @@ Two rounds per query:
 """
 
 COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "true_ids",
-               "false_ids", "pre_ids")
+               "false_ids", "pre_ids", "limit")
 
 
 def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
@@ -50,9 +50,13 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
     return subs
 
 
-def merge_filter_round(outs: list) -> dict:
+def merge_filter_round(outs: list, limit: int | None = None) -> dict:
     """Merge the workers' filter answers (global-keyed), survivors,
-    token counts, and store stats."""
+    token counts, and store stats. When limit is set, each alias's
+    merged survivor list is truncated to that count.
+    NOTE: this truncation is correct for filter-only queries; for
+    joins, truncating anchor survivors here can under-produce output
+    rows. The session's _assemble is the final output-row cap."""
     filters, survivors, store = {}, {}, {}
     tokens = 0
     for out in outs:
@@ -65,8 +69,10 @@ def merge_filter_round(outs: list) -> dict:
             agg = store.setdefault(alias, {})
             for key, v in st.items():
                 agg[key] = agg.get(key, 0) + v
-    return dict(filters=filters,
-                survivors={a: sorted(v) for a, v in survivors.items()},
+    merged = {a: sorted(v) for a, v in survivors.items()}
+    if limit is not None:
+        merged = {a: v[:limit] for a, v in merged.items()}
+    return dict(filters=filters, survivors=merged,
                 fresh_tokens=tokens, store=store)
 
 

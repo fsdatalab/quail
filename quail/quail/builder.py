@@ -74,6 +74,7 @@ class Query:
         self._doc_columns = {}
         self._filters = {}
         self._joins = []
+        self._limit = None
 
     # ---- scope -------------------------------------------------------
 
@@ -221,6 +222,12 @@ class Query:
                                     anchor=anchor))
         return self
 
+    def limit(self, n: int) -> "Query":
+        if not isinstance(n, int) or n <= 0:
+            raise CompileError("LIMIT must be a positive integer")
+        self._limit = n
+        return self
+
     def select(self, *cols) -> LogicalPlan:
         if not self._joins and not self._filters:
             raise CompileError("the query has no AI predicate; a plain "
@@ -242,7 +249,8 @@ class Query:
             doc_columns=dict(self._doc_columns),
             filters={a: tuple(v) for a, v in self._filters.items()},
             joins=tuple(self._joins),
-            columns=tuple(columns))
+            columns=tuple(columns),
+            limit=self._limit)
         return assemble_plan(desc)
 
 

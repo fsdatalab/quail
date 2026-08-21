@@ -262,6 +262,10 @@ class BoundBuilder:
                             anchor=anchor, semantics=semantics)
         return self
 
+    def limit(self, n):
+        self._inner.limit(n)
+        return self
+
     def select(self, *cols) -> "Query":
         # the builder is always as_written: the order you chain calls
         # is the order that runs (design section 2.5)
@@ -417,6 +421,7 @@ class Query:
             kv_dtype=plan.kv_dtype,
             chunk_tokens=plan.chunk_tokens,
             workers=plan.workers,
+            limit=plan.limit,
             shards=shards,
             true_ids=true_ids, false_ids=false_ids,
             # the engine preamble, once: the worker prepends it to
@@ -541,5 +546,9 @@ class Query:
                 vals = self.session.column_values(c.provider, c.column)
                 row.append(vals[pos[c.alias]])
             proj_rows.append(tuple(row))
+        # upstream caps filter survivors, not output rows; join fan-out
+        # can produce more rows than survivors, so truncate here
+        if plan.limit is not None:
+            proj_rows = proj_rows[:plan.limit]
         return Result(columns=cols, rows=proj_rows, report=report,
                       answer_rows=answer_rows)

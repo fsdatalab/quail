@@ -12,7 +12,7 @@ from quail.runtime.coordinator import (filter_round_payloads,
 def payload():
     return dict(
         model="qwen3-4b-fp8", kv_dtype="bf16", chunk_tokens=1000,
-        true_ids=[1], false_ids=[2], pre_ids=[9],
+        true_ids=[1], false_ids=[2], pre_ids=[9], limit=None,
         docs={"r": [[i] * (10 + i) for i in range(6)],
               "p": [[i] * 5 for i in range(4)]},
         filters={"r": [[7, 7]]},
@@ -103,6 +103,40 @@ def test_join_round_refuses_mixed_anchors():
     with pytest.raises(NotImplementedError):
         join_round_payloads(p, p["shards"], 2,
                             {"r": [0], "p": [0]})
+
+
+def test_merge_filter_round_limit_truncates():
+    outs = [
+        dict(filters={"r": {0: [1], 2: [1], 4: [1]}},
+             survivors={"r": [0, 2, 4]},
+             fresh_tokens=100, store={}),
+        dict(filters={"r": {1: [1], 3: [1], 5: [1]}},
+             survivors={"r": [1, 3, 5]},
+             fresh_tokens=50, store={}),
+    ]
+    m = merge_filter_round(outs, limit=4)
+    assert m["survivors"]["r"] == [0, 1, 2, 3]
+
+
+def test_merge_filter_round_no_limit():
+    outs = [
+        dict(filters={"r": {0: [1], 2: [1]}},
+             survivors={"r": [0, 2]},
+             fresh_tokens=10, store={}),
+        dict(filters={"r": {1: [1]}},
+             survivors={"r": [1]},
+             fresh_tokens=10, store={}),
+    ]
+    m = merge_filter_round(outs, limit=None)
+    assert m["survivors"]["r"] == [0, 1, 2]
+
+
+def test_filter_round_carries_limit():
+    p = payload()
+    p["limit"] = 3
+    subs = filter_round_payloads(p, p["shards"], 2)
+    for s in subs:
+        assert s["limit"] == 3
 
 
 def test_merge_join_round_disjoint_anchors():

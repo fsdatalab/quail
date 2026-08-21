@@ -343,6 +343,60 @@ def test_three_way_join_tuples_and_gate(sess, tmp_path):
     assert jstage["partners"] == ["p", "g"]
 
 
+def test_limit_truncates_filter_results(sess):
+    truth = {"r": {"q1:": [1, 1, 1, 1, 1, 1]}}
+    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
+           "PROMPT('q1: {0}', r.review), {'selectivity': 0.9}) LIMIT 3")
+    q = sess.sql(sql)
+    assert q.logical.root.limit == 3
+    res = q.run(_execute=make_executor(truth))
+    assert len(res.rows) == 3
+
+
+def test_limit_payload_and_plan(sess):
+    truth = {"r": {"q1:": [1] * 6}}
+    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
+           "PROMPT('q1: {0}', r.review)) LIMIT 2")
+    seen = {}
+    q = sess.sql(sql)
+    plan = q.plan()
+    assert plan.limit == 2
+    q.run(_execute=make_executor(truth, seen=seen))
+    assert seen["payload"]["limit"] == 2
+
+
+def test_limit_with_join(sess):
+    sql = """
+        SELECT r.id, p.asin FROM reviews r
+        JOIN products p
+          ON AI_FILTER(PROMPT('match {0} {1}', r.review,
+                              p.description), {'selectivity': 0.5})
+        LIMIT 2
+    """
+    join = {("r", "p"): lambda a, p: 1}
+    res = sess.sql(sql).run(_execute=make_executor({}, join))
+    assert len(res.rows) == 2
+
+
+def test_no_limit_returns_all(sess):
+    truth = {"r": {"q1:": [1, 1, 1, 1, 1, 1]}}
+    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
+           "PROMPT('q1: {0}', r.review), {'selectivity': 0.9})")
+    res = sess.sql(sql).run(_execute=make_executor(truth))
+    assert len(res.rows) == 6
+
+
+def test_builder_limit_session(sess):
+    truth = {"r": {"q1:": [1] * 6}}
+    q = (sess.docs("reviews").alias("r")
+         .ai_filter(quail.prompt("q1: {0}", quail.col("r.review")),
+                    selectivity=0.9)
+         .limit(2)
+         .select("r.id"))
+    res = q.run(_execute=make_executor(truth))
+    assert len(res.rows) == 2
+
+
 def test_gate_after_full_join_filters_partner_tuples(sess, tmp_path):
     # an anti gate on the join's partner table, written after the
     # join: its casualties must not appear in output tuples (order
