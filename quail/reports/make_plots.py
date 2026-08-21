@@ -23,7 +23,7 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import QUAIL, STOCK, GOOD, DARK
+from plot_colors import BLUE, GRAY, GREEN, DARK
 
 
 def load(name):
@@ -45,28 +45,35 @@ quail_join = load("dispatch_gate.json")["gpus1"]["join"]["wall_s"]
 fig, (a1, a2) = plt.subplots(1, 2, figsize=(9, 4))
 
 for ax, title, stock_val, quail_val, stock_label in [
-    (a1, "5-filter chain, 10k docs", stock_filter, quail_filter, "Stock vLLM\n(tuned)"),
-    (a2, "72k-pair join", stockj, quail_join, "Stock vLLM\n(grouped)"),
+    (a1, "5-filter chain, 10k docs", stock_filter, quail_filter,
+     "Stock vLLM\n(tuned)"),
+    (a2, "72k-pair join", stockj, quail_join,
+     "Stock vLLM\n(grouped)"),
 ]:
     bars = ax.bar(
         [stock_label, "Quail"], [stock_val, quail_val],
-        color=[STOCK, QUAIL], width=0.52, edgecolor="white", linewidth=0.8,
+        color=[GRAY, BLUE], width=0.52, edgecolor="white", linewidth=0.8,
     )
-    for b, v in zip(bars, [stock_val, quail_val]):
-        ax.text(
-            b.get_x() + b.get_width() / 2, v + stock_val * 0.02,
-            f"{v:.1f} s", ha="center", va="bottom", fontsize=10.5,
-            fontweight="bold", color=DARK,
-        )
     speedup = stock_val / quail_val
+    speedup_txt = (f"{speedup:.1f}x" if speedup >= 2
+                   else f"{speedup:.2f}x")
+
     ax.text(
-        1, quail_val + stock_val * 0.10,
-        f"{speedup:.1f}x" if speedup >= 2 else f"{speedup:.2f}x",
-        ha="center", fontsize=11, fontweight="bold", color=GOOD,
+        bars[0].get_x() + bars[0].get_width() / 2,
+        stock_val + stock_val * 0.02,
+        f"{stock_val:.1f} s", ha="center", va="bottom",
+        fontsize=10.5, fontweight="bold", color=DARK,
+    )
+    ax.text(
+        bars[1].get_x() + bars[1].get_width() / 2,
+        quail_val + stock_val * 0.02,
+        f"{quail_val:.1f} s  ({speedup_txt} faster)",
+        ha="center", va="bottom", fontsize=10.5,
+        fontweight="bold", color=GREEN,
     )
     ax.set_title(title, fontsize=11, fontweight="normal", pad=8)
     ax.set_ylabel("wall time (s)")
-    ax.set_ylim(0, stock_val * 1.22)
+    ax.set_ylim(0, stock_val * 1.25)
     ax.grid(axis="y", alpha=0.4)
 
 fig.savefig(OUT / "vs_stock.png")
@@ -87,24 +94,27 @@ restored = [sum(s.get("restored_docs", 0)
 
 fig, ax = plt.subplots(figsize=(10, 7.2))
 h = 0.36
-ax.barh([i - h / 2 for i in y], cw, height=h, color=STOCK,
-        label="Cold (no store)", edgecolor="white", linewidth=0.5)
-ax.barh([i + h / 2 for i in y], ww, height=h, color=QUAIL,
-        label="Warm (store)", edgecolor="white", linewidth=0.5)
+ax.barh([i - h / 2 for i in y], cw, height=h, color=GRAY,
+        label="Cold pass (store disabled)", edgecolor="white",
+        linewidth=0.5)
+ax.barh([i + h / 2 for i in y], ww, height=h, color=BLUE,
+        label="Warm pass (store enabled)", edgecolor="white",
+        linewidth=0.5)
 for i, q in enumerate(qids):
-    ax.text(cw[i] * 1.05, i - h / 2, f"{cw[i]:.0f} s",
+    x_end = max(cw[i], ww[i])
+    ax.text(x_end * 1.12, i - h / 2, f"{cw[i]:.0f} s",
             va="center", fontsize=7.5, color="#777777")
     label = f"{ww[i]:.0f} s"
     if restored[i]:
         label += f"  ({restored[i]} restored)"
-    ax.text(ww[i] * 1.05, i + h / 2, label,
-            va="center", fontsize=7.5, color=QUAIL, fontweight="medium")
+    ax.text(x_end * 1.12, i + h / 2, label,
+            va="center", fontsize=7.5, color=BLUE)
 ax.set_yticks(list(y))
 descs = [f"{q}: {cold[q]['desc']}" for q in qids]
 ax.set_yticklabels(descs, fontsize=8)
 ax.invert_yaxis()
 ax.set_xscale("log")
-ax.set_xlim(8, 3000)
+ax.set_xlim(8, 4500)
 ax.set_xlabel("wall time (s, log scale)")
 ax.set_title(
     f"QUAIL-B SF=0.1  ·  cold {suite['passes']['cold']['pass_wall_s']:.0f} s"

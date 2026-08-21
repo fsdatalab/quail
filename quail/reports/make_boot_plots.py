@@ -23,7 +23,7 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import QUAIL, STOCK, GOOD, TEAL, ORANGE, DARK
+from plot_colors import BLUE, GRAY, GREEN, TEAL, ORANGE, DARK
 
 
 def load(name):
@@ -41,7 +41,7 @@ def mean_s(side, key):
 
 
 phases = [
-    ("load_model", mean_s(q_cold, "load_model_s"), QUAIL),
+    ("load_model", mean_s(q_cold, "load_model_s"), BLUE),
     ("arena", mean_s(q_cold, "arena_s"), TEAL),
     ("warm_kernels", mean_s(q_cold, "warm_kernels_s"), ORANGE),
 ]
@@ -86,32 +86,28 @@ ax_q.legend(handles=handles, loc="upper center",
             handlelength=1.1)
 
 # ---- right: total cold boot comparison ------------------------------
+speedup = s_total / q_total
 bars = ax_cmp.bar(
     ["Quail", "Stock vLLM"], [q_total, s_total],
-    color=[GOOD, STOCK], width=0.5, edgecolor="white", linewidth=0.8,
+    color=[GREEN, GRAY], width=0.5, edgecolor="white", linewidth=0.8,
 )
-for b, v, med in zip(bars, [q_total, s_total],
-                      [q_cold["boot_s"]["median"],
-                       s_cold["boot_s"]["median"]]):
-    ax_cmp.text(
-        b.get_x() + b.get_width() / 2, v + s_total * 0.02,
-        f"{v:.1f} s", ha="center", va="bottom",
-        fontsize=10.5, fontweight="bold", color=DARK,
-    )
-    ax_cmp.text(
-        b.get_x() + b.get_width() / 2, v + s_total * 0.09,
-        f"median {med:.1f}", ha="center", va="bottom",
-        fontsize=8, color="#888888",
-    )
 
-speedup = s_total / q_total
 ax_cmp.text(
-    0, q_total + s_total * 0.18,
-    f"{speedup:.0f}x faster", ha="center", fontsize=10.5,
-    fontweight="bold", color=GOOD,
+    bars[0].get_x() + bars[0].get_width() / 2,
+    q_total + s_total * 0.03,
+    f"{q_total:.1f} s  ({speedup:.0f}x faster)",
+    ha="center", va="bottom", fontsize=10, fontweight="bold",
+    color=GREEN,
+)
+ax_cmp.text(
+    bars[1].get_x() + bars[1].get_width() / 2,
+    s_total + s_total * 0.03,
+    f"{s_total:.1f} s",
+    ha="center", va="bottom", fontsize=10, fontweight="bold",
+    color=DARK,
 )
 
-ax_cmp.set_ylim(0, s_total * 1.28)
+ax_cmp.set_ylim(0, s_total * 1.2)
 ax_cmp.set_ylabel("seconds")
 ax_cmp.set_title("Cold boot total", fontsize=11, loc="left")
 ax_cmp.text(

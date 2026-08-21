@@ -19,7 +19,7 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import QUAIL, STOCK, GOOD, BAD, DARK
+from plot_colors import BLUE, GRAY, GREEN, RED, DARK
 
 
 def load(name):
@@ -37,18 +37,19 @@ def mean(rows, key):
 
 
 rungs = [
-    ("A0  stock, fp8 KV",              stock["A0"]["runs"],     STOCK),
-    ("A1  stock, bf16 KV",             stock["A1"]["runs"],     STOCK),
-    ("A2  Quail executor, vLLM kernels", packed["runs"]["A2"],  QUAIL),
-    ("A3  Quail executor, our kernels",  packed["runs"]["A3"],  GOOD),
+    ("A0  stock, fp8 KV",              stock["A0"]["runs"],     GRAY),
+    ("A1  stock, bf16 KV",             stock["A1"]["runs"],     GRAY),
+    ("A2  Quail executor, vLLM kernels", packed["runs"]["A2"],  BLUE),
+    ("A3  Quail executor, our kernels",  packed["runs"]["A3"],  GREEN),
 ]
 labels = [r[0] for r in rungs]
 walls = [mean(r[1], "wall") for r in rungs]
 colors = [r[2] for r in rungs]
 
-fig, ax = plt.subplots(figsize=(9, 3.8))
+fig, ax = plt.subplots(figsize=(9, 4.2))
 y = list(range(len(rungs)))
-ax.barh(y, walls, height=0.52, color=colors, edgecolor="white", linewidth=0.8)
+ax.barh(y, walls, height=0.48, color=colors, edgecolor="white",
+        linewidth=0.8)
 
 for i, w in enumerate(walls):
     rows = rungs[i][1]
@@ -67,19 +68,17 @@ deltas = [
 for i, label in deltas:
     d = walls[i + 1] - walls[i]
     sign = "+" if d > 0 else ""
-    color = BAD if d > 0 else GOOD
-    mid_x = max(walls[i], walls[i + 1]) + 0.2
-    ax.annotate(
-        f"  {label}  {sign}{d:.1f} s",
-        xy=(mid_x, i + 0.5),
-        fontsize=8, color=color, ha="left", va="center",
-        fontweight="medium",
+    color = RED if d > 0 else GREEN
+    ax.text(
+        52, i + 0.5,
+        f"{label}  {sign}{d:.1f} s",
+        fontsize=8.5, color=color, ha="right", va="center",
     )
 
 ax.set_yticks(y)
 ax.set_yticklabels(labels, fontsize=9.5)
 ax.invert_yaxis()
-ax.set_xlim(0, 56)
+ax.set_xlim(0, 52)
 ax.set_xlabel("seconds  (10k docs, 5 filters, one H100)")
 ax.set_title("Forward-pass ablation", loc="left")
 ax.grid(axis="x", alpha=0.3)
