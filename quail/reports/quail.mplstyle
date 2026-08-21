@@ -1,0 +1,25 @@
+axes.spines.top: False
+axes.spines.right: False
+axes.labelsize: 10
+axes.titlesize: 12
+axes.grid: False
+
+xtick.labelsize: 9
+ytick.labelsize: 9
+
+figure.dpi: 150
+figure.autolayout: True
+
+savefig.dpi: 150
+savefig.bbox: tight
+savefig.pad_inches: 0.15
+
+font.size: 10
+font.family: sans-serif
+font.sans-serif: Helvetica, Arial, DejaVu Sans
+
+lines.linewidth: 1.5
+lines.markersize: 5
+
+legend.frameon: False
+legend.fontsize: 9
