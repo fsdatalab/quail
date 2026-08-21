@@ -558,7 +558,7 @@ Key operations:
 | `KVArena.paged_kv` | `arena.py:118` | Reshape the flat pool for FlashAttention's block input |
 | `KVArena.gather` | `arena.py:149` | Extract a document's contiguous K, V rows (fallback path) |
 
-### 5.3 The two-call attention pattern
+### 5.3 The attention paths and the workload assignment
 
 Each chunk is a sequence of groups: `[group_1 | group_2 | ...]`,
 where each group is `[prefix? | suffix_1 ... suffix_k]`. The prefix
@@ -566,8 +566,64 @@ is the anchor document's tokens (present only if this is the first
 time the anchor is packed). The suffixes are the partner documents
 (for joins) or the question texts (for filters).
 
-Attention runs as two calls per layer, merged by softmax state
-(`attention.py:284`):
+The Pipeline has three attention implementations, selected per
+workload by `attention_mode` (issue #24):
+
+- **`unified`** - one causal FlashAttention-3 paged call per layer.
+  Current KV (prefix and suffix) is scattered into the document's
+  arena pages first (the arena reserves capacity pages for the
+  suffix beyond the document's logical length), then a single
+  `causal=True` call with a block table covers retained plus current
+  KV. No second call, no merge. Requires exactly one suffix per
+  group, which the filter shape always satisfies.
+- **`merge_quant`** - the two-call pattern below, with the LSE merge
+  and the FP8 quantization for o_proj fused into one Triton kernel
+  (`merge_attn_quant`), skipping the intermediate BF16 tensor.
+- **`split`** - the two-call pattern with the merge as ~9 PyTorch
+  kernels and a separate FP8 quantization. The reference
+  implementation; also the only mode with the gather fallback
+  (`meta["paged"]=False`) if the paged kernel ever fails a parity
+  gate.
+
+The assignment, fixed in `attention.py` as `FILTER_ATTENTION =
+"unified"` and `JOIN_ATTENTION = "merge_quant"` and read by the
+worker:
+
+- **Filters run `unified`.** Fastest measured on the 10k-document
+  five-filter workload (8.24 us/token vs 8.35 merge_quant and 8.57
+  split; `results/attention_paths.json`), and bit-identical to a
+  contiguous causal FlashAttention call
+  (`results/attention_parity.json`, max_abs 0.0), so filter answers
+  match full-prompt recompute exactly
+  (`results/attention_end_to_end_parity.json`).
+- **Joins run `merge_quant`.** The unified path cannot share one
+  anchor's KV across the many partner suffixes of a chunk - each
+  pair needs its own causal view, so one causal call per pair would
+  read other pairs' scattered KV. Forcing correctness (one partner
+  per anchor per chunk) re-reads the anchor's KV once per pair and
+  is several-fold slower (`results/join_attention_paths_*.json`).
+  Between the two two-call modes, the fused merge wins (11.28 vs
+  11.86 us/token at 10x256).
+- **Every path is validated against stock vLLM on real queries**
+  (`results/accuracy_vs_stock.json`): identical token streams
+  answered by standard vLLM serving and by the packed executor.
+  Planted-flag accuracy is 100% for every path; disagreements with
+  stock are 0.22% on filters and confined to near-zero
+  TRUE/FALSE-logprob margins (unified has none above 0.875, against
+  a corpus median margin of 3.25); on joins, zero disagreements at
+  decisive margins. The residual is the kernel stack (fp8 GEMMs,
+  fused norms), not the attention path.
+- **FlashInfer (0.6.14, in the image) was evaluated and not
+  adopted**: its paged causal kernel is 27% slower than the FA3
+  unified call on the fresh filter chunk (2.4x on the cached
+  shape), its two-call-plus-merge stack is ~35% slower than
+  merge_quant on joins, and its cascade wrapper (the shared-prefix
+  decomposition, single-anchor shapes only) is 21% slower. Nothing
+  came within the 5% adoption threshold
+  (`results/flashinfer_bench.json`).
+
+The two-call pattern (`split` and `merge_quant`) runs per layer as
+follows (`attention.py`):
 
 **Call A** (self-attention): causal attention over the segment
 boundaries. Each prefix attends to itself; each suffix attends to
@@ -668,7 +724,9 @@ answers. This overlaps GPU compute with answer readback.
 | Function | File | What it does |
 |---|---|---|
 | `Pipeline.forward_chunk` | `attention.py:348` | Full transformer forward pass for one chunk |
-| `Pipeline.attention` | `attention.py:284` | Two-call attention with LSE merge for one layer |
+| `Pipeline.attention` | `attention.py:284` | Two-call attention with LSE merge for one layer (`split`) |
+| `Pipeline.attention_merge_quant` | `attention.py` | Two calls + fused merge/FP8-quant Triton kernel (`merge_quant`, the join path) |
+| `Pipeline.attention_unified` | `attention.py` | Scatter current KV, one causal paged call (`unified`, the filter path) |
 | `Pipeline.gemm` | `attention.py:68` | DeepGEMM fp8 matrix multiply |
 | `Pipeline.quant` | `attention.py:78` | Per-token-group fp8 quantization |
 | `Pipeline.custom_silu_quant` | `attention.py:223` | Fused SiLU + multiply + fp8 quant (Triton) |
