@@ -13,7 +13,9 @@ profiled numbers. No maps, no classification, no aggregation, no
 cascades. The same discipline applies to relational algebra: the
 only relational operator is projection, because a result has to
 name its columns. No non-AI predicates, no equality joins, no
-GROUP BY, no ORDER BY, no LIMIT, no DISTINCT, no expressions. A
+GROUP BY, no ORDER BY, no DISTINCT, no expressions. LIMIT N is
+supported as early termination: the filter loop stops admitting
+documents once enough survivors are found. A
 query that needs those runs Quail for the semantic part and does
 the relational part in whatever database the ids came from.
 
@@ -363,9 +365,10 @@ Snowflake AISQL syntax, and only this subset of it:
 
 Rejected with a named error, not worked around: every relational
 operator except the projection above — non-AI predicates (including
-equality join conditions), GROUP BY, ORDER BY, LIMIT, DISTINCT,
+equality join conditions), GROUP BY, ORDER BY, DISTINCT,
 expressions in the SELECT list, set operations, subqueries other
-than the EXISTS form. Also OR between AI predicates (a disjunction
+than the EXISTS form. (LIMIT N is accepted; see §3.1 early
+termination.) Also OR between AI predicates (a disjunction
 belongs inside one prompt's text, where the model evaluates it),
 AI_FILTER over more than two providers, and any other AI_*
 function.

@@ -210,16 +210,18 @@ in the Snowflake dialect. `AI_FILTER(PROMPT(...))` appears in WHERE
 conjuncts; join predicates appear in `JOIN ... ON` clauses; `EXISTS`
 and `NOT EXISTS` subqueries map to exists and anti semantics.
 
-The front end rejects every relational operator except projection:
-GROUP BY, ORDER BY, LIMIT, DISTINCT, HAVING, UNION, INTERSECT,
+The front end rejects every relational operator except projection
+and LIMIT: GROUP BY, ORDER BY, DISTINCT, HAVING, UNION, INTERSECT,
 EXCEPT, window functions, OR between AI predicates, and subqueries
-other than the EXISTS form. The rejection list is explicit
+other than the EXISTS form. LIMIT N stops the filter loop once N
+survivors are found (early termination); the builder equivalent is
+`.limit(n)` before `.select()`. The rejection list is explicit
 (`compile.py:22-33`), so new SQL surface cannot enter silently.
 
 ### Builder API
 
 The builder (`builder.py`) mirrors the SQL constructs: `docs()`,
-`.alias()`, `.ai_filter()`, `.ai_join()`, `.select()`. The builder
+`.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. The builder
 always uses `as_written` order (the chain order is the execution
 order). Both entry points collect the same `QueryDesc` and call the
 same `assemble_plan`, so the plans are structurally identical.
