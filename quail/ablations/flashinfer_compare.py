@@ -39,12 +39,20 @@ FlashInfer has to beat one FA3 kernel launch outright to displace
 it. Cascade should behave like our two-call path (it is the same
 decomposition) with a different merge implementation.
 
+A third cell, bench_tuned, is the fairness pass: the same shapes
+with every backend string the wrappers accept forced in turn
+(instead of "auto"), plus a hybrid variant whose two FlashInfer
+attention calls are merged by our fused merge_quant kernel, so
+kernel quality is measured separately from fusion.
+
 Run from the quail/ directory (tee per house rule):
 
     uv run modal run ablations/flashinfer_compare.py::run_probe \
         2>&1 | tee results/flashinfer_probe.log
     uv run modal run ablations/flashinfer_compare.py::run_bench \
         2>&1 | tee results/flashinfer_bench.log
+    uv run modal run ablations/flashinfer_compare.py::run_bench_tuned \
+        2>&1 | tee results/flashinfer_tuned.log
 """
 
 import json
@@ -171,11 +179,10 @@ def _median_ms(torch, fn, iters=20):
     return times[len(times) // 2]
 
 
-@app.function(timeout=2400, **GPU_KW)
-def bench(q_heads: int = 32) -> str:
-    """q_heads=32 is the 4B geometry (4:1 GQA); 64 is the 32B
-    geometry (8:1 GQA)."""
-    import math
+def _case_builder(q_heads):
+    """The synthetic chunk builder at the engine's geometry. Shared
+    by bench and bench_tuned so both cells time identical tensors
+    (same seeds, same arena layout)."""
     from types import SimpleNamespace
 
     import numpy as np
@@ -183,7 +190,6 @@ def bench(q_heads: int = 32) -> str:
 
     from quail.executor.arena import KVArena
     from quail.executor.attention import Pipeline
-    from quail.executor.loop import pack_chunk
 
     torch.manual_seed(7)
     H, KH, D = q_heads, 8, 128
@@ -244,6 +250,37 @@ def bench(q_heads: int = 32) -> str:
                     groups=groups, q=q, k=k3, v=v3, fresh=fresh,
                     n_tokens=n_tokens, kept_lens=kept_lens,
                     suffix_counts=suffix_counts, suffix_len=suffix_len)
+
+    return SimpleNamespace(torch=torch, np=np, rng=rng, H=H, KH=KH,
+                           D=D, PAGE=PAGE, build_case=build_case)
+
+
+def _bench_cases(S):
+    """The four workload shapes, identical in bench and bench_tuned."""
+    rng = S.rng
+    return [
+        S.build_case("filter_fresh",
+                     [int(x) for x in rng.integers(180, 460, size=340)],
+                     [1] * 340, 32, fresh=True),
+        S.build_case("filter_cached",
+                     [int(x) for x in rng.integers(180, 460, size=340)],
+                     [1] * 340, 32, fresh=False),
+        S.build_case("join", [3530] * 10, [26] * 10, 42, fresh=False),
+        S.build_case("join_fanout", [3530], [256], 42, fresh=False),
+    ]
+
+
+@app.function(timeout=2400, **GPU_KW)
+def bench(q_heads: int = 32) -> str:
+    """q_heads=32 is the 4B geometry (4:1 GQA); 64 is the 32B
+    geometry (8:1 GQA)."""
+    import numpy as np
+    import torch
+
+    from quail.executor.loop import pack_chunk
+
+    S = _case_builder(q_heads)
+    H, KH, D, PAGE = S.H, S.KH, S.D, S.PAGE
 
     # ---- the FA3 sides: the engine's own paths over pack_chunk ----
 
@@ -462,16 +499,7 @@ def bench(q_heads: int = 32) -> str:
             out["errors"] = errors
         return out
 
-    cases = [
-        build_case("filter_fresh",
-                   [int(x) for x in rng.integers(180, 460, size=340)],
-                   [1] * 340, 32, fresh=True),
-        build_case("filter_cached",
-                   [int(x) for x in rng.integers(180, 460, size=340)],
-                   [1] * 340, 32, fresh=False),
-        build_case("join", [3530] * 10, [26] * 10, 42, fresh=False),
-        build_case("join_fanout", [3530], [256], 42, fresh=False),
-    ]
+    cases = _bench_cases(S)
 
     try:
         import flashinfer as fi
@@ -523,3 +551,242 @@ def bench(q_heads: int = 32) -> str:
 @app.local_entrypoint()
 def run_bench(q_heads: int = 32):
     print(bench.remote(q_heads))
+
+
+# ------------------------------------------------- the fairness pass
+
+@app.function(timeout=3600, **GPU_KW)
+def bench_tuned(q_heads: int = 32) -> str:
+    """Give FlashInfer its best configuration (issue #24 follow-up):
+    force each backend string the 0.6.14 wrappers accept instead of
+    "auto", and add a hybrid two-call variant whose two FlashInfer
+    attention calls are merged by our fused merge_quant Triton
+    kernel - separating kernel quality from fusion. Page size stays
+    16 on both stacks: it is an arena property the engine sets, and
+    both sides run the same value."""
+    import numpy as np
+    import torch
+
+    from quail.executor.loop import pack_chunk
+
+    S = _case_builder(q_heads)
+    H, KH, D, PAGE = S.H, S.KH, S.D, S.PAGE
+
+    import flashinfer as fi
+
+    BACKENDS = ("auto", "fa2", "fa3", "cutlass", "trtllm-gen")
+    cases = _bench_cases(S)
+
+    report = dict(
+        cell="flashinfer_tuned", flashinfer=fi.__version__,
+        q_heads=H, kv_heads=KH, backends_tried=list(BACKENDS),
+        prediction=(
+            "Forcing a backend moves the filter-shape gap little "
+            "(auto already picks per shape); the hybrid variant "
+            "removes roughly the fusion share of the join gap but "
+            "the ragged+paged pair still trails merge_quant; "
+            "nothing reaches the 5% adoption bar."),
+        note=("Same timing method as flashinfer_bench: plan() and "
+              "JIT compilation outside the timed region, median of "
+              "20 CUDA-event runs after 3 warmups, times include KV "
+              "scatter, merge, and FP8 quantization."),
+        shapes={})
+
+    with torch.inference_mode():
+        for case in cases:
+            name = case["name"]
+            arena = case["arena"]
+            pipeline = case["pipeline"]
+            n = case["n_tokens"]
+            kept = case["kept_lens"]
+            counts = case["suffix_counts"]
+            slen = case["suffix_len"]
+            q3, k3, v3 = case["q"], case["k"], case["v"]
+            q_flat, k_flat, v_flat = (q3.view(n, -1), k3.view(n, -1),
+                                      v3.view(n, -1))
+            n_pages = arena.accounting.n_pages
+            kcache = arena.k[0].view(n_pages, PAGE, KH, D)
+            vcache = arena.v[0].view(n_pages, PAGE, KH, D)
+
+            def pages_of(i):
+                return arena.accounting.owned[(name, i)]
+
+            def i32(x):
+                return torch.tensor(x, dtype=torch.int32)
+
+            def ws():
+                return torch.empty(160 * 1024 * 1024,
+                                   dtype=torch.uint8, device="cuda")
+
+            row = dict(n_tokens=n, fa3={}, paged_causal={},
+                       paged_causal_max_abs={},
+                       two_call_merge_state={},
+                       two_call_fused_merge={}, rejected={})
+
+            # same-run FA3 references
+            mq_chunk = pack_chunk(torch, arena, case["groups"],
+                                  pinned=True,
+                                  attention_mode="merge_quant")
+
+            def run_mq():
+                mq_chunk["meta"]["layer"] = 0
+                return pipeline.attention_merge_quant(
+                    q_flat, k_flat, v_flat, mq_chunk["meta"])
+            row["fa3"]["merge_quant"] = _median_ms(torch, run_mq)
+
+            unified_ok = all(c == 1 for c in counts)
+            if unified_ok:
+                uni_chunk = pack_chunk(torch, arena, case["groups"],
+                                       pinned=True,
+                                       attention_mode="unified")
+                uni = uni_chunk["meta"]["unified"]
+
+                def run_uni():
+                    uni_chunk["meta"]["layer"] = 0
+                    o = pipeline.attention_unified(
+                        q_flat, k_flat, v_flat, uni_chunk["meta"])
+                    return pipeline.quant(o)
+                row["fa3"]["unified_plus_quant"] = _median_ms(
+                    torch, run_uni)
+                uni_chunk["meta"]["layer"] = 0
+                ref = pipeline.attention_unified(
+                    q_flat, k_flat, v_flat, uni_chunk["meta"])
+
+                kv_lens = [k + slen for k in kept]
+                page_counts = [-(-x // PAGE) for x in kv_lens]
+                q_lens = (kv_lens if case["fresh"]
+                          else [slen] * len(kept))
+                uni_plan_args = (
+                    i32([0] + list(np.cumsum(q_lens))),
+                    i32([0] + list(np.cumsum(page_counts))),
+                    i32([p for i in range(len(kept))
+                         for p in pages_of(i)[:page_counts[i]]]),
+                    i32([(x - 1) % PAGE + 1 for x in kv_lens]))
+
+            # the two-call plan inputs, shared by both merge variants
+            # (a merge_quant chunk carries cross["source"] for the
+            # fused kernel; its cross layout equals the split one)
+            sp_chunk = pack_chunk(torch, arena, case["groups"],
+                                  pinned=True,
+                                  attention_mode="merge_quant")
+            meta = sp_chunk["meta"]
+            cross = meta["cross"]
+            rows_idx = cross["rows"]
+            source = cross["source"]
+            cu_a = meta["cu_a"].cpu()
+            kept_pages = [-(-k // PAGE) for k in kept]
+            paged_plan_args = (
+                cross["cu_q"].cpu(),
+                i32([0] + list(np.cumsum(kept_pages))),
+                i32([p for i in range(len(kept))
+                     for p in pages_of(i)[:kept_pages[i]]]),
+                i32([(k - 1) % PAGE + 1 for k in kept]))
+
+            for be in BACKENDS:
+                # one causal paged call (the unified equivalent)
+                if unified_ok:
+                    try:
+                        wrapper = fi.BatchPrefillWithPagedKVCacheWrapper(
+                            ws(), "NHD", backend=be)
+                        wrapper.plan(
+                            *uni_plan_args, H, KH, D, PAGE,
+                            causal=True,
+                            q_data_type=torch.bfloat16,
+                            kv_data_type=torch.bfloat16)
+
+                        def run_fi_unified():
+                            pipeline.kv_row_scatter(
+                                k3, v3, uni["src"], uni["dst"], 0)
+                            o = wrapper.run(q3, (kcache, vcache))
+                            return pipeline.quant(o.view(n, -1))
+                        row["paged_causal"][be] = _median_ms(
+                            torch, run_fi_unified)
+                        pipeline.kv_row_scatter(k3, v3, uni["src"],
+                                                uni["dst"], 0)
+                        got = wrapper.run(q3, (kcache, vcache))
+                        row["paged_causal_max_abs"][be] = float(
+                            (got.view(n, -1).float()
+                             - ref.float()).abs().max().item())
+                        del wrapper
+                    except Exception as exc:
+                        row["rejected"][f"paged_causal[{be}]"] = \
+                            repr(exc)
+
+                # two calls, merged by their merge_state and by our
+                # fused kernel
+                try:
+                    ragged = fi.BatchPrefillWithRaggedKVCacheWrapper(
+                        ws(), "NHD", backend=be)
+                    ragged.plan(cu_a, cu_a, H, KH, D, causal=True,
+                                q_data_type=torch.bfloat16,
+                                kv_data_type=torch.bfloat16)
+                    paged = fi.BatchPrefillWithPagedKVCacheWrapper(
+                        ws(), "NHD", backend=be)
+                    paged.plan(*paged_plan_args, H, KH, D, PAGE,
+                               causal=False,
+                               q_data_type=torch.bfloat16,
+                               kv_data_type=torch.bfloat16)
+
+                    def run_two_call():
+                        if meta["kv_src"] is not None:
+                            pipeline.kv_row_scatter(
+                                k3, v3, meta["kv_src"],
+                                meta["kv_dst"], 0)
+                        oa, la = ragged.run(q3, k3, v3,
+                                            return_lse=True)
+                        q_suf = q3.index_select(0, rows_idx)
+                        ob, lb = paged.run(q_suf, (kcache, vcache),
+                                           return_lse=True)
+                        merged, _ = fi.merge_state(
+                            oa.index_select(0, rows_idx),
+                            la.index_select(0, rows_idx), ob, lb)
+                        o = oa.index_copy_(0, rows_idx, merged)
+                        return pipeline.quant(o.view(n, -1))
+                    row["two_call_merge_state"][be] = _median_ms(
+                        torch, run_two_call)
+
+                    def run_two_call_fused():
+                        if meta["kv_src"] is not None:
+                            pipeline.kv_row_scatter(
+                                k3, v3, meta["kv_src"],
+                                meta["kv_dst"], 0)
+                        oa, la = ragged.run(q3, k3, v3,
+                                            return_lse=True)
+                        q_suf = q3.index_select(0, rows_idx)
+                        ob, lb = paged.run(q_suf, (kcache, vcache),
+                                           return_lse=True)
+                        la_t = (la if la.shape[0] == n
+                                else la.transpose(0, 1))
+                        lb_t = (lb
+                                if lb.shape[0] == rows_idx.shape[0]
+                                else lb.transpose(0, 1))
+                        return pipeline.merge_attn_quant(
+                            oa, la_t, ob, lb_t, source)
+                    row["two_call_fused_merge"][be] = _median_ms(
+                        torch, run_two_call_fused)
+                    del ragged, paged
+                except Exception as exc:
+                    row["rejected"][f"two_call[{be}]"] = repr(exc)
+
+            us = {}
+            for group in ("fa3", "paged_causal",
+                          "two_call_merge_state",
+                          "two_call_fused_merge"):
+                for k, v in row[group].items():
+                    key = k if group == "fa3" else f"{group}[{k}]"
+                    us[key] = round(v * 1e3 / n, 3)
+            row["us_per_fresh_token"] = us
+            report["shapes"][name] = row
+            print(f"[flashinfer_tuned] {name}: {json.dumps(us)}",
+                  flush=True)
+            if row["rejected"]:
+                print(f"[flashinfer_tuned] {name} rejected: "
+                      f"{list(row['rejected'])}", flush=True)
+
+    tag = "" if H == 32 else f"_{H}h"
+    return _write(report, f"flashinfer_tuned{tag}")
+
+
+@app.local_entrypoint()
+def run_bench_tuned(q_heads: int = 32):
+    print(bench_tuned.remote(q_heads))
