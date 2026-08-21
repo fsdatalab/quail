@@ -95,7 +95,11 @@ below is where join answers are graded against ground truth.
 ## Accuracy against stock vLLM
 
 Cell: `ablations/accuracy_vs_stock.py`
-(`results/accuracy_vs_stock.json`). The same token id streams
+(`results/accuracy_vs_stock.json`; the per-question raw answer sets
+both sides produce stay on the Modal volume `quail-results` at
+`/results/ablations/accuracy_{stock,quail}_raw*.json` - the
+`combine` step reads them there, and only its summary is committed).
+The same token id streams
 answered by standard vLLM serving (v1 engine, bf16 KV, prefix
 caching on, the committed client's batch settings, one request per
 document-stage or pair, TRUE/FALSE-constrained single token at
