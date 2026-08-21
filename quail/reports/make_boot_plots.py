@@ -7,6 +7,7 @@ tests/gpu/boot_profile.py) and writes reports/plots/boot_profile.png.
 """
 
 import json
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -14,17 +15,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
-ROOT = Path(__file__).resolve().parents[1]
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[0]
 RESULTS = ROOT / "results"
-OUT = Path(__file__).resolve().parent / "plots"
+OUT = HERE / "plots"
 OUT.mkdir(exist_ok=True)
 
-BLUE = "#2979FF"
-TEAL = "#00897B"
-ORANGE = "#FB8C00"
-GRAY = "#9E9E9E"
-GREEN = "#43A047"
-DARK = "#424242"
+plt.style.use(HERE / "quail.mplstyle")
+sys.path.insert(0, str(HERE))
+from plot_colors import BLUE, TEAL, ORANGE, GRAY, GREEN, DARK
 
 
 def load(name):
@@ -50,7 +49,7 @@ q_total = mean_s(q_cold, "boot_s")
 s_total = mean_s(s_cold, "boot_s")
 
 fig, (ax_q, ax_cmp) = plt.subplots(
-    1, 2, figsize=(10.5, 3.8), dpi=150,
+    1, 2, figsize=(10.5, 3.8),
     gridspec_kw={"width_ratios": [1.35, 1]},
 )
 
@@ -74,7 +73,7 @@ ax_q.set_xlabel("seconds", fontsize=9)
 ax_q.set_title(f"Quail cold phases  ·  {q_total:.1f} s mean "
                f"(median {q_cold['boot_s']['median']:.1f})",
                fontsize=11, fontweight="bold", loc="left")
-ax_q.spines[["top", "right", "left"]].set_visible(False)
+ax_q.spines["left"].set_visible(False)
 
 handles = [
     Patch(facecolor=c,
@@ -83,7 +82,7 @@ handles = [
 ]
 ax_q.legend(handles=handles, loc="upper center",
             bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=8.5,
-            frameon=False, handlelength=1.1)
+            handlelength=1.1)
 
 # ---- right: total cold comparison ------------------------------------
 labels = ["Quail", "Stock vLLM"]
@@ -100,7 +99,6 @@ ax_cmp.set_ylim(0, s_total * 1.28)
 ax_cmp.set_ylabel("seconds", fontsize=9)
 ax_cmp.set_title("Cold boot total", fontsize=11,
                  fontweight="bold", loc="left")
-ax_cmp.spines[["top", "right"]].set_visible(False)
 ax_cmp.text(0.5, -0.16,
             "warm boot = 0.0 s on both  ·  3 H100 SXM trials",
             transform=ax_cmp.transAxes, ha="center", fontsize=8,
@@ -108,8 +106,7 @@ ax_cmp.text(0.5, -0.16,
 
 fig.suptitle("Cold boot: Quail vs stock vLLM", fontsize=13,
              fontweight="bold", x=0.01, ha="left", y=1.02)
-fig.tight_layout()
 fig.subplots_adjust(bottom=0.22)
 out = OUT / "boot_profile.png"
-fig.savefig(out, bbox_inches="tight")
+fig.savefig(out)
 print("wrote", out)

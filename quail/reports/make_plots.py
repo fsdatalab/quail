@@ -8,21 +8,22 @@ reports/plots/. Run from the quail/ directory:
 """
 
 import json
+import sys
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-ROOT = Path(__file__).resolve().parents[1]
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[0]
 RESULTS = ROOT / "results"
-OUT = Path(__file__).resolve().parent / "plots"
+OUT = HERE / "plots"
 OUT.mkdir(exist_ok=True)
 
-ACCENT = "#2979FF"
-GRAY = "#9E9E9E"
-GREEN = "#43A047"
-DARK = "#424242"
+plt.style.use(HERE / "quail.mplstyle")
+sys.path.insert(0, str(HERE))
+from plot_colors import BLUE, GRAY, GREEN, DARK
 
 
 def load(name):
@@ -54,7 +55,6 @@ a1.set_title("5-filter chain, 10,000 documents", fontsize=11)
 a1.set_ylim(0, 46)
 a1.text(1, quail_filter + 4, f"{stock_filter / quail_filter:.2f}x faster",
         ha="center", fontsize=10, color=GREEN)
-a1.spines[["top", "right"]].set_visible(False)
 
 labels = ["Stock vLLM\n(grouped)", "Quail"]
 vals = [stockj, quail_join]
@@ -67,9 +67,7 @@ a2.set_ylabel("wall time (seconds, lower is better)")
 a2.set_ylim(0, 85)
 a2.text(1, quail_join + 3, f"{stockj / quail_join:.1f}x faster",
         ha="center", fontsize=10, color=GREEN)
-a2.spines[["top", "right"]].set_visible(False)
-fig.tight_layout()
-fig.savefig(OUT / "vs_stock.png", dpi=150)
+fig.savefig(OUT / "vs_stock.png")
 plt.close(fig)
 
 # ---- figure 3: QUAIL-B SF=0.1, cold vs warm -------------------------
@@ -89,7 +87,7 @@ fig, ax = plt.subplots(figsize=(9, 6.8))
 h = 0.38
 ax.barh([i - h / 2 for i in y], cw, height=h, color=GRAY,
         label="Cold pass (store disabled)")
-ax.barh([i + h / 2 for i in y], ww, height=h, color=ACCENT,
+ax.barh([i + h / 2 for i in y], ww, height=h, color=BLUE,
         label="Warm pass (store enabled)")
 for i, q in enumerate(qids):
     ax.text(cw[i] * 1.04, i - h / 2, f"{cw[i]:.0f} s",
@@ -98,7 +96,7 @@ for i, q in enumerate(qids):
     if restored[i]:
         label += f" ({restored[i]} docs restored)"
     ax.text(ww[i] * 1.04, i + h / 2, label,
-            va="center", fontsize=7.5, color=ACCENT)
+            va="center", fontsize=7.5, color=BLUE)
 ax.set_yticks(list(y))
 descs = [f"{q}: {cold[q]['desc']}" for q in qids]
 ax.set_yticklabels(descs, fontsize=8)
@@ -111,9 +109,7 @@ ax.set_title(
     f"warm pass {suite['passes']['warm']['pass_wall_s']:.0f} s",
     fontsize=11)
 ax.legend(loc="lower right", fontsize=9)
-ax.spines[["top", "right"]].set_visible(False)
-fig.tight_layout()
-fig.savefig(OUT / "quailb_cold_warm.png", dpi=150)
+fig.savefig(OUT / "quailb_cold_warm.png")
 plt.close(fig)
 
 print("wrote", *[p.name for p in sorted(OUT.glob("*.png"))])
