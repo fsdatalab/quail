@@ -453,11 +453,18 @@ Measured (all in `results/*_32b.json` / `*_64h.json`):
   analysis carries less weight than at 4B; the planted-truth
   grading above replaces it.
 - FlashInfer at the 64-head geometry
-  (`flashinfer_bench_64h.json`): still nothing within the 5% bar -
-  paged causal 31% behind the single FA3 call on the fresh filter
-  chunk (3.0x on the rewind chunk), two-call + merge_state 46%
-  behind merge_quant on joins, cascade 21% behind on the fan-out
-  shape.
+  (`flashinfer_bench_64h.json`, tuned pass in
+  `flashinfer_tuned_64h.json`): the same pattern as 4B, at both
+  settings. At auto dispatch: paged causal 31% behind the single
+  FA3 call on the fresh filter chunk (3.0x on the rewind chunk),
+  two-call + merge_state 46% behind merge_quant on joins, cascade
+  21% behind on the fan-out shape. With the best forced backend:
+  fa2 again rescues the filter shapes (fresh +14%, rewind +19%
+  against unified), joins stay +33% to +48% pure and +18% to +27%
+  for the hybrid that uses our fused kernel. The hybrid on the
+  fresh filter chunk is again within 5% (+2.4%) with the same
+  three caveats as at 4B. Closest pure variant: 14% behind -
+  nothing within the 5% bar at this geometry either.
 
 The assignment (filters unified, joins merge_quant) holds unchanged
 on both in-scope models.
