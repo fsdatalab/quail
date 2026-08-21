@@ -111,6 +111,10 @@ class PinnedStore:
     of KV even at 4x document length)."""
 
     STAGING_SLOTS = 4
+    STAGING_SLOTS_LARGE = 2   # slot count once a document crosses
+    #                           STAGING_LARGE_THRESHOLD tokens
+    STAGING_MIN_TOKENS = 4096
+    STAGING_LARGE_THRESHOLD = 8192
     SLAB_BYTES = 8 << 30
 
     def __init__(self, capacity_tokens: int, n_layers: int, n_kv: int,
@@ -150,8 +154,9 @@ class PinnedStore:
         (measured: warm B5 ran 2.8x its cold wall); two keep the
         copy overlap at a fraction of the price."""
         torch = self.torch
-        tokens = max(tokens, 4096)
-        n = 2 if tokens > 8192 else self.STAGING_SLOTS
+        tokens = max(tokens, self.STAGING_MIN_TOKENS)
+        n = (self.STAGING_SLOTS_LARGE if tokens > self.STAGING_LARGE_THRESHOLD
+             else self.STAGING_SLOTS)
         self._staging = [torch.empty((tokens, self.row_width),
                                      dtype=self._dtype, device="cuda")
                          for _ in range(n)]

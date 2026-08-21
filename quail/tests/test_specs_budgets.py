@@ -62,11 +62,14 @@ def test_chunk_budget_is_the_index_cap():
 def test_arena_tokens_at_bf16():
     # the design table said ~400k with one chunk of activation
     # reservation; the milestone 1 filter run OOMed there, so the
-    # reservation is two chunks and the arena lands near 346k -
-    # still ~865 mean-length documents resident at once
+    # reservation is two chunks, and a further ~4.8 GiB is reserved
+    # for the pinned store's device staging ring (store_staging_bytes)
+    # so a later warm-pass store can't OOM against an arena that
+    # already claimed the whole budget - the arena lands near 313k,
+    # still ~780 mean-length documents resident at once
     tokens = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM)
-    assert 330_000 <= tokens <= 360_000
-    assert tokens // 400 >= 800
+    assert 300_000 <= tokens <= 330_000
+    assert tokens // 400 >= 750
 
 
 def test_arena_doubles_at_fp8_kv():
