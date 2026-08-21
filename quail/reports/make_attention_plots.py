@@ -259,33 +259,31 @@ def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
         ("fa3_split_plus_quant", "FA3 split + quant", BLUE),
         ("fa3_merge_quant", "FA3 merge_quant", ORANGE),
         ("fa3_unified_plus_quant", "FA3 unified + quant", GREEN),
-        ("fi_paged_causal_plus_quant", "FlashInfer paged causal",
-         RED),
-        ("fi_two_call_merge_plus_quant",
-         "FlashInfer two-call + merge_state", TEAL),
-        ("fi_cascade_plus_quant", "FlashInfer cascade", GRAY),
-        ("fi_best_tuned", "FlashInfer best forced backend", DARK),
+        ("fi_best", "FlashInfer best config", RED),
     ]
+    _wrapper_label = {"paged_causal": "paged causal",
+                      "two_call_merge_state": "two-call"}
 
-    def best_tuned(skey):
-        # the fastest pure-FlashInfer variant across forced backends
+    def best_fi(skey):
         row = tuned.get(skey)
         if not row:
             return None
-        pool = [(v, f"{grp} {be}")
+        pool = [(v, f"{_wrapper_label[grp]}, {be}")
                 for grp in ("paged_causal", "two_call_merge_state")
                 for be, v in row[grp].items()]
         return min(pool) if pool else None
 
-    fig, ax = plt.subplots(figsize=(10.5, 5.2))
+    fig, ax = plt.subplots(figsize=(10.5, 3.8))
     bar_h = 0.15
     yticks, ylabels = [], []
     for si, (skey, slabel) in enumerate(shapes):
         row = fi["shapes"][skey]
-        vals = {**row["fa3"], **row["flashinfer"]}
-        bt = best_tuned(skey)
+        vals = dict(row["fa3"])
+        bt = best_fi(skey)
+        fi_note = ""
         if bt is not None:
-            vals["fi_best_tuned"] = bt[0]
+            vals["fi_best"] = bt[0]
+            fi_note = bt[1]
         present = [(k, lab, c) for k, lab, c in variants if k in vals]
         base = si * (len(variants) + 1.4) * bar_h
         for vi, (k, lab, c) in enumerate(present):
@@ -293,7 +291,7 @@ def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
             ypos = base + vi * bar_h
             ax.barh(ypos, v, height=bar_h * 0.82, color=c,
                     edgecolor="white")
-            note = f" ({bt[1]})" if k == "fi_best_tuned" else ""
+            note = f" ({fi_note})" if k == "fi_best" else ""
             ax.text(v + 0.05, ypos, f"{v:.2f}{note}", va="center",
                     fontsize=8, color=DARK)
         yticks.append(base + (len(present) - 1) * bar_h / 2)
