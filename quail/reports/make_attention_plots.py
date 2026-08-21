@@ -49,9 +49,9 @@ def mean(rows, key):
 
 # ---------------------------------------------- figure 1: path speed
 
-def fig_paths():
-    ap = load("attention_paths.json")
-    joins = {label: load(f"join_attention_paths_{label}.json")
+def fig_paths(tag="", model_label="Qwen3 4B fp8"):
+    ap = load(f"attention_paths{tag}.json")
+    joins = {label: load(f"join_attention_paths{tag}_{label}.json")
              for label in ("10x256", "1x2560", "100x256")}
 
     fig, (ax1, ax2) = plt.subplots(
@@ -66,12 +66,13 @@ def fig_paths():
     ax1.barh(list(y), us, height=0.55,
              color=[PATH_COLOR[m] for m in modes], edgecolor="white")
     for i, (u, w) in enumerate(zip(us, walls)):
-        ax1.text(u + 0.06, i, f"{u:.2f} us/token   {w:.1f} s wall",
+        ax1.text(u + 0.008 * max(us), i,
+                 f"{u:.2f} us/token   {w:.1f} s wall",
                  va="center", fontsize=9, color=DARK)
     ax1.set_yticks(list(y))
     ax1.set_yticklabels([PATH_LABEL[m] for m in modes], fontsize=9.5)
     ax1.invert_yaxis()
-    ax1.set_xlim(0, max(us) * 1.55)
+    ax1.set_xlim(0, max(us) * 1.6)
     ax1.set_xlabel("us per fresh token (lower is better)", fontsize=9)
     ax1.spines[["top", "right"]].set_visible(False)
     ax1.set_title(
@@ -85,26 +86,29 @@ def fig_paths():
                   "1x2560": "1 anchor x 2,560 (high fan-out)",
                   "100x256": "100 anchors x 256 (multi-chunk)"}
     jmodes = ["split", "merge_quant", "unified_waves"]
-    clip = 40.0
+    clip = 3.0 * max(mean(joins[s]["runs"]["split"], "us_per_token")
+                     for s in shapes)
     bar_h = 0.24
     yticks, ylabels = [], []
     for si, shape in enumerate(shapes):
         base = si * (len(jmodes) + 1) * bar_h
+        mq = mean(joins[shape]["runs"]["merge_quant"],
+                  "us_per_token")
         for mi, m in enumerate(jmodes):
             u = mean(joins[shape]["runs"][m], "us_per_token")
             ypos = base + mi * bar_h
             shown = min(u, clip)
             ax2.barh(ypos, shown, height=bar_h * 0.82,
                      color=PATH_COLOR[m], edgecolor="white")
-            label = f"{u:.1f}"
             if u > clip:
-                label = f"{u:.0f} us/token (28x merge_quant) →"
-                ax2.text(clip - 0.4, ypos, label, va="center",
+                label = (f"{u:.0f} us/token "
+                         f"({u / mq:.0f}x merge_quant) →")
+                ax2.text(clip * 0.99, ypos, label, va="center",
                          ha="right", fontsize=8.5, color="white",
                          fontweight="bold")
             else:
-                ax2.text(shown + 0.4, ypos, label, va="center",
-                         fontsize=8.5, color=DARK)
+                ax2.text(shown + 0.01 * clip, ypos, f"{u:.1f}",
+                         va="center", fontsize=8.5, color=DARK)
         yticks.append(base + bar_h)
         ylabels.append(shape_note[shape])
     ax2.set_yticks(yticks)
@@ -121,17 +125,19 @@ def fig_paths():
     ax2.legend(handles, [PATH_LABEL[m] for m in jmodes],
                loc="lower right", fontsize=8.5, frameon=False)
 
-    fig.suptitle("Attention paths by workload (Qwen3 4B fp8, one H100)",
-                 fontsize=12, fontweight="bold", x=0.01, ha="left")
+    fig.suptitle(
+        f"Attention paths by workload ({model_label}, one H100)",
+        fontsize=12, fontweight="bold", x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.94))
-    fig.savefig(OUT / "attention_paths.png", bbox_inches="tight")
-    print("wrote", OUT / "attention_paths.png")
+    fig.savefig(OUT / f"attention_paths{tag}.png",
+                bbox_inches="tight")
+    print("wrote", OUT / f"attention_paths{tag}.png")
 
 
 # ------------------------------------- figure 2: accuracy vs stock
 
-def fig_accuracy():
-    acc = load("accuracy_vs_stock.json")
+def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
+    acc = load(f"accuracy_vs_stock{tag}.json")
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 3.9), dpi=150)
 
@@ -153,7 +159,7 @@ def fig_accuracy():
     yticks, ylabels = [], []
     for gi, (gname, series) in enumerate(
             (("filters: planted flags", flag_acc),
-             ("join: planted keys\n(the 4B model's floor)", key_acc))):
+             ("join: planted keys", key_acc))):
         base = gi * (len(entities) + 1.2) * bar_h
         for ei, (ent, color) in enumerate(entities):
             v = series[ent]
@@ -198,7 +204,7 @@ def fig_accuracy():
         ax2.barh(i, rate, height=0.55, color=color, edgecolor="white",
                  alpha=0.45)
         ax2.barh(i, dec, height=0.55, color=color, edgecolor="white")
-        ax2.text(rate + 0.15, i,
+        ax2.text(rate + 0.1, i,
                  f"{d['disagreements']}/{d['compared']}"
                  f"  ({rate:.2f}%),  {d['decisive_disagreements']} at "
                  f"decisive margin",
@@ -206,7 +212,9 @@ def fig_accuracy():
     ax2.set_yticks(list(y))
     ax2.set_yticklabels([r[0] for r in rows], fontsize=9)
     ax2.invert_yaxis()
-    ax2.set_xlim(0, 26)
+    max_rate = max(100.0 * d["disagreements"] / d["compared"]
+                   for _, d, _ in rows)
+    ax2.set_xlim(0, max(max_rate * 2.6, 3.0))
     ax2.set_xlabel("answers that differ from stock vLLM (%)",
                    fontsize=9)
     ax2.spines[["top", "right"]].set_visible(False)
@@ -229,18 +237,19 @@ def fig_accuracy():
              ha="right", va="top")
 
     fig.suptitle(
-        "Accuracy against stock vLLM: identical token streams, "
-        "TRUE/FALSE constrained, temperature 0",
+        f"Accuracy against stock vLLM ({model_label}): identical "
+        f"token streams, TRUE/FALSE constrained, temperature 0",
         fontsize=12, fontweight="bold", x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0.03, 1, 0.93))
-    fig.savefig(OUT / "accuracy_vs_stock.png", bbox_inches="tight")
-    print("wrote", OUT / "accuracy_vs_stock.png")
+    fig.savefig(OUT / f"accuracy_vs_stock{tag}.png",
+                bbox_inches="tight")
+    print("wrote", OUT / f"accuracy_vs_stock{tag}.png")
 
 
 # ------------------------------------------ figure 3: FlashInfer
 
-def fig_flashinfer():
-    fi = load("flashinfer_bench.json")
+def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
+    fi = load(f"flashinfer_bench{tag}.json")
     shapes = [
         ("filter_fresh", "filter, fresh chunk\n(~110k tokens)"),
         ("filter_cached", "filter, rewind chunk\n(~11k tokens)"),
@@ -282,19 +291,30 @@ def fig_flashinfer():
                   "scatter, merge, and FP8 quantization "
                   "(lower is better)", fontsize=9)
     ax.spines[["top", "right"]].set_visible(False)
-    ax.set_title("FlashInfer 0.6.14 against FlashAttention-3 on the "
-                 "real chunk shapes", fontsize=12, fontweight="bold",
-                 loc="left")
+    ax.set_title(f"FlashInfer 0.6.14 against FlashAttention-3 on "
+                 f"the real chunk shapes ({geom_label})",
+                 fontsize=12, fontweight="bold", loc="left")
     handles = [plt.Rectangle((0, 0), 1, 1, color=c)
                for _, _, c in variants]
     ax.legend(handles, [lab for _, lab, _ in variants],
               loc="lower right", fontsize=8.5, frameon=False)
     fig.tight_layout()
-    fig.savefig(OUT / "flashinfer_compare.png", bbox_inches="tight")
-    print("wrote", OUT / "flashinfer_compare.png")
+    fig.savefig(OUT / f"flashinfer_compare{tag}.png",
+                bbox_inches="tight")
+    print("wrote", OUT / f"flashinfer_compare{tag}.png")
 
 
 if __name__ == "__main__":
     fig_paths()
     fig_accuracy()
     fig_flashinfer()
+    # the 32B variants render once their result files exist
+    for fn, args in (
+            (fig_paths, ("_32b", "Qwen3 32B fp8")),
+            (fig_accuracy, ("_32b", "Qwen3 32B fp8")),
+            (fig_flashinfer,
+             ("_64h", "32B geometry: 64 query heads"))):
+        try:
+            fn(*args)
+        except FileNotFoundError as exc:
+            print(f"skipped {args[0]}: {exc}")

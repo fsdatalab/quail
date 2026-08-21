@@ -216,6 +216,32 @@ percent of each other"; the measured gap (35-45% on joins) came in
 above that band - FlashInfer's merge_state plus its separate paged
 call costs more than expected next to the fused Triton kernel.
 
+## Qwen3 32B fp8
+
+The same battery on the second in-scope model (one H100, chunk
+budget 41,943 tokens, arena 64,453 tokens - the kernel index cap and
+the smaller free memory both bind harder than at 4B).
+
+Predictions, stated before the runs:
+
+- The ranking holds on both workloads: the mechanism (one paged
+  causal call for the filter shape; two calls plus fused merge for
+  fan-out) does not depend on model size. The RELATIVE gaps shrink:
+  the launch and merge overhead the paths differ by is roughly
+  constant per token, while the per-token GEMM work is ~8x larger.
+- Absolute rate lands in the 45-70 us/token band for filters
+  (params ratio over the 4B's 8.45, minus large-GEMM efficiency).
+- Kernel parity at the 32B geometry (64 query heads, 8:1 GQA):
+  unified stays bit-identical to the contiguous call.
+- Accuracy vs stock: flag accuracy 100% for both systems; the 32B
+  model should clear the 4B's floor on the planted-key join (the
+  4B answered TRUE to nearly everything; 32B should actually
+  compare the keys), margins widen, and the join disagreement rate
+  drops well below the 4B's ~9%.
+- FlashInfer at 64 heads: FA3 stays ahead; adopt only if within 5%.
+
+Measured: RESULTS_PENDING_32B
+
 ## Edge cases covered
 
 - Page-boundary lengths, many-page documents (2,049- and

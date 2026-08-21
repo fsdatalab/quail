@@ -232,7 +232,8 @@ def build_join_corpus(tokenizer):
 # --------------------------------------------------------- stock side
 
 @app.function(timeout=5400, **GPU_KW)
-def stock_side(n_docs: int = 1000) -> str:
+def stock_side(n_docs: int = 1000,
+               model: str = "qwen3-4b-fp8") -> str:
     """Every (document, stage) and every join pair through standard
     vLLM serving, twice for filters (natural and shuffled order)."""
     import sys
@@ -244,16 +245,17 @@ def stock_side(n_docs: int = 1000) -> str:
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
-    from corpus import MODEL
     from quail.executor.loop import true_false_ids
+    from quail.specs import MODELS
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    spec = MODELS[model]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
     body_ids, q_ids, _, kinds = build_filter_corpus(tokenizer, n_docs)
     anchor_ids, frame_ids, suffix_ids, _ = build_join_corpus(tokenizer)
     t_ids, f_ids = true_false_ids(tokenizer)
     allowed = sorted(t_ids | f_ids)
 
-    llm = LLM(model=MODEL, kv_cache_dtype="auto",
+    llm = LLM(model=spec.hf_name, kv_cache_dtype="auto",
               max_num_batched_tokens=STOCK_STEP_TOKENS,
               max_num_seqs=STOCK_MAX_SEQS,
               gpu_memory_utilization=0.92,
@@ -319,8 +321,8 @@ def stock_side(n_docs: int = 1000) -> str:
         jmargins2[idx] = jm_s[pos]
 
     report = dict(
-        cell="stock_side", n_docs=n_docs, n_stages=n_stages,
-        kinds=kinds,
+        cell="stock_side", model=spec.name, n_docs=n_docs,
+        n_stages=n_stages, kinds=kinds,
         config=dict(kv="auto (bf16)", prefix_caching=True,
                     step_tokens=STOCK_STEP_TOKENS,
                     max_num_seqs=STOCK_MAX_SEQS,
@@ -331,13 +333,15 @@ def stock_side(n_docs: int = 1000) -> str:
         filter_bits_rep=bits2, filter_margins_rep=margins2,
         join_bits=jbits, join_margins=jmargins,
         join_bits_rep=jbits2, join_margins_rep=jmargins2)
-    return _write(report, "accuracy_stock_raw")
+    tag = "" if spec.name == "qwen3-4b-fp8" else "_32b"
+    return _write(report, f"accuracy_stock_raw{tag}")
 
 
 # --------------------------------------------------------- quail side
 
 @app.function(timeout=5400, **GPU_KW)
-def quail_side(n_docs: int = 1000) -> str:
+def quail_side(n_docs: int = 1000,
+               model: str = "qwen3-4b-fp8") -> str:
     """The packed executor's real loops under each attention path on
     the same token streams, plus the production two-round sequence."""
     import sys
@@ -349,7 +353,6 @@ def quail_side(n_docs: int = 1000) -> str:
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
-    from corpus import MODEL
     from quail.executor.arena import KVArena
     from quail.executor.attention import (FILTER_ATTENTION,
                                           JOIN_ATTENTION, Pipeline)
@@ -357,14 +360,14 @@ def quail_side(n_docs: int = 1000) -> str:
                                      run_join, warm_kernels)
     from quail.executor.model import load_model
     from quail.planner import budgets
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+    from quail.specs import H100_SXM, MODELS
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    spec = MODELS[model]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
     body_ids, q_ids, _, kinds = build_filter_corpus(tokenizer, n_docs)
     anchor_ids, frame_ids, suffix_ids, _ = build_join_corpus(tokenizer)
 
-    model = load_model(MODEL)
-    spec = QWEN3_4B_FP8
+    model_mod = load_model(spec.hf_name)
     chunk = budgets.chunk_budget(spec, H100_SXM)
     arena_tok = budgets.arena_tokens(spec, H100_SXM, chunk)
     arena = KVArena(n_layers=spec.layers,
@@ -372,8 +375,8 @@ def quail_side(n_docs: int = 1000) -> str:
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena, kernels="quail")
-    answerer = Answerer(torch, F, model, tokenizer)
+    pipeline = Pipeline(model_mod, arena, kernels="quail")
+    answerer = Answerer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     budget = min(chunk, pipeline.max_chunk_tokens)
 
@@ -428,26 +431,30 @@ def quail_side(n_docs: int = 1000) -> str:
             JOIN_ATTENTION])
 
     report = dict(
-        cell="quail_side", n_docs=n_docs, kinds=kinds, walls=walls,
+        cell="quail_side", model=spec.name, n_docs=n_docs,
+        kinds=kinds, walls=walls,
         assignment=dict(filters=FILTER_ATTENTION, joins=JOIN_ATTENTION),
         mode_switch_clean=bool(mode_switch_clean),
         filters=filters, joins=joins)
-    return _write(report, "accuracy_quail_raw")
+    tag = "" if spec.name == "qwen3-4b-fp8" else "_32b"
+    return _write(report, f"accuracy_quail_raw{tag}")
 
 
 # --------------------------------------------------------- comparison
 
 @app.function(timeout=1800, image=image,
               volumes={"/results": results_vol})
-def combine(n_docs: int = 1000) -> str:
+def combine(n_docs: int = 1000,
+            model: str = "qwen3-4b-fp8") -> str:
     """Read both raw answer sets from the results volume and build
     the comparison report (CPU only)."""
     import numpy as np
 
+    tag = "" if model == "qwen3-4b-fp8" else "_32b"
     results_vol.reload()
-    with open("/results/ablations/accuracy_stock_raw.json") as f:
+    with open(f"/results/ablations/accuracy_stock_raw{tag}.json") as f:
         stock = json.load(f)
-    with open("/results/ablations/accuracy_quail_raw.json") as f:
+    with open(f"/results/ablations/accuracy_quail_raw{tag}.json") as f:
         quail = json.load(f)
     assert stock["n_docs"] == quail["n_docs"] == n_docs
 
@@ -586,7 +593,7 @@ def combine(n_docs: int = 1000) -> str:
             key_accuracy_stock=round(good_s / total, 4))
 
     report = dict(
-        cell="accuracy_vs_stock", n_docs=n_docs,
+        cell="accuracy_vs_stock", model=model, n_docs=n_docs,
         stock_config=stock["config"],
         stock_self_control=control,
         stock_join_control=join_control,
@@ -599,30 +606,30 @@ def combine(n_docs: int = 1000) -> str:
                  for m in ("split", "merge_quant", "unified")},
         join={m: compare_join(m)
               for m in ("split", "merge_quant")})
-    return _write(report, "accuracy_vs_stock")
+    return _write(report, f"accuracy_vs_stock{tag}")
 
 
 @app.local_entrypoint()
-def run_all(n_docs: int = 1000):
-    sh = stock_side.spawn(n_docs)
-    qh = quail_side.spawn(n_docs)
+def run_all(n_docs: int = 1000, model: str = "qwen3-4b-fp8"):
+    sh = stock_side.spawn(n_docs, model)
+    qh = quail_side.spawn(n_docs, model)
     print(f"stock fc: {sh.object_id}", flush=True)
     print(f"quail fc: {qh.object_id}", flush=True)
     sh.get()
     qh.get()
-    print(combine.remote(n_docs))
+    print(combine.remote(n_docs, model))
 
 
 @app.local_entrypoint()
-def run_combine(n_docs: int = 1000):
-    print(combine.remote(n_docs))
+def run_combine(n_docs: int = 1000, model: str = "qwen3-4b-fp8"):
+    print(combine.remote(n_docs, model))
 
 
 @app.local_entrypoint()
-def run_quail_only(n_docs: int = 1000):
+def run_quail_only(n_docs: int = 1000, model: str = "qwen3-4b-fp8"):
     """Re-run the Quail side against an already-written stock raw
     file, then combine."""
-    qh = quail_side.spawn(n_docs)
+    qh = quail_side.spawn(n_docs, model)
     print(f"quail fc: {qh.object_id}", flush=True)
     qh.get()
-    print(combine.remote(n_docs))
+    print(combine.remote(n_docs, model))

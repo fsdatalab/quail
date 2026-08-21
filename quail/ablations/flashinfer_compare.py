@@ -172,7 +172,9 @@ def _median_ms(torch, fn, iters=20):
 
 
 @app.function(timeout=2400, **GPU_KW)
-def bench() -> str:
+def bench(q_heads: int = 32) -> str:
+    """q_heads=32 is the 4B geometry (4:1 GQA); 64 is the 32B
+    geometry (8:1 GQA)."""
     import math
     from types import SimpleNamespace
 
@@ -184,7 +186,7 @@ def bench() -> str:
     from quail.executor.loop import pack_chunk
 
     torch.manual_seed(7)
-    H, KH, D = 32, 8, 128
+    H, KH, D = q_heads, 8, 128
     PAGE = 16
 
     weight = SimpleNamespace(shape=(4096, 4096))
@@ -480,6 +482,7 @@ def bench() -> str:
 
     report = dict(
         cell="flashinfer_bench", flashinfer=fi_version,
+        q_heads=H, kv_heads=KH,
         prediction=(
             "Two-call stacks within tens of percent of each other; "
             "FA3 unified stays ahead on the filter shapes unless "
@@ -513,9 +516,10 @@ def bench() -> str:
                       f"fi-vs-fa3 max_abs "
                       f"{row['flashinfer']['fi_unified_max_abs_vs_fa3']}",
                       flush=True)
-    return _write(report, "flashinfer_bench")
+    tag = "" if H == 32 else f"_{H}h"
+    return _write(report, f"flashinfer_bench{tag}")
 
 
 @app.local_entrypoint()
-def run_bench():
-    print(bench.remote())
+def run_bench(q_heads: int = 32):
+    print(bench.remote(q_heads))
