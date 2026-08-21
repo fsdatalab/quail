@@ -24,7 +24,7 @@ payload to the worker, which calls the executor.
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
-| `planner/calibration.py` | Measured constants (a, a2, q_kv) and scaling | specs |
+| `planner/calibration.py` | Measured constants (a, a2) and scaling | specs |
 | `planner/calibrate.py` | Length-sweep measure of a and a2 | calibration, executor |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
 | `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, calibration, plan |
@@ -67,17 +67,18 @@ worker.execute (runtime/worker.py, on Modal GPU)
   |
   v
 _assemble (runtime/session.py)
-  gates, replay-checks, projects -> Result
+  gates, assembles tuples, projects -> Result
 ```
 
 ## 1. System overview
 
 Quail (QUery-Aware Inference Layer) is a query engine for two
 operators over document collections: `AI_FILTER` (does this document
-satisfy a yes/no predicate?) and `AI_JOIN` (does this pair of
-documents satisfy a yes/no predicate?). The model answers each
-predicate in a single token (YES or NO), constrained at decode time
-so no autoregressive generation ever runs.
+satisfy a yes/no predicate?) and `AI_JOIN` (does this tuple of
+documents - two or more, all in one prompt - satisfy a yes/no
+predicate?). The model answers each predicate in a single token
+(TRUE or FALSE), constrained at decode time so no autoregressive
+generation ever runs.
 
 The current scope is filter queries and joins, Qwen3 4B fp8 weights,
 bf16 KV, on one or more H100 GPUs hosted on Modal.
@@ -93,15 +94,18 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
 4. The `Session` tokenizes each scanned column (cached per session)
    and calls the planner with the token counts.
 5. The planner produces a `PhysicalPlan`: stage order, anchor
-   choices, KV dtype, chunk budget, admission budget, sharding, and
-   a store length threshold. No wall-time prediction is produced.
+   choices, chunk budget, admission budget, sharding, and a store
+   length threshold. KV is always bf16. No wall-time prediction is
+   produced.
 6. The session builds a payload (token id lists and planned settings)
    and ships it to a Modal worker over RPC.
-7. The worker runs the packed executor on the GPU: filter chains and
-   join stages, with gating between stages.
+7. The worker runs the packed executor on the GPU: filter chains,
+   exists/anti gates, and the one full join (a single cross-product
+   stage, however many tables it spans).
 8. The worker returns raw answer rows. The session assembles output
-   tuples, runs a replay check (for multi-join chains), applies the
-   projection, and returns a `Result`.
+   tuples from the full join's YES rows (each member checked against
+   its table's final survivor set), applies the projection, and
+   returns a `Result`.
 
 ## 2. Query compilation
 
@@ -122,21 +126,34 @@ There are four operators, defined in `logical.py`:
   single scanned column. Each predicate has a prompt template, column
   references, and an optional selectivity (the fraction of documents
   expected to pass).
-- **SemanticJoin**: a yes/no predicate over a pair of documents from
-  two different scans. Supports three semantics:
-  - `full`: produce every matching (left, right) pair.
-  - `exists`: keep left documents that match at least one right
-    document (a semi-join).
-  - `anti`: keep left documents that match no right document (an
-    anti-join).
+- **SemanticJoin**: one yes/no predicate over a whole tuple of
+  documents, one per table - the cross product of its tables
+  filtered by a single prompt that holds every document at once
+  (the BigQuery/Snowflake AI-join shape; never a chain of pairwise
+  stages). A query has at most one `full` join, plus any number of
+  gates:
+  - `full`: produce every matching tuple.
+  - `exists`: keep outer documents that match at least one inner
+    document (a semi-join; two tables).
+  - `anti`: keep outer documents that match no inner document (an
+    anti-join; two tables).
 - **Project**: column selection at the root. No computed columns.
 
 ### Prompt layout
 
-Every operator's prompt is rewritten to one layout before it runs:
+Every operator's prompt starts from the same anchor block. A filter
+runs as:
 
 ```
-[SHARED_PRE] [document] [frame] [suffix]
+[SHARED_PRE] [document] [frame] [question suffix]
+```
+
+and a join renders each tuple as the anchor block, its naming line,
+then one labeled block per partner and the question:
+
+```
+[SHARED_PRE] [anchor document] [naming line: (The document above is {0}.)]
+[DOCUMENT {1}:] [partner document] ... [instruction + question with {0},{1},... markers kept]
 ```
 
 `SHARED_PRE` is `"DOCUMENT:\n"`, defined once in `logical.py`. It is
@@ -156,7 +173,7 @@ dropped it to 0.0014. `"DOCUMENT:\n"` left it at 0.397. Long
 documents (B4) were immune to all three. Task text therefore lives
 after the document, in the frame and the suffix.
 
-A user's `PROMPT('template {0} ...', cols...)` is canonicalized at
+A filter's `PROMPT('template {0} ...', col)` is canonicalized at
 bind time (`split_frame` in `logical.py`). Any user text before the
 first placeholder is stripped out and becomes the frame. The
 canonical template is `SHARED_PRE`, then `{0}` (the document the
@@ -165,15 +182,26 @@ is document-only: `[SHARED_PRE + document]`. The frame is not
 stored.
 
 A filter carries the frame at the head of each stage's question
-suffix. A join writes the frame into the anchor's kept KV once per
-anchor (`write_suffix_tokens`), so pairs read it from KV instead of
-paying its tokens per pair. On B5, putting that frame in the
-per-pair suffix added 6.1M fresh tokens and 95 s.
+suffix. A join prompt is bound differently (`bind_join_prompt`):
+the template is never inlined - each tuple renders as labeled
+document blocks (the anchor first, under the bare `SHARED_PRE`
+label) followed by the template as the question, appended verbatim
+with its `{0}`, `{1}`, ... placeholder markers kept as written.
+Each partner block is labeled with its own marker
+(`DOCUMENT {1}:`, `DOCUMENT {2}:`, etc.), so a marker in the
+question resolves to its block. The anchor's naming line -
+"(The document above is {0}.)" - is written into its kept KV
+once per anchor (`write_suffix_tokens`, the same mechanism the
+old frame used), mapping the top block to its marker so the
+question can reference it without paying those tokens per tuple.
+Partner block labels and the question ride in every tuple's
+suffix.
 
-The planner prices the preamble once per document and the frame
-once per filter document or once per join anchor, never per pair.
-See `logical.py` (`SHARED_PRE`, `split_frame`, `bind_prompt`) and
-the suite writeup `2026-08-19-shared-preamble-join-store.md`.
+The planner prices the preamble once per document, the naming line
+once per join anchor, and labels + question once per tuple. See
+`logical.py` (`SHARED_PRE`, `split_frame`, `bind_prompt`,
+`bind_join_prompt`) and the suite writeup
+`2026-08-19-shared-preamble-join-store.md`.
 
 ### AI SQL front end
 
@@ -182,16 +210,18 @@ in the Snowflake dialect. `AI_FILTER(PROMPT(...))` appears in WHERE
 conjuncts; join predicates appear in `JOIN ... ON` clauses; `EXISTS`
 and `NOT EXISTS` subqueries map to exists and anti semantics.
 
-The front end rejects every relational operator except projection:
-GROUP BY, ORDER BY, LIMIT, DISTINCT, HAVING, UNION, INTERSECT,
+The front end rejects every relational operator except projection
+and LIMIT: GROUP BY, ORDER BY, DISTINCT, HAVING, UNION, INTERSECT,
 EXCEPT, window functions, OR between AI predicates, and subqueries
-other than the EXISTS form. The rejection list is explicit
+other than the EXISTS form. LIMIT N stops the filter loop once N
+survivors are found (early termination); the builder equivalent is
+`.limit(n)` before `.select()`. The rejection list is explicit
 (`compile.py:22-33`), so new SQL surface cannot enter silently.
 
 ### Builder API
 
 The builder (`builder.py`) mirrors the SQL constructs: `docs()`,
-`.alias()`, `.ai_filter()`, `.ai_join()`, `.select()`. The builder
+`.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. The builder
 always uses `as_written` order (the chain order is the execution
 order). Both entry points collect the same `QueryDesc` and call the
 same `assemble_plan`, so the plans are structurally identical.
@@ -247,24 +277,29 @@ documents it kills (1 minus selectivity). A selectivity of 1 (kills
 nothing) goes last. When any filter lacks a selectivity, `as_written`
 is used.
 
-**Join stage order** (`decide.py:135`): when multiple joins exist and
-all carry selectivities, the planner enumerates connected
-permutations (typically 2 to 4 tables, so the enumeration is small)
-and picks the one with the smallest survivor-thinned pair-token
-total. The survivor thinning uses: `n * (1 - (1-s)^partners)` for
-the expected distinct documents surviving each stage
-(`decide.py:107`).
+**Join order** (`order_joins` in `decide.py`): when several join
+specs exist (exists/anti gates plus at most one full join) and all
+carry selectivities, the planner enumerates the permutations
+(typically 2 to 4 specs, so the enumeration is small) and picks the
+one with the smallest survivor-thinned tuple-token total. Every
+spec is self-contained (the cross product over its own tables), so
+every order runs; order changes cost, never results. The survivor
+thinning uses `n * (1 - (1-s)^partner_tuples)` for the expected
+documents in some passing tuple (`_surviving_docs`).
 
-**Anchor selection** (`decide.py:171`): for each join stage, the
-planner picks the side whose pair-token total is smaller when the
-other side streams. In practice, the longer side anchors (anchor
-tokens are paid once per document, partner tokens once per pair). A
-user override wins, with a remark when it prices worse.
+**Anchor selection** (`choose_anchor` in `decide.py`): for each
+join, the planner picks the table whose tuple-token total is
+smallest when the other tables stream. In practice, the side with
+the most document tokens anchors (anchor tokens are paid once per
+document, partner tokens once per tuple). A user override wins,
+with a remark when it prices worse; an exists/anti gate always
+anchors on the outer table, because the gate applies to it.
 
-**Sharding** (`decide.py:193`): greedy balance by token count across
-workers. Filters split documents; joins split anchor documents (every
-pair belongs to exactly one anchor, so gating, dedup, and the next
-stage's pair list stay local to the GPU holding the anchor).
+**Sharding** (`balanced_shards` in `decide.py`): greedy balance by
+token count across workers. Filters split documents; joins split
+anchor documents (every tuple belongs to exactly one anchor, so
+gating and each anchor's tuple stream stay local to the GPU holding
+the anchor).
 
 ### Pseudocode: filter order decision
 
@@ -281,25 +316,15 @@ sort predicates by cost (stable, so ties keep written order)
 ### Pseudocode: anchor selection
 
 ```
-for each side (left, right) of the join:
-    compute pair_tokens(side as anchor) =
-        n_anchor_docs * mean_anchor_tokens          (prefix, once each)
-      + n_anchor_docs * n_partner_docs               (number of pairs)
-        * (mean_partner_tokens + question_tokens)    (suffix, once each)
-pick the side with fewer pair_tokens as anchor
-```
-
-### Pseudocode: KV dtype argmin
-
-```
-tax = q_kv * fresh_tokens
-saving = 0
-if store exists and restored_tokens > 0:
-    saving += (kappa_bf16 - kappa_fp8) / store_bandwidth * restored_tokens
-if tax < saving:
-    pick fp8
-else:
-    pick bf16
+for each table of the join:
+    compute tuple_tokens(table as anchor) =
+        n_anchor_docs                                (prefix + naming
+        * (mean_anchor_tokens + pre + note_tokens)    line, once each)
+      + product of every table's n_docs              (number of tuples)
+        * (sum over partners of
+             (label_tokens + mean_partner_tokens)
+           + question_tokens)                        (suffix, once each)
+pick the table with the fewest tuple_tokens as anchor
 ```
 
 ### Settings from the spec structs
@@ -337,10 +362,10 @@ attention term dominates.
 
 ### Decisions that use calibration constants
 
-Two decisions compare compute cost against byte-transfer cost and
-therefore need measured constants.
+One decision compares compute cost against byte-transfer cost and
+therefore needs measured constants.
 
-**Access per scan** (`decide.py:252`): `read` (compute the
+**Access per scan** (`decide.py:314`): `read` (compute the
 document's KV from scratch) or `restore` (load KV from the pinned
 host store). Restore wins when the store's bandwidth beats
 `kappa / a` (the serving rate expressed as KV bytes per second), or
@@ -351,32 +376,18 @@ The crossover is: solve `kappa / bw = a + a2 * h` for `h`, where
 bandwidth of 55 GB/s, restore wins at every document length for the
 4B model.
 
-**KV dtype selection** (`decide.py:263`): bf16 or fp8 for the KV
-arena. The argmin is one inequality per query:
-
-    fp8 wins iff q_kv * fresh_tokens
-                 < (kappa_bf16 - kappa_fp8) / bw * restored_tokens
-
-`q_kv` is the measured per-token cost of converting bf16 KV to fp8.
-A cold query (no restored tokens) always picks bf16, because fp8
-saves nothing on fresh tokens and pays the conversion tax. A warm
-query with many restored tokens can pick fp8, because the halved KV
-size lets the store transfer twice as fast.
-
-Note: the fp8 KV arena is not built yet (issue #5), so the planner
-currently overrides the argmin to bf16 when it would pick fp8
-(`decide.py:392-397`).
+KV is always bf16. The planner does not choose a KV dtype and does
+not model a conversion tax.
 
 ## 4. Calibration
 
-The planner's break-even decisions use three measured constants per
+The planner's restore break-even uses two measured constants per
 (model, device) pair, stored as JSON in `calibration/`:
 
 | Constant | Meaning |
 |---|---|
 | `a` (s/token) | Wall seconds per fresh token in the packed loop, efficiency included |
-| `a2` (s/token^2) | The quadratic attention coefficient; bends the break-evens for long documents |
-| `q_kv` (s/token) | The fp8 KV conversion tax per fresh token |
+| `a2` (s/token^2) | The quadratic attention coefficient; bends the restore break-even for long documents |
 
 A model/device pair without a calibration file gets defaults scaled
 from the anchor measurement (Qwen3 4B on H100) using spec ratios: a
@@ -405,19 +416,18 @@ single forward pass, sharing KV across them through a paged arena.
 
 | Function | File | What it does |
 |---|---|---|
-| `plan_query` | `decide.py:285` | Top-level: logical plan + token counts -> physical plan or refusal |
-| `order_filters_indexed` | `decide.py:81` | Sort filter stages by cost-per-killed-document |
-| `order_joins` | `decide.py:135` | Pick the join stage order that minimizes total pair tokens |
-| `choose_anchor` | `decide.py:171` | Pick the cheaper anchor side for a join |
-| `choose_kv_dtype` | `decide.py:263` | The fp8 vs bf16 argmin over fresh and restored tokens |
-| `balanced_shards` | `decide.py:193` | Greedy-balance documents across workers by token count |
-| `access_for_scan` | `decide.py:252` | Decide read vs restore for a scanned corpus |
-| `store_length_threshold` | `decide.py:222` | Length cutoff for which documents to store |
-| `chunk_budget` | `budgets.py:62` | Tokens per forward pass (min of memory and kernel bounds) |
-| `arena_tokens` | `budgets.py:69` | KV residency budget (device memory minus weights and activations) |
-| `load_calibration` | `calibration.py:80` | Load or spec-scale the calibration constants |
+| `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
+| `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
+| `order_joins` | `decide.py` | Order the join specs (gates + the one full join) by total tuple tokens |
+| `choose_anchor` | `decide.py` | Pick the cheapest anchor table for a join |
+| `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
+| `access_for_scan` | `decide.py` | Decide read vs restore for a scanned corpus |
+| `store_length_threshold` | `decide.py` | Length cutoff for which documents to store |
+| `chunk_budget` | `budgets.py` | Tokens per forward pass (min of memory and kernel bounds) |
+| `arena_tokens` | `budgets.py` | KV residency budget (device memory minus weights and activations) |
+| `load_calibration` | `calibration.py` | Load or spec-scale the calibration constants |
 | `measure` | `calibrate.py` | Length sweep + affine fit of a, a2 (GPU) |
-| `commit_calibration` | `calibration.py` | Write the three constants to the pair file |
+| `commit_calibration` | `calibration.py` | Write the two constants to the pair file |
 
 ### 5.1 Chunk packing
 
@@ -642,10 +652,10 @@ RMS-normalized. These are the inputs to the answer readout.
 ### 5.5 Answer readout
 
 The `Answerer` (`loop.py:60`) scores the final hidden states against
-only the YES and NO token embeddings (not the full vocabulary). It
+only the TRUE and FALSE token embeddings (not the full vocabulary). It
 projects the normed hidden state through a sub-selected `lm_head`
-weight matrix (only the rows for YES/NO token ids), takes the argmax
-within the YES set and within the NO set, and compares.
+weight matrix (only the rows for TRUE/FALSE token ids), takes the argmax
+within the TRUE set and within the FALSE set, and compares.
 
 `AsyncAnswers` (`loop.py:92`) makes the readout non-blocking: it
 computes the answer bits on GPU, copies them to pinned host memory
@@ -665,12 +675,12 @@ answers. This overlaps GPU compute with answer readback.
 | `Pipeline.custom_norm_quant` | `attention.py:235` | Fused residual-add + RMSNorm + fp8 quant (Triton) |
 | `Pipeline.custom_qk_norm_rope` | `attention.py:248` | Fused QK-norm + RoPE (Triton) |
 | `pack_chunk` | `loop.py:125` | Build GPU tensors for one chunk from group specs (all index tensors staged through pinned memory) |
-| `pack_stream` | `pack.py:57` | Brim-pack a pair list into chunks (join path) |
+| `pack_stream` | `pack.py:57` | Brim-pack the join's tuple list into chunks (join path) |
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
 | `run_filter` | `loop.py:462` | The filter chain execution loop |
-| `run_join` | `loop.py:241` | The join execution loop with gating between stages |
+| `run_join` | `loop.py:241` | The join execution loop (one cross-product stage per join; multi-stage gating stays available to GPU cells) |
 | `warm_kernels` | `loop.py:387` | Pre-compile all DeepGEMM and Triton kernel configs |
-| `Answerer` | `loop.py:60` | YES/NO scoring from final hidden states |
+| `Answerer` | `loop.py:60` | TRUE/FALSE scoring from final hidden states |
 | `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
 
 ### 5.6 The overlapped execution loop
@@ -826,33 +836,25 @@ stage boundary. The `already_kept` parameter tells the packer which
 anchors' KV is already resident, so their groups do not pack fresh
 prefix tokens.
 
-### Pseudocode: join gating, dedup, and replay
+### Pseudocode: the n-way join as one cross-product stage
 
 ```
-# stage 1: anchor B joined with partner A
-for each anchor group:
-    plan = pack_stream(anchors, suffix_lists, budget,
-                       keep = {all anchors if stage 2 exists})
-    for each chunk in plan:
-        build, launch, collect answers
-    gate: survivors = anchors where any partner answered YES
-    free pages for non-survivors
+# the join: anchor B, partners A and C, one prompt per tuple
+tuples = cross product of surviving A indices x surviving C indices
+suffixes = for each tuple:
+    label_A + doc_A + label_C + doc_C + question
+plan = pack_stream(anchors, suffixes, budget)
+for each chunk in plan:
+    # each anchor's first group writes the naming line into its
+    # kept KV (write_suffix_tokens), then its tuples stream
+    build, launch, collect answers
 
-# stage 2: surviving anchor B joined with partner C
-# replay: survivors' KV is already in the arena (kept from stage 1)
-    plan = pack_stream(survivor_anchors, suffix_lists_C, budget,
-                       already_kept = {all survivors})
-    # dedup: each survivor appears once, regardless of how many
-    # A partners it matched in stage 1
-    for each chunk in plan:
-        # groups have carried=false (prefix not packed)
-        # call B reads the anchor's KV from arena pages
-        build, launch, collect answers
+# an exists/anti gate is the two-table case of the same stage,
+# with the keep rule applied to the anchor's answers
 
-# assemble output: for each surviving B,
-#   for each A that matched B in stage 1,
-#     for each C that matched B in stage 2,
-#       emit (A, B, C)
+# assemble output: for each anchor B with YES rows,
+#   for each YES tuple (A, C) whose members survive their tables'
+#   final gates, emit (B, A, C)
 ```
 
 ## 7. The KV store

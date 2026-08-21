@@ -10,7 +10,7 @@ Grouped by input:
 - Settings from the spec structs alone: the admission budget and the
   chunk budget (quail.planner.budgets).
 - Decisions that compare compute against bytes (the only consumers of
-  measured constants): access per scan, and the KV dtype argmin.
+  measured constants): access per scan. KV is always bf16.
 
 Pushdown is not a decision at all: filters attach above their scans in
 the logical plan, so a filter always runs before the joins its
@@ -34,16 +34,17 @@ from quail.specs import DeviceSpec, ModelSpec
 def _collect(plan: LogicalPlan):
     """(scans, filters_by_alias, join_specs_in_written_order).
 
-    The tree is left-deep by construction (assemble_plan folds joins
-    left to right), so an in-order walk recovers written order."""
+    Each join's first input is the accumulated tree (assemble_plan
+    folds specs in written order), so an in-order walk recovers
+    written order."""
     scans, filters, joins = [], {}, []
 
     def walk(node):
         if isinstance(node, Project):
             walk(node.input)
         elif isinstance(node, SemanticJoin):
-            walk(node.left)
-            walk(node.right)
+            for child in node.inputs:
+                walk(child)
             joins.append(node)
         elif isinstance(node, SemanticFilter):
             walk(node.input)
@@ -118,69 +119,106 @@ def order_filters(predicates, rule: str):
 
 
 def _surviving_docs(n_docs: float, n_partners: float,
-                    pair_selectivity: float) -> float:
+                    tuple_selectivity: float) -> float:
     """Expected distinct documents left with at least one matching
-    pair: n * (1 - (1-s)^partners)."""
-    if pair_selectivity is None:
+    tuple: n * (1 - (1-s)^partner_tuples)."""
+    if tuple_selectivity is None:
         return n_docs
-    return n_docs * (1.0 - (1.0 - pair_selectivity) ** max(1, n_partners))
+    return n_docs * (1.0 - (1.0 - tuple_selectivity)
+                     ** max(1.0, n_partners))
+
+
+def _join_aliases(join) -> list:
+    """The join's table aliases, placeholder order (each placeholder
+    names a distinct table, checked at bind time)."""
+    return [r.alias for r in join.predicate.args]
+
+
+def _label_counts(join) -> dict:
+    """alias -> (block label tokens, anchor naming-line tokens), from
+    the bind-time counts the prompt carries."""
+    out = {a: (lt, nt) for a, lt, nt in join.predicate.labels}
+    if any(lt is None for lt, _ in out.values()):
+        raise ValueError(
+            "join prompts were bound without a tokenizer; the planner "
+            "needs token counts (pass one to compile_sql / docs)")
+    return out
+
+
+def _cross_tuples(join, live: dict, anchor: str) -> float:
+    tuples = live[anchor]
+    for a in _join_aliases(join):
+        if a != anchor:
+            tuples *= live[a]
+    return tuples
 
 
 def _stage_tokens(join, live: dict, stats: dict, anchor: str,
                   pre_tokens: int = 0) -> float:
-    """Pair-token total of one stage at the current live counts: the
-    anchor prefixes (engine preamble, document, and the stage's frame
-    written into kept KV) once each, the partner document plus
-    question tail once per pair. The frame is per anchor, never per
-    pair - that is the point of writing it into kept KV."""
-    a1, a2 = _join_sides(join)
-    partner = a2 if anchor == a1 else a1
-    pairs = live[anchor] * live[partner]
-    frame = join.predicate.frame_tokens or 0
-    tail = _question_tokens(join.predicate) - frame
+    """Token total of one join at the current live counts. The join
+    is the cross product under one prompt: the anchor prefix (engine
+    preamble, document, naming line - kept KV) is paid once per
+    anchor document; every partner document with its block label,
+    plus the rendered question, is paid once per tuple."""
+    labels = _label_counts(join)
+    partners = [a for a in _join_aliases(join) if a != anchor]
+    tuples = _cross_tuples(join, live, anchor)
+    per_tuple = _question_tokens(join.predicate)
+    for p in partners:
+        per_tuple += stats[p].mean_doc_tokens + labels[p][0]
     return (live[anchor] * (stats[anchor].mean_doc_tokens + pre_tokens
-                            + frame)
-            + pairs * (stats[partner].mean_doc_tokens + tail))
+                            + labels[anchor][1])
+            + tuples * per_tuple)
 
 
-def _join_sides(join) -> tuple[str, str]:
-    aliases = []
-    for r in join.predicate.args:
-        if r.alias not in aliases:
-            aliases.append(r.alias)
-    return aliases[0], aliases[1]
+def _thin(live: dict, join, anchor: str) -> None:
+    """Update live counts past one join, for cost enumeration only.
+    full thins every table to the documents expected in some passing
+    tuple; exists keeps matched anchors; anti keeps unmatched ones."""
+    sel = join.selectivity
+    aliases = _join_aliases(join)
+
+    def others(x):
+        out = 1.0
+        for a in aliases:
+            if a != x:
+                out *= live[a]
+        return out
+
+    if join.semantics == "full":
+        new = {a: _surviving_docs(live[a], others(a), sel)
+               for a in aliases}
+        live.update(new)
+    elif sel is not None:
+        matched = _surviving_docs(live[anchor], others(anchor), sel)
+        live[anchor] = (matched if join.semantics == "exists"
+                        else live[anchor] - matched)
 
 
-def order_joins(joins, rule: str, stats: dict, first_alias: str,
-                anchors: dict, pre_tokens: int = 0):
-    """Join stage order over the join graph: enumerate the connected
-    permutations (2-4 relations, trivial) and compare survivor-thinned
-    pair-token totals. All candidates run at the same rate, so the
-    comparison is pure token counting."""
+def order_joins(joins, rule: str, stats: dict, anchors: dict,
+                pre_tokens: int = 0):
+    """Join order over the specs (the gates and the one full join):
+    enumerate the permutations (2-4 specs, trivial) and compare
+    survivor-thinned token totals. Every spec is self-contained - the
+    cross product over its own tables - so every order runs; order
+    changes cost, never results. All candidates run at the same rate,
+    so the comparison is pure token counting."""
     if rule == "as_written" or len(joins) <= 1:
         return list(joins)
 
     def total(order):
         live = {a: float(s.n_docs) for a, s in stats.items()}
-        scope = {first_alias}
         tokens = 0.0
         for j in order:
-            a1, a2 = _join_sides(j)
-            if a1 not in scope and a2 not in scope:
-                return None    # disconnected: not a runnable order
-            scope.update((a1, a2))
             anchor = anchors[id(j)]
             tokens += _stage_tokens(j, live, stats, anchor, pre_tokens)
-            partner = a2 if anchor == a1 else a1
-            n_a, n_p = live[anchor], live[partner]
-            live[anchor] = _surviving_docs(n_a, n_p, j.selectivity)
-            live[partner] = _surviving_docs(n_p, n_a, j.selectivity)
+            _thin(live, j, anchor)
         return tokens
 
     best, best_tokens = list(joins), total(list(joins))
     for perm in itertools.permutations(joins):
         t = total(list(perm))
-        if t is not None and (best_tokens is None or t < best_tokens):
+        if t < best_tokens:
             best, best_tokens = list(perm), t
     return best
 
@@ -189,22 +227,25 @@ def order_joins(joins, rule: str, stats: dict, first_alias: str,
 
 def choose_anchor(join, stats: dict,
                   pre_tokens: int = 0) -> tuple[str, list]:
-    """The side whose pair-token total is smaller when the other side
-    streams - in practice the longer side anchors (anchor tokens are
-    paid once per document, partner tokens once per pair). A user
-    override wins, with a remark when it prices worse."""
-    a1, a2 = _join_sides(join)
-    live = {a1: float(stats[a1].n_docs), a2: float(stats[a2].n_docs)}
+    """The table whose token total is smallest when the others stream
+    - in practice the side with the most document tokens anchors
+    (anchor tokens are paid once per document, partner tokens once
+    per tuple). A compile-time anchor (a user override, or the outer
+    table of an exists/anti gate) wins, with a remark when it prices
+    worse."""
+    aliases = _join_aliases(join)
+    live = {a: float(stats[a].n_docs) for a in aliases}
     cost = {a: _stage_tokens(join, live, stats, a, pre_tokens)
-            for a in (a1, a2)}
-    planner_pick = a1 if cost[a1] <= cost[a2] else a2
+            for a in aliases}
+    planner_pick = min(aliases, key=lambda a: cost[a])
     remarks = []
     if join.anchor is not None:
-        if join.anchor != planner_pick:
+        if join.anchor != planner_pick \
+                and cost[join.anchor] > cost[planner_pick]:
             remarks.append(
                 f"anchor {join.anchor!r} was forced; {planner_pick!r} "
                 f"prices lower ({cost[planner_pick]:,.0f} vs "
-                f"{cost[join.anchor]:,.0f} pair tokens)")
+                f"{cost[join.anchor]:,.0f} tuple tokens)")
         return join.anchor, remarks
     return planner_pick, remarks
 
@@ -226,7 +267,7 @@ def balanced_shards(doc_tokens, workers: int):
     return tuple(tuple(sorted(s)) for s in shards), loads
 
 
-# ------------------------------------- access and dtype (the break-evens)
+# ------------------------------------- access (the one break-even)
 
 def restore_crossover_tokens(model: ModelSpec, cal: Calibration,
                              read_bw: float) -> float:
@@ -281,32 +322,11 @@ def access_for_scan(stats: CorpusStats, model: ModelSpec,
     return "restore" if stats.mean_doc_tokens >= crossover else "read"
 
 
-def choose_kv_dtype(model: ModelSpec, cal: Calibration,
-                    fresh_tokens: float, restored_tokens: float,
-                    store_bw: float | None,
-                    overflow_recompute_saved_s: float = 0.0):
-    """The section-6 argmin, one inequality per query:
-
-        fp8 wins  iff  q_kv x fresh_tokens
-                       <  (kappa_bf16 - kappa_fp8) / bw x restored_tokens
-                          + overflow recompute saved by the 2x store
-
-    A cold query has zero restored tokens, so bf16 wins it by the full
-    conversion tax. Returns (dtype, fp8_cost_s, fp8_saving_s)."""
-    tax = cal.q_kv_s_per_token * fresh_tokens
-    saving = overflow_recompute_saved_s
-    if store_bw and restored_tokens:
-        elems = model.kv_elements_per_token
-        saving += (2.0 - 1.0) * elems * restored_tokens / store_bw
-    return ("fp8" if tax < saving else "bf16", tax, saving)
-
-
 # ---------------------------------------------------------- the planner
 
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                store: StoreSpec | None = None,
-               kv_dtype: str | None = None,
                order: str | None = None,
                calibration: Calibration | None = None):
     """LogicalPlan + corpus token counts -> PhysicalPlan | Refusal.
@@ -334,13 +354,23 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
     chunk = budgets.chunk_budget(model, device)
     pre = _preamble_tokens(filters, joins)
-    max_tail = max((_question_tokens(p.prompt)
-                    for fs in filters.values() for p in fs),
-                   default=0)
-    max_tail = max([max_tail] + [_question_tokens(j.predicate)
-                                 for j in joins])
+
+    # anchors come before the chunk refusal: a join's atomic suffix
+    # (every partner document plus the question) depends on which
+    # table anchors
+    anchors = {}
+    for j in joins:
+        anchor, notes = choose_anchor(j, stats, pre)
+        anchors[id(j)] = anchor
+        remarks.extend(notes)
+
+    needs = []      # the largest single admission each operator makes
     for s in scans:
-        need = pre + stats[s.alias].max_doc_tokens + max_tail
+        fq = max((_question_tokens(p.prompt)
+                  for p in filters.get(s.alias, ())), default=None)
+        if fq is None:
+            continue
+        need = pre + stats[s.alias].max_doc_tokens + fq
         if need > chunk:
             return Refusal(
                 reasons=(f"a document of {s.alias!r} plus the engine "
@@ -350,85 +380,60 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                          f"hold it",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
+        needs.append(need)
+    for j in joins:
+        anchor = anchors[id(j)]
+        labels = _label_counts(j)
+        partners = [a for a in _join_aliases(j) if a != anchor]
+        need = (pre + stats[anchor].max_doc_tokens + labels[anchor][1]
+                + sum(labels[p][0] + stats[p].max_doc_tokens
+                      for p in partners)
+                + _question_tokens(j.predicate))
+        if need > chunk:
+            return Refusal(
+                reasons=(f"one tuple of the join anchored on "
+                         f"{anchor!r} needs {need} tokens (the anchor "
+                         f"document, every partner document with its "
+                         f"label, and the question, all in one "
+                         f"prompt); the chunk budget is {chunk} and "
+                         f"suffixes are atomic - no chunk can ever "
+                         f"hold it",),
+                constraint="suffix_over_chunk",
+                needed=need, available=chunk, unit="tokens")
+        needs.append(need)
 
-    admission_bf16 = budgets.arena_tokens(model.with_kv_bytes(2.0),
-                                          device, chunk)
-    working_set = pre \
-        + max(stats[s.alias].max_doc_tokens for s in scans) \
-        + max_tail
-    if admission_bf16 < working_set and store is None:
+    admission = budgets.arena_tokens(model, device, chunk)
+    working_set = max(needs)
+    if admission < working_set and store is None:
         return Refusal(
-            reasons=(f"the arena holds {admission_bf16} tokens against "
+            reasons=(f"the arena holds {admission} tokens against "
                      f"a {working_set}-token working set and there is "
                      f"no store to spill to (cpu_memory_gb is 0)",),
             constraint="store_needed_but_disabled",
-            needed=working_set, available=admission_bf16, unit="tokens")
+            needed=working_set, available=admission, unit="tokens")
 
     # ---- order
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(filters, joins)
+    ordered_joins = order_joins(joins, rule, stats, anchors, pre)
 
-    anchors = {}
-    for j in joins:
-        anchor, notes = choose_anchor(j, stats, pre)
-        anchors[id(j)] = anchor
-        remarks.extend(notes)
-    first_alias = scans[0].alias
-    ordered_joins = order_joins(joins, rule, stats, first_alias,
-                                anchors, pre)
-
-    # ---- KV dtype: the argmin over this query's fresh and restored
-    # tokens (unless forced). Every KV-owning document pays the
-    # engine preamble once, so scans count pre per document.
     accesses = {s.alias: access_for_scan(stats[s.alias], model, cal,
                                          store) for s in scans}
-    fresh = sum(stats[s.alias].total_tokens
-                + stats[s.alias].n_docs * pre for s in scans
-                if accesses[s.alias] == "read")
-    restored = sum(stats[s.alias].total_tokens
-                   + stats[s.alias].n_docs * pre for s in scans
-                   if accesses[s.alias] == "restore")
     live = {a: float(st.n_docs) for a, st in stats.items()}
     for fs in filters.values():
         surv = 1.0
         for p in order_filters(fs, rule):
-            n = live[_filter_alias(p)]
-            fresh += n * surv * _question_tokens(p.prompt)
             surv *= p.selectivity if p.selectivity is not None else 1.0
         live[_filter_alias(fs[0])] *= surv
     join_token_counts = []
     for j in ordered_joins:
         anchor = anchors[id(j)]
-        a1, a2 = _join_sides(j)
-        partner = a2 if anchor == a1 else a1
-        pairs = live[anchor] * live[partner]
+        tuples = _cross_tuples(j, live, anchor)
         tokens = _stage_tokens(j, live, stats, anchor, pre)
-        join_token_counts.append((pairs, tokens))
-        # the anchor prefix term is already in the scan totals above
-        fresh += tokens - live[anchor] * (stats[anchor].mean_doc_tokens
-                                          + pre)
-        n_a, n_p = live[anchor], live[partner]
-        live[anchor] = _surviving_docs(n_a, n_p, j.selectivity)
-        live[partner] = _surviving_docs(n_p, n_a, j.selectivity)
+        join_token_counts.append((tuples, tokens))
+        _thin(live, j, anchor)
 
-    if kv_dtype is not None:
-        dtype, source_dtype = kv_dtype, f"forced kv_dtype={kv_dtype!r}"
-    else:
-        dtype, tax, saving = choose_kv_dtype(
-            model, cal, fresh, restored,
-            store.read_bw if store else None)
-        source_dtype = (f"argmin: fp8 tax {tax:.2f} s vs byte saving "
-                        f"{saving:.2f} s")
-        if dtype == "fp8":
-            # the fp8 arena's conversion kernels are not built yet;
-            # the argmin's preference is recorded, not executed
-            source_dtype += ("; fp8 priced lower but its arena is "
-                             "not built - running bf16")
-            dtype = "bf16"
-    remarks.append(f"kv_dtype={dtype} ({source_dtype})")
-    kv_bytes = 1.0 if dtype == "fp8" else 2.0
-    admission = budgets.arena_tokens(model.with_kv_bytes(kv_bytes),
-                                     device, chunk)
+    remarks.append("kv_dtype=bf16 (always)")
 
     store_min = 0
     if store is not None:
@@ -437,8 +442,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         all_lengths = [t + pre
                        for toks in doc_tokens.values() for t in toks]
         store_min = store_length_threshold(
-            all_lengths, store.capacity_bytes,
-            model.with_kv_bytes(kv_bytes).kappa)
+            all_lengths, store.capacity_bytes, model.kappa)
         if store_min > 1:
             stored = [t for t in all_lengths if t >= store_min]
             remarks.append(
@@ -472,25 +476,25 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             operators.append(dict(op="FilterChain", alias=s.alias,
                                   stages=stages))
     written = {id(j): i for i, j in enumerate(joins)}
-    for j, (pairs, tokens) in zip(ordered_joins, join_token_counts):
-        a1, a2 = _join_sides(j)
+    for j, (tuples, tokens) in zip(ordered_joins, join_token_counts):
         anchor = anchors[id(j)]
         operators.append(dict(
             op="JoinStage", written_pos=written[id(j)], anchor=anchor,
-            partner=a2 if anchor == a1 else a1,
+            partners=[a for a in _join_aliases(j) if a != anchor],
             semantics=j.semantics, selectivity=j.selectivity,
-            expected_pairs=round(pairs, 1),
-            pair_tokens=round(tokens, 1)))
+            expected_tuples=round(tuples, 1),
+            tuple_tokens=round(tokens, 1)))
     operators.append(dict(
         op="Sink",
         columns=[f"{c.alias}.{c.column}" for c in plan.root.columns]))
 
     return PhysicalPlan(
         model=model.name, device=device.name, workers=workers,
-        tensor_parallel=tp, kv_dtype=dtype, chunk_tokens=chunk,
+        tensor_parallel=tp, kv_dtype="bf16", chunk_tokens=chunk,
         admission_tokens=admission, order_rule=rule, order_source=source,
         calibration_source=cal.source,
         store_min_doc_tokens=store_min,
+        limit=plan.root.limit,
         operators=tuple(operators), remarks=tuple(remarks))
 
 
@@ -510,13 +514,15 @@ def explain(logical: LogicalPlan, physical) -> str:
         pad = "  " * (depth + 1)
         if isinstance(node, Project):
             cols = ", ".join(f"{c.alias}.{c.column}" for c in node.columns)
-            lines.append(f"{pad}Project [{cols}]")
+            lim = f" LIMIT {node.limit}" if node.limit is not None else ""
+            lines.append(f"{pad}Project [{cols}]{lim}")
             render(node.input, depth + 1)
         elif isinstance(node, SemanticJoin):
             lines.append(f"{pad}SemanticJoin ({node.semantics}, "
+                         f"x{len(node.inputs)} inputs, "
                          f"sel={node.selectivity}, anchor={node.anchor})")
-            render(node.left, depth + 1)
-            render(node.right, depth + 1)
+            for child in node.inputs:
+                render(child, depth + 1)
         elif isinstance(node, SemanticFilter):
             sels = [p.selectivity for p in node.predicates]
             lines.append(f"{pad}SemanticFilter (x{len(node.predicates)}, "
@@ -540,6 +546,8 @@ def explain(logical: LogicalPlan, physical) -> str:
                  f"kv_dtype={physical.kv_dtype}")
     lines.append(f"  chunk_tokens={physical.chunk_tokens} "
                  f"admission_tokens={physical.admission_tokens}")
+    if physical.limit is not None:
+        lines.append(f"  limit={physical.limit}")
     lines.append("  prompt layout: engine preamble + document + "
                  "suffix (preamble_tokens per stage below count the "
                  "shared preamble)")

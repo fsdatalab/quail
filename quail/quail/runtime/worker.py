@@ -1,19 +1,21 @@
 """The Modal worker: one container, one H100, one executor.
 
 Takes the coordinator's payload (token ids and the planned settings,
-nothing else), runs the filter chains and join stages on the packed
-executor, gates between stages next to the GPU, and returns the raw
-answer rows. The coordinator assembles tuples, replay-checks, and
-projects - it never sees a tensor.
+nothing else), runs the filter chains and the join stages on the
+packed executor, gates between stages next to the GPU, and returns
+the raw answer rows. The coordinator assembles tuples and projects -
+it never sees a tensor.
 
-Consecutive full-join stages sharing one anchor run as a single
-multi-stage run_join call, so the anchor's KV is computed in stage 1
-and read again in stage 2 - the cross-stage reuse the executor's kept
-KV exists for. exists/anti stages run alone; their early-stop
-optimization is not built yet, so they stream the full partner list
-and the keep rule is applied to the answers.
+A join stage is the cross product under one prompt: each anchor
+document's KV is computed once (kept, with the naming line written
+after it), and every tuple of the partner tables streams against it
+as one suffix - every partner document behind its block label, then
+the question. exists/anti gates run the same way over one partner
+table and apply the keep rule to the answers; their early-stop
+optimization is not built yet, so they stream the full list.
 """
 
+import itertools
 import json
 import os
 import time
@@ -75,10 +77,8 @@ def execute(payload: dict) -> dict:
     from quail.specs import DEVICES, MODELS
 
     if payload["kv_dtype"] != "bf16":
-        raise NotImplementedError(
-            "the fp8 KV arena is not built yet; the planner only "
-            "picks fp8 under warm-store pressure at scales the store "
-            "cannot hold in bf16")
+        raise ValueError(
+            f"KV is always bf16; got {payload['kv_dtype']!r}")
 
     spec = MODELS[payload["model"]]
     device = DEVICES["h100-sxm"]
@@ -114,10 +114,10 @@ def execute(payload: dict) -> dict:
     model, arena, pipeline = (booted["model"], booted["arena"],
                               booted["pipeline"])
     chunk = budgets.chunk_budget(spec, device)
-    # the worker has no tokenizer: the YES/NO token ids ride in the
+    # the worker has no tokenizer: the TRUE/FALSE token ids ride in the
     # payload
-    answerer = _PayloadAnswerer(torch, F, model, payload["yes_ids"],
-                                payload["no_ids"])
+    answerer = _PayloadAnswerer(torch, F, model, payload["true_ids"],
+                                payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
     budget = min(chunk, pipeline.max_chunk_tokens,
                  payload["chunk_tokens"])
@@ -181,7 +181,7 @@ def _execute_single(state, payload: dict) -> dict:
     # across operators; a partner document rides in the suffix raw
     pre = payload.get("pre_ids") or []
     answerer = _PayloadAnswerer(torch, state["F"], state["model"],
-                                payload["yes_ids"], payload["no_ids"])
+                                payload["true_ids"], payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
     budget = min(state["chunk"], pipeline.max_chunk_tokens,
                  payload["chunk_tokens"])
@@ -204,6 +204,7 @@ def _execute_single(state, payload: dict) -> dict:
     out_filters = {}
     store_stats = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
+    limit = payload.get("limit")
 
     t0 = time.perf_counter()
     with torch.inference_mode():
@@ -219,7 +220,7 @@ def _execute_single(state, payload: dict) -> dict:
                             if store_cfg else None),
                 store_min_tokens=(store_cfg["min_doc_tokens"]
                                   if store_cfg else 1),
-                stats=stats)
+                stats=stats, limit=limit)
             store_stats[alias] = stats
             total_tokens += tokens
             out_filters[alias] = {int(d): row
@@ -234,13 +235,13 @@ def _execute_single(state, payload: dict) -> dict:
             anchor_alias = group[0]["anchor"]
             anchors_glob = list(survivors[anchor_alias])
             stage_suffixes = []
-            partner_globs = []
+            tuple_globs = []
             for j in group:
-                partners = list(survivors[j["partner"]])
-                partner_globs.append(partners)
+                tuples = [list(t) for t in itertools.product(
+                    *[survivors[p] for p in j["partners"]])]
+                tuple_globs.append(tuples)
                 stage_suffixes.append(
-                    [j["mid"] + docs[j["partner"]][p] + j["tail"]
-                     for p in partners])
+                    [_tuple_suffix(j, docs, t) for t in tuples])
             prefixes = [pre + docs[anchor_alias][a]
                         for a in anchors_glob]
             jstats = {}
@@ -265,7 +266,7 @@ def _execute_single(state, payload: dict) -> dict:
                 out_joins.append(dict(
                     rows={int(a): row for a, row in ans[si].items()},
                     anchor_index=anchors_glob,
-                    partner_index=partner_globs[si]))
+                    partner_index=tuple_globs[si]))
             # gate the anchor set for stages after this group
             last = ans[len(group) - 1]
             kept = {anchors_glob[a] for a, row in last.items()
@@ -365,7 +366,7 @@ def _child_boot(state, sub):
                      chunk=chunk, warmed=False, store=None)
         boot["kind"] = "cold"
     answerer = _PayloadAnswerer(torch, F, state["model"],
-                                sub["yes_ids"], sub["no_ids"])
+                                sub["true_ids"], sub["false_ids"])
     state["async_ans"] = AsyncAnswers(torch, answerer)
     state["budget"] = min(state["chunk"],
                           state["pipeline"].max_chunk_tokens,
@@ -423,6 +424,7 @@ def _child_filters(state, sub):
                boot_s=boot["boot_s"], boot_kind=boot["kind"],
                boot=boot)
     pre = sub.get("pre_ids") or []
+    limit = sub.get("limit")
     t0 = _time.perf_counter()
     with torch.inference_mode():
         state["pipeline"].attention_mode = "unified"
@@ -439,7 +441,7 @@ def _child_filters(state, sub):
                             if store_cfg else None),
                 store_min_tokens=(store_cfg["min_doc_tokens"]
                                   if store_cfg else 1),
-                stats=stats, store_ids=index)
+                stats=stats, store_ids=index, limit=limit)
             out["store"][alias] = stats
             out["fresh_tokens"] += tokens
             out["filters"][alias] = {index[d]: row
@@ -473,13 +475,22 @@ def _child_joins(state, sub):
     with torch.inference_mode():
         state["pipeline"].attention_mode = "merge_quant"
         for group in _stage_groups(sub["joins"]):
-            stage_suffixes, partner_globs = [], []
+            stage_suffixes, tuple_globs = [], []
             for j in group:
-                partner = sub["partners"][j["partner"]]
-                partner_globs.append(list(partner["index"]))
+                # partner docs ride keyed by local position; tuples
+                # combine one local position per partner alias
+                locals_ = [range(len(sub["partners"][p]["index"]))
+                           for p in j["partners"]]
+                combos = list(itertools.product(*locals_))
+                tuple_globs.append(
+                    [[sub["partners"][p]["index"][c]
+                      for p, c in zip(j["partners"], combo)]
+                     for combo in combos])
+                part_docs = {p: sub["partners"][p]["docs"]
+                             for p in j["partners"]}
                 stage_suffixes.append(
-                    [j["mid"] + doc + j["tail"]
-                     for doc in partner["docs"]])
+                    [_tuple_suffix(j, part_docs, combo)
+                     for combo in combos])
             prefixes = [pre + anchor_docs[a] for a in live]
             jstats = {}
             ans, _, tokens = run_join(
@@ -506,7 +517,7 @@ def _child_joins(state, sub):
                     rows={int(a): row for a, row in ans[si].items()},
                     anchor_index=[anchors_glob[live[a]]
                                   for a in range(len(live))],
-                    partner_index=partner_globs[si]))
+                    partner_index=tuple_globs[si]))
             last = ans[len(group) - 1]
             kept = {a for a, row in last.items() if any(row)}
             if group[-1]["semantics"] == "anti":
@@ -555,10 +566,11 @@ def _execute_multi(payload: dict) -> dict:
     k = payload["workers"]
     shards = payload.get("shards", {})
     _ensure_children(k)
+    limit = payload.get("limit")
     t0 = _time.perf_counter()
     fouts = _round("filters",
                    coordinator.filter_round_payloads(payload, shards, k))
-    merged = coordinator.merge_filter_round(fouts)
+    merged = coordinator.merge_filter_round(fouts, limit=limit)
     out_joins = []
     if payload["joins"]:
         jsubs = coordinator.join_round_payloads(
@@ -615,6 +627,18 @@ def execute_8(payload: dict) -> dict:
     return _execute_multi(payload)
 
 
+def _tuple_suffix(join, docs, member) -> list:
+    """One tuple's stream: every partner document behind its block
+    label, then the rendered question. `member` holds one document
+    index per partner alias, in the join's partner order."""
+    out = []
+    for alias, g in zip(join["partners"], member):
+        out += join["labels"][alias]
+        out += docs[alias][g]
+    out += join["tail"]
+    return out
+
+
 def _stage_groups(joins):
     """Consecutive full stages sharing an anchor run as one gated
     multi-stage call; everything else runs alone. The anchor prefix
@@ -637,24 +661,24 @@ def _stage_groups(joins):
 
 
 class _PayloadAnswerer:
-    """The Answerer, built from YES/NO token ids shipped in the
+    """The Answerer, built from TRUE/FALSE token ids shipped in the
     payload instead of a tokenizer."""
 
-    def __init__(self, torch, F, model, yes_ids, no_ids):
+    def __init__(self, torch, F, model, true_ids, false_ids):
         self.F = F
-        self.allowed = sorted(set(yes_ids) | set(no_ids))
+        self.allowed = sorted(set(true_ids) | set(false_ids))
         sel = torch.tensor(self.allowed, device="cuda")
         self.weights = model.lm_head.weight.index_select(0, sel).to(
             torch.bfloat16)
-        self.yes_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed) if t in set(yes_ids)],
-            device="cuda")
-        self.no_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed) if t in set(no_ids)],
-            device="cuda")
+        self.true_cols = torch.tensor(
+            [i for i, t in enumerate(self.allowed)
+             if t in set(true_ids)], device="cuda")
+        self.false_cols = torch.tensor(
+            [i for i, t in enumerate(self.allowed)
+             if t in set(false_ids)], device="cuda")
 
     def __call__(self, normed):
         scores = self.F.linear(normed, self.weights)
-        yes = scores.index_select(1, self.yes_cols).amax(dim=1)
-        no = scores.index_select(1, self.no_cols).amax(dim=1)
-        return (yes > no).int().cpu().tolist()
+        t = scores.index_select(1, self.true_cols).amax(dim=1)
+        f = scores.index_select(1, self.false_cols).amax(dim=1)
+        return (t > f).int().cpu().tolist()

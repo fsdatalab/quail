@@ -1,7 +1,7 @@
 """Every derived quantity in the design's spec table (engine_design.md
 section 8). Pure arithmetic over the two spec structs; the only
-measured inputs are the calibration constants, and only the two
-break-even rows consume them.
+measured inputs are the calibration constants, and only the
+restore break-even row consumes them.
 
 The two token budgets, and why neither makes the GPU faster:
 
@@ -15,6 +15,7 @@ The two token budgets, and why neither makes the GPU faster:
   policy into a certainty.
 """
 
+from quail.executor.kvstore import PinnedStore
 from quail.specs import DeviceSpec, ModelSpec
 
 POOL_FRACTION = 0.92    # the fraction of device memory the executor
@@ -32,6 +33,11 @@ ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
 #                         single-chunk reservation OOMed the milestone
 #                         filter run with 4.7 GiB reserved-but-
 #                         unallocated on top of the live set.
+STORE_KV_BYTES = 2.0    # the pinned store's staging tensors are always
+#                         bf16, independent of a model's own kv_bytes
+#                         (kept only for the arena's synthetic-fp8
+#                         test): PinnedStore._alloc_staging never asks
+#                         the model, it hardcodes torch.bfloat16.
 
 
 def tensor_parallel(model: ModelSpec, device: DeviceSpec) -> int:
@@ -66,16 +72,30 @@ def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     return max(b, int(compute_knee(model, device)))
 
 
+def store_staging_bytes(model: ModelSpec) -> float:
+    """Device memory the pinned KV store's staging ring can hold at
+    once: STAGING_BUDGET_TOKENS total token-rows, in bf16. Reserved
+    unconditionally (not just when a query's payload asks for a
+    store): the arena is built once per warm container and outlives
+    any single query, so a later query turning the store on must not
+    be able to blow past what the first query's boot already
+    committed."""
+    return (PinnedStore.STAGING_BUDGET_TOKENS
+            * model.kv_elements_per_token * STORE_KV_BYTES)
+
+
 def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None) -> int:
     """The admission budget: tokens of document KV resident at once.
-    What is left after weights and the chunk's activation reservation,
-    in KV bytes. Token-based, never a document count (a count cannot
-    see length; the 4,096-seq default thrashed at 2.40x reads)."""
+    What is left after weights, the chunk's activation reservation,
+    and the store's staging reservation, in KV bytes. Token-based,
+    never a document count (a count cannot see length; the 4,096-seq
+    default thrashed at 2.40x reads)."""
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
     free = (device.mem_bytes * POOL_FRACTION - model.W_mem
-            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
+            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token
+            - store_staging_bytes(model))
     return int(free // model.kappa)
 
 
@@ -160,8 +180,8 @@ def attention_crossover(model: ModelSpec, device: DeviceSpec,
 def store_break_even_bytes_per_s(model: ModelSpec,
                                  a_s_per_token: float) -> float:
     """The bandwidth a KV store must beat for restore to win over
-    recompute: kappa x the serving rate. 7-9 GB/s at 4B/H100
-    depending on KV dtype and rate; pinned host memory's 55 GB/s
+    recompute: kappa x the serving rate. About 18 GB/s at 4B/H100
+    bf16 KV and the packed rate; pinned host memory's 55 GB/s
     clears it, disk and volumes do not."""
     return model.kappa / a_s_per_token
 

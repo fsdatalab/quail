@@ -62,11 +62,14 @@ def test_chunk_budget_is_the_index_cap():
 def test_arena_tokens_at_bf16():
     # the design table said ~400k with one chunk of activation
     # reservation; the milestone 1 filter run OOMed there, so the
-    # reservation is two chunks and the arena lands near 346k -
-    # still ~865 mean-length documents resident at once
+    # reservation is two chunks, and a further ~4.8 GiB is reserved
+    # for the pinned store's device staging ring (store_staging_bytes)
+    # so a later warm-pass store can't OOM against an arena that
+    # already claimed the whole budget - the arena lands near 313k,
+    # still ~780 mean-length documents resident at once
     tokens = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM)
-    assert 330_000 <= tokens <= 360_000
-    assert tokens // 400 >= 800
+    assert 300_000 <= tokens <= 330_000
+    assert tokens // 400 >= 750
 
 
 def test_arena_doubles_at_fp8_kv():
@@ -90,24 +93,19 @@ def test_calibration_anchor_file():
     assert cal.source == "calibrated"
     assert cal.rate_tokens_per_s == pytest.approx(121_045, rel=1e-3)
     assert cal.a2_s_per_token2 == pytest.approx(4.9336e-10, rel=1e-3)
-    assert cal.q_kv_s_per_token == pytest.approx(0.59e-6, rel=1e-3)
 
 
 def test_store_break_even_under_pinned_bandwidth():
     cal = load_calibration(QWEN3_4B_FP8, H100_SXM)
     bw = channel_bandwidths()
-    fp8 = budgets.store_break_even_bytes_per_s(
-        QWEN3_4B_FP8.with_kv_bytes(1.0), cal.a_s_per_token)
     bf16 = budgets.store_break_even_bytes_per_s(
         QWEN3_4B_FP8, cal.a_s_per_token)
-    # 7-9 GB/s at fp8 KV depending on rate; the design table's 7.2
-    # used the engine-era 97k rate, the calibrated packed rate gives
-    # ~8.9. Pinned host memory clears both; disk and volumes do not.
-    assert 7e9 <= fp8 <= 9.5e9
-    assert bf16 == pytest.approx(2 * fp8, rel=1e-6)
+    # ~18 GB/s at bf16 KV and the packed 121k rate. Pinned host
+    # memory clears it; disk and volumes do not.
+    assert 17e9 <= bf16 <= 19e9
     assert bw["pinned_h2d"] > bf16
-    assert bw["disk_read"] < fp8
-    assert bw["volume_read"] < fp8
+    assert bw["disk_read"] < bf16
+    assert bw["volume_read"] < bf16
 
 
 def test_spec_scaled_defaults_for_uncalibrated_pair():
@@ -117,9 +115,8 @@ def test_spec_scaled_defaults_for_uncalibrated_pair():
     assert cal.source.startswith("spec-scaled")
     assert cal.a_s_per_token == pytest.approx(
         2 * anchor.a_s_per_token, rel=1e-6)
-    # same KV shape and same device: the conversion tax carries over
-    assert cal.q_kv_s_per_token == pytest.approx(
-        anchor.q_kv_s_per_token, rel=1e-6)
+    assert cal.a2_s_per_token2 == pytest.approx(
+        2 * anchor.a2_s_per_token2, rel=1e-6)
 
 
 def test_derived_table_complete():
@@ -147,9 +144,8 @@ def test_resolve_pair_unknown():
 
 def test_make_record_and_commit(tmp_path):
     loaded = Calibration(a_s_per_token=8e-6, a2_s_per_token2=5e-10,
-                         q_kv_s_per_token=5.9e-7, source="calibrated")
+                         source="calibrated")
     rec = make_record(QWEN3_4B_FP8, H100_SXM, 9e-6, 6e-10,
-                      loaded.q_kv_s_per_token,
                       points=[{"doc_tokens": 256}],
                       channels={"pinned_h2d": 1.0},
                       loaded=loaded, lengths=(256, 1024),
@@ -157,7 +153,8 @@ def test_make_record_and_commit(tmp_path):
     assert rec["model"] == "qwen3-4b-fp8"
     assert rec["device"] == "h100-sxm"
     assert rec["loaded_before"]["a"] == 8e-6
-    assert "not measured" in rec["provenance"]["q_kv"]
+    assert "q_kv" not in rec
+    assert "q_kv" not in rec["provenance"]
     dest = commit_calibration(rec, dest=tmp_path / "pair.json")
     written = dest.read_text()
     assert "a_s_per_token" in written

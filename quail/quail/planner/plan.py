@@ -8,7 +8,7 @@ inequality, and nothing in the system consumes an estimated wall.
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -58,7 +58,7 @@ class PhysicalPlan:
     device: str
     workers: int
     tensor_parallel: int
-    kv_dtype: str              # "bf16" | "fp8"
+    kv_dtype: str              # always "bf16"
     chunk_tokens: int          # the batch size (activation/index bound)
     admission_tokens: int      # KV residency (the arena)
     order_rule: str            # "as_written" | "by_cost"
@@ -67,6 +67,7 @@ class PhysicalPlan:
     store_min_doc_tokens: int = 0    # documents at or above this
     #                                  length use the KV store; 0 =
     #                                  no store, 1 = everything stores
+    limit: int | None = None   # output row cap; None = no limit
     operators: tuple = ()      # ordered operator dicts, JSON-able
     remarks: tuple = ()
 
@@ -102,5 +103,3 @@ class EngineConfig:
     gpus: int = 1
     cpu_memory_gb: int = 64
     model: str = "qwen3-4b-fp8"
-    kv_dtype: Optional[str] = None    # force "bf16" or "fp8"; None =
-    #                                   the planner's argmin

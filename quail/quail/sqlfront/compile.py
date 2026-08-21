@@ -7,6 +7,22 @@ positions - WHERE conjuncts and JOIN ON - plus the [NOT] EXISTS form,
 and reject everything else by node class: the rejection list below is
 literally a list of forbidden sqlglot classes, so new SQL surface
 cannot creep in silently.
+
+A query has at most ONE join predicate, however many tables it joins:
+a single AI_FILTER(PROMPT(...)) whose prompt references the FROM
+table and every JOINed table, evaluated over their cross product with
+every document in one model call. It is written either Snowflake
+style (on the last JOIN's ON, earlier JOINs bare) or BigQuery style
+(tables comma-joined or CROSS JOINed in FROM, the predicate a WHERE
+term):
+
+    FROM reviews a JOIN threads b JOIN products c
+      ON AI_FILTER(PROMPT('... {0} ... {1} ... {2}',
+                          a.review, b.thread, c.description))
+
+    FROM reviews a, threads b, products c
+    WHERE AI_FILTER(PROMPT('... {0} ... {1} ... {2}',
+                           a.review, b.thread, c.description))
 """
 
 import sqlglot
@@ -15,14 +31,13 @@ from sqlglot import exp
 from quail.catalog import Catalog
 from quail.logical import (ColumnRef, CompileError, FilterPredicate,
                            JoinSpec, LogicalPlan, QueryDesc,
-                           assemble_plan, bind_prompt)
+                           assemble_plan, bind_join_prompt, bind_prompt)
 
 # Every relational operator except the projection, named and refused.
 # OR is rejected separately with its own message.
 FORBIDDEN = (
     (exp.Group, "GROUP BY"),
     (exp.Order, "ORDER BY"),
-    (exp.Limit, "LIMIT"),
     (exp.Distinct, "DISTINCT"),
     (exp.Having, "HAVING"),
     (exp.Qualify, "QUALIFY"),
@@ -32,7 +47,8 @@ FORBIDDEN = (
     (exp.Intersect, "INTERSECT"),
 )
 
-FILTER_OPTION_KEYS = {"selectivity"}
+# one option surface: anchor is rejected after parsing when the
+# predicate turns out to be a one-provider filter
 JOIN_OPTION_KEYS = {"selectivity", "anchor"}
 
 
@@ -151,8 +167,12 @@ class _Binder:
                 out[key] = str(value.this)
         return out
 
-    def parse_ai_filter(self, node, allowed: set, scope=None):
-        """(prompt, options, provider aliases referenced)."""
+    def parse_ai_filter(self, node, allowed: set, scope=None,
+                        join=None):
+        """(prompt, options, provider aliases referenced). join: True
+        binds the join layout (labeled document blocks, the template
+        as the per-tuple question), False the filter layout, None
+        decides by how many providers the prompt references."""
         if not _is_call(node, "AI_FILTER"):
             raise CompileError(
                 f"only AI_FILTER(PROMPT(...)) predicates are "
@@ -178,13 +198,16 @@ class _Binder:
                 raise CompileError(f"PROMPT arguments must be column "
                                    f"references, got {a.sql()}")
             refs.append(self.resolve_column(a, scope))
-        prompt = bind_prompt(template, tuple(refs), self.tokenizer)
-        for r in refs:
-            self.note_doc_column(r)
         aliases = []
         for r in refs:
             if r.alias not in aliases:
                 aliases.append(r.alias)
+        if join is None:
+            join = len(aliases) > 1
+        binder = bind_join_prompt if join else bind_prompt
+        prompt = binder(template, tuple(refs), self.tokenizer)
+        for r in refs:
+            self.note_doc_column(r)
         return prompt, options, aliases
 
 
@@ -209,6 +232,22 @@ def _where_terms(where) -> list:
     return terms       # the pop order above yields written order
 
 
+def _parse_limit(tree) -> int | None:
+    """Extract a plain LIMIT N from the parse tree. ORDER BY ... LIMIT
+    is rejected by the FORBIDDEN list (ORDER BY is still forbidden), so
+    this only handles the early-termination case."""
+    limit_node = tree.args.get("limit")
+    if limit_node is None:
+        return None
+    expr = limit_node.expression
+    if not isinstance(expr, exp.Literal) or expr.is_string:
+        raise CompileError("LIMIT must be a positive integer")
+    value = int(expr.this)
+    if value <= 0:
+        raise CompileError("LIMIT must be a positive integer")
+    return value
+
+
 def compile_sql(sql: str, catalog: Catalog,
                 tokenizer=None) -> LogicalPlan:
     """AI SQL text -> LogicalPlan, or CompileError. `tokenizer` is any
@@ -222,6 +261,8 @@ def compile_sql(sql: str, catalog: Catalog,
         raise CompileError("the query must be a single SELECT")
     _reject_forbidden(tree)
 
+    limit = _parse_limit(tree)
+
     b = _Binder(catalog, tokenizer)
 
     from_ = _from_clause(tree)
@@ -229,35 +270,50 @@ def compile_sql(sql: str, catalog: Catalog,
         raise CompileError("FROM must name one registered provider")
     b.add_table(from_.this)
 
+    joined_aliases = []       # tables brought in by JOIN clauses
+    on_pred = None
     for join in tree.args.get("joins") or []:
-        if join.side or (join.kind and join.kind.upper() != "INNER"):
+        if join.side or (join.kind
+                         and join.kind.upper() not in ("INNER",
+                                                       "CROSS")):
             raise CompileError(
                 f"only plain JOIN is supported, got "
                 f"{join.side or ''} {join.kind or ''} JOIN".strip())
         if not isinstance(join.this, exp.Table):
             raise CompileError("JOIN must name one registered provider")
-        alias = b.add_table(join.this)
+        joined_aliases.append(b.add_table(join.this))
         on = join.args.get("on")
         if on is None:
-            raise CompileError("JOIN needs ON AI_FILTER(PROMPT(...))")
-        prompt, options, aliases = b.parse_ai_filter(on, JOIN_OPTION_KEYS)
-        if len(aliases) != 2:
+            continue    # a bare/cross-joined table: the one join
+            #             predicate must cover it
+        if on_pred is not None:
             raise CompileError(
-                f"a join predicate must reference exactly two "
-                f"providers, got {aliases}")
-        if alias not in aliases:
+                "one join predicate per query: the n-way join is a "
+                "single AI_FILTER(PROMPT(...)) over the cross product "
+                "of its tables - reference every joined table in that "
+                "one prompt and put any extra condition in its text "
+                "([NOT] EXISTS stays a separate gate)")
+        on_pred = b.parse_ai_filter(on, JOIN_OPTION_KEYS, join=True)
+
+    def add_join_spec(prompt, options, aliases):
+        expected = {b.tables[0][0], *joined_aliases}
+        if set(aliases) != expected:
             raise CompileError(
-                f"the ON predicate of JOIN {alias} must reference "
-                f"{alias}")
+                f"the join prompt must reference exactly the FROM "
+                f"table and every JOINed table ({sorted(expected)}), "
+                f"got {aliases}")
         anchor = options.get("anchor")
         if anchor is not None and anchor not in aliases:
             raise CompileError(
-                f"anchor {anchor!r} is not a side of this join "
+                f"anchor {anchor!r} is not a table of this join "
                 f"({aliases})")
-        b.joins.append(JoinSpec(alias=alias, prompt=prompt,
-                                semantics="full",
+        b.joins.append(JoinSpec(aliases=tuple(joined_aliases),
+                                prompt=prompt, semantics="full",
                                 selectivity=options.get("selectivity"),
                                 anchor=anchor))
+
+    if on_pred is not None:
+        add_join_spec(*on_pred)
 
     for term in _where_terms(tree.args.get("where")):
         anti = False
@@ -271,15 +327,35 @@ def compile_sql(sql: str, catalog: Catalog,
             raise CompileError(f"NOT is only supported as NOT EXISTS, "
                                f"got NOT {node.sql()}")
         prompt, options, aliases = b.parse_ai_filter(
-            term, FILTER_OPTION_KEYS)
-        if len(aliases) != 1:
+            term, JOIN_OPTION_KEYS)
+        if len(aliases) == 1:
+            if "anchor" in options:
+                raise CompileError(
+                    "anchor is a join option; a one-provider "
+                    "AI_FILTER takes only selectivity")
+            b.filters.setdefault(aliases[0], []).append(
+                FilterPredicate(prompt=prompt,
+                                selectivity=options.get("selectivity")))
+            continue
+        # a multi-provider WHERE predicate is the join predicate,
+        # BigQuery style: tables cross-joined in FROM, filtered here
+        if on_pred is not None or any(j.semantics == "full"
+                                      for j in b.joins):
             raise CompileError(
-                f"a WHERE filter must reference exactly one provider, "
-                f"got {aliases}; a two-provider predicate is a join "
-                f"and belongs in JOIN ... ON")
-        b.filters.setdefault(aliases[0], []).append(
-            FilterPredicate(prompt=prompt,
-                            selectivity=options.get("selectivity")))
+                "one join predicate per query: the n-way join is a "
+                "single AI_FILTER(PROMPT(...)) over the cross product "
+                "of its tables - reference every joined table in that "
+                "one prompt and put any extra condition in its text "
+                "([NOT] EXISTS stays a separate gate)")
+        add_join_spec(prompt, options, aliases)
+
+    if joined_aliases and not any(j.semantics == "full"
+                                  for j in b.joins):
+        raise CompileError(
+            f"JOINed tables {joined_aliases} have no join predicate: "
+            f"give one AI_FILTER(PROMPT(...)) - on the last JOIN or "
+            f"as a WHERE term - whose prompt references every joined "
+            f"table")
 
     columns = _compile_projection(b, tree.expressions)
 
@@ -293,7 +369,8 @@ def compile_sql(sql: str, catalog: Catalog,
         doc_columns=dict(b.doc_columns),
         filters={a: tuple(v) for a, v in b.filters.items()},
         joins=tuple(b.joins),
-        columns=tuple(columns))
+        columns=tuple(columns),
+        limit=limit)
     return assemble_plan(desc)
 
 
@@ -316,15 +393,23 @@ def _compile_exists(b: _Binder, node: exp.Exists, anti: bool) -> None:
         raise CompileError("the EXISTS subquery takes exactly one "
                            "AI_FILTER predicate")
     prompt, options, aliases = b.parse_ai_filter(terms[0],
-                                                 JOIN_OPTION_KEYS)
+                                                 JOIN_OPTION_KEYS,
+                                                 join=True)
     if len(aliases) != 2 or alias not in aliases:
         raise CompileError(
             "the EXISTS predicate must reference the inner provider "
             "and exactly one outer provider")
-    b.joins.append(JoinSpec(alias=alias, prompt=prompt,
+    outer = next(a for a in aliases if a != alias)
+    anchor = options.get("anchor")
+    if anchor is not None and anchor != outer:
+        raise CompileError(
+            f"exists/anti always anchor on the outer table {outer!r} "
+            f"- the gate applies to its documents - got anchor "
+            f"{anchor!r}")
+    b.joins.append(JoinSpec(aliases=(alias,), prompt=prompt,
                             semantics="anti" if anti else "exists",
                             selectivity=options.get("selectivity"),
-                            anchor=options.get("anchor")))
+                            anchor=outer))
 
 
 def _compile_projection(b: _Binder, expressions) -> list:

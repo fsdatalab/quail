@@ -216,3 +216,85 @@ def test_admission_refuses_impossible_shapes():
         FilterAdmission([1000], [10], 500, 100, 16)     # over chunk
     with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 2000, 2, 16)      # over arena
+
+
+def test_admission_limit_stops_early():
+    # 10 docs, all pass one stage, limit=3. With deliver_lag=0 (answers
+    # land immediately), the scheduler stops admitting after the first
+    # chunk's survivors reach the limit.
+    doc_tokens = [50] * 10
+    stage_tokens = [10]
+    truth = [[1] for _ in range(10)]
+    sched = FilterAdmission(doc_tokens, stage_tokens, 200,
+                            arena_pages=100, page_tokens=16, limit=3)
+    chunks = _drive(sched, truth, deliver_lag=0)
+    assert sched._survivor_count >= 3
+    assert len(sched.survivors()) >= 3
+    # fewer docs admitted than the full corpus
+    assert len(sched.answers) < 10
+
+
+def test_admission_limit_drains_in_flight():
+    # limit=1 with 2 docs admitted in the same chunk: the second
+    # answer still lands (in_flight drains) even though the limit is
+    # already met
+    sched = FilterAdmission([50, 50], [10], 200,
+                            arena_pages=100, page_tokens=16, limit=1)
+    groups = sched.next_chunk()
+    assert len(groups) == 2
+    sched.report(0, 0, True)
+    assert sched._survivor_count == 1
+    # done() is False because doc 1 is still in_flight
+    assert not sched.done()
+    sched.report(1, 0, True)
+    assert sched.done()
+    assert sched._survivor_count == 2
+
+
+def test_admission_limit_none_processes_all():
+    doc_tokens = [50] * 5
+    truth = [[1] for _ in range(5)]
+    sched = FilterAdmission(doc_tokens, [10], 500,
+                            arena_pages=100, page_tokens=16, limit=None)
+    _drive(sched, truth)
+    assert len(sched.survivors()) == 5
+
+
+def test_admission_limit_reduces_work():
+    """Run the same corpus with and without a limit. The limited run
+    should admit fewer documents and build fewer chunks."""
+    rng = random.Random(42)
+    n_docs = 80
+    n_stages = 3
+    doc_tokens = [rng.randrange(30, 200) for _ in range(n_docs)]
+    stage_tokens = [rng.randrange(10, 40) for _ in range(n_stages)]
+    budget = max(doc_tokens) + sum(stage_tokens) + 300
+    arena_pages = max(pages_for(max(doc_tokens), 16), 60)
+    truth = [[1 if rng.random() < 0.8 else 0
+              for _ in range(n_stages)] for _ in range(n_docs)]
+    limit = 5
+
+    # unlimited run
+    sched_all = FilterAdmission(doc_tokens, stage_tokens, budget,
+                                arena_pages, 16, limit=None)
+    chunks_all = _drive(sched_all, truth, deliver_lag=0)
+    admitted_all = len(sched_all.answers)
+
+    # limited run (same truth table, same parameters)
+    sched_lim = FilterAdmission(doc_tokens, stage_tokens, budget,
+                                arena_pages, 16, limit=limit)
+    chunks_lim = _drive(sched_lim, truth, deliver_lag=0)
+    admitted_lim = len(sched_lim.answers)
+
+    # the limited run must have found enough survivors
+    assert len(sched_lim.survivors()) >= limit
+
+    # the limited run admitted strictly fewer documents
+    assert admitted_lim < admitted_all, (
+        f"limit={limit} admitted {admitted_lim}, unlimited admitted "
+        f"{admitted_all}; early termination did not reduce work")
+
+    # the limited run built fewer chunks
+    assert len(chunks_lim) < len(chunks_all), (
+        f"limit={limit} built {len(chunks_lim)} chunks, unlimited "
+        f"built {len(chunks_all)}; expected fewer chunks")

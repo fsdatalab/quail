@@ -15,6 +15,19 @@ two LogicalPlans compare equal.
                      selectivity=0.05)
             .select("r.id", "p.id"))
 
+A join is one call, however many tables it spans: pass a list as the
+right side and a prompt with one placeholder per table, and every
+tuple of the cross product is judged by that single prompt (all the
+documents in one model call - never a chain of pairwise stages):
+
+    .ai_join([docs(catalog, "products").alias("p"),
+              docs(catalog, "terms").alias("m")],
+             prompt("Document {0} discusses the product in {1} and "
+                    "mentions the term in {2}.",
+                    col("r.review"), col("p.description"),
+                    col("m.term")),
+             selectivity=0.01)
+
 The order you chain calls is the order that runs - nothing is ever
 reordered behind your back (the builder is always `as_written`).
 """
@@ -25,7 +38,7 @@ from typing import Optional
 from quail.catalog import Catalog
 from quail.logical import (ColumnRef, CompileError, FilterPredicate,
                            JoinSpec, LogicalPlan, QueryDesc,
-                           assemble_plan, bind_prompt)
+                           assemble_plan, bind_join_prompt, bind_prompt)
 
 
 @dataclass(frozen=True)
@@ -61,6 +74,7 @@ class Query:
         self._doc_columns = {}
         self._filters = {}
         self._joins = []
+        self._limit = None
 
     # ---- scope -------------------------------------------------------
 
@@ -105,9 +119,10 @@ class Query:
                 f"is computed once")
         self._doc_columns[ref.alias] = ref.column
 
-    def _bind(self, p: PromptSpec):
+    def _bind(self, p: PromptSpec, join: bool = False):
         refs = tuple(self._resolve(c) for c in p.cols)
-        bound = bind_prompt(p.template, refs, self._tokenizer)
+        binder = bind_join_prompt if join else bind_prompt
+        bound = binder(p.template, refs, self._tokenizer)
         for r in refs:
             self._note_doc_column(r)
         aliases = []
@@ -129,41 +144,88 @@ class Query:
             FilterPredicate(prompt=bound, selectivity=selectivity))
         return self
 
-    def ai_join(self, other: "Query", p: PromptSpec,
+    def ai_join(self, others, p: PromptSpec,
                 selectivity: Optional[float] = None,
                 anchor: Optional[str] = None,
                 semantics: str = "full") -> "Query":
+        """Join one or more tables with a single prompt: every tuple
+        of the cross product (this query's documents x each joined
+        table's documents) is judged by one model call holding all
+        the documents. `others` is one docs(...) query or a list of
+        them; `p` needs one placeholder per table, this query's
+        included. exists/anti take exactly one other table and gate
+        this side's documents instead of producing tuples."""
         if semantics not in ("full", "exists", "anti"):
             raise CompileError(f"semantics must be full, exists, or "
                                f"anti, got {semantics!r}")
-        if not isinstance(other, Query) or other._joins \
-                or len(other._tables) != 1:
+        others = [others] if isinstance(others, Query) else list(others)
+        if semantics != "full" and len(others) != 1:
             raise CompileError(
-                "the right side of ai_join must be a single "
-                "(optionally filtered) docs(...) query")
-        alias, provider = other._tables[0]
-        if alias in self._scope():
-            raise CompileError(f"duplicate table alias {alias!r}")
-        self._tables.append((alias, provider))
-        for a, preds in other._filters.items():
-            self._filters.setdefault(a, []).extend(preds)
-        for a, c in other._doc_columns.items():
-            self._note_doc_column(ColumnRef(alias=a,
-                                            provider=self._scope()[a],
-                                            column=c))
-        bound, aliases = self._bind(p)
-        if len(aliases) != 2 or alias not in aliases:
+                "an exists/anti gate takes exactly one inner table; "
+                "use one ai_join call per gate")
+        if semantics == "full" \
+                and any(j.semantics == "full" for j in self._joins):
             raise CompileError(
-                f"a join predicate must reference the joined table "
-                f"{alias!r} and exactly one other provider, got "
-                f"{aliases}")
-        if anchor is not None and anchor not in aliases:
-            raise CompileError(f"anchor {anchor!r} is not a side of "
-                               f"this join ({aliases})")
-        self._joins.append(JoinSpec(alias=alias, prompt=bound,
+                "one full ai_join per query: the n-way join is a "
+                "single prompt over the cross product of its tables - "
+                "join every table in that one call and put any extra "
+                "condition in the prompt's text (exists/anti gates "
+                "stay separate calls)")
+        new_aliases = []
+        for other in others:
+            if not isinstance(other, Query) or other._joins \
+                    or len(other._tables) != 1:
+                raise CompileError(
+                    "every joined side of ai_join must be a single "
+                    "(optionally filtered) docs(...) query")
+            alias, provider = other._tables[0]
+            if alias in self._scope():
+                raise CompileError(f"duplicate table alias {alias!r}")
+            self._tables.append((alias, provider))
+            for a, preds in other._filters.items():
+                self._filters.setdefault(a, []).extend(preds)
+            for a, c in other._doc_columns.items():
+                self._note_doc_column(
+                    ColumnRef(alias=a, provider=self._scope()[a],
+                              column=c))
+            new_aliases.append(alias)
+        bound, aliases = self._bind(p, join=True)
+        if semantics == "full":
+            expected = {self._tables[0][0], *new_aliases}
+            if set(aliases) != expected:
+                raise CompileError(
+                    f"the join prompt must reference exactly this "
+                    f"query's table and every joined table "
+                    f"({sorted(expected)}), got {aliases}")
+            if anchor is not None and anchor not in aliases:
+                raise CompileError(
+                    f"anchor {anchor!r} is not a table of this join "
+                    f"({aliases})")
+        else:
+            inner = new_aliases[0]
+            if len(aliases) != 2 or inner not in aliases:
+                raise CompileError(
+                    f"an exists/anti prompt must reference the inner "
+                    f"table {inner!r} and exactly one outer table, "
+                    f"got {aliases}")
+            outer = next(a for a in aliases if a != inner)
+            if anchor is not None and anchor != outer:
+                raise CompileError(
+                    f"exists/anti always anchor on the outer table "
+                    f"{outer!r} - the gate applies to its documents - "
+                    f"got anchor {anchor!r}")
+            anchor = outer
+        self._joins.append(JoinSpec(aliases=tuple(new_aliases),
+                                    prompt=bound,
                                     semantics=semantics,
                                     selectivity=selectivity,
                                     anchor=anchor))
+        return self
+
+    def limit(self, n: int) -> "Query":
+        if not isinstance(n, int) or n <= 0:
+            raise CompileError("LIMIT must be a positive integer")
+        self._limit = n
         return self
 
     def select(self, *cols) -> LogicalPlan:
@@ -187,7 +249,8 @@ class Query:
             doc_columns=dict(self._doc_columns),
             filters={a: tuple(v) for a, v in self._filters.items()},
             joins=tuple(self._joins),
-            columns=tuple(columns))
+            columns=tuple(columns),
+            limit=self._limit)
         return assemble_plan(desc)
 
 

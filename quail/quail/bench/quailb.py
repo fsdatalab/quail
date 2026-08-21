@@ -54,6 +54,7 @@ SETS = {
     "reports": (2_000, 3_000, True),
     "products": (1_000, 150, True),
     "terms": (2_560, 32, False),
+    "claims": (1_000, 20, True),
 }
 
 
@@ -61,7 +62,7 @@ SETS = {
 
 def flags_line(bits, prefix="FLAG"):
     return ("\n\n[FLAGS] "
-            + " ".join(f"{prefix}_{j+1}={'YES' if b else 'NO'}"
+            + " ".join(f"{prefix}_{j+1}={'TRUE' if b else 'FALSE'}"
                        for j, b in enumerate(bits)))
 
 
@@ -85,10 +86,7 @@ def concat_to_chars(pool, target_chars, start):
 
 
 def flag_question(prefix, j):
-    return (f"\n\nExample: if the line said [FLAGS] {prefix}_9=NO, "
-            f"then {prefix}_9 has value NO.\nInstruction: output only "
-            f"the value of {prefix}_{j} from the [FLAGS] line above."
-            f"\n{prefix}_{j}=")
+    return f"\n\nIs {prefix}_{j} in the [FLAGS] line TRUE?"
 
 
 # ------------------------------------------------------- set builders
@@ -122,6 +120,44 @@ def _biodex_rows(n=2000):
         if len(rows) >= n:
             break
     return rows
+
+
+def _fever_data(n_claims):
+    """FEVER claims (SUPPORTS/REFUTES only - those carry a real
+    annotated evidence page) and the small pool of Wikipedia pages
+    those claims actually reference. The evidence pool is bounded by
+    the sampled claims, the same way the terms table bounds BioDEX's
+    join - a full join against all 5M wiki pages is not the query
+    under test."""
+    from huggingface_hub import hf_hub_download
+    f = hf_hub_download("fever/fever", "v1.0/labelled_dev/0000.parquet",
+                        repo_type="dataset",
+                        revision="refs/convert/parquet")
+    rows = pq.read_table(f).to_pylist()
+    seen, claims = set(), []
+    for r in rows:
+        if (r["id"] in seen or r["label"] not in ("SUPPORTS", "REFUTES")
+                or not r["evidence_wiki_url"]):
+            continue
+        seen.add(r["id"])
+        claims.append(r)
+        if len(claims) >= n_claims:
+            break
+    pages_needed = {r["evidence_wiki_url"] for r in claims}
+    page_text = {}
+    for shard in range(10):
+        if len(page_text) >= len(pages_needed):
+            break
+        fw = hf_hub_download(
+            "fever/fever",
+            f"wiki_pages/partial-wikipedia_pages/{shard:04d}.parquet",
+            repo_type="dataset", revision="refs/convert/parquet")
+        t = pq.read_table(fw, columns=["id", "text"])
+        for pid, txt in zip(t.column("id").to_pylist(),
+                            t.column("text").to_pylist()):
+            if pid in pages_needed and pid not in page_text:
+                page_text[pid] = txt
+    return claims, page_text
 
 
 def _abtbuy_products():
@@ -220,6 +256,23 @@ def build_sets(data_dir, sf, lf):
     write("terms", [f"tm{i}" for i in range(len(vocab))], vocab,
           col="term")
 
+    # claims + evidence: real FEVER claims and only the Wikipedia
+    # pages those claims reference - a bounded real join, no planted
+    # keys, ground truth is the FEVER label
+    n_claims = _n_docs("claims", sf)
+    claims, page_text = _fever_data(n_claims)
+    pq.write_table(pa.table({
+        "id": [f"cl{i}" for i in range(len(claims))],
+        "claim": [c["claim"] for c in claims],
+        "label": [c["label"] for c in claims],
+        "evidence_wiki_url": [c["evidence_wiki_url"] for c in claims],
+    }), d / "claims.parquet")
+    ev_ids = list(page_text.keys())
+    pq.write_table(pa.table({
+        "id": ev_ids,
+        "text": [page_text[p] for p in ev_ids],
+    }), d / "evidence.parquet")
+
     # slices for B7 and B10
     rv = pq.read_table(d / "reviews.parquet")
     n7 = max(4, int(5_000 * sf))
@@ -240,7 +293,8 @@ def register_sets(sess, data_dir):
     for name, id_col in (("reviews", "id"), ("threads", "id"),
                          ("reports", "id"), ("products", "id"),
                          ("terms", "id"), ("reviews5k", "id"),
-                         ("reviews2k", "id"), ("threads2k", "id")):
+                         ("reviews2k", "id"), ("threads2k", "id"),
+                         ("claims", "id"), ("evidence", "id")):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col=id_col))
 
@@ -281,41 +335,16 @@ def queries(sess):
                 selectivity=sel).select("a.id", "b.id")
         return make
 
-    # Template text before {0} becomes the per-anchor frame: the
-    # engine relocates it after the document and writes it into the
-    # anchor's kept KV once per anchor, so the framing costs tokens
-    # per anchor, not per pair (folding it into the per-pair tail
-    # cost 6.1M extra tokens / +95 s on B5's 512k pairs, measured).
-    # The suffix after the partner stays short - it is paid per pair.
-    # The frame sits right before the candidates (after the document),
-    # where the 4B is far more sensitive to its wording than it was
-    # to the same text far before the document: "Decide whether the
-    # report describes that reaction..." at close range read as a YES
-    # prior (observed selectivity 0.76 vs the original 0.287).
-    # Judgment-neutral wording, measured below.
-    REACTION = ("Candidate medical reaction terms follow, one at a "
-                "time. For each, judge strictly from the report "
-                "above whether it describes that reaction as "
-                "something the patient experienced.\n\n{0}\n\n"
-                "CANDIDATE REACTION: {1}\nInstruction: answer YES if "
-                "the report above describes this reaction, NO "
-                "otherwise.\nANSWER=")
-    DISCUSS = ("Product descriptions follow, one at a time. For "
-               "each, judge strictly from the text above whether it "
-               "discusses that product.\n\n{0}\n\nPRODUCT:\n{1}\n"
-               "Instruction: answer YES if the text above discusses "
-               "this product, NO otherwise.\nANSWER=")
-    MENTION = ("Medical terms follow, one at a time. For each, judge "
-               "strictly from the text above whether it mentions "
-               "that term.\n\n{0}\n\nTERM: {1}\nInstruction: answer "
-               "YES if the text above mentions this term, NO "
-               "otherwise.\nANSWER=")
-    KEYEQ = ("Candidate documents follow, one at a time. For each, "
-             "judge strictly whether its [FLAGS] or key value "
-             "matches the [KEYS] X value in the report above.\n\n"
-             "{0}\n\nCANDIDATE:\n{1}\nInstruction: answer YES if the "
-             "candidate's [FLAGS] or key value matches the report's "
-             "[KEYS] X value, NO otherwise.\nANSWER=")
+    REACTION = ("Does {0} describe the reaction named in {1} as "
+                "something the patient experienced?")
+    DISCUSS = "Does {0} discuss the product described in {1}?"
+    MENTION = "Does {0} mention the medical term in {1}?"
+    KEYEQ3 = ("Do the [FLAGS] or key values in {1} and in {2} both "
+              "match the [KEYS] X value in {0}?")
+    REACTION_DISCUSS = ("Does {0} describe the reaction named in {1} "
+                        "as something the patient experienced and also "
+                        "discuss the product described in {2}?")
+    SUPPORT = "Does {1} support the claim made in {0}?"
 
     q = {}
     q["B1"] = ("1F reviews: the per-query floor", lambda: sess.sql(
@@ -373,31 +402,32 @@ def queries(sess):
 
     def b10():
         import quail as _q
+        # the 3-way join: one prompt holds all three documents; every
+        # (b, a, c) tuple of the cross product is one model call. The
+        # provided selectivity is per tuple (the old two stages at .2
+        # and .1 pass together for about .02 of the triples).
         return (sess.docs("threads2k").alias("b")
-                .ai_join(sess.docs("reviews2k").alias("a"),
-                         _q.prompt(KEYEQ, _q.col("b.thread"),
-                                   _q.col("a.body")),
-                         selectivity=0.2, anchor="b")
-                .ai_join(sess.docs("products").alias("c"),
-                         _q.prompt(KEYEQ, _q.col("b.thread"),
+                .ai_join([sess.docs("reviews2k").alias("a"),
+                          sess.docs("products").alias("c")],
+                         _q.prompt(KEYEQ3, _q.col("b.thread"),
+                                   _q.col("a.body"),
                                    _q.col("c.description")),
-                         selectivity=0.1, anchor="b")
+                         selectivity=0.02, anchor="b")
                 .select("a.id", "b.id", "c.id"))
-    q["B10"] = ("2J chain, gating + dedup + replay", b10)
+    q["B10"] = ("3-way join, planted keys: one prompt per triple", b10)
 
     def b11():
         import quail as _q
         return (sess.docs("reports").alias("r")
-                .ai_join(sess.docs("terms").alias("m"),
-                         _q.prompt(REACTION, _q.col("r.report"),
-                                   _q.col("m.term")),
-                         selectivity=0.05, anchor="r")
-                .ai_join(sess.docs("products").alias("p"),
-                         _q.prompt(DISCUSS, _q.col("r.report"),
+                .ai_join([sess.docs("terms").alias("m"),
+                          sess.docs("products").alias("p")],
+                         _q.prompt(REACTION_DISCUSS,
+                                   _q.col("r.report"),
+                                   _q.col("m.term"),
                                    _q.col("p.description")),
-                         selectivity=0.05, anchor="r")
+                         selectivity=0.0025, anchor="r")
                 .select("m.id", "r.id", "p.id"))
-    q["B11"] = ("2J star: kept anchors read twice", b11)
+    q["B11"] = ("3-way join, long anchors: one prompt per triple", b11)
     q["B12"] = ("2F + 1J: two-sided pushdown",
                 content_join("threads", "thread", "products",
                              "description", DISCUSS, 0.1,
@@ -412,8 +442,8 @@ def queries(sess):
     q["B14"] = ("B5 rerun, new question: the anchor restore",
                 content_join("reports", "report", "terms", "term",
                              REACTION.replace(
-                                 "describes this reaction",
-                                 "explicitly reports this reaction"),
+                                 "describe the reaction",
+                                 "explicitly report the reaction"),
                              0.05))
 
     def b15():
@@ -428,24 +458,21 @@ def queries(sess):
                          selectivity=0.1, semantics="exists")
                 .ai_join(sess.docs("reports").alias("r"),
                          _q.prompt(
-                             "Patient reports follow, one at a time. "
-                             "For each, judge strictly whether both "
-                             "it and the thread above discuss "
-                             "medicine.\n\n{0}\n\nREPORT:\n{1}\n"
-                             "Instruction: answer YES if both texts "
-                             "discuss medicine, NO otherwise.\n"
-                             "ANSWER=",
+                             "Do {0} and {1} both discuss medicine?",
                              _q.col("t.thread"), _q.col("r.report")),
                          selectivity=0.2)
                 .select("t.id", "r.id"))
     q["B15"] = ("everything at once", b15)
+    q["B16"] = ("1J claims x evidence: FEVER, real labels not planted",
+                content_join("claims", "claim", "evidence", "text",
+                             SUPPORT, 0.00108))
     return q
 
 
 # ----------------------------------------------------------- driver
 
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
-              out_path=None, cpu_memory_gb=80):
+              out_path=None, cpu_memory_gb=80, model="qwen3-4b-fp8"):
     """cpu_memory_gb defaults to what the 96 GB worker container
     holds: a 64 GB store (8 slabs). The corpus KV usually exceeds it,
     so the length threshold keeps the longest documents - partial
@@ -454,7 +481,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     from quail.planner.plan import EngineConfig
 
     d = build_sets(data_dir, sf, lf)
-    sess = quail.Session(EngineConfig(gpus=gpus,
+    sess = quail.Session(EngineConfig(gpus=gpus, model=model,
                                       cpu_memory_gb=cpu_memory_gb))
     register_sets(sess, d)
     qdefs = queries(sess)
@@ -482,8 +509,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                                rows=len(res.rows),
                                peak_gib=res.report.get("peak_gib"),
                                stages=res.report["stages"],
-                               store=res.report.get("store"),
-                               replay=res.report.get("replay_check"))
+                               store=res.report.get("store"))
                 except Exception as e:            # noqa: BLE001
                     row = dict(query=qid, desc=desc,
                                error=f"{type(e).__name__}: {e}")
@@ -507,15 +533,16 @@ def main():
     ap.add_argument("--sf", type=float, default=0.1)
     ap.add_argument("--lf", type=int, default=1)
     ap.add_argument("--gpus", type=int, default=1)
+    ap.add_argument("--model", default="qwen3-4b-fp8")
     ap.add_argument("--data-dir", default="results/quailb_data")
     ap.add_argument("--only", default=None,
                     help="comma-separated query ids")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     only = set(args.only.split(",")) if args.only else None
-    out = args.out or f"results/quailb_sf{args.sf}_lf{args.lf}.json"
+    out = args.out or f"results/quailb_sf{args.sf}_lf{args.lf}_{args.model}.json"
     run_suite(args.data_dir, sf=args.sf, lf=args.lf, gpus=args.gpus,
-              only=only, out_path=out)
+              only=only, out_path=out, model=args.model)
 
 
 if __name__ == "__main__":

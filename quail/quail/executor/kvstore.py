@@ -111,6 +111,11 @@ class PinnedStore:
     of KV even at 4x document length)."""
 
     STAGING_SLOTS = 4
+    STAGING_MIN_TOKENS = 4096
+    STAGING_BUDGET_TOKENS = 4 * 8192  # max total token-rows across
+    #                                   all staging slots; _alloc_staging
+    #                                   derives slot count from this so
+    #                                   the ring never exceeds it
     SLAB_BYTES = 8 << 30
 
     def __init__(self, capacity_tokens: int, n_layers: int, n_kv: int,
@@ -143,15 +148,14 @@ class PinnedStore:
 
 
     def _alloc_staging(self, tokens):
-        """The device staging ring: STAGING_SLOTS slots for small
-        documents, 2 for large ones. Staging is device memory that
-        competes with the arena - four maximum-document slots at the
-        SF=0.1 report length cost ~11 GB and slowed every warm query
-        (measured: warm B5 ran 2.8x its cold wall); two keep the
-        copy overlap at a fraction of the price."""
+        """The device staging ring: slot count is derived from
+        STAGING_BUDGET_TOKENS so total staging GPU memory is capped.
+        Small documents get up to STAGING_SLOTS slots; large ones
+        get fewer (down to 1) so the budget holds."""
         torch = self.torch
-        tokens = max(tokens, 4096)
-        n = 2 if tokens > 8192 else self.STAGING_SLOTS
+        tokens = max(tokens, self.STAGING_MIN_TOKENS)
+        n = max(1, min(self.STAGING_SLOTS,
+                       self.STAGING_BUDGET_TOKENS // tokens))
         self._staging = [torch.empty((tokens, self.row_width),
                                      dtype=self._dtype, device="cuda")
                          for _ in range(n)]
@@ -167,17 +171,19 @@ class PinnedStore:
         return i
 
     def _ensure_staging(self, tokens):
-        """Grow the staging buffers to hold `tokens` rows. The store
-        is created at the session's first store-carrying query, which
-        may not scan the longest corpus - a fixed size silently
-        skipped every save of a longer document (measured: no report
-        was ever stored because staging was sized from the reviews)."""
+        """Grow the staging buffers to hold `tokens` rows, up to the
+        budget cap. Returns False when `tokens` exceeds
+        STAGING_BUDGET_TOKENS (even 1 slot would blow the reservation);
+        the caller skips the save."""
         if tokens <= self._staging[0].shape[0]:
-            return
+            return True
+        if tokens > self.STAGING_BUDGET_TOKENS:
+            return False
         for e in self._staging_events:
             e.synchronize()
         self._staging = []      # free the old ring before growing
         self._alloc_staging(tokens)
+        return True
 
     def _k_cols(self, layer):
         a = layer * 2 * self.kv_width
@@ -208,7 +214,8 @@ class PinnedStore:
             return None
         if tokens > self.slab_tokens:
             return None
-        self._ensure_staging(tokens)
+        if not self._ensure_staging(tokens):
+            return None
         got = alloc_with_reclaim(self.allocs, self.extents, tokens,
                                  keep_hash=key[0])
         if got is None:

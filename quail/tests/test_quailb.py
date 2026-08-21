@@ -23,7 +23,7 @@ def test_plant_flags_rates_and_determinism():
 
 
 def test_flags_line_format():
-    assert flags_line([1, 0], "T") == "\n\n[FLAGS] T_1=YES T_2=NO"
+    assert flags_line([1, 0], "T") == "\n\n[FLAGS] T_1=TRUE T_2=FALSE"
 
 
 def test_concat_to_chars_reaches_target_and_cycles():
@@ -52,6 +52,18 @@ def _standin_sets(tmp_path):
     write("reviews5k", "body", 8, "review")
     write("reviews2k", "body", 6, "review")
     write("threads2k", "thread", 6, "thread")
+    # B16: same columns as build_sets writes for FEVER
+    pq.write_table(pa.table({
+        "id": [f"cl{i}" for i in range(6)],
+        "claim": [f"claim {i} " + "pad " * 8 for i in range(6)],
+        "label": ["SUPPORTS" if i % 2 == 0 else "REFUTES"
+                  for i in range(6)],
+        "evidence_wiki_url": [f"Page_{i}" for i in range(6)],
+    }), tmp_path / "claims.parquet")
+    pq.write_table(pa.table({
+        "id": [f"Page_{i}" for i in range(6)],
+        "text": [f"evidence {i} " + "pad " * 20 for i in range(6)],
+    }), tmp_path / "evidence.parquet")
     return tmp_path
 
 
@@ -60,7 +72,7 @@ def test_all_queries_compile_and_plan(tmp_path):
     sess = quail.Session(EngineConfig(gpus=1), tokenizer=str.split)
     register_sets(sess, tmp_path)
     qdefs = queries(sess)
-    assert len(qdefs) == 16        # B1-B15 with B3 twice
+    assert len(qdefs) == 17        # B1-B16, B3 twice
     for qid, (desc, make) in qdefs.items():
         q = make()
         plan = q.plan()

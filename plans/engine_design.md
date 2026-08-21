@@ -13,7 +13,9 @@ profiled numbers. No maps, no classification, no aggregation, no
 cascades. The same discipline applies to relational algebra: the
 only relational operator is projection, because a result has to
 name its columns. No non-AI predicates, no equality joins, no
-GROUP BY, no ORDER BY, no LIMIT, no DISTINCT, no expressions. A
+GROUP BY, no ORDER BY, no DISTINCT, no expressions. LIMIT N is
+supported as early termination: the filter loop stops admitting
+documents once enough survivors are found. A
 query that needs those runs Quail for the semantic part and does
 the relational part in whatever database the ids came from.
 
@@ -180,36 +182,69 @@ there are never lists to line up: each AI_FILTER call carries its
 own object. A filter predicate takes `selectivity` (one rough
 number — the fraction of documents that pass; used only for
 ordering, §2.5). A join predicate takes `selectivity` (the
-fraction of pairs that pass) and `anchor`, which names the table
-alias whose documents anchor that stage — one value, because one
-predicate is one join stage. Omitted options mean: no selectivity
-(that predicate keeps its written position) and planner-chosen
-anchor (the longer side).
+fraction of tuples that pass) and `anchor`, which names the table
+alias whose documents anchor the join. Omitted options mean: no
+selectivity (that predicate keeps its written position) and
+planner-chosen anchor (the cheaper side, in practice the longer
+one).
 
-An n-way join is written the way Snowflake writes it: one JOIN
-clause per edge of the join graph, each edge with its own
-predicate and its own options. A 3-way chain:
+An n-way join is ONE predicate, however many tables it spans —
+the BigQuery/Snowflake AI-join shape: the cross product of the
+tables, filtered by a single prompt that holds every document at
+once. One placeholder per table; each tuple is one model call.
+It is never a chain of pairwise stages. Two spellings compile to
+the same plan — the predicate on the last JOIN's ON (earlier
+JOINs bare), or comma-joined tables with the predicate as a WHERE
+term:
 
 ```sql
 SELECT a.id, b.id, c.id
 FROM reviews a
 JOIN threads b
-  ON AI_FILTER(PROMPT('Does review {0} praise this thread? {1}',
-                      a.review, b.thread),
-               {'selectivity': 0.2, 'anchor': 'b'})
 JOIN products c
-  ON AI_FILTER(PROMPT('Does thread {0} recommend product {1}?',
-                      b.thread, c.description),
-               {'selectivity': 0.1, 'anchor': 'b'})
+  ON AI_FILTER(PROMPT('Review {0} praises the thread in {1} and
+                       that thread recommends the product in {2}.',
+                      a.review, b.thread, c.description),
+               {'selectivity': 0.02, 'anchor': 'b'})
+
+SELECT a.id, b.id, c.id
+FROM reviews a, threads b, products c
+WHERE AI_FILTER(PROMPT('...same prompt...', a.review, b.thread,
+                       c.description), {'selectivity': 0.02})
 ```
 
-Two predicates give two edges (a–b, b–c), which the planner runs
-as two stages. Here `b` anchors both, so each surviving thread's
-document KV is computed in stage 1 and read again in stage 2 —
-the cross-stage reuse the executor's kept KV exists for. Writing
-`{'anchor': 'a'}` on the first edge instead would force reviews to
-anchor stage 1; the planner would then warn in `explain()` if that
-choice prices worse.
+At run time each tuple renders as labeled document blocks followed
+by the template as the question, appended verbatim — the {0}, {1},
+{2} markers stay in it and nothing is ever filled in. Each partner
+block is labeled with its own marker, and the anchor's naming line
+maps the top block to its marker, so a marker in the question
+resolves to its block:
+
+```
+DOCUMENT:                              <- the anchor block: the bare
+<thread b17>                              engine preamble + document,
+                                          KV kept once per anchor and
+(The document above is {1}.)              byte-identical to a filter
+                                          scan's stored prefix; the
+DOCUMENT {0}:                             naming line written into
+<review a3>                               kept KV once per anchor
+
+DOCUMENT {2}:                          <- each partner block + the
+<product c9>                              instruction + question: one
+                                          suffix, paid once per tuple
+Evaluate TRUE or FALSE for the following
+question: Does {0} praise the thread
+in {1} and does that thread recommend
+the product in {2}?
+ANSWER:
+```
+
+The anchor's document KV is computed once and every tuple of the
+partner tables streams against it. There is exactly one join
+predicate per query (a conjunction over three tables belongs
+inside the one prompt's text, the same rule OR already follows);
+`[NOT] EXISTS` gates stay separate terms. A forced `anchor` that
+prices worse gets a warning in `explain()`.
 
 ### 2.4 The builder entry point
 
@@ -330,9 +365,10 @@ Snowflake AISQL syntax, and only this subset of it:
 
 Rejected with a named error, not worked around: every relational
 operator except the projection above — non-AI predicates (including
-equality join conditions), GROUP BY, ORDER BY, LIMIT, DISTINCT,
+equality join conditions), GROUP BY, ORDER BY, DISTINCT,
 expressions in the SELECT list, set operations, subqueries other
-than the EXISTS form. Also OR between AI predicates (a disjunction
+than the EXISTS form. (LIMIT N is accepted; see §3.1 early
+termination.) Also OR between AI predicates (a disjunction
 belongs inside one prompt's text, where the model evaluates it),
 AI_FILTER over more than two providers, and any other AI_*
 function.
@@ -382,15 +418,16 @@ model runs; the coordinator applies it at the sink.
 Simpler than a database optimizer, on purpose. Three decisions are
 not decisions at all:
 
-- **Pushdown is unconditional.** A filter on one side of a join
-  always runs before that join. Under true pairwise join semantics
+- **Pushdown is unconditional.** A filter on one table of a join
+  always runs before that join. Under cross-product join semantics
   this cannot lose: evaluating the filter costs one question per
   document either way (the join neither duplicates nor drops the
-  documents the filter must judge — it only pairs them), and
-  running it first deletes every pair the failed documents would
-  have generated. There is no Cortex-style pull-up case to price,
-  because we never rewrite a join into anything else — AI_JOIN is
-  evaluated as the pairwise predicate it declares.
+  documents the filter must judge — it only combines them into
+  tuples), and running it first deletes every tuple the failed
+  documents would have generated. There is no Cortex-style
+  pull-up case to price, because we never rewrite a join into
+  anything else — AI_JOIN is evaluated as the tuple predicate it
+  declares.
 - **No selectivity estimation.** Selectivities are provided by the
   user (rough numbers; only ordering consumes them) or absent.
   Absent means as-written order. A sampling pass at plan time is a
@@ -411,19 +448,21 @@ the rate cancels out of every comparison, so these survive any
 miscalibration):
 
 1. **Order** (only under `by_cost`): filters sorted by cost per
-   killed document — (question tokens) / (1 − selectivity). Join
-   stage order over the join graph: enumerate (2–4 relations,
-   trivial), compare candidate orders by their survivor-thinned
-   pair-token totals, the formulas from `join_plan.md`.
-2. **Anchor per join stage**: the side whose pair-token total is
-   smaller when the other side streams — in practice the longer
-   side anchors (anchor tokens are paid once per document,
-   partner tokens once per pair). `{'anchor': ...}` overrides.
+   killed document — (question tokens) / (1 − selectivity). The
+   join specs (the exists/anti gates and the one full join):
+   enumerate the permutations (2–4 specs, trivial), compare
+   candidate orders by their survivor-thinned tuple-token totals.
+2. **Anchor per join**: the table whose tuple-token total is
+   smallest when the others stream — in practice the side with
+   the most document tokens anchors (anchor tokens are paid once
+   per document, partner tokens once per tuple). `{'anchor': ...}`
+   overrides; an exists/anti gate always anchors on the outer
+   table, because the gate applies to its documents.
 3. **Sharding**: filters split documents by token count across
    GPUs (`_balanced_shards`); joins split by anchor document.
-   Every pair belongs to exactly one anchor, so gating, dedup,
-   and the next stage's pair list stay local to the GPU holding
-   the anchor; the coordinator re-shards only when the next stage
+   Every tuple belongs to exactly one anchor, so gating and each
+   anchor's tuple stream stay local to the GPU holding the
+   anchor; the coordinator re-shards only when another spec
    anchors on a different relation, and merges final answers.
 
 **Settings from the spec structs alone** (§8):
@@ -438,15 +477,18 @@ miscalibration):
    derived, never typed in.
 
 **Decisions that compare compute against bytes** (the only
-consumers of measured constants: a, q_kv, and the host channel
-bandwidths — plus a2 to refine both at long document lengths):
+consumers of measured constants: a and the host channel
+bandwidths — plus a2 to refine the restore break-even at long
+document lengths):
 
 6. **Access per scan**: read, restore, or spill. Restore wins
    when the warm store's bandwidth beats kappa x the serving rate
-   (the measured 7.2 GB/s break-even at 4B against pinned host
-   memory's 55 GB/s); a2 moves the crossover for long documents.
-7. **KV dtype**: the argmin inequality of §6 — q_kv x fresh
-   tokens against the transfer and overflow savings.
+   (about 18 GB/s at 4B bf16 KV and the packed rate, against
+   pinned host memory's 55 GB/s); a2 moves the crossover for
+   long documents.
+
+KV is always bf16. The planner does not choose a KV dtype and
+does not model a conversion tax.
 
 Infeasible configurations — weights don't fit the cards, the
 arena cannot hold one working set, a suffix exceeds the chunk
@@ -469,9 +511,9 @@ and nothing in the system consumes an estimated wall.
 |---|---|---|
 | `DocScan` | worker CPU + store | resolve (provider, column) to token arrays (cached tokenization); execute the planned access: read, restore (batched pinned-memory loads), spill |
 | `FilterChain` | the executor | gated stages over continuously admitted documents: documents are anchors, each stage's question tail is a one-suffix stream, survivors advance (§6) |
-| `JoinStage` | the executor | brim-packed chunks over the stage's pair list; exists/anti streams stop early |
+| `JoinStage` | the executor | brim-packed chunks over the join's tuple list (the cross product of the surviving tables); exists/anti streams stop early |
 | `Gate` / `Dedup` | worker CPU, inside the chunk loop | survivors and distinct anchors, decided the moment a chunk's answers land — the next chunk's contents depend on them, so they cannot live a network hop away |
-| `Assemble` | worker CPU per shard, coordinator merges | tuple reassembly from recorded answers (`joinlogic.py`, moved over as is); the coordinator only concatenates shard outputs |
+| `Assemble` | worker CPU per shard, coordinator merges | output tuples read off the one full join's YES rows, each member checked against its table's final survivor set; the coordinator only concatenates shard outputs |
 | `Sink` | coordinator CPU | applies the `Project`; returns ids/tuples plus the run report |
 
 `DocScan` is an explicit plan node because it is where
@@ -487,8 +529,9 @@ a packed forward loop. The engine is gone from this design. One
 substrate — the packed executor — runs both operators, because a
 filter chain is the degenerate join:
 
-- **Join stage**: anchor = one side's document; suffixes = partner
-  document + question tail, one per pair.
+- **Join stage**: anchor = one table's document; suffixes = one per
+  tuple of the other tables' cross product — every partner document
+  behind its block label, then the question.
 - **Filter stage**: anchor = the document; suffix = the question
   tail, exactly one per stage. Stage j+1 attaches a fresh suffix to
   the same kept anchor KV.
@@ -575,51 +618,12 @@ thousands of small allocations and frees boring.) At 4B with bf16
 KV the arena holds ~400k tokens — roughly 1,000 mean-length
 documents resident at once.
 
-**KV dtype: the planner picks the latency argmin, and the
-conversion overhead is already measured, twice.** One dtype per
-session, identical in the arena and the store.
-
-fp8 KV is not free speed; it is a conversion tax. Storing KV in
-fp8 costs a quantize on every write and a dequant on every read,
-and buys nothing back on the GPU, because attention — the only
-consumer of KV bytes — is 4% of step time. Both committed
-measurements agree on the size of the tax:
-
-- The kernel ladder ran the same engine boot both ways: 96,946
-  tok/s with fp8 KV, 102,820 with bf16 — a 5.9% rate cost, i.e.
-  **q_kv = 0.59 µs per fresh token** at 4B/H100
-  (`exploration/plans/packed_forward.md`, the ladder run).
-- End to end, the identical 10k-document five-filter query
-  measured 38.1 s with bf16 KV against 39.8 s with fp8
-  (`filter_cells_bf16.json` vs `filter_cells.json`): 0.46 µs per
-  fresh token over the 3.84M fresh tokens — the ladder number,
-  inside the run-to-run band.
-
-What fp8 buys is bytes, and bytes are priced by the same
-arithmetic: store transfers move kappa(dtype) x tokens over a
-known channel (halving kappa returns 1.34 µs per restored token
-at pinned 55 GB/s), and store capacity doubles (documents past
-cpu_memory_gb / kappa lose their slot and are recomputed on later
-queries at the serving rate). So the pick is one inequality,
-evaluated per query from numbers the plan already has:
-
-    fp8 wins  iff  q_kv x fresh_tokens
-                   <  (kappa_bf16 − kappa_fp8) / bw_channel
-                        x restored_tokens
-                      + overflow recompute saved by the 2x store
-
-q_kv generalizes without re-measuring: an elementwise conversion
-is bandwidth work, so it scales with KV elements per token (the
-same 2 x L x n_kv x d_h that makes kappa) and inversely with
-device memory bandwidth — spec arithmetic, like everything else
-in §8, with the 4B/H100 measurement as the anchor.
-
-Where the inequality lands: a cold query has zero restored tokens,
-so bf16 wins it by the full 5.9%. fp8 wins only when a warm
-suite's restore and overflow traffic outweighs a ~0.6 µs tax on
-every fresh token — heavy store pressure and comparatively little
-fresh compute. `explain()` prints both walls and the pick;
-`kv_dtype` in the config forces either.
+**KV is always bf16.** One dtype per session, identical in the
+arena and the store. The planner does not pick fp8 and does not
+price a conversion tax. fp8 KV would cost a quantize on every
+write and a dequant on every read; attention is a small share of
+step time, so those conversions buy no GPU speed. The arena and
+the store both use 2-byte elements (`kv_bytes = 2`).
 
 **Continuous admission — bin packing by tokens, twice.** There is
 a pending queue of documents and a resident set; nothing runs in
@@ -655,7 +659,7 @@ tokens, three filters:
    are free: some chunk packs the group
    `[D's 400 tokens | q1's 25 tokens]`. Self-attention runs within
    each segment; D's KV is written to its pages; q1's KV is
-   written nowhere. The YES/NO logits at q1's last position are
+   written nowhere. The TRUE/FALSE logits at q1's last position are
    stage 1's answer.
 2. On YES, a later chunk packs just the 25-token group `q2`, no
    prefix segment: its cross-attention reads D's pages, its
@@ -721,9 +725,8 @@ shared by its GPUs: capacity =
 document id), holding document-prefix KV only (suffix KV never
 exists anywhere). The executor reads it with plain batched H2D
 copies — no connector indirection, which is where stock vLLM lost
-five sixths of the link (10.2 of 55.4 GB/s). Store dtype matches
-the executor's KV dtype, so the phase-2 dtype question from the
-earlier draft disappears with the second executor. Eviction is the
+five sixths of the link (10.2 of 55.4 GB/s). Store dtype is bf16,
+matching the executor. Eviction is the
 length threshold, not LRU (a scanning query thrashes LRU; it
 cannot thrash a length cutoff).
 
@@ -780,10 +783,7 @@ efficiency factor (measured 0.35 on 4B/H100 — 91–93% of peak inside
 the GEMMs, the rest lost to the memory-bound work between them).
 Default for an uncalibrated model: carry the efficiency over via
 spec-ratio scaling (the existing `_scale`), and say so in
-`explain()`. The fp8-KV conversion tax q_kv (§6) is the same kind
-of constant: anchored by one measurement (0.59 µs/token at
-4B/H100), scaled to other models by KV elements per token and to
-other devices by memory bandwidth.
+`explain()`.
 
 Sharper constants come from a **calibration file**, and it is
 important to say when that file is made: offline, once per
@@ -797,22 +797,21 @@ planner reads constants from the file when one exists for this
 pair and from the spec-scaled defaults when it does not, and
 `explain()` names the source. Calibration is run when a model is
 onboarded or the software stack changes, and never otherwise;
-plans never require it — only the two break-even decisions get
+plans never require it — only the restore break-even gets
 sharper from it.
 
-The file holds exactly three numbers per (model, device), because
-only the byte-vs-compute decisions consume constants at all:
+The file holds exactly two numbers per (model, device), because
+only the restore decision consumes constants at all:
 
 | constant | meaning | decides | 4B/H100 today |
 |---|---|---|---|
-| a | seconds per fresh token in the packed loop (1/rate; embeds the efficiency factor) | the restore break-even (restore wins iff kappa/bandwidth < a) and the fresh side of the dtype inequality | 8.26 µs (121,045 tok/s, kernel ladder) |
-| a2 | seconds per token-pair of attention (the quadratic coefficient) | refines both break-evens at long document lengths: moves the restore crossover, matters in the LF=4 regime, inert at ordinary lengths | 4.93e-10 |
-| q_kv | the fp8-KV conversion tax per fresh token | the dtype argmin (§6) | 0.59 µs |
+| a | seconds per fresh token in the packed loop (1/rate; embeds the efficiency factor) | the restore break-even (restore wins iff kappa/bandwidth < a) | 8.26 µs (121,045 tok/s, kernel ladder) |
+| a2 | seconds per token-pair of attention (the quadratic coefficient) | refines the restore break-even at long document lengths: moves the restore crossover, matters in the LF=4 regime, inert at ordinary lengths | 4.93e-10 |
 
 Plus one table per host configuration, model-independent, measured
 once by the pinprobe protocol: the channel bandwidths (pinned
 H2D/D2H ~55 GB/s, unpinned ~11, disk ~2.6-3.9, volume ~0.9-3.2) —
-the byte side of both break-evens.
+the byte side of the restore break-even.
 
 Everything else the planner does consumes no constants: filter
 order, join stage order, and anchor choice compare candidates that
@@ -859,9 +858,10 @@ Two knobs, both explicit in every reported result:
   4x the tokens per document with real text throughout.
 
 Filter cost scales as SF x LF. Join cost scales as SF x LF_partner
-per fixed partner list, and as SF^2 where both sides scale — true
-pairwise joins are quadratic, and the benchmark does not hide it:
-each join query's table row states its pair-count formula. The
+per fixed partner list, and as SF^n where n scaling tables cross —
+a cross-product join multiplies its table sizes, and the benchmark
+does not hide it: each join query's table row states its
+tuple-count formula. The
 reference grid: (SF, LF) in {(0.1, 1), (1, 1), (1, 4)}; SF=0.1 is
 the development scale, (1, 4) pushes long documents toward the
 attention crossover on purpose.
@@ -906,11 +906,13 @@ Quail refuses (aggregation, grouping, ordering, arithmetic, outer
 joins), and keep the filter/join skeleton. The 22 queries collapse
 into eight skeleton families — filter-only scans (Q1, Q6), plain
 2-way joins (Q12, Q14, Q17, Q19), filtered 2-way joins (Q3's core,
-Q16), 3-way-and-deeper chains (Q3, Q10, Q18), stars (Q2, Q5, Q8,
-Q9, Q11), exists (Q4, Q20), anti (Q16, Q22), exists+anti combined
-(Q21) — plus Q13, which is an outer join and has no analogue here.
-Fifteen queries cover all eight families with variants that isolate
-one engine mechanism each. F = filter stage, J = join stage.
+Q16), 3-way-and-deeper joins (Q3, Q10, Q18; chains and stars alike
+become one n-way cross-product join here, so Q2, Q5, Q8, Q9, Q11
+land in the same family), exists (Q4, Q20), anti (Q16, Q22),
+exists+anti combined (Q21) — plus Q13, which is an outer join and
+has no analogue here. Fifteen queries cover the families with
+variants that isolate one engine mechanism each. F = filter stage,
+J = join.
 
 | id | TPC-H skeleton | shape | sets | pair/doc volume at SF=1 | what it isolates | sizing estimate (SF=1, LF=1) |
 |---|---|---|---|---|---|---|
@@ -923,8 +925,8 @@ one engine mechanism each. F = filter stage, J = join stage.
 | B7 | Q19 | 1J full | reviews(5k slice) x products | 5M pairs | pure pair predicate, no gating anywhere (Q19's OR lives inside the one prompt) | ~29 min |
 | B8 | Q4 | 1J exists | threads x products | 10k anchors, early-stop streams | exists semantics; expected-scan pricing vs measured | ~7 min |
 | B9 | Q21 | 1J exists + 1J anti | threads x products, threads x terms | two early-stop passes | anti semantics; the combined semi/anti family | ~11 min |
-| B10 | Q3 | 2J chain | reviews(2k) x threads(2k) x products | stage sels .2/.1; stage-2 pairs must equal survivors x partners exactly | 3-way gating and dedup at scale | ~16 min |
-| B11 | Q9 | 2J star | reports x terms, reports x products | anchor KV computed once, read by both stages | star shape; kept-anchor reuse across stages | ~60 min |
+| B10 | Q3 | 3-way join | threads(2k) x reviews(2k) x products | one prompt per (b, a, c) triple over the full cross product | the n-way join: every document of a tuple in one model call | grows with the triple count |
+| B11 | Q9 | 3-way join | reports x terms x products | long anchors kept, both partners stream per triple | the n-way join on long anchor documents | grows with the triple count |
 | B12 | Q16 | 2F + 1J | threads, products | both sides filtered (.3, .5) before joining | two-sided pushdown; multiplicative pair shrink | ~9 min |
 | B13 | Q1 rerun | 5F | reviews, new flags | 50k docs, warm store | cross-query restore for a scan (the persist result inside the engine) | ~2.5 min warm |
 | B14 | Q14 rerun | 1J | reports x products, new keys | 2M pairs, warm anchors | cross-query restore for join anchors (prefix share ~19%) | ~13 min cold / ~11 warm |
@@ -983,19 +985,18 @@ analytically equivalent form:
   `by_cost` chose. This client measured 42.9 s against rewind's
   39.8 s — the gap is the block-boundary recompute and the
   request-count overhead, not a handicapped client.
-- **Joins: one request per pair, ordered anchor-major.** All of
-  an anchor's pairs are submitted consecutively, so vLLM's prefix
+- **Joins: one request per tuple, ordered anchor-major.** All of
+  an anchor's tuples are submitted consecutively, so vLLM's prefix
   cache re-serves the anchor document's KV across its whole
-  partner stream instead of evicting it between scattered hits —
+  tuple stream instead of evicting it between scattered hits —
   the reordering is exactly what makes stock benefit from prefix
   caching at all (the arbitrary-order variant, priced at 1.87x
-  worse in the exploration, is never run). Stock also gets
-  Quail's stage order and anchor orientation, and between stages
-  the same gating and dedup applied as client bookkeeping, so an
-  n-way join's stock pair lists shrink identically to Quail's.
-  Admission is matched from the same pool arithmetic. This is the
-  committed grouped protocol behind the 429 s side of the 4.1x
-  result.
+  worse in the exploration, is never run). Stock gets the same
+  rendered prompts (labeled blocks + question), Quail's anchor
+  orientation, and the same gate bookkeeping client-side, so its
+  tuple lists shrink identically to Quail's. Admission is matched
+  from the same pool arithmetic. This is the committed grouped
+  protocol behind the 429 s side of the 4.1x result.
 Expectations, from the committed measurements: at (1, 1) the join
 queries carry
 the gap (measured 4.1x on the B5 shape), the filter queries are
@@ -1019,8 +1020,8 @@ quail/                        (new repository)
     planner/
       plan.py                 # PhysicalPlan, Refusal
       budgets.py              # spec-derived arena/chunk arithmetic
-      decide.py               # order, anchor, sharding, access, dtype:
-                              # token arithmetic plus the two break-evens
+      decide.py               # order, anchor, sharding, access:
+                              # token arithmetic plus the restore break-even
                               # (reads the calibration file if present)
     executor/
       pack.py                 # brim packing, admission queue (from joinlogic.py)
