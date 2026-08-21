@@ -17,6 +17,7 @@ image.
 
 import time
 
+from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.executor.pack import FilterAdmission, pack_stream
 
 
@@ -611,7 +612,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
         used += len(d) + q_max
         i += 1
     original_mode = pipeline.attention_mode
-    for mode in ("unified", "merge_quant"):
+    for mode in dict.fromkeys((FILTER_ATTENTION, JOIN_ATTENTION)):
         pipeline.attention_mode = mode
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
                    question_ids, budget)

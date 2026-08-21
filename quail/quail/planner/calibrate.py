@@ -48,7 +48,7 @@ def _boot(spec: ModelSpec, device: DeviceSpec):
     from transformers import AutoTokenizer
 
     from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
+    from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.loop import Answerer, AsyncAnswers
     from quail.executor.model import load_model
 
@@ -62,7 +62,7 @@ def _boot(spec: ModelSpec, device: DeviceSpec):
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
     pipeline = Pipeline(model, arena)
-    pipeline.attention_mode = "unified"
+    pipeline.attention_mode = FILTER_ATTENTION
     answerer = Answerer(torch, F, model, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     exec_budget = min(chunk, pipeline.max_chunk_tokens)

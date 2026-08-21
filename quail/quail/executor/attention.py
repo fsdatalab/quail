@@ -29,6 +29,21 @@ Modal image.
 
 GROUP = 128            # fp8 quant group size, matches the engine
 
+# The workload-to-path assignment (issue #24). Filters run "unified":
+# one causal paged FlashAttention call over kept plus current KV -
+# fastest on the filter shape and bit-identical to a contiguous
+# causal call, so filter answers match full recompute exactly. Joins
+# run "merge_quant": the two-call pattern with the fused merge+quant
+# kernel - "unified" cannot share one anchor's KV across the many
+# partner suffixes of a chunk (each pair needs its own causal view),
+# so the two-call pattern is required, and the fused kernel is its
+# fastest form. "split" stays as the parity reference and the
+# gather-fallback path (meta["paged"]=False). Evidence:
+# results/attention_paths.json, results/join_attention_paths_*.json,
+# results/accuracy_vs_stock.json.
+FILTER_ATTENTION = "unified"
+JOIN_ATTENTION = "merge_quant"
+
 
 class Pipeline:
     """Packed forward passes with shared-prefix attention over the
