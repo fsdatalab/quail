@@ -23,7 +23,7 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, TEAL, ORANGE, GRAY, GREEN, DARK
+from plot_colors import QUAIL, STOCK, GOOD, TEAL, ORANGE, DARK
 
 
 def load(name):
@@ -41,7 +41,7 @@ def mean_s(side, key):
 
 
 phases = [
-    ("load_model", mean_s(q_cold, "load_model_s"), BLUE),
+    ("load_model", mean_s(q_cold, "load_model_s"), QUAIL),
     ("arena", mean_s(q_cold, "arena_s"), TEAL),
     ("warm_kernels", mean_s(q_cold, "warm_kernels_s"), ORANGE),
 ]
@@ -49,31 +49,32 @@ q_total = mean_s(q_cold, "boot_s")
 s_total = mean_s(s_cold, "boot_s")
 
 fig, (ax_q, ax_cmp) = plt.subplots(
-    1, 2, figsize=(10.5, 3.8),
-    gridspec_kw={"width_ratios": [1.35, 1]},
+    1, 2, figsize=(10.5, 3.5),
+    gridspec_kw={"width_ratios": [1.4, 1]},
 )
 
-# ---- left: Quail phases on a Quail-scale axis ------------------------
+# ---- left: Quail cold boot phases -----------------------------------
 left = 0.0
 for name, val, color in phases:
     if val <= 0:
         continue
-    ax_q.barh(0, val, left=left, height=0.55, color=color,
-              edgecolor="white", linewidth=1.0)
+    ax_q.barh(0, val, left=left, height=0.48, color=color,
+              edgecolor="white", linewidth=1.2)
     if val >= 3.0:
         ax_q.text(left + val / 2, 0, f"{val:.1f} s",
-                  ha="center", va="center", fontsize=10,
+                  ha="center", va="center", fontsize=10.5,
                   color="white", fontweight="bold")
     left += val
 
-ax_q.set_xlim(0, q_total * 1.05)
-ax_q.set_ylim(-0.55, 0.55)
+ax_q.set_xlim(0, q_total * 1.08)
+ax_q.set_ylim(-0.5, 0.5)
 ax_q.set_yticks([])
-ax_q.set_xlabel("seconds", fontsize=9)
-ax_q.set_title(f"Quail cold phases  ·  {q_total:.1f} s mean "
-               f"(median {q_cold['boot_s']['median']:.1f})",
-               fontsize=11, fontweight="bold", loc="left")
+ax_q.set_xlabel("seconds")
+ax_q.set_title(
+    f"Quail cold phases  ·  {q_total:.1f} s",
+    fontsize=11, loc="left")
 ax_q.spines["left"].set_visible(False)
+ax_q.grid(False)
 
 handles = [
     Patch(facecolor=c,
@@ -81,32 +82,46 @@ handles = [
     for n, v, c in phases
 ]
 ax_q.legend(handles=handles, loc="upper center",
-            bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=8.5,
+            bbox_to_anchor=(0.5, -0.22), ncol=3, fontsize=8.5,
             handlelength=1.1)
 
-# ---- right: total cold comparison ------------------------------------
-labels = ["Quail", "Stock vLLM"]
-vals = [q_total, s_total]
-cols = [GREEN, GRAY]
-bars = ax_cmp.bar(labels, vals, color=cols, width=0.55)
-for b, v, med in zip(bars, vals,
-                     [q_cold["boot_s"]["median"],
-                      s_cold["boot_s"]["median"]]):
-    ax_cmp.text(b.get_x() + b.get_width() / 2, v + s_total * 0.025,
-                f"{v:.1f} s\nmedian {med:.1f}",
-                ha="center", va="bottom", fontsize=9, color=DARK)
-ax_cmp.set_ylim(0, s_total * 1.28)
-ax_cmp.set_ylabel("seconds", fontsize=9)
-ax_cmp.set_title("Cold boot total", fontsize=11,
-                 fontweight="bold", loc="left")
-ax_cmp.text(0.5, -0.16,
-            "warm boot = 0.0 s on both  ·  3 H100 SXM trials",
-            transform=ax_cmp.transAxes, ha="center", fontsize=8,
-            color=DARK)
+# ---- right: total cold boot comparison ------------------------------
+bars = ax_cmp.bar(
+    ["Quail", "Stock vLLM"], [q_total, s_total],
+    color=[GOOD, STOCK], width=0.5, edgecolor="white", linewidth=0.8,
+)
+for b, v, med in zip(bars, [q_total, s_total],
+                      [q_cold["boot_s"]["median"],
+                       s_cold["boot_s"]["median"]]):
+    ax_cmp.text(
+        b.get_x() + b.get_width() / 2, v + s_total * 0.02,
+        f"{v:.1f} s", ha="center", va="bottom",
+        fontsize=10.5, fontweight="bold", color=DARK,
+    )
+    ax_cmp.text(
+        b.get_x() + b.get_width() / 2, v + s_total * 0.09,
+        f"median {med:.1f}", ha="center", va="bottom",
+        fontsize=8, color="#888888",
+    )
 
-fig.suptitle("Cold boot: Quail vs stock vLLM", fontsize=13,
-             fontweight="bold", x=0.01, ha="left", y=1.02)
-fig.subplots_adjust(bottom=0.22)
+speedup = s_total / q_total
+ax_cmp.text(
+    0, q_total + s_total * 0.18,
+    f"{speedup:.0f}x faster", ha="center", fontsize=10.5,
+    fontweight="bold", color=GOOD,
+)
+
+ax_cmp.set_ylim(0, s_total * 1.28)
+ax_cmp.set_ylabel("seconds")
+ax_cmp.set_title("Cold boot total", fontsize=11, loc="left")
+ax_cmp.text(
+    0.5, -0.18,
+    "warm boot = 0.0 s on both  ·  3 H100 SXM trials",
+    transform=ax_cmp.transAxes, ha="center", fontsize=8,
+    color="#888888",
+)
+
+fig.subplots_adjust(bottom=0.24, wspace=0.35)
 out = OUT / "boot_profile.png"
 fig.savefig(out)
 print("wrote", out)

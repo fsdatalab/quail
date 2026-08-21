@@ -19,7 +19,7 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY, GREEN, RED, DARK
+from plot_colors import QUAIL, STOCK, GOOD, BAD, DARK
 
 
 def load(name):
@@ -36,29 +36,28 @@ def mean(rows, key):
     return sum(r[key] for r in rows) / len(rows)
 
 
-LIGHT_GRAY = "#B0B0B0"
-
 rungs = [
-    ("A0  stock vLLM, fp8 KV",      stock["A0"]["runs"],       LIGHT_GRAY),
-    ("A1  stock vLLM, bf16 KV",      stock["A1"]["runs"],       LIGHT_GRAY),
-    ("A2  our executor, vLLM kernels", packed["runs"]["A2"],    BLUE),
-    ("A3  our executor, our kernels",  packed["runs"]["A3"],    GREEN),
+    ("A0  stock, fp8 KV",              stock["A0"]["runs"],     STOCK),
+    ("A1  stock, bf16 KV",             stock["A1"]["runs"],     STOCK),
+    ("A2  Quail executor, vLLM kernels", packed["runs"]["A2"],  QUAIL),
+    ("A3  Quail executor, our kernels",  packed["runs"]["A3"],  GOOD),
 ]
 labels = [r[0] for r in rungs]
 walls = [mean(r[1], "wall") for r in rungs]
 colors = [r[2] for r in rungs]
 
-fig, ax = plt.subplots(figsize=(9, 3.6))
+fig, ax = plt.subplots(figsize=(9, 3.8))
 y = list(range(len(rungs)))
-ax.barh(y, walls, height=0.55, color=colors, edgecolor="white")
+ax.barh(y, walls, height=0.52, color=colors, edgecolor="white", linewidth=0.8)
 
 for i, w in enumerate(walls):
     rows = rungs[i][1]
     tok = mean(rows, "tok_s") if "tok_s" in rows[0] else None
-    txt = f"{w:.1f} s"
+    txt = f" {w:.1f} s"
     if tok:
-        txt += f"   {tok / 1000:.0f}k tok/s"
-    ax.text(w + 0.3, i, txt, va="center", fontsize=9.5, color=DARK)
+        txt += f"  ·  {tok / 1000:.0f}k tok/s"
+    ax.text(w + 0.2, i, txt, va="center", fontsize=9.5, color=DARK,
+            fontweight="bold")
 
 deltas = [
     (0, "bf16 KV"),
@@ -68,18 +67,22 @@ deltas = [
 for i, label in deltas:
     d = walls[i + 1] - walls[i]
     sign = "+" if d > 0 else ""
-    color = RED if d > 0 else GREEN
-    ax.annotate(f"{label}: {sign}{d:.1f} s",
-                xy=((walls[i] + walls[i + 1]) / 2, i + 0.5),
-                fontsize=8.5, color=color, ha="center", va="center")
+    color = BAD if d > 0 else GOOD
+    mid_x = max(walls[i], walls[i + 1]) + 0.2
+    ax.annotate(
+        f"  {label}  {sign}{d:.1f} s",
+        xy=(mid_x, i + 0.5),
+        fontsize=8, color=color, ha="left", va="center",
+        fontweight="medium",
+    )
 
 ax.set_yticks(y)
 ax.set_yticklabels(labels, fontsize=9.5)
 ax.invert_yaxis()
-ax.set_xlim(0, 52)
-ax.set_xlabel("seconds (10k documents, 5 filters, one H100)", fontsize=9)
-ax.set_title("Forward-pass ablation", fontsize=12, fontweight="bold",
-             loc="left")
+ax.set_xlim(0, 56)
+ax.set_xlabel("seconds  (10k docs, 5 filters, one H100)")
+ax.set_title("Forward-pass ablation", loc="left")
+ax.grid(axis="x", alpha=0.3)
 
 fig.savefig(OUT / "ablation_ladder.png")
 print("wrote", OUT / "ablation_ladder.png")
