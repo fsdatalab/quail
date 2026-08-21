@@ -24,6 +24,55 @@ parity corpus.
   worker reads those constants.
 - FlashInfer was measured and not adopted (details below).
 
+## Kernel provenance
+
+Every kernel and algorithm used in the three attention paths, with
+its open-source origin:
+
+- **FlashAttention-3 varlen** (`flash_attn_varlen_func`, `fa_version=3`):
+  all three paths call this for their attention work. It is the Hopper
+  (SM 9.0) async + low-precision attention kernel from Dao et al.,
+  "FlashAttention-3: Fast and Accurate Attention with Asynchrony and
+  Low-precision" (2024). We call vLLM's vendored fork
+  (`vllm.vllm_flash_attn`), which is
+  [vllm-project/flash-attention](https://github.com/vllm-project/flash-attention),
+  built from [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention).
+- **Paged KV with block table** (the `block_table` + `seqused_k`
+  arguments to the varlen call): FA3's paged-attention API. The paged
+  attention idea is from Kwon et al., "Efficient Memory Management
+  for Large Language Model Serving with PagedAttention" (2023),
+  [vllm-project/vllm](https://github.com/vllm-project/vllm).
+- **Online-softmax LSE merge** (the `sigmoid(lse_b - lse_a)` formula
+  in the `split` path's `attention()` method): the standard two-pass
+  merge of partial attention outputs using log-sum-exp statistics.
+  From Milakov & Gimelshein, "Online normalizer calculation for
+  softmax" (2018); reused inside FlashAttention for tiling.
+- **`merge_quant` Triton kernel** (`merge_attn_quant`): written for
+  this project. Fuses the LSE merge above with per-group FP8
+  quantization in one kernel launch, replacing the `split` path's
+  BF16 merge + separate `per_token_group_quant_fp8` (two launches).
+  The merge math is the same online-softmax formula; the FP8
+  quantization follows vLLM's group-quantize pattern.
+- **`silu_mul_quant` Triton kernel**: written for this project. Fuses
+  SiLU-gated activation with FP8 quantization. Replaces vLLM's
+  `silu_and_mul` + separate quantize (two launches).
+- **`add_rms_norm_quant` Triton kernel**: written for this project.
+  Fuses residual add + RMSNorm + FP8 quantization. Replaces vLLM's
+  `fused_add_rms_norm` + separate quantize (two launches).
+- **`qk_norm_rope` Triton kernel**: written for this project. Fuses
+  per-head Q/K RMSNorm + rotary embedding. Replaces vLLM's two
+  `rms_norm` calls + `rotary_emb` (five launches).
+- **`kv_row_scatter` Triton kernel**: written for this project.
+  Scatters fresh KV rows into paged arena slots. Replaces `gather` +
+  `index_copy_` (four launches per layer).
+- **DeepGEMM FP8 matmuls**: all linear projections (QKV, O, gate-up,
+  down) use vLLM's `fp8_gemm_nt` from `vllm.utils.deep_gemm`.
+
+The `kernels="vllm"` code path in `Pipeline` runs the equivalent
+sequence of vLLM's own ops for each fused kernel above, and the
+ablation ladder (issue #9) measured the difference. The fused kernels
+change launch count; no novel attention algorithm is introduced.
+
 ## Why filters get `unified`
 
 - Speed, measured on the 10,000-document five-filter workload
@@ -184,7 +233,13 @@ they do not move planted-truth accuracy on either workload.
 ## FlashInfer and other off-the-shelf kernels
 
 FlashInfer 0.6.14 ships in the vLLM 0.26.0 image
-(`results/flashinfer_probe.json`). The benchmark
+(`results/flashinfer_probe.json`; the latest release at time of
+writing is 0.6.16, whose changes are FP4/MoE quantization and
+sparse-MLA padding - nothing that changes the paged-prefill,
+merge_state, or cascade kernels benchmarked here).
+[flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer),
+Ye et al., "FlashInfer: Efficient and Customizable Attention Engine
+for LLM Inference Serving" (2025). The benchmark
 (`ablations/flashinfer_compare.py`,
 `results/flashinfer_bench.json`) times each stack's full
 attention-to-o_proj work (KV scatter + attention + merge + FP8
@@ -208,6 +263,14 @@ its shared level must be shared by every query in the batch).
 FlashInfer's paged causal kernel is 27% slower than the single FA3
 call on the fresh filter chunk and 2.4x slower on the rewind chunk.
 Decision: stay on FA3 plus the one custom Triton merge kernel.
+The three FlashInfer APIs tested:
+`BatchPrefillWithPagedKVCacheWrapper` (paged causal prefill, the
+FlashInfer equivalent of the unified path), `merge_state` (the
+FlashInfer equivalent of the LSE merge in split/merge_quant, based
+on FlashInfer's composable attention-state algebra), and
+`MultiLevelCascadeAttentionWrapper` (two-level cascade: shared
+prefix KV + per-request suffix KV in one fused call).
+
 Hydragen ships no reusable prefill kernel to import (the
 decomposition idea is already what `split`/`merge_quant`
 implement, on standard FA3 calls), and SGLang's RadixAttention is
