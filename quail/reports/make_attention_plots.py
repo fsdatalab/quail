@@ -245,6 +245,10 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
 
 def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
     fi = load(f"flashinfer_bench{tag}.json")
+    try:
+        tuned = load(f"flashinfer_tuned{tag}.json")["shapes"]
+    except FileNotFoundError:
+        tuned = {}
     shapes = [
         ("filter_fresh", "filter, fresh chunk\n(~110k tokens)"),
         ("filter_cached", "filter, rewind chunk\n(~11k tokens)"),
@@ -260,14 +264,28 @@ def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
         ("fi_two_call_merge_plus_quant",
          "FlashInfer two-call + merge_state", TEAL),
         ("fi_cascade_plus_quant", "FlashInfer cascade", GRAY),
+        ("fi_best_tuned", "FlashInfer best forced backend", DARK),
     ]
 
-    fig, ax = plt.subplots(figsize=(10.5, 4.6))
+    def best_tuned(skey):
+        # the fastest pure-FlashInfer variant across forced backends
+        row = tuned.get(skey)
+        if not row:
+            return None
+        pool = [(v, f"{grp} {be}")
+                for grp in ("paged_causal", "two_call_merge_state")
+                for be, v in row[grp].items()]
+        return min(pool) if pool else None
+
+    fig, ax = plt.subplots(figsize=(10.5, 5.2))
     bar_h = 0.15
     yticks, ylabels = [], []
     for si, (skey, slabel) in enumerate(shapes):
         row = fi["shapes"][skey]
         vals = {**row["fa3"], **row["flashinfer"]}
+        bt = best_tuned(skey)
+        if bt is not None:
+            vals["fi_best_tuned"] = bt[0]
         present = [(k, lab, c) for k, lab, c in variants if k in vals]
         base = si * (len(variants) + 1.4) * bar_h
         for vi, (k, lab, c) in enumerate(present):
@@ -275,7 +293,8 @@ def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
             ypos = base + vi * bar_h
             ax.barh(ypos, v, height=bar_h * 0.82, color=c,
                     edgecolor="white")
-            ax.text(v + 0.05, ypos, f"{v:.2f}", va="center",
+            note = f" ({bt[1]})" if k == "fi_best_tuned" else ""
+            ax.text(v + 0.05, ypos, f"{v:.2f}{note}", va="center",
                     fontsize=8, color=DARK)
         yticks.append(base + (len(present) - 1) * bar_h / 2)
         ylabels.append(slabel)

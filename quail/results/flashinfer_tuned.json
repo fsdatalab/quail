@@ -1,0 +1,171 @@
+{
+  "cell": "flashinfer_tuned",
+  "flashinfer": "0.6.14",
+  "q_heads": 32,
+  "kv_heads": 8,
+  "backends_tried": [
+    "auto",
+    "fa2",
+    "fa3",
+    "cutlass",
+    "trtllm-gen"
+  ],
+  "prediction": "Forcing a backend moves the filter-shape gap little (auto already picks per shape); the hybrid variant removes roughly the fusion share of the join gap but the ragged+paged pair still trails merge_quant; nothing reaches the 5% adoption bar.",
+  "note": "Same timing method as flashinfer_bench: plan() and JIT compilation outside the timed region, median of 20 CUDA-event runs after 3 warmups, times include KV scatter, merge, and FP8 quantization.",
+  "shapes": {
+    "filter_fresh": {
+      "n_tokens": 121901,
+      "fa3": {
+        "merge_quant": 2.9802238941192627,
+        "unified_plus_quant": 3.0355520248413086
+      },
+      "paged_causal": {
+        "auto": 3.793600082397461,
+        "fa2": 3.4639039039611816,
+        "fa3": 3.8076159954071045
+      },
+      "paged_causal_max_abs": {
+        "auto": 0.0078125,
+        "fa2": 0.015625,
+        "fa3": 0.0078125
+      },
+      "two_call_merge_state": {
+        "auto": 4.573056221008301,
+        "fa2": 3.496864080429077,
+        "fa3": 4.595935821533203
+      },
+      "two_call_fused_merge": {
+        "auto": 4.141215801239014,
+        "fa2": 3.1015360355377197,
+        "fa3": 4.157919883728027
+      },
+      "rejected": {
+        "paged_causal[cutlass]": "AssertionError('backend must be fa2 or fa3 in gen_batch_prefill_module(), got: cutlass')",
+        "two_call[cutlass]": "ValueError('device must be a cuda device')",
+        "paged_causal[trtllm-gen]": "RuntimeError(\"Error in function 'TllmGenFmhaRunner' at /usr/local/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/trtllm/fmha/fmhaRunner.cuh:37: Unsupported architecture\")",
+        "two_call[trtllm-gen]": "NotImplementedError('Variable length is not implemented for trtllm-gen backend yet.')"
+      },
+      "us_per_fresh_token": {
+        "merge_quant": 0.024,
+        "unified_plus_quant": 0.025,
+        "paged_causal[auto]": 0.031,
+        "paged_causal[fa2]": 0.028,
+        "paged_causal[fa3]": 0.031,
+        "two_call_merge_state[auto]": 0.038,
+        "two_call_merge_state[fa2]": 0.029,
+        "two_call_merge_state[fa3]": 0.038,
+        "two_call_fused_merge[auto]": 0.034,
+        "two_call_fused_merge[fa2]": 0.025,
+        "two_call_fused_merge[fa3]": 0.034
+      }
+    },
+    "filter_cached": {
+      "n_tokens": 10880,
+      "fa3": {
+        "merge_quant": 0.5161600112915039,
+        "unified_plus_quant": 0.39001598954200745
+      },
+      "paged_causal": {
+        "auto": 1.0002559423446655,
+        "fa2": 0.4433920085430145,
+        "fa3": 0.9968960285186768
+      },
+      "paged_causal_max_abs": {
+        "auto": 0.00390625,
+        "fa2": 0.00390625,
+        "fa3": 0.00390625
+      },
+      "two_call_merge_state": {
+        "auto": 1.554144024848938,
+        "fa2": 0.8711040019989014,
+        "fa3": 1.555616021156311
+      },
+      "two_call_fused_merge": {
+        "auto": 1.2426879405975342,
+        "fa2": 0.5603200197219849,
+        "fa3": 1.2408640384674072
+      },
+      "rejected": {
+        "paged_causal[cutlass]": "AssertionError('backend must be fa2 or fa3 in gen_batch_prefill_module(), got: cutlass')",
+        "two_call[cutlass]": "ValueError('device must be a cuda device')",
+        "paged_causal[trtllm-gen]": "RuntimeError(\"Error in function 'TllmGenFmhaRunner' at /usr/local/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/trtllm/fmha/fmhaRunner.cuh:37: Unsupported architecture\")",
+        "two_call[trtllm-gen]": "NotImplementedError('Variable length is not implemented for trtllm-gen backend yet.')"
+      },
+      "us_per_fresh_token": {
+        "merge_quant": 0.047,
+        "unified_plus_quant": 0.036,
+        "paged_causal[auto]": 0.092,
+        "paged_causal[fa2]": 0.041,
+        "paged_causal[fa3]": 0.092,
+        "two_call_merge_state[auto]": 0.143,
+        "two_call_merge_state[fa2]": 0.08,
+        "two_call_merge_state[fa3]": 0.143,
+        "two_call_fused_merge[auto]": 0.114,
+        "two_call_fused_merge[fa2]": 0.052,
+        "two_call_fused_merge[fa3]": 0.114
+      }
+    },
+    "join": {
+      "n_tokens": 10920,
+      "fa3": {
+        "merge_quant": 1.3831360340118408
+      },
+      "paged_causal": {},
+      "paged_causal_max_abs": {},
+      "two_call_merge_state": {
+        "auto": 1.8858239650726318,
+        "fa2": 2.6137280464172363,
+        "fa3": 1.8907519578933716
+      },
+      "two_call_fused_merge": {
+        "auto": 1.5972479581832886,
+        "fa2": 2.2068159580230713,
+        "fa3": 1.603935956954956
+      },
+      "rejected": {
+        "two_call[cutlass]": "ValueError('device must be a cuda device')",
+        "two_call[trtllm-gen]": "NotImplementedError('Variable length is not implemented for trtllm-gen backend yet.')"
+      },
+      "us_per_fresh_token": {
+        "merge_quant": 0.127,
+        "two_call_merge_state[auto]": 0.173,
+        "two_call_merge_state[fa2]": 0.239,
+        "two_call_merge_state[fa3]": 0.173,
+        "two_call_fused_merge[auto]": 0.146,
+        "two_call_fused_merge[fa2]": 0.202,
+        "two_call_fused_merge[fa3]": 0.147
+      }
+    },
+    "join_fanout": {
+      "n_tokens": 10752,
+      "fa3": {
+        "merge_quant": 1.3653759956359863
+      },
+      "paged_causal": {},
+      "paged_causal_max_abs": {},
+      "two_call_merge_state": {
+        "auto": 1.8096959590911865,
+        "fa2": 2.466464042663574,
+        "fa3": 1.801151990890503
+      },
+      "two_call_fused_merge": {
+        "auto": 1.509984016418457,
+        "fa2": 2.098144054412842,
+        "fa3": 1.5219199657440186
+      },
+      "rejected": {
+        "two_call[cutlass]": "ValueError('device must be a cuda device')",
+        "two_call[trtllm-gen]": "NotImplementedError('Variable length is not implemented for trtllm-gen backend yet.')"
+      },
+      "us_per_fresh_token": {
+        "merge_quant": 0.127,
+        "two_call_merge_state[auto]": 0.168,
+        "two_call_merge_state[fa2]": 0.229,
+        "two_call_merge_state[fa3]": 0.168,
+        "two_call_fused_merge[auto]": 0.14,
+        "two_call_fused_merge[fa2]": 0.195,
+        "two_call_fused_merge[fa3]": 0.142
+      }
+    }
+  }
+}

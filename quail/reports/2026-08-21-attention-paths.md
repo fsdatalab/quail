@@ -278,13 +278,74 @@ Per-layer milliseconds:
 | join 10 x 26-suffix groups | 1.38 (merge_quant) | - | 1.88 | not applicable |
 | join 1 anchor x 256 (fan-out) | 1.33 (merge_quant) | - | 1.79 | 1.61 |
 
-The issue's rule was: adopt off-the-shelf if within 5%. The closest
-FlashInfer result is 21% slower (cascade on the single-anchor
+The issue's rule was: adopt off-the-shelf if within 5%. At
+FlashInfer's default dispatch (`backend="auto"`, this table) the
+closest result was 21% slower (cascade on the single-anchor
 fan-out shape, and cascade cannot run multi-anchor chunks at all -
-its shared level must be shared by every query in the batch).
-FlashInfer's paged causal kernel is 27% slower than the single FA3
-call on the fresh filter chunk and 2.4x slower on the rewind chunk.
-Decision: stay on FA3 plus the one custom Triton merge kernel.
+its shared level must be shared by every query in the batch);
+paged causal was 27% slower than the single FA3 call on the fresh
+filter chunk and 2.4x slower on the rewind chunk. Because "auto"
+might not be FlashInfer's best configuration, a second cell gave
+it every backend it accepts (next subsection). Best case it closes
+to 14% on filters and 32% on joins. Decision: stay on FA3 plus the
+one custom Triton merge kernel.
+
+### The fairness pass: FlashInfer at its best settings
+
+Cell: `bench_tuned` in the same file
+(`results/flashinfer_tuned.json`). Two changes give FlashInfer its
+best shot: every backend string is forced in turn instead of
+`"auto"`, and a hybrid variant runs their two attention calls
+merged by our fused merge_quant kernel, so their kernel quality is
+measured separately from our fusion advantage. Prediction, stated
+before the run: forcing a backend moves the filter-shape gap
+little; the hybrid removes roughly the fusion share of the join
+gap but still trails; nothing reaches the 5% bar.
+
+What the wrappers accept on H100 in 0.6.14: `auto`, `fa2`, and
+`fa3` run; `cutlass` is rejected (the prefill module only accepts
+fa2/fa3) and `trtllm-gen` is rejected ("Unsupported architecture"
+for this runner, and not implemented for ragged inputs). The
+cascade wrapper takes no backend argument, so it could not be
+tuned further. Rejections are recorded per variant in the result
+file.
+
+Per-layer milliseconds, same-run FA3 reference (run-to-run wobble
+on these references is about 2%):
+
+| Shape | assigned FA3 path | best pure FlashInfer | hybrid: their calls + our merge kernel |
+|---|---|---|---|
+| filter, fresh chunk | 3.04 (unified) | 3.46 paged causal, fa2 (+14%) | 3.10, fa2 (+2.2%) |
+| filter, rewind chunk | 0.39 (unified) | 0.44 paged causal, fa2 (+14%) | 0.56, fa2 (+44%) |
+| join 10 x 26 | 1.38 (merge_quant) | 1.89 two-call, auto (+36%) | 1.60, auto (+15%) |
+| join fan-out | 1.37 (merge_quant) | 1.80 two-call, fa3 (+32%) | 1.51, auto (+11%) |
+
+Measured against the prediction:
+
+- "Forcing a backend moves the filter-shape gap little" was wrong.
+  `auto` selects FlashInfer's FA3 template on every shape, but on
+  our filter chunks its FA2 template is the faster one: forcing
+  fa2 cut the fresh-chunk gap from 27% to 14% and the rewind-chunk
+  gap from 2.4x to 14%. On the join shapes the opposite holds (fa2
+  is 39% slower than their FA3 template there), so no single
+  forced backend wins everywhere - the numbers above take the best
+  backend per shape.
+- The hybrid behaved as predicted: swapping their `merge_state`
+  plus separate quantization for our fused kernel removes 0.29 ms
+  of the 0.50 ms join gap; the remaining 11-16% is their kernel
+  pair against the two FA3 calls.
+- One entry does land within 5%: the hybrid on the fresh filter
+  chunk (+2.2% against unified). It does not change the decision,
+  for three reasons: it is still slower, not faster; it keeps our
+  custom Triton kernel and adds a FlashInfer dependency plus two
+  wrappers on top, so it sheds no code - and shedding code is what
+  the 5% rule is for; and the same variant is 44% behind unified
+  on the rewind chunk, which filters also run.
+
+Every pure FlashInfer variant - the ones that would actually
+replace our code - stays 14% or more behind the assigned path on
+every shape. The decision stands on the tuned numbers, not just
+the defaults.
 The three FlashInfer APIs tested:
 `BatchPrefillWithPagedKVCacheWrapper` (paged causal prefill, the
 FlashInfer equivalent of the unified path), `merge_state` (the
@@ -305,20 +366,21 @@ percent of each other"; the measured gap (35-45% on joins) came in
 above that band - FlashInfer's merge_state plus its separate paged
 call costs more than expected next to the fused Triton kernel.
 
-Reading the gap: part of the join-shape difference is fusion by
-construction - the FlashInfer stack is three launches (ragged
-causal call, paged call, merge_state) plus a separate quantization,
-where merge_quant does merge and quantization in one kernel. The
-rest is the prefill kernel under default dispatch: the wrappers
-were built with `backend="auto"` and the arena's 16-token pages,
-and no forced-backend or page-size sweep was run - the measured
-claim is "FlashInfer at its defaults on our chunk shapes", not its
-best achievable configuration. The shapes are also FA3's home
-regime (large bf16 prefill chunks), while FlashInfer's published
-edge is decode and shared-prefix batch decode, which is what
-cascade was designed for. The 2.4-3.0x gap on the small rewind
-chunk against 27-31% on the large fresh chunk is the signature of
-fixed per-run overhead dominating a launch-bound shape.
+Reading the gap, with the fairness pass measured: the join-shape
+difference splits into a fusion share and a kernel share, and the
+hybrid variant separates them directly - our fused merge+quant
+kernel accounts for 0.29 ms of the 0.50 ms, their attention kernel
+pair against the two FA3 calls for the rest. The filter-shape gap
+at defaults was mostly FlashInfer's own backend dispatch: `auto`
+picks its FA3 template everywhere, and on our filter chunks its
+FA2 template is the faster one. The first pass's guess that fixed
+per-run overhead explained the 2.4x rewind-chunk gap was wrong -
+forcing fa2 removed almost all of it (down to 14%). The shapes are
+FA3's home regime (large bf16 prefill chunks), while FlashInfer's
+published edge is decode and shared-prefix batch decode, which is
+what cascade was designed for. Page size was not swept: it is an
+arena property the engine sets, and both stacks run the same
+16-token pages.
 
 ## Qwen3 32B fp8
 
@@ -441,7 +503,8 @@ on both in-scope models.
 All runs on Modal app `quail-milestone1`, one H100, tee'd logs in
 `results/*.log`:
 
-- `flashinfer_probe.log`, `flashinfer_bench.log`
+- `flashinfer_probe.log`, `flashinfer_bench.log`,
+  `flashinfer_tuned.log`, `flashinfer_tuned_64h.log`
 - `attention_parity.log`, `attention_e2e_parity.log`
 - `join_attention_paths.log` (the three-shape sweep)
 - `accuracy_vs_stock.log`
