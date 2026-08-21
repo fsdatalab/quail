@@ -66,7 +66,6 @@ def main():
     make_corpus(corpus_path)
 
     sess = quail.Session(EngineConfig(gpus=1))
-    sess.set_store(False)
     sess.register("docs", quail.DocumentProvider.from_parquet(
         corpus_path, id_col="id"))
 

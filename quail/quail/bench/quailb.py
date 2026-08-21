@@ -1,12 +1,10 @@
-"""QUAIL-B: fifteen queries over five document sets, cold and warm.
+"""QUAIL-B: sixteen queries over five document sets.
 
 The design (engine_design.md section 9): TPC-H's filter/join
 skeletons over real text, planted predicates with known ground truth,
 two scale knobs (SF scales document counts, LF scales document
-length by concatenating real text), and a two-pass protocol in one
-session - cold (store disabled, flushed) then warm (store enabled).
-Provided vs observed selectivity is printed per stage, which is the
-instrument check.
+length by concatenating real text). Provided vs observed selectivity
+is printed per stage, which is the instrument check.
 
 Measured caveat, stated up front: the 4B checkpoint answers YES to
 essentially every constrained one-token equality judgment (measured
@@ -472,52 +470,40 @@ def queries(sess):
 # ----------------------------------------------------------- driver
 
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
-              out_path=None, cpu_memory_gb=80, model="qwen3-4b-fp8"):
-    """cpu_memory_gb defaults to what the 96 GB worker container
-    holds: a 64 GB store (8 slabs). The corpus KV usually exceeds it,
-    so the length threshold keeps the longest documents - partial
-    restores are the capacity arithmetic working, not a bug."""
+              out_path=None, model="qwen3-4b-fp8"):
     import quail
     from quail.planner.plan import EngineConfig
 
     d = build_sets(data_dir, sf, lf)
-    sess = quail.Session(EngineConfig(gpus=gpus, model=model,
-                                      cpu_memory_gb=cpu_memory_gb))
+    sess = quail.Session(EngineConfig(gpus=gpus, model=model))
     register_sets(sess, d)
     qdefs = queries(sess)
     ids = [i for i in qdefs if only is None or i in only]
-    suite = dict(sf=sf, lf=lf, gpus=gpus, passes={})
+    suite = dict(sf=sf, lf=lf, gpus=gpus, queries=[])
     try:
-        for pass_name in ("cold", "warm"):
-            sess.set_store(pass_name == "warm")
-            if pass_name == "cold":
-                sess.flush_store()
-            rows = []
-            t_pass = time.time()
-            for qid in ids:
-                desc, make = qdefs[qid]
-                print(f"[quailb] {pass_name} {qid}: {desc}",
-                      flush=True)
-                try:
-                    res = make().run()
-                    row = dict(query=qid, desc=desc,
-                               wall_s=res.report["wall_s"],
-                               boot_s=res.report["boot_s"],
-                               boot_kind=res.report.get("boot_kind"),
-                               boot=res.report.get("boot"),
-                               fresh_tokens=res.report["fresh_tokens"],
-                               rows=len(res.rows),
-                               peak_gib=res.report.get("peak_gib"),
-                               stages=res.report["stages"],
-                               store=res.report.get("store"))
-                except Exception as e:            # noqa: BLE001
-                    row = dict(query=qid, desc=desc,
-                               error=f"{type(e).__name__}: {e}")
-                rows.append(row)
-                print(f"[quailb] {row}", flush=True)
-            suite["passes"][pass_name] = dict(
-                queries=rows,
-                pass_wall_s=round(time.time() - t_pass, 1))
+        rows = []
+        t_pass = time.time()
+        for qid in ids:
+            desc, make = qdefs[qid]
+            print(f"[quailb] {qid}: {desc}", flush=True)
+            try:
+                res = make().run()
+                row = dict(query=qid, desc=desc,
+                           wall_s=res.report["wall_s"],
+                           boot_s=res.report["boot_s"],
+                           boot_kind=res.report.get("boot_kind"),
+                           boot=res.report.get("boot"),
+                           fresh_tokens=res.report["fresh_tokens"],
+                           rows=len(res.rows),
+                           peak_gib=res.report.get("peak_gib"),
+                           stages=res.report["stages"])
+            except Exception as e:            # noqa: BLE001
+                row = dict(query=qid, desc=desc,
+                           error=f"{type(e).__name__}: {e}")
+            rows.append(row)
+            print(f"[quailb] {row}", flush=True)
+        suite["queries"] = rows
+        suite["wall_s"] = round(time.time() - t_pass, 1)
     finally:
         sess.close()
     if out_path:

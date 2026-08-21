@@ -30,23 +30,13 @@ class CorpusStats:
 
 
 @dataclass(frozen=True)
-class StoreSpec:
-    """A pinned host KV store: measured read bandwidth, bytes/s.
-    `warm` means KV for this corpus is already saved from an earlier
-    query. capacity_bytes caps what it may hold (None = unbounded)."""
-    read_bw: float
-    warm: bool = False
-    capacity_bytes: Optional[float] = None
-
-
-@dataclass(frozen=True)
 class Refusal:
     """The answer when this configuration cannot execute the query:
     the violated constraint, what was needed, what was available -
     instead of running something degraded."""
     reasons: tuple
     constraint: str    # "weights_need_more_cards" | "suffix_over_chunk"
-    #                    | "store_needed_but_disabled" | "unknown_model"
+    #                    | "unknown_model"
     needed: float
     available: float
     unit: str          # "cards" | "tokens" | "bytes"
@@ -64,9 +54,6 @@ class PhysicalPlan:
     order_rule: str            # "as_written" | "by_cost"
     order_source: str          # which rule chose it, for explain()
     calibration_source: str    # "calibrated" | "spec-scaled from ..."
-    store_min_doc_tokens: int = 0    # documents at or above this
-    #                                  length use the KV store; 0 =
-    #                                  no store, 1 = everything stores
     limit: int | None = None   # output row cap; None = no limit
     operators: tuple = ()      # ordered operator dicts, JSON-able
     remarks: tuple = ()
@@ -99,7 +86,6 @@ def resolve_model(name: str):
 
 @dataclass(frozen=True)
 class EngineConfig:
-    """The three knobs, mapping directly onto Modal resources."""
+    """The two knobs, mapping directly onto Modal resources."""
     gpus: int = 1
-    cpu_memory_gb: int = 64
     model: str = "qwen3-4b-fp8"

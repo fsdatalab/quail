@@ -6,8 +6,7 @@ children, so the split and the merge never cross a network hop.
 The sharding contract, from the design: filters split documents by
 token count; joins split by anchor document, so gating and each
 anchor's tuple stream stay local to the GPU holding the anchor.
-Shards are deterministic for a given corpus, which is what lets each
-GPU's store slice serve the same documents query after query.
+Shards are deterministic for a given corpus.
 
 Two rounds per query:
 
@@ -43,8 +42,6 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
         sub = {key: payload[key] for key in COMMON_KEYS}
         sub.update(docs=docs, doc_index=index,
                    filters=payload["filters"],
-                   store=payload.get("store"),
-                   store_flush=payload.get("store_flush", False),
                    worker=w, workers=k)
         subs.append(sub)
     return subs
@@ -52,12 +49,12 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
 
 def merge_filter_round(outs: list, limit: int | None = None) -> dict:
     """Merge the workers' filter answers (global-keyed), survivors,
-    token counts, and store stats. When limit is set, each alias's
+    and token counts. When limit is set, each alias's
     merged survivor list is truncated to that count.
     NOTE: this truncation is correct for filter-only queries; for
     joins, truncating anchor survivors here can under-produce output
     rows. The session's _assemble is the final output-row cap."""
-    filters, survivors, store = {}, {}, {}
+    filters, survivors = {}, {}
     tokens = 0
     for out in outs:
         tokens += out["fresh_tokens"]
@@ -65,15 +62,11 @@ def merge_filter_round(outs: list, limit: int | None = None) -> dict:
             filters.setdefault(alias, {}).update(rows)
         for alias, surv in out["survivors"].items():
             survivors.setdefault(alias, []).extend(surv)
-        for alias, st in (out.get("store") or {}).items():
-            agg = store.setdefault(alias, {})
-            for key, v in st.items():
-                agg[key] = agg.get(key, 0) + v
     merged = {a: sorted(v) for a, v in survivors.items()}
     if limit is not None:
         merged = {a: v[:limit] for a, v in merged.items()}
     return dict(filters=filters, survivors=merged,
-                fresh_tokens=tokens, store=store)
+                fresh_tokens=tokens)
 
 
 def join_round_payloads(payload: dict, shards: dict, k: int,
@@ -119,7 +112,6 @@ def join_round_payloads(payload: dict, shards: dict, k: int,
                    anchor_docs=[payload["docs"][anchor_alias][g]
                                 for g in anchors],
                    partners=partners,
-                   store=payload.get("store"),
                    worker=w, workers=k)
         subs.append(sub)
     return subs

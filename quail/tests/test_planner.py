@@ -11,10 +11,9 @@ from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.planner.calibration import load_calibration
 from quail.planner.decide import (balanced_shards, explain,
-                                  order_filters, plan_query,
-                                  restore_crossover_tokens)
+                                  order_filters, plan_query)
 from quail.planner.plan import (EngineConfig, PhysicalPlan, Refusal,
-                                StoreSpec, resolve_model)
+                                resolve_model)
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
@@ -202,22 +201,6 @@ def test_preamble_counted_once_per_document(catalog):
         "flag 0 of: ANSWER:"))
 
 
-def test_store_threshold_includes_preamble(catalog):
-    # stored extents are [preamble + document] rows; a capacity that
-    # holds exactly the two longest documents plus their preambles
-    # yields a pre-inclusive threshold
-    from quail.logical import SHARED_PRE
-    logical = _five_filter_plan(catalog, (0.5,))
-    pre = len(tok(SHARED_PRE))
-    kappa = QWEN3_4B_FP8.with_kv_bytes(2.0).kappa
-    cap = (700 + 2 * pre + 0.25) * kappa
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [100, 200, 300, 400]},
-                      store=StoreSpec(read_bw=55e9, warm=False,
-                                      capacity_bytes=cap))
-    assert plan.store_min_doc_tokens == 300 + pre
-
-
 def test_join_tokens_note_per_anchor_labels_per_tuple(catalog):
     # the anchor's naming line is written into kept KV once per
     # anchor document; a partner's block label and the rendered
@@ -255,58 +238,21 @@ def test_refusal_suffix_over_chunk(catalog):
     assert r.constraint == "suffix_over_chunk"
 
 
-def test_refusal_store_needed_but_disabled(catalog):
-    # fits a chunk but not the arena: only a store could hold it
-    small_arena = replace(H100_SXM, mem_bytes=6.5e9)
-    logical = _five_filter_plan(catalog, (0.9,))
-    r = plan_query(logical, model=QWEN3_4B_FP8, device=small_arena,
-                   doc_tokens={"r": [8_000]})
-    assert isinstance(r, Refusal)
-    assert r.constraint == "store_needed_but_disabled"
-
-
 def test_refusal_unknown_model():
     r = resolve_model("qwen9-13b")
     assert isinstance(r, Refusal)
     assert r.constraint == "unknown_model"
 
 
-def test_access_read_when_cold_restore_when_warm(catalog):
-    logical = _five_filter_plan(catalog, (0.9,))
-    toks = {"r": [400] * 100}
-    cold = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens=toks,
-                      store=StoreSpec(read_bw=55e9, warm=False))
-    scan = next(op for op in cold.operators if op["op"] == "DocScan")
-    assert scan["access"] == "read"
-
-    warm = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens=toks,
-                      store=StoreSpec(read_bw=55e9, warm=True))
-    scan = next(op for op in warm.operators if op["op"] == "DocScan")
-    assert scan["access"] == "restore"     # 55 GB/s beats the break-even
-
-
-def test_restore_crossover_zero_for_pinned():
-    # pinned 55 GB/s beats kappa/a at every length; a slow volume
-    # crosses only for long documents
-    assert restore_crossover_tokens(QWEN3_4B_FP8, CAL, 55e9) == 0.0
-    assert restore_crossover_tokens(QWEN3_4B_FP8, CAL, 3e9) > 10_000
-
-
 def test_kv_is_always_bf16(catalog):
     logical = _five_filter_plan(catalog, (0.9,))
-    cold = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100})
-    warm = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [400] * 100},
-                      store=StoreSpec(read_bw=55e9, warm=True))
-    assert cold.kv_dtype == "bf16"
-    assert warm.kv_dtype == "bf16"
-    assert any("kv_dtype=bf16 (always)" in r for r in cold.remarks)
+    assert plan.kv_dtype == "bf16"
+    assert any("kv_dtype=bf16 (always)" in r for r in plan.remarks)
     from quail.planner import budgets
-    assert cold.admission_tokens == budgets.arena_tokens(
-        QWEN3_4B_FP8, H100_SXM, cold.chunk_tokens)
+    assert plan.admission_tokens == budgets.arena_tokens(
+        QWEN3_4B_FP8, H100_SXM, plan.chunk_tokens)
 
 
 def test_explain_prints_tree_settings_and_source(catalog):
@@ -328,5 +274,4 @@ def test_explain_prints_tree_settings_and_source(catalog):
 
 def test_engine_config_defaults():
     cfg = EngineConfig()
-    assert (cfg.gpus, cfg.cpu_memory_gb, cfg.model) == \
-        (1, 64, "qwen3-4b-fp8")
+    assert (cfg.gpus, cfg.model) == (1, "qwen3-4b-fp8")

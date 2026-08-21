@@ -7,7 +7,7 @@ import pytest
 
 from quail.planner import budgets
 from quail.planner.calibrate import resolve_pair
-from quail.planner.calibration import (Calibration, channel_bandwidths,
+from quail.planner.calibration import (Calibration,
                                        commit_calibration, fit_affine,
                                        load_calibration, make_record)
 from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -62,14 +62,11 @@ def test_chunk_budget_is_the_index_cap():
 def test_arena_tokens_at_bf16():
     # the design table said ~400k with one chunk of activation
     # reservation; the milestone 1 filter run OOMed there, so the
-    # reservation is two chunks, and a further ~4.8 GiB is reserved
-    # for the pinned store's device staging ring (store_staging_bytes)
-    # so a later warm-pass store can't OOM against an arena that
-    # already claimed the whole budget - the arena lands near 313k,
-    # still ~780 mean-length documents resident at once
+    # reservation is two chunks. Without the CPU store staging
+    # reservation the arena gets the full remaining memory.
     tokens = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM)
-    assert 300_000 <= tokens <= 330_000
-    assert tokens // 400 >= 750
+    assert 340_000 <= tokens <= 370_000
+    assert tokens // 400 >= 850
 
 
 def test_arena_doubles_at_fp8_kv():
@@ -93,19 +90,6 @@ def test_calibration_anchor_file():
     assert cal.source == "calibrated"
     assert cal.rate_tokens_per_s == pytest.approx(121_045, rel=1e-3)
     assert cal.a2_s_per_token2 == pytest.approx(4.9336e-10, rel=1e-3)
-
-
-def test_store_break_even_under_pinned_bandwidth():
-    cal = load_calibration(QWEN3_4B_FP8, H100_SXM)
-    bw = channel_bandwidths()
-    bf16 = budgets.store_break_even_bytes_per_s(
-        QWEN3_4B_FP8, cal.a_s_per_token)
-    # ~18 GB/s at bf16 KV and the packed 121k rate. Pinned host
-    # memory clears it; disk and volumes do not.
-    assert 17e9 <= bf16 <= 19e9
-    assert bw["pinned_h2d"] > bf16
-    assert bw["disk_read"] < bf16
-    assert bw["volume_read"] < bf16
 
 
 def test_spec_scaled_defaults_for_uncalibrated_pair():

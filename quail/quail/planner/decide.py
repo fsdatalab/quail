@@ -24,8 +24,7 @@ from quail.logical import (LogicalPlan, Project, Scan, SemanticFilter,
                            SemanticJoin)
 from quail.planner import budgets
 from quail.planner.calibration import Calibration, load_calibration
-from quail.planner.plan import (CorpusStats, PhysicalPlan, Refusal,
-                                StoreSpec)
+from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -267,66 +266,10 @@ def balanced_shards(doc_tokens, workers: int):
     return tuple(tuple(sorted(s)) for s in shards), loads
 
 
-# ------------------------------------- access (the one break-even)
-
-def restore_crossover_tokens(model: ModelSpec, cal: Calibration,
-                             read_bw: float) -> float:
-    """The document length past which loading KV beats recomputing it:
-    solve kappa/bw = a + a2*h for h. 0 means the channel beats
-    recompute at every length (bandwidth above kappa/a - the store
-    break-even); a2 moves the crossover down for long documents."""
-    per_token_load = model.kappa / read_bw
-    if per_token_load <= cal.a_s_per_token:
-        return 0.0
-    return (per_token_load - cal.a_s_per_token) / cal.a2_s_per_token2
-
-
-def store_length_threshold(doc_tokens, capacity_bytes, kappa) -> int:
-    """The store-or-not length cutoff under a capacity: keep the
-    LONGEST documents whose KV fits. Recompute cost per byte rises
-    with document length, so the top of the length list is worth the
-    most per stored byte - and a length threshold cannot be thrashed
-    by a scanning query the way LRU can.
-
-    Returns 1 when capacity holds everything, 0 when nothing fits.
-    At a boundary tie the threshold moves up so the stored set never
-    exceeds the capacity."""
-    if capacity_bytes is None:
-        return 1
-    budget_tok = int(capacity_bytes / kappa)
-    lengths = sorted((int(t) for t in doc_tokens), reverse=True)
-    if sum(lengths) <= budget_tok:
-        return 1
-    taken, threshold = 0, 0
-    for h in lengths:
-        if taken + h > budget_tok:
-            break
-        taken += h
-        threshold = h
-    while threshold and sum(h for h in lengths
-                            if h >= threshold) > budget_tok:
-        threshold += 1
-    if threshold and not any(h >= threshold for h in lengths):
-        return 0
-    return threshold
-
-
-def access_for_scan(stats: CorpusStats, model: ModelSpec,
-                    cal: Calibration, store) -> str:
-    """read | restore. Restore wins when the warm store's bandwidth
-    beats kappa x the serving rate, or when the corpus's documents sit
-    past the a2-refined crossover."""
-    if store is None or not store.warm:
-        return "read"
-    crossover = restore_crossover_tokens(model, cal, store.read_bw)
-    return "restore" if stats.mean_doc_tokens >= crossover else "read"
-
-
 # ---------------------------------------------------------- the planner
 
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-               store: StoreSpec | None = None,
                order: str | None = None,
                calibration: Calibration | None = None):
     """LogicalPlan + corpus token counts -> PhysicalPlan | Refusal.
@@ -403,22 +346,12 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         needs.append(need)
 
     admission = budgets.arena_tokens(model, device, chunk)
-    working_set = max(needs)
-    if admission < working_set and store is None:
-        return Refusal(
-            reasons=(f"the arena holds {admission} tokens against "
-                     f"a {working_set}-token working set and there is "
-                     f"no store to spill to (cpu_memory_gb is 0)",),
-            constraint="store_needed_but_disabled",
-            needed=working_set, available=admission, unit="tokens")
 
     # ---- order
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(filters, joins)
     ordered_joins = order_joins(joins, rule, stats, anchors, pre)
 
-    accesses = {s.alias: access_for_scan(stats[s.alias], model, cal,
-                                         store) for s in scans}
     live = {a: float(st.n_docs) for a, st in stats.items()}
     for fs in filters.values():
         surv = 1.0
@@ -435,28 +368,13 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
     remarks.append("kv_dtype=bf16 (always)")
 
-    store_min = 0
-    if store is not None:
-        # stored extents are [engine preamble + document] rows, so the
-        # capacity arithmetic and the threshold are in those units
-        all_lengths = [t + pre
-                       for toks in doc_tokens.values() for t in toks]
-        store_min = store_length_threshold(
-            all_lengths, store.capacity_bytes, model.kappa)
-        if store_min > 1:
-            stored = [t for t in all_lengths if t >= store_min]
-            remarks.append(
-                f"store capped: {len(stored)} of {len(all_lengths)} "
-                f"documents stored, length threshold {store_min} "
-                f"(preamble included)")
-
     # ---- operators, in execution order
     operators = []
     for s in scans:
         shards, loads = balanced_shards(doc_tokens[s.alias], workers)
         operators.append(dict(
             op="DocScan", alias=s.alias, provider=s.provider,
-            column=s.column, access=accesses[s.alias],
+            column=s.column, access="read",
             n_docs=stats[s.alias].n_docs,
             total_tokens=stats[s.alias].total_tokens,
             shards=shards, shard_token_loads=loads))
@@ -493,7 +411,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         tensor_parallel=tp, kv_dtype="bf16", chunk_tokens=chunk,
         admission_tokens=admission, order_rule=rule, order_source=source,
         calibration_source=cal.source,
-        store_min_doc_tokens=store_min,
         limit=plan.root.limit,
         operators=tuple(operators), remarks=tuple(remarks))
 

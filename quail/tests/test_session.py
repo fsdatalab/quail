@@ -223,44 +223,6 @@ def test_pick_corpus_tokenizer_parity_guard():
     assert tok is primary and "failed parity" in note
 
 
-def test_store_payload_and_warm_tracking(sess):
-    truth = {"r": {"q1:": [1, 0, 1, 0, 1, 0]}}
-    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
-           "PROMPT('q1: {0}', r.review), {'selectivity': 0.5})")
-    seen = {}
-    res = sess.sql(sql).run(_execute=make_executor(truth, seen=seen))
-    store = seen["payload"]["store"]
-    # default config: 64 GB container minus 16 GB headroom
-    assert store is not None
-    assert store["capacity_bytes"] == pytest.approx(48e9)
-    assert store["min_doc_tokens"] == 1     # everything fits
-    assert "r" in store["hashes"] and len(store["hashes"]["r"]) == 16
-    assert res.report["store"] is None      # fake executor has none
-
-    # a fake executor that reports store activity marks the session
-    # warm, so the NEXT plan chooses restore
-    def with_store(payload):
-        out = make_executor(truth)(payload)
-        out["store"] = {"r": dict(stored_docs=6, restored_docs=0)}
-        return out
-
-    sess.sql(sql).run(_execute=with_store)
-    q2 = sess.sql(sql)
-    plan = q2.plan()
-    scan = next(op for op in plan.operators if op["op"] == "DocScan")
-    assert scan["access"] == "restore"
-
-
-def test_store_disabled_when_no_cpu_memory(tmp_path):
-    import quail
-    from quail.planner.plan import EngineConfig
-    s = quail.Session(EngineConfig(cpu_memory_gb=0), tokenizer=fake_tok)
-    s.register("reviews", quail.DocumentProvider.from_parquet(
-        _parquet(tmp_path / "r.parquet", {
-            "id": ["r0"], "review": ["w " * 30]}), id_col="id"))
-    assert s.store_spec(["h"]) is None
-
-
 def test_payload_carries_workers_and_shards(tmp_path):
     import quail
     from quail.planner.plan import EngineConfig

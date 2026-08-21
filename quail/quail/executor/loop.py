@@ -246,8 +246,7 @@ def _cumsum(xs):
 # ------------------------------------------------------------ the join
 
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
-             stage_suffixes, budget, group_size=None, store=None,
-             store_hash=None, store_min_tokens=1, store_ids=None,
+             stage_suffixes, budget, group_size=None,
              stats=None, stage_frames=None):
     """The join driver: every stage streams a partner list against the
     anchor side; gated anchors advance between stages.
@@ -263,9 +262,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     of that stage reads the frame from KV instead of carrying its
     tokens, so framing costs tokens per anchor, not per pair. A
     later stage's frame overwrites the earlier one's rows - each
-    stage's pairs attend only their own frame. The frame rows are
-    NOT part of the stored prefix, so the store stays
-    query-independent.
+    stage's pairs attend only their own frame.
 
     Pipelining, one rule: while the GPU runs a chunk, the CPU builds
     the next buildable one. Within a stage that is the next chunk of
@@ -276,17 +273,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     copies (AsyncAnswers); an anchor's prefix KV is written to its
     arena pages exactly once and the pages free when its group leaves
     its last stage. Suffix KV is never written anywhere.
-
-    store / store_hash / store_min_tokens / store_ids: the pinned KV
-    store, exactly run_filter's contract. An anchor whose prefix is
-    already stored restores into its pages instead of computing (its
-    chunks carry only partner suffixes); an anchor leaving its last
-    stage - gated out or finished - is copied out on the side stream
-    when its prefix is at least store_min_tokens long, its pages
-    returned only after the copy lands. store_ids maps anchor list
-    positions to stable store key ids (the anchor's global document
-    index, the same key a filter scan of the same corpus uses).
-    stats, when given, is filled with restored/stored counts.
 
     Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
     partners, present only for anchors that reached stage j; spans =
@@ -305,23 +291,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     spans = []
     tokens = 0
 
-    def skey(a):
-        return (store_hash, store_ids[a] if store_ids else a)
-
     restored = set()
-    if store is not None:
-        restored = {a for a in range(n) if skey(a) in store}
-    load_events = {}     # anchor -> store load event, awaited pre-launch
-    pending_saves = []   # (anchor, event): pages held until the copy lands
-    saving = set()       # anchors with an in-flight save: drain frees them
-    save_after = None    # an event recorded after the newest forward;
-    #                      any such event orders a save behind the
-    #                      compute that wrote the anchor's pages
-    if stats is not None:
-        stats.update(restored_docs=len(restored),
-                     restored_tokens=sum(len(anchor_prefixes[a])
-                                         for a in restored),
-                     stored_docs=0, stored_tokens=0)
 
     def plan_stage(members, j):
         live = [a for a in members
@@ -344,34 +314,15 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                                      already_kept=already_loc)
         return live, plan, to_cache
 
-    def drain_saves(block=False):
-        rest = []
-        for a, ev in pending_saves:
-            if block:
-                ev.synchronize()
-            if ev.query():
-                arena.free_key(a)
-                saving.discard(a)
-            else:
-                rest.append((a, ev))
-        pending_saves[:] = rest
-
     def build(j, idx, chunk_groups):
         frame = frames[j]
         specs = []
         for a, start, end, carried in chunk_groups:
             key = idx[a]
             f = len(anchor_prefixes[key])
-            if key not in arena.accounting.owned \
-                    and (carried or key in restored):
+            if key not in arena.accounting.owned and carried:
                 got = arena.alloc(key, f + frame_max)
-                if got is None and pending_saves:
-                    # pages held only by in-flight store saves
-                    drain_saves(block=True)
-                    got = arena.alloc(key, f + frame_max)
                 assert got is not None, "arena underprovisioned"
-                if not carried:
-                    load_events[key] = store.load(skey(key), arena, key)
             sufs = stage_suffixes[j][start:end]
             if frame and start == 0 and sufs:
                 # the anchor's first group of this stage: the frame
@@ -398,19 +349,14 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         return pack_chunk(torch, arena, specs)
 
     def launch(j, chunk):
-        nonlocal tokens, save_after
+        nonlocal tokens
         tokens += chunk["tokens"]
-        for key, _ in chunk["layout"]:
-            ev = load_events.pop(key, None)
-            if ev is not None:
-                torch.cuda.current_stream().wait_event(ev)
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
         normed = pipeline.forward_chunk(chunk)
         e1.record()
         spans.append((j, e0, e1))
-        save_after = e1
         return async_ans.submit(normed)
 
     def scatter(j, idx, chunk_groups, bits):
@@ -423,31 +369,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             pos += cnt
 
     def free_if_owned(key):
-        """Free an anchor's pages - after copying them to the store
-        when it qualifies (long enough, not already stored). Pages
-        with an in-flight save are freed by drain_saves instead."""
-        if key not in arena.accounting.owned or key in saving:
-            return
-        if (store is not None and save_after is not None
-                and len(anchor_prefixes[key]) >= store_min_tokens
-                and skey(key) not in store):
-            ev = store.save(skey(key), arena, key,
-                            len(anchor_prefixes[key]),
-                            after_event=save_after)
-            if ev is not None:
-                saving.add(key)
-                pending_saves.append((key, ev))
-                if stats is not None:
-                    stats["stored_docs"] += 1
-                    stats["stored_tokens"] += len(anchor_prefixes[key])
-                return
-        arena.free_key(key)
+        if key in arena.accounting.owned:
+            arena.free_key(key)
 
     prefetch = None     # (idx, plan, handle0) of the next group's
     #                     stage 0, chunk 0 already launched
     for g, members in enumerate(groups):
         for j in range(k):
-            drain_saves()
             if j == 0 and prefetch is not None:
                 idx, plan, h0 = prefetch
                 prefetch = None
@@ -499,7 +427,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 for a in idx:
                     if not any(ans[j][a]):
                         free_if_owned(a)
-    drain_saves(block=True)
     return ans, spans, tokens
 
 
@@ -581,10 +508,8 @@ def _shared_preamble_tokens(question_ids):
 
 
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
-               question_ids, budget, trace=None, store=None,
-               store_hash=None, store_min_tokens=1, stats=None,
-               store_ids=None, timing=None, pinned=True,
-               limit=None):
+               question_ids, budget, trace=None, stats=None,
+               timing=None, pinned=True, limit=None):
     """The filter chain on the packed executor: continuous admission,
     survivor priority, pages freed on NO or after the last stage.
 
@@ -594,19 +519,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     (tokens, groups, fresh admissions) is appended per chunk, aligned
     with spans - the shape data for chasing per-chunk anomalies.
 
-    store / store_hash / store_min_tokens: the pinned KV store. A
-    document already in the store restores into its pages instead of
-    computing (its stage-1 chunk carries only the question); a
-    document leaving its last stage is copied out on the side stream
-    when it is at least store_min_tokens long, its pages returned
-    only after the copy lands. stats, when given, is filled with
-    restored/stored counts. store_ids maps local document positions
-    to stable store key ids (a sharded worker keys by global index,
-    so its store slice survives across queries).
-
     timing: optional dict; when given, CPU seconds per loop phase
     (next_chunk, alloc, pack and its sub-phases, forward launch,
-    submit, report wait/scatter, drain_saves) accumulate into it.
+    submit, report wait/scatter) accumulate into it.
     Timing is host-side only and does not change what runs.
 
     pinned: pass False to build chunk tensors with pageable blocking
@@ -619,54 +534,21 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     stage_tokens = [len(question_ids[0])] \
         + [len(q) - p for q in question_ids[1:]]
     tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
-    def skey(d):
-        return (store_hash, store_ids[d] if store_ids else d)
-
-    restored = set()
-    if store is not None:
-        restored = {d for d in range(len(doc_ids))
-                    if skey(d) in store}
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
         arena_pages=arena.accounting.n_pages,
         page_tokens=arena.accounting.page_tokens,
-        kept_extra_tokens=p, restored=restored, limit=limit)
+        kept_extra_tokens=p, limit=limit)
     spans, tokens = [], 0
     outstanding = []     # (groups, handle) in launch order
-    load_events = {}     # doc -> store load event, awaited pre-launch
-    pending_saves = []   # (doc, event): pages held until the copy lands
-    if stats is not None:
-        stats.update(restored_docs=len(restored),
-                     restored_tokens=sum(len(doc_ids[d])
-                                         for d in restored),
-                     stored_docs=0, stored_tokens=0)
 
     def to_spec(doc, stage, fresh):
         if fresh:
-            if doc in restored:
-                # KV loads from the store; stage 1 is question-only
-                return dict(key=doc, prefix=None,
-                            f=len(doc_ids[doc]), suffixes=[tails[0]],
-                            write_suffix_tokens=p)
             return dict(key=doc, prefix=doc_ids[doc],
                         f=len(doc_ids[doc]), suffixes=[tails[0]],
                         write_suffix_tokens=p)
         return dict(key=doc, prefix=None, f=len(doc_ids[doc]) + p,
                     suffixes=[tails[stage]])
-
-    def drain_saves(block=False):
-        t = time.perf_counter() if timing is not None else 0.0
-        rest = []
-        for doc, ev in pending_saves:
-            if block:
-                ev.synchronize()
-            if ev.query():
-                arena.free_key(doc)
-                sched.release(doc)
-            else:
-                rest.append((doc, ev))
-        pending_saves[:] = rest
-        _tick(timing, "drain_saves", t)
 
     def report(entry):
         t = time.perf_counter() if timing is not None else 0.0
@@ -675,22 +557,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         t = _tick(timing, "report_wait", t)
         for (doc, stage, _fresh), bit in zip(groups, bits):
             yes = bool(bit)
-            last = stage == len(stage_tokens) - 1
-            leaving = (not yes) or last
-            save = (leaving and store is not None
-                    and len(doc_ids[doc]) >= store_min_tokens
-                    and skey(doc) not in store)
-            if save:
-                ev = store.save(skey(doc), arena, doc,
-                                len(doc_ids[doc]),
-                                after_event=handle[0])
-                if ev is not None:
-                    sched.report(doc, stage, yes, release=False)
-                    pending_saves.append((doc, ev))
-                    if stats is not None:
-                        stats["stored_docs"] += 1
-                        stats["stored_tokens"] += len(doc_ids[doc])
-                    continue
             sched.report(doc, stage, yes)
             if doc not in sched.resident \
                     and doc in arena.accounting.owned:
@@ -698,27 +564,18 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         _tick(timing, "report_rest", t)
 
     while not sched.done():
-        drain_saves()
         t = time.perf_counter() if timing is not None else 0.0
         groups = sched.next_chunk()
         t = _tick(timing, "next_chunk", t)
         if not groups:
             if outstanding:
                 report(outstanding.pop(0))
-            else:
-                # nothing in flight: only pending saves hold pages
-                assert pending_saves, \
-                    "nothing buildable and nothing in flight"
-                drain_saves(block=True)
             continue
         for doc, stage, fresh in groups:
             if fresh:
                 got = arena.alloc(doc, len(doc_ids[doc]) + p)
                 assert got is not None, \
                     "scheduler admitted a doc the arena cannot hold"
-                if doc in restored:
-                    load_events[doc] = store.load(skey(doc), arena,
-                                                  doc)
         t = _tick(timing, "alloc", t)
         chunk = pack_chunk(torch, arena, [to_spec(*g) for g in groups],
                            timing=timing, pinned=pinned)
@@ -728,10 +585,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             trace.append(dict(
                 tokens=chunk["tokens"], groups=len(groups),
                 fresh=sum(1 for _, _, f in groups if f)))
-        for doc, _, fresh in groups:
-            if fresh and doc in load_events:
-                torch.cuda.current_stream().wait_event(
-                    load_events.pop(doc))
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
@@ -748,5 +601,4 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             report(outstanding.pop(0))
     while outstanding:
         report(outstanding.pop(0))
-    drain_saves(block=True)
     return sched.answers, spans, tokens
