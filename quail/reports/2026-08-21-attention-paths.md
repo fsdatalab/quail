@@ -62,9 +62,17 @@ its open-source origin:
 - **`qk_norm_rope` Triton kernel**: written for this project. Fuses
   per-head Q/K RMSNorm + rotary embedding. Replaces vLLM's two
   `rms_norm` calls + `rotary_emb` (five launches).
-- **`kv_row_scatter` Triton kernel**: written for this project.
-  Scatters fresh KV rows into paged arena slots. Replaces `gather` +
-  `index_copy_` (four launches per layer).
+- **`kv_row_scatter` Triton kernel**: the standard "append new KV
+  rows into page slots" operation every paged-KV engine has - vLLM's
+  is the `reshape_and_cache_flash` CUDA kernel
+  (`csrc/cache_kernels.cu`, driven by a per-token `slot_mapping`),
+  FlashInfer's is `append_paged_kv_cache`. Ours is a Triton
+  rewrite that also fuses a source-side gather: only a subset of the
+  packed chunk's rows gets written, from arbitrary positions, where
+  vLLM's op writes every input token and would need a separate
+  `index_select` first. The `gather` + `index_copy_` sequence it
+  replaced (four launches per layer) was this project's own earlier
+  fallback, not vLLM's kernel.
 - **DeepGEMM FP8 matmuls**: all linear projections (QKV, O, gate-up,
   down) use vLLM's `fp8_gemm_nt` from `vllm.utils.deep_gemm`.
 
@@ -247,6 +255,20 @@ quantization) on synthetic tensors shaped like the real chunks,
 with an output cross-check against the FA3 paths (max_abs 0.008 /
 0.004, bf16 rounding - both stacks compute the same attention).
 
+Timing method: every variant gets 3 unmeasured warmup calls, then
+the median of 20 CUDA-event-timed runs. FlashInfer's `plan()` (its
+host-side scheduling step) runs once, outside the timed region. So
+FlashInfer's JIT kernel compilation and its planning cost are both
+excluded; the numbers compare GPU kernel time only. In serving,
+plan() would run per batch on the CPU, so the exclusion favors
+FlashInfer. Empty cells in the table are structural skips, not
+failures - the cell records per-variant exceptions in an `errors`
+field, and that field is empty in every banked run. The
+paged-causal variant skips the join shapes under the same guard as
+FA3 unified (one causal call per pair cannot share the anchor's
+KV), and cascade fits only the single-anchor shape because its
+shared level must be shared by every query in the batch.
+
 Per-layer milliseconds:
 
 | Shape | best FA3 path | FlashInfer paged causal | FlashInfer two-call + merge_state | FlashInfer cascade |
@@ -282,6 +304,21 @@ The prediction before the run said "two-call stacks within tens of
 percent of each other"; the measured gap (35-45% on joins) came in
 above that band - FlashInfer's merge_state plus its separate paged
 call costs more than expected next to the fused Triton kernel.
+
+Reading the gap: part of the join-shape difference is fusion by
+construction - the FlashInfer stack is three launches (ragged
+causal call, paged call, merge_state) plus a separate quantization,
+where merge_quant does merge and quantization in one kernel. The
+rest is the prefill kernel under default dispatch: the wrappers
+were built with `backend="auto"` and the arena's 16-token pages,
+and no forced-backend or page-size sweep was run - the measured
+claim is "FlashInfer at its defaults on our chunk shapes", not its
+best achievable configuration. The shapes are also FA3's home
+regime (large bf16 prefill chunks), while FlashInfer's published
+edge is decode and shared-prefix batch decode, which is what
+cascade was designed for. The 2.4-3.0x gap on the small rewind
+chunk against 27-31% on the large fresh chunk is the signature of
+fixed per-run overhead dominating a launch-bound shape.
 
 ## Qwen3 32B fp8
 
