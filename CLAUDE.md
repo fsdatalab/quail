@@ -38,10 +38,11 @@ engineers talking to each other at a whiteboard. No jargon.
 
 # Scope
 
-Filter queries only, Qwen3 4B fp8, one H100. Open-ended maps,
-classification, speculation, forking, and the 32B model were removed
-on purpose. Do not reintroduce them without being asked; if a change
-needs one of them, say so instead of quietly adding it back.
+Filter queries only, Qwen3 4B fp8 or Qwen3 32B fp8, one H100 per model
+(one model copy per GPU - no tensor-parallel weight sharding across
+GPUs). Open-ended maps, classification, speculation, and forking were
+removed on purpose. Do not reintroduce them without being asked; if a
+change needs one of them, say so instead of quietly adding it back.
 
 # Experiments
 

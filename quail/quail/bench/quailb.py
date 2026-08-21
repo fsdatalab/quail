@@ -472,7 +472,7 @@ def queries(sess):
 # ----------------------------------------------------------- driver
 
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
-              out_path=None, cpu_memory_gb=80):
+              out_path=None, cpu_memory_gb=80, model="qwen3-4b-fp8"):
     """cpu_memory_gb defaults to what the 96 GB worker container
     holds: a 64 GB store (8 slabs). The corpus KV usually exceeds it,
     so the length threshold keeps the longest documents - partial
@@ -481,7 +481,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     from quail.planner.plan import EngineConfig
 
     d = build_sets(data_dir, sf, lf)
-    sess = quail.Session(EngineConfig(gpus=gpus,
+    sess = quail.Session(EngineConfig(gpus=gpus, model=model,
                                       cpu_memory_gb=cpu_memory_gb))
     register_sets(sess, d)
     qdefs = queries(sess)
@@ -533,15 +533,16 @@ def main():
     ap.add_argument("--sf", type=float, default=0.1)
     ap.add_argument("--lf", type=int, default=1)
     ap.add_argument("--gpus", type=int, default=1)
+    ap.add_argument("--model", default="qwen3-4b-fp8")
     ap.add_argument("--data-dir", default="results/quailb_data")
     ap.add_argument("--only", default=None,
                     help="comma-separated query ids")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     only = set(args.only.split(",")) if args.only else None
-    out = args.out or f"results/quailb_sf{args.sf}_lf{args.lf}.json"
+    out = args.out or f"results/quailb_sf{args.sf}_lf{args.lf}_{args.model}.json"
     run_suite(args.data_dir, sf=args.sf, lf=args.lf, gpus=args.gpus,
-              only=only, out_path=out)
+              only=only, out_path=out, model=args.model)
 
 
 if __name__ == "__main__":
