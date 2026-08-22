@@ -206,10 +206,7 @@ def _execute_single(state, payload: dict) -> dict:
     out_filters = {}
     store_stats = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
-    # LIMIT caps output rows. With joins, capping each table's filter
-    # would drop join inputs and change the result; the session
-    # truncates the final rows instead.
-    limit = payload.get("limit") if not payload["joins"] else None
+    limit = payload.get("limit")
 
     t0 = time.perf_counter()
     with torch.inference_mode():

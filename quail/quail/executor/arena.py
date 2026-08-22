@@ -99,15 +99,17 @@ class KVArena:
         self.device = device
 
     def alloc(self, key, tokens: int, capacity_tokens: int | None = None):
-        capacity_tokens = tokens if capacity_tokens is None else capacity_tokens
         pages = self.accounting.alloc(key, tokens, capacity_tokens)
         if pages is None:
             return None
-        self._rows[key] = self.torch.tensor(
-            self.accounting.row_indices(key), dtype=self.torch.int64)
-        self._capacity_rows[key] = self.torch.tensor(
+        # the logical rows are the first `tokens` entries of the
+        # capacity rows (same pages, same order), so build once and
+        # slice instead of walking the pages twice
+        cap = self.torch.tensor(
             self.accounting.row_indices(key, capacity_tokens),
             dtype=self.torch.int64)
+        self._capacity_rows[key] = cap
+        self._rows[key] = cap[:tokens]
         return pages
 
     def free_key(self, key):

@@ -156,6 +156,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     pages runs self-attention only (the probe's unpacked reference).
     """
     t = time.perf_counter() if timing is not None else 0.0
+    # unified scatters every fresh row through its own src/dst map, so
+    # the cross and kv_writes bookkeeping below is two-call only
+    two_call = attention_mode != "unified"
     ids, pos, cu_a, finals = [], [], [0], []
     suffix_rows = []
     kv_writes, layout = [], []
@@ -172,7 +175,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             ids.extend(g["prefix"])
             pos.extend(range(len(g["prefix"])))
             cu_a.append(len(ids))
-            if paged:
+            if paged and two_call:
                 kv_writes.append((key, row0, row0 + len(g["prefix"]),
                                   0))
         s_row0 = len(ids)
@@ -183,7 +186,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             cu_a.append(len(ids))
             finals.append(len(ids) - 1)
             wst = g.get("write_suffix_tokens", 0)
-            if si == 0 and wst and paged:
+            if si == 0 and wst and paged and two_call:
                 # the shared question preamble joins the kept KV right
                 # after the document rows: after the fresh prefix, or
                 # after a restored document's f rows
@@ -191,7 +194,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 kv_writes.append((key, srow, srow + wst, dest))
         s_count = len(ids) - s_row0
         layout.append((key, len(g["suffixes"])))
-        if s_count and f and paged:
+        if s_count and f and paged and two_call:
             suffix_rows.extend(range(s_row0, len(ids)))
             cu_q.append(cu_q[-1] + s_count)
             cross_keys.append(key)
@@ -207,14 +210,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
     t = _tick(timing, "pack_py", t)
     cross = None
-    if cross_keys and attention_mode != "unified":
+    if cross_keys:
         table, _ = arena.block_table(cross_keys)
         t = _tick(timing, "pack_blocktable", t)
         used = _staged(torch, cross_used, torch.int32, pinned)
         cross = dict(
             rows=_staged(torch, suffix_rows, torch.int64, pinned),
             cu_q=_staged(torch, cu_q, torch.int32, pinned),
-            max_q=max_q, keys=cross_keys, used=used,
+            max_q=max_q, used=used,
             max_used=max(cross_used), table=table)
         # row -> its index in call B's output, -1 for prefix rows;
         # the fused merge kernel's map (the split reference ignores it)
@@ -233,7 +236,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         keys = []
         used = []
         cu_full = [0]
-        src = []
         dst = []
         max_full_q = 0
         for key, r0, r1, logical_start, full_used in unified_specs:
@@ -244,13 +246,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 raise RuntimeError("unified attention cache capacity is short")
             keys.append(key)
             used.append(full_used)
-            src.extend(range(r0, r1))
             dst.append(selected)
             cu_full.append(cu_full[-1] + count)
             max_full_q = max(max_full_q, count)
         table, _ = arena.block_table(keys)
+        # every unified group spans its full row range and groups pack
+        # consecutively, so the source map is the identity
         unified = dict(
-            src=_staged(torch, src, torch.int64, pinned),
+            src=_staged(torch, torch.arange(len(ids), dtype=torch.int64),
+                        torch.int64, pinned),
             dst=_staged(torch, torch.cat(dst), torch.int64, pinned),
             cu_q=_staged(torch, cu_full, torch.int32, pinned),
             used=_staged(torch, used, torch.int32, pinned),
@@ -258,15 +262,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
     # All current KV writes use one scatter.
     kv_src = kv_dst = None
-    if kv_writes and attention_mode != "unified":
+    if kv_writes:
         src = []
         dst_parts = []
         for key, r0, r1, dest in kv_writes:
             src.extend(range(r0, r1))
-            dst_parts.extend(
-                arena._rows[key][dest:dest + (r1 - r0)].tolist())
+            dst_parts.append(arena._rows[key][dest:dest + (r1 - r0)])
         kv_src = _staged(torch, src, torch.int64, pinned)
-        kv_dst = _staged(torch, dst_parts, torch.int64, pinned)
+        kv_dst = _staged(torch, torch.cat(dst_parts), torch.int64,
+                         pinned)
     t = _tick(timing, "pack_kv", t)
 
     meta = dict(
@@ -281,13 +285,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         meta=meta, tokens=len(ids), layout=layout)
     _tick(timing, "pack_h2d", t)
     return out
-
-
-def _cumsum(xs):
-    total = 0
-    for x in xs:
-        total += x
-        yield total
 
 
 # ------------------------------------------------------------ the join
@@ -616,7 +613,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
         used += len(d) + q_max
         i += 1
     original_mode = pipeline.attention_mode
-    for mode in dict.fromkeys((FILTER_ATTENTION, JOIN_ATTENTION)):
+    for mode in (FILTER_ATTENTION, JOIN_ATTENTION):
         pipeline.attention_mode = mode
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
                    question_ids, budget)
@@ -689,8 +686,11 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         restored = {d for d in range(len(doc_ids))
                     if skey(d) in store}
     unified = pipeline.attention_mode == "unified"
-    temp_tail = max(len(question_ids[0]) - p, 0,
-                    *(len(t) for t in tails[1:])) if unified else 0
+    # unified scatters each stage's question tail (the tokens past the
+    # kept preamble) into the doc's pages; capacity must cover the
+    # longest tail, or zero when every question is pure preamble
+    temp_tail = max(0, *(len(q) - p for q in question_ids)) \
+        if unified else 0
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
         arena_pages=arena.accounting.n_pages,
@@ -756,10 +756,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                         stats["stored_docs"] += 1
                         stats["stored_tokens"] += len(doc_ids[doc])
                     continue
-            sched.report(doc, stage, passed)
-            if doc not in sched.resident \
-                    and doc in arena.accounting.owned:
-                arena.free_key(doc)
+            for d in sched.report(doc, stage, passed):
+                arena.free_key(d)
         _tick(timing, "report_rest", t)
 
     while not sched.done():

@@ -119,6 +119,41 @@ JOIN_ORPHANS = 8     # the last partners carry an X no anchor has
 JOIN_TEMPLATE = ("Does the [KEY] X value in {1} equal the [KEYS] X "
                  "value in {0}?")
 
+# The five filter stages: (kind, flag column, question text). The
+# corpus builders and combine() both read this one definition, so the
+# truth combine grades against is the truth the GPU cells planted.
+FILTER_STAGES = (
+    ("flag", 0, "Does the [FLAGS] line above show FLAG_1=TRUE?"),
+    ("flag", 1, "Does the [FLAGS] line above show FLAG_2=TRUE?"),
+    ("flag", 2, "Does the [FLAGS] line above show FLAG_3=TRUE?"),
+    ("natural", None,
+     "Is the overall sentiment of the review above positive?"),
+    ("flag", 3, "Does the [FLAGS] line above show FLAG_4=TRUE?"),
+)
+
+
+def _draw_flags(n_docs):
+    """The seeded flag matrix: the planted truth, drawn identically
+    by the GPU corpus builders and the CPU combine cell."""
+    import numpy as np
+    rng = np.random.default_rng(CORPUS_SEED)
+    return (rng.random((n_docs, len(FLAG_SELECTIVITY)))
+            < np.array(FLAG_SELECTIVITY)[None, :]).astype(int)
+
+
+def _join_key_truth():
+    """(a_keys, p_keys, truth): the planted key assignment and the
+    pair truth it implies, shared by build_join_corpus and combine."""
+    a_keys = [JOIN_KEY_WORDS[i % len(JOIN_KEY_WORDS)]
+              for i in range(JOIN_ANCHORS)]
+    p_keys = [JOIN_KEY_WORDS[p % len(JOIN_KEY_WORDS)]
+              if p < JOIN_PARTNERS - JOIN_ORPHANS else f"nomatch{p}"
+              for p in range(JOIN_PARTNERS)]
+    truth = [[int(a_keys[a] == p_keys[p])
+              for p in range(JOIN_PARTNERS)]
+             for a in range(JOIN_ANCHORS)]
+    return a_keys, p_keys, truth
+
 
 def _write(result, name):
     print(json.dumps(result, indent=2)[:4000], flush=True)
@@ -135,26 +170,15 @@ def build_filter_corpus(tokenizer, n_docs):
     """(body_ids, q_ids, flags, kinds). flags[d][j] is the planted
     truth for flag stages, None columns for natural stages. kinds[d]
     labels the document's edge class."""
-    import numpy as np
-
     import sys
     sys.path.insert(0, "/root/gpu_tests")
-    from corpus import build_pool
+    from corpus import build_pool, flags_line
 
     from quail.logical import SHARED_PRE, render_filter_question
 
-    rng = np.random.default_rng(CORPUS_SEED)
-    n_flags = len(FLAG_SELECTIVITY)
-    flags = (rng.random((n_docs, n_flags))
-             < np.array(FLAG_SELECTIVITY)[None, :]).astype(int)
+    flags = _draw_flags(n_docs)
     pool = build_pool(min(10_000, n_docs + 8 * N_LONG))
     extra = pool[n_docs:]
-
-    def flags_line(row):
-        vals = " ".join(
-            f"FLAG_{j + 1}={'TRUE' if v else 'FALSE'}"
-            for j, v in enumerate(row))
-        return f"\n\n[FLAGS] {vals}"
 
     bodies, kinds = [], []
     for d in range(n_docs):
@@ -172,20 +196,12 @@ def build_filter_corpus(tokenizer, n_docs):
             kinds.append("plain")
         bodies.append(SHARED_PRE + body + flags_line(flags[d]))
 
-    questions = [
-        ("flag", 0, "Does the [FLAGS] line above show FLAG_1=TRUE?"),
-        ("flag", 1, "Does the [FLAGS] line above show FLAG_2=TRUE?"),
-        ("flag", 2, "Does the [FLAGS] line above show FLAG_3=TRUE?"),
-        ("natural", None,
-         "Is the overall sentiment of the review above positive?"),
-        ("flag", 3, "Does the [FLAGS] line above show FLAG_4=TRUE?"),
-    ]
     body_ids = tokenizer(bodies, add_special_tokens=False)["input_ids"]
     q_ids = [tokenizer(render_filter_question("\n\n" + text),
                        add_special_tokens=False)["input_ids"]
-             for _, _, text in questions]
+             for _, _, text in FILTER_STAGES]
     stage_truth = [flags[:, col] if kind == "flag" else None
-                   for kind, col, _ in questions]
+                   for kind, col, _ in FILTER_STAGES]
     return body_ids, q_ids, stage_truth, kinds
 
 
@@ -203,25 +219,16 @@ def build_join_corpus(tokenizer):
 
     pool = build_pool(2_000)
     used = iter(range(200, 2_000))
+    a_keys, p_keys, truth = _join_key_truth()
 
-    anchors, a_keys = [], []
+    anchors = []
     for i in range(JOIN_ANCHORS):
         body = "\n\n".join(pool[next(used)] for _ in range(6))
-        key = JOIN_KEY_WORDS[i % len(JOIN_KEY_WORDS)]
-        a_keys.append(key)
-        anchors.append(f"{SHARED_PRE}{body}\n\n[KEYS] X={key}")
+        anchors.append(f"{SHARED_PRE}{body}\n\n[KEYS] X={a_keys[i]}")
 
-    partners, p_keys = [], []
+    partners = []
     for p in range(JOIN_PARTNERS):
-        body = pool[next(used)]
-        key = JOIN_KEY_WORDS[p % len(JOIN_KEY_WORDS)] \
-            if p < JOIN_PARTNERS - JOIN_ORPHANS else f"nomatch{p}"
-        p_keys.append(key)
-        partners.append(f"{body}\n\n[KEY] X={key}")
-
-    truth = [[int(a_keys[a] == p_keys[p])
-              for p in range(JOIN_PARTNERS)]
-             for a in range(JOIN_ANCHORS)]
+        partners.append(f"{pool[next(used)]}\n\n[KEY] X={p_keys[p]}")
 
     tok = lambda t: tokenizer(t, add_special_tokens=False)["input_ids"]
     anchor_ids = [tok(a) for a in anchors]
@@ -239,10 +246,7 @@ def stock_side(n_docs: int = 1000,
                model: str = "qwen3-4b-fp8") -> str:
     """Every (document, stage) and every join pair through standard
     vLLM serving, twice for filters (natural and shuffled order)."""
-    import sys
     import time
-
-    sys.path.insert(0, "/root/gpu_tests")
 
     import numpy as np
     from transformers import AutoTokenizer
@@ -295,33 +299,32 @@ def stock_side(n_docs: int = 1000,
               f"in {wall}s", flush=True)
         return [b for b, _ in pairs], [m for _, m in pairs], wall
 
+    def run_shuffled(prompts, seed, tag):
+        """The pass-to-pass control: the same prompts in a shuffled
+        submission order, answers unscrambled back to prompt order."""
+        order = list(range(len(prompts)))
+        np.random.default_rng(seed).shuffle(order)
+        bits_s, margins_s, wall = run_prompts(
+            [prompts[i] for i in order], tag)
+        bits = [0] * len(order)
+        margins = [0.0] * len(order)
+        for pos, idx in enumerate(order):
+            bits[idx] = bits_s[pos]
+            margins[idx] = margins_s[pos]
+        return bits, margins, wall
+
     n_stages = len(q_ids)
     filter_prompts = [body_ids[d] + q_ids[j]
                       for d in range(n_docs) for j in range(n_stages)]
     bits1, margins1, wall1 = run_prompts(filter_prompts, "filters/1")
-
-    order = list(range(len(filter_prompts)))
-    np.random.default_rng(7).shuffle(order)
-    bits2_s, margins2_s, wall2 = run_prompts(
-        [filter_prompts[i] for i in order], "filters/2-shuffled")
-    bits2 = [0] * len(order)
-    margins2 = [0.0] * len(order)
-    for pos, idx in enumerate(order):
-        bits2[idx] = bits2_s[pos]
-        margins2[idx] = margins2_s[pos]
+    bits2, margins2, wall2 = run_shuffled(filter_prompts, 7,
+                                          "filters/2-shuffled")
 
     join_prompts = [a + frame_ids + s
                     for a in anchor_ids for s in suffix_ids]
     jbits, jmargins, jwall = run_prompts(join_prompts, "join")
-    jorder = list(range(len(join_prompts)))
-    np.random.default_rng(11).shuffle(jorder)
-    jb_s, jm_s, jwall2 = run_prompts(
-        [join_prompts[i] for i in jorder], "join/2-shuffled")
-    jbits2 = [0] * len(jorder)
-    jmargins2 = [0.0] * len(jorder)
-    for pos, idx in enumerate(jorder):
-        jbits2[idx] = jb_s[pos]
-        jmargins2[idx] = jm_s[pos]
+    jbits2, jmargins2, jwall2 = run_shuffled(join_prompts, 11,
+                                             "join/2-shuffled")
 
     report = dict(
         cell="stock_side", model=spec.name, n_docs=n_docs,
@@ -347,10 +350,7 @@ def quail_side(n_docs: int = 1000,
                model: str = "qwen3-4b-fp8") -> str:
     """The packed executor's real loops under each attention path on
     the same token streams, plus the production two-round sequence."""
-    import sys
     import time
-
-    sys.path.insert(0, "/root/gpu_tests")
 
     import torch
     import torch.nn.functional as F
@@ -452,8 +452,6 @@ def combine(n_docs: int = 1000,
             model: str = "qwen3-4b-fp8") -> str:
     """Read both raw answer sets from the results volume and build
     the comparison report (CPU only)."""
-    import numpy as np
-
     tag = "" if model == "qwen3-4b-fp8" else "_32b"
     results_vol.reload()
     with open(f"/results/ablations/accuracy_stock_raw{tag}.json") as f:
@@ -462,34 +460,33 @@ def combine(n_docs: int = 1000,
         quail = json.load(f)
     assert stock["n_docs"] == quail["n_docs"] == n_docs
 
-    # the corpus truth is rebuilt here (CPU, no tokenizer needed for
-    # flags/keys - the same seeded draw both sides used)
-    rng = np.random.default_rng(CORPUS_SEED)
-    n_flags = len(FLAG_SELECTIVITY)
-    flags = (rng.random((n_docs, n_flags))
-             < np.array(FLAG_SELECTIVITY)[None, :]).astype(int)
-    stage_kind = ["flag", "flag", "flag", "natural", "flag"]
-    stage_col = [0, 1, 2, None, 3]
-    n_stages = len(stage_kind)
+    # the corpus truth is rebuilt from the same module-level
+    # definitions the GPU cells planted (CPU, no tokenizer needed)
+    flags = _draw_flags(n_docs)
+    stage_kind = [kind for kind, _, _ in FILTER_STAGES]
+    stage_col = [col for _, col, _ in FILTER_STAGES]
+    n_stages = len(FILTER_STAGES)
     kinds = stock["kinds"]
 
     sbits = stock["filter_bits"]
     smargins = stock["filter_margins"]
-    sbits2 = stock["filter_bits_rep"]
 
     def s_at(d, j):
         return sbits[d * n_stages + j]
 
+    def flip_control(bits, bits_rep, margins):
+        """Pass-to-pass flips and the margins they happened at."""
+        flips = [i for i, (a, b) in enumerate(zip(bits, bits_rep))
+                 if a != b]
+        fm = sorted(abs(margins[i]) for i in flips)
+        return dict(
+            flips=len(flips), of=len(bits),
+            rate=round(len(flips) / len(bits), 5),
+            flip_margin_max=(fm[-1] if fm else 0.0),
+            flip_margin_p50=(fm[len(fm) // 2] if fm else 0.0))
+
     # stock's own pass-to-pass control
-    flips = [i for i, (a, b) in enumerate(zip(sbits, sbits2))
-             if a != b]
-    flip_margins = sorted(abs(smargins[i]) for i in flips)
-    control = dict(
-        flips=len(flips), of=len(sbits),
-        rate=round(len(flips) / len(sbits), 5),
-        flip_margin_max=(flip_margins[-1] if flip_margins else 0.0),
-        flip_margin_p50=(flip_margins[len(flip_margins) // 2]
-                         if flip_margins else 0.0))
+    control = flip_control(sbits, stock["filter_bits_rep"], smargins)
 
     # stock accuracy on the planted flags (all documents, pass 1)
     stock_acc = {}
@@ -542,15 +539,8 @@ def combine(n_docs: int = 1000,
             survivors_stock=len(s_surv),
             survivor_overlap=len(q_surv & s_surv))
 
-    # join truth from the same key assignment
-    a_keys = [JOIN_KEY_WORDS[i % len(JOIN_KEY_WORDS)]
-              for i in range(JOIN_ANCHORS)]
-    p_keys = [JOIN_KEY_WORDS[p % len(JOIN_KEY_WORDS)]
-              if p < JOIN_PARTNERS - JOIN_ORPHANS else f"nomatch{p}"
-              for p in range(JOIN_PARTNERS)]
-    jtruth = [[int(a_keys[a] == p_keys[p])
-               for p in range(JOIN_PARTNERS)]
-              for a in range(JOIN_ANCHORS)]
+    # join truth from the same key assignment the corpus planted
+    _, _, jtruth = _join_key_truth()
     jbits = stock["join_bits"]
     jmargins = stock["join_margins"]
 
@@ -560,15 +550,8 @@ def combine(n_docs: int = 1000,
         return dict(p25=m[n // 4], p50=m[n // 2], p75=m[3 * n // 4],
                     under_1=round(sum(1 for x in m if x < 1.0) / n, 4))
 
-    jflips = [i for i, (a, b) in enumerate(
-        zip(jbits, stock["join_bits_rep"])) if a != b]
-    jflip_m = sorted(abs(jmargins[i]) for i in jflips)
-    join_control = dict(
-        flips=len(jflips), of=len(jbits),
-        rate=round(len(jflips) / len(jbits), 5),
-        flip_margin_max=(jflip_m[-1] if jflip_m else 0.0),
-        flip_margin_p50=(jflip_m[len(jflip_m) // 2]
-                         if jflip_m else 0.0))
+    join_control = flip_control(jbits, stock["join_bits_rep"],
+                                jmargins)
 
     def compare_join(mode):
         q = {int(a): row for a, row in quail["joins"][mode].items()}

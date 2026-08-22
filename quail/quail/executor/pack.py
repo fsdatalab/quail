@@ -294,6 +294,9 @@ class FilterAdmission:
     def report(self, doc, stage, passed, release=True):
         """One landed answer. Frees pages on FALSE or on the last
         stage; otherwise the next-stage suffix becomes ready.
+        Returns the docs whose pages were freed (at most this one),
+        so the caller frees their arena keys too - the same protocol
+        as drain_ready.
 
         release=False keeps a leaving document's pages held (the store
         is copying them out); the caller returns them with release()
@@ -305,9 +308,11 @@ class FilterAdmission:
             self._survivor_count += 1
         if passed and not last:
             self.ready.append((doc, stage + 1))
-            return
+            return ()
         if release:
             self.free_pages += self.resident.pop(doc)
+            return (doc,)
+        return ()
 
     def release(self, doc):
         """Return a document's pages after a deferred store save."""

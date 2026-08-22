@@ -367,6 +367,57 @@ ATTENTION_PATHS = (
 )
 
 
+def _boot_executor(model):
+    """The production boot arithmetic, shared by the attention-path
+    cells: spec, tokenizer, arena, pipeline, answerer, async answers,
+    chunk budget, arena tokens."""
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoTokenizer
+
+    from quail.executor.arena import KVArena
+    from quail.executor.attention import Pipeline
+    from quail.executor.loop import Answerer, AsyncAnswers
+    from quail.executor.model import load_model
+    from quail.planner import budgets
+    from quail.specs import H100_SXM, MODELS
+
+    spec = MODELS[model]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    model_mod = load_model(spec.hf_name)
+    chunk = budgets.chunk_budget(spec, H100_SXM)
+    arena_tok = budgets.arena_tokens(spec, H100_SXM, chunk)
+    arena = KVArena(n_layers=spec.layers,
+                    n_pages=arena_tok // budgets.PAGE_TOKENS,
+                    page_tokens=budgets.PAGE_TOKENS,
+                    n_kv=spec.n_kv, d_head=spec.d_head,
+                    dtype=torch.bfloat16)
+    pipeline = Pipeline(model_mod, arena, kernels="quail",
+                        attention_mode="merge_quant")
+    answerer = Answerer(torch, F, model_mod, tokenizer)
+    async_ans = AsyncAnswers(torch, answerer)
+    budget = min(chunk, pipeline.max_chunk_tokens)
+    return (spec, tokenizer, arena, pipeline, answerer, async_ans,
+            budget, arena_tok)
+
+
+def _disagreements(left, right, n_stages=None):
+    """Answer differences between two {doc: bits} maps. Rows of
+    unequal length count every unmatched trailing bit. Returns
+    (total, by_stage); by_stage is [] unless n_stages is given."""
+    total = 0
+    by_stage = [0] * (n_stages or 0)
+    for d in set(left) | set(right):
+        a, b = left.get(d, []), right.get(d, [])
+        for j, (x, y) in enumerate(zip(a, b)):
+            if x != y:
+                total += 1
+                if n_stages:
+                    by_stage[j] += 1
+        total += abs(len(a) - len(b))
+    return total, by_stage
+
+
 @app.function(timeout=1200, **GPU_KW)
 def attention_parity(q_heads: int = 32) -> str:
     """Compare split and unified attention with a contiguous reference.
@@ -379,10 +430,7 @@ def attention_parity(q_heads: int = 32) -> str:
     geometry (8:1 GQA).
     """
     import math
-    import sys
     from types import SimpleNamespace
-
-    sys.path.insert(0, "/root/gpu_tests")
 
     import torch
 
@@ -614,33 +662,12 @@ def attention_end_to_end_parity(n_docs: int = 256,
     sys.path.insert(0, "/root/gpu_tests")
 
     import torch
-    import torch.nn.functional as F
-    from transformers import AutoTokenizer
 
     from corpus import build_corpus
-    from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
-    from quail.executor.loop import (Answerer, AsyncAnswers, pack_chunk,
-                                     run_filter)
-    from quail.executor.model import load_model
-    from quail.planner import budgets
-    from quail.specs import H100_SXM, MODELS
+    from quail.executor.loop import pack_chunk, run_filter
 
-    spec = MODELS[model]
-    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    model_mod = load_model(spec.hf_name)
-    chunk_budget = budgets.chunk_budget(spec, H100_SXM)
-    arena_tokens = budgets.arena_tokens(spec, H100_SXM, chunk_budget)
-    arena = KVArena(
-        n_layers=spec.layers,
-        n_pages=arena_tokens // budgets.PAGE_TOKENS,
-        page_tokens=budgets.PAGE_TOKENS,
-        n_kv=spec.n_kv, d_head=spec.d_head, dtype=torch.bfloat16)
-    pipeline = Pipeline(model_mod, arena, kernels="quail",
-                        attention_mode="merge_quant")
-    answerer = Answerer(torch, F, model_mod, tokenizer)
-    async_answers = AsyncAnswers(torch, answerer)
-    budget = min(chunk_budget, pipeline.max_chunk_tokens)
+    (spec, tokenizer, arena, pipeline, answerer, async_answers,
+     budget, _) = _boot_executor(model)
     body_ids, question_ids, flags = build_corpus(tokenizer, n_docs)
 
     def full_prompt_reference():
@@ -683,19 +710,6 @@ def attention_end_to_end_parity(n_docs: int = 256,
             live = [d for d in live if stage_bits[d]]
         return answers
 
-    def disagreements(left, right):
-        count = 0
-        by_stage = [0] * len(question_ids)
-        for d in range(n_docs):
-            a = left.get(d, [])
-            b = right.get(d, [])
-            for stage, (x, y) in enumerate(zip(a, b)):
-                if x != y:
-                    count += 1
-                    by_stage[stage] += 1
-            count += abs(len(a) - len(b))
-        return count, by_stage
-
     outputs = {}
     with torch.inference_mode():
         for mode in ("split", "merge_quant", "unified"):
@@ -736,17 +750,18 @@ def attention_end_to_end_parity(n_docs: int = 256,
     comparisons = {}
     reference = outputs["full_prompt"]
     for mode in ("split", "merge_quant", "unified"):
-        count, by_stage = disagreements(outputs[mode], reference)
+        count, by_stage = _disagreements(outputs[mode], reference,
+                                         len(question_ids))
         comparisons[mode] = dict(
             disagreements=count, disagreements_by_stage=by_stage,
             answered=sum(len(row) for row in outputs[mode].values()),
             wrong=_wrong_count(outputs[mode], flags))
-    split_unified, split_unified_by_stage = disagreements(
-        outputs["split"], outputs["unified"])
+    split_unified, split_unified_by_stage = _disagreements(
+        outputs["split"], outputs["unified"], len(question_ids))
     comparisons["split_vs_unified"] = dict(
         disagreements=split_unified,
         disagreements_by_stage=split_unified_by_stage)
-    store_diff, _ = disagreements(restored_answers, baseline_store)
+    store_diff, _ = _disagreements(restored_answers, baseline_store)
     comparisons["unified_store_restore"] = dict(
         disagreements=store_diff, restored_docs=stats["restored_docs"],
         of_docs=n_store)
@@ -881,32 +896,12 @@ def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
     sys.path.insert(0, "/root/gpu_tests")
 
     import torch
-    import torch.nn.functional as F
-    from transformers import AutoTokenizer
 
     from corpus import biodex_sample
-    from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
-    from quail.executor.loop import Answerer, AsyncAnswers, run_join
-    from quail.executor.model import load_model
-    from quail.planner import budgets
-    from quail.specs import H100_SXM, MODELS
+    from quail.executor.loop import run_join
 
-    spec = MODELS[model]
-    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    model_mod = load_model(spec.hf_name)
-    chunk_budget = budgets.chunk_budget(spec, H100_SXM)
-    arena_tokens = budgets.arena_tokens(spec, H100_SXM, chunk_budget)
-    arena = KVArena(
-        n_layers=spec.layers,
-        n_pages=arena_tokens // budgets.PAGE_TOKENS,
-        page_tokens=budgets.PAGE_TOKENS,
-        n_kv=spec.n_kv, d_head=spec.d_head, dtype=torch.bfloat16)
-    pipeline = Pipeline(model_mod, arena, kernels="quail",
-                        attention_mode="merge_quant")
-    answerer = Answerer(torch, F, model_mod, tokenizer)
-    async_answers = AsyncAnswers(torch, answerer)
-    budget = min(chunk_budget, pipeline.max_chunk_tokens)
+    (spec, tokenizer, arena, pipeline, _, async_answers,
+     budget, arena_tokens) = _boot_executor(model)
     data = biodex_sample(tokenizer, n_reports=n_reports)
     prefixes = data["prefixes"]
     suffixes = data["suffixes"][:n_terms]
@@ -993,33 +988,12 @@ def attention_paths(n_docs: int = 10000, reps: int = 2,
     sys.path.insert(0, "/root/gpu_tests")
 
     import torch
-    import torch.nn.functional as F
-    from transformers import AutoTokenizer
 
     from corpus import build_corpus
-    from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
-    from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
-                                     warm_kernels)
-    from quail.executor.model import load_model
-    from quail.planner import budgets
-    from quail.specs import H100_SXM, MODELS
+    from quail.executor.loop import run_filter, warm_kernels
 
-    spec = MODELS[model]
-    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    model_mod = load_model(spec.hf_name)
-    chunk = budgets.chunk_budget(spec, H100_SXM)
-    arena_tok = budgets.arena_tokens(spec, H100_SXM, chunk)
-    arena = KVArena(n_layers=spec.layers,
-                    n_pages=arena_tok // budgets.PAGE_TOKENS,
-                    page_tokens=budgets.PAGE_TOKENS,
-                    n_kv=spec.n_kv, d_head=spec.d_head,
-                    dtype=torch.bfloat16)
-    pipeline = Pipeline(model_mod, arena, kernels="quail",
-                        attention_mode="merge_quant")
-    answerer = Answerer(torch, F, model_mod, tokenizer)
-    async_ans = AsyncAnswers(torch, answerer)
-    exec_budget = min(chunk, pipeline.max_chunk_tokens)
+    (spec, tokenizer, arena, pipeline, _, async_ans,
+     exec_budget, arena_tok) = _boot_executor(model)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
 
     predictions = {
@@ -1080,19 +1054,11 @@ def attention_paths(n_docs: int = 10000, reps: int = 2,
         report["runs"][mode] = rows
         answers_by_path[mode] = answers
 
-    def disagreements(left, right):
-        total = 0
-        for doc in set(left) | set(right):
-            a = left.get(doc, [])
-            b = right.get(doc, [])
-            total += sum(x != y for x, y in zip(a, b))
-            total += abs(len(a) - len(b))
-        return total
-
     baseline = answers_by_path["split"]
     for mode in ("merge_quant", "unified"):
         report["comparisons"][mode] = dict(
-            disagreements=disagreements(baseline, answers_by_path[mode]),
+            disagreements=_disagreements(
+                baseline, answers_by_path[mode])[0],
             wall_delta_s=round(
                 report["runs"][mode][-1]["wall"]
                 - report["runs"]["split"][-1]["wall"], 3))
@@ -1137,7 +1103,6 @@ def profile_packed(n_docs: int = 3000) -> str:
     exceed the stock 4.00 us/token; GEMM and attention match A3.
     """
     import sys
-    import time
 
     sys.path.insert(0, "/root/gpu_tests")
 

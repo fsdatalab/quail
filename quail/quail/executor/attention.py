@@ -23,10 +23,11 @@ plain PyTorch ops and a separate quantize), lives in
 ablations/split_reference.py; comparison cells install it through
 the attention_override hook.
 
-Pipeline(kernels="vllm") swaps the three Triton kernels for the engine's
-own ops (fused-add rms_norm + separate quantize, silu_and_mul +
-separate quantize, per-head norms + rotary module) - the ablation
-ladder's A2 rung. Everything else in the pass is identical.
+Pipeline(kernels="vllm") swaps three of the five Triton kernels (norm,
+qk, silu) for the engine's own ops (fused-add rms_norm + separate
+quantize, silu_and_mul + separate quantize, per-head norms + rotary
+module) - the ablation ladder's A2 rung. Everything else in the pass
+is identical.
 
 Everything here imports torch lazily: the module only runs inside the
 Modal image.
@@ -62,10 +63,6 @@ class Pipeline:
         if kernels not in ("quail", "vllm"):
             raise ValueError(f"kernels must be 'quail' or 'vllm', "
                              f"got {kernels!r}")
-        if attention_mode not in ("merge_quant", "unified"):
-            raise ValueError(
-                "attention_mode must be 'merge_quant' or 'unified', "
-                f"got {attention_mode!r}")
         self.kernels = kernels
         self.attention_mode = attention_mode
         # comparison scripts install a retired path here (bf16 out,
@@ -93,6 +90,20 @@ class Pipeline:
                          layer.mlp.gate_up_proj.weight.shape[0])
                      for layer in self.layers)
         self.max_chunk_tokens = (2**31 - 1) // widest
+
+    # the mode is reassigned per phase (filters then joins in one
+    # session), so validate at every write, not just construction
+    @property
+    def attention_mode(self):
+        return self._attention_mode
+
+    @attention_mode.setter
+    def attention_mode(self, mode):
+        if mode not in ("merge_quant", "unified"):
+            raise ValueError(
+                "attention_mode must be 'merge_quant' or 'unified', "
+                f"got {mode!r}")
+        self._attention_mode = mode
 
     # ---- weights and quant ------------------------------------------
 
@@ -466,7 +477,6 @@ class Pipeline:
     def attention_merge_quant(self, q, k, v, meta):
         """The two-call attention path with the fused merge plus FP8
         quantization kernel. It returns the input pair for o_proj."""
-        torch = self.torch
         n = q.shape[0]
         H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
         q3 = q.view(n, H, D)
