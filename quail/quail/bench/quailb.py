@@ -78,6 +78,12 @@ SETS = {
     "reports": 2_000,
     "claims": 1_000,
     "citations": 2_000,
+    # real matched-pair counts in the source data (Kopcke/Rahm
+    # entity-matching benchmarks) - not scalable up like the other
+    # pools, only down, since every pair is a real listing, not
+    # generated or padded text.
+    "abt_buy": 1_081,
+    "amazon_google": 1_113,
 }
 
 ASPECTS = ["the acting", "the plot", "the directing", "the cinematography",
@@ -206,6 +212,89 @@ def _lepard_rows(n):
     return rows
 
 
+ENTITY_MATCH_REPO = "adhariya/quail-entity-matching-benchmarks"
+
+
+def _matched_pairs(map_path, id_left, id_right, left_text, right_text):
+    """Shuffled, deduplicated (left_text, right_text) pairs from a
+    perfect-mapping CSV: one pair per unique left id, keeping only
+    pairs where both sides' text is non-empty. Dedup on the left id
+    only - the source mappings are almost entirely 1:1 (Abt-Buy: 1097
+    mapping rows over 1081 unique Abt ids; Amazon-Google: 1300 rows
+    over 1113 unique Amazon ids), so the handful of 1-to-many rows
+    just lose their extra partner rather than making the ground truth
+    ambiguous."""
+    import csv
+
+    with open(map_path, encoding="latin-1", newline="") as f:
+        rows = list(csv.DictReader(f))
+    seen, pairs = set(), []
+    for r in rows:
+        lid, rid = r[id_left], r[id_right]
+        if lid in seen or lid not in left_text or rid not in right_text:
+            continue
+        seen.add(lid)
+        pairs.append((left_text[lid], right_text[rid]))
+    rng = np.random.default_rng(DATA_SEED)
+    rng.shuffle(pairs)
+    return pairs
+
+
+def _abt_buy_rows(n):
+    """n real matched (Abt listing, Buy listing) text pairs. Source
+    CSVs are not redistributed with this repo - mirrored privately at
+    ENTITY_MATCH_REPO on HuggingFace (see quail/reports/ for how and
+    why)."""
+    from huggingface_hub import hf_hub_download
+
+    abt_f = hf_hub_download(ENTITY_MATCH_REPO, "abt-buy/Abt.csv",
+                            repo_type="dataset", token=True)
+    buy_f = hf_hub_download(ENTITY_MATCH_REPO, "abt-buy/Buy.csv",
+                            repo_type="dataset", token=True)
+    map_f = hf_hub_download(ENTITY_MATCH_REPO,
+                            "abt-buy/abt_buy_perfectMapping.csv",
+                            repo_type="dataset", token=True)
+
+    def _load(path):
+        import csv
+        with open(path, encoding="latin-1", newline="") as f:
+            return {r["id"]: f"{r.get('name', '')}. "
+                             f"{r.get('description', '')}".strip(". ")
+                   for r in csv.DictReader(f)}
+
+    pairs = _matched_pairs(map_f, "idAbt", "idBuy", _load(abt_f),
+                           _load(buy_f))
+    return pairs[:n]
+
+
+def _amazon_google_rows(n):
+    """n real matched (Amazon listing, Google Products listing) text
+    pairs. Same private mirror as Abt-Buy - see ENTITY_MATCH_REPO."""
+    from huggingface_hub import hf_hub_download
+
+    amz_f = hf_hub_download(ENTITY_MATCH_REPO,
+                            "amazon-google/Amazon.csv",
+                            repo_type="dataset", token=True)
+    goog_f = hf_hub_download(ENTITY_MATCH_REPO,
+                             "amazon-google/GoogleProducts.csv",
+                             repo_type="dataset", token=True)
+    map_f = hf_hub_download(
+        ENTITY_MATCH_REPO,
+        "amazon-google/Amzon_GoogleProducts_perfectMapping.csv",
+        repo_type="dataset", token=True)
+
+    def _load(path, name_col):
+        import csv
+        with open(path, encoding="latin-1", newline="") as f:
+            return {r["id"]: f"{r.get(name_col, '')}. "
+                             f"{r.get('description', '')}".strip(". ")
+                   for r in csv.DictReader(f)}
+
+    pairs = _matched_pairs(map_f, "idAmazon", "idGoogleBase",
+                           _load(amz_f, "title"), _load(goog_f, "name"))
+    return pairs[:n]
+
+
 def _vocab_table(rows, idx, cap=None):
     """A frequency-sorted, deduplicated vocabulary column from one
     field across sampled rows (the `terms` table, from `reactions`)."""
@@ -244,8 +333,44 @@ def _build_citations(d, sf):
     }), path)
 
 
+def _build_matched_pair_tables(d, sf, set_name, table_l, table_r,
+                               id_l, id_r, loader):
+    """table_l.parquet / table_r.parquet, idempotent: n real matched
+    pairs, each row carrying match_id - the partner table's id for
+    the one row it's really paired with, so a join's answers can be
+    scored against real ground truth the same way LEP-2 uses
+    passage_id (see ABT-1/AG-1 in queries() below). Called from both
+    branches of build_sets, same reason as _build_citations."""
+    path_l, path_r = d / f"{table_l}.parquet", d / f"{table_r}.parquet"
+    if path_l.exists() and path_r.exists():
+        return
+    n = _n_docs(set_name, sf)
+    pairs = loader(n)
+    pq.write_table(pa.table({
+        "id": [f"{id_l}{i}" for i in range(len(pairs))],
+        "description": [p[0] for p in pairs],
+        "match_id": [f"{id_r}{i}" for i in range(len(pairs))],
+    }), path_l)
+    pq.write_table(pa.table({
+        "id": [f"{id_r}{i}" for i in range(len(pairs))],
+        "description": [p[1] for p in pairs],
+        "match_id": [f"{id_l}{i}" for i in range(len(pairs))],
+    }), path_r)
+
+
+def _build_abt_buy(d, sf):
+    _build_matched_pair_tables(d, sf, "abt_buy", "abt", "buy", "at",
+                               "by", _abt_buy_rows)
+
+
+def _build_amazon_google(d, sf):
+    _build_matched_pair_tables(d, sf, "amazon_google", "amazon",
+                               "google", "az", "gp",
+                               _amazon_google_rows)
+
+
 def build_sets(data_dir, sf, lf=1):
-    """All seven tables as parquet files, cached by sf.
+    """All eleven tables as parquet files, cached by sf.
 
     lf (load factor) is accepted but unused: documents here are real
     and unpadded, so there's nothing to scale. Kept in the signature
@@ -254,6 +379,8 @@ def build_sets(data_dir, sf, lf=1):
     marker = d / "DONE"
     if marker.exists():
         _build_citations(d, sf)
+        _build_abt_buy(d, sf)
+        _build_amazon_google(d, sf)
         return d
     d.mkdir(parents=True, exist_ok=True)
 
@@ -307,6 +434,13 @@ def build_sets(data_dir, sf, lf=1):
         "passage_id": [r[2] for r in lep],
     }), d / "citations.parquet")
 
+    # abt/buy, amazon/google: real entity-matching pairs, each row
+    # carrying match_id (the partner table's id for its one real
+    # match) - see _build_matched_pair_tables above and ABT-1/AG-1 in
+    # queries() below.
+    _build_abt_buy(d, sf)
+    _build_amazon_google(d, sf)
+
     marker.write_text("ok")
     return d
 
@@ -314,7 +448,8 @@ def build_sets(data_dir, sf, lf=1):
 def register_sets(sess, data_dir):
     from quail.catalog import DocumentProvider
     for name in ("reviews", "aspects", "reports", "terms",
-                "claims", "evidence", "citations"):
+                "claims", "evidence", "citations", "abt", "buy",
+                "amazon", "google"):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
 
@@ -461,6 +596,17 @@ LEPJOIN = ("Judge strictly from the excerpt above whether the passage "
            "being cited in the excerpt above, FALSE otherwise.\n"
            "ANSWER=")
 
+# ABT-1/AG-1 only: real ground truth exists for this one too (each
+# row's match_id, from the source mapping - see ENTITY_MATCH_REPO),
+# not a judge-pass approximation. Shared across both entity-matching
+# datasets - it's the same task, product listings instead of legal
+# text.
+PRODUCT_MATCH = ("Judge strictly from the product listing above whether "
+                 "the listing below describes the exact same product for "
+                 "sale.\n\n{0}\n\nLISTING:\n{1}\nInstruction: answer TRUE "
+                 "if the listing below describes the exact same product "
+                 "as the listing above, FALSE otherwise.\nANSWER=")
+
 
 # ---------------------------------------------------------- queries
 
@@ -603,6 +749,18 @@ def queries(sess):
     q["LEP-7"] = ("2F + 1J: two-sided pushdown - LEP1+LEP2 on excerpts, "
                   "LEPS1 on passages, each filtered before the self-join",
                   lep7)
+
+    # Entity matching: Abt-Buy and Amazon-Google, the Kopcke/Rahm
+    # benchmark pairs. Join alone only, by design - each side is a
+    # short product listing, not a document worth filtering on its
+    # own the way reviews/reports/claims/excerpts are.
+    q["ABT-1"] = ("join: product match (Abt x Buy)", make(
+        "abt", "p", "description", [],
+        [("buy", "y", "description", PRODUCT_MATCH)], ["p.id", "y.id"]))
+    q["AG-1"] = ("join: product match (Amazon x GoogleProducts)", make(
+        "amazon", "z", "description", [],
+        [("google", "g", "description", PRODUCT_MATCH)],
+        ["z.id", "g.id"]))
 
     return q
 
