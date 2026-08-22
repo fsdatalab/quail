@@ -748,7 +748,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     # under unified attention a suffix's KV occupies cache slots for
     # the length of its chunk, so a document's pages must also cover
     # the longest question tail
-    temp_tail = max(len(q) - p for q in question_ids) \
+    temp_tail = max(len(question_ids[0]) - p, 0,
+                    *(len(t) for t in tails[1:])) \
         if unified and arena_writes else 0
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
