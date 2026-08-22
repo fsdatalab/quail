@@ -1,6 +1,8 @@
-"""The packed forward pass: DeepGEMM matmuls, three Triton fused
+"""The packed forward pass: DeepGEMM matmuls, five Triton fused
 kernels, FlashAttention-3 varlen self-attention, paged cross-attention
-against the arena, and the softmax-state (LSE) merge.
+against the arena, and the softmax-state (LSE) merge. Provenance of
+every kernel and algorithm: reports/2026-08-21-attention-paths.md,
+"Kernel provenance".
 
 A chunk is [group_1 | group_2 | ...] where each group is
 [prefix? | suffix_1 .. suffix_k]. Per layer, attention is two calls
@@ -98,6 +100,8 @@ class Pipeline:
         raise AttributeError(f"no weight scale on {type(linear).__name__}")
 
     def gemm(self, q_input, input_scale, linear):
+        # all linear projections (QKV, O, gate-up, down) run vLLM's
+        # DeepGEMM fp8 matmul; weights and scales are vLLM's layout
         from vllm.utils.deep_gemm import fp8_gemm_nt
         out = self.torch.empty(
             (q_input.shape[0], linear.weight.shape[0]),
@@ -132,7 +136,11 @@ class Pipeline:
                                norm.variance_epsilon)
         return hidden, residual
 
-    # ---- the three Triton kernels (exploration round 3/4, verbatim) --
+    # ---- the Triton fused kernels -----------------------------------
+    # All five are written for this project; each fuses a sequence of
+    # vLLM ops into one launch (the kernels="vllm" path runs the
+    # unfused sequence for comparison). Full provenance:
+    # reports/2026-08-21-attention-paths.md, "Kernel provenance".
 
     def _triton_kernels(self):
         if hasattr(self, "_kernels"):
@@ -140,6 +148,7 @@ class Pipeline:
         import triton
         import triton.language as tl
 
+        # fuses vLLM's silu_and_mul + per_token_group_quant_fp8
         @triton.jit
         def silu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
                            s_stride_g, s_stride_t,
@@ -164,6 +173,7 @@ class Pipeline:
             g_idx = block * GPB + tl.arange(0, GPB)
             tl.store(s_ptr + g_idx * s_stride_g + t * s_stride_t, scale)
 
+        # fuses vLLM's fused_add_rms_norm + per_token_group_quant_fp8
         @triton.jit
         def add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
                                stride_x, stride_res, stride_q,
@@ -199,6 +209,8 @@ class Pipeline:
             tl.store(s_ptr + g_idx * s_stride_g + t * s_stride_t, scale,
                      mask=g_idx < NG)
 
+        # fuses vLLM's two per-head rms_norm calls + rotary_emb
+        # (five launches) into one
         @triton.jit
         def qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, pos_ptr,
                          qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
@@ -247,6 +259,10 @@ class Pipeline:
             tl.store(k_out_ptr + t * stride_ko + kb_offs,
                      out_b.to(k_out_ptr.dtype.element_ty))
 
+        # the paged-KV append every paged engine has (vLLM:
+        # reshape_and_cache_flash; FlashInfer: append_paged_kv_cache),
+        # with a fused source-side gather: only selected rows of the
+        # packed chunk are written, from arbitrary positions
         @triton.jit
         def kv_row_scatter(k_src_ptr, v_src_ptr, k_dst_ptr, v_dst_ptr,
                            src_rows_ptr, dst_rows_ptr,
@@ -261,6 +277,9 @@ class Pipeline:
             v = tl.load(v_src_ptr + s * ROW + offs, mask=mask)
             tl.store(v_dst_ptr + d * ROW + offs, v, mask=mask)
 
+        # the online-softmax LSE merge (Milakov & Gimelshein 2018 -
+        # the same formula the split path runs in plain torch) fused
+        # with vLLM's per-group fp8 quantize pattern
         @triton.jit
         def merge_attn_quant(a_ptr, b_ptr, la_ptr, lb_ptr, source_ptr,
                              q_ptr, s_ptr,
@@ -428,6 +447,9 @@ class Pipeline:
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None):
+        # FlashAttention-3 (Dao et al. 2024) via vLLM's vendored fork;
+        # block_table + seqused_k is FA3's paged-KV API (the paged
+        # cache design is vLLM's PagedAttention, Kwon et al. 2023)
         from vllm.vllm_flash_attn import flash_attn_varlen_func
         return flash_attn_varlen_func(
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
@@ -494,7 +516,8 @@ class Pipeline:
 
         la = self._lse_tokens_first(lse_a, n).index_select(0, rows)
         lb = self._lse_tokens_first(lse_b, rows.shape[0])
-        # (wa*A + wb*B)/(wa+wb) == A + (B-A)*sigmoid(lse_b - lse_a):
+        # online-softmax merge (Milakov & Gimelshein 2018):
+        # (wa*A + wb*B)/(wa+wb) == A + (B-A)*sigmoid(lse_b - lse_a),
         # same merge, no fp32 copies of the row tensors
         w = torch.sigmoid(lb - la).to(torch.bfloat16)[..., None]
         merged = torch.lerp(out_a.index_select(0, rows), out_b, w)
@@ -543,7 +566,10 @@ class Pipeline:
 
     def attention_unified(self, q, k, v, meta):
         """Write every current token into its cache slot, then run one
-        causal paged attention call over retained and current KV."""
+        causal paged attention call over retained and current KV.
+
+        No new kernel: the same FA3 paged varlen call as call B in the
+        two-call paths, causal, with the fresh rows scattered first."""
         n = q.shape[0]
         H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
         q3 = q.view(n, H, D)
