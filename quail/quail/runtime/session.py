@@ -386,6 +386,7 @@ class Query:
             _, _, toks = sess.scan(s.provider, s.column)
             docs[s.alias] = toks
         filter_qids = {}
+        filter_writes = {}
         for op in plan.operators:
             if op["op"] != "FilterChain":
                 continue
@@ -394,6 +395,7 @@ class Query:
             filter_qids[alias] = [
                 _question_ids(sess, preds[st["written_pos"]].prompt)
                 for st in op["stages"]]
+            filter_writes[alias] = op.get("arena_writes")
         join_specs = []
         for op in plan.operators:
             if op["op"] != "JoinStage":
@@ -429,6 +431,9 @@ class Query:
             pre_ids=sess.tokenizer(SHARED_PRE),
             docs=docs,
             filters=filter_qids,
+            # the planner's per-chain call on whether the arena is
+            # written; None (an old plan) lets run_filter derive it
+            filter_arena_writes=filter_writes,
             joins=join_specs,
             store=store)
 

@@ -777,15 +777,30 @@ that runs until `FilterAdmission.done()`:
    KV store if they meet the length threshold.
 
 Single-stage queries (one question, no store) skip the arena
-entirely (`arena_writes=None` picks this automatically): no later
-stage reads any document's KV, so the alloc, the per-layer KV
-scatter, and the paged attention read serve no one. Each
-[document | question] packs as ONE causal segment - the same
-single causal pass stock vLLM runs per request - and admission runs
-on the token budget alone (`FilterAdmission` with
-`arena_pages=None`). The two paths answer identically: the
-kernel-parity cells measured the unified paged causal call
-bit-identical to the contiguous causal call the fast path runs
+entirely: no later stage reads any document's KV, so the alloc, the
+per-layer KV scatter, and the paged attention read serve no one.
+The planner makes the call - the FilterChain operator carries an
+`arena_writes` field (False exactly when one stage runs with no
+store), it shows in `explain()`, and the payload forwards it to
+`run_filter`. Handed `arena_writes=None` (direct callers, old
+payloads), `run_filter` derives the same rule itself; False against
+a later reader raises. Each [document | question] packs as ONE
+causal segment and admission runs on the token budget alone
+(`FilterAdmission` with `arena_pages=None`).
+
+This is strictly less work than stock vLLM does for the same
+prompt. Stock vLLM also writes every prompt token's KV into its
+paged cache, and its FA3 prefill reads K and V back through the
+block table - it has to, because the decode steps that generate the
+answer read that KV afterward. Quail's filter answers come off the
+final-position hidden states of the same forward pass (the
+`Answerer` readout), so no decode step exists and the KV write has
+no reader at all. Same attention arithmetic, minus the cache write
+and the block-table indirection.
+
+The two quail paths answer identically: the kernel-parity cells
+measured the unified paged causal call bit-identical to the
+contiguous causal call the fast path runs
 (`results/attention_parity.json`), and the m1_filter1 cell gates on
 0 answer flips across the full 10,000-document workload (the cell
 also records the A/B walls; see

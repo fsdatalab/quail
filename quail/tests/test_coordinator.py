@@ -139,6 +139,19 @@ def test_filter_round_carries_limit():
         assert s["limit"] == 3
 
 
+def test_filter_round_carries_arena_writes():
+    p = payload()
+    p["filter_arena_writes"] = {"r": False}
+    subs = filter_round_payloads(p, p["shards"], 2)
+    for s in subs:
+        assert s["filter_arena_writes"] == {"r": False}
+    # a payload without the key (an old plan) forwards None: the
+    # executor derives the rule itself
+    subs = filter_round_payloads(payload(), payload()["shards"], 2)
+    for s in subs:
+        assert s["filter_arena_writes"] is None
+
+
 def test_merge_join_round_disjoint_anchors():
     # partner_index entries are index tuples (one global index per
     # partner alias), identical on every worker

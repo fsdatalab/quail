@@ -19,19 +19,37 @@ every document still paid:
 
 The fast path skips all of it when nothing will read the KV:
 
+- The planner decides. `plan_query` puts an `arena_writes` field on
+  every FilterChain operator: False exactly when the chain has one
+  stage and no store, True otherwise. `explain()` shows the field on
+  the FilterChain line, and the plan carries a remark saying why
+  when writes are off. The payload forwards the decision per alias
+  (`filter_arena_writes`) and the worker passes it to `run_filter`.
+- `run_filter(arena_writes=...)` executes the decision. `None`
+  (direct callers: warmups, ablation cells, old payloads) derives
+  the same rule from its arguments. `True` forces the arena path
+  (the baseline in this report). `False` with multiple stages or a
+  store raises, because `store.save` and later stages read the
+  arena - a wrong planner call fails loudly.
 - `pack_chunk`: a fresh group whose key owns no arena pages packs
   `[document | question]` as ONE causal segment. Under unified
   attention a chunk is either all paged or all unpaged; mixing
   raises.
 - `attention_unified`: a chunk with no arena pages runs the plain
-  varlen causal call - the same computation stock vLLM runs per
-  request. No scatter, no paged read, no merge.
-- `run_filter(arena_writes=None)` picks the fast path automatically
-  for exactly one stage and no store. `True` forces the arena path
-  (the baseline in this report); `False` with multiple stages or a
-  store raises, because `store.save` and later stages read the arena.
+  varlen causal call. No scatter, no paged read, no merge.
 - `FilterAdmission(arena_pages=None)` removes the page bin:
   admission is the token budget alone.
+
+This is less work per token than stock vLLM does for the same
+prompt, not just a match. Stock vLLM (the pinned vllm==0.26.0, v1
+engine) writes every prompt token's KV into its paged cache with
+`reshape_and_cache_flash` and its one causal FA3 call reads K and V
+back through the block table - quail's unified path copies exactly
+that pattern. Stock cannot skip the write: after prefill it decodes,
+and the generated tokens read the prompt's KV. A quail filter never
+decodes - the TRUE/FALSE answer is read from the final position's
+hidden state in the same forward pass - so the KV has no reader and
+both the write and the paged read can go.
 
 The join path is untouched: `run_join` still allocates pages for
 every anchor - a join group's many suffixes share the anchor's KV

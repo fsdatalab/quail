@@ -186,6 +186,37 @@ def test_order_by_cost_reorders_payload(sess):
     assert "q1:" in seen2["payload"]["filters"]["r"][0]
 
 
+def test_payload_carries_filter_arena_writes(sess, tmp_path):
+    # the default session has a store (cpu_memory_gb=64), so even a
+    # single-stage filter keeps writes on: store.save reads the arena
+    truth = {"r": {"q1:": [1, 0, 1, 0, 1, 0]}}
+    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
+           "PROMPT('q1: {0}', r.review), {'selectivity': 0.5})")
+    seen = {}
+    sess.sql(sql).run(_execute=make_executor(truth, seen=seen))
+    assert seen["payload"]["filter_arena_writes"] == {"r": True}
+
+    # no store and one stage: the planner turns writes off
+    s = quail.Session(EngineConfig(cpu_memory_gb=0),
+                      tokenizer=fake_tok)
+    s.register("reviews", quail.DocumentProvider.from_parquet(
+        _parquet(tmp_path / "r2.parquet", {
+            "id": [f"r{i}" for i in range(6)],
+            "review": [f"review {i} " + "pad " * 20
+                       for i in range(6)],
+        }), id_col="id"))
+    seen = {}
+    s.sql(sql).run(_execute=make_executor(truth, seen=seen))
+    assert seen["payload"]["filter_arena_writes"] == {"r": False}
+    assert "arena_writes=False" in s.sql(sql).explain()
+
+    # a second stage re-reads survivors' KV, store or not
+    truth2 = {"r": {"q1:": [1] * 6, "q2:": [1] * 6}}
+    seen = {}
+    s.sql(FILTER_SQL).run(_execute=make_executor(truth2, seen=seen))
+    assert seen["payload"]["filter_arena_writes"] == {"r": True}
+
+
 def test_refusal_raises_on_run_prints_in_explain(sess, tmp_path):
     sess.register("huge", quail.DocumentProvider.from_parquet(
         _parquet(tmp_path / "h.parquet", {

@@ -473,8 +473,16 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                     selectivity=p.selectivity,
                     expected_docs=round(n * surv, 1)))
                 surv *= p.selectivity if p.selectivity is not None else 1.0
+            # a lone stage with no store leaves every document's KV
+            # with no reader: later stages re-read it, store.save
+            # copies it out, and nothing else ever touches it
+            writes = len(stages) > 1 or store is not None
             operators.append(dict(op="FilterChain", alias=s.alias,
-                                  stages=stages))
+                                  arena_writes=writes, stages=stages))
+            if not writes:
+                remarks.append(
+                    f"filter on {s.alias!r}: arena writes off (one "
+                    f"stage, no store - nothing reads the KV again)")
     written = {id(j): i for i, j in enumerate(joins)}
     for j, (tuples, tokens) in zip(ordered_joins, join_token_counts):
         anchor = anchors[id(j)]
