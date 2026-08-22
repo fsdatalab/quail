@@ -685,7 +685,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, trace=None, store=None,
                store_hash=None, store_min_tokens=1, stats=None,
                store_ids=None, timing=None, pinned=True,
-               limit=None, arena_writes=None):
+               limit=None, *, arena_writes):
     """The filter chain on the packed executor: continuous admission,
     survivor priority, pages freed on FALSE or after the last stage.
 
@@ -713,19 +713,19 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     pinned: pass False to build chunk tensors with pageable blocking
     copies (the pre-#12 path; the ablation ladder's staging rung).
 
-    arena_writes: whether document KV is written into the arena. The
-    planner decides this per filter chain (the FilterChain operator's
-    arena_writes field, forwarded through the payload): False when
-    one stage runs with no store, because nothing ever reads the KV
-    again - the arena alloc, the per-layer KV scatter, and the paged
+    arena_writes (required): whether document KV is written into the
+    arena. The rule lives in the planner alone: plan_query sets it
+    per filter chain (the FilterChain operator's arena_writes field,
+    forwarded through the payload) - False when one stage runs with
+    no store, because nothing ever reads the KV again. With False,
+    the arena alloc, the per-layer KV scatter, and the paged
     attention read are all skipped, [document | question] packs as
     one causal segment, and admission runs on the token budget
-    alone. None derives the same rule from the arguments (direct
-    callers: warmups, ablation cells, old payloads). True forces the
-    arena path (the before/after measurement). False with multiple
-    stages or a store raises - store.save and later stages read the
-    arena - so a wrong planner call fails loudly instead of
-    dropping KV a later pass needs.
+    alone. Direct callers (warmups, calibration, ablation cells)
+    state their intent explicitly; this function never derives the
+    value. False with multiple stages or a store raises - store.save
+    and later stages read the arena - so a wrong caller fails loudly
+    instead of dropping KV a later pass needs.
 
     Returns (answers, spans, tokens): answers[d] = 0/1 list up to the
     first FALSE (gated); spans and tokens as in run_join.
@@ -737,10 +737,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     def skey(d):
         return (store_hash, store_ids[d] if store_ids else d)
 
-    if arena_writes is None:
-        arena_writes = len(question_ids) > 1 or store is not None
-    elif not arena_writes and (len(question_ids) > 1
-                               or store is not None):
+    if not arena_writes and (len(question_ids) > 1
+                             or store is not None):
         # a later stage re-reads the KV; store.save copies it out of
         # the arena - both need the pages this switch skips
         raise ValueError("arena_writes=False needs a single stage and "

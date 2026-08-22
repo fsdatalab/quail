@@ -779,14 +779,15 @@ that runs until `FilterAdmission.done()`:
 Single-stage queries (one question, no store) skip the arena
 entirely: no later stage reads any document's KV, so the alloc, the
 per-layer KV scatter, and the paged attention read serve no one.
-The planner makes the call - the FilterChain operator carries an
-`arena_writes` field (False exactly when one stage runs with no
-store), it shows in `explain()`, and the payload forwards it to
-`run_filter`. Handed `arena_writes=None` (direct callers, old
-payloads), `run_filter` derives the same rule itself; False against
-a later reader raises. Each [document | question] packs as ONE
-causal segment and admission runs on the token budget alone
-(`FilterAdmission` with `arena_pages=None`).
+The planner makes the call, and only the planner - the FilterChain
+operator carries an `arena_writes` field (False exactly when one
+stage runs with no store), it shows in `explain()`, and the payload
+forwards it to `run_filter`. `run_filter` requires the argument and
+never derives it; direct callers (warmups, calibration, the GPU
+cells, the ablation scripts) state their intent explicitly, and
+False against a later reader raises. Each [document | question]
+packs as ONE causal segment and admission runs on the token budget
+alone (`FilterAdmission` with `arena_pages=None`).
 
 This is strictly less work than stock vLLM does for the same
 prompt. Stock vLLM also writes every prompt token's KV into its

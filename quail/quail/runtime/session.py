@@ -395,7 +395,7 @@ class Query:
             filter_qids[alias] = [
                 _question_ids(sess, preds[st["written_pos"]].prompt)
                 for st in op["stages"]]
-            filter_writes[alias] = op.get("arena_writes")
+            filter_writes[alias] = op["arena_writes"]
         join_specs = []
         for op in plan.operators:
             if op["op"] != "JoinStage":
@@ -432,7 +432,7 @@ class Query:
             docs=docs,
             filters=filter_qids,
             # the planner's per-chain call on whether the arena is
-            # written; None (an old plan) lets run_filter derive it
+            # written; run_filter requires it and never derives it
             filter_arena_writes=filter_writes,
             joins=join_specs,
             store=store)

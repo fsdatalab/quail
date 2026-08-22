@@ -306,7 +306,7 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
             # vLLM CUDA ops stays out of the measured reps
             run_filter(torch, arena, pipeline, async_ans,
                        body_ids[:256], q_ids, exec_budget,
-                       pinned=pinned)
+                       pinned=pinned, arena_writes=True)
             torch.cuda.synchronize()
             rows = []
             for rep in range(reps):
@@ -315,7 +315,8 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
                 t0 = time.perf_counter()
                 answers, spans, tokens = run_filter(
                     torch, arena, pipeline, async_ans, body_ids,
-                    q_ids, exec_budget, timing=timers, pinned=pinned)
+                    q_ids, exec_budget, timing=timers, pinned=pinned,
+                    arena_writes=True)
                 torch.cuda.synchronize()
                 wall = time.perf_counter() - t0
                 answered = sum(len(v) for v in answers.values())
@@ -702,7 +703,7 @@ def attention_end_to_end_parity(n_docs: int = 256,
             set_path(pipeline, mode)
             outputs[mode], _, _ = run_filter(
                 torch, arena, pipeline, async_answers,
-                body_ids, question_ids, budget)
+                body_ids, question_ids, budget, arena_writes=True)
         outputs["full_prompt"] = full_prompt_reference()
 
         # store round trip under the filter assignment: pass 1 saves
@@ -722,15 +723,15 @@ def attention_end_to_end_parity(n_docs: int = 256,
         set_path(pipeline, "unified")
         baseline_store, _, _ = run_filter(
             torch, arena, pipeline, async_answers, store_docs,
-            question_ids, budget)
+            question_ids, budget, arena_writes=True)
         run_filter(torch, arena, pipeline, async_answers, store_docs,
                    question_ids, budget, store=store, store_hash="p",
-                   store_min_tokens=1)
+                   store_min_tokens=1, arena_writes=True)
         stats = {}
         restored_answers, _, _ = run_filter(
             torch, arena, pipeline, async_answers, store_docs,
             question_ids, budget, store=store, store_hash="p",
-            store_min_tokens=1, stats=stats)
+            store_min_tokens=1, stats=stats, arena_writes=True)
     torch.cuda.synchronize()
 
     comparisons = {}
@@ -1047,7 +1048,8 @@ def attention_paths(n_docs: int = 10000, reps: int = 2,
         set_path(pipeline, mode)
         with torch.inference_mode():
             run_filter(torch, arena, pipeline, async_ans,
-                       body_ids[:min(256, n_docs)], q_ids, exec_budget)
+                       body_ids[:min(256, n_docs)], q_ids, exec_budget,
+                       arena_writes=True)
             torch.cuda.synchronize()
             rows = []
             for rep in range(reps):
@@ -1056,7 +1058,8 @@ def attention_paths(n_docs: int = 10000, reps: int = 2,
                 t0 = time.perf_counter()
                 answers, spans, tokens = run_filter(
                     torch, arena, pipeline, async_ans, body_ids,
-                    q_ids, exec_budget, timing=timers)
+                    q_ids, exec_budget, timing=timers,
+                    arena_writes=True)
                 torch.cuda.synchronize()
                 wall = time.perf_counter() - t0
                 answered = sum(len(v) for v in answers.values())
@@ -1190,14 +1193,16 @@ def profile_packed(n_docs: int = 3000) -> str:
             # unprofiled reference: the true rate
             _, _, tokens = run_filter(torch, arena, pipeline,
                                       async_ans, body_ids, q_ids,
-                                      exec_budget, pinned=pinned)
+                                      exec_budget, pinned=pinned,
+                                      arena_writes=True)
             torch.cuda.synchronize()
             with torch.profiler.profile(
                     activities=[torch.profiler.ProfilerActivity.CPU,
                                 torch.profiler.ProfilerActivity.CUDA]
             ) as prof:
                 run_filter(torch, arena, pipeline, async_ans, body_ids,
-                           q_ids, exec_budget, pinned=pinned)
+                           q_ids, exec_budget, pinned=pinned,
+                           arena_writes=True)
                 torch.cuda.synchronize()
 
         cats, counts = {}, {}

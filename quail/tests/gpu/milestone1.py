@@ -463,7 +463,8 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
         with torch.inference_mode():
             answers, spans, tokens = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
-                exec_budget, trace=chunk_trace, timing=timers)
+                exec_budget, trace=chunk_trace, timing=timers,
+                arena_writes=True)
         torch.cuda.synchronize()
         wall = time.perf_counter() - t0
         answered = sum(len(v) for v in answers.values())
@@ -804,7 +805,7 @@ def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
             answers, spans, tokens = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
                 exec_budget, store=store, store_hash="m1",
-                store_min_tokens=1, stats=stats)
+                store_min_tokens=1, stats=stats, arena_writes=True)
         torch.cuda.synchronize()
         wall = time.perf_counter() - t0
         survivors = [d for d, row in answers.items()
@@ -847,7 +848,7 @@ def profile_filter_run(n_docs: int = 3000) -> str:
         warm_kernels(torch, arena, pipeline, async_ans, body_ids,
                      q_ids, exec_budget)
         run_filter(torch, arena, pipeline, async_ans, body_ids, q_ids,
-                   exec_budget)      # unprofiled reference pass
+                   exec_budget, arena_writes=True)  # unprofiled reference
     torch.cuda.synchronize()
 
     t0 = time.perf_counter()
@@ -857,7 +858,7 @@ def profile_filter_run(n_docs: int = 3000) -> str:
         with torch.inference_mode():
             answers, spans, tokens = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
-                exec_budget)
+                exec_budget, arena_writes=True)
         torch.cuda.synchronize()
     region_wall = time.perf_counter() - t0
 

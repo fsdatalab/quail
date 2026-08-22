@@ -25,12 +25,14 @@ The fast path skips all of it when nothing will read the KV:
   the FilterChain line, and the plan carries a remark saying why
   when writes are off. The payload forwards the decision per alias
   (`filter_arena_writes`) and the worker passes it to `run_filter`.
-- `run_filter(arena_writes=...)` executes the decision. `None`
-  (direct callers: warmups, ablation cells, old payloads) derives
-  the same rule from its arguments. `True` forces the arena path
-  (the baseline in this report). `False` with multiple stages or a
-  store raises, because `store.save` and later stages read the
-  arena - a wrong planner call fails loudly.
+- `run_filter(arena_writes=...)` executes the decision and requires
+  it: the argument has no default and the function never derives it,
+  so the rule lives in the planner alone. Direct callers (warmups,
+  calibration, the GPU cells, the ablation scripts) state their
+  intent explicitly - `True` is the arena path (the baseline in
+  this report). `False` with multiple stages or a store raises,
+  because `store.save` and later stages read the arena - a wrong
+  caller fails loudly.
 - `pack_chunk`: a fresh group whose key owns no arena pages packs
   `[document | question]` as ONE causal segment. Under unified
   attention a chunk is either all paged or all unpaged; mixing

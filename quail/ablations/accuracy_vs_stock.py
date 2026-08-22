@@ -397,7 +397,7 @@ def quail_side(n_docs: int = 1000,
             t0 = time.perf_counter()
             answers, _, _ = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
-                budget)
+                budget, arena_writes=True)
             torch.cuda.synchronize()
             walls[f"filter_{mode}"] = round(
                 time.perf_counter() - t0, 2)
@@ -422,7 +422,8 @@ def quail_side(n_docs: int = 1000,
         # rounds, on one arena - must reproduce the isolated runs
         set_path(pipeline, FILTER_ATTENTION)
         prod_f, _, _ = run_filter(torch, arena, pipeline, async_ans,
-                                  body_ids, q_ids, budget)
+                                  body_ids, q_ids, budget,
+                                  arena_writes=True)
         set_path(pipeline, JOIN_ATTENTION)
         prod_j, _, _ = run_join(torch, arena, pipeline, async_ans,
                                 anchor_ids, [suffix_ids], budget,
