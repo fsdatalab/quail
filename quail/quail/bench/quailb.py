@@ -77,6 +77,7 @@ SETS = {
     "reviews": 50_000,
     "reports": 2_000,
     "claims": 1_000,
+    "citations": 2_000,
 }
 
 ASPECTS = ["the acting", "the plot", "the directing", "the cinematography",
@@ -162,6 +163,49 @@ def _fever_data(n_claims):
     return claims, page_text
 
 
+def _lepard_rows(n):
+    """Real LePaRD citation events, unpadded: (destination_context,
+    canonical passage text, passage_id) per row, one row per distinct
+    dest_id (a citing case can quote several passages; one keeps the
+    sample from packing near-duplicate excerpts under different
+    passage_ids).
+
+    Passage text comes from passage_dict.json's canonical entry for
+    that passage_id, not the CSV's own `quote` column - `quote` is
+    often just the isolated cited clause, sometimes with OCR noise
+    and no surrounding grammar (e.g. "foster[s] an excessive
+    government entanglement with religion."); passage_dict gives the
+    fuller paragraph it was drawn from - real numbers, measured on
+    this file: destination_context averages 709 chars, raw `quote`
+    132, the canonical passage 242 - long enough to actually read."""
+    import json as _json
+
+    from huggingface_hub import hf_hub_download
+    import pandas as pd
+
+    csv_path = hf_hub_download("rmahari/LePaRD", "top_10000_data.csv.gz",
+                               repo_type="dataset")
+    dict_path = hf_hub_download("rmahari/LePaRD", "passage_dict.json",
+                                repo_type="dataset")
+    passages = _json.load(open(dict_path))["data"]
+
+    rows, seen_dest = [], set()
+    cols = ["dest_id", "destination_context", "passage_id"]
+    for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=50_000):
+        for r in chunk.itertuples(index=False):
+            if r.dest_id in seen_dest:
+                continue
+            text = passages.get(r.passage_id)
+            ctx = str(r.destination_context)
+            if not text or len(ctx) < 50:
+                continue
+            seen_dest.add(r.dest_id)
+            rows.append((ctx, str(text).strip(), r.passage_id))
+            if len(rows) >= n:
+                return rows
+    return rows
+
+
 def _vocab_table(rows, idx, cap=None):
     """A frequency-sorted, deduplicated vocabulary column from one
     field across sampled rows (the `terms` table, from `reactions`)."""
@@ -174,8 +218,34 @@ def _vocab_table(rows, idx, cap=None):
     return vocab[:cap] if cap else vocab
 
 
+def _build_citations(d, sf):
+    """citations.parquet, idempotent: real LePaRD citation events,
+    self-joined against itself - one table, one row per citing case,
+    its own excerpt (destination_context) and its own actually-cited
+    passage (passage_dict.json text) on the same row. A join query
+    reads this same table under two aliases with two different
+    columns - see LEP-2 in queries() below.
+
+    Called from both branches of build_sets (cache hit and full
+    build) rather than gated behind the one whole-directory DONE
+    marker, so adding a table later backfills existing sf caches
+    instead of silently no-op'ing against a stale marker - exactly
+    what broke the first time this table was added."""
+    path = d / "citations.parquet"
+    if path.exists():
+        return
+    n = _n_docs("citations", sf)
+    lep = _lepard_rows(n)
+    pq.write_table(pa.table({
+        "id": [f"lp{i}" for i in range(len(lep))],
+        "destination_context": [r[0] for r in lep],
+        "passage_text": [r[1] for r in lep],
+        "passage_id": [r[2] for r in lep],
+    }), path)
+
+
 def build_sets(data_dir, sf, lf=1):
-    """All six tables as parquet files, cached by sf.
+    """All seven tables as parquet files, cached by sf.
 
     lf (load factor) is accepted but unused: documents here are real
     and unpadded, so there's nothing to scale. Kept in the signature
@@ -183,6 +253,7 @@ def build_sets(data_dir, sf, lf=1):
     d = Path(data_dir) / f"sf{sf}"
     marker = d / "DONE"
     if marker.exists():
+        _build_citations(d, sf)
         return d
     d.mkdir(parents=True, exist_ok=True)
 
@@ -221,6 +292,21 @@ def build_sets(data_dir, sf, lf=1):
         "text": [page_text[p] for p in ev_ids],
     }), d / "evidence.parquet")
 
+    # citations: real LePaRD citation events, self-joined against
+    # itself - one table, one row per citing case, its own excerpt
+    # (destination_context) and its own actually-cited passage
+    # (passage_dict.json text) on the same row. A join query reads
+    # this same table under two aliases with two different columns -
+    # see LEP-2 in queries() below.
+    n = _n_docs("citations", sf)
+    lep = _lepard_rows(n)
+    pq.write_table(pa.table({
+        "id": [f"lp{i}" for i in range(len(lep))],
+        "destination_context": [r[0] for r in lep],
+        "passage_text": [r[1] for r in lep],
+        "passage_id": [r[2] for r in lep],
+    }), d / "citations.parquet")
+
     marker.write_text("ok")
     return d
 
@@ -228,7 +314,7 @@ def build_sets(data_dir, sf, lf=1):
 def register_sets(sess, data_dir):
     from quail.catalog import DocumentProvider
     for name in ("reviews", "aspects", "reports", "terms",
-                "claims", "evidence"):
+                "claims", "evidence", "citations"):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
 
@@ -327,6 +413,53 @@ F13 = ("Judge strictly from the Wikipedia passage above whether it "
        "or role), rather than an organization, place, or event.\n\n"
        "{0}\n\nInstruction: answer TRUE if the passage primarily "
        "describes a specific person, FALSE otherwise.\nANSWER=")
+
+# LePaRD predicates: "excerpt" for destination_context throughout,
+# to avoid colliding with this dataset's own use of "passage" for
+# the quoted/cited text.
+LEP1 = ("Judge strictly from the excerpt above whether it argues that "
+        "the cited case's reasoning does not apply here.\n\n{0}\n\n"
+        "Instruction: answer TRUE if the excerpt argues the cited "
+        "case's reasoning does not apply here, FALSE otherwise.\n"
+        "ANSWER=")
+
+LEP2 = ("Judge strictly from the excerpt above whether it discusses a "
+        "procedural or jurisdictional issue.\n\n{0}\n\nInstruction: "
+        "answer TRUE if the excerpt discusses a procedural or "
+        "jurisdictional issue, FALSE otherwise.\nANSWER=")
+
+LEP3 = ("Judge strictly from the excerpt above whether it treats the "
+        "cited passage as binding precedent.\n\n{0}\n\nInstruction: "
+        "answer TRUE if the excerpt treats the cited passage as "
+        "binding precedent, FALSE otherwise.\nANSWER=")
+
+LEP4 = ("Judge strictly from the excerpt above whether it cites the "
+        "passage to support a conclusion about a party's liability or "
+        "guilt.\n\n{0}\n\nInstruction: answer TRUE if the excerpt "
+        "cites the passage to support a conclusion about a party's "
+        "liability or guilt, FALSE otherwise.\nANSWER=")
+
+LEP5 = ("Judge strictly from the excerpt above whether it acknowledges "
+        "disagreement between courts on the issue.\n\n{0}\n\n"
+        "Instruction: answer TRUE if the excerpt acknowledges "
+        "disagreement between courts on the issue, FALSE otherwise.\n"
+        "ANSWER=")
+
+# LEP-7 only: filters the passage side of the self-join, not just the
+# excerpt (anchor) side.
+LEPS1 = ("Judge strictly from the passage above whether it states a "
+         "general legal rule.\n\n{0}\n\nInstruction: answer TRUE if "
+         "the passage states a general legal rule, FALSE otherwise.\n"
+         "ANSWER=")
+
+# The LEP-2..LEP-7 join predicate: real ground truth exists for this
+# one (passage_id, from the dataset itself, not a judge pass) - see
+# judge_pass.py's LEP probe.
+LEPJOIN = ("Judge strictly from the excerpt above whether the passage "
+           "below is the one being cited.\n\n{0}\n\nPASSAGE:\n{1}\n"
+           "Instruction: answer TRUE if the passage below is the one "
+           "being cited in the excerpt above, FALSE otherwise.\n"
+           "ANSWER=")
 
 
 # ---------------------------------------------------------- queries
@@ -428,6 +561,48 @@ def queries(sess):
     q["FEV-6"] = ("3F + 1J: two-sided pushdown, deeper - F11 -> F12 on "
                   "claims, F13 on evidence, each filtered before J3",
                   fev6)
+
+    # LePaRD: one table, `citations`, self-joined - the anchor alias
+    # ("d") reads destination_context, the partner alias ("s") reads
+    # passage_text, both from the same registered provider. Same
+    # five-shape pattern as IMDB/BioDEX, plus a 5-filter chain
+    # (LEP-6) and the two-sided pushdown (LEP-7, matching FEV-5/6).
+    q["LEP-1"] = ("filter: LEP1 (reasoning does not apply)", make(
+        "citations", "d", "destination_context", [LEP1], [], ["d.id"]))
+    q["LEP-2"] = ("join: self-join (citations x citations)", make(
+        "citations", "d", "destination_context", [],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+    q["LEP-3"] = ("LEP1 -> join, dependent", make(
+        "citations", "d", "destination_context", [LEP1],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+    q["LEP-4"] = ("LEP1 -> LEP2 -> join, 2 filters then 1 join", make(
+        "citations", "d", "destination_context", [LEP1, LEP2],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+    q["LEP-5"] = ("LEP1 -> LEP2 -> LEP3 -> join, 3 filters then 1 join",
+                  make("citations", "d", "destination_context",
+                      [LEP1, LEP2, LEP3],
+                      [("citations", "s", "passage_text", LEPJOIN)],
+                      ["d.id", "s.id"]))
+    q["LEP-6"] = ("LEP1..LEP5 -> join, 5 filters then 1 join", make(
+        "citations", "d", "destination_context",
+        [LEP1, LEP2, LEP3, LEP4, LEP5],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+
+    def lep7():
+        dq = (sess.docs("citations").alias("d")
+              .ai_filter(quail.prompt(LEP1,
+                                      quail.col("d.destination_context")))
+              .ai_filter(quail.prompt(LEP2,
+                                      quail.col("d.destination_context"))))
+        sq = (sess.docs("citations").alias("s")
+              .ai_filter(quail.prompt(LEPS1, quail.col("s.passage_text"))))
+        return (dq.ai_join(
+            sq, quail.prompt(LEPJOIN, quail.col("d.destination_context"),
+                             quail.col("s.passage_text")))
+                .select("d.id", "s.id"))
+    q["LEP-7"] = ("2F + 1J: two-sided pushdown - LEP1+LEP2 on excerpts, "
+                  "LEPS1 on passages, each filtered before the self-join",
+                  lep7)
 
     return q
 

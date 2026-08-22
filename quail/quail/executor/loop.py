@@ -114,18 +114,30 @@ class AsyncAnswers:
         t = scores.index_select(1, ans.true_cols).amax(dim=1)
         f = scores.index_select(1, ans.false_cols).amax(dim=1)
         bits = (t > f).to(torch.uint8)
+        margin = (t - f).float()
         host = torch.empty(bits.shape[0], dtype=torch.uint8,
                            pin_memory=True)
         host.copy_(bits, non_blocking=True)
+        # The margin copy is a second small pinned transfer alongside
+        # the bits - negligible next to the KV/attention traffic this
+        # loop is actually bottlenecked on. Kept only so a join's
+        # decision can be recalibrated per predicate (a fixed 0.0 cut
+        # on TRUE-minus-FALSE, same as bits, until something reads
+        # this) without redoing the forward pass - see judge_pass.py's
+        # LEP-2 precision/recall numbers for why this exists.
+        host_margin = torch.empty(margin.shape[0], dtype=torch.float32,
+                                  pin_memory=True)
+        host_margin.copy_(margin, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
-        return event, host
+        return event, host, host_margin
 
     @staticmethod
     def result(handle):
-        event, host = handle
+        event, host, host_margin = handle
         event.synchronize()
-        return [int(b) for b in host.tolist()]
+        return ([int(b) for b in host.tolist()],
+               [float(m) for m in host_margin.tolist()])
 
 
 # ------------------------------------------------------- chunk packing
@@ -288,13 +300,28 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     index, the same key a filter scan of the same corpus uses).
     stats, when given, is filled with restored/stored counts.
 
-    Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
-    partners, present only for anchors that reached stage j; spans =
-    (stage, start_event, end_event) per forward for GPU-time sums;
-    tokens = fresh tokens packed.
+    Returns (ans, margins, spans, tokens): ans[j][a] = 0/1 row over
+    stage-j partners, present only for anchors that reached stage j;
+    margins[j][a] = the matching TRUE-minus-FALSE float row (same
+    shape as ans[j][a], same 0.0 cut that produced its bits) - kept
+    for post-hoc threshold calibration, not read by this loop itself;
+    spans = (stage, start_event, end_event) per forward for GPU-time
+    sums; tokens = fresh tokens packed.
     """
     k = len(stage_suffixes)
     n = len(anchor_prefixes)
+    if n == 0:
+        # An upstream filter chain can legitimately reduce the anchor
+        # side to nothing before a join runs (e.g. a restrictive
+        # multi-filter chain with no survivors). group_size would
+        # otherwise fall back to n (0), and range(0, 0, 0) is a
+        # ValueError - "arg 3 must not be zero" - not an empty range.
+        # Zero anchors means zero pairs, unconditionally: nothing to
+        # pack, launch, or gate.
+        if stats is not None:
+            stats.update(restored_docs=0, restored_tokens=0,
+                         stored_docs=0, stored_tokens=0)
+        return [dict() for _ in range(k)], [dict() for _ in range(k)], [], 0
     group_size = n if group_size is None else group_size
     groups = [list(range(i, min(i + group_size, n)))
               for i in range(0, n, group_size)]
@@ -302,6 +329,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     frames = stage_frames or [[] for _ in range(k)]
     frame_max = max(len(f) for f in frames)
     ans = [dict() for _ in range(k)]
+    margins = [dict() for _ in range(k)]
     spans = []
     tokens = 0
 
@@ -413,13 +441,15 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         save_after = e1
         return async_ans.submit(normed)
 
-    def scatter(j, idx, chunk_groups, bits):
+    def scatter(j, idx, chunk_groups, bits, pair_margins):
         pos = 0
         for a, start, end, _ in chunk_groups:
             if frames[j] and start == 0 and end > start:
                 pos += 1        # the frame entry's bit means nothing
             cnt = end - start
             ans[j].setdefault(idx[a], []).extend(bits[pos:pos + cnt])
+            margins[j].setdefault(idx[a], []).extend(
+                pair_margins[pos:pos + cnt])
             pos += cnt
 
     def free_if_owned(key):
@@ -462,7 +492,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     last_chunk[a_l] = t
 
             def finish(handle, t):
-                scatter(j, idx, plan[t], async_ans.result(handle))
+                bits, pair_margins = async_ans.result(handle)
+                scatter(j, idx, plan[t], bits, pair_margins)
                 if j == k - 1:
                     # a cut anchor's pages have no reader past its
                     # last chunk of its final stage; freeing at stage
@@ -500,7 +531,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     if not any(ans[j][a]):
                         free_if_owned(a)
     drain_saves(block=True)
-    return ans, spans, tokens
+    return ans, margins, spans, tokens
 
 
 # ------------------------------------------------------------- warmup
@@ -671,7 +702,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     def report(entry):
         t = time.perf_counter() if timing is not None else 0.0
         groups, handle = entry
-        bits = async_ans.result(handle)
+        bits, _margins = async_ans.result(handle)  # filters don't
+        # use per-answer margins (no join-side calibration need here)
         t = _tick(timing, "report_wait", t)
         for (doc, stage, _fresh), bit in zip(groups, bits):
             yes = bool(bit)
