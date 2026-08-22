@@ -787,8 +787,9 @@ on the token budget alone (`FilterAdmission` with
 kernel-parity cells measured the unified paged causal call
 bit-identical to the contiguous causal call the fast path runs
 (`results/attention_parity.json`), and the m1_filter1 cell gates on
-0 answer flips across the full 10,000-document workload
-(`results/m1_filter1.json`, which also carries the measured walls).
+0 answer flips across the full 10,000-document workload (the cell
+also records the A/B walls; see
+`reports/2026-08-22-single-stage-fast-path.md`).
 
 **`run_join`** (`loop.py:216`): the join driver. The pair list is
 pre-planned by `pack_stream`, then chunks are launched in order.
