@@ -1,33 +1,61 @@
-"""QUAIL-B: fifteen queries over five document sets, cold and warm.
+"""QUAIL-B: sixteen queries over three real document sets.
 
-The design (engine_design.md section 9): TPC-H's filter/join
-skeletons over real text, planted predicates with known ground truth,
-two scale knobs (SF scales document counts, LF scales document
-length by concatenating real text), and a two-pass protocol in one
-session - cold (store disabled, flushed) then warm (store enabled).
-Provided vs observed selectivity is printed per stage, which is the
-instrument check.
+The design (`reports/query-design.md`): real filter and join
+predicates over real, unpadded, un-concatenated text, ground-truthed
+by a Qwen3-32B judge pass (`quail/bench/judge_pass.py` - separate from
+this benchmark) rather than by planted flags. IMDB and BioDEX each get
+filter alone, join alone, then a filter chain of depth 1, 2, and 3
+feeding a single join (a document survives every filter, then joins
+against the partner table) - five queries per dataset. FEVER stops
+that chain at depth 2 (FEV-1..FEV-4). A depth-3 chain (person -> date
+-> place, before joining) hit 0 rows at both sf=0.1 and sf=0.2 - real
+FEVER claims are single-fact sentences, so "about a person" + "has a
+date" essentially never also names a place; see git history for the
+predicate that tried to fix this before the query was cut instead.
+FEVER gets two more queries in its place: FEV-5, a two-sided filter ->
+join (one filter on each table before the join runs, not just the
+anchor side), and FEV-6, the same shape one filter deeper on the
+claims side. The primary goal of this benchmark is
+exercising joins, not stacking filters, so the two-sided shape - both
+tables filtered independently before the join runs - is the more
+useful FEVER-specific query to keep. Only claims/evidence carry real
+text on both sides of a join in this dataset (every other partner
+table - aspects, terms - is a short vocabulary word or phrase, not a
+document worth filtering on its own), so the two-sided shape is
+FEVER-only.
 
-Measured caveat, stated up front: the 4B checkpoint answers YES to
-essentially every constrained one-token equality judgment (measured
-twice through a trivially-correct reference path). Content-style
-predicates (the BioDEX shape) discriminate. So the join predicates
-here are content questions wherever the design allows, and the
-planted-key stages (B10) will show observed selectivity near 1.0 -
-the gating machinery still executes, the instrument shows the bias,
-and timing claims never depend on the model answering correctly.
+Deeper filter chains stand in for a second, dependent join (filter ->
+filter -> join -> join): two joins in one query, where the second
+join only runs over whatever the first join kept, is a real shape but
+a much less exercised path in the engine today (gating, dedup, and
+replay all have to hold across the join boundary), so it is left out
+of this set rather than folded in silently. If a query genuinely
+needs a second dependent join, that is a deliberate addition, not
+this one.
 
-Filter flags planted per set (rates fixed by seed):
-    reviews  F1-F8 at .9 .9 .9 .8 .8 .2 .9 .8
-             B2 asks F1-F5; B3 asks F1 F2 F6(.2) F7 F3; B13 asks
-             F3 F4 F5 F7 F8 (new questions, same documents - that is
-             what makes its warm restore honest)
-    threads  T1-T3 at .05 .3 .9
-    reports  R1-R2 at .5 .4
+Two shapes from the design doc are not here: join-first ("join then
+filter the joined output") and the F-J-F-J interleaved 4-operator
+chain. Both need a filter to run on a join's output, and the current
+builder can't express that - `Query.ai_filter()` files a predicate
+under its table alias regardless of when it's called, and
+`assemble_plan()` (`quail/logical.py`) always attaches a table's
+filters to its Scan node before any join is folded in ("filters
+always run before joins, section 4's unconditional pushdown," per
+that file's comment). Calling `.ai_filter()` after `.ai_join()` today
+does not raise - it silently produces a filter-then-join plan, which
+is a different, wrong query. Adding a real post-join filter operator
+is engine work (`logical.py`, `planner/decide.py`, the executor), not
+a query change, and is not done here.
+
+Selectivity hints are omitted throughout: none of these predicates
+have been through the judge pass yet (see `reports/query-design.md`),
+so there's no measured number to hand the planner. Omitting
+`selectivity=` is a real, supported state - the planner falls back to
+`as_written` ordering instead of guessing (`planner/decide.py`).
 
 Build the data and run:
 
-    uv run python -m quail.bench.quailb --sf 0.1 --lf 1
+    uv run python -m quail.bench.quailb --sf 0.1
 """
 
 import argparse
@@ -39,54 +67,27 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-FLAG_SEED = 424242
 DATA_SEED = 20260818
-CHARS_PER_TOKEN = 4.2
 
-REVIEW_RATES = (0.9, 0.9, 0.9, 0.8, 0.8, 0.2, 0.9, 0.8)
-THREAD_RATES = (0.05, 0.3, 0.9)
-REPORT_RATES = (0.5, 0.4)
-
+# Base document counts at sf=1. Only these three scale with sf; the
+# partner tables (aspects, terms) are fixed vocabulary and evidence is
+# bounded by whichever claims get sampled (see the FEVER open item in
+# query-design.md).
 SETS = {
-    # name: (docs at SF=1, mean tokens at LF=1, scales_with_sf)
-    "reviews": (50_000, 400, True),
-    "threads": (10_000, 1_200, True),
-    "reports": (2_000, 3_000, True),
-    "products": (1_000, 150, True),
-    "terms": (2_560, 32, False),
-    "claims": (1_000, 20, True),
+    "reviews": 50_000,
+    "reports": 2_000,
+    "claims": 1_000,
+    "citations": 2_000,
 }
 
-
-# ---------------------------------------------------------- planting
-
-def flags_line(bits, prefix="FLAG"):
-    return ("\n\n[FLAGS] "
-            + " ".join(f"{prefix}_{j+1}={'TRUE' if b else 'FALSE'}"
-                       for j, b in enumerate(bits)))
+ASPECTS = ["the acting", "the plot", "the directing", "the cinematography",
+           "the soundtrack", "the pacing", "the ending", "the dialogue",
+           "the special effects", "the character development",
+           "the screenplay", "the editing"]
 
 
-def plant_flags(n_docs, rates, seed_offset):
-    rng = np.random.default_rng(FLAG_SEED + seed_offset)
-    return (rng.random((n_docs, len(rates)))
-            < np.array(rates)[None, :]).astype(int)
-
-
-def concat_to_chars(pool, target_chars, start):
-    """Real text concatenated to a target length, cycling the pool.
-    The counter tracks the joined length exactly (separators count
-    only between parts)."""
-    parts, total, i = [], -2, start
-    while total < target_chars:
-        t = pool[i % len(pool)]
-        parts.append(t)
-        total += len(t) + 2
-        i += 1
-    return "\n\n".join(parts), i
-
-
-def flag_question(prefix, j):
-    return f"\n\nIs {prefix}_{j} in the [FLAGS] line TRUE?"
+def _n_docs(name, sf):
+    return max(8, int(SETS[name] * sf))
 
 
 # ------------------------------------------------------- set builders
@@ -106,17 +107,19 @@ def _imdb_pool():
     return texts
 
 
-def _biodex_rows(n=2000):
+def _biodex_rows(n):
+    """Real BioDEX rows, unpadded, un-concatenated: (text, reactions)
+    per row. `reactions` seeds the `terms` table."""
     from datasets import load_dataset
     ds = load_dataset("BioDEX/BioDEX-Reactions", split="train",
                       streaming=True)
     rows = []
     for row in ds:
         text = str(row.get("fulltext_processed") or row.get("abstract"))
-        terms = [t.strip() for t in
-                 str(row.get("reactions", "")).split(",") if t.strip()]
-        if len(text) >= 200 and terms:
-            rows.append((text, terms))
+        reactions = [t.strip() for t in
+                     str(row.get("reactions", "")).split(",") if t.strip()]
+        if len(text) >= 200 and reactions:
+            rows.append((text, reactions))
         if len(rows) >= n:
             break
     return rows
@@ -126,9 +129,9 @@ def _fever_data(n_claims):
     """FEVER claims (SUPPORTS/REFUTES only - those carry a real
     annotated evidence page) and the small pool of Wikipedia pages
     those claims actually reference. The evidence pool is bounded by
-    the sampled claims, the same way the terms table bounds BioDEX's
-    join - a full join against all 5M wiki pages is not the query
-    under test."""
+    the sampled claims - a full join against all 5M wiki pages is not
+    the query under test (see the FEVER open item in
+    query-design.md)."""
     from huggingface_hub import hf_hub_download
     f = hf_hub_download("fever/fever", "v1.0/labelled_dev/0000.parquet",
                         repo_type="dataset",
@@ -160,107 +163,123 @@ def _fever_data(n_claims):
     return claims, page_text
 
 
-def _abtbuy_products():
-    # the matchbench repo is a legacy script dataset; its
-    # auto-converted parquet lives on the convert branch
+def _lepard_rows(n):
+    """Real LePaRD citation events, unpadded: (destination_context,
+    canonical passage text, passage_id) per row, one row per distinct
+    dest_id (a citing case can quote several passages; one keeps the
+    sample from packing near-duplicate excerpts under different
+    passage_ids).
+
+    Passage text comes from passage_dict.json's canonical entry for
+    that passage_id, not the CSV's own `quote` column - `quote` is
+    often just the isolated cited clause, sometimes with OCR noise
+    and no surrounding grammar (e.g. "foster[s] an excessive
+    government entanglement with religion."); passage_dict gives the
+    fuller paragraph it was drawn from - real numbers, measured on
+    this file: destination_context averages 709 chars, raw `quote`
+    132, the canonical passage 242 - long enough to actually read."""
+    import json as _json
+
     from huggingface_hub import hf_hub_download
-    f = hf_hub_download("matchbench/Abt-Buy",
-                        "source/source/0000.parquet",
-                        repo_type="dataset",
-                        revision="refs/convert/parquet")
-    table = pq.read_table(f)
-    cols = {c.lower(): c for c in table.column_names}
-    names = table.column(cols.get("name", "name")).to_pylist()
-    descs = (table.column(cols["description"]).to_pylist()
-             if "description" in cols else [""] * len(names))
-    out = []
-    for name, desc in zip(names, descs):
-        text = f"{name or ''}. {desc or ''}".strip(". ")
-        if text:
-            out.append(text)
-    return out
+    import pandas as pd
+
+    csv_path = hf_hub_download("rmahari/LePaRD", "top_10000_data.csv.gz",
+                               repo_type="dataset")
+    dict_path = hf_hub_download("rmahari/LePaRD", "passage_dict.json",
+                                repo_type="dataset")
+    passages = _json.load(open(dict_path))["data"]
+
+    rows, seen_dest = [], set()
+    cols = ["dest_id", "destination_context", "passage_id"]
+    for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=50_000):
+        for r in chunk.itertuples(index=False):
+            if r.dest_id in seen_dest:
+                continue
+            text = passages.get(r.passage_id)
+            ctx = str(r.destination_context)
+            if not text or len(ctx) < 50:
+                continue
+            seen_dest.add(r.dest_id)
+            rows.append((ctx, str(text).strip(), r.passage_id))
+            if len(rows) >= n:
+                return rows
+    return rows
 
 
-def _n_docs(name, sf):
-    base, _, scales = SETS[name]
-    return max(8, int(base * sf)) if scales else base
-
-
-def build_sets(data_dir, sf, lf):
-    """All five sets (plus the B7/B10 slices) as parquet files,
-    cached by (sf, lf)."""
-    d = Path(data_dir) / f"sf{sf}_lf{lf}"
-    marker = d / "DONE"
-    if marker.exists():
-        return d
-    d.mkdir(parents=True, exist_ok=True)
-    imdb = _imdb_pool()
-    bio = _biodex_rows()
-    prods = _abtbuy_products()
-
-    def write(name, ids, bodies, col="body"):
-        pq.write_table(pa.table({"id": ids, col: bodies}),
-                       d / f"{name}.parquet")
-
-    # reviews: single IMDB texts padded to length by LF, 8 flags
-    n = _n_docs("reviews", sf)
-    target = int(SETS["reviews"][1] * lf * CHARS_PER_TOKEN)
-    flags = plant_flags(n, REVIEW_RATES, seed_offset=1)
-    bodies, cursor = [], 0
-    for i in range(n):
-        text, cursor = concat_to_chars(imdb, target, cursor)
-        bodies.append(text + flags_line(flags[i], "FLAG"))
-    write("reviews", [f"rv{i}" for i in range(n)], bodies)
-    np.save(d / "reviews_flags.npy", flags)
-
-    # threads: stacked IMDB, 3 flags, a planted key
-    n = _n_docs("threads", sf)
-    target = int(SETS["threads"][1] * lf * CHARS_PER_TOKEN)
-    tflags = plant_flags(n, THREAD_RATES, seed_offset=2)
-    bodies = []
-    for i in range(n):
-        text, cursor = concat_to_chars(imdb, target, cursor)
-        bodies.append(text + flags_line(tflags[i], "T")
-                      + f"\n[KEYS] X={i % 40}")
-    write("threads", [f"th{i}" for i in range(n)], bodies,
-          col="thread")
-    np.save(d / "threads_flags.npy", tflags)
-
-    # reports: BioDEX text to length, 2 flags
-    n = _n_docs("reports", sf)
-    target = int(SETS["reports"][1] * lf * CHARS_PER_TOKEN)
-    rflags = plant_flags(n, REPORT_RATES, seed_offset=3)
-    bio_texts = [t for t, _ in bio]
-    bodies, bcur = [], 0
-    for i in range(n):
-        text, bcur = concat_to_chars(bio_texts, target, bcur)
-        bodies.append(text + flags_line(rflags[i], "R"))
-    write("reports", [f"rp{i}" for i in range(n)], bodies,
-          col="report")
-    np.save(d / "reports_flags.npy", rflags)
-
-    # products: ABT-BUY descriptions (cycled if SF needs more)
-    n = _n_docs("products", sf)
-    bodies = [prods[i % len(prods)] for i in range(n)]
-    write("products", [f"pr{i}" for i in range(n)], bodies,
-          col="description")
-
-    # terms: the reaction vocabulary, fixed size, never scales
+def _vocab_table(rows, idx, cap=None):
+    """A frequency-sorted, deduplicated vocabulary column from one
+    field across sampled rows (the `terms` table, from `reactions`)."""
     freq = {}
-    for _, terms in bio:
-        for t in terms:
+    for row in rows:
+        for t in row[idx]:
             freq[t] = freq.get(t, 0) + 1
     vocab = [t for t, _ in sorted(freq.items(),
                                   key=lambda kv: (-kv[1], kv[0]))]
-    vocab = vocab[:SETS["terms"][0]]
-    write("terms", [f"tm{i}" for i in range(len(vocab))], vocab,
-          col="term")
+    return vocab[:cap] if cap else vocab
+
+
+def _build_citations(d, sf):
+    """citations.parquet, idempotent: real LePaRD citation events,
+    self-joined against itself - one table, one row per citing case,
+    its own excerpt (destination_context) and its own actually-cited
+    passage (passage_dict.json text) on the same row. A join query
+    reads this same table under two aliases with two different
+    columns - see LEP-2 in queries() below.
+
+    Called from both branches of build_sets (cache hit and full
+    build) rather than gated behind the one whole-directory DONE
+    marker, so adding a table later backfills existing sf caches
+    instead of silently no-op'ing against a stale marker - exactly
+    what broke the first time this table was added."""
+    path = d / "citations.parquet"
+    if path.exists():
+        return
+    n = _n_docs("citations", sf)
+    lep = _lepard_rows(n)
+    pq.write_table(pa.table({
+        "id": [f"lp{i}" for i in range(len(lep))],
+        "destination_context": [r[0] for r in lep],
+        "passage_text": [r[1] for r in lep],
+        "passage_id": [r[2] for r in lep],
+    }), path)
+
+
+def build_sets(data_dir, sf, lf=1):
+    """All seven tables as parquet files, cached by sf.
+
+    lf (load factor) is accepted but unused: documents here are real
+    and unpadded, so there's nothing to scale. Kept in the signature
+    so callers don't have to change when it's wired back up."""
+    d = Path(data_dir) / f"sf{sf}"
+    marker = d / "DONE"
+    if marker.exists():
+        _build_citations(d, sf)
+        return d
+    d.mkdir(parents=True, exist_ok=True)
+
+    def write(name, ids, col_name, values):
+        pq.write_table(pa.table({"id": ids, col_name: values}),
+                       d / f"{name}.parquet")
+
+    # reviews: real IMDB text, one row = one review, unpadded
+    n = _n_docs("reviews", sf)
+    imdb = _imdb_pool()
+    write("reviews", [f"rv{i}" for i in range(n)], "body", imdb[:n])
+    write("aspects", [f"as{i}" for i in range(len(ASPECTS))],
+          "aspect", ASPECTS)
+
+    # reports: real BioDEX text, one row = one report, unpadded
+    n = _n_docs("reports", sf)
+    bio = _biodex_rows(n)
+    write("reports", [f"rp{i}" for i in range(len(bio))], "report",
+          [t for t, _ in bio])
+    terms = _vocab_table(bio, 1, cap=2_560)
+    write("terms", [f"tm{i}" for i in range(len(terms))], "term", terms)
 
     # claims + evidence: real FEVER claims and only the Wikipedia
-    # pages those claims reference - a bounded real join, no planted
-    # keys, ground truth is the FEVER label
-    n_claims = _n_docs("claims", sf)
-    claims, page_text = _fever_data(n_claims)
+    # pages those claims reference
+    n = _n_docs("claims", sf)
+    claims, page_text = _fever_data(n)
     pq.write_table(pa.table({
         "id": [f"cl{i}" for i in range(len(claims))],
         "claim": [c["claim"] for c in claims],
@@ -273,199 +292,318 @@ def build_sets(data_dir, sf, lf):
         "text": [page_text[p] for p in ev_ids],
     }), d / "evidence.parquet")
 
-    # slices for B7 and B10
-    rv = pq.read_table(d / "reviews.parquet")
-    n7 = max(4, int(5_000 * sf))
-    pq.write_table(rv.slice(0, min(n7, rv.num_rows)),
-                   d / "reviews5k.parquet")
-    n10 = max(4, int(2_000 * sf))
-    pq.write_table(rv.slice(0, min(n10, rv.num_rows)),
-                   d / "reviews2k.parquet")
-    th = pq.read_table(d / "threads.parquet")
-    pq.write_table(th.slice(0, min(n10, th.num_rows)),
-                   d / "threads2k.parquet")
+    # citations: real LePaRD citation events, self-joined against
+    # itself - one table, one row per citing case, its own excerpt
+    # (destination_context) and its own actually-cited passage
+    # (passage_dict.json text) on the same row. A join query reads
+    # this same table under two aliases with two different columns -
+    # see LEP-2 in queries() below.
+    n = _n_docs("citations", sf)
+    lep = _lepard_rows(n)
+    pq.write_table(pa.table({
+        "id": [f"lp{i}" for i in range(len(lep))],
+        "destination_context": [r[0] for r in lep],
+        "passage_text": [r[1] for r in lep],
+        "passage_id": [r[2] for r in lep],
+    }), d / "citations.parquet")
+
     marker.write_text("ok")
     return d
 
 
 def register_sets(sess, data_dir):
     from quail.catalog import DocumentProvider
-    for name, id_col in (("reviews", "id"), ("threads", "id"),
-                         ("reports", "id"), ("products", "id"),
-                         ("terms", "id"), ("reviews5k", "id"),
-                         ("reviews2k", "id"), ("threads2k", "id"),
-                         ("claims", "id"), ("evidence", "id")):
+    for name in ("reviews", "aspects", "reports", "terms",
+                "claims", "evidence", "citations"):
         sess.register(name, DocumentProvider.from_parquet(
-            str(Path(data_dir) / f"{name}.parquet"), id_col=id_col))
+            str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
+
+
+# ---------------------------------------------------------- predicates
+#
+# Same shape as the REACTION/SUPPORT templates this replaces: the
+# instruction text is written before {0}, and the engine relocates it
+# to just after the document (`split_frame` in `quail/logical.py`) so
+# it's paid once per anchor's kept KV, not once per pair. Frame sits
+# right before the candidate/question, which is where the 4B model is
+# sensitive to wording - neutral, "judge strictly" phrasing throughout,
+# the fix already validated on the original REACTION predicate (see
+# query-design.md).
+#
+# None of these have been through the judge pass. Wording may need to
+# change once that pass runs and some predicate misses the 90%
+# agreement floor or clusters selectivity with another predicate.
+
+F1 = ("Judge strictly from the review above whether it mentions at "
+      "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
+      "answer TRUE if the review mentions at least one positive aspect "
+      "of the movie, FALSE otherwise.\nANSWER=")
+
+F4 = ("Judge strictly from the review above whether it discusses the "
+      "ending of the movie.\n\n{0}\n\nInstruction: answer TRUE if the "
+      "review discusses the ending of the movie, FALSE otherwise.\n"
+      "ANSWER=")
+
+F5 = ("Judge strictly from the review above whether it mentions any "
+      "specific actor or actress by name.\n\n{0}\n\nInstruction: "
+      "answer TRUE if the review mentions a specific actor or actress "
+      "by name, FALSE otherwise.\nANSWER=")
+
+DISCUSS_ASPECT = ("Candidate movie aspects follow, one at a time. For "
+                   "each, judge strictly from the review above whether "
+                   "it discusses that aspect of the movie.\n\n{0}\n\n"
+                   "ASPECT: {1}\nInstruction: answer TRUE if the review "
+                   "above discusses this aspect, FALSE otherwise.\n"
+                   "ANSWER=")
+
+F7 = ("Judge strictly from the report above whether it describes a "
+      "case involving a female patient.\n\n{0}\n\nInstruction: answer "
+      "TRUE if the report describes a case involving a female patient, "
+      "FALSE otherwise.\nANSWER=")
+
+F8 = ("Judge strictly from the report above whether it describes "
+      "combination drug therapy.\n\n{0}\n\nInstruction: answer TRUE if "
+      "the report describes combination drug therapy, FALSE otherwise.\n"
+      "ANSWER=")
+
+F9 = ("Judge strictly from the report above whether it describes a "
+      "serious or life-threatening adverse event.\n\n{0}\n\n"
+      "Instruction: answer TRUE if the report describes a serious or "
+      "life-threatening adverse event, FALSE otherwise.\nANSWER=")
+
+# Unchanged from the earlier design: after-document frame, neutral
+# wording. An earlier version with similar framing before the report
+# measured selectivity 0.76 (biased toward YES); this version measured
+# 0.287.
+REACTION = ("Candidate medical reaction terms follow, one at a time. "
+            "For each, judge strictly from the report above whether it "
+            "describes that reaction as something the patient "
+            "experienced.\n\n{0}\n\nCANDIDATE REACTION: {1}\n"
+            "Instruction: answer TRUE if the report above describes "
+            "this reaction, FALSE otherwise.\nANSWER=")
+
+F11 = ("Judge strictly from the claim above whether it asserts "
+       "something about a person, rather than an organization, place, "
+       "or event.\n\n{0}\n\nInstruction: answer TRUE if the claim "
+       "asserts something about a person, FALSE otherwise.\nANSWER=")
+
+F12 = ("Judge strictly from the claim above whether it contains a "
+       "specific date or year.\n\n{0}\n\nInstruction: answer TRUE if "
+       "the claim contains a specific date or year, FALSE otherwise.\n"
+       "ANSWER=")
+
+F14 = ("Judge strictly from the claim above whether it references a "
+       "specific place (a city, country, or other named location).\n\n"
+       "{0}\n\nInstruction: answer TRUE if the claim references a "
+       "specific place, FALSE otherwise.\nANSWER=")
+
+# Unchanged from the earlier design: same after-document fix as
+# REACTION, for the same reason.
+SUPPORT = ("Wikipedia passages follow, one at a time. For each, judge "
+           "strictly from the claim above whether it supports that "
+           "claim.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer TRUE if "
+           "the passage above supports this claim, FALSE otherwise.\n"
+           "ANSWER=")
+
+# FEV-5 only: filters the evidence side of a join, not just the
+# anchor. Mirrors F11's "about a person" judgment so the join pairs
+# claim and passage on the same axis, independently filtered.
+F13 = ("Judge strictly from the Wikipedia passage above whether it "
+       "primarily describes a specific person (their life, actions, "
+       "or role), rather than an organization, place, or event.\n\n"
+       "{0}\n\nInstruction: answer TRUE if the passage primarily "
+       "describes a specific person, FALSE otherwise.\nANSWER=")
+
+# LePaRD predicates: "excerpt" for destination_context throughout,
+# to avoid colliding with this dataset's own use of "passage" for
+# the quoted/cited text.
+LEP1 = ("Judge strictly from the excerpt above whether it argues that "
+        "the cited case's reasoning does not apply here.\n\n{0}\n\n"
+        "Instruction: answer TRUE if the excerpt argues the cited "
+        "case's reasoning does not apply here, FALSE otherwise.\n"
+        "ANSWER=")
+
+LEP2 = ("Judge strictly from the excerpt above whether it discusses a "
+        "procedural or jurisdictional issue.\n\n{0}\n\nInstruction: "
+        "answer TRUE if the excerpt discusses a procedural or "
+        "jurisdictional issue, FALSE otherwise.\nANSWER=")
+
+LEP3 = ("Judge strictly from the excerpt above whether it treats the "
+        "cited passage as binding precedent.\n\n{0}\n\nInstruction: "
+        "answer TRUE if the excerpt treats the cited passage as "
+        "binding precedent, FALSE otherwise.\nANSWER=")
+
+LEP4 = ("Judge strictly from the excerpt above whether it cites the "
+        "passage to support a conclusion about a party's liability or "
+        "guilt.\n\n{0}\n\nInstruction: answer TRUE if the excerpt "
+        "cites the passage to support a conclusion about a party's "
+        "liability or guilt, FALSE otherwise.\nANSWER=")
+
+LEP5 = ("Judge strictly from the excerpt above whether it acknowledges "
+        "disagreement between courts on the issue.\n\n{0}\n\n"
+        "Instruction: answer TRUE if the excerpt acknowledges "
+        "disagreement between courts on the issue, FALSE otherwise.\n"
+        "ANSWER=")
+
+# LEP-7 only: filters the passage side of the self-join, not just the
+# excerpt (anchor) side.
+LEPS1 = ("Judge strictly from the passage above whether it states a "
+         "general legal rule.\n\n{0}\n\nInstruction: answer TRUE if "
+         "the passage states a general legal rule, FALSE otherwise.\n"
+         "ANSWER=")
+
+# The LEP-2..LEP-7 join predicate: real ground truth exists for this
+# one (passage_id, from the dataset itself, not a judge pass) - see
+# judge_pass.py's LEP probe.
+LEPJOIN = ("Judge strictly from the excerpt above whether the passage "
+           "below is the one being cited.\n\n{0}\n\nPASSAGE:\n{1}\n"
+           "Instruction: answer TRUE if the passage below is the one "
+           "being cited in the excerpt above, FALSE otherwise.\n"
+           "ANSWER=")
 
 
 # ---------------------------------------------------------- queries
-
-def _filter_sql(alias, table, col, stages):
-    conj = "\n  AND ".join(
-        f"AI_FILTER(PROMPT('{{0}}{flag_question(p, j)}', "
-        f"{alias}.{col}), {{'selectivity': {s}}})"
-        for p, j, s in stages)
-    return f"SELECT {alias}.id FROM {table} {alias} WHERE {conj}"
-
 
 def queries(sess):
     """id -> (description, callable() -> Query). Fresh Query objects
     per call so each pass re-plans."""
     import quail
 
-    def content_join(left, lcol, right, rcol, text, sel,
-                     lfilters=(), rfilters=()):
-        def make():
-            lq = sess.docs(left).alias("a")
-            for p, j, s in lfilters:
-                lq = lq.ai_filter(
-                    quail.prompt("{0}" + flag_question(p, j),
-                                 quail.col(f"a.{lcol}")),
-                    selectivity=s)
-            rq = sess.docs(right).alias("b")
-            for p, j, s in rfilters:
-                rq = rq.ai_filter(
-                    quail.prompt("{0}" + flag_question(p, j),
-                                 quail.col(f"b.{rcol}")),
-                    selectivity=s)
-            return lq.ai_join(
-                rq, quail.prompt(text, quail.col(f"a.{lcol}"),
-                                 quail.col(f"b.{rcol}")),
-                selectivity=sel).select("a.id", "b.id")
-        return make
-
-    REACTION = ("Does {0} describe the reaction named in {1} as "
-                "something the patient experienced?")
-    DISCUSS = "Does {0} discuss the product described in {1}?"
-    MENTION = "Does {0} mention the medical term in {1}?"
-    KEYEQ3 = ("Do the [FLAGS] or key values in {1} and in {2} both "
-              "match the [KEYS] X value in {0}?")
-    REACTION_DISCUSS = ("Does {0} describe the reaction named in {1} "
-                        "as something the patient experienced and also "
-                        "discuss the product described in {2}?")
-    SUPPORT = "Does {1} support the claim made in {0}?"
+    def make(doc_table, doc_alias, doc_col, filters, joins, select):
+        """filters: list of prompt templates applied in order to the
+        base table. joins: list of (partner_table, partner_alias,
+        partner_col, prompt_template) applied in order, each dependent
+        on whatever survived the stages before it."""
+        def build():
+            qy = sess.docs(doc_table).alias(doc_alias)
+            for tmpl in filters:
+                qy = qy.ai_filter(
+                    quail.prompt(tmpl, quail.col(f"{doc_alias}.{doc_col}")))
+            for partner, palias, pcol, tmpl in joins:
+                qy = qy.ai_join(
+                    sess.docs(partner).alias(palias),
+                    quail.prompt(tmpl, quail.col(f"{doc_alias}.{doc_col}"),
+                                quail.col(f"{palias}.{pcol}")))
+            return qy.select(*select)
+        return build
 
     q = {}
-    q["B1"] = ("1F reviews: the per-query floor", lambda: sess.sql(
-        _filter_sql("r", "reviews", "body", [("FLAG", 1, 0.9)])))
-    q["B2"] = ("5F reviews: the filter-chain anchor", lambda: sess.sql(
-        _filter_sql("r", "reviews", "body",
-                    [("FLAG", 1, 0.9), ("FLAG", 2, 0.9),
-                     ("FLAG", 3, 0.9), ("FLAG", 4, 0.8),
-                     ("FLAG", 5, 0.8)])))
-    b3 = _filter_sql("r", "reviews", "body",
-                     [("FLAG", 1, 0.9), ("FLAG", 2, 0.9),
-                      ("FLAG", 6, 0.2), ("FLAG", 7, 0.9),
-                      ("FLAG", 3, 0.9)])
-    q["B3w"] = ("5F ordering, as written", lambda: sess.sql(
-        b3, order="as_written"))
-    q["B3c"] = ("5F ordering, by cost", lambda: sess.sql(
-        b3, order="by_cost"))
-    q["B4"] = ("2F reports: long documents", lambda: sess.sql(
-        _filter_sql("r", "reports", "report",
-                    [("R", 1, 0.5), ("R", 2, 0.4)])))
-    q["B5"] = ("1J reports x terms: the BioDEX shape",
-               content_join("reports", "report", "terms", "term",
-                            REACTION, 0.05))
-    q["B6"] = ("1F + 1J: pushdown deletes the pair list",
-               content_join("threads", "thread", "products",
-                            "description", DISCUSS, 0.05,
-                            lfilters=[("T", 1, 0.05)]))
-    q["B7"] = ("1J pure pair predicate",
-               content_join("reviews5k", "body", "products",
-                            "description", DISCUSS, 0.1))
 
-    def b8():
-        import quail as _q
-        return (sess.docs("threads").alias("t")
-                .ai_join(sess.docs("products").alias("s"),
-                         _q.prompt(DISCUSS, _q.col("t.thread"),
-                                   _q.col("s.description")),
-                         selectivity=0.3, semantics="exists")
-                .select("t.id"))
-    q["B8"] = ("1J exists", b8)
+    # IMDB: filter alone, join alone, then filter-chain depth 1/2/3
+    # feeding the one join (reviews x aspects).
+    q["IMDB-1"] = ("filter: F1 (at least one positive aspect)", make(
+        "reviews", "r", "body", [F1], [], ["r.id"]))
+    q["IMDB-2"] = ("join: J1 (reviews x aspects)", make(
+        "reviews", "r", "body", [],
+        [("aspects", "a", "aspect", DISCUSS_ASPECT)], ["r.id", "a.id"]))
+    q["IMDB-3"] = ("F1 -> J1, dependent", make(
+        "reviews", "r", "body", [F1],
+        [("aspects", "a", "aspect", DISCUSS_ASPECT)], ["r.id", "a.id"]))
+    q["IMDB-4"] = ("F1 -> F4 -> J1, 2 filters then 1 join", make(
+        "reviews", "r", "body", [F1, F4],
+        [("aspects", "a", "aspect", DISCUSS_ASPECT)], ["r.id", "a.id"]))
+    q["IMDB-5"] = ("F1 -> F4 -> F5 -> J1, 3 filters then 1 join", make(
+        "reviews", "r", "body", [F1, F4, F5],
+        [("aspects", "a", "aspect", DISCUSS_ASPECT)], ["r.id", "a.id"]))
 
-    def b9():
-        import quail as _q
-        return (sess.docs("threads").alias("t")
-                .ai_join(sess.docs("products").alias("s"),
-                         _q.prompt(DISCUSS, _q.col("t.thread"),
-                                   _q.col("s.description")),
-                         selectivity=0.3, semantics="exists")
-                .ai_join(sess.docs("terms").alias("m"),
-                         _q.prompt(MENTION, _q.col("t.thread"),
-                                   _q.col("m.term")),
-                         selectivity=0.1, semantics="anti")
-                .select("t.id"))
-    q["B9"] = ("exists + anti", b9)
+    # BioDEX: same five shapes (reports x terms).
+    q["BIO-1"] = ("filter: F7 (female patient)", make(
+        "reports", "r", "report", [F7], [], ["r.id"]))
+    q["BIO-2"] = ("join: J1 (reports x terms)", make(
+        "reports", "r", "report", [],
+        [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
+    q["BIO-3"] = ("F7 -> J1, dependent", make(
+        "reports", "r", "report", [F7],
+        [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
+    q["BIO-4"] = ("F7 -> F8 -> J1, 2 filters then 1 join", make(
+        "reports", "r", "report", [F7, F8],
+        [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
+    q["BIO-5"] = ("F7 -> F8 -> F9 -> J1, 3 filters then 1 join", make(
+        "reports", "r", "report", [F7, F8, F9],
+        [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
 
-    def b10():
-        import quail as _q
-        # the 3-way join: one prompt holds all three documents; every
-        # (b, a, c) tuple of the cross product is one model call. The
-        # provided selectivity is per tuple (the old two stages at .2
-        # and .1 pass together for about .02 of the triples).
-        return (sess.docs("threads2k").alias("b")
-                .ai_join([sess.docs("reviews2k").alias("a"),
-                          sess.docs("products").alias("c")],
-                         _q.prompt(KEYEQ3, _q.col("b.thread"),
-                                   _q.col("a.body"),
-                                   _q.col("c.description")),
-                         selectivity=0.02, anchor="b")
-                .select("a.id", "b.id", "c.id"))
-    q["B10"] = ("3-way join, planted keys: one prompt per triple", b10)
+    # FEVER: filter alone, join alone, then a filter chain to depth 2
+    # only (depth 3 hit 0 rows - see the module docstring), plus the
+    # two-sided FEV-5/FEV-6 pushdown, the shape that actually tests
+    # joins under independent filtering on both sides.
+    q["FEV-1"] = ("filter: F11 (about a person)", make(
+        "claims", "c", "claim", [F11], [], ["c.id"]))
+    q["FEV-2"] = ("join: J3 (claims x evidence)", make(
+        "claims", "c", "claim", [],
+        [("evidence", "e", "text", SUPPORT)], ["c.id", "e.id"]))
+    q["FEV-3"] = ("F11 -> J3, dependent", make(
+        "claims", "c", "claim", [F11],
+        [("evidence", "e", "text", SUPPORT)], ["c.id", "e.id"]))
+    q["FEV-4"] = ("F11 -> F12 -> J3, 2 filters then 1 join", make(
+        "claims", "c", "claim", [F11, F12],
+        [("evidence", "e", "text", SUPPORT)], ["c.id", "e.id"]))
 
-    def b11():
-        import quail as _q
-        return (sess.docs("reports").alias("r")
-                .ai_join([sess.docs("terms").alias("m"),
-                          sess.docs("products").alias("p")],
-                         _q.prompt(REACTION_DISCUSS,
-                                   _q.col("r.report"),
-                                   _q.col("m.term"),
-                                   _q.col("p.description")),
-                         selectivity=0.0025, anchor="r")
-                .select("m.id", "r.id", "p.id"))
-    q["B11"] = ("3-way join, long anchors: one prompt per triple", b11)
-    q["B12"] = ("2F + 1J: two-sided pushdown",
-                content_join("threads", "thread", "products",
-                             "description", DISCUSS, 0.1,
-                             lfilters=[("T", 2, 0.3)],
-                             rfilters=[]))
-    q["B13"] = ("B2 rerun, new questions: the scan restore",
-                lambda: sess.sql(_filter_sql(
-                    "r", "reviews", "body",
-                    [("FLAG", 3, 0.9), ("FLAG", 4, 0.8),
-                     ("FLAG", 5, 0.8), ("FLAG", 7, 0.9),
-                     ("FLAG", 8, 0.8)])))
-    q["B14"] = ("B5 rerun, new question: the anchor restore",
-                content_join("reports", "report", "terms", "term",
-                             REACTION.replace(
-                                 "describe the reaction",
-                                 "explicitly report the reaction"),
-                             0.05))
+    def fev5():
+        cq = (sess.docs("claims").alias("c")
+              .ai_filter(quail.prompt(F11, quail.col("c.claim"))))
+        eq = (sess.docs("evidence").alias("e")
+              .ai_filter(quail.prompt(F13, quail.col("e.text"))))
+        return (cq.ai_join(eq, quail.prompt(SUPPORT, quail.col("c.claim"),
+                                            quail.col("e.text")))
+                .select("c.id", "e.id"))
+    q["FEV-5"] = ("2F + 1J: two-sided pushdown - F11 on claims, F13 on "
+                  "evidence, each filtered before J3", fev5)
 
-    def b15():
-        import quail as _q
-        return (sess.docs("threads").alias("t")
-                .ai_filter(_q.prompt("{0}" + flag_question("T", 3),
-                                     _q.col("t.thread")),
-                           selectivity=0.9)
-                .ai_join(sess.docs("terms").alias("m"),
-                         _q.prompt(MENTION, _q.col("t.thread"),
-                                   _q.col("m.term")),
-                         selectivity=0.1, semantics="exists")
-                .ai_join(sess.docs("reports").alias("r"),
-                         _q.prompt(
-                             "Do {0} and {1} both discuss medicine?",
-                             _q.col("t.thread"), _q.col("r.report")),
-                         selectivity=0.2)
-                .select("t.id", "r.id"))
-    q["B15"] = ("everything at once", b15)
-    q["B16"] = ("1J claims x evidence: FEVER, real labels not planted",
-                content_join("claims", "claim", "evidence", "text",
-                             SUPPORT, 0.00108))
+    def fev6():
+        cq = (sess.docs("claims").alias("c")
+              .ai_filter(quail.prompt(F11, quail.col("c.claim")))
+              .ai_filter(quail.prompt(F12, quail.col("c.claim"))))
+        eq = (sess.docs("evidence").alias("e")
+              .ai_filter(quail.prompt(F13, quail.col("e.text"))))
+        return (cq.ai_join(eq, quail.prompt(SUPPORT, quail.col("c.claim"),
+                                            quail.col("e.text")))
+                .select("c.id", "e.id"))
+    q["FEV-6"] = ("3F + 1J: two-sided pushdown, deeper - F11 -> F12 on "
+                  "claims, F13 on evidence, each filtered before J3",
+                  fev6)
+
+    # LePaRD: one table, `citations`, self-joined - the anchor alias
+    # ("d") reads destination_context, the partner alias ("s") reads
+    # passage_text, both from the same registered provider. Same
+    # five-shape pattern as IMDB/BioDEX, plus a 5-filter chain
+    # (LEP-6) and the two-sided pushdown (LEP-7, matching FEV-5/6).
+    q["LEP-1"] = ("filter: LEP1 (reasoning does not apply)", make(
+        "citations", "d", "destination_context", [LEP1], [], ["d.id"]))
+    q["LEP-2"] = ("join: self-join (citations x citations)", make(
+        "citations", "d", "destination_context", [],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+    q["LEP-3"] = ("LEP1 -> join, dependent", make(
+        "citations", "d", "destination_context", [LEP1],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+    q["LEP-4"] = ("LEP1 -> LEP2 -> join, 2 filters then 1 join", make(
+        "citations", "d", "destination_context", [LEP1, LEP2],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+    q["LEP-5"] = ("LEP1 -> LEP2 -> LEP3 -> join, 3 filters then 1 join",
+                  make("citations", "d", "destination_context",
+                      [LEP1, LEP2, LEP3],
+                      [("citations", "s", "passage_text", LEPJOIN)],
+                      ["d.id", "s.id"]))
+    q["LEP-6"] = ("LEP1..LEP5 -> join, 5 filters then 1 join", make(
+        "citations", "d", "destination_context",
+        [LEP1, LEP2, LEP3, LEP4, LEP5],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+
+    def lep7():
+        dq = (sess.docs("citations").alias("d")
+              .ai_filter(quail.prompt(LEP1,
+                                      quail.col("d.destination_context")))
+              .ai_filter(quail.prompt(LEP2,
+                                      quail.col("d.destination_context"))))
+        sq = (sess.docs("citations").alias("s")
+              .ai_filter(quail.prompt(LEPS1, quail.col("s.passage_text"))))
+        return (dq.ai_join(
+            sq, quail.prompt(LEPJOIN, quail.col("d.destination_context"),
+                             quail.col("s.passage_text")))
+                .select("d.id", "s.id"))
+    q["LEP-7"] = ("2F + 1J: two-sided pushdown - LEP1+LEP2 on excerpts, "
+                  "LEPS1 on passages, each filtered before the self-join",
+                  lep7)
+
     return q
 
 
@@ -486,7 +624,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     register_sets(sess, d)
     qdefs = queries(sess)
     ids = [i for i in qdefs if only is None or i in only]
-    suite = dict(sf=sf, lf=lf, gpus=gpus, passes={})
+    suite = dict(sf=sf, lf=lf, gpus=gpus, model=model, passes={})
     try:
         for pass_name in ("cold", "warm"):
             sess.set_store(pass_name == "warm")
@@ -495,11 +633,11 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             rows = []
             t_pass = time.time()
             for qid in ids:
-                desc, make = qdefs[qid]
+                desc, build = qdefs[qid]
                 print(f"[quailb] {pass_name} {qid}: {desc}",
                       flush=True)
                 try:
-                    res = make().run()
+                    res = build().run()
                     row = dict(query=qid, desc=desc,
                                wall_s=res.report["wall_s"],
                                boot_s=res.report["boot_s"],
@@ -531,13 +669,15 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sf", type=float, default=0.1)
-    ap.add_argument("--lf", type=int, default=1)
+    ap.add_argument("--lf", type=int, default=1,
+                    help="load factor, unused for now (see build_sets)")
     ap.add_argument("--gpus", type=int, default=1)
-    ap.add_argument("--model", default="qwen3-4b-fp8")
     ap.add_argument("--data-dir", default="results/quailb_data")
     ap.add_argument("--only", default=None,
                     help="comma-separated query ids")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--model", default="qwen3-4b-fp8",
+                    help="registered ModelSpec name, see quail.specs.MODELS")
     args = ap.parse_args()
     only = set(args.only.split(",")) if args.only else None
     out = args.out or f"results/quailb_sf{args.sf}_lf{args.lf}_{args.model}.json"
