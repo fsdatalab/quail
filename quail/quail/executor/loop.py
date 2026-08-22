@@ -693,8 +693,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         restored = {d for d in range(len(doc_ids))
                     if skey(d) in store}
     unified = pipeline.attention_mode == "unified"
-    temp_tail = max(len(question_ids[0]) - p,
-                    *(len(t) for t in tails[1:])) if unified else 0
+    # the longest question tail a document's capacity pages must
+    # hold; max(int, *empty) raised TypeError on single-stage queries
+    temp_tail = max(len(q) - p for q in question_ids) if unified else 0
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
         arena_pages=arena.accounting.n_pages,
