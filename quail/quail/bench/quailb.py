@@ -762,6 +762,23 @@ def queries(sess):
         [("google", "g", "description", PRODUCT_MATCH)],
         ["z.id", "g.id"]))
 
+    # Cross-dataset: join across the two entity-matching benchmarks
+    # themselves, not within one matched pair. Abt-Buy (electronics)
+    # and Amazon-Google (mostly software) are different catalogs with
+    # no source mapping between them, so unlike ABT-1/AG-1 this has
+    # no real ground truth - it's a judge-pass-style query like
+    # IMDB/BioDEX/FEVER, testing the join shape and expected to run
+    # near-zero selectivity (the catalogs barely overlap in content).
+    q["CROSS-1"] = ("join: cross-dataset product match (Buy x Amazon)",
+                    make("buy", "y", "description", [],
+                        [("amazon", "z", "description", PRODUCT_MATCH)],
+                        ["y.id", "z.id"]))
+    q["CROSS-2"] = ("join: cross-dataset product match "
+                    "(Abt x GoogleProducts)",
+                    make("abt", "p", "description", [],
+                        [("google", "g", "description", PRODUCT_MATCH)],
+                        ["p.id", "g.id"]))
+
     return q
 
 
