@@ -344,6 +344,18 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     """
     k = len(stage_suffixes)
     n = len(anchor_prefixes)
+    if n == 0:
+        # An upstream filter chain can legitimately reduce the anchor
+        # side to nothing before a join runs (e.g. a restrictive
+        # multi-filter chain with no survivors). group_size would
+        # otherwise fall back to n (0), and range(0, 0, 0) is a
+        # ValueError - "arg 3 must not be zero" - not an empty range.
+        # Zero anchors means zero pairs, unconditionally: nothing to
+        # pack, launch, or gate.
+        if stats is not None:
+            stats.update(restored_docs=0, restored_tokens=0,
+                         stored_docs=0, stored_tokens=0)
+        return [dict() for _ in range(k)], [], 0
     group_size = n if group_size is None else group_size
     groups = [list(range(i, min(i + group_size, n)))
               for i in range(0, n, group_size)]
