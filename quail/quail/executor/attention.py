@@ -493,10 +493,8 @@ class Pipeline:
             q_suf, kp, vp, cross["cu_q"], None,
             cross["max_q"], cross["max_used"], causal=False,
             block_table=cross["table"], seqused_k=cross["used"])
-        if lse_a.shape[0] != n:
-            lse_a = lse_a.transpose(0, 1)
-        if lse_b.shape[0] != rows.shape[0]:
-            lse_b = lse_b.transpose(0, 1)
+        lse_a = lse_a.transpose(0, 1)
+        lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(
             out_a, lse_a, out_b, lse_b, cross["source"])
         meta["layer"] += 1

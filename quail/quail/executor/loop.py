@@ -211,13 +211,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         table, _ = arena.block_table(cross_keys)
         t = _tick(timing, "pack_blocktable", t)
         used = _staged(torch, cross_used, torch.int32, pinned)
-        cu_k = _staged(torch, [0] + list(_cumsum(cross_used)),
-                       torch.int32, pinned)
         cross = dict(
             rows=_staged(torch, suffix_rows, torch.int64, pinned),
             cu_q=_staged(torch, cu_q, torch.int32, pinned),
             max_q=max_q, keys=cross_keys, used=used,
-            max_used=max(cross_used), table=table, cu_k=cu_k)
+            max_used=max(cross_used), table=table)
         # row -> its index in call B's output, -1 for prefix rows;
         # the fused merge kernel's map (the split reference ignores it)
         source = [-1] * len(ids)
@@ -344,14 +342,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     """
     k = len(stage_suffixes)
     n = len(anchor_prefixes)
-    if n == 0:
-        # An upstream filter chain can legitimately reduce the anchor
-        # side to nothing before a join runs (e.g. a restrictive
-        # multi-filter chain with no survivors). group_size would
-        # otherwise fall back to n (0), and range(0, 0, 0) is a
-        # ValueError - "arg 3 must not be zero" - not an empty range.
-        # Zero anchors means zero pairs, unconditionally: nothing to
-        # pack, launch, or gate.
+    if n == 0 or k == 0:
         if stats is not None:
             stats.update(restored_docs=0, restored_tokens=0,
                          stored_docs=0, stored_tokens=0)
@@ -685,6 +676,11 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     stage_tokens = [len(question_ids[0])] \
         + [len(q) - p for q in question_ids[1:]]
     tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
+    for i, t in enumerate(tails):
+        if not t:
+            raise ValueError(
+                f"stage {i} question has no tokens beyond the shared "
+                f"preamble ({p} tokens)")
     def skey(d):
         return (store_hash, store_ids[d] if store_ids else d)
 

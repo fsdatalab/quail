@@ -321,7 +321,12 @@ class FilterAdmission:
 
     def done(self):
         if self._limit_reached():
-            return not self.in_flight
+            if self.in_flight:
+                return False
+            while self.ready:
+                doc, _ = self.ready.popleft()
+                self.free_pages += self.resident.pop(doc)
+            return True
         return (not self.pending and not self.ready
                 and not self.in_flight)
 
