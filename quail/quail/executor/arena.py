@@ -154,10 +154,3 @@ class KVArena:
                             dtype=torch.int32, pin_memory=True) \
             .to(self.device, non_blocking=True)
         return table, used
-
-    def gather(self, layer: int, key):
-        """A document's (K, V) rows, contiguous - the copy fallback if
-        the paged kernel path fails a parity gate."""
-        rows = self.rows_gpu(key)
-        return (self.k[layer].index_select(0, rows),
-                self.v[layer].index_select(0, rows))

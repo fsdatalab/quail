@@ -62,6 +62,8 @@ import os
 
 import modal
 
+from split_reference import set_path
+
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
@@ -75,7 +77,8 @@ image = (
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail", "baselines")
+    .add_local_python_source("quail", "baselines",
+                             "split_reference")
     .add_local_dir("tests/gpu", remote_path="/root/gpu_tests")
 )
 
@@ -375,7 +378,8 @@ def quail_side(n_docs: int = 1000,
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model_mod, arena, kernels="quail")
+    pipeline = Pipeline(model_mod, arena, kernels="quail",
+                        attention_mode="merge_quant")
     answerer = Answerer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     budget = min(chunk, pipeline.max_chunk_tokens)
@@ -389,7 +393,7 @@ def quail_side(n_docs: int = 1000,
     filters, joins, walls = {}, {}, {}
     with torch.inference_mode():
         for mode in ("split", "merge_quant", "unified"):
-            pipeline.attention_mode = mode
+            set_path(pipeline, mode)
             t0 = time.perf_counter()
             answers, _, _ = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
@@ -403,7 +407,7 @@ def quail_side(n_docs: int = 1000,
                   f"in {walls[f'filter_{mode}']}s", flush=True)
 
         for mode in ("split", "merge_quant"):
-            pipeline.attention_mode = mode
+            set_path(pipeline, mode)
             t0 = time.perf_counter()
             ans, _, _ = run_join(
                 torch, arena, pipeline, async_ans, anchor_ids,
@@ -416,10 +420,10 @@ def quail_side(n_docs: int = 1000,
 
         # the production sequence: the worker's mode switch between
         # rounds, on one arena - must reproduce the isolated runs
-        pipeline.attention_mode = FILTER_ATTENTION
+        set_path(pipeline, FILTER_ATTENTION)
         prod_f, _, _ = run_filter(torch, arena, pipeline, async_ans,
                                   body_ids, q_ids, budget)
-        pipeline.attention_mode = JOIN_ATTENTION
+        set_path(pipeline, JOIN_ATTENTION)
         prod_j, _, _ = run_join(torch, arena, pipeline, async_ans,
                                 anchor_ids, [suffix_ids], budget,
                                 stage_frames=[frame_ids])

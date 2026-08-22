@@ -112,7 +112,8 @@ def accuracy(n_reports: int = 4, n_terms: int = 64) -> str:
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena)
+    pipeline = Pipeline(model, arena,
+                        attention_mode="merge_quant")
     answerer = Answerer(torch, F, model, tokenizer)
 
     packed_answers = []
@@ -124,7 +125,8 @@ def accuracy(n_reports: int = 4, n_terms: int = 64) -> str:
             chunk_d = pack_chunk(
                 torch, arena,
                 [dict(key=key, prefix=prefixes[r],
-                      f=len(prefixes[r]), suffixes=suffixes)])
+                      f=len(prefixes[r]), suffixes=suffixes)],
+                attention_mode="merge_quant")
             normed = pipeline.forward_chunk(chunk_d)
             packed_answers.extend(answerer(normed))
             packed_margins.extend(answerer.margins(normed))

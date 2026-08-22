@@ -5,20 +5,23 @@ every kernel and algorithm: reports/2026-08-21-attention-paths.md,
 "Kernel provenance".
 
 A chunk is [group_1 | group_2 | ...] where each group is
-[prefix? | suffix_1 .. suffix_k]. Per layer, attention is two calls
-merged by softmax state: call A is causal over the segment boundaries
-(each prefix over itself, each suffix over itself), call B is
-non-causal - every suffix token against its group's kept context,
+[prefix? | suffix_1 .. suffix_k]. Two attention paths ship, one per
+workload. merge_quant (joins): call A is causal over the segment
+boundaries (each prefix over itself, each suffix over itself), call B
+is non-causal - every suffix token against its group's kept context,
 which lives in the arena's pages (fresh prefixes are scattered into
-their pages in the same layer, before call B reads them). Suffix
-positions start at the kept-context length, identical to standalone
-requests, so answers are comparable to per-pair prompts.
+their pages in the same layer, before call B reads them) - and one
+Triton kernel merges the two by softmax state and quantizes for
+o_proj. unified (filters): every current token is scattered into its
+cache slot first, then a single causal paged call covers kept plus
+current KV - no merge. Suffix positions start at the kept-context
+length, identical to standalone requests, so answers are comparable
+to per-pair prompts.
 
-Ported from the exploration's join executor; the one structural change
-is that call B reads paged KV through a block table instead of
-chunk-slice/kept-tensor concatenation. meta["paged"]=False switches to
-the gather fallback (contiguous copies) if the paged kernel ever fails
-a parity gate.
+The retired third path, split (the two-call pattern with the merge as
+plain PyTorch ops and a separate quantize), lives in
+ablations/split_reference.py; comparison cells install it through
+the attention_override hook.
 
 Pipeline(kernels="vllm") swaps the three Triton kernels for the engine's
 own ops (fused-add rms_norm + separate quantize, silu_and_mul +
@@ -39,8 +42,8 @@ GROUP = 128            # fp8 quant group size, matches the engine
 # kernel - "unified" cannot share one anchor's KV across the many
 # partner suffixes of a chunk (each pair needs its own causal view),
 # so the two-call pattern is required, and the fused kernel is its
-# fastest form. "split" stays as the parity reference and the
-# gather-fallback path (meta["paged"]=False). Evidence:
+# fastest form. The retired "split" path (the pre-fusion two-call
+# implementation) lives in ablations/split_reference.py. Evidence:
 # results/attention_paths.json, results/join_attention_paths_*.json,
 # results/accuracy_vs_stock.json.
 FILTER_ATTENTION = "unified"
@@ -51,21 +54,23 @@ class Pipeline:
     """Packed forward passes with shared-prefix attention over the
     paged arena."""
 
-    def __init__(self, model, arena, kernels="quail",
-                 attention_mode="split"):
+    def __init__(self, model, arena, kernels="quail", *,
+                 attention_mode):
         import torch
         from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
         if kernels not in ("quail", "vllm"):
             raise ValueError(f"kernels must be 'quail' or 'vllm', "
                              f"got {kernels!r}")
-        if attention_mode not in ("split", "merge_quant", "unified"):
+        if attention_mode not in ("merge_quant", "unified"):
             raise ValueError(
-                "attention_mode must be 'split', 'merge_quant', "
-                "or 'unified', "
+                "attention_mode must be 'merge_quant' or 'unified', "
                 f"got {attention_mode!r}")
         self.kernels = kernels
         self.attention_mode = attention_mode
+        # comparison scripts install a retired path here (bf16 out,
+        # like unified); None means attention_mode picks the path
+        self.attention_override = None
 
         self.torch = torch
         self.model = model
@@ -278,7 +283,8 @@ class Pipeline:
             tl.store(v_dst_ptr + d * ROW + offs, v, mask=mask)
 
         # the online-softmax LSE merge (Milakov & Gimelshein 2018 -
-        # the same formula the split path runs in plain torch) fused
+        # the same formula the retired split reference in
+        # ablations/split_reference.py runs in plain torch) fused
         # with vLLM's per-group fp8 quantize pattern
         @triton.jit
         def merge_attn_quant(a_ptr, b_ptr, la_ptr, lb_ptr, source_ptr,
@@ -443,7 +449,7 @@ class Pipeline:
             D=dim, GPB=gpb, UE8M0=self.use_ue8m0)
         return q, scales
 
-    # ---- attention: two calls, one merge ----------------------------
+    # ---- attention: the two workload paths --------------------------
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None):
@@ -457,76 +463,8 @@ class Pipeline:
             block_table=block_table, seqused_k=seqused_k,
             causal=causal, fa_version=3, return_softmax_lse=True)
 
-    @staticmethod
-    def _lse_tokens_first(lse, n_tokens):
-        # normalize to (tokens, heads); the wrapper returns
-        # (heads, tokens) for varlen
-        if lse.shape[0] != n_tokens:
-            return lse.transpose(0, 1).contiguous()
-        return lse
-
-    def attention(self, q, k, v, meta):
-        """meta carries the chunk layout; see pack_chunk in loop.py."""
-        torch = self.torch
-        n = q.shape[0]
-        H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
-        q3 = q.view(n, H, D)
-        k3 = k.view(n, KH, D)
-        v3 = v.contiguous().view(n, KH, D)
-        layer = meta["layer"]
-
-        # fresh KV into the arena's pages, before call B reads them:
-        # one scatter kernel per layer for the whole chunk
-        if meta["kv_src"] is not None:
-            self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"],
-                                layer)
-
-        out_a, lse_a = self._fa(
-            q3, k3, v3, meta["cu_a"], meta["cu_a"],
-            meta["max_a"], meta["max_a"], causal=True)
-
-        cross = meta["cross"]
-        if cross is None:
-            # no kept-context reads in this chunk: whole-pair segments
-            # (probe reference) or a cache-only pass
-            meta["layer"] += 1
-            return out_a.view(n, H * D)
-
-        rows = cross["rows"]
-        q_suf = q3.index_select(0, rows)
-        if meta.get("paged", True):
-            kp, vp = self.arena.paged_kv(layer)
-            out_b, lse_b = self._fa(
-                q_suf, kp, vp, cross["cu_q"], None,
-                cross["max_q"], cross["max_used"], causal=False,
-                block_table=cross["table"], seqused_k=cross["used"])
-        else:
-            # gather fallback: contiguous copies of each group's kept
-            # context, concatenated in group order
-            ks, vs = [], []
-            for key in cross["keys"]:
-                kg, vg = self.arena.gather(layer, key)
-                ks.append(kg)
-                vs.append(vg)
-            kx = ks[0] if len(ks) == 1 else torch.cat(ks)
-            vx = vs[0] if len(vs) == 1 else torch.cat(vs)
-            out_b, lse_b = self._fa(
-                q_suf, kx, vx, cross["cu_q"], cross["cu_k"],
-                cross["max_q"], cross["max_used"], causal=False)
-
-        la = self._lse_tokens_first(lse_a, n).index_select(0, rows)
-        lb = self._lse_tokens_first(lse_b, rows.shape[0])
-        # online-softmax merge (Milakov & Gimelshein 2018):
-        # (wa*A + wb*B)/(wa+wb) == A + (B-A)*sigmoid(lse_b - lse_a),
-        # same merge, no fp32 copies of the row tensors
-        w = torch.sigmoid(lb - la).to(torch.bfloat16)[..., None]
-        merged = torch.lerp(out_a.index_select(0, rows), out_b, w)
-        out = out_a.index_copy_(0, rows, merged)
-        meta["layer"] += 1
-        return out.view(n, H * D)
-
     def attention_merge_quant(self, q, k, v, meta):
-        """The split attention path with Charles's merge plus FP8
+        """The two-call attention path with the fused merge plus FP8
         quantization kernel. It returns the input pair for o_proj."""
         torch = self.torch
         n = q.shape[0]
@@ -614,13 +552,15 @@ class Pipeline:
                 q, k = self.vllm_qk_norm_rope(qkv, positions, attn)
             v = qkv[:, (self.num_q_heads + self.num_kv_heads)
                     * self.head_dim:]
-            if self.attention_mode == "merge_quant":
-                o_in, o_scale = self.attention_merge_quant(q, k, v, meta)
-            elif self.attention_mode == "unified":
-                attn_out = self.attention_unified(q, k, v, meta)
+            if self.attention_override is not None:
+                # a comparison script's installed path, e.g. the
+                # retired split in ablations/split_reference.py
+                attn_out = self.attention_override(q, k, v, meta)
                 o_in, o_scale = self.quant(attn_out)
+            elif self.attention_mode == "merge_quant":
+                o_in, o_scale = self.attention_merge_quant(q, k, v, meta)
             else:
-                attn_out = self.attention(q, k, v, meta)
+                attn_out = self.attention_unified(q, k, v, meta)
                 o_in, o_scale = self.quant(attn_out)
             hidden = self.gemm(o_in, o_scale, attn.o_proj)
             if self.kernels == "quail":

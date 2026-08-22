@@ -69,7 +69,7 @@ def execute(payload: dict) -> dict:
     import torch.nn.functional as F
 
     from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
+    from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
                                      run_join, warm_kernels)
@@ -105,7 +105,8 @@ def execute(payload: dict) -> dict:
                         dtype=torch.bfloat16)
         boot["arena_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        pipeline = Pipeline(model, arena)
+        pipeline = Pipeline(model, arena,
+                            attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
         booted = dict(model=model, arena=arena, pipeline=pipeline,
                       warmed=False)
@@ -334,7 +335,7 @@ def _child_boot(state, sub):
     import torch.nn.functional as F
 
     from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
+    from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import AsyncAnswers, warm_kernels
     from quail.executor.model import load_model
@@ -360,7 +361,8 @@ def _child_boot(state, sub):
                         dtype=torch.bfloat16)
         boot["arena_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        pipeline = Pipeline(model, arena)
+        pipeline = Pipeline(model, arena,
+                            attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
         state.update(torch=torch, F=F, model=model, arena=arena,
                      pipeline=pipeline, spec=spec,

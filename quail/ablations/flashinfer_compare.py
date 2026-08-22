@@ -60,6 +60,8 @@ import os
 
 import modal
 
+from split_reference import attention_split
+
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
@@ -73,7 +75,8 @@ image = (
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail", "baselines")
+    .add_local_python_source("quail", "baselines",
+                             "split_reference")
 )
 
 # House rule: never create new Modal app names.
@@ -215,7 +218,8 @@ def _case_builder(q_heads):
         arena = KVArena(n_layers=1, n_pages=pages_needed + 8,
                         page_tokens=PAGE, n_kv=KH, d_head=D,
                         dtype=torch.bfloat16)
-        pipeline = Pipeline(model, arena, kernels="quail")
+        pipeline = Pipeline(model, arena, kernels="quail",
+                            attention_mode="merge_quant")
         groups = []
         n_tokens = 0
         for i, kept in enumerate(kept_lens):
@@ -294,12 +298,13 @@ def bench(q_heads: int = 32) -> str:
         arena = case["arena"]
 
         split_chunk = pack_chunk(torch, arena, case["groups"],
-                                 pinned=True, attention_mode="split")
+                                 pinned=True,
+                                 attention_mode="merge_quant")
 
         def run_split():
             split_chunk["meta"]["layer"] = 0
-            o = pipeline.attention(q_flat, k_flat, v_flat,
-                                   split_chunk["meta"])
+            o = attention_split(pipeline, q_flat, k_flat, v_flat,
+                                split_chunk["meta"])
             return pipeline.quant(o)
         out["fa3_split_plus_quant"] = _median_ms(torch, run_split)
 
@@ -402,7 +407,8 @@ def bench(q_heads: int = 32) -> str:
         # -- two calls plus FlashInfer's merge (split equivalent) --
         try:
             chunk = pack_chunk(torch, arena, case["groups"],
-                               pinned=True, attention_mode="split")
+                               pinned=True,
+                               attention_mode="merge_quant")
             meta = chunk["meta"]
             cross = meta["cross"]
             rows = cross["rows"]

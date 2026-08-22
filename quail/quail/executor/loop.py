@@ -131,8 +131,8 @@ class AsyncAnswers:
 
 # ------------------------------------------------------- chunk packing
 
-def pack_chunk(torch, arena, groups, timing=None, pinned=True,
-               attention_mode="split"):
+def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
+               attention_mode):
     """Tensors for one chunk, built from groups in chunk order.
 
     Each group is a dict:
@@ -218,12 +218,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True,
             cu_q=_staged(torch, cu_q, torch.int32, pinned),
             max_q=max_q, keys=cross_keys, used=used,
             max_used=max(cross_used), table=table, cu_k=cu_k)
-        if attention_mode == "merge_quant":
-            source = [-1] * len(ids)
-            for i, row in enumerate(suffix_rows):
-                source[row] = i
-            cross["source"] = _staged(
-                torch, source, torch.int32, pinned)
+        # row -> its index in call B's output, -1 for prefix rows;
+        # the fused merge kernel's map (the split reference ignores it)
+        source = [-1] * len(ids)
+        for i, row in enumerate(suffix_rows):
+            source[row] = i
+        cross["source"] = _staged(
+            torch, source, torch.int32, pinned)
     t = _tick(timing, "pack_cross", t)
 
     # all of the chunk's KV writes as one list of (source, destination)
@@ -272,7 +273,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True,
 
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
-        unified=unified, paged=True,
+        unified=unified,
         cu_a=_staged(torch, cu_a, torch.int32, pinned),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = dict(

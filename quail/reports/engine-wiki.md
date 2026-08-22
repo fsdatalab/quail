@@ -556,7 +556,6 @@ Key operations:
 | `KVArena.rows_gpu` | `arena.py:110` | The document's row indices on device, cached per residency |
 | `KVArena.block_table` | `arena.py:125` | Build the block table for paged attention (flat on the host, one staged copy) |
 | `KVArena.paged_kv` | `arena.py:118` | Reshape the flat pool for FlashAttention's block input |
-| `KVArena.gather` | `arena.py:149` | Extract a document's contiguous K, V rows (fallback path) |
 
 ### 5.3 The attention paths and the workload assignment
 
@@ -579,11 +578,17 @@ workload by `attention_mode` (issue #24):
 - **`merge_quant`** - the two-call pattern below, with the LSE merge
   and the FP8 quantization for o_proj fused into one Triton kernel
   (`merge_attn_quant`), skipping the intermediate BF16 tensor.
-- **`split`** - the two-call pattern with the merge as ~9 PyTorch
-  kernels and a separate FP8 quantization. The reference
-  implementation; also the only mode with the gather fallback
-  (`meta["paged"]=False`) if the paged kernel ever fails a parity
-  gate.
+
+These two are the only modes the engine ships. The retired third
+path, **`split`** (the two-call pattern with the merge as ~9 PyTorch
+kernels and a separate FP8 quantization), lives in
+`ablations/split_reference.py`: it is the readable reference the
+fused merge kernel is checked against, and comparison cells install
+it through the pipeline's `attention_override` hook. Its gather
+fallback (contiguous KV copies instead of paged reads) was removed
+with it - the paged read path is validated by the parity cells
+(bit-identical to a contiguous causal call on every edge case)
+instead of by a runtime fallback.
 
 The assignment, fixed in `attention.py` as `FILTER_ATTENTION =
 "unified"` and `JOIN_ATTENTION = "merge_quant"` and read by the
@@ -630,10 +635,10 @@ worker:
   merge_quant on joins, and its cascade wrapper (the shared-prefix
   decomposition, single-anchor shapes only) is 21% slower. Nothing
   came within the 5% adoption threshold
-  (`results/flashinfer_bench.json`).
+  (`results/flashinfer_tuned.json`).
 
-The two-call pattern (`split` and `merge_quant`) runs per layer as
-follows (`attention.py`):
+The two-call pattern (`merge_quant`; the retired `split` reference
+runs the same two calls) runs per layer as follows (`attention.py`):
 
 **Call A** (self-attention): causal attention over the segment
 boundaries. Each prefix attends to itself; each suffix attends to
@@ -734,7 +739,6 @@ answers. This overlaps GPU compute with answer readback.
 | Function | File | What it does |
 |---|---|---|
 | `Pipeline.forward_chunk` | `attention.py:348` | Full transformer forward pass for one chunk |
-| `Pipeline.attention` | `attention.py:284` | Two-call attention with LSE merge for one layer (`split`) |
 | `Pipeline.attention_merge_quant` | `attention.py` | Two calls + fused merge/FP8-quant Triton kernel (`merge_quant`, the join path) |
 | `Pipeline.attention_unified` | `attention.py` | Scatter current KV, one causal paged call (`unified`, the filter path) |
 | `Pipeline.gemm` | `attention.py:68` | DeepGEMM fp8 matrix multiply |

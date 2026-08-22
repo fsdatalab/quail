@@ -1,9 +1,11 @@
 """The workload-to-path assignment: importable without torch, names
-real modes, and never puts a join on the unified path."""
+real modes, and never puts a join on the unified path. The engine
+ships exactly these two modes; the retired split path lives in
+ablations/split_reference.py."""
 
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 
-MODES = ("split", "merge_quant", "unified")
+MODES = ("merge_quant", "unified")
 
 
 def test_assignment_names_real_modes():

@@ -18,10 +18,19 @@ parity corpus.
   call over kept plus current KV.
 - Joins run the `merge_quant` path: the two-call pattern with the
   fused LSE-merge + FP8-quantize Triton kernel.
-- `split` stays as the parity reference and the gather-fallback
-  path. No path was removed; the assignment is fixed in
-  `attention.py` as `FILTER_ATTENTION` / `JOIN_ATTENTION`, and the
-  worker reads those constants.
+- The assignment is fixed in `attention.py` as `FILTER_ATTENTION` /
+  `JOIN_ATTENTION`, and the worker reads those constants.
+- `split` - the pre-fusion implementation of the two-call pattern
+  (same two FA3 calls, merge as plain PyTorch ops, separate
+  quantization) - was removed from the engine once the assignment
+  was settled. It lives on in `ablations/split_reference.py` as the
+  readable reference the fused merge kernel is checked against;
+  comparison cells install it through the pipeline's
+  `attention_override` hook. Its gather fallback (contiguous KV
+  copies instead of paged reads) was removed with it: the paged
+  read path is validated by the parity cells (bit-identical to a
+  contiguous causal call on every edge case), not by a runtime
+  fallback.
 - FlashInfer was measured and not adopted (details below).
 
 ## Kernel provenance
@@ -42,11 +51,12 @@ its open-source origin:
   attention idea is from Kwon et al., "Efficient Memory Management
   for Large Language Model Serving with PagedAttention" (2023),
   [vllm-project/vllm](https://github.com/vllm-project/vllm).
-- **Online-softmax LSE merge** (the `sigmoid(lse_b - lse_a)` formula
-  in the `split` path's `attention()` method): the standard two-pass
-  merge of partial attention outputs using log-sum-exp statistics.
-  From Milakov & Gimelshein, "Online normalizer calculation for
-  softmax" (2018); reused inside FlashAttention for tiling.
+- **Online-softmax LSE merge** (the `sigmoid(lse_b - lse_a)`
+  formula; plain-torch form in `ablations/split_reference.py`, fused
+  form in `merge_attn_quant`): the standard two-pass merge of partial
+  attention outputs using log-sum-exp statistics. From Milakov &
+  Gimelshein, "Online normalizer calculation for softmax" (2018);
+  reused inside FlashAttention for tiling.
 - **`merge_quant` Triton kernel** (`merge_attn_quant`): written for
   this project. Fuses the LSE merge above with per-group FP8
   quantization in one kernel launch, replacing the `split` path's
@@ -418,7 +428,15 @@ on both in-scope models.
 - `attention.py`: the assignment constants (`FILTER_ATTENTION =
   "unified"`, `JOIN_ATTENTION = "merge_quant"`) with the evidence
   pointers; worker, calibration boot, and kernel warmup read them
-  instead of string literals.
+  instead of string literals. The mode argument is now required at
+  construction (no default), and the engine ships only the two
+  assigned paths.
+- The split path and its gather fallback removed from the engine;
+  the implementation moved to `ablations/split_reference.py`
+  (comparison cells install it through the new `attention_override`
+  hook). `KVArena.gather` deleted; the milestone probe's
+  attention-math gate now checks the production merge_quant path,
+  dequantized, against the fp32 reference.
 - `ablations/accuracy_vs_stock.py`: the stock-comparison cell (new).
 - `ablations/flashinfer_compare.py`: probe + benchmark (new).
 - `ablations/forward_pass.py`: join cell gained the unified-waves
@@ -427,8 +445,8 @@ on both in-scope models.
   import is fixed to `true_false_ids`.
 - `tests/test_attention_assignment.py`: the assignment names real
   modes and joins are never unified (CPU test).
-- Wiki section 5.3 rewritten for the three paths and the
-  assignment.
+- Wiki section 5.3 rewritten for the two shipped paths, the
+  assignment, and the retired reference.
 
 ## Run log
 
@@ -439,4 +457,6 @@ All runs on Modal app `quail-milestone1`, one H100, tee'd logs in
   `flashinfer_tuned.log`, `flashinfer_tuned_64h.log`
 - `attention_parity.log`, `attention_e2e_parity.log`
 - `join_attention_paths.log` (the three-shape sweep)
+- `m1_probe_post_split_removal.log` (the milestone probe gates on
+  the engine without the split path)
 - `accuracy_vs_stock.log`
