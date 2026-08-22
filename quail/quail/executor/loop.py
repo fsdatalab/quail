@@ -693,7 +693,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         restored = {d for d in range(len(doc_ids))
                     if skey(d) in store}
     unified = pipeline.attention_mode == "unified"
-    temp_tail = max(len(question_ids[0]) - p,
+    temp_tail = max(len(question_ids[0]) - p, 0,
                     *(len(t) for t in tails[1:])) if unified else 0
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,

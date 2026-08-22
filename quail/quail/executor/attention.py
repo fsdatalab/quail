@@ -525,65 +525,6 @@ class Pipeline:
         meta["layer"] += 1
         return out.view(n, H * D)
 
-    def attention_merge_quant(self, q, k, v, meta):
-        """The split attention path with Charles's merge plus FP8
-        quantization kernel. It returns the input pair for o_proj."""
-        torch = self.torch
-        n = q.shape[0]
-        H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
-        q3 = q.view(n, H, D)
-        k3 = k.view(n, KH, D)
-        v3 = v.contiguous().view(n, KH, D)
-        layer = meta["layer"]
-
-        if meta["kv_src"] is not None:
-            self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"],
-                                layer)
-
-        out_a, lse_a = self._fa(
-            q3, k3, v3, meta["cu_a"], meta["cu_a"],
-            meta["max_a"], meta["max_a"], causal=True)
-        cross = meta["cross"]
-        if cross is None:
-            meta["layer"] += 1
-            return self.quant(out_a.view(n, H * D))
-
-        rows = cross["rows"]
-        q_suf = q3.index_select(0, rows)
-        kp, vp = self.arena.paged_kv(layer)
-        out_b, lse_b = self._fa(
-            q_suf, kp, vp, cross["cu_q"], None,
-            cross["max_q"], cross["max_used"], causal=False,
-            block_table=cross["table"], seqused_k=cross["used"])
-        if lse_a.shape[0] != n:
-            lse_a = lse_a.transpose(0, 1)
-        if lse_b.shape[0] != rows.shape[0]:
-            lse_b = lse_b.transpose(0, 1)
-        q_out, scales = self.merge_attn_quant(
-            out_a, lse_a, out_b, lse_b, cross["source"])
-        meta["layer"] += 1
-        return q_out, scales
-
-    def attention_unified(self, q, k, v, meta):
-        """Write every current token into its cache slot, then run one
-        causal paged attention call over retained and current KV."""
-        n = q.shape[0]
-        H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
-        q3 = q.view(n, H, D)
-        k3 = k.view(n, KH, D)
-        v3 = v.contiguous().view(n, KH, D)
-        layer = meta["layer"]
-        unified = meta["unified"]
-        self.kv_row_scatter(k3, v3, unified["src"], unified["dst"],
-                            layer)
-        kp, vp = self.arena.paged_kv(layer)
-        out, _ = self._fa(
-            q3, kp, vp, unified["cu_q"], None,
-            unified["max_q"], unified["max_used"], causal=True,
-            block_table=unified["table"], seqused_k=unified["used"])
-        meta["layer"] += 1
-        return out.view(n, H * D)
-
     # ---- the forward loop -------------------------------------------
 
     def forward_chunk(self, chunk):
