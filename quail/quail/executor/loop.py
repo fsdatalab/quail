@@ -17,6 +17,7 @@ image.
 
 import time
 
+from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.executor.pack import FilterAdmission, pack_stream
 
 
@@ -130,8 +131,8 @@ class AsyncAnswers:
 
 # ------------------------------------------------------- chunk packing
 
-def pack_chunk(torch, arena, groups, timing=None, pinned=True,
-               attention_mode="split"):
+def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
+               attention_mode):
     """Tensors for one chunk, built from groups in chunk order.
 
     Each group is a dict:
@@ -217,12 +218,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True,
             cu_q=_staged(torch, cu_q, torch.int32, pinned),
             max_q=max_q, keys=cross_keys, used=used,
             max_used=max(cross_used), table=table, cu_k=cu_k)
-        if attention_mode == "merge_quant":
-            source = [-1] * len(ids)
-            for i, row in enumerate(suffix_rows):
-                source[row] = i
-            cross["source"] = _staged(
-                torch, source, torch.int32, pinned)
+        # row -> its index in call B's output, -1 for prefix rows;
+        # the fused merge kernel's map (the split reference ignores it)
+        source = [-1] * len(ids)
+        for i, row in enumerate(suffix_rows):
+            source[row] = i
+        cross["source"] = _staged(
+            torch, source, torch.int32, pinned)
     t = _tick(timing, "pack_cross", t)
 
     # all of the chunk's KV writes as one list of (source, destination)
@@ -271,7 +273,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True,
 
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
-        unified=unified, paged=True,
+        unified=unified,
         cu_a=_staged(torch, cu_a, torch.int32, pinned),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = dict(
@@ -611,7 +613,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
         used += len(d) + q_max
         i += 1
     original_mode = pipeline.attention_mode
-    for mode in ("unified", "merge_quant"):
+    for mode in dict.fromkeys((FILTER_ATTENTION, JOIN_ATTENTION)):
         pipeline.attention_mode = mode
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
                    question_ids, budget)
@@ -638,7 +640,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                store_ids=None, timing=None, pinned=True,
                limit=None):
     """The filter chain on the packed executor: continuous admission,
-    survivor priority, pages freed on NO or after the last stage.
+    survivor priority, pages freed on FALSE or after the last stage.
 
     doc_ids: per-document token lists (the planted flag line included).
     question_ids: per-stage question token lists, planner order.
@@ -665,7 +667,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     copies (the pre-#12 path; the ablation ladder's staging rung).
 
     Returns (answers, spans, tokens): answers[d] = 0/1 list up to the
-    first NO (gated); spans and tokens as in run_join.
+    first FALSE (gated); spans and tokens as in run_join.
     """
     p = _shared_preamble_tokens(question_ids)
     stage_tokens = [len(question_ids[0])] \
@@ -729,9 +731,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         bits = async_ans.result(handle)
         t = _tick(timing, "report_wait", t)
         for (doc, stage, _fresh), bit in zip(groups, bits):
-            yes = bool(bit)
+            passed = bool(bit)
             last = stage == len(stage_tokens) - 1
-            leaving = (not yes) or last
+            leaving = (not passed) or last
             save = (leaving and store is not None
                     and len(doc_ids[doc]) >= store_min_tokens
                     and skey(doc) not in store)
@@ -740,13 +742,13 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                                 len(doc_ids[doc]),
                                 after_event=handle[0])
                 if ev is not None:
-                    sched.report(doc, stage, yes, release=False)
+                    sched.report(doc, stage, passed, release=False)
                     pending_saves.append((doc, ev))
                     if stats is not None:
                         stats["stored_docs"] += 1
                         stats["stored_tokens"] += len(doc_ids[doc])
                     continue
-            sched.report(doc, stage, yes)
+            sched.report(doc, stage, passed)
             if doc not in sched.resident \
                     and doc in arena.accounting.owned:
                 arena.free_key(doc)

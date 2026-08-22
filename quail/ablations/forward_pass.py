@@ -4,12 +4,12 @@ five-filter workload (~3.83M fresh tokens).
 
   A0  stock vLLM, fp8 KV - the committed production setting:
       pipelined per-(document, stage) client, prefix caching on,
-      25,305 step tokens, constrained YES/NO sampler
+      25,305 step tokens, constrained TRUE/FALSE sampler
   A1  stock vLLM, bf16 KV - isolates the fp8 KV conversion tax
       (the ladder measured 96,946 -> 102,820 tok/s from dtype alone)
   A2  packed executor with vLLM's own between-GEMM kernels: "no
       engine" and the kept-KV machinery (arena with the host-index
-      cache, paged cross-attention, LSE merge, 12-row YES/NO
+      cache, paged cross-attention, LSE merge, 12-row TRUE/FALSE
       readout), 110,376-token chunks, pinned-memory staging - the
       current executor in every respect except the kernels
   A3  A2 + our three Triton kernels (norm+add+quantize,
@@ -42,12 +42,15 @@ GPU until it exits, so two engine boots in one container fail
 comparisons carry the +/-3% container band.
 
 Gates: A3 must reproduce the banked current-executor counts exactly
-(1,807 survivors, 6,294 wrong of 23,113 answered; banked in
-results/m1_filter.json). A2 runs different quant kernels, so its
+(4,645 survivors, 0 wrong of 40,052 answered on the TRUE/FALSE
+corpus; results/attention_paths.json split rows). A2 runs different quant kernels, so its
 answers are reported against A3's, not gated to zero: this
-checkpoint's YES/NO margins are thin, and the exploration measured
-1,768 flipped answers per 10,000 from one silu-kernel swap, so
-low-thousands disagreement at 10k documents is the expected band.
+checkpoint's TRUE/FALSE margins are thin, and the exploration
+measured 1,768 flipped answers per 10,000 from one silu-kernel swap,
+so low-thousands disagreement at 10k documents is the expected band.
+(The banked bands predate the 2026-08-21 YES/NO to TRUE/FALSE corpus
+conversion; A3's gate counts were re-banked on the converted
+corpus.)
 Every rung reports wrong answers against the planted flags.
 
 Run from the quail/ directory (tee to a file per house rule):
@@ -59,6 +62,8 @@ import json
 import os
 
 import modal
+
+from split_reference import attention_split, set_path
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
@@ -76,7 +81,8 @@ image = (
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail", "baselines")
+    .add_local_python_source("quail", "baselines",
+                             "split_reference")
     # corpus.py lives next to the milestone cells; mount it beside the
     # ablation cell rather than moving shared workload code
     .add_local_dir("tests/gpu", remote_path="/root/gpu_tests")
@@ -149,11 +155,11 @@ def stock_rung(rung: str, kv_dtype: str, n_docs: int = 10000,
 
     from baselines.stock import run_filter_chain
     from corpus import MODEL, build_corpus
-    from quail.executor.loop import yes_no_ids
+    from quail.executor.loop import true_false_ids
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
-    yes, no = yes_no_ids(tokenizer)
+    true, false = true_false_ids(tokenizer)
 
     report = dict(
         cell="ablation_stock", rung=rung, kv=kv_dtype, n_docs=n_docs,
@@ -173,16 +179,16 @@ def stock_rung(rung: str, kv_dtype: str, n_docs: int = 10000,
               enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
-                              allowed_token_ids=sorted(yes | no))
+                              allowed_token_ids=sorted(true | false))
     engine = llm.llm_engine
     # warm the engine (kernel compile, allocator) outside the
     # measured reps
     run_filter_chain(engine, sampling, body_ids[:64], q_ids,
-                     STOCK_BUDGET, tag="w", yes_ids=yes)
+                     STOCK_BUDGET, tag="w", true_ids=true)
     for rep in range(reps):
         r = run_filter_chain(engine, sampling, body_ids, q_ids,
                              STOCK_BUDGET, tag=f"{rung}{rep}",
-                             yes_ids=yes)
+                             true_ids=true)
         by_doc = {}
         for (i, j), bit in r["answers"].items():
             by_doc.setdefault(i, {})[j] = bit
@@ -223,7 +229,7 @@ PACKED_PREDICTIONS = {
 
 # banked current-executor counts (results/m1_filter.json); A3 must
 # reproduce them exactly
-BANKED_A3 = dict(survivors=1807, wrong=6294, answered=23113)
+BANKED_A3 = dict(survivors=4645, wrong=0, answered=40052)
 
 
 @app.function(timeout=5400, **GPU_KW)
@@ -242,7 +248,8 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
 
     from corpus import MODEL, build_corpus
     from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
+    from quail.executor.attention import (FILTER_ATTENTION,
+                                          Pipeline)
     from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
                                      warm_kernels)
     from quail.executor.model import load_model
@@ -259,7 +266,7 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena)
+    pipeline = Pipeline(model, arena, attention_mode=FILTER_ATTENTION)
     answerer = Answerer(torch, F, model, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     exec_budget = min(chunk, pipeline.max_chunk_tokens)
@@ -354,20 +361,22 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
 # ---------------------------------------------------- attention paths
 
 ATTENTION_PATHS = (
-    ("split", "current two-call attention, BF16 merge, separate quant"),
+    ("split", "retired two-call attention, BF16 merge, separate quant (ablations/split_reference.py)"),
     ("merge_quant", "two-call attention, fused merge and FP8 quant"),
     ("unified", "one causal paged attention call, separate quant"),
 )
 
 
 @app.function(timeout=1200, **GPU_KW)
-def attention_parity() -> str:
+def attention_parity(q_heads: int = 32) -> str:
     """Compare split and unified attention with a contiguous reference.
 
     The cases cover fresh and retained prefixes, page boundaries, several
     groups in one call, and noncontiguous physical pages. The contiguous
     reference uses the same FlashAttention call without a block table, so a
     unified versus reference difference isolates the paged mapping and mask.
+    q_heads=32 is the 4B geometry (4:1 GQA); q_heads=64 is the 32B
+    geometry (8:1 GQA).
     """
     import math
     import sys
@@ -381,7 +390,7 @@ def attention_parity() -> str:
     from quail.executor.attention import Pipeline
     from quail.executor.loop import pack_chunk
 
-    heads = 32
+    heads = q_heads
     kv_heads = 8
     head_dim = 128
     page_tokens = 16
@@ -413,10 +422,14 @@ def attention_parity() -> str:
 
     def error(left, right):
         delta = (left.float() - right.float()).abs()
+        flat = delta.flatten()
+        # kthvalue instead of quantile: quantile rejects tensors over
+        # 2^24 elements, which the 64-head many-page case exceeds
+        k = max(1, int(0.99 * flat.numel()))
         return dict(
             max_abs=float(delta.max().item()),
             mean_abs=float(delta.mean().item()),
-            p99_abs=float(torch.quantile(delta.flatten(), 0.99).item()),
+            p99_abs=float(flat.kthvalue(k).values.item()),
             fraction_over_1e_2=float((delta > 1e-2).float().mean().item()),
             fraction_over_5e_2=float((delta > 5e-2).float().mean().item()))
 
@@ -445,7 +458,8 @@ def attention_parity() -> str:
         needed = sum(math.ceil((f + s) / page_tokens)
                      for f, s in specs)
         arena = fragmented_arena(needed)
-        pipeline = Pipeline(model, arena, kernels="quail")
+        pipeline = Pipeline(model, arena, kernels="quail",
+                            attention_mode="merge_quant")
         groups = []
         q_parts = []
         k_parts = []
@@ -513,12 +527,13 @@ def attention_parity() -> str:
         v_flat = v.view(v.shape[0], -1)
 
         split_chunk = pack_chunk(
-            torch, arena, groups, pinned=True, attention_mode="split")
+            torch, arena, groups, pinned=True,
+            attention_mode="merge_quant")
         unified_chunk = pack_chunk(
             torch, arena, groups, pinned=True, attention_mode="unified")
         split_chunk["meta"]["layer"] = 0
-        split = pipeline.attention(
-            q_flat, k_flat, v_flat, split_chunk["meta"])
+        split = attention_split(
+            pipeline, q_flat, k_flat, v_flat, split_chunk["meta"])
         unified_chunk["meta"]["layer"] = 0
         unified = pipeline.attention_unified(
             q_flat, k_flat, v_flat, unified_chunk["meta"])
@@ -549,25 +564,50 @@ def attention_parity() -> str:
             split_vs_contiguous=error(split, contiguous),
             split_vs_unified=error(split, unified))
 
+    def safe_case(name, specs, fresh):
+        """One case, or its error: an edge case that crashes must not
+        take the rest of the sweep with it."""
+        try:
+            out = run_case(name, specs, fresh)
+            torch.cuda.synchronize()
+            return out
+        except Exception as exc:
+            return dict(name=name, fresh=fresh, specs=specs,
+                        error=repr(exc))
+
     torch.manual_seed(12345)
     cases = [
-        run_case("fresh_page_edges", [(15, 1), (16, 7), (17, 11)], True),
-        run_case("cached_page_edges", [(15, 1), (16, 7), (17, 11)], False),
-        run_case("cached_long", [(63, 32), (129, 13), (511, 7)], False),
+        safe_case("fresh_page_edges", [(15, 1), (16, 7), (17, 11)], True),
+        safe_case("cached_page_edges", [(15, 1), (16, 7), (17, 11)], False),
+        safe_case("cached_long", [(63, 32), (129, 13), (511, 7)], False),
+        # issue #24 edge cases: documents spanning hundreds of pages,
+        # documents shorter than the suffix, one-token documents, a
+        # wide chunk of small groups, and (last: it may legitimately
+        # be refused) the empty document
+        safe_case("cached_many_pages", [(2049, 37), (4097, 15)], False),
+        safe_case("fresh_many_pages", [(2049, 37)], True),
+        safe_case("tiny_docs", [(1, 5), (2, 30), (3, 3)], False),
+        safe_case("fresh_tiny_docs", [(1, 5), (2, 30), (3, 3)], True),
+        safe_case("suffix_dominates", [(7, 300), (5, 111)], False),
+        safe_case("many_groups", [(15, 2), (16, 3), (17, 2)] * 16, False),
+        safe_case("fresh_empty_doc", [(0, 9)], True),
     ]
     torch.cuda.synchronize()
     report = dict(
-        cell="attention_parity", seed=12345,
+        cell="attention_parity", q_heads=heads, kv_heads=kv_heads,
+        seed=12345,
         interpretation=(
             "Unified versus contiguous checks the paged mask and row mapping. "
             "Both FlashAttention paths are also compared with an explicit "
             "float32 causal attention reference."),
         cases=cases)
-    return _write(report, "attention_parity")
+    tag = "" if heads == 32 else f"_{heads}h"
+    return _write(report, f"attention_parity{tag}")
 
 
 @app.function(timeout=2400, **GPU_KW)
-def attention_end_to_end_parity(n_docs: int = 256) -> str:
+def attention_end_to_end_parity(n_docs: int = 256,
+                                model: str = "qwen3-4b-fp8") -> str:
     """Compare filter answers with full prompt recomputation."""
     import sys
 
@@ -577,18 +617,18 @@ def attention_end_to_end_parity(n_docs: int = 256) -> str:
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
-    from corpus import MODEL, build_corpus
+    from corpus import build_corpus
     from quail.executor.arena import KVArena
     from quail.executor.attention import Pipeline
     from quail.executor.loop import (Answerer, AsyncAnswers, pack_chunk,
                                      run_filter)
     from quail.executor.model import load_model
     from quail.planner import budgets
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+    from quail.specs import H100_SXM, MODELS
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = load_model(MODEL)
-    spec = QWEN3_4B_FP8
+    spec = MODELS[model]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    model_mod = load_model(spec.hf_name)
     chunk_budget = budgets.chunk_budget(spec, H100_SXM)
     arena_tokens = budgets.arena_tokens(spec, H100_SXM, chunk_budget)
     arena = KVArena(
@@ -596,8 +636,9 @@ def attention_end_to_end_parity(n_docs: int = 256) -> str:
         n_pages=arena_tokens // budgets.PAGE_TOKENS,
         page_tokens=budgets.PAGE_TOKENS,
         n_kv=spec.n_kv, d_head=spec.d_head, dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena, kernels="quail")
-    answerer = Answerer(torch, F, model, tokenizer)
+    pipeline = Pipeline(model_mod, arena, kernels="quail",
+                        attention_mode="merge_quant")
+    answerer = Answerer(torch, F, model_mod, tokenizer)
     async_answers = AsyncAnswers(torch, answerer)
     budget = min(chunk_budget, pipeline.max_chunk_tokens)
     body_ids, question_ids, flags = build_corpus(tokenizer, n_docs)
@@ -605,7 +646,7 @@ def attention_end_to_end_parity(n_docs: int = 256) -> str:
     def full_prompt_reference():
         answers = {d: [] for d in range(n_docs)}
         live = list(range(n_docs))
-        pipeline.attention_mode = "split"
+        set_path(pipeline, "merge_quant")
         for stage, question in enumerate(question_ids):
             stage_bits = {}
             start = 0
@@ -626,7 +667,7 @@ def attention_end_to_end_parity(n_docs: int = 256) -> str:
                     for d, prompt in zip(docs, prompts)]
                 packed = pack_chunk(
                     torch, arena, groups, pinned=True,
-                    attention_mode="split")
+                    attention_mode="merge_quant")
                 final_rows = []
                 row = 0
                 for prompt in prompts:
@@ -657,17 +698,44 @@ def attention_end_to_end_parity(n_docs: int = 256) -> str:
 
     outputs = {}
     with torch.inference_mode():
-        for mode in ("split", "unified"):
-            pipeline.attention_mode = mode
+        for mode in ("split", "merge_quant", "unified"):
+            set_path(pipeline, mode)
             outputs[mode], _, _ = run_filter(
                 torch, arena, pipeline, async_answers,
                 body_ids, question_ids, budget)
         outputs["full_prompt"] = full_prompt_reference()
+
+        # store round trip under the filter assignment: pass 1 saves
+        # every document's KV, pass 2 restores instead of computing.
+        # Restored KV is a byte copy of computed KV, so pass 2 must
+        # reproduce the no-store answers exactly - this covers the
+        # restore path's interaction with unified scattering and the
+        # preamble rewind.
+        from quail.executor.kvstore import PinnedStore
+        n_store = min(64, n_docs)
+        store_docs = body_ids[:n_store]
+        store = PinnedStore(
+            capacity_tokens=sum(len(d) for d in store_docs) + 4096,
+            n_layers=spec.layers, n_kv=spec.n_kv, d_head=spec.d_head,
+            max_doc_tokens=max(len(d) for d in store_docs) + 256,
+            dtype=torch.bfloat16)
+        set_path(pipeline, "unified")
+        baseline_store, _, _ = run_filter(
+            torch, arena, pipeline, async_answers, store_docs,
+            question_ids, budget)
+        run_filter(torch, arena, pipeline, async_answers, store_docs,
+                   question_ids, budget, store=store, store_hash="p",
+                   store_min_tokens=1)
+        stats = {}
+        restored_answers, _, _ = run_filter(
+            torch, arena, pipeline, async_answers, store_docs,
+            question_ids, budget, store=store, store_hash="p",
+            store_min_tokens=1, stats=stats)
     torch.cuda.synchronize()
 
     comparisons = {}
     reference = outputs["full_prompt"]
-    for mode in ("split", "unified"):
+    for mode in ("split", "merge_quant", "unified"):
         count, by_stage = disagreements(outputs[mode], reference)
         comparisons[mode] = dict(
             disagreements=count, disagreements_by_stage=by_stage,
@@ -678,20 +746,135 @@ def attention_end_to_end_parity(n_docs: int = 256) -> str:
     comparisons["split_vs_unified"] = dict(
         disagreements=split_unified,
         disagreements_by_stage=split_unified_by_stage)
+    store_diff, _ = disagreements(restored_answers, baseline_store)
+    comparisons["unified_store_restore"] = dict(
+        disagreements=store_diff, restored_docs=stats["restored_docs"],
+        of_docs=n_store)
     report = dict(
-        cell="attention_end_to_end_parity", n_docs=n_docs,
+        cell="attention_end_to_end_parity", model=spec.name,
+        n_docs=n_docs,
         reference=(
             "Every document and stage recomputes the complete document plus "
             "question as one causal sequence without paging or an LSE merge."),
         comparisons=comparisons,
-        pass_unified=comparisons["unified"]["disagreements"] == 0)
-    return _write(report, "attention_end_to_end_parity")
+        pass_unified=comparisons["unified"]["disagreements"] == 0,
+        pass_store=(store_diff == 0
+                    and stats["restored_docs"] == n_store))
+    tag = "" if spec.name == "qwen3-4b-fp8" else "_32b"
+    return _write(report, f"attention_end_to_end_parity{tag}")
+
+
+def _unified_join_waves(torch, arena, pipeline, async_ans, prefixes,
+                        suffixes, budget):
+    """The unified path on a join, in the only packing under which it
+    is correct: one partner suffix per anchor per chunk. Two pairs of
+    one anchor cannot share a causal call - the later pair's tokens
+    would read the earlier pair's scattered KV - so the fan-out that
+    the two-call pattern shares within one chunk becomes one wave of
+    chunks per partner index here.
+
+    Phase 1 per cohort: cache-only split-mode chunks write the
+    anchors' prefix KV into pages sized for prefix + longest suffix.
+    Phase 2: for each partner index, one unified chunk carrying that
+    suffix for every anchor in the cohort. Readback is pipelined the
+    same way run_filter pipelines it.
+
+    Returns (answers, chunks, fresh_tokens): answers[a] = the 0/1 row
+    over partners, matching run_join's ans[0]."""
+    from quail.executor.loop import pack_chunk
+
+    n = len(prefixes)
+    n_terms = len(suffixes)
+    max_s = max(len(s) for s in suffixes)
+    page_tokens = arena.accounting.page_tokens
+    total_pages = arena.accounting.n_pages
+    answers = {a: [] for a in range(n)}
+    chunks = tokens = 0
+
+    def pages_for(a):
+        return -(-(len(prefixes[a]) + max_s) // page_tokens)
+
+    cohorts, cur, cur_pages = [], [], 0
+    for a in range(n):
+        need = pages_for(a)
+        if cur and cur_pages + need > total_pages - 8:
+            cohorts.append(cur)
+            cur, cur_pages = [], 0
+        cur.append(a)
+        cur_pages += need
+    if cur:
+        cohorts.append(cur)
+
+    for cohort in cohorts:
+        for a in cohort:
+            got = arena.alloc(a, len(prefixes[a]),
+                              capacity_tokens=len(prefixes[a]) + max_s)
+            assert got is not None, "cohort exceeds the arena"
+        # phase 1: write prefix KV. Each group rides a 1-token dummy
+        # suffix (its bit is discarded, its KV never written) so the
+        # chunk has answer rows - a zero-final chunk would hand the
+        # final-norm kernel an empty launch.
+        set_path(pipeline, "merge_quant")
+        dummy = [suffixes[0][0]]
+        start = 0
+        while start < len(cohort):
+            end, used = start, 0
+            while end < len(cohort) \
+                    and used + len(prefixes[cohort[end]]) + 1 <= budget:
+                used += len(prefixes[cohort[end]]) + 1
+                end += 1
+            groups = [dict(key=a, prefix=prefixes[a],
+                           f=len(prefixes[a]), suffixes=[dummy])
+                      for a in cohort[start:end]]
+            chunk = pack_chunk(torch, arena, groups, pinned=True,
+                               attention_mode="merge_quant")
+            pipeline.forward_chunk(chunk)
+            chunks += 1
+            tokens += chunk["tokens"] - len(groups)
+            start = end
+        # phase 2: one wave per partner index
+        pipeline.attention_mode = "unified"
+        outstanding = []
+
+        def collect(entry):
+            members, handle = entry
+            for a, bit in zip(members, async_ans.result(handle)):
+                answers[a].append(bit)
+
+        for t in range(n_terms):
+            groups = [dict(key=a, prefix=None, f=len(prefixes[a]),
+                           suffixes=[suffixes[t]]) for a in cohort]
+            chunk = pack_chunk(torch, arena, groups, pinned=True,
+                               attention_mode="unified")
+            normed = pipeline.forward_chunk(chunk)
+            chunks += 1
+            tokens += chunk["tokens"]
+            outstanding.append((cohort, async_ans.submit(normed)))
+            while len(outstanding) > 1:
+                collect(outstanding.pop(0))
+        while outstanding:
+            collect(outstanding.pop(0))
+        for a in cohort:
+            arena.free_key(a)
+    return answers, chunks, tokens
 
 
 @app.function(timeout=3600, **GPU_KW)
 def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
-                         reps: int = 1) -> str:
-    """Compare split and fused merge attention on the join workload."""
+                         reps: int = 1,
+                         model: str = "qwen3-4b-fp8") -> str:
+    """All three attention paths on the join workload.
+
+    split and merge_quant run the production join loop (run_join).
+    unified runs as waves (_unified_join_waves), the only packing
+    under which one causal call per pair is correct.
+
+    Prediction, stated before the run: merge_quant beats split by its
+    fused merge; unified is several-fold slower - each anchor's KV is
+    re-read once per partner instead of once per ~26-partner group
+    (about 26x the arena read traffic at 10x256), in n_terms small
+    launches instead of a few budget-sized chunks.
+    """
     import sys
     import time
 
@@ -701,17 +884,17 @@ def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
-    from corpus import MODEL, biodex_sample
+    from corpus import biodex_sample
     from quail.executor.arena import KVArena
     from quail.executor.attention import Pipeline
     from quail.executor.loop import Answerer, AsyncAnswers, run_join
     from quail.executor.model import load_model
     from quail.planner import budgets
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+    from quail.specs import H100_SXM, MODELS
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = load_model(MODEL)
-    spec = QWEN3_4B_FP8
+    spec = MODELS[model]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    model_mod = load_model(spec.hf_name)
     chunk_budget = budgets.chunk_budget(spec, H100_SXM)
     arena_tokens = budgets.arena_tokens(spec, H100_SXM, chunk_budget)
     arena = KVArena(
@@ -719,50 +902,60 @@ def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
         n_pages=arena_tokens // budgets.PAGE_TOKENS,
         page_tokens=budgets.PAGE_TOKENS,
         n_kv=spec.n_kv, d_head=spec.d_head, dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena, kernels="quail")
-    answerer = Answerer(torch, F, model, tokenizer)
+    pipeline = Pipeline(model_mod, arena, kernels="quail",
+                        attention_mode="merge_quant")
+    answerer = Answerer(torch, F, model_mod, tokenizer)
     async_answers = AsyncAnswers(torch, answerer)
     budget = min(chunk_budget, pipeline.max_chunk_tokens)
     data = biodex_sample(tokenizer, n_reports=n_reports)
     prefixes = data["prefixes"]
     suffixes = data["suffixes"][:n_terms]
-    modes = ("split", "merge_quant")
+    modes = ("split", "merge_quant", "unified_waves")
     report = dict(
-        cell="join_attention_paths", n_reports=n_reports,
+        cell="join_attention_paths", model=spec.name,
+        n_reports=n_reports,
         n_terms=n_terms, pairs=n_reports * n_terms, reps=reps,
         budget=budget, arena_tokens=arena_tokens,
         prediction=(
-            "Fusing the attention merge with FP8 quantization should make "
-            "merge_quant faster than split."),
+            "merge_quant fastest (fused merge); unified several-fold "
+            "slower: anchor KV re-read once per partner instead of "
+            "once per suffix group, in n_terms small launches."),
         runs={}, comparisons={})
     print(f"[join_attention_paths] {report['prediction']}", flush=True)
 
+    def run_mode(mode):
+        if mode == "unified_waves":
+            answers, n_chunks, tokens = _unified_join_waves(
+                torch, arena, pipeline, async_answers, prefixes,
+                suffixes, budget)
+            return answers, n_chunks, tokens
+        set_path(pipeline, mode)
+        answers, spans, tokens = run_join(
+            torch, arena, pipeline, async_answers, prefixes,
+            [suffixes], budget)
+        return answers[0], len(spans), tokens
+
     outputs = {}
     for mode in modes:
-        pipeline.attention_mode = mode
         with torch.inference_mode():
             # Warm the exact measured shape. This covers FlashAttention,
             # DeepGEMM, quantization, scatter, and boundary-copy kernels.
-            run_join(
-                torch, arena, pipeline, async_answers, prefixes,
-                [suffixes], budget)
+            run_mode(mode)
             torch.cuda.synchronize()
             rows = []
             for rep in range(reps):
                 torch.cuda.reset_peak_memory_stats()
                 start = time.perf_counter()
-                answers, spans, tokens = run_join(
-                    torch, arena, pipeline, async_answers, prefixes,
-                    [suffixes], budget)
+                answers, n_chunks, tokens = run_mode(mode)
                 torch.cuda.synchronize()
                 wall = time.perf_counter() - start
                 flat = [bit for anchor in range(n_reports)
-                        for bit in answers[0][anchor]]
+                        for bit in answers[anchor]]
                 row = dict(
                     mode=mode, rep=rep, wall=round(wall, 3),
                     fresh_tokens=tokens,
                     us_per_token=round(wall * 1e6 / tokens, 3),
-                    chunks=len(spans), yes=sum(flat),
+                    chunks=n_chunks, yes=sum(flat),
                     peak_gib=round(
                         torch.cuda.max_memory_allocated() / 2**30, 2))
                 rows.append(row)
@@ -778,16 +971,21 @@ def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
             wall_delta_s=round(
                 report["runs"][mode][-1]["wall"]
                 - report["runs"]["split"][-1]["wall"], 3))
-    return _write(report, "join_attention_paths")
+    tag = "" if spec.name == "qwen3-4b-fp8" else "_32b"
+    return _write(
+        report, f"join_attention_paths{tag}_{n_reports}x{n_terms}")
 
 
 @app.function(timeout=5400, **GPU_KW)
-def attention_paths(n_docs: int = 10000, reps: int = 2) -> str:
+def attention_paths(n_docs: int = 10000, reps: int = 2,
+                    model: str = "qwen3-4b-fp8") -> str:
     """Compare the current A3 attention path with both proposed paths.
 
     All paths share one model, one arena, one container, and the current
     Quail kernels. Each path gets an unmeasured warmup before its measured
-    repetitions.
+    repetitions. model picks the spec ("qwen3-4b-fp8" or
+    "qwen3-32b-fp8"); results for a non-default model write to a
+    suffixed file.
     """
     import sys
     import time
@@ -798,27 +996,28 @@ def attention_paths(n_docs: int = 10000, reps: int = 2) -> str:
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
-    from corpus import MODEL, build_corpus
+    from corpus import build_corpus
     from quail.executor.arena import KVArena
     from quail.executor.attention import Pipeline
     from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
                                      warm_kernels)
     from quail.executor.model import load_model
     from quail.planner import budgets
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+    from quail.specs import H100_SXM, MODELS
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = load_model(MODEL)
-    chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
-    arena_tok = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, chunk)
-    spec = QWEN3_4B_FP8
+    spec = MODELS[model]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    model_mod = load_model(spec.hf_name)
+    chunk = budgets.chunk_budget(spec, H100_SXM)
+    arena_tok = budgets.arena_tokens(spec, H100_SXM, chunk)
     arena = KVArena(n_layers=spec.layers,
                     n_pages=arena_tok // budgets.PAGE_TOKENS,
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena, kernels="quail")
-    answerer = Answerer(torch, F, model, tokenizer)
+    pipeline = Pipeline(model_mod, arena, kernels="quail",
+                        attention_mode="merge_quant")
+    answerer = Answerer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     exec_budget = min(chunk, pipeline.max_chunk_tokens)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
@@ -829,7 +1028,8 @@ def attention_paths(n_docs: int = 10000, reps: int = 2) -> str:
         "unified": "0.3 to 0.7 us/token faster than split",
     }
     report = dict(
-        cell="attention_paths", n_docs=n_docs, reps=reps,
+        cell="attention_paths", model=spec.name, n_docs=n_docs,
+        reps=reps,
         exec_budget=exec_budget, arena_tokens=arena_tok,
         paths={name: description for name, description in ATTENTION_PATHS},
         predictions=predictions, runs={}, comparisons={})
@@ -844,7 +1044,7 @@ def attention_paths(n_docs: int = 10000, reps: int = 2) -> str:
 
     answers_by_path = {}
     for mode, _ in ATTENTION_PATHS:
-        pipeline.attention_mode = mode
+        set_path(pipeline, mode)
         with torch.inference_mode():
             run_filter(torch, arena, pipeline, async_ans,
                        body_ids[:min(256, n_docs)], q_ids, exec_budget)
@@ -896,7 +1096,8 @@ def attention_paths(n_docs: int = 10000, reps: int = 2) -> str:
             wall_delta_s=round(
                 report["runs"][mode][-1]["wall"]
                 - report["runs"]["split"][-1]["wall"], 3))
-    return _write(report, "attention_paths")
+    tag = "" if spec.name == "qwen3-4b-fp8" else "_32b"
+    return _write(report, f"attention_paths{tag}")
 
 
 # ---------------------------------------------------------- profiling
@@ -946,7 +1147,8 @@ def profile_packed(n_docs: int = 3000) -> str:
 
     from corpus import MODEL, build_corpus
     from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
+    from quail.executor.attention import (FILTER_ATTENTION,
+                                          Pipeline)
     from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
                                      warm_kernels)
     from quail.executor.model import load_model
@@ -963,7 +1165,7 @@ def profile_packed(n_docs: int = 3000) -> str:
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena)
+    pipeline = Pipeline(model, arena, attention_mode=FILTER_ATTENTION)
     answerer = Answerer(torch, F, model, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     exec_budget = min(chunk, pipeline.max_chunk_tokens)
@@ -1099,27 +1301,46 @@ def probe_api():
 
 @app.local_entrypoint()
 def run_attention_paths(n_docs: int = 10000, reps: int = 2,
-                        out: str = "results/attention_paths.json"):
-    _save(attention_paths.remote(n_docs, reps), out)
+                        model: str = "qwen3-4b-fp8"):
+    print(attention_paths.remote(n_docs, reps, model))
 
 
 @app.local_entrypoint()
-def run_attention_parity():
-    result = attention_parity.remote()
+def run_attention_parity(q_heads: int = 32):
+    result = attention_parity.remote(q_heads)
     print(result)
 
 
 @app.local_entrypoint()
-def run_attention_end_to_end_parity(n_docs: int = 256):
-    result = attention_end_to_end_parity.remote(n_docs)
+def run_attention_end_to_end_parity(n_docs: int = 256,
+                                    model: str = "qwen3-4b-fp8"):
+    result = attention_end_to_end_parity.remote(n_docs, model)
     print(result)
 
 
 @app.local_entrypoint()
 def run_join_attention_paths(n_reports: int = 10, n_terms: int = 256,
-                             reps: int = 1):
-    result = join_attention_paths.remote(n_reports, n_terms, reps)
+                             reps: int = 1,
+                             model: str = "qwen3-4b-fp8"):
+    result = join_attention_paths.remote(n_reports, n_terms, reps,
+                                         model)
     print(result)
+
+
+@app.local_entrypoint()
+def run_join_paths_sweep(model: str = "qwen3-4b-fp8"):
+    """The three fan-out shapes of the join ablation: the committed
+    10x256 sample, one anchor at full fan-out, and the 100-anchor
+    multi-chunk scale. The sweep is the point here - the join
+    assignment must hold across fan-out, not at one shape."""
+    handles = [(n_r, n_t,
+                join_attention_paths.spawn(n_r, n_t, reps, model))
+               for n_r, n_t, reps in
+               ((10, 256, 2), (1, 2560, 1), (100, 256, 1))]
+    for n_r, n_t, h in handles:
+        print(f"join {n_r}x{n_t} fc: {h.object_id}", flush=True)
+    for n_r, n_t, h in handles:
+        print(h.get())
 
 
 @app.local_entrypoint()

@@ -186,7 +186,7 @@ class Session:
 
     @property
     def tokenizer(self):
-        """The exact tokenizer: prompts, YES/NO ids, parity samples."""
+        """The exact tokenizer: prompts, TRUE/FALSE ids, parity samples."""
         if self._tok is None:
             from transformers import AutoTokenizer
             hf = AutoTokenizer.from_pretrained(self.model.hf_name)
@@ -511,7 +511,7 @@ class Query:
                     survivors[alias] = [d for d in survivors[alias]
                                         if d not in keep]
 
-        # ---- output tuples: the one full join's YES rows, each
+        # ---- output tuples: the one full join's TRUE rows, each
         # member checked against its table's final survivor set (a
         # gate written after the join still applies - order changes
         # cost, never results)

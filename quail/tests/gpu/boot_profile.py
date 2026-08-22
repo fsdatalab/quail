@@ -86,7 +86,8 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
     import torch.nn.functional as F
 
     from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
+    from quail.executor.attention import (FILTER_ATTENTION,
+                                          Pipeline)
     from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
     from quail.executor.model import load_model
     from quail.planner import budgets
@@ -114,7 +115,8 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
                         dtype=torch.bfloat16)
         boot["arena_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        pipeline = Pipeline(model, arena)
+        pipeline = Pipeline(
+            model, arena, attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
         answerer = Answerer(torch, F, model, tokenizer)
         async_ans = AsyncAnswers(torch, answerer)

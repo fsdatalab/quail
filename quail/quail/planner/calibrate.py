@@ -19,9 +19,9 @@ from quail.specs import DEVICES, MODELS, DeviceSpec, ModelSpec
 LENGTHS = (256, 1024, 4096, 8192)
 TOKENS_PER_POINT = 1_500_000
 
-# Any short YES/NO suffix works; the answers are not graded.
+# Any short TRUE/FALSE suffix works; the answers are not graded.
 _QUESTION = ("\n\nDoes the document mention a finding? "
-             "Answer YES or NO.\nAnswer=")
+             "Answer TRUE or FALSE.\nANSWER:")
 _FILLER = "The document discusses a clinical finding. "
 
 
@@ -48,7 +48,7 @@ def _boot(spec: ModelSpec, device: DeviceSpec):
     from transformers import AutoTokenizer
 
     from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
+    from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.loop import Answerer, AsyncAnswers
     from quail.executor.model import load_model
 
@@ -61,8 +61,8 @@ def _boot(spec: ModelSpec, device: DeviceSpec):
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena)
-    pipeline.attention_mode = "unified"
+    pipeline = Pipeline(model, arena,
+                        attention_mode=FILTER_ATTENTION)
     answerer = Answerer(torch, F, model, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     exec_budget = min(chunk, pipeline.max_chunk_tokens)
