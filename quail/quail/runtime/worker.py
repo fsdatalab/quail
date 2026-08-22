@@ -243,7 +243,7 @@ def _execute_single(state, payload: dict) -> dict:
             prefixes = [pre + docs[anchor_alias][a]
                         for a in anchors_glob]
             jstats = {}
-            ans, margins, _, tokens = run_join(
+            ans, _, tokens = run_join(
                 torch, arena, pipeline, async_ans, prefixes,
                 stage_suffixes, budget,
                 stage_frames=[j.get("frame") or [] for j in group],
@@ -263,8 +263,6 @@ def _execute_single(state, payload: dict) -> dict:
             for si, j in enumerate(group):
                 out_joins.append(dict(
                     rows={int(a): row for a, row in ans[si].items()},
-                    margins={int(a): row
-                            for a, row in margins[si].items()},
                     anchor_index=anchors_glob,
                     partner_index=tuple_globs[si]))
             # gate the anchor set for stages after this group
@@ -491,7 +489,7 @@ def _child_joins(state, sub):
                      for combo in combos])
             prefixes = [pre + anchor_docs[a] for a in live]
             jstats = {}
-            ans, margins, _, tokens = run_join(
+            ans, _, tokens = run_join(
                 torch, state["arena"], state["pipeline"],
                 state["async_ans"], prefixes, stage_suffixes,
                 state["budget"],
@@ -513,8 +511,6 @@ def _child_joins(state, sub):
             for si, j in enumerate(group):
                 out_joins.append(dict(
                     rows={int(a): row for a, row in ans[si].items()},
-                    margins={int(a): row
-                            for a, row in margins[si].items()},
                     anchor_index=[anchors_glob[live[a]]
                                   for a in range(len(live))],
                     partner_index=tuple_globs[si]))
