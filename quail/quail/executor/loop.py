@@ -817,8 +817,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             report(outstanding.pop(0))
     while outstanding:
         report(outstanding.pop(0))
+    for doc in sched.drain_ready():
+        arena.free_key(doc)
     drain_saves(block=True)
-    for doc in sched.stranded():
-        if doc in arena.accounting.owned:
-            arena.free_key(doc)
     return sched.answers, spans, tokens
