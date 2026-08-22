@@ -574,7 +574,11 @@ workload by `attention_mode` (issue #24):
   suffix beyond the document's logical length), then a single
   `causal=True` call with a block table covers retained plus current
   KV. No second call, no merge. Requires exactly one suffix per
-  group, which the filter shape always satisfies.
+  paged group, which the filter shape always satisfies. A chunk
+  whose groups own no pages at all (the single-stage fast path,
+  section 5.6) runs one plain varlen causal call instead - same
+  math, no scatter, no paged read; a chunk cannot mix paged and
+  unpaged groups.
 - **`merge_quant`** - the two-call pattern below, with the LSE merge
   and the FP8 quantization for o_proj fused into one Triton kernel
   (`merge_attn_quant`), skipping the intermediate BF16 tensor.
@@ -771,6 +775,20 @@ that runs until `FilterAdmission.done()`:
    freed immediately; survivors advance to their next stage.
 5. Documents leaving their last stage (or failing) are saved to the
    KV store if they meet the length threshold.
+
+Single-stage queries (one question, no store) skip the arena
+entirely (`arena_writes=None` picks this automatically): no later
+stage reads any document's KV, so the alloc, the per-layer KV
+scatter, and the paged attention read serve no one. Each
+[document | question] packs as ONE causal segment - the same
+single causal pass stock vLLM runs per request - and admission runs
+on the token budget alone (`FilterAdmission` with
+`arena_pages=None`). The two paths answer identically: the
+kernel-parity cells measured the unified paged causal call
+bit-identical to the contiguous causal call the fast path runs
+(`results/attention_parity.json`), and the m1_filter1 cell gates on
+0 answer flips across the full 10,000-document workload
+(`results/m1_filter1.json`, which also carries the measured walls).
 
 **`run_join`** (`loop.py:216`): the join driver. The pair list is
 pre-planned by `pack_stream`, then chunks are launched in order.

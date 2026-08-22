@@ -18,6 +18,12 @@ current KV - no merge. Suffix positions start at the kept-context
 length, identical to standalone requests, so answers are comparable
 to per-pair prompts.
 
+A chunk whose groups own no arena pages (a single-stage filter with
+no store: nothing ever reads the KV again) skips the arena in both
+modes: each group packs [prefix | suffix] as one causal segment and
+call A alone is the whole answer - no scatter, no paged read, no
+merge.
+
 The retired third path, split (the two-call pattern with the merge as
 plain PyTorch ops and a separate quantize), lives in
 ablations/split_reference.py; comparison cells install it through
@@ -507,7 +513,15 @@ class Pipeline:
         causal paged attention call over retained and current KV.
 
         No new kernel: the same FA3 paged varlen call as call B in the
-        two-call paths, causal, with the fresh rows scattered first."""
+        two-call paths, causal, with the fresh rows scattered first.
+
+        A chunk with no arena pages at all (meta["unified"] is None:
+        the single-stage filter fast path, where every group packed
+        [prefix | suffix] as one causal segment) runs the plain
+        varlen causal call instead - no scatter, no paged read. The
+        kernel-parity cells measured the paged causal call
+        bit-identical to this contiguous one, so the two shapes of a
+        filter chunk answer identically."""
         n = q.shape[0]
         H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
         q3 = q.view(n, H, D)
@@ -515,6 +529,12 @@ class Pipeline:
         v3 = v.contiguous().view(n, KH, D)
         layer = meta["layer"]
         unified = meta["unified"]
+        if unified is None:
+            out, _ = self._fa(
+                q3, k3, v3, meta["cu_a"], meta["cu_a"],
+                meta["max_a"], meta["max_a"], causal=True)
+            meta["layer"] += 1
+            return out.view(n, H * D)
         self.kv_row_scatter(k3, v3, unified["src"], unified["dst"],
                             layer)
         kp, vp = self.arena.paged_kv(layer)

@@ -192,6 +192,10 @@ class FilterAdmission:
     stage_tokens: per-stage question suffix token counts.
     chunk_budget: tokens per forward pass (one bin).
     arena_pages / page_tokens: the admission budget (the other bin).
+    arena_pages=None removes the page bin: the driver never writes
+    the arena (a single-stage query with no store has no later
+    reader of any document's KV), so admission is the token budget
+    alone and no page accounting happens at all.
 
     Rules, from the design:
     - survivor suffixes pack before fresh admissions, so residency
@@ -215,6 +219,8 @@ class FilterAdmission:
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
         self.page_tokens = page_tokens
+        # None: no page bin - nothing is ever written to the arena,
+        # so there is nothing to account
         self.free_pages = arena_pages
         self.limit = limit
         self._survivor_count = 0
@@ -231,7 +237,8 @@ class FilterAdmission:
             if need > chunk_budget:
                 raise ValueError(f"document {d} + question needs {need} "
                                  f"tokens > chunk budget {chunk_budget}")
-            if pages_for(t + kept_extra_tokens, page_tokens) > arena_pages:
+            if arena_pages is not None and pages_for(
+                    t + kept_extra_tokens, page_tokens) > arena_pages:
                 raise ValueError(f"document {d} needs more pages than "
                                  f"the arena holds")
         self.pending = deque(range(len(self.doc_tokens)))
@@ -267,21 +274,24 @@ class FilterAdmission:
         skipped = deque()
         while self.pending and not blocked_pages:
             doc = self.pending.popleft()
-            need_pages = pages_for(self.doc_tokens[doc] + self.kept_extra,
-                                   self.page_tokens)
-            if need_pages > self.free_pages:
-                # pages are granted in order: put it back and stop
-                # claiming pages behind it
-                self.pending.appendleft(doc)
-                blocked_pages = True
-                break
+            if self.free_pages is not None:
+                need_pages = pages_for(
+                    self.doc_tokens[doc] + self.kept_extra,
+                    self.page_tokens)
+                if need_pages > self.free_pages:
+                    # pages are granted in order: put it back and stop
+                    # claiming pages behind it
+                    self.pending.appendleft(doc)
+                    blocked_pages = True
+                    break
             cost = self.stage_tokens[0] + (
                 0 if doc in self.restored else self.doc_tokens[doc])
             if cost > room:
                 skipped.append(doc)   # chunk room only; retry next chunk
                 continue
-            self.free_pages -= need_pages
-            self.resident[doc] = need_pages
+            if self.free_pages is not None:
+                self.free_pages -= need_pages
+                self.resident[doc] = need_pages
             groups.append((doc, 0, True))
             self.in_flight.add(doc)
             room -= cost
@@ -306,12 +316,13 @@ class FilterAdmission:
         if passed and not last:
             self.ready.append((doc, stage + 1))
             return
-        if release:
+        if release and self.free_pages is not None:
             self.free_pages += self.resident.pop(doc)
 
     def release(self, doc):
         """Return a document's pages after a deferred store save."""
-        self.free_pages += self.resident.pop(doc)
+        if self.free_pages is not None:
+            self.free_pages += self.resident.pop(doc)
 
     # ---- progress ------------------------------------------------------
 

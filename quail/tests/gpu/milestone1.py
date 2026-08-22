@@ -25,10 +25,11 @@ milestone and reopens the design's executor section.
 
 Run from the quail/ directory (tee to a file per house rule):
 
-    uv run modal run tests/gpu/milestone1.py::run_probe  2>&1 | tee results/m1_probe.log
-    uv run modal run tests/gpu/milestone1.py::run_filter 2>&1 | tee results/m1_filter.log
-    uv run modal run tests/gpu/milestone1.py::run_join   2>&1 | tee results/m1_join.log
-    uv run modal run tests/gpu/milestone1.py::run_join3  2>&1 | tee results/m1_join3.log
+    uv run modal run tests/gpu/milestone1.py::run_probe   2>&1 | tee results/m1_probe.log
+    uv run modal run tests/gpu/milestone1.py::run_filter  2>&1 | tee results/m1_filter.log
+    uv run modal run tests/gpu/milestone1.py::run_filter1 2>&1 | tee results/m1_filter1.log
+    uv run modal run tests/gpu/milestone1.py::run_join    2>&1 | tee results/m1_join.log
+    uv run modal run tests/gpu/milestone1.py::run_join3   2>&1 | tee results/m1_join3.log
 """
 
 import json
@@ -282,6 +283,58 @@ def probe() -> str:
         mixed_expect = answerer(alone1) + answerer(alone0)
         mixed_got = answerer(mixed)
         dis_mixed = sum(x != y for x, y in zip(mixed_got, mixed_expect))
+
+        # 6. the single-stage fast path: a fresh group whose key owns
+        # no arena pages packs [prefix | suffix] as ONE causal
+        # segment - no scatter, no paged read - and must answer as
+        # the paged path, under BOTH attention modes (the probe
+        # pipeline boots merge_quant; production filters run
+        # unified, where the fast chunk takes the plain-causal
+        # fallback). One suffix per group (the driver's shape); a
+        # multi-suffix unpaged group raises by construction.
+        fast_answers = []
+        for suf in sufs:
+            fc = pack_mq([fresh_group("np", prefix, [suf])])
+            assert fc["meta"]["kv_src"] is None
+            assert fc["meta"]["cross"] is None
+            fast_answers.extend(answerer(pipeline.forward_chunk(fc)))
+        dis_fast = sum(a != b for a, b in zip(fast_answers,
+                                              shared_answers))
+
+        pipeline.attention_mode = "unified"
+        fast_uni = []
+        for suf in sufs:
+            fc = pack_chunk(torch, arena,
+                            [fresh_group("np", prefix, [suf])],
+                            attention_mode="unified")
+            assert fc["meta"]["unified"] is None
+            fast_uni.extend(answerer(pipeline.forward_chunk(fc)))
+        pipeline.attention_mode = "merge_quant"
+        dis_fast_uni = sum(a != b for a, b in zip(fast_uni,
+                                                  shared_answers))
+
+        try:
+            pack_mq([fresh_group("np", prefix, sufs[:2])])
+            raised = False
+        except ValueError:
+            raised = True
+        # two fast groups in ONE chunk: segments must not bleed
+        both_fast = pipeline.forward_chunk(pack_mq(
+            [fresh_group("np0", prefix, [sufs2[0]]),
+             fresh_group("np1", p1, [sufs2[0]])]))
+        dis_fast_multi = sum(
+            x != y for x, y in
+            zip(answerer(both_fast),
+                [multi_expect[0], multi_expect[len(sufs2)]]))
+        # a unified chunk cannot mix a paged group with a fast one
+        try:
+            pack_chunk(torch, arena,
+                       [kept_group("r0", len(prefix), [sufs[0]]),
+                        fresh_group("np", prefix, [sufs[0]])],
+                       attention_mode="unified")
+            mixed_raised = False
+        except ValueError:
+            mixed_raised = True
     arena.free_key("r0")
 
     gap = (normed_shared.float()
@@ -295,6 +348,11 @@ def probe() -> str:
         kept_vs_shared_disagreements=int(dis_ks),
         multi_group_disagreements=int(dis_multi),
         mixed_kept_fresh_disagreements=int(dis_mixed),
+        fast_path_disagreements=int(dis_fast),
+        fast_path_unified_disagreements=int(dis_fast_uni),
+        fast_path_multi_group_disagreements=int(dis_fast_multi),
+        fast_path_multi_suffix_raises=bool(raised),
+        unified_mixed_chunk_raises=bool(mixed_raised),
     )
 
     # ---- 7. rate at the large-chunk geometry: 2 reports x all terms
@@ -342,7 +400,10 @@ def probe() -> str:
     # 0.08 = the old 0.05 bf16 budget plus fp8 per-128-group
     # quantization error on the dequantized merge_quant output
     result["pass"] = (worst < 0.08 and dis_su == 0 and dis_ks == 0
-                      and dis_multi == 0 and dis_mixed == 0)
+                      and dis_multi == 0 and dis_mixed == 0
+                      and dis_fast == 0 and dis_fast_uni == 0
+                      and dis_fast_multi == 0 and raised
+                      and mixed_raised)
     return _write(result, "probe")
 
 
@@ -439,6 +500,120 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
         report["runs"].append(row)
         print(f"[m1_filter] {row}", flush=True)
     return _write(report, "filter")
+
+
+# ------------------------------------------- single-stage fast path
+
+@app.function(timeout=3600, **GPU_KW)
+def filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
+    """Issue #6: the single-stage fast path. One boolean question, no
+    store: no later stage reads any document's KV, so the arena
+    alloc, the per-layer KV scatter, and the paged attention read
+    are skipped - [document | question] packs as one causal segment
+    and admission runs on the token budget alone.
+
+    A/B in one cell: arena_writes=True is the configured baseline
+    (the same documents through the arena on the production unified
+    path), arena_writes=False the fast path. Same corpus, same
+    budget, both paths warmed.
+
+    PREDICTION, from measured constants: ~3.23M fresh tokens (3.20M
+    corpus + 10k one-question suffixes). The unified filter path ran
+    8.45 us/token at the five-stage geometry
+    (results/attention_paths.json), which puts the arena run near
+    27-28 s. The fast path removes the per-layer scatter of every
+    current token (the fused kv_row_scatter), the paged-KV
+    indirection inside the attention read, and the per-chunk
+    block-table build and page alloc on the CPU (mostly hidden
+    behind the GPU): a 2-5% cut. That is smaller than the 6.3% the
+    same switch bought on the retired split path, because unified
+    already dropped call B and the LSE merge - the two largest
+    things the old fast path skipped.
+
+    Answers: the kernel-parity cells measured the unified paged
+    causal call bit-identical to the contiguous causal call
+    (results/attention_parity.json, max_abs 0.0 on every case), and
+    the fast path IS the contiguous call over the same
+    [document | question] rows at the same positions. The gate is
+    therefore exact: 0 answer flips between the two paths. (The old
+    split-path version of this cell needed a stock-vLLM referee
+    because its two paths differed by the LSE-merge rounding;
+    unified removed that difference, so the referee and the
+    re-chunked noise-floor control are gone with it.)
+    """
+    import time
+
+    from corpus import build_corpus
+    from quail.executor.attention import FILTER_ATTENTION
+    from quail.executor.loop import run_filter, warm_kernels
+
+    (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
+     exec_budget, arena_tok) = _boot(FILTER_ATTENTION)
+    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs,
+                                          n_filters=1)
+    corpus_tokens = sum(len(b) for b in body_ids)
+    report = dict(
+        cell="m1_filter1", n_docs=n_docs, corpus_tokens=corpus_tokens,
+        exec_budget=exec_budget, arena_tokens=arena_tok, kv="bf16",
+        attention_mode=FILTER_ATTENTION,
+        prediction=("arena ~27-28 s at the measured 8.45 us/token; "
+                    "fast 2-5% under it; 0 answer flips (the paged "
+                    "causal call is bit-identical to the contiguous "
+                    "one)"),
+        runs=[])
+    print(f"[m1_filter1] {report['prediction']}", flush=True)
+
+    # warm_kernels runs both attention modes through the arena path
+    # and, for this single-stage query, the fast path too - both
+    # measured paths compile before the first rep
+    t_warm = time.perf_counter()
+    with torch.inference_mode():
+        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
+                     q_ids, exec_budget)
+    torch.cuda.synchronize()
+    kernel_cache.commit()
+    report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
+    print(f"[m1_filter1] warmup {report['warmup_s']} s", flush=True)
+
+    modes = (("arena", True), ("no_arena", False))
+    last = {}
+    for rep in range(reps):
+        for mode, aw in modes:
+            torch.cuda.reset_peak_memory_stats()
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                answers, spans, tokens = run_filter(
+                    torch, arena, pipeline, async_ans, body_ids,
+                    q_ids, exec_budget, arena_writes=aw)
+            torch.cuda.synchronize()
+            wall = time.perf_counter() - t0
+            last[mode] = answers
+            row = dict(
+                rep=rep, mode=mode, wall=round(wall, 2),
+                fresh_tokens=tokens, tok_s=round(tokens / wall, 1),
+                answered=sum(map(len, answers.values())),
+                true=sum(bit for r in answers.values() for bit in r),
+                wrong=sum(bit != int(flags[d][0])
+                          for d, r in answers.items() for bit in r),
+                chunks=len(spans),
+                gpu_s=round(sum(e0.elapsed_time(e1)
+                                for _, e0, e1 in spans) / 1e3, 2),
+                peak_gib=round(
+                    torch.cuda.max_memory_allocated() / 2**30, 2))
+            report["runs"].append(row)
+            print(f"[m1_filter1] {row}", flush=True)
+    best = {mode: min(r["wall"] for r in report["runs"]
+                      if r["mode"] == mode)
+            for mode, _ in modes}
+    report["best_wall"] = best
+    report["saved_s"] = round(best["arena"] - best["no_arena"], 2)
+    flips = sum(last["arena"][d] != last["no_arena"][d]
+                for d in range(n_docs))
+    report["flips"] = flips
+    print(f"[m1_filter1] flips {flips}, saved {report['saved_s']} s",
+          flush=True)
+    report["pass"] = flips == 0
+    return _write(report, "filter1")
 
 
 # --------------------------------------------------------------- join
@@ -976,6 +1151,12 @@ def run_probe(out: str = "results/m1_probe.json"):
 def run_filter(n_docs: int = 10000, reps: int = 2, budget: int = 0,
                out: str = "results/m1_filter.json"):
     _save(filter_run.remote(n_docs, reps, budget), out)
+
+
+@app.local_entrypoint()
+def run_filter1(n_docs: int = 10000, reps: int = 2,
+                out: str = "results/m1_filter1.json"):
+    _save(filter1_run.remote(n_docs, reps), out)
 
 
 @app.local_entrypoint()

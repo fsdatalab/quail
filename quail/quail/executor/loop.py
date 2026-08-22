@@ -152,8 +152,17 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 anchor KV after stage 1
 
     A fresh prefix is scattered into its pages when the key owns pages
-    (allocated by the caller before packing); a fresh group without
-    pages runs self-attention only (the probe's unpacked reference).
+    (allocated by the caller before packing). A fresh group WITHOUT
+    pages touches no arena state at all: its [prefix | suffix] packs
+    as ONE causal segment, so the suffix reads the prefix through
+    call A alone - no scatter, no cross read (the single-stage
+    filter's fast path; the probe's unpacked reference is the
+    zero-suffix case of it). That only works with at most one suffix:
+    two suffixes in one segment would attend to each other, and
+    per-suffix prefix copies are the unshared reference this path
+    exists to avoid. Under unified attention a chunk is either all
+    paged (the one paged call covers every row) or all unpaged
+    (call A covers every row); mixing the two raises.
     """
     t = time.perf_counter() if timing is not None else 0.0
     ids, pos, cu_a, finals = [], [], [0], []
@@ -169,9 +178,16 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         paged = key in arena.accounting.owned
         row0 = len(ids)
         if fresh:
+            if not paged and len(g["suffixes"]) > 1:
+                raise ValueError(
+                    f"group {key!r}: an unpaged fresh group packs "
+                    f"[prefix | suffix] as one causal segment, which "
+                    f"only one suffix may join - allocate pages or "
+                    f"split the group")
             ids.extend(g["prefix"])
             pos.extend(range(len(g["prefix"])))
-            cu_a.append(len(ids))
+            if paged or not g["suffixes"]:
+                cu_a.append(len(ids))
             if paged:
                 kv_writes.append((key, row0, row0 + len(g["prefix"]),
                                   0))
@@ -198,12 +214,18 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             cross_used.append(f)
             max_q = max(max_q, s_count)
         if attention_mode == "unified":
-            if len(g["suffixes"]) != 1 or not paged:
+            if paged:
+                if len(g["suffixes"]) != 1:
+                    raise ValueError(
+                        "unified attention requires exactly one "
+                        "suffix per paged group")
+                logical_start = 0 if fresh else f
+                unified_specs.append(
+                    (key, row0, len(ids), logical_start, f + s_count))
+            elif not fresh:
                 raise ValueError(
-                    "unified attention requires one paged suffix per group")
-            logical_start = 0 if fresh else f
-            unified_specs.append(
-                (key, row0, len(ids), logical_start, f + s_count))
+                    "unified attention requires pages for a kept "
+                    "group - an unpaged kept group has no KV to read")
 
     t = _tick(timing, "pack_py", t)
     cross = None
@@ -231,7 +253,12 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # row pairs: the attention pass scatters them with a single kernel
     # launch per layer (kv_row_scatter)
     unified = None
-    if attention_mode == "unified":
+    if attention_mode == "unified" and unified_specs:
+        if len(unified_specs) != len(layout):
+            raise ValueError(
+                "a unified chunk cannot mix paged and unpaged "
+                "groups: the one paged call covers every row or "
+                "none (the fast path packs whole chunks unpaged)")
         keys = []
         used = []
         cu_full = [0]
@@ -627,9 +654,17 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
     original_mode = pipeline.attention_mode
     for mode in dict.fromkeys((FILTER_ATTENTION, JOIN_ATTENTION)):
         pipeline.attention_mode = mode
+        # arena_writes=True keeps the warmup on the paged machinery
+        # (scatter, paged reads, the merge kernel) even when the
+        # query itself will take the single-stage fast path
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
-                   question_ids, budget)
+                   question_ids, budget, arena_writes=True)
     pipeline.attention_mode = original_mode
+    if len(question_ids) == 1:
+        # the fast path's own shape: one causal segment per group,
+        # no paging, under the session's configured mode
+        run_filter(torch, arena, pipeline, async_ans, warm_docs,
+                   question_ids, budget, arena_writes=False)
 
 
 # ---------------------------------------------------------- the filter
@@ -650,7 +685,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, trace=None, store=None,
                store_hash=None, store_min_tokens=1, stats=None,
                store_ids=None, timing=None, pinned=True,
-               limit=None):
+               limit=None, arena_writes=None):
     """The filter chain on the packed executor: continuous admission,
     survivor priority, pages freed on FALSE or after the last stage.
 
@@ -678,6 +713,15 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     pinned: pass False to build chunk tensors with pageable blocking
     copies (the pre-#12 path; the ablation ladder's staging rung).
 
+    arena_writes: None picks per query shape. A single-stage query
+    with no store has no later reader of any document's KV, so the
+    arena alloc, the per-layer KV scatter, and the paged attention
+    read are skipped: [document | question] packs as one causal
+    segment and admission runs on the token budget alone. True
+    forces the arena path (the before/after measurement); False
+    with multiple stages or a store raises, because store.save and
+    later stages read the arena.
+
     Returns (answers, spans, tokens): answers[d] = 0/1 list up to the
     first FALSE (gated); spans and tokens as in run_join.
     """
@@ -688,17 +732,28 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     def skey(d):
         return (store_hash, store_ids[d] if store_ids else d)
 
+    if arena_writes is None:
+        arena_writes = len(question_ids) > 1 or store is not None
+    elif not arena_writes and (len(question_ids) > 1
+                               or store is not None):
+        # a later stage re-reads the KV; store.save copies it out of
+        # the arena - both need the pages this switch skips
+        raise ValueError("arena_writes=False needs a single stage and "
+                         "no store")
     restored = set()
     if store is not None:
         restored = {d for d in range(len(doc_ids))
                     if skey(d) in store}
     unified = pipeline.attention_mode == "unified"
-    # the longest question tail a document's capacity pages must
-    # hold; max(int, *empty) raised TypeError on single-stage queries
-    temp_tail = max(len(q) - p for q in question_ids) if unified else 0
+    # under unified attention a suffix's KV occupies cache slots for
+    # the length of its chunk, so a document's pages must also cover
+    # the longest question tail
+    temp_tail = max(len(q) - p for q in question_ids) \
+        if unified and arena_writes else 0
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
-        arena_pages=arena.accounting.n_pages,
+        arena_pages=(arena.accounting.n_pages if arena_writes
+                     else None),
         page_tokens=arena.accounting.page_tokens,
         kept_extra_tokens=p + temp_tail, restored=restored, limit=limit)
     spans, tokens = [], 0
@@ -782,7 +837,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                 drain_saves(block=True)
             continue
         for doc, stage, fresh in groups:
-            if fresh:
+            if fresh and arena_writes:
                 logical = len(doc_ids[doc]) + p
                 got = arena.alloc(
                     doc, logical,
