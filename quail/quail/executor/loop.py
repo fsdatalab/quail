@@ -550,7 +550,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     free_if_owned(a)
             else:
                 for a in idx:
-                    if not any(ans[j][a]):
+                    if not any(ans[j].get(a, [])):
                         free_if_owned(a)
     drain_saves(block=True)
     return ans, spans, tokens
@@ -608,7 +608,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
     q_max = max(len(q) for q in question_ids)
     warm_docs, used = [], 0
     i = 0
-    while True:
+    while doc_ids:
         d = doc_ids[i % len(doc_ids)]
         if used + len(d) + q_max > budget:
             break
@@ -818,4 +818,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     while outstanding:
         report(outstanding.pop(0))
     drain_saves(block=True)
+    for doc in sched.stranded():
+        if doc in arena.accounting.owned:
+            arena.free_key(doc)
     return sched.answers, spans, tokens

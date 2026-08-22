@@ -137,7 +137,7 @@ class PinnedStore:
                        for _ in range(n_slabs)]
         self.extents = {}       # key -> (slab, offset, tokens)
         self.stream = torch.cuda.Stream()
-        self._alloc_staging(max_doc_tokens)
+        self._alloc_staging(min(max_doc_tokens, self.STAGING_BUDGET_TOKENS))
 
     def __contains__(self, key) -> bool:
         return key in self.extents

@@ -206,7 +206,7 @@ def _execute_single(state, payload: dict) -> dict:
     out_filters = {}
     store_stats = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
-    limit = payload.get("limit")
+    limit = payload.get("limit") if not payload["joins"] else None
 
     t0 = time.perf_counter()
     with torch.inference_mode():

@@ -45,6 +45,7 @@ FORBIDDEN = (
     (exp.Union, "UNION"),
     (exp.Except, "EXCEPT"),
     (exp.Intersect, "INTERSECT"),
+    (exp.Offset, "OFFSET"),
 )
 
 # one option surface: anchor is rejected after parsing when the

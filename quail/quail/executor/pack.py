@@ -239,6 +239,7 @@ class FilterAdmission:
         self.in_flight = set()     # docs inside a launched chunk
         self.resident = {}         # doc -> pages held
         self.answers = {}          # doc -> [0/1 per answered stage]
+        self._stranded = []        # docs drained from ready by limit
 
     # ---- chunk building ------------------------------------------------
 
@@ -326,9 +327,16 @@ class FilterAdmission:
             while self.ready:
                 doc, _ = self.ready.popleft()
                 self.free_pages += self.resident.pop(doc)
+                self._stranded.append(doc)
             return True
         return (not self.pending and not self.ready
                 and not self.in_flight)
+
+    def stranded(self):
+        """Docs drained from the ready queue by an early limit exit.
+        Their scheduler pages are freed; the caller must free their
+        arena keys."""
+        return list(self._stranded)
 
     def survivors(self):
         """Documents that answered TRUE at every stage."""
