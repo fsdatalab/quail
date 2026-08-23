@@ -12,16 +12,21 @@ milestone and reopens the design's executor section.
            reference walls predate the assignment and their bands
            hold.
 
-  filter   the committed 10k-document five-filter workload
-           (filter_cells_bf16.json is the bf16-KV reference: rewind
-           wall ~38.0 s, survivors 1873, answered 23381).
-           PREDICTION, stated before the run: ~3.84M fresh tokens at
-           the 121k tok/s packed rate -> ~32 s, survivors near 1873.
+  filter   the committed 10k-document five-filter workload on the
+           TRUE/FALSE corpus (re-banked 2026-08-23; the gate counts
+           match results/attention_paths.json: survivors 4645,
+           0 wrong of 40,052 answered, ~4.10M fresh tokens). The
+           committed results/m1_filter.json still holds the YES/NO-
+           era run (survivors 1807) that the 2026-08-18 reports pin.
+           PREDICTION: ~35 s wall, survivors 4645 exactly, 0 wrong.
 
-  join     the committed 256k-pair 2-way BioDEX join
-           (join2way.json: packed wall 103.5-103.6 s, 8,417,425
-           fresh tokens, 77 chunks, 177,831 TRUE).
-           PREDICTION: within 10% of 103.6 s, yes count near 177,831.
+  join     the committed 256k-pair 2-way BioDEX join (join2way.json
+           packed wall 103.5-103.6 s, 8,417,425 fresh tokens, 77
+           chunks). The TRUE/FALSE corpus conversion and the
+           merge_quant join path moved the TRUE count from 177,831
+           to 254,208 (re-banked 2026-08-23); the committed
+           results/m1_join.json still holds the YES/NO-era run.
+           PREDICTION: within 10% of 103.6 s, yes count near 254,208.
 
 Run from the quail/ directory (tee to a file per house rule):
 
@@ -369,12 +374,12 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
         cell="m1_filter", n_docs=n_docs, corpus_tokens=corpus_tokens,
         n_filters=len(q_ids), exec_budget=exec_budget,
         arena_tokens=arena_tok, kv="bf16",
-        prediction=("~3.84M fresh tokens at the 121k tok/s packed "
-                    "rate -> ~32 s; committed bf16 chain reference "
-                    "38.0 s, survivors 1873, answered 23381"),
-        reference=dict(artifact="filter_cells_bf16.json",
-                       wall_s=38.0, survivors=1873, answered=23381,
-                       wrong=6229),
+        prediction=("~4.10M fresh tokens -> ~35 s; survivors 4645, "
+                    "0 wrong of 40052 answered (TRUE/FALSE corpus, "
+                    "re-banked 2026-08-23)"),
+        reference=dict(artifact="attention_paths.json split rows",
+                       wall_s=34.6, survivors=4645, answered=40052,
+                       wrong=0),
         runs=[])
     print(f"[m1_filter] {report['prediction']}", flush=True)
 
@@ -460,9 +465,11 @@ def join_run(n_reports: int = 100, reps: int = 2) -> str:
         arena_tokens=arena_tok, kv="bf16",
         prediction=("within 10% of the committed packed 103.6 s; "
                     "~8.42M fresh tokens, ~77 chunks, yes near "
-                    "177,831"),
-        reference=dict(artifact="join2way.json", wall_s=103.6,
-                       fresh_tokens=8417425, chunks=77, yes=177831),
+                    "254,208 (TRUE/FALSE corpus, merge_quant)"),
+        reference=dict(artifact="join2way.json wall; yes re-banked "
+                       "2026-08-23 on the TRUE/FALSE corpus "
+                       "(merge_quant)", wall_s=103.6,
+                       fresh_tokens=8417425, chunks=77, yes=254208),
         lengths=dict(
             prefix_mean=round(sum(map(len, prefixes)) / n_reports, 1),
             suffix_mean=round(sum(len(s) for s in suffixes)
