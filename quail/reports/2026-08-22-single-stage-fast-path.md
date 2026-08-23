@@ -111,23 +111,36 @@ The referee and the re-chunked noise-floor control are gone with it.
 
 ## Measured
 
-Not yet measured. The session that authored this stack cannot reach
-Modal: its egress proxy does not carry gRPC, which the Modal client
-requires. Two commands settle it (from `quail/`, on this branch):
+Probe passed every gate (results/m1_probe.json):
 
-    uv run modal run tests/gpu/milestone1.py::run_probe   2>&1 | tee results/m1_probe.log
-    uv run modal run tests/gpu/milestone1.py::run_filter1 2>&1 | tee results/m1_filter1.log
+- `fast_path_disagreements`: 0
+- `fast_path_unified_disagreements`: 0
+- `fast_path_multi_group_disagreements`: 0
+- `fast_path_multi_suffix_raises`: true
+- `unified_mixed_chunk_raises`: true
+- Rate at the large-chunk geometry: 86,320 tok/s
 
-then
+Filter1 A/B (results/m1_filter1.json), 10,000 documents, 3,046,895
+corpus tokens + 460,000 question tokens = 3,506,895 fresh tokens,
+32 chunks, bf16 KV, unified attention, best of 2 repetitions:
 
-    uv run --with matplotlib python reports/make_single_stage_fast_path_plots.py
+| path       | wall (s) | tok/s   | wrong | peak GiB |
+|------------|----------|---------|-------|----------|
+| arena      |    28.65 | 122,404 |     0 |    61.43 |
+| fast path  |    28.30 | 123,930 |     0 |    61.42 |
 
-and fill this section from `results/m1_probe.json` and
-`results/m1_filter1.json`. The probe must pass every gate before the
-filter1 walls count.
+- **Saved**: 0.35 s (1.2%)
+- **Answer flips**: 0 (bit-identical, as predicted)
+- **Wrong answers**: 0 on every run
 
-Figure (produced by the plot script after the run):
-plots/single_stage_fast_path.png
+The direction matches the prediction: the fast path is faster and the
+answers are identical. The magnitude (1.2%) is below the predicted
+2-5%, which is consistent with the report's own reasoning: unified
+already removed call B and the LSE merge, leaving only the scatter
+and paged indirection to skip. Those two are a small fraction of the
+total work at this geometry (32 chunks of 110k tokens, 36 layers).
+
+Figure: plots/single_stage_fast_path.png
 
 ## What would falsify the prediction
 
