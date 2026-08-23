@@ -972,6 +972,63 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
 
 
 @app.function(timeout=5400, **GPU_KW)
+def baseline_filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
+    """Stock vLLM on the single-stage filter workload (one question,
+    10,000 documents): one request per document, prefix caching on,
+    bf16 KV, document-cap admission.
+
+    PREDICTION: 3.5M fresh tokens (no prefix sharing - each document
+    is unique). At the five-stage baseline's measured ~101k fresh
+    tok/s, ~34-36 s. Single-stage has less scheduling overhead
+    (10k requests vs 23k) but no cross-stage prefix sharing."""
+    from baselines.stock import run_filter_chain
+    from corpus import MODEL, build_corpus
+    from vllm import SamplingParams
+    from quail.executor.loop import true_false_ids
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs,
+                                          n_filters=1)
+    true, false = true_false_ids(tokenizer)
+
+    from baselines.stock_boot import time_llm_boot
+    llm, boot = time_llm_boot(
+        model=MODEL, max_num_batched_tokens=25_305,
+        max_num_seqs=2648, gpu_memory_utilization=0.92,
+        enable_prefix_caching=True, disable_log_stats=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1,
+                              min_tokens=1,
+                              allowed_token_ids=sorted(true | false))
+    engine = llm.llm_engine
+    budget = 374_891
+    prediction = ("~34-36 s (3.5M fresh tokens at the five-stage "
+                  "baseline's ~101k tok/s)")
+    report = dict(cell="baseline_filter1", n_docs=n_docs,
+                  submission="separate requests per document, "
+                             "document-cap admission",
+                  budget_tokens=budget, step_tokens=25_305,
+                  prediction=prediction,
+                  boot=boot, boot_s=boot["boot_s"],
+                  runs=[])
+    print(f"\n[baseline_filter1] {prediction}\n", flush=True)
+    print(f"[baseline_filter1] boot {boot}", flush=True)
+    run_filter_chain(engine, sampling, body_ids[:64], q_ids, budget,
+                     tag="w", true_ids=true)
+    for rep in range(reps):
+        r = run_filter_chain(engine, sampling, body_ids, q_ids,
+                             budget, tag=f"r{rep}", true_ids=true)
+        row = dict(rep=rep, wall=round(r["wall"], 2),
+                   requests=r["requests"],
+                   fresh_tokens=r["prompt_tokens"] - r["cached_tokens"],
+                   survivors=len(r["survivors"]))
+        report["runs"].append(row)
+        print(f"[baseline_filter1] {row}", flush=True)
+    return _write(report, "baseline_filter1")
+
+
+@app.function(timeout=5400, **GPU_KW)
 def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                       reps: int = 2) -> str:
     """Stock vLLM on the dispatch gate's 72k-pair synthetic join:
@@ -1198,6 +1255,12 @@ def run_filter_store(n_docs: int = 5000, capacity_gb: int = 250,
 def run_baseline_filter(n_docs: int = 10000, reps: int = 2,
                         out: str = "results/baseline_filter.json"):
     _save(baseline_filter_run.remote(n_docs, reps), out)
+
+
+@app.local_entrypoint()
+def run_baseline_filter1(n_docs: int = 10000, reps: int = 2,
+                         out: str = "results/baseline_filter1.json"):
+    _save(baseline_filter1_run.remote(n_docs, reps), out)
 
 
 @app.local_entrypoint()
