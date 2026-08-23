@@ -208,6 +208,7 @@ def _execute_single(state, payload: dict) -> dict:
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
     limit = payload.get("limit")
 
+    filter_writes = payload["filter_arena_writes"]
     t0 = time.perf_counter()
     with torch.inference_mode():
         pipeline.attention_mode = FILTER_ATTENTION
@@ -222,7 +223,8 @@ def _execute_single(state, payload: dict) -> dict:
                             if store_cfg else None),
                 store_min_tokens=(store_cfg["min_doc_tokens"]
                                   if store_cfg else 1),
-                stats=stats, limit=limit)
+                stats=stats, limit=limit,
+                arena_writes=filter_writes[alias])
             store_stats[alias] = stats
             total_tokens += tokens
             out_filters[alias] = {int(d): row
@@ -429,6 +431,7 @@ def _child_filters(state, sub):
                boot=boot)
     pre = sub.get("pre_ids") or []
     limit = sub.get("limit")
+    filter_writes = sub["filter_arena_writes"]
     t0 = _time.perf_counter()
     with torch.inference_mode():
         state["pipeline"].attention_mode = FILTER_ATTENTION
@@ -445,7 +448,8 @@ def _child_filters(state, sub):
                             if store_cfg else None),
                 store_min_tokens=(store_cfg["min_doc_tokens"]
                                   if store_cfg else 1),
-                stats=stats, store_ids=index, limit=limit)
+                stats=stats, store_ids=index, limit=limit,
+                arena_writes=filter_writes[alias])
             out["store"][alias] = stats
             out["fresh_tokens"] += tokens
             out["filters"][alias] = {index[d]: row

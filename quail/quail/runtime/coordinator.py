@@ -43,6 +43,7 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
         sub = {key: payload[key] for key in COMMON_KEYS}
         sub.update(docs=docs, doc_index=index,
                    filters=payload["filters"],
+                   filter_arena_writes=payload["filter_arena_writes"],
                    store=payload.get("store"),
                    store_flush=payload.get("store_flush", False),
                    worker=w, workers=k)

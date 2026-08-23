@@ -74,6 +74,36 @@ def test_b3_ordering_by_cost_vs_as_written(catalog):
     assert [s["selectivity"] for s in chain["stages"]] == list(sels)
 
 
+def test_filter_arena_writes_decision(catalog):
+    # one stage, no store: nothing reads the KV again - writes off,
+    # visible in the operator, the remark, and explain()
+    single = _five_filter_plan(catalog, (0.9,))
+    plan = plan_query(single, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [400] * 100})
+    chain = next(op for op in plan.operators
+                 if op["op"] == "FilterChain")
+    assert chain["arena_writes"] is False
+    assert any("arena writes off" in r for r in plan.remarks)
+    assert "arena_writes=False" in explain(single, plan)
+
+    # a second stage re-reads survivors' KV
+    plan = plan_query(_five_filter_plan(catalog, (0.9, 0.9)),
+                      model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [400] * 100})
+    chain = next(op for op in plan.operators
+                 if op["op"] == "FilterChain")
+    assert chain["arena_writes"] is True
+    assert not any("arena writes off" in r for r in plan.remarks)
+
+    # store.save copies KV out of the arena, even with one stage
+    plan = plan_query(single, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [400] * 100},
+                      store=StoreSpec(read_bw=55e9, warm=False))
+    chain = next(op for op in plan.operators
+                 if op["op"] == "FilterChain")
+    assert chain["arena_writes"] is True
+
+
 def test_default_rule_falls_back_without_selectivity(catalog):
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_filter(prompt("a: {0}", col("r.review")))

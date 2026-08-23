@@ -574,7 +574,11 @@ workload by `attention_mode` (issue #24):
   suffix beyond the document's logical length), then a single
   `causal=True` call with a block table covers retained plus current
   KV. No second call, no merge. Requires exactly one suffix per
-  group, which the filter shape always satisfies.
+  paged group, which the filter shape always satisfies. A chunk
+  whose groups own no pages at all (the single-stage fast path,
+  section 5.6) runs one plain varlen causal call instead - same
+  math, no scatter, no paged read; a chunk cannot mix paged and
+  unpaged groups.
 - **`merge_quant`** - the two-call pattern below, with the LSE merge
   and the FP8 quantization for o_proj fused into one Triton kernel
   (`merge_attn_quant`), skipping the intermediate BF16 tensor.
@@ -771,6 +775,37 @@ that runs until `FilterAdmission.done()`:
    freed immediately; survivors advance to their next stage.
 5. Documents leaving their last stage (or failing) are saved to the
    KV store if they meet the length threshold.
+
+Single-stage queries (one question, no store) skip the arena
+entirely: no later stage reads any document's KV, so the alloc, the
+per-layer KV scatter, and the paged attention read serve no one.
+The planner makes the call, and only the planner - the FilterChain
+operator carries an `arena_writes` field (False exactly when one
+stage runs with no store), it shows in `explain()`, and the payload
+forwards it to `run_filter`. `run_filter` requires the argument and
+never derives it; direct callers (warmups, calibration, the GPU
+cells, the ablation scripts) state their intent explicitly, and
+False against a later reader raises. Each [document | question]
+packs as ONE causal segment and admission runs on the token budget
+alone (`FilterAdmission` with `arena_pages=None`).
+
+This is strictly less work than stock vLLM does for the same
+prompt. Stock vLLM also writes every prompt token's KV into its
+paged cache, and its FA3 prefill reads K and V back through the
+block table - it has to, because the decode steps that generate the
+answer read that KV afterward. Quail's filter answers come off the
+final-position hidden states of the same forward pass (the
+`Answerer` readout), so no decode step exists and the KV write has
+no reader at all. Same attention arithmetic, minus the cache write
+and the block-table indirection.
+
+The two quail paths answer identically: the kernel-parity cells
+measured the unified paged causal call bit-identical to the
+contiguous causal call the fast path runs
+(`results/attention_parity.json`), and the m1_filter1 cell gates on
+0 answer flips across the full 10,000-document workload (the cell
+also records the A/B walls; see
+`reports/2026-08-22-single-stage-fast-path.md`).
 
 **`run_join`** (`loop.py:216`): the join driver. The pair list is
 pre-planned by `pack_stream`, then chunks are launched in order.

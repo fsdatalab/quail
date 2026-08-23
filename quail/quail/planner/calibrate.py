@@ -127,9 +127,11 @@ def measure(model: ModelSpec, device: DeviceSpec,
         body_ids = [stream[i * h:(i + 1) * h] for i in range(n_docs)]
         t0 = time.perf_counter()
         with torch.inference_mode():
+            # one stage, no store: the production shape for this
+            # query is the fast path, so the constants measure it
             _, spans, tokens = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
-                exec_budget)
+                exec_budget, arena_writes=False)
         torch.cuda.synchronize()
         wall = time.perf_counter() - t0
         gpu_s = sum(e0.elapsed_time(e1) for _, e0, e1 in spans) / 1e3

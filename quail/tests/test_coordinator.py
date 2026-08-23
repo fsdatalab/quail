@@ -16,6 +16,7 @@ def payload():
         docs={"r": [[i] * (10 + i) for i in range(6)],
               "p": [[i] * 5 for i in range(4)]},
         filters={"r": [[7, 7]]},
+        filter_arena_writes={"r": True},
         joins=[dict(anchor="r", partners=["p"], semantics="full",
                     labels={"p": [2]}, frame=[8], tail=[3])],
         store=None, workers=2,
@@ -137,6 +138,14 @@ def test_filter_round_carries_limit():
     subs = filter_round_payloads(p, p["shards"], 2)
     for s in subs:
         assert s["limit"] == 3
+
+
+def test_filter_round_carries_arena_writes():
+    p = payload()
+    p["filter_arena_writes"] = {"r": False}
+    subs = filter_round_payloads(p, p["shards"], 2)
+    for s in subs:
+        assert s["filter_arena_writes"] == {"r": False}
 
 
 def test_merge_join_round_disjoint_anchors():
