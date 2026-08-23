@@ -69,7 +69,7 @@ def execute(payload: dict) -> dict:
     import torch.nn.functional as F
 
     from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
+    from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
                                      run_join, warm_kernels)
@@ -105,7 +105,8 @@ def execute(payload: dict) -> dict:
                         dtype=torch.bfloat16)
         boot["arena_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        pipeline = Pipeline(model, arena)
+        pipeline = Pipeline(model, arena,
+                            attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
         booted = dict(model=model, arena=arena, pipeline=pipeline,
                       warmed=False)
@@ -169,6 +170,7 @@ def _execute_single(state, payload: dict) -> dict:
     store, torch, F."""
     import torch.nn.functional as F  # noqa: F401 (state carries it)
 
+    from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
     from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import AsyncAnswers, run_filter, run_join
 
@@ -208,6 +210,7 @@ def _execute_single(state, payload: dict) -> dict:
 
     t0 = time.perf_counter()
     with torch.inference_mode():
+        pipeline.attention_mode = FILTER_ATTENTION
         for alias, qids in payload["filters"].items():
             stats = {}
             answers, _, tokens = run_filter(
@@ -229,6 +232,7 @@ def _execute_single(state, payload: dict) -> dict:
                 if len(row) == len(qids) and all(row))
 
         out_joins = []
+        pipeline.attention_mode = JOIN_ATTENTION
         for group in _stage_groups(payload["joins"]):
             anchor_alias = group[0]["anchor"]
             anchors_glob = list(survivors[anchor_alias])
@@ -331,7 +335,7 @@ def _child_boot(state, sub):
     import torch.nn.functional as F
 
     from quail.executor.arena import KVArena
-    from quail.executor.attention import Pipeline
+    from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import AsyncAnswers, warm_kernels
     from quail.executor.model import load_model
@@ -357,7 +361,8 @@ def _child_boot(state, sub):
                         dtype=torch.bfloat16)
         boot["arena_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        pipeline = Pipeline(model, arena)
+        pipeline = Pipeline(model, arena,
+                            attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
         state.update(torch=torch, F=F, model=model, arena=arena,
                      pipeline=pipeline, spec=spec,
@@ -410,6 +415,7 @@ def _child_boot(state, sub):
 def _child_filters(state, sub):
     import time as _time
 
+    from quail.executor.attention import FILTER_ATTENTION
     from quail.executor.loop import run_filter
 
     _child_boot(state, sub)
@@ -425,6 +431,7 @@ def _child_filters(state, sub):
     limit = sub.get("limit")
     t0 = _time.perf_counter()
     with torch.inference_mode():
+        state["pipeline"].attention_mode = FILTER_ATTENTION
         for alias, qids in sub["filters"].items():
             stats = {}
             index = sub["doc_index"][alias]
@@ -456,6 +463,7 @@ def _child_filters(state, sub):
 def _child_joins(state, sub):
     import time as _time
 
+    from quail.executor.attention import JOIN_ATTENTION
     from quail.executor.loop import run_join
 
     _child_boot(state, sub)
@@ -470,6 +478,7 @@ def _child_joins(state, sub):
     store_stats = {}
     t0 = _time.perf_counter()
     with torch.inference_mode():
+        state["pipeline"].attention_mode = JOIN_ATTENTION
         for group in _stage_groups(sub["joins"]):
             stage_suffixes, tuple_globs = [], []
             for j in group:

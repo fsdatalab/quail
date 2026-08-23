@@ -1,0 +1,207 @@
+{
+  "cell": "attention_paths",
+  "n_docs": 10000,
+  "reps": 2,
+  "exec_budget": 110376,
+  "arena_tokens": 313206,
+  "paths": {
+    "split": "current two-call attention, BF16 merge, separate quant",
+    "merge_quant": "two-call attention, fused merge and FP8 quant",
+    "unified": "one causal paged attention call, separate quant"
+  },
+  "predictions": {
+    "split": "the committed A3 rate",
+    "merge_quant": "0.3 to 0.5 us/token faster than split",
+    "unified": "0.3 to 0.7 us/token faster than split"
+  },
+  "runs": {
+    "split": [
+      {
+        "mode": "split",
+        "rep": 0,
+        "wall": 37.003,
+        "fresh_tokens": 4097571,
+        "us_per_token": 9.03,
+        "answered": 40052,
+        "survivors": 4645,
+        "wrong": 0,
+        "chunks": 99,
+        "gpu_s": 36.895,
+        "peak_gib": 61.42,
+        "cpu_phase_s": {
+          "alloc": 0.803,
+          "drain_saves": 0.0,
+          "forward_launch": 32.405,
+          "n_chunks": 99,
+          "next_chunk": 0.026,
+          "pack": 1.866,
+          "pack_blocktable": 0.27,
+          "pack_cross": 0.079,
+          "pack_h2d": 0.504,
+          "pack_kv": 0.623,
+          "pack_py": 0.196,
+          "report_rest": 0.089,
+          "report_wait": 0.651,
+          "submit": 1.155
+        }
+      },
+      {
+        "mode": "split",
+        "rep": 1,
+        "wall": 36.84,
+        "fresh_tokens": 4097571,
+        "us_per_token": 8.991,
+        "answered": 40052,
+        "survivors": 4645,
+        "wrong": 0,
+        "chunks": 99,
+        "gpu_s": 36.563,
+        "peak_gib": 61.42,
+        "cpu_phase_s": {
+          "alloc": 0.745,
+          "drain_saves": 0.0,
+          "forward_launch": 32.83,
+          "n_chunks": 99,
+          "next_chunk": 0.024,
+          "pack": 2.226,
+          "pack_blocktable": 0.274,
+          "pack_cross": 0.077,
+          "pack_h2d": 0.494,
+          "pack_kv": 0.628,
+          "pack_py": 0.164,
+          "report_rest": 0.084,
+          "report_wait": 0.652,
+          "submit": 0.27
+        }
+      }
+    ],
+    "merge_quant": [
+      {
+        "mode": "merge_quant",
+        "rep": 0,
+        "wall": 35.728,
+        "fresh_tokens": 4097571,
+        "us_per_token": 8.719,
+        "answered": 40052,
+        "survivors": 4645,
+        "wrong": 0,
+        "chunks": 99,
+        "gpu_s": 35.626,
+        "peak_gib": 60.58,
+        "cpu_phase_s": {
+          "alloc": 0.819,
+          "drain_saves": 0.0,
+          "forward_launch": 18.144,
+          "n_chunks": 99,
+          "next_chunk": 0.028,
+          "pack": 2.201,
+          "pack_blocktable": 0.278,
+          "pack_cross": 0.377,
+          "pack_h2d": 0.495,
+          "pack_kv": 0.653,
+          "pack_py": 0.202,
+          "report_rest": 0.091,
+          "report_wait": 14.25,
+          "submit": 0.186
+        }
+      },
+      {
+        "mode": "merge_quant",
+        "rep": 1,
+        "wall": 35.556,
+        "fresh_tokens": 4097571,
+        "us_per_token": 8.677,
+        "answered": 40052,
+        "survivors": 4645,
+        "wrong": 0,
+        "chunks": 99,
+        "gpu_s": 35.465,
+        "peak_gib": 60.58,
+        "cpu_phase_s": {
+          "alloc": 0.748,
+          "drain_saves": 0.0,
+          "forward_launch": 18.016,
+          "n_chunks": 99,
+          "next_chunk": 0.023,
+          "pack": 2.078,
+          "pack_blocktable": 0.271,
+          "pack_cross": 0.367,
+          "pack_h2d": 0.489,
+          "pack_kv": 0.626,
+          "pack_py": 0.158,
+          "report_rest": 0.086,
+          "report_wait": 14.405,
+          "submit": 0.19
+        }
+      }
+    ],
+    "unified": [
+      {
+        "mode": "unified",
+        "rep": 0,
+        "wall": 34.669,
+        "fresh_tokens": 4097571,
+        "us_per_token": 8.461,
+        "answered": 40052,
+        "survivors": 4645,
+        "wrong": 0,
+        "chunks": 102,
+        "gpu_s": 34.589,
+        "peak_gib": 61.42,
+        "cpu_phase_s": {
+          "alloc": 0.79,
+          "drain_saves": 0.0,
+          "forward_launch": 7.407,
+          "n_chunks": 102,
+          "next_chunk": 0.024,
+          "pack": 1.613,
+          "pack_cross": 0.0,
+          "pack_h2d": 0.495,
+          "pack_kv": 0.771,
+          "pack_py": 0.182,
+          "report_rest": 0.094,
+          "report_wait": 24.377,
+          "submit": 0.353
+        }
+      },
+      {
+        "mode": "unified",
+        "rep": 1,
+        "wall": 34.623,
+        "fresh_tokens": 4097571,
+        "us_per_token": 8.45,
+        "answered": 40052,
+        "survivors": 4645,
+        "wrong": 0,
+        "chunks": 102,
+        "gpu_s": 34.551,
+        "peak_gib": 61.42,
+        "cpu_phase_s": {
+          "alloc": 0.763,
+          "drain_saves": 0.0,
+          "forward_launch": 7.433,
+          "n_chunks": 102,
+          "next_chunk": 0.021,
+          "pack": 1.538,
+          "pack_cross": 0.0,
+          "pack_h2d": 0.489,
+          "pack_kv": 0.745,
+          "pack_py": 0.169,
+          "report_rest": 0.091,
+          "report_wait": 24.406,
+          "submit": 0.36
+        }
+      }
+    ]
+  },
+  "comparisons": {
+    "merge_quant": {
+      "disagreements": 0,
+      "wall_delta_s": -1.284
+    },
+    "unified": {
+      "disagreements": 0,
+      "wall_delta_s": -2.217
+    }
+  }
+}

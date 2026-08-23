@@ -19,26 +19,26 @@ asyncio anywhere.
 import time
 
 
-def _yes(out, yes_ids=None):
+def _true_bit(out, true_ids=None):
     """The answer bit. Under the one-token constrained sampler
-    (allowed_token_ids = YES|NO ids, max_tokens=1) this is a token-id
-    check, identical to the packed executor's answerer. The text scan
-    below is the fallback for unconstrained models that restate the
-    flag line or chatter - first decisive word wins."""
-    if yes_ids is not None:
+    (allowed_token_ids = TRUE|FALSE ids, max_tokens=1) this is a
+    token-id check, identical to the packed executor's answerer. The
+    text scan below is the fallback for unconstrained models that
+    restate the flag line or chatter - first decisive word wins."""
+    if true_ids is not None:
         toks = out.outputs[0].token_ids
         if toks:
-            return 1 if int(toks[0]) in yes_ids else 0
+            return 1 if int(toks[0]) in true_ids else 0
     t = out.outputs[0].text.upper()
-    iy = t.find("YES")
-    if iy < 0:
+    it = t.find("TRUE")
+    if it < 0:
         return 0
-    ino = t.find("NO")
-    return 1 if ino < 0 or iy < ino else 0
+    ifa = t.find("FALSE")
+    return 1 if ifa < 0 or it < ifa else 0
 
 
 def run_filter_chain(engine, sampling_params, body_ids, q_ids,
-                     budget_tokens, tag="q", yes_ids=None):
+                     budget_tokens, tag="q", true_ids=None):
     """The stock filter baseline, the committed client's admission
     exactly: the token budget expressed as a DOCUMENT cap of
     budget // (mean document + longest question), and a document
@@ -83,7 +83,7 @@ def run_filter_chain(engine, sampling_params, body_ids, q_ids,
             counters["prompt_tokens"] += len(out.prompt_token_ids)
             counters["cached_tokens"] += (
                 getattr(out, "num_cached_tokens", 0) or 0)
-            got = _yes(out, yes_ids)
+            got = _true_bit(out, true_ids)
             answers[(i, j + 1)] = got
             if got and j + 1 < n:
                 submit(i, j + 1)      # the document keeps its slot
@@ -97,7 +97,7 @@ def run_filter_chain(engine, sampling_params, body_ids, q_ids,
 
 
 def run_join_grouped(llm, sampling_params, prefixes, suffixes,
-                     yes_ids):
+                     true_ids):
     """The stock join baseline: one request per pair, anchor-major
     order (all of an anchor's pairs consecutive), prefix caching left
     to the engine. One generate() over the full list - the join has
@@ -108,7 +108,7 @@ def run_join_grouped(llm, sampling_params, prefixes, suffixes,
     outputs = llm.generate(pair_prompts, sampling_params,
                            use_tqdm=False)
     wall = time.time() - t0
-    answers = [1 if int(o.outputs[0].token_ids[0]) in yes_ids else 0
+    answers = [1 if int(o.outputs[0].token_ids[0]) in true_ids else 0
                for o in outputs]
     cached = sum(getattr(o, "num_cached_tokens", 0) or 0
                  for o in outputs)

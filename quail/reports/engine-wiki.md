@@ -74,8 +74,8 @@ _assemble (runtime/session.py)
 
 Quail (QUery-Aware Inference Layer) is a query engine for two
 operators over document collections: `AI_FILTER` (does this document
-satisfy a yes/no predicate?) and `AI_JOIN` (does this tuple of
-documents - two or more, all in one prompt - satisfy a yes/no
+satisfy a true/false predicate?) and `AI_JOIN` (does this tuple of
+documents - two or more, all in one prompt - satisfy a true/false
 predicate?). The model answers each predicate in a single token
 (TRUE or FALSE), constrained at decode time so no autoregressive
 generation ever runs.
@@ -103,7 +103,7 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    exists/anti gates, and the one full join (a single cross-product
    stage, however many tables it spans).
 8. The worker returns raw answer rows. The session assembles output
-   tuples from the full join's YES rows (each member checked against
+   tuples from the full join's TRUE rows (each member checked against
    its table's final survivor set), applies the projection, and
    returns a `Result`.
 
@@ -122,11 +122,11 @@ There are four operators, defined in `logical.py`:
 
 - **Scan**: reads one column of one registered provider (e.g.,
   `reviews.body`).
-- **SemanticFilter**: a conjunction of yes/no predicates over a
+- **SemanticFilter**: a conjunction of true/false predicates over a
   single scanned column. Each predicate has a prompt template, column
   references, and an optional selectivity (the fraction of documents
   expected to pass).
-- **SemanticJoin**: one yes/no predicate over a whole tuple of
+- **SemanticJoin**: one true/false predicate over a whole tuple of
   documents, one per table - the cross product of its tables
   filtered by a single prompt that holds every document at once
   (the BigQuery/Snowflake AI-join shape; never a chain of pairwise
@@ -491,7 +491,7 @@ while not done:
 When answers arrive:
 ```
 for each (doc, stage, answer):
-    if answer = NO or stage is the last stage:
+    if answer = FALSE or stage is the last stage:
         free the document's pages
     else:
         add (doc, stage+1) to the ready queue
@@ -556,9 +556,8 @@ Key operations:
 | `KVArena.rows_gpu` | `arena.py:110` | The document's row indices on device, cached per residency |
 | `KVArena.block_table` | `arena.py:125` | Build the block table for paged attention (flat on the host, one staged copy) |
 | `KVArena.paged_kv` | `arena.py:118` | Reshape the flat pool for FlashAttention's block input |
-| `KVArena.gather` | `arena.py:149` | Extract a document's contiguous K, V rows (fallback path) |
 
-### 5.3 The two-call attention pattern
+### 5.3 The attention paths and the workload assignment
 
 Each chunk is a sequence of groups: `[group_1 | group_2 | ...]`,
 where each group is `[prefix? | suffix_1 ... suffix_k]`. The prefix
@@ -566,8 +565,80 @@ is the anchor document's tokens (present only if this is the first
 time the anchor is packed). The suffixes are the partner documents
 (for joins) or the question texts (for filters).
 
-Attention runs as two calls per layer, merged by softmax state
-(`attention.py:284`):
+The Pipeline has three attention implementations, selected per
+workload by `attention_mode` (issue #24):
+
+- **`unified`** - one causal FlashAttention-3 paged call per layer.
+  Current KV (prefix and suffix) is scattered into the document's
+  arena pages first (the arena reserves capacity pages for the
+  suffix beyond the document's logical length), then a single
+  `causal=True` call with a block table covers retained plus current
+  KV. No second call, no merge. Requires exactly one suffix per
+  group, which the filter shape always satisfies.
+- **`merge_quant`** - the two-call pattern below, with the LSE merge
+  and the FP8 quantization for o_proj fused into one Triton kernel
+  (`merge_attn_quant`), skipping the intermediate BF16 tensor.
+
+These two are the only modes the engine ships. The retired third
+path, **`split`** (the two-call pattern with the merge as ~9 PyTorch
+kernels and a separate FP8 quantization), lives in
+`ablations/split_reference.py`: it is the readable reference the
+fused merge kernel is checked against, and comparison cells install
+it through the pipeline's `attention_override` hook. Its gather
+fallback (contiguous KV copies instead of paged reads) was removed
+with it - the paged read path is validated by the parity cells
+(bit-identical to a contiguous causal call on every edge case)
+instead of by a runtime fallback.
+
+The assignment, fixed in `attention.py` as `FILTER_ATTENTION =
+"unified"` and `JOIN_ATTENTION = "merge_quant"` and read by the
+worker:
+
+- **Filters run `unified`.** Fastest measured on the 10k-document
+  five-filter workload (8.45 us/token vs 8.68 merge_quant and 8.99
+  split on the TRUE/FALSE corpus; `results/attention_paths.json` -
+  where all three paths return identical, 100%-correct answers on
+  all 40,052 planted-flag questions), and bit-identical to a
+  contiguous causal FlashAttention call
+  (`results/attention_parity.json`, max_abs 0.0), so filter answers
+  match full-prompt recompute exactly
+  (`results/attention_end_to_end_parity.json`).
+- **Joins run `merge_quant`.** The unified path cannot share one
+  anchor's KV across the many partner suffixes of a chunk - each
+  pair needs its own causal view, so one causal call per pair would
+  read other pairs' scattered KV. Forcing correctness (one partner
+  per anchor per chunk) re-reads the anchor's KV once per pair and
+  is several-fold slower (`results/join_attention_paths_*.json`).
+  Between the two two-call modes, the fused merge wins (11.28 vs
+  11.86 us/token at 10x256).
+- **Every path is validated against stock vLLM on real queries**
+  (`results/accuracy_vs_stock.json`): identical token streams
+  answered by standard vLLM serving and by the packed executor.
+  Planted-flag accuracy is 100% for every path; disagreements with
+  stock are 0.22% on filters and confined to near-zero
+  TRUE/FALSE-logprob margins (unified has none above 0.875, against
+  a corpus median margin of 3.25); on joins, zero disagreements at
+  decisive margins. The residual is the kernel stack (fp8 GEMMs,
+  fused norms), not the attention path.
+- **The assignment holds on both in-scope models.** The same battery
+  on Qwen3 32B fp8 (`results/*_32b.json`, `results/*_64h.json`):
+  unified 59.94 us/token vs merge_quant 60.35 and split 61.60 on the
+  10k filter workload with identical answers across paths;
+  merge_quant ahead 4-5% on every join shape; kernel parity
+  bit-identical at 64 query heads; all paths exact against full
+  recompute; ~99% planted-key join accuracy for stock and Quail
+  alike.
+- **FlashInfer (0.6.14, in the image) was evaluated and not
+  adopted**: its paged causal kernel is 27% slower than the FA3
+  unified call on the fresh filter chunk (2.4x on the cached
+  shape), its two-call-plus-merge stack is ~35% slower than
+  merge_quant on joins, and its cascade wrapper (the shared-prefix
+  decomposition, single-anchor shapes only) is 21% slower. Nothing
+  came within the 5% adoption threshold
+  (`results/flashinfer_tuned.json`).
+
+The two-call pattern (`merge_quant`; the retired `split` reference
+runs the same two calls) runs per layer as follows (`attention.py`):
 
 **Call A** (self-attention): causal attention over the segment
 boundaries. Each prefix attends to itself; each suffix attends to
@@ -668,7 +739,8 @@ answers. This overlaps GPU compute with answer readback.
 | Function | File | What it does |
 |---|---|---|
 | `Pipeline.forward_chunk` | `attention.py:348` | Full transformer forward pass for one chunk |
-| `Pipeline.attention` | `attention.py:284` | Two-call attention with LSE merge for one layer |
+| `Pipeline.attention_merge_quant` | `attention.py` | Two calls + fused merge/FP8-quant Triton kernel (`merge_quant`, the join path) |
+| `Pipeline.attention_unified` | `attention.py` | Scatter current KV, one causal paged call (`unified`, the filter path) |
 | `Pipeline.gemm` | `attention.py:68` | DeepGEMM fp8 matrix multiply |
 | `Pipeline.quant` | `attention.py:78` | Per-token-group fp8 quantization |
 | `Pipeline.custom_silu_quant` | `attention.py:223` | Fused SiLU + multiply + fp8 quant (Triton) |
@@ -738,7 +810,7 @@ while scheduler is not done:
     groups = scheduler.next_chunk()
     if no groups:
         wait for the oldest in-flight chunk's answers
-        gate those answers (free pages for NO, enqueue next stage for YES)
+        gate those answers (free pages for FALSE, enqueue next stage for TRUE)
         continue
 
     for each fresh document in groups:
@@ -817,7 +889,7 @@ one anchor's KV in a single forward pass.
 
 Between join stages, gating drops anchors that had no surviving
 pairs. `gate()` (`pack.py:132`) returns anchor indices where any
-answer was YES. Dropped anchors' pages are freed immediately.
+answer was TRUE. Dropped anchors' pages are freed immediately.
 
 ### Dedup
 
@@ -852,8 +924,8 @@ for each chunk in plan:
 # an exists/anti gate is the two-table case of the same stage,
 # with the keep rule applied to the anchor's answers
 
-# assemble output: for each anchor B with YES rows,
-#   for each YES tuple (A, C) whose members survive their tables'
+# assemble output: for each anchor B with TRUE rows,
+#   for each TRUE tuple (A, C) whose members survive their tables'
 #   final gates, emit (B, A, C)
 ```
 

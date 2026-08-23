@@ -59,6 +59,15 @@ change needs one of them, say so instead of quietly adding it back.
   function call id (the `fc-...` Modal assigns to one invocation)
   and keep that id in the tee file. When you need the result, pull
   it with `modal.FunctionCall.from_id("<id>").get()`.
+- Raw experiment data (per-item records, per-question answers,
+  anything an aggregation step reads) lives on the `quail-results`
+  Modal volume. Do not commit it. Reports cite it by volume path:
+  `/results/ablations/<file>.json`.
+- Commit only the aggregated summary a report's numbers and plot
+  script read, to `quail/results/`: totals, means, percentiles,
+  per-configuration rows - never one record per item. Committed
+  summaries keep plots and review working without Modal access and
+  pin the numbers to the commit.
 - State the prediction before the run, then report what happened
   against it.
 - Compute from measured constants first; run one confirming cell, not
@@ -75,8 +84,9 @@ All experiment and feature reports live under `quail/reports/`.
 - Every PR that includes an experiment must produce a report in
   `quail/reports/`. Name the file `YYYY-MM-DD-<short-slug>.md`.
   The report states the setup, the prediction, the measured result,
-  and what the numbers mean. Reference data files in `results/`
-  by path.
+  and what the numbers mean. Reference committed summary files in
+  `results/` by path, and raw data by its `quail-results` volume
+  path.
 - When a report is superseded or its numbers are no longer current,
   move it to `quail/reports/old/`. Do not delete old reports.
 - When a PR ships a new feature (a code change that lands on main),

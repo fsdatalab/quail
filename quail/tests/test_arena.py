@@ -49,6 +49,15 @@ def test_row_indices_follow_pages():
     assert rows == expect
 
 
+def test_capacity_reserves_pages_without_extending_logical_length():
+    a = PageArena(n_pages=4, page_tokens=4)
+    pages = a.alloc("d", 5, capacity_tokens=10)
+    assert len(pages) == 3
+    assert a.tokens["d"] == 5
+    assert len(a.row_indices("d")) == 5
+    assert len(a.row_indices("d", 10)) == 10
+
+
 def test_no_page_shared_between_documents():
     rng = random.Random(5)
     a = PageArena(n_pages=64, page_tokens=16)

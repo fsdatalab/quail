@@ -5,20 +5,28 @@ milestone and reopens the design's executor section.
   probe    correctness gates before any timed run: attention math vs
            an fp32 reference, packed answers vs unpacked per-pair
            references, kept-KV replay, multi-group and mixed
-           fresh/kept chunks, paged vs gather cross-attention, and a
-           rate read at the large-chunk geometry. Every parity gate
-           requires 0 disagreements.
+           fresh/kept chunks, and a rate read at the large-chunk
+           geometry. Every parity gate requires 0 disagreements.
+           Cells run the production path assignment (probe and joins
+           on merge_quant, filters on unified); the committed
+           reference walls predate the assignment and their bands
+           hold.
 
-  filter   the committed 10k-document five-filter workload
-           (filter_cells_bf16.json is the bf16-KV reference: rewind
-           wall ~38.0 s, survivors 1873, answered 23381).
-           PREDICTION, stated before the run: ~3.84M fresh tokens at
-           the 121k tok/s packed rate -> ~32 s, survivors near 1873.
+  filter   the committed 10k-document five-filter workload on the
+           TRUE/FALSE corpus (re-banked 2026-08-23; the gate counts
+           match results/attention_paths.json: survivors 4645,
+           0 wrong of 40,052 answered, ~4.10M fresh tokens). The
+           committed results/m1_filter.json still holds the YES/NO-
+           era run (survivors 1807) that the 2026-08-18 reports pin.
+           PREDICTION: ~35 s wall, survivors 4645 exactly, 0 wrong.
 
-  join     the committed 256k-pair 2-way BioDEX join
-           (join2way.json: packed wall 103.5-103.6 s, 8,417,425
-           fresh tokens, 77 chunks, 177,831 YES).
-           PREDICTION: within 10% of 103.6 s, yes count near 177,831.
+  join     the committed 256k-pair 2-way BioDEX join (join2way.json
+           packed wall 103.5-103.6 s, 8,417,425 fresh tokens, 77
+           chunks). The TRUE/FALSE corpus conversion and the
+           merge_quant join path moved the TRUE count from 177,831
+           to 254,208 (re-banked 2026-08-23); the committed
+           results/m1_join.json still holds the YES/NO-era run.
+           PREDICTION: within 10% of 103.6 s, yes count near 254,208.
 
 Run from the quail/ directory (tee to a file per house rule):
 
@@ -76,7 +84,7 @@ GPU_KW = dict(image=image, gpu="H100!", memory=65536,
                        "/results": results_vol})
 
 
-def _boot():
+def _boot(attention_mode):
     """Model, pipeline, arena, answerers - the one executor, sized by
     the plan arithmetic (chunk budget at the kernel cap, arena from
     the admission budget, bf16 KV)."""
@@ -101,7 +109,7 @@ def _boot():
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena)
+    pipeline = Pipeline(model, arena, attention_mode=attention_mode)
     answerer = Answerer(torch, F, model, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     exec_budget = min(chunk, pipeline.max_chunk_tokens)
@@ -131,12 +139,15 @@ def probe() -> str:
     from quail.executor.loop import pack_chunk
 
     (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
-     exec_budget, arena_tok) = _boot()
+     exec_budget, arena_tok) = _boot("merge_quant")
     result = {"exec_budget": exec_budget, "arena_tokens": arena_tok,
               "gates": {}}
 
-    # ---- 1. attention math in isolation: the two-call paged merge
-    # against a plain fp32 reference on random [prefix | 3 suffixes]
+    # ---- 1. attention math in isolation: the production two-call
+    # path (merge_quant) against a plain fp32 reference on random
+    # [prefix | 3 suffixes]. The path returns the fp8 GEMM input, so
+    # the check dequantizes it; the gate budget is fp8 per-128-group
+    # quantization error on top of the old bf16 rounding.
     H, KH, D = pipeline.num_q_heads, pipeline.num_kv_heads, \
         pipeline.head_dim
     f0, sufs0 = 256, [32, 32, 32]
@@ -154,7 +165,7 @@ def probe() -> str:
         cu.append(cu[-1] + s)
     table, _ = arena.block_table(["m0"])
     meta0 = dict(
-        layer=0, paged=True,
+        layer=0,
         kv_src=torch.arange(f0, dtype=torch.int64, device="cuda"),
         kv_dst=arena.rows_gpu("m0")[:f0],
         cu_a=torch.tensor(cu, dtype=torch.int32, device="cuda"),
@@ -163,15 +174,19 @@ def probe() -> str:
             rows=torch.arange(f0, n0, device="cuda"),
             cu_q=torch.tensor([0, n0 - f0], dtype=torch.int32,
                               device="cuda"),
-            max_q=n0 - f0, keys=["m0"],
+            max_q=n0 - f0,
             used=torch.tensor([f0], dtype=torch.int32, device="cuda"),
             max_used=f0, table=table,
-            cu_k=torch.tensor([0, f0], dtype=torch.int32,
-                              device="cuda")))
+            source=torch.tensor([-1] * f0 + list(range(n0 - f0)),
+                                dtype=torch.int32, device="cuda")))
     with torch.inference_mode():
-        shared0 = pipeline.attention(
+        q_fp8, scales = pipeline.attention_merge_quant(
             q0.reshape(n0, H * D), k0.reshape(n0, KH * D),
-            v0.reshape(n0, KH * D), meta0).view(n0, H, D)
+            v0.reshape(n0, KH * D), meta0)
+        # dequantize: one 128-value group per head, scales (tokens,
+        # heads) after the column-major permute
+        shared0 = (q_fp8.float().view(n0, H, D)
+                   * scales.float().view(n0, H, 1)).to(torch.bfloat16)
 
         def ref_rows(qr, kr, vr):
             kk = kr.repeat_interleave(H // KH, dim=1).float()
@@ -213,20 +228,22 @@ def probe() -> str:
     def kept_group(key, f, sfx):
         return dict(key=key, prefix=None, f=f, suffixes=sfx)
 
+    def pack_mq(groups):
+        return pack_chunk(torch, arena, groups,
+                          attention_mode="merge_quant")
+
     with torch.inference_mode():
         # 2. shared (paged) vs unshared per-pair references
         arena.alloc("r0", len(prefix))
-        shared_chunk = pack_chunk(torch, arena,
-                                  [fresh_group("r0", prefix, sufs)])
+        shared_chunk = pack_mq([fresh_group("r0", prefix, sufs)])
         normed_shared = pipeline.forward_chunk(shared_chunk)
         shared_answers = answerer(normed_shared)
 
         unshared_answers, unshared_rows = [], []
         for suf in sufs:
-            one = pack_chunk(torch, arena,
-                             [dict(key="ref", prefix=prefix + suf,
-                                   f=len(prefix) + len(suf),
-                                   suffixes=[])])
+            one = pack_mq([dict(key="ref", prefix=prefix + suf,
+                                f=len(prefix) + len(suf),
+                                suffixes=[])])
             one["final_indices"] = torch.tensor(
                 [len(prefix) + len(suf) - 1], device="cuda")
             normed = pipeline.forward_chunk(one)
@@ -234,32 +251,25 @@ def probe() -> str:
             unshared_answers.extend(answerer(normed))
 
         # 3. kept-KV replay: the same suffixes against the pages only
-        kept_chunk = pack_chunk(torch, arena,
-                                [kept_group("r0", len(prefix), sufs)])
+        kept_chunk = pack_mq([kept_group("r0", len(prefix), sufs)])
         kept_answers = answerer(pipeline.forward_chunk(kept_chunk))
-
-        # 6. paged vs gather on the same kept chunk
-        gather_chunk = pack_chunk(torch, arena,
-                                  [kept_group("r0", len(prefix), sufs)])
-        gather_chunk["meta"]["paged"] = False
-        gather_answers = answerer(pipeline.forward_chunk(gather_chunk))
 
         # 4. multi-group: two reports in ONE chunk answer as alone
         p1 = data["prefixes"][1]
         sufs2 = data["suffixes"][64:96]
         arena.alloc("a0", len(prefix))
-        alone0 = pipeline.forward_chunk(pack_chunk(
-            torch, arena, [fresh_group("a0", prefix, sufs2)]))
+        alone0 = pipeline.forward_chunk(pack_mq(
+            [fresh_group("a0", prefix, sufs2)]))
         arena.free_key("a0")
         arena.alloc("a1", len(p1))
-        alone1 = pipeline.forward_chunk(pack_chunk(
-            torch, arena, [fresh_group("a1", p1, sufs2)]))
+        alone1 = pipeline.forward_chunk(pack_mq(
+            [fresh_group("a1", p1, sufs2)]))
         arena.free_key("a1")
         arena.alloc("b0", len(prefix))
         arena.alloc("b1", len(p1))
-        both = pipeline.forward_chunk(pack_chunk(
-            torch, arena, [fresh_group("b0", prefix, sufs2),
-                           fresh_group("b1", p1, sufs2)]))
+        both = pipeline.forward_chunk(pack_mq(
+            [fresh_group("b0", prefix, sufs2),
+             fresh_group("b1", p1, sufs2)]))
         arena.free_key("b0")
         arena.free_key("b1")
         multi_expect = answerer(alone0) + answerer(alone1)
@@ -268,8 +278,7 @@ def probe() -> str:
 
         # 5. mixed gate: a fresh group and a kept group in ONE chunk
         arena.alloc("m1", len(p1))
-        mixed = pipeline.forward_chunk(pack_chunk(
-            torch, arena,
+        mixed = pipeline.forward_chunk(pack_mq(
             [fresh_group("m1", p1, sufs2),
              kept_group("r0", len(prefix), sufs2)]))
         arena.free_key("m1")
@@ -284,11 +293,9 @@ def probe() -> str:
     dis_su = sum(a != b for a, b in zip(shared_answers,
                                         unshared_answers))
     dis_ks = sum(a != b for a, b in zip(kept_answers, shared_answers))
-    dis_pg = sum(a != b for a, b in zip(gather_answers, kept_answers))
     result["gates"].update(
         shared_vs_unshared_disagreements=int(dis_su),
         kept_vs_shared_disagreements=int(dis_ks),
-        paged_vs_gather_disagreements=int(dis_pg),
         multi_group_disagreements=int(dis_multi),
         mixed_kept_fresh_disagreements=int(dis_mixed),
     )
@@ -313,7 +320,9 @@ def probe() -> str:
                      kept_group(key, len(p),
                                 data_full["suffixes"][start:end]))
                 first = False
-                chunks.append(pack_chunk(torch, arena, [g]))
+                chunks.append(pack_chunk(
+                    torch, arena, [g],
+                    attention_mode="merge_quant"))
         for c in chunks[:2]:
             pipeline.forward_chunk(c)     # deepgemm + shape warmup
         torch.cuda.synchronize()
@@ -333,9 +342,10 @@ def probe() -> str:
         arena.free_key(f"rate{r}")
     result["peak_gib"] = round(
         torch.cuda.max_memory_allocated() / 2**30, 2)
-    result["pass"] = (worst < 0.05 and dis_su == 0 and dis_ks == 0
-                      and dis_pg == 0 and dis_multi == 0
-                      and dis_mixed == 0)
+    # 0.08 = the old 0.05 bf16 budget plus fp8 per-128-group
+    # quantization error on the dequantized merge_quant output
+    result["pass"] = (worst < 0.08 and dis_su == 0 and dis_ks == 0
+                      and dis_multi == 0 and dis_mixed == 0)
     return _write(result, "probe")
 
 
@@ -351,10 +361,11 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
     import time
 
     from corpus import build_corpus
+    from quail.executor.attention import FILTER_ATTENTION
     from quail.executor.loop import run_filter
 
     (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
-     exec_budget, arena_tok) = _boot()
+     exec_budget, arena_tok) = _boot(FILTER_ATTENTION)
     if budget:
         exec_budget = budget
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
@@ -363,12 +374,12 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
         cell="m1_filter", n_docs=n_docs, corpus_tokens=corpus_tokens,
         n_filters=len(q_ids), exec_budget=exec_budget,
         arena_tokens=arena_tok, kv="bf16",
-        prediction=("~3.84M fresh tokens at the 121k tok/s packed "
-                    "rate -> ~32 s; committed bf16 chain reference "
-                    "38.0 s, survivors 1873, answered 23381"),
-        reference=dict(artifact="filter_cells_bf16.json",
-                       wall_s=38.0, survivors=1873, answered=23381,
-                       wrong=6229),
+        prediction=("~4.10M fresh tokens -> ~35 s; survivors 4645, "
+                    "0 wrong of 40052 answered (TRUE/FALSE corpus, "
+                    "re-banked 2026-08-23)"),
+        reference=dict(artifact="attention_paths.json split rows",
+                       wall_s=34.6, survivors=4645, answered=40052,
+                       wrong=0),
         runs=[])
     print(f"[m1_filter] {report['prediction']}", flush=True)
 
@@ -440,10 +451,11 @@ def join_run(n_reports: int = 100, reps: int = 2) -> str:
     import time
 
     from corpus import biodex_sample
+    from quail.executor.attention import JOIN_ATTENTION
     from quail.executor.loop import run_join
 
     (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
-     exec_budget, arena_tok) = _boot()
+     exec_budget, arena_tok) = _boot(JOIN_ATTENTION)
     data = biodex_sample(tokenizer, n_reports=n_reports)
     prefixes, suffixes = data["prefixes"], data["suffixes"]
     n_terms = len(suffixes)
@@ -453,9 +465,11 @@ def join_run(n_reports: int = 100, reps: int = 2) -> str:
         arena_tokens=arena_tok, kv="bf16",
         prediction=("within 10% of the committed packed 103.6 s; "
                     "~8.42M fresh tokens, ~77 chunks, yes near "
-                    "177,831"),
-        reference=dict(artifact="join2way.json", wall_s=103.6,
-                       fresh_tokens=8417425, chunks=77, yes=177831),
+                    "254,208 (TRUE/FALSE corpus, merge_quant)"),
+        reference=dict(artifact="join2way.json wall; yes re-banked "
+                       "2026-08-23 on the TRUE/FALSE corpus "
+                       "(merge_quant)", wall_s=103.6,
+                       fresh_tokens=8417425, chunks=77, yes=254208),
         lengths=dict(
             prefix_mean=round(sum(map(len, prefixes)) / n_reports, 1),
             suffix_mean=round(sum(len(s) for s in suffixes)
@@ -499,12 +513,13 @@ def join3_run() -> str:
     import time
 
     from corpus import N_B, N_C, nway_corpus, nway_truth
+    from quail.executor.attention import JOIN_ATTENTION
     from quail.executor.loop import run_join
     from quail.executor.pack import (assemble, brute_force_triples,
                                      gate)
 
     (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
-     exec_budget, arena_tok) = _boot()
+     exec_budget, arena_tok) = _boot(JOIN_ATTENTION)
     b_prefix, a_suffix, c_suffix = nway_corpus(tokenizer)
     truth1, _ = nway_truth()
     report = dict(
@@ -570,12 +585,13 @@ def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
     import time
 
     from corpus import build_corpus
+    from quail.executor.attention import FILTER_ATTENTION
     from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import run_filter
     from quail.specs import QWEN3_4B_FP8
 
     (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
-     exec_budget, arena_tok) = _boot()
+     exec_budget, arena_tok) = _boot(FILTER_ATTENTION)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
     corpus_tokens = sum(len(b) for b in body_ids)
     kappa = QWEN3_4B_FP8.kappa
@@ -651,10 +667,11 @@ def profile_filter_run(n_docs: int = 3000) -> str:
     import time
 
     from corpus import build_corpus
+    from quail.executor.attention import FILTER_ATTENTION
     from quail.executor.loop import run_filter, warm_kernels
 
     (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
-     exec_budget, arena_tok) = _boot()
+     exec_budget, arena_tok) = _boot(FILTER_ATTENTION)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
     with torch.inference_mode():
         warm_kernels(torch, arena, pipeline, async_ans, body_ids,
@@ -733,13 +750,13 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
     from baselines.stock import run_filter_chain
     from corpus import MODEL, build_corpus
     from vllm import SamplingParams
-    from quail.executor.loop import yes_no_ids
+    from quail.executor.loop import true_false_ids
 
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
-    yes, no = yes_no_ids(tokenizer)
+    true, false = true_false_ids(tokenizer)
 
     # the committed BF16-KV stock knobs (our engine's KV is bf16, so
     # the fp8 config's 749,782 budget oversubscribes the ~473k-token
@@ -752,7 +769,7 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
         enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
-                              allowed_token_ids=sorted(yes | no))
+                              allowed_token_ids=sorted(true | false))
     engine = llm.llm_engine
     budget = 374_891     # the committed bf16-KV admission budget
     report = dict(cell="baseline_filter", n_docs=n_docs,
@@ -765,10 +782,10 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
     print(f"[baseline_filter] boot {boot}", flush=True)
     # warm the engine (kernel compile, allocator)
     run_filter_chain(engine, sampling, body_ids[:64], q_ids, budget,
-                     tag="w", yes_ids=yes)
+                     tag="w", true_ids=true)
     for rep in range(reps):
         r = run_filter_chain(engine, sampling, body_ids, q_ids,
-                             budget, tag=f"r{rep}", yes_ids=yes)
+                             budget, tag=f"r{rep}", true_ids=true)
         row = dict(rep=rep, wall=round(r["wall"], 2),
                    requests=r["requests"],
                    fresh_tokens=r["prompt_tokens"] - r["cached_tokens"],
@@ -795,7 +812,7 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
     from baselines.stock import run_join_grouped
     from corpus import MODEL
     from vllm import SamplingParams
-    from quail.executor.loop import yes_no_ids
+    from quail.executor.loop import true_false_ids
 
     from transformers import AutoTokenizer
 
@@ -814,11 +831,11 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                             f"{colors[i % 6]}.")
                 for i in range(n_reports)]
     suffixes = [tok(f"\n\nCANDIDATE:\nThe candidate color is "
-                    f"{colors[j % 6]}.\nInstruction: answer YES if "
+                    f"{colors[j % 6]}.\nInstruction: answer TRUE if "
                     f"the report says its dominant color is the "
-                    f"candidate color, NO otherwise.\nANSWER=")
+                    f"candidate color, FALSE otherwise.\nANSWER=")
                 for j in range(n_cands)]
-    yes, no = yes_no_ids(tokenizer)
+    true, false = true_false_ids(tokenizer)
     max_seqs = 4096
     # 0.92, same as quail's pool fraction. The committed join2way
     # stock arm ran 0.88 only because its container booted two
@@ -830,7 +847,7 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
         enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
-                              allowed_token_ids=sorted(yes | no))
+                              allowed_token_ids=sorted(true | false))
     report = dict(cell="baseline_join", n_reports=n_reports,
                   n_cands=n_cands, pairs=n_reports * n_cands,
                   submission="one request per pair, anchor-major, "
@@ -841,10 +858,12 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                   boot=boot, boot_s=boot["boot_s"],
                   runs=[])
     print(f"[baseline_join] boot {boot}", flush=True)
-    run_join_grouped(llm, sampling, prefixes[:2], suffixes[:32], yes)
+    run_join_grouped(llm, sampling, prefixes[:2], suffixes[:32],
+                     true)
     for rep in range(reps):
         llm.reset_prefix_cache()
-        r = run_join_grouped(llm, sampling, prefixes, suffixes, yes)
+        r = run_join_grouped(llm, sampling, prefixes, suffixes,
+                             true)
         row = dict(rep=rep, wall=round(r["wall"], 2),
                    fresh_tokens=r["fresh_tokens"],
                    tok_s=round(r["fresh_tokens"] / r["wall"], 1),
@@ -864,7 +883,7 @@ def debug_join() -> str:
     shape; agreement means the answers are the model's.
 
     Measured twice (plain question and few-shot example): the 4B
-    answers YES to every constrained one-token equality judgment on
+    answers TRUE to every constrained one-token equality judgment on
     BOTH paths, 0 disagreements - the executor is exonerated, the
     checkpoint cannot judge symbolic equality. Content-style
     predicates (the BioDEX shape) discriminate."""
@@ -873,7 +892,7 @@ def debug_join() -> str:
     from quail.executor.loop import pack_chunk
 
     (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
-     exec_budget, arena_tok) = _boot()
+     exec_budget, arena_tok) = _boot("merge_quant")
 
     filler = ("The projector hummed while the reel changed and nobody "
               "in the back row noticed the splice. ")
@@ -883,10 +902,10 @@ def debug_join() -> str:
     mid_t = "\n\nCANDIDATE:\n"
     tail_t = ("\nExample: if the report says the dominant color is "
               "green and the candidate color is green, the answer is "
-              "YES. If the report says green and the candidate color "
-              "is blue, the answer is NO.\nInstruction: answer YES if "
-              "the report says its dominant color is the candidate "
-              "color, NO otherwise.\nANSWER=")
+              "TRUE. If the report says green and the candidate color "
+              "is blue, the answer is FALSE.\nInstruction: answer "
+              "TRUE if the report says its dominant color is the "
+              "candidate color, FALSE otherwise.\nANSWER=")
 
     def tok(t):
         return tokenizer(t, add_special_tokens=False)["input_ids"]
@@ -912,7 +931,8 @@ def debug_join() -> str:
             for s in suffixes:
                 one = pack_chunk(torch, arena,
                                  [dict(key=f"x{i}", prefix=p + s,
-                                       f=len(p) + len(s), suffixes=[])])
+                                       f=len(p) + len(s), suffixes=[])],
+                                 attention_mode="merge_quant")
                 one["final_indices"] = torch.tensor(
                     [len(p) + len(s) - 1], device="cuda")
                 row.extend(answerer(pipeline.forward_chunk(one)))
@@ -924,7 +944,8 @@ def debug_join() -> str:
         packed_chunk = pack_chunk(
             torch, arena,
             [dict(key=f"a{i}", prefix=p, f=len(p), suffixes=suffixes)
-             for i, p in enumerate(prefixes)])
+             for i, p in enumerate(prefixes)],
+            attention_mode="merge_quant")
         bits = answerer(pipeline.forward_chunk(packed_chunk))
         packed = [bits[:12], bits[12:]]
         for i in range(2):

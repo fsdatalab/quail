@@ -1,12 +1,11 @@
 {
   "exec_budget": 110376,
-  "arena_tokens": 345974,
+  "arena_tokens": 313206,
   "gates": {
-    "attention_math_max_diff": 0.0068,
-    "shared_vs_unshared_max_hidden_gap": 4.9688,
+    "attention_math_max_diff": 0.0296,
+    "shared_vs_unshared_max_hidden_gap": 5.625,
     "shared_vs_unshared_disagreements": 0,
     "kept_vs_shared_disagreements": 0,
-    "paged_vs_gather_disagreements": 0,
     "multi_group_disagreements": 0,
     "mixed_kept_fresh_disagreements": 0
   },
@@ -17,9 +16,9 @@
   "rate": {
     "chunks": 2,
     "tokens": 169452,
-    "wall_s": 2.183,
-    "tok_s": 77609.0
+    "wall_s": 1.969,
+    "tok_s": 86071.8
   },
-  "peak_gib": 62.88,
+  "peak_gib": 57.49,
   "pass": true
 }

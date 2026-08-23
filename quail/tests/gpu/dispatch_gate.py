@@ -59,7 +59,8 @@ def build_filter_parquet(path, n_docs=10000):
              < np.array(SELECTIVITY)[None, :]).astype(int)
     bodies = []
     for d, f in zip(docs, flags):
-        line = " ".join(f"FLAG_{j+1}={'YES' if v else 'NO'}"
+        line = " ".join(
+            f"FLAG_{j+1}={'TRUE' if v else 'FALSE'}"
                         for j, v in enumerate(f))
         bodies.append(d + "\n\n[FLAGS] " + line)
     pq.write_table(pa.table({
@@ -82,8 +83,8 @@ def build_join_parquets(rpath, cpath, n_reports=60, n_cands=1200):
 
 
 def question(j):
-    return (f"\n\nExample: if the line said [FLAGS] FLAG_9=NO, then "
-            f"FLAG_9 has value NO.\nInstruction: output only the value "
+    return (f"\n\nExample: if the line said [FLAGS] FLAG_9=FALSE, "
+            f"then FLAG_9 has value FALSE.\nInstruction: output only the value "
             f"of FLAG_{j} from the [FLAGS] line above.\nFLAG_{j}=")
 
 
@@ -108,7 +109,7 @@ def run_pair(tmp, gpus):
                    quail.prompt(
                        "Judge strictly from {0} whether it says its "
                        "dominant color is the color named in {1}. "
-                       "Answer YES if it does, NO otherwise."
+                       "Answer TRUE if it does, FALSE otherwise."
                        "\nANSWER=",
                        quail.col("r.report"), quail.col("c.body")),
                    selectivity=1 / 6)

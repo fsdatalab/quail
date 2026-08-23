@@ -3,7 +3,7 @@
 The packed executor's answers are compared against stock vLLM running
 the same [prefix | suffix] prompts one pair per request. Both use the
 same checkpoint, the same bf16 KV dtype, and the same constrained
-YES/NO readout. The gate is 0 answer disagreements and a small hidden
+TRUE/FALSE readout. The gate is 0 answer disagreements and a small hidden
 gap, not a speed comparison.
 
 What this catches that the probe (milestone1.py::probe) does not: the
@@ -66,7 +66,7 @@ def accuracy(n_reports: int = 4, n_terms: int = 64) -> str:
     from corpus import biodex_sample
     from quail.executor.arena import KVArena
     from quail.executor.attention import Pipeline
-    from quail.executor.loop import Answerer, pack_chunk, yes_no_ids
+    from quail.executor.loop import Answerer, pack_chunk, true_false_ids
     from quail.executor.model import load_model
     from quail.planner import budgets
     from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -77,15 +77,15 @@ def accuracy(n_reports: int = 4, n_terms: int = 64) -> str:
     suffixes = data["suffixes"][:n_terms]
     pairs = [(r, t) for r in range(n_reports) for t in range(n_terms)]
 
-    # ---- stock vLLM: one request per pair, constrained YES/NO
-    yes, no = yes_no_ids(tokenizer)
+    # ---- stock vLLM: one request per pair, constrained TRUE/FALSE
+    true, false = true_false_ids(tokenizer)
     llm = LLM(model=MODEL, max_num_batched_tokens=25_305,
               max_num_seqs=256, gpu_memory_utilization=0.45,
               kv_cache_dtype="bfloat16",
               enable_prefix_caching=False, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1,
-                              allowed_token_ids=sorted(yes | no),
+                              allowed_token_ids=sorted(true | false),
                               logprobs=20)
     prompts = [prefixes[r] + suffixes[t] for r, t in pairs]
     outs = llm.generate(prompts, sampling)
@@ -93,12 +93,12 @@ def accuracy(n_reports: int = 4, n_terms: int = 64) -> str:
     stock_logps = []
     for o in outs:
         lp = o.outputs[0].logprobs[0]
-        yes_lp = max((lp[t].logprob for t in yes if t in lp),
-                     default=-float("inf"))
-        no_lp = max((lp[t].logprob for t in no if t in lp),
-                    default=-float("inf"))
-        stock_answers.append(int(yes_lp > no_lp))
-        stock_logps.append((yes_lp, no_lp))
+        true_lp = max((lp[t].logprob for t in true if t in lp),
+                      default=-float("inf"))
+        false_lp = max((lp[t].logprob for t in false if t in lp),
+                       default=-float("inf"))
+        stock_answers.append(int(true_lp > false_lp))
+        stock_logps.append((true_lp, false_lp))
     del llm
     torch.cuda.empty_cache()
 
@@ -112,7 +112,8 @@ def accuracy(n_reports: int = 4, n_terms: int = 64) -> str:
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model, arena)
+    pipeline = Pipeline(model, arena,
+                        attention_mode="merge_quant")
     answerer = Answerer(torch, F, model, tokenizer)
 
     packed_answers = []
@@ -124,7 +125,8 @@ def accuracy(n_reports: int = 4, n_terms: int = 64) -> str:
             chunk_d = pack_chunk(
                 torch, arena,
                 [dict(key=key, prefix=prefixes[r],
-                      f=len(prefixes[r]), suffixes=suffixes)])
+                      f=len(prefixes[r]), suffixes=suffixes)],
+                attention_mode="merge_quant")
             normed = pipeline.forward_chunk(chunk_d)
             packed_answers.extend(answerer(normed))
             packed_margins.extend(answerer.margins(normed))
@@ -134,7 +136,7 @@ def accuracy(n_reports: int = 4, n_terms: int = 64) -> str:
     disagree = sum(a != b for a, b in zip(packed_answers, stock_answers))
     # hidden gap: packed final hidden vs stock's is not directly
     # comparable (stock does not expose hidden states), so the
-    # numerical check is the answer margin: packed yes-minus-no
+    # numerical check is the answer margin: packed true-minus-false
     # against stock's logprob difference. Sign agreement is the gate.
     sign_agree = sum(
         (m > 0) == (s[0] > s[1])
@@ -144,8 +146,8 @@ def accuracy(n_reports: int = 4, n_terms: int = 64) -> str:
         pairs=len(pairs),
         prediction=("0 answer disagreements; packed margin sign "
                     "matches stock logprob sign on every pair"),
-        packed_yes=int(sum(packed_answers)),
-        stock_yes=int(sum(stock_answers)),
+        packed_true=int(sum(packed_answers)),
+        stock_true=int(sum(stock_answers)),
         answer_disagreements=int(disagree),
         margin_sign_agreements=int(sign_agree),
         margin_sign_pairs=len(pairs),

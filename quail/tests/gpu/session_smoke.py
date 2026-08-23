@@ -9,10 +9,10 @@ What this smoke gates, measured:
   provided-vs-observed report are the checks.
 - join: 12 reports x 36 candidates = 432 pairs. The PLUMBING is the
   gate here (pair count, projection, report), NOT accuracy: the 4B
-  answers YES to essentially every constrained one-token equality
+  answers TRUE to essentially every constrained one-token equality
   judgment. Measured twice through a trivially-correct causal
   reference path (milestone1.py::run_debug_join, with and without a
-  few-shot example): all-YES both times, 0 disagreements against the
+  few-shot example): all-TRUE both times, 0 disagreements against the
   packed executor. Content-style predicates (the BioDEX shape) discriminate;
   symbolic equality does not. QUAIL-B's join predicates must use a
   checkpoint-verified phrasing.
@@ -50,7 +50,8 @@ def make_filter_parquet(path, n_docs=200, rates=(0.6, 0.5)):
     flags = rng.random((n_docs, len(rates))) < np.array(rates)
     bodies = []
     for i in range(n_docs):
-        line = " ".join(f"FLAG_{j+1}={'YES' if flags[i, j] else 'NO'}"
+        line = " ".join(
+            f"FLAG_{j+1}={'TRUE' if flags[i, j] else 'FALSE'}"
                         for j in range(len(rates)))
         bodies.append(FILLER * 8 + f"\n\n[FLAGS] {line}")
     pq.write_table(pa.table({
@@ -67,7 +68,7 @@ def make_join_parquets(rdir, cdir, n_reports=12, n_cands=36):
     4B can answer: the report states one fact (its dominant color),
     the candidate names one color, the question compares them. The
     two-planted-key form (X=<k> on both sides) is known to fail - the
-    committed nway3 run measured the model answering YES to nearly
+    committed nway3 run measured the model answering TRUE to nearly
     every such pair."""
     keys = len(COLORS)
     reports = []
@@ -88,8 +89,8 @@ def make_join_parquets(rdir, cdir, n_reports=12, n_cands=36):
     return truth
 
 
-FILTER_Q = ("\n\nExample: if the line said [FLAGS] FLAG_9=NO, then "
-            "FLAG_9 has value NO.\nInstruction: output only the value "
+FILTER_Q = ("\n\nExample: if the line said [FLAGS] FLAG_9=FALSE, "
+            "then FLAG_9 has value FALSE.\nInstruction: output only the value "
             "of FLAG_{j} from the [FLAGS] line above.\nFLAG_{j}=")
 
 
@@ -152,7 +153,7 @@ def main():
                    quail.prompt(
                        "Judge strictly from {0} whether it says its "
                        "dominant color is the color named in {1}. "
-                       "Answer YES if it does, NO otherwise."
+                       "Answer TRUE if it does, FALSE otherwise."
                        "\nANSWER=",
                        quail.col("r.report"), quail.col("c.body")),
                    selectivity=1 / 6)

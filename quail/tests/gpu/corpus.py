@@ -1,8 +1,11 @@
-"""The milestone 1 corpora, byte-identical to the committed runs.
+"""The milestone 1 corpora.
 
-Two workloads, both ported verbatim from the exploration (same seeds,
-same planted lines, same truncation), so the new executor's walls and
-answers compare directly against the committed artifacts:
+Two workloads ported from the exploration (same seeds, same
+truncation). 2026-08-21: the planted values and answer instructions
+changed from YES/NO to TRUE/FALSE to match the engine's constrained
+readout (true_false_ids), so answer counts no longer compare against
+pre-change artifacts; walls still do (token counts move by a few
+tokens per document):
 
 - the 10,000-document five-filter IMDB corpus with planted [FLAGS]
   lines (filter_cells.json / filter_cells_bf16.json);
@@ -47,16 +50,17 @@ def build_pool(n_docs):
 
 def flags_line(flags):
     return "\n\n[FLAGS] " + " ".join(
-        f"FLAG_{j+1}={'YES' if f else 'NO'}" for j, f in enumerate(flags))
+        f"FLAG_{j+1}={'TRUE' if f else 'FALSE'}"
+        for j, f in enumerate(flags))
 
 
 def question(j):
     """Filter j's question. Every question shares a 33-token preamble;
     the executor keeps its KV with the document after stage 1, the way
     chain mode's rewind kept it resident."""
-    return (f"\n\nExample: if the line said [FLAGS] FLAG_9=NO, then FLAG_9 "
-            f"has value NO.\nInstruction: output only the value of FLAG_{j} "
-            f"from the [FLAGS] line above.\nFLAG_{j}=")
+    return (f"\n\nExample: if the line said [FLAGS] FLAG_9=FALSE, then "
+            f"FLAG_9 has value FALSE.\nInstruction: output only the value "
+            f"of FLAG_{j} from the [FLAGS] line above.\nFLAG_{j}=")
 
 
 def build_corpus(tok, n_docs, seed_offset=100, n_filters=None):
@@ -124,9 +128,9 @@ def nway_corpus(tokenizer):
     def suffix(doc, key):
         return tokenizer(
             f"\n\nCANDIDATE DOCUMENT:\n{doc}\n"
-            f"Instruction: answer YES if the [KEY] {key} value in the "
+            f"Instruction: answer TRUE if the [KEY] {key} value in the "
             f"candidate equals the [KEYS] {key} value in the report "
-            f"document, NO otherwise.\nANSWER=",
+            f"document, FALSE otherwise.\nANSWER=",
             add_special_tokens=False)["input_ids"]
 
     a_suffix = [suffix(d, "X") for d in a_docs]
@@ -136,8 +140,8 @@ def nway_corpus(tokenizer):
 
 def pair_suffix_text(term):
     return (f"\n\nCANDIDATE REACTION: {term}\n"
-            f"Instruction: answer YES if the report above describes "
-            f"this reaction, NO otherwise.\nANSWER=")
+            f"Instruction: answer TRUE if the report above describes "
+            f"this reaction, FALSE otherwise.\nANSWER=")
 
 
 def biodex_sample(tokenizer, n_reports=100, vocab_cap=3718,

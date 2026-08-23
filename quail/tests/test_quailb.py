@@ -1,69 +1,39 @@
-"""QUAIL-B's CPU half: planting arithmetic, and every query compiling
-and planning against stand-in sets (no downloads, no GPU)."""
+"""CPU checks for the QUAIL-B query catalog and table schemas."""
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 import quail
-from quail.bench.quailb import (SETS, concat_to_chars, flags_line,
-                                plant_flags, queries, register_sets)
+from quail.bench.quailb import ASPECTS, SETS, queries, register_sets
 from quail.planner.plan import EngineConfig, Refusal
 
 
-def test_plant_flags_rates_and_determinism():
-    rates = (0.9, 0.2)
-    a = plant_flags(5000, rates, seed_offset=1)
-    b = plant_flags(5000, rates, seed_offset=1)
-    assert (a == b).all()
-    means = a.mean(axis=0)
-    assert abs(means[0] - 0.9) < 0.03
-    assert abs(means[1] - 0.2) < 0.03
-
-
-def test_flags_line_format():
-    assert flags_line([1, 0], "T") == "\n\n[FLAGS] T_1=TRUE T_2=FALSE"
-
-
-def test_concat_to_chars_reaches_target_and_cycles():
-    pool = ["abcd", "efgh"]
-    text, cursor = concat_to_chars(pool, 30, start=0)
-    assert len(text) >= 30
-    assert cursor > 2       # cycled past the pool once
-
-
 def _standin_sets(tmp_path):
-    """Tiny parquet files with the real schemas."""
-    def write(name, col, n, words):
+    """Write small parquet files with the benchmark table schemas."""
+    def write(name, col, values):
         pq.write_table(pa.table({
-            "id": [f"{name}{i}" for i in range(n)],
-            col: [f"{words} {i} " + "pad " * 20
-                  + flags_line([1, 1, 1, 0, 1, 0, 1, 0], "FLAG")
-                  + flags_line([1, 0, 1], "T")
-                  + flags_line([1, 0], "R")
-                  for i in range(n)]}),
-            tmp_path / f"{name}.parquet")
-    write("reviews", "body", 12, "review")
-    write("threads", "thread", 10, "thread")
-    write("reports", "report", 8, "report")
-    write("products", "description", 6, "product")
-    write("terms", "term", 6, "term")
-    write("reviews5k", "body", 8, "review")
-    write("reviews2k", "body", 6, "review")
-    write("threads2k", "thread", 6, "thread")
-    # B16: same columns as build_sets writes for FEVER
+            "id": [f"{name}{i}" for i in range(len(values))],
+            col: values,
+        }), tmp_path / f"{name}.parquet")
+
+    write("reviews", "body", [f"review text {i}" for i in range(12)])
+    write("aspects", "aspect", ASPECTS)
+    write("reports", "report", [f"medical report {i}" for i in range(8)])
+    write("terms", "term", [f"reaction {i}" for i in range(6)])
     pq.write_table(pa.table({
         "id": [f"cl{i}" for i in range(6)],
-        "claim": [f"claim {i} " + "pad " * 8 for i in range(6)],
+        "claim": [f"claim {i}" for i in range(6)],
         "label": ["SUPPORTS" if i % 2 == 0 else "REFUTES"
                   for i in range(6)],
         "evidence_wiki_url": [f"Page_{i}" for i in range(6)],
     }), tmp_path / "claims.parquet")
+    write("evidence", "text", [f"Wikipedia passage {i}" for i in range(6)])
     pq.write_table(pa.table({
-        "id": [f"Page_{i}" for i in range(6)],
-        "text": [f"evidence {i} " + "pad " * 20 for i in range(6)],
-    }), tmp_path / "evidence.parquet")
+        "id": [f"lp{i}" for i in range(6)],
+        "destination_context": [f"citation excerpt {i}" for i in range(6)],
+        "passage_text": [f"cited passage {i}" for i in range(6)],
+        "passage_id": [f"passage-{i}" for i in range(6)],
+    }), tmp_path / "citations.parquet")
     return tmp_path
 
 
@@ -72,15 +42,25 @@ def test_all_queries_compile_and_plan(tmp_path):
     sess = quail.Session(EngineConfig(gpus=1), tokenizer=str.split)
     register_sets(sess, tmp_path)
     qdefs = queries(sess)
-    assert len(qdefs) == 17        # B1-B16, B3 twice
-    for qid, (desc, make) in qdefs.items():
-        q = make()
-        plan = q.plan()
+    expected = {
+        *(f"IMDB-{i}" for i in range(1, 6)),
+        *(f"BIO-{i}" for i in range(1, 6)),
+        *(f"FEV-{i}" for i in range(1, 7)),
+        *(f"LEP-{i}" for i in range(1, 8)),
+    }
+    assert set(qdefs) == expected
+    for qid, (_, build) in qdefs.items():
+        query = build()
+        plan = query.plan()
         assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
-        text = q.explain()
-        assert "physical:" in text, qid
+        assert "physical:" in query.explain(), qid
 
 
 def test_set_table_matches_design():
-    assert SETS["reviews"][0] == 50_000
-    assert SETS["terms"][2] is False    # fixed, never scales
+    assert SETS == {
+        "reviews": 50_000,
+        "reports": 2_000,
+        "claims": 1_000,
+        "citations": 2_000,
+    }
+    assert len(ASPECTS) == 12
