@@ -296,20 +296,7 @@ def build_sets(data_dir, sf, lf=1):
         "text": [page_text[p] for p in ev_ids],
     }), d / "evidence.parquet")
 
-    # citations: real LePaRD citation events, self-joined against
-    # itself - one table, one row per citing case, its own excerpt
-    # (destination_context) and its own actually-cited passage
-    # (passage_dict.json text) on the same row. A join query reads
-    # this same table under two aliases with two different columns -
-    # see LEP-2 in queries() below.
-    n = _n_docs("citations", sf)
-    lep = _lepard_rows(n)
-    pq.write_table(pa.table({
-        "id": [f"lp{i}" for i in range(len(lep))],
-        "destination_context": [r[0] for r in lep],
-        "passage_text": [r[1] for r in lep],
-        "passage_id": [r[2] for r in lep],
-    }), d / "citations.parquet")
+    _build_citations(d, sf)
 
     marker.write_text("ok")
     return d
@@ -476,16 +463,22 @@ def queries(sess):
     def make(doc_table, doc_alias, doc_col, filters, joins, select):
         """filters: list of prompt templates applied in order to the
         base table. joins: list of (partner_table, partner_alias,
-        partner_col, prompt_template) applied in order, each dependent
-        on whatever survived the stages before it."""
+        partner_col, prompt_template[, partner_filters]) applied in
+        order, each dependent on whatever survived the stages before
+        it; partner_filters push filters onto the partner side before
+        the join (the FEV-5/6 and LEP-7 two-sided shape)."""
         def build():
             qy = sess.docs(doc_table).alias(doc_alias)
             for tmpl in filters:
                 qy = qy.ai_filter(
                     quail.prompt(tmpl, quail.col(f"{doc_alias}.{doc_col}")))
-            for partner, palias, pcol, tmpl in joins:
+            for partner, palias, pcol, tmpl, *rest in joins:
+                pq = sess.docs(partner).alias(palias)
+                for pf in (rest[0] if rest else ()):
+                    pq = pq.ai_filter(
+                        quail.prompt(pf, quail.col(f"{palias}.{pcol}")))
                 qy = qy.ai_join(
-                    sess.docs(partner).alias(palias),
+                    pq,
                     quail.prompt(tmpl, quail.col(f"{doc_alias}.{doc_col}"),
                                 quail.col(f"{palias}.{pcol}")))
             return qy.select(*select)
@@ -542,29 +535,15 @@ def queries(sess):
         "claims", "c", "claim", [F11, F12],
         [("evidence", "e", "text", SUPPORT)], ["c.id", "e.id"]))
 
-    def fev5():
-        cq = (sess.docs("claims").alias("c")
-              .ai_filter(quail.prompt(F11, quail.col("c.claim"))))
-        eq = (sess.docs("evidence").alias("e")
-              .ai_filter(quail.prompt(F13, quail.col("e.text"))))
-        return (cq.ai_join(eq, quail.prompt(SUPPORT, quail.col("c.claim"),
-                                            quail.col("e.text")))
-                .select("c.id", "e.id"))
     q["FEV-5"] = ("2F + 1J: two-sided pushdown - F11 on claims, F13 on "
-                  "evidence, each filtered before J3", fev5)
-
-    def fev6():
-        cq = (sess.docs("claims").alias("c")
-              .ai_filter(quail.prompt(F11, quail.col("c.claim")))
-              .ai_filter(quail.prompt(F12, quail.col("c.claim"))))
-        eq = (sess.docs("evidence").alias("e")
-              .ai_filter(quail.prompt(F13, quail.col("e.text"))))
-        return (cq.ai_join(eq, quail.prompt(SUPPORT, quail.col("c.claim"),
-                                            quail.col("e.text")))
-                .select("c.id", "e.id"))
+                  "evidence, each filtered before J3", make(
+        "claims", "c", "claim", [F11],
+        [("evidence", "e", "text", SUPPORT, [F13])], ["c.id", "e.id"]))
     q["FEV-6"] = ("3F + 1J: two-sided pushdown, deeper - F11 -> F12 on "
                   "claims, F13 on evidence, each filtered before J3",
-                  fev6)
+                  make(
+        "claims", "c", "claim", [F11, F12],
+        [("evidence", "e", "text", SUPPORT, [F13])], ["c.id", "e.id"]))
 
     # LePaRD: one table, `citations`, self-joined - the anchor alias
     # ("d") reads destination_context, the partner alias ("s") reads
@@ -592,21 +571,12 @@ def queries(sess):
         [LEP1, LEP2, LEP3, LEP4, LEP5],
         [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
 
-    def lep7():
-        dq = (sess.docs("citations").alias("d")
-              .ai_filter(quail.prompt(LEP1,
-                                      quail.col("d.destination_context")))
-              .ai_filter(quail.prompt(LEP2,
-                                      quail.col("d.destination_context"))))
-        sq = (sess.docs("citations").alias("s")
-              .ai_filter(quail.prompt(LEPS1, quail.col("s.passage_text"))))
-        return (dq.ai_join(
-            sq, quail.prompt(LEPJOIN, quail.col("d.destination_context"),
-                             quail.col("s.passage_text")))
-                .select("d.id", "s.id"))
     q["LEP-7"] = ("2F + 1J: two-sided pushdown - LEP1+LEP2 on excerpts, "
                   "LEPS1 on passages, each filtered before the self-join",
-                  lep7)
+                  make(
+        "citations", "d", "destination_context", [LEP1, LEP2],
+        [("citations", "s", "passage_text", LEPJOIN, [LEPS1])],
+        ["d.id", "s.id"]))
 
     return q
 

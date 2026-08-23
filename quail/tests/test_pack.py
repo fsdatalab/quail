@@ -251,6 +251,24 @@ def test_admission_limit_drains_in_flight():
     assert sched._survivor_count == 2
 
 
+def test_admission_limit_drain_ready_returns_stranded():
+    # 3 docs, 2 stages, limit=1. All pass stage 0. The stage-1 suffix
+    # is 200 tokens, so the next chunk holds only doc 0's; it passes
+    # and meets the limit while docs 1 and 2 still sit in ready.
+    # drain_ready returns them and restores their pages.
+    sched = FilterAdmission([50, 50, 50], [10, 200], 250,
+                            arena_pages=100, page_tokens=16, limit=1)
+    for doc, _, _ in sched.next_chunk():        # all fresh, stage 0
+        sched.report(doc, 0, True)
+    groups = sched.next_chunk()
+    assert groups == [(0, 1, False)]            # room for one suffix
+    sched.report(0, 1, True)                    # limit reached
+    assert sched.done()
+    assert sched.drain_ready() == [1, 2]
+    assert sched.free_pages == 100
+    assert not sched.resident
+
+
 def test_admission_limit_none_processes_all():
     doc_tokens = [50] * 5
     truth = [[1] for _ in range(5)]

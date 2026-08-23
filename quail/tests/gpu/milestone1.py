@@ -170,11 +170,9 @@ def probe() -> str:
             rows=torch.arange(f0, n0, device="cuda"),
             cu_q=torch.tensor([0, n0 - f0], dtype=torch.int32,
                               device="cuda"),
-            max_q=n0 - f0, keys=["m0"],
+            max_q=n0 - f0,
             used=torch.tensor([f0], dtype=torch.int32, device="cuda"),
             max_used=f0, table=table,
-            cu_k=torch.tensor([0, f0], dtype=torch.int32,
-                              device="cuda"),
             source=torch.tensor([-1] * f0 + list(range(n0 - f0)),
                                 dtype=torch.int32, device="cuda")))
     with torch.inference_mode():

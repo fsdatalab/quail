@@ -28,12 +28,9 @@ is paged-only, like the production paths.
 import functools
 
 
-def _tokens_first(lse, n_tokens):
-    # normalize to (tokens, heads); the FA3 wrapper returns
-    # (heads, tokens) for varlen
-    if lse.shape[0] != n_tokens:
-        return lse.transpose(0, 1).contiguous()
-    return lse
+def _tokens_first(lse):
+    # FA3 varlen returns (heads, tokens); transpose to (tokens, heads)
+    return lse.transpose(0, 1).contiguous()
 
 
 def attention_split(pipeline, q, k, v, meta):
@@ -74,8 +71,8 @@ def attention_split(pipeline, q, k, v, meta):
         cross["max_q"], cross["max_used"], causal=False,
         block_table=cross["table"], seqused_k=cross["used"])
 
-    la = _tokens_first(lse_a, n).index_select(0, rows)
-    lb = _tokens_first(lse_b, rows.shape[0])
+    la = _tokens_first(lse_a).index_select(0, rows)
+    lb = _tokens_first(lse_b)
     # online-softmax merge (Milakov & Gimelshein 2018):
     # (wa*A + wb*B)/(wa+wb) == A + (B-A)*sigmoid(lse_b - lse_a),
     # same merge, no fp32 copies of the row tensors

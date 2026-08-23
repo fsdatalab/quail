@@ -122,7 +122,8 @@ def measure(model: ModelSpec, device: DeviceSpec,
 
     points, rows = [], []
     for h in lengths:
-        n_docs = max(8, tokens_per_point // h)
+        n_docs = max(1, min(max(8, tokens_per_point // h),
+                         len(stream) // h))
         body_ids = [stream[i * h:(i + 1) * h] for i in range(n_docs)]
         t0 = time.perf_counter()
         with torch.inference_mode():

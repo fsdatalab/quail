@@ -423,7 +423,12 @@ class Query:
             kv_dtype=plan.kv_dtype,
             chunk_tokens=plan.chunk_tokens,
             workers=plan.workers,
-            limit=plan.limit,
+            # the payload limit is the per-filter admission cap. With
+            # joins, capping a table's filter would drop join inputs
+            # and change the result, so it is only sent for pure
+            # filter queries; _assemble truncates the output rows
+            # either way
+            limit=plan.limit if not join_specs else None,
             shards=shards,
             true_ids=true_ids, false_ids=false_ids,
             # the engine preamble, once: the worker prepends it to

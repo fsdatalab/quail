@@ -153,7 +153,8 @@ class PinnedStore:
         Small documents get up to STAGING_SLOTS slots; large ones
         get fewer (down to 1) so the budget holds."""
         torch = self.torch
-        tokens = max(tokens, self.STAGING_MIN_TOKENS)
+        tokens = min(max(tokens, self.STAGING_MIN_TOKENS),
+                     self.STAGING_BUDGET_TOKENS)
         n = max(1, min(self.STAGING_SLOTS,
                        self.STAGING_BUDGET_TOKENS // tokens))
         self._staging = [torch.empty((tokens, self.row_width),
