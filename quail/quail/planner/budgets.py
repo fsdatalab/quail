@@ -175,6 +175,133 @@ def attention_crossover(model: ModelSpec, device: DeviceSpec,
     return (lo + hi) / 2
 
 
+# ---- speed-of-light (issue #26): the floor a query's measured wall
+# time can never beat. See reports/2026-08-23-sol-throughput-cost.md
+# for the derivation this section implements.
+#
+# _attention_time (above) models `chunk` query tokens all reading ONE
+# shared `context` - exactly what a join stage does (KV rewind: every
+# partner reads the anchor's one cached prefix) and what a filter
+# stage after the first does (a new predicate's few tokens reading
+# the document's already-resident KV). It does NOT model a filter's
+# FIRST stage: that's causal self-attention, where each document
+# attends only to itself, and different documents in the same batched
+# chunk have different lengths - there is no single shared `context`
+# to pass in. That needs its own FLOPs count (sum of each document's
+# own triangular pair count), so it gets its own function below.
+#
+# Both functions below take a whole batch (every document, or every
+# streaming item, in one query) and aggregate FLOPs and bytes-moved
+# BEFORE taking max(), not after: summing many small per-item
+# max(compute, memory) calls overstates the floor versus how one
+# fused batched kernel actually behaves (sum of maxes >= max of
+# sums). Getting this backwards is exactly the kind of SOL-formula
+# bug that manufactures a false "efficiency > 100%" alarm.
+
+def spec_ceiling_tokens_per_s(model: ModelSpec, device: DeviceSpec
+                              ) -> float:
+    """The headline number: tokens/second if every FLOP the card can
+    do went into the forward pass and nothing else existed. 2P FLOPs
+    per token against the peak rate. ~275k tok/s for Qwen3-4B/H100."""
+    return device.peak_flops / (2.0 * model.params)
+
+
+def elementwise_time(model: ModelSpec, device: DeviceSpec,
+                     chunk: int) -> float:
+    """Ideal seconds for the per-token tax: two RMSNorms, the fp8
+    quantization before each GEMM, the SwiGLU activation, and two
+    residual adds. Memory-bound at every batch size - a fixed
+    per-token cost with no compute knee, so no max() here."""
+    inter = model.intermediate
+    qkv_out = (model.n_q + 2 * model.n_kv) * model.d_head
+    norm = 2 * (2 * model.hidden * ACT_BYTES)
+    quant = ((model.hidden + qkv_out + model.hidden + inter)
+             * (ACT_BYTES + model.w_bytes))
+    swiglu = 3 * inter * ACT_BYTES
+    residual = 2 * (3 * model.hidden * ACT_BYTES)
+    per_token = norm + quant + swiglu + residual
+    return per_token * chunk * model.layers / device.hbm_bw
+
+
+def _causal_prefill_attention_time(model: ModelSpec, device: DeviceSpec,
+                                   doc_lengths) -> float:
+    """Ideal seconds for a batch of documents each doing causal
+    self-attention over only their own tokens (a filter chain's
+    first stage, or a join anchor's first-ever prefix build) - never
+    against each other, so this is NOT chunk-tokens-times-one-context.
+
+    Token at position p in a document of length L attends to p prior
+    tokens (0-indexed), so one document's pair count is
+    L*(L+1)/2 and its FLOPs are 4x that (2 matmuls, 2 FLOPs/pair):
+    2*n_q*d_head*L*(L+1). Summed over the batch, then compared
+    against the memory side (each document writes its own KV once,
+    plus its own Q/O traffic) - same shape as _attention_time's
+    `moved` term, with each document supplying its own length as
+    both chunk and context since it reads nothing external."""
+    doc_lengths = list(doc_lengths)
+    chunk = sum(doc_lengths)
+    if chunk == 0:
+        return 0.0
+    flops = 2.0 * model.n_q * model.d_head * sum(
+        L * (L + 1) for L in doc_lengths)
+    moved = (chunk * model.kappa / model.layers
+             + 2.0 * chunk * model.n_q * model.d_head * ACT_BYTES)
+    return max(flops / device.peak_flops,
+              moved / device.hbm_bw) * model.layers
+
+
+def _shared_context_attention_time(model: ModelSpec, device: DeviceSpec,
+                                   chunks_contexts) -> float:
+    """Ideal seconds for a batch of streaming items - a filter's
+    later stages, or a join's partners - each a few new tokens
+    (`chunk_i`) reading one already-resident, per-item cached prefix
+    (`context_i`). This is `_attention_time`'s shape, exactly, just
+    aggregated across many small items instead of called once per
+    item (see the module note on why: summing per-item max() calls
+    would overstate the floor)."""
+    chunks_contexts = list(chunks_contexts)
+    if not chunks_contexts:
+        return 0.0
+    flops = sum(4.0 * c * s * model.n_q * model.d_head
+               for c, s in chunks_contexts)
+    moved = sum(s * model.kappa / model.layers
+               + 2.0 * c * model.n_q * model.d_head * ACT_BYTES
+               for c, s in chunks_contexts)
+    return max(flops / device.peak_flops,
+              moved / device.hbm_bw) * model.layers
+
+
+def sol_seconds(model: ModelSpec, device: DeviceSpec, *,
+                causal_doc_lengths, streaming_chunks_contexts) -> float:
+    """The floor: minimum seconds to process a query's real workload
+    if every kernel ran at peak. `causal_doc_lengths`: one entry per
+    document whose KV gets built fresh this query (filter stage 0,
+    or a join anchor not already resident from an earlier operator
+    and not restored from the store - see the caller in
+    runtime/session.py for how "already resident" is tracked so a
+    shared document isn't charged for its prefix build twice).
+    `streaming_chunks_contexts`: one (chunk_tokens, context_tokens)
+    pair per streaming item - a later filter stage's predicate
+    against its document, or one join tuple's suffix against its
+    anchor's cached prefix.
+
+    Projection and elementwise cost don't care how the total chunk
+    is split across documents (dense GEMMs and per-token bookkeeping
+    are batch-composition-agnostic), so those run once on the grand
+    total. Only attention needs the causal/streaming split, per the
+    module note above."""
+    causal_doc_lengths = list(causal_doc_lengths)
+    streaming_chunks_contexts = list(streaming_chunks_contexts)
+    total_chunk = (sum(causal_doc_lengths)
+                  + sum(c for c, _ in streaming_chunks_contexts))
+    return (_projection_time(model, device, total_chunk)
+           + elementwise_time(model, device, total_chunk)
+           + _causal_prefill_attention_time(model, device,
+                                            causal_doc_lengths)
+           + _shared_context_attention_time(model, device,
+                                            streaming_chunks_contexts))
+
+
 # ---- rows that consume a calibration constant
 
 def store_break_even_bytes_per_s(model: ModelSpec,

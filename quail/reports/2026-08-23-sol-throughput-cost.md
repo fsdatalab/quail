@@ -219,31 +219,41 @@ exist. `rows` (row count) is already captured in the benchmark
 driver at `quailb.py:822`. This is a formatting change to the report
 row, not new instrumentation.
 
-## 7. $/query — one new constant, one new multiply
+## 7. $/query — GPU, CPU, and memory, each with their own rate
 
 ```
-cost_dollars = gpu_count * (wall_s + boot_s) * rate_per_gpu_second
+cost_dollars = gpu_count * (wall_s + boot_s) * rate_gpu_per_s
+             + cpu_memory_gb * (wall_s + boot_s) * rate_mem_per_gib_s
 ```
+
+CPU core-seconds left out for now: the worker's `@app.function`
+calls (`quail/quail/runtime/worker.py`) set `gpu=` and `memory=` but
+never `cpu=`, so there's no explicit core count to multiply the CPU
+rate against — only Modal's unrequested default. Worth resolving
+before this ships, not assumed away.
 
 - `gpu_count` = `EngineConfig.gpus` (`quail/quail/planner/plan.py:103`).
   Scope note: one model copy per GPU, no tensor-parallel sharing
   across cards (see project scope), so this is a flat multiply, not
   a TP-aware split.
-- `rate_per_gpu_second`: Modal's Python SDK (v1.5.4, already in
-  `quail/.venv`) exposes `modal.Workspace.from_context().billing
-  .rates()` — an async call returning a `Mapping[str, Decimal]` of
-  current per-resource rates for the workspace. This accounts for
-  region multipliers and preemptibility. The worker requests
-  `gpu="H100!"` (non-preemptible — the `!` pins it), so whichever key
-  in that mapping corresponds to non-preemptible H100 SXM is the
-  right one to read.
-  - **Open item**: the exact key name in that mapping (something
-    like `"h100"` or `"gpu-h100"`) isn't knowable without an actual
-    authenticated call against the workspace — it's server-provided,
-    not documented in the SDK source. First implementation step:
-    call `rates()` once, print the dict, and note which key is used.
-  - Fallback constant if the call fails or for offline estimates:
-    ~$3.95/hour ≈ $0.001097/second, per the issue.
+- `cpu_memory_gb` = `EngineConfig.cpu_memory_gb` (`plan.py:104`,
+  default 64, the benchmark driver runs at 80). Worker containers
+  actually request 96 GiB (`memory=98304`) for one GPU — close to
+  the ~100 GiB point past which the issue itself said memory cost
+  stops being negligible, so it's included rather than skipped.
+- Rates: hardcoded, checked in at
+  `quail/quail/calibration/modal_rates.json` — given directly by the
+  user from the Modal pricing page for this workspace, not pulled
+  from the live API. In scope: `gpu_per_second["h100-sxm"]` =
+  0.001097 (matches the issue's own fallback estimate of ~$3.95/hr
+  almost exactly), `memory_per_gib_per_second` = 0.00000222.
+  - Modal's SDK also exposes `modal.Workspace.from_context()
+    .billing.rates()` (confirmed callable, v1.5.4, `quail/.venv`) —
+    an async call returning current per-resource rates for the
+    actual workspace, accounting for region and preemptibility. Not
+    used as the primary source here since the user already supplied
+    the numbers directly; worth a one-time live call later just to
+    cross-check the checked-in file hasn't drifted.
 - Report the **cold pass cost separately from warm** (the issue's
   point): cold includes `boot_s`, which is a real dollar cost the
   user pays once per container, not a per-query cost that

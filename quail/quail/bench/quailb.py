@@ -71,6 +71,58 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# issue #26: docs/s, tokens/s, $/query, and the SOL efficiency check.
+# The floor (sol_s / sol_efficiency) is computed per query inside
+# session.py's report - see reports/2026-08-23-sol-throughput-cost.md
+# for the full derivation. This module adds the two things that are
+# specific to a benchmark run, not to a single query: dollar cost
+# (needs EngineConfig's gpu/memory knobs, which quailb.py already
+# owns) and the hard check that efficiency never exceeds 100% -
+# SOL is a lower bound, so a query that beats it did not get faster
+# than physically possible, it means wall_s or sol_s was computed
+# wrong.
+EFFICIENCY_TOLERANCE = 0.02   # 2% slack for the shared-context
+#                               approximations sol_seconds makes when
+#                               a batch mixes items of different
+#                               lengths (see budgets.py's module note
+#                               on aggregating before max()); not a
+#                               blank check
+
+
+def _modal_rates():
+    path = (Path(__file__).resolve().parents[1]
+            / "calibration" / "modal_rates.json")
+    with open(path) as f:
+        return json.load(f)
+
+
+def _cost_dollars(wall_s, boot_s, gpus, cpu_memory_gb, rates):
+    """gpu-seconds + memory-GiB-seconds, at the checked-in Modal
+    rates (quail/calibration/modal_rates.json). CPU core-seconds are
+    left out: the worker never requests an explicit core count (see
+    that file's provenance note), so there's nothing concrete to
+    multiply the CPU rate against yet."""
+    active_s = wall_s + (boot_s or 0.0)
+    gpu_cost = gpus * active_s * rates["gpu_per_second"]["h100-sxm"]
+    mem_cost = cpu_memory_gb * active_s * rates["memory_per_gib_per_second"]
+    return round(gpu_cost + mem_cost, 6)
+
+
+def _docs_per_s(report, wall_s):
+    """Documents actually processed per second (warm/cold wall time,
+    boot excluded). Every filter chain's stage 0 evaluates its whole
+    input corpus, so that count is the corpus size; a join-only query
+    has no filter stage 0, so fall back to the first join stage's
+    tuple count - the real unit of work when there's no filter."""
+    if not wall_s:
+        return None
+    stage0 = [s["evaluated"] for s in report["stages"]
+             if s["op"] == "filter" and s["stage"] == 0]
+    if stage0:
+        return round(sum(stage0) / wall_s, 1)
+    joins = [s["tuples"] for s in report["stages"] if s["op"] == "join"]
+    return round(joins[0] / wall_s, 1) if joins else None
+
 DATA_SEED = 20260818
 
 # Base document counts at sf=1. Only these three scale with sf; the
@@ -598,6 +650,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     register_sets(sess, d)
     qdefs = queries(sess)
     ids = [i for i in qdefs if only is None or i in only]
+    rates = _modal_rates()
     suite = dict(sf=sf, lf=lf, gpus=gpus, model=model, passes={})
     try:
         for pass_name in ("cold", "warm"):
@@ -612,16 +665,46 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                       flush=True)
                 try:
                     res = build().run()
+                    wall_s = res.report["wall_s"]
+                    boot_s = res.report.get("boot_s")
+                    sol_s = res.report.get("sol_s")
+                    efficiency = res.report.get("sol_efficiency")
+                    # SOL is a lower bound: nothing can run faster.
+                    # An efficiency above 100% (past a small slack for
+                    # the aggregation approximations, see
+                    # EFFICIENCY_TOLERANCE) means wall_s or sol_s was
+                    # computed wrong, not a real speedup - fail this
+                    # query loudly instead of reporting an impossible
+                    # number, per issue #26.
+                    if (sol_s is not None and wall_s
+                            and sol_s > wall_s * (1 + EFFICIENCY_TOLERANCE)):
+                        raise AssertionError(
+                            f"{qid} {pass_name}: measured wall_s="
+                            f"{wall_s} beats the speed-of-light floor "
+                            f"sol_s={sol_s} (efficiency="
+                            f"{efficiency:.1%}) - not a real speedup, "
+                            f"a bug in the wall_s/fresh_tokens "
+                            f"measurement or in sol_seconds()'s model "
+                            f"of this query's workload")
                     row = dict(query=qid, desc=desc,
-                               wall_s=res.report["wall_s"],
-                               boot_s=res.report["boot_s"],
+                               wall_s=wall_s,
+                               boot_s=boot_s,
                                boot_kind=res.report.get("boot_kind"),
                                boot=res.report.get("boot"),
                                fresh_tokens=res.report["fresh_tokens"],
                                rows=len(res.rows),
                                peak_gib=res.report.get("peak_gib"),
                                stages=res.report["stages"],
-                               store=res.report.get("store"))
+                               store=res.report.get("store"),
+                               sol_s=sol_s,
+                               sol_efficiency=efficiency,
+                               tokens_per_s=(
+                                   round(res.report["fresh_tokens"]
+                                        / wall_s) if wall_s else None),
+                               docs_per_s=_docs_per_s(res.report, wall_s),
+                               cost_dollars=_cost_dollars(
+                                   wall_s, boot_s, gpus, cpu_memory_gb,
+                                   rates))
                 except Exception as e:            # noqa: BLE001
                     row = dict(query=qid, desc=desc,
                                error=f"{type(e).__name__}: {e}")

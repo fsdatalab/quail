@@ -521,6 +521,108 @@ class Query:
                     survivors[alias] = [d for d in survivors[alias]
                                         if d not in keep]
 
+        # ---- speed-of-light (issue #26): budgets.sol_seconds needs
+        # two shapes of fresh work (see its docstring and
+        # reports/2026-08-23-sol-throughput-cost.md for the
+        # derivation) - a document's first-ever KV write (causal
+        # self-attention, a filter chain's stage 0, or a join
+        # anchor's first touch by ANY operator in this query) versus
+        # new tokens streaming against an already-resident KV (a
+        # filter's later stages; every join partner, which always
+        # reads its anchor's cached prefix - KV rewind's whole
+        # point). `built` tracks which (alias, doc) pairs already
+        # have resident KV as plan.operators is walked in its actual
+        # order, so an alias a join anchors after a preceding filter
+        # already scanned it is not charged for its prefix build
+        # twice.
+        #
+        # Not modeled: KV store restores (issue #6's PinnedStore) -
+        # a restored document's prefix costs nothing real, but this
+        # walk has no per-document restore identity, only the
+        # aggregate `report["store"][alias]["restored_tokens"]`
+        # count. So on a warm pass with restores, causal_doc_lengths
+        # overstates the true causal-build cost, making sol_s an
+        # overestimate of the floor there - the safe direction (it
+        # risks understating efficiency, never a false "faster than
+        # possible" alarm). Cold passes are unaffected: the store is
+        # flushed before them, so restored_tokens is always 0.
+        pre_len = len(self.session.tokenizer(SHARED_PRE))
+        built: dict = {}
+        causal_doc_lengths = []
+        streaming_chunks_contexts = []
+        join_i = 0
+        for op in plan.operators:
+            if op["op"] == "FilterChain":
+                alias = op["alias"]
+                rows = out["filters"][alias]
+                preds = filters[alias]
+                suffix_lens = [
+                    len(_question_ids(self.session,
+                                      preds[st["written_pos"]].prompt))
+                    for st in op["stages"]]
+                cum_before, running = [], 0
+                for L in suffix_lens:
+                    cum_before.append(running)
+                    running += L
+                resident = built.setdefault(alias, set())
+                for si in range(len(op["stages"])):
+                    evaluated = [d for d, row in rows.items()
+                                if len(row) > si]
+                    if si == 0:
+                        for d in evaluated:
+                            if d not in resident:
+                                causal_doc_lengths.append(
+                                    pre_len + self._doc_tokens[alias][d]
+                                    + suffix_lens[0])
+                        resident.update(evaluated)
+                    else:
+                        for d in evaluated:
+                            context = (pre_len
+                                      + self._doc_tokens[alias][d]
+                                      + cum_before[si])
+                            streaming_chunks_contexts.append(
+                                (suffix_lens[si], context))
+            elif op["op"] == "JoinStage":
+                jout = out["joins"][join_i]
+                join_i += 1
+                anchor = op["anchor"]
+                j = joins[op["written_pos"]]
+                spec = _join_spec(self.session, j.predicate, anchor,
+                                  op["partners"])
+                frame_len = len(spec["frame"])
+                tail_len = len(spec["tail"])
+                label_lens = {p: len(spec["labels"][p])
+                              for p in op["partners"]}
+                resident = built.setdefault(anchor, set())
+                anchor_map = jout["anchor_index"]
+                for gd in anchor_map:
+                    if gd not in resident:
+                        causal_doc_lengths.append(
+                            pre_len + self._doc_tokens[anchor][gd])
+                resident.update(anchor_map)
+                tuples = jout["partner_index"]
+                suffix_lens = [
+                    sum(label_lens[p] for p in op["partners"])
+                    + sum(self._doc_tokens[p][g] for p, g in
+                          zip(op["partners"], t))
+                    + tail_len
+                    for t in tuples]
+                for local_a, row in jout["rows"].items():
+                    context = (pre_len
+                              + self._doc_tokens[anchor][anchor_map[local_a]]
+                              + frame_len)
+                    for pi in range(len(row)):
+                        streaming_chunks_contexts.append(
+                            (suffix_lens[pi], context))
+        from quail.planner.budgets import sol_seconds
+        report["sol_s"] = round(sol_seconds(
+            self.session.model, self.session.device,
+            causal_doc_lengths=causal_doc_lengths,
+            streaming_chunks_contexts=streaming_chunks_contexts), 4)
+        report["sol_efficiency"] = (
+            round(report["sol_s"] / report["wall_s"], 4)
+            if report["wall_s"] else None)
+
         # ---- output tuples: the one full join's TRUE rows, each
         # member checked against its table's final survivor set (a
         # gate written after the join still applies - order changes
