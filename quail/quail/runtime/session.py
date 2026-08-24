@@ -10,10 +10,13 @@
 Both entry points return the same runnable Query: sess.sql() compiles
 AI SQL, sess.docs() starts the builder.
 
-What run() supports: filter-only queries, exists/anti gates, and the
-one full join - however many tables it spans, since an n-way join is
-a single cross-product stage (every document of a tuple in one
-prompt), never a chain of pairwise stages. The KV store and GPU
+What run() supports: filter-only queries, exists/anti gates, and
+full joins that share one anchor table. Each join is one
+cross-product stage (every document of a tuple in one prompt);
+several stages compose when they anchor on the same table, and the
+final tuples come from matching the stages' surviving pairs on that
+table's document ids. Stages anchored on different tables need the
+between-group re-shard, which is not built yet. The KV store and GPU
 snapshots are later steps; cpu_memory_gb is carried but not yet
 consumed.
 """
@@ -521,28 +524,52 @@ class Query:
                     survivors[alias] = [d for d in survivors[alias]
                                         if d not in keep]
 
-        # ---- output tuples: the one full join's TRUE rows, each
-        # member checked against its table's final survivor set (a
-        # gate written after the join still applies - order changes
-        # cost, never results)
+        # ---- output tuples: the full stages' TRUE rows, equi-joined
+        # on the shared anchor's document ids (id matching only, no
+        # model calls), each member checked against its table's final
+        # survivor set (a gate written after a join still applies -
+        # order changes cost, never results)
         cols = [f"{c.alias}.{c.column}" for c in
                 self.logical.root.columns]
         if not full_stages:
             alias_order = [scans[0].alias]
             tuples = [(d,) for d in survivors[scans[0].alias]]
         else:
-            (op, rows, partner_map), = full_stages  # one by compile
-            alias_order = [op["anchor"]] + list(op["partners"])
+            anchor = full_stages[0][0]["anchor"]
+            if any(op["anchor"] != anchor for op, _, _ in full_stages):
+                raise NotImplementedError(
+                    "full join stages anchored on different tables "
+                    "need the between-group re-shard, which is not "
+                    "built yet")
+            alias_order = [anchor]
+            for op, _, _ in full_stages:
+                alias_order += [p for p in op["partners"]
+                                if p not in alias_order]
             keep = {a: set(survivors[a]) for a in alias_order}
-            tuples = []
-            for a, ts in matches(rows).items():
-                if a not in keep[op["anchor"]]:
-                    continue
-                for ti in ts:
-                    member = partner_map[ti]
-                    if all(g in keep[al] for al, g in
-                           zip(op["partners"], member)):
-                        tuples.append((a, *member))
+            # one assignment (alias -> document) per candidate tuple.
+            # Each stage extends the anchor's assignments with its
+            # matched partner tuples; a partner alias two stages
+            # share must carry the same document in both (the
+            # equi-join). An anchor document gated out mid-group has
+            # no rows in later stages, so its assignments extend to
+            # nothing and drop.
+            assigns = [{anchor: a} for a in sorted(full_stages[0][1])
+                       if a in keep[anchor]]
+            for op, rows, partner_map in full_stages:
+                m = matches(rows)
+                extended = []
+                for asg in assigns:
+                    for ti in m.get(asg[anchor], ()):
+                        member = partner_map[ti]
+                        new = dict(asg)
+                        if all(g in keep[al]
+                               and new.setdefault(al, g) == g
+                               for al, g in zip(op["partners"],
+                                                member)):
+                            extended.append(new)
+                assigns = extended
+            tuples = [tuple(asg[a] for a in alias_order)
+                      for asg in assigns]
 
         proj_rows = []
         for tup in tuples:

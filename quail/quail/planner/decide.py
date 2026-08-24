@@ -250,6 +250,42 @@ def choose_anchor(join, stats: dict,
     return planner_pick, remarks
 
 
+def choose_shared_anchor(joins, stats: dict,
+                         pre_tokens: int = 0) -> tuple[str, list]:
+    """One anchor for every full join: the table they all share.
+    Anchoring every stage there keeps that table's KV resident across
+    stages and needs no re-shard between them. When more than one
+    table is shared, the one with the smallest summed stage tokens
+    anchors. A forced anchor (a user override on any join) wins when
+    it is a shared table; anything that would put two stages on
+    different anchors needs the between-group re-shard, which is not
+    built yet, and raises plainly."""
+    shared = set(_join_aliases(joins[0]))
+    for j in joins[1:]:
+        shared &= set(_join_aliases(j))
+    if not shared:
+        raise NotImplementedError(
+            "multiple full joins that share no table need the "
+            "between-group re-shard, which is not built yet")
+    forced = {j.anchor for j in joins if j.anchor is not None}
+    if len(forced) > 1 or (forced and not forced <= shared):
+        raise NotImplementedError(
+            f"forced anchors {sorted(forced)} would put the full "
+            f"join stages on different anchors; the between-group "
+            f"re-shard is not built yet (shared tables: "
+            f"{sorted(shared)})")
+    if forced:
+        (anchor,) = forced
+        return anchor, []
+    live = {a: float(s.n_docs) for a, s in stats.items()}
+
+    def total(a):
+        return sum(_stage_tokens(j, live, stats, a, pre_tokens)
+                   for j in joins)
+
+    return min(sorted(shared), key=total), []
+
+
 # --------------------------------------------- sharding (token arithmetic)
 
 def balanced_shards(doc_tokens, workers: int):
@@ -359,7 +395,17 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     # (every partner document plus the question) depends on which
     # table anchors
     anchors = {}
+    full_joins = [j for j in joins if j.semantics == "full"]
+    if len(full_joins) > 1:
+        # multiple full joins run as one same-anchor group; anchoring
+        # them elsewhere needs the unbuilt between-group re-shard
+        anchor, notes = choose_shared_anchor(full_joins, stats, pre)
+        for j in full_joins:
+            anchors[id(j)] = anchor
+        remarks.extend(notes)
     for j in joins:
+        if id(j) in anchors:
+            continue
         anchor, notes = choose_anchor(j, stats, pre)
         anchors[id(j)] = anchor
         remarks.extend(notes)

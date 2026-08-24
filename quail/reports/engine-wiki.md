@@ -100,11 +100,14 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
 6. The session builds a payload (token id lists and planned settings)
    and ships it to a Modal worker over RPC.
 7. The worker runs the packed executor on the GPU: filter chains,
-   exists/anti gates, and the one full join (a single cross-product
-   stage, however many tables it spans).
+   exists/anti gates, and the full join stages (each one a
+   cross-product stage, however many tables it spans; consecutive
+   stages sharing an anchor run as one gated group).
 8. The worker returns raw answer rows. The session assembles output
-   tuples from the full join's TRUE rows (each member checked against
-   its table's final survivor set), applies the projection, and
+   tuples from the full stages' TRUE rows - with several stages,
+   matched on the shared anchor's document ids, no model calls -
+   each member checked against its table's final survivor set. It
+   applies LIMIT to these final tuples, then the projection, and
    returns a `Result`.
 
 ## 2. Query compilation
@@ -129,9 +132,10 @@ There are four operators, defined in `logical.py`:
 - **SemanticJoin**: one true/false predicate over a whole tuple of
   documents, one per table - the cross product of its tables
   filtered by a single prompt that holds every document at once
-  (the BigQuery/Snowflake AI-join shape; never a chain of pairwise
-  stages). A query has at most one `full` join, plus any number of
-  gates:
+  (the BigQuery/Snowflake AI-join shape). A query may hold several
+  `full` joins - each its own predicate and stage, composed by id
+  matching at assembly (issue #38; execution currently requires all
+  of them to share one anchor table) - plus any number of gates:
   - `full`: produce every matching tuple.
   - `exists`: keep outer documents that match at least one inner
     document (a semi-join; two tables).
@@ -210,13 +214,24 @@ in the Snowflake dialect. `AI_FILTER(PROMPT(...))` appears in WHERE
 conjuncts; join predicates appear in `JOIN ... ON` clauses; `EXISTS`
 and `NOT EXISTS` subqueries map to exists and anti semantics.
 
+Each multi-table `AI_FILTER(PROMPT(...))` - on a JOIN's ON or as a
+WHERE term - is one join predicate; a query may have several.
+Coverage rule: every JOINed table must appear in at least one join
+predicate, and the predicates' tables must form one connected graph
+with the FROM table.
+
 The front end rejects every relational operator except projection
 and LIMIT: GROUP BY, ORDER BY, DISTINCT, HAVING, UNION, INTERSECT,
 EXCEPT, window functions, OR between AI predicates, and subqueries
-other than the EXISTS form. LIMIT N stops the filter loop once N
-survivors are found (early termination); the builder equivalent is
-`.limit(n)` before `.select()`. The rejection list is explicit
-(`compile.py:22-33`), so new SQL surface cannot enter silently.
+other than the EXISTS form. LIMIT N caps the output rows. For a
+filter-only query that means the filter loop stops once N survivors
+are found (early termination); for a join query the filter round
+gets no limit - one document can appear in zero or many output rows
+(#39) - and `_assemble` truncates the final tuples instead
+(`filter_round_limit` in `runtime/coordinator.py` decides). The
+builder equivalent is `.limit(n)` before `.select()`. The rejection
+list is explicit (`compile.py:22-33`), so new SQL surface cannot
+enter silently.
 
 ### Builder API
 
@@ -278,22 +293,30 @@ nothing) goes last. When any filter lacks a selectivity, `as_written`
 is used.
 
 **Join order** (`order_joins` in `decide.py`): when several join
-specs exist (exists/anti gates plus at most one full join) and all
-carry selectivities, the planner enumerates the permutations
-(typically 2 to 4 specs, so the enumeration is small) and picks the
-one with the smallest survivor-thinned tuple-token total. Every
-spec is self-contained (the cross product over its own tables), so
-every order runs; order changes cost, never results. The survivor
+specs exist (exists/anti gates plus the full joins) and all carry
+selectivities, the planner enumerates the permutations (typically 2
+to 4 specs, so the enumeration is small) and picks the one with the
+smallest survivor-thinned tuple-token total. Every spec is
+self-contained (the cross product over its own tables), so every
+order runs; order changes cost, never results. The survivor
 thinning uses `n * (1 - (1-s)^partner_tuples)` for the expected
 documents in some passing tuple (`_surviving_docs`).
 
-**Anchor selection** (`choose_anchor` in `decide.py`): for each
+**Anchor selection** (`choose_anchor` in `decide.py`): for a lone
 join, the planner picks the table whose tuple-token total is
 smallest when the other tables stream. In practice, the side with
 the most document tokens anchors (anchor tokens are paid once per
 document, partner tokens once per tuple). A user override wins,
 with a remark when it prices worse; an exists/anti gate always
-anchors on the outer table, because the gate applies to it.
+anchors on the outer table, because the gate applies to it. With
+more than one full join (`choose_shared_anchor`), every full stage
+anchors on the table all of them share - that keeps the anchor's KV
+resident across stages and needs no re-shard between them; when
+several tables are shared, the one with the smallest summed stage
+tokens wins. Full joins sharing no table, or forced anchors that
+would split the stages, raise NotImplementedError until the
+between-group re-shard is built (issue #38's later slices; the
+joint order-and-anchor search with barrier costs lands there too).
 
 **Sharding** (`balanced_shards` in `decide.py`): greedy balance by
 token count across workers. Filters split documents; joins split
@@ -418,8 +441,9 @@ single forward pass, sharing KV across them through a paged arena.
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
-| `order_joins` | `decide.py` | Order the join specs (gates + the one full join) by total tuple tokens |
-| `choose_anchor` | `decide.py` | Pick the cheapest anchor table for a join |
+| `order_joins` | `decide.py` | Order the join specs (gates + full joins) by total tuple tokens |
+| `choose_anchor` | `decide.py` | Pick the cheapest anchor table for a lone join |
+| `choose_shared_anchor` | `decide.py` | Anchor every full join on the table they all share |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
 | `access_for_scan` | `decide.py` | Decide read vs restore for a scanned corpus |
 | `store_length_threshold` | `decide.py` | Length cutoff for which documents to store |
@@ -1123,10 +1147,11 @@ merge: concatenate per-stage answer rows
 
 | Function | File | What it does |
 |---|---|---|
-| `filter_round_payloads` | `coordinator.py:25` | Build per-worker filter sub-payloads |
-| `merge_filter_round` | `coordinator.py:53` | Merge workers' filter answers |
-| `join_round_payloads` | `coordinator.py:73` | Build per-worker join sub-payloads |
-| `merge_join_round` | `coordinator.py:120` | Concatenate workers' join answer rows |
+| `filter_round_limit` | `coordinator.py:25` | The filter round's limit: None when the payload has joins (#39) |
+| `filter_round_payloads` | `coordinator.py:41` | Build per-worker filter sub-payloads |
+| `merge_filter_round` | `coordinator.py:73` | Merge workers' filter answers |
+| `join_round_payloads` | `coordinator.py:98` | Build per-worker join sub-payloads |
+| `merge_join_round` | `coordinator.py:147` | Concatenate workers' join answer rows |
 | `execute` | `worker.py:64` | Single-GPU Modal worker entry point |
 | `execute_2/4/8` | `worker.py:495-519` | Multi-GPU Modal worker entry points |
 | `_execute_single` | `worker.py:144` | Single-GPU execution core (shared by all paths) |

@@ -22,6 +22,22 @@ COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "true_ids",
                "false_ids", "pre_ids", "limit")
 
 
+def filter_round_limit(payload: dict):
+    """The limit the filter round may enforce: the payload's limit
+    for a filter-only query, None when the payload has joins.
+
+    LIMIT counts output rows. A filter-only query yields one row per
+    surviving document, so stopping at `limit` survivors is correct
+    and saves work. A join turns one document into zero or many
+    output rows, so cutting survivor lists would drop rows (#39);
+    join queries are capped once, on the final tuples, in _assemble.
+    The session already sends limit=None for join queries; this
+    guard makes the rule hold for any payload."""
+    if payload.get("joins"):
+        return None
+    return payload.get("limit")
+
+
 def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
     """Per-worker sub-payloads for the filter round. shards:
     alias -> one tuple of global document indices per worker.
@@ -41,6 +57,9 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
             docs[alias] = [toks[i] for i in idx]
             index[alias] = idx
         sub = {key: payload[key] for key in COMMON_KEYS}
+        # the child never sees the joins, so the join-vs-filter limit
+        # rule (filter_round_limit) must be applied at split time
+        sub["limit"] = filter_round_limit(payload)
         sub.update(docs=docs, doc_index=index,
                    filters=payload["filters"],
                    filter_arena_writes=payload["filter_arena_writes"],

@@ -157,18 +157,62 @@ def test_join_prompt_keeps_markers_and_labels_blocks():
     assert render_join_question(p.template) == p.tail
 
 
-def test_join_rejects_second_predicate_and_repeat_alias(catalog):
-    two_ons = """
-        SELECT a.id FROM reviews a
-        JOIN threads b
-          ON AI_FILTER(PROMPT('x {0} {1}', a.review, b.thread))
-        JOIN products p
-          ON AI_FILTER(PROMPT('y {0} {1}', b.thread, p.description))
-    """
-    with pytest.raises(CompileError) as e:
-        compile_sql(two_ons, catalog, tok)
-    assert "one join predicate" in str(e.value)
+TWO_ONS = """
+    SELECT a.id FROM reviews a
+    JOIN threads b
+      ON AI_FILTER(PROMPT('x {0} {1}', a.review, b.thread),
+                   {'selectivity': 0.5})
+    JOIN products p
+      ON AI_FILTER(PROMPT('y {0} {1}', b.thread, p.description),
+                   {'selectivity': 0.2})
+"""
 
+TWO_WHERE = """
+    SELECT a.id FROM reviews a, threads b, products p
+    WHERE AI_FILTER(PROMPT('x {0} {1}', a.review, b.thread),
+                    {'selectivity': 0.5})
+      AND AI_FILTER(PROMPT('y {0} {1}', b.thread, p.description),
+                    {'selectivity': 0.2})
+"""
+
+
+def test_two_join_predicates_compile_to_two_specs(catalog):
+    # a chain: each multi-table AI_FILTER is its own pairwise join
+    plan = compile_sql(TWO_ONS, catalog, tok)
+    outer = plan.root.input
+    assert isinstance(outer, SemanticJoin)
+    inner = outer.inputs[0]
+    assert isinstance(inner, SemanticJoin)
+    assert [r.alias for r in inner.predicate.args] == ["a", "b"]
+    assert [r.alias for r in outer.predicate.args] == ["b", "p"]
+    assert inner.selectivity == 0.5 and outer.selectivity == 0.2
+    # both SQL styles and the chained builder produce the same plan
+    built = (docs(catalog, "reviews", tok).alias("a")
+             .ai_join(docs(catalog, "threads", tok).alias("b"),
+                      prompt("x {0} {1}", col("a.review"),
+                             col("b.thread")), selectivity=0.5)
+             .ai_join(docs(catalog, "products", tok).alias("p"),
+                      prompt("y {0} {1}", col("b.thread"),
+                             col("p.description")), selectivity=0.2)
+             .select("a.id"))
+    assert plan == compile_sql(TWO_WHERE, catalog, tok) == built
+
+
+def test_on_plus_where_join_predicates_accepted(catalog):
+    # one predicate on the ON, the second a WHERE term - two specs
+    sql = ("SELECT r.id FROM reviews r JOIN products p ON AI_FILTER("
+           "PROMPT('x {0} {1}', r.review, p.description)) "
+           "JOIN threads t "
+           "WHERE AI_FILTER(PROMPT('y {0} {1}', p.description, "
+           "t.thread))")
+    plan = compile_sql(sql, catalog, tok)
+    outer = plan.root.input
+    assert [r.alias for r in outer.predicate.args] == ["p", "t"]
+    assert [r.alias for r in outer.inputs[0].predicate.args] == \
+        ["r", "p"]
+
+
+def test_join_prompt_repeat_alias_rejected(catalog):
     with pytest.raises(CompileError) as e:
         compile_sql("""
             SELECT a.id FROM reviews a
@@ -178,14 +222,42 @@ def test_join_rejects_second_predicate_and_repeat_alias(catalog):
         """, catalog, tok)
     assert "distinct table" in str(e.value)
 
+
+def test_builder_chained_joins_produce_two_specs(catalog):
+    plan = (docs(catalog, "reviews", tok).alias("a")
+            .ai_join(docs(catalog, "threads", tok).alias("b"),
+                     prompt("x {0} {1}", col("a.review"),
+                            col("b.thread")))
+            .ai_join(docs(catalog, "products", tok).alias("p"),
+                     prompt("y {0} {1}", col("b.thread"),
+                            col("p.description")))
+            .select("a.id"))
+    outer = plan.root.input
+    assert isinstance(outer, SemanticJoin)
+    assert isinstance(outer.inputs[0], SemanticJoin)
+
+    # a chained call's prompt must cover the table it joins ...
     q = (docs(catalog, "reviews", tok).alias("a")
          .ai_join(docs(catalog, "threads", tok).alias("b"),
-                  prompt("x {0} {1}", col("a.review"), col("b.thread"))))
+                  prompt("x {0} {1}", col("a.review"),
+                         col("b.thread"))))
     with pytest.raises(CompileError) as e:
         q.ai_join(docs(catalog, "products", tok).alias("p"),
                   prompt("y {0} {1}", col("a.review"),
+                         col("b.thread")))
+    assert "joined but not referenced" in str(e.value)
+
+
+def test_builder_join_must_touch_query_rejected(catalog):
+    # ... and at least one table already in the query, so the joins
+    # connect to it
+    q = docs(catalog, "reviews", tok).alias("a")
+    with pytest.raises(CompileError) as e:
+        q.ai_join([docs(catalog, "threads", tok).alias("b"),
+                   docs(catalog, "products", tok).alias("p")],
+                  prompt("y {0} {1}", col("b.thread"),
                          col("p.description")))
-    assert "one full ai_join" in str(e.value)
+    assert "at least one table already in the query" in str(e.value)
 
 
 def test_join_predicate_must_cover_every_joined_table(catalog):
@@ -201,6 +273,18 @@ def test_join_predicate_must_cover_every_joined_table(catalog):
             SELECT a.id FROM reviews a JOIN threads b
         """, catalog, tok)
     assert "no join predicate" in str(e.value)
+
+
+def test_disconnected_join_graph_rejected(catalog):
+    # b-p is a connected pair, but no predicate touches the FROM
+    # table a, so a's cross product would pass through unfiltered
+    with pytest.raises(CompileError) as e:
+        compile_sql("""
+            SELECT a.id FROM reviews a, threads b, products p
+            WHERE AI_FILTER(PROMPT('x {0} {1}', b.thread,
+                                   p.description))
+        """, catalog, tok)
+    assert "connected graph" in str(e.value)
 
 
 def test_exists_and_anti(catalog):
@@ -365,17 +449,23 @@ def test_rejected_with_named_error(catalog, sql, fragment):
     assert fragment.lower() in str(e.value).lower()
 
 
-def test_second_join_predicate_in_where_rejected(catalog):
-    # a multi-provider WHERE AI_FILTER is the join predicate (the
-    # BigQuery form); with an ON predicate already given it is a
-    # second one, and there is only ever one
+def test_two_join_predicates_over_the_same_pair(catalog):
+    # two predicates over the same two tables: two specs; a pair must
+    # answer TRUE to both. Only the first spec carries the joined
+    # table into the tree
     sql = ("SELECT r.id FROM reviews r JOIN products p ON AI_FILTER("
            "PROMPT('x {0} {1}', r.review, p.description)) "
            "WHERE AI_FILTER(PROMPT('y {0} {1}', r.review, "
            "p.description))")
-    with pytest.raises(CompileError) as e:
-        compile_sql(sql, catalog, tok)
-    assert "one join predicate" in str(e.value)
+    plan = compile_sql(sql, catalog, tok)
+    outer = plan.root.input
+    assert isinstance(outer, SemanticJoin)
+    assert len(outer.inputs) == 1              # p already in the tree
+    inner = outer.inputs[0]
+    assert isinstance(inner, SemanticJoin)
+    assert len(inner.inputs) == 2
+    assert [r.alias for r in inner.predicate.args] == ["r", "p"]
+    assert [r.alias for r in outer.predicate.args] == ["r", "p"]
 
 
 def test_limit_parses_and_threads(catalog):
