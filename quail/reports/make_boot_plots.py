@@ -28,10 +28,13 @@ sys.path.insert(0, str(HERE))
 from plot_colors import BLUE, GRAY, GREEN, ORANGE, TEAL, DARK
 
 tiered = json.load(open(RESULTS / "boot_tiered.json"))
+# boot phases from the profiler-off control: py-spy adds ~4.6 s to
+# the warm phase, and the old reference was measured without it
+nospy = json.load(open(RESULTS / "boot_tiered_nospy.json"))
 old = json.load(open(RESULTS / "boot_profile.json"))
 stock_q = json.load(open(RESULTS / "baseline_filter1.json"))
 
-new_cold = tiered["touch"]["cold"]
+new_cold = nospy["touch"]["cold"]
 old_cold = old["quail"]["cold"]
 compile_cold = tiered["compile"]["cold"]
 
@@ -72,17 +75,18 @@ max_total = max(mean_s(c, "boot_s") for _, c, _ in rows)
 ax_boot.set_xlim(0, max_total * 1.22)
 ax_boot.set_ylim(-0.45, 1.85)
 ax_boot.set_yticks([])
-ax_boot.set_xlabel("cold container boot (seconds, 3-trial mean)")
+ax_boot.set_xlabel("cold container boot (seconds, trial mean)")
 ax_boot.legend(
     handles=[Patch(facecolor=c, label=n) for n, _, c in PHASES],
-    loc="lower right", fontsize=8.5, handlelength=1.1)
+    loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=3,
+    fontsize=8.5, handlelength=1.1)
 ax_boot.set_title(
     f"compile pass (once ever, not per container): "
     f"{compile_cold['warm_kernels_s']:.0f} s warmup phase",
     fontsize=9.5, loc="left", color=DARK)
 
 # ---- right: first query after boot vs stock vLLM --------------------
-best = tiered["query"]["best_wall"]["no_arena"]
+best = nospy["query"]["best_wall"]["no_arena"]
 ref = tiered["reference"]["quail_query"]["no_arena_wall_s"]
 stock_wall = min(r["wall"] for r in stock_q["runs"])
 bars = ax_q.bar(["Quail\n(this run)", "Quail\n(committed)",
@@ -94,9 +98,8 @@ for bar, v in zip(bars, [best, ref, stock_wall]):
               f"{v:.1f}", ha="center", fontsize=10,
               fontweight="bold", color=DARK)
 ax_q.text(bars[2].get_x() + bars[2].get_width() / 2,
-          stock_wall / 2,
-          f"{(stock_wall / best - 1) * 100:.0f}% slower",
-          ha="center", fontsize=9, color="white",
+          stock_wall / 2, f"+{(stock_wall / best - 1) * 100:.0f}%",
+          ha="center", fontsize=9.5, color="white",
           fontweight="bold")
 ax_q.set_ylim(0, stock_wall * 1.18)
 ax_q.set_ylabel("filter query wall (seconds)")

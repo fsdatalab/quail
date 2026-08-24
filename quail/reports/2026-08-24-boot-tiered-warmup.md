@@ -78,13 +78,68 @@ the budget costs ~20x the swept compute - fine once, not per boot).
 
 ## Measured
 
-TO FILL AFTER RUN.
+All on Qwen3 4B fp8 / H100 SXM, vLLM 0.26.0, one container per
+trial. Committed summaries: `results/boot_tiered.json` (py-spy
+attached), `results/boot_tiered_nospy.json` (profiler off),
+`results/baseline_filter1.json` (stock, refreshed same day).
+
+Compile pass, once ever (force_compile, py-spy attached):
+
+- warmup phase 103.8 s (the generator's full size list to the
+  110,376-token budget plus all forward-pass shapes), inside the
+  predicted "minutes once ever". This pass also wrote the marker;
+  every following boot took the touch path.
+
+Touch boots, profiler off (the clean walls; 2 trials):
+
+- `warm_kernels_s` 3.44 / 3.81 s (mean 3.62 s) - inside the
+  predicted 2-4 s, and below the swept warmup's 3.68-4.9 s in the
+  committed `results/boot_profile.json`.
+- `boot_s` 37.5 / 40.4 s, of which model loading is 32.6 / 34.8 s -
+  load-dominated, as predicted.
+
+Touch boots, py-spy attached (3 trials): `warm_kernels_s`
+7.51-8.94 s (mean 8.25 s). The profiler itself adds ~4.6 s to the
+warm phase at 100 Hz sampling, so its numbers locate time but do
+not stand as walls.
+
+Where boot time goes (py-spy MainThread profiles, on the
+`quail-results` volume): model loading splits between network/file
+reads and vLLM's per-tensor weight loaders, with a visible ~10 s of
+Python module imports (torch/vLLM) inside the measured
+load-model span; the warm phase is GPU-bound (cuda synchronize on
+the warm chunks) plus DeepGEMM cache reads.
+
+The query after a touch boot (10,000 IMDB documents, one filter
+question, 2 trials x 2 reps x both paths, profiler off):
+
+- best fast-path wall 28.42 s, best arena wall 28.75 s, 0 wrong
+  answers - within 0.4% of the committed 28.30 / 28.65 s
+  (`results/m1_filter1.json`).
+- stock vLLM, same corpus, submission = separate requests per
+  document with document-cap admission, rerun the same day: 34.18 /
+  34.51 s. Quail's 28.42 s is 20% faster.
 
 Figure: plots/boot_tiered.png
 
 ## What the numbers mean
 
-TO FILL AFTER RUN.
+- The per-container warmup no longer re-runs the GEMM sweep, and
+  per-container boot cost did not regress: 3.62 s of touch against
+  3.7-4.9 s of sweep before, with strictly more compile coverage
+  behind it (the generator's complete list to the budget, which the
+  per-boot sweep could never afford).
+- The one-time price of that coverage is 103.8 s, paid once per
+  (software stack, GPU, model, budget) into the shared volume - not
+  per container, not per query.
+- Query behavior is unchanged, as the audit predicted: kernels key
+  on token counts, not on query content, so decoupling warmup from
+  the payload could not move the query numbers - and it did not
+  (28.42 s vs 28.30 s committed, 0 wrong).
+- Boot is now load-model-bound: ~33 s of the ~39 s cold boot is
+  weight loading (network + per-tensor loaders + imports). That is
+  the next thing to attack if boot matters; warmup is no longer on
+  the critical path.
 
 ## Data
 

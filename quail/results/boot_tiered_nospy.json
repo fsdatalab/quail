@@ -1,0 +1,352 @@
+{
+  "cell": "boot_tiered",
+  "model": "Qwen/Qwen3-4B-FP8",
+  "gpu": "H100!",
+  "vllm": "0.26.0",
+  "prediction": "compile boot: generator sweep + unseen-config compiles, minutes once ever; touch boot warm_kernels_s 2-4 s (vs 3.7-4.9 s swept); cold boot_s load_model-dominated (28-38 s); query best fast wall 28.3 s +-3%, 0 wrong, under stock's 33.4 s",
+  "reference": {
+    "quail_query": {
+      "no_arena_wall_s": 28.3,
+      "arena_wall_s": 28.65,
+      "wrong": 0,
+      "source": "results/m1_filter1.json"
+    },
+    "stock_query": {
+      "wall_s": 33.41,
+      "submission": "separate requests per document, document-cap admission",
+      "source": "results/baseline_filter1.json"
+    },
+    "old_boot": {
+      "warm_kernels_s": [
+        3.68,
+        4.9
+      ],
+      "boot_s": [
+        33.61,
+        45.3
+      ],
+      "source": "results/boot_profile.json"
+    }
+  },
+  "compile": {
+    "skipped": true
+  },
+  "touch": {
+    "side": "quail",
+    "n_trials": 2,
+    "trials": [
+      {
+        "cold": {
+          "kind": "cold",
+          "load_model_s": 34.82,
+          "arena_s": 0.46,
+          "pipeline_s": 0.0,
+          "warm_kernels_s": 3.81,
+          "warm_tier": "touch",
+          "boot_s": 40.35
+        },
+        "pyspy": {
+          "ok": false,
+          "path": null,
+          "error": "disabled"
+        },
+        "side": "quail",
+        "trial": 0,
+        "warm": {
+          "kind": "warm",
+          "load_model_s": 0.0,
+          "arena_s": 0.0,
+          "pipeline_s": 0.0,
+          "warm_kernels_s": 0.0,
+          "boot_s": 0.0
+        },
+        "query": [
+          {
+            "rep": 0,
+            "mode": "arena",
+            "wall": 29.2,
+            "fresh_tokens": 3506895,
+            "tok_s": 120093.0,
+            "wrong": 0,
+            "chunks": 32,
+            "gpu_s": 29.13
+          },
+          {
+            "rep": 0,
+            "mode": "no_arena",
+            "wall": 28.85,
+            "fresh_tokens": 3506895,
+            "tok_s": 121550.0,
+            "wrong": 0,
+            "chunks": 32,
+            "gpu_s": 28.82
+          },
+          {
+            "rep": 1,
+            "mode": "arena",
+            "wall": 29.33,
+            "fresh_tokens": 3506895,
+            "tok_s": 119587.1,
+            "wrong": 0,
+            "chunks": 32,
+            "gpu_s": 29.26
+          },
+          {
+            "rep": 1,
+            "mode": "no_arena",
+            "wall": 28.89,
+            "fresh_tokens": 3506895,
+            "tok_s": 121403.9,
+            "wrong": 0,
+            "chunks": 32,
+            "gpu_s": 28.85
+          }
+        ]
+      },
+      {
+        "cold": {
+          "kind": "cold",
+          "load_model_s": 32.58,
+          "arena_s": 0.48,
+          "pipeline_s": 0.0,
+          "warm_kernels_s": 3.44,
+          "warm_tier": "touch",
+          "boot_s": 37.49
+        },
+        "pyspy": {
+          "ok": false,
+          "path": null,
+          "error": "disabled"
+        },
+        "side": "quail",
+        "trial": 1,
+        "warm": {
+          "kind": "warm",
+          "load_model_s": 0.0,
+          "arena_s": 0.0,
+          "pipeline_s": 0.0,
+          "warm_kernels_s": 0.0,
+          "boot_s": 0.0
+        },
+        "query": [
+          {
+            "rep": 0,
+            "mode": "arena",
+            "wall": 28.75,
+            "fresh_tokens": 3506895,
+            "tok_s": 121976.4,
+            "wrong": 0,
+            "chunks": 32,
+            "gpu_s": 28.69
+          },
+          {
+            "rep": 0,
+            "mode": "no_arena",
+            "wall": 28.42,
+            "fresh_tokens": 3506895,
+            "tok_s": 123383.1,
+            "wrong": 0,
+            "chunks": 32,
+            "gpu_s": 28.39
+          },
+          {
+            "rep": 1,
+            "mode": "arena",
+            "wall": 28.84,
+            "fresh_tokens": 3506895,
+            "tok_s": 121617.2,
+            "wrong": 0,
+            "chunks": 32,
+            "gpu_s": 28.78
+          },
+          {
+            "rep": 1,
+            "mode": "no_arena",
+            "wall": 28.45,
+            "fresh_tokens": 3506895,
+            "tok_s": 123286.0,
+            "wrong": 0,
+            "chunks": 32,
+            "gpu_s": 28.41
+          }
+        ]
+      }
+    ],
+    "cold": {
+      "boot_s": {
+        "mean": 38.92,
+        "median": 38.92,
+        "trials": [
+          40.35,
+          37.49
+        ]
+      },
+      "load_model_s": {
+        "mean": 33.7,
+        "median": 33.7,
+        "trials": [
+          34.82,
+          32.58
+        ]
+      },
+      "arena_s": {
+        "mean": 0.47,
+        "median": 0.47,
+        "trials": [
+          0.46,
+          0.48
+        ]
+      },
+      "pipeline_s": {
+        "mean": 0.0,
+        "median": 0.0,
+        "trials": [
+          0.0,
+          0.0
+        ]
+      },
+      "warm_kernels_s": {
+        "mean": 3.62,
+        "median": 3.62,
+        "trials": [
+          3.81,
+          3.44
+        ]
+      }
+    },
+    "warm": {
+      "boot_s": {
+        "mean": 0.0,
+        "median": 0.0,
+        "trials": [
+          0.0,
+          0.0
+        ]
+      },
+      "load_model_s": {
+        "mean": 0.0,
+        "median": 0.0,
+        "trials": [
+          0.0,
+          0.0
+        ]
+      },
+      "arena_s": {
+        "mean": 0.0,
+        "median": 0.0,
+        "trials": [
+          0.0,
+          0.0
+        ]
+      },
+      "pipeline_s": {
+        "mean": 0.0,
+        "median": 0.0,
+        "trials": [
+          0.0,
+          0.0
+        ]
+      },
+      "warm_kernels_s": {
+        "mean": 0.0,
+        "median": 0.0,
+        "trials": [
+          0.0,
+          0.0
+        ]
+      }
+    }
+  },
+  "stock": {
+    "reused": "results/boot_profile.json"
+  },
+  "query": {
+    "runs": [
+      {
+        "rep": 0,
+        "mode": "arena",
+        "wall": 29.2,
+        "fresh_tokens": 3506895,
+        "tok_s": 120093.0,
+        "wrong": 0,
+        "chunks": 32,
+        "gpu_s": 29.13
+      },
+      {
+        "rep": 0,
+        "mode": "no_arena",
+        "wall": 28.85,
+        "fresh_tokens": 3506895,
+        "tok_s": 121550.0,
+        "wrong": 0,
+        "chunks": 32,
+        "gpu_s": 28.82
+      },
+      {
+        "rep": 1,
+        "mode": "arena",
+        "wall": 29.33,
+        "fresh_tokens": 3506895,
+        "tok_s": 119587.1,
+        "wrong": 0,
+        "chunks": 32,
+        "gpu_s": 29.26
+      },
+      {
+        "rep": 1,
+        "mode": "no_arena",
+        "wall": 28.89,
+        "fresh_tokens": 3506895,
+        "tok_s": 121403.9,
+        "wrong": 0,
+        "chunks": 32,
+        "gpu_s": 28.85
+      },
+      {
+        "rep": 0,
+        "mode": "arena",
+        "wall": 28.75,
+        "fresh_tokens": 3506895,
+        "tok_s": 121976.4,
+        "wrong": 0,
+        "chunks": 32,
+        "gpu_s": 28.69
+      },
+      {
+        "rep": 0,
+        "mode": "no_arena",
+        "wall": 28.42,
+        "fresh_tokens": 3506895,
+        "tok_s": 123383.1,
+        "wrong": 0,
+        "chunks": 32,
+        "gpu_s": 28.39
+      },
+      {
+        "rep": 1,
+        "mode": "arena",
+        "wall": 28.84,
+        "fresh_tokens": 3506895,
+        "tok_s": 121617.2,
+        "wrong": 0,
+        "chunks": 32,
+        "gpu_s": 28.78
+      },
+      {
+        "rep": 1,
+        "mode": "no_arena",
+        "wall": 28.45,
+        "fresh_tokens": 3506895,
+        "tok_s": 123286.0,
+        "wrong": 0,
+        "chunks": 32,
+        "gpu_s": 28.41
+      }
+    ],
+    "best_wall": {
+      "arena": 28.75,
+      "no_arena": 28.42
+    },
+    "wrong": 0
+  }
+}
