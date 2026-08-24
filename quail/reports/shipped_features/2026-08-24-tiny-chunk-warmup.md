@@ -47,7 +47,9 @@ logs `results/dg_buckets.log`, `dg_validate.log`):
 The final row's run created ZERO new kernel-cache files during the
 measured query - on a fully cold cache, a gated chain now runs with
 no mid-run compile at all. Every tail chunk sits at the per-chunk
-launch floor.
+launch floor. At 32B - the model that paid a 9.3 s stall - the
+chain's first run under the new warmup measured 70.66 us/token,
+inside the warm-run container band, no stalls.
 
 The warm sweep grew from 332 to 1,024 items, but the added items are
 small matmuls; the cold sweep (every compile included) took ~4 min
