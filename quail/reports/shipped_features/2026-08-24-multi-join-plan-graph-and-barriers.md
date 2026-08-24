@@ -65,9 +65,20 @@ the plan had to become the graph the execution actually follows.
 Re-ordering the remaining stages at a barrier (the plan's stage
 order is fixed at compile time; only a one-stage group's anchor and
 every group's shards are re-decided from measured counts).
-Benchmarks for the chain and star shapes, and one case where
-token-length asymmetry makes the re-shard win, are issue #38's last
-slice and need engine runs.
+
+## Benchmarks
+
+The measured cells for issue #38's benchmark slice - the gate
+against its formula, and the re-shard trade against the forced
+shared-anchor baseline - are in
+`reports/2026-08-24-join-gate-and-reshard.md` (script
+`tests/gpu/join_bench.py`, summary `results/join_bench.json`).
+Headlines: gate mechanics exact and bit-for-bit reproducible; the
+two-group barrier plan measured 11.3x fewer tokens and 11.3x faster
+than the forced shared anchor, with plan-predicted token counts
+matching measurement to 0.03%; and an accuracy finding - anchor
+orientation flipped a planted stage from exact to all-TRUE - that
+feeds issue #43's orientation check.
 
 ## GPU smoke of the barrier path
 
