@@ -151,3 +151,39 @@ def test_docs_per_s_two_sided_query_uses_anchor_only():
         {"op": "join", "anchor": "e", "partners": ["c"], "tuples": 1980},
     ])
     assert quailb._docs_per_s(report, 1.82) == pytest.approx(57 / 1.82, abs=0.05)
+
+
+def test_docs_count_matches_docs_per_s_numerator():
+    """_docs_count (split out of _docs_per_s for sol_report.py's raw
+    "Docs" column) must agree with _docs_per_s's own numerator for
+    every query shape - filter-only, join-only, and two-sided."""
+    filter_only = dict(stages=[
+        {"op": "filter", "alias": "r", "stage": 0, "evaluated": 500},
+        {"op": "filter", "alias": "r", "stage": 1, "evaluated": 480},
+    ])
+    join_only = dict(stages=[
+        {"op": "join", "anchor": "r", "partners": ["a"], "tuples": 2000},
+    ])
+    two_sided = dict(stages=[
+        {"op": "filter", "alias": "c", "stage": 0, "evaluated": 100},
+        {"op": "filter", "alias": "e", "stage": 0, "evaluated": 57},
+        {"op": "join", "anchor": "e", "partners": ["c"], "tuples": 1980},
+    ])
+    for report in (filter_only, join_only, two_sided):
+        count = quailb._docs_count(report)
+        rate = quailb._docs_per_s(report, 10.0)
+        assert count is not None
+        assert rate == pytest.approx(count / 10.0, abs=0.05)
+    assert quailb._docs_count(filter_only) == 500
+    assert quailb._docs_count(join_only) == 2000
+    assert quailb._docs_count(two_sided) == 57
+
+
+def test_docs_per_s_zero_wall_s_returns_none():
+    """wall_s=0 must not raise ZeroDivisionError - it should report
+    unknown throughput, not crash the row."""
+    report = dict(stages=[
+        {"op": "filter", "alias": "r", "stage": 0, "evaluated": 10},
+    ])
+    assert quailb._docs_per_s(report, 0) is None
+    assert quailb._docs_count(report) == 10   # the count itself is fine

@@ -120,10 +120,11 @@ def _cost_dollars(wall_s, boot_s, gpus, cpu_memory_gb, rates):
     return round(gpu_cost + mem_cost, 6)
 
 
-def _docs_per_s(report, wall_s):
-    """Documents actually processed per second (warm/cold wall time,
-    boot excluded). Every filter chain's stage 0 evaluates its whole
-    input corpus, so that count is the corpus size.
+def _docs_count(report):
+    """Documents actually processed this query - the same unit
+    _docs_per_s divides by wall_s. Every filter chain's stage 0
+    evaluates its whole input corpus, so that count is the corpus
+    size.
 
     A two-sided query (a filter on both the join's anchor AND a
     partner table - FEV-5/6, LEP-7) has TWO stage-0 filter entries
@@ -133,9 +134,11 @@ def _docs_per_s(report, wall_s):
     join, use only the anchor's own stage-0 count (the anchor is the
     query's driving table); fall back to the join's tuple count if
     the anchor itself has no filter. Only sum across stage-0 entries
-    for a plain filter chain, where there's just one table."""
-    if not wall_s:
-        return None
+    for a plain filter chain, where there's just one table.
+
+    Split out from _docs_per_s (2026-08-25) so the report table
+    (sol_report.py) can show the raw count next to the rate, not just
+    the rate."""
     joins = [s for s in report["stages"] if s["op"] == "join"]
     if joins:
         anchor = joins[0]["anchor"]
@@ -143,11 +146,20 @@ def _docs_per_s(report, wall_s):
                         if s["op"] == "filter" and s["stage"] == 0
                         and s["alias"] == anchor]
         if anchor_stage0:
-            return round(anchor_stage0[0] / wall_s, 1)
-        return round(joins[0]["tuples"] / wall_s, 1)
+            return anchor_stage0[0]
+        return joins[0]["tuples"]
     stage0 = [s["evaluated"] for s in report["stages"]
              if s["op"] == "filter" and s["stage"] == 0]
-    return round(sum(stage0) / wall_s, 1) if stage0 else None
+    return sum(stage0) if stage0 else None
+
+
+def _docs_per_s(report, wall_s):
+    """Documents processed per second, warm/cold wall time, boot
+    excluded. See _docs_count for which documents count and why."""
+    if not wall_s:
+        return None
+    count = _docs_count(report)
+    return round(count / wall_s, 1) if count is not None else None
 
 DATA_SEED = 20260818
 
