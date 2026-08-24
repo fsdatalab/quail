@@ -16,6 +16,14 @@ write anchor KV) and timing every chunk with CUDA events:
           prefixes + ~1,200 short suffixes per chunk
   IMDB-2  join DISCUSS_ASPECT, 5,000 reviews x 12 aspects - ~90 short
           anchors + ~1,050 suffixes per chunk
+  LEP-2   join LEPJOIN, citations self-join, 200 x 200 - a third
+          corpus (legal text); ~200-token anchors, ~165-token suffixes
+  FEV-2   join SUPPORT, 100 claims x 57 evidence pages - the mirror
+          image of BIO-2: ~11-token claim anchors, whole Wikipedia
+          passages (~385 tokens with label+question) as suffixes
+  BIO-F3  filter chain F7 -> F8 -> F9 over the 200 reports - multiple
+          stages, arena writes on, KV rewind between stages; later
+          stages send ~60-token tails against each document's kept KV
 
 Every chunk is one measured point: its composition (the executor's
 trace) and its GPU milliseconds. Raw per-chunk records go to the
@@ -35,6 +43,20 @@ The old benchmark's join queries measured ~15 us/token wall against a
 ~10 prediction, so the join queries are expected to land above the
 filter fit; the per-chunk GPU times say whether the gap is on the GPU
 or host-side.
+
+LEP-2, FEV-2, and BIO-F3 were added after that first pass confirmed
+the join gap. Predictions for them use the RECALIBRATED constants
+plus the measured join terms (a2x = 1.21-1.23x the causal 2*a2c,
+plus ~37 us / ~126 us per suffix at 4B / 32B), stated before the run:
+
+  4B:  LEP-2 8.4, FEV-2 8.2, BIO-F3 10.4-10.6 us/token
+  32B: LEP-2 58.1, FEV-2 57.2, BIO-F3 66-67 us/token
+
+The sharper tests: FEV-2's big suffixes against tiny anchors should
+land near the causal filter rate (a big suffix prices like a
+document); BIO-F3's late suffix-only chunks should price at the
+cross coefficient a2x, the same term the joins needed - one term
+explaining both shapes.
 
 Run from the quail/ directory (tee per house rule; keep the fc- ids):
 
@@ -86,11 +108,12 @@ GPU_KW = dict(image=image, gpu="H100!", memory=65536,
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})
 
-QUERY_IDS = ("BIO-1", "IMDB-1", "BIO-2", "IMDB-2")
+QUERY_IDS = ("BIO-1", "IMDB-1", "BIO-2", "IMDB-2",
+             "LEP-2", "FEV-2", "BIO-F3")
 
 
 def _queries(tok):
-    """The four QUAIL-B workloads as executor inputs, built exactly
+    """The QUAIL-B workloads as executor inputs, built exactly
     the way the session builds them (session._payload / _join_spec):
     filter bodies are [engine preamble + document], the question is
     the bound prompt's tail with placeholders stripped; join suffixes
@@ -98,8 +121,10 @@ def _queries(tok):
     anchor naming line rides as the stage frame."""
     import re
 
-    from quail.bench.quailb import (ASPECTS, DISCUSS_ASPECT, F1, F7,
-                                    REACTION, _biodex_rows, _imdb_pool,
+    from quail.bench.quailb import (ASPECTS, DISCUSS_ASPECT, F1, F7, F8,
+                                    F9, LEPJOIN, REACTION, SUPPORT,
+                                    _biodex_rows, _fever_data,
+                                    _imdb_pool, _lepard_rows,
                                     _vocab_table)
     from quail.logical import (SHARED_PRE, ColumnRef, bind_join_prompt,
                                bind_prompt, join_anchor_note,
@@ -109,13 +134,26 @@ def _queries(tok):
     reports = [t for t, _ in bio]
     terms = _vocab_table(bio, 1, cap=2_560)
     reviews = _imdb_pool()[:5_000]
+    lep = _lepard_rows(200)
+    fev_claims, fev_pages = _fever_data(100)
 
     pre = tok(SHARED_PRE)
 
-    def filter_q(template, alias, col, texts):
+    def stage_ids(template, alias, col):
         p = bind_prompt(template, (ColumnRef(alias, alias, col),), tok)
-        qids = tok(re.sub(r"\{\d+\}", "", p.tail))
-        return dict(kind="filter", qids=qids,
+        return tok(re.sub(r"\{\d+\}", "", p.tail))
+
+    def filter_q(template, alias, col, texts):
+        return dict(kind="filter", qids=stage_ids(template, alias, col),
+                    bodies=[pre + tok(t) for t in texts])
+
+    def chain_q(templates, alias, col, texts):
+        """A multi-stage filter chain: later stages send only the
+        question tail past the stages' shared token prefix, against
+        the document's kept KV (KV rewind between stages)."""
+        return dict(kind="chain",
+                    qids_stages=[stage_ids(t, alias, col)
+                                 for t in templates],
                     bodies=[pre + tok(t) for t in texts])
 
     def join_q(template, cols, anchor_texts, partner_texts):
@@ -136,6 +174,21 @@ def _queries(tok):
                         reports, terms),
         "IMDB-2": join_q(DISCUSS_ASPECT, (("r", "body"), ("a", "aspect")),
                          reviews, ASPECTS),
+        # LEP-2: the citations self-join - a third corpus (legal text),
+        # excerpt anchors with ~150-token passage suffixes
+        "LEP-2": join_q(LEPJOIN,
+                        (("d", "destination_context"),
+                         ("s", "passage_text")),
+                        [r[0] for r in lep], [r[1] for r in lep]),
+        # FEV-2: claims x evidence in the written template's layout
+        # (claim above, passage below) - short anchors, whole Wikipedia
+        # passages as suffixes: the big-suffix regime
+        "FEV-2": join_q(SUPPORT, (("c", "claim"), ("e", "text")),
+                        [c["claim"] for c in fev_claims],
+                        list(fev_pages.values())),
+        # BIO-F3: BIO-5's filter chain without its join - 3 stages,
+        # arena writes on, KV rewind between stages
+        "BIO-F3": chain_q([F7, F8, F9], "r", "report", reports),
     }
 
 
@@ -157,6 +210,14 @@ def _run_one(torch, arena, pipeline, async_ans, budget, q):
             _, spans, tokens = run_filter(
                 torch, arena, pipeline, async_ans, q["bodies"],
                 [q["qids"]], budget, trace=trace, arena_writes=False)
+        elif q["kind"] == "chain":
+            pipeline.attention_mode = FILTER_ATTENTION
+            # multiple stages need the arena: later stages read the
+            # document's kept KV
+            _, spans, tokens = run_filter(
+                torch, arena, pipeline, async_ans, q["bodies"],
+                q["qids_stages"], budget, trace=trace,
+                arena_writes=True)
         else:
             pipeline.attention_mode = JOIN_ATTENTION
             _, spans, tokens = run_join(
@@ -221,12 +282,20 @@ def sweep(model_name: str, only=None, tag: str = "full") -> str:
         q = queries[qid]
         summary, chunks = _run_one(torch, arena, pipeline, async_ans,
                                    budget, q)
-        lengths = (dict(body_tokens=[len(b) for b in q["bodies"]],
-                        q_tokens=len(q["qids"]))
-                   if q["kind"] == "filter" else
-                   dict(prefix_tokens=[len(p) for p in q["prefixes"]],
-                        suffix_tokens=[len(s) for s in q["suffixes"]],
-                        frame_tokens=len(q["frame"])))
+        if q["kind"] == "filter":
+            lengths = dict(body_tokens=[len(b) for b in q["bodies"]],
+                           q_tokens=len(q["qids"]))
+        elif q["kind"] == "chain":
+            from quail.executor.loop import _shared_preamble_tokens
+            lengths = dict(
+                body_tokens=[len(b) for b in q["bodies"]],
+                q_tokens_stages=[len(s) for s in q["qids_stages"]],
+                shared_p=_shared_preamble_tokens(q["qids_stages"]))
+        else:
+            lengths = dict(
+                prefix_tokens=[len(p) for p in q["prefixes"]],
+                suffix_tokens=[len(s) for s in q["suffixes"]],
+                frame_tokens=len(q["frame"]))
         record["queries"][qid] = dict(summary=summary, chunks=chunks,
                                       **lengths)
         summaries[qid] = summary

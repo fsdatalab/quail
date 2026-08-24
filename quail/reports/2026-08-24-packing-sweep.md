@@ -16,9 +16,12 @@ Each chunk is one measured point.
 
 ## Setup
 
-Four QUAIL-B queries at sf=0.1, run exactly as the benchmark's cold
-pass runs them (no store; single-stage filters on the fast path with
-arena writes off; joins write anchor KV), on one H100 per model:
+Seven QUAIL-B workloads at sf=0.1, run exactly as the benchmark's
+cold pass runs them (no store; single-stage filters on the fast path
+with arena writes off; joins and the chain write KV), on one H100 per
+model. The first four ran as one pass; the last three were added
+after that pass confirmed the join gap, to cover the corpora and
+shapes it left out:
 
 | Query | Shape | What its chunks look like |
 |---|---|---|
@@ -26,12 +29,16 @@ arena writes off; joins write anchor KV), on one H100 per model:
 | IMDB-1 | filter over 5,000 real IMDB reviews | ~300 short documents per chunk |
 | BIO-2 | join, 200 reports x 614 terms | 1-2 long anchor prefixes + ~1,200 suffixes of ~85 tokens |
 | IMDB-2 | join, 5,000 reviews x 12 aspects | ~90 short anchors + ~1,050 suffixes per chunk |
+| LEP-2 | self-join, 200 LePaRD citations x 200 passages | ~200-token anchors + ~165-token suffixes (third corpus: legal text) |
+| FEV-2 | join, 100 FEVER claims x 57 evidence pages | the mirror of BIO-2: ~11-token claim anchors + ~385-token Wikipedia-passage suffixes |
+| BIO-F3 | 3-stage filter chain (F7 -> F8 -> F9) over the 200 reports | stage-1 documents mixed with ~60-token later-stage tails read against each document's kept KV (KV rewind) |
 
-Between them these queries produce, on their own, the variation issue
-#25 asked to sweep: mixed document lengths inside one chunk, many
-small pieces per chunk, partly-empty chunks at stream tails, and both
-join shapes. Chunk fill ran 13-100%; pieces per chunk ran 8 to
-~1,250.
+Between them these workloads produce, on their own, the variation
+issue #25 asked to sweep: mixed document lengths inside one chunk,
+many small pieces per chunk, partly-empty chunks at stream tails,
+both join orientations (long anchors with short suffixes and the
+reverse), four corpora, and a multi-stage chain. Chunk fill ran
+13-100%; pieces per chunk ran 8 to ~1,250.
 
 The cell is `ablations/packing_sweep.py` (runs the executor's
 `run_filter` / `run_join` directly, with the new per-chunk `trace`).
@@ -39,11 +46,12 @@ The fit is `ablations/packing_sweep_fit.py`. The committed summary the
 numbers and plots below read is `results/packing_sweep.json`. Raw
 per-chunk records live on the `quail-results` volume:
 
-- `/results/ablations/packing_sweep_qwen3-4b-fp8_full.json` (+ `_rep0..2`)
-- `/results/ablations/packing_sweep_qwen3-32b-fp8_full.json` (+ `_rep0..2`)
+- `/results/ablations/packing_sweep_qwen3-4b-fp8_full.json` (+ `_ext`, `_rep0..2`)
+- `/results/ablations/packing_sweep_qwen3-32b-fp8_full.json` (+ `_ext`, `_rep0..2`)
 
 Function call ids are in `results/packing_sweep_4b.log`,
-`packing_sweep_32b.log`, `packing_reps_4b.log`, `packing_reps_32b.log`.
+`packing_sweep_32b.log`, `packing_reps_4b.log`, `packing_reps_32b.log`,
+`packing_ext_4b.log`, and `packing_ext_32b.log`.
 
 The fit regresses, over chunks:
 
@@ -52,10 +60,11 @@ The fit regresses, over chunks:
 where `T` is the chunk's fresh tokens, `Sc` sums `n * L` over causal
 segments (a token attends ~half its own segment; the /2 is absorbed in
 `a2c`, matching how the length-sweep `a2` was always defined), and
-`Sx` sums `suffix tokens * anchor context` for join suffixes, which
-read the whole kept anchor. Filter chunks have `Sx = 0`, so filter
-chunks alone pin `(a, a2c)` - the two constants the calibration files
-carry. Join chunks then test the cross term.
+`Sx` sums `fresh tokens * kept context` over the pieces that read KV
+kept from before - join suffixes reading their anchor, and a chain's
+later-stage question tails reading their document. Chunks with no
+such reads (`Sx = 0`) pin `(a, a2c)` - the two constants the
+calibration files carry. The rest test the cross term.
 
 ## Predictions, stated before the run
 
@@ -74,6 +83,23 @@ us/token (the 107k-121k tok/s band of earlier runs); join chunks land
 above the filter fit, and if the gap is on the GPU it shows up as
 roughly 100-200 us per suffix; container-to-container variation needs
 re-measuring because the exploration saw up to 45%.
+
+The three added workloads were predicted from the RECALIBRATED
+constants plus the join terms the first pass measured (`a2x` at
+1.21-1.23x the causal `2*a2c`, ~37 us / ~126 us per suffix), stated
+before their run:
+
+| Query | 4B predicted | 32B predicted |
+|---|---|---|
+| LEP-2 | 8.4 | 58.1 |
+| FEV-2 | 8.2 | 57.2 |
+| BIO-F3 | 10.4-10.6 | 66-67 |
+
+The two sharp tests: FEV-2's big suffixes against tiny anchors should
+land near the causal filter rate (a big suffix prices like a
+document), and BIO-F3's later-stage tails should price at the same
+cross coefficient `a2x` the joins needed - one term explaining both
+shapes.
 
 ## Results
 

@@ -50,15 +50,27 @@ def chunk_points(rec, qid):
     q = rec["queries"][qid]
     out = []
     if "body_tokens" in q:
-        body, q0 = q["body_tokens"], q["q_tokens"]
+        body = q["body_tokens"]
+        stages = q.get("q_tokens_stages") or [q["q_tokens"]]
+        p = q.get("shared_p", 0)
         for ch in q["chunks"]:
-            T = Sc = 0.0
+            T = Sc = Sx = 0.0
+            n_suf = 0
             for doc, stage, fresh in ch["pieces"]:
-                n = body[doc] + q0
-                T += n
-                Sc += n * n
+                if stage == 0:
+                    n = body[doc] + stages[0]
+                    T += n
+                    Sc += n * n
+                else:
+                    # a later stage's tail past the stages' shared
+                    # preamble, against the document's kept KV
+                    t = stages[stage] - p
+                    T += t
+                    Sc += t * t
+                    Sx += t * (body[doc] + p)
+                    n_suf += 1
             assert T == ch["tokens"], (qid, T, ch["tokens"])
-            out.append(dict(T=T, Sc=Sc, Sx=0.0, suffixes=0,
+            out.append(dict(T=T, Sc=Sc, Sx=Sx, suffixes=n_suf,
                             gpu_s=ch["gpu_ms"] / 1e3))
     else:
         pre, suf, fr = (q["prefix_tokens"], q["suffix_tokens"],
@@ -137,15 +149,22 @@ def bins(points, n_bins=N_BINS):
 
 
 def analyze(records):
-    """records: list of raw record dicts for ONE model (full + reps).
-    Returns the summary block for that model."""
+    """records: list of raw record dicts for ONE model. Tags: "full"
+    and "ext" carry per-chunk data (disjoint query sets, merged here);
+    "rep*" records only feed the container table."""
     model = records[0]["model"]
     a_old, a2_old = OLD[model]
-    full = next(r for r in records if r["tag"] == "full")
-    pts = {qid: chunk_points(full, qid) for qid in full["queries"]}
+    main = [r for r in records if not r["tag"].startswith("rep")]
+    full = next(r for r in main if r["tag"] == "full")
+    pts, sources = {}, {}
+    for r in main:
+        for qid in r["queries"]:
+            pts[qid] = chunk_points(r, qid)
+            sources[qid] = r
 
     queries = {}
-    for qid, q in full["queries"].items():
+    for qid in pts:
+        q = sources[qid]["queries"][qid]
         p = pts[qid]
         T = sum(c["T"] for c in p)
         pred_old = sum(a_old * c["T"] + a2_old * (c["Sc"] + c["Sx"])
@@ -159,10 +178,11 @@ def analyze(records):
             predicted_us_old=round(pred_old / T * 1e6, 3),
             chunk_bins=bins(p))
 
-    filt = [p for qid in pts if queries[qid]["kind"] == "filter"
-            for p in pts[qid]]
-    join = [p for qid in pts if queries[qid]["kind"] == "join"
-            for p in pts[qid]]
+    # the causal fit takes every chunk with no cross reads, whatever
+    # query it came from; every chunk that reads kept KV (join
+    # suffixes, chain stages past the first) tests the cross term
+    filt = [p for ps in pts.values() for p in ps if p["Sx"] == 0]
+    join = [p for ps in pts.values() for p in ps if p["Sx"] > 0]
     # two-pass fit: a chunk more than 5% off its own GPU time is
     # excluded and reported - ordinary scatter here is under 2%, and
     # the one observed case is the container's first measured chunk
@@ -185,12 +205,13 @@ def analyze(records):
                / sum(p["Sx"] ** 2 for p in join))
         leftover = {}
         for qid in pts:
-            if queries[qid]["kind"] != "join":
+            cross = [p for p in pts[qid] if p["Sx"] > 0]
+            n_suf = sum(p["suffixes"] for p in cross)
+            if not n_suf:
                 continue
             lo = sum(p["gpu_s"] - (a * p["T"] + a2c * p["Sc"]
-                                   + a2x * p["Sx"]) for p in pts[qid])
-            leftover[qid] = round(
-                lo / sum(p["suffixes"] for p in pts[qid]) * 1e6, 1)
+                                   + a2x * p["Sx"]) for p in cross)
+            leftover[qid] = round(lo / n_suf * 1e6, 1)
         x4, r24 = fit(filt + join,
                       lambda p: [p["T"], p["Sc"], p["Sx"],
                                  p["suffixes"]])

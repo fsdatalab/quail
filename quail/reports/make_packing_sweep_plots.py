@@ -21,7 +21,10 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, DARK, GRAY, RED
+from plot_colors import BLUE, DARK, GRAY, GREEN, RED
+
+KIND_COLOR = {"filter": BLUE, "join": RED, "chain": GREEN}
+KIND_MARK = {"filter": "o", "join": "^", "chain": "s"}
 
 with open(ROOT / "results" / "packing_sweep.json") as f:
     data = json.load(f)
@@ -42,8 +45,8 @@ for ax, model in zip(axes, MODELS):
     old = data["loaded_before"][model]
     xs_all = []
     for qid, q in sorted(block["queries"].items()):
-        color = BLUE if q["kind"] == "filter" else RED
-        marker = "o" if q["kind"] == "filter" else "^"
+        color = KIND_COLOR[q["kind"]]
+        marker = KIND_MARK[q["kind"]]
         xs = [b["x_mean_ctx"] for b in q["chunk_bins"]]
         ys = [b["us_per_token"] for b in q["chunk_bins"]]
         xs_all += xs
@@ -97,21 +100,27 @@ for ax, model in zip(axes, MODELS):
                             relpos=(1.0, 0.3)))
     ax.plot([], [], "o", color=BLUE, label="filter chunks")
     ax.plot([], [], "^", color=RED, label="join chunks")
+    if any(q["kind"] == "chain" for q in block["queries"].values()):
+        ax.plot([], [], "s", color=GREEN, label="chain chunks")
     ax.legend(loc="upper left")
 fig.savefig(OUT / "packing_sweep_context.png", dpi=150)
 plt.close(fig)
 
 # --------------------------------------- fig 2: measured vs predicted
 
-ORDER = ("IMDB-1", "BIO-1", "IMDB-2", "BIO-2")
+ORDER = ("IMDB-1", "BIO-1", "BIO-F3", "FEV-2", "IMDB-2", "LEP-2",
+         "BIO-2")
+n_q = max(len(data["models"][m]["queries"]) for m in MODELS)
 fig, axes = plt.subplots(1, len(MODELS),
-                         figsize=(4.4 * len(MODELS), 3.4))
+                         figsize=((1.1 + 0.82 * n_q) * len(MODELS),
+                                  3.4))
 axes = [axes] if len(MODELS) == 1 else list(axes)
 for ax, model in zip(axes, MODELS):
     block = data["models"][model]
-    for i, qid in enumerate(ORDER):
+    order = [q for q in ORDER if q in block["queries"]]
+    for i, qid in enumerate(order):
         q = block["queries"][qid]
-        color = BLUE if q["kind"] == "filter" else RED
+        color = KIND_COLOR[q["kind"]]
         ax.bar(i, q["us_per_token_gpu"], width=0.55, color=color)
         ax.text(i, q["us_per_token_gpu"] / 2,
                 f"{q['us_per_token_gpu']:.1f}", ha="center",
@@ -130,9 +139,9 @@ for ax, model in zip(axes, MODELS):
             ax.plot([i] * len(reps), list(reps.values()), "o",
                     color=DARK, markersize=3.5, zorder=4)
     ax.set_title(SHORT[model])
-    ax.set_xticks(range(len(ORDER)))
+    ax.set_xticks(range(len(order)))
     ax.set_xticklabels([f"{q}\n{block['queries'][q]['kind']}"
-                        for q in ORDER])
+                        for q in order])
     ax.set_ylabel("GPU time per fresh token (us)")
     ax.set_ylim(0, None)
     if model == MODELS[0]:
