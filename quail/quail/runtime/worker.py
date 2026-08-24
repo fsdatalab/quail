@@ -173,7 +173,6 @@ def _execute_single(state, payload: dict) -> dict:
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
     from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import AsyncAnswers, run_filter, run_join
-    from quail.runtime.coordinator import filter_round_limit
 
     torch = state["torch"]
     spec = state["spec"]
@@ -207,9 +206,7 @@ def _execute_single(state, payload: dict) -> dict:
     out_filters = {}
     store_stats = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
-    # None when the payload has joins: LIMIT caps output rows, and a
-    # join fans one survivor into zero or many rows (#39)
-    limit = filter_round_limit(payload)
+    limit = payload.get("limit")
 
     filter_writes = payload["filter_arena_writes"]
     t0 = time.perf_counter()
@@ -578,9 +575,7 @@ def _execute_multi(payload: dict) -> dict:
     k = payload["workers"]
     shards = payload.get("shards", {})
     _ensure_children(k)
-    # None when the payload has joins: LIMIT caps output rows, and a
-    # join fans one survivor into zero or many rows (#39)
-    limit = coordinator.filter_round_limit(payload)
+    limit = payload.get("limit")
     t0 = _time.perf_counter()
     fouts = _round("filters",
                    coordinator.filter_round_payloads(payload, shards, k))

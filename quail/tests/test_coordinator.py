@@ -3,8 +3,7 @@ parent runs between its GPU children. Pure CPU."""
 
 import pytest
 
-from quail.runtime.coordinator import (filter_round_limit,
-                                       filter_round_payloads,
+from quail.runtime.coordinator import (filter_round_payloads,
                                        join_round_payloads,
                                        merge_filter_round,
                                        merge_join_round)
@@ -133,27 +132,9 @@ def test_merge_filter_round_no_limit():
     assert m["survivors"]["r"] == [0, 1, 2]
 
 
-def test_filter_round_limit_rule():
-    # LIMIT counts output rows. Filter-only: one survivor is one row,
-    # so the filter round may stop early. With joins, cutting
-    # survivor lists drops output rows (#39), so the round gets None.
+def test_filter_round_carries_limit():
     p = payload()
     p["limit"] = 3
-    assert filter_round_limit(p) is None      # payload has joins
-    p["joins"] = []
-    assert filter_round_limit(p) == 3
-    p["limit"] = None
-    assert filter_round_limit(p) is None
-
-
-def test_filter_round_carries_limit_only_without_joins():
-    p = payload()
-    p["limit"] = 3
-    subs = filter_round_payloads(p, p["shards"], 2)
-    for s in subs:
-        # the payload has a join: no per-worker early stop (#39)
-        assert s["limit"] is None
-    p["joins"] = []
     subs = filter_round_payloads(p, p["shards"], 2)
     for s in subs:
         assert s["limit"] == 3
@@ -165,52 +146,6 @@ def test_filter_round_carries_arena_writes():
     subs = filter_round_payloads(p, p["shards"], 2)
     for s in subs:
         assert s["filter_arena_writes"] == {"r": False}
-
-
-def test_join_round_two_same_anchor_stages():
-    # two full stages sharing one anchor: one round; every worker
-    # gets both stages and every partner table of either stage
-    p = payload()
-    p["docs"]["m"] = [[9] * 3 for _ in range(3)]
-    p["joins"].append(dict(anchor="r", partners=["m"],
-                           semantics="full", labels={"m": [4]},
-                           frame=[8], tail=[3]))
-    subs = join_round_payloads(p, p["shards"], 2, {"r": [0, 1, 3, 4]})
-    for s in subs:
-        assert len(s["joins"]) == 2
-        assert sorted(s["partners"]) == ["m", "p"]
-        assert s["partners"]["m"]["index"] == [0, 1, 2]
-        assert s["partners"]["p"]["index"] == [0, 1, 2, 3]
-    assert subs[0]["anchor_index"] == [0, 4]
-    assert subs[1]["anchor_index"] == [1, 3]
-
-
-def test_merge_join_round_two_stages():
-    # stage 2 rows exist only for anchors the stage-1 gate kept; the
-    # merge keeps the stages aligned and the anchors disjoint
-    outs = [
-        dict(joins=[dict(rows={0: [1, 0], 1: [0, 0]},
-                         anchor_index=[0, 4],
-                         partner_index=[[1], [2]]),
-                    dict(rows={0: [0, 1, 1]},
-                         anchor_index=[0, 4],
-                         partner_index=[[0], [1], [2]])],
-             fresh_tokens=10, wall_s=1.0),
-        dict(joins=[dict(rows={0: [1, 1]},
-                         anchor_index=[3],
-                         partner_index=[[1], [2]]),
-                    dict(rows={0: [1, 0, 0]},
-                         anchor_index=[3],
-                         partner_index=[[0], [1], [2]])],
-             fresh_tokens=10, wall_s=1.0),
-    ]
-    merged = merge_join_round(outs)
-    assert len(merged) == 2
-    assert merged[0]["anchor_index"] == [0, 4, 3]
-    assert merged[0]["rows"] == {0: [1, 0], 1: [0, 0], 2: [1, 1]}
-    assert merged[1]["anchor_index"] == [0, 4, 3]
-    assert merged[1]["rows"] == {0: [0, 1, 1], 2: [1, 0, 0]}
-    assert merged[1]["partner_index"] == [[0], [1], [2]]
 
 
 def test_merge_join_round_disjoint_anchors():

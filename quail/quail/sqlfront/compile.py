@@ -8,25 +8,21 @@ and reject everything else by node class: the rejection list below is
 literally a list of forbidden sqlglot classes, so new SQL surface
 cannot creep in silently.
 
-Each multi-table AI_FILTER(PROMPT(...)) is one join predicate,
-evaluated over the cross product of the tables its prompt references
-with every document in one model call. A query may have several. A
-predicate is written either Snowflake style (on a JOIN's ON; a bare
-JOIN leaves its table to another predicate) or BigQuery style (tables
-comma-joined or CROSS JOINed in FROM, the predicate a WHERE term):
+A query has at most ONE join predicate, however many tables it joins:
+a single AI_FILTER(PROMPT(...)) whose prompt references the FROM
+table and every JOINed table, evaluated over their cross product with
+every document in one model call. It is written either Snowflake
+style (on the last JOIN's ON, earlier JOINs bare) or BigQuery style
+(tables comma-joined or CROSS JOINed in FROM, the predicate a WHERE
+term):
 
     FROM reviews a JOIN threads b JOIN products c
       ON AI_FILTER(PROMPT('... {0} ... {1} ... {2}',
                           a.review, b.thread, c.description))
 
     FROM reviews a, threads b, products c
-    WHERE AI_FILTER(PROMPT('... {0} ... {1}', a.review, b.thread))
-      AND AI_FILTER(PROMPT('... {0} ... {1}', b.thread, c.description))
-
-Coverage rule: every JOINed table must appear in at least one join
-predicate, and the predicates' tables must form one connected graph
-with the FROM table - otherwise some table would never be compared
-with the rest of the query.
+    WHERE AI_FILTER(PROMPT('... {0} ... {1} ... {2}',
+                           a.review, b.thread, c.description))
 """
 
 import sqlglot
@@ -276,7 +272,7 @@ def compile_sql(sql: str, catalog: Catalog,
     b.add_table(from_.this)
 
     joined_aliases = []       # tables brought in by JOIN clauses
-    on_preds = []
+    on_pred = None
     for join in tree.args.get("joins") or []:
         if join.side or (join.kind
                          and join.kind.upper() not in ("INNER",
@@ -289,39 +285,36 @@ def compile_sql(sql: str, catalog: Catalog,
         joined_aliases.append(b.add_table(join.this))
         on = join.args.get("on")
         if on is None:
-            continue    # a bare/cross-joined table: some join
-            #             predicate must cover it (checked below)
-        on_preds.append(b.parse_ai_filter(on, JOIN_OPTION_KEYS,
-                                          join=True))
-
-    claimed = set()           # joined tables already carried by a spec
+            continue    # a bare/cross-joined table: the one join
+            #             predicate must cover it
+        if on_pred is not None:
+            raise CompileError(
+                "one join predicate per query: the n-way join is a "
+                "single AI_FILTER(PROMPT(...)) over the cross product "
+                "of its tables - reference every joined table in that "
+                "one prompt and put any extra condition in its text "
+                "([NOT] EXISTS stays a separate gate)")
+        on_pred = b.parse_ai_filter(on, JOIN_OPTION_KEYS, join=True)
 
     def add_join_spec(prompt, options, aliases):
-        joinable = {b.tables[0][0], *joined_aliases}
-        outside = [a for a in aliases if a not in joinable]
-        if outside:
+        expected = {b.tables[0][0], *joined_aliases}
+        if set(aliases) != expected:
             raise CompileError(
-                f"the join prompt references {outside}, which are not "
-                f"the FROM table or JOINed tables of this query "
-                f"({sorted(joinable)})")
+                f"the join prompt must reference exactly the FROM "
+                f"table and every JOINed table ({sorted(expected)}), "
+                f"got {aliases}")
         anchor = options.get("anchor")
         if anchor is not None and anchor not in aliases:
             raise CompileError(
                 f"anchor {anchor!r} is not a table of this join "
                 f"({aliases})")
-        # each spec carries the joined tables its prompt references
-        # that no earlier spec carried, so assemble_plan folds every
-        # table into the tree exactly once
-        news = tuple(a for a in joined_aliases
-                     if a in aliases and a not in claimed)
-        claimed.update(news)
-        b.joins.append(JoinSpec(aliases=news,
+        b.joins.append(JoinSpec(aliases=tuple(joined_aliases),
                                 prompt=prompt, semantics="full",
                                 selectivity=options.get("selectivity"),
                                 anchor=anchor))
 
-    for pred in on_preds:
-        add_join_spec(*pred)
+    if on_pred is not None:
+        add_join_spec(*on_pred)
 
     for term in _where_terms(tree.args.get("where")):
         anti = False
@@ -345,11 +338,25 @@ def compile_sql(sql: str, catalog: Catalog,
                 FilterPredicate(prompt=prompt,
                                 selectivity=options.get("selectivity")))
             continue
-        # a multi-provider WHERE predicate is a join predicate,
+        # a multi-provider WHERE predicate is the join predicate,
         # BigQuery style: tables cross-joined in FROM, filtered here
+        if on_pred is not None or any(j.semantics == "full"
+                                      for j in b.joins):
+            raise CompileError(
+                "one join predicate per query: the n-way join is a "
+                "single AI_FILTER(PROMPT(...)) over the cross product "
+                "of its tables - reference every joined table in that "
+                "one prompt and put any extra condition in its text "
+                "([NOT] EXISTS stays a separate gate)")
         add_join_spec(prompt, options, aliases)
 
-    _check_join_coverage(b, joined_aliases)
+    if joined_aliases and not any(j.semantics == "full"
+                                  for j in b.joins):
+        raise CompileError(
+            f"JOINed tables {joined_aliases} have no join predicate: "
+            f"give one AI_FILTER(PROMPT(...)) - on the last JOIN or "
+            f"as a WHERE term - whose prompt references every joined "
+            f"table")
 
     columns = _compile_projection(b, tree.expressions)
 
@@ -366,42 +373,6 @@ def compile_sql(sql: str, catalog: Catalog,
         columns=tuple(columns),
         limit=limit)
     return assemble_plan(desc)
-
-
-def _check_join_coverage(b: _Binder, joined_aliases: list) -> None:
-    """The coverage rule: every JOINed table must appear in at least
-    one join predicate, and the predicates' tables must form one
-    connected graph with the FROM table. A table outside that graph
-    would never be compared with the rest of the query, so its cross
-    product would pass through unfiltered."""
-    if not joined_aliases:
-        return
-    preds = [{r.alias for r in j.prompt.args}
-             for j in b.joins if j.semantics == "full"]
-    uncovered = [a for a in joined_aliases
-                 if not any(a in p for p in preds)]
-    if uncovered:
-        raise CompileError(
-            f"JOINed tables {uncovered} appear in no join predicate: "
-            f"every JOINed table must appear in at least one "
-            f"AI_FILTER(PROMPT(...)) join predicate - on a JOIN's ON "
-            f"or as a WHERE term")
-    root = b.tables[0][0]
-    reached = {root}
-    grew = True
-    while grew:
-        grew = False
-        for p in preds:
-            if p & reached and not p <= reached:
-                reached |= p
-                grew = True
-    disconnected = sorted(a for a in joined_aliases
-                          if a not in reached)
-    if disconnected:
-        raise CompileError(
-            f"join predicates do not connect {disconnected} to the "
-            f"FROM table {root!r}: the predicates' tables must form "
-            f"one connected graph with it")
 
 
 def _compile_exists(b: _Binder, node: exp.Exists, anti: bool) -> None:
