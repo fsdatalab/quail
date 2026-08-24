@@ -332,3 +332,60 @@ at fault.
 
 Nothing above has been implemented yet — this document is the
 research and design pass the issue asked for before touching code.
+
+## 11. Update: implemented and validated on real hardware (2026-08-23)
+
+Items 1-4 above are built (`budgets.py`'s `sol_seconds` and its
+supporting roofline functions; `session.py`'s per-query workload
+walk; `quailb.py`'s new report columns and the hard efficiency
+assertion). Item 5 uses the rates the user supplied directly
+(`quail/calibration/modal_rates.json`) rather than a live
+`Workspace.billing.rates()` call — see that file's provenance note.
+Item 6 (the report generator) is not done yet.
+
+Validated with two real runs on Modal (`tests/gpu/sol_check.py`):
+IMDB-1, IMDB-2, IMDB-5, BIO-2, FEV-5, cold + warm, sf=0.1,
+qwen3-4b-fp8, one H100. All 10 runs landed 53-68% efficiency — well
+under the 100% physical limit, in the range the old exploration's
+~35%-full-loop measurement would predict for individual operators
+running closer to the roofline than a full-loop average.
+
+The first run caught a real bug in the SOL model, not just noise:
+IMDB-2 and IMDB-5's warm passes restored KV for 517 and 675
+documents from a store an earlier query in the same run had already
+written. The initial `sol_seconds()` had no restore accounting, so
+it charged every anchor a full causal-build cost regardless -
+`sol_s` didn't move between cold and warm, but real restores made
+`wall_s` genuinely faster, so **efficiency rose instead of fell**
+(IMDB-5: 64% cold -> a wrong 73% warm). Section 5's original
+reasoning called ignoring restores "the safe direction" - that was
+backwards: an unmoving, too-large `sol_s` over a shrinking `wall_s`
+is exactly how this check could have crossed 100% on a healthy run,
+just not with quite enough restored volume in this particular
+experiment. Fixed by netting each alias's `restored_tokens` out of
+its causal-build candidates (largest documents first, since the
+store only takes documents at or above its minimum length) before
+computing the floor - rerun confirmed IMDB-5 now correctly reads 57%
+warm (down from cold, as restores should make it), not 73%.
+
+Full suite output for both runs (the buggy one and the fixed rerun)
+is `results/sol_check_sf0.1_4b_uncorrected.json` and
+`results/sol_check_sf0.1_4b_corrected.json` - each query's full
+report dict, including `sol_s` / `sol_efficiency` / `store`
+(restored/stored token counts) / `cost_dollars`.
+
+| Query | Shape | Pass | Wall (s) | SOL (s) | Efficiency | Restored tok | Cost ($) |
+|---|---|---|---|---|---|---|---|
+| IMDB-1 | filter only | cold | 15.06 | 10.195 | 68% | 0 | 0.0806 |
+| IMDB-1 | filter only | warm | 16.51 | 10.195 | 62% | 0 | 0.0210 |
+| IMDB-2 | join only | cold | 53.18 | 35.549 | 67% | 0 | 0.0678 |
+| IMDB-2 | join only | warm | 52.42 | 33.058 | 63% | 433,576 | 0.0668 |
+| IMDB-5 | 3 filters + join | cold | 23.94 | 15.028 | 63% | 0 | 0.0305 |
+| IMDB-5 | 3 filters + join | warm | 20.69 | 11.742 | 57% | 571,791 | 0.0264 |
+| BIO-2 | join only | cold | 140.31 | 87.717 | 63% | 0 | 0.1788 |
+| BIO-2 | join only | warm | 142.87 | 87.717 | 61% | 0 | 0.1821 |
+| FEV-5 | 2-sided filter + join | cold | 1.84 | 1.135 | 62% | 0 | 0.0023 |
+| FEV-5 | 2-sided filter + join | warm | 2.01 | 1.056 | 53% | 13,631 | 0.0026 |
+
+(Corrected-code numbers throughout; the uncorrected run's IMDB-2 and
+IMDB-5 warm efficiency read 68% and 73% respectively before the fix.)

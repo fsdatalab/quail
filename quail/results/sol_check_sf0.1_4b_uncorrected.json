@@ -1,0 +1,503 @@
+{
+  "sf": 0.1,
+  "lf": 1,
+  "gpus": 1,
+  "model": "qwen3-4b-fp8",
+  "passes": {
+    "cold": {
+      "queries": [
+        {
+          "query": "IMDB-1",
+          "desc": "filter: F1 (at least one positive aspect)",
+          "wall_s": 14.61,
+          "boot_s": 36.02,
+          "boot_kind": "cold",
+          "boot": {
+            "kind": "cold",
+            "load_model_s": 30.43,
+            "arena_s": 0.35,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 5.18,
+            "boot_s": 36.02
+          },
+          "fresh_tokens": 1774233,
+          "rows": 4131,
+          "peak_gib": 64.39,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.8262,
+              "evaluated": 5000
+            }
+          ],
+          "store": null,
+          "sol_s": 10.195,
+          "sol_efficiency": 0.6978,
+          "tokens_per_s": 121440,
+          "docs_per_s": 342.2,
+          "cost_dollars": 0.064533
+        },
+        {
+          "query": "IMDB-2",
+          "desc": "join: J1 (reviews x aspects)",
+          "wall_s": 53.01,
+          "boot_s": 0.0,
+          "boot_kind": "warm",
+          "boot": {
+            "kind": "warm",
+            "load_model_s": 0.0,
+            "arena_s": 0.0,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 0.0,
+            "boot_s": 0.0
+          },
+          "fresh_tokens": 6124233,
+          "rows": 59364,
+          "peak_gib": 64.39,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "r",
+              "partners": [
+                "a"
+              ],
+              "semantics": "full",
+              "provided_selectivity": null,
+              "observed_selectivity": 0.9894,
+              "tuples": 60000
+            }
+          ],
+          "store": null,
+          "sol_s": 35.5492,
+          "sol_efficiency": 0.6706,
+          "tokens_per_s": 115530,
+          "docs_per_s": 1131.9,
+          "cost_dollars": 0.067567
+        },
+        {
+          "query": "IMDB-5",
+          "desc": "F1 -> F4 -> F5 -> J1, 3 filters then 1 join",
+          "wall_s": 23.56,
+          "boot_s": 0.0,
+          "boot_kind": "warm",
+          "boot": {
+            "kind": "warm",
+            "load_model_s": 0.0,
+            "arena_s": 0.0,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 0.0,
+            "boot_s": 0.0
+          },
+          "fresh_tokens": 2767445,
+          "rows": 7202,
+          "peak_gib": 64.39,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.8262,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.2593,
+              "evaluated": 4131
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.563,
+              "evaluated": 1071
+            },
+            {
+              "op": "join",
+              "anchor": "r",
+              "partners": [
+                "a"
+              ],
+              "semantics": "full",
+              "provided_selectivity": null,
+              "observed_selectivity": 0.9953,
+              "tuples": 7236
+            }
+          ],
+          "store": null,
+          "sol_s": 15.0282,
+          "sol_efficiency": 0.6379,
+          "tokens_per_s": 117464,
+          "docs_per_s": 212.2,
+          "cost_dollars": 0.03003
+        },
+        {
+          "query": "BIO-2",
+          "desc": "join: J1 (reports x terms)",
+          "wall_s": 140.36,
+          "boot_s": 0.0,
+          "boot_kind": "warm",
+          "boot": {
+            "kind": "warm",
+            "load_model_s": 0.0,
+            "arena_s": 0.0,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 0.0,
+            "boot_s": 0.0
+          },
+          "fresh_tokens": 11347799,
+          "rows": 121094,
+          "peak_gib": 64.39,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "r",
+              "partners": [
+                "m"
+              ],
+              "semantics": "full",
+              "provided_selectivity": null,
+              "observed_selectivity": 0.9861,
+              "tuples": 122800
+            }
+          ],
+          "store": null,
+          "sol_s": 87.7174,
+          "sol_efficiency": 0.6249,
+          "tokens_per_s": 80848,
+          "docs_per_s": 874.9,
+          "cost_dollars": 0.178903
+        },
+        {
+          "query": "FEV-5",
+          "desc": "2F + 1J: two-sided pushdown - F11 on claims, F13 on evidence, each filtered before J3",
+          "wall_s": 1.82,
+          "boot_s": 0.0,
+          "boot_kind": "warm",
+          "boot": {
+            "kind": "warm",
+            "load_model_s": 0.0,
+            "arena_s": 0.0,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 0.0,
+            "boot_s": 0.0
+          },
+          "fresh_tokens": 206879,
+          "rows": 712,
+          "peak_gib": 64.39,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "c",
+              "stage": 0,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.55,
+              "evaluated": 100
+            },
+            {
+              "op": "filter",
+              "alias": "e",
+              "stage": 0,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.6316,
+              "evaluated": 57
+            },
+            {
+              "op": "join",
+              "anchor": "e",
+              "partners": [
+                "c"
+              ],
+              "semantics": "full",
+              "provided_selectivity": null,
+              "observed_selectivity": 0.3596,
+              "tuples": 1980
+            }
+          ],
+          "store": null,
+          "sol_s": 1.1353,
+          "sol_efficiency": 0.6238,
+          "tokens_per_s": 113670,
+          "docs_per_s": 86.3,
+          "cost_dollars": 0.00232
+        }
+      ],
+      "pass_wall_s": 302.9
+    },
+    "warm": {
+      "queries": [
+        {
+          "query": "IMDB-1",
+          "desc": "filter: F1 (at least one positive aspect)",
+          "wall_s": 16.34,
+          "boot_s": 0.0,
+          "boot_kind": "warm",
+          "boot": {
+            "kind": "warm",
+            "load_model_s": 0.0,
+            "arena_s": 0.0,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 0.0,
+            "boot_s": 0.0
+          },
+          "fresh_tokens": 1774233,
+          "rows": 4131,
+          "peak_gib": 64.39,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.8262,
+              "evaluated": 5000
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 517,
+              "stored_tokens": 433576
+            }
+          },
+          "sol_s": 10.195,
+          "sol_efficiency": 0.6239,
+          "tokens_per_s": 108582,
+          "docs_per_s": 306.0,
+          "cost_dollars": 0.020827
+        },
+        {
+          "query": "IMDB-2",
+          "desc": "join: J1 (reviews x aspects)",
+          "wall_s": 52.13,
+          "boot_s": 0.0,
+          "boot_kind": "warm",
+          "boot": {
+            "kind": "warm",
+            "load_model_s": 0.0,
+            "arena_s": 0.0,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 0.0,
+            "boot_s": 0.0
+          },
+          "fresh_tokens": 5690657,
+          "rows": 59364,
+          "peak_gib": 64.39,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "r",
+              "partners": [
+                "a"
+              ],
+              "semantics": "full",
+              "provided_selectivity": null,
+              "observed_selectivity": 0.9894,
+              "tuples": 60000
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 517,
+              "restored_tokens": 433576,
+              "stored_docs": 0,
+              "stored_tokens": 0
+            }
+          },
+          "sol_s": 35.5492,
+          "sol_efficiency": 0.6819,
+          "tokens_per_s": 109163,
+          "docs_per_s": 1151.0,
+          "cost_dollars": 0.066445
+        },
+        {
+          "query": "IMDB-5",
+          "desc": "F1 -> F4 -> F5 -> J1, 3 filters then 1 join",
+          "wall_s": 20.58,
+          "boot_s": 0.0,
+          "boot_kind": "warm",
+          "boot": {
+            "kind": "warm",
+            "load_model_s": 0.0,
+            "arena_s": 0.0,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 0.0,
+            "boot_s": 0.0
+          },
+          "fresh_tokens": 2195654,
+          "rows": 7202,
+          "peak_gib": 64.39,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 0,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.8262,
+              "evaluated": 5000
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 1,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.2593,
+              "evaluated": 4131
+            },
+            {
+              "op": "filter",
+              "alias": "r",
+              "stage": 2,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.563,
+              "evaluated": 1071
+            },
+            {
+              "op": "join",
+              "anchor": "r",
+              "partners": [
+                "a"
+              ],
+              "semantics": "full",
+              "provided_selectivity": null,
+              "observed_selectivity": 0.9953,
+              "tuples": 7236
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 675,
+              "restored_tokens": 571791,
+              "stored_docs": 0,
+              "stored_tokens": 0
+            }
+          },
+          "sol_s": 15.0282,
+          "sol_efficiency": 0.7302,
+          "tokens_per_s": 106689,
+          "docs_per_s": 243.0,
+          "cost_dollars": 0.026231
+        },
+        {
+          "query": "BIO-2",
+          "desc": "join: J1 (reports x terms)",
+          "wall_s": 142.71,
+          "boot_s": 0.0,
+          "boot_kind": "warm",
+          "boot": {
+            "kind": "warm",
+            "load_model_s": 0.0,
+            "arena_s": 0.0,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 0.0,
+            "boot_s": 0.0
+          },
+          "fresh_tokens": 11347799,
+          "rows": 121094,
+          "peak_gib": 64.94,
+          "stages": [
+            {
+              "op": "join",
+              "anchor": "r",
+              "partners": [
+                "m"
+              ],
+              "semantics": "full",
+              "provided_selectivity": null,
+              "observed_selectivity": 0.9861,
+              "tuples": 122800
+            }
+          ],
+          "store": {
+            "r": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 57,
+              "stored_tokens": 397761
+            }
+          },
+          "sol_s": 87.7174,
+          "sol_efficiency": 0.6147,
+          "tokens_per_s": 79516,
+          "docs_per_s": 860.5,
+          "cost_dollars": 0.181898
+        },
+        {
+          "query": "FEV-5",
+          "desc": "2F + 1J: two-sided pushdown - F11 on claims, F13 on evidence, each filtered before J3",
+          "wall_s": 1.97,
+          "boot_s": 0.0,
+          "boot_kind": "warm",
+          "boot": {
+            "kind": "warm",
+            "load_model_s": 0.0,
+            "arena_s": 0.0,
+            "pipeline_s": 0.0,
+            "warm_kernels_s": 0.0,
+            "boot_s": 0.0
+          },
+          "fresh_tokens": 193248,
+          "rows": 712,
+          "peak_gib": 64.94,
+          "stages": [
+            {
+              "op": "filter",
+              "alias": "c",
+              "stage": 0,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.55,
+              "evaluated": 100
+            },
+            {
+              "op": "filter",
+              "alias": "e",
+              "stage": 0,
+              "provided_selectivity": null,
+              "observed_selectivity": 0.6316,
+              "evaluated": 57
+            },
+            {
+              "op": "join",
+              "anchor": "e",
+              "partners": [
+                "c"
+              ],
+              "semantics": "full",
+              "provided_selectivity": null,
+              "observed_selectivity": 0.3596,
+              "tuples": 1980
+            }
+          ],
+          "store": {
+            "c": {
+              "restored_docs": 0,
+              "restored_tokens": 0,
+              "stored_docs": 100,
+              "stored_tokens": 1342
+            },
+            "e": {
+              "restored_docs": 36,
+              "restored_tokens": 13631,
+              "stored_docs": 57,
+              "stored_tokens": 21213
+            }
+          },
+          "sol_s": 1.1353,
+          "sol_efficiency": 0.5763,
+          "tokens_per_s": 98095,
+          "docs_per_s": 79.7,
+          "cost_dollars": 0.002511
+        }
+      ],
+      "pass_wall_s": 261.5
+    }
+  }
+}
