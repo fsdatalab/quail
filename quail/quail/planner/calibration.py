@@ -1,14 +1,29 @@
 """The measured constants the planner's break-even decision consumes.
 
-Exactly two numbers per (model, device) pair, written offline by
+Four constants per (model, device) pair, written offline by
 `quail.planner.calibrate.measure` (Modal entry: quail/runtime/calibrate.py)
 and checked into quail/calibration/:
 
-    a      seconds per fresh token in the packed loop (1/rate; embeds
-           the measured efficiency factor)
-    a2     seconds per token-pair of attention (the quadratic
-           coefficient; refines the restore break-even at long
-           documents)
+    a      seconds per fresh token (linear-layer matmuls; 1/rate)
+    a2     seconds per attention pair (one value for both causal
+           and paged attention: the FLOPs per pair are the same
+           regardless of where the KV lives)
+    c      seconds per chunk (CUDA launch floor per forward pass)
+    p      seconds per paged-attention suffix dispatch (kernel
+           overhead from non-contiguous KV page reads)
+
+The chunk-level cost model:
+
+    gpu_seconds = a * T  +  a2 * S  +  c  +  p * suffixes
+
+    T          fresh tokens in the chunk
+    S          total attention pairs: causal (n^2 per segment, the
+               /2 absorbed into a2) plus cross-read (suffix_tokens *
+               anchor_tokens, no /2)
+    suffixes   paged-attention dispatch count in the chunk
+
+The planner uses only a and a2 (for the restore-vs-recompute
+break-even); c and p are for prediction and diagnostics.
 
 Plus one host table, model-independent: the channel bandwidths from
 the pinprobe protocol.
@@ -32,7 +47,9 @@ ANCHOR_FILE = "qwen3-4b-fp8_h100-sxm.json"
 class Calibration:
     a_s_per_token: float
     a2_s_per_token2: float
-    source: str            # "calibrated" | "spec-scaled from <anchor>"
+    source: str
+    c_s_per_chunk: float = 0.0
+    p_s_per_suffix: float = 0.0
 
     @property
     def rate_tokens_per_s(self) -> float:
@@ -45,21 +62,36 @@ def channel_bandwidths() -> dict:
         return json.load(f)["bandwidth_bytes_per_s"]
 
 
-def fit_affine(points) -> tuple[float, float]:
-    """Least-squares (a, a2) for t = a + a2*h over (h, t) points -
-    measure()'s fit, kept here so it is CPU-testable. Needs at least
-    two distinct lengths."""
+def lstsq(ys, cols):
+    """Ordinary least squares via normal equations."""
+    k = len(cols[0])
+    ata = [[sum(c[i] * c[j] for c in cols) for j in range(k)]
+           for i in range(k)]
+    atb = [sum(c[i] * y for c, y in zip(cols, ys)) for i in range(k)]
+    for i in range(k):
+        for j in range(i + 1, k):
+            f = ata[j][i] / ata[i][i]
+            for m in range(i, k):
+                ata[j][m] -= f * ata[i][m]
+            atb[j] -= f * atb[i]
+    x = [0.0] * k
+    for i in reversed(range(k)):
+        x[i] = (atb[i] - sum(ata[i][j] * x[j]
+                for j in range(i + 1, k))) / ata[i][i]
+    return x
+
+
+def fit_cost_model(points):
+    """OLS for gpu_s = a*T + a2*S + c + p*suffixes.
+    points: list of dicts with keys T, S, suffixes, gpu_s.
+    Returns (a, a2, c, p). Needs at least four points."""
     n = len(points)
-    sx = sum(h for h, _ in points)
-    sy = sum(t for _, t in points)
-    sxx = sum(h * h for h, _ in points)
-    sxy = sum(h * t for h, t in points)
-    denom = n * sxx - sx * sx
-    if denom <= 0:
-        raise ValueError("need at least two distinct lengths")
-    a2 = (n * sxy - sx * sy) / denom
-    a = (sy - a2 * sx) / n
-    return a, a2
+    if n < 4:
+        raise ValueError(f"need at least 4 points, got {n}")
+    ys = [p["gpu_s"] for p in points]
+    cols = [(p["T"], p["S"], 1.0, float(p["suffixes"])) for p in points]
+    a, a2, c, p = lstsq(ys, cols)
+    return a, a2, c, p
 
 
 def _load_file(path: Path) -> dict:
@@ -69,10 +101,7 @@ def _load_file(path: Path) -> dict:
 
 def _scale(model: ModelSpec, device: DeviceSpec,
            anchor_model: ModelSpec, anchor_device: DeviceSpec) -> float:
-    """Spec-ratio scaling of per-token compute cost from the anchor: a
-    model with more params costs proportionally more per token, a
-    device with a higher ceiling proportionally less. The measured
-    efficiency is assumed to travel; the absolute rates do not."""
+    """Spec-ratio scaling of per-token compute cost from the anchor."""
     return ((model.params / anchor_model.params)
             * (anchor_device.peak_flops / device.peak_flops))
 
@@ -83,7 +112,9 @@ def load_calibration(model: ModelSpec, device: DeviceSpec) -> Calibration:
         d = _load_file(path)
         return Calibration(a_s_per_token=d["a_s_per_token"],
                            a2_s_per_token2=d["a2_s_per_token2"],
-                           source="calibrated")
+                           source="calibrated",
+                           c_s_per_chunk=d.get("c_s_per_chunk", 0.0),
+                           p_s_per_suffix=d.get("p_s_per_suffix", 0.0))
 
     anchor = _load_file(CALIBRATION_DIR / ANCHOR_FILE)
     anchor_model = MODELS[anchor["model"]]
@@ -96,32 +127,37 @@ def load_calibration(model: ModelSpec, device: DeviceSpec) -> Calibration:
 
 
 def make_record(model: ModelSpec, device: DeviceSpec,
-                a: float, a2: float,
-                points: list, channels: dict, loaded: Calibration,
-                lengths, tokens_per_point: int) -> dict:
+                a: float, a2: float, c: float, p: float,
+                points: list, channels: dict,
+                loaded: Calibration) -> dict:
     """The JSON the measure step returns and --commit writes from."""
     return dict(
         model=model.name, device=device.name,
         a_s_per_token=a, a2_s_per_token2=a2,
+        c_s_per_chunk=c, p_s_per_suffix=p,
         provenance=dict(
-            a=("wall seconds per fresh token, length sweep "
-               f"{list(lengths)} at ~{tokens_per_point} tokens per "
-               "point, affine fit intercept"),
-            a2="affine fit slope of the same sweep"),
+            a="seconds per fresh token, OLS over per-chunk GPU time",
+            a2="seconds per attention pair (one coefficient, "
+               "causal and paged), same fit",
+            c="per-chunk CUDA launch floor, same fit intercept",
+            p="per paged-attention suffix dispatch, same fit"),
         points=points,
         channels_measured_bytes_per_s=channels,
         loaded_before=dict(a=loaded.a_s_per_token,
                            a2=loaded.a2_s_per_token2,
+                           c=loaded.c_s_per_chunk,
+                           p=loaded.p_s_per_suffix,
                            source=loaded.source))
 
 
 def commit_calibration(record: dict, dest: Path | None = None) -> Path:
-    """Write the two constants where load_calibration reads them."""
+    """Write the four constants where load_calibration reads them."""
     dest = dest or (CALIBRATION_DIR
                     / f"{record['model']}_{record['device']}.json")
     keep = {k: record[k] for k in
             ("model", "device", "a_s_per_token",
-             "a2_s_per_token2", "provenance")}
+             "a2_s_per_token2", "c_s_per_chunk",
+             "p_s_per_suffix", "provenance")}
     dest.parent.mkdir(parents=True, exist_ok=True)
     with open(dest, "w") as f:
         json.dump(keep, f, indent=2)
