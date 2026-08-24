@@ -106,8 +106,8 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
         model = load_model(MODEL)
         boot["load_model_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        chunk = budgets.chunk_budget(spec, device)
-        arena_tok = budgets.arena_tokens(spec, device, chunk)
+        chunk_tokens = budgets.chunk_budget(spec, device)
+        arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
@@ -120,10 +120,10 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
         boot["pipeline_s"] = time.perf_counter() - t0
         answerer = Answerer(torch, F, model, tokenizer)
         async_ans = AsyncAnswers(torch, answerer)
-        budget = min(chunk, pipeline.max_chunk_tokens)
+        chunk_tokens = min(chunk_tokens, pipeline.max_chunk_tokens)
         state = dict(torch=torch, model=model, arena=arena,
                      pipeline=pipeline, async_ans=async_ans,
-                     budget=budget, warmed=False)
+                     chunk_tokens=chunk_tokens, warmed=False)
         boot["kind"] = "cold"
     else:
         state = reuse
@@ -131,13 +131,13 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
         arena = state["arena"]
         pipeline = state["pipeline"]
         async_ans = state["async_ans"]
-        budget = state["budget"]
+        chunk_tokens = state["chunk_tokens"]
 
     if not state["warmed"]:
         t0 = time.perf_counter()
         with torch.inference_mode():
             warm_kernels(torch, arena, pipeline, async_ans,
-                         docs, [warm_q], budget)
+                         docs, [warm_q], chunk_tokens)
         torch.cuda.synchronize()
         kernel_cache.commit()
         boot["warm_kernels_s"] = time.perf_counter() - t0

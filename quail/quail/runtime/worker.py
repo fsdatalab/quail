@@ -54,7 +54,7 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
 # warm container keeps the loaded model, the arena, and the pinned KV
 # store across execute() calls, which is what makes a session's later
 # queries boot in milliseconds and restore instead of recompute.
-_BOOTED = {}      # model name -> dict(model, arena, pipeline, budget)
+_BOOTED = {}      # model name -> dict(model, arena, pipeline)
 _STORE = None     # one PinnedStore per container, shared
 
 
@@ -96,8 +96,8 @@ def execute(payload: dict) -> dict:
         # budgets.* is tiny CPU; fold into arena_s so the four phases
         # cover the cold-load span without a leftover residual
         t0 = time.perf_counter()
-        chunk = budgets.chunk_budget(spec, device)
-        arena_tok = budgets.arena_tokens(spec, device, chunk)
+        chunk_tokens = budgets.chunk_budget(spec, device)
+        arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
@@ -119,19 +119,19 @@ def execute(payload: dict) -> dict:
     answerer = _PayloadAnswerer(torch, F, model, payload["true_ids"],
                                 payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
-    budget = payload["chunk_tokens"]
+    chunk_tokens = payload["chunk_tokens"]
 
     if not booted["warmed"]:
         t0 = time.perf_counter()
         with torch.inference_mode():
             # boot-side warmup: the dense token sweep plus one
-            # budget-sized chunk, so every kernel configuration
+            # chunk_tokens-sized batch, so every kernel configuration
             # compiles outside measured walls
             first_alias = next(iter(docs))
             warm_q = (next(iter(payload["filters"].values()))[0]
                       if payload["filters"] else [1, 2, 3])
             warm_kernels(torch, arena, pipeline, async_ans,
-                         docs[first_alias], [warm_q], budget)
+                         docs[first_alias], [warm_q], chunk_tokens)
         torch.cuda.synchronize()
         kernel_cache.commit()   # keep the compiles even if the run dies
         boot["warm_kernels_s"] = time.perf_counter() - t0
@@ -187,7 +187,7 @@ def _execute_single(state, payload: dict) -> dict:
     answerer = _PayloadAnswerer(torch, state["F"], state["model"],
                                 payload["true_ids"], payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
-    budget = payload["chunk_tokens"]
+    chunk_tokens = payload["chunk_tokens"]
 
     store_cfg = payload.get("store")
     if store_cfg is not None and state.get("store") is None:
@@ -220,7 +220,7 @@ def _execute_single(state, payload: dict) -> dict:
             answers, _, tokens = run_filter(
                 torch, arena, pipeline, async_ans,
                 [pre + d for d in docs[alias]], qids,
-                budget,
+                chunk_tokens,
                 store=store if store_cfg else None,
                 store_hash=(store_cfg["hashes"][alias]
                             if store_cfg else None),
@@ -257,7 +257,7 @@ def _execute_single(state, payload: dict) -> dict:
                     specs[0],
                     {a: [len(docs[a][g]) for g in survivors[a]]
                      for a in specs[0]["aliases"]},
-                    len(pre), budget)
+                    len(pre), chunk_tokens)
             group = [stage_for_anchor(s, anchor_alias) for s in specs]
             anchors_glob = list(survivors[anchor_alias])
             stage_suffixes = []
@@ -273,7 +273,7 @@ def _execute_single(state, payload: dict) -> dict:
             jstats = {}
             ans, _, tokens = run_join(
                 torch, arena, pipeline, async_ans, prefixes,
-                stage_suffixes, budget,
+                stage_suffixes, chunk_tokens,
                 stage_frames=[j.get("frame") or [] for j in group],
                 group_size=1 if len(group) > 1 else None,
                 store=store if store_cfg else None,
@@ -375,8 +375,8 @@ def _child_boot(state, sub):
         model = load_model(spec.hf_name)
         boot["load_model_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        chunk = budgets.chunk_budget(spec, device)
-        arena_tok = budgets.arena_tokens(spec, device, chunk)
+        chunk_tokens = budgets.chunk_budget(spec, device)
+        arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
@@ -394,7 +394,7 @@ def _child_boot(state, sub):
     answerer = _PayloadAnswerer(torch, F, state["model"],
                                 sub["true_ids"], sub["false_ids"])
     state["async_ans"] = AsyncAnswers(torch, answerer)
-    state["budget"] = sub["chunk_tokens"]
+    state["chunk_tokens"] = sub["chunk_tokens"]
     if not state["warmed"]:
         docs = next((d for d in sub.get("docs", {}).values() if d),
                     None)
@@ -406,7 +406,7 @@ def _child_boot(state, sub):
         with torch.inference_mode():
             warm_kernels(torch, state["arena"], state["pipeline"],
                          state["async_ans"], docs, [warm_q],
-                         state["budget"])
+                         state["chunk_tokens"])
         torch.cuda.synchronize()
         kernel_cache.commit()
         boot["warm_kernels_s"] = time.perf_counter() - t0
@@ -461,7 +461,7 @@ def _child_filters(state, sub):
                 torch, state["arena"], state["pipeline"],
                 state["async_ans"],
                 [pre + d for d in sub["docs"][alias]], qids,
-                state["budget"],
+                state["chunk_tokens"],
                 store=state["store"] if store_cfg else None,
                 store_hash=(store_cfg["hashes"][alias]
                             if store_cfg else None),
@@ -525,7 +525,7 @@ def _child_joins(state, sub):
         ans, _, tokens = run_join(
             torch, state["arena"], state["pipeline"],
             state["async_ans"], prefixes, stage_suffixes,
-            state["budget"],
+            state["chunk_tokens"],
             stage_frames=[j.get("frame") or [] for j in group],
             group_size=1 if len(group) > 1 else None,
             store=state["store"] if store_cfg else None,
