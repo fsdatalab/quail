@@ -27,14 +27,12 @@ plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
 from plot_colors import BLUE, GRAY, GREEN, ORANGE, RED, TEAL, DARK
 
-tiered = json.load(open(RESULTS / "boot_tiered.json"))
 # boot phases from the profiler-off control: py-spy adds ~4.6 s to
 # the warm phase
 nospy = json.load(open(RESULTS / "boot_tiered_nospy.json"))
 stock_q = json.load(open(RESULTS / "baseline_filter1.json"))
 
 new_cold = nospy["touch"]["cold"]
-compile_cold = tiered["compile"]["cold"]
 
 
 def mean_s(agg, key):
@@ -73,10 +71,6 @@ ax_boot.legend(
     handles=[Patch(facecolor=c, label=n) for n, _, c in PHASES],
     loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=3,
     fontsize=8.5, handlelength=1.1)
-ax_boot.set_title(
-    f"compile pass (once ever, not per container): "
-    f"{compile_cold['warm_kernels_s']:.0f} s warmup phase",
-    fontsize=9.5, loc="left", color=DARK)
 
 # ---- right: first query after boot vs stock vLLM --------------------
 best = nospy["query"]["best_wall"]["no_arena"]
