@@ -684,9 +684,7 @@ all of its cost is steady-state GPU time, not boot.
 
 Figure: plots/sol_docs_per_s.png
 
-Documents/second, warm pass, log-scaled (78-1,145 docs/s, a ~15x
-spread - more than one order of magnitude, so linear would compress
-the smaller bars unreadably). IMDB-2 leads at 1,145 docs/s: it's a
+Documents/second, warm pass, linear (78-1,145 docs/s). IMDB-2 leads at 1,145 docs/s: it's a
 join, and a join's per-document cost is dominated by short streaming
 reads against an already-built anchor, not a full causal prefill.
 FEV-5 is lowest (78 docs/s) - it's also the smallest query by document

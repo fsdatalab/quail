@@ -74,11 +74,6 @@ def fig_rate(rows, key, ylabel, title, color, out_name, fmt):
     labels = [r["query"] for r in rows]
     vals = [r[key] for r in rows]
 
-    # More than one order of magnitude across queries (docs/s spans
-    # ~78-1145, ~15x) gets a log axis, per this repo's plotting rules
-    # (quail.mplstyle's linear default is fine for tokens/s, which
-    # only spans ~1.4x here).
-    log = (max(vals) / min(vals)) > 10
     x = np.arange(len(labels))
     fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.1), 4.2))
     ax.bar(x, vals, color=color, width=0.55)
@@ -87,11 +82,7 @@ def fig_rate(rows, key, ylabel, title, color, out_name, fmt):
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
-    if log:
-        ax.set_yscale("log")
-        ax.set_ylabel(f"{ylabel} (log scale)")
-    else:
-        ax.set_ylabel(ylabel)
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
