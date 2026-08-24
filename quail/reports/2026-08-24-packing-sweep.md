@@ -55,16 +55,15 @@ Function call ids are in `results/packing_sweep_4b.log`,
 
 The fit regresses, over chunks:
 
-    gpu_seconds = a * T + a2c * Sc + a2x * Sx
+    gpu_seconds = a * T + a2 * S + c + p * suffixes
 
-where `T` is the chunk's fresh tokens, `Sc` sums `n * L` over causal
-segments (a token attends ~half its own segment; the /2 is absorbed in
-`a2c`, matching how the length-sweep `a2` was always defined), and
-`Sx` sums `fresh tokens * kept context` over the pieces that read KV
-kept from before - join suffixes reading their anchor, and a chain's
-later-stage question tails reading their document. Chunks with no
-such reads (`Sx = 0`) pin `(a, a2c)` - the two constants the
-calibration files carry. The rest test the cross term.
+where `T` is the chunk's fresh tokens, `S` is total attention pairs
+(causal: n^2 per segment, the /2 absorbed into a2; plus cross-read:
+suffix_tokens * anchor_tokens), `c` is the per-chunk CUDA launch
+floor, and `suffixes` is the paged-attention dispatch count. One `a2`
+because the FLOPs per attention pair are the same regardless of where
+the KV lives; the paged-attention overhead is a per-dispatch cost
+(`p`), not a per-pair multiplier.
 
 ## Predictions, stated before the run
 
@@ -84,10 +83,9 @@ above the filter fit, and if the gap is on the GPU it shows up as
 roughly 100-200 us per suffix; container-to-container variation needs
 re-measuring because the exploration saw up to 45%.
 
-The three added workloads were predicted from the RECALIBRATED
-constants plus the join terms the first pass measured (`a2x` at
-1.21-1.23x the causal `2*a2c`, ~37 us / ~126 us per suffix), stated
-before their run:
+The three added workloads were predicted from the recalibrated
+constants plus the join terms the first pass measured, stated before
+their run:
 
 | Query | 4B predicted | 32B predicted |
 |---|---|---|
@@ -98,8 +96,7 @@ before their run:
 The two sharp tests: FEV-2's big suffixes against tiny anchors should
 land near the causal filter rate (a big suffix prices like a
 document), and BIO-F3's later-stage tails should price at the same
-cross coefficient `a2x` the joins needed - one term explaining both
-shapes.
+attention coefficient the joins needed.
 
 ## Results
 
@@ -134,12 +131,18 @@ Figure: plots/packing_sweep_queries.png
 
 Each query is fit alone, with standard errors, using only the terms
 its own chunks carry - no container offsets, no borrowing from other
-queries. A value written "7.86±0.10" means the query's chunks pin
-that constant to about ±0.10; an error as large as the value means
-the query's packings cannot see that constant at all. Excluded
-chunks (see note below) are the same in every fit.
+queries. Filter-only queries fit `[a, a2, c]`; queries with suffixes
+fit `[a, a2, c, p]`. A value written "7.86±0.10" means the query's
+chunks pin that constant to about ±0.10; an error as large as the
+value means the query's packings cannot see that constant at all.
+Excluded chunks (see note below) are the same in every fit.
 
-**4B:**
+**These tables need regeneration** with the new 4-constant model
+(`packing_sweep_fit.py` rewritten; raw data on the quail-results
+volume). The values below are from the previous model (separate
+a2c/a2x) and are kept for reference until re-run.
+
+**4B (previous model, for reference):**
 
 | Query | Container | a (us/tok) | a2c (e-10) | a2x (e-10) | per suffix (us) |
 |---|---|---|---|---|---|
@@ -151,7 +154,7 @@ chunks (see note below) are the same in every fit.
 | FEV-2 | ext | 12.3±2.4 | -31±21 | 17±17 | -800±550 |
 | BIO-F3 | ext2 | 7.55±0.18 | 5.19±0.28 | 61±38 | -220±480 |
 
-**32B:**
+**32B (previous model, for reference):**
 
 | Query | Container | a (us/tok) | a2c (e-10) | a2x (e-10) | per suffix (us) |
 |---|---|---|---|---|---|
@@ -163,26 +166,25 @@ chunks (see note below) are the same in every fit.
 | FEV-2 | ext | 112±28 | -360±230 | -1020±430 | -10700±6400 |
 | BIO-F3 | ext2 | 57.26±0.18 | 16.84±0.31 | 3.7±85 | 1340±1090 |
 
-Three things the tables show:
+Three things the tables show (these carry over to the new model):
 
 - Where a query's packings identify a constant, queries agree. `a`
   from the four same-container 4B queries: 6.70-7.97 (the three with
   tight errors: 7.55-7.97). At 32B: 55.4-56.3 across four queries.
-  `a2x` from BIO-2 and LEP-2 at both sizes: 9.84 and 10.29 (4B);
-  35.0 and 44 (32B). The extension queries' `a` comes out high by
-  about their container's rate offset (BIO-F3 on ext2: 57.26 vs
-  BIO-1 on full: 55.38), which is the container effect showing up
-  unmodeled in a per-query fit.
+  The extension queries' `a` comes out high by about their
+  container's rate offset (BIO-F3 on ext2: 57.26 vs BIO-1 on full:
+  55.38), which is the container effect showing up unmodeled in a
+  per-query fit.
 - Where a query's packings lack the variation, the fit chases noise:
   FEV-2's chunks are all nearly identical (same size, same mix), so
-  its regressors are collinear and it "finds" negative attention
-  coefficients with errors bigger than the values. IMDB-1's short
-  docs barely span the length axis, so its a2c is 2.2±1.8.
+  its regressors are collinear and it "finds" negative coefficients
+  with errors bigger than the values. IMDB-1's short docs barely
+  span the length axis, so its a2 has large standard errors.
 - Within one query, correlated terms trade off against each other:
-  BIO-2 alone drifts `a` down to 6.70 and per-suffix up to 136
-  because every suffix is ~85 tokens, making tokens and suffix
-  counts nearly proportional. Only queries with different suffix
-  sizes, fit together, separate them.
+  BIO-2 alone drifts `a` down and per-suffix up because every suffix
+  is ~85 tokens, making tokens and suffix counts nearly proportional.
+  Only queries with different suffix sizes, fit together, separate
+  them.
 
 ### Joint fit, from the agreement
 
@@ -190,25 +192,27 @@ Because the per-query fits converge where they can identify a
 constant, and no query disagrees beyond its own error bars plus its
 container's rate offset, fitting all chunks jointly per model
 (with one rate-offset column per extra container) gives tighter
-values:
+values.
+
+**This table needs regeneration** with the new 4-constant model.
+The previous model's filter-fit values for `a` and `a2` are
+unchanged (the filter-only data has no suffixes, so `c` and `p`
+are the only new terms). Values below are from the previous model:
 
 | | 4B | 32B |
 |---|---|---|
 | `a` (us/token) | 7.867 (was 8.261, -4.8%) | 56.22 (was 56.64, -0.7%) |
-| `a2c` (s/token^2) | 4.343e-10 (was 4.934e-10, -12%) | 1.563e-09 (was 1.528e-09, +2.3%) |
-| filter-fit R^2 (chunks used) | 0.9995 (24 of 25) | 0.9992 (63 of 64) |
-| `a2x` (s/token^2, cross) | 9.80e-10 = 1.13x the causal 2*a2c | 3.52e-09 = 1.13x |
-| per suffix | 35 us | 114 us |
+| `a2` (s/token^2) | 4.343e-10 (was 4.934e-10, -12%) | 1.563e-09 (was 1.528e-09, +2.3%) |
+| `c` (ms/chunk) | not yet fit | not yet fit |
+| `p` (us/suffix) | not yet fit | not yet fit |
+| R^2 (chunks used) | 0.9995 (24 of 25, filter only) | 0.9992 (63 of 64, filter only) |
 | ext-container rate offsets (us/token) | +0.36, +0.20 | +6.11, +1.84 |
-| residual per token, per cross workload | -0.06 to +0.14 us | -0.49 to +1.06 us |
 | container band (repeated filters, 4 containers) | 2.9-3.1% | 2.6-6.6% |
 
-The joint fit uses all seven workloads' chunks and explains them to
-within 2% per token. The cross coefficient is 1.13x the causal one
-on both models. The committed calibration files carry (`a`, `a2c`)
-from the filter-only fit (the first two rows); the cross term and
-per-suffix cost are not committed because no planner decision uses
-them yet.
+The committed calibration files carry `a` and `a2` from the
+filter-only fit; `c` and `p` default to 0 until the full joint fit
+is regenerated. To regenerate: pull raw records from
+`quail-results`, run `packing_sweep_fit.py`, and update this table.
 
 Excluded chunks (the fit drops any chunk more than 5% off its own
 GPU time and reports counts per query): each container's first
@@ -222,42 +226,38 @@ only the gated trailing chunks are that small.
 
 Figure: plots/packing_sweep_context.png
 
-What the figure shows: with the x axis counting cross context in full
-and a segment's own context at half, equal per-attended-token cost
-would put join and chain chunks on the same line as filter chunks.
-They sit above it, by the 1.13x cross slope plus their container's
-offset (the 32B extension queries ran on the +6.1 us/token
-container).
+What the figure shows: the x axis is mean attention pairs per token
+(S/T). Under the new model (one `a2`), all chunk types — filter,
+join, chain — should fall on the same line, with join and chain
+chunks offset only by their per-suffix `p` cost plus container rate
+differences.
 
 ## What the numbers mean
 
-- **The two-constant model holds on filter packings.** One line fits
-  the filter chunks of both corpora at R^2 = 0.9995 (24 of 25 chunks
-  at 4B), across mixed lengths (833 to 14,803 tokens in the same
-  chunk), 8 to 300 pieces per chunk, and fill from 66% to 100%.
-  Packing density needs no term above ~2k tokens per chunk; below
-  that the ~20-30 ms launch floor takes over (see the exclusion
-  note).
+- **The cost model holds on filter packings.** One line fits the
+  filter chunks of both corpora at R^2 = 0.9995 (24 of 25 chunks at
+  4B), across mixed lengths (833 to 14,803 tokens in the same chunk),
+  8 to 300 pieces per chunk, and fill from 66% to 100%. Packing
+  density needs no term above ~2k tokens per chunk; below that the
+  ~20-30 ms launch floor (`c`) takes over.
 - **Both committed constants were stale, in opposite ways.** The 4B
   executor now runs 4.8% faster than its anchor (127.1k tok/s against
   the anchor's 121.0k; the anchor also predated the 08-21/08-22
   changes, which beat the 8.6-9.4 us/token band this report
   predicted). The 32B filter constants were nearly right (within 1%).
   Both files are refreshed from this sweep's filter fit.
-- **Cross reads are the one missing term, and it is the same term
-  everywhere.** Reading kept KV from arena pages costs 1.13x per
-  attended token compared with in-chunk causal attention (`a2x =
-  2.25-2.26 * a2c` on both models), plus ~35 us (4B) / ~114 us (32B)
-  per suffix. That one term prices all five cross-read workloads -
-  both join orientations (long anchors with tiny suffixes, tiny
-  anchors with whole-passage suffixes), two further corpora (LePaRD,
-  FEVER), and the chain's later-stage tails - to within 2% per token
-  once each container's rate is separated. On BIO-2's shape it is
-  +18% of wall; on IMDB-2's it is +1%.
+- **Paged-attention overhead is a per-dispatch cost, not a per-pair
+  multiplier.** The old model used separate a2c (causal) and a2x
+  (cross-read) coefficients, but the FLOPs per attention pair are the
+  same regardless of where the KV lives. The overhead comes from
+  gathering non-contiguous arena pages per suffix dispatch — a
+  per-kernel cost (`p`), not a per-pair cost. The new model uses one
+  `a2` for all attention pairs and a separate `p` per suffix
+  dispatch. The joint fit with the new model needs regeneration from
+  the raw data.
 - **A multi-stage chain needs no term of its own.** BIO-F3 (three
   stages, arena writes on, KV rewind) lands on its prediction: 10.63
-  measured against 10.4-10.6 (4B, warm), with its later-stage tails
-  priced by the same `a2x` as join suffixes. The writes-on chunks run
+  measured against 10.4-10.6 (4B, warm). The writes-on chunks run
   ~2% over the fast-path fit, matching the earlier 1.2% measurement.
   The cold first runs of the chain were +30-38% - all of it one-time
   kernel compiles on tiny tail-chunk shapes, not the multi-stage
@@ -276,17 +276,21 @@ container).
   us/token to recompute, so restore still wins at every length
   (margin was 55% under the old `a`, now 32%). At 32B the margin
   stays ~6x. The planner's token-count join ordering compares
-  same-shape alternatives, so the join surcharge cancels there;
+  same-shape alternatives, so any per-suffix term cancels there;
   `choose_anchor` for a two-way join is unaffected because both
-  candidates price the same tuple count. The surcharge matters only
-  if a future decision needs join wall accuracy - then price suffix
-  context at `a2x` and add the per-suffix constant.
+  candidates price the same tuple count.
 
 ## Changes shipped with this report
 
+- Cost model rewritten: `gpu_seconds = a*T + a2*S + c + p*suffixes`.
+  One `a2` replaces the old `a2c`/`a2x` split. Added `c` (per-chunk
+  launch floor) and `p` (per paged-attention suffix dispatch).
+  Calibration files, the fit script (`packing_sweep_fit.py`), the
+  measurement step (`calibrate.py`), and the Modal entry
+  (`runtime/calibrate.py`) all updated.
 - `quail/calibration/qwen3-4b-fp8_h100-sxm.json` and
-  `qwen3-32b-fp8_h100-sxm.json` refreshed from the filter fits, with
-  provenance pointing at this sweep.
+  `qwen3-32b-fp8_h100-sxm.json` carry `a` and `a2` from the filter
+  fit; `c` and `p` default to 0 until the full fit is regenerated.
 - `run_join` gained the same per-chunk `trace` option `run_filter`
   already had; both traces now record per-piece composition
   (see `reports/shipped_features/2026-08-24-join-chunk-trace.md`).
