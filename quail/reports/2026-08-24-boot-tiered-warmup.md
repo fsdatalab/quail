@@ -134,6 +134,10 @@ shapes), run in a fresh container after a touch boot
   just a large chunk at the normal per-token rate. No compile stall
   anywhere, which is the tiny-chunk ladder plus generator coverage
   doing exactly what the compile pass promised.
+- stock vLLM on the same five-filter workload, rerun the same day
+  (submission: separate requests per (document, stage), pipelined,
+  token-budget admission; `results/baseline_filter.json`): 43.25 /
+  42.80 s, same 4,645 survivors. Quail's 34.91 s is 18% faster.
 
 Figure: plots/boot_tiered.png
 
