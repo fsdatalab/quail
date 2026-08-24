@@ -198,7 +198,8 @@ def _round_boot(boot: dict) -> dict:
 
 
 def _quail_boot_once(*, reuse: dict | None,
-                     force_compile: bool = False) -> tuple[dict, dict]:
+                     force_compile: bool = False,
+                     model_key: str = "qwen3-4b-fp8") -> tuple[dict, dict]:
     """One Quail boot. reuse=None is cold; reuse=state is warm skip."""
     import torch
     import torch.nn.functional as F
@@ -209,19 +210,19 @@ def _quail_boot_once(*, reuse: dict | None,
     from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
     from quail.executor.model import load_model
     from quail.planner import budgets
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+    from quail.specs import DEVICES, MODELS
     from transformers import AutoTokenizer
 
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
                 pipeline_s=0.0, warm_kernels_s=0.0)
     t_boot = time.perf_counter()
-    spec = QWEN3_4B_FP8
-    device = H100_SXM
+    spec = MODELS[model_key]
+    device = DEVICES["h100-sxm"]
 
     if reuse is None:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL)
+        tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
         t0 = time.perf_counter()
-        model = load_model(MODEL)
+        model = load_model(spec.hf_name)
         boot["load_model_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
         chunk_tokens = budgets.chunk_budget(spec, device)
@@ -256,7 +257,8 @@ def _quail_boot_once(*, reuse: dict | None,
         t0 = time.perf_counter()
         with torch.inference_mode():
             warm = warm_kernels(torch, arena, pipeline, async_ans,
-                                chunk_tokens, model_name=MODEL,
+                                chunk_tokens,
+                                model_name=spec.hf_name,
                                 force_compile=force_compile)
         torch.cuda.synchronize()
         kernel_cache.commit()
@@ -270,19 +272,22 @@ def _quail_boot_once(*, reuse: dict | None,
 
 
 def _profiled_boot(tag: str, *, force_compile: bool,
-                   spy: bool = True) -> tuple[dict, dict]:
+                   spy: bool = True,
+                   model_key: str = "qwen3-4b-fp8") -> tuple[dict, dict]:
     """Cold boot, py-spy attached unless spy=False (the profiler
     costs real wall; the no-spy control isolates it)."""
     if not spy:
         state, cold = _quail_boot_once(reuse=None,
-                                       force_compile=force_compile)
+                                       force_compile=force_compile,
+                                       model_key=model_key)
         return state, dict(cold=cold, pyspy=dict(ok=False,
                                                  path=None,
                                                  error="disabled"))
     spy_path = f"/results/boot/pyspy_{tag}.speedscope.json"
     stop = _pyspy_start(spy_path)
     state, cold = _quail_boot_once(reuse=None,
-                                   force_compile=force_compile)
+                                   force_compile=force_compile,
+                                   model_key=model_key)
     spy_row = stop()
     if spy_row["ok"]:
         try:
@@ -297,9 +302,12 @@ def _profiled_boot(tag: str, *, force_compile: bool,
 # -------------------------------------------------------------- cells
 
 @app.function(timeout=7200, **GPU_KW)
-def compile_trial() -> dict:
+def compile_trial(model_key: str = "qwen3-4b-fp8",
+                  spy: bool = True) -> dict:
     """The one-time compile pass, forced, timed, py-spy recorded."""
-    _, row = _profiled_boot("compile", force_compile=True)
+    _, row = _profiled_boot(f"{model_key}-compile",
+                            force_compile=True, spy=spy,
+                            model_key=model_key)
     row.update(side="quail_compile", trial=0)
     print(f"[boot_tiered] compile: {row['cold']}", flush=True)
     return row
@@ -307,16 +315,18 @@ def compile_trial() -> dict:
 
 @app.function(timeout=7200, max_containers=8, **GPU_KW)
 def touch_trial(trial: int = 0, reps: int = 2,
-                spy: bool = True) -> dict:
+                spy: bool = True,
+                model_key: str = "qwen3-4b-fp8") -> dict:
     """One fresh container: touch-pass boot, warm reuse, then the
     m1_filter1 query on both paths."""
     from corpus import build_corpus
     from quail.executor.attention import FILTER_ATTENTION
     from quail.executor.loop import run_filter
 
-    state, row = _profiled_boot(f"touch{trial}",
-                                force_compile=False, spy=spy)
-    _, warm = _quail_boot_once(reuse=state)
+    state, row = _profiled_boot(f"{model_key}-touch{trial}",
+                                force_compile=False, spy=spy,
+                                model_key=model_key)
+    _, warm = _quail_boot_once(reuse=state, model_key=model_key)
     row.update(side="quail", trial=trial, warm=warm)
     print(f"[boot_tiered] touch trial {trial}: cold={row['cold']} "
           f"warm={warm}", flush=True)
@@ -384,7 +394,8 @@ def write_report(report: dict, name: str = "boot_tiered") -> str:
 def main(touch_trials: int = 3, reps: int = 2,
          stock_trials: int = 0, spy: bool = True,
          skip_compile: bool = False,
-         name: str = "boot_tiered"):
+         name: str = "boot_tiered",
+         model: str = "qwen3-4b-fp8"):
     """Compile pass first (so touch trials see the marker), then
     touch trials in parallel; stock boot rows rerun only on request.
     --skip-compile with --no-spy is the profiler-off control against
@@ -394,11 +405,11 @@ def main(touch_trials: int = 3, reps: int = 2,
     if skip_compile:
         compile_row = dict(skipped=True)
     else:
-        h = compile_trial.spawn()
+        h = compile_trial.spawn(model, spy)
         print(f"[boot_tiered] compile fc={h.object_id}", flush=True)
         compile_row = h.get()
 
-    t_handles = [touch_trial.spawn(i, reps, spy)
+    t_handles = [touch_trial.spawn(i, reps, spy, model)
                  for i in range(touch_trials)]
     s_handles = [stock_boot_trial.spawn(i)
                  for i in range(stock_trials)]
@@ -411,7 +422,7 @@ def main(touch_trials: int = 3, reps: int = 2,
     best = {m: min(r["wall"] for r in query_runs if r["mode"] == m)
             for m in ("arena", "no_arena")}
     report = dict(
-        cell="boot_tiered", model=MODEL, gpu="H100!", vllm="0.26.0",
+        cell="boot_tiered", model=model, gpu="H100!", vllm="0.26.0",
         prediction=PREDICTION, reference=REFERENCE,
         compile=compile_row,
         touch=_aggregate("quail", touch_rows),
