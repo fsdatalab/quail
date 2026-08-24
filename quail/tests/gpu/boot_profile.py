@@ -8,18 +8,21 @@ container then records one warm reuse. The summary reports mean and
 median per phase across trials.
 
 PREDICTION (stated before the run): Quail cold is dominated by
-load_model_s when the kernel-cache volume is warm, and by
-warm_kernels_s on a cold kernel cache; arena_s and pipeline_s are
-small. Stock cold is weight load plus KV-cache profiling inside
-LLM(...). Both warm boots are near 0 (Quail hits _BOOTED /
-warmed=True; stock keeps the LLM instance).
+load_model_s when the kernel-cache volume is warm (warm_kernels
+no-ops; cubins load on first use), and by warm_kernels_s on a
+cold kernel cache; arena_s and pipeline_s are small. Stock cold
+is weight load plus KV-cache profiling inside LLM(...). Both
+warm boots are near 0 (Quail hits _BOOTED / warmed=True; stock
+keeps the LLM instance).
 
 Cold-cache Quail-only (principled sweep, --cold-cache, one
 confirming trial): warm_kernels_s dominates. Expected 90-240 s
 at 4B (DeepGEMM configs compile from scratch; run_join and
 tiny filter chunks run). load_model_s stays 30-40 s (committed
 warm-cache profile mean 35.1 s). Warm reuse still ~0.
-Committed warm-cache warm_kernels_s was 4.46 s mean.
+Committed warm-cache warm_kernels_s was 4.46 s mean
+(before the skip-if-cached change; a warm volume should now
+report skipped=True and ~0 s).
 
 Run from the quail/ directory (tee per house rule):
 
@@ -74,10 +77,10 @@ GPU_KW = dict(image=image, gpu="H100!", memory=65536,
                        "/results": results_vol})
 
 PREDICTION = (
-    "Quail cold: load_model_s dominates when kernels are cached; "
-    "warm_kernels_s dominates on a cold kernel cache; arena + "
-    "pipeline small. Stock cold: LLM(...) = weights + KV profiling. "
-    "Both warm ≈ 0."
+    "Quail cold: load_model_s dominates when kernels are cached "
+    "(warm_kernels no-ops); warm_kernels_s dominates on a cold "
+    "kernel cache; arena + pipeline small. Stock cold: LLM(...) = "
+    "weights + KV profiling. Both warm ≈ 0."
 )
 COLD_CACHE_PREDICTION = (
     "Cold kernel cache, no volume read. Principled DeepGEMM M list "
@@ -86,7 +89,8 @@ COLD_CACHE_PREDICTION = (
     "(long-prefix/short-suffix, short-prefix/long-suffix, tiny). "
     "warm_kernels_s dominates: 90-240 s at 4B. load_model_s 30-40 s. "
     "Warm reuse ~0. Compared with committed warm-cache "
-    "warm_kernels_s of 4.46 s mean."
+    "warm_kernels_s of 4.46 s mean (pre-skip). A warm volume now "
+    "skips the sweep."
 )
 
 

@@ -32,8 +32,9 @@ image = (
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           # JIT artifacts persist on the kernel-cache volume so each
-          # DeepGEMM/Triton configuration compiles once ever, not
-          # once per container
+          # DeepGEMM/Triton configuration compiles once ever. A later
+          # container skips the boot sweep and loads cubins on first
+          # use.
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
@@ -124,9 +125,8 @@ def execute(payload: dict) -> dict:
     if not booted["warmed"]:
         t0 = time.perf_counter()
         with torch.inference_mode():
-            # boot-side warmup: the dense token sweep plus one
-            # chunk_tokens-sized batch, so every kernel configuration
-            # compiles outside measured walls
+            # boot-side compile only when the volume has no cubins.
+            # A warm volume skips; first real chunk loads each file.
             first_alias = next(iter(docs))
             warm_q = (next(iter(payload["filters"].values()))[0]
                       if payload["filters"] else [1, 2, 3])

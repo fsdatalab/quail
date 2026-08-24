@@ -74,3 +74,8 @@ Figure: plots/boot_profile_cold.png
   `run_join` in `warm_kernels`.
 - `tests/gpu/boot_profile.py`: `--cold-cache` and `--no-stock`.
 - `tests/test_kernel_warmup.py`: CPU tests for the helpers.
+
+Follow-up: `warm_kernels` now no-ops when both caches already have
+binaries. The 4.46 s warm-cache number above is the old replay. A
+warm volume should report `skipped=True` and ~0 s. The cold-cache
+209.22 s figure is unchanged: `--cold-cache` points at empty `/tmp`.

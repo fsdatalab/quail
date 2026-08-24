@@ -15,6 +15,7 @@ torch is imported lazily; this module runs only inside the Modal
 image.
 """
 
+import os
 import time
 
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
@@ -588,6 +589,45 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 TINY_WARM_TOKENS = (64, 128, 256, 512, 1024, 2048)
 
 
+def kernel_cache_roots():
+    """Directories DeepGEMM and Triton read for compiled kernels.
+
+    Matches the Modal image env. Empty string means the env is
+    unset; then the cache is treated as missing and warm_kernels
+    runs. FlashAttention-3 is not here: it ships in the vLLM wheel.
+    """
+    dg = (os.environ.get("DG_JIT_CACHE_DIR")
+          or os.environ.get("DG_CACHE_DIR")
+          or "")
+    triton = os.environ.get("TRITON_CACHE_DIR") or ""
+    return dg, triton
+
+
+def _has_compiled_binary(root, suffixes):
+    if not root or not os.path.isdir(root):
+        return False
+    for dirpath, _, files in os.walk(root):
+        for name in files:
+            if name.endswith(suffixes):
+                return True
+    return False
+
+
+def kernel_cache_ready():
+    """True when the volume already has DeepGEMM cubins and Triton
+    binaries.
+
+    DeepGEMM writes cache/<name>.<hash>/kernel.cubin. Triton writes
+    a .so (sometimes a .cubin) per specialization. One of each means
+    a prior container compiled this stack onto the volume. A missing
+    shape still compiles on first use; this only skips the boot
+    sweep.
+    """
+    dg, triton = kernel_cache_roots()
+    return (_has_compiled_binary(dg, (".cubin",))
+            and _has_compiled_binary(triton, (".so", ".cubin")))
+
+
 def _repeat_ids(ids, n):
     ids = ids or [1]
     n = max(1, n)
@@ -665,12 +705,21 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
     """Compile the kernels a run can hit, at boot, outside measured
     walls.
 
-    DeepGEMM M values come from vLLM's config-boundary generator
-    (one list per linear, up to the chunk budget). Attention is
-    warmed by the real loops: run_filter (unified, fast path, tiny
-    chunks) and run_join (both join orientations plus a tiny tail).
-    Flipping attention_mode on a filter chunk is not a join warmup.
+    Skips when the kernel volume already has DeepGEMM cubins and
+    Triton binaries. Those files are not loaded at process start;
+    the first real chunk loads each cubin (milliseconds, not a
+    compile). FlashAttention-3 is already in the vLLM wheel.
+
+    On an empty cache: DeepGEMM M values come from vLLM's
+    config-boundary generator (one list per linear, up to the chunk
+    budget). Attention is warmed by the real loops: run_filter
+    (unified, fast path, tiny chunks) and run_join (both join
+    orientations plus a tiny tail). Flipping attention_mode on a
+    filter chunk is not a join warmup.
     """
+    if kernel_cache_ready():
+        return dict(n_gemm=0, n_filter=0, n_join=0,
+                    m_source="skipped", skipped=True)
     layer = pipeline.layers[0]
     linears = (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
                layer.mlp.gate_up_proj, layer.mlp.down_proj)
@@ -730,7 +779,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
         n_join += 1
     pipeline.attention_mode = original_mode
     return dict(n_gemm=n_gemm, n_filter=n_filter, n_join=n_join,
-                m_source=source)
+                m_source=source, skipped=False)
 
 
 # ---------------------------------------------------------- the filter

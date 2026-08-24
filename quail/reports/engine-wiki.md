@@ -780,7 +780,7 @@ answers. This overlaps GPU compute with answer readback.
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
 | `run_filter` | `loop.py:462` | The filter chain execution loop |
 | `run_join` | `loop.py:241` | The join execution loop (one cross-product stage per join; multi-stage gating stays available to GPU cells) |
-| `warm_kernels` | `loop.py:387` | Pre-compile all DeepGEMM and Triton kernel configs |
+| `warm_kernels` | `loop.py` | Compile DeepGEMM/Triton configs on an empty cache; no-op when the volume already has cubins |
 | `Answerer` | `loop.py:60` | TRUE/FALSE scoring from final hidden states |
 | `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
 
@@ -1253,7 +1253,8 @@ created. vLLM is used as a library for its loader and kernels.
 **DeepGEMM**: all linear projections run as fp8 GEMMs through
 DeepGEMM (`attention.py:68`), which JIT-compiles a kernel
 configuration per token count. Compiled artifacts persist on a Modal
-volume, so each configuration compiles once per software stack.
+volume, so each configuration compiles once per software stack. A
+later container skips the boot sweep when those files are present.
 
 **Triton kernels**: three custom fused kernels
 (`attention.py:103-221`):
@@ -1263,11 +1264,14 @@ volume, so each configuration compiles once per software stack.
   quantization.
 - `qk_norm_rope`: fused QK-norm and rotary position embedding.
 
-**Kernel warmup** (`loop.py:warm_kernels`): before any measured run,
-DeepGEMM M values come from vLLM's config-boundary generator
+**Kernel warmup** (`loop.py:warm_kernels`): skipped when the
+kernel volume already has DeepGEMM cubins and Triton binaries.
+Those files are not loaded at process start; the first real chunk
+loads each cubin. FlashAttention-3 ships in the vLLM wheel, not
+the volume. On an empty cache the function compiles: DeepGEMM M
+values from vLLM's config-boundary generator
 (`_generate_optimal_warmup_m_values`, one list per linear, up to
-the chunk budget). Attention is warmed by the real loops:
-`run_filter` (unified, the no-arena fast path, and tiny 64-2,048
-token chunks) and `run_join` (long-prefix/short-suffix,
-short-prefix/long-suffix, and a tiny tail). Flipping
-`attention_mode` on a filter chunk is not a join warmup.
+the chunk budget), then the real loops (`run_filter` unified /
+fast path / tiny 64-2,048 token chunks, and `run_join` both
+orientations plus a tiny tail). Flipping `attention_mode` on a
+filter chunk is not a join warmup.
