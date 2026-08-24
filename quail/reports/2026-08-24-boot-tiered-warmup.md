@@ -160,6 +160,12 @@ this query, so these rows establish the reference):
   container-dependent).
 - Query (10,000 documents, one filter): best fast-path wall
   201.4 s, best arena wall 203.1 s, 0 wrong of 10,000.
+- Stock vLLM, same corpus and GPU, same day (submission: separate
+  requests per document, document-cap admission;
+  `results/baseline_filter1_32b.json`): 220.1 / 221.2 s, same
+  8,943 survivors. Quail is 9% faster - a smaller gap than 4B's
+  20%, because the 32B run is more GPU-compute-bound, which
+  narrows what packing can save.
 
 Figure: plots/boot_tiered_32b.png
 
