@@ -1,0 +1,63 @@
+{
+  "cell": "boot_query_after_skip",
+  "model": "Qwen/Qwen3-4B-FP8",
+  "gpu": "H100!",
+  "vllm": "0.26.0",
+  "prediction": "Quail warm_kernels skipped (~0 s). Quail cold boot 30-38 s (load_model). Quail first 10k 5-filter query 35-42 s (34.6 s warmed plus lazy cubin load). Stock cold boot ~250 s. Stock query 48.7-49.0 s committed.",
+  "quail_boot": {
+    "kind": "cold",
+    "load_model_s": 79.41,
+    "arena_s": 0.44,
+    "pipeline_s": 0.0,
+    "warm_kernels_s": 0.05,
+    "boot_s": 81.43,
+    "warmup": {
+      "n_gemm": 0,
+      "n_filter": 0,
+      "n_join": 0,
+      "m_source": "skipped",
+      "skipped": true
+    },
+    "warm_reuse_s": 0.0,
+    "note": "load_model_s ran in parallel with m1_filter against the same hf-cache volume. Prior solo load_model_s was 30-38 s (boot_profile.json mean 35.1 s)."
+  },
+  "stock_boot": {
+    "kind": "cold",
+    "boot_s": 242.65,
+    "llm_init_s": 242.65,
+    "warm_reuse_s": 0.0,
+    "submission": "LLM(...) constructor, same knobs as the bf16 stock filter baseline (step 25305, 2648 seqs, prefix cache on)"
+  },
+  "quail_query": {
+    "cell": "m1_filter",
+    "n_docs": 10000,
+    "n_filters": 5,
+    "warmup_s": 0.05,
+    "wall_s": 43.88,
+    "fresh_tokens": 4097571,
+    "answered": 40052,
+    "survivors": 4645,
+    "wrong": 0,
+    "chunks": 102,
+    "first_chunk_ms": 8744.1,
+    "second_chunk_ms": 1911.6,
+    "warmed_reference_s": 34.6,
+    "warmed_reference": "attention_paths.json split rows"
+  },
+  "stock_query": {
+    "source": "results/baseline_filter.json",
+    "n_docs": 10000,
+    "submission": "separate requests per (document, stage), pipelined, token-budget admission",
+    "wall_s_mean": 48.88,
+    "wall_s": [48.74, 49.03],
+    "note": "Committed stock client, not re-run this session. Older YES/NO corpus (23381 requests). Quail this session is TRUE/FALSE (40052 answers)."
+  },
+  "function_calls": {
+    "quail_boot": "fc-01M0TTZA8D6MXYFEC7F8SDA6Z0",
+    "stock_boot": "fc-01M0TTZADHWMPW8J6TESP791T9"
+  },
+  "volume": {
+    "boot": "/results/boot/compare.json",
+    "query": "/results/m1/m1_filter.json"
+  }
+}
