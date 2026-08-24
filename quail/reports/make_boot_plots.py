@@ -25,7 +25,7 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY, GREEN, ORANGE, TEAL, DARK
+from plot_colors import BLUE, GRAY, GREEN, ORANGE, RED, TEAL, DARK
 
 tiered = json.load(open(RESULTS / "boot_tiered.json"))
 # boot phases from the profiler-off control: py-spy adds ~4.6 s to
@@ -109,3 +109,45 @@ ax_q.set_title("10k-document single-stage filter", fontsize=10,
 fig.tight_layout()
 fig.savefig(OUT / "boot_tiered.png", dpi=150, bbox_inches="tight")
 print(f"wrote {OUT / 'boot_tiered.png'}")
+
+
+# ---- figure 2: inside the touch pass (py-spy timeline) --------------
+tl = json.load(open(RESULTS / "boot_touch_timeline.json"))
+timeline = tl["timeline_touch0"]
+cats = timeline["categories"]
+bin_s = timeline["bin_s"]
+n = timeline["n_bins"]
+xs = [i * bin_s for i in range(n)]
+
+CAT_COLORS = {
+    "gpu wait (answer event)": BLUE,
+    "answer submit (pinned alloc + logits)": TEAL,
+    "gemm + quant launches": ORANGE,
+    "attention + triton launches": GREEN,
+    "deepgemm cache reads (disk)": RED,
+    "packing + admission (cpu)": GRAY,
+    "other": DARK,
+}
+
+fig2, ax = plt.subplots(figsize=(10.5, 3.0))
+bottom = [0.0] * n
+for c in cats:
+    vals = [v / bin_s for v in timeline["matrix"][c]]  # busy fraction
+    if not any(vals):
+        continue
+    ax.bar(xs, vals, width=bin_s, bottom=bottom, align="edge",
+           color=CAT_COLORS[c], label=c, linewidth=0)
+    bottom = [b + v for b, v in zip(bottom, vals)]
+ax.set_xlim(0, n * bin_s)
+ax.set_ylim(0, 1.15)
+ax.set_yticks([0, 0.5, 1.0])
+ax.set_ylabel("share of each 0.1 s bin")
+ax.set_xlabel(
+    "seconds into the touch pass (py-spy attached: runs 8.9 s here "
+    "vs 3.6 s clean; profiler stretches CPU launch work most)")
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.32), ncol=3,
+          fontsize=8, handlelength=1.1)
+fig2.tight_layout()
+fig2.savefig(OUT / "boot_touch_timeline.png", dpi=150,
+             bbox_inches="tight")
+print(f"wrote {OUT / 'boot_touch_timeline.png'}")

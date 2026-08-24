@@ -137,6 +137,38 @@ shapes), run in a fresh container after a touch boot
 
 Figure: plots/boot_tiered.png
 
+### Inside the touch pass
+
+Figure: plots/boot_touch_timeline.png
+
+A 0.1-second-binned timeline of the touch pass, from the py-spy
+MainThread samples of touch trial 0, categorized by what the CPU
+was doing (committed summary: `results/boot_touch_timeline.json`).
+Read it with the caveat that the profiler was attached: the phase
+runs 8.9 s here against 3.62 s clean, and sampling stretches
+CPU-side launch work more than GPU waits.
+
+- The first ~2.5 s is kernel-launch work for the first budget-sized
+  chunk: GEMM + quant launches, attention and Triton launches, with
+  red bursts of DeepGEMM reading cached kernel binaries off the
+  volume on first sight (~0.5 s total across the phase - the loads
+  the touch pass exists to absorb).
+- The solid band after it is the CPU blocked while the GPU runs
+  that chunk (the block lands in the answer submit's pinned-memory
+  allocation, which waits on a busy device).
+- The second launch band is the other attention mode's budget chunk
+  plus the tiny-chunk ladder, again with cache-read bursts.
+- The tail is pure GPU wait: the fast-path chunk running to
+  completion and the final synchronize.
+
+So the clean 3.62 s decomposes as roughly 2.8 s of GPU forward
+compute on the three budget-sized warm chunks, ~0.3-0.4 s of tiny
+ladder, and ~0.5 s of one-time cache loads - the phase is
+GPU-compute-bound, not overhead-bound. Shrinking it further means
+warming with smaller forward chunks plus bare budget-sized GEMMs
+(~1 s touch), at the price of the first real query paying a few
+tens of milliseconds of binary loads itself.
+
 ## What the numbers mean
 
 - The per-container warmup no longer re-runs the GEMM sweep, and
