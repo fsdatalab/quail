@@ -110,20 +110,36 @@ Figure: plots/join_orientation_accuracy.png
 
 The engine is identical in both runs; recombination is checked
 against brute force in `tests/gpu/barrier_smoke.py`. The difference
-is the model. The likely mechanism is distance to the answer
-position: anchored, the long document's single color sentence sits
-~2,900 tokens before the question; streamed, the partner block ends
-right before it. This is the same distance effect the `SHARED_PRE`
-measurement documented (`quail/logical.py`).
+is the model, and this failure shape was cross-checked before: the
+exploration's nway3 measurement ran planted-key pairs with
+~4,000-token anchored documents through a trivially-correct causal
+reference implementation (`tests/gpu/milestone1.py`,
+`run_debug_join`) and got the same near-all-TRUE answers with zero
+disagreements against the packed executor (recorded in
+`tests/gpu/session_smoke.py`'s docstring). So this is not the
+engine; the model itself stops discriminating.
+
+The variable is not distance from the fact to the question. The
+color line is the LAST line of every document here, so in the
+failing orientation it sits only ~65 tokens before the answer
+position - while the working orientation recalls a color from the
+top of the context, across all 3,000 intervening tokens, exactly.
+What separates every failure from every success in these cells is
+the length of the anchored document the judgment must read: ~450
+tokens (session smoke) and ~800 tokens (gate stages 1 and 2) answer
+exactly; ~3,000 tokens answers TRUE for every pair. The failure
+direction is always toward TRUE (0.825 at gate stage 3, 1.0 here):
+when the model stops discriminating, it says yes.
 
 Caveats and consequence:
 
-- This corpus is one planted sentence inside filler - the worst case
-  for distance. Real predicates over real documents measure sensible
-  selectivities with long anchored documents (the REACTION shape on
-  ~3,500-token anchored reports), so the size of the effect on real
-  text is unknown. Issue #43's orientation check is the measurement
-  that settles it, with real predicates run both ways.
+- This corpus is an extreme shape: 130 copies of one filler
+  sentence and a single fact line. Real prose behaves differently -
+  the REACTION shape measures sensible selectivities on
+  ~3,500-token anchored reports - so where the collapse threshold
+  sits on real text, and whether it moves at all, is unknown. Issue
+  #43's orientation check is the measurement that settles it, with
+  real predicates run both ways.
 - Until that measurement exists, anchor choice is not purely a cost
   decision at current model quality. The escape hatch is explicit:
   `anchor=` forces the orientation, and the planner honors it (with
