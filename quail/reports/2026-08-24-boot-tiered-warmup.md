@@ -157,6 +157,8 @@ this query, so these rows establish the reference):
 - Query (10,000 documents, one filter): best fast-path wall
   201.4 s, best arena wall 203.1 s, 0 wrong of 10,000.
 
+Figure: plots/boot_tiered_32b.png
+
 Figure: plots/boot_touch_timeline_32b.png
 
 ### Inside the touch pass
