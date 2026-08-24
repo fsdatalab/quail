@@ -3,27 +3,29 @@
 Making AI SQL filter and join queries fast by changing how the
 inference layer manages KV memory.
 
-Two things live here:
+Three things live here:
 
 - **`plans/engine_design.md`** — the settled design for the Quail
   engine: a declarative query engine for AI_FILTER and AI_JOIN
   (Snowflake AISQL syntax, one packed executor, Modal runtime).
-  The engine itself will be built in its own repository from that
-  document.
-- **`exploration/`** — the exploration that produced the design:
-  the `quail` package (planner, cost model, vLLM extensions,
-  clients), the Modal experiments, the committed results, and the
-  CPU test suite. Its own README explains the workload and the
-  measured findings. Frozen as evidence; the design document
-  cites its result files by path.
+- **`quail/`** — the engine built from that document: the `quail`
+  package (planner, executor, runtime, SQL front end and builder),
+  the GPU test cells, the committed result summaries, and the
+  reports. Its own README explains the layout;
+  `quail/reports/engine-wiki.md` is the living design reference.
+- **`old_exploration/`** — the exploration that produced the design.
+  Frozen as evidence; the design document cites its result files by
+  path.
 
-To run the exploration code, work from inside `exploration/`:
+Working conventions — writing style, experiments, reports, plots,
+issue and PR descriptions — are in `AGENTS.md`.
+
+To run the engine's CPU tests, work from inside `quail/`:
 
 ```bash
-cd exploration
-pip install -e ".[dev]"
-python -m pytest tests/ -q     # CPU tests, no GPU
+cd quail
+uv run pytest tests/ -q     # CPU tests, no GPU
 ```
 
-Engine experiments need Modal (one H100); see
-`exploration/README.md`.
+Engine runs go through Modal (Qwen3 4B or 32B fp8, one H100 per
+model copy); see `quail/README.md`.
