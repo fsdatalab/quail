@@ -1,0 +1,185 @@
+{
+  "cell": "boot_tiered",
+  "model": "qwen3-32b-fp8",
+  "gpu": "H100!",
+  "vllm": "0.26.0",
+  "prediction": "compile boot: generator sweep + unseen-config compiles, minutes once ever; touch boot warm_kernels_s 2-4 s (vs 3.7-4.9 s swept); cold boot_s load_model-dominated (28-38 s); query best fast wall 28.3 s +-3%, 0 wrong, under stock's 33.4 s",
+  "reference": {
+    "quail_query": {
+      "no_arena_wall_s": 28.3,
+      "arena_wall_s": 28.65,
+      "wrong": 0,
+      "source": "results/m1_filter1.json"
+    },
+    "stock_query": {
+      "wall_s": 33.41,
+      "submission": "separate requests per document, document-cap admission",
+      "source": "results/baseline_filter1.json"
+    },
+    "old_boot": {
+      "warm_kernels_s": [
+        3.68,
+        4.9
+      ],
+      "boot_s": [
+        33.61,
+        45.3
+      ],
+      "source": "results/boot_profile.json"
+    }
+  },
+  "compile": {
+    "skipped": true
+  },
+  "touch": {
+    "side": "quail",
+    "n_trials": 0,
+    "trials": [],
+    "cold": {
+      "boot_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      },
+      "load_model_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      },
+      "arena_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      },
+      "pipeline_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      },
+      "warm_kernels_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      }
+    },
+    "warm": {
+      "boot_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      },
+      "load_model_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      },
+      "arena_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      },
+      "pipeline_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      },
+      "warm_kernels_s": {
+        "mean": null,
+        "median": null,
+        "trials": []
+      }
+    }
+  },
+  "stock": {
+    "side": "stock",
+    "n_trials": 1,
+    "trials": [
+      {
+        "side": "stock",
+        "trial": 0,
+        "cold": {
+          "kind": "cold",
+          "llm_init_s": 282.46,
+          "weight_load_s": null,
+          "kv_profile_s": null,
+          "boot_s": 282.46
+        },
+        "warm": {
+          "kind": "warm",
+          "llm_init_s": 0.0,
+          "weight_load_s": null,
+          "kv_profile_s": null,
+          "boot_s": 0.0
+        }
+      }
+    ],
+    "cold": {
+      "boot_s": {
+        "mean": 282.46,
+        "median": 282.46,
+        "trials": [
+          282.46
+        ]
+      },
+      "llm_init_s": {
+        "mean": 282.46,
+        "median": 282.46,
+        "trials": [
+          282.46
+        ]
+      },
+      "weight_load_s": {
+        "mean": null,
+        "median": null,
+        "trials": [
+          null
+        ]
+      },
+      "kv_profile_s": {
+        "mean": null,
+        "median": null,
+        "trials": [
+          null
+        ]
+      }
+    },
+    "warm": {
+      "boot_s": {
+        "mean": 0.0,
+        "median": 0.0,
+        "trials": [
+          0.0
+        ]
+      },
+      "llm_init_s": {
+        "mean": 0.0,
+        "median": 0.0,
+        "trials": [
+          0.0
+        ]
+      },
+      "weight_load_s": {
+        "mean": null,
+        "median": null,
+        "trials": [
+          null
+        ]
+      },
+      "kv_profile_s": {
+        "mean": null,
+        "median": null,
+        "trials": [
+          null
+        ]
+      }
+    }
+  },
+  "query": {
+    "runs": [],
+    "best_wall": {
+      "arena": null,
+      "no_arena": null
+    },
+    "wrong": 0
+  }
+}
