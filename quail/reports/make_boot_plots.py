@@ -128,9 +128,12 @@ for model, entry in tl["models"].items():
     ax.set_ylim(0, 1.15)
     ax.set_yticks([0, 0.5, 1.0])
     ax.set_ylabel("share of each 0.1 s bin")
+    note = ("recorded under py-spy, which slows it: this phase is "
+            "3.6 s without the profiler" if model == "qwen3-4b-fp8"
+            else "recorded under py-spy; 11-22 s without it, "
+                 "host-speed dependent")
     ax.set_xlabel(
-        f"seconds into the touch pass, {model} (py-spy attached: "
-        "the profiler stretches CPU launch work most)")
+        f"seconds into the touch pass, {model} ({note})")
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.32),
               ncol=3, fontsize=8, handlelength=1.1)
     fig2.tight_layout()
