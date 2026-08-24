@@ -74,9 +74,9 @@ def test_join_group_anchors_follow_filter_shards():
 
 
 def test_join_group_reshards_an_anchor_without_filter_shards():
-    # the anchor has no filter shard (it was a partner before the
-    # barrier): shards balance fresh over the live documents - the
-    # re-shard. Only token ids move; KV is computed on the new GPU.
+    # a hand-built payload with no shard entry at all for the anchor:
+    # shards balance fresh over the live documents. Only token ids
+    # move; KV is computed on the new GPU.
     p = payload()
     del p["shards"]["r"]
     survivors = {"r": [0, 1, 3, 5]}
@@ -84,6 +84,24 @@ def test_join_group_reshards_an_anchor_without_filter_shards():
     covered = sorted(g for s in subs for g in s["anchor_index"])
     assert covered == [0, 1, 3, 5]
     assert all(s["anchor_index"] for s in subs)
+
+
+def test_join_group_reshards_an_unfiltered_anchor_over_its_live_set():
+    # engine payloads ship a scan shard for EVERY alias, but an
+    # anchor that ran no filter round (it was a partner before the
+    # barrier) has no KV on any GPU to stay near: its scan shard is
+    # ignored and shards balance fresh over the live documents - the
+    # re-shard.
+    p = payload()
+    group = [dict(anchor="p", partners=["r"], semantics="full",
+                  labels={"r": [2]}, frame=[8], tail=[3])]
+    # both live p docs sit in p's first scan shard ((0, 1), (2, 3));
+    # following that shard would leave worker 1 with no anchors
+    survivors = {"p": [0, 1], "r": [0, 1, 3]}
+    subs = join_group_payloads(p, 2, survivors, group)
+    assert [s["anchor_index"] for s in subs] == [[0], [1]]
+    # a filtered anchor still follows its filter shard (locality):
+    # test_join_group_anchors_follow_filter_shards above
 
 
 def test_join_group_carries_pre_and_store():

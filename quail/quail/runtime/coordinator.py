@@ -203,13 +203,14 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
                         group: list) -> list:
     """Per-worker sub-payloads for ONE anchor group's round. Every
     stage in `group` shares the group's anchor (materialize each with
-    stage_for_anchor first). Anchors follow the alias's filter shard
-    when one exists - the live subset of a balanced shard stays
-    roughly balanced, and that GPU's store slice may hold the
-    anchor's KV from the filter round - and are balanced fresh over
-    the live documents otherwise (the re-shard). Partners are the
-    full surviving lists, identical on every worker so the partner
-    index space matches at the merge."""
+    stage_for_anchor first). An anchor that ran the filter round
+    follows its filter shard - the live subset of a balanced shard
+    stays roughly balanced, and that GPU's store slice may hold the
+    anchor's KV from the filter round. An anchor with no filter round
+    has no KV anywhere to stay near, so its shards are balanced fresh
+    over the live documents (the re-shard). Partners are the full
+    surviving lists, identical on every worker so the partner index
+    space matches at the merge."""
     if not group:
         return []
     anchor_alias = group[0]["anchor"]
@@ -222,7 +223,7 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
 
     live = surv(anchor_alias)
     shards = payload.get("shards") or {}
-    if anchor_alias in shards:
+    if anchor_alias in payload["filters"] and anchor_alias in shards:
         alive = set(live)
         anchor_shards = [[g for g in shard if g in alive]
                          for shard in shards[anchor_alias]]
