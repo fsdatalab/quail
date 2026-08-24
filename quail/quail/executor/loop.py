@@ -705,10 +705,11 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
             body = (stream * (t // len(stream) + 1))[:max(8, t - q_max)]
             run_filter(torch, arena, pipeline, async_ans, [body],
                        question_ids, budget, arena_writes=True)
+    pipeline.attention_mode = JOIN_ATTENTION
+    run_join(torch, arena, pipeline, async_ans, warm_docs,
+             [question_ids * max(1, 8 // len(question_ids))], budget)
     pipeline.attention_mode = original_mode
     if len(question_ids) == 1:
-        # the fast path's own shape: one causal segment per group,
-        # no paging, under the session's configured mode
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
                    question_ids, budget, arena_writes=False)
 
