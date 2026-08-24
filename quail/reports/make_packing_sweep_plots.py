@@ -21,10 +21,14 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, DARK, GRAY, GREEN, RED
+from plot_colors import (BLUE, BROWN, DARK, GRAY, GREEN, ORANGE,
+                         PURPLE, RED, TEAL)
 
 KIND_COLOR = {"filter": BLUE, "join": RED, "chain": GREEN}
-KIND_MARK = {"filter": "o", "join": "^", "chain": "s"}
+# fig 1: one color per query, fixed assignment
+QUERY_COLOR = {"BIO-1": BLUE, "IMDB-1": TEAL, "BIO-F3": GREEN,
+               "BIO-2": RED, "IMDB-2": ORANGE, "LEP-2": PURPLE,
+               "FEV-2": BROWN}
 
 with open(ROOT / "results" / "packing_sweep.json") as f:
     data = json.load(f)
@@ -44,18 +48,16 @@ for ax, model in zip(axes, MODELS):
     a, a2c = fit["a_s_per_token"], fit["a2c_s_per_token2"]
     old = data["loaded_before"][model]
     xs_all = []
-    # one series per query: its bins joined by a thin line, the query
-    # id written at the series' end (color still says the kind)
+    # one series per query, one color per query, labeled directly
     ends = []
     for qid, q in sorted(block["queries"].items()):
-        color = KIND_COLOR[q["kind"]]
-        marker = KIND_MARK[q["kind"]]
+        color = QUERY_COLOR[qid]
         bins_q = sorted(q["chunk_bins"], key=lambda b: b["x_mean_ctx"])
         xs = [b["x_mean_ctx"] for b in bins_q]
         ys = [b["us_per_token"] for b in bins_q]
         xs_all += xs
-        ax.plot(xs, ys, marker, color=color, markersize=4,
-                linestyle="-", linewidth=0.8, zorder=3)
+        ax.plot(xs, ys, "o", color=color, markersize=4,
+                linestyle="-", linewidth=1.0, zorder=3)
         ends.append((xs[-1], ys[-1], qid, color))
     # stagger the labels of series that end close together
     ends.sort(key=lambda e: (round(e[0], -2), e[1]))
@@ -67,7 +69,7 @@ for ax, model in zip(axes, MODELS):
             else 0
         last_x = x
         ax.annotate(qid, (x, y), textcoords="offset points",
-                    xytext=(5, -3 + 9 * stack), fontsize=7.5,
+                    xytext=(6, -3 + 10 * stack), fontsize=8.5,
                     color=color)
     lo, hi = 0, max(xs_all) * 1.06
     grid = [lo + (hi - lo) * i / 60 for i in range(61)]
@@ -101,25 +103,12 @@ for ax, model in zip(axes, MODELS):
         jf = block["fits"]["join"]
         slope_ratio = jf["a2x_s_per_token2"] / (2 * a2c)
         suffix_us = jf["per_suffix_s"] * 1e6
-        jb = [b for q in block["queries"].values()
-              if q["kind"] == "join" for b in q["chunk_bins"]]
-        jb.sort(key=lambda b: b["x_mean_ctx"])
-        mid = jb[len(jb) // 2]
-        ax.annotate(
-            f"join chunks: reading kept anchor KV\ncosts "
-            f"{slope_ratio:.2f}x per attended token,\n"
-            f"plus ~{suffix_us:.0f} us per suffix",
-            xy=(mid["x_mean_ctx"], mid["us_per_token"]),
-            xycoords="data", textcoords="axes fraction",
-            xytext=(0.05, 0.66), ha="left", va="center",
-            fontsize=8, color=RED,
-            arrowprops=dict(arrowstyle="-", color=RED, lw=0.6,
-                            relpos=(1.0, 0.3)))
-    ax.plot([], [], "o", color=BLUE, label="filter chunks")
-    ax.plot([], [], "^", color=RED, label="join chunks")
-    if any(q["kind"] == "chain" for q in block["queries"].values()):
-        ax.plot([], [], "s", color=GREEN, label="chain chunks")
-    ax.legend(loc="upper left")
+        ax.text(0.03, 0.97,
+                f"queries whose chunks read kept KV (joins, the\n"
+                f"chain) sit above the line: {slope_ratio:.2f}x per "
+                f"attended\ntoken, plus ~{suffix_us:.0f} us per suffix",
+                transform=ax.transAxes, ha="left", va="top",
+                fontsize=8, color=DARK)
 fig.savefig(OUT / "packing_sweep_context.png", dpi=150)
 plt.close(fig)
 
