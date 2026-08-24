@@ -144,40 +144,53 @@ for model, entry in tl["models"].items():
 
 
 # ---- figure 3: 32B boot phases + query ------------------------------
+# One bar per container, not a mean: 32B weight-load speed varies
+# 3.5x with the container drawn, and averaging that hides it. The
+# starred container is the one the timeline figure profiles.
 t32 = json.load(open(RESULTS / "boot_tiered_32b.json"))
-cold32 = t32["touch"]["cold"]
+t32spy = json.load(open(RESULTS / "boot_tiered_32b_spy.json"))
+rows32 = [(r["cold"], label) for r, label in zip(
+    t32spy["touch"]["trials"] + t32["touch"]["trials"],
+    ["container 1 (fast)*", "container 2 (slow)",
+     "container 3 (slow)"])]
 
 fig3, (ax_b, ax_q2) = plt.subplots(
-    1, 2, figsize=(10.5, 3.4),
+    1, 2, figsize=(10.5, 3.6),
     gridspec_kw={"width_ratios": [1.5, 1]})
 
-left = 0.0
-total32 = mean_s(cold32, "boot_s")
-for name, key, color in PHASES:
-    val = mean_s(cold32, key)
-    if not val:
-        continue
-    ax_b.barh(0, val, left=left, height=0.42, color=color)
-    if val >= total32 * 0.15:
-        ax_b.text(left + val / 2, 0, f"{val:.1f}",
-                  ha="center", va="center", fontsize=9.5,
-                  color="white", fontweight="bold")
-    elif val >= total32 * 0.02:
-        ax_b.text(left + val / 2, -0.31, f"{val:.1f}",
-                  ha="center", va="top", fontsize=9.5,
-                  color=DARK, fontweight="bold")
-    left += val
-ax_b.text(total32 + 6, 0, f"{total32:.0f} s", va="center",
-          fontsize=10, color=DARK, fontweight="bold")
-ax_b.set_xlim(0, total32 * 1.22)
-ax_b.set_ylim(-0.45, 0.75)
+max32 = max(c["boot_s"] for c, _ in rows32)
+for y, (cold, label) in enumerate(reversed(rows32)):
+    left = 0.0
+    for name, key, color in PHASES:
+        val = cold[key]
+        if not val:
+            continue
+        ax_b.barh(y, val, left=left, height=0.42, color=color)
+        if val >= max32 * 0.15:
+            ax_b.text(left + val / 2, y, f"{val:.0f}",
+                      ha="center", va="center", fontsize=9.5,
+                      color="white", fontweight="bold")
+        elif val >= max32 * 0.02:
+            ax_b.text(left + val / 2, y - 0.31, f"{val:.1f}",
+                      ha="center", va="top", fontsize=9,
+                      color=DARK)
+        left += val
+    ax_b.text(cold["boot_s"] + 6, y, f"{cold['boot_s']:.0f} s",
+              va="center", fontsize=10, color=DARK,
+              fontweight="bold")
+    ax_b.text(-6, y + 0.33, label, fontsize=9, color=DARK,
+              ha="left")
+ax_b.set_xlim(0, max32 * 1.2)
+ax_b.set_ylim(-0.55, 2.85)
 ax_b.set_yticks([])
 ax_b.set_xlabel(
-    "cold container boot, qwen3-32b-fp8 (seconds, 2-trial mean; "
-    "weight-load speed varies 2-6 min by container)")
+    "cold container boot, qwen3-32b-fp8 (seconds; one bar per "
+    "container - Modal hosts differ 3.5x)\n"
+    "* the container the touch-timeline figure profiles; its "
+    "warmup includes py-spy overhead")
 ax_b.legend(
     handles=[Patch(facecolor=c, label=n) for n, _, c in PHASES],
-    loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=3,
+    loc="upper center", bbox_to_anchor=(0.5, -0.42), ncol=3,
     fontsize=8.5, handlelength=1.1)
 
 best32 = t32["query"]["best_wall"]["no_arena"]
