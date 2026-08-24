@@ -95,6 +95,12 @@ def lstsq(ys, cols):
            for i in range(k)]
     atb = [sum(c[i] * y for c, y in zip(cols, ys)) for i in range(k)]
     for i in range(k):
+        piv = max(range(i, k), key=lambda r: abs(ata[r][i]))
+        if abs(ata[piv][i]) < 1e-30:
+            ata[i][i] = 1e-30
+            continue
+        ata[i], ata[piv] = ata[piv], ata[i]
+        atb[i], atb[piv] = atb[piv], atb[i]
         for j in range(i + 1, k):
             f = ata[j][i] / ata[i][i]
             for m in range(i, k):
@@ -102,6 +108,9 @@ def lstsq(ys, cols):
             atb[j] -= f * atb[i]
     x = [0.0] * k
     for i in reversed(range(k)):
+        if abs(ata[i][i]) < 1e-30:
+            x[i] = 0.0
+            continue
         x[i] = (atb[i] - sum(ata[i][j] * x[j]
                              for j in range(i + 1, k))) / ata[i][i]
     return x
