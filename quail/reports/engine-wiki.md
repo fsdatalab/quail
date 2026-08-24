@@ -1263,10 +1263,11 @@ volume, so each configuration compiles once per software stack.
   quantization.
 - `qk_norm_rope`: fused QK-norm and rotary position embedding.
 
-**Kernel warmup** (`loop.py:347`): before any measured run, the
-warmup function sweeps DeepGEMM across a dense set of token counts
-(every 256 tokens up to 4,096, every 1,024 up to 32,768, every
-2,048 up to the budget) for each of the four linear projections.
-After the GEMM sweep, one budget-sized filter chunk warms the Triton
-kernels and attention path. This ensures no JIT compilation occurs
-during measured walls.
+**Kernel warmup** (`loop.py:warm_kernels`): before any measured run,
+DeepGEMM M values come from vLLM's config-boundary generator
+(`_generate_optimal_warmup_m_values`, one list per linear, up to
+the chunk budget). Attention is warmed by the real loops:
+`run_filter` (unified, the no-arena fast path, and tiny 64-2,048
+token chunks) and `run_join` (long-prefix/short-suffix,
+short-prefix/long-suffix, and a tiny tail). Flipping
+`attention_mode` on a filter chunk is not a join warmup.

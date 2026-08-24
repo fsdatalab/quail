@@ -582,77 +582,155 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 
 # ------------------------------------------------------------- warmup
 
+# Trailing chunks of a gated chain are 100-500 tokens. The GEMM
+# sweep launches bare matmuls; these sizes also need a real forward
+# so Triton and FlashAttention compile the packed-chunk shapes.
+TINY_WARM_TOKENS = (64, 128, 256, 512, 1024, 2048)
+
+
+def _repeat_ids(ids, n):
+    ids = ids or [1]
+    n = max(1, n)
+    return (ids * ((n + len(ids) - 1) // len(ids)))[:n]
+
+
+def deepgemm_m_values(n, max_tokens, torch=None):
+    """Token counts (M) that can change DeepGEMM's compiled config.
+
+    Uses vLLM's generator, which mirrors DeepGEMM's C++ heuristic
+    (block tiles and wave transitions). Fallback is every block_m=64
+    below 4,096, then 1,024/2,048 steps. Always includes max_tokens.
+    n is the linear's output width (weight.shape[0]).
+    Returns (sizes, source) where source is 'vllm' or 'fallback'."""
+    if torch is not None:
+        try:
+            from vllm.model_executor.warmup.deep_gemm_warmup import (
+                _generate_optimal_warmup_m_values)
+            ms = _generate_optimal_warmup_m_values(
+                max_tokens, n, torch.device("cuda"))
+            return sorted(set(ms) | {max_tokens}), "vllm"
+        except Exception:
+            pass
+    small = set(range(64, min(4097, max_tokens + 1), 64))
+    mid = set(range(4096, min(32769, max_tokens + 1), 1024))
+    large = set(range(32768, max_tokens + 1, 2048))
+    tiny = {1, 2, 4, 8, 16, 32}
+    return sorted(small | mid | large | tiny | {max_tokens}), "fallback"
+
+
+def filter_warmup_docs(doc_ids, q_max, budget):
+    """Documents that fill one filter chunk, cycling if needed."""
+    if not doc_ids or q_max >= budget:
+        return []
+    out, used, i = [], 0, 0
+    while True:
+        d = doc_ids[i % len(doc_ids)]
+        if used + len(d) + q_max > budget:
+            break
+        out.append(d)
+        used += len(d) + q_max
+        i += 1
+        if i > 0 and i % len(doc_ids) == 0 and used == 0:
+            break
+        if i >= max(len(doc_ids), 1) * 8:
+            break
+    return out
+
+
+def join_warmup_jobs(doc_ids, question_ids, budget):
+    """Three packer shapes run_join actually builds.
+
+    Long prefix + many short suffixes (BIO-2 orientation), short
+    prefix + longer suffixes (FEV-2 orientation), and a tiny tail
+    chunk. CPU only; the caller launches run_join on each."""
+    stream = doc_ids[0] if doc_ids else [1, 2, 3]
+    q = question_ids[0] if question_ids else [1, 2, 3]
+    jobs = []
+    pre = _repeat_ids(stream, min(2048, max(16, budget // 8)))
+    suf = _repeat_ids(q, min(80, max(8, len(q))))
+    n_suf = max(2, (budget - len(pre)) // len(suf))
+    jobs.append(([pre, pre], [[suf] * n_suf]))
+    spre = _repeat_ids(stream, 16)
+    lsuf = _repeat_ids(stream, 256) + q
+    if len(spre) + len(lsuf) <= budget:
+        n2 = max(2, (budget - len(spre)) // len(lsuf))
+        jobs.append(([spre] * 4, [[lsuf] * n2]))
+    jobs.append(([_repeat_ids(stream, 32)],
+                 [[_repeat_ids(q, 16)] * 4]))
+    return jobs
+
+
 def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
                  question_ids, budget):
-    """Compile every kernel configuration a run can hit, at boot,
-    outside measured walls (the protocol measures with kernels
-    compiled).
+    """Compile the kernels a run can hit, at boot, outside measured
+    walls.
 
-    DeepGEMM picks a kernel configuration per token count and
-    JIT-compiles each one on first sight (~3-10 s per configuration).
-    The configuration (its JIT-debug log shows block widths like 112)
-    varies with the token count FINER than powers of two - a
-    geometric sweep left ~41 s of compile lumps inside the first
-    measured run - so the sweep is dense at small counts and steps
-    at large ones, the same reason vLLM's DeepGEMM warmup iterates
-    the token dimension. Compiled artifacts land in the kernel cache
-    (a volume in the Modal images), so all of this costs real time
-    once per software stack, ever.
-
-    After the sweep, one budget-sized chunk warms the Triton kernels
-    and the attention path. doc_ids are cycled, so small corpora
-    still warm full-size shapes."""
+    DeepGEMM M values come from vLLM's config-boundary generator
+    (one list per linear, up to the chunk budget). Attention is
+    warmed by the real loops: run_filter (unified, fast path, tiny
+    chunks) and run_join (both join orientations plus a tiny tail).
+    Flipping attention_mode on a filter chunk is not a join warmup.
+    """
     layer = pipeline.layers[0]
     linears = (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
                layer.mlp.gate_up_proj, layer.mlp.down_proj)
-    # granular at every size, including the big ones: DeepGEMM's
-    # config choice (its debug log shows block widths like 112)
-    # tracks the token count finer than powers of two, and the
-    # measured lumps came from mid-size drain chunks, so there is no
-    # "big sizes are covered by the sweep" shortcut
-    sizes = sorted(
-        {m for m in range(64, 4097, 256)}
-        | {m for m in range(4096, 32769, 1024)}
-        | {m for m in range(32768, budget + 1, 2048)}
-        | {budget})
-    work = [(m, lin) for m in sizes for lin in linears]
+    work = []
+    source = "fallback"
+    for lin in linears:
+        ms, src = deepgemm_m_values(lin.weight.shape[0], budget, torch)
+        source = src
+        work.extend((m, lin) for m in ms)
+    n_gemm = len(work)
     try:
         from tqdm import tqdm
         work = tqdm(work, desc="quail kernel warmup", unit="gemm")
     except ImportError:
         pass
     with torch.inference_mode():
+        cur, buf = None, None
         for m, lin in work:
-            x = torch.randn(m, lin.weight.shape[1], device="cuda",
-                            dtype=torch.bfloat16)
-            q, s = pipeline.quant(x)
+            if lin is not cur:
+                buf = torch.randn(budget, lin.weight.shape[1],
+                                  device="cuda", dtype=torch.bfloat16)
+                cur = lin
+            q, s = pipeline.quant(buf[:m])
             pipeline.gemm(q, s, lin)
+        buf = None
         torch.cuda.synchronize()
 
-    q_max = max(len(q) for q in question_ids)
-    warm_docs, used = [], 0
-    i = 0
-    while doc_ids:
-        d = doc_ids[i % len(doc_ids)]
-        if used + len(d) + q_max > budget:
-            break
-        warm_docs.append(d)
-        used += len(d) + q_max
-        i += 1
+    q_max = max((len(q) for q in question_ids), default=0)
+    warm_docs = filter_warmup_docs(doc_ids, q_max, budget)
+    stream = warm_docs[0] if warm_docs else (doc_ids[0] if doc_ids
+                                             else [1, 2, 3])
     original_mode = pipeline.attention_mode
-    for mode in (FILTER_ATTENTION, JOIN_ATTENTION):
-        pipeline.attention_mode = mode
-        # arena_writes=True keeps the warmup on the paged machinery
-        # (scatter, paged reads, the merge kernel) even when the
-        # query itself will take the single-stage fast path
+    n_filter = 0
+    pipeline.attention_mode = FILTER_ATTENTION
+    if warm_docs:
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
                    question_ids, budget, arena_writes=True)
+        n_filter += 1
+        if len(question_ids) == 1:
+            run_filter(torch, arena, pipeline, async_ans, warm_docs,
+                       question_ids, budget, arena_writes=False)
+            n_filter += 1
+    for t in TINY_WARM_TOKENS:
+        if t >= budget:
+            continue
+        body = _repeat_ids(stream, max(8, t - q_max))
+        run_filter(torch, arena, pipeline, async_ans, [body],
+                   question_ids, budget, arena_writes=True)
+        n_filter += 1
+
+    n_join = 0
+    pipeline.attention_mode = JOIN_ATTENTION
+    for prefixes, suffixes in join_warmup_jobs(
+            doc_ids, question_ids, budget):
+        run_join(torch, arena, pipeline, async_ans, prefixes,
+                 suffixes, budget)
+        n_join += 1
     pipeline.attention_mode = original_mode
-    if len(question_ids) == 1:
-        # the fast path's own shape: one causal segment per group,
-        # no paging, under the session's configured mode
-        run_filter(torch, arena, pipeline, async_ans, warm_docs,
-                   question_ids, budget, arena_writes=False)
+    return dict(n_gemm=n_gemm, n_filter=n_filter, n_join=n_join,
+                m_source=source)
 
 
 # ---------------------------------------------------------- the filter
