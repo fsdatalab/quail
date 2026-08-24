@@ -582,3 +582,83 @@ two adversarial reviews' findings were.
 
 216 tests pass (214 + 2 for the renormalization logic in the comparison
 plot).
+
+## 18. A store methodology gap in the profiler comparison (2026-08-25)
+
+`Session.store_enabled` defaults to `True` (`runtime/session.py`).
+`quailb.py`'s cold/warm passes turn it off/on explicitly; section 16's
+`torch_profiler_compare.py` and `torch_profiler_explore.py` never
+called `set_store()` at all, so they silently ran with the store on.
+Both scripts also "warm the container" by running IMDB-1 once before
+profiling it - with the store on, that meant IMDB-1's profiled run
+could restore its own KV from the warmup call instead of building it
+fresh, which is not the same workload `sol_breakdown` assumes when
+nothing is restored.
+
+**Prediction before rerunning with `sess.set_store(False)` added to
+both scripts:** IMDB-1, BIO-2, and FEV-5 shouldn't change much - BIO-2
+and FEV-5 use tables no other query touches, and IMDB-1 restored 0
+tokens even in `quailb.py`'s own warm pass. IMDB-2 and IMDB-5 (which
+do restore under warm conditions per section 15) might get slower once
+restores are forced off. The attention-high/elementwise-low pattern
+should hold regardless, since BIO-2 and FEV-5 already showed it with
+no possible restore path.
+
+**Result**, rerun on Modal (`results/torch_profiler_compare_corrected.json`,
+prior run kept at `results/torch_profiler_compare_uncorrected.json`):
+
+| Query | sol_s before | sol_s after | wall_s before | wall_s after |
+|---|---|---|---|---|
+| IMDB-1 | 7.702 | 10.195 | 12.52 | 14.46 |
+| IMDB-2 | 33.381 | 35.872 | 57.82 | 52.97 |
+| IMDB-5 | 11.785 | 15.071 | 22.04 | 24.18 |
+| BIO-2 | 87.764 | 87.764 | 147.59 | 139.76 |
+| FEV-5 | 1.058 | 1.138 | 2.78 | 1.83 |
+
+BIO-2's `sol_s` is identical before and after, confirming it had no
+restore path either way. IMDB-1's jumped from 7.70s to 10.20s - it was
+restoring essentially its whole corpus from the redundant self-warmup
+call, and 10.195s now matches `results/sol_check_sf0.1_4b_corrected.json`'s
+validated cold-pass number for IMDB-1 exactly. IMDB-2 and IMDB-5 also
+increased, as predicted. The "unmodeled" kernel share also dropped
+across every query, including BIO-2 and FEV-5 (5.36%→4.63%,
+16.39%→6.27%) - larger than restores alone explain, most likely
+because writing newly-built KV *into* the store (not just restoring
+from it) is itself a memcpy the profiler classifies as unmodeled, and
+that write traffic disappears entirely once the store is off for the
+whole run, not just the restore side of it.
+
+The attention-high/elementwise-low pattern (section 17) holds, and is
+if anything sharper with the confound removed - now that "unmodeled"
+is a smaller, more consistent slice, the renormalized comparison is
+less diluted:
+
+| Query | attn: measured ÷ formula | elem: measured ÷ formula | proj: measured ÷ formula |
+|---|---|---|---|
+| IMDB-1 | 2.12x | 0.66x | 1.11x |
+| IMDB-2 | 2.29x | 0.51x | 1.13x |
+| IMDB-5 | 2.01x | 0.61x | 1.11x |
+| BIO-2 | 1.48x | 0.45x | 0.99x |
+| FEV-5 | 2.17x | 0.53x | 1.12x |
+
+BIO-2 - the one query untouched by the store bug at any point - sits
+at the *low* end of the attention ratio, not the high end. That rules
+out the store confound as the explanation for section 17's finding:
+real causal attention kernels are running at roughly a third to a half
+of the peak-FLOP rate `_causal_prefill_attention_time` assumes, fairly
+consistently across query shapes, while the dense-projection formula
+tracks real DeepGEMM time closely (0.99-1.13x) throughout.
+
+A new figure, `plots/torch_profiler_totals.png`
+(`plot_torch_profiler_comparison.py`'s `fig_totals`), makes the same
+point a different way: for every query, `sol_s <= total kernel time
+(torch.profiler) <= wall_s`, in that order, with no exceptions. The
+gap from `sol_s` up to kernel time is real kernels running below peak
+(mostly attention, per the table above); the gap from kernel time up
+to `wall_s` is time spent outside any GPU kernel at all (Python,
+scheduling, launch gaps) - small on every query here, kernel time
+tracks within a few percent of wall_s throughout.
+
+No new tests: the fix is two lines (`sess.set_store(False)`) in
+scripts that only run on Modal, with no local-testable surface of
+their own. Same 216 tests pass as section 17.

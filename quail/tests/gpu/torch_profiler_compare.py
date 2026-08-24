@@ -93,10 +93,22 @@ def compare() -> str:
     d = build_sets("/results/quailb_data", sf=0.1, lf=1)
     sess = quail.Session(EngineConfig(gpus=1, model="qwen3-4b-fp8",
                                       cpu_memory_gb=80))
+    # Session.store_enabled defaults to True (session.py) - quailb.py's
+    # cold/warm passes turn it off/on explicitly, this script didn't,
+    # so the profiled run could silently restore KV a query's own
+    # earlier warmup call (or an earlier query sharing a table) had
+    # already written, understating the real causal-build kernel
+    # time sol_breakdown is compared against. Force cold (full
+    # compute, no restores) for every query profiled here, matching
+    # what sol_breakdown's causal_doc_lengths assumes when there is
+    # nothing to restore from.
+    sess.set_store(False)
     register_sets(sess, d)
     qdefs = queries(sess)
 
-    # warm the container once (cold boot noise not the point here)
+    # warm the container once (cold boot noise not the point here) -
+    # store is off above, so this can't pollute the profiled runs'
+    # KV state either way, but keeping order explicit.
     _desc0, build0 = qdefs[SOL_CHECK_QUERIES[0]]
     build0().run(_execute=lambda p: worker_mod.execute.local(p))
 

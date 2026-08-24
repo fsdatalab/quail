@@ -61,6 +61,12 @@ def explore() -> str:
     d = build_sets("/results/quailb_data", sf=0.1, lf=1)
     sess = quail.Session(EngineConfig(gpus=1, model="qwen3-4b-fp8",
                                       cpu_memory_gb=80))
+    # Force cold (store off) - see the matching note in
+    # torch_profiler_compare.py. This script warms up and profiles
+    # the SAME query (IMDB-1) back to back, which would otherwise
+    # let the profiled run restore KV the warmup call had just
+    # written, understating real causal-build kernel time.
+    sess.set_store(False)
     register_sets(sess, d)
     qdefs = queries(sess)
     _desc, build = qdefs["IMDB-1"]

@@ -30,7 +30,7 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY, GREEN, DARK, ORANGE, RED
+from plot_colors import BLUE, GRAY, GREEN, DARK, ORANGE, RED, TEAL
 
 BUCKETS = ["projection", "elementwise", "attention"]
 BUCKET_COLOR = {"projection": BLUE, "elementwise": ORANGE, "attention": GREEN}
@@ -115,8 +115,55 @@ def fig_unmodeled_share(rows):
     plt.close(fig)
 
 
+def fig_totals(rows):
+    """Total query time, three ways, per query: wall_s (this system's
+    own end-to-end measurement - Python, kernel launches, everything),
+    the torch.profiler kernel sum (total_kernel_us - only time the GPU
+    was actually executing a kernel, so it's <= wall_s by construction),
+    and sol_s (the formula's floor). Expected ordering is sol_s <=
+    kernel time <= wall_s: the gap from sol_s up to kernel time is real
+    kernels running below their peak rate (the attention finding
+    above); the gap from kernel time up to wall_s is time spent outside
+    any GPU kernel at all (Python, scheduling, kernel-launch gaps).
+
+    wall_s here is measured under torch.profiler instrumentation, which
+    adds its own overhead (torch_profiler_compare.py's own docstring
+    flags this) - read it as "roughly wall clock while profiled," not
+    as directly comparable to the un-instrumented cold/warm wall_s
+    elsewhere in this report."""
+    queries = [r["query"] for r in rows]
+    n = len(queries)
+    wall = [r["wall_s"] for r in rows]
+    kernel = [r["total_kernel_us"] / 1e6 for r in rows]
+    sol = [r["sol_s"] for r in rows]
+
+    x = np.arange(n)
+    width = 0.26
+    fig, ax = plt.subplots(figsize=(2.6 * n, 4.5))
+    ax.bar(x - width, wall, width, color=GRAY, label="wall_s (our system)")
+    ax.bar(x, kernel, width, color=TEAL, label="kernel time (torch.profiler)")
+    ax.bar(x + width, sol, width, color=BLUE, label="sol_s (our SOL estimate)")
+    for xi, w, k, s in zip(x, wall, kernel, sol):
+        ax.text(xi - width, w, f"{w:.1f}s", ha="center", va="bottom",
+               fontsize=7.5)
+        ax.text(xi, k, f"{k:.1f}s", ha="center", va="bottom", fontsize=7.5)
+        ax.text(xi + width, s, f"{s:.1f}s", ha="center", va="bottom",
+               fontsize=7.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(queries, fontsize=9)
+    ax.set_ylabel("seconds")
+    ax.set_title("Total query time: our system vs. profiled kernel time "
+                "vs. the SOL floor")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.savefig(OUT / "torch_profiler_totals.png", bbox_inches="tight")
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     rows = load()
     fig_comparison(rows)
     fig_unmodeled_share(rows)
-    print(f"[plot_torch_profiler_comparison] wrote 2 PNGs to {OUT}")
+    fig_totals(rows)
+    print(f"[plot_torch_profiler_comparison] wrote 3 PNGs to {OUT}")
