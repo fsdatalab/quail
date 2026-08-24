@@ -6,24 +6,8 @@ from dataclasses import replace
 import pytest
 
 from quail.planner import budgets
-from quail.planner.calibrate import resolve_pair
-from quail.planner.calibration import (Calibration, channel_bandwidths,
-                                       commit_calibration, fit_affine,
-                                       load_calibration, make_record)
+from quail.planner.decide import channel_bandwidths, load_calibration
 from quail.specs import H100_SXM, QWEN3_4B_FP8
-
-
-def test_fit_affine_recovers_the_line():
-    a, a2 = 8.6e-6, 4.9e-10
-    points = [(h, a + a2 * h) for h in (256, 1024, 4096, 8192)]
-    got_a, got_a2 = fit_affine(points)
-    assert got_a == pytest.approx(a, rel=1e-9)
-    assert got_a2 == pytest.approx(a2, rel=1e-9)
-
-
-def test_fit_affine_needs_two_lengths():
-    with pytest.raises(ValueError):
-        fit_affine([(4096, 1e-5), (4096, 1.1e-5)])
 
 
 def test_kappa_and_widths():
@@ -127,36 +111,3 @@ def test_derived_table_complete():
     assert table["chunk_budget"] == 110_376
     assert table["serving_rate_tokens_per_s"] == pytest.approx(121_045,
                                                                rel=1e-3)
-
-
-def test_resolve_pair_known():
-    spec, device = resolve_pair("qwen3-4b-fp8", "h100-sxm")
-    assert spec is QWEN3_4B_FP8
-    assert device is H100_SXM
-
-
-def test_resolve_pair_unknown():
-    with pytest.raises(ValueError, match="unknown model"):
-        resolve_pair("not-a-model", "h100-sxm")
-    with pytest.raises(ValueError, match="unknown device"):
-        resolve_pair("qwen3-4b-fp8", "not-a-device")
-
-
-def test_make_record_and_commit(tmp_path):
-    loaded = Calibration(a_s_per_token=8e-6, a2_s_per_token2=5e-10,
-                         source="calibrated")
-    rec = make_record(QWEN3_4B_FP8, H100_SXM, 9e-6, 6e-10,
-                      points=[{"doc_tokens": 256}],
-                      channels={"pinned_h2d": 1.0},
-                      loaded=loaded, lengths=(256, 1024),
-                      tokens_per_point=1000)
-    assert rec["model"] == "qwen3-4b-fp8"
-    assert rec["device"] == "h100-sxm"
-    assert rec["loaded_before"]["a"] == 8e-6
-    assert "q_kv" not in rec
-    assert "q_kv" not in rec["provenance"]
-    dest = commit_calibration(rec, dest=tmp_path / "pair.json")
-    written = dest.read_text()
-    assert "a_s_per_token" in written
-    assert "points" not in written
-    assert "channels_measured_bytes_per_s" not in written

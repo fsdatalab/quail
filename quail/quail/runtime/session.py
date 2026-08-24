@@ -32,8 +32,8 @@ from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (SHARED_PRE, CompileError, LogicalPlan,
                            join_anchor_note, join_label,
                            render_join_question)
-from quail.planner.calibration import channel_bandwidths
-from quail.planner.decide import _collect, explain, plan_query
+from quail.planner.decide import (_collect, channel_bandwidths, explain,
+                                  plan_query)
 from quail.planner.plan import (EngineConfig, Refusal, StoreSpec,
                                 resolve_model)
 from quail.specs import DEVICES

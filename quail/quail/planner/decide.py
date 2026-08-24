@@ -19,14 +19,56 @@ re-ordering.
 """
 
 import itertools
+import json
+from dataclasses import dataclass
+from pathlib import Path
 
 from quail.logical import (LogicalPlan, Project, Scan, SemanticFilter,
                            SemanticJoin)
 from quail.planner import budgets
-from quail.planner.calibration import Calibration, load_calibration
 from quail.planner.plan import (CorpusStats, PhysicalPlan, Refusal,
                                 StoreSpec)
-from quail.specs import DeviceSpec, ModelSpec
+from quail.specs import DEVICES, MODELS, DeviceSpec, ModelSpec
+
+_CAL_DIR = Path(__file__).resolve().parents[1] / "calibration"
+_ANCHOR_FILE = "qwen3-4b-fp8_h100-sxm.json"
+
+
+@dataclass(frozen=True)
+class Calibration:
+    a_s_per_token: float
+    a2_s_per_token2: float
+    source: str
+
+    @property
+    def rate_tokens_per_s(self) -> float:
+        return 1.0 / self.a_s_per_token
+
+
+def channel_bandwidths() -> dict:
+    with open(_CAL_DIR / "channels.json") as f:
+        return json.load(f)["bandwidth_bytes_per_s"]
+
+
+def load_calibration(model: ModelSpec, device: DeviceSpec) -> Calibration:
+    """Read a and a2 from quail/calibration/{model}_{device}.json.
+    A pair without a file is spec-ratio-scaled from the 4B/H100
+    anchor. Nothing here measures."""
+    path = _CAL_DIR / f"{model.name}_{device.name}.json"
+    if path.exists():
+        with open(path) as f:
+            d = json.load(f)
+        return Calibration(a_s_per_token=d["a_s_per_token"],
+                           a2_s_per_token2=d["a2_s_per_token2"],
+                           source="calibrated")
+    with open(_CAL_DIR / _ANCHOR_FILE) as f:
+        anchor = json.load(f)
+    s = ((model.params / MODELS[anchor["model"]].params)
+         * (DEVICES[anchor["device"]].peak_flops / device.peak_flops))
+    return Calibration(
+        a_s_per_token=anchor["a_s_per_token"] * s,
+        a2_s_per_token2=anchor["a2_s_per_token2"] * s,
+        source=f"spec-scaled from {anchor['model']}/{anchor['device']}")
 
 
 # ---------------------------------------------------------- tree walk

@@ -8,10 +8,10 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
 
 - `quail/specs/` has the model and device structs. Every planner
   input comes from them.
-- `quail/planner/` has the budget arithmetic, calibration loading
-  and measurement, the physical plan, and the planner decisions
-  (stage order, anchor choice, sharding, access method). KV is
-  always bf16.
+- `quail/planner/` has the budget arithmetic, the physical plan,
+  and the planner decisions (stage order, anchor choice, sharding,
+  access method). It loads `a` and `a2` from the JSON files below.
+  KV is always bf16.
 - `quail/calibration/` has the measured constants per (model, device)
   pair: `a`, `a2`, and the host channel bandwidth table.
 - `quail/catalog.py`, `quail/logical.py`, `quail/sqlfront/`, and
@@ -21,8 +21,7 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
   the paged KV arena, attention kernels, the overlapped loop, and
   weight loading. The GPU parts run only inside the Modal image.
 - `quail/runtime/` is the run side: the session (plan, payload,
-  recombination), the multi-GPU coordinator, the Modal worker, and
-  the calibrate entry.
+  recombination), the multi-GPU coordinator, and the Modal worker.
 - `quail/bench/` has the QUAIL-B benchmark queries.
 - `tests/` has CPU tests. `tests/gpu/` has the Modal GPU cells -
   milestone gates, smokes, and benchmarks - which cost GPU time and
@@ -48,62 +47,28 @@ Modal volume. Teed logs stay local and are not committed.
 
 ## Calibration
 
-The planner's restore break-even uses two measured constants per
-(model, device) pair. The constants are stored in
-`quail/calibration/{model}_{device}.json`:
+The planner's restore break-even uses two constants per (model,
+device) pair, stored in `quail/calibration/{model}_{device}.json`:
 
-- `a_s_per_token`: wall seconds per fresh token in the packed loop
-  (the serving rate, with all overhead included).
+- `a_s_per_token`: seconds per fresh token in the packed loop.
 - `a2_s_per_token2`: the quadratic attention coefficient. It bends
   the restore break-even for long documents.
 
-A pair without a calibration file gets defaults scaled from the anchor
-measurement (Qwen3 4B on H100) using spec ratios. The plan's
-`calibration_source` field says where the values came from.
-
-To measure a pair, run the calibrate entry on the engine app:
-
-```
-uv run modal run quail/runtime/calibrate.py --model qwen3-4b-fp8 --device h100-sxm 2>&1 | tee results/calibrate.log
-```
-
-The measure step (`quail.planner.calibrate.measure`) does the following:
-
-- It sweeps document length (256, 1,024, 4,096, and 8,192 tokens,
-  about 1.5M fresh tokens per point) through the packed filter and
-  fits `t(h) = a + a2*h` by least squares. The planner's crossover
-  formulas use the same form.
-- It re-probes the host copy channels (pinned and unpinned, both
-  directions, 2 GiB timed copies) for comparison against
-  `quail/calibration/channels.json`.
-
-The result goes to `results/calibrate.json` only. To write it where
-the planner reads it, pass `--commit`:
-
-```
-uv run modal run quail/runtime/calibrate.py --model qwen3-4b-fp8 --device h100-sxm --commit 2>&1 | tee results/calibrate.log
-```
+A pair without a file is spec-ratio-scaled from the 4B/H100
+anchor. The plan's `calibration_source` field says where the values
+came from. There is no measure entry on this branch; the length
+sweep (`calibrate.py`) was removed so it can be rewritten.
 
 ## Adding a new model
 
-There are three steps, and one constraint to know about.
-
-First, add a spec struct in `quail/specs/` (about 15 lines). Every
-field except `params` and `w_mem_bytes` comes from the model's HF
+Add a spec struct in `quail/specs/` (about 15 lines). Every field
+except `params` and `w_mem_bytes` comes from the model's HF
 `config.json`. Register the spec in `quail/specs/__init__.py`.
 
-Second, run the calibrate entry with `--model` set to the new spec
-name and `--commit`. One run measures `a` and `a2` and writes the
-calibration file. The Modal function is wired to H100 today; a new
-device needs a `gpu=` mapping in `quail/runtime/calibrate.py` as
-well as a device spec.
+The executor's fused kernels assume the Qwen3 architecture:
+QK-norm before rope, gated SiLU MLP, and fp8 block-quantized
+weights. Another Qwen3-family fp8 checkpoint works without
+changes. A different model family needs kernel-path changes first.
 
-Third, know that the executor's fused kernels assume the Qwen3
-architecture: QK-norm before rope, gated SiLU MLP, and fp8
-block-quantized weights. Another Qwen3-family fp8 checkpoint works
-without changes. A different model family needs kernel-path changes
-first.
-
-State the prediction before the run and compare after, per the house
-rule. The calibrate entry prints the previously loaded constants
-(`loaded_before`) next to the fresh fit for exactly that comparison.
+Until a new measure path exists, a new pair uses the spec-scaled
+defaults from the 4B/H100 JSON.

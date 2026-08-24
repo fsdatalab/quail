@@ -709,7 +709,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     the arena alloc, the per-layer KV scatter, and the paged
     attention read are all skipped, [document | question] packs as
     one causal segment, and admission runs on the token budget
-    alone. Direct callers (warmups, calibration, ablation cells)
+    alone. Direct callers (warmups, ablation cells)
     state their intent explicitly; this function never derives the
     value. False with multiple stages or a store raises - store.save
     and later stages read the arena - so a wrong caller fails loudly

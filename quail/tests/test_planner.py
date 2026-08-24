@@ -9,10 +9,9 @@ import pytest
 
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
-from quail.planner.calibration import load_calibration
 from quail.planner.decide import (balanced_shards, explain,
-                                  order_filters, pick_runtime_anchor,
-                                  plan_query,
+                                  load_calibration, order_filters,
+                                  pick_runtime_anchor, plan_query,
                                   restore_crossover_tokens)
 from quail.planner.plan import (EngineConfig, PhysicalPlan, Refusal,
                                 StoreSpec, resolve_model)
