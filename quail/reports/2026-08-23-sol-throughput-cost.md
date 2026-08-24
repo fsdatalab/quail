@@ -505,3 +505,80 @@ already flagged: resolving the CPU core-count term for `$/query` if the
 worker ever requests one, and a live `Workspace.billing.rates()`
 cross-check against the hardcoded rates in `modal_rates.json` — neither
 blocking, both explicitly deferred, not forgotten.
+
+## 17. "How do you verify SOL is accurate?" — a three-phase answer (2026-08-25)
+
+The claim "sol_s is accurate" splits into levels, and each got a different
+verification method:
+
+**Formula math sanity** (`tests/test_budgets_sol_properties.py`, 22 tests):
+does each formula behave the way its own roofline derivation says it
+should — monotonic, exactly linear where there's no `max()`, quadratic in
+the compute-bound regime and not below the crossover, subadditive the way
+the "aggregate before `max()`" design note claims, `compute_knee`/
+`attention_crossover` landing exactly where their two sides are equal.
+Caught a real bug immediately: `sol_seconds()` of a genuinely empty
+workload returned ~0.00108s, not 0.0 — `_projection_time(chunk=0)`'s
+weight-read memory term is chunk-independent, so it charged reading every
+weight matrix even for a kernel that never launches. Fixed with a
+`chunk==0` short-circuit; verified byte-identical output on real
+non-zero-chunk data. `sol_seconds_breakdown()` was also split out of
+`sol_seconds()` here (same arithmetic, four terms kept separate), needed
+by both these tests and phase 3 below.
+
+**Formula behavior, visualized** (`reports/plot_sol_formula_diagnostics.py`,
+5 PNGs): the same properties as pictures — causal attention flat then
+quadratic at the ~24,639-token crossover, streaming attention flat then
+linear (never quadratic — the whole reason it's a separate function),
+projection's compute knee (~416 tokens) against elementwise's dead-straight
+no-knee line, and the subadditivity gap's actual shape (peaks at ~50%
+when a compute-bound and a memory-bound item are equal-sized, not when one
+dwarfs the other — the first sweep attempt showed a wrong, ~5×10⁻⁸%
+of neither, from sweeping the wrong pair of magnitudes).
+
+**Real kernels vs. the formula's structure** (`tests/gpu/
+torch_profiler_compare.py`, `reports/plot_torch_profiler_comparison.py`):
+the level the first two can't reach — does the formula's internal
+*shape*, not just its aggregate bound, match what the GPU actually
+does? `session.py` now records `report["sol_breakdown"]` (the four
+terms separately) alongside `sol_s`. One `torch.profiler` call per
+query (not two — `sol_breakdown` comes from token counts, not timing,
+so it's safe to read off the same profiled call; only `wall_s` would be
+unreliable under profiling overhead, and this comparison doesn't need
+`wall_s`). `Query.run()`'s existing `_execute` seam wraps the real
+worker call via `worker.execute.local(payload)` — in-process, no RPC,
+no changes to `worker.py`. Kernel-class rules were built from a real
+exploratory trace (`tests/gpu/torch_profiler_explore.py`), not ported
+from the old exploration's vLLM-based rules, which don't apply to this
+engine's DeepGEMM/Triton/FlashAttention-3 kernels.
+
+Result, consistent across all 5 validated queries regardless of shape:
+
+| | measured (renormalized, excl. ~5-16% unmodeled) | formula |
+|---|---|---|
+| projection | closely matches, everywhere | closely matches, everywhere |
+| attention | consistently *higher* than predicted | consistently *lower* than measured |
+| elementwise | consistently *lower* than measured | consistently *higher* than predicted |
+
+Projection matching closely is expected — `_projection_time` and DeepGEMM
+are both doing the same GEMM math with nothing subtle in between. The
+attention/elementwise gap is the real finding: attention costs relatively
+more, and elementwise relatively less, than their formulas predict, on
+every query shape tried (filter-only, join-only, a 3-filter chain into a
+join, a different dataset's join, a two-sided filter-then-join) — not one
+workload's noise. Two kernels this project doesn't model in any SOL term
+(`qk_norm_rope` — RoPE, and `kv_row_scatter` — KV-write bookkeeping) sit in
+the excluded "unmodeled" bucket, not inside either measured attention or
+measured elementwise, so they don't explain this gap; it's about how the
+two *modeled* shapes compare to each other, not about what's missing
+entirely.
+
+This doesn't threaten the efficiency invariant — `sol_s` stayed well under
+`wall_s` on every query, same as every prior run — it's evidence about
+*tightness*, not correctness of the bound. Worth a closer look at whether
+`elementwise_time`'s memory-bound assumption holds as tightly in practice
+as projection's does; not blocking, and not treated as a bug the way the
+two adversarial reviews' findings were.
+
+216 tests pass (214 + 2 for the renormalization logic in the comparison
+plot).
