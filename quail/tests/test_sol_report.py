@@ -236,6 +236,46 @@ def test_render_markdown_table_empty_rows():
     assert table.splitlines()[0].startswith("| Query")
 
 
+def test_render_markdown_table_error_containing_pipe_stays_one_row():
+    """An adversarial review (2026-08-25) found that an error message
+    containing "|" - a real possibility, KeyError reprs quote dicts -
+    added an extra column separator and misaligned every cell after
+    it in that row. Every row, including error rows, must have the
+    same number of UNESCAPED column separators as the header - a
+    backslash-escaped "\\|" is one literal character in a markdown
+    table, not a new column, so it must not count as one."""
+    import re
+
+    cold_error = dict(query="X-1", desc="broken",
+                      error='KeyError: "a|b" not found in {"x": 1}')
+    warm_error = dict(query="X-1", desc="broken",
+                      error='KeyError: "a|b" not found in {"x": 1}')
+    rows = sol_report.build_rows(_suite([cold_error], [warm_error]))
+    table = sol_report.render_markdown_table(rows)
+    lines = table.splitlines()
+    unescaped = lambda s: len(re.findall(r"(?<!\\)\|", s))
+    header_columns = unescaped(lines[0])
+    for line in lines[1:]:
+        assert unescaped(line) == header_columns, line
+    assert "a\\|b" in table   # escaped, not silently dropped either
+
+
+def test_render_markdown_table_docs_none_renders_dash_not_python_none():
+    """An adversarial review (2026-08-25) found that a success-path
+    row with docs=None (no stage-0 filter and no join - _docs_count's
+    fallback logic returns None) printed the literal string "None"
+    instead of "—", the only field skipping the None->dash convention
+    every other column follows."""
+    row = _row("X-1", "no stage-0, no join", 0, 5.0, 1.0, 100)
+    row["stages"] = [{"op": "filter", "alias": "r", "stage": 1,
+                      "evaluated": 0}]   # no stage 0 present at all
+    rows = sol_report.build_rows(_suite([row], [row]))
+    assert rows[0]["docs"] is None   # sanity: this really is the None case
+    table = sol_report.render_markdown_table(rows)
+    assert "None" not in table
+    assert "—" in table.splitlines()[2]
+
+
 # ---- plot_sol_comparison ---------------------------------------------
 
 def test_plot_sol_comparison_writes_a_file(tmp_path):

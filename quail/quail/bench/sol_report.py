@@ -36,7 +36,12 @@ from pathlib import Path
 def build_rows(suite: dict) -> list[dict]:
     """One row per query id present in either pass. Pulls straight
     from what run_suite() already computed - no new arithmetic here,
-    just picking which pass's numbers go in which column."""
+    just picking which pass's numbers go in which column.
+
+    A duplicate query id within one pass's list silently keeps the
+    last one (a plain dict comprehension) - not reachable from
+    run_suite() today, which iterates each qid once per pass, so
+    this is a latent assumption on the input shape, not a live bug."""
     cold_by_id = {r["query"]: r for r in suite["passes"]["cold"]["queries"]}
     warm_by_id = {r["query"]: r for r in suite["passes"]["warm"]["queries"]}
     ids = list(dict.fromkeys(list(cold_by_id) + list(warm_by_id)))
@@ -118,6 +123,10 @@ def _fmt_cost(n) -> str:
     return "—" if n is None else f"${n:.4f}"
 
 
+def _fmt_int(n) -> str:
+    return "—" if n is None else str(n)
+
+
 def render_markdown_table(rows: list[dict]) -> str:
     """The issue's column set, as a markdown table. Error rows print
     the query id and error message in place of the numbers, and
@@ -130,11 +139,17 @@ def render_markdown_table(rows: list[dict]) -> str:
     lines = [header, sep]
     for r in rows:
         if r["error"]:
-            lines.append(f"| {r['query']} | ERROR: {r['error']} | | | | "
+            # a `|` in the error text (KeyError reprs quote dicts, a
+            # message could embed almost anything) would otherwise
+            # add an extra column separator and misalign every cell
+            # after it in this row - caught by an adversarial review,
+            # 2026-08-25
+            safe_error = r["error"].replace("|", "\\|")
+            lines.append(f"| {r['query']} | ERROR: {safe_error} | | | | "
                          f"| | | | | |")
             continue
         lines.append(
-            f"| {r['query']} | {r['docs']} | {_fmt_tokens(r['tokens'])} "
+            f"| {r['query']} | {_fmt_int(r['docs'])} | {_fmt_tokens(r['tokens'])} "
             f"| {_fmt_s(r['cold_s'])} | {_fmt_s(r['warm_s'])} "
             f"| {_fmt_s(r['sol_s'])} | {_fmt_pct(r['efficiency'])} "
             f"| {_fmt_rate(r['docs_per_s_warm'])} "
@@ -146,7 +161,14 @@ def render_markdown_table(rows: list[dict]) -> str:
 def plot_sol_comparison(rows: list[dict], out_path: str) -> None:
     """Measured (warm wall_s) vs SOL(s) per query, grouped bars, in
     make_plots.py's palette. Skips error rows - nothing to plot for a
-    query that didn't produce a number."""
+    query that didn't produce a number.
+
+    Doesn't visually flag sol_s > warm_s (efficiency over 100%) as
+    anything other than an ordinary bar pair - that combination can't
+    come out of a live run_suite() call today (quailb.SolViolation
+    aborts the run first), so this only matters for a stale or hand-
+    edited suite JSON. Worth a real highlight if that ever becomes a
+    live path instead of a should-not-happen one."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
