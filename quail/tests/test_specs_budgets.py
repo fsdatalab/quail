@@ -91,8 +91,8 @@ def test_attention_crossover_near_12k():
 def test_calibration_anchor_file():
     cal = load_calibration(QWEN3_4B_FP8, H100_SXM)
     assert cal.source == "calibrated"
-    assert cal.rate_tokens_per_s == pytest.approx(121_045, rel=1e-3)
-    assert cal.a2_s_per_token2 == pytest.approx(4.9336e-10, rel=1e-3)
+    assert cal.rate_tokens_per_s == pytest.approx(127_121, rel=1e-3)
+    assert cal.a2_s_per_token2 == pytest.approx(4.3431e-10, rel=1e-3)
 
 
 def test_store_break_even_under_pinned_bandwidth():
@@ -100,7 +100,7 @@ def test_store_break_even_under_pinned_bandwidth():
     bw = channel_bandwidths()
     bf16 = budgets.store_break_even_bytes_per_s(
         QWEN3_4B_FP8, cal.a_s_per_token)
-    # ~18 GB/s at bf16 KV and the packed 121k rate. Pinned host
+    # ~19 GB/s at bf16 KV and the packed 127k rate. Pinned host
     # memory clears it; disk and volumes do not.
     assert 17e9 <= bf16 <= 19e9
     assert bw["pinned_h2d"] > bf16
@@ -125,7 +125,7 @@ def test_derived_table_complete():
                                   cal.a_s_per_token)
     assert table["tensor_parallel"] == 1
     assert table["chunk_budget"] == 110_376
-    assert table["serving_rate_tokens_per_s"] == pytest.approx(121_045,
+    assert table["serving_rate_tokens_per_s"] == pytest.approx(127_121,
                                                                rel=1e-3)
 
 

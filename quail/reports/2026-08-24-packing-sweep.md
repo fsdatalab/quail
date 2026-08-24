@@ -82,10 +82,10 @@ Measured, GPU us per fresh token (wall differed from GPU by under
 
 | Query | 4B measured | vs predicted | 32B measured | vs predicted |
 |---|---|---|---|---|
-| BIO-1 | 10.33 | -6% | 65.63 | +1% |
-| IMDB-1 | 8.09 | -5% | 57.03 | -1% |
-| BIO-2 | 12.23 | +18% | XX | XX |
-| IMDB-2 | 8.55 | +1% | XX | XX |
+| BIO-1 | 10.33 | -6.6% | 65.63 | +0.5% |
+| IMDB-1 | 8.09 | -4.9% | 57.03 | -0.7% |
+| BIO-2 | 12.23 | +17.6% | 71.87 | +13.6% |
+| IMDB-2 | 8.55 | +1.0% | 58.55 | +2.2% |
 
 Figure: plots/packing_sweep_queries.png
 
@@ -93,12 +93,19 @@ Fits over the per-chunk points:
 
 | | 4B | 32B |
 |---|---|---|
-| `a` (us/token) | 7.867 (was 8.261, -4.8%) | XX (was 56.64) |
-| `a2c` (s/token^2) | 4.343e-10 (was 4.934e-10) | XX (was 1.528e-09) |
-| filter-fit R^2, chunks | 0.9998, 25 | XX |
-| `a2x` (s/token^2, cross) | 1.070e-09 = 1.23x the causal 2*a2c | XX |
-| leftover per suffix | ~37 us | XX |
-| container band (filters, 4 containers) | 2.9-3.1% | XX |
+| `a` (us/token) | 7.867 (was 8.261, -4.8%) | 56.22 (was 56.64, -0.7%) |
+| `a2c` (s/token^2) | 4.343e-10 (was 4.934e-10, -12%) | 1.563e-09 (was 1.528e-09, +2.3%) |
+| filter-fit R^2 (chunks used) | 0.9995 (24 of 25) | 0.9992 (63 of 64) |
+| `a2x` (s/token^2, cross) | 1.070e-09 = 1.23x the causal 2*a2c | 3.793e-09 = 1.21x |
+| leftover per suffix (joint fit) | ~37 us | ~126 us |
+| container band (filters, 4 containers) | 2.9-3.1% | 2.6-6.6% |
+
+One chunk per model was excluded from the filter fit: each
+container's first measured chunk paid a leftover kernel compile once
+(+14% on that one chunk at 32B, cached afterward). The fit script
+excludes any chunk more than 5% off its own GPU time and reports the
+count; the all-chunk fit is kept alongside in the summary
+(`fits.filter.all_chunks`).
 
 Figure: plots/packing_sweep_context.png
 
@@ -129,9 +136,12 @@ above it.
   anchors it is +1%. This is the term the model was missing - not
   chunk fill, not segment count.
 - **Container-to-container variation collapsed.** The exploration
-  measured up to 45%; four containers here sit within 3% on both
-  filter queries at 4B (XX at 32B). Committed constants are fine; no
-  boot-time calibration needed.
+  measured up to 45%. Four containers here: 2.9-3.1% at 4B; at 32B,
+  2.6% on the short-document filter and 6.6% on the long-document one
+  (the full run's container was the fastest of its four). Committed
+  constants are fine - the worst band is 6.6% against decision
+  margins of 32% and larger - so no boot-time calibration and no
+  worst-case constants are needed.
 - **No break-even flips.** Restore-vs-recompute at 4B: loading KV
   costs 5.33 us/token at the pinned 27.7 GB/s channel against 7.87
   us/token to recompute, so restore still wins at every length

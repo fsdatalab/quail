@@ -1,10 +1,10 @@
 {
   "model": "qwen3-32b-fp8",
   "device": "h100-sxm",
-  "a_s_per_token": 5.66366321319351e-05,
-  "a2_s_per_token2": 1.528474073628451e-09,
+  "a_s_per_token": 5.622289056764812e-05,
+  "a2_s_per_token2": 1.5631996462124575e-09,
   "provenance": {
-    "a": "wall seconds per fresh token, length sweep [256, 1024, 4096, 8192] at ~1500000 tokens per point, affine fit intercept",
-    "a2": "affine fit slope of the same sweep"
+    "a": "per-chunk regression over the 2026-08-24 packing sweep's filter chunks (BIO-1 + IMDB-1, real corpora, 63 of 64 chunks; one first-chunk kernel-compile outlier excluded; R2=0.9992; raw: quail-results volume ablations/packing_sweep_qwen3-32b-fp8_full.json)",
+    "a2": "the same regression's causal-context coefficient, in the length-sweep convention (reports/2026-08-24-packing-sweep.md)"
   }
 }

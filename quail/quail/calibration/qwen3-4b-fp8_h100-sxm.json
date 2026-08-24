@@ -1,10 +1,10 @@
 {
   "model": "qwen3-4b-fp8",
   "device": "h100-sxm",
-  "a_s_per_token": 8.261391217315875e-06,
-  "a2_s_per_token2": 4.933635085554017e-10,
+  "a_s_per_token": 7.866518901530957e-06,
+  "a2_s_per_token2": 4.3430850375630705e-10,
   "provenance": {
-    "a": "1 / 121,045 tok/s: the packed custom-kernel ladder rung (exploration single_filter_forward_vllm_kernels.json)",
-    "a2": "quadratic prefill coefficient from the alpha sweep fit (exploration cost_model_fit.json)"
+    "a": "per-chunk regression over the 2026-08-24 packing sweep's filter chunks (BIO-1 + IMDB-1, real corpora, 24 of 25 chunks; one first-chunk kernel-compile outlier excluded; R2=0.9995; raw: quail-results volume ablations/packing_sweep_qwen3-4b-fp8_full.json)",
+    "a2": "the same regression's causal-context coefficient, in the length-sweep convention (reports/2026-08-24-packing-sweep.md)"
   }
 }

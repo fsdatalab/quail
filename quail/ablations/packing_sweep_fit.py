@@ -163,9 +163,21 @@ def analyze(records):
             for p in pts[qid]]
     join = [p for qid in pts if queries[qid]["kind"] == "join"
             for p in pts[qid]]
-    (a, a2c), r2f = fit(filt, lambda p: [p["T"], p["Sc"]])
-    fits = dict(filter=dict(a_s_per_token=a, a2c_s_per_token2=a2c,
-                            r2=round(r2f, 5), n_chunks=len(filt)))
+    # two-pass fit: a chunk more than 5% off its own GPU time is
+    # excluded and reported - ordinary scatter here is under 2%, and
+    # the one observed case is the container's first measured chunk
+    # paying a leftover kernel compile (+14% once, cached after). The
+    # all-chunk fit rides along for comparison.
+    (a0, a2c0), r20 = fit(filt, lambda p: [p["T"], p["Sc"]])
+    res = [abs(p["gpu_s"] - (a0 * p["T"] + a2c0 * p["Sc"]))
+           for p in filt]
+    kept = [p for p, r in zip(filt, res) if r <= 0.05 * p["gpu_s"]]
+    (a, a2c), r2f = fit(kept, lambda p: [p["T"], p["Sc"]])
+    fits = dict(filter=dict(
+        a_s_per_token=a, a2c_s_per_token2=a2c, r2=round(r2f, 5),
+        n_chunks=len(kept), n_excluded=len(filt) - len(kept),
+        all_chunks=dict(a_s_per_token=a0, a2c_s_per_token2=a2c0,
+                        r2=round(r20, 5))))
     if join:
         resid = [p["gpu_s"] - (a * p["T"] + a2c * p["Sc"])
                  for p in join]
