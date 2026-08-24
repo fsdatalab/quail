@@ -1,0 +1,26 @@
+{
+  "gpu_per_second": {
+    "b300": 0.001972,
+    "b200": 0.001736,
+    "h200-sxm": 0.001261,
+    "h100-sxm": 0.001097,
+    "rtx-pro-6000": 0.000842,
+    "a100-80gb": 0.000694,
+    "a100-40gb": 0.000583,
+    "l40s": 0.000542,
+    "a10": 0.000306,
+    "l4": 0.000222,
+    "t4": 0.000164
+  },
+  "cpu_per_core_per_second": 0.0000131,
+  "cpu_min_cores_per_container": 0.125,
+  "memory_per_gib_per_second": 0.00000222,
+  "volume_per_gib_per_month": 0.09,
+  "volume_free_gib_per_month": 1024,
+  "provenance": {
+    "source": "given directly by the user from the Modal pricing page for this workspace, 2026-08-23",
+    "in_scope_gpu": "h100-sxm, the only device this project targets (see project scope: one H100 per model copy, Qwen3 4B/32B fp8)",
+    "note": "h100-sxm matches issue #26's fallback estimate of ~$3.95/hr almost exactly (0.001097 * 3600 = 3.95)",
+    "confirm_before_relying_on": "cross-check against a live modal.Workspace.from_context().billing.rates() call before using for anything actually billed; these are a hardcoded fallback"
+  }
+}
