@@ -160,7 +160,76 @@ def analyze(records):
     for r in main:
         for qid in r["queries"]:
             pts[qid] = chunk_points(r, qid)
+            for p in pts[qid]:
+                p["tag"] = r["tag"]
             sources[qid] = r
+
+    # Each record is one container, and containers differ by a few
+    # percent in plain rate (the container table below measures it on
+    # repeats). Records beyond "full" therefore get an offset column
+    # delta_tag on T, so a second container's rate lands in its
+    # offset instead of bending the shared coefficients.
+    tags = sorted({r["tag"] for r in main if r["tag"] != "full"})
+
+    def cols(p, k):
+        base = [p["T"], p["Sc"], p["Sx"], p["suffixes"]][:k]
+        return base + [p["T"] if p["tag"] == t else 0.0 for t in tags]
+
+    every = [p for ps in pts.values() for p in ps]
+    # exclusion pass: a chunk more than 5% off its own GPU time under
+    # the full model is excluded from every fit - ordinary scatter is
+    # under 2%. Observed causes, both reported in the sweep report:
+    # one-time kernel compiles (a cold container's first chunk; tiny
+    # tail-chunk shapes no warmup covered, 0.7-0.9 s once), and the
+    # ~20 ms per-chunk launch floor that dominates chunks under ~2k
+    # tokens (a gated chain's trailing suffix chunks).
+    x0, _ = fit(every, lambda p: cols(p, 4))
+    for p in every:
+        pred = sum(c * xi for c, xi in zip(cols(p, 4), x0))
+        p["_drop"] = abs(p["gpu_s"] - pred) > 0.05 * p["gpu_s"]
+    dropped = [p for p in every if p["_drop"]]
+
+    filt = [p for p in every if not p["_drop"] and p["Sx"] == 0]
+    join = [p for p in every if not p["_drop"] and p["Sx"] > 0]
+    kept = filt + join
+    xf, r2f = fit(filt, lambda p: cols(p, 2))
+    a, a2c = xf[0], xf[1]
+    offsets = {t: round(d * 1e6, 3) for t, d in zip(tags, xf[2:])}
+    fits = dict(filter=dict(
+        a_s_per_token=a, a2c_s_per_token2=a2c, r2=round(r2f, 5),
+        n_chunks=len(filt),
+        n_excluded=sum(1 for p in dropped if p["Sx"] == 0),
+        container_offset_us_per_token=offsets))
+
+    def base(p):
+        d = dict(zip(tags, xf[2:]))
+        return ((a + d.get(p["tag"], 0.0)) * p["T"] + a2c * p["Sc"])
+
+    if join:
+        resid = [p["gpu_s"] - base(p) for p in join]
+        a2x = (sum(r * p["Sx"] for r, p in zip(resid, join))
+               / sum(p["Sx"] ** 2 for p in join))
+        leftover = {}
+        for qid in pts:
+            cross = [p for p in pts[qid]
+                     if p["Sx"] > 0 and not p["_drop"]]
+            n_suf = sum(p["suffixes"] for p in cross)
+            if not n_suf:
+                continue
+            lo = sum(p["gpu_s"] - base(p) - a2x * p["Sx"]
+                     for p in cross)
+            leftover[qid] = round(lo / n_suf * 1e6, 1)
+        x4, r24 = fit(kept, lambda p: cols(p, 4))
+        fits["join"] = dict(
+            a2x_s_per_token2=a2x, a2x_over_a2c=round(a2x / a2c, 2),
+            leftover_us_per_suffix=leftover,
+            n_excluded=sum(1 for p in dropped if p["Sx"] > 0),
+            joint4=dict(a_s_per_token=x4[0], a2c_s_per_token2=x4[1],
+                        a2x_s_per_token2=x4[2], per_suffix_s=x4[3],
+                        container_offset_us_per_token={
+                            t: round(d * 1e6, 3)
+                            for t, d in zip(tags, x4[4:])},
+                        r2=round(r24, 5)))
 
     queries = {}
     for qid in pts:
@@ -169,58 +238,20 @@ def analyze(records):
         T = sum(c["T"] for c in p)
         pred_old = sum(a_old * c["T"] + a2_old * (c["Sc"] + c["Sx"])
                        for c in p)
-        queries[qid] = dict(
+        keep_q = [c for c in p if not c["_drop"]]
+        row = dict(
             kind=q["summary"]["kind"], chunks=q["summary"]["chunks"],
             fresh_tokens=q["summary"]["fresh_tokens"],
             wall_s=q["summary"]["wall_s"], gpu_s=q["summary"]["gpu_s"],
             us_per_token_wall=q["summary"]["us_per_token_wall"],
             us_per_token_gpu=q["summary"]["us_per_token_gpu"],
             predicted_us_old=round(pred_old / T * 1e6, 3),
-            chunk_bins=bins(p))
-
-    # the causal fit takes every chunk with no cross reads, whatever
-    # query it came from; every chunk that reads kept KV (join
-    # suffixes, chain stages past the first) tests the cross term
-    filt = [p for ps in pts.values() for p in ps if p["Sx"] == 0]
-    join = [p for ps in pts.values() for p in ps if p["Sx"] > 0]
-    # two-pass fit: a chunk more than 5% off its own GPU time is
-    # excluded and reported - ordinary scatter here is under 2%, and
-    # the one observed case is the container's first measured chunk
-    # paying a leftover kernel compile (+14% once, cached after). The
-    # all-chunk fit rides along for comparison.
-    (a0, a2c0), r20 = fit(filt, lambda p: [p["T"], p["Sc"]])
-    res = [abs(p["gpu_s"] - (a0 * p["T"] + a2c0 * p["Sc"]))
-           for p in filt]
-    kept = [p for p, r in zip(filt, res) if r <= 0.05 * p["gpu_s"]]
-    (a, a2c), r2f = fit(kept, lambda p: [p["T"], p["Sc"]])
-    fits = dict(filter=dict(
-        a_s_per_token=a, a2c_s_per_token2=a2c, r2=round(r2f, 5),
-        n_chunks=len(kept), n_excluded=len(filt) - len(kept),
-        all_chunks=dict(a_s_per_token=a0, a2c_s_per_token2=a2c0,
-                        r2=round(r20, 5))))
-    if join:
-        resid = [p["gpu_s"] - (a * p["T"] + a2c * p["Sc"])
-                 for p in join]
-        a2x = (sum(r * p["Sx"] for r, p in zip(resid, join))
-               / sum(p["Sx"] ** 2 for p in join))
-        leftover = {}
-        for qid in pts:
-            cross = [p for p in pts[qid] if p["Sx"] > 0]
-            n_suf = sum(p["suffixes"] for p in cross)
-            if not n_suf:
-                continue
-            lo = sum(p["gpu_s"] - (a * p["T"] + a2c * p["Sc"]
-                                   + a2x * p["Sx"]) for p in cross)
-            leftover[qid] = round(lo / n_suf * 1e6, 1)
-        x4, r24 = fit(filt + join,
-                      lambda p: [p["T"], p["Sc"], p["Sx"],
-                                 p["suffixes"]])
-        fits["join"] = dict(
-            a2x_s_per_token2=a2x, a2x_over_a2c=round(a2x / a2c, 2),
-            leftover_us_per_suffix=leftover,
-            joint4=dict(a_s_per_token=x4[0], a2c_s_per_token2=x4[1],
-                        a2x_s_per_token2=x4[2],
-                        per_suffix_s=x4[3], r2=round(r24, 5)))
+            chunk_bins=bins(keep_q or p))
+        if len(keep_q) < len(p):
+            # the summary keeps the run's honest totals; only the
+            # bins (and fits) drop the compile-stall chunks
+            row["n_excluded"] = len(p) - len(keep_q)
+        queries[qid] = row
 
     containers = defaultdict(dict)
     for r in records:
