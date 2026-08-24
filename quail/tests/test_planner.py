@@ -173,6 +173,89 @@ def test_three_way_anchor_and_tuple_count(catalog):
     assert stage["partners"] == ["p", "t"]
 
 
+def _chain(catalog, sels=(0.1, 0.1), anchors=(None, None)):
+    """Two pairwise joins sharing table t: ai(r, t), ai(t, p)."""
+    return (docs(catalog, "reviews", tok).alias("r")
+            .ai_join(docs(catalog, "threads", tok).alias("t"),
+                     prompt("m1 {0} {1}", col("r.review"),
+                            col("t.thread")),
+                     selectivity=sels[0], anchor=anchors[0])
+            .ai_join(docs(catalog, "products", tok).alias("p"),
+                     prompt("m2 {0} {1}", col("t.thread"),
+                            col("p.description")),
+                     selectivity=sels[1], anchor=anchors[1])
+            .select("r.id", "t.id", "p.asin"))
+
+
+def test_two_full_joins_anchor_on_the_shared_table(catalog):
+    # t is the one table both joins reference, so both stages anchor
+    # on t and run as one group - even though r's longer documents
+    # would win choose_anchor for the first join alone
+    toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
+    plan = plan_query(_chain(catalog), model=QWEN3_4B_FP8,
+                      device=H100_SXM, doc_tokens=toks,
+                      order="as_written")
+    stages = [op for op in plan.operators if op["op"] == "JoinStage"]
+    assert [s["anchor"] for s in stages] == ["t", "t"]
+    assert [s["written_pos"] for s in stages] == [0, 1]
+    assert stages[0]["partners"] == ["r"]
+    assert stages[1]["partners"] == ["p"]
+    assert stages[0]["expected_tuples"] == 10 * 8
+    # the second stage sees only anchors the first stage's gate kept
+    assert stages[1]["expected_tuples"] < 8 * 6
+
+    # by_cost may reorder the stages but never moves the anchor
+    by_cost = plan_query(_chain(catalog), model=QWEN3_4B_FP8,
+                         device=H100_SXM, doc_tokens=toks)
+    stages = [op for op in by_cost.operators
+              if op["op"] == "JoinStage"]
+    assert [s["anchor"] for s in stages] == ["t", "t"]
+
+
+def test_forced_shared_anchor_wins(catalog):
+    toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
+    plan = plan_query(_chain(catalog, anchors=("t", None)),
+                      model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks, order="as_written")
+    stages = [op for op in plan.operators if op["op"] == "JoinStage"]
+    assert [s["anchor"] for s in stages] == ["t", "t"]
+
+
+def test_forced_anchor_off_the_shared_table_raises(catalog):
+    # r is not in the second join, so anchoring the first stage on r
+    # would need the between-group re-shard
+    toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
+    with pytest.raises(NotImplementedError) as e:
+        plan_query(_chain(catalog, anchors=("r", None)),
+                   model=QWEN3_4B_FP8, device=H100_SXM,
+                   doc_tokens=toks, order="as_written")
+    assert "re-shard" in str(e.value)
+
+
+def test_full_joins_sharing_no_table_raise(catalog, tmp_path):
+    # a chain of three: ai(r,t), ai(t,p), ai(p,g) - no single table
+    # appears in all three, so one shared anchor cannot exist
+    catalog.register("tags", DocumentProvider.from_parquet(
+        _parquet(tmp_path / "g.parquet", ["id", "tag"]), id_col="id"))
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("m1 {0} {1}", col("r.review"),
+                               col("t.thread")))
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m2 {0} {1}", col("t.thread"),
+                               col("p.description")))
+               .ai_join(docs(catalog, "tags", tok).alias("g"),
+                        prompt("m3 {0} {1}", col("p.description"),
+                               col("g.tag")))
+               .select("r.id"))
+    with pytest.raises(NotImplementedError) as e:
+        plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                   doc_tokens={"r": [100] * 4, "t": [100] * 4,
+                               "p": [100] * 4, "g": [100] * 4},
+                   order="as_written")
+    assert "share no table" in str(e.value)
+
+
 def test_join_order_runs_selective_gate_first(catalog):
     # an expensive .9 full join and a cheap .01 exists gate on the
     # same table: by_cost runs the gate first so the join sees few
