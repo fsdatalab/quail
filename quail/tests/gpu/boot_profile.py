@@ -419,7 +419,8 @@ def main(touch_trials: int = 3, reps: int = 2,
     stock_rows = [hh.get() for hh in s_handles]
 
     query_runs = [r for row in touch_rows for r in row["query"]]
-    best = {m: min(r["wall"] for r in query_runs if r["mode"] == m)
+    best = {m: min((r["wall"] for r in query_runs
+                    if r["mode"] == m), default=None)
             for m in ("arena", "no_arena")}
     report = dict(
         cell="boot_tiered", model=model, gpu="H100!", vllm="0.26.0",
