@@ -83,7 +83,7 @@ for ax, model in zip(axes, MODELS):
     if "join" in block["fits"]:
         jf = block["fits"]["join"]
         slope_ratio = jf["a2x_s_per_token2"] / (2 * a2c)
-        suffix_us = jf["joint4"]["per_suffix_s"] * 1e6
+        suffix_us = jf["per_suffix_s"] * 1e6
         jb = [b for q in block["queries"].values()
               if q["kind"] == "join" for b in q["chunk_bins"]]
         jb.sort(key=lambda b: b["x_mean_ctx"])

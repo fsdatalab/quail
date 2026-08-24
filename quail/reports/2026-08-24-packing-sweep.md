@@ -112,6 +112,21 @@ Measured, GPU us per fresh token (wall differed from GPU by under
 | IMDB-1 | 8.09 | -4.9% | 57.03 | -0.7% |
 | BIO-2 | 12.23 | +17.6% | 71.87 | +13.6% |
 | IMDB-2 | 8.55 | +1.0% | 58.55 | +2.2% |
+| LEP-2 | 8.84 | +4.4% | 63.31 | +10.6% |
+| FEV-2 | 8.72 | +1.8% | 64.69 | +12.4% |
+| BIO-F3 | 10.63 | -3.8% | 69.07 | +5.8% |
+
+The extension rows ran on one further container per model, and their
+whole excess is that container's rate: within each of those queries
+the per-chunk excess is flat and uncorrelated with context (the fit
+separates it below as +0.36 and +6.1 us/token for the two ext
+containers). The BIO-F3 rows are warm re-runs. The cold first runs
+measured 13.67 (4B) and 91.94 (32B) us/token - +30% and +38% - and
+the per-chunk records show all of that sitting in a handful of tiny
+gated tail chunks paying one-time kernel compiles (0.7-0.9 s per
+chunk at 4B, up to 9.3 s at 32B, on 66-523-token chunks whose shapes
+no warmup covered). On the warm container the same chunks run at the
+launch floor (next section) and the chain lands on its prediction.
 
 Figure: plots/packing_sweep_queries.png
 
@@ -122,52 +137,77 @@ Fits over the per-chunk points:
 | `a` (us/token) | 7.867 (was 8.261, -4.8%) | 56.22 (was 56.64, -0.7%) |
 | `a2c` (s/token^2) | 4.343e-10 (was 4.934e-10, -12%) | 1.563e-09 (was 1.528e-09, +2.3%) |
 | filter-fit R^2 (chunks used) | 0.9995 (24 of 25) | 0.9992 (63 of 64) |
-| `a2x` (s/token^2, cross) | 1.070e-09 = 1.23x the causal 2*a2c | 3.793e-09 = 1.21x |
-| leftover per suffix (joint fit) | ~37 us | ~126 us |
-| container band (filters, 4 containers) | 2.9-3.1% | 2.6-6.6% |
+| `a2x` (s/token^2, cross) | 9.80e-10 = 1.13x the causal 2*a2c | 3.52e-09 = 1.13x |
+| per suffix | 35 us | 114 us |
+| ext-container rate offsets (us/token) | +0.36, +0.20 | +6.11, +1.84 |
+| residual per token, per cross workload | -0.06 to +0.14 us | -0.49 to +1.06 us |
+| container band (repeated filters, 4 containers) | 2.9-3.1% | 2.6-6.6% |
 
-One chunk per model was excluded from the filter fit: each
-container's first measured chunk paid a leftover kernel compile once
-(+14% on that one chunk at 32B, cached afterward). The fit script
-excludes any chunk more than 5% off its own GPU time and reports the
-count; the all-chunk fit is kept alongside in the summary
-(`fits.filter.all_chunks`).
+With those terms, one model explains all seven workloads on both
+models to within 2% per token. The same fit shape holds across model
+sizes: the cross coefficient is 1.13x the causal one on both.
+
+Excluded chunks (the fit drops any chunk more than 5% off its own
+GPU time and reports counts per query): each container's first
+measured chunk pays one leftover kernel compile; a cold chain's tiny
+gated tail chunks pay compiles of 0.7-9.3 s once; and warm tail
+chunks under ~2k tokens sit on a per-chunk launch floor of ~20-27 ms
+(4B) / ~25-30 ms (32B) - a 165-token chunk costs ~20 ms no matter
+what is in it. The floor is the one place chunk fill genuinely
+matters; across a whole chain query it is ~1% of wall time, because
+only the gated trailing chunks are that small.
 
 Figure: plots/packing_sweep_context.png
 
 What the figure shows: with the x axis counting cross context in full
 and a segment's own context at half, equal per-attended-token cost
-would put join chunks on the same line as filter chunks. They sit
-above it.
+would put join and chain chunks on the same line as filter chunks.
+They sit above it, by the 1.13x cross slope plus their container's
+offset (the 32B extension queries ran on the +6.1 us/token
+container).
 
 ## What the numbers mean
 
 - **The two-constant model holds on filter packings.** One line fits
-  all 25 filter chunks of both corpora at R^2 = 0.9998, across mixed
-  lengths (833 to 14,803 tokens in the same chunk), 8 to 300 pieces
-  per chunk, and fill from 66% to 100%. Adding a per-chunk fixed cost
-  changes nothing (7 ms per ~1 s chunk). Packing density does not
-  need a term.
+  the filter chunks of both corpora at R^2 = 0.9995 (24 of 25 chunks
+  at 4B), across mixed lengths (833 to 14,803 tokens in the same
+  chunk), 8 to 300 pieces per chunk, and fill from 66% to 100%.
+  Packing density needs no term above ~2k tokens per chunk; below
+  that the ~20-30 ms launch floor takes over (see the exclusion
+  note).
 - **Both committed constants were stale, in opposite ways.** The 4B
   executor now runs 4.8% faster than its anchor (127.1k tok/s against
   the anchor's 121.0k; the anchor also predated the 08-21/08-22
   changes, which beat the 8.6-9.4 us/token band this report
   predicted). The 32B filter constants were nearly right (within 1%).
   Both files are refreshed from this sweep's filter fit.
-- **Join chunks cost more than the causal model says, on the GPU.**
-  Reading a kept anchor's KV from arena pages costs 1.23x per
+- **Cross reads are the one missing term, and it is the same term
+  everywhere.** Reading kept KV from arena pages costs 1.13x per
   attended token compared with in-chunk causal attention (`a2x =
-  1.070e-09` against `2*a2c = 8.685e-10` at 4B), plus ~37 us per
-  suffix. On BIO-2's shape that is +18% wall; on IMDB-2's short
-  anchors it is +1%. This is the term the model was missing - not
-  chunk fill, not segment count.
-- **Container-to-container variation collapsed.** The exploration
-  measured up to 45%. Four containers here: 2.9-3.1% at 4B; at 32B,
-  2.6% on the short-document filter and 6.6% on the long-document one
-  (the full run's container was the fastest of its four). Committed
-  constants are fine - the worst band is 6.6% against decision
-  margins of 32% and larger - so no boot-time calibration and no
-  worst-case constants are needed.
+  2.25-2.26 * a2c` on both models), plus ~35 us (4B) / ~114 us (32B)
+  per suffix. That one term prices all five cross-read workloads -
+  both join orientations (long anchors with tiny suffixes, tiny
+  anchors with whole-passage suffixes), two further corpora (LePaRD,
+  FEVER), and the chain's later-stage tails - to within 2% per token
+  once each container's rate is separated. On BIO-2's shape it is
+  +18% of wall; on IMDB-2's it is +1%.
+- **A multi-stage chain needs no term of its own.** BIO-F3 (three
+  stages, arena writes on, KV rewind) lands on its prediction: 10.63
+  measured against 10.4-10.6 (4B, warm), with its later-stage tails
+  priced by the same `a2x` as join suffixes. The writes-on chunks run
+  ~2% over the fast-path fit, matching the earlier 1.2% measurement.
+  The cold first runs of the chain were +30-38% - all of it one-time
+  kernel compiles on tiny tail-chunk shapes, not the multi-stage
+  path.
+- **Container-to-container variation collapsed, but is bigger than
+  the repeat runs alone showed.** The exploration measured up to 45%.
+  Six containers per model here: the repeated filters span 2.9-3.1%
+  at 4B and 2.6-6.6% at 32B, and the two extension containers add
+  rate offsets of +2.5-4.6% (4B) and +3.3-10.9% (32B). So the band is
+  roughly 5% at 4B and 11% at 32B - wide enough to notice, far from
+  45%, and still under every decision margin (32% at 4B, ~6x at 32B),
+  so no boot-time calibration and no worst-case constants are
+  needed.
 - **No break-even flips.** Restore-vs-recompute at 4B: loading KV
   costs 5.33 us/token at the pinned 27.7 GB/s channel against 7.87
   us/token to recompute, so restore still wins at every length
@@ -192,7 +232,11 @@ above it.
 
     uv run modal run ablations/packing_sweep.py --model qwen3-4b-fp8 \
         2>&1 | tee results/packing_sweep_4b.log
-    # pull the raw records, then:
+    uv run modal run ablations/packing_sweep.py --model qwen3-4b-fp8 \
+        --queries LEP-2,FEV-2,BIO-F3 --tag ext \
+        2>&1 | tee results/packing_ext_4b.log
+    # pull the raw records, then (a warm re-run listed after its cold
+    # record overrides it, so fits use the compile-free measurement):
     uv run python ablations/packing_sweep_fit.py \
-        packing_sweep_*.json --out results/packing_sweep.json
+        <full> <ext> <ext2> <reps...> --out results/packing_sweep.json
     uv run --with matplotlib python reports/make_packing_sweep_plots.py

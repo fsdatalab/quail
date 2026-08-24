@@ -27,6 +27,10 @@ Usage, from quail/:
 
     uv run python ablations/packing_sweep_fit.py \
         <packing_sweep_*.json ...> --out results/packing_sweep.json
+
+When two records carry the same query id (a re-run), the one listed
+later wins - pass a warm re-run after the cold record so the fits and
+the query table use the compile-free measurement.
 """
 
 import argparse
@@ -189,47 +193,64 @@ def analyze(records):
         p["_drop"] = abs(p["gpu_s"] - pred) > 0.05 * p["gpu_s"]
     dropped = [p for p in every if p["_drop"]]
 
-    filt = [p for p in every if not p["_drop"] and p["Sx"] == 0]
-    join = [p for p in every if not p["_drop"] and p["Sx"] > 0]
-    kept = filt + join
-    xf, r2f = fit(filt, lambda p: cols(p, 2))
-    a, a2c = xf[0], xf[1]
-    offsets = {t: round(d * 1e6, 3) for t, d in zip(tags, xf[2:])}
+    # (a, a2c) come from the first record's causal chunks alone - the
+    # committed-constants fit, on the same container as that record's
+    # joins, so the shape terms below are anchored by chunks with no
+    # container offset in them.
+    filt = [p for p in every if not p["_drop"] and p["Sx"] == 0
+            and p["tag"] == "full"]
+    (a, a2c), r2f = fit(filt, lambda p: [p["T"], p["Sc"]])
     fits = dict(filter=dict(
         a_s_per_token=a, a2c_s_per_token2=a2c, r2=round(r2f, 5),
         n_chunks=len(filt),
-        n_excluded=sum(1 for p in dropped if p["Sx"] == 0),
-        container_offset_us_per_token=offsets))
+        n_excluded=sum(1 for p in dropped
+                       if p["Sx"] == 0 and p["tag"] == "full")))
 
-    def base(p):
-        d = dict(zip(tags, xf[2:]))
-        return ((a + d.get(p["tag"], 0.0)) * p["T"] + a2c * p["Sc"])
+    # everything else fits the residual past (a, a2c): the cross
+    # coefficient, the per-suffix cost, and one rate offset per extra
+    # record (= per container). The full record's join chunks carry
+    # no offset column, so they anchor a2x and the per-suffix term;
+    # the extra records' flat excess lands in their offsets.
+    rest = [p for p in every if not p["_drop"]
+            and not (p["Sx"] == 0 and p["tag"] == "full")]
+    if rest:
+        ys = [p["gpu_s"] - a * p["T"] - a2c * p["Sc"] for p in rest]
 
-    if join:
-        resid = [p["gpu_s"] - base(p) for p in join]
-        a2x = (sum(r * p["Sx"] for r, p in zip(resid, join))
-               / sum(p["Sx"] ** 2 for p in join))
+        def rcols(p):
+            return [p["Sx"], float(p["suffixes"])] + \
+                [p["T"] if p["tag"] == t else 0.0 for t in tags]
+
+        xr = lstsq(ys, rcols_matrix := [rcols(p) for p in rest])
+        a2x, suf_s = xr[0], xr[1]
+        offs = dict(zip(tags, xr[2:]))
+        # per-query residual past the full model, in us per token so
+        # suffix-sparse chunks (a chain's mixed chunks) do not blow
+        # the number up; comparable to the container band directly
         leftover = {}
         for qid in pts:
             cross = [p for p in pts[qid]
                      if p["Sx"] > 0 and not p["_drop"]]
-            n_suf = sum(p["suffixes"] for p in cross)
-            if not n_suf:
+            if not cross:
                 continue
-            lo = sum(p["gpu_s"] - base(p) - a2x * p["Sx"]
+            lo = sum(p["gpu_s"] - a * p["T"] - a2c * p["Sc"]
+                     - a2x * p["Sx"] - suf_s * p["suffixes"]
+                     - offs.get(p["tag"], 0.0) * p["T"]
                      for p in cross)
-            leftover[qid] = round(lo / n_suf * 1e6, 1)
-        x4, r24 = fit(kept, lambda p: cols(p, 4))
+            leftover[qid] = round(
+                lo / sum(p["T"] for p in cross) * 1e6, 2)
+        pred = [sum(c * x for c, x in zip(row, xr))
+                for row in rcols_matrix]
+        ss_res = sum((y - q) ** 2 for y, q in zip(ys, pred))
+        mean = sum(ys) / len(ys)
+        ss_tot = sum((y - mean) ** 2 for y in ys) or 1e-12
         fits["join"] = dict(
             a2x_s_per_token2=a2x, a2x_over_a2c=round(a2x / a2c, 2),
-            leftover_us_per_suffix=leftover,
+            per_suffix_s=suf_s,
+            container_offset_us_per_token={
+                t: round(d * 1e6, 3) for t, d in offs.items()},
+            residual_us_per_token=leftover,
             n_excluded=sum(1 for p in dropped if p["Sx"] > 0),
-            joint4=dict(a_s_per_token=x4[0], a2c_s_per_token2=x4[1],
-                        a2x_s_per_token2=x4[2], per_suffix_s=x4[3],
-                        container_offset_us_per_token={
-                            t: round(d * 1e6, 3)
-                            for t, d in zip(tags, x4[4:])},
-                        r2=round(r24, 5)))
+            r2=round(1 - ss_res / ss_tot, 5))
 
     queries = {}
     for qid in pts:
@@ -253,8 +274,13 @@ def analyze(records):
             row["n_excluded"] = len(p) - len(keep_q)
         queries[qid] = row
 
+    # deliberate same-query repeats only (full + rep*): an ext/ext2
+    # pair re-runs a query to shed one-time kernel compiles, and that
+    # delta is not container variation
     containers = defaultdict(dict)
     for r in records:
+        if not (r["tag"] == "full" or r["tag"].startswith("rep")):
+            continue
         for qid, q in r["queries"].items():
             containers[qid][r["tag"]] = q["summary"]["us_per_token_gpu"]
     spread = {}
@@ -297,8 +323,10 @@ def main():
         if "join" in block["fits"]:
             j = block["fits"]["join"]
             print(f"[{m}] join a2x={j['a2x_s_per_token2']:.3e} "
-                  f"(= {j['a2x_over_a2c']} x a2c) leftover/suffix "
-                  f"{j['leftover_us_per_suffix']}")
+                  f"(= {j['a2x_over_a2c']} x a2c) per-suffix "
+                  f"{j['per_suffix_s'] * 1e6:.1f} us  offsets "
+                  f"{j['container_offset_us_per_token']}  residual "
+                  f"us/tok {j['residual_us_per_token']}")
 
 
 if __name__ == "__main__":
