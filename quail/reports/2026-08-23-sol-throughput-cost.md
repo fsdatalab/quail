@@ -389,3 +389,58 @@ report dict, including `sol_s` / `sol_efficiency` / `store`
 
 (Corrected-code numbers throughout; the uncorrected run's IMDB-2 and
 IMDB-5 warm efficiency read 68% and 73% respectively before the fix.)
+
+## 12. Adversarial review (2026-08-24): one high-severity bug, three minor
+
+A GPU run proves the common case works; it doesn't prove the check
+can't be fooled by a query shape the run didn't happen to exercise.
+A fresh review agent - not primed with any of the reasoning in this
+document - was asked to try to break the implementation rather than
+read and confirm it. It also noted that none of the 156 existing
+tests exercised `sol_s`, `sol_efficiency`, `docs_per_s`, or
+`cost_dollars` at all, which is exactly how the first finding shipped
+unnoticed.
+
+**High**: the `efficiency <= 100%` check (Section 5's whole point)
+never actually stopped anything. `raise AssertionError(...)` sat
+inside the same `try/except` in `quailb.py`'s row-building loop that
+turns any exception into an `error` string in the results row -
+indistinguishable from a Refusal or a network hiccup. `run_suite`
+returned normally, exit 0, as if nothing had happened. Fixed with a
+dedicated `SolViolation(RuntimeError)`, re-raised explicitly before
+the generic `except Exception` clause so it can't be caught by it.
+
+**Medium**: a join anchor's per-stage "frame" (the naming line
+written into its kept KV, e.g. "the document above is...") had its
+length used correctly as part of what partner suffixes read
+*against*, but the write itself was never charged as its own chunk
+of work in `sol_seconds()`'s input. Safe direction (makes the floor
+slightly too generous, not too tight), but a real missing kernel
+call. Fixed: one more streaming entry per anchor per join stage.
+
+**Low** (two): the restore-correction heuristic (Section 11) used
+whatever was left with no signal if `restored_tokens` for an alias
+ever exceeded what the walk had charged as build candidates - not
+reachable in the current query catalog, degrades safely, now leaves
+a report remark instead of vanishing silently. And `_docs_per_s`
+summed *every* stage-0 filter's evaluated count, which double-counts
+across two different tables for a two-sided query (FEV-5/6, LEP-7);
+fixed to use only the join anchor's own count when a join is present.
+
+Checked and confirmed fine, no change: the LEP-2 self-join (one
+table, two aliases) doesn't cross-contaminate the `built`/
+`causal_by_alias` tracking; a zero-survivor upstream filter doesn't
+crash the floor computation; the multi-stage filter chain's
+accumulated context has no off-by-one; and aggregating FLOPs/bytes
+before `max()` (Section 4's design choice) is mathematically
+guaranteed to produce a value at or below the true floor, so it can
+only make the invariant check more conservative, never a source of
+false alarms.
+
+All four fixes shipped with regression tests
+(`test_sol_violation_aborts_run_suite`,
+`test_run_suite_reports_sol_and_cost_fields`,
+`test_docs_per_s_two_sided_query_uses_anchor_only`) exercising
+`run_suite` end to end through a new `_execute` test seam (mirroring
+`Query.run()`'s existing one), closing the coverage gap that let the
+high-severity bug ship. 159 tests pass.
