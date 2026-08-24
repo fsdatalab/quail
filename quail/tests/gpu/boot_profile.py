@@ -151,17 +151,24 @@ def _pyspy_start(out_path: str):
     return stop
 
 
-def _speedscope_top(path: str, n: int = 15) -> list[dict]:
-    """Top-n functions by self time from a py-spy speedscope file."""
+def _speedscope_top(path: str, n: int = 15,
+                    thread: str = "MainThread") -> dict:
+    """Top-n functions by self time from a py-spy speedscope file.
+
+    Restricted to profiles whose name contains `thread` (all threads
+    if none match): with --idle every parked helper thread samples
+    too, and summing across threads buries the boot work under
+    threading.wait and selector polls."""
     with open(path) as f:
         data = json.load(f)
     frames = data["shared"]["frames"]
+    profiles = [p for p in data["profiles"]
+                if p.get("type") == "sampled"]
+    named = [p for p in profiles if thread in p.get("name", "")]
     self_s: dict[int, float] = {}
     cum_s: dict[int, float] = {}
     total = 0.0
-    for prof in data["profiles"]:
-        if prof.get("type") != "sampled":
-            continue
+    for prof in (named or profiles):
         for stack, w in zip(prof["samples"], prof["weights"]):
             if not stack:
                 continue
@@ -262,20 +269,28 @@ def _quail_boot_once(*, reuse: dict | None,
     return state, _round_boot(boot)
 
 
-def _profiled_boot(tag: str, *, force_compile: bool) -> tuple[dict, dict]:
-    """Cold boot under py-spy; returns (state, row)."""
+def _profiled_boot(tag: str, *, force_compile: bool,
+                   spy: bool = True) -> tuple[dict, dict]:
+    """Cold boot, py-spy attached unless spy=False (the profiler
+    costs real wall; the no-spy control isolates it)."""
+    if not spy:
+        state, cold = _quail_boot_once(reuse=None,
+                                       force_compile=force_compile)
+        return state, dict(cold=cold, pyspy=dict(ok=False,
+                                                 path=None,
+                                                 error="disabled"))
     spy_path = f"/results/boot/pyspy_{tag}.speedscope.json"
     stop = _pyspy_start(spy_path)
     state, cold = _quail_boot_once(reuse=None,
                                    force_compile=force_compile)
-    spy = stop()
-    if spy["ok"]:
+    spy_row = stop()
+    if spy_row["ok"]:
         try:
-            spy["summary"] = _speedscope_top(spy_path)
+            spy_row["summary"] = _speedscope_top(spy_path)
         except (OSError, ValueError, KeyError) as e:
-            spy["summary"] = dict(error=repr(e))
+            spy_row["summary"] = dict(error=repr(e))
         results_vol.commit()
-    row = dict(cold=cold, pyspy=spy)
+    row = dict(cold=cold, pyspy=spy_row)
     return state, row
 
 
@@ -291,14 +306,16 @@ def compile_trial() -> dict:
 
 
 @app.function(timeout=7200, max_containers=8, **GPU_KW)
-def touch_trial(trial: int = 0, reps: int = 2) -> dict:
+def touch_trial(trial: int = 0, reps: int = 2,
+                spy: bool = True) -> dict:
     """One fresh container: touch-pass boot, warm reuse, then the
     m1_filter1 query on both paths."""
     from corpus import build_corpus
     from quail.executor.attention import FILTER_ATTENTION
     from quail.executor.loop import run_filter
 
-    state, row = _profiled_boot(f"touch{trial}", force_compile=False)
+    state, row = _profiled_boot(f"touch{trial}",
+                                force_compile=False, spy=spy)
     _, warm = _quail_boot_once(reuse=state)
     row.update(side="quail", trial=trial, warm=warm)
     print(f"[boot_tiered] touch trial {trial}: cold={row['cold']} "
@@ -355,9 +372,9 @@ def stock_boot_trial(trial: int = 0) -> dict:
 
 @app.function(timeout=600, image=image, memory=4096,
               volumes={"/results": results_vol})
-def write_report(report: dict) -> str:
+def write_report(report: dict, name: str = "boot_tiered") -> str:
     os.makedirs("/results/boot", exist_ok=True)
-    with open("/results/boot/boot_tiered.json", "w") as f:
+    with open(f"/results/boot/{name}.json", "w") as f:
         json.dump(report, f, indent=2)
     results_vol.commit()
     return json.dumps(report, indent=2)
@@ -365,17 +382,23 @@ def write_report(report: dict) -> str:
 
 @app.local_entrypoint()
 def main(touch_trials: int = 3, reps: int = 2,
-         stock_trials: int = 0,
-         out: str = "results/boot_tiered.json"):
+         stock_trials: int = 0, spy: bool = True,
+         skip_compile: bool = False,
+         name: str = "boot_tiered"):
     """Compile pass first (so touch trials see the marker), then
-    touch trials in parallel; stock boot rows rerun only on request."""
+    touch trials in parallel; stock boot rows rerun only on request.
+    --skip-compile with --no-spy is the profiler-off control against
+    an already-written marker."""
     print(f"[boot_tiered] prediction: {PREDICTION}", flush=True)
 
-    h = compile_trial.spawn()
-    print(f"[boot_tiered] compile fc={h.object_id}", flush=True)
-    compile_row = h.get()
+    if skip_compile:
+        compile_row = dict(skipped=True)
+    else:
+        h = compile_trial.spawn()
+        print(f"[boot_tiered] compile fc={h.object_id}", flush=True)
+        compile_row = h.get()
 
-    t_handles = [touch_trial.spawn(i, reps)
+    t_handles = [touch_trial.spawn(i, reps, spy)
                  for i in range(touch_trials)]
     s_handles = [stock_boot_trial.spawn(i)
                  for i in range(stock_trials)]
@@ -396,14 +419,17 @@ def main(touch_trials: int = 3, reps: int = 2,
                else dict(reused="results/boot_profile.json")),
         query=dict(runs=query_runs, best_wall=best,
                    wrong=sum(r["wrong"] for r in query_runs)))
-    payload = write_report.remote(report)
+    payload = write_report.remote(report, name)
+    out = f"results/{name}.json"
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(payload)
     print(f"[boot_tiered] saved {out}", flush=True)
 
-    ct = compile_row["cold"]
-    print(f"[boot_tiered] compile boot: warm_kernels_s="
-          f"{ct['warm_kernels_s']} boot_s={ct['boot_s']}", flush=True)
+    if not skip_compile:
+        ct = compile_row["cold"]
+        print(f"[boot_tiered] compile boot: warm_kernels_s="
+              f"{ct['warm_kernels_s']} boot_s={ct['boot_s']}",
+              flush=True)
     agg = report["touch"]["cold"]
     print(f"[boot_tiered] touch boots: warm_kernels_s "
           f"mean={agg['warm_kernels_s']['mean']} boot_s "
