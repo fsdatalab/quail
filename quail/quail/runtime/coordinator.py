@@ -9,13 +9,15 @@ anchor's tuple stream stay local to the GPU holding the anchor.
 Shards are deterministic for a given corpus, which is what lets each
 GPU's store slice serve the same documents query after query.
 
-Two rounds per query:
+Rounds per query, following the plan's node graph:
 
   round 1 (filters): every worker filters its shard of every alias.
-  round 2 (joins): anchors follow their filter shard (their KV is on
-  that GPU); every worker sees every surviving partner. Stages that
-  anchor on different aliases would need a re-shard between stages;
-  that is refused plainly until the benchmark needs it.
+  one join round per JoinGroup node: anchors follow the alias's
+  filter shard when one exists (that GPU's store slice may hold
+  their KV); every worker sees every surviving partner. A Barrier
+  node between groups thins the live sets from the finished stages'
+  passing pairs (step 4.6 of issue #38) and re-shards the next
+  anchor over the measured live set.
 """
 
 COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "true_ids",
@@ -95,23 +97,122 @@ def merge_filter_round(outs: list, limit: int | None = None) -> dict:
                 fresh_tokens=tokens, store=store)
 
 
-def join_round_payloads(payload: dict, shards: dict, k: int,
-                        survivors: dict) -> list:
-    """Per-worker sub-payloads for the join round.
+def stage_for_anchor(spec: dict, anchor: str) -> dict:
+    """A child-facing copy of one join stage spec with its anchor
+    decided: partners in placeholder order, the anchor's naming line
+    as the frame, block labels for the partners only. The payload
+    spec carries labels and naming lines for every table, so a
+    barrier-time anchor re-pick needs no re-tokenization. A spec
+    without the per-table maps (a hand-built payload) is already
+    materialized and passes through unchanged."""
+    if "frames" not in spec:
+        return spec
+    partners = [a for a in spec["aliases"] if a != anchor]
+    out = dict(spec)
+    out.update(anchor=anchor, partners=partners,
+               frame=spec["frames"][anchor],
+               labels={p: spec["labels"][p] for p in partners})
+    return out
 
-    Every join stage must share one anchor alias (the same-anchor
-    chain and star shapes; a stage anchored elsewhere needs the
-    deferred re-shard). Anchors follow their filter shard; partners
-    are the full surviving lists, identical on every worker so the
-    partner index space matches at the merge."""
-    joins = payload["joins"]
-    if not joins:
+
+def derive_plan_nodes(joins: list) -> list:
+    """JoinGroup/Barrier nodes reconstructed from bare stage specs,
+    for payloads built without a planner (ablation cells, direct
+    worker calls). The executor's grouping rule: consecutive full
+    stages with one anchor share a gated call, a gate runs alone,
+    and an anchor switch inserts a Barrier."""
+    nodes = []
+    cur = None
+    n_groups = n_barriers = 0
+
+    def flush():
+        nonlocal cur, n_groups
+        if cur is None:
+            return
+        nodes.append(dict(id=f"group:{n_groups}", op="JoinGroup",
+                          inputs=(), anchor=cur["anchor"],
+                          stage_idxs=tuple(cur["idxs"]), stages=()))
+        n_groups += 1
+        cur = None
+
+    for i, j in enumerate(joins):
+        if (cur is not None and j["semantics"] == "full" and cur["full"]
+                and cur["anchor"] == j["anchor"]):
+            cur["idxs"].append(i)
+            continue
+        prev_anchor = cur["anchor"] if cur is not None else None
+        flush()
+        if prev_anchor is not None and prev_anchor != j["anchor"]:
+            nodes.append(dict(id=f"barrier:{n_barriers}", op="Barrier",
+                              inputs=(), next_anchor=j["anchor"],
+                              thins=()))
+            n_barriers += 1
+        cur = dict(anchor=j["anchor"], full=(j["semantics"] == "full"),
+                   idxs=[i])
+    flush()
+    return nodes
+
+
+def gate_group(stage_out: dict, semantics: str) -> list:
+    """Anchor survivors after one group, from its LAST stage's rows.
+    Full and exists keep anchors with any TRUE; anti keeps the
+    evaluated anchors with none. An anchor gated out mid-group has no
+    last-stage row, so it drops from a full group automatically."""
+    evaluated = list(stage_out["anchor_index"])
+    kept = {evaluated[a] for a, row in stage_out["rows"].items()
+            if any(row)}
+    if semantics == "anti":
+        return [g for g in evaluated if g not in kept]
+    return sorted(kept)
+
+
+def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
+    """The barrier's thinning (issue #38, step 4.6): a document stays
+    live only if every finished full stage touching its table has it
+    in at least one surviving pair - a YES answer of an anchor still
+    in its table's current survivor set. Cost only: a document
+    dropped here appears in no output tuple anyway (recombination's
+    keep sets enforce results), so thinning changes what later stages
+    evaluate, never what the query returns."""
+    for out in full_stage_outs:
+        anchor, partners = out["anchor"], out["partners"]
+        alive = set(survivors.get(anchor, out["anchor_index"]))
+        seen = {al: set() for al in (anchor, *partners)}
+        for la, row in out["rows"].items():
+            ga = out["anchor_index"][la]
+            if ga not in alive:
+                continue
+            hit = False
+            for ti, bit in enumerate(row):
+                if bit:
+                    hit = True
+                    for al, gp in zip(partners,
+                                      out["partner_index"][ti]):
+                        seen[al].add(gp)
+            if hit:
+                seen[anchor].add(ga)
+        for al, ids in seen.items():
+            if al in survivors:
+                survivors[al] = [g for g in survivors[al] if g in ids]
+            else:
+                survivors[al] = sorted(ids)
+    return survivors
+
+
+def join_group_payloads(payload: dict, k: int, survivors: dict,
+                        group: list) -> list:
+    """Per-worker sub-payloads for ONE anchor group's round. Every
+    stage in `group` shares the group's anchor (materialize each with
+    stage_for_anchor first). Anchors follow the alias's filter shard
+    when one exists - the live subset of a balanced shard stays
+    roughly balanced, and that GPU's store slice may hold the
+    anchor's KV from the filter round - and are balanced fresh over
+    the live documents otherwise (the re-shard). Partners are the
+    full surviving lists, identical on every worker so the partner
+    index space matches at the merge."""
+    if not group:
         return []
-    anchor_alias = joins[0]["anchor"]
-    if any(j["anchor"] != anchor_alias for j in joins):
-        raise NotImplementedError(
-            "join stages anchored on different aliases need the "
-            "between-stage re-shard, which is not built yet")
+    anchor_alias = group[0]["anchor"]
 
     def surv(alias):
         # an alias with no filters survives whole
@@ -119,24 +220,31 @@ def join_round_payloads(payload: dict, shards: dict, k: int,
             return list(survivors[alias])
         return list(range(len(payload["docs"][alias])))
 
-    anchor_shards = shards.get(anchor_alias)
-    partner_aliases = sorted({p for j in joins for p in j["partners"]})
+    live = surv(anchor_alias)
+    shards = payload.get("shards") or {}
+    if anchor_alias in shards:
+        alive = set(live)
+        anchor_shards = [[g for g in shard if g in alive]
+                         for shard in shards[anchor_alias]]
+    else:
+        from quail.planner.decide import balanced_shards
+        toks = payload["docs"][anchor_alias]
+        idx_shards, _ = balanced_shards([len(toks[g]) for g in live],
+                                        k)
+        anchor_shards = [[live[i] for i in s] for s in idx_shards]
+    partner_aliases = sorted({p for j in group for p in j["partners"]})
     partners = {alias: dict(index=surv(alias),
                             docs=[payload["docs"][alias][g]
                                   for g in surv(alias)])
                 for alias in partner_aliases}
     subs = []
-    anchor_live = set(surv(anchor_alias))
     for w in range(k):
-        shard = anchor_shards[w] if anchor_shards \
-            else range(len(payload["docs"][anchor_alias]))
-        anchors = [g for g in shard if g in anchor_live]
         sub = {key: payload[key] for key in COMMON_KEYS}
-        sub.update(joins=joins,
+        sub.update(joins=group,
                    anchor_alias=anchor_alias,
-                   anchor_index=anchors,
+                   anchor_index=list(anchor_shards[w]),
                    anchor_docs=[payload["docs"][anchor_alias][g]
-                                for g in anchors],
+                                for g in anchor_shards[w]],
                    partners=partners,
                    store=payload.get("store"),
                    worker=w, workers=k)

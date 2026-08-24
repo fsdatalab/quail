@@ -11,11 +11,28 @@ from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.planner.calibration import load_calibration
 from quail.planner.decide import (balanced_shards, explain,
-                                  order_filters, plan_query,
+                                  order_filters, pick_runtime_anchor,
+                                  plan_query,
                                   restore_crossover_tokens)
 from quail.planner.plan import (EngineConfig, PhysicalPlan, Refusal,
                                 StoreSpec, resolve_model)
 from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+
+def filter_chain(plan, alias=None):
+    return next(n for n in plan.nodes if n["op"] == "FilterChain"
+                and (alias is None or n["alias"] == alias))
+
+
+def join_stages(plan):
+    """Every join stage in execution order, across the plan's
+    JoinGroup nodes."""
+    return [st for n in plan.nodes if n["op"] == "JoinGroup"
+            for st in n["stages"]]
+
+
+def node_kinds(plan):
+    return [n["op"] for n in plan.nodes]
 
 
 def _parquet(path, columns):
@@ -59,8 +76,7 @@ def test_b3_ordering_by_cost_vs_as_written(catalog):
 
     by_cost = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                          doc_tokens=toks)
-    chain = next(op for op in by_cost.operators
-                 if op["op"] == "FilterChain")
+    chain = filter_chain(by_cost)
     assert by_cost.order_rule == "by_cost"     # every predicate has a sel
     assert chain["stages"][0]["selectivity"] == 0.2
     # the other four only see the 20% it passes
@@ -69,8 +85,7 @@ def test_b3_ordering_by_cost_vs_as_written(catalog):
     as_written = plan_query(logical, model=QWEN3_4B_FP8,
                             device=H100_SXM, doc_tokens=toks,
                             order="as_written")
-    chain = next(op for op in as_written.operators
-                 if op["op"] == "FilterChain")
+    chain = filter_chain(as_written)
     assert [s["selectivity"] for s in chain["stages"]] == list(sels)
 
 
@@ -80,8 +95,7 @@ def test_filter_arena_writes_decision(catalog):
     single = _five_filter_plan(catalog, (0.9,))
     plan = plan_query(single, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100})
-    chain = next(op for op in plan.operators
-                 if op["op"] == "FilterChain")
+    chain = filter_chain(plan)
     assert chain["arena_writes"] is False
     assert any("arena writes off" in r for r in plan.remarks)
     assert "arena_writes=False" in explain(single, plan)
@@ -90,8 +104,7 @@ def test_filter_arena_writes_decision(catalog):
     plan = plan_query(_five_filter_plan(catalog, (0.9, 0.9)),
                       model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100})
-    chain = next(op for op in plan.operators
-                 if op["op"] == "FilterChain")
+    chain = filter_chain(plan)
     assert chain["arena_writes"] is True
     assert not any("arena writes off" in r for r in plan.remarks)
 
@@ -99,8 +112,7 @@ def test_filter_arena_writes_decision(catalog):
     plan = plan_query(single, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100},
                       store=StoreSpec(read_bw=55e9, warm=False))
-    chain = next(op for op in plan.operators
-                 if op["op"] == "FilterChain")
+    chain = filter_chain(plan)
     assert chain["arena_writes"] is True
 
 
@@ -141,14 +153,13 @@ def test_anchor_longer_side_and_override(catalog):
     toks = {"r": [3000] * 50, "p": [100] * 500}
     plan = plan_query(joined(None), model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    stage = next(op for op in plan.operators if op["op"] == "JoinStage")
+    stage = join_stages(plan)[0]
     assert stage["anchor"] == "r"      # the longer side anchors
     assert stage["partners"] == ["p"]
 
     forced = plan_query(joined("p"), model=QWEN3_4B_FP8,
                         device=H100_SXM, doc_tokens=toks)
-    stage = next(op for op in forced.operators
-                 if op["op"] == "JoinStage")
+    stage = join_stages(forced)[0]
     assert stage["anchor"] == "p"
     assert stage["partners"] == ["r"]
     assert any("prices lower" in r for r in forced.remarks)
@@ -165,7 +176,7 @@ def test_three_way_anchor_and_tuple_count(catalog):
     toks = {"r": [3000] * 20, "p": [100] * 30, "t": [50] * 40}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    stage = next(op for op in plan.operators if op["op"] == "JoinStage")
+    stage = join_stages(plan)[0]
     # every tuple of the cross product is one evaluation
     assert stage["expected_tuples"] == 20 * 30 * 40
     # the longest side anchors; partners keep placeholder order
@@ -187,54 +198,74 @@ def _chain(catalog, sels=(0.1, 0.1), anchors=(None, None)):
             .select("r.id", "t.id", "p.asin"))
 
 
-def test_two_full_joins_anchor_on_the_shared_table(catalog):
-    # t is the one table both joins reference, so both stages anchor
-    # on t and run as one group - even though r's longer documents
-    # would win choose_anchor for the first join alone
+def test_chain_splits_into_groups_when_the_long_side_anchors(catalog):
+    # r's documents are 3,000 tokens against t's 50 and p's 100:
+    # streaming r as a partner would pay its tokens once per pair, so
+    # the cheapest plan anchors r for stage 1 and p for stage 2 - two
+    # groups with a barrier between them, not one shared-anchor group
     toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
     plan = plan_query(_chain(catalog), model=QWEN3_4B_FP8,
                       device=H100_SXM, doc_tokens=toks,
                       order="as_written")
-    stages = [op for op in plan.operators if op["op"] == "JoinStage"]
-    assert [s["anchor"] for s in stages] == ["t", "t"]
+    stages = join_stages(plan)
+    assert [s["anchor"] for s in stages] == ["r", "p"]
     assert [s["written_pos"] for s in stages] == [0, 1]
-    assert stages[0]["partners"] == ["r"]
-    assert stages[1]["partners"] == ["p"]
+    assert stages[0]["partners"] == ["t"]
+    assert stages[1]["partners"] == ["t"]
     assert stages[0]["expected_tuples"] == 10 * 8
-    # the second stage sees only anchors the first stage's gate kept
+    # the second stage sees the gate-thinned live counts
     assert stages[1]["expected_tuples"] < 8 * 6
+    kinds = node_kinds(plan)
+    assert kinds.count("JoinGroup") == 2
+    assert kinds.count("Barrier") == 1
+    barrier = plan.nodes_by_op("Barrier")[0]
+    assert barrier["next_anchor"] == "p"
+    assert set(barrier["thins"]) == {"t", "p"}
+    # the barrier's outputs feed the second group's inputs
+    group2 = plan.nodes_by_op("JoinGroup")[1]
+    assert all(src == barrier["id"] for src, _ in group2["inputs"])
 
-    # by_cost may reorder the stages but never moves the anchor
-    by_cost = plan_query(_chain(catalog), model=QWEN3_4B_FP8,
-                         device=H100_SXM, doc_tokens=toks)
-    stages = [op for op in by_cost.operators
-              if op["op"] == "JoinStage"]
+
+def test_chain_shares_one_anchor_when_the_shared_table_is_longest(
+        catalog):
+    # t (the shared table) has the long documents: anchoring it once
+    # and keeping its KV across both stages is the cheapest plan -
+    # one group, no barrier
+    toks = {"r": [50] * 10, "t": [3000] * 8, "p": [50] * 6}
+    plan = plan_query(_chain(catalog), model=QWEN3_4B_FP8,
+                      device=H100_SXM, doc_tokens=toks,
+                      order="as_written")
+    stages = join_stages(plan)
     assert [s["anchor"] for s in stages] == ["t", "t"]
+    kinds = node_kinds(plan)
+    assert kinds.count("JoinGroup") == 1
+    assert kinds.count("Barrier") == 0
 
 
-def test_forced_shared_anchor_wins(catalog):
+def test_forced_anchor_is_honored_with_a_remark_when_it_prices_worse(
+        catalog):
+    # stage 1 forced onto t (the short side) is honored; stage 2 is
+    # free and switches to p. The remark names the cheaper free plan.
     toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
     plan = plan_query(_chain(catalog, anchors=("t", None)),
                       model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks, order="as_written")
-    stages = [op for op in plan.operators if op["op"] == "JoinStage"]
-    assert [s["anchor"] for s in stages] == ["t", "t"]
+    stages = join_stages(plan)
+    assert stages[0]["anchor"] == "t"
+    assert any("prices lower" in r for r in plan.remarks)
+
+    # a forced anchor that IS part of the free optimum needs no remark
+    same = plan_query(_chain(catalog, anchors=("r", None)),
+                      model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks, order="as_written")
+    assert join_stages(same)[0]["anchor"] == "r"
+    assert not any("prices lower" in r for r in same.remarks)
 
 
-def test_forced_anchor_off_the_shared_table_raises(catalog):
-    # r is not in the second join, so anchoring the first stage on r
-    # would need the between-group re-shard
-    toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
-    with pytest.raises(NotImplementedError) as e:
-        plan_query(_chain(catalog, anchors=("r", None)),
-                   model=QWEN3_4B_FP8, device=H100_SXM,
-                   doc_tokens=toks, order="as_written")
-    assert "re-shard" in str(e.value)
-
-
-def test_full_joins_sharing_no_table_raise(catalog, tmp_path):
-    # a chain of three: ai(r,t), ai(t,p), ai(p,g) - no single table
-    # appears in all three, so one shared anchor cannot exist
+def test_three_join_chain_plans_with_barriers(catalog, tmp_path):
+    # ai(r,t), ai(t,p), ai(p,g): no table appears in all three
+    # predicates, so no single anchor exists - the plan splits into
+    # anchor groups with barriers between them
     catalog.register("tags", DocumentProvider.from_parquet(
         _parquet(tmp_path / "g.parquet", ["id", "tag"]), id_col="id"))
     logical = (docs(catalog, "reviews", tok).alias("r")
@@ -248,12 +279,41 @@ def test_full_joins_sharing_no_table_raise(catalog, tmp_path):
                         prompt("m3 {0} {1}", col("p.description"),
                                col("g.tag")))
                .select("r.id"))
-    with pytest.raises(NotImplementedError) as e:
-        plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                   doc_tokens={"r": [100] * 4, "t": [100] * 4,
-                               "p": [100] * 4, "g": [100] * 4},
-                   order="as_written")
-    assert "share no table" in str(e.value)
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [100] * 4, "t": [100] * 4,
+                                  "p": [100] * 4, "g": [100] * 4},
+                      order="as_written")
+    stages = join_stages(plan)
+    assert len(stages) == 3
+    # every stage anchors on one of its own tables
+    aliases = [("r", "t"), ("t", "p"), ("p", "g")]
+    for st, tabs in zip(stages, aliases):
+        assert st["anchor"] in tabs
+    kinds = node_kinds(plan)
+    # equal lengths and counts: one anchor switch is optimal (any
+    # zero-switch plan would need a table in all three predicates)
+    assert kinds.count("JoinGroup") == 2
+    assert kinds.count("Barrier") == 1
+    # recombination reads every stage's pairs
+    rec = plan.nodes_by_op("Recombine")[0]
+    pair_ports = [port for _, port in rec["inputs"]
+                  if port.startswith("pairs:")]
+    assert len(pair_ports) == 3
+
+
+def test_pick_runtime_anchor_prefers_cheap_side_within_the_chunk():
+    spec = dict(anchor="t", aliases=["t", "p"],
+                frames={"t": [1] * 5, "p": [1] * 5},
+                labels={"t": [1] * 2, "p": [1] * 2}, tail=[1] * 11)
+    live = {"t": [50] * 5, "p": [100] * 6}
+    # p's documents are longer: anchoring p pays them once each
+    # instead of once per tuple
+    assert pick_runtime_anchor(spec, live, 1, 10_000) == "p"
+    # a chunk too small for a p-anchored tuple falls back to the
+    # compile-time anchor (always a candidate - it passed the
+    # compile-time refusal check)
+    need_p = 1 + 100 + 5 + 11 + 2 + 50
+    assert pick_runtime_anchor(spec, live, 1, need_p - 1) == "t"
 
 
 def test_join_order_runs_selective_gate_first(catalog):
@@ -273,14 +333,13 @@ def test_join_order_runs_selective_gate_first(catalog):
     toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    stages = [op for op in plan.operators if op["op"] == "JoinStage"]
+    stages = join_stages(plan)
     assert stages[0]["selectivity"] == 0.01
 
     as_written = plan_query(logical, model=QWEN3_4B_FP8,
                             device=H100_SXM, doc_tokens=toks,
                             order="as_written")
-    stages = [op for op in as_written.operators
-              if op["op"] == "JoinStage"]
+    stages = join_stages(as_written)
     assert stages[0]["selectivity"] == 0.9
 
 
@@ -305,8 +364,7 @@ def test_preamble_counted_once_per_document(catalog):
     logical = _five_filter_plan(catalog, (0.5,))
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 10})
-    chain = next(op for op in plan.operators
-                 if op["op"] == "FilterChain")
+    chain = filter_chain(plan)
     st = chain["stages"][0]
     # the shared preamble is per document (stage 0), never per stage
     assert st["preamble_tokens"] == len(tok(SHARED_PRE))
@@ -347,7 +405,7 @@ def test_join_tokens_note_per_anchor_labels_per_tuple(catalog):
     toks = {"r": [100] * 4, "p": [10] * 3}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    stage = next(op for op in plan.operators if op["op"] == "JoinStage")
+    stage = join_stages(plan)[0]
     pre = len(tok(SHARED_PRE))
     # r is placeholder 0 (the anchor's naming line), p is placeholder
     # 1 (its block label)
@@ -390,13 +448,13 @@ def test_access_read_when_cold_restore_when_warm(catalog):
     cold = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks,
                       store=StoreSpec(read_bw=55e9, warm=False))
-    scan = next(op for op in cold.operators if op["op"] == "DocScan")
+    scan = cold.nodes_by_op("DocScan")[0]
     assert scan["access"] == "read"
 
     warm = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks,
                       store=StoreSpec(read_bw=55e9, warm=True))
-    scan = next(op for op in warm.operators if op["op"] == "DocScan")
+    scan = warm.nodes_by_op("DocScan")[0]
     assert scan["access"] == "restore"     # 55 GB/s beats the break-even
 
 
