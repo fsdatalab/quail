@@ -44,14 +44,31 @@ for ax, model in zip(axes, MODELS):
     a, a2c = fit["a_s_per_token"], fit["a2c_s_per_token2"]
     old = data["loaded_before"][model]
     xs_all = []
+    # one series per query: its bins joined by a thin line, the query
+    # id written at the series' end (color still says the kind)
+    ends = []
     for qid, q in sorted(block["queries"].items()):
         color = KIND_COLOR[q["kind"]]
         marker = KIND_MARK[q["kind"]]
-        xs = [b["x_mean_ctx"] for b in q["chunk_bins"]]
-        ys = [b["us_per_token"] for b in q["chunk_bins"]]
+        bins_q = sorted(q["chunk_bins"], key=lambda b: b["x_mean_ctx"])
+        xs = [b["x_mean_ctx"] for b in bins_q]
+        ys = [b["us_per_token"] for b in bins_q]
         xs_all += xs
-        ax.plot(xs, ys, marker, color=color, markersize=4.5,
-                linestyle="none", zorder=3)
+        ax.plot(xs, ys, marker, color=color, markersize=4,
+                linestyle="-", linewidth=0.8, zorder=3)
+        ends.append((xs[-1], ys[-1], qid, color))
+    # stagger the labels of series that end close together
+    ends.sort(key=lambda e: (round(e[0], -2), e[1]))
+    last_x = None
+    stack = 0
+    for x, y, qid, color in ends:
+        stack = stack + 1 if (last_x is not None
+                              and abs(x - last_x) < max(xs_all) * 0.08) \
+            else 0
+        last_x = x
+        ax.annotate(qid, (x, y), textcoords="offset points",
+                    xytext=(5, -3 + 9 * stack), fontsize=7.5,
+                    color=color)
     lo, hi = 0, max(xs_all) * 1.06
     grid = [lo + (hi - lo) * i / 60 for i in range(61)]
     # the causal fit in this x (mean attended context): t = a + 2*a2c*x
