@@ -24,6 +24,7 @@ from quail.planner.calibration import (Calibration, commit_calibration,
 from quail.runtime.worker import (app, hf_cache, image, kernel_cache,
                                   results_vol)
 
+# This entry is H100-only until another device is wired here.
 _MODAL_DEVICE = "h100-sxm"
 
 
@@ -42,9 +43,7 @@ def calibrate_run(model: str, device: str, loaded_before: dict,
     spec, dev = resolve_pair(model, device)
     loaded = Calibration(a_s_per_token=loaded_before["a"],
                          a2_s_per_token2=loaded_before["a2"],
-                         source=loaded_before["source"],
-                         c_s_per_chunk=loaded_before.get("c", 0.0),
-                         p_s_per_suffix=loaded_before.get("p", 0.0))
+                         source=loaded_before["source"])
     result = measure(spec, dev, tokens_per_point=tokens_per_point,
                      loaded=loaded)
     print(json.dumps(result, indent=2), flush=True)
@@ -63,13 +62,11 @@ def run(model: str = "qwen3-4b-fp8", device: str = "h100-sxm",
     spec, dev = resolve_pair(model, device)
     loaded = load_calibration(spec, dev)
     print(f"[calibrate] loaded_before a={loaded.a_s_per_token} "
-          f"a2={loaded.a2_s_per_token2} c={loaded.c_s_per_chunk} "
-          f"p={loaded.p_s_per_suffix} source={loaded.source}",
+          f"a2={loaded.a2_s_per_token2} source={loaded.source}",
           flush=True)
     payload = calibrate_run.remote(
         model, device,
         dict(a=loaded.a_s_per_token, a2=loaded.a2_s_per_token2,
-             c=loaded.c_s_per_chunk, p=loaded.p_s_per_suffix,
              source=loaded.source))
     result = json.loads(payload)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -79,9 +76,7 @@ def run(model: str = "qwen3-4b-fp8", device: str = "h100-sxm",
     print(f"saved {out}")
     print(f"[calibrate] measured a={result['a_s_per_token']} "
           f"a2={result['a2_s_per_token2']} "
-          f"c={result['c_s_per_chunk']} "
-          f"p={result['p_s_per_suffix']} "
-          f"(was a={loaded.a_s_per_token}, a2={loaded.a2_s_per_token2})")
+          f"(was {loaded.a_s_per_token}, {loaded.a2_s_per_token2})")
     if commit:
         dest = commit_calibration(result)
         print(f"committed {dest}")

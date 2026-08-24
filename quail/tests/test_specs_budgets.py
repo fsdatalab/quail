@@ -8,29 +8,22 @@ import pytest
 from quail.planner import budgets
 from quail.planner.calibrate import resolve_pair
 from quail.planner.calibration import (Calibration, channel_bandwidths,
-                                       commit_calibration, fit_cost_model,
+                                       commit_calibration, fit_affine,
                                        load_calibration, make_record)
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
-def test_fit_cost_model_recovers_constants():
-    a, a2, c, p = 8.6e-6, 4.9e-10, 0.025, 1.2e-5
-    points = []
-    for T, S, suf in [(1000, 500_000, 0), (4000, 8_000_000, 0),
-                       (8000, 32_000_000, 0), (2000, 2_000_000, 10),
-                       (3000, 4_500_000, 20)]:
-        gpu_s = a * T + a2 * S + c + p * suf
-        points.append(dict(T=T, S=S, suffixes=suf, gpu_s=gpu_s))
-    ga, ga2, gc, gp = fit_cost_model(points)
-    assert ga == pytest.approx(a, rel=1e-9)
-    assert ga2 == pytest.approx(a2, rel=1e-9)
-    assert gc == pytest.approx(c, rel=1e-9)
-    assert gp == pytest.approx(p, rel=1e-9)
+def test_fit_affine_recovers_the_line():
+    a, a2 = 8.6e-6, 4.9e-10
+    points = [(h, a + a2 * h) for h in (256, 1024, 4096, 8192)]
+    got_a, got_a2 = fit_affine(points)
+    assert got_a == pytest.approx(a, rel=1e-9)
+    assert got_a2 == pytest.approx(a2, rel=1e-9)
 
 
-def test_fit_cost_model_needs_four_points():
-    with pytest.raises(ValueError, match="at least 4"):
-        fit_cost_model([dict(T=100, S=5000, suffixes=0, gpu_s=0.01)] * 3)
+def test_fit_affine_needs_two_lengths():
+    with pytest.raises(ValueError):
+        fit_affine([(4096, 1e-5), (4096, 1.1e-5)])
 
 
 def test_kappa_and_widths():
@@ -100,8 +93,6 @@ def test_calibration_anchor_file():
     assert cal.source == "calibrated"
     assert cal.rate_tokens_per_s == pytest.approx(127_121, rel=1e-3)
     assert cal.a2_s_per_token2 == pytest.approx(4.3431e-10, rel=1e-3)
-    assert cal.c_s_per_chunk == 0.0
-    assert cal.p_s_per_suffix == 0.0
 
 
 def test_store_break_even_under_pinned_bandwidth():
@@ -126,8 +117,6 @@ def test_spec_scaled_defaults_for_uncalibrated_pair():
         2 * anchor.a_s_per_token, rel=1e-6)
     assert cal.a2_s_per_token2 == pytest.approx(
         2 * anchor.a2_s_per_token2, rel=1e-6)
-    assert cal.c_s_per_chunk == 0.0
-    assert cal.p_s_per_suffix == 0.0
 
 
 def test_derived_table_complete():
@@ -155,25 +144,19 @@ def test_resolve_pair_unknown():
 
 def test_make_record_and_commit(tmp_path):
     loaded = Calibration(a_s_per_token=8e-6, a2_s_per_token2=5e-10,
-                         source="calibrated", c_s_per_chunk=0.02,
-                         p_s_per_suffix=1e-5)
-    rec = make_record(QWEN3_4B_FP8, H100_SXM, 9e-6, 6e-10, 1e-3, 1.5e-5,
-                      points=[dict(T=1000, S=500000, suffixes=0,
-                                   gpu_s=0.01)],
+                         source="calibrated")
+    rec = make_record(QWEN3_4B_FP8, H100_SXM, 9e-6, 6e-10,
+                      points=[{"doc_tokens": 256}],
                       channels={"pinned_h2d": 1.0},
-                      loaded=loaded)
+                      loaded=loaded, lengths=(256, 1024),
+                      tokens_per_point=1000)
     assert rec["model"] == "qwen3-4b-fp8"
     assert rec["device"] == "h100-sxm"
-    assert rec["a_s_per_token"] == 9e-6
-    assert rec["c_s_per_chunk"] == 1e-3
-    assert rec["p_s_per_suffix"] == 1.5e-5
     assert rec["loaded_before"]["a"] == 8e-6
-    assert rec["loaded_before"]["c"] == 0.02
-    assert rec["loaded_before"]["p"] == 1e-5
+    assert "q_kv" not in rec
+    assert "q_kv" not in rec["provenance"]
     dest = commit_calibration(rec, dest=tmp_path / "pair.json")
     written = dest.read_text()
     assert "a_s_per_token" in written
-    assert "c_s_per_chunk" in written
-    assert "p_s_per_suffix" in written
     assert "points" not in written
     assert "channels_measured_bytes_per_s" not in written
