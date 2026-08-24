@@ -667,11 +667,20 @@ class Query:
                         f"inconsistent for this alias")
             causal_doc_lengths.extend(lengths)
         report["remarks"] = list(report["remarks"]) + sol_remarks
-        from quail.planner.budgets import sol_seconds
-        report["sol_s"] = round(sol_seconds(
+        from quail.planner.budgets import sol_seconds_breakdown
+        breakdown = sol_seconds_breakdown(
             self.session.model, self.session.device,
             causal_doc_lengths=causal_doc_lengths,
-            streaming_chunks_contexts=streaming_chunks_contexts), 4)
+            streaming_chunks_contexts=streaming_chunks_contexts)
+        report["sol_s"] = round(sum(breakdown.values()), 4)
+        # the four terms separately - not needed for the efficiency
+        # invariant itself (that only needs the sum), but this is
+        # what a per-component comparison against a real profiler
+        # trace needs to hold against, term by term rather than only
+        # the aggregate (reports/2026-08-23-sol-throughput-cost.md,
+        # the profiler cross-check discussion)
+        report["sol_breakdown"] = {k: round(v, 4)
+                                   for k, v in breakdown.items()}
         report["sol_efficiency"] = (
             round(report["sol_s"] / report["wall_s"], 4)
             if report["wall_s"] else None)

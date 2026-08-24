@@ -113,6 +113,14 @@ def test_filter_query_rows_and_report(sess):
     # stage 2 only saw stage-1 survivors
     assert stages[1]["evaluated"] == 4
     assert res.report["wall_s"] == 1.0
+    # sol_breakdown: the four terms sol_s is the sum of, for
+    # per-component checks (property tests, profiler comparisons)
+    # that the single sol_s total can't support on its own
+    breakdown = res.report["sol_breakdown"]
+    assert set(breakdown) == {"projection", "elementwise",
+                              "causal_attention", "streaming_attention"}
+    assert sum(breakdown.values()) == pytest.approx(res.report["sol_s"],
+                                                     abs=1e-3)
 
 
 def test_builder_run_matches_sql(sess):

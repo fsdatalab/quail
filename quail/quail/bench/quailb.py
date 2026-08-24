@@ -743,6 +743,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                                stages=res.report["stages"],
                                store=res.report.get("store"),
                                sol_s=sol_s,
+                               sol_breakdown=res.report.get("sol_breakdown"),
                                sol_efficiency=efficiency,
                                tokens_per_s=(
                                    round(res.report["fresh_tokens"]
