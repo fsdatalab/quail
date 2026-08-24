@@ -155,7 +155,7 @@ def _enumerate(fn, spec, budget, num_sms):
 @app.function(image=image, gpu="H100!", timeout=3600, memory=65536,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/results": results_vol})
-def diagnose(run_query: bool = True) -> str:
+def diagnose(run_query: bool = True, keep_ladder: bool = False) -> str:
     # cold, container-local caches + the library's JIT debug log,
     # set before anything imports the JIT machinery
     os.environ["DG_JIT_DEBUG"] = "1"
@@ -164,7 +164,8 @@ def diagnose(run_query: bool = True) -> str:
     os.environ["TRITON_CACHE_DIR"] = "/tmp/triton-cold"
 
     import quail.executor.loop as loop_mod
-    loop_mod.TINY_WARM_TOKENS = ()   # attribution wants the stalls
+    if not keep_ladder:
+        loop_mod.TINY_WARM_TOKENS = ()   # attribution wants the stalls
 
     import torch
 
@@ -324,7 +325,9 @@ def diagnose(run_query: bool = True) -> str:
 
 
 @app.local_entrypoint()
-def run(no_query: bool = False):
-    call = diagnose.spawn(not no_query)
+def run(no_query: bool = False, keep_ladder: bool = False):
+    # keep_ladder=True is the validation mode: production warmup as
+    # is, expecting ZERO new cache files during the measured query
+    call = diagnose.spawn(not no_query, keep_ladder)
     print(f"[dg] fc={call.object_id}", flush=True)
     print(call.get(), flush=True)

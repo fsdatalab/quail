@@ -629,17 +629,33 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
     layer = pipeline.layers[0]
     linears = (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
                layer.mlp.gate_up_proj, layer.mlp.down_proj)
-    # granular at every size, including the big ones: DeepGEMM's
-    # config choice (its debug log shows block widths like 112)
-    # tracks the token count finer than powers of two, and the
-    # measured lumps came from mid-size drain chunks, so there is no
-    # "big sizes are covered by the sweep" shortcut
-    sizes = sorted(
-        {m for m in range(64, 4097, 256)}
-        | {m for m in range(4096, 32769, 1024)}
-        | {m for m in range(32768, budget + 1, 2048)}
-        | {budget})
-    work = [(m, lin) for m in sizes for lin in linears]
+    # Below 4,096 tokens the sizes are provably complete: vLLM ships
+    # a generator mirroring DeepGEMM's own config heuristic (its
+    # comment links the C++ source), yielding every token count at
+    # which the chosen kernel configuration can change. Gated chains
+    # produce data-dependent tiny chunks, and each unseen config
+    # costs a ~2.4 s nvcc compile mid-run (measured, 2026-08-24), so
+    # this is the range where guessed steps are not good enough.
+    # Above 4,096 chunk sizes are packer-controlled and the stepped
+    # grid has covered them in practice (one +0.46 s miss ever); the
+    # generator's full list up to the budget would multiply warm-boot
+    # compute ~20x for that residual, so the steps stay.
+    coarse = sorted({m for m in range(4096, 32769, 1024)}
+                    | {m for m in range(32768, budget + 1, 2048)}
+                    | {budget})
+    fallback_small = list(range(64, 4097, 256))
+
+    def small_sizes(lin):
+        try:
+            from vllm.model_executor.warmup.deep_gemm_warmup import (
+                _generate_optimal_warmup_m_values)
+            return _generate_optimal_warmup_m_values(
+                4096, lin.weight.shape[0],
+                torch.device("cuda"))
+        except Exception:            # noqa: BLE001  version drift
+            return fallback_small
+    work = [(m, lin) for lin in linears
+            for m in small_sizes(lin) + coarse]
     try:
         from tqdm import tqdm
         work = tqdm(work, desc="quail kernel warmup", unit="gemm")
