@@ -133,13 +133,14 @@ committed as `results/barrier_smoke.json`; the teed log is
 
 ## Tests
 
-`uv run pytest tests/ -q` from `quail/`: 180 passed. New coverage:
+`uv run pytest tests/ -q` from `quail/`: 181 passed. New coverage:
 the joint search splitting a chain into groups when the long side
 anchors and keeping one group when the shared table is longest, a
 three-join chain planning two groups and one barrier, forced-anchor
 remarks, `pick_runtime_anchor` cost and chunk-fit behavior, the
 barrier's thinning (single stage and intersection across stages),
-`gate_group`, `stage_for_anchor`, the re-shard of an anchor without
-filter shards, `derive_plan_nodes`, and end-to-end recombination
-across a barrier checked against the shared-anchor chain's expected
-triples.
+`gate_group`, `stage_for_anchor`, the re-shard of an anchor with no
+filter round (both with no shard entry at all and with a scan shard
+present that must be ignored), `derive_plan_nodes`, and end-to-end
+recombination across a barrier checked against the shared-anchor
+chain's expected triples.

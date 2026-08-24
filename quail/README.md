@@ -1,8 +1,8 @@
 # Quail
 
 A query engine for AI_FILTER and AI_JOIN over document collections.
-Filter queries and joins only. The first model is Qwen3 4B fp8, and
-workers run on H100 GPUs through Modal.
+Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
+32B fp8, one H100 per model copy, and workers run through Modal.
 
 ## Layout
 
@@ -20,8 +20,13 @@ workers run on H100 GPUs through Modal.
 - `quail/executor/` is the packed executor: chunk packing, admission,
   the paged KV arena, attention kernels, the overlapped loop, and
   weight loading. The GPU parts run only inside the Modal image.
-- `tests/` has CPU tests. `tests/gpu/` has the milestone 1 Modal
-  cells, which cost GPU time and run only when invoked explicitly.
+- `quail/runtime/` is the run side: the session (plan, payload,
+  recombination), the multi-GPU coordinator, the Modal worker, and
+  the calibrate entry.
+- `quail/bench/` has the QUAIL-B benchmark queries.
+- `tests/` has CPU tests. `tests/gpu/` has the Modal GPU cells -
+  milestone gates, smokes, and benchmarks - which cost GPU time and
+  run only when invoked explicitly.
 
 ## Setup and tests
 
@@ -37,8 +42,9 @@ GPU cells (Modal, H100). Tee output to a file per house rule:
 uv run modal run tests/gpu/milestone1.py::run_probe 2>&1 | tee results/m1_probe.log
 ```
 
-Milestone 1 results are in `results/` (JSON and teed logs) and on the
-quail-results Modal volume under `m1/`.
+Committed result summaries (the JSON files reports cite) are in
+`results/`; raw per-item run records live on the `quail-results`
+Modal volume. Teed logs stay local and are not committed.
 
 ## Calibration
 
