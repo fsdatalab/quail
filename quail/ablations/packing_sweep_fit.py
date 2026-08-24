@@ -1,0 +1,241 @@
+"""Fit the cost-model constants from packing-sweep records (issue #25).
+
+CPU only. Reads the raw per-chunk records the packing_sweep cell wrote
+to the quail-results volume (pull them first, e.g.
+`modal volume get quail-results ablations/packing_sweep_<model>_<tag>.json .`)
+and writes the aggregated summary the report and plot script read:
+results/packing_sweep.json. Raw records are never committed.
+
+The model, in the calibrate convention (the causal /2 is absorbed in
+the fitted coefficient, matching the a2 the length sweep fits):
+
+    gpu_seconds(chunk) = a * T + a2c * Sc + a2x * Sx
+
+    T    fresh tokens in the chunk
+    Sc   sum over causal segments of n * L: a segment's tokens attend
+         ~L/2 of their own segment (documents+question in filters,
+         anchor prefixes and the suffix's own tokens in joins)
+    Sx   sum over join suffixes of n * (anchor + frame): every suffix
+         token reads the WHOLE kept anchor context, no /2
+
+Filter chunks have Sx = 0, so the filter chunks alone pin (a, a2c) -
+the two constants the calibration files carry. Join chunks then test
+whether a2x is just the /2 bookkeeping (a2x = 2 * a2c) or the paged
+cross read costs more per context token.
+
+Usage, from quail/:
+
+    uv run python ablations/packing_sweep_fit.py \
+        <packing_sweep_*.json ...> --out results/packing_sweep.json
+"""
+
+import argparse
+import json
+from collections import defaultdict
+
+# The constants that were loaded before this sweep, for the
+# prediction-vs-measured comparison in the report. 4B: the old
+# exploration's anchor (custom-kernel ladder rung + old alpha sweep).
+# 32B: the 2026-08-20 length-sweep fit, measured before the
+# attention-path assignment and the 08-22 bug-fix rounds.
+OLD = {
+    "qwen3-4b-fp8": (8.261391217315875e-06, 4.933635085554017e-10),
+    "qwen3-32b-fp8": (5.66366321319351e-05, 1.528474073628451e-09),
+}
+N_BINS = 12
+
+
+def chunk_points(rec, qid):
+    """Per-chunk (T, Sc, Sx, suffixes, gpu_s) for one query."""
+    q = rec["queries"][qid]
+    out = []
+    if "body_tokens" in q:
+        body, q0 = q["body_tokens"], q["q_tokens"]
+        for ch in q["chunks"]:
+            T = Sc = 0.0
+            for doc, stage, fresh in ch["pieces"]:
+                n = body[doc] + q0
+                T += n
+                Sc += n * n
+            assert T == ch["tokens"], (qid, T, ch["tokens"])
+            out.append(dict(T=T, Sc=Sc, Sx=0.0, suffixes=0,
+                            gpu_s=ch["gpu_ms"] / 1e3))
+    else:
+        pre, suf, fr = (q["prefix_tokens"], q["suffix_tokens"],
+                        q["frame_tokens"])
+        for ch in q["chunks"]:
+            T = Sc = Sx = 0.0
+            n_suf = 0
+            for a, start, end, carried in ch["pieces"]:
+                h0 = pre[a]
+                if carried:
+                    T += h0
+                    Sc += h0 * h0
+                if start == 0 and end > start:     # frame entry
+                    T += fr
+                    Sx += fr * h0
+                    Sc += fr * fr
+                for k in range(start, end):
+                    n = suf[k]
+                    T += n
+                    Sc += n * n
+                    Sx += n * (h0 + fr)
+                n_suf += end - start
+            assert T == ch["tokens"], (qid, T, ch["tokens"])
+            out.append(dict(T=T, Sc=Sc, Sx=Sx, suffixes=n_suf,
+                            gpu_s=ch["gpu_ms"] / 1e3))
+    return out
+
+
+def lstsq(ys, cols):
+    """Ordinary least squares via normal equations (2-4 columns)."""
+    k = len(cols[0])
+    ata = [[sum(c[i] * c[j] for c in cols) for j in range(k)]
+           for i in range(k)]
+    atb = [sum(c[i] * y for c, y in zip(cols, ys)) for i in range(k)]
+    for i in range(k):
+        for j in range(i + 1, k):
+            f = ata[j][i] / ata[i][i]
+            for m in range(i, k):
+                ata[j][m] -= f * ata[i][m]
+            atb[j] -= f * atb[i]
+    x = [0.0] * k
+    for i in reversed(range(k)):
+        x[i] = (atb[i] - sum(ata[i][j] * x[j]
+                             for j in range(i + 1, k))) / ata[i][i]
+    return x
+
+
+def fit(points, cols_of):
+    ys = [p["gpu_s"] for p in points]
+    cols = [cols_of(p) for p in points]
+    x = lstsq(ys, cols)
+    pred = [sum(ci * xi for ci, xi in zip(c, x)) for c in cols]
+    ss_res = sum((y - p) ** 2 for y, p in zip(ys, pred))
+    mean = sum(ys) / len(ys)
+    ss_tot = sum((y - mean) ** 2 for y in ys) or 1e-12
+    return x, 1 - ss_res / ss_tot
+
+
+def bins(points, n_bins=N_BINS):
+    """Bin chunks by mean attended context per token, x = (Sc/2+Sx)/T.
+    Committed in place of per-chunk records (house rule: aggregates
+    only). Each bin: mean x, mean us/token, chunk count, token sum."""
+    pts = sorted(points, key=lambda p: (p["Sc"] / 2 + p["Sx"]) / p["T"])
+    size = max(1, -(-len(pts) // n_bins))
+    out = []
+    for i in range(0, len(pts), size):
+        grp = pts[i:i + size]
+        tok = sum(p["T"] for p in grp)
+        out.append(dict(
+            x_mean_ctx=round(sum((p["Sc"] / 2 + p["Sx"]) / p["T"]
+                                 for p in grp) / len(grp), 1),
+            us_per_token=round(sum(p["gpu_s"] for p in grp)
+                               / tok * 1e6, 3),
+            chunks=len(grp), tokens=tok))
+    return out
+
+
+def analyze(records):
+    """records: list of raw record dicts for ONE model (full + reps).
+    Returns the summary block for that model."""
+    model = records[0]["model"]
+    a_old, a2_old = OLD[model]
+    full = next(r for r in records if r["tag"] == "full")
+    pts = {qid: chunk_points(full, qid) for qid in full["queries"]}
+
+    queries = {}
+    for qid, q in full["queries"].items():
+        p = pts[qid]
+        T = sum(c["T"] for c in p)
+        pred_old = sum(a_old * c["T"] + a2_old * (c["Sc"] + c["Sx"])
+                       for c in p)
+        queries[qid] = dict(
+            kind=q["summary"]["kind"], chunks=q["summary"]["chunks"],
+            fresh_tokens=q["summary"]["fresh_tokens"],
+            wall_s=q["summary"]["wall_s"], gpu_s=q["summary"]["gpu_s"],
+            us_per_token_wall=q["summary"]["us_per_token_wall"],
+            us_per_token_gpu=q["summary"]["us_per_token_gpu"],
+            predicted_us_old=round(pred_old / T * 1e6, 3),
+            chunk_bins=bins(p))
+
+    filt = [p for qid in pts if queries[qid]["kind"] == "filter"
+            for p in pts[qid]]
+    join = [p for qid in pts if queries[qid]["kind"] == "join"
+            for p in pts[qid]]
+    (a, a2c), r2f = fit(filt, lambda p: [p["T"], p["Sc"]])
+    fits = dict(filter=dict(a_s_per_token=a, a2c_s_per_token2=a2c,
+                            r2=round(r2f, 5), n_chunks=len(filt)))
+    if join:
+        resid = [p["gpu_s"] - (a * p["T"] + a2c * p["Sc"])
+                 for p in join]
+        a2x = (sum(r * p["Sx"] for r, p in zip(resid, join))
+               / sum(p["Sx"] ** 2 for p in join))
+        leftover = {}
+        for qid in pts:
+            if queries[qid]["kind"] != "join":
+                continue
+            lo = sum(p["gpu_s"] - (a * p["T"] + a2c * p["Sc"]
+                                   + a2x * p["Sx"]) for p in pts[qid])
+            leftover[qid] = round(
+                lo / sum(p["suffixes"] for p in pts[qid]) * 1e6, 1)
+        x4, r24 = fit(filt + join,
+                      lambda p: [p["T"], p["Sc"], p["Sx"],
+                                 p["suffixes"]])
+        fits["join"] = dict(
+            a2x_s_per_token2=a2x, a2x_over_a2c=round(a2x / a2c, 2),
+            leftover_us_per_suffix=leftover,
+            joint4=dict(a_s_per_token=x4[0], a2c_s_per_token2=x4[1],
+                        a2x_s_per_token2=x4[2],
+                        per_suffix_s=x4[3], r2=round(r24, 5)))
+
+    containers = defaultdict(dict)
+    for r in records:
+        for qid, q in r["queries"].items():
+            containers[qid][r["tag"]] = q["summary"]["us_per_token_gpu"]
+    spread = {}
+    for qid, by_tag in containers.items():
+        vals = sorted(by_tag.values())
+        if len(vals) >= 2:
+            spread[qid] = dict(
+                by_container=by_tag,
+                band_pct=round((vals[-1] / vals[0] - 1) * 100, 1))
+    return dict(queries=queries, fits=fits, containers=spread,
+                budget=full["budget"], boot_s=full["boot_s"])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("records", nargs="+")
+    ap.add_argument("--out", default="results/packing_sweep.json")
+    args = ap.parse_args()
+    by_model = defaultdict(list)
+    raw_paths = defaultdict(list)
+    for path in args.records:
+        rec = json.load(open(path))
+        by_model[rec["model"]].append(rec)
+        raw_paths[rec["model"]].append(
+            f"/results/ablations/packing_sweep_{rec['model']}_"
+            f"{rec['tag']}.json")
+    out = dict(models={m: analyze(rs) for m, rs in by_model.items()},
+               loaded_before={m: dict(a_s_per_token=a,
+                                      a2_s_per_token2=a2)
+                              for m, (a, a2) in OLD.items()},
+               raw_volume_paths=dict(raw_paths))
+    with open(args.out, "w") as f:
+        json.dump(out, f, indent=1)
+        f.write("\n")
+    print(f"wrote {args.out}")
+    for m, block in out["models"].items():
+        f = block["fits"]["filter"]
+        print(f"[{m}] filter a={f['a_s_per_token'] * 1e6:.3f} us/tok "
+              f"a2c={f['a2c_s_per_token2']:.3e} R2={f['r2']}")
+        if "join" in block["fits"]:
+            j = block["fits"]["join"]
+            print(f"[{m}] join a2x={j['a2x_s_per_token2']:.3e} "
+                  f"(= {j['a2x_over_a2c']} x a2c) leftover/suffix "
+                  f"{j['leftover_us_per_suffix']}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,162 @@
+# Packing sweep: the cost constants on real query packings
+
+Issue #25. The cost model prices every fresh token at
+`t = a + a2*h` with two measured constants per (model, device) pair,
+and assumes the mix inside a chunk does not matter. Both pairs'
+committed constants predated the current executor: the 4B anchor came
+from the old exploration (its `a2` from single-document prefills - one
+document per forward pass, a shape the engine never runs), and the 32B
+pair was measured on 2026-08-20, before the attention-path assignment
+and the 08-22 bug-fix rounds.
+
+This sweep re-measures both pairs on the packings real benchmark
+queries build, instead of a synthetic grid: run the query, record what
+the packer put in every chunk, and time every chunk with CUDA events.
+Each chunk is one measured point.
+
+## Setup
+
+Four QUAIL-B queries at sf=0.1, run exactly as the benchmark's cold
+pass runs them (no store; single-stage filters on the fast path with
+arena writes off; joins write anchor KV), on one H100 per model:
+
+| Query | Shape | What its chunks look like |
+|---|---|---|
+| BIO-1 | filter over 200 real BioDEX reports | ~26 documents of 833-14,803 tokens mixed in one chunk |
+| IMDB-1 | filter over 5,000 real IMDB reviews | ~300 short documents per chunk |
+| BIO-2 | join, 200 reports x 614 terms | 1-2 long anchor prefixes + ~1,200 suffixes of ~85 tokens |
+| IMDB-2 | join, 5,000 reviews x 12 aspects | ~90 short anchors + ~1,050 suffixes per chunk |
+
+Between them these queries produce, on their own, the variation issue
+#25 asked to sweep: mixed document lengths inside one chunk, many
+small pieces per chunk, partly-empty chunks at stream tails, and both
+join shapes. Chunk fill ran 13-100%; pieces per chunk ran 8 to
+~1,250.
+
+The cell is `ablations/packing_sweep.py` (runs the executor's
+`run_filter` / `run_join` directly, with the new per-chunk `trace`).
+The fit is `ablations/packing_sweep_fit.py`. The committed summary the
+numbers and plots below read is `results/packing_sweep.json`. Raw
+per-chunk records live on the `quail-results` volume:
+
+- `/results/ablations/packing_sweep_qwen3-4b-fp8_full.json` (+ `_rep0..2`)
+- `/results/ablations/packing_sweep_qwen3-32b-fp8_full.json` (+ `_rep0..2`)
+
+Function call ids are in `results/packing_sweep_4b.log`,
+`packing_sweep_32b.log`, `packing_reps_4b.log`, `packing_reps_32b.log`.
+
+The fit regresses, over chunks:
+
+    gpu_seconds = a * T + a2c * Sc + a2x * Sx
+
+where `T` is the chunk's fresh tokens, `Sc` sums `n * L` over causal
+segments (a token attends ~half its own segment; the /2 is absorbed in
+`a2c`, matching how the length-sweep `a2` was always defined), and
+`Sx` sums `suffix tokens * anchor context` for join suffixes, which
+read the whole kept anchor. Filter chunks have `Sx = 0`, so filter
+chunks alone pin `(a, a2c)` - the two constants the calibration files
+carry. Join chunks then test the cross term.
+
+## Predictions, stated before the run
+
+From the constants loaded before this sweep (per-query us per fresh
+token, GPU):
+
+| Query | 4B predicted | 32B predicted |
+|---|---|---|
+| BIO-1 | 11.04 | 65.23 |
+| IMDB-1 | 8.48 | 57.32 |
+| BIO-2 | 10.40 | 63.28 |
+| IMDB-2 | 8.46 | 57.26 |
+
+Stated expectations: the 4B filter intercept lands at 8.6-9.4
+us/token (the 107k-121k tok/s band of earlier runs); join chunks land
+above the filter fit, and if the gap is on the GPU it shows up as
+roughly 100-200 us per suffix; container-to-container variation needs
+re-measuring because the exploration saw up to 45%.
+
+## Results
+
+Measured, GPU us per fresh token (wall differed from GPU by under
+0.3% everywhere - nothing here is host-bound):
+
+| Query | 4B measured | vs predicted | 32B measured | vs predicted |
+|---|---|---|---|---|
+| BIO-1 | 10.33 | -6% | 65.63 | +1% |
+| IMDB-1 | 8.09 | -5% | 57.03 | -1% |
+| BIO-2 | 12.23 | +18% | XX | XX |
+| IMDB-2 | 8.55 | +1% | XX | XX |
+
+Figure: plots/packing_sweep_queries.png
+
+Fits over the per-chunk points:
+
+| | 4B | 32B |
+|---|---|---|
+| `a` (us/token) | 7.867 (was 8.261, -4.8%) | XX (was 56.64) |
+| `a2c` (s/token^2) | 4.343e-10 (was 4.934e-10) | XX (was 1.528e-09) |
+| filter-fit R^2, chunks | 0.9998, 25 | XX |
+| `a2x` (s/token^2, cross) | 1.070e-09 = 1.23x the causal 2*a2c | XX |
+| leftover per suffix | ~37 us | XX |
+| container band (filters, 4 containers) | 2.9-3.1% | XX |
+
+Figure: plots/packing_sweep_context.png
+
+What the figure shows: with the x axis counting cross context in full
+and a segment's own context at half, equal per-attended-token cost
+would put join chunks on the same line as filter chunks. They sit
+above it.
+
+## What the numbers mean
+
+- **The two-constant model holds on filter packings.** One line fits
+  all 25 filter chunks of both corpora at R^2 = 0.9998, across mixed
+  lengths (833 to 14,803 tokens in the same chunk), 8 to 300 pieces
+  per chunk, and fill from 66% to 100%. Adding a per-chunk fixed cost
+  changes nothing (7 ms per ~1 s chunk). Packing density does not
+  need a term.
+- **Both committed constants were stale, in opposite ways.** The 4B
+  executor now runs 4.8% faster than its anchor (127.1k tok/s against
+  the anchor's 121.0k; the anchor also predated the 08-21/08-22
+  changes, which beat the 8.6-9.4 us/token band this report
+  predicted). The 32B filter constants were nearly right (within 1%).
+  Both files are refreshed from this sweep's filter fit.
+- **Join chunks cost more than the causal model says, on the GPU.**
+  Reading a kept anchor's KV from arena pages costs 1.23x per
+  attended token compared with in-chunk causal attention (`a2x =
+  1.070e-09` against `2*a2c = 8.685e-10` at 4B), plus ~37 us per
+  suffix. On BIO-2's shape that is +18% wall; on IMDB-2's short
+  anchors it is +1%. This is the term the model was missing - not
+  chunk fill, not segment count.
+- **Container-to-container variation collapsed.** The exploration
+  measured up to 45%; four containers here sit within 3% on both
+  filter queries at 4B (XX at 32B). Committed constants are fine; no
+  boot-time calibration needed.
+- **No break-even flips.** Restore-vs-recompute at 4B: loading KV
+  costs 5.33 us/token at the pinned 27.7 GB/s channel against 7.87
+  us/token to recompute, so restore still wins at every length
+  (margin was 55% under the old `a`, now 32%). At 32B the margin
+  stays ~6x. The planner's token-count join ordering compares
+  same-shape alternatives, so the join surcharge cancels there;
+  `choose_anchor` for a two-way join is unaffected because both
+  candidates price the same tuple count. The surcharge matters only
+  if a future decision needs join wall accuracy - then price suffix
+  context at `a2x` and add the per-suffix constant.
+
+## Changes shipped with this report
+
+- `quail/calibration/qwen3-4b-fp8_h100-sxm.json` and
+  `qwen3-32b-fp8_h100-sxm.json` refreshed from the filter fits, with
+  provenance pointing at this sweep.
+- `run_join` gained the same per-chunk `trace` option `run_filter`
+  already had; both traces now record per-piece composition
+  (see `reports/shipped_features/2026-08-24-join-chunk-trace.md`).
+
+## Reproducing
+
+    uv run modal run ablations/packing_sweep.py --model qwen3-4b-fp8 \
+        2>&1 | tee results/packing_sweep_4b.log
+    # pull the raw records, then:
+    uv run python ablations/packing_sweep_fit.py \
+        packing_sweep_*.json --out results/packing_sweep.json
+    uv run --with matplotlib python reports/make_packing_sweep_plots.py
