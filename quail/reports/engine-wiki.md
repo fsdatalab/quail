@@ -93,19 +93,29 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    Scan, SemanticFilter, SemanticJoin, and Project operators).
 4. The `Session` tokenizes each scanned column (cached per session)
    and calls the planner with the token counts.
-5. The planner produces a `PhysicalPlan`: stage order, anchor
-   choices, chunk budget, admission budget, sharding, and a store
-   length threshold. KV is always bf16. No wall-time prediction is
-   produced.
-6. The session builds a payload (token id lists and planned settings)
-   and ships it to a Modal worker over RPC.
-7. The worker runs the packed executor on the GPU: filter chains,
-   exists/anti gates, and the one full join (a single cross-product
-   stage, however many tables it spans).
+5. The planner produces a `PhysicalPlan`: a dataflow graph of nodes
+   (DocScan, FilterChain, JoinGroup, Barrier, Recombine, Sink) whose
+   edges carry either a table's live document ids or one stage's
+   passing pairs - plus the chunk budget, admission budget,
+   sharding, and a store length threshold. Stage order and anchors
+   come from one joint search. KV is always bf16. No wall-time
+   prediction is produced.
+6. The session builds a payload (token id lists, planned settings,
+   and the plan's node graph) and ships it to a Modal worker over
+   RPC.
+7. The worker executes the graph on the GPU: filter chains,
+   exists/anti gates, and the full join stages (each one a
+   cross-product stage, however many tables it spans). Consecutive
+   full stages sharing an anchor run as one gated group over the
+   anchor's kept KV; a Barrier node between groups thins the live
+   sets to the surviving pairs' documents and, on several GPUs,
+   re-shards the next anchor over the measured live set.
 8. The worker returns raw answer rows. The session assembles output
-   tuples from the full join's TRUE rows (each member checked against
-   its table's final survivor set), applies the projection, and
-   returns a `Result`.
+   tuples by equi-joining the full stages' TRUE rows on shared
+   document ids (each stage keyed on its own anchor), no model
+   calls, each member checked against its table's final survivor
+   set. It applies LIMIT to these final tuples, then the projection,
+   and returns a `Result`.
 
 ## 2. Query compilation
 
@@ -129,9 +139,10 @@ There are four operators, defined in `logical.py`:
 - **SemanticJoin**: one true/false predicate over a whole tuple of
   documents, one per table - the cross product of its tables
   filtered by a single prompt that holds every document at once
-  (the BigQuery/Snowflake AI-join shape; never a chain of pairwise
-  stages). A query has at most one `full` join, plus any number of
-  gates:
+  (the BigQuery/Snowflake AI-join shape). A query may hold several
+  `full` joins - each its own predicate and stage, composed by id
+  matching at assembly (issue #38); stages may anchor on different
+  tables, split into groups by barriers - plus any number of gates:
   - `full`: produce every matching tuple.
   - `exists`: keep outer documents that match at least one inner
     document (a semi-join; two tables).
@@ -210,13 +221,24 @@ in the Snowflake dialect. `AI_FILTER(PROMPT(...))` appears in WHERE
 conjuncts; join predicates appear in `JOIN ... ON` clauses; `EXISTS`
 and `NOT EXISTS` subqueries map to exists and anti semantics.
 
+Each multi-table `AI_FILTER(PROMPT(...))` - on a JOIN's ON or as a
+WHERE term - is one join predicate; a query may have several.
+Coverage rule: every JOINed table must appear in at least one join
+predicate, and the predicates' tables must form one connected graph
+with the FROM table.
+
 The front end rejects every relational operator except projection
 and LIMIT: GROUP BY, ORDER BY, DISTINCT, HAVING, UNION, INTERSECT,
 EXCEPT, window functions, OR between AI predicates, and subqueries
-other than the EXISTS form. LIMIT N stops the filter loop once N
-survivors are found (early termination); the builder equivalent is
-`.limit(n)` before `.select()`. The rejection list is explicit
-(`compile.py:22-33`), so new SQL surface cannot enter silently.
+other than the EXISTS form. LIMIT N caps the output rows. For a
+filter-only query that means the filter loop stops once N survivors
+are found (early termination); for a join query the filter round
+gets no limit - one document can appear in zero or many output rows
+(#39) - and `_assemble` truncates the final tuples instead
+(`filter_round_limit` in `runtime/coordinator.py` decides). The
+builder equivalent is `.limit(n)` before `.select()`. The rejection
+list is explicit (`compile.py:22-33`), so new SQL surface cannot
+enter silently.
 
 ### Builder API
 
@@ -277,23 +299,34 @@ documents it kills (1 minus selectivity). A selectivity of 1 (kills
 nothing) goes last. When any filter lacks a selectivity, `as_written`
 is used.
 
-**Join order** (`order_joins` in `decide.py`): when several join
-specs exist (exists/anti gates plus at most one full join) and all
-carry selectivities, the planner enumerates the permutations
-(typically 2 to 4 specs, so the enumeration is small) and picks the
-one with the smallest survivor-thinned tuple-token total. Every
-spec is self-contained (the cross product over its own tables), so
-every order runs; order changes cost, never results. The survivor
-thinning uses `n * (1 - (1-s)^partner_tuples)` for the expected
-documents in some passing tuple (`_surviving_docs`).
+**Join order and anchors, one search** (`plan_joins` in
+`decide.py`): stage order and per-stage anchors are decided
+together, because they interact - anchors set what an order is
+worth, and order sets which stages can share an anchor's KV (issue
+#38). The planner enumerates every (order, anchor) sequence (only
+the written order under `as_written`; a gate's anchor is fixed to
+its outer table, a forced anchor is honored with a remark when it
+prices worse) and walks each one's cost with live counts:
 
-**Anchor selection** (`choose_anchor` in `decide.py`): for each
-join, the planner picks the table whose tuple-token total is
-smallest when the other tables stream. In practice, the side with
-the most document tokens anchors (anchor tokens are paid once per
-document, partner tokens once per tuple). A user override wins,
-with a remark when it prices worse; an exists/anti gate always
-anchors on the outer table, because the gate applies to it.
+- a stage opening a group pays the anchor's KV once per live anchor
+  document (preamble + document + naming line), plus a fixed
+  re-shard overhead when it follows a group on a different anchor
+  (`RESHARD_OVERHEAD_TOKENS`, 0 until measured - the fresh-KV term
+  is the real cost);
+- a stage continuing a same-anchor run of full stages pays only its
+  naming line (the frame rewrite into kept KV);
+- every stage pays its pair stream: each partner document behind its
+  block label, plus the question, once per tuple;
+- after each stage the live counts thin by
+  `n * (1 - (1-s)^partner_tuples)` (`_surviving_docs`).
+
+The cheapest sequence wins; its anchor switches become groups and
+Barrier nodes at emission. Every sequence runs (each spec is the
+cross product over its own tables), so order and anchors change
+cost, never results. At run time, `pick_runtime_anchor` re-picks a
+one-stage group's anchor from the measured live counts (issue #38,
+step 4.1) - the same arithmetic over the payload's token id lists,
+restricted to anchors whose worst-case tuple fits the chunk budget.
 
 **Sharding** (`balanced_shards` in `decide.py`): greedy balance by
 token count across workers. Filters split documents; joins split
@@ -418,8 +451,8 @@ single forward pass, sharing KV across them through a paged arena.
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
-| `order_joins` | `decide.py` | Order the join specs (gates + the one full join) by total tuple tokens |
-| `choose_anchor` | `decide.py` | Pick the cheapest anchor table for a join |
+| `plan_joins` | `decide.py` | The joint (order x anchor) search: cost every sequence, keep the cheapest |
+| `pick_runtime_anchor` | `decide.py` | Re-pick a one-stage group's anchor at a barrier, from measured live counts |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
 | `access_for_scan` | `decide.py` | Decide read vs restore for a scanned corpus |
 | `store_length_threshold` | `decide.py` | Length cutoff for which documents to store |
@@ -1074,59 +1107,78 @@ own CUDA context, arena, and store slice. The parent process (inside
 the same Modal container) sends payloads over pipes, so there is no
 network hop between rounds.
 
-### Two rounds per query
+### Rounds follow the plan's node graph
 
-**Round 1 (filters)**: every worker filters its shard of every alias.
+**The filter round**: every worker filters its shard of every alias.
 Sharding is by token count (the planner's `balanced_shards`). After
 this round, the parent merges survivors.
 
-**Round 2 (joins)**: anchors follow their filter shard (their KV is
-on that GPU). Every worker sees every surviving partner (replicated).
-The partner index space is the same on every worker, so the merged
-answer rows are consistent.
+**One join round per JoinGroup node**: anchors follow the alias's
+filter shard when one exists (their KV may be in that GPU's store
+slice); an anchor with no filter shard - it was a partner before the
+barrier - gets fresh balanced shards over its live documents. That
+re-shard moves no KV: partners never owned any, so the parent ships
+token ids (which every round does anyway) and each GPU computes its
+new anchor slice's KV. Every worker sees every surviving partner
+(replicated), so the partner index space is the same on every worker
+and the merged answer rows are consistent.
+
+**Barrier nodes between groups**: the parent thins every table the
+stages ahead touch to the documents in some surviving pair of every
+finished full stage (`thin_survivors`, issue #38 step 4.6 - cost
+only, results are enforced at recombination), and a one-stage group
+with no forced anchor re-picks its anchor from the measured live
+counts (`pick_runtime_anchor`).
 
 ### Sharding contract
 
 Filters split documents. Joins split anchors. Every pair belongs to
-exactly one anchor, so gating, dedup, and the next stage's pair list
-stay local to the GPU holding the anchor. All join stages must share
-one anchor alias (the same-anchor chain and star shapes); a stage
-anchored on a different alias would need a re-shard between stages,
-which is not built yet.
+exactly one anchor, so gating and each anchor's tuple stream stay
+local to the GPU holding the anchor within a group; groups anchored
+on different tables run as separate rounds with the barrier's
+re-shard between them.
 
 ### Pseudocode: multi-GPU coordinator
 
 ```
-# round 1: filters
+# the filter round
 for each worker w:
     build sub-payload with worker w's shard of each filtered alias
     send to child process w
 collect all filter answers
 merge: union the per-alias answer dicts and survivor lists
 
-# between rounds: compute survivors per alias
-for each alias with filters:
-    survivors[alias] = documents that passed all filter stages
-
-# round 2: joins (if any)
-for each worker w:
-    anchors = documents in worker w's shard that survived filters
-    partners = ALL surviving partner documents (replicated)
-    send (anchors, partners, join specs) to child process w
-collect all join answers
-merge: concatenate per-stage answer rows
-    (anchors are disjoint across workers;
-     partner indices are the same on every worker)
+# then walk the plan's join nodes in order
+for each node:
+    if node is a Barrier:
+        thin survivors: keep only documents in a surviving pair of
+        every finished full stage that touches their table
+        continue
+    # node is a JoinGroup
+    if the group has one free-anchor full stage:
+        re-pick its anchor from measured live token counts
+    for each worker w:
+        anchors = live anchor docs in w's shard (filter shard when
+                  one exists; fresh balanced shards otherwise)
+        partners = ALL live partner documents (replicated)
+        send (anchors, partners, the group's stages) to child w
+    collect, merge (anchors disjoint, partner indices identical)
+    gate: the anchor's survivors from the group's last stage
 ```
 
 ### Key functions: coordinator and worker
 
 | Function | File | What it does |
 |---|---|---|
-| `filter_round_payloads` | `coordinator.py:25` | Build per-worker filter sub-payloads |
-| `merge_filter_round` | `coordinator.py:53` | Merge workers' filter answers |
-| `join_round_payloads` | `coordinator.py:73` | Build per-worker join sub-payloads |
-| `merge_join_round` | `coordinator.py:120` | Concatenate workers' join answer rows |
+| `filter_round_limit` | `coordinator.py:25` | The filter round's limit: None when the payload has joins (#39) |
+| `filter_round_payloads` | `coordinator.py` | Build per-worker filter sub-payloads |
+| `merge_filter_round` | `coordinator.py` | Merge workers' filter answers |
+| `join_group_payloads` | `coordinator.py` | Build per-worker sub-payloads for one anchor group's round (re-shards an anchor with no filter shard) |
+| `merge_join_round` | `coordinator.py` | Concatenate workers' join answer rows |
+| `stage_for_anchor` | `coordinator.py` | Materialize a stage spec for the round's chosen anchor |
+| `thin_survivors` | `coordinator.py` | The barrier's step-4.6 thinning from finished stages' pairs |
+| `gate_group` | `coordinator.py` | Anchor survivors after one group (full/exists/anti keep rules) |
+| `derive_plan_nodes` | `coordinator.py` | Reconstruct group/barrier nodes for hand-built payloads |
 | `execute` | `worker.py:64` | Single-GPU Modal worker entry point |
 | `execute_2/4/8` | `worker.py:495-519` | Multi-GPU Modal worker entry points |
 | `_execute_single` | `worker.py:144` | Single-GPU execution core (shared by all paths) |

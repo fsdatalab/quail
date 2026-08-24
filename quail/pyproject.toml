@@ -11,7 +11,10 @@ dependencies = [
     "huggingface-hub>=0.26",
     "pyarrow>=17.0",
     "numpy>=2.0",
-    "modal>=1.0",
+    # api-proxy-support pulls python-socks, which the Modal client
+    # needs to connect from behind an HTTPS proxy (e.g. remote
+    # Claude Code containers); without it, runs fail at connect
+    "modal[api-proxy-support]>=1.0",
     "bpe-qwen>=0.1.5",
     "datasets>=5.0.1",
 ]

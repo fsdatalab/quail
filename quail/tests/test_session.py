@@ -278,7 +278,7 @@ def test_store_payload_and_warm_tracking(sess):
     sess.sql(sql).run(_execute=with_store)
     q2 = sess.sql(sql)
     plan = q2.plan()
-    scan = next(op for op in plan.operators if op["op"] == "DocScan")
+    scan = plan.nodes_by_op("DocScan")[0]
     assert scan["access"] == "restore"
 
 
@@ -333,12 +333,16 @@ def test_payload_carries_true_false_and_join_spec(sess):
     j = payload["joins"][0]
     assert "pre" not in j
     assert j["anchor"] == "r" and j["partners"] == ["p"]
-    # the naming line goes into the anchor's kept KV once per anchor;
-    # each partner's block label (its own placeholder marker) and the
-    # question (the raw template, markers kept - never filled in)
-    # ride per tuple. r is placeholder 0, p is placeholder 1.
-    assert j["frame"] == fake_tok(join_anchor_note(0))
-    assert j["labels"] == {"p": fake_tok(join_label(1))}
+    assert j["aliases"] == ["r", "p"]
+    # naming lines and block labels ship for EVERY table, so a
+    # barrier-time anchor re-pick needs no re-tokenization; the round
+    # builder (stage_for_anchor) picks the chosen anchor's naming
+    # line as the frame and the partners' labels. r is placeholder 0,
+    # p is placeholder 1.
+    assert j["frames"] == {"r": fake_tok(join_anchor_note(0)),
+                           "p": fake_tok(join_anchor_note(1))}
+    assert j["labels"] == {"r": fake_tok(join_label(0)),
+                           "p": fake_tok(join_label(1))}
     assert j["tail"] == fake_tok(
         "\n\nEvaluate TRUE or FALSE for the following question: "
         "Does {0} match {1}? Answer.\nANSWER:")
@@ -426,6 +430,171 @@ def test_builder_limit_session(sess):
          .select("r.id"))
     res = q.run(_execute=make_executor(truth))
     assert len(res.rows) == 2
+
+
+def _register_tags(sess, tmp_path):
+    sess.register("tags", quail.DocumentProvider.from_parquet(
+        _parquet(tmp_path / "g.parquet", {
+            "id": [f"g{i}" for i in range(3)],
+            "tag": [f"tag {i}" for i in range(3)],
+        }), id_col="id"))
+
+
+def _chain_query(sess, limit=None):
+    """Two pairwise joins sharing p: ai(r, p), ai(p, g). Anchors are
+    forced onto p, the shared table, so both stages run as one group
+    whatever the cost model prefers - the shared-anchor shape these
+    tests exercise. The barrier shape has its own test below."""
+    q = (sess.docs("reviews").alias("r")
+         .ai_join(sess.docs("products").alias("p"),
+                  quail.prompt("m1 {0} {1}", quail.col("r.review"),
+                               quail.col("p.description")),
+                  selectivity=0.5, anchor="p")
+         .ai_join(sess.docs("tags").alias("g"),
+                  quail.prompt("m2 {0} {1}", quail.col("p.description"),
+                               quail.col("g.tag")),
+                  selectivity=0.5, anchor="p"))
+    if limit is not None:
+        q = q.limit(limit)
+    return q.select("r.id", "p.asin", "g.id")
+
+
+# p1 matches no review, so the gate drops it before stage 2
+J1 = lambda p, r: 1 if p != 1 and (p + r) % 3 == 0 else 0  # noqa: E731
+J2 = lambda p, g: 1 if (p + g) % 2 == 0 else 0             # noqa: E731
+
+CHAIN_EXPECT = sorted(
+    (f"r{r}", f"p{p}", f"g{g}")
+    for p in range(4) for r in range(6) for g in range(3)
+    if J1(p, r) and J2(p, g))
+
+
+def test_two_join_chain_recombination(sess, tmp_path):
+    _register_tags(sess, tmp_path)
+    seen = {}
+    join = {("p", "r"): J1, ("p", "g"): J2}
+    res = _chain_query(sess).run(
+        _execute=make_executor({}, join, seen=seen))
+    # both stages anchored on the shared table, one per payload entry
+    assert [j["anchor"] for j in seen["payload"]["joins"]] == \
+        ["p", "p"]
+    assert sorted(res.rows) == CHAIN_EXPECT
+    # p1 was gated after stage 1: stage 2 evaluated 3 anchors, not 4
+    jstages = [s for s in res.report["stages"] if s["op"] == "join"]
+    assert jstages[0]["tuples"] == 4 * 6
+    assert jstages[1]["tuples"] == 3 * 3
+
+
+def test_two_join_chain_matches_pack_assemble(sess, tmp_path):
+    # pack.assemble is the reference semantics for two stages sharing
+    # one anchor: each surviving p's matched r's crossed with its
+    # matched g's
+    from quail.executor.pack import assemble
+
+    _register_tags(sess, tmp_path)
+    join = {("p", "r"): J1, ("p", "g"): J2}
+    res = _chain_query(sess).run(_execute=make_executor({}, join))
+    s1, s2 = res.answer_rows["joins"]
+    ans1 = {s1["anchor_index"][a]: row for a, row in s1["rows"].items()}
+    ans2 = {s2["anchor_index"][a]: row for a, row in s2["rows"].items()}
+    got = sorted((int(r[1:]), int(p[1:]), int(g[1:]))
+                 for r, p, g in res.rows)
+    assert got == assemble(ans1, ans2)
+
+
+def test_gate_after_two_join_chain_filters_tuples(sess, tmp_path):
+    # an anti gate on g, written after both joins: its casualties
+    # must not appear in any output triple (survivor-set filtering
+    # applies to every stage's members)
+    _register_tags(sess, tmp_path)
+    q = (sess.docs("reviews").alias("r")
+         .ai_join(sess.docs("products").alias("p"),
+                  quail.prompt("m1 {0} {1}", quail.col("r.review"),
+                               quail.col("p.description")),
+                  anchor="p")
+         .ai_join(sess.docs("tags").alias("g"),
+                  quail.prompt("m2 {0} {1}", quail.col("p.description"),
+                               quail.col("g.tag")),
+                  anchor="p")
+         .ai_join(sess.docs("reviews").alias("x"),
+                  quail.prompt("m3 {0} {1}", quail.col("g.tag"),
+                               quail.col("x.review")),
+                  semantics="anti")
+         .select("r.id", "p.asin", "g.id"))
+    join = {("p", "r"): J1, ("p", "g"): J2,
+            ("g", "x"): lambda g, x: 1 if g == 0 else 0}
+    res = q.run(_execute=make_executor({}, join))
+    assert sorted(res.rows) == [t for t in CHAIN_EXPECT
+                                if t[2] != "g0"]
+
+
+def test_two_join_chain_limit_caps_final_triples(sess, tmp_path):
+    _register_tags(sess, tmp_path)
+    seen = {}
+    join = {("p", "r"): J1, ("p", "g"): J2}
+    res = _chain_query(sess, limit=3).run(
+        _execute=make_executor({}, join, seen=seen))
+    # no upstream cut: the cap applies to the final triples only
+    assert seen["payload"]["limit"] is None
+    assert len(res.rows) == 3
+    assert set(res.rows) <= set(CHAIN_EXPECT)
+    assert len(CHAIN_EXPECT) > 3
+
+
+def test_limit_join_payload_carries_no_filter_limit(sess):
+    # #39: with a join, the filter round must not stop at LIMIT
+    # survivors - the payload ships limit=None and _assemble caps the
+    # output rows
+    sql = """
+        SELECT r.id, p.asin FROM reviews r
+        JOIN products p
+          ON AI_FILTER(PROMPT('match {0} {1}', r.review,
+                              p.description), {'selectivity': 0.5})
+        WHERE AI_FILTER(PROMPT('q1: {0}', r.review),
+                        {'selectivity': 0.9})
+        LIMIT 2
+    """
+    truth = {"r": {"q1:": [1, 1, 1, 1, 1, 0]}}
+    # only r4 matches: a filter cut to the first 2 survivors would
+    # leave zero matching pairs; the correct answer is 2 of r4's 4
+    join = {("r", "p"): lambda a, p: 1 if a == 4 else 0}
+    seen = {}
+    q = sess.sql(sql)
+    assert q.plan().limit == 2
+    res = q.run(_execute=make_executor(truth, join, seen=seen))
+    assert seen["payload"]["limit"] is None
+    assert len(res.rows) == 2
+    assert all(r == "r4" for r, _ in res.rows)
+
+
+def test_chain_with_barrier_recombination(sess, tmp_path):
+    # stage 1 forced onto r, stage 2 forced onto g: two groups with a
+    # barrier between them. Recombination equi-joins the two pair
+    # sets on p - the alias the stages share - even though neither
+    # stage anchors on it.
+    _register_tags(sess, tmp_path)
+    q = (sess.docs("reviews").alias("r")
+         .ai_join(sess.docs("products").alias("p"),
+                  quail.prompt("m1 {0} {1}", quail.col("r.review"),
+                               quail.col("p.description")),
+                  selectivity=0.5, anchor="r")
+         .ai_join(sess.docs("tags").alias("g"),
+                  quail.prompt("m2 {0} {1}", quail.col("p.description"),
+                               quail.col("g.tag")),
+                  selectivity=0.5, anchor="g")
+         .select("r.id", "p.asin", "g.id"))
+    plan = q.plan()
+    kinds = [n["op"] for n in plan.nodes]
+    assert kinds.count("JoinGroup") == 2
+    assert kinds.count("Barrier") == 1
+    seen = {}
+    join = {("r", "p"): lambda r, p: J1(p, r),
+            ("g", "p"): lambda g, p: J2(p, g)}
+    res = q.run(_execute=make_executor({}, join, seen=seen))
+    assert [j["anchor"] for j in seen["payload"]["joins"]] == \
+        ["r", "g"]
+    # same pair semantics as the shared-anchor chain, same triples
+    assert sorted(res.rows) == CHAIN_EXPECT
 
 
 def test_gate_after_full_join_filters_partner_tuples(sess, tmp_path):

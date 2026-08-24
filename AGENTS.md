@@ -96,6 +96,18 @@ All experiment and feature reports live under `quail/reports/`.
 - `quail/reports/engine-wiki.md` is a living reference doc, not a
   per-PR report. Update it in place when the engine's design changes.
 
+# Issues and PR descriptions
+
+Include a figure whenever one carries the point better than text:
+
+- For measured numbers, embed the report's committed plot. Link the
+  image by its raw GitHub URL pinned to a commit
+  (`.../raw/<sha>/quail/reports/plots/<name>.png`) so it keeps
+  rendering as the branch moves. Do not make new plots just for an
+  issue or PR body; reuse the report's.
+- For a design, plan, or dataflow change, include a mermaid diagram
+  of the structure (GitHub renders ```mermaid blocks).
+
 # Plots
 
 Every report with measured results should include at least one plot.
