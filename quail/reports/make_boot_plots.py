@@ -29,13 +29,11 @@ from plot_colors import BLUE, GRAY, GREEN, ORANGE, RED, TEAL, DARK
 
 tiered = json.load(open(RESULTS / "boot_tiered.json"))
 # boot phases from the profiler-off control: py-spy adds ~4.6 s to
-# the warm phase, and the old reference was measured without it
+# the warm phase
 nospy = json.load(open(RESULTS / "boot_tiered_nospy.json"))
-old = json.load(open(RESULTS / "boot_profile.json"))
 stock_q = json.load(open(RESULTS / "baseline_filter1.json"))
 
 new_cold = nospy["touch"]["cold"]
-old_cold = old["quail"]["cold"]
 compile_cold = tiered["compile"]["cold"]
 
 
@@ -51,29 +49,24 @@ fig, (ax_boot, ax_q) = plt.subplots(
     1, 2, figsize=(10.5, 3.4),
     gridspec_kw={"width_ratios": [1.5, 1]})
 
-# ---- left: cold boot phases, swept warmup vs touch pass -------------
-rows = [("before: swept warmup", old_cold, 1.0),
-        ("after: touch pass", new_cold, 0.0)]
-for label, cold, y in rows:
-    left = 0.0
-    for _, key, color in PHASES:
-        val = mean_s(cold, key)
-        if not val:
-            continue
-        ax_boot.barh(y, val, left=left, height=0.42, color=color)
-        if val >= 2.5:
-            ax_boot.text(left + val / 2, y, f"{val:.1f}",
-                         ha="center", va="center", fontsize=9.5,
-                         color="white", fontweight="bold")
-        left += val
-    total = mean_s(cold, "boot_s")
-    ax_boot.text(total + 0.6, y, f"{total:.1f} s", va="center",
-                 fontsize=10, color=DARK, fontweight="bold")
-    ax_boot.text(-0.6, y + 0.32, label, fontsize=9.5, color=DARK)
+# ---- left: what a cold container boot spends its time on ------------
+left = 0.0
+for name, key, color in PHASES:
+    val = mean_s(new_cold, key)
+    if not val:
+        continue
+    ax_boot.barh(0, val, left=left, height=0.42, color=color)
+    if val >= 2.5:
+        ax_boot.text(left + val / 2, 0, f"{val:.1f}",
+                     ha="center", va="center", fontsize=9.5,
+                     color="white", fontweight="bold")
+    left += val
+total = mean_s(new_cold, "boot_s")
+ax_boot.text(total + 0.6, 0, f"{total:.1f} s", va="center",
+             fontsize=10, color=DARK, fontweight="bold")
 
-max_total = max(mean_s(c, "boot_s") for _, c, _ in rows)
-ax_boot.set_xlim(0, max_total * 1.22)
-ax_boot.set_ylim(-0.45, 1.85)
+ax_boot.set_xlim(0, total * 1.22)
+ax_boot.set_ylim(-0.45, 0.75)
 ax_boot.set_yticks([])
 ax_boot.set_xlabel("cold container boot (seconds, trial mean)")
 ax_boot.legend(
@@ -87,17 +80,14 @@ ax_boot.set_title(
 
 # ---- right: first query after boot vs stock vLLM --------------------
 best = nospy["query"]["best_wall"]["no_arena"]
-ref = tiered["reference"]["quail_query"]["no_arena_wall_s"]
 stock_wall = min(r["wall"] for r in stock_q["runs"])
-bars = ax_q.bar(["Quail\n(this run)", "Quail\n(committed)",
-                 "stock vLLM"],
-                [best, ref, stock_wall],
-                color=[GREEN, GRAY, GRAY], width=0.55)
-for bar, v in zip(bars, [best, ref, stock_wall]):
+bars = ax_q.bar(["Quail", "stock vLLM"], [best, stock_wall],
+                color=[GREEN, GRAY], width=0.45)
+for bar, v in zip(bars, [best, stock_wall]):
     ax_q.text(bar.get_x() + bar.get_width() / 2, v + 0.5,
               f"{v:.1f}", ha="center", fontsize=10,
               fontweight="bold", color=DARK)
-ax_q.text(bars[2].get_x() + bars[2].get_width() / 2,
+ax_q.text(bars[1].get_x() + bars[1].get_width() / 2,
           stock_wall / 2, f"+{(stock_wall / best - 1) * 100:.0f}%",
           ha="center", fontsize=9.5, color="white",
           fontweight="bold")

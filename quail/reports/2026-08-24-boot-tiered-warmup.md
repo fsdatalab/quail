@@ -137,13 +137,35 @@ shapes), run in a fresh container after a touch boot
 
 Figure: plots/boot_tiered.png
 
+### 32B
+
+The same verification on Qwen3 32B fp8, one H100
+(`results/boot_tiered_32b.json`; no prior 32B numbers existed for
+this query, so these rows establish the reference):
+
+- Compile pass: 38.0 s once ever - shorter than 4B's 103.8 s
+  because 32B's chunk budget is smaller, so the sweep range is
+  smaller.
+- Touch boots: 19.4 / 22.1 s on two slow containers (weight loads
+  of 347 / 377 s on the same containers), 11.2 s on a faster one
+  (weight load 103.7 s) - host speed moves both phases together.
+  The py-spy profile of the 11.2 s boot shows ~70% of it waiting
+  for the GPU: at 32B the three budget-sized warm chunks are
+  compute, not overhead.
+- Boot is dominated by the 32B weight load (1.7-6.3 min observed;
+  container-dependent).
+- Query (10,000 documents, one filter): best fast-path wall
+  201.4 s, best arena wall 203.1 s, 0 wrong of 10,000.
+
+Figure: plots/boot_touch_timeline_32b.png
+
 ### Inside the touch pass
 
 Figure: plots/boot_touch_timeline.png
 
 A 0.1-second-binned timeline of the touch pass, from the py-spy
-MainThread samples of touch trial 0, categorized by what the CPU
-was doing (committed summary: `results/boot_touch_timeline.json`).
+MainThread samples of 4B touch trial 0 (the 32B one above reads the
+same way), categorized by what the CPU was doing (committed summary: `results/boot_touch_timeline.json`).
 Read it with the caveat that the profiler was attached: the phase
 runs 8.9 s here against 3.62 s clean, and sampling stretches
 CPU-side launch work more than GPU waits.
@@ -153,9 +175,11 @@ CPU-side launch work more than GPU waits.
   red bursts of DeepGEMM reading cached kernel binaries off the
   volume on first sight (~0.5 s total across the phase - the loads
   the touch pass exists to absorb).
-- The solid band after it is the CPU blocked while the GPU runs
-  that chunk (the block lands in the answer submit's pinned-memory
-  allocation, which waits on a busy device).
+- The solid band after it is the CPU waiting while the GPU runs
+  that chunk. In a real query this time is never idle: the CPU
+  packs and launches the next chunk while the GPU runs the current
+  one. Warmup is the degenerate case - the whole warm corpus fits
+  one chunk, so there is no next chunk to build.
 - The second launch band is the other attention mode's budget chunk
   plus the tiny-chunk ladder, again with cache-read bursts.
 - The tail is pure GPU wait: the fast-path chunk running to
