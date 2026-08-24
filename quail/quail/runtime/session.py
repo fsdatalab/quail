@@ -536,19 +536,28 @@ class Query:
         # already scanned it is not charged for its prefix build
         # twice.
         #
-        # Not modeled: KV store restores (issue #6's PinnedStore) -
-        # a restored document's prefix costs nothing real, but this
-        # walk has no per-document restore identity, only the
-        # aggregate `report["store"][alias]["restored_tokens"]`
-        # count. So on a warm pass with restores, causal_doc_lengths
-        # overstates the true causal-build cost, making sol_s an
-        # overestimate of the floor there - the safe direction (it
-        # risks understating efficiency, never a false "faster than
-        # possible" alarm). Cold passes are unaffected: the store is
-        # flushed before them, so restored_tokens is always 0.
+        # KV store restores (issue #6's PinnedStore): a restored
+        # document's prefix costs nothing real. Charging it anyway
+        # inflates sol_s - and an inflated sol_s is the DANGEROUS
+        # direction, not a safe one: a real restore-driven speedup
+        # lowers measured wall_s while an unmodeled sol_s stays put,
+        # so efficiency = sol_s/wall_s only goes UP as restores help
+        # more, which is exactly how this check could cross 100% on
+        # a perfectly healthy run. (First draft of this comment
+        # claimed the opposite; confirmed backwards empirically on
+        # 2026-08-23 - see reports/2026-08-23-sol-throughput-cost.md
+        # for the run that caught it.) There's no per-document
+        # restore identity available here, only the aggregate
+        # `out["store"][alias]["restored_tokens"]` count, so this
+        # walk builds causal lengths per alias first and removes
+        # that many tokens' worth (largest documents first - the
+        # store only takes documents at or above
+        # plan.store_min_doc_tokens, so restores skew toward the
+        # longer end of whatever's left unbuilt) before flattening
+        # into the list sol_seconds() actually sees.
         pre_len = len(self.session.tokenizer(SHARED_PRE))
         built: dict = {}
-        causal_doc_lengths = []
+        causal_by_alias: dict = {}
         streaming_chunks_contexts = []
         join_i = 0
         for op in plan.operators:
@@ -569,9 +578,10 @@ class Query:
                     evaluated = [d for d, row in rows.items()
                                 if len(row) > si]
                     if si == 0:
+                        bucket = causal_by_alias.setdefault(alias, [])
                         for d in evaluated:
                             if d not in resident:
-                                causal_doc_lengths.append(
+                                bucket.append(
                                     pre_len + self._doc_tokens[alias][d]
                                     + suffix_lens[0])
                         resident.update(evaluated)
@@ -595,9 +605,10 @@ class Query:
                               for p in op["partners"]}
                 resident = built.setdefault(anchor, set())
                 anchor_map = jout["anchor_index"]
+                bucket = causal_by_alias.setdefault(anchor, [])
                 for gd in anchor_map:
                     if gd not in resident:
-                        causal_doc_lengths.append(
+                        bucket.append(
                             pre_len + self._doc_tokens[anchor][gd])
                 resident.update(anchor_map)
                 tuples = jout["partner_index"]
@@ -614,6 +625,16 @@ class Query:
                     for pi in range(len(row)):
                         streaming_chunks_contexts.append(
                             (suffix_lens[pi], context))
+        store_stats = out.get("store") or {}
+        causal_doc_lengths = []
+        for alias, lengths in causal_by_alias.items():
+            restored = store_stats.get(alias, {}).get("restored_tokens", 0)
+            if restored:
+                lengths = sorted(lengths, reverse=True)
+                removed = 0
+                while lengths and removed < restored:
+                    removed += lengths.pop(0)
+            causal_doc_lengths.extend(lengths)
         from quail.planner.budgets import sol_seconds
         report["sol_s"] = round(sol_seconds(
             self.session.model, self.session.device,
