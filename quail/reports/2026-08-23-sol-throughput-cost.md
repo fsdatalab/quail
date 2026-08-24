@@ -341,7 +341,8 @@ walk; `quailb.py`'s new report columns and the hard efficiency
 assertion). Item 5 uses the rates the user supplied directly
 (`quail/calibration/modal_rates.json`) rather than a live
 `Workspace.billing.rates()` call — see that file's provenance note.
-Item 6 (the report generator) is not done yet.
+Item 6 (the report generator) is built too, as of 2026-08-25 — see
+section 16.
 
 Validated with two real runs on Modal (`tests/gpu/sol_check.py`):
 IMDB-1, IMDB-2, IMDB-5, BIO-2, FEV-5, cold + warm, sf=0.1,
@@ -444,3 +445,63 @@ All four fixes shipped with regression tests
 `run_suite` end to end through a new `_execute` test seam (mirroring
 `Query.run()`'s existing one), closing the coverage gap that let the
 high-severity bug ship. 159 tests pass.
+
+## 16. The report generator, and a second adversarial review (2026-08-25)
+
+Item 6, finally built: `quail/quail/bench/sol_report.py`. `build_rows(suite)`
+takes a `run_suite()` suite dict and produces one row per query with the
+exact column set the issue specifies — Docs/Tokens from the cold pass (no
+restores, the true full corpus), SOL(s)/Efficiency/Docs-per-s/Tok-per-s from
+the warm pass (matching the issue's own "(warm)" labels), and cost reported
+for both passes separately, per the issue's explicit point that cold's boot
+time is a real cost. `render_markdown_table(rows)` formats it;
+`plot_sol_comparison(rows, out_path)` draws the measured-vs-floor bar chart,
+matplotlib imported lazily so the module doesn't require it — matching
+`reports/make_plots.py`'s existing on-demand-dependency convention. A
+`_docs_count` helper was split out of `quailb._docs_per_s` (a pure refactor)
+so the table's raw "Docs" column and the existing rate could share one
+implementation instead of two.
+
+Run against the real validated data from section 14/15's GPU runs
+(`results/sol_check_sf0.1_4b_corrected.json`), the tool reproduces every
+number in this document's own table exactly. The chart is committed at
+`reports/plots/sol_report_sf0.1_4b.png`.
+
+29 tests shipped with the first version. A second adversarial review —
+same method as section 12: a fresh agent, not primed with any of this
+reasoning, asked to construct real failing inputs rather than read and nod
+— found two real bugs in `render_markdown_table`, both edge cases the
+first test suite's fixtures never exercised because they always described
+plausible-looking data:
+
+- An error message containing `|` (a real possibility — `KeyError` reprs
+  quote dicts, exception text can embed almost anything) added an
+  unescaped column separator, misaligning every cell after it in that row.
+  Fixed by escaping `|` in the error text before interpolating it.
+- A success-path row where `docs` is `None` (`_docs_count`'s fallback when
+  a query has no stage-0 filter and no join) printed the Python string
+  `"None"` instead of the `—` every other empty field uses — the one
+  column that skipped its formatter. Fixed with a new `_fmt_int` helper.
+
+Both fixes verified against the real data: table and chart output are
+byte-identical to before the fix, confirming they only change behavior for
+the previously-buggy edge cases. Two other things the review flagged were
+confirmed not live bugs and documented in code rather than fixed: a
+duplicate query id within one pass silently keeps the last one (`build_rows`
+uses a plain dict comprehension), unreachable because `run_suite()` iterates
+each id once per pass; and the chart doesn't visually flag an impossible
+`sol_s > warm_s` row, unreachable because `SolViolation` (section 12) aborts
+the run before such a row could exist in a suite this repo actually
+produces.
+
+192 tests pass with matplotlib installed (161 from before this section,
+plus 29 for `sol_report.py`, 2 more for the `_docs_count` refactor — the 4
+matplotlib-dependent tests skip cleanly without it installed, and were
+separately verified to pass with `uv run --with matplotlib`).
+
+All six items from the issue's original checklist are now built and
+validated. What's left is exactly what section 7's fallback-constant note
+already flagged: resolving the CPU core-count term for `$/query` if the
+worker ever requests one, and a live `Workspace.billing.rates()`
+cross-check against the hardcoded rates in `modal_rates.json` — neither
+blocking, both explicitly deferred, not forgotten.
