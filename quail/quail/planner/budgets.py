@@ -132,7 +132,18 @@ def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
 def _projection_time(model: ModelSpec, device: DeviceSpec,
                      chunk: int) -> float:
     """Ideal seconds for all dense projections in one chunk, all
-    layers: each GEMM takes max(math, memory)."""
+    layers: each GEMM takes max(math, memory).
+
+    chunk=0 short-circuits to 0.0 rather than falling through to the
+    loop below: `moved`'s weight-read term (params * w_bytes) is
+    chunk-independent, so without this guard a zero-token chunk would
+    still price reading every weight matrix once - a kernel that
+    never launches shouldn't cost anything. Caught by a property test
+    (test_budgets_sol_properties.py) checking sol_seconds() of a
+    genuinely empty workload is exactly 0.0, not the ~1ms this bug
+    produced."""
+    if chunk == 0:
+        return 0.0
     t = 0.0
     for din, dout in _projection_shapes(model):
         params = din * dout
@@ -312,16 +323,39 @@ def sol_seconds(model: ModelSpec, device: DeviceSpec, *,
     are batch-composition-agnostic), so those run once on the grand
     total. Only attention needs the causal/streaming split, per the
     module note above."""
+    return sum(sol_seconds_breakdown(
+        model, device, causal_doc_lengths=causal_doc_lengths,
+        streaming_chunks_contexts=streaming_chunks_contexts).values())
+
+
+def sol_seconds_breakdown(model: ModelSpec, device: DeviceSpec, *,
+                          causal_doc_lengths, streaming_chunks_contexts
+                          ) -> dict:
+    """The same four terms sol_seconds() sums, kept separate. Exists
+    for two things sol_seconds()'s single number can't do: property
+    tests that check one term's behavior in isolation (e.g. that
+    causal attention alone scales up with document length, without
+    the other three terms diluting the signal), and comparing against
+    a real per-kernel-class profiler trace (torch.profiler groups
+    kernels into roughly these same four buckets - matmuls, norm/
+    quant/activation, and the two attention shapes - so this is the
+    number to hold the measured split against, not the summed total).
+
+    Keys: "projection", "elementwise", "causal_attention",
+    "streaming_attention" - sol_seconds(...) is exactly sum(this
+    dict's values()), kept in sync by construction (sol_seconds calls
+    this function rather than duplicating the arithmetic)."""
     causal_doc_lengths = list(causal_doc_lengths)
     streaming_chunks_contexts = list(streaming_chunks_contexts)
     total_chunk = (sum(causal_doc_lengths)
                   + sum(c for c, _ in streaming_chunks_contexts))
-    return (_projection_time(model, device, total_chunk)
-           + elementwise_time(model, device, total_chunk)
-           + _causal_prefill_attention_time(model, device,
-                                            causal_doc_lengths)
-           + _shared_context_attention_time(model, device,
-                                            streaming_chunks_contexts))
+    return dict(
+        projection=_projection_time(model, device, total_chunk),
+        elementwise=elementwise_time(model, device, total_chunk),
+        causal_attention=_causal_prefill_attention_time(
+            model, device, causal_doc_lengths),
+        streaming_attention=_shared_context_attention_time(
+            model, device, streaming_chunks_contexts))
 
 
 # ---- rows that consume a calibration constant
