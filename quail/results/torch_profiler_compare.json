@@ -1,0 +1,127 @@
+[
+  {
+    "query": "IMDB-1",
+    "desc": "filter: F1 (at least one positive aspect)",
+    "wall_s": 12.52,
+    "sol_s": 7.7016,
+    "sol_breakdown": {
+      "projection": 4.9214,
+      "elementwise": 2.4852,
+      "causal_attention": 0.295,
+      "streaming_attention": 0.0
+    },
+    "measured_pct": {
+      "projection": 59.56,
+      "elementwise": 17.69,
+      "attention": 6.52,
+      "unmodeled": 16.23,
+      "other": 0.0
+    },
+    "formula_pct": {
+      "projection": 63.9,
+      "elementwise": 32.27,
+      "attention": 3.83
+    },
+    "total_kernel_us": 12247743.937999932
+  },
+  {
+    "query": "IMDB-2",
+    "desc": "join: J1 (reviews x aspects)",
+    "wall_s": 57.82,
+    "sol_s": 33.3806,
+    "sol_breakdown": {
+      "projection": 20.8954,
+      "elementwise": 10.5516,
+      "causal_attention": 0.2356,
+      "streaming_attention": 1.6979
+    },
+    "measured_pct": {
+      "projection": 61.77,
+      "elementwise": 13.87,
+      "attention": 11.31,
+      "unmodeled": 8.99,
+      "other": 4.05
+    },
+    "formula_pct": {
+      "projection": 62.6,
+      "elementwise": 31.61,
+      "attention": 5.79
+    },
+    "total_kernel_us": 50709973.10900039
+  },
+  {
+    "query": "IMDB-5",
+    "desc": "F1 -> F4 -> F5 -> J1, 3 filters then 1 join",
+    "wall_s": 22.04,
+    "sol_s": 11.785,
+    "sol_breakdown": {
+      "projection": 7.3932,
+      "elementwise": 3.7334,
+      "causal_attention": 0.2646,
+      "streaming_attention": 0.3938
+    },
+    "measured_pct": {
+      "projection": 59.52,
+      "elementwise": 16.24,
+      "attention": 8.73,
+      "unmodeled": 14.27,
+      "other": 1.24
+    },
+    "formula_pct": {
+      "projection": 62.73,
+      "elementwise": 31.68,
+      "attention": 5.59
+    },
+    "total_kernel_us": 20199378.059999924
+  },
+  {
+    "query": "BIO-2",
+    "desc": "join: J1 (reports x terms)",
+    "wall_s": 147.59,
+    "sol_s": 87.7642,
+    "sol_breakdown": {
+      "projection": 41.6676,
+      "elementwise": 21.0411,
+      "causal_attention": 0.6974,
+      "streaming_attention": 24.358
+    },
+    "measured_pct": {
+      "projection": 43.36,
+      "elementwise": 9.78,
+      "attention": 38.62,
+      "unmodeled": 5.36,
+      "other": 2.87
+    },
+    "formula_pct": {
+      "projection": 47.48,
+      "elementwise": 23.97,
+      "attention": 28.55
+    },
+    "total_kernel_us": 141918269.05900007
+  },
+  {
+    "query": "FEV-5",
+    "desc": "2F + 1J: two-sided pushdown - F11 on claims, F13 on evidence, each filtered before J3",
+    "wall_s": 2.78,
+    "sol_s": 1.0583,
+    "sol_breakdown": {
+      "projection": 0.6589,
+      "elementwise": 0.3327,
+      "causal_attention": 0.004,
+      "streaming_attention": 0.0628
+    },
+    "measured_pct": {
+      "projection": 56.37,
+      "elementwise": 13.18,
+      "attention": 10.97,
+      "unmodeled": 16.39,
+      "other": 3.09
+    },
+    "formula_pct": {
+      "projection": 62.25,
+      "elementwise": 31.43,
+      "attention": 6.31
+    },
+    "total_kernel_us": 1879279.4920001186
+  }
+]
