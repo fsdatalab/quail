@@ -241,9 +241,23 @@ def _run_one(torch, arena, pipeline, async_ans, budget, q):
 
 
 @app.function(**GPU_KW, timeout=3600)
-def sweep(model_name: str, only=None, tag: str = "full") -> str:
+def sweep(model_name: str, only=None, tag: str = "full",
+          cold_cache: bool = False, warm_tiny: bool = True) -> str:
     import socket
     import time
+
+    # cold_cache: point the kernel caches at a container-local
+    # directory instead of the shared volume, so this run compiles
+    # from scratch - the A/B for the tiny-chunk warmup ladder. Must
+    # happen before anything imports the JIT libraries.
+    if cold_cache:
+        for var in ("DG_CACHE_DIR", "DG_JIT_CACHE_DIR"):
+            os.environ[var] = "/tmp/dg-cold"
+        os.environ["TRITON_CACHE_DIR"] = "/tmp/triton-cold"
+
+    import quail.executor.loop as loop_mod
+    if not warm_tiny:
+        loop_mod.TINY_WARM_TOKENS = ()
 
     from quail.executor.loop import run_join, warm_kernels
     from quail.planner.calibrate import _boot, resolve_pair
@@ -315,11 +329,13 @@ def sweep(model_name: str, only=None, tag: str = "full") -> str:
 
 @app.local_entrypoint()
 def run(model: str = "qwen3-4b-fp8", queries: str = "",
-        reps: int = 1, tag: str = ""):
+        reps: int = 1, tag: str = "", cold_cache: bool = False,
+        no_warm_tiny: bool = False):
     only = [q.strip() for q in queries.split(",") if q.strip()] or None
     base = tag or ("full" if reps == 1 else "rep")
     calls = [sweep.spawn(model, only,
-                         base if reps == 1 else f"{base}{i}")
+                         base if reps == 1 else f"{base}{i}",
+                         cold_cache, not no_warm_tiny)
              for i in range(reps)]
     for c in calls:
         # house rule: keep the fc- id in the tee file; results can be

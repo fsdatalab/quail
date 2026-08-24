@@ -122,6 +122,48 @@ def lstsq(ys, cols):
     return x
 
 
+def _inv(mat):
+    """Gauss-Jordan inverse for the small normal-equation matrices."""
+    k = len(mat)
+    aug = [row[:] + [1.0 if i == j else 0.0 for j in range(k)]
+           for i, row in enumerate(mat)]
+    for i in range(k):
+        piv = max(range(i, k), key=lambda r: abs(aug[r][i]))
+        aug[i], aug[piv] = aug[piv], aug[i]
+        if abs(aug[i][i]) < 1e-30:
+            return None
+        f = aug[i][i]
+        aug[i] = [v / f for v in aug[i]]
+        for r in range(k):
+            if r != i and aug[r][i]:
+                fr = aug[r][i]
+                aug[r] = [v - fr * w for v, w in zip(aug[r], aug[i])]
+    return [row[k:] for row in aug]
+
+
+def fit_se(points, cols_of):
+    """OLS plus standard errors: SE_i = sqrt(RSS/(n-k) * (X'X)^-1_ii).
+    A coefficient whose SE rivals its value is not identified by
+    these chunks - that is a result, not a failure."""
+    ys = [p["gpu_s"] for p in points]
+    cols = [cols_of(p) for p in points]
+    k, n = len(cols[0]), len(cols)
+    x = lstsq(ys, cols)
+    pred = [sum(ci * xi for ci, xi in zip(c, x)) for c in cols]
+    rss = sum((y - q) ** 2 for y, q in zip(ys, pred))
+    mean = sum(ys) / n
+    r2 = 1 - rss / (sum((y - mean) ** 2 for y in ys) or 1e-12)
+    ata = [[sum(c[i] * c[j] for c in cols) for j in range(k)]
+           for i in range(k)]
+    inv = _inv(ata)
+    if inv is None or n <= k:
+        return x, [None] * k, r2
+    sigma2 = rss / (n - k)
+    ses = [(sigma2 * inv[i][i]) ** 0.5 if inv[i][i] > 0 else None
+           for i in range(k)]
+    return x, ses, r2
+
+
 def fit(points, cols_of):
     ys = [p["gpu_s"] for p in points]
     cols = [cols_of(p) for p in points]
@@ -252,6 +294,26 @@ def analyze(records):
             n_excluded=sum(1 for p in dropped if p["Sx"] > 0),
             r2=round(1 - ss_res / ss_tot, 5))
 
+    # Per-query fits, for comparison against the shared constants: each
+    # query alone, no container offsets, only the columns its chunks
+    # carry. Standard errors say which constants that query's packings
+    # can actually pin down; the shared fit above exists because no
+    # single query pins them all.
+    per_query = {}
+    for qid in pts:
+        kq = [p for p in pts[qid] if not p["_drop"]]
+        has_x = any(p["Sx"] > 0 for p in kq)
+        names = ["a", "a2c"] + (["a2x", "per_suffix_s"] if has_x
+                                else [])
+        x, ses, r2q = fit_se(kq, lambda p: [p["T"], p["Sc"]] + (
+            [p["Sx"], float(p["suffixes"])] if has_x else []))
+        per_query[qid] = dict(
+            tag=sources[qid]["tag"], n_chunks=len(kq),
+            r2=round(r2q, 5),
+            coefficients={nm: [v, ses[i]]
+                          for i, (nm, v) in enumerate(zip(names, x))})
+    fits["per_query"] = per_query
+
     queries = {}
     for qid in pts:
         q = sources[qid]["queries"][qid]
@@ -327,6 +389,18 @@ def main():
                   f"{j['per_suffix_s'] * 1e6:.1f} us  offsets "
                   f"{j['container_offset_us_per_token']}  residual "
                   f"us/tok {j['residual_us_per_token']}")
+        for qid, pq in block["fits"]["per_query"].items():
+            def show(nm, scale, unit):
+                c = pq["coefficients"].get(nm)
+                if c is None:
+                    return f"{nm}=-"
+                se = "?" if c[1] is None else f"{c[1] * scale:.2f}"
+                return f"{nm}={c[0] * scale:.2f}±{se}{unit}"
+            print(f"[{m}]   {qid:7s} ({pq['tag']:4s} n={pq['n_chunks']:3d}) "
+                  + "  ".join([show("a", 1e6, "us"),
+                               show("a2c", 1e10, "e-10"),
+                               show("a2x", 1e10, "e-10"),
+                               show("per_suffix_s", 1e6, "us")]))
 
 
 if __name__ == "__main__":

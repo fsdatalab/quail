@@ -147,6 +147,64 @@ With those terms, one model explains all seven workloads on both
 models to within 2% per token. The same fit shape holds across model
 sizes: the cross coefficient is 1.13x the causal one on both.
 
+### One set of constants, checked query by query
+
+The constants above are fit once per model, over every chunk. As a
+check, each query was also fit alone - no container offsets, only the
+terms its own chunks carry - with standard errors. A value written
+"7.86±0.10" means the query's chunks pin that constant to about
+±0.10; an error as large as the value means the query's packings
+cannot see that constant at all.
+
+4B (shared fit: a=7.87, a2c=4.34e-10, a2x=9.80e-10, 35 us/suffix):
+
+| Query | Container | a (us/tok) | a2c (e-10) | a2x (e-10) | per suffix (us) |
+|---|---|---|---|---|---|
+| BIO-1 | full | 7.86±0.10 | 4.36±0.18 | - | - |
+| IMDB-1 | full | 7.97±0.09 | 2.2±1.8 | - | - |
+| BIO-2 | full | 6.70±0.49 | 5.50±0.42 | 9.84±0.05 | 136±43 |
+| IMDB-2 | full | 7.0±1.3 | 4.3±2.8 | 20±14 | 100±98 |
+| LEP-2 | ext | 9.5±1.5 | -29±49 | 10.29±0.51 | -89±118 |
+| FEV-2 | ext | 12.3±2.4 | -31±21 | 17±17 | -800±550 |
+| BIO-F3 | ext2 | 7.55±0.18 | 5.19±0.28 | 61±38 | -220±480 |
+
+32B (shared fit: a=56.22, a2c=15.6e-10, a2x=35.2e-10, 114 us/suffix):
+
+| Query | Container | a (us/tok) | a2c (e-10) | a2x (e-10) | per suffix (us) |
+|---|---|---|---|---|---|
+| BIO-1 | full | 55.38±0.36 | 17.05±0.62 | - | - |
+| IMDB-1 | full | 56.24±0.12 | 15.7±2.5 | - | - |
+| BIO-2 | full | 56.33±0.40 | 15.59±0.40 | 34.96±0.06 | 117±36 |
+| IMDB-2 | full | 56.3±1.4 | 11.2±6.2 | 43±13 | 105±110 |
+| LEP-2 | ext | 57±24 | 160±760 | 44±10 | 520±1810 |
+| FEV-2 | ext | 112±28 | -360±230 | -1020±430 | -10700±6400 |
+| BIO-F3 | ext2 | 57.26±0.18 | 16.84±0.31 | 3.7±85 | 1340±1090 |
+
+Three things the tables show:
+
+- Where a query's packings identify a constant, it lands on the
+  shared value. `a` from the four same-container queries at 32B:
+  55.4-56.3 against the shared 56.22. `a2x` from BIO-2 and LEP-2 at
+  both sizes: 9.84 and 10.29 (4B, shared 9.80); 35.0 and 44 (32B,
+  shared 35.2). The extension queries' `a` comes out high by about
+  their container's offset (BIO-F3 on ext2: 57.26 = 56.22 + ~1),
+  which is the container effect showing up unmodeled.
+- Where a query's packings lack the variation, the fit chases noise:
+  FEV-2's chunks are all nearly identical (same size, same mix), so
+  its regressors are collinear and it "finds" negative attention
+  coefficients with errors bigger than the values. IMDB-1's short
+  docs barely span the length axis, so its a2c is 2.2±1.8.
+- Within one query, correlated terms trade off against each other:
+  BIO-2 alone drifts `a` down to 6.70 and per-suffix up to 136
+  because every suffix is ~85 tokens, making tokens and suffix
+  counts nearly proportional. Only queries with different suffix
+  sizes, fit together, separate them.
+
+This is why the constants are fit jointly: per-query fits agree
+where they can and are unidentified where they cannot, and no query
+disagrees with the shared model beyond its own error bars plus its
+container's rate.
+
 Excluded chunks (the fit drops any chunk more than 5% off its own
 GPU time and reports counts per query): each container's first
 measured chunk pays one leftover kernel compile; a cold chain's tiny

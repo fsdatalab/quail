@@ -596,6 +596,16 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 
 # ------------------------------------------------------------- warmup
 
+# Chunk sizes (tokens) the tiny-chunk warmup ladder builds. A gated
+# chain's trailing chunks are 100-500 tokens - a shape neither the
+# GEMM sweep's bare matmuls nor the full-size warm chunks build as an
+# actual forward pass - and each such shape paid a 0.7-9.3 s one-time
+# kernel compile mid-run (measured in the 2026-08-24 packing sweep).
+# Empty this tuple to disable the ladder (the sweep cell's warmup A/B
+# does), never to save boot time: a warm tiny chunk costs ~20-30 ms.
+TINY_WARM_TOKENS = (64, 128, 256, 512, 1024, 2048)
+
+
 def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
                  question_ids, budget):
     """Compile every kernel configuration a run can hit, at boot,
@@ -653,6 +663,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
         warm_docs.append(d)
         used += len(d) + q_max
         i += 1
+    stream = warm_docs[0] if warm_docs else [0]
     original_mode = pipeline.attention_mode
     for mode in (FILTER_ATTENTION, JOIN_ATTENTION):
         pipeline.attention_mode = mode
@@ -661,6 +672,14 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
         # query itself will take the single-stage fast path
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
                    question_ids, budget, arena_writes=True)
+        # tiny chunks, one document each: the trailing-chunk shapes
+        # of gated multi-stage runs (see TINY_WARM_TOKENS)
+        for t in TINY_WARM_TOKENS:
+            if t >= budget:
+                continue
+            body = (stream * (t // len(stream) + 1))[:max(8, t - q_max)]
+            run_filter(torch, arena, pipeline, async_ans, [body],
+                       question_ids, budget, arena_writes=True)
     pipeline.attention_mode = original_mode
     if len(question_ids) == 1:
         # the fast path's own shape: one causal segment per group,
