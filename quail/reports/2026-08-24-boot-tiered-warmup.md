@@ -120,6 +120,21 @@ question, 2 trials x 2 reps x both paths, profiler off):
   document with document-cap admission, rerun the same day: 34.18 /
   34.51 s. Quail's 28.42 s is 20% faster.
 
+The gated five-filter query (the KV write path: multi-stage keeps
+each document's KV, writes the shared question preamble, gates
+between stages, and its trailing chunks are data-dependent tiny
+shapes), run in a fresh container after a touch boot
+(`results/m1_filter.json`, touch warmup 4.85 s):
+
+- rep 0 wall 34.91 s, rep 1 wall 35.07 s, against the committed
+  34.6 s reference; 4,645 survivors and 0 wrong of 40,052 answered,
+  exactly matching the reference.
+- rep 0 is the container's first run ever, and its per-chunk times
+  match rep 1 to within a few milliseconds - every slow chunk is
+  just a large chunk at the normal per-token rate. No compile stall
+  anywhere, which is the tiny-chunk ladder plus generator coverage
+  doing exactly what the compile pass promised.
+
 Figure: plots/boot_tiered.png
 
 ## What the numbers mean
