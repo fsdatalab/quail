@@ -1,9 +1,13 @@
 """CPU checks for the QUAIL-B query catalog and table schemas."""
 
+import itertools
+
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 import quail
+from quail.bench import quailb
 from quail.bench.quailb import ASPECTS, SETS, queries, register_sets
 from quail.planner.plan import EngineConfig, Refusal
 
@@ -64,3 +68,86 @@ def test_set_table_matches_design():
         "citations": 2_000,
     }
     assert len(ASPECTS) == 12
+
+
+# ---- run_suite's SOL/cost wiring -----------------------------------
+#
+# An adversarial review (2026-08-24) found that none of the tests
+# above - or anywhere else in the suite - ever exercised sol_s,
+# sol_efficiency, docs_per_s, or cost_dollars, or the SolViolation
+# check meant to guard them. That gap is exactly how a real bug
+# shipped: the original `raise AssertionError(...)` for a query
+# beating the speed-of-light floor sat inside the same try/except
+# that turns any exception into a results-row string, so it never
+# actually stopped a run - it just became one more `error` entry,
+# silently, and run_suite returned normally. These tests exercise
+# run_suite itself (not just the pieces), through its _execute seam,
+# so that regression can't come back unnoticed.
+
+def _fake_execute(wall_s=1.0, boot_s=0.0, fresh_tokens=1000):
+    """A worker stand-in good enough for any single-filter or
+    filter+join query in the catalog: every document passes every
+    filter stage, every join tuple matches. Real selectivity doesn't
+    matter for these tests - only that run_suite's row-building and
+    SolViolation wiring run end to end."""
+    def _exec(payload):
+        out = dict(filters={}, joins=[], wall_s=wall_s, boot_s=boot_s,
+                  fresh_tokens=fresh_tokens)
+        survivors = {a: list(range(len(d)))
+                    for a, d in payload["docs"].items()}
+        for alias, qids in payload["filters"].items():
+            n = len(payload["docs"][alias])
+            out["filters"][alias] = {d: [1] * len(qids) for d in range(n)}
+        for j in payload["joins"]:
+            anchor, partners = j["anchor"], j["partners"]
+            tuples = list(itertools.product(
+                *[survivors[p] for p in partners]))
+            rows = {a: [1 for _ in tuples] for a in survivors[anchor]}
+            out["joins"].append(dict(
+                rows=rows, anchor_index=survivors[anchor],
+                partner_index=[list(t) for t in tuples]))
+        return out
+    return _exec
+
+
+def test_sol_violation_aborts_run_suite(tmp_path, monkeypatch):
+    """The regression test for the bug the adversarial review found:
+    a query reporting an impossibly fast wall_s must abort run_suite
+    with SolViolation, not disappear into an `error` row while the
+    suite keeps going."""
+    _standin_sets(tmp_path)
+    monkeypatch.setattr(quailb, "build_sets", lambda *a, **k: tmp_path)
+    with pytest.raises(quailb.SolViolation):
+        quailb.run_suite(str(tmp_path), sf=0.1, only={"IMDB-1"},
+                         _execute=_fake_execute(wall_s=0.0001))
+
+
+def test_run_suite_reports_sol_and_cost_fields(tmp_path, monkeypatch):
+    """A normal (non-violating) run reports every new issue #26 field,
+    with sane values, and no error."""
+    _standin_sets(tmp_path)
+    monkeypatch.setattr(quailb, "build_sets", lambda *a, **k: tmp_path)
+    suite = quailb.run_suite(str(tmp_path), sf=0.1, only={"IMDB-5"},
+                             _execute=_fake_execute(wall_s=30.0, boot_s=2.0))
+    row = suite["passes"]["cold"]["queries"][0]
+    assert "error" not in row, row
+    assert row["query"] == "IMDB-5"
+    for key in ("sol_s", "sol_efficiency", "tokens_per_s", "docs_per_s",
+               "cost_dollars"):
+        assert row[key] is not None, f"{key} missing: {row}"
+    assert 0 < row["sol_efficiency"] <= 1.0 + quailb.EFFICIENCY_TOLERANCE
+    assert row["cost_dollars"] > 0
+
+
+def test_docs_per_s_two_sided_query_uses_anchor_only():
+    """FEV-5/6 and LEP-7's shape: a filter on both the join's anchor
+    and a partner table, so report["stages"] has TWO stage-0 filter
+    entries over two different tables. The original _docs_per_s
+    summed them - unrelated tables' document counts added together -
+    caught by an adversarial review, 2026-08-24."""
+    report = dict(stages=[
+        {"op": "filter", "alias": "c", "stage": 0, "evaluated": 100},
+        {"op": "filter", "alias": "e", "stage": 0, "evaluated": 57},
+        {"op": "join", "anchor": "e", "partners": ["c"], "tuples": 1980},
+    ])
+    assert quailb._docs_per_s(report, 1.82) == pytest.approx(57 / 1.82, abs=0.05)

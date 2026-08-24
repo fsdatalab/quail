@@ -610,6 +610,20 @@ class Query:
                     if gd not in resident:
                         bucket.append(
                             pre_len + self._doc_tokens[anchor][gd])
+                    # the frame (this stage's naming line) is written
+                    # into the anchor's kept KV fresh every stage,
+                    # even when the anchor's own prefix isn't -
+                    # "a later stage's frame overwrites the earlier
+                    # one's rows" (loop.py's pack_chunk docstring).
+                    # Missed by the first draft of this walk (caught
+                    # by an adversarial review, 2026-08-24): frame_len
+                    # was already used as part of the partner suffixes'
+                    # CONTEXT below, but the write that puts it there
+                    # was never charged its own chunk of work.
+                    if frame_len:
+                        streaming_chunks_contexts.append((
+                            frame_len,
+                            pre_len + self._doc_tokens[anchor][gd]))
                 resident.update(anchor_map)
                 tuples = jout["partner_index"]
                 suffix_lens = [
@@ -627,6 +641,7 @@ class Query:
                             (suffix_lens[pi], context))
         store_stats = out.get("store") or {}
         causal_doc_lengths = []
+        sol_remarks = []
         for alias, lengths in causal_by_alias.items():
             restored = store_stats.get(alias, {}).get("restored_tokens", 0)
             if restored:
@@ -634,7 +649,24 @@ class Query:
                 removed = 0
                 while lengths and removed < restored:
                     removed += lengths.pop(0)
+                if removed < restored:
+                    # store_stats reports more restored tokens for
+                    # this alias than this walk ever charged as
+                    # causal-build candidates - the two are tracking
+                    # different things somewhere. Degrades safely
+                    # (every candidate is already gone, sol_s can't
+                    # go any lower from this), but it means the SOL
+                    # walk and the engine's own restore telemetry
+                    # disagree, which is worth seeing rather than
+                    # silently absorbing (flagged by an adversarial
+                    # review, 2026-08-24).
+                    sol_remarks.append(
+                        f"sol_s: {alias!r} reports {restored} "
+                        f"restored_tokens but the walk only charged "
+                        f"{removed} - restore accounting may be "
+                        f"inconsistent for this alias")
             causal_doc_lengths.extend(lengths)
+        report["remarks"] = list(report["remarks"]) + sol_remarks
         from quail.planner.budgets import sol_seconds
         report["sol_s"] = round(sol_seconds(
             self.session.model, self.session.device,

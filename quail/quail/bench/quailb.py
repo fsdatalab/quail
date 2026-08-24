@@ -81,6 +81,18 @@ import pyarrow.parquet as pq
 # SOL is a lower bound, so a query that beats it did not get faster
 # than physically possible, it means wall_s or sol_s was computed
 # wrong.
+class SolViolation(RuntimeError):
+    """A query's measured wall time beat the speed-of-light floor.
+
+    Deliberately NOT a subclass of the errors run_suite's per-query
+    try/except catches and turns into an `error` row - an adversarial
+    review (2026-08-24) caught that the original `AssertionError` sat
+    inside that same try/except, so it got silently swallowed into a
+    results-row string and the suite kept going, exit 0, as if
+    nothing had happened. That defeated the entire point of the
+    check. run_suite re-raises this one explicitly instead."""
+
+
 EFFICIENCY_TOLERANCE = 0.02   # 2% slack for the shared-context
 #                               approximations sol_seconds makes when
 #                               a batch mixes items of different
@@ -111,17 +123,31 @@ def _cost_dollars(wall_s, boot_s, gpus, cpu_memory_gb, rates):
 def _docs_per_s(report, wall_s):
     """Documents actually processed per second (warm/cold wall time,
     boot excluded). Every filter chain's stage 0 evaluates its whole
-    input corpus, so that count is the corpus size; a join-only query
-    has no filter stage 0, so fall back to the first join stage's
-    tuple count - the real unit of work when there's no filter."""
+    input corpus, so that count is the corpus size.
+
+    A two-sided query (a filter on both the join's anchor AND a
+    partner table - FEV-5/6, LEP-7) has TWO stage-0 filter entries
+    over two different tables. Summing them (the original version of
+    this function) added unrelated tables' document counts together
+    - caught by an adversarial review, 2026-08-24. When there's a
+    join, use only the anchor's own stage-0 count (the anchor is the
+    query's driving table); fall back to the join's tuple count if
+    the anchor itself has no filter. Only sum across stage-0 entries
+    for a plain filter chain, where there's just one table."""
     if not wall_s:
         return None
+    joins = [s for s in report["stages"] if s["op"] == "join"]
+    if joins:
+        anchor = joins[0]["anchor"]
+        anchor_stage0 = [s["evaluated"] for s in report["stages"]
+                        if s["op"] == "filter" and s["stage"] == 0
+                        and s["alias"] == anchor]
+        if anchor_stage0:
+            return round(anchor_stage0[0] / wall_s, 1)
+        return round(joins[0]["tuples"] / wall_s, 1)
     stage0 = [s["evaluated"] for s in report["stages"]
              if s["op"] == "filter" and s["stage"] == 0]
-    if stage0:
-        return round(sum(stage0) / wall_s, 1)
-    joins = [s["tuples"] for s in report["stages"] if s["op"] == "join"]
-    return round(joins[0] / wall_s, 1) if joins else None
+    return round(sum(stage0) / wall_s, 1) if stage0 else None
 
 DATA_SEED = 20260818
 
@@ -636,11 +662,19 @@ def queries(sess):
 # ----------------------------------------------------------- driver
 
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
-              out_path=None, cpu_memory_gb=80, model="qwen3-4b-fp8"):
+              out_path=None, cpu_memory_gb=80, model="qwen3-4b-fp8",
+              _execute=None):
     """cpu_memory_gb defaults to what the 96 GB worker container
     holds: a 64 GB store (8 slabs). The corpus KV usually exceeds it,
     so the length threshold keeps the longest documents - partial
-    restores are the capacity arithmetic working, not a bug."""
+    restores are the capacity arithmetic working, not a bug.
+
+    _execute: the same worker-seam Query.run() takes - None ships to
+    the real Modal worker, a callable lets tests fake the worker's
+    output without touching Modal. Exists so the SOL/cost row-
+    building and the SolViolation wiring below are unit-testable
+    (they weren't, before an adversarial review caught that gap on
+    2026-08-24 - see SolViolation's docstring)."""
     import quail
     from quail.planner.plan import EngineConfig
 
@@ -664,7 +698,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                 print(f"[quailb] {pass_name} {qid}: {desc}",
                       flush=True)
                 try:
-                    res = build().run()
+                    res = build().run(_execute=_execute)
                     wall_s = res.report["wall_s"]
                     boot_s = res.report.get("boot_s")
                     sol_s = res.report.get("sol_s")
@@ -678,7 +712,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                     # number, per issue #26.
                     if (sol_s is not None and wall_s
                             and sol_s > wall_s * (1 + EFFICIENCY_TOLERANCE)):
-                        raise AssertionError(
+                        raise SolViolation(
                             f"{qid} {pass_name}: measured wall_s="
                             f"{wall_s} beats the speed-of-light floor "
                             f"sol_s={sol_s} (efficiency="
@@ -705,6 +739,12 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                                cost_dollars=_cost_dollars(
                                    wall_s, boot_s, gpus, cpu_memory_gb,
                                    rates))
+                except SolViolation:
+                    # never swallow this into an error row - it must
+                    # abort the run, not blend in with a Refusal or a
+                    # transient network error (see SolViolation's
+                    # docstring for why this line exists)
+                    raise
                 except Exception as e:            # noqa: BLE001
                     row = dict(query=qid, desc=desc,
                                error=f"{type(e).__name__}: {e}")
