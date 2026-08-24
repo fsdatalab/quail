@@ -111,13 +111,14 @@ def measure(model: ModelSpec, device: DeviceSpec,
     from quail.executor.loop import run_filter, warm_kernels
 
     loaded = loaded or load_calibration(model, device)
+    spec, _ = resolve_pair(model, device)
     (torch, tokenizer, pipeline, arena, async_ans,
      exec_budget) = _boot(model, device)
     q_ids = [tokenizer(_QUESTION, add_special_tokens=False)["input_ids"]]
     stream = _token_ids(tokenizer, max(lengths) + tokens_per_point)
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans,
-                     [stream[:512]] * 64, q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=spec.hf_name)
     torch.cuda.synchronize()
 
     points, rows = [], []

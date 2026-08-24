@@ -1,23 +1,45 @@
-"""Boot-time breakdown: Quail vs stock vLLM, cold and warm.
+"""Tiered boot verification: compile pass, touch pass, py-spy, query.
 
-Quail's worker boot (load_model, arena, pipeline, warm_kernels) and
-stock's LLM(...) constructor are timed side-by-side on H100 SXM with
-the same vLLM pin (0.26.0). Each side runs `trials` independent
-containers (default 3) so cold boots are real process starts; each
-container then records one warm reuse. The summary reports mean and
-median per phase across trials.
+The boot strategy under test (quail/executor/loop.py): the compile
+pass builds every kernel configuration once per (software stack, GPU,
+model, budget) and records a marker on the kernel-cache volume; every
+later container boots with the touch pass, which only runs each hot
+kernel once so cached binaries load into the process outside measured
+walls. Nothing in warmup depends on the query.
 
-PREDICTION (stated before the run): Quail cold is dominated by
-load_model_s when the kernel-cache volume is warm, and by
-warm_kernels_s on a cold kernel cache; arena_s and pipeline_s are
-small. Stock cold is weight load plus KV-cache profiling inside
-LLM(...). Both warm boots are near 0 (Quail hits _BOOTED /
-warmed=True; stock keeps the LLM instance).
+This cell measures, on Qwen3 4B fp8 / H100 SXM:
+
+1. one compile-pass boot (force_compile=True), py-spy recorded;
+2. `touch_trials` fresh containers booting with the touch pass,
+   py-spy recorded, phase-timed;
+3. in each touch container, the single-stage filter query from
+   m1_filter1 (10,000 IMDB documents, one question), both the arena
+   path and the fast path, `reps` repetitions each - so the boot
+   change is checked against the committed query numbers.
+
+Stock vLLM boot rows are reused from the committed
+results/boot_profile.json (the stock side did not change); rerun
+them with --stock-trials N if wanted. The stock QUERY comparison
+runs separately (same corpus, submission = separate requests per
+document):
+
+    uv run modal run tests/gpu/milestone1.py::run_baseline_filter1 \\
+        2>&1 | tee results/baseline_filter1.log
+
+PREDICTION (stated before the run): the compile-pass boot pays the
+generator's full sweep plus any configurations the shared volume has
+not seen (minutes on a volume that predates the generator sizes);
+the touch boot's warm_kernels_s is 2-4 s (three budget-sized chunks
+at ~1 s each, plus two tiny-chunk ladders at ~0.2 s), against
+3.7-4.9 s for the swept warmup in the committed boot_profile.json;
+cold boot_s stays load_model-dominated (28-38 s). The query matches
+the committed m1_filter1 numbers within noise (best fast-path wall
+28.3 s +-3%, 0 wrong), and stays under stock's 33.4 s.
 
 Run from the quail/ directory (tee per house rule):
 
     uv run modal run tests/gpu/boot_profile.py \\
-        2>&1 | tee results/boot_profile.log
+        2>&1 | tee results/boot_tiered.log
 """
 
 from __future__ import annotations
@@ -38,7 +60,7 @@ image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
     .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
-                 "numpy", "datasets")
+                 "numpy", "datasets", "py-spy")
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -65,12 +87,100 @@ GPU_KW = dict(image=image, gpu="H100!", memory=65536,
                        "/results": results_vol})
 
 PREDICTION = (
-    "Quail cold: load_model_s dominates when kernels are cached; "
-    "warm_kernels_s dominates on a cold kernel cache; arena + "
-    "pipeline small. Stock cold: LLM(...) = weights + KV profiling. "
-    "Both warm ≈ 0."
-)
+    "compile boot: generator sweep + unseen-config compiles, minutes "
+    "once ever; touch boot warm_kernels_s 2-4 s (vs 3.7-4.9 s swept); "
+    "cold boot_s load_model-dominated (28-38 s); query best fast wall "
+    "28.3 s +-3%, 0 wrong, under stock's 33.4 s")
 
+# The committed numbers this run is checked against.
+REFERENCE = dict(
+    quail_query=dict(no_arena_wall_s=28.30, arena_wall_s=28.65,
+                     wrong=0, source="results/m1_filter1.json"),
+    stock_query=dict(
+        wall_s=33.41,
+        submission="separate requests per document, "
+                   "document-cap admission",
+        source="results/baseline_filter1.json"),
+    old_boot=dict(warm_kernels_s=(3.68, 4.9),
+                  boot_s=(33.61, 45.3),
+                  source="results/boot_profile.json"))
+
+
+# ------------------------------------------------------------- py-spy
+
+def _pyspy_start(out_path: str):
+    """Attach py-spy to this process; returns stop() -> status dict.
+
+    Sampling at 100 Hz with --idle so blocking waits (weight reads,
+    cuda synchronize) stay attributed to the Python frame that made
+    them. If attach fails (ptrace policy), the run continues and the
+    status carries the error - phase timers still cover the boot.
+    """
+    import signal
+    import subprocess
+
+    try:
+        # same-uid attach needs ptrace scope 0 on hardened kernels
+        with open("/proc/sys/kernel/yama/ptrace_scope", "w") as f:
+            f.write("0")
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    proc = subprocess.Popen(
+        ["py-spy", "record", "--pid", str(os.getpid()),
+         "--format", "speedscope", "--output", out_path,
+         "--rate", "100", "--idle"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    time.sleep(1.0)          # let the sampler attach before the work
+
+    def stop() -> dict:
+        if proc.poll() is not None:
+            err = (proc.stderr.read() or b"").decode()[-400:]
+            return dict(ok=False, path=None, error=err.strip())
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return dict(ok=False, path=None, error="py-spy hung")
+        err = (proc.stderr.read() or b"").decode()[-400:]
+        ok = proc.returncode == 0 and os.path.exists(out_path)
+        return dict(ok=ok, path=out_path if ok else None,
+                    error=None if ok else err.strip())
+
+    return stop
+
+
+def _speedscope_top(path: str, n: int = 15) -> list[dict]:
+    """Top-n functions by self time from a py-spy speedscope file."""
+    with open(path) as f:
+        data = json.load(f)
+    frames = data["shared"]["frames"]
+    self_s: dict[int, float] = {}
+    cum_s: dict[int, float] = {}
+    total = 0.0
+    for prof in data["profiles"]:
+        if prof.get("type") != "sampled":
+            continue
+        for stack, w in zip(prof["samples"], prof["weights"]):
+            if not stack:
+                continue
+            total += w
+            self_s[stack[-1]] = self_s.get(stack[-1], 0.0) + w
+            for fi in set(stack):
+                cum_s[fi] = cum_s.get(fi, 0.0) + w
+    top = sorted(self_s.items(), key=lambda kv: -kv[1])[:n]
+    out = []
+    for fi, s in top:
+        fr = frames[fi]
+        where = f"{fr.get('file', '?')}:{fr.get('line', '?')}"
+        out.append(dict(func=fr.get("name", "?"), at=where,
+                        self_s=round(s, 2),
+                        cum_s=round(cum_s.get(fi, 0.0), 2)))
+    return dict(total_sampled_s=round(total, 2), top=out)
+
+
+# --------------------------------------------------------- quail boot
 
 def _round_boot(boot: dict) -> dict:
     out = dict(boot)
@@ -80,7 +190,8 @@ def _round_boot(boot: dict) -> dict:
     return out
 
 
-def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
+def _quail_boot_once(*, reuse: dict | None,
+                     force_compile: bool = False) -> tuple[dict, dict]:
     """One Quail boot. reuse=None is cold; reuse=state is warm skip."""
     import torch
     import torch.nn.functional as F
@@ -121,8 +232,9 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
         answerer = Answerer(torch, F, model, tokenizer)
         async_ans = AsyncAnswers(torch, answerer)
         chunk_tokens = min(chunk_tokens, pipeline.max_chunk_tokens)
-        state = dict(torch=torch, model=model, arena=arena,
-                     pipeline=pipeline, async_ans=async_ans,
+        state = dict(torch=torch, tokenizer=tokenizer, model=model,
+                     arena=arena, pipeline=pipeline,
+                     async_ans=async_ans,
                      chunk_tokens=chunk_tokens, warmed=False)
         boot["kind"] = "cold"
     else:
@@ -136,11 +248,13 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
     if not state["warmed"]:
         t0 = time.perf_counter()
         with torch.inference_mode():
-            warm_kernels(torch, arena, pipeline, async_ans,
-                         docs, [warm_q], chunk_tokens)
+            warm = warm_kernels(torch, arena, pipeline, async_ans,
+                                chunk_tokens, model_name=MODEL,
+                                force_compile=force_compile)
         torch.cuda.synchronize()
         kernel_cache.commit()
         boot["warm_kernels_s"] = time.perf_counter() - t0
+        boot["warm_tier"] = warm["tier"]
         state["warmed"] = True
         boot["kind"] = "cold"
 
@@ -148,23 +262,76 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
     return state, _round_boot(boot)
 
 
-@app.function(timeout=3600, max_containers=8, **GPU_KW)
-def quail_boot_trial(trial: int = 0) -> dict:
-    """One container: cold Quail boot, then warm reuse."""
+def _profiled_boot(tag: str, *, force_compile: bool) -> tuple[dict, dict]:
+    """Cold boot under py-spy; returns (state, row)."""
+    spy_path = f"/results/boot/pyspy_{tag}.speedscope.json"
+    stop = _pyspy_start(spy_path)
+    state, cold = _quail_boot_once(reuse=None,
+                                   force_compile=force_compile)
+    spy = stop()
+    if spy["ok"]:
+        try:
+            spy["summary"] = _speedscope_top(spy_path)
+        except (OSError, ValueError, KeyError) as e:
+            spy["summary"] = dict(error=repr(e))
+        results_vol.commit()
+    row = dict(cold=cold, pyspy=spy)
+    return state, row
+
+
+# -------------------------------------------------------------- cells
+
+@app.function(timeout=7200, **GPU_KW)
+def compile_trial() -> dict:
+    """The one-time compile pass, forced, timed, py-spy recorded."""
+    _, row = _profiled_boot("compile", force_compile=True)
+    row.update(side="quail_compile", trial=0)
+    print(f"[boot_tiered] compile: {row['cold']}", flush=True)
+    return row
+
+
+@app.function(timeout=7200, max_containers=8, **GPU_KW)
+def touch_trial(trial: int = 0, reps: int = 2) -> dict:
+    """One fresh container: touch-pass boot, warm reuse, then the
+    m1_filter1 query on both paths."""
     from corpus import build_corpus
-    from transformers import AutoTokenizer
+    from quail.executor.attention import FILTER_ATTENTION
+    from quail.executor.loop import run_filter
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    # Small corpus: boot warmup only needs enough docs to fill one
-    # budget-sized chunk; full 10k is wasted work for this cell.
-    body_ids, q_ids, _flags = build_corpus(tokenizer, 256)
-    warm_q = q_ids[0]
+    state, row = _profiled_boot(f"touch{trial}", force_compile=False)
+    _, warm = _quail_boot_once(reuse=state)
+    row.update(side="quail", trial=trial, warm=warm)
+    print(f"[boot_tiered] touch trial {trial}: cold={row['cold']} "
+          f"warm={warm}", flush=True)
 
-    state, cold = _quail_boot_once(body_ids, warm_q, reuse=None)
-    _, warm = _quail_boot_once(body_ids, warm_q, reuse=state)
-    row = dict(side="quail", trial=trial, cold=cold, warm=warm)
-    print(f"[boot_profile] quail trial {trial}: cold={cold} warm={warm}",
-          flush=True)
+    torch = state["torch"]
+    pipeline = state["pipeline"]
+    body_ids, q_ids, flags = build_corpus(state["tokenizer"], 10000,
+                                          n_filters=1)
+    pipeline.attention_mode = FILTER_ATTENTION
+    runs = []
+    for rep in range(reps):
+        for mode, aw in (("arena", True), ("no_arena", False)):
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                answers, spans, tokens = run_filter(
+                    torch, state["arena"], pipeline,
+                    state["async_ans"], body_ids, q_ids,
+                    state["chunk_tokens"], arena_writes=aw)
+            torch.cuda.synchronize()
+            wall = time.perf_counter() - t0
+            runs.append(dict(
+                rep=rep, mode=mode, wall=round(wall, 2),
+                fresh_tokens=tokens,
+                tok_s=round(tokens / wall, 1),
+                wrong=sum(bit != int(flags[d][0])
+                          for d, r in answers.items() for bit in r),
+                chunks=len(spans),
+                gpu_s=round(sum(e0.elapsed_time(e1)
+                                for _, e0, e1 in spans) / 1e3, 2)))
+            print(f"[boot_tiered] trial {trial} query {runs[-1]}",
+                  flush=True)
+    row["query"] = runs
     return row
 
 
@@ -178,61 +345,69 @@ def stock_boot_trial(trial: int = 0) -> dict:
         model=MODEL, max_num_batched_tokens=25_305,
         max_num_seqs=2648, gpu_memory_utilization=0.92,
         enable_prefix_caching=True, disable_log_stats=True)
-    # Touch the engine so construction is fully settled before the
-    # warm measurement (kept instance, no re-init).
     _ = llm.llm_engine
     warm = warm_boot_dict()
     row = dict(side="stock", trial=trial, cold=cold, warm=warm)
-    print(f"[boot_profile] stock trial {trial}: cold={cold} warm={warm}",
+    print(f"[boot_tiered] stock trial {trial}: cold={cold}",
           flush=True)
     return row
 
 
 @app.function(timeout=600, image=image, memory=4096,
               volumes={"/results": results_vol})
-def write_boot_report(report: dict) -> str:
-    """Persist per-side and merged compare JSON on the results volume."""
+def write_report(report: dict) -> str:
     os.makedirs("/results/boot", exist_ok=True)
-    for name, key in (("quail", "quail"), ("stock", "stock"),
-                      ("compare", None)):
-        payload = report if key is None else report[key]
-        with open(f"/results/boot/{name}.json", "w") as f:
-            json.dump(payload, f, indent=2)
+    with open("/results/boot/boot_tiered.json", "w") as f:
+        json.dump(report, f, indent=2)
     results_vol.commit()
     return json.dumps(report, indent=2)
 
 
 @app.local_entrypoint()
-def main(trials: int = 3, out: str = "results/boot_profile.json"):
-    """Spawn `trials` cold containers per side, aggregate mean/median."""
-    print(f"[boot_profile] prediction: {PREDICTION}", flush=True)
-    print(f"[boot_profile] trials={trials} (mean + median)", flush=True)
+def main(touch_trials: int = 3, reps: int = 2,
+         stock_trials: int = 0,
+         out: str = "results/boot_tiered.json"):
+    """Compile pass first (so touch trials see the marker), then
+    touch trials in parallel; stock boot rows rerun only on request."""
+    print(f"[boot_tiered] prediction: {PREDICTION}", flush=True)
 
-    q_handles = [quail_boot_trial.spawn(i) for i in range(trials)]
-    s_handles = [stock_boot_trial.spawn(i) for i in range(trials)]
-    quail_trials = [h.get() for h in q_handles]
-    stock_trials = [h.get() for h in s_handles]
+    h = compile_trial.spawn()
+    print(f"[boot_tiered] compile fc={h.object_id}", flush=True)
+    compile_row = h.get()
 
+    t_handles = [touch_trial.spawn(i, reps)
+                 for i in range(touch_trials)]
+    s_handles = [stock_boot_trial.spawn(i)
+                 for i in range(stock_trials)]
+    for hh in t_handles + s_handles:
+        print(f"[boot_tiered] fc={hh.object_id}", flush=True)
+    touch_rows = [hh.get() for hh in t_handles]
+    stock_rows = [hh.get() for hh in s_handles]
+
+    query_runs = [r for row in touch_rows for r in row["query"]]
+    best = {m: min(r["wall"] for r in query_runs if r["mode"] == m)
+            for m in ("arena", "no_arena")}
     report = dict(
-        cell="boot_profile",
-        model=MODEL,
-        gpu="H100!",
-        vllm="0.26.0",
-        prediction=PREDICTION,
-        quail=_aggregate("quail", quail_trials),
-        stock=_aggregate("stock", stock_trials),
-    )
-    payload = write_boot_report.remote(report)
+        cell="boot_tiered", model=MODEL, gpu="H100!", vllm="0.26.0",
+        prediction=PREDICTION, reference=REFERENCE,
+        compile=compile_row,
+        touch=_aggregate("quail", touch_rows),
+        stock=(_aggregate("stock", stock_rows) if stock_rows
+               else dict(reused="results/boot_profile.json")),
+        query=dict(runs=query_runs, best_wall=best,
+                   wrong=sum(r["wrong"] for r in query_runs)))
+    payload = write_report.remote(report)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    text = payload if isinstance(payload, str) else json.dumps(payload,
-                                                               indent=2)
-    Path(out).write_text(text)
-    print(f"[boot_profile] saved {out}", flush=True)
+    Path(out).write_text(payload)
+    print(f"[boot_tiered] saved {out}", flush=True)
 
-    parsed = json.loads(text)
-    for side in ("quail", "stock"):
-        for phase in ("cold", "warm"):
-            boot = parsed[side][phase].get("boot_s", {})
-            print(f"[boot_profile] {side} {phase} boot_s "
-                  f"mean={boot.get('mean')} median={boot.get('median')} "
-                  f"trials={boot.get('trials')}", flush=True)
+    ct = compile_row["cold"]
+    print(f"[boot_tiered] compile boot: warm_kernels_s="
+          f"{ct['warm_kernels_s']} boot_s={ct['boot_s']}", flush=True)
+    agg = report["touch"]["cold"]
+    print(f"[boot_tiered] touch boots: warm_kernels_s "
+          f"mean={agg['warm_kernels_s']['mean']} boot_s "
+          f"mean={agg['boot_s']['mean']}", flush=True)
+    print(f"[boot_tiered] query best {best} wrong="
+          f"{report['query']['wrong']} (ref: no_arena 28.30, "
+          f"stock 33.41)", flush=True)

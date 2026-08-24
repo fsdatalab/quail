@@ -451,8 +451,8 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
     from quail.executor.loop import warm_kernels
     t_warm = time.perf_counter()
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
     torch.cuda.synchronize()
     kernel_cache.commit()    # keep the compiles even if the run dies
     report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
@@ -572,8 +572,8 @@ def filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
     # measured paths compile before the first rep
     t_warm = time.perf_counter()
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
     torch.cuda.synchronize()
     kernel_cache.commit()
     report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
@@ -783,8 +783,8 @@ def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
     from quail.executor.loop import warm_kernels
     t_warm = time.perf_counter()
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
     torch.cuda.synchronize()
     kernel_cache.commit()
 
@@ -850,8 +850,8 @@ def profile_filter_run(n_docs: int = 3000) -> str:
      exec_budget, arena_tok) = _boot(FILTER_ATTENTION)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
         run_filter(torch, arena, pipeline, async_ans, body_ids, q_ids,
                    exec_budget, arena_writes=True)  # unprofiled reference
     torch.cuda.synchronize()
