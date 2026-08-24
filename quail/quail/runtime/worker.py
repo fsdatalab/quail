@@ -114,14 +114,12 @@ def execute(payload: dict) -> dict:
         boot["kind"] = "cold"
     model, arena, pipeline = (booted["model"], booted["arena"],
                               booted["pipeline"])
-    chunk = budgets.chunk_budget(spec, device)
     # the worker has no tokenizer: the TRUE/FALSE token ids ride in the
     # payload
     answerer = _PayloadAnswerer(torch, F, model, payload["true_ids"],
                                 payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
-    budget = min(chunk, pipeline.max_chunk_tokens,
-                 payload["chunk_tokens"])
+    budget = payload["chunk_tokens"]
 
     if not booted["warmed"]:
         t0 = time.perf_counter()
@@ -146,8 +144,7 @@ def execute(payload: dict) -> dict:
         boot[k] = round(boot[k], 2)
     boot["boot_s"] = round(boot_s, 2)
     state = dict(model=model, arena=arena, pipeline=pipeline,
-                 spec=spec, chunk=chunk, torch=torch, F=F,
-                 store=_STORE)
+                 spec=spec, torch=torch, F=F, store=_STORE)
     report = _execute_single(state, payload)
     _STORE = state["store"]
     report["boot_s"] = boot["boot_s"]
@@ -166,8 +163,8 @@ def execute(payload: dict) -> dict:
 def _execute_single(state, payload: dict) -> dict:
     """The single-GPU execution core, shared by the ephemeral
     function (module-global state) and the snapshot worker class
-    (instance state). state: model, arena, pipeline, spec, chunk,
-    store, torch, F."""
+    (instance state). state: model, arena, pipeline, spec, store,
+    torch, F."""
     import torch.nn.functional as F  # noqa: F401 (state carries it)
 
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
@@ -190,8 +187,7 @@ def _execute_single(state, payload: dict) -> dict:
     answerer = _PayloadAnswerer(torch, state["F"], state["model"],
                                 payload["true_ids"], payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
-    budget = min(state["chunk"], pipeline.max_chunk_tokens,
-                 payload["chunk_tokens"])
+    budget = payload["chunk_tokens"]
 
     store_cfg = payload.get("store")
     if store_cfg is not None and state.get("store") is None:
@@ -393,14 +389,12 @@ def _child_boot(state, sub):
         boot["pipeline_s"] = time.perf_counter() - t0
         state.update(torch=torch, F=F, model=model, arena=arena,
                      pipeline=pipeline, spec=spec,
-                     chunk=chunk, warmed=False, store=None)
+                     warmed=False, store=None)
         boot["kind"] = "cold"
     answerer = _PayloadAnswerer(torch, F, state["model"],
                                 sub["true_ids"], sub["false_ids"])
     state["async_ans"] = AsyncAnswers(torch, answerer)
-    state["budget"] = min(state["chunk"],
-                          state["pipeline"].max_chunk_tokens,
-                          sub["chunk_tokens"])
+    state["budget"] = sub["chunk_tokens"]
     if not state["warmed"]:
         docs = next((d for d in sub.get("docs", {}).values() if d),
                     None)
