@@ -80,17 +80,42 @@ def _find_selector():
 
 
 def _api_dump():
-    import deep_gemm
-    out = dict(version=getattr(deep_gemm, "__version__", "?"),
-               file=getattr(deep_gemm, "__file__", "?"),
-               top=sorted(d for d in dir(deep_gemm)
-                          if not d.startswith("_")))
+    """What actually provides the fp8 matmul in this stack: the
+    deep_gemm package if importable, else whatever vllm's wrapper
+    resolves to. Never raises - the dump IS the diagnosis."""
+    out = {}
     try:
-        from deep_gemm import jit_kernels
-        out["jit_kernels"] = sorted(d for d in dir(jit_kernels)
-                                    if not d.startswith("_"))
-    except ImportError:
-        pass
+        import deep_gemm
+        out["deep_gemm"] = dict(
+            version=getattr(deep_gemm, "__version__", "?"),
+            file=getattr(deep_gemm, "__file__", "?"),
+            top=sorted(d for d in dir(deep_gemm)
+                       if not d.startswith("_")))
+    except ImportError as e:
+        out["deep_gemm_import_error"] = str(e)
+    try:
+        from vllm.utils import deep_gemm as vdg
+        out["vllm_wrapper"] = dict(
+            file=getattr(vdg, "__file__", "?"),
+            top=sorted(d for d in dir(vdg) if not d.startswith("_")))
+        for probe in ("is_deep_gemm_supported", "has_deep_gemm"):
+            fn = getattr(vdg, probe, None)
+            if callable(fn):
+                try:
+                    out["vllm_wrapper"][probe] = bool(fn())
+                except Exception as e:      # noqa: BLE001
+                    out["vllm_wrapper"][probe] = f"raised: {e}"
+        out["vllm_wrapper"]["fp8_gemm_nt"] = repr(
+            getattr(vdg, "fp8_gemm_nt", None))
+    except Exception as e:                  # noqa: BLE001
+        out["vllm_wrapper_error"] = str(e)
+    try:
+        import importlib.metadata as md
+        out["gemm_dists"] = sorted(
+            d.metadata["Name"] for d in md.distributions()
+            if "gemm" in (d.metadata["Name"] or "").lower())
+    except Exception as e:                  # noqa: BLE001
+        out["dists_error"] = str(e)
     return out
 
 
@@ -153,10 +178,11 @@ def diagnose(run_query: bool = True) -> str:
 
     sel_name, sel = _find_selector()
     result["selector"] = sel_name
+    result["api"] = _api_dump()
+    print(f"[dg] api={json.dumps(result['api'])}", flush=True)
     if sel is None:
-        result["api"] = _api_dump()
-        print(f"[dg] selector not found; api={result['api']}",
-              flush=True)
+        print("[dg] no python selector found; bucket enumeration "
+              "skipped, attribution still runs", flush=True)
     else:
         print(f"[dg] selector: {sel_name}", flush=True)
         for model_name in ("qwen3-4b-fp8", "qwen3-32b-fp8"):
