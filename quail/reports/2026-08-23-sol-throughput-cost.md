@@ -662,3 +662,41 @@ tracks within a few percent of wall_s throughout.
 No new tests: the fix is two lines (`sess.set_store(False)`) in
 scripts that only run on Modal, with no local-testable surface of
 their own. Same 216 tests pass as section 17.
+
+## 19. Cost and throughput, plotted (2026-08-25)
+
+The report table (section 6) already has cost, docs/s, and tokens/s
+columns; nothing in this section computes anything new, it just
+charts the columns `sol_report.build_rows()` already produces from
+`results/sol_check_sf0.1_4b_corrected.json`
+(`reports/make_sol_cost_throughput_plots.py`):
+
+Figure: plots/sol_cost_by_query.png
+
+Cold vs. warm dollar cost per query. IMDB-1's cold bar ($0.081) is
+disproportionately large next to its warm bar ($0.021) - not because
+IMDB-1 itself is expensive, but because it happened to run first in
+this suite and so is the one query charged the one-time model boot
+cost (`boot_s`, ~48s). Every other query's cold pass had `boot_s = 0`.
+BIO-2, the largest query by fresh tokens, costs the most either way
+(~$0.18) and its cold/warm costs are nearly identical, since almost
+all of its cost is steady-state GPU time, not boot.
+
+Figure: plots/sol_docs_per_s.png
+
+Documents/second, warm pass, log-scaled (78-1,145 docs/s, a ~15x
+spread - more than one order of magnitude, so linear would compress
+the smaller bars unreadably). IMDB-2 leads at 1,145 docs/s: it's a
+join, and a join's per-document cost is dominated by short streaming
+reads against an already-built anchor, not a full causal prefill.
+FEV-5 is lowest (78 docs/s) - it's also the smallest query by document
+count (57), so per-document fixed overhead (boot-adjacent setup,
+short-query effects) has more relative weight.
+
+Figure: plots/sol_tokens_per_s.png
+
+Tokens/second, warm pass, linear (79k-109k, under 1.4x - no log
+needed). Much tighter than docs/s across queries, because tokens/s
+is closer to a hardware property (roughly how fast the GPU forwards
+tokens) while docs/s also depends on how many tokens each query's
+documents happen to contain.
