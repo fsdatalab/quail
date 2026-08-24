@@ -101,6 +101,32 @@ the filter round restored in the join round instead of recomputing.
 Summary committed as `results/barrier_smoke.json`; the teed log is
 `results/barrier_smoke.log` (not committed, like other logs).
 
+## Two review fixes, after that run
+
+- The re-shard condition was wrong. `join_group_payloads` followed
+  any shard present in the payload, and engine payloads ship a scan
+  shard for every alias, so the fresh balance over live documents
+  never ran: an unfiltered anchor kept its static scan shard however
+  the live set thinned, and after heavy thinning one GPU could hold
+  every live anchor. The condition is now "the anchor ran the filter
+  round" - that is the only case where a GPU already holds its KV -
+  and any other anchor balances fresh over its live documents.
+  Results were never affected, only load balance. Unit test: an
+  unfiltered anchor whose whole live set sat in one scan shard now
+  splits across workers (`test_coordinator.py`).
+- The smoke's thinning gate could not fail on that corpus draw: all
+  12 candidates had a stage-1 match, so "stage 2 evaluated labels x
+  thinned candidates" held with nothing thinned. Reports now draw
+  from only 4 of the 6 colors while candidates keep all 6, so the
+  unused colors' candidates can match no report, and the run fails
+  outright if every candidate survives the barrier. Prediction for
+  the re-run, from the drawn seed: the same 7 filter survivors, 8 of
+  12 candidates surviving the barrier, stage 2 at 6 x 8 = 48 tuples,
+  and 14 rows equal to brute force on both GPU counts. The re-run is
+  pending - Modal is not reachable from the review environment - so
+  the committed `results/barrier_smoke.json` still holds the
+  previous corpus's run.
+
 ## Tests
 
 `uv run pytest tests/ -q` from `quail/`: 180 passed. New coverage:

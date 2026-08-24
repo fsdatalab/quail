@@ -13,7 +13,11 @@ What this smoke gates, and what it does not:
   the answer rows the worker reports - correctness of the barrier
   plumbing, independent of model accuracy.
 - HARD: stage 2 evaluated n_labels x (candidates with at least one
-  stage-1 match) tuples - the barrier's thinning is visible.
+  stage-1 match) tuples - the barrier's thinning is visible. Reports
+  draw from only four of the six colors while candidates cover all
+  six, so at least two candidates can match no report and the count
+  check cannot pass vacuously; a run where every candidate survives
+  the barrier fails outright.
 - Informational: agreement with the planted truth. Stage 1 is the
   content-style color predicate the session smoke proved on the 4B;
   stage 2 compares two short color statements, a shape the session
@@ -42,6 +46,10 @@ SEED = 20260824
 FILLER = ("The projector hummed while the reel changed and nobody in "
           "the back row noticed the splice. ")
 COLORS = ("blue", "red", "green", "yellow", "purple", "orange")
+# reports use only the first 4 colors; candidates cover all 6, so the
+# 4 candidates of the unused colors can match no report and the
+# barrier's thinning always has something to remove
+N_REPORT_COLORS = 4
 N_REPORTS = 10
 N_CANDS = 12
 FLAG_RATE = 0.7
@@ -60,7 +68,7 @@ def make_parquets(tmp):
         reports.append(
             FILLER * 20
             + f"\n\nThe dominant color in this scene is "
-              f"{COLORS[i % len(COLORS)]}."
+              f"{COLORS[i % N_REPORT_COLORS]}."
             + f"\n\n[FLAGS] FLAG_1={'TRUE' if flags[i] else 'FALSE'}")
     cands = [f"The candidate color is {COLORS[j % len(COLORS)]}."
              for j in range(N_CANDS)]
@@ -74,7 +82,7 @@ def make_parquets(tmp):
     pq.write_table(pa.table({
         "id": [f"g{k}" for k in range(len(COLORS))],
         "label": labels}), f"{tmp}/labels.parquet")
-    truth1 = {(i, j): int(i % len(COLORS) == j % len(COLORS))
+    truth1 = {(i, j): int(i % N_REPORT_COLORS == j % len(COLORS))
               for i in range(N_REPORTS) for j in range(N_CANDS)}
     truth2 = {(j, k): int(j % len(COLORS) == k)
               for j in range(N_CANDS) for k in range(len(COLORS))}
@@ -161,6 +169,12 @@ def run_one(gpus, flags, truth1, truth2, tmp):
     jstages = [s for s in res.report["stages"] if s["op"] == "join"]
     assert jstages[1]["tuples"] == len(COLORS) * len(thinned_c), (
         jstages[1]["tuples"], len(COLORS), len(thinned_c))
+    # HARD: the count check above is meaningless if nothing thinned;
+    # the corpus guarantees candidates with no possible match, so a
+    # full survivor set means thinning did not run
+    assert len(thinned_c) < N_CANDS, (
+        "every candidate survived the barrier; the thinning gate "
+        "was vacuous on this run")
 
     # informational: agreement with the planted truth
     keep_r = {i for i in range(N_REPORTS) if flags[i]}
@@ -170,11 +184,14 @@ def run_one(gpus, flags, truth1, truth2, tmp):
         for k in range(len(COLORS))
         if truth1[(i, j)] and truth2[(j, k)])
     agree = len(set(got) & set(planted))
+    planted_thinned = {j for j in range(N_CANDS)
+                       if any(truth1[(i, j)] for i in keep_r)}
     summary = dict(
         gpus=gpus, rows=len(got),
         rows_match_brute_force=True,
         stage2_tuples=jstages[1]["tuples"],
         thinned_candidates=len(thinned_c),
+        planted_thinned_candidates=len(planted_thinned),
         candidates_total=N_CANDS,
         planted_triples=len(planted),
         agree_with_planted=agree,
@@ -191,6 +208,17 @@ def run_one(gpus, flags, truth1, truth2, tmp):
 def main():
     tmp = tempfile.mkdtemp()
     flags, truth1, truth2 = make_parquets(tmp)
+    keep_r = {i for i in range(N_REPORTS) if flags[i]}
+    planted_thinned = {j for j in range(N_CANDS)
+                       if any(truth1[(i, j)] for i in keep_r)}
+    print(f"prediction: rows equal the CPU brute-force recombination "
+          f"on both GPU counts; if the model matches the planted "
+          f"truth, {len(planted_thinned)} of {N_CANDS} candidates "
+          f"survive the barrier and stage 2 evaluates "
+          f"{len(COLORS)} x {len(planted_thinned)} = "
+          f"{len(COLORS) * len(planted_thinned)} tuples; a full "
+          f"{N_CANDS}-candidate survivor set fails the run",
+          flush=True)
     summary = {}
     summary["one_gpu"] = run_one(1, flags, truth1, truth2, tmp)
     summary["two_gpu"] = run_one(2, flags, truth1, truth2, tmp)
