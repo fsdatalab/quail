@@ -51,8 +51,18 @@ launch floor.
 
 The warm sweep grew from 332 to 1,024 items, but the added items are
 small matmuls; the cold sweep (every compile included) took ~4 min
-against ~11 min for the old 332-item sweep. Known residual, unchanged:
-above 4,096 tokens a chunk size between grid steps can still compile
-once per software stack (observed once, +0.46 s); chunk sizes there
-are packer-controlled, and closing it with the generator's full list
-to the 110k budget would multiply warm-boot compute ~20x.
+against ~11 min for the old 332-item sweep. The sweep loop now
+reuses one input buffer per linear instead of allocating a random
+tensor per item. Boot cost on the shared (warm) volume: 4B boots
+measured 78-94 s with the new sweep against 59-62 s before it - but
+per-container weight-load speed varies by tens of seconds (one 32B
+container loaded checkpoint shards at 2.6 min each), so the sweep's
+own share of that delta is bounded by, not equal to, the difference.
+First boot after this change pays the new configurations once into
+the shared cache (+33 s observed at 4B) and commits them.
+
+Known residual, unchanged: above 4,096 tokens a chunk size between
+grid steps can still compile once per software stack (observed once,
++0.46 s); chunk sizes there are packer-controlled, and closing it
+with the generator's full list to the 110k budget would multiply
+warm-boot compute ~20x.
