@@ -662,11 +662,20 @@ def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
     except ImportError:
         pass
     with torch.inference_mode():
+        # one buffer per linear, row-sliced per call (row slices stay
+        # contiguous): the sweep only needs each kernel LAUNCHED
+        # once, and a fresh randn per item was most of the sweep's
+        # warm-boot cost at 1,024 items. Peak transient memory equals
+        # the old per-item allocation (budget x widest input).
+        cur, buf = None, None
         for m, lin in work:
-            x = torch.randn(m, lin.weight.shape[1], device="cuda",
-                            dtype=torch.bfloat16)
-            q, s = pipeline.quant(x)
+            if lin is not cur:
+                buf = torch.randn(budget, lin.weight.shape[1],
+                                  device="cuda", dtype=torch.bfloat16)
+                cur = lin
+            q, s = pipeline.quant(buf[:m])
             pipeline.gemm(q, s, lin)
+        buf = None
         torch.cuda.synchronize()
 
     q_max = max(len(q) for q in question_ids)
