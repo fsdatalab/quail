@@ -130,33 +130,16 @@ launch floor (next section) and the chain lands on its prediction.
 
 Figure: plots/packing_sweep_queries.png
 
-Fits over the per-chunk points:
+### Per-query per-model fits
 
-| | 4B | 32B |
-|---|---|---|
-| `a` (us/token) | 7.867 (was 8.261, -4.8%) | 56.22 (was 56.64, -0.7%) |
-| `a2c` (s/token^2) | 4.343e-10 (was 4.934e-10, -12%) | 1.563e-09 (was 1.528e-09, +2.3%) |
-| filter-fit R^2 (chunks used) | 0.9995 (24 of 25) | 0.9992 (63 of 64) |
-| `a2x` (s/token^2, cross) | 9.80e-10 = 1.13x the causal 2*a2c | 3.52e-09 = 1.13x |
-| per suffix | 35 us | 114 us |
-| ext-container rate offsets (us/token) | +0.36, +0.20 | +6.11, +1.84 |
-| residual per token, per cross workload | -0.06 to +0.14 us | -0.49 to +1.06 us |
-| container band (repeated filters, 4 containers) | 2.9-3.1% | 2.6-6.6% |
+Each query is fit alone, with standard errors, using only the terms
+its own chunks carry - no container offsets, no borrowing from other
+queries. A value written "7.86±0.10" means the query's chunks pin
+that constant to about ±0.10; an error as large as the value means
+the query's packings cannot see that constant at all. Excluded
+chunks (see note below) are the same in every fit.
 
-With those terms, one model explains all seven workloads on both
-models to within 2% per token. The same fit shape holds across model
-sizes: the cross coefficient is 1.13x the causal one on both.
-
-### One set of constants, checked query by query
-
-The constants above are fit once per model, over every chunk. As a
-check, each query was also fit alone - no container offsets, only the
-terms its own chunks carry - with standard errors. A value written
-"7.86±0.10" means the query's chunks pin that constant to about
-±0.10; an error as large as the value means the query's packings
-cannot see that constant at all.
-
-4B (shared fit: a=7.87, a2c=4.34e-10, a2x=9.80e-10, 35 us/suffix):
+**4B:**
 
 | Query | Container | a (us/tok) | a2c (e-10) | a2x (e-10) | per suffix (us) |
 |---|---|---|---|---|---|
@@ -168,7 +151,7 @@ cannot see that constant at all.
 | FEV-2 | ext | 12.3±2.4 | -31±21 | 17±17 | -800±550 |
 | BIO-F3 | ext2 | 7.55±0.18 | 5.19±0.28 | 61±38 | -220±480 |
 
-32B (shared fit: a=56.22, a2c=15.6e-10, a2x=35.2e-10, 114 us/suffix):
+**32B:**
 
 | Query | Container | a (us/tok) | a2c (e-10) | a2x (e-10) | per suffix (us) |
 |---|---|---|---|---|---|
@@ -182,13 +165,14 @@ cannot see that constant at all.
 
 Three things the tables show:
 
-- Where a query's packings identify a constant, it lands on the
-  shared value. `a` from the four same-container queries at 32B:
-  55.4-56.3 against the shared 56.22. `a2x` from BIO-2 and LEP-2 at
-  both sizes: 9.84 and 10.29 (4B, shared 9.80); 35.0 and 44 (32B,
-  shared 35.2). The extension queries' `a` comes out high by about
-  their container's offset (BIO-F3 on ext2: 57.26 = 56.22 + ~1),
-  which is the container effect showing up unmodeled.
+- Where a query's packings identify a constant, queries agree. `a`
+  from the four same-container 4B queries: 6.70-7.97 (the three with
+  tight errors: 7.55-7.97). At 32B: 55.4-56.3 across four queries.
+  `a2x` from BIO-2 and LEP-2 at both sizes: 9.84 and 10.29 (4B);
+  35.0 and 44 (32B). The extension queries' `a` comes out high by
+  about their container's rate offset (BIO-F3 on ext2: 57.26 vs
+  BIO-1 on full: 55.38), which is the container effect showing up
+  unmodeled in a per-query fit.
 - Where a query's packings lack the variation, the fit chases noise:
   FEV-2's chunks are all nearly identical (same size, same mix), so
   its regressors are collinear and it "finds" negative attention
@@ -200,10 +184,31 @@ Three things the tables show:
   counts nearly proportional. Only queries with different suffix
   sizes, fit together, separate them.
 
-This is why the constants are fit jointly: per-query fits agree
-where they can and are unidentified where they cannot, and no query
-disagrees with the shared model beyond its own error bars plus its
-container's rate.
+### Joint fit, from the agreement
+
+Because the per-query fits converge where they can identify a
+constant, and no query disagrees beyond its own error bars plus its
+container's rate offset, fitting all chunks jointly per model
+(with one rate-offset column per extra container) gives tighter
+values:
+
+| | 4B | 32B |
+|---|---|---|
+| `a` (us/token) | 7.867 (was 8.261, -4.8%) | 56.22 (was 56.64, -0.7%) |
+| `a2c` (s/token^2) | 4.343e-10 (was 4.934e-10, -12%) | 1.563e-09 (was 1.528e-09, +2.3%) |
+| filter-fit R^2 (chunks used) | 0.9995 (24 of 25) | 0.9992 (63 of 64) |
+| `a2x` (s/token^2, cross) | 9.80e-10 = 1.13x the causal 2*a2c | 3.52e-09 = 1.13x |
+| per suffix | 35 us | 114 us |
+| ext-container rate offsets (us/token) | +0.36, +0.20 | +6.11, +1.84 |
+| residual per token, per cross workload | -0.06 to +0.14 us | -0.49 to +1.06 us |
+| container band (repeated filters, 4 containers) | 2.9-3.1% | 2.6-6.6% |
+
+The joint fit uses all seven workloads' chunks and explains them to
+within 2% per token. The cross coefficient is 1.13x the causal one
+on both models. The committed calibration files carry (`a`, `a2c`)
+from the filter-only fit (the first two rows); the cross term and
+per-suffix cost are not committed because no planner decision uses
+them yet.
 
 Excluded chunks (the fit drops any chunk more than 5% off its own
 GPU time and reports counts per query): each container's first
