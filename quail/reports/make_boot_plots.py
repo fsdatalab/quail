@@ -141,3 +141,58 @@ for model, entry in tl["models"].items():
     fig2.savefig(OUT / f"boot_touch_timeline{suffix}.png", dpi=150,
                  bbox_inches="tight")
     print(f"wrote {OUT / f'boot_touch_timeline{suffix}.png'}")
+
+
+# ---- figure 3: 32B boot phases + query ------------------------------
+t32 = json.load(open(RESULTS / "boot_tiered_32b.json"))
+cold32 = t32["touch"]["cold"]
+
+fig3, (ax_b, ax_q2) = plt.subplots(
+    1, 2, figsize=(10.5, 3.4),
+    gridspec_kw={"width_ratios": [1.5, 1]})
+
+left = 0.0
+total32 = mean_s(cold32, "boot_s")
+for name, key, color in PHASES:
+    val = mean_s(cold32, key)
+    if not val:
+        continue
+    ax_b.barh(0, val, left=left, height=0.42, color=color)
+    if val >= total32 * 0.15:
+        ax_b.text(left + val / 2, 0, f"{val:.1f}",
+                  ha="center", va="center", fontsize=9.5,
+                  color="white", fontweight="bold")
+    elif val >= total32 * 0.02:
+        ax_b.text(left + val / 2, -0.31, f"{val:.1f}",
+                  ha="center", va="top", fontsize=9.5,
+                  color=DARK, fontweight="bold")
+    left += val
+ax_b.text(total32 + 6, 0, f"{total32:.0f} s", va="center",
+          fontsize=10, color=DARK, fontweight="bold")
+ax_b.set_xlim(0, total32 * 1.22)
+ax_b.set_ylim(-0.45, 0.75)
+ax_b.set_yticks([])
+ax_b.set_xlabel(
+    "cold container boot, qwen3-32b-fp8 (seconds, 2-trial mean; "
+    "weight-load speed varies 2-6 min by container)")
+ax_b.legend(
+    handles=[Patch(facecolor=c, label=n) for n, _, c in PHASES],
+    loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=3,
+    fontsize=8.5, handlelength=1.1)
+
+best32 = t32["query"]["best_wall"]["no_arena"]
+bars = ax_q2.bar(["4B", "32B"], [best, best32],
+                 color=[GRAY, GREEN], width=0.45)
+for bar, v in zip(bars, [best, best32]):
+    ax_q2.text(bar.get_x() + bar.get_width() / 2, v + 4,
+               f"{v:.1f}", ha="center", fontsize=10,
+               fontweight="bold", color=DARK)
+ax_q2.set_ylim(0, best32 * 1.18)
+ax_q2.set_ylabel("filter query wall (seconds)")
+ax_q2.set_title("same 10k-document filter, both models",
+                fontsize=10, loc="left")
+
+fig3.tight_layout()
+fig3.savefig(OUT / "boot_tiered_32b.png", dpi=150,
+             bbox_inches="tight")
+print(f"wrote {OUT / 'boot_tiered_32b.png'}")
