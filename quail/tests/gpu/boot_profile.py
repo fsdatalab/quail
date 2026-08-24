@@ -363,13 +363,16 @@ def touch_trial(trial: int = 0, reps: int = 2,
 
 
 @app.function(timeout=3600, max_containers=8, **GPU_KW)
-def stock_boot_trial(trial: int = 0) -> dict:
+def stock_boot_trial(trial: int = 0,
+                     model_key: str = "qwen3-4b-fp8") -> dict:
     """One container: cold LLM(...), then warm reuse dict."""
     from baselines.stock_boot import time_llm_boot, warm_boot_dict
+    from quail.specs import MODELS
 
-    # Same knobs as the committed bf16 stock filter baseline.
+    # Same knobs as the committed stock filter baseline.
     llm, cold = time_llm_boot(
-        model=MODEL, max_num_batched_tokens=25_305,
+        model=MODELS[model_key].hf_name,
+        max_num_batched_tokens=25_305,
         max_num_seqs=2648, gpu_memory_utilization=0.92,
         enable_prefix_caching=True, disable_log_stats=True)
     _ = llm.llm_engine
@@ -411,7 +414,7 @@ def main(touch_trials: int = 3, reps: int = 2,
 
     t_handles = [touch_trial.spawn(i, reps, spy, model)
                  for i in range(touch_trials)]
-    s_handles = [stock_boot_trial.spawn(i)
+    s_handles = [stock_boot_trial.spawn(i, model)
                  for i in range(stock_trials)]
     for hh in t_handles + s_handles:
         print(f"[boot_tiered] fc={hh.object_id}", flush=True)
