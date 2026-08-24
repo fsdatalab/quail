@@ -1,36 +1,23 @@
 """Boot-time breakdown: Quail vs stock vLLM, cold and warm.
 
-Quail's worker boot (load_model, arena, pipeline, warm_kernels) and
-stock's LLM(...) constructor are timed side-by-side on H100 SXM with
-the same vLLM pin (0.26.0). Each side runs `trials` independent
-containers (default 3) so cold boots are real process starts; each
-container then records one warm reuse. The summary reports mean and
-median per phase across trials.
+Quail's worker boot (load_model, arena, pipeline) and stock's
+LLM(...) constructor are timed side-by-side on H100 SXM with the
+same vLLM pin (0.26.0). There is no kernel warmup: the first real
+chunk loads cubins from the volume. Each side runs `trials`
+independent containers (default 3) so cold boots are real process
+starts; each container then records one warm reuse. The summary
+reports mean and median per phase across trials.
 
 PREDICTION (stated before the run): Quail cold is dominated by
-load_model_s when the kernel-cache volume is warm (warm_kernels
-no-ops; cubins load on first use), and by warm_kernels_s on a
-cold kernel cache; arena_s and pipeline_s are small. Stock cold
-is weight load plus KV-cache profiling inside LLM(...). Both
-warm boots are near 0 (Quail hits _BOOTED / warmed=True; stock
+load_model_s (30-38 s). arena_s and pipeline_s are small. Stock
+cold is weight load plus KV-cache profiling inside LLM(...)
+(~250 s). Both warm boots are near 0 (Quail hits _BOOTED; stock
 keeps the LLM instance).
-
-Cold-cache Quail-only (principled sweep, --cold-cache, one
-confirming trial): warm_kernels_s dominates. Expected 90-240 s
-at 4B (DeepGEMM configs compile from scratch; run_join and
-tiny filter chunks run). load_model_s stays 30-40 s (committed
-warm-cache profile mean 35.1 s). Warm reuse still ~0.
-Committed warm-cache warm_kernels_s was 4.46 s mean
-(before the skip-if-cached change; a warm volume should now
-report skipped=True and ~0 s).
 
 Run from the quail/ directory (tee per house rule):
 
     uv run modal run tests/gpu/boot_profile.py \\
         2>&1 | tee results/boot_profile.log
-    uv run modal run tests/gpu/boot_profile.py --cold-cache \\
-        --trials 1 --no-stock \\
-        2>&1 | tee results/boot_profile_cold.log
 """
 
 from __future__ import annotations
@@ -77,20 +64,9 @@ GPU_KW = dict(image=image, gpu="H100!", memory=65536,
                        "/results": results_vol})
 
 PREDICTION = (
-    "Quail cold: load_model_s dominates when kernels are cached "
-    "(warm_kernels no-ops); warm_kernels_s dominates on a cold "
-    "kernel cache; arena + pipeline small. Stock cold: LLM(...) = "
-    "weights + KV profiling. Both warm ≈ 0."
-)
-COLD_CACHE_PREDICTION = (
-    "Cold kernel cache, no volume read. Principled DeepGEMM M list "
-    "from vLLM's config-boundary generator up to the chunk budget, "
-    "plus run_filter (unified, fast path, tiny chunks) and run_join "
-    "(long-prefix/short-suffix, short-prefix/long-suffix, tiny). "
-    "warm_kernels_s dominates: 90-240 s at 4B. load_model_s 30-40 s. "
-    "Warm reuse ~0. Compared with committed warm-cache "
-    "warm_kernels_s of 4.46 s mean (pre-skip). A warm volume now "
-    "skips the sweep."
+    "Quail cold: load_model_s 30-38 s; arena + pipeline small. "
+    "No kernel warmup. Stock cold: LLM(...) = weights + KV "
+    "profiling (~250 s). Both warm ≈ 0."
 )
 
 
@@ -102,7 +78,7 @@ def _round_boot(boot: dict) -> dict:
     return out
 
 
-def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
+def _quail_boot_once(*, reuse: dict | None) -> tuple[dict, dict]:
     """One Quail boot. reuse=None is cold; reuse=state is warm skip."""
     import torch
     import torch.nn.functional as F
@@ -110,14 +86,14 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
     from quail.executor.arena import KVArena
     from quail.executor.attention import (FILTER_ATTENTION,
                                           Pipeline)
-    from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
+    from quail.executor.loop import Answerer, AsyncAnswers
     from quail.executor.model import load_model
     from quail.planner import budgets
     from quail.specs import H100_SXM, QWEN3_4B_FP8
     from transformers import AutoTokenizer
 
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
-                pipeline_s=0.0, warm_kernels_s=0.0)
+                pipeline_s=0.0)
     t_boot = time.perf_counter()
     spec = QWEN3_4B_FP8
     device = H100_SXM
@@ -145,53 +121,20 @@ def _quail_boot_once(docs, warm_q, *, reuse: dict | None) -> tuple[dict, dict]:
         chunk_tokens = min(chunk_tokens, pipeline.max_chunk_tokens)
         state = dict(torch=torch, model=model, arena=arena,
                      pipeline=pipeline, async_ans=async_ans,
-                     chunk_tokens=chunk_tokens, warmed=False)
+                     chunk_tokens=chunk_tokens)
         boot["kind"] = "cold"
     else:
         state = reuse
-        torch = state["torch"]
-        arena = state["arena"]
-        pipeline = state["pipeline"]
-        async_ans = state["async_ans"]
-        chunk_tokens = state["chunk_tokens"]
-
-    if not state["warmed"]:
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            stats = warm_kernels(torch, arena, pipeline, async_ans,
-                                 docs, [warm_q], chunk_tokens)
-        torch.cuda.synchronize()
-        boot["warm_kernels_s"] = time.perf_counter() - t0
-        boot["warmup"] = stats
-        state["warmed"] = True
-        boot["kind"] = "cold"
 
     boot["boot_s"] = time.perf_counter() - t_boot
     return state, _round_boot(boot)
 
 
 @app.function(timeout=3600, max_containers=8, **GPU_KW)
-def quail_boot_trial(trial: int = 0, cold_cache: bool = False) -> dict:
-    """One container: cold Quail boot, then warm reuse.
-
-    cold_cache=True points DeepGEMM and Triton at /tmp so this
-    container does not read the shared kernel-cache volume."""
-    if cold_cache:
-        os.environ["DG_CACHE_DIR"] = "/tmp/dg-cold"
-        os.environ["DG_JIT_CACHE_DIR"] = "/tmp/dg-cold"
-        os.environ["TRITON_CACHE_DIR"] = "/tmp/triton-cold"
-
-    from corpus import build_corpus
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    # Small corpus: boot warmup only needs enough docs to fill one
-    # budget-sized chunk; full 10k is wasted work for this cell.
-    body_ids, q_ids, _flags = build_corpus(tokenizer, 256)
-    warm_q = q_ids[0]
-
-    state, cold = _quail_boot_once(body_ids, warm_q, reuse=None)
-    _, warm = _quail_boot_once(body_ids, warm_q, reuse=state)
+def quail_boot_trial(trial: int = 0) -> dict:
+    """One container: cold Quail boot, then warm reuse."""
+    state, cold = _quail_boot_once(reuse=None)
+    _, warm = _quail_boot_once(reuse=state)
     row = dict(side="quail", trial=trial, cold=cold, warm=warm)
     print(f"[boot_profile] quail trial {trial}: cold={cold} warm={warm}",
           flush=True)
@@ -223,7 +166,7 @@ def stock_boot_trial(trial: int = 0) -> dict:
 def write_boot_report(report: dict) -> str:
     """Persist per-side and merged compare JSON on the results volume."""
     os.makedirs("/results/boot", exist_ok=True)
-    tag = "cold" if report.get("cold_cache") else "compare"
+    tag = "compare"
     with open(f"/results/boot/{tag}.json", "w") as f:
         json.dump(report, f, indent=2)
     with open("/results/boot/quail.json", "w") as f:
@@ -236,21 +179,17 @@ def write_boot_report(report: dict) -> str:
 
 
 @app.local_entrypoint()
-def main(trials: int = 3, out: str = "",
-         cold_cache: bool = False, no_stock: bool = False):
+def main(trials: int = 3, out: str = "", no_stock: bool = False):
     """Spawn `trials` cold containers per side, aggregate mean/median.
 
     Does not write Modal return values to a local JSON file. Prints
     each fc- id. The volume record is /results/boot/*.json. Pass
-    --cold-cache to skip the shared kernel volume; --no-stock to
-    time Quail only."""
-    pred = COLD_CACHE_PREDICTION if cold_cache else PREDICTION
-    print(f"[boot_profile] prediction: {pred}", flush=True)
-    print(f"[boot_profile] trials={trials} cold_cache={cold_cache} "
-          f"stock={not no_stock}", flush=True)
+    --no-stock to time Quail only."""
+    print(f"[boot_profile] prediction: {PREDICTION}", flush=True)
+    print(f"[boot_profile] trials={trials} stock={not no_stock}",
+          flush=True)
 
-    q_handles = [quail_boot_trial.spawn(i, cold_cache)
-                 for i in range(trials)]
+    q_handles = [quail_boot_trial.spawn(i) for i in range(trials)]
     s_handles = ([] if no_stock
                  else [stock_boot_trial.spawn(i) for i in range(trials)])
     for h in q_handles + s_handles:
@@ -263,8 +202,7 @@ def main(trials: int = 3, out: str = "",
         model=MODEL,
         gpu="H100!",
         vllm="0.26.0",
-        prediction=pred,
-        cold_cache=cold_cache,
+        prediction=PREDICTION,
         quail=_aggregate("quail", quail_trials),
     )
     if stock_trials:
@@ -283,6 +221,3 @@ def main(trials: int = 3, out: str = "",
             print(f"[boot_profile] {side} {phase} boot_s "
                   f"mean={boot.get('mean')} median={boot.get('median')} "
                   f"trials={boot.get('trials')}", flush=True)
-    q0 = parsed["quail"]["trials"][0]["cold"]
-    if "warmup" in q0:
-        print(f"[boot_profile] warmup {q0['warmup']}", flush=True)

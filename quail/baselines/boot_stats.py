@@ -36,8 +36,7 @@ def summarize(trials: list[dict], phase: str, keys: list[str]) -> dict:
 def aggregate(side: str, trials: list[dict]) -> dict:
     trials = sorted(trials, key=lambda t: t["trial"])
     if side == "quail":
-        keys = ["boot_s", "load_model_s", "arena_s", "pipeline_s",
-                "warm_kernels_s"]
+        keys = ["boot_s", "load_model_s", "arena_s", "pipeline_s"]
     else:
         keys = ["boot_s", "llm_init_s", "weight_load_s", "kv_profile_s"]
     return dict(

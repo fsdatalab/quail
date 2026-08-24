@@ -360,7 +360,7 @@ def quail_side(n_docs: int = 1000,
     from quail.executor.attention import (FILTER_ATTENTION,
                                           JOIN_ATTENTION, Pipeline)
     from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
-                                     run_join, warm_kernels)
+                                     run_join)
     from quail.executor.model import load_model
     from quail.planner import budgets
     from quail.specs import H100_SXM, MODELS
@@ -383,12 +383,6 @@ def quail_side(n_docs: int = 1000,
     answerer = Answerer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     budget = min(chunk, pipeline.max_chunk_tokens)
-
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, budget)
-    torch.cuda.synchronize()
-    kernel_cache.commit()
 
     filters, joins, walls = {}, {}, {}
     with torch.inference_mode():

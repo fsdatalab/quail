@@ -29,7 +29,7 @@ payload to the worker, which calls the executor.
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
 | `executor/pack.py` | Chunk packing (pack_stream, FilterAdmission) | nothing |
-| `executor/loop.py` | Execution loops (run_filter, run_join, warm_kernels) | arena, attention, pack |
+| `executor/loop.py` | Execution loops (run_filter, run_join) | arena, attention, pack |
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
 | `executor/kvstore.py` | Pinned CPU KV store (save, load, extent allocation) | nothing (torch lazy) |
 | `runtime/session.py` | Session, Query, tokenization, payload assembly | catalog, logical, planner, sqlfront, builder |
@@ -780,7 +780,6 @@ answers. This overlaps GPU compute with answer readback.
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
 | `run_filter` | `loop.py:462` | The filter chain execution loop |
 | `run_join` | `loop.py:241` | The join execution loop (one cross-product stage per join; multi-stage gating stays available to GPU cells) |
-| `warm_kernels` | `loop.py` | Compile DeepGEMM/Triton configs on an empty cache; no-op when the volume already has cubins |
 | `Answerer` | `loop.py:60` | TRUE/FALSE scoring from final hidden states |
 | `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
 
@@ -1253,8 +1252,10 @@ created. vLLM is used as a library for its loader and kernels.
 **DeepGEMM**: all linear projections run as fp8 GEMMs through
 DeepGEMM (`attention.py:68`), which JIT-compiles a kernel
 configuration per token count. Compiled artifacts persist on a Modal
-volume, so each configuration compiles once per software stack. A
-later container skips the boot sweep when those files are present.
+volume, so each configuration compiles once per software stack.
+There is no boot sweep. The first real chunk loads each cubin
+into this process. A missing shape compiles on first use.
+FlashAttention-3 ships in the vLLM wheel, not the volume.
 
 **Triton kernels**: three custom fused kernels
 (`attention.py:103-221`):
@@ -1263,15 +1264,3 @@ later container skips the boot sweep when those files are present.
 - `add_rms_norm_quant`: fused residual add, RMSNorm, and fp8
   quantization.
 - `qk_norm_rope`: fused QK-norm and rotary position embedding.
-
-**Kernel warmup** (`loop.py:warm_kernels`): skipped when the
-kernel volume already has DeepGEMM cubins and Triton binaries.
-Those files are not loaded at process start; the first real chunk
-loads each cubin. FlashAttention-3 ships in the vLLM wheel, not
-the volume. On an empty cache the function compiles: DeepGEMM M
-values from vLLM's config-boundary generator
-(`_generate_optimal_warmup_m_values`, one list per linear, up to
-the chunk budget), then the real loops (`run_filter` unified /
-fast path / tiny 64-2,048 token chunks, and `run_join` both
-orientations plus a tiny tail). Flipping `attention_mode` on a
-filter chunk is not a join warmup.

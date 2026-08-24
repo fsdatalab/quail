@@ -14,19 +14,19 @@ def test_aggregate_quail_three_trials():
     trials = [
         dict(side="quail", trial=0,
              cold=dict(boot_s=30.0, load_model_s=10.0, arena_s=1.0,
-                       pipeline_s=0.5, warm_kernels_s=18.5),
+                       pipeline_s=0.5),
              warm=dict(boot_s=0.0, load_model_s=0.0, arena_s=0.0,
-                       pipeline_s=0.0, warm_kernels_s=0.0)),
+                       pipeline_s=0.0)),
         dict(side="quail", trial=1,
              cold=dict(boot_s=32.0, load_model_s=11.0, arena_s=1.0,
-                       pipeline_s=0.5, warm_kernels_s=19.5),
+                       pipeline_s=0.5),
              warm=dict(boot_s=0.01, load_model_s=0.0, arena_s=0.0,
-                       pipeline_s=0.0, warm_kernels_s=0.0)),
+                       pipeline_s=0.0)),
         dict(side="quail", trial=2,
              cold=dict(boot_s=34.0, load_model_s=12.0, arena_s=1.0,
-                       pipeline_s=0.5, warm_kernels_s=20.5),
+                       pipeline_s=0.5),
              warm=dict(boot_s=0.0, load_model_s=0.0, arena_s=0.0,
-                       pipeline_s=0.0, warm_kernels_s=0.0)),
+                       pipeline_s=0.0)),
     ]
     agg = aggregate("quail", trials)
     assert agg["n_trials"] == 3

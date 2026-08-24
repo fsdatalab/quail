@@ -444,20 +444,6 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
         runs=[])
     print(f"[m1_filter] {report['prediction']}", flush=True)
 
-    # boot-side warmup: one budget-sized chunk, so DeepGEMM and
-    # Triton compile their full-size configurations outside the
-    # measured walls (a small warmup chunk left ~52 s of JIT inside
-    # rep 0)
-    from quail.executor.loop import warm_kernels
-    t_warm = time.perf_counter()
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
-    torch.cuda.synchronize()
-    kernel_cache.commit()    # keep the compiles even if the run dies
-    report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
-    print(f"[m1_filter] warmup {report['warmup_s']} s", flush=True)
-
     for rep in range(reps):
         torch.cuda.reset_peak_memory_stats()
         chunk_trace = []
@@ -549,7 +535,7 @@ def filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
 
     from corpus import build_corpus
     from quail.executor.attention import FILTER_ATTENTION
-    from quail.executor.loop import run_filter, warm_kernels
+    from quail.executor.loop import run_filter
 
     (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
      exec_budget, arena_tok) = _boot(FILTER_ATTENTION)
@@ -566,18 +552,6 @@ def filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
                     "one)"),
         runs=[])
     print(f"[m1_filter1] {report['prediction']}", flush=True)
-
-    # warm_kernels runs both attention modes through the arena path
-    # and, for this single-stage query, the fast path too - both
-    # measured paths compile before the first rep
-    t_warm = time.perf_counter()
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
-    torch.cuda.synchronize()
-    kernel_cache.commit()
-    report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
-    print(f"[m1_filter1] warmup {report['warmup_s']} s", flush=True)
 
     modes = (("arena", True), ("no_arena", False))
     last = {}
@@ -780,21 +754,12 @@ def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
         max_doc_tokens=max(len(b) for b in body_ids))
     store_init_s = round(time.perf_counter() - t_store, 2)
 
-    from quail.executor.loop import warm_kernels
-    t_warm = time.perf_counter()
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
-    torch.cuda.synchronize()
-    kernel_cache.commit()
-
     report = dict(
         cell="m1_filter_store", n_docs=n_docs,
         corpus_tokens=corpus_tokens,
         store_capacity_gb=capacity_gb,
         store_kv_gb=round(corpus_tokens * kappa / 1e9, 1),
         store_init_s=store_init_s,
-        warmup_s=round(time.perf_counter() - t_warm, 2),
         prediction=("cold ~20 s plus offload tail; warm passes near "
                     "half the cold wall (committed persist: 1.9-2.1x)"),
         runs=[])
@@ -844,14 +809,12 @@ def profile_filter_run(n_docs: int = 3000) -> str:
 
     from corpus import build_corpus
     from quail.executor.attention import FILTER_ATTENTION
-    from quail.executor.loop import run_filter, warm_kernels
+    from quail.executor.loop import run_filter
 
     (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
      exec_budget, arena_tok) = _boot(FILTER_ATTENTION)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
         run_filter(torch, arena, pipeline, async_ans, body_ids, q_ids,
                    exec_budget, arena_writes=True)  # unprofiled reference
     torch.cuda.synchronize()

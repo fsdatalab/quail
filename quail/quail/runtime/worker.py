@@ -31,10 +31,8 @@ image = (
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-          # JIT artifacts persist on the kernel-cache volume so each
-          # DeepGEMM/Triton configuration compiles once ever. A later
-          # container skips the boot sweep and loads cubins on first
-          # use.
+          # JIT artifacts persist on the kernel-cache volume. First
+          # use of a shape loads the cubin; there is no boot sweep.
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
@@ -73,7 +71,7 @@ def execute(payload: dict) -> dict:
     from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
-                                     run_join, warm_kernels)
+                                     run_join)
     from quail.planner import budgets
     from quail.specs import DEVICES, MODELS
 
@@ -83,18 +81,17 @@ def execute(payload: dict) -> dict:
 
     spec = MODELS[payload["model"]]
     device = DEVICES["h100-sxm"]
-    docs = payload["docs"]
 
     t_boot = time.perf_counter()
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
-                pipeline_s=0.0, warm_kernels_s=0.0)
+                pipeline_s=0.0)
     booted = _BOOTED.get(spec.name)
     if booted is None:
         from quail.executor.model import load_model
         t0 = time.perf_counter()
         model = load_model(spec.hf_name)
         boot["load_model_s"] = time.perf_counter() - t0
-        # budgets.* is tiny CPU; fold into arena_s so the four phases
+        # budgets.* is tiny CPU; fold into arena_s so the three phases
         # cover the cold-load span without a leftover residual
         t0 = time.perf_counter()
         chunk_tokens = budgets.chunk_budget(spec, device)
@@ -109,8 +106,7 @@ def execute(payload: dict) -> dict:
         pipeline = Pipeline(model, arena,
                             attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
-        booted = dict(model=model, arena=arena, pipeline=pipeline,
-                      warmed=False)
+        booted = dict(model=model, arena=arena, pipeline=pipeline)
         _BOOTED[spec.name] = booted
         boot["kind"] = "cold"
     model, arena, pipeline = (booted["model"], booted["arena"],
@@ -122,25 +118,8 @@ def execute(payload: dict) -> dict:
     async_ans = AsyncAnswers(torch, answerer)
     chunk_tokens = payload["chunk_tokens"]
 
-    if not booted["warmed"]:
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            # boot-side compile only when the volume has no cubins.
-            # A warm volume skips; first real chunk loads each file.
-            first_alias = next(iter(docs))
-            warm_q = (next(iter(payload["filters"].values()))[0]
-                      if payload["filters"] else [1, 2, 3])
-            warm_kernels(torch, arena, pipeline, async_ans,
-                         docs[first_alias], [warm_q], chunk_tokens)
-        torch.cuda.synchronize()
-        kernel_cache.commit()   # keep the compiles even if the run dies
-        boot["warm_kernels_s"] = time.perf_counter() - t0
-        booted["warmed"] = True
-        boot["kind"] = "cold"
-
-    boot_s = time.perf_counter() - t_boot   # load + compile
-    for k in ("load_model_s", "arena_s", "pipeline_s",
-              "warm_kernels_s"):
+    boot_s = time.perf_counter() - t_boot
+    for k in ("load_model_s", "arena_s", "pipeline_s"):
         boot[k] = round(boot[k], 2)
     boot["boot_s"] = round(boot_s, 2)
     state = dict(model=model, arena=arena, pipeline=pipeline,
@@ -360,7 +339,7 @@ def _child_boot(state, sub):
     from quail.executor.arena import KVArena
     from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.kvstore import PinnedStore
-    from quail.executor.loop import AsyncAnswers, warm_kernels
+    from quail.executor.loop import AsyncAnswers
     from quail.executor.model import load_model
     from quail.planner import budgets
     from quail.specs import DEVICES, MODELS
@@ -368,7 +347,7 @@ def _child_boot(state, sub):
     spec = MODELS[sub["model"]]
     device = DEVICES["h100-sxm"]
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
-                pipeline_s=0.0, warm_kernels_s=0.0)
+                pipeline_s=0.0)
     t_boot = time.perf_counter()
     if "pipeline" not in state:
         t0 = time.perf_counter()
@@ -388,32 +367,13 @@ def _child_boot(state, sub):
                             attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
         state.update(torch=torch, F=F, model=model, arena=arena,
-                     pipeline=pipeline, spec=spec,
-                     warmed=False, store=None)
+                     pipeline=pipeline, spec=spec, store=None)
         boot["kind"] = "cold"
     answerer = _PayloadAnswerer(torch, F, state["model"],
                                 sub["true_ids"], sub["false_ids"])
     state["async_ans"] = AsyncAnswers(torch, answerer)
     state["chunk_tokens"] = sub["chunk_tokens"]
-    if not state["warmed"]:
-        docs = next((d for d in sub.get("docs", {}).values() if d),
-                    None)
-        if docs is None:
-            docs = sub.get("anchor_docs") or [[1, 2, 3]]
-        warm_q = (next(iter(sub["filters"].values()))[0]
-                  if sub.get("filters") else [1, 2, 3])
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            warm_kernels(torch, state["arena"], state["pipeline"],
-                         state["async_ans"], docs, [warm_q],
-                         state["chunk_tokens"])
-        torch.cuda.synchronize()
-        kernel_cache.commit()
-        boot["warm_kernels_s"] = time.perf_counter() - t0
-        state["warmed"] = True
-        boot["kind"] = "cold"
-    for k in ("load_model_s", "arena_s", "pipeline_s",
-              "warm_kernels_s"):
+    for k in ("load_model_s", "arena_s", "pipeline_s"):
         boot[k] = round(boot[k], 2)
     boot["boot_s"] = round(time.perf_counter() - t_boot, 2)
     state["boot"] = boot

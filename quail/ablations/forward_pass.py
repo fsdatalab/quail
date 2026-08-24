@@ -250,8 +250,7 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
     from quail.executor.arena import KVArena
     from quail.executor.attention import (FILTER_ATTENTION,
                                           Pipeline)
-    from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
-                                     warm_kernels)
+    from quail.executor.loop import (Answerer, AsyncAnswers, run_filter)
     from quail.executor.model import load_model
     from quail.planner import budgets
     from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -284,19 +283,6 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
         runs={})
     print(f"[ablation_packed] predictions: "
           f"{json.dumps(PACKED_PREDICTIONS)}", flush=True)
-
-    # one warmup covers every rung: the DeepGEMM configuration sweep
-    # is kernel-mode independent, and the budget-sized pass warms the
-    # Triton kernels and the attention path
-    t_warm = time.perf_counter()
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
-    torch.cuda.synchronize()
-    kernel_cache.commit()
-    report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
-    print(f"[ablation_packed] warmup {report['warmup_s']} s",
-          flush=True)
 
     answers_by_rung = {}
     for name, kernels, pinned, _change in PACKED_RUNGS:
@@ -991,7 +977,7 @@ def attention_paths(n_docs: int = 10000, reps: int = 2,
     import torch
 
     from corpus import build_corpus
-    from quail.executor.loop import run_filter, warm_kernels
+    from quail.executor.loop import run_filter
 
     (spec, tokenizer, arena, pipeline, _, async_ans,
      exec_budget, arena_tok) = _boot_executor(model)
@@ -1010,12 +996,6 @@ def attention_paths(n_docs: int = 10000, reps: int = 2,
         predictions=predictions, runs={}, comparisons={})
     print(f"[attention_paths] predictions: {json.dumps(predictions)}",
           flush=True)
-
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
-    torch.cuda.synchronize()
-    kernel_cache.commit()
 
     answers_by_path = {}
     for mode, _ in ATTENTION_PATHS:
@@ -1117,8 +1097,7 @@ def profile_packed(n_docs: int = 3000) -> str:
     from quail.executor.arena import KVArena
     from quail.executor.attention import (FILTER_ATTENTION,
                                           Pipeline)
-    from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
-                                     warm_kernels)
+    from quail.executor.loop import (Answerer, AsyncAnswers, run_filter)
     from quail.executor.model import load_model
     from quail.planner import budgets
     from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -1138,12 +1117,6 @@ def profile_packed(n_docs: int = 3000) -> str:
     async_ans = AsyncAnswers(torch, answerer)
     exec_budget = min(chunk, pipeline.max_chunk_tokens)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
-
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
-    torch.cuda.synchronize()
-    kernel_cache.commit()
 
     result = {"n_docs": n_docs, "exec_budget": exec_budget,
           "stock_reference_us_per_token": dict(
