@@ -197,6 +197,28 @@ def attention_crossover(model: ModelSpec, device: DeviceSpec,
 # fused batched kernel actually behaves (sum of maxes >= max of
 # sums). Getting this backwards is exactly the kind of SOL-formula
 # bug that manufactures a false "efficiency > 100%" alarm.
+#
+# Neither function prices softmax (the normalize step between the
+# two attention matmuls) separately, and that's deliberate, not an
+# oversight - checked, not assumed:
+#   - Compute: softmax is ~4 elementwise ops per (query, key) score
+#     pair, with no d_head factor. The matmul FLOPs above DO have a
+#     d_head factor, so softmax adds about 1/d_head of the matmul
+#     term (~0.8% at this model's d_head=128) - negligible on its own.
+#   - Memory: this is the term that actually matters, and it hinges
+#     on kernel fusion. A naive attention pass would write the full
+#     (chunk x context) score matrix to HBM for softmax to read back
+#     - for a typical streaming item that's MORE bytes than the KV
+#     read this module already counts, not negligible at all. The
+#     real kernel (executor/attention.py) is FlashAttention-3 with
+#     online softmax (`return_softmax_lse=True`) - the score matrix
+#     never leaves on-chip memory. The only thing that does is the
+#     LSE (log-sum-exp) state, one scalar per (query token, head),
+#     which comes out to about 0.1% of the KV traffic already
+#     counted. If the engine ever moved to an unfused attention
+#     kernel, this omission would need revisiting - it is correct
+#     for the kernel this project actually runs, not attention in
+#     general.
 
 def spec_ceiling_tokens_per_s(model: ModelSpec, device: DeviceSpec
                               ) -> float:
