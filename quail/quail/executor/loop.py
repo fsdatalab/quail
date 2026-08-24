@@ -319,7 +319,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, group_size=None, store=None,
              store_hash=None, store_min_tokens=1, store_ids=None,
-             stats=None, stage_frames=None):
+             stats=None, stage_frames=None, trace=None):
     """The join driver: every stage streams a partner list against the
     anchor side; gated anchors advance between stages.
 
@@ -358,6 +358,12 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     positions to stable store key ids (the anchor's global document
     index, the same key a filter scan of the same corpus uses).
     stats, when given, is filled with restored/stored counts.
+
+    trace: optional list; when given, one dict of chunk composition
+    (stage, tokens, and the (anchor, start, end, carried) group
+    pieces) is appended per launched chunk, in launch order - so
+    aligned with spans even when a gate prefetch builds chunks out
+    of order.
 
     Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
     partners, present only for anchors that reached stage j; spans =
@@ -471,12 +477,20 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     prefix=anchor_prefixes[key] if carried else None,
                     f=f + (len(frame) if frame else 0),
                     suffixes=sufs))
-        return pack_chunk(torch, arena, specs,
-                          attention_mode=pipeline.attention_mode)
+        chunk = pack_chunk(torch, arena, specs,
+                           attention_mode=pipeline.attention_mode)
+        if trace is not None:
+            chunk["_pieces"] = [(idx[a], start, end, int(carried))
+                                for a, start, end, carried
+                                in chunk_groups]
+        return chunk
 
     def launch(j, chunk):
         nonlocal tokens, save_after
         tokens += chunk["tokens"]
+        if trace is not None:
+            trace.append(dict(stage=j, tokens=chunk["tokens"],
+                              pieces=chunk.pop("_pieces")))
         for key, _ in chunk["layout"]:
             ev = load_events.pop(key, None)
             if ev is not None:
@@ -680,8 +694,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     doc_ids: per-document token lists (the planted flag line included).
     question_ids: per-stage question token lists, planner order.
     trace: optional list; when given, one dict of chunk composition
-    (tokens, groups, fresh admissions) is appended per chunk, aligned
-    with spans - the shape data for chasing per-chunk anomalies.
+    (tokens, groups, fresh admissions, and the (doc, stage, fresh)
+    pieces) is appended per chunk, aligned with spans - the shape
+    data for chasing per-chunk anomalies.
 
     store / store_hash / store_min_tokens: the pinned KV store. A
     document already in the store restores into its pages instead of
@@ -850,7 +865,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         if trace is not None:
             trace.append(dict(
                 tokens=chunk["tokens"], groups=len(groups),
-                fresh=sum(1 for _, _, f in groups if f)))
+                fresh=sum(1 for _, _, f in groups if f),
+                pieces=[(doc, stage, int(f))
+                        for doc, stage, f in groups]))
         for doc, _, fresh in groups:
             if fresh and doc in load_events:
                 torch.cuda.current_stream().wait_event(
