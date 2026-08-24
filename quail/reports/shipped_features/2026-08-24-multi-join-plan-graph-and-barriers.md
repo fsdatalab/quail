@@ -84,21 +84,27 @@ feeds issue #43's orientation check.
 
 `tests/gpu/barrier_smoke.py` (Modal, qwen3-4b-fp8): a filter on 10
 reports, then `ai(r, c)` anchored r and `ai(c, g)` anchored g -
-forced anchors, so the plan is two JoinGroups with one Barrier. Run
-on 1 GPU (the worker's plan-node walk) and 2 GPUs (per-group rounds
-and the parent's thinning). Prediction: the returned rows equal a
-CPU brute-force recombination of the worker's own answer rows, and
-stage 2 evaluates labels x barrier-thinned candidates.
+forced anchors, so the plan is two JoinGroups with one Barrier.
+Reports draw from only 4 of the 6 colors while candidates cover all
+6, so the unused colors' candidates can match no report and the
+thinning check cannot pass vacuously; the run fails outright if
+every candidate survives the barrier. Run on 1 GPU (the worker's
+plan-node walk and thinning) and 2 GPUs (per-group rounds, the
+parent's thinning, and the re-shard of the unfiltered stage-2
+anchor). Prediction, stated before the run: the returned rows equal
+a CPU brute-force recombination of the worker's own answer rows on
+both GPU counts; if the model matches the planted truth, 8 of 12
+candidates survive the barrier and stage 2 evaluates 6 x 8 = 48
+tuples.
 
 Result, both GPU counts: 14 rows, exactly matching the brute-force
-recombination, and stage 2 evaluated 72 tuples (6 labels x 12 live
-candidates - consistent with the rule, though nothing thinned out on
-this data: the 7 filter-surviving reports covered all 6 colors, so
-every candidate had a match). The model also matched the planted
-truth 14 of 14 with both stages at the planted 1/6 selectivity. The
-store worked across the barrier: 7 report documents stored during
-the filter round restored in the join round instead of recomputing.
-Summary committed as `results/barrier_smoke.json`; the teed log is
+recombination; 8 of 12 candidates survived the barrier (the planted
+count exactly); stage 2 evaluated 48 tuples = 6 labels x 8 thinned
+candidates. The model matched the planted truth 14 of 14 with both
+stages at the planted 1/6 selectivity. The store worked across the
+barrier: the 7 filter-surviving report documents restored in the
+join round instead of recomputing, on both GPU counts. Summary
+committed as `results/barrier_smoke.json`; the teed log is
 `results/barrier_smoke.log` (not committed, like other logs).
 
 ## Two review fixes, after that run
@@ -119,13 +125,11 @@ Summary committed as `results/barrier_smoke.json`; the teed log is
   thinned candidates" held with nothing thinned. Reports now draw
   from only 4 of the 6 colors while candidates keep all 6, so the
   unused colors' candidates can match no report, and the run fails
-  outright if every candidate survives the barrier. Prediction for
-  the re-run, from the drawn seed: the same 7 filter survivors, 8 of
-  12 candidates surviving the barrier, stage 2 at 6 x 8 = 48 tuples,
-  and 14 rows equal to brute force on both GPU counts. The re-run is
-  pending - Modal is not reachable from the review environment - so
-  the committed `results/barrier_smoke.json` still holds the
-  previous corpus's run.
+  outright if every candidate survives the barrier. The re-run
+  measured exactly the prediction from the drawn seed: the same 7
+  filter survivors, 8 of 12 candidates surviving the barrier, stage
+  2 at 6 x 8 = 48 tuples, and 14 rows equal to brute force on both
+  GPU counts - the smoke section above reports it.
 
 ## Tests
 
