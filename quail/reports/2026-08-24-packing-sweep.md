@@ -285,6 +285,11 @@ container).
 - `run_join` gained the same per-chunk `trace` option `run_filter`
   already had; both traces now record per-piece composition
   (see `reports/shipped_features/2026-08-24-join-chunk-trace.md`).
+- `warm_kernels` gained a tiny-chunk warmup ladder, closing the
+  compile-stall gap this sweep found. Validated on two cold kernel
+  caches: without it the chain's tail chunks stalled 9.3-12.9 s
+  each (query GPU time 40.7 s); with it, 14 ms-5.4 s (17.6 s) -
+  see `reports/shipped_features/2026-08-24-tiny-chunk-warmup.md`.
 
 ## Reproducing
 
