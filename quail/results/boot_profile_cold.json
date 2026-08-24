@@ -1,0 +1,37 @@
+{
+  "cell": "boot_profile",
+  "model": "Qwen/Qwen3-4B-FP8",
+  "gpu": "H100!",
+  "vllm": "0.26.0",
+  "cold_cache": true,
+  "n_trials": 1,
+  "prediction": "warm_kernels_s 90-240 s; load_model_s 30-40 s; warm reuse ~0",
+  "function_call_id": "fc-01M0TSWDBEV0TEA25FAWTYT1WX",
+  "raw_volume_path": "/results/boot/cold.json",
+  "quail": {
+    "cold": {
+      "boot_s": 240.97,
+      "load_model_s": 30.02,
+      "arena_s": 0.34,
+      "pipeline_s": 0.0,
+      "warm_kernels_s": 209.22
+    },
+    "warm": {
+      "boot_s": 0.0,
+      "warm_kernels_s": 0.0
+    },
+    "warmup": {
+      "n_gemm": 7583,
+      "n_filter": 8,
+      "n_join": 3,
+      "m_source": "vllm"
+    }
+  },
+  "committed_warm_cache": {
+    "source": "results/boot_profile.json",
+    "n_trials": 3,
+    "load_model_s_mean": 35.1,
+    "warm_kernels_s_mean": 4.46,
+    "boot_s_mean": 41.28
+  }
+}
