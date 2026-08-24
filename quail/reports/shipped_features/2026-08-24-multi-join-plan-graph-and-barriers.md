@@ -1,10 +1,9 @@
 # Multiple pairwise joins, the rest: plan graph, joint search, barriers
 
 Date: 2026-08-24. Slices 2-5 of issue #38, on top of the first slice
-(same PR). CPU-side code and CPU tests only; no engine run, so no
-measurements in this note. The shared-anchor requirement is gone:
-any connected set of full joins plans and executes, on one GPU or
-several.
+(same PR). The shared-anchor requirement is gone: any connected set
+of full joins plans and executes, on one GPU or several. Gated by
+the CPU suite plus one GPU smoke of the barrier path (below).
 
 ## What changed
 
@@ -69,6 +68,27 @@ every group's shards are re-decided from measured counts).
 Benchmarks for the chain and star shapes, and one case where
 token-length asymmetry makes the re-shard win, are issue #38's last
 slice and need engine runs.
+
+## GPU smoke of the barrier path
+
+`tests/gpu/barrier_smoke.py` (Modal, qwen3-4b-fp8): a filter on 10
+reports, then `ai(r, c)` anchored r and `ai(c, g)` anchored g -
+forced anchors, so the plan is two JoinGroups with one Barrier. Run
+on 1 GPU (the worker's plan-node walk) and 2 GPUs (per-group rounds
+and the parent's thinning). Prediction: the returned rows equal a
+CPU brute-force recombination of the worker's own answer rows, and
+stage 2 evaluates labels x barrier-thinned candidates.
+
+Result, both GPU counts: 14 rows, exactly matching the brute-force
+recombination, and stage 2 evaluated 72 tuples (6 labels x 12 live
+candidates - consistent with the rule, though nothing thinned out on
+this data: the 7 filter-surviving reports covered all 6 colors, so
+every candidate had a match). The model also matched the planted
+truth 14 of 14 with both stages at the planted 1/6 selectivity. The
+store worked across the barrier: 7 report documents stored during
+the filter round restored in the join round instead of recomputing.
+Summary committed as `results/barrier_smoke.json`; the teed log is
+`results/barrier_smoke.log` (not committed, like other logs).
 
 ## Tests
 
