@@ -143,10 +143,10 @@ def matches(answer_rows):
 
 
 def assemble(ans1_rows, ans2_rows):
-    """Output triples of two pairwise join stages sharing one anchor,
-    from recorded answers: the reference semantics for the session's
-    recombination (_assemble generalizes this to k stages and adds
-    the survivor-set checks) and the milestone-1 replay cell.
+    """Output triples of a pairwise-chained 3-way from recorded
+    answers. Kept for the milestone-1 replay cell only: the engine
+    now runs an n-way join as one cross-product stage under a single
+    prompt, so the session never chains stages or calls this.
 
     ans1_rows: b -> row of 0/1 over A (stage 1, anchored on b).
     ans2_rows: b -> row of 0/1 over C, present only for gated

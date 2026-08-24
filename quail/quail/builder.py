@@ -15,10 +15,10 @@ two LogicalPlans compare equal.
                      selectivity=0.05)
             .select("r.id", "p.id"))
 
-One ai_join call is one predicate, however many tables it spans: pass
-a list as the right side and a prompt with one placeholder per table,
-and every tuple of the cross product is judged by that single prompt
-(all the documents in one model call):
+A join is one call, however many tables it spans: pass a list as the
+right side and a prompt with one placeholder per table, and every
+tuple of the cross product is judged by that single prompt (all the
+documents in one model call - never a chain of pairwise stages):
 
     .ai_join([docs(catalog, "products").alias("p"),
               docs(catalog, "terms").alias("m")],
@@ -27,17 +27,6 @@ and every tuple of the cross product is judged by that single prompt
                     col("r.review"), col("p.description"),
                     col("m.term")),
              selectivity=0.01)
-
-Chained ai_join calls compose separate pairwise joins - one JoinSpec
-each. Each call's prompt must reference every table that call joins
-and at least one table already in the query, so the joins connect:
-
-    .ai_join(docs(catalog, "products").alias("p"),
-             prompt("m1 {0} {1}", col("r.review"),
-                    col("p.description")))
-    .ai_join(docs(catalog, "recalls").alias("c"),
-             prompt("m2 {0} {1}", col("p.description"),
-                    col("c.notice")))
 
 The order you chain calls is the order that runs - nothing is ever
 reordered behind your back (the builder is always `as_written`).
@@ -160,14 +149,12 @@ class Query:
                 anchor: Optional[str] = None,
                 semantics: str = "full") -> "Query":
         """Join one or more tables with a single prompt: every tuple
-        of the cross product is judged by one model call holding all
+        of the cross product (this query's documents x each joined
+        table's documents) is judged by one model call holding all
         the documents. `others` is one docs(...) query or a list of
-        them; `p` needs one placeholder per table it references -
-        every table this call joins, plus at least one table already
-        in the query (the first call references this query's own
-        table). Chained calls add one pairwise join each. exists/anti
-        take exactly one other table and gate this side's documents
-        instead of producing tuples."""
+        them; `p` needs one placeholder per table, this query's
+        included. exists/anti take exactly one other table and gate
+        this side's documents instead of producing tuples."""
         if semantics not in ("full", "exists", "anti"):
             raise CompileError(f"semantics must be full, exists, or "
                                f"anti, got {semantics!r}")
@@ -176,6 +163,14 @@ class Query:
             raise CompileError(
                 "an exists/anti gate takes exactly one inner table; "
                 "use one ai_join call per gate")
+        if semantics == "full" \
+                and any(j.semantics == "full" for j in self._joins):
+            raise CompileError(
+                "one full ai_join per query: the n-way join is a "
+                "single prompt over the cross product of its tables - "
+                "join every table in that one call and put any extra "
+                "condition in the prompt's text (exists/anti gates "
+                "stay separate calls)")
         new_aliases = []
         for other in others:
             if not isinstance(other, Query) or other._joins \
@@ -196,20 +191,12 @@ class Query:
             new_aliases.append(alias)
         bound, aliases = self._bind(p, join=True)
         if semantics == "full":
-            # each call's prompt must cover the tables that call
-            # joins and touch at least one table already in the
-            # query, so every join connects to the join graph
-            missing = [a for a in new_aliases if a not in aliases]
-            if missing:
+            expected = {self._tables[0][0], *new_aliases}
+            if set(aliases) != expected:
                 raise CompileError(
-                    f"the join prompt must reference every table this "
-                    f"call joins; {missing} joined but not referenced "
-                    f"(got {aliases})")
-            if all(a in new_aliases for a in aliases):
-                raise CompileError(
-                    f"the join prompt must reference at least one "
-                    f"table already in the query, so this join "
-                    f"connects to it; got only new tables {aliases}")
+                    f"the join prompt must reference exactly this "
+                    f"query's table and every joined table "
+                    f"({sorted(expected)}), got {aliases}")
             if anchor is not None and anchor not in aliases:
                 raise CompileError(
                     f"anchor {anchor!r} is not a table of this join "
