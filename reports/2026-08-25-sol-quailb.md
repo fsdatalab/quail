@@ -168,9 +168,7 @@ The two compute terms grow differently. `T_dense` is linear in
 tokens; `T_attention` is quadratic in the length of the document
 whose KV is held, because a sequence of length `m` scores `T(m)`
 pairs. So the longer the held document, the larger attention's share
-of the work. The curves in the figure are that relation, drawn from
-the equations over a synthetic single document; the 26 queries sit
-on and around them.
+of the work.
 
 The two terms also scale differently with model size. `T_dense`
 scales with the parameter count, 31,206,298,624 over 3,633,511,936
@@ -179,10 +177,11 @@ against 589,824 or 3.56x, and both models price it against the same
 bf16 peak.
 
 Put together: a query's cost multiplier from 4B to 32B lies between
-3.56 and 8.59, at whatever its mix is. Claims, excerpts, reviews and
-evidence are 0.6 to 6.3% attention and multiply by 8.3 to 8.6.
-BioDEX reports, at 4,146 tokens, are 32 to 40% attention and
-multiply by 6.6 to 7.0.
+3.56 and 8.59, at whatever its mix is. The five BioDEX queries hold
+4,146-token reports and spend 32 to 40% of their compute on
+attention, so they multiply by 6.6 to 7.0. Every other query holds
+documents of 11 to 370 tokens, spends under 7% on attention, and
+multiplies by 8.3 to 8.6.
 
 Long documents therefore make the big model relatively cheaper, not
 dearer.
