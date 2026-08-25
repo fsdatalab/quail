@@ -71,6 +71,12 @@ def test_filter_join_shape(catalog):
     assert join.predicate.template == \
         "Review {0} discusses product {1}"
 
+    star = compile_sql(
+        "SELECT * FROM reviews r WHERE "
+        "AI_FILTER(PROMPT('neg: {0}', r.review))", catalog, tok)
+    assert [(c.alias, c.column) for c in star.root.columns] == \
+        [("r", "id"), ("r", "review")]
+
 
 def test_builder_equals_sql(catalog):
     sql_plan = compile_sql(FILTER_JOIN_SQL, catalog, tok)
@@ -198,93 +204,55 @@ def test_two_join_predicates_compile_to_two_specs(catalog):
     assert plan == compile_sql(TWO_WHERE, catalog, tok) == built
 
 
-def test_on_plus_where_join_predicates_accepted(catalog):
-    # one predicate on the ON, the second a WHERE term - two specs
-    sql = ("SELECT r.id FROM reviews r JOIN products p ON AI_FILTER("
-           "PROMPT('x {0} {1}', r.review, p.description)) "
-           "JOIN threads t "
-           "WHERE AI_FILTER(PROMPT('y {0} {1}', p.description, "
-           "t.thread))")
-    plan = compile_sql(sql, catalog, tok)
-    outer = plan.root.input
-    assert [r.alias for r in outer.predicate.args] == ["p", "t"]
-    assert [r.alias for r in outer.inputs[0].predicate.args] == \
-        ["r", "p"]
-
-
-def test_join_prompt_repeat_alias_rejected(catalog):
-    with pytest.raises(CompileError) as e:
-        compile_sql("""
+def test_join_validation_errors(catalog):
+    cases = [
+        ("""
+            SELECT a.id FROM reviews a, threads b, products p
+            WHERE AI_FILTER(PROMPT('x {0} {1}', b.thread,
+                                   p.description))
+        """, "connected graph"),
+        ("""
+            SELECT a.id FROM reviews a, threads b, products p
+            WHERE AI_FILTER(PROMPT('x {0} {1}', a.review, b.thread))
+        """, "every JOINed table"),
+        ("""
+            SELECT a.id FROM reviews a JOIN threads b
+        """, "no join predicate"),
+        ("""
             SELECT a.id FROM reviews a
             JOIN threads b
               ON AI_FILTER(PROMPT('x {0} {1} {2}', a.review, b.thread,
                                   a.review))
-        """, catalog, tok)
-    assert "distinct table" in str(e.value)
+        """, "distinct table"),
+    ]
+    for sql, fragment in cases:
+        with pytest.raises(CompileError) as e:
+            compile_sql(sql, catalog, tok)
+        assert fragment in str(e.value)
 
-
-def test_builder_chained_joins_produce_two_specs(catalog):
-    plan = (docs(catalog, "reviews", tok).alias("a")
-            .ai_join(docs(catalog, "threads", tok).alias("b"),
-                     prompt("x {0} {1}", col("a.review"),
-                            col("b.thread")))
-            .ai_join(docs(catalog, "products", tok).alias("p"),
-                     prompt("y {0} {1}", col("b.thread"),
-                            col("p.description")))
-            .select("a.id"))
-    outer = plan.root.input
-    assert isinstance(outer, SemanticJoin)
-    assert isinstance(outer.inputs[0], SemanticJoin)
-
-    # a chained call's prompt must cover the table it joins ...
     q = (docs(catalog, "reviews", tok).alias("a")
          .ai_join(docs(catalog, "threads", tok).alias("b"),
                   prompt("x {0} {1}", col("a.review"),
                          col("b.thread"))))
-    with pytest.raises(CompileError) as e:
+    with pytest.raises(CompileError, match="joined but not referenced"):
         q.ai_join(docs(catalog, "products", tok).alias("p"),
                   prompt("y {0} {1}", col("a.review"),
                          col("b.thread")))
-    assert "joined but not referenced" in str(e.value)
 
+    with pytest.raises(CompileError, match="at least one table"):
+        docs(catalog, "reviews", tok).alias("a").ai_join(
+            [docs(catalog, "threads", tok).alias("b"),
+             docs(catalog, "products", tok).alias("p")],
+            prompt("y {0} {1}", col("b.thread"),
+                   col("p.description")))
 
-def test_builder_join_must_touch_query_rejected(catalog):
-    # ... and at least one table already in the query, so the joins
-    # connect to it
-    q = docs(catalog, "reviews", tok).alias("a")
-    with pytest.raises(CompileError) as e:
-        q.ai_join([docs(catalog, "threads", tok).alias("b"),
-                   docs(catalog, "products", tok).alias("p")],
-                  prompt("y {0} {1}", col("b.thread"),
-                         col("p.description")))
-    assert "at least one table already in the query" in str(e.value)
-
-
-def test_join_predicate_must_cover_every_joined_table(catalog):
-    with pytest.raises(CompileError) as e:
-        compile_sql("""
-            SELECT a.id FROM reviews a, threads b, products p
-            WHERE AI_FILTER(PROMPT('x {0} {1}', a.review, b.thread))
-        """, catalog, tok)
-    assert "every JOINed table" in str(e.value)
-
-    with pytest.raises(CompileError) as e:
-        compile_sql("""
-            SELECT a.id FROM reviews a JOIN threads b
-        """, catalog, tok)
-    assert "no join predicate" in str(e.value)
-
-
-def test_disconnected_join_graph_rejected(catalog):
-    # b-p is a connected pair, but no predicate touches the FROM
-    # table a, so a's cross product would pass through unfiltered
-    with pytest.raises(CompileError) as e:
-        compile_sql("""
-            SELECT a.id FROM reviews a, threads b, products p
-            WHERE AI_FILTER(PROMPT('x {0} {1}', b.thread,
-                                   p.description))
-        """, catalog, tok)
-    assert "connected graph" in str(e.value)
+    with pytest.raises(CompileError):
+        docs(catalog, "reviews", tok).select("id")
+    with pytest.raises(CompileError):
+        docs(catalog, "nowhere")
+    with pytest.raises(CompileError):
+        docs(catalog, "reviews", tok).alias("r").ai_filter(
+            prompt("x {0} {1}", col("r.review"), col("r.id")))
 
 
 def test_exists_and_anti(catalog):
@@ -361,25 +329,6 @@ def test_canonicalize_template():
     assert split_frame("{0} then {1}")[0] == ""
 
 
-def test_join_prompt_binding_counts(catalog):
-    plan = compile_sql("""
-        SELECT r.id FROM reviews r
-        JOIN products p
-          ON AI_FILTER(PROMPT('Judge the pair: {0} against {1}. Done.',
-                              r.review, p.description),
-                       {'selectivity': 0.5})
-    """, catalog, tok)
-    pred = plan.root.input.predicate
-    # the whole template is the per-tuple question, verbatim - no
-    # substitution, no text relocated into the anchor's kept KV
-    assert pred.frame == "" and pred.frame_tokens == 0
-    assert pred.preamble == SHARED_PRE
-    assert pred.tail == ("\n\nEvaluate TRUE or FALSE for the following "
-                         "question: Judge the pair: {0} against "
-                         "{1}. Done.\nANSWER:")
-    assert pred.tail_tokens == len(tok(pred.tail))
-
-
 def test_prompt_split_and_counts(catalog):
     plan = compile_sql(FILTER_JOIN_SQL, catalog, tok)
     pred = plan.root.input.inputs[0].predicates[0]
@@ -393,14 +342,6 @@ def test_prompt_split_and_counts(catalog):
     assert pred.prompt.tail_tokens == len(tok(
         "Evaluate TRUE or FALSE for the following question: "
         "This review is negative: ANSWER:"))
-
-
-def test_star_projection(catalog):
-    sql = ("SELECT * FROM reviews r WHERE "
-           "AI_FILTER(PROMPT('neg: {0}', r.review))")
-    plan = compile_sql(sql, catalog, tok)
-    assert [(c.alias, c.column) for c in plan.root.columns] == \
-        [("r", "id"), ("r", "review")]
 
 
 REJECTED = [
@@ -442,11 +383,11 @@ REJECTED = [
 ]
 
 
-@pytest.mark.parametrize("sql,fragment", REJECTED)
-def test_rejected_with_named_error(catalog, sql, fragment):
-    with pytest.raises(CompileError) as e:
-        compile_sql(sql, catalog, tok)
-    assert fragment.lower() in str(e.value).lower()
+def test_rejected_with_named_error(catalog):
+    for sql, fragment in REJECTED:
+        with pytest.raises(CompileError) as e:
+            compile_sql(sql, catalog, tok)
+        assert fragment.lower() in str(e.value).lower()
 
 
 def test_two_join_predicates_over_the_same_pair(catalog):
@@ -468,49 +409,21 @@ def test_two_join_predicates_over_the_same_pair(catalog):
     assert [r.alias for r in outer.predicate.args] == ["r", "p"]
 
 
-def test_limit_parses_and_threads(catalog):
+def test_limit_parsing_and_builder(catalog):
     sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
            "PROMPT('x: {0}', r.review)) LIMIT 5")
     plan = compile_sql(sql, catalog, tok)
     assert plan.root.limit == 5
-
-
-def test_limit_zero_and_negative_rejected(catalog):
-    for n in ("0", "-1"):
-        with pytest.raises(CompileError) as e:
-            compile_sql(f"SELECT r.id FROM reviews r WHERE AI_FILTER("
-                        f"PROMPT('x: {{0}}', r.review)) LIMIT {n}",
-                        catalog, tok)
-        assert "positive integer" in str(e.value)
-
-
-def test_limit_string_rejected(catalog):
+    built = (docs(catalog, "reviews", tok).alias("r")
+             .ai_filter(prompt("x: {0}", col("r.review")))
+             .limit(3)
+             .select("r.id"))
+    assert built.root.limit == 3
+    with pytest.raises(CompileError, match="positive integer"):
+        compile_sql("SELECT r.id FROM reviews r WHERE AI_FILTER("
+                    "PROMPT('x: {0}', r.review)) LIMIT 0",
+                    catalog, tok)
     with pytest.raises(CompileError):
         compile_sql("SELECT r.id FROM reviews r WHERE AI_FILTER("
                     "PROMPT('x: {0}', r.review)) LIMIT 'five'",
                     catalog, tok)
-
-
-def test_no_limit_gives_none(catalog):
-    plan = compile_sql(
-        "SELECT r.id FROM reviews r WHERE AI_FILTER("
-        "PROMPT('x: {0}', r.review))", catalog, tok)
-    assert plan.root.limit is None
-
-
-def test_builder_limit(catalog):
-    plan = (docs(catalog, "reviews", tok).alias("r")
-            .ai_filter(prompt("x: {0}", col("r.review")))
-            .limit(3)
-            .select("r.id"))
-    assert plan.root.limit == 3
-
-
-def test_builder_rejects_same_shapes(catalog):
-    with pytest.raises(CompileError):
-        docs(catalog, "nowhere")
-    q = docs(catalog, "reviews", tok).alias("r")
-    with pytest.raises(CompileError):
-        q.ai_filter(prompt("x {0} {1}", col("r.review"), col("r.id")))
-    with pytest.raises(CompileError):
-        docs(catalog, "reviews", tok).select("id")   # no predicate

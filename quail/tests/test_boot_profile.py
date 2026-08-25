@@ -3,14 +3,12 @@
 from baselines.boot_stats import aggregate, mean, median
 
 
-def test_mean_median_ignore_none():
+def test_aggregate_quail_three_trials():
     assert mean([1.0, None, 3.0]) == 2.0
     assert median([1.0, None, 3.0]) == 2.0
     assert mean([]) is None
     assert median([None, None]) is None
 
-
-def test_aggregate_quail_three_trials():
     trials = [
         dict(side="quail", trial=0,
              cold=dict(boot_s=30.0, load_model_s=10.0, arena_s=1.0,

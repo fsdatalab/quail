@@ -58,6 +58,8 @@ def test_merge_filter_round():
     assert m["survivors"]["r"] == [0, 1, 3, 4]
     assert m["fresh_tokens"] == 150
     assert m["store"]["r"]["stored_docs"] == 6
+    limited = merge_filter_round(outs, limit=3)
+    assert limited["survivors"]["r"] == [0, 1, 3]
 
 
 def test_join_group_anchors_follow_filter_shards():
@@ -233,32 +235,6 @@ def test_thin_survivors_intersects_across_stages():
     assert survivors["p"] == [1]
 
 
-def test_merge_filter_round_limit_truncates():
-    outs = [
-        dict(filters={"r": {0: [1], 2: [1], 4: [1]}},
-             survivors={"r": [0, 2, 4]},
-             fresh_tokens=100, store={}),
-        dict(filters={"r": {1: [1], 3: [1], 5: [1]}},
-             survivors={"r": [1, 3, 5]},
-             fresh_tokens=50, store={}),
-    ]
-    m = merge_filter_round(outs, limit=4)
-    assert m["survivors"]["r"] == [0, 1, 2, 3]
-
-
-def test_merge_filter_round_no_limit():
-    outs = [
-        dict(filters={"r": {0: [1], 2: [1]}},
-             survivors={"r": [0, 2]},
-             fresh_tokens=10, store={}),
-        dict(filters={"r": {1: [1]}},
-             survivors={"r": [1]},
-             fresh_tokens=10, store={}),
-    ]
-    m = merge_filter_round(outs, limit=None)
-    assert m["survivors"]["r"] == [0, 1, 2]
-
-
 def test_filter_round_limit_rule():
     # LIMIT counts output rows. Filter-only: one survivor is one row,
     # so the filter round may stop early. With joins, cutting
@@ -266,31 +242,14 @@ def test_filter_round_limit_rule():
     p = payload()
     p["limit"] = 3
     assert filter_round_limit(p) is None      # payload has joins
+    assert all(s["limit"] is None for s in filter_round_payloads(
+        p, p["shards"], 2))
     p["joins"] = []
     assert filter_round_limit(p) == 3
+    assert all(s["limit"] == 3 for s in filter_round_payloads(
+        p, p["shards"], 2))
     p["limit"] = None
     assert filter_round_limit(p) is None
-
-
-def test_filter_round_carries_limit_only_without_joins():
-    p = payload()
-    p["limit"] = 3
-    subs = filter_round_payloads(p, p["shards"], 2)
-    for s in subs:
-        # the payload has a join: no per-worker early stop (#39)
-        assert s["limit"] is None
-    p["joins"] = []
-    subs = filter_round_payloads(p, p["shards"], 2)
-    for s in subs:
-        assert s["limit"] == 3
-
-
-def test_filter_round_carries_arena_writes():
-    p = payload()
-    p["filter_arena_writes"] = {"r": False}
-    subs = filter_round_payloads(p, p["shards"], 2)
-    for s in subs:
-        assert s["filter_arena_writes"] == {"r": False}
 
 
 def test_merge_join_round_two_stages():

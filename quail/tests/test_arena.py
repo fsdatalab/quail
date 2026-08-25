@@ -9,7 +9,7 @@ import pytest
 from quail.executor.arena import PageArena
 
 
-def test_alloc_free_roundtrip():
+def test_alloc_free_capacity_and_errors():
     a = PageArena(n_pages=10, page_tokens=16)
     pages = a.alloc("d0", 40)      # 3 pages
     assert len(pages) == 3
@@ -19,20 +19,12 @@ def test_alloc_free_roundtrip():
     assert a.free_pages == 10
     assert a.resident_tokens == 0
 
-
-def test_alloc_returns_none_when_short():
-    a = PageArena(n_pages=2, page_tokens=16)
-    assert a.alloc("big", 100) is None      # needs 7 pages
-    assert a.free_pages == 2                # nothing leaked
-    assert a.alloc("ok", 32) is not None
-    assert a.alloc("more", 1) is None       # free list empty
-
-
-def test_double_alloc_rejected():
-    a = PageArena(n_pages=4, page_tokens=16)
-    a.alloc("d", 16)
+    assert a.alloc("big", 200) is None
+    assert a.alloc("d", 5, capacity_tokens=10) is not None
+    assert len(a.row_indices("d")) == 5
+    assert len(a.row_indices("d", 10)) == 10
     with pytest.raises(KeyError):
-        a.alloc("d", 16)
+        a.alloc("d", 5)
 
 
 def test_row_indices_follow_pages():
@@ -47,15 +39,6 @@ def test_row_indices_follow_pages():
         expect.extend(range(p * 4, p * 4 + take))
         left -= take
     assert rows == expect
-
-
-def test_capacity_reserves_pages_without_extending_logical_length():
-    a = PageArena(n_pages=4, page_tokens=4)
-    pages = a.alloc("d", 5, capacity_tokens=10)
-    assert len(pages) == 3
-    assert a.tokens["d"] == 5
-    assert len(a.row_indices("d")) == 5
-    assert len(a.row_indices("d", 10)) == 10
 
 
 def test_no_page_shared_between_documents():

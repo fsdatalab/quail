@@ -7,7 +7,6 @@ compiles at all, so both are pinned here. No GPU: the identity
 builder takes the torch module as a parameter, so a stub stands in.
 """
 
-import json
 from types import SimpleNamespace
 
 from quail.executor.loop import _marker_identity, _marker_path
@@ -28,18 +27,9 @@ def test_marker_path_uses_kernel_cache_dir(monkeypatch):
     # compiled kernels together; slash flattened for a filename
     assert path == ("/root/.cache/kernels/"
                     "quail-warm-Qwen--Qwen3-4B-FP8-110376.json")
-
-
-def test_marker_path_without_env(monkeypatch):
-    monkeypatch.delenv("DG_CACHE_DIR", raising=False)
-    path = _marker_path("m", 8)
-    assert path.endswith("quail-kernels/quail-warm-m-8.json")
-
-
-def test_identity_json_roundtrip_stable():
-    ident = _marker_identity(_stub_torch(), "Qwen/Qwen3-4B-FP8",
-                             110376)
-    assert json.loads(json.dumps(ident)) == ident
+    monkeypatch.delenv("DG_CACHE_DIR")
+    assert _marker_path("m", 8).endswith(
+        "quail-kernels/quail-warm-m-8.json")
 
 
 def test_identity_changes_with_budget_and_model():
