@@ -64,7 +64,7 @@ change needs one of them, say so instead of quietly adding it back.
   Modal volume. Do not commit it. Reports cite it by volume path:
   `/results/ablations/<file>.json`.
 - Commit only the aggregated summary a report's numbers and plot
-  script read, to `quail/results/`: totals, means, percentiles,
+  script read, to `results/`: totals, means, percentiles,
   per-configuration rows - never one record per item. Committed
   summaries keep plots and review working without Modal access and
   pin the numbers to the commit.
@@ -79,21 +79,21 @@ change needs one of them, say so instead of quietly adding it back.
 
 # Reports
 
-All experiment and feature reports live under `quail/reports/`.
+All experiment and feature reports live under `reports/`.
 
 - Every PR that includes an experiment must produce a report in
-  `quail/reports/`. Name the file `YYYY-MM-DD-<short-slug>.md`.
+  `reports/`. Name the file `YYYY-MM-DD-<short-slug>.md`.
   The report states the setup, the prediction, the measured result,
   and what the numbers mean. Reference committed summary files in
   `results/` by path, and raw data by its `quail-results` volume
   path.
 - When a report is superseded or its numbers are no longer current,
-  move it to `quail/reports/old/`. Do not delete old reports.
+  move it to `reports/old/`. Do not delete old reports.
 - When a PR ships a new feature (a code change that lands on main),
-  add a short description in `quail/reports/shipped_features/`.
+  add a short description in `reports/shipped_features/`.
   Name the file `YYYY-MM-DD-<short-slug>.md`. It should say what
   changed, why, and the before/after numbers if applicable.
-- `quail/reports/engine-wiki.md` is a living reference doc, not a
+- `reports/engine-wiki.md` is a living reference doc, not a
   per-PR report. Update it in place when the engine's design changes.
 
 # Issues and PR descriptions
@@ -102,7 +102,7 @@ Include a figure whenever one carries the point better than text:
 
 - For measured numbers, embed the report's committed plot. Link the
   image by its raw GitHub URL pinned to a commit
-  (`.../raw/<sha>/quail/reports/plots/<name>.png`) so it keeps
+  (`.../raw/<sha>/reports/plots/<name>.png`) so it keeps
   rendering as the branch moves. Do not make new plots just for an
   issue or PR body; reuse the report's.
 - For a design, plan, or dataflow change, include a mermaid diagram
@@ -115,21 +115,21 @@ Every report with measured results should include at least one plot.
 ## Where plotting code lives
 
 - One script per report (or per group of related reports), named
-  `make_<slug>_plots.py`, in `quail/reports/`.
-- Output PNGs go to `quail/reports/plots/`. When a report moves to
+  `make_<slug>_plots.py`, in `reports/`.
+- Output PNGs go to `reports/plots/`. When a report moves to
   `old/`, its PNGs move to `old/plots/`.
 - Reference plots in the report by relative path:
   `"Figure: plots/<name>.png"`.
-- Each script should be runnable standalone from `quail/`:
+- Each script should be runnable standalone from the repository root:
   `uv run --with matplotlib python reports/make_<slug>_plots.py`.
 
 ## Style
 
-Use `quail/reports/quail.mplstyle` in every plotting script:
+Use `reports/quail.mplstyle` in every plotting script:
 
     plt.style.use(Path(__file__).parent / "quail.mplstyle")
 
-Import colors from `quail/reports/plot_colors.py`:
+Import colors from `reports/plot_colors.py`:
 
     from plot_colors import BLUE, GRAY, GREEN, RED, DARK, ORANGE, TEAL
 

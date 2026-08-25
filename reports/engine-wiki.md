@@ -4,7 +4,7 @@ This document describes every algorithm and technique in the Quail
 engine, for use as a reference when writing the paper. It covers the
 full path from a user's query to GPU execution and back.
 
-All file references are relative to `quail/quail/` unless otherwise
+All file references are relative to `quail/` unless otherwise
 noted.
 
 ## Module map

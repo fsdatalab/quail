@@ -537,7 +537,7 @@
 </section>
 
 <div class="footer">
-  Design and measurements: quail/reports/2026-08-21-attention-paths.md and quail/reports/2026-08-24-packed-unified-joins.md.
+  Design and measurements: reports/2026-08-21-attention-paths.md and reports/2026-08-24-packed-unified-joins.md.
   Kernel sequences verified against vLLM 0.26.0 source (model_executor/models/qwen3.py: qkv_proj &rarr; split &rarr; per-head q_norm/k_norm
   &rarr; rotary_emb &rarr; attn &rarr; o_proj; models/qwen2.py: gate_up_proj &rarr; silu_and_mul &rarr; down_proj; layers/layernorm.py:
   rms_norm / fused_add_rms_norm; layers/quantization/fp8.py + kernels/linear/scaled_mm/deep_gemm.py: dynamic per-token-group

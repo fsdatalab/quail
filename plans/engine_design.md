@@ -1,10 +1,9 @@
 # Quail engine: a declarative query engine for AI_FILTER and AI_JOIN
 
-Status: design for the new repo. This exploration repo stays as the
-evidence base; the engine gets its own repository (working name:
-`quail`), built clean from this design. Nothing in the new repo may
-depend on experiment scripts here — the constants, the executor
-loop, and the pure-logic modules move over; the rest is history.
+Status: original design for the current engine. The engine now lives
+in this repository. The old exploration files are available in Git
+history at commit `e617c512dc40989deaeff66614af4b706a0a4be4`.
+The engine does not depend on those experiment scripts.
 
 Scope: AI_FILTER and AI_JOIN only. Qwen3 4B fp8 is the first model,
 H100 workers on Modal the first device — but the optimizer is built
@@ -19,16 +18,17 @@ documents once enough survivors are found. A
 query that needs those runs Quail for the semantic part and does
 the relational part in whatever database the ids came from.
 
-What the design rests on (all committed in this repo):
+What the design rests on. The source files below are available in Git
+history at the commit named above.
 
 | result | where |
 |---|---|
-| Packed executor, 2-way join, 256k pairs: 103.6 s vs 429 s for stock vLLM submitting grouped requests per pair — 4.1x | `exploration/results/engine/join2way.json` |
-| Packed executor, 3-way join, gated and deduped between stages, replay-consistent | `exploration/results/engine/join_nway3.json` |
-| Packed single filter: 121,045 tok/s vs 96,946 on the engine — the packed loop is the faster substrate for filters too | `exploration/plans/packed_forward.md`, `single_filter_forward_vllm_kernels.json` |
-| Chain semantics (keep document KV, attach question suffixes) beat per-stage requests: 39.8 s vs 42.9 s at 10k docs | `exploration/results/engine/filter_cells.json` |
-| Cross-query KV restore from a pinned CPU store: 1.9–2.1x over recompute | `exploration/results/engine/persist_split7_quail_waves_chain_10k.json` |
-| Attention-merge parity: 0 disagreements across all gates; rate 82.1k tok/s at the large-chunk geometry | `exploration/results/engine/join_probe.json` |
+| Packed executor, 2-way join, 256k pairs: 103.6 s vs 429 s for stock vLLM submitting grouped requests per pair — 4.1x | `old_exploration/results/engine/join2way.json` |
+| Packed executor, 3-way join, gated and deduped between stages, replay-consistent | `old_exploration/results/engine/join_nway3.json` |
+| Packed single filter: 121,045 tok/s vs 96,946 on the engine — the packed loop is the faster substrate for filters too | `old_exploration/plans/packed_forward.md`, `old_exploration/results/engine/single_filter_forward_vllm_kernels.json` |
+| Chain semantics (keep document KV, attach question suffixes) beat per-stage requests: 39.8 s vs 42.9 s at 10k docs | `old_exploration/results/engine/filter_cells.json` |
+| Cross-query KV restore from a pinned CPU store: 1.9–2.1x over recompute | `old_exploration/results/engine/persist_split7_quail_waves_chain_10k.json` |
+| Attention-merge parity: 0 disagreements across all gates; rate 82.1k tok/s at the large-chunk geometry | `old_exploration/results/engine/join_probe.json` |
 ---
 
 ## 1. Shape of the system
@@ -791,8 +791,8 @@ important to say when that file is made: offline, once per
 `quail calibrate <model> <device>` — that runs the batch sweep and
 the parity probe (~10 GPU-minutes) and writes the measured
 constants to a JSON checked into the repo, exactly what
-`exploration/results/engine/cost_model_fit.json` is in the exploration repo
-today. Nothing is ever measured at plan time or at query time: the
+`old_exploration/results/engine/cost_model_fit.json` is available in
+Git history at the commit named above. Nothing is ever measured at plan time or at query time: the
 planner reads constants from the file when one exists for this
 pair and from the spec-scaled defaults when it does not, and
 `explain()` names the source. Calibration is run when a model is
@@ -1008,10 +1008,10 @@ run at a fifth of the link.
 
 ---
 
-## 10. The new repo
+## 10. Repository layout
 
 ```
-quail/                        (new repository)
+./
   quail/
     specs/                    # ModelSpec per file + DeviceSpec; qwen3_4b.py first
     catalog.py                # DocumentProvider, Session catalog

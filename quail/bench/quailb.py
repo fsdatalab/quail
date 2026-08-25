@@ -815,7 +815,7 @@ def main():
             raise ValueError("the evaluation report requires accuracy")
         report_path = args.report_path or (
             f"results/benchmark/{suite['artifact_stem']}.md")
-        script = Path(__file__).resolve().parents[2] / "reports" \
+        script = Path(__file__).resolve().parents[1] / "reports" \
             / "make_quailb_eval_plots.py"
         subprocess.run(
             [sys.executable, str(script), "--input", out,
