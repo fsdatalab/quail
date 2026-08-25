@@ -89,6 +89,16 @@ def build_rows(suite: dict) -> list[dict]:
         rate_src = warm if warm_ok else cold
         docs = _docs_count_of(size_src)
         tokens = size_src.get("fresh_tokens")
+        # tokens_per_s_sol divides fresh_tokens by sol_s - both must
+        # come from rate_src, not size_src: a restore-heavy warm pass
+        # has a smaller sol_s (session.py discounts restored
+        # documents) but size_src's tokens is the full cold-pass
+        # count with nothing restored. Dividing cold's tokens by
+        # warm's sol_s stapled together two different passes' numbers
+        # and inflated the ratio by up to ~26% on the validated data
+        # (IMDB-5) - docs_per_s_sol was unaffected since document
+        # count doesn't change between passes, only token count does.
+        sol_tokens = rate_src.get("fresh_tokens")
         sol_s = rate_src.get("sol_s")
         rows.append(dict(
             query=qid,
@@ -107,7 +117,8 @@ def build_rows(suite: dict) -> list[dict]:
             docs_per_s_sol=(
                 round(docs / sol_s, 1) if docs and sol_s else None),
             tokens_per_s_sol=(
-                round(tokens / sol_s) if tokens and sol_s else None),
+                round(sol_tokens / sol_s)
+                if sol_tokens and sol_s else None),
             cost_sol=_sol_cost(sol_s, gpus, cpu_memory_gb),
         ))
     return rows

@@ -759,10 +759,10 @@ when it's absent.
 | Query | Docs/s (warm) | Docs/s (SOL) | Tok/s (warm) | Tok/s (SOL) | Cost (warm) | Cost (SOL) |
 |---|---|---|---|---|---|---|
 | IMDB-1 | 303 | 490 | 107k | 174k | $0.0210 | $0.0130 |
-| IMDB-2 | 1,145 | 1,815 | 109k | 185k | $0.0668 | $0.0421 |
-| IMDB-5 | 242 | 426 | 106k | 236k | $0.0264 | $0.0150 |
+| IMDB-2 | 1,145 | 1,815 | 109k | 172k | $0.0668 | $0.0421 |
+| IMDB-5 | 242 | 426 | 106k | 187k | $0.0264 | $0.0150 |
 | BIO-2 | 860 | 1,400 | 79k | 129k | $0.1821 | $0.1118 |
-| FEV-5 | 28 | 54 | 96k | 196k | $0.0026 | $0.0013 |
+| FEV-5 | 28 | 54 | 96k | 183k | $0.0026 | $0.0013 |
 
 Figure: plots/sol_docs_per_s.png, plots/sol_tokens_per_s.png,
 plots/sol_cost_estimate.png
@@ -774,6 +774,20 @@ both the lowest efficiency (53%) and the widest relative gap (28
 measured vs. 54 SOL-estimated docs/s, a 1.90x spread); IMDB-2 has the
 highest efficiency (63%) and the narrowest gap (1.59x). No query
 breaks that ordering.
+
+**A second real bug this surfaced (2026-08-26)**: `tokens_per_s_sol`
+divided `tokens` (the cold-pass fresh-token count) by `sol_s` from
+`rate_src` (the warm pass). For the two queries with real KV-store
+restores that quarter (IMDB-2, IMDB-5) and FEV-5, warm's `sol_s` is
+discounted for restored documents but `tokens` still counted the full,
+restore-free cold-pass corpus - two different passes' numbers divided
+against each other. The `1 / efficiency` invariant this section states
+held exactly for `docs_per_s_sol` and `cost_sol` (document count and
+`sol_s` both track a single pass consistently) but not for
+`tokens_per_s_sol`, which came out up to 26% too high (IMDB-5: 236k
+instead of 187k). Fixed by dividing `sol_s` against the same pass's
+own `fresh_tokens` (`rate_src`, not `size_src`) - the table above and
+`plots/sol_tokens_per_s.png` are the corrected numbers.
 
 6 new tests (`docs_per_s_sol`/`tokens_per_s_sol`/`cost_sol` computed
 correctly, the direction invariant on real validated data - SOL rate

@@ -84,7 +84,13 @@ def test_build_rows_sol_derived_cost_and_rate_are_correctly_directioned():
     r = rows[0]
 
     assert r["docs_per_s_sol"] == round(r["docs"] / r["sol_s"], 1)
-    assert r["tokens_per_s_sol"] == round(r["tokens"] / r["sol_s"])
+    # tokens_per_s_sol must divide the WARM pass's own fresh_tokens
+    # (5,690,657) by sol_s, not r["tokens"] (6,124,233, the cold
+    # pass's count) - cold's larger, restore-free token count over
+    # warm's smaller, restore-discounted sol_s would staple together
+    # two different passes' numbers and inflate the rate (a real bug
+    # this test used to encode instead of catch).
+    assert r["tokens_per_s_sol"] == round(5_690_657 / r["sol_s"])
     assert r["cost_sol"] == _cost_dollars(
         r["sol_s"], 0.0, 1, 80, _modal_rates())
 
