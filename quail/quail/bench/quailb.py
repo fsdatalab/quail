@@ -1,61 +1,9 @@
-"""QUAIL-B: twenty-three queries over four document sets.
+"""QUAIL-B: twenty-six queries over four document sets.
 
-The design (`reports/query-design.md`): real filter and join
-predicates over real, unpadded, un-concatenated text, ground-truthed
-by a Qwen3-32B judge pass (`quail/bench/judge_pass.py` - separate from
-this benchmark) rather than by planted flags. IMDB and BioDEX each get
-filter alone, join alone, then a filter chain of depth 1, 2, and 3
-feeding a single join (a document survives every filter, then joins
-against the partner table) - five queries per dataset. FEVER stops
-that chain at depth 2 (FEV-1..FEV-4). A depth-3 chain (person -> date
--> place, before joining) hit 0 rows at both sf=0.1 and sf=0.2 - real
-FEVER claims are single-fact sentences, so "about a person" + "has a
-date" essentially never also names a place; see git history for the
-predicate that tried to fix this before the query was cut instead.
-FEVER gets two more queries in its place: FEV-5, a two-sided filter ->
-join (one filter on each table before the join runs, not just the
-anchor side), and FEV-6, the same shape one filter deeper on the
-claims side. The primary goal of this benchmark is
-exercising joins, not stacking filters, so the two-sided shape - both
-tables filtered independently before the join runs - is the more
-useful FEVER-specific query to keep. Only claims/evidence carry real
-text on both sides of a join in this dataset (every other partner
-table - aspects, terms - is a short vocabulary word or phrase, not a
-document worth filtering on its own), so the two-sided shape is
-FEVER-only among these three datasets.
-
-LePaRD adds seven queries over legal citation text. They cover a
-self-join, filter chains with depths from one to five, and filtering
-both sides before the join.
-
-Deeper filter chains stand in for a second, dependent join (filter ->
-filter -> join -> join): two joins in one query, where the second
-join only runs over whatever the first join kept, is a real shape but
-a much less exercised path in the engine today (gating, dedup, and
-replay all have to hold across the join boundary), so it is left out
-of this set rather than folded in silently. If a query genuinely
-needs a second dependent join, that is a deliberate addition, not
-this one.
-
-Two shapes from the design doc are not here: join-first ("join then
-filter the joined output") and the F-J-F-J interleaved 4-operator
-chain. Both need a filter to run on a join's output, and the current
-builder can't express that - `Query.ai_filter()` files a predicate
-under its table alias regardless of when it's called, and
-`assemble_plan()` (`quail/logical.py`) always attaches a table's
-filters to its Scan node before any join is folded in ("filters
-always run before joins, section 4's unconditional pushdown," per
-that file's comment). Calling `.ai_filter()` after `.ai_join()` today
-does not raise - it silently produces a filter-then-join plan, which
-is a different, wrong query. Adding a real post-join filter operator
-is engine work (`logical.py`, `planner/decide.py`, the executor), not
-a query change, and is not done here.
-
-Selectivity hints are omitted throughout: none of these predicates
-have been through the judge pass yet (see `reports/query-design.md`),
-so there's no measured number to hand the planner. Omitting
-`selectivity=` is a real, supported state - the planner falls back to
-`as_written` ordering instead of guessing (`planner/decide.py`).
+Real filter and join predicates over real, unpadded, un-concatenated
+text, rather than planted flags. Selectivity hints are omitted
+throughout, so the planner falls back to `as_written` ordering
+instead of guessing (`planner/decide.py`).
 
 Build the data and run:
 
@@ -502,6 +450,12 @@ def queries(sess):
     q["IMDB-5"] = ("F1 -> F4 -> F5 -> J1, 3 filters then 1 join", make(
         "reviews", "r", "body", [F1, F4, F5],
         [("aspects", "a", "aspect", DISCUSS_ASPECT)], ["r.id", "a.id"]))
+    # filter chains with no join: IMDB-4 and IMDB-5 without their join,
+    # so the difference is the join's cost.
+    q["IMDB-6"] = ("F1 -> F4, 2 filters, no join", make(
+        "reviews", "r", "body", [F1, F4], [], ["r.id"]))
+    q["IMDB-7"] = ("F1 -> F4 -> F5, 3 filters, no join", make(
+        "reviews", "r", "body", [F1, F4, F5], [], ["r.id"]))
 
     # BioDEX: same five shapes (reports x terms).
     q["BIO-1"] = ("filter: F7 (female patient)", make(
@@ -577,6 +531,11 @@ def queries(sess):
         "citations", "d", "destination_context", [LEP1, LEP2],
         [("citations", "s", "passage_text", LEPJOIN, [LEPS1])],
         ["d.id", "s.id"]))
+    # LEP-6 without its join: the deepest filter chain in the suite,
+    # five stages of KV reuse with no join work mixed in.
+    q["LEP-8"] = ("LEP1..LEP5, 5 filters, no join", make(
+        "citations", "d", "destination_context",
+        [LEP1, LEP2, LEP3, LEP4, LEP5], [], ["d.id"]))
 
     return q
 

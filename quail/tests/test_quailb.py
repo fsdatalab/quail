@@ -43,10 +43,10 @@ def test_all_queries_compile_and_plan(tmp_path):
     register_sets(sess, tmp_path)
     qdefs = queries(sess)
     expected = {
-        *(f"IMDB-{i}" for i in range(1, 6)),
+        *(f"IMDB-{i}" for i in range(1, 8)),
         *(f"BIO-{i}" for i in range(1, 6)),
         *(f"FEV-{i}" for i in range(1, 7)),
-        *(f"LEP-{i}" for i in range(1, 8)),
+        *(f"LEP-{i}" for i in range(1, 9)),
     }
     assert set(qdefs) == expected
     for qid, (_, build) in qdefs.items():
