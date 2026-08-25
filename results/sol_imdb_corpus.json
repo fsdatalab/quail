@@ -1,0 +1,37 @@
+{
+  "what": "Token-length summary of the QUAIL-B reviews set at sf=0.1, for the speed-of-light bound (plans/sol_model.md). Aggregates only; no per-document record.",
+  "corpus": {
+    "set": "reviews",
+    "source": "stanfordnlp/imdb",
+    "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+    "scale_factor": 0.1,
+    "data_seed": 20260818,
+    "n_docs": 5000
+  },
+  "tokenizer": {
+    "model": "Qwen/Qwen3-4B-FP8",
+    "add_special_tokens": false
+  },
+  "doc_tokens": {
+    "sum": 1494233,
+    "sum_sq": 704459757,
+    "mean": 298.8466,
+    "min": 22,
+    "max": 2135
+  },
+  "prefix_tokens": {
+    "preamble_tokens": 2,
+    "sum": 1504233,
+    "sum_sq": 710456689,
+    "note": "prefix = SHARED_PRE + document; the span whose KV survives a rewind"
+  },
+  "question_tokens": {
+    "F1": 54,
+    "F4": 48,
+    "note": "Prompt.tail_tokens from logical.bind_prompt, placeholders stripped. The frame is not paid by filters: runtime/session._question_ids sends prompt.tail only."
+  },
+  "stage1_totals": {
+    "tokens": 1774233,
+    "causal_pairs": 444634043
+  }
+}
