@@ -24,13 +24,19 @@ BIO-1, FEV-1, LEP-1). So the suite could not measure what a filter
 chain costs on its own.
 
 That matters because a filter chain's later stages do not rebuild a
-document's KV. Stage 0 builds it; every later stage appends only its
-own question tokens, which read the KV that is already there. The
-saving is large - for a two-filter chain over the 5,000 IMDB reviews
-at sf=0.1, rebuilding instead of reusing would raise the token count
-from 1.97M to 3.21M, a factor of 1.63. Until now that saving was
-always measured together with join work, which is a much bigger and
-differently shaped cost.
+document's KV. Stage 0 builds it and keeps the document rows plus the
+token prefix its question shares with the later stages' questions
+(`_shared_preamble_tokens` in `executor/loop.py`). Every later stage
+then computes only the tokens of its own question past that shared
+prefix, reading the KV that is already there.
+
+The saving is large. For IMDB-6 over the 5,000 IMDB reviews at
+sf=0.1: F1 and F4 share an 18-token prefix, so stage 1 computes 30
+tokens per surviving document rather than its full 48, against a
+context of `2 + review + 18`. Rebuilding instead of reusing would
+raise the token count from 1,898,163 to 3,215,318, a factor of 1.69.
+Until now that saving was always measured together with join work,
+which is a much bigger and differently shaped cost.
 
 Because each new query is an exact filter prefix of an existing one,
 subtracting the two isolates the join:
@@ -44,9 +50,10 @@ reuse with nothing else mixed in.
 
 ## Numbers
 
-None measured. These queries have not been run on a GPU. The 1.63x
-figure above is computed from the committed IMDB-1 token count and
-the tokenized corpus, not from a run of IMDB-6.
+None measured. These queries have not been run on a GPU. The 1.69x
+figure above is computed from the committed IMDB-1 token count, the
+tokenized corpus, and the engine's own shared-preamble rule, not from
+a run of IMDB-6.
 
 The predicates carry no selectivity hints, matching every other query
 in the suite, so the planner uses `as_written` ordering.
