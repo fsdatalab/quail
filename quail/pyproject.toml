@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["matplotlib>=3.9", "pytest>=8.0"]
 
 [build-system]
 requires = ["hatchling"]

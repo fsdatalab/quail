@@ -7,12 +7,29 @@ instead of guessing (`planner/decide.py`).
 
 Build the data and run:
 
-    uv run python -m quail.bench.quailb --sf 0.1
+    mkdir -p results/benchmark
+    run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb.log"
+    uv run python -m quail.bench.quailb --sf 0.1 \
+        --model qwen3-4b-fp8 --gpus 1 \
+        --prediction "State the expected runtime and accuracy here" \
+        2>&1 | tee "$run_log"
+
+Omitting `--only` runs all twenty-six queries.
+
+The command reads the matching ground truth from the `quail-results`
+Modal volume. It writes the aggregate JSON summary and Markdown report
+under `results/benchmark/`. It writes the PNG plot under
+`reports/plots/benchmark/`. Raw returned rows and model answers stay on
+the Modal volume. The aggregate JSON is also saved on that volume.
 """
 
 import argparse
 import json
+import subprocess
+import sys
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +37,20 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 DATA_SEED = 20260818
+CACHE_SCHEMA_VERSION = 2
+
+# Exact source snapshots for the benchmark corpus.  The row selection below
+# is deterministic only when the upstream revisions are fixed as well as the
+# sampling seed.
+SOURCE_REVISIONS = {
+    "stanfordnlp/imdb": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+    "BioDEX/BioDEX-Reactions":
+        "01a5dacdabd144a120af04931a11a99febd48432",
+    # FEVER's parquet files live on its conversion ref, so this is the
+    # resolved commit for refs/convert/parquet rather than the default branch.
+    "fever/fever": "5f577157472532aa1d9924d2df63aac44f70cf2b",
+    "rmahari/LePaRD": "0194f95c3091acceab3b887c9b09ef432cf84052",
+}
 
 # Base document counts at sf=1. Only these three scale with sf; the
 # partner tables (aspects, terms) are fixed vocabulary and evidence is
@@ -51,7 +82,8 @@ def _imdb_pool():
         f = hf_hub_download(
             "stanfordnlp/imdb",
             f"plain_text/{split}-00000-of-00001.parquet",
-            repo_type="dataset")
+            repo_type="dataset",
+            revision=SOURCE_REVISIONS["stanfordnlp/imdb"])
         texts += pq.read_table(f, columns=["text"]).column(
             "text").to_pylist()
     rng = np.random.default_rng(DATA_SEED)
@@ -63,8 +95,9 @@ def _biodex_rows(n):
     """Real BioDEX rows, unpadded, un-concatenated: (text, reactions)
     per row. `reactions` seeds the `terms` table."""
     from datasets import load_dataset
-    ds = load_dataset("BioDEX/BioDEX-Reactions", split="train",
-                      streaming=True)
+    ds = load_dataset(
+        "BioDEX/BioDEX-Reactions", split="train", streaming=True,
+        revision=SOURCE_REVISIONS["BioDEX/BioDEX-Reactions"])
     rows = []
     for row in ds:
         text = str(row.get("fulltext_processed") or row.get("abstract"))
@@ -87,7 +120,7 @@ def _fever_data(n_claims):
     from huggingface_hub import hf_hub_download
     f = hf_hub_download("fever/fever", "v1.0/labelled_dev/0000.parquet",
                         repo_type="dataset",
-                        revision="refs/convert/parquet")
+                        revision=SOURCE_REVISIONS["fever/fever"])
     rows = pq.read_table(f).to_pylist()
     seen, claims = set(), []
     for r in rows:
@@ -106,7 +139,8 @@ def _fever_data(n_claims):
         fw = hf_hub_download(
             "fever/fever",
             f"wiki_pages/partial-wikipedia_pages/{shard:04d}.parquet",
-            repo_type="dataset", revision="refs/convert/parquet")
+            repo_type="dataset",
+            revision=SOURCE_REVISIONS["fever/fever"])
         t = pq.read_table(fw, columns=["id", "text"])
         for pid, txt in zip(t.column("id").to_pylist(),
                             t.column("text").to_pylist()):
@@ -136,9 +170,11 @@ def _lepard_rows(n):
     import pandas as pd
 
     csv_path = hf_hub_download("rmahari/LePaRD", "top_10000_data.csv.gz",
-                               repo_type="dataset")
+                               repo_type="dataset",
+                               revision=SOURCE_REVISIONS["rmahari/LePaRD"])
     dict_path = hf_hub_download("rmahari/LePaRD", "passage_dict.json",
-                                repo_type="dataset")
+                                repo_type="dataset",
+                                revision=SOURCE_REVISIONS["rmahari/LePaRD"])
     passages = _json.load(open(dict_path))["data"]
 
     rows, seen_dest = [], set()
@@ -170,7 +206,7 @@ def _vocab_table(rows, idx, cap=None):
     return vocab[:cap] if cap else vocab
 
 
-def _build_citations(d, sf):
+def _build_citations(d, sf, force=False):
     """citations.parquet, idempotent: real LePaRD citation events,
     self-joined against itself - one table, one row per citing case,
     its own excerpt (destination_context) and its own actually-cited
@@ -184,7 +220,7 @@ def _build_citations(d, sf):
     instead of silently no-op'ing against a stale marker - exactly
     what broke the first time this table was added."""
     path = d / "citations.parquet"
-    if path.exists():
+    if path.exists() and not force:
         return
     n = _n_docs("citations", sf)
     lep = _lepard_rows(n)
@@ -205,8 +241,19 @@ def build_sets(data_dir, sf, lf=1):
     d = Path(data_dir) / f"sf{sf}"
     marker = d / "DONE"
     if marker.exists():
-        _build_citations(d, sf)
-        return d
+        expected = {
+            "cache_schema_version": CACHE_SCHEMA_VERSION,
+            "data_seed": DATA_SEED,
+            "scale_factor": sf,
+            "source_revisions": SOURCE_REVISIONS,
+        }
+        try:
+            current = json.loads(marker.read_text())
+        except json.JSONDecodeError:
+            current = None
+        if current == expected:
+            _build_citations(d, sf)
+            return d
     d.mkdir(parents=True, exist_ok=True)
 
     def write(name, ids, col_name, values):
@@ -223,8 +270,11 @@ def build_sets(data_dir, sf, lf=1):
     # reports: real BioDEX text, one row = one report, unpadded
     n = _n_docs("reports", sf)
     bio = _biodex_rows(n)
-    write("reports", [f"rp{i}" for i in range(len(bio))], "report",
-          [t for t, _ in bio])
+    pq.write_table(pa.table({
+        "id": [f"rp{i}" for i in range(len(bio))],
+        "report": [t for t, _ in bio],
+        "reactions": [r for _, r in bio],
+    }), d / "reports.parquet")
     terms = _vocab_table(bio, 1, cap=2_560)
     write("terms", [f"tm{i}" for i in range(len(terms))], "term", terms)
 
@@ -244,9 +294,14 @@ def build_sets(data_dir, sf, lf=1):
         "text": [page_text[p] for p in ev_ids],
     }), d / "evidence.parquet")
 
-    _build_citations(d, sf)
+    _build_citations(d, sf, force=True)
 
-    marker.write_text("ok")
+    marker.write_text(json.dumps({
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "data_seed": DATA_SEED,
+        "scale_factor": sf,
+        "source_revisions": SOURCE_REVISIONS,
+    }, indent=2, sort_keys=True))
     return d
 
 
@@ -542,22 +597,107 @@ def queries(sess):
 
 # ----------------------------------------------------------- driver
 
+def _artifact_stem(started, sf, lf, model):
+    timestamp = started.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}-quailb-sf{sf}-lf{lf}-{model}"
+
+
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
-              out_path=None, cpu_memory_gb=80, model="qwen3-4b-fp8"):
+              out_path=None, cpu_memory_gb=80, model="qwen3-4b-fp8",
+              accuracy=True, ground_truth_collection=None,
+              h100_usd_per_hour=3.9492, ground_truth_files=None,
+              prediction=None, artifact_stem=None):
     """cpu_memory_gb defaults to what the 96 GB worker container
     holds: a 64 GB store (8 slabs). The corpus KV usually exceeds it,
     so the length threshold keeps the longest documents - partial
     restores are the capacity arithmetic working, not a bug."""
     import quail
+    from quail.bench.evaluate import (
+        BenchmarkEvaluator,
+        H100_PRICE_SOURCE,
+        ModalVolumeFiles,
+        add_query_metrics,
+        corpus_identity,
+        load_ground_truth,
+        read_corpus,
+        summarize_queries,
+    )
     from quail.planner.plan import EngineConfig
 
     d = build_sets(data_dir, sf, lf)
+    corpus_rows = read_corpus(d)
+    corpus = corpus_identity(
+        corpus_rows, sf, DATA_SEED, SOURCE_REVISIONS)
+    evaluator = None
+    truth = None
+    result_files = ground_truth_files or ModalVolumeFiles()
+    if accuracy:
+        truth = load_ground_truth(
+            result_files, scale_factor=sf, corpus_id=corpus["corpus_id"],
+            collection_id=ground_truth_collection)
+        if truth.corpus_id != corpus["corpus_id"]:
+            raise ValueError(
+                f"benchmark corpus {corpus['corpus_id']} does not match "
+                f"ground truth {truth.corpus_id}")
+        evaluator = BenchmarkEvaluator(truth, corpus_rows)
     sess = quail.Session(EngineConfig(gpus=gpus, model=model,
                                       cpu_memory_gb=cpu_memory_gb))
     register_sets(sess, d)
     qdefs = queries(sess)
     ids = [i for i in qdefs if only is None or i in only]
-    suite = dict(sf=sf, lf=lf, gpus=gpus, model=model, passes={})
+    started = datetime.now(timezone.utc)
+    artifact_stem = artifact_stem or _artifact_stem(
+        started, sf, lf, model)
+    run_id = (f"qb_{started.strftime('%Y%m%dT%H%M%SZ')}_"
+              f"{uuid.uuid4().hex[:8]}")
+    raw_root = f"benchmarks/quailb/runs/{run_id}"
+    aggregate_volume_path = f"{raw_root}/{artifact_stem}.json"
+    suite = dict(
+        run_id=run_id,
+        artifact_stem=artifact_stem,
+        started_at=started.isoformat(),
+        prediction=prediction,
+        sf=sf, lf=lf, gpus=gpus, model=model,
+        corpus_id=corpus["corpus_id"],
+        raw_volume_path=f"/results/{raw_root}",
+        aggregate_volume_path=f"/results/{aggregate_volume_path}",
+        pricing=dict(
+            gpu="H100",
+            h100_usd_per_hour=h100_usd_per_hour,
+            gpu_count=gpus,
+            price_source=H100_PRICE_SOURCE,
+            method=("query runtime in hours multiplied by the H100 hourly "
+                    "price and GPU count"),
+        ),
+        metric_definitions=dict(
+            runtime_s=("GPU worker query runtime; corpus construction, "
+                       "ground truth loading, and local evaluation are "
+                       "excluded"),
+            runtime_with_boot_s=("GPU worker query runtime plus model load "
+                                 "and warmup; ground truth loading is "
+                                 "excluded"),
+            pass_wall_s=("host time for the query loop; ground truth "
+                         "loading is excluded"),
+            tokens_processed=("sum of fresh tokens sent through model "
+                              "forward calls; tokens read from KV are not "
+                              "counted again"),
+            input_document_rows=("sum of input table rows for every query "
+                                 "alias; a self join counts the table once "
+                                 "per alias"),
+            documents_per_second=("input_document_rows divided by query "
+                                  "runtime_s"),
+            inference_cost_per_token_usd=("inference_cost_usd divided by "
+                                          "tokens_processed"),
+            answer_accuracy=("agreement with saved labels on model calls "
+                             "that the query evaluated"),
+            output_accuracy=("precision, recall, and F1 for final returned "
+                             "rows against rows derived from saved labels"),
+        ),
+        ground_truth=(
+            dict(collection_id=truth.collection_id,
+                 reference_model=truth.reference_model)
+            if truth else None),
+        passes={})
     try:
         for pass_name in ("cold", "warm"):
             sess.set_store(pass_name == "warm")
@@ -570,7 +710,8 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                 print(f"[quailb] {pass_name} {qid}: {desc}",
                       flush=True)
                 try:
-                    res = build().run()
+                    query = build()
+                    res = query.run()
                     row = dict(query=qid, desc=desc,
                                wall_s=res.report["wall_s"],
                                boot_s=res.report["boot_s"],
@@ -581,14 +722,35 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                                peak_gib=res.report.get("peak_gib"),
                                stages=res.report["stages"],
                                store=res.report.get("store"))
+                    if evaluator is not None:
+                        evaluation = evaluator.evaluate(query, res)
+                        add_query_metrics(
+                            row, evaluation, h100_usd_per_hour, gpus)
+                        raw_path = f"{raw_root}/{pass_name}/{qid}.json"
+                        result_files.write_json(raw_path, {
+                            "run_id": run_id,
+                            "pass": pass_name,
+                            "query": qid,
+                            "description": desc,
+                            "columns": res.columns,
+                            "rows": res.rows,
+                            "answer_rows": res.answer_rows,
+                            "engine_report": res.report,
+                            "accuracy": row["accuracy"],
+                        })
+                        row["raw_volume_path"] = f"/results/{raw_path}"
                 except Exception as e:            # noqa: BLE001
                     row = dict(query=qid, desc=desc,
                                error=f"{type(e).__name__}: {e}")
                 rows.append(row)
                 print(f"[quailb] {row}", flush=True)
-            suite["passes"][pass_name] = dict(
+            passed = dict(
                 queries=rows,
                 pass_wall_s=round(time.time() - t_pass, 1))
+            if evaluator is not None:
+                passed["summary"] = summarize_queries(
+                    rows, h100_usd_per_hour, gpus)
+            suite["passes"][pass_name] = passed
     finally:
         sess.close()
     if out_path:
@@ -596,6 +758,10 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         with open(out_path, "w") as f:
             json.dump(suite, f, indent=2)
         print(f"[quailb] saved {out_path}", flush=True)
+    result_files.write_json(aggregate_volume_path, suite)
+    print(
+        f"[quailb] saved /results/{aggregate_volume_path} on quail-results",
+        flush=True)
     return suite
 
 
@@ -607,15 +773,53 @@ def main():
     ap.add_argument("--gpus", type=int, default=1)
     ap.add_argument("--data-dir", default="results/quailb_data")
     ap.add_argument("--only", default=None,
-                    help="comma-separated query ids")
-    ap.add_argument("--out", default=None)
+                    help=("comma-separated query ids; default runs all "
+                          "queries"))
+    ap.add_argument(
+        "--out", default=None,
+        help=("JSON path; default uses a UTC timestamp under "
+              "results/benchmark/"))
     ap.add_argument("--model", default="qwen3-4b-fp8",
                     help="registered ModelSpec name, see quail.specs.MODELS")
+    ap.add_argument(
+        "--accuracy", action=argparse.BooleanOptionalAction, default=True,
+        help="compare answers and output rows with the Modal ground truth")
+    ap.add_argument("--ground-truth-collection", default=None,
+                    help="collection id; default is the one matching the corpus")
+    ap.add_argument("--h100-usd-per-hour", type=float, default=3.9492,
+                    help="H100 price used for query cost estimates")
+    ap.add_argument("--prediction", default=None,
+                    help="prediction stated before this benchmark run")
+    ap.add_argument(
+        "--report", action=argparse.BooleanOptionalAction, default=True,
+        help=("write a Markdown report under results/benchmark/ and a PNG "
+              "plot under reports/plots/benchmark/"))
+    ap.add_argument("--report-path", default=None,
+                    help="Markdown path; default uses the run UTC timestamp")
     args = ap.parse_args()
     only = set(args.only.split(",")) if args.only else None
-    out = args.out or f"results/quailb_sf{args.sf}_lf{args.lf}_{args.model}.json"
-    run_suite(args.data_dir, sf=args.sf, lf=args.lf, gpus=args.gpus,
-              only=only, out_path=out, model=args.model)
+    started = datetime.now(timezone.utc)
+    artifact_stem = _artifact_stem(
+        started, args.sf, args.lf, args.model)
+    out = args.out or f"results/benchmark/{artifact_stem}.json"
+    suite = run_suite(
+        args.data_dir, sf=args.sf, lf=args.lf, gpus=args.gpus,
+        only=only, out_path=out, model=args.model,
+        accuracy=args.accuracy,
+        ground_truth_collection=args.ground_truth_collection,
+        h100_usd_per_hour=args.h100_usd_per_hour,
+        prediction=args.prediction,
+        artifact_stem=artifact_stem)
+    if args.report:
+        if not args.accuracy:
+            raise ValueError("the evaluation report requires accuracy")
+        report_path = args.report_path or (
+            f"results/benchmark/{suite['artifact_stem']}.md")
+        script = Path(__file__).resolve().parents[2] / "reports" \
+            / "make_quailb_eval_plots.py"
+        subprocess.run(
+            [sys.executable, str(script), "--input", out,
+             "--report", report_path], check=True)
 
 
 if __name__ == "__main__":
