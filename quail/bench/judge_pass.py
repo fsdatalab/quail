@@ -154,26 +154,19 @@ PREDICATES = (
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
 
 
-# Rows per model call. This is the only thing about the pass that is
-# not already on a PredicateSpec, because it is hand-tuned to how long
-# the documents are: BioDEX reports go 8 at a time at ~4,146 tokens
-# each, IMDB reviews 256 at ~299. A group of k predicates over one
-# column submits k * rows prompts per call.
-FILTER_ROWS_PER_CALL = {
-    ("reviews", "body"): 256,
-    ("reports", "report"): 8,
-    ("claims", "claim"): 100,
-    ("evidence", "text"): 57,
-    ("citations", "destination_context"): 50,
-    ("citations", "passage_text"): 100,
-}
+# One call to the model is one Parquet part, so this sets the resume
+# granularity, not the GPU batch size: vLLM re-chunks whatever it is
+# handed against max_num_batched_tokens and max_num_seqs. Left rows
+# per call is derived from how many prompts each left row produces --
+# one per predicate in a filter group, one per partner row in a join.
+PROMPTS_PER_CALL = 256
 
-# Anchor documents per model call for a join. Each anchor is paired
-# with the whole partner table in one call, so this is the same tuning
-# against document length.
-JOIN_ANCHORS_PER_CALL = {
-    "reviews": 64, "reports": 4, "claims": 20, "citations": 50,
-}
+
+def rows_per_call(prompts_per_row: int) -> int:
+    """At least one row, even when a single row already exceeds the
+    target: a part cannot be smaller than one left row."""
+    return max(1, PROMPTS_PER_CALL // prompts_per_row)
+
 
 # One GPU container per workload, so the four run side by side. The
 # split is by workload rather than by predicate because a container
@@ -196,8 +189,8 @@ def filter_groups(specs) -> list:
         if spec.kind == "filter":
             groups.setdefault((spec.left_table, spec.left_column),
                               []).append(spec)
-    return [(table, tuple(members), FILTER_ROWS_PER_CALL[(table, column)])
-            for (table, column), members in groups.items()]
+    return [(table, tuple(members), rows_per_call(len(members)))
+            for (table, _column), members in groups.items()]
 
 
 def join_specs(specs) -> tuple:
@@ -758,8 +751,8 @@ def _write_qwen_join_parts(judge: ModelJudge,
                            verification: VerificationSample,
                            spec: PredicateSpec, left_rows: list[dict],
                            right_rows: list[dict], identity: dict,
-                           corpus_id: str, anchor_batch: int,
-                           source_label=None) -> None:
+                           corpus_id: str, source_label=None) -> None:
+    anchor_batch = rows_per_call(len(right_rows))
     for start in range(0, len(left_rows), anchor_batch):
         end = min(start + anchor_batch, len(left_rows))
         part = _part_path(spec, identity, start, end)
@@ -1008,7 +1001,7 @@ def judge_workload(corpus_id: str, workload: str) -> str:
             continue
         _write_qwen_join_parts(
             judge, verification, spec, left, right, identities[spec.key],
-            corpus_id_, JOIN_ANCHORS_PER_CALL[spec.left_table],
+            corpus_id_,
             source_label=(_fever_source_label
                           if spec.source_policy.startswith("fever")
                           else None))

@@ -4,9 +4,8 @@ from dataclasses import replace
 
 from quail.bench.judge_pass import (
     MODEL_NAME,
-    FILTER_ROWS_PER_CALL,
-    JOIN_ANCHORS_PER_CALL,
     PREDICATES,
+    PROMPTS_PER_CALL,
     WORKLOADS,
     _compact_label_parts,
     _corpus_identity,
@@ -16,6 +15,7 @@ from quail.bench.judge_pass import (
     label_set_identity,
     predicate_version,
     render_filter_prompt,
+    rows_per_call,
     render_join_prompt,
     filter_groups,
     join_specs,
@@ -150,17 +150,18 @@ def test_every_predicate_belongs_to_exactly_one_workload():
 
 
 def test_what_each_container_runs_is_read_off_the_specs():
-    """Only the batch sizes are stated; the grouping, the tables and
-    which join needs no model call all come from the PredicateSpec."""
+    """Nothing about the plan is stated: the grouping, the tables, the
+    rows per call and which join needs no model call all follow from
+    the PredicateSpec."""
     plan = {w: ([(t, len(g), n) for t, g, n in filter_groups(
                     workload_specs(w))],
                 [s.legacy_code for s in join_specs(workload_specs(w))])
             for w in WORKLOADS}
     assert plan == {
-        "imdb": ([("reviews", 3, 256)], ["DISCUSS_ASPECT"]),
-        "biodex": ([("reports", 3, 8)], ["REACTION"]),
-        "fever": ([("claims", 2, 100), ("evidence", 1, 57)], ["SUPPORT"]),
-        "lepard": ([("citations", 5, 50), ("citations", 1, 100)],
+        "imdb": ([("reviews", 3, 85)], ["DISCUSS_ASPECT"]),
+        "biodex": ([("reports", 3, 85)], ["REACTION"]),
+        "fever": ([("claims", 2, 128), ("evidence", 1, 256)], ["SUPPORT"]),
+        "lepard": ([("citations", 5, 51), ("citations", 1, 256)],
                    ["LEPJOIN"]),
     }
 
@@ -174,13 +175,16 @@ def test_filters_group_by_the_column_they_read():
     assert columns == {"destination_context", "passage_text"}
 
 
-def test_every_predicate_has_a_batch_size():
-    """A missing entry is a KeyError at run time, on the GPU."""
-    for spec in PREDICATES:
-        if spec.kind == "filter":
-            assert (spec.left_table, spec.left_column) in FILTER_ROWS_PER_CALL
-        elif spec.source_policy != "lepard_passage_id":
-            assert spec.left_table in JOIN_ANCHORS_PER_CALL
+def test_rows_per_call_holds_the_prompt_count_near_the_target():
+    """The rule has to survive a join whose one anchor already exceeds
+    the target: BioDEX pairs each report with 614 reactions, so a part
+    cannot be smaller than one anchor."""
+    for prompts_per_row in (1, 2, 3, 5, 12, 57, 255, 256, 614):
+        rows = rows_per_call(prompts_per_row)
+        assert rows >= 1
+        prompts = rows * prompts_per_row
+        assert prompts <= max(PROMPTS_PER_CALL, prompts_per_row)
+        assert prompts + prompts_per_row > PROMPTS_PER_CALL
 
 
 def test_only_lepards_join_skips_the_model():
