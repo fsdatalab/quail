@@ -1,4 +1,4 @@
-"""Accuracy validation of every attention path against stock vLLM
+"""Accuracy validation of both attention paths against stock vLLM
 (issue #24, part 1 - the most important part).
 
 The comparison: the same token streams answered by two systems.
@@ -46,7 +46,7 @@ Predictions, stated before the run (house rule):
   to a contiguous causal FA3 call (results/attention_parity.json),
   so its differences from stock are kernel-stack differences (fp8
   GEMMs, fused norms), not attention-path differences.
-- Every path's disagreement rate lands within a small multiple of
+- Both paths' disagreement rates land within a small multiple of
   stock's own pass-to-pass flip rate, and disagreements concentrate
   at |margin| near zero. Disagreements at decisive margins (say
   |margin| > 1.0) are the red flag; the target for those is zero.
@@ -62,8 +62,6 @@ import os
 
 import modal
 
-from split_reference import set_path
-
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
@@ -77,8 +75,7 @@ image = (
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail", "baselines",
-                             "split_reference")
+    .add_local_python_source("quail", "baselines")
     .add_local_dir("tests/gpu", remote_path="/root/gpu_tests")
 )
 
@@ -392,8 +389,8 @@ def quail_side(n_docs: int = 1000,
 
     filters, joins, walls = {}, {}, {}
     with torch.inference_mode():
-        for mode in ("split", "merge_quant", "unified"):
-            set_path(pipeline, mode)
+        for mode in ("merge_quant", "unified"):
+            pipeline.attention_mode = mode
             t0 = time.perf_counter()
             answers, _, _ = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
@@ -406,8 +403,8 @@ def quail_side(n_docs: int = 1000,
                   f"{sum(len(r) for r in answers.values())} answers "
                   f"in {walls[f'filter_{mode}']}s", flush=True)
 
-        for mode in ("split", "merge_quant"):
-            set_path(pipeline, mode)
+        for mode in ("merge_quant",):
+            pipeline.attention_mode = mode
             t0 = time.perf_counter()
             ans, _, _ = run_join(
                 torch, arena, pipeline, async_ans, anchor_ids,
@@ -420,11 +417,11 @@ def quail_side(n_docs: int = 1000,
 
         # the production sequence: the worker's mode switch between
         # rounds, on one arena - must reproduce the isolated runs
-        set_path(pipeline, FILTER_ATTENTION)
+        pipeline.attention_mode = FILTER_ATTENTION
         prod_f, _, _ = run_filter(torch, arena, pipeline, async_ans,
                                   body_ids, q_ids, budget,
                                   arena_writes=True)
-        set_path(pipeline, JOIN_ATTENTION)
+        pipeline.attention_mode = JOIN_ATTENTION
         prod_j, _, _ = run_join(torch, arena, pipeline, async_ans,
                                 anchor_ids, [suffix_ids], budget,
                                 stage_frames=[frame_ids])
@@ -591,9 +588,9 @@ def combine(n_docs: int = 1000,
         mode_switch_clean=quail["mode_switch_clean"],
         walls=dict(stock=stock["walls"], quail=quail["walls"]),
         filters={m: compare_filters(m)
-                 for m in ("split", "merge_quant", "unified")},
+                 for m in ("merge_quant", "unified")},
         join={m: compare_join(m)
-              for m in ("split", "merge_quant")})
+              for m in ("merge_quant",)})
     return _write(report, f"accuracy_vs_stock{tag}")
 
 

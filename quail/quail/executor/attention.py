@@ -6,28 +6,24 @@ every kernel and algorithm: reports/2026-08-21-attention-paths.md,
 
 A chunk is [group_1 | group_2 | ...] where each group is
 [prefix? | suffix_1 .. suffix_k]. Two attention paths ship, one per
-workload. merge_quant (joins): call A is causal over the segment
+workload. merge_quant: call A is causal over the segment
 boundaries (each prefix over itself, each suffix over itself), call B
 is non-causal - every suffix token against its group's kept context,
 which lives in the arena's pages (fresh prefixes are scattered into
 their pages in the same layer, before call B reads them) - and one
 Triton kernel merges the two by softmax state and quantizes for
-o_proj. unified (filters): every current token is scattered into its
-cache slot first, then a single causal paged call covers kept plus
-current KV - no merge. Suffix positions start at the kept-context
-length, identical to standalone requests, so answers are comparable
-to per-pair prompts.
+o_proj. unified: every current token is scattered into a cache slot
+first, then a single causal paged call covers kept plus current KV.
+On joins, every suffix has a separate page-table row. Full anchor
+pages are shared, while suffix rows use temporary pages. Suffix
+positions start at the kept-context length, identical to standalone
+requests, so answers are comparable to per-pair prompts.
 
 A chunk whose groups own no arena pages (a single-stage filter with
 no store: nothing ever reads the KV again) skips the arena in both
 modes: each group packs [prefix | suffix] as one causal segment and
 call A alone is the whole answer - no scatter, no paged read, no
 merge.
-
-The retired third path, split (the two-call pattern with the merge as
-plain PyTorch ops and a separate quantize), lives in
-ablations/split_reference.py; comparison cells install it through
-the attention_override hook.
 
 Pipeline(kernels="vllm") swaps three of the five Triton kernels (norm,
 qk, silu) for the engine's own ops (fused-add rms_norm + separate
@@ -46,13 +42,10 @@ GROUP = 128            # fp8 quant group size, matches the engine
 # fastest on the filter shape and bit-identical to a contiguous
 # causal call, so filter answers match full recompute exactly. Joins
 # run "merge_quant": the two-call pattern with the fused merge+quant
-# kernel - "unified" cannot share one anchor's KV across the many
-# partner suffixes of a chunk (each pair needs its own causal view),
-# so the two-call pattern is required, and the fused kernel is its
-# fastest form. The retired "split" path (the pre-fusion two-call
-# implementation) lives in ablations/split_reference.py. Evidence:
-# results/attention_paths.json, results/join_attention_paths_*.json,
-# results/accuracy_vs_stock.json.
+# kernel. A unified join can share the anchor's full pages while each
+# suffix gets temporary private pages. The benchmark decides which
+# path ships. Evidence: results/attention_paths.json,
+# results/join_attention_paths_*.json, results/accuracy_vs_stock.json.
 FILTER_ATTENTION = "unified"
 JOIN_ATTENTION = "merge_quant"
 
@@ -71,9 +64,6 @@ class Pipeline:
                              f"got {kernels!r}")
         self.kernels = kernels
         self.attention_mode = attention_mode
-        # comparison scripts install a retired path here (bf16 out,
-        # like unified); None means attention_mode picks the path
-        self.attention_override = None
 
         self.torch = torch
         self.model = model
@@ -299,10 +289,8 @@ class Pipeline:
             v = tl.load(v_src_ptr + s * ROW + offs, mask=mask)
             tl.store(v_dst_ptr + d * ROW + offs, v, mask=mask)
 
-        # the online-softmax LSE merge (Milakov & Gimelshein 2018 -
-        # the same formula the retired split reference in
-        # ablations/split_reference.py runs in plain torch) fused
-        # with vLLM's per-group fp8 quantize pattern
+        # the online-softmax LSE merge (Milakov & Gimelshein 2018)
+        # fused with vLLM's per-group fp8 quantize pattern
         @triton.jit
         def merge_attn_quant(a_ptr, b_ptr, la_ptr, lb_ptr, source_ptr,
                              q_ptr, s_ptr,
@@ -543,8 +531,13 @@ class Pipeline:
                 meta["max_a"], meta["max_a"], causal=True)
             meta["layer"] += 1
             return out.view(n, H * D)
-        self.kv_row_scatter(k3, v3, unified["src"], unified["dst"],
-                            layer)
+        if unified["src"].numel():
+            self.kv_row_scatter(k3, v3, unified["src"], unified["dst"],
+                                layer)
+        if unified["tail_src"] is not None:
+            self.kv_row_scatter(
+                self.arena.k[layer], self.arena.v[layer],
+                unified["tail_src"], unified["tail_dst"], layer)
         kp, vp = self.arena.paged_kv(layer)
         out, _ = self._fa(
             q3, kp, vp, unified["cu_q"], None,
@@ -556,6 +549,13 @@ class Pipeline:
     # ---- the forward loop -------------------------------------------
 
     def forward_chunk(self, chunk):
+        try:
+            return self._forward_chunk(chunk)
+        finally:
+            for key in chunk.pop("temporary_keys", ()):
+                self.arena.free_key(key)
+
+    def _forward_chunk(self, chunk):
         meta = chunk["meta"]
         meta["layer"] = 0
         input_ids, positions = chunk["input_ids"], chunk["positions"]
@@ -580,12 +580,7 @@ class Pipeline:
                 q, k = self.vllm_qk_norm_rope(qkv, positions, attn)
             v = qkv[:, (self.num_q_heads + self.num_kv_heads)
                     * self.head_dim:]
-            if self.attention_override is not None:
-                # a comparison script's installed path, e.g. the
-                # retired split in ablations/split_reference.py
-                attn_out = self.attention_override(q, k, v, meta)
-                o_in, o_scale = self.quant(attn_out)
-            elif self.attention_mode == "merge_quant":
+            if self.attention_mode == "merge_quant":
                 o_in, o_scale = self.attention_merge_quant(q, k, v, meta)
             else:
                 attn_out = self.attention_unified(q, k, v, meta)

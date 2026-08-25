@@ -4,14 +4,14 @@ One preallocated buffer per layer, sized to the admission budget,
 divided into fixed 16-token pages with a free list. A resident
 document owns a list of pages; the pages return to the free list the
 instant the document fails a stage or answers its last one. The paged
-attention kernels read this layout natively (block tables), so there
-are no copies and no compaction - and since admission never lets
-page-rounded resident tokens exceed the arena, allocation cannot fail.
+attention kernels read this layout natively through block tables, so
+there is no compaction. Admission makes persistent document claims fit.
+Packed unified joins also make short-lived claims while packing a
+chunk, so an oversized chunk can still need to be split.
 
 PageArena is the accounting (pure Python, CPU-tested); KVArena is the
 tensor backing and runs only where torch and a GPU exist.
 """
-
 
 class PageArena:
     """Page accounting: a free list and per-document page lists."""
@@ -112,6 +112,11 @@ class KVArena:
         self._rows[key] = cap[:tokens]
         return pages
 
+    def alloc_temporary(self, tokens: int):
+        key = object()
+        pages = self.alloc(key, tokens)
+        return None if pages is None else (key, pages)
+
     def free_key(self, key):
         self._rows.pop(key)
         self._capacity_rows.pop(key)
@@ -140,8 +145,17 @@ class KVArena:
         Built flat on the host and staged through pinned memory: the
         old per-key loop issued one tiny pageable H2D copy per key,
         which blocked the CPU behind the running chunk."""
-        torch = self.torch
         pages = [self.accounting.owned[k] for k in keys]
+        table = self.block_table_rows(pages, pad_to=pad_to)
+        torch = self.torch
+        used = torch.tensor([self.accounting.tokens[k] for k in keys],
+                            dtype=torch.int32, pin_memory=True) \
+            .to(self.device, non_blocking=True)
+        return table, used
+
+    def block_table_rows(self, pages, pad_to=None):
+        """A block table from explicit physical page rows."""
+        torch = self.torch
         width = max(len(p) for p in pages)
         if pad_to:
             width = max(width, pad_to)
@@ -150,9 +164,6 @@ class KVArena:
             flat.extend(p)
             flat.extend([0] * (width - len(p)))
         table = torch.tensor(flat, dtype=torch.int32,
-                             pin_memory=True).view(len(keys), width) \
+                             pin_memory=True).view(len(pages), width) \
             .to(self.device, non_blocking=True)
-        used = torch.tensor([self.accounting.tokens[k] for k in keys],
-                            dtype=torch.int32, pin_memory=True) \
-            .to(self.device, non_blocking=True)
-        return table, used
+        return table

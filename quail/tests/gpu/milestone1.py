@@ -438,7 +438,7 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
         prediction=("~4.10M fresh tokens -> ~35 s; survivors 4645, "
                     "0 wrong of 40052 answered (TRUE/FALSE corpus, "
                     "re-banked 2026-08-23)"),
-        reference=dict(artifact="attention_paths.json split rows",
+        reference=dict(artifact="attention_paths.json unified rows",
                        wall_s=34.6, survivors=4645, answered=40052,
                        wrong=0),
         runs=[])
@@ -529,21 +529,15 @@ def filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
     current token (the fused kv_row_scatter), the paged-KV
     indirection inside the attention read, and the per-chunk
     block-table build and page alloc on the CPU (mostly hidden
-    behind the GPU): a 2-5% cut. That is smaller than the 6.3% the
-    same switch bought on the retired split path, because unified
-    already dropped call B and the LSE merge - the two largest
-    things the old fast path skipped.
+    behind the GPU): a 2-5% cut. Unified already avoids call B and the
+    LSE merge, so the remaining difference is smaller.
 
     Answers: the kernel-parity cells measured the unified paged
     causal call bit-identical to the contiguous causal call
     (results/attention_parity.json, max_abs 0.0 on every case), and
     the fast path IS the contiguous call over the same
     [document | question] rows at the same positions. The gate is
-    therefore exact: 0 answer flips between the two paths. (The old
-    split-path version of this cell needed a stock-vLLM referee
-    because its two paths differed by the LSE-merge rounding;
-    unified removed that difference, so the referee and the
-    re-chunked noise-floor control are gone with it.)
+    therefore exact: 0 answer flips between the two paths.
     """
     import time
 

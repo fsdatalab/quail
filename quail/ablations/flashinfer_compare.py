@@ -60,8 +60,6 @@ import os
 
 import modal
 
-from split_reference import attention_split
-
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
@@ -75,8 +73,7 @@ image = (
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail", "baselines",
-                             "split_reference")
+    .add_local_python_source("quail", "baselines")
 )
 
 # House rule: never create new Modal app names.
@@ -297,17 +294,6 @@ def bench(q_heads: int = 32) -> str:
         pipeline = case["pipeline"]
         arena = case["arena"]
 
-        split_chunk = pack_chunk(torch, arena, case["groups"],
-                                 pinned=True,
-                                 attention_mode="merge_quant")
-
-        def run_split():
-            split_chunk["meta"]["layer"] = 0
-            o = attention_split(pipeline, q_flat, k_flat, v_flat,
-                                split_chunk["meta"])
-            return pipeline.quant(o)
-        out["fa3_split_plus_quant"] = _median_ms(torch, run_split)
-
         mq_chunk = pack_chunk(torch, arena, case["groups"],
                               pinned=True, attention_mode="merge_quant")
 
@@ -404,7 +390,7 @@ def bench(q_heads: int = 32) -> str:
             except Exception as exc:
                 errors["fi_paged_causal"] = repr(exc)
 
-        # -- two calls plus FlashInfer's merge (split equivalent) --
+        # -- two calls plus FlashInfer's merge --
         try:
             chunk = pack_chunk(torch, arena, case["groups"],
                                pinned=True,
@@ -670,8 +656,6 @@ def bench_tuned(q_heads: int = 32) -> str:
                     i32([(x - 1) % PAGE + 1 for x in kv_lens]))
 
             # the two-call plan inputs, shared by both merge variants
-            # (a merge_quant chunk carries cross["source"] for the
-            # fused kernel; its cross layout equals the split one)
             sp_chunk = pack_chunk(torch, arena, case["groups"],
                                   pinned=True,
                                   attention_mode="merge_quant")
