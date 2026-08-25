@@ -1,26 +1,44 @@
-"""Speed of light: a floor on the wall time of one query.
+"""Speed of light: the least time one query can take on one GPU.
 
-SoL prices only the work the hardware cannot avoid - dense
-projection FLOPs, attention pair FLOPs, weight reads, KV traffic -
-and drops every source of loss. A run can approach it and never beat
-it, so the gap between a measured wall and SoL is the whole of what
-the engine could still win.
+Read this file top to bottom. It is meant to be checked by hand.
 
-This module derives everything from the two spec structs and the
-query, and borrows nothing from the planner. It does not import
-`planner/budgets.py`, it reads no calibration constant, and no
-efficiency factor appears anywhere in it. That is what makes it a
-bound rather than an estimate: every number in it is a datasheet
-figure, a model dimension, or a count of work the query cannot
-avoid. Nothing in the planner reads it either.
+Three things cost time and nothing else is counted:
 
-The formulas and their assumptions are `plans/sol_model.md`. This
-module implements the filter-chain case (sections 4-6) and joins
-(section 8).
+  1. the dense projections - 2 FLOPs per parameter per token
+  2. attention - 4 * n_q * d_head FLOPs per scored (query, key) pair,
+     per layer
+  3. moving bytes - the weights once per forward pass, KV once per
+     token written, and KV again wherever a later stage reads it back
 
-The split is deliberate: `filter_chain_workload` is query-shape
-arithmetic with no hardware in it, and `bound` is hardware
-arithmetic with no query shape in it. Each is checkable on its own.
+Everything below is arithmetic over four counts and two spec structs.
+No measured constant and no fitted efficiency factor appears anywhere,
+which is what makes the answer a floor rather than a prediction: a run
+can approach it and can never beat it.
+
+
+KV reuse, the part that has to be right
+---------------------------------------
+Every document has a PREFIX: the engine's shared preamble plus the
+document text. Its KV is computed once and stays resident in the
+arena. Anything attached after it is a SUFFIX - a filter's question,
+or a join's partner block plus question. Suffix KV is computed, used
+for that one evaluation, and thrown away (`executor/pack.py`: suffix
+KV is never cached).
+
+So a document is read once no matter how many questions get asked
+about it. A second filter does not rescan the document; it rewinds to
+the end of the prefix and attaches a new suffix. That is why a
+five-filter chain costs barely more than a one-filter chain, and it
+is the single fact this file exists to price correctly.
+
+Three operations cover every query in QUAIL-B:
+
+    scan()      compute a prefix and its first suffix, from nothing
+    ask()       reuse a resident prefix, attach one more suffix
+    stream()    reuse a resident prefix, attach many suffixes (a join)
+
+`ask` and `stream` never charge for the document again. `scan` is the
+only one that does.
 """
 
 import math
@@ -29,319 +47,287 @@ from dataclasses import dataclass
 from quail.specs import DeviceSpec, ModelSpec
 
 
+# ---------------------------------------------------------------- 1
+# The model, counted rather than looked up
+
+
 def dense_params(model: ModelSpec) -> int:
-    """Parameters every token passes through, counted from the model
-    dimensions rather than read off `ModelSpec.params`.
+    """Parameters every token passes through.
 
-    `params` is a rounded stand-in - 3.6e9 where Qwen3-4B's real
-    non-embedding count is 3,633,511,936, which is 0.93% higher and
-    moves T_dense by the same 0.93%. A bound cannot round its
-    largest term, so it counts instead.
+    Counted from the model dimensions, not read off
+    `ModelSpec.params`, which is rounded: 3.6e9 where Qwen3-4B's real
+    non-embedding count is 3,633,511,936. That 0.93% lands straight
+    on the largest term of the bound.
 
-    The count assumes the Qwen3 block: q/k/v/o projections with no
-    bias, a gated MLP (gate, up, down over `intermediate`), two RMS
-    norms per layer, and q/k head norms. Embeddings are excluded on
-    purpose - a token touches its own row and nothing else, so they
-    are not 2 FLOPs per parameter per token. The lm_head is excluded
-    for the same reason plus a second one: a filter reads logits at
-    one position per evaluation, not at every token.
+    Assumes the Qwen3 block: q/k/v/o projections with no bias, a
+    gated MLP, two RMS norms per layer, and q/k head norms.
+    Embeddings and the lm_head are left out: a token touches one
+    embedding row rather than doing 2 FLOPs per parameter, and a
+    filter reads logits at one position per evaluation.
     """
     h, dh = model.hidden, model.d_head
     attn = h * model.n_q * dh + 2 * h * model.n_kv * dh + model.n_q * dh * h
     mlp = 3 * h * model.intermediate
-    norms = 2 * h + 2 * dh          # 2 RMS norms, q norm, k norm
+    norms = 2 * h + 2 * dh
     return (attn + mlp + norms) * model.layers + h
 
 
+def flops_per_pair(model: ModelSpec) -> int:
+    """Attention FLOPs for one (query token, key token) pair in one
+    layer. The QK dot product runs over d_head dimensions, so
+    2 * d_head; multiplying the weight into V costs another
+    2 * d_head. Times n_q heads. At 4B: 4 * 32 * 128 = 16,384."""
+    return 4 * model.n_q * model.d_head
+
+
+def kv_bytes_per_token(model: ModelSpec) -> float:
+    """One token's KV: a key and a value, per layer, per KV head.
+    At 4B: 2 * 36 * 8 * 128 * 2 bytes = 147,456."""
+    return model.kappa
+
+
+# ---------------------------------------------------------------- 2
+# What the GPU is asked to do
+
+
+def triangle(n: float) -> float:
+    """A causal sequence attending to itself: token 1 sees 1 key,
+    token 2 sees 2, and so on. 1 + 2 + ... + n."""
+    return n * (n + 1) / 2
+
+
 @dataclass(frozen=True)
-class Corpus:
-    """The base document set, reduced to what the bound needs.
+class Work:
+    """Four counts. No seconds and no hardware in here."""
+    tokens: float = 0.0       # tokens pushed through the forward pass
+    pairs: float = 0.0        # scored (query, key) pairs, per layer
+    kv_written: float = 0.0   # KV rows written
+    kv_read: float = 0.0      # KV rows read back out of the arena
 
-    A prefix is one document's retained span: the engine's shared
-    preamble plus the document text. Its KV is computed once and
-    survives every rewind, so it is the unit both the pair count and
-    the KV read-back count are written in.
+    def __add__(self, o: "Work") -> "Work":
+        return Work(self.tokens + o.tokens, self.pairs + o.pairs,
+                    self.kv_written + o.kv_written,
+                    self.kv_read + o.kv_read)
 
-    The pair count is quadratic in length, so a total is not enough -
-    the second moment has to come from the length distribution and
-    cannot be recovered from the mean.
+    def __mul__(self, k: float) -> "Work":
+        """The same work done k times."""
+        return Work(self.tokens * k, self.pairs * k,
+                    self.kv_written * k, self.kv_read * k)
+
+
+def scan(prefix: float, suffix: float) -> Work:
+    """Compute one document from nothing: [prefix | suffix] as one
+    causal sequence. Every token attends to itself and everything
+    before it, so the pairs are one triangle over the whole length.
+
+    This is the only operation that pays for the document text.
     """
-    n_docs: int
-    sum_prefix: float       # sum_i b_i
-    sum_prefix_sq: float    # sum_i b_i^2
-
-    @classmethod
-    def from_doc_tokens(cls, doc_tokens, preamble_tokens: int = 0):
-        b = [int(d) + preamble_tokens for d in doc_tokens]
-        return cls(n_docs=len(b), sum_prefix=float(sum(b)),
-                   sum_prefix_sq=float(sum(x * x for x in b)))
+    n = prefix + suffix
+    return Work(tokens=n, pairs=triangle(n), kv_written=n, kv_read=0.0)
 
 
-@dataclass(frozen=True)
-class FilterStage:
-    """One filter in the chain.
+def ask(prefix: float, suffix: float) -> Work:
+    """Attach one more suffix to a prefix already in the arena.
 
-    `question_tokens` is everything the stage appends per live
-    document: the engine's task instruction, the user's question, and
-    the answer cue.
+    Only the suffix is computed. Each of its tokens attends to the
+    whole resident prefix - a rectangle, `suffix * prefix` - and to
+    itself and the suffix tokens before it - a triangle. The prefix
+    is read back out of the arena once.
 
-    What survives the stage can be given two ways. `selectivity` is
-    the fraction of entering documents that pass, and the surviving
-    token mass is then inferred by scaling - the random-survivor
-    assumption. `surviving_docs` and `surviving_prefix` are the
-    measured counts, and when both are given they are used instead
-    and no assumption is made.
-
-    Prefer the measured pair wherever labels exist. The assumption is
-    not a rounding error: on QUAIL-B's F4 (discusses the ending) the
-    survivors average 391 prefix tokens against the 312 of the pool
-    they came from, because long reviews discuss endings more often,
-    and scaling by selectivity undercounts their token mass by 20%.
+    The document is not recomputed and does not appear in `tokens`.
+    That is KV rewind.
     """
-    question_tokens: int
-    selectivity: float = 1.0
-    surviving_docs: float | None = None
-    surviving_prefix: float | None = None
-
-    @property
-    def measured(self) -> bool:
-        return (self.surviving_docs is not None
-                and self.surviving_prefix is not None)
+    return Work(tokens=suffix,
+                pairs=suffix * prefix + triangle(suffix),
+                kv_written=suffix,
+                kv_read=prefix)
 
 
-@dataclass(frozen=True)
-class Workload:
-    """What the query asks of the hardware, with no hardware in it.
+def stream(prefix: float, suffixes) -> Work:
+    """One resident prefix, many suffixes: a join anchor and its
+    tuples.
 
-    `tokens` is new tokens pushed through the forward pass.
-    `pairs` is scored (query token, key token) pairs, per layer.
-    `kv_read_tokens` is prefix tokens read back out of the arena by
-    stages after the first; the write side is one write per new
-    token and is already `tokens`.
+    Suffixes are atomic and never attend to each other
+    (`executor/pack.py`), so each is its own rectangle over the
+    prefix plus its own triangle - exactly `ask`, repeated. The
+    difference is the arena: the prefix is read back once for the
+    whole stream, not once per tuple, because the tuples run
+    consecutively against it.
     """
-    tokens: float
-    pairs: float
-    kv_read_tokens: float
-    per_stage: tuple = ()    # one (tokens, pairs, kv_read) per stage
+    tokens = pairs = 0.0
+    for u in suffixes:
+        tokens += u
+        pairs += u * prefix + triangle(u)
+    return Work(tokens=tokens, pairs=pairs, kv_written=tokens,
+                kv_read=prefix)
 
-    def __add__(self, other: "Workload") -> "Workload":
-        """Two parts of one query. Legal because the three counts are
-        counts: a query's work is the work of its stages."""
-        return Workload(self.tokens + other.tokens,
-                        self.pairs + other.pairs,
-                        self.kv_read_tokens + other.kv_read_tokens,
-                        self.per_stage + other.per_stage)
+
+# ---------------------------------------------------------------- 3
+# Whole queries
+
+
+def survivors(lengths, selectivity: float):
+    """Which documents pass a filter.
+
+    A selectivity says how many survive, not which. This keeps an
+    evenly spaced slice of the length-sorted list, so the survivors
+    carry the same length distribution as the pool they came from.
+
+    That is an assumption, and it is visible here rather than hidden
+    in a scaling factor. It is also wrong in a known direction: the
+    QUAIL-B predicates prefer long documents, so the real survivors
+    carry more tokens than this (up to 31% more after three filters).
+    It changes the bound by under 0.1%, because a later stage adds
+    only about 50 tokens per surviving document while the first scan
+    already paid for every prefix.
+    """
+    keep = round(len(lengths) * selectivity)
+    if keep <= 0:
+        return []
+    if keep >= len(lengths):
+        return list(lengths)
+    order = sorted(lengths)
+    step = len(order) / keep
+    return [order[min(len(order) - 1, int(i * step))] for i in range(keep)]
+
+
+def filter_chain(doc_tokens, preamble: int, questions, selectivities):
+    """A chain of filters over one document set.
+
+    The first stage scans every document. Every later stage rewinds
+    to the end of the document and asks its own question of whatever
+    survived so far.
+
+    doc_tokens: one token count per document.
+    questions: one question length per stage.
+    selectivities: one per stage, the fraction of the documents
+    entering that stage that pass it. The last one is never used.
+    """
+    live = list(doc_tokens)
+    work = Work()
+    for i, q in enumerate(questions):
+        step = scan if i == 0 else ask
+        for d in live:
+            work = work + step(preamble + d, q)
+        if i + 1 < len(questions):
+            live = survivors(live, selectivities[i])
+    return work
+
+
+def join(anchor_tokens, partner_tokens, preamble: int, note: int,
+         label: int, question: int, anchor_resident: bool) -> Work:
+    """Every live anchor against every live partner.
+
+    One side anchors: its KV is held and every tuple attends to it.
+    The other streams: a copy of each of its documents rides in every
+    tuple's suffix, alongside that block's label and the question.
+
+    `note` is the anchor naming line, written into each anchor's kept
+    KV once for this stage. `anchor_resident` is True when a filter
+    on the anchor side already computed the prefixes, which is every
+    query here with a filter before its join; then the join adds the
+    naming line and the tuples, and nothing else.
+    """
+    suffixes = [label + p + question for p in partner_tokens]
+    work = Work()
+    for a in anchor_tokens:
+        prefix = preamble + a
+        if anchor_resident:
+            work = work + ask(prefix, note)
+        else:
+            work = work + scan(prefix, note)
+        work = work + stream(prefix + note, suffixes)
+    return work
+
+
+def cheaper_anchor(left, right, preamble, note, label, question,
+                   left_resident, right_resident):
+    """Both orientations of a join, and the one the engine would run.
+
+    The planner keeps whichever side is cheaper to hold and streams
+    the other, so the bound has to make the same choice or it is not
+    a bound on what runs. Anchoring the long side costs one prefix
+    per document; anchoring the short side copies every long document
+    into every tuple. On FEVER, where claims average 11 tokens and
+    evidence 370, that is a 5.5x difference.
+
+    Returns (work, "left" | "right", {orientation: tokens}).
+    """
+    if not left or not right:
+        return Work(), "left", {"left": 0.0, "right": 0.0}
+    a = join(left, right, preamble, note, label, question, left_resident)
+    b = join(right, left, preamble, note, label, question, right_resident)
+    pick = "left" if a.tokens <= b.tokens else "right"
+    return ({"left": a, "right": b}[pick], pick,
+            {"left": a.tokens, "right": b.tokens})
+
+
+# ---------------------------------------------------------------- 4
+# Seconds
 
 
 @dataclass(frozen=True)
-class SoLBound:
-    """Seconds, plus every intermediate the arithmetic passed
-    through, so each line can be checked against the derivation."""
-    workload: Workload
+class Seconds:
+    """The bound, with every term it was built from."""
+    work: Work
     passes: int
     bytes_moved: float
-    t_dense: float
-    t_attention: float
-    t_compute: float
-    t_memory: float
+    dense: float
+    attention: float
+    compute: float
+    memory: float
 
     @property
-    def seconds(self) -> float:
-        return max(self.t_compute, self.t_memory)
+    def sol(self) -> float:
+        return max(self.compute, self.memory)
 
     @property
     def bound_by(self) -> str:
-        return "compute" if self.t_compute >= self.t_memory else "memory"
+        return "compute" if self.compute >= self.memory else "memory"
 
     def explain(self) -> str:
-        w = self.workload
+        w = self.work
         return "\n".join([
-            f"tokens          {w.tokens:>18,.0f}",
-            f"attention pairs {w.pairs:>18,.0f}",
-            f"kv read tokens  {w.kv_read_tokens:>18,.0f}",
-            f"forward passes  {self.passes:>18,d}",
-            f"bytes moved     {self.bytes_moved:>18,.0f}",
-            f"T_dense         {self.t_dense:>18.4f} s",
-            f"T_attention     {self.t_attention:>18.4f} s",
-            f"T_compute       {self.t_compute:>18.4f} s",
-            f"T_memory        {self.t_memory:>18.4f} s",
-            f"SoL             {self.seconds:>18.4f} s "
-            f"({self.bound_by} bound)",
+            f"tokens         {w.tokens:>18,.0f}",
+            f"pairs          {w.pairs:>18,.0f}",
+            f"kv written     {w.kv_written:>18,.0f}",
+            f"kv read        {w.kv_read:>18,.0f}",
+            f"forward passes {self.passes:>18,d}",
+            f"bytes moved    {self.bytes_moved:>18,.0f}",
+            f"T_dense        {self.dense:>18.4f} s",
+            f"T_attention    {self.attention:>18.4f} s",
+            f"T_compute      {self.compute:>18.4f} s",
+            f"T_memory       {self.memory:>18.4f} s",
+            f"SoL            {self.sol:>18.4f} s ({self.bound_by} bound)",
         ])
 
 
-def filter_chain_workload(corpus: Corpus, stages,
-                          carry_question_kv: bool = False) -> Workload:
-    """Tokens, pairs and KV read-backs for a chain of filters over
-    one document set. Sections 4 and 5 of `plans/sol_model.md`.
+def seconds(work: Work, model: ModelSpec, device: DeviceSpec,
+            chunk_tokens: int) -> Seconds:
+    """Turn the four counts into a floor on wall time.
 
-    Stage 1 computes each document's whole sequence
-    [preamble | document | question 1] from nothing, so it pays a
-    full causal triangle. Every later stage rewinds to the end of the
-    document and computes only its own question tokens: those attend
-    to the retained prefix (a rectangle) and to each other (a small
-    triangle).
+    `chunk_tokens` is the batch size the forward pass runs at. It
+    decides how many times the weights are re-read, and what the
+    engine picks for it is a planner decision, so it is an input
+    here with no default.
 
-    Each stage thins the live set. A stage carrying measured
-    `surviving_docs` and `surviving_prefix` sets both exactly; a
-    stage carrying only a selectivity scales both by it, which
-    assumes the survivors are a uniform random sample of what
-    entered. That assumption is the only one here the data can
-    violate, and it does: see `FilterStage`.
-
-    carry_question_kv counts each stage's question tokens as part of
-    the prefix that later stages read back and attend over. The
-    engine does not keep them (`executor/pack.py`: suffix KV is never
-    cached), so False is what the engine does; True reproduces a hand
-    derivation that folded question 1 into the document length.
-    """
-    stages = tuple(stages)
-    if not stages:
-        raise ValueError("a filter chain needs at least one stage")
-    n, B = corpus.n_docs, corpus.sum_prefix
-    tokens = pairs = kv_read = 0.0
-    per_stage = []
-    live_n, live_B = float(n), float(B)   # documents and prefix mass
-    #                                       entering the current stage
-    carried = 0             # question tokens folded into the prefix
-    for s, st in enumerate(stages):
-        q = st.question_tokens
-        if s == 0:
-            # full causal triangle over l_i = b_i + q, summed over
-            # documents: sum l_i(l_i+1)/2 needs both moments.
-            sum_l = B + n * q
-            sum_l_sq = (corpus.sum_prefix_sq + 2 * q * B + n * q * q)
-            st_tokens = sum_l
-            st_pairs = (sum_l_sq + sum_l) / 2
-            st_read = 0.0
-        else:
-            prefix = live_B + live_n * carried
-            st_tokens = live_n * q
-            st_pairs = q * prefix + live_n * q * (q + 1) / 2
-            st_read = prefix
-        tokens += st_tokens
-        pairs += st_pairs
-        kv_read += st_read
-        per_stage.append((st_tokens, st_pairs, st_read))
-        if st.measured:
-            live_n, live_B = st.surviving_docs, st.surviving_prefix
-        else:
-            live_n *= st.selectivity
-            live_B *= st.selectivity
-        if carry_question_kv:
-            carried += q
-    return Workload(tokens=tokens, pairs=pairs, kv_read_tokens=kv_read,
-                    per_stage=tuple(per_stage))
-
-
-@dataclass(frozen=True)
-class JoinSide:
-    """One side of a join, as the two moments of a length."""
-    n: int
-    total: float        # sum of lengths
-    total_sq: float     # sum of squared lengths
-
-    @classmethod
-    def from_lengths(cls, lengths, add: int = 0):
-        v = [float(x) + add for x in lengths]
-        return cls(len(v), sum(v), sum(x * x for x in v))
-
-
-@dataclass(frozen=True)
-class JoinStage:
-    """One join: every live anchor against every live partner.
-
-    `anchor` holds the live anchors' prefix lengths, `SHARED_PRE` plus
-    the document. `suffix` holds one length per live partner: that
-    partner's block label, its document, and the question tail, which
-    together are what a tuple appends. Both are per side, not per
-    tuple, because a full cross product makes the tuple sums separable
-    - `sum over tuples of u * c` is `sum_p u` times `sum_a c`. A gated
-    or deduped tuple set is not separable and this does not model it.
-
-    `note_tokens` is the anchor naming line, written into each
-    anchor's kept KV once per stage. `opens_anchor` is False when a
-    filter on the anchor table already computed the prefixes, which is
-    every QUAIL-B query with a filter before its join; then only the
-    naming line is fresh.
-    """
-    anchor: JoinSide
-    suffix: JoinSide
-    note_tokens: int = 0
-    opens_anchor: bool = True
-
-    @property
-    def tuples(self) -> int:
-        return self.anchor.n * self.suffix.n
-
-
-def join_workload(stage: JoinStage) -> Workload:
-    """Tokens, pairs and KV read-backs for one join. Section 8 of
-    `plans/sol_model.md`.
-
-    The anchor context each tuple attends to is the prefix plus the
-    naming line. A tuple's suffix is atomic: its tokens attend to that
-    context and to each other, never to another tuple's
-    (`executor/pack.py`), so it is one rectangle and one triangle per
-    tuple, the same shape as a filter's question.
-    """
-    f, n_a = stage.note_tokens, stage.anchor.n
-    # context = prefix + naming line, first two moments
-    ctx1 = stage.anchor.total + n_a * f
-    ctx2 = (stage.anchor.total_sq + 2 * f * stage.anchor.total
-            + n_a * f * f)
-    su1, su2 = stage.suffix.total, stage.suffix.total_sq
-    if stage.opens_anchor:
-        tokens = ctx1
-        pairs = (ctx2 + ctx1) / 2
-    else:
-        # only the naming line is computed, over a resident prefix
-        tokens = n_a * f
-        pairs = f * stage.anchor.total + n_a * f * (f + 1) / 2
-    tokens += n_a * su1
-    pairs += su1 * ctx1 + n_a * (su2 + su1) / 2
-    # every anchor's context is read back at least once: its tuple
-    # stream always outruns one chunk at these sizes
-    return Workload(tokens=tokens, pairs=pairs, kv_read_tokens=ctx1,
-                    per_stage=((tokens, pairs, ctx1),))
-
-
-def bound(model: ModelSpec, device: DeviceSpec, workload: Workload,
-          chunk_tokens: int) -> SoLBound:
-    """Seconds for a workload on one (model, device). Section 6 of
-    `plans/sol_model.md`.
-
-    Compute and memory are combined with max, not added: the two
-    engines run at once and a floor may assume they overlap
-    perfectly. Within compute the dense and attention terms are
-    added, because they are separate kernels on the same SMs.
-
-    chunk_tokens is the batch size the forward pass runs at, and it
-    is an input with no default. It sets how many times the weights
-    are re-read, so a wrong value moves the answer, and the value the
-    engine happens to use is a planner decision this bound must not
-    reach into. State it at the call site.
+    Compute and memory are combined with max, not added: the
+    arithmetic units and the memory system run at once and a floor
+    may assume they overlap perfectly. Inside compute the two terms
+    are added, because the dense and attention kernels are separate
+    launches on the same SMs.
     """
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be at least 1")
-    t_dense = (2.0 * dense_params(model) * workload.tokens
-               / device.peak_flops)
-    pair_flops = 4.0 * model.n_q * model.d_head
-    t_attention = (pair_flops * workload.pairs * model.layers
-                   / device.attn_flops)
-    passes = math.ceil(workload.tokens / chunk_tokens)
+    dense = 2.0 * dense_params(model) * work.tokens / device.peak_flops
+    # attention runs in bf16 (FlashAttention-3 over bf16 KV), so it
+    # prices against the bf16 peak, not the fp8 one
+    attention = (flops_per_pair(model) * work.pairs * model.layers
+                 / device.attn_flops)
+    passes = math.ceil(work.tokens / chunk_tokens) if work.tokens else 0
     moved = (model.W_mem * passes
-             + model.kappa * (workload.tokens + workload.kv_read_tokens))
-    return SoLBound(workload=workload, passes=passes, bytes_moved=moved,
-                    t_dense=t_dense, t_attention=t_attention,
-                    t_compute=t_dense + t_attention,
-                    t_memory=moved / device.hbm_bw)
-
-
-def filter_chain_sol(model: ModelSpec, device: DeviceSpec,
-                     corpus: Corpus, stages, chunk_tokens: int,
-                     carry_question_kv: bool = False) -> SoLBound:
-    """The two halves together, for the common case."""
-    return bound(model, device,
-                 filter_chain_workload(corpus, stages, carry_question_kv),
-                 chunk_tokens)
+             + kv_bytes_per_token(model) * (work.kv_written + work.kv_read))
+    return Seconds(work=work, passes=passes, bytes_moved=moved,
+                   dense=dense, attention=attention,
+                   compute=dense + attention,
+                   memory=moved / device.hbm_bw)
