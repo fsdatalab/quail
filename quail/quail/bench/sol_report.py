@@ -37,17 +37,20 @@ def build_rows(suite: dict) -> list[dict]:
     """One row per query id present in either pass. Pulls straight
     from what run_suite() already computed - no new arithmetic here,
     just picking which pass's numbers go in which column - except for
-    the three sol_*/ceiling fields below, which ARE new arithmetic:
-    what docs/s, tokens/s, and $/query would be if this exact
-    workload (the real docs/tokens this query actually processed) ran
-    in sol_s instead of wall_s. Time and cost are bounded BELOW by
-    sol_s (nothing runs faster than the floor, so nothing costs less
-    than floor-time x rate) - a FLOOR, same direction as sol_s itself.
-    Throughput is the reciprocal of time, so it's bounded ABOVE by the
-    same floor: docs/sol_s is the highest rate this workload could
-    ever hit, a CEILING, not a floor. Mixing that up (calling a rate
-    a "floor") would tell a reader the real number can only go up from
-    here, when for docs/s and tokens/s it can only go down.
+    the three docs_per_s_sol/tokens_per_s_sol/cost_sol fields below,
+    which ARE new arithmetic: what docs/s, tokens/s, and $/query would
+    be if this exact workload (the real docs/tokens this query
+    actually processed) ran in sol_s instead of wall_s, i.e. at peak
+    hardware speed with none of the real run's overhead.
+
+    Cost scales directly with time, so cost_sol is always <= the
+    measured cost (sol_s is never more than wall_s, so less time at
+    the same rate is less money). Throughput is the reciprocal of
+    time, so docs_per_s_sol/tokens_per_s_sol run the other way: always
+    >= the measured rate (the same work in less time is a higher
+    rate). Both directions follow from one fact - sol_s <= wall_s -
+    just applied to a quantity that scales with time (cost) versus one
+    that scales inversely with it (a rate).
 
     A duplicate query id within one pass's list silently keeps the
     last one (a plain dict comprehension) - not reachable from
@@ -77,9 +80,9 @@ def build_rows(suite: dict) -> list[dict]:
                              cold_s=None, warm_s=None, sol_s=None,
                              efficiency=None, docs_per_s_warm=None,
                              tokens_per_s_warm=None, cost_cold=None,
-                             cost_warm=None, docs_per_s_sol_ceiling=None,
-                             tokens_per_s_sol_ceiling=None,
-                             cost_sol_floor=None))
+                             cost_warm=None, docs_per_s_sol=None,
+                             tokens_per_s_sol=None,
+                             cost_sol=None))
             continue
 
         size_src = cold if cold_ok else warm
@@ -101,21 +104,21 @@ def build_rows(suite: dict) -> list[dict]:
             tokens_per_s_warm=warm.get("tokens_per_s") if warm_ok else None,
             cost_cold=cold.get("cost_dollars") if cold_ok else None,
             cost_warm=warm.get("cost_dollars") if warm_ok else None,
-            docs_per_s_sol_ceiling=(
+            docs_per_s_sol=(
                 round(docs / sol_s, 1) if docs and sol_s else None),
-            tokens_per_s_sol_ceiling=(
+            tokens_per_s_sol=(
                 round(tokens / sol_s) if tokens and sol_s else None),
-            cost_sol_floor=_sol_cost(sol_s, gpus, cpu_memory_gb),
+            cost_sol=_sol_cost(sol_s, gpus, cpu_memory_gb),
         ))
     return rows
 
 
 def _sol_cost(sol_s, gpus, cpu_memory_gb):
-    """$/query if the engine ran this exact workload at the SOL
-    floor: the same gpu-seconds + memory-GiB-seconds arithmetic
-    quailb._cost_dollars uses for the measured cost, with wall_s
-    replaced by sol_s and boot_s=0 (boot is fixed setup time, not
-    part of the compute floor)."""
+    """$/query if the engine ran this exact workload at peak hardware
+    speed (sol_s): the same gpu-seconds + memory-GiB-seconds
+    arithmetic quailb._cost_dollars uses for the measured cost, with
+    wall_s replaced by sol_s and boot_s=0 (boot is fixed setup time,
+    not part of the compute estimate)."""
     if not sol_s:
         return None
     from quail.bench.quailb import _cost_dollars, _modal_rates
@@ -197,21 +200,24 @@ def render_markdown_table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def render_sol_ceiling_table(rows: list[dict]) -> str:
+def render_sol_estimate_table(rows: list[dict]) -> str:
     """A second table, not the issue's original column set: measured
-    (warm) against what sol_s implies for the SAME workload - a
-    CEILING for the two rate columns (docs/s, tok/s can only be
-    lower in reality, never higher than the floor-time rate) and a
-    FLOOR for cost (same direction as sol_s itself). Answers "what's
-    the best this exact query could ever do on this hardware", not
-    "what should I expect before running a query I haven't run yet" -
-    sol_s is computed from this query's own real evaluated/restored
-    counts (runtime/session.py), not from a pre-execution plan
-    estimate, so this is a best-case reference for a query of this
-    shape and size, not a live predictor for an unrun query."""
-    header = ("| Query | Docs/s (warm) | Docs/s (SOL ceiling) "
-             "| Tok/s (warm) | Tok/s (SOL ceiling) | Cost (warm) "
-             "| Cost (SOL floor) |")
+    (warm) against what sol_s implies for the SAME workload at peak
+    hardware speed. Docs/s and tok/s can only be lower in reality,
+    never higher than the sol_s-implied rate; cost can only be higher
+    in reality, never lower than the sol_s-implied cost - both follow
+    from sol_s <= wall_s, just applied to a quantity that scales with
+    time (cost) versus one that scales inversely with it (a rate).
+    Answers "what's the best this exact query could ever do on this
+    hardware", not "what should I expect before running a query I
+    haven't run yet" - sol_s is computed from this query's own real
+    evaluated/restored counts (runtime/session.py), not from a
+    pre-execution plan estimate, so this is a best-case reference for
+    a query of this shape and size, not a live predictor for an unrun
+    query."""
+    header = ("| Query | Docs/s (warm) | Docs/s (SOL) "
+             "| Tok/s (warm) | Tok/s (SOL) | Cost (warm) "
+             "| Cost (SOL) |")
     sep = "|---|---|---|---|---|---|---|"
     lines = [header, sep]
     for r in rows:
@@ -221,11 +227,11 @@ def render_sol_ceiling_table(rows: list[dict]) -> str:
             continue
         lines.append(
             f"| {r['query']} | {_fmt_rate(r['docs_per_s_warm'])} "
-            f"| {_fmt_rate(r['docs_per_s_sol_ceiling'])} "
+            f"| {_fmt_rate(r['docs_per_s_sol'])} "
             f"| {_fmt_rate(r['tokens_per_s_warm'])} "
-            f"| {_fmt_rate(r['tokens_per_s_sol_ceiling'])} "
+            f"| {_fmt_rate(r['tokens_per_s_sol'])} "
             f"| {_fmt_cost(r['cost_warm'])} "
-            f"| {_fmt_cost(r['cost_sol_floor'])} |")
+            f"| {_fmt_cost(r['cost_sol'])} |")
     return "\n".join(lines)
 
 
@@ -262,12 +268,12 @@ def plot_sol_comparison(rows: list[dict], out_path: str) -> None:
     fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.1), 4.5))
     ax.bar([i - width / 2 for i in x], measured, width, label="Measured (warm)",
           color=GRAY)
-    ax.bar([i + width / 2 for i in x], sol, width, label="SOL floor",
+    ax.bar([i + width / 2 for i in x], sol, width, label="SOL estimate",
           color=ACCENT)
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels, rotation=30, ha="right")
     ax.set_ylabel("seconds")
-    ax.set_title("Measured wall time vs. speed-of-light floor", color=DARK)
+    ax.set_title("Measured wall time vs. speed-of-light estimate", color=DARK)
     ax.legend()
     ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
@@ -285,7 +291,7 @@ def main():
     rows = build_rows(suite)
     print(render_markdown_table(rows))
     print()
-    print(render_sol_ceiling_table(rows))
+    print(render_sol_estimate_table(rows))
     plot_sol_comparison(rows, sys.argv[2])
     print(f"\n[sol_report] wrote {sys.argv[2]}")
 

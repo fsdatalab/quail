@@ -30,7 +30,7 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY, GREEN, DARK, ORANGE, RED, TEAL
+from plot_colors import BLUE, GRAY, GREEN, DARK, ORANGE, TEAL
 
 BUCKETS = ["projection", "elementwise", "attention"]
 BUCKET_COLOR = {"projection": BLUE, "elementwise": ORANGE, "attention": GREEN}
@@ -92,35 +92,12 @@ def fig_comparison(rows):
     plt.close(fig)
 
 
-def fig_unmodeled_share(rows):
-    """How much of each query's total measured kernel time falls into
-    the "unmodeled" bucket at all - I/O, RoPE, KV-scatter bookkeeping,
-    sampling kernels. Not a formula error (SOL only ever claimed to
-    model the forward pass's four terms), but worth seeing per query
-    since it's the ceiling on how tight the profiler comparison above
-    can ever be."""
-    queries = [r["query"] for r in rows]
-    unmodeled = [r["measured_pct"].get("unmodeled", 0.0) for r in rows]
-    other = [r["measured_pct"].get("other", 0.0) for r in rows]
-
-    fig, ax = plt.subplots(figsize=(6.5, 4.2))
-    ax.bar(queries, unmodeled, color=RED, label="unmodeled (I/O, RoPE, "
-          "KV-scatter, sampling)")
-    ax.bar(queries, other, bottom=unmodeled, color=GRAY, label="other "
-          "(uncategorized)")
-    ax.set_ylabel("% of total measured kernel time")
-    ax.set_title("What SOL's formula doesn't claim to price at all")
-    ax.legend(fontsize=8)
-    fig.savefig(OUT / "torch_profiler_unmodeled_share.png")
-    plt.close(fig)
-
-
 def fig_totals(rows):
     """Total query time, three ways, per query: wall_s (this system's
     own end-to-end measurement - Python, kernel launches, everything),
     the torch.profiler kernel sum (total_kernel_us - only time the GPU
     was actually executing a kernel, so it's <= wall_s by construction),
-    and sol_s (the formula's floor). Expected ordering is sol_s <=
+    and sol_s (the formula's estimate). Expected ordering is sol_s <=
     kernel time <= wall_s: the gap from sol_s up to kernel time is real
     kernels running below their peak rate (the attention finding
     above); the gap from kernel time up to wall_s is time spent outside
@@ -142,7 +119,7 @@ def fig_totals(rows):
     fig, ax = plt.subplots(figsize=(2.6 * n, 4.5))
     ax.bar(x - width, wall, width, color=GRAY, label="wall_s (our system)")
     ax.bar(x, kernel, width, color=TEAL, label="kernel time (torch.profiler)")
-    ax.bar(x + width, sol, width, color=BLUE, label="sol_s (our SOL estimate)")
+    ax.bar(x + width, sol, width, color=BLUE, label="sol_s (peak-hardware estimate)")
     for xi, w, k, s in zip(x, wall, kernel, sol):
         ax.text(xi - width, w, f"{w:.1f}s", ha="center", va="bottom",
                fontsize=7.5)
@@ -154,7 +131,7 @@ def fig_totals(rows):
     ax.set_xticklabels(queries, fontsize=9)
     ax.set_ylabel("seconds")
     ax.set_title("Total query time: our system vs. profiled kernel time "
-                "vs. the SOL floor")
+                "vs. the peak-hardware estimate")
     ax.legend(fontsize=8, loc="upper left")
     ax.spines[["top", "right"]].set_visible(False)
     fig.savefig(OUT / "torch_profiler_totals.png", bbox_inches="tight")
@@ -164,6 +141,5 @@ def fig_totals(rows):
 if __name__ == "__main__":
     rows = load()
     fig_comparison(rows)
-    fig_unmodeled_share(rows)
     fig_totals(rows)
-    print(f"[plot_torch_profiler_comparison] wrote 3 PNGs to {OUT}")
+    print(f"[plot_torch_profiler_comparison] wrote 2 PNGs to {OUT}")

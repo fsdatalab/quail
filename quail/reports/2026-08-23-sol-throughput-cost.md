@@ -526,15 +526,18 @@ non-zero-chunk data. `sol_seconds_breakdown()` was also split out of
 `sol_seconds()` here (same arithmetic, four terms kept separate), needed
 by both these tests and phase 3 below.
 
-**Formula behavior, visualized** (`reports/plot_sol_formula_diagnostics.py`,
-5 PNGs): the same properties as pictures — causal attention flat then
-quadratic at the ~24,639-token crossover, streaming attention flat then
-linear (never quadratic — the whole reason it's a separate function),
-projection's compute knee (~416 tokens) against elementwise's dead-straight
-no-knee line, and the subadditivity gap's actual shape (peaks at ~50%
-when a compute-bound and a memory-bound item are equal-sized, not when one
-dwarfs the other — the first sweep attempt showed a wrong, ~5×10⁻⁸%
-of neither, from sweeping the wrong pair of magnitudes).
+**Formula behavior, visualized** (`reports/plot_sol_formula_diagnostics.py`):
+the same properties as pictures — causal attention flat then quadratic at
+the ~24,639-token crossover, streaming attention flat then linear (never
+quadratic — the whole reason it's a separate function), projection's
+compute knee (~416 tokens) against elementwise's dead-straight no-knee
+line. (An earlier version of this section also plotted the subadditivity
+gap — the overstatement from pricing every item separately and summing
+instead of aggregating before one `max()` — peaking at ~50% when a
+compute-bound and a memory-bound item are equal-sized; that plot was
+trimmed from the report at request, section 21, since section 4's
+aggregate-before-`max()` design note already covers the same point in
+text.)
 
 **Real kernels vs. the formula's structure** (`tests/gpu/
 torch_profiler_compare.py`, `reports/plot_torch_profiler_comparison.py`):
@@ -704,19 +707,20 @@ documents happen to contain.
 Section 6 reports `sol_s` and efficiency against wall time, but
 docs/s, tokens/s, and cost were still only ever the measured (warm)
 numbers - nothing in the report said what those three would be if the
-same workload ran at the floor. `sol_report.build_rows()` now adds
-three fields: `docs_per_s_sol_ceiling`, `tokens_per_s_sol_ceiling`,
-`cost_sol_floor`.
+same workload ran at peak hardware speed instead. `sol_report.
+build_rows()` now adds three fields: `docs_per_s_sol`,
+`tokens_per_s_sol`, `cost_sol`.
 
-**Floor or ceiling depends on which side of a division the number is
-on.** `sol_s` is a floor on time - nothing runs faster. Cost is
-`time x rate`, same direction, so `cost_sol_floor` is a floor too -
-nothing costs less. Throughput is `count / time` - a rate, the
-reciprocal of time - so the floor on time is a **ceiling** on rate:
-`docs_per_s_sol_ceiling` and `tokens_per_s_sol_ceiling` are the
-highest a query of this shape could ever hit, not the lowest. Calling
-a throughput number a "floor" would tell a reader the real number can
-only go up from here; for docs/s and tokens/s it can only go down.
+**Which direction each one moves depends on whether it scales with
+time or against it.** `sol_s` is never more than the measured
+`wall_s` - nothing runs faster than peak. Cost is `time x rate`, same
+direction, so `cost_sol` is never more than the measured cost either
+- less time at the same rate is less money. Throughput is `count /
+time` - a rate, the reciprocal of time - so it runs the other way:
+`docs_per_s_sol` and `tokens_per_s_sol` are never less than the
+measured rate - the same work in less time is a higher rate. Both
+facts come from the one thing that's actually true (`sol_s <= wall_s`
+), just applied to two different kinds of quantity.
 
 **What this is not**: a pre-execution predictor. `sol_s` is computed
 from the query's own real evaluated/restored counts after it runs
@@ -727,32 +731,32 @@ model to predict from yet. These three fields are a best-case
 reference for a query of this shape and size that has already run,
 not a live estimate for one that hasn't.
 
-**A real bug this surfaced**: the first version of `docs_per_s_sol_
-ceiling` used `docs` (the cold-pass corpus size) as the numerator,
-while the already-shipped `docs_per_s_warm` field was computed by an
-older `run_suite()` from the warm pass's own `_docs_count()` call.
-For four of five queries these agree. For FEV-5 - the one two-sided
-query (a filter on both the join's anchor and a partner table) - they
-didn't: `results/sol_check_sf0.1_4b_corrected.json` was committed
-(`b3f9606`) before the `_docs_count` two-sided-summing bug fix
-(`3ec98d5`, an adversarial review two commits later), so its stored
-`docs_per_s` for FEV-5 was stale - 85.3/78.1 (cold/warm), computed
-from the old buggy sum of both tables' stage-0 counts (157), not the
-current, correct anchor-only count (57). The symptom was exactly what
-a stale value should produce: the "ceiling" came out *below* the
-measured rate (54 vs. a stale 78.1), which cannot happen once
-`sol_s <= wall_s` holds (section 12's invariant). Fixed the stale
-field directly in the committed JSON - same underlying raw data
-(`evaluated` counts, `wall_s`), recomputed with the current, already-
-fixed `_docs_count()` (31.0/28.4, cold/warm) - not a new measurement,
-a correction of a derived field the earlier fix never propagated to.
-`quailb.py`'s `suite = dict(...)` now also persists `cpu_memory_gb`
-(only `gpus` was saved before), so `cost_sol_floor` doesn't have to
-guess the container size for future runs; `build_rows()` falls back
-to 80 (the default every suite committed before this field existed
-actually ran with) when it's absent.
+**A real bug this surfaced**: the first version of `docs_per_s_sol`
+used `docs` (the cold-pass corpus size) as the numerator, while the
+already-shipped `docs_per_s_warm` field was computed by an older
+`run_suite()` from the warm pass's own `_docs_count()` call. For four
+of five queries these agree. For FEV-5 - the one two-sided query (a
+filter on both the join's anchor and a partner table) - they didn't:
+`results/sol_check_sf0.1_4b_corrected.json` was committed (`b3f9606`)
+before the `_docs_count` two-sided-summing bug fix (`3ec98d5`, an
+adversarial review two commits later), so its stored `docs_per_s` for
+FEV-5 was stale - 85.3/78.1 (cold/warm), computed from the old buggy
+sum of both tables' stage-0 counts (157), not the current, correct
+anchor-only count (57). The symptom was exactly what a stale value
+should produce: the SOL-derived rate came out *below* the measured
+rate (54 vs. a stale 78.1), which cannot happen once `sol_s <= wall_s`
+holds (section 12's invariant). Fixed the stale field directly in the
+committed JSON - same underlying raw data (`evaluated` counts,
+`wall_s`), recomputed with the current, already-fixed `_docs_count()`
+(31.0/28.4, cold/warm) - not a new measurement, a correction of a
+derived field the earlier fix never propagated to. `quailb.py`'s
+`suite = dict(...)` now also persists `cpu_memory_gb` (only `gpus`
+was saved before), so `cost_sol` doesn't have to guess the container
+size for future runs; `build_rows()` falls back to 80 (the default
+every suite committed before this field existed actually ran with)
+when it's absent.
 
-| Query | Docs/s (warm) | Docs/s (SOL ceiling) | Tok/s (warm) | Tok/s (SOL ceiling) | Cost (warm) | Cost (SOL floor) |
+| Query | Docs/s (warm) | Docs/s (SOL) | Tok/s (warm) | Tok/s (SOL) | Cost (warm) | Cost (SOL) |
 |---|---|---|---|---|---|---|
 | IMDB-1 | 303 | 490 | 107k | 174k | $0.0210 | $0.0130 |
 | IMDB-2 | 1,145 | 1,815 | 109k | 185k | $0.0668 | $0.0421 |
@@ -761,19 +765,55 @@ actually ran with) when it's absent.
 | FEV-5 | 28 | 54 | 96k | 196k | $0.0026 | $0.0013 |
 
 Figure: plots/sol_docs_per_s.png, plots/sol_tokens_per_s.png,
-plots/sol_cost_vs_floor.png
+plots/sol_cost_estimate.png
 
-The gap between measured and ceiling/floor tracks efficiency (section
-6) exactly, since the ceiling-to-measured ratio is just `1 /
-efficiency` (same `docs`/`tokens` divided by `sol_s` vs. `warm_s`).
-FEV-5 has both the lowest efficiency (53%) and the widest relative
-gap (28 measured vs. 54 ceiling docs/s, a 1.90x spread); IMDB-2 has
-the highest efficiency (63%) and the narrowest gap (1.59x). No
-query breaks that ordering.
+The gap between measured and SOL tracks efficiency (section 6)
+exactly, since the SOL-to-measured ratio is just `1 / efficiency`
+(same `docs`/`tokens` divided by `sol_s` vs. `warm_s`). FEV-5 has
+both the lowest efficiency (53%) and the widest relative gap (28
+measured vs. 54 SOL-estimated docs/s, a 1.90x spread); IMDB-2 has the
+highest efficiency (63%) and the narrowest gap (1.59x). No query
+breaks that ordering.
 
-6 new tests (`docs_per_s_sol_ceiling`/`tokens_per_s_sol_ceiling`/
-`cost_sol_floor` computed correctly, the ceiling >= measured / floor
-<= measured invariant on real validated data, `cpu_memory_gb` read
-from the suite with the documented fallback, error rows return
-`None`, the new `render_sol_ceiling_table()`). 216 tests pass without
-matplotlib installed (6 more skip cleanly); 222 pass with it.
+6 new tests (`docs_per_s_sol`/`tokens_per_s_sol`/`cost_sol` computed
+correctly, the direction invariant on real validated data - SOL rate
+>= measured, SOL cost <= measured - `cpu_memory_gb` read from the
+suite with the documented fallback, error rows return `None`, the new
+`render_sol_estimate_table()`). 241 tests pass without matplotlib
+installed as of this section (6 more skip cleanly); 247 pass with it -
+the jump from the 216/222 in section 19 is `main`'s multi-join test
+suite, picked up by the merge in section 18/19, not new tests from
+this section.
+
+## 21. Trimming the report and simplifying the language (2026-08-25)
+
+Two plots removed, at request: `sol_formula_subadditivity_gap.png`
+("why sol_seconds aggregates before max(), not after" - section 12's
+design note already covers this in text) and `torch_profiler_
+unmodeled_share.png` ("what SOL's formula doesn't claim to price at
+all" - section 17's discussion already covers this). Fewer figures,
+same findings, still in the text.
+
+"Ceiling" and "floor" are gone from every user-facing label in this
+feature (columns, plot titles/legends, table headers) - section 20
+above rewritten to say what actually happens (SOL rate >= measured,
+SOL cost <= measured) instead of naming it with two different words
+depending on direction. Code fields renamed to match:
+`docs_per_s_sol_ceiling` -> `docs_per_s_sol`, `tokens_per_s_sol_
+ceiling` -> `tokens_per_s_sol`, `cost_sol_floor` -> `cost_sol`,
+`render_sol_ceiling_table()` -> `render_sol_estimate_table()`. The
+established meaning of "floor" for `sol_s` itself (the time no query
+can run faster than) is unchanged - that one has no direction
+ambiguity to cause confusion, since time only moves one way.
+
+The three formula-scaling plots that survive (`sol_formula_causal_
+attention_scaling.png`, `sol_formula_streaming_attention_scaling.png`,
+`sol_formula_projection_vs_elementwise.png`) switched from log-log
+axes to linear, at request. Log-log was what made the crossover
+points (the compute knee at ~416 tokens, the causal-attention
+crossover at ~24,639 tokens) visible at all against the formulas'
+full valid range, which spans several orders of magnitude - so each
+plot's x-axis now sweeps only to about 6x its own crossover point
+(causal attention to ~148k tokens, projection/elementwise to ~2,500)
+instead of the full range, keeping the crossover legible on a linear
+axis instead of compressed against the origin.

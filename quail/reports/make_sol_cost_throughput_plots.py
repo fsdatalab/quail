@@ -5,19 +5,20 @@ workload. Reads the same committed, validated summary the rest of
 this report's numbers come from - no new arithmetic, just plotting
 columns build_rows() already computes.
 
-Time and cost share a direction: sol_s is a FLOOR (nothing runs
-faster), so sol-derived cost is a floor too (nothing costs less).
-Throughput is a rate - the reciprocal of time - so sol-derived
-docs/s and tokens/s are a CEILING (nothing goes faster than the
-floor-time rate). See sol_report.build_rows()'s docstring for the
-full reasoning.
+Time and cost share a direction: sol_s is never more than wall_s, so
+sol-derived cost is never more than measured cost either (less time
+at the same rate is less money). Throughput is a rate - the
+reciprocal of time - so it runs the other way: sol-derived docs/s and
+tokens/s are never less than measured (the same work in less time is
+a higher rate). See sol_report.build_rows()'s docstring for the full
+reasoning.
 
 Run from the quail/ directory:
 
     uv run --with matplotlib python reports/make_sol_cost_throughput_plots.py
 
 Writes reports/plots/sol_cost_by_query.png,
-reports/plots/sol_cost_vs_floor.png, reports/plots/sol_docs_per_s.png,
+reports/plots/sol_cost_estimate.png, reports/plots/sol_docs_per_s.png,
 reports/plots/sol_tokens_per_s.png.
 """
 
@@ -82,7 +83,7 @@ def fig_pair(rows, measured_key, sol_key, ylabel, title, sol_color,
             sol_label, out_name, fmt):
     """Grouped bars: what actually happened (warm, gray) against what
     sol_s implies for that exact workload (sol_color) - the same
-    measured-vs-floor pattern plots/sol_report_sf0.1_4b.png uses for
+    measured-vs-SOL pattern plots/sol_report_sf0.1_4b.png uses for
     wall time, extended to cost and throughput."""
     labels = [r["query"] for r in rows]
     measured = [r[measured_key] for r in rows]
@@ -113,19 +114,19 @@ def fig_pair(rows, measured_key, sol_key, ylabel, title, sol_color,
 if __name__ == "__main__":
     rows = load_rows()
     fig_cost(rows)
-    fig_pair(rows, "cost_warm", "cost_sol_floor", "cost ($)",
-             "Cost: measured vs. the SOL floor (lower is the limit)",
-             BLUE, "SOL floor", "sol_cost_vs_floor.png",
+    fig_pair(rows, "cost_warm", "cost_sol", "cost ($)",
+             "Cost: measured vs. SOL estimate",
+             BLUE, "SOL estimate", "sol_cost_estimate.png",
              lambda v: f"${v:.3f}")
-    fig_pair(rows, "docs_per_s_warm", "docs_per_s_sol_ceiling",
+    fig_pair(rows, "docs_per_s_warm", "docs_per_s_sol",
              "documents/second",
-             "Docs/s: measured vs. the SOL ceiling (higher is the limit)",
-             BLUE, "SOL ceiling", "sol_docs_per_s.png",
+             "Docs/s: measured vs. SOL estimate",
+             BLUE, "SOL estimate", "sol_docs_per_s.png",
              lambda v: f"{v:,.0f}")
-    fig_pair(rows, "tokens_per_s_warm", "tokens_per_s_sol_ceiling",
+    fig_pair(rows, "tokens_per_s_warm", "tokens_per_s_sol",
              "tokens/second",
-             "Tok/s: measured vs. the SOL ceiling (higher is the limit)",
-             GREEN, "SOL ceiling", "sol_tokens_per_s.png",
+             "Tok/s: measured vs. SOL estimate",
+             GREEN, "SOL estimate", "sol_tokens_per_s.png",
              lambda v: f"{v/1000:.0f}k")
     print(f"[make_sol_cost_throughput_plots] wrote 4 PNGs to {OUT}, "
          f"from {SUITE_PATH.relative_to(ROOT)}")
