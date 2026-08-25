@@ -537,10 +537,20 @@ for qid, rec in queries.items():
         "tuples": (len(live) * len(after(doc_lengths(rec["partner_column"]),
                                          rec["partner_filters"]))
                    if "join" in rec else 0),
+        "document_column": rec["document_column"],
+        "partner_column": rec.get("partner_column"),
         "anchor": anchor, "anchor_tokens_both_ways": both,
+        # mean length of the documents whose KV is held: the context
+        # every question and every tuple attends over, so the thing
+        # that decides how much of the compute is attention
+        "held_column": (rec["document_column"] if anchor != "right"
+                        else rec["partner_column"]),
         "tokens": work.tokens, "pairs": work.pairs,
         "kv_written": work.kv_written, "kv_read": work.kv_read,
         "models": {}}
+    held = rows[qid]["held_column"]
+    rows[qid]["held_mean_doc_tokens"] = (
+        sum(lengths[held].values()) / len(lengths[held]))
     for model in MODELS:
         s = seconds(work, model, H100_SXM, CHUNK[model.name])
         rows[qid]["models"][model.name] = {
@@ -548,6 +558,23 @@ for qid, rec in queries.items():
             "t_dense": s.dense, "t_attention": s.attention,
             "t_compute": s.compute, "t_memory": s.memory,
             "sol_s": s.sol, "bound_by": s.bound_by}
+
+# The same arithmetic over a synthetic document, so the curve the 26
+# queries scatter around is drawn from the equations rather than
+# fitted to the points: one filter, one document of length d, a
+# 50-token question. The share does not depend on how many documents
+# there are, only on how long each one is.
+curve = {"document_tokens": [], "attention_share": {m.name: []
+                                                    for m in MODELS}}
+d = 4.0
+while d <= 40_000:
+    w = scan(PRE + d, 50)
+    curve["document_tokens"].append(round(d, 1))
+    for model in MODELS:
+        sec = seconds(w, model, H100_SXM, CHUNK[model.name])
+        curve["attention_share"][model.name].append(
+            round(100 * sec.attention / sec.compute, 4))
+    d *= 1.12
 
 hdr = (f"{'query':7} {'tokens':>11} {'pairs':>15} {'tuples':>8} "
        f"{'anchor':>7}  {'4B SoL':>9} {'att%':>5}  {'32B SoL':>9} "
@@ -576,6 +603,7 @@ json.dump({
                   "quail-results, qwen3-32b-fp8 answering",
         "tokenizer": "Qwen/Qwen3-4B-FP8, shared by every Qwen3 model"},
     "chunk_tokens": CHUNK,
+    "attention_share_curve": curve,
     "measured_inputs": {
         "preamble_tokens": PRE,
         "document_lengths": {
