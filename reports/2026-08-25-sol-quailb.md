@@ -9,15 +9,17 @@ moved. Everything a real run also pays - kernel efficiency, launch
 gaps, scheduling, the host - is left out, so a run can approach
 these numbers and can never beat them.
 
-Nothing here is fitted or measured on a GPU. `quail/sol.py` imports
-only `quail.specs`, and the whole file is arithmetic small enough to
-check by hand. The equations are `plans/sol_model.md`.
+Nothing here is fitted or measured on a GPU. The equations are
+`plans/sol_model.md`, and `reports/make_sol_quailb.py` is those
+equations plus the measurement of their inputs - one file, small
+enough to check by hand.
 
 ## The three inputs
 
 Every number below comes from exactly three measured things.
 `reports/make_sol_quailb.py` measures them and computes the table in
-one pass; `results/sol_quailb_sf0.1.json` holds both.
+one pass, and writes both to `/sol/sol_quailb_sf0.1.json` on the
+`quail-results` volume.
 
 1. **Document lengths.** Each corpus tokenized with the Qwen3
    tokenizer, kept as a length histogram so nothing is lost and no

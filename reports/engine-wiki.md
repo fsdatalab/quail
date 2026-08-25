@@ -21,7 +21,6 @@ payload to the worker, which calls the executor.
 | `logical.py` | Logical operators (Scan, Filter, Join, Project) and plan assembly | nothing |
 | `builder.py` | Builder API entry point | catalog, logical |
 | `sqlfront/compile.py` | AI SQL entry point (sqlglot parser and binder) | catalog, logical |
-| `sol.py` | Speed-of-light floor for one query (offline; borrows no cost model) | specs |
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
