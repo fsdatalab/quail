@@ -526,16 +526,20 @@ non-zero-chunk data. `sol_seconds_breakdown()` was also split out of
 `sol_seconds()` here (same arithmetic, four terms kept separate), needed
 by both these tests and phase 3 below.
 
-**Formula behavior, visualized** (`reports/plot_sol_formula_diagnostics.py`):
-the same properties as pictures — causal attention flat then quadratic at
-the ~24,639-token crossover, streaming attention flat then linear (never
-quadratic — the whole reason it's a separate function), projection's
-compute knee (~416 tokens) against elementwise's dead-straight no-knee
-line. (An earlier version of this section also plotted the subadditivity
-gap — the overstatement from pricing every item separately and summing
-instead of aggregating before one `max()` — peaking at ~50% when a
-compute-bound and a memory-bound item are equal-sized; that plot was
-trimmed from the report at request, section 21, since section 4's
+**Formula behavior, visualized** (`reports/plot_sol_formula_diagnostics.py`,
+removed section 22 below): the same properties as pictures — causal
+attention flat then quadratic at the ~24,639-token crossover, streaming
+attention flat then linear (never quadratic — the whole reason it's a
+separate function), projection's compute knee (~416 tokens) against
+elementwise's dead-straight no-knee line. These were synthetic sweeps of
+the formula's own math at fixed model/hardware constants, not this PR's
+measured query results — the property tests above are what actually
+verify this behavior; the plots were a picture of what those tests check
+numerically. (An earlier version of this section also plotted the
+subadditivity gap — the overstatement from pricing every item separately
+and summing instead of aggregating before one `max()` — peaking at ~50%
+when a compute-bound and a memory-bound item are equal-sized; that plot
+was trimmed from the report at request, section 21, since section 4's
 aggregate-before-`max()` design note already covers the same point in
 text.)
 
@@ -830,4 +834,23 @@ full valid range, which spans several orders of magnitude - so each
 plot's x-axis now sweeps only to about 6x its own crossover point
 (causal attention to ~148k tokens, projection/elementwise to ~2,500)
 instead of the full range, keeping the crossover legible on a linear
-axis instead of compressed against the origin.
+axis instead of compressed against the origin. (These three, plus
+`sol_formula_component_breakdown.png`, were removed entirely in
+section 22 below - "survive" here only describes this section's own
+point in time.)
+
+## 22. Removing the formula-only diagnostic plots (2026-08-26)
+
+`reports/plot_sol_formula_diagnostics.py` and its four outputs
+(`sol_formula_causal_attention_scaling.png`, `sol_formula_streaming_
+attention_scaling.png`, `sol_formula_projection_vs_elementwise.png`,
+`sol_formula_component_breakdown.png`) are gone. All four were
+synthetic sweeps of the formula's own math at fixed Qwen3-4B/H100
+constants - useful as a picture of what section 17's property tests
+(`test_budgets_sol_properties.py`) already check numerically, but not
+built from this PR's actual measured query results the way every
+other plot in this report is. The findings they illustrated (the
+compute knee, the causal-attention crossover, the two-regime scaling)
+are still covered in section 17's text and enforced by the property
+tests; only the standalone pictures are gone. No test depended on the
+removed script. 247 tests pass, unchanged.
