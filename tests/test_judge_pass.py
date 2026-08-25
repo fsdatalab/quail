@@ -4,8 +4,9 @@ from dataclasses import replace
 
 from quail.bench.judge_pass import (
     MODEL_NAME,
+    FILTER_ROWS_PER_CALL,
+    JOIN_ANCHORS_PER_CALL,
     PREDICATES,
-    WORKLOAD_PLAN,
     WORKLOADS,
     _compact_label_parts,
     _corpus_identity,
@@ -16,6 +17,8 @@ from quail.bench.judge_pass import (
     predicate_version,
     render_filter_prompt,
     render_join_prompt,
+    filter_groups,
+    join_specs,
     workload_specs,
 )
 
@@ -88,7 +91,6 @@ def test_saved_verification_sample_covers_completed_parts_after_resume(
 
     spec = _spec("quailb.imdb.review.discusses_ending")
     identity = {"label_set_id": "ls_test"}
-    monkeypatch.setattr(judge_pass, "PREDICATES", (spec,))
     monkeypatch.setattr(judge_pass, "VOLUME_ROOT", tmp_path)
     parts = (tmp_path / "label_sets" / spec.workload / spec.slug
              / identity["label_set_id"] / "parts")
@@ -105,7 +107,8 @@ def test_saved_verification_sample_covers_completed_parts_after_resume(
                     for i in range(20)]
     }
 
-    sample = _saved_verification_sample(corpus, {spec.key: identity})
+    sample = _saved_verification_sample(
+        corpus, {spec.key: identity}, specs=(spec,))
 
     assert len(sample.rows[spec.key]) == 16
     assert sample.rows[spec.key][0] == (
@@ -139,44 +142,50 @@ def test_compact_label_parts_keeps_every_saved_row(tmp_path):
 
 def test_every_predicate_belongs_to_exactly_one_workload():
     """The four containers between them must cover the collection: a
-    predicate in no workload is silently never labelled, and one in
-    two workloads is judged twice."""
+    predicate in no workload is never labelled, one in two is judged
+    twice."""
     seen = [spec.key for w in WORKLOADS for spec in workload_specs(w)]
     assert sorted(seen) == sorted(spec.key for spec in PREDICATES)
     assert len(seen) == len(set(seen)) == 19
 
 
-def test_the_plan_names_every_predicate_its_workload_owns():
-    """What a container actually judges is the plan, not the workload
-    field, so the two have to agree."""
-    for workload, plan in WORKLOAD_PLAN.items():
-        named = {k for _, keys in plan["filters"] for k in keys}
-        for slot in ("join", "source_join"):
-            if slot in plan:
-                named.add(plan[slot][0])
-        assert named == {spec.key for spec in workload_specs(workload)}, (
-            workload)
+def test_what_each_container_runs_is_read_off_the_specs():
+    """Only the batch sizes are stated; the grouping, the tables and
+    which join needs no model call all come from the PredicateSpec."""
+    plan = {w: ([(t, len(g), n) for t, g, n in filter_groups(
+                    workload_specs(w))],
+                [s.legacy_code for s in join_specs(workload_specs(w))])
+            for w in WORKLOADS}
+    assert plan == {
+        "imdb": ([("reviews", 3, 256)], ["DISCUSS_ASPECT"]),
+        "biodex": ([("reports", 3, 8)], ["REACTION"]),
+        "fever": ([("claims", 2, 100), ("evidence", 1, 57)], ["SUPPORT"]),
+        "lepard": ([("citations", 5, 50), ("citations", 1, 100)],
+                   ["LEPJOIN"]),
+    }
 
 
-def test_the_plan_reads_the_tables_its_predicates_declare():
-    for workload, plan in WORKLOAD_PLAN.items():
-        for (table, batch), keys in plan["filters"]:
-            assert batch > 0
-            for key in keys:
-                assert _spec(key).left_table == table
-        for slot in ("join", "source_join"):
-            if slot not in plan:
-                continue
-            key, left, right = plan[slot][0], plan[slot][1], plan[slot][2]
-            spec = _spec(key)
-            assert spec.kind == "join"
-            assert (spec.left_table, spec.right_table) == (left, right)
+def test_filters_group_by_the_column_they_read():
+    """LePaRD reads two columns of one table, and each gets its own
+    batch size, so grouping by table alone would merge them."""
+    groups = filter_groups(workload_specs("lepard"))
+    assert len(groups) == 2
+    columns = {spec.left_column for _, g, _ in groups for spec in g}
+    assert columns == {"destination_context", "passage_text"}
 
 
-def test_verification_sample_can_be_scoped_to_one_workload():
-    """Each container reruns only its own predicates, so the sample
-    has to take a subset rather than always walking PREDICATES."""
-    spec = _spec("quailb.imdb.review.discusses_ending")
-    sample = _saved_verification_sample({}, {}, specs=())
-    assert sample.rows == {}
-    assert spec in workload_specs("imdb")
+def test_every_predicate_has_a_batch_size():
+    """A missing entry is a KeyError at run time, on the GPU."""
+    for spec in PREDICATES:
+        if spec.kind == "filter":
+            assert (spec.left_table, spec.left_column) in FILTER_ROWS_PER_CALL
+        elif spec.source_policy != "lepard_passage_id":
+            assert spec.left_table in JOIN_ANCHORS_PER_CALL
+
+
+def test_only_lepards_join_skips_the_model():
+    """It is labelled from the dataset's own passage ids, so its
+    container does almost no GPU work."""
+    free = [s.key for s in PREDICATES
+            if s.kind == "join" and s.source_policy == "lepard_passage_id"]
+    assert free == ["quailb.lepard.excerpt.cites_passage"]

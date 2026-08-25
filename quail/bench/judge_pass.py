@@ -154,62 +154,54 @@ PREDICATES = (
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
 
 
-# Which predicates each workload owns, and the batch sizes the pass
-# runs them at. One GPU container takes one workload, so the four run
-# side by side; the batch sizes are unchanged from the serial pass.
-#
-# The split is by workload rather than by predicate because a
-# container boots the 32B model once (~107 s) and then amortizes it
-# over everything it judges. BioDEX is 48% of the work on its own, so
-# it sets the wall time; splitting finer only helps if its join is
-# sharded too, which would mean merging partial label sets.
-WORKLOAD_PLAN = {
-    "imdb": {
-        "filters": ((("reviews", 256), (
-            "quailb.imdb.review.mentions_positive_aspect",
-            "quailb.imdb.review.discusses_ending",
-            "quailb.imdb.review.mentions_named_actor")),),
-        "join": ("quailb.imdb.review.discusses_aspect",
-                 "reviews", "aspects", 64),
-    },
-    "biodex": {
-        "filters": ((("reports", 8), (
-            "quailb.biodex.report.involves_female_patient",
-            "quailb.biodex.report.describes_combination_therapy",
-            "quailb.biodex.report.describes_serious_adverse_event")),),
-        "join": ("quailb.biodex.report.experienced_reaction",
-                 "reports", "terms", 4),
-    },
-    "fever": {
-        "filters": ((("claims", 100), (
-            "quailb.fever.claim.about_person",
-            "quailb.fever.claim.contains_date")),
-                    (("evidence", 57), (
-            "quailb.fever.passage.about_person",))),
-        "join": ("quailb.fever.passage.supports_claim",
-                 "claims", "evidence", 20),
-        "source_label": "fever",
-    },
-    "lepard": {
-        "filters": ((("citations", 50), (
-            "quailb.lepard.excerpt.reasoning_does_not_apply",
-            "quailb.lepard.excerpt.procedural_or_jurisdictional",
-            "quailb.lepard.excerpt.treats_passage_as_binding",
-            "quailb.lepard.excerpt.supports_liability_or_guilt",
-            "quailb.lepard.excerpt.acknowledges_court_disagreement")),
-                    (("citations", 100), (
-            "quailb.lepard.passage.states_general_rule",))),
-        # LePaRD's join labels come from the dataset's own passage_id,
-        # not from the judge, so it needs no model call
-        "source_join": ("quailb.lepard.excerpt.cites_passage",
-                        "citations", "citations"),
-    },
+# Rows per model call. This is the only thing about the pass that is
+# not already on a PredicateSpec, because it is hand-tuned to how long
+# the documents are: BioDEX reports go 8 at a time at ~4,146 tokens
+# each, IMDB reviews 256 at ~299. A group of k predicates over one
+# column submits k * rows prompts per call.
+FILTER_ROWS_PER_CALL = {
+    ("reviews", "body"): 256,
+    ("reports", "report"): 8,
+    ("claims", "claim"): 100,
+    ("evidence", "text"): 57,
+    ("citations", "destination_context"): 50,
+    ("citations", "passage_text"): 100,
 }
-WORKLOADS = tuple(WORKLOAD_PLAN)
+
+# Anchor documents per model call for a join. Each anchor is paired
+# with the whole partner table in one call, so this is the same tuning
+# against document length.
+JOIN_ANCHORS_PER_CALL = {
+    "reviews": 64, "reports": 4, "claims": 20, "citations": 50,
+}
+
+# One GPU container per workload, so the four run side by side. The
+# split is by workload rather than by predicate because a container
+# boots the 32B model once (~107 s) and then amortizes it over
+# everything it judges.
+WORKLOADS = tuple(dict.fromkeys(spec.workload for spec in PREDICATES))
 
 
 def workload_specs(workload: str) -> tuple:
     return tuple(p for p in PREDICATES if p.workload == workload)
+
+
+def filter_groups(specs) -> list:
+    """Filter predicates grouped by the column they read, in spec
+    order. Predicates over one column are judged together, so each
+    prompt batch carries one document and every question asked of
+    it."""
+    groups: dict = {}
+    for spec in specs:
+        if spec.kind == "filter":
+            groups.setdefault((spec.left_table, spec.left_column),
+                              []).append(spec)
+    return [(table, tuple(members), FILTER_ROWS_PER_CALL[(table, column)])
+            for (table, column), members in groups.items()]
+
+
+def join_specs(specs) -> tuple:
+    return tuple(p for p in specs if p.kind == "join")
 
 
 def _load_corpus(corpus_id: str) -> tuple[Path, dict, dict]:
@@ -970,8 +962,9 @@ def judge_workload(corpus_id: str, workload: str) -> str:
     Every part file is written under a content-addressed path and
     skipped when it already exists, so a container that dies part way
     resumes where it stopped."""
-    plan = WORKLOAD_PLAN[workload]
     specs = workload_specs(workload)
+    if not specs:
+        raise ValueError(f"no predicates for workload {workload!r}")
     t_total = time.perf_counter()
     results_vol.reload()
     corpus_dir, corpus_manifest, rows = _load_corpus(corpus_id)
@@ -1000,25 +993,25 @@ def judge_workload(corpus_id: str, workload: str) -> str:
           flush=True)
     verification = VerificationSample()
 
-    for (table, batch_rows), keys in plan["filters"]:
-        _write_filter_parts(
-            judge, verification, rows[table],
-            [PREDICATE_BY_KEY[k] for k in keys], identities,
-            corpus_manifest["corpus_id"], batch_rows)
+    corpus_id_ = corpus_manifest["corpus_id"]
+    for table, group, rows_per_call in filter_groups(specs):
+        _write_filter_parts(judge, verification, rows[table], list(group),
+                            identities, corpus_id_, rows_per_call)
 
-    if "join" in plan:
-        key, left, right, anchor_batch = plan["join"]
-        spec = PREDICATE_BY_KEY[key]
+    for spec in join_specs(specs):
+        left, right = rows[spec.left_table], rows[spec.right_table]
+        if spec.source_policy == "lepard_passage_id":
+            # the dataset's own passage ids are the truth here, so this
+            # join needs no model call at all
+            _write_lepard_source(spec, left, right, identities[spec.key],
+                                 corpus_id_)
+            continue
         _write_qwen_join_parts(
-            judge, verification, spec, rows[left], rows[right],
-            identities[key], corpus_manifest["corpus_id"], anchor_batch,
+            judge, verification, spec, left, right, identities[spec.key],
+            corpus_id_, JOIN_ANCHORS_PER_CALL[spec.left_table],
             source_label=(_fever_source_label
-                          if plan.get("source_label") == "fever" else None))
-    if "source_join" in plan:
-        key, left, right = plan["source_join"]
-        _write_lepard_source(
-            PREDICATE_BY_KEY[key], rows[left], rows[right],
-            identities[key], corpus_manifest["corpus_id"])
+                          if spec.source_policy.startswith("fever")
+                          else None))
 
     manifests = {spec.key: _complete_manifest(
         spec, identities[spec.key], _expected_rows(spec, rows))
@@ -1155,7 +1148,7 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
 
     names = ([w.strip() for w in only.split(",")] if only
              else list(WORKLOADS))
-    unknown = [w for w in names if w not in WORKLOAD_PLAN]
+    unknown = [w for w in names if w not in WORKLOADS]
     if unknown:
         raise ValueError(f"unknown workloads: {unknown}")
 
