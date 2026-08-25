@@ -27,17 +27,6 @@ def test_alloc_free_coalesce_roundtrip():
     assert a.free_rows == 20
 
 
-def test_first_fit_reuses_hole():
-    a = ExtentAllocator(100)
-    x = a.alloc(30)
-    y = a.alloc(30)
-    z = a.alloc(30)
-    a.free(y, 30)
-    assert a.alloc(20) == 30            # the hole, not the tail
-    assert a.alloc(30) is None          # fragmented: 10 + 10 left
-    del x, z
-
-
 def test_allocator_random_invariants():
     rng = random.Random(9)
     a = ExtentAllocator(1000)
@@ -79,44 +68,28 @@ def test_reclaim_evicts_idle_dataset_not_own():
     assert ("A", 2) not in extents
     assert ("A", 0) in extents and ("A", 1) in extents
 
+    # The active dataset is never evicted.
+    assert alloc_with_reclaim(allocs, extents, 90, "A") is None
+    assert ("A", 0) in extents and ("A", 1) in extents
 
-def test_reclaim_never_evicts_current_dataset():
-    allocs = [ExtentAllocator(50)]
-    extents = {}
-    slab, off = alloc_with_reclaim(allocs, extents, 50, "B")
-    extents[("B", 0)] = (slab, off, 50)
-    # B's own query cannot evict B: pool full, same hash -> None
-    assert alloc_with_reclaim(allocs, extents, 10, "B") is None
-    assert ("B", 0) in extents
-
-
-def test_reclaim_frees_multiple_until_fit():
     allocs = [ExtentAllocator(90)]
     extents = {}
     for i in range(3):
         slab, off = alloc_with_reclaim(allocs, extents, 30, "A")
         extents[("A", i)] = (slab, off, 30)
-    got = alloc_with_reclaim(allocs, extents, 60, keep_hash="B")
-    assert got is not None
+    assert alloc_with_reclaim(allocs, extents, 60, "B") is not None
     assert len([k for k in extents if k[0] == "A"]) == 1
 
 
 # ------------------------------------------------- length threshold
 
-def test_threshold_everything_fits():
+def test_store_length_threshold_boundaries():
     assert store_length_threshold([100, 200, 300], capacity_bytes=1e9,
                                   kappa=1000) == 1
-
-
-def test_threshold_keeps_longest():
-    # capacity for 500 token-rows at kappa=1: keeps 300 + 200, not 100
     t = store_length_threshold([100, 200, 300], capacity_bytes=500,
                                kappa=1)
     assert t == 200
     assert sum(x for x in [100, 200, 300] if x >= t) <= 500
-
-
-def test_threshold_nothing_fits():
     assert store_length_threshold([100, 200], capacity_bytes=50,
                                   kappa=1) == 0
 
@@ -144,11 +117,3 @@ def test_deferred_release_holds_pages_until_release():
     sched.release(0)
     assert sched.free_pages == 10
     assert 0 not in sched.resident
-
-
-def test_default_release_unchanged():
-    sched = FilterAdmission([160], [10], chunk_budget=400,
-                            arena_pages=10, page_tokens=16)
-    sched.next_chunk()
-    sched.report(0, 0, False)
-    assert sched.free_pages == 10

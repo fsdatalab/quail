@@ -23,7 +23,9 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
 - `quail/runtime/` is the run side: the session (plan, payload,
   recombination), the multi-GPU coordinator, the Modal worker, and
   the calibrate entry.
-- `quail/bench/` has the QUAIL-B benchmark queries.
+- `quail/bench/` has the QUAIL-B benchmark queries. Its
+  [README](quail/bench/README.md) explains how to run the benchmark and
+  label a new predicate.
 - `tests/` has CPU tests. `tests/gpu/` has the Modal GPU cells -
   milestone gates, smokes, and benchmarks - which cost GPU time and
   run only when invoked explicitly.

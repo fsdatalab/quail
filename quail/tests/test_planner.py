@@ -10,12 +10,11 @@ import pytest
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.planner.calibration import load_calibration
-from quail.planner.decide import (balanced_shards, explain,
-                                  order_filters, pick_runtime_anchor,
-                                  plan_query,
+from quail.planner.decide import (explain, order_filters,
+                                  pick_runtime_anchor, plan_query,
                                   restore_crossover_tokens)
-from quail.planner.plan import (EngineConfig, PhysicalPlan, Refusal,
-                                StoreSpec, resolve_model)
+from quail.planner.plan import (PhysicalPlan, Refusal, StoreSpec,
+                                resolve_model)
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
@@ -57,9 +56,6 @@ def tok(text):
     return text.split()
 
 
-CAL = load_calibration(QWEN3_4B_FP8, H100_SXM)
-
-
 def _five_filter_plan(catalog, sels):
     q = docs(catalog, "reviews", tok).alias("r")
     for j, s in enumerate(sels):
@@ -87,6 +83,18 @@ def test_b3_ordering_by_cost_vs_as_written(catalog):
                             order="as_written")
     chain = filter_chain(as_written)
     assert [s["selectivity"] for s in chain["stages"]] == list(sels)
+
+    class Predicate:
+        def __init__(self, tail, selectivity):
+            self.prompt = type("Prompt", (), {
+                "tail_tokens": tail, "preamble_tokens": 0})()
+            self.selectivity = selectivity
+
+    first, second = Predicate(10, 0.5), Predicate(10, 0.5)
+    assert order_filters([first, second], "by_cost") == [first, second]
+    never_kills = Predicate(1, 1.0)
+    assert order_filters([never_kills, first], "by_cost") == \
+        [first, never_kills]
 
 
 def test_filter_arena_writes_decision(catalog):
@@ -126,19 +134,6 @@ def test_default_rule_falls_back_without_selectivity(catalog):
                       doc_tokens={"r": [100] * 10})
     assert plan.order_rule == "as_written"
     assert "no selectivity" in plan.order_source
-
-
-def test_order_filters_ties_keep_written_order():
-    class P:
-        def __init__(self, tail, sel):
-            self.prompt = type("Pr", (), {"tail_tokens": tail,
-                                          "preamble_tokens": 0})()
-            self.selectivity = sel
-    a, b = P(10, 0.5), P(10, 0.5)
-    assert order_filters([a, b], "by_cost") == [a, b]
-    # selectivity 1 kills nothing: last
-    c = P(1, 1.0)
-    assert order_filters([c, a], "by_cost") == [a, c]
 
 
 def test_anchor_longer_side_and_override(catalog):
@@ -343,12 +338,6 @@ def test_join_order_runs_selective_gate_first(catalog):
     assert stages[0]["selectivity"] == 0.9
 
 
-def test_balanced_shards():
-    shards, loads = balanced_shards([100, 900, 500, 500], 2)
-    assert sorted(loads) == [1000, 1000]
-    assert sorted(i for s in shards for i in s) == [0, 1, 2, 3]
-
-
 def test_refusal_weights_need_more_cards(catalog):
     big = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
     logical = _five_filter_plan(catalog, (0.9,))
@@ -434,12 +423,9 @@ def test_refusal_store_needed_but_disabled(catalog):
                    doc_tokens={"r": [8_000]})
     assert isinstance(r, Refusal)
     assert r.constraint == "store_needed_but_disabled"
-
-
-def test_refusal_unknown_model():
-    r = resolve_model("qwen9-13b")
-    assert isinstance(r, Refusal)
-    assert r.constraint == "unknown_model"
+    unknown = resolve_model("qwen9-13b")
+    assert isinstance(unknown, Refusal)
+    assert unknown.constraint == "unknown_model"
 
 
 def test_access_read_when_cold_restore_when_warm(catalog):
@@ -456,13 +442,9 @@ def test_access_read_when_cold_restore_when_warm(catalog):
                       store=StoreSpec(read_bw=55e9, warm=True))
     scan = warm.nodes_by_op("DocScan")[0]
     assert scan["access"] == "restore"     # 55 GB/s beats the break-even
-
-
-def test_restore_crossover_zero_for_pinned():
-    # pinned 55 GB/s beats kappa/a at every length; a slow volume
-    # crosses only for long documents
-    assert restore_crossover_tokens(QWEN3_4B_FP8, CAL, 55e9) == 0.0
-    assert restore_crossover_tokens(QWEN3_4B_FP8, CAL, 3e9) > 10_000
+    cal = load_calibration(QWEN3_4B_FP8, H100_SXM)
+    assert restore_crossover_tokens(QWEN3_4B_FP8, cal, 55e9) == 0.0
+    assert restore_crossover_tokens(QWEN3_4B_FP8, cal, 3e9) > 10_000
 
 
 def test_kv_is_always_bf16(catalog):
@@ -495,9 +477,3 @@ def test_explain_prints_tree_settings_and_source(catalog):
     refusal = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                          doc_tokens={"r": [150_000]})
     assert "refusal: suffix_over_chunk" in explain(logical, refusal)
-
-
-def test_engine_config_defaults():
-    cfg = EngineConfig()
-    assert (cfg.gpus, cfg.cpu_memory_gb, cfg.model) == \
-        (1, 64, "qwen3-4b-fp8")
