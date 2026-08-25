@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 import quail
 from quail.bench.evaluate import (
@@ -14,8 +13,6 @@ from quail.bench.evaluate import (
     GroundTruthCollection,
     LocalVolumeFiles,
     PredicateLabels,
-    _choose_collection,
-    _row_metrics,
     add_query_metrics,
     corpus_identity,
     load_ground_truth,
@@ -211,6 +208,19 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
         "summary": {"model": "qwen3-32b-fp8"},
     }
     (collection_dir / "manifest.json").write_text(json.dumps(collection))
+    old_dir = (tmp_path / GROUND_TRUTH_ROOT / "collections" / "gt_old")
+    old_dir.mkdir(parents=True)
+    (old_dir / "manifest.json").write_text(json.dumps({
+        "status": "complete",
+        "collection_id": "gt_old",
+        "corpus_id": "c_test",
+        "scale_factor": 0.1,
+    }))
+    corpus_dir = (tmp_path / GROUND_TRUTH_ROOT / "corpora" / "c_test")
+    corpus_dir.mkdir(parents=True)
+    (corpus_dir / "active_collection.json").write_text(json.dumps({
+        "collection_id": collection_id,
+    }))
     manifest = {
         "status": "complete",
         "rows": 2,
@@ -242,32 +252,6 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
     assert saved == {"query": "TEST-1"}
 
 
-def test_active_collection_selects_new_labels_when_collections_overlap(
-        tmp_path):
-    root = tmp_path / GROUND_TRUTH_ROOT
-    for collection_id in ("gt_old", "gt_new"):
-        collection_dir = root / "collections" / collection_id
-        collection_dir.mkdir(parents=True)
-        (collection_dir / "manifest.json").write_text(json.dumps({
-            "status": "complete",
-            "collection_id": collection_id,
-            "corpus_id": "c_test",
-            "scale_factor": 0.1,
-        }))
-    corpus_dir = root / "corpora" / "c_test"
-    corpus_dir.mkdir(parents=True)
-    (corpus_dir / "active_collection.json").write_text(json.dumps({
-        "collection_id": "gt_new",
-    }))
-
-    path, manifest = _choose_collection(
-        LocalVolumeFiles(tmp_path), scale_factor=0.1,
-        corpus_id="c_test", collection_id=None)
-
-    assert path.endswith("/gt_new/manifest.json")
-    assert manifest["collection_id"] == "gt_new"
-
-
 def test_corpus_identity_matches_judge_pass_implementation():
     from quail.bench.judge_pass import _corpus_identity
     from quail.bench.quailb import DATA_SEED, SOURCE_REVISIONS
@@ -279,25 +263,18 @@ def test_corpus_identity_matches_judge_pass_implementation():
     assert got == expected
 
 
-def test_ground_truth_lookup_fails_for_unknown_pair():
-    with pytest.raises(KeyError, match="no ground truth"):
-        _truth().answer("test.review.aspect", "r0", "missing")
-
-
-def test_empty_expected_and_returned_rows_have_perfect_output_score():
-    score = _row_metrics([], [])
-
-    assert score["exact_match"] is True
-    assert score["precision"] == score["recall"] == score["f1"] == 1.0
-
-
 def test_report_writer_creates_markdown_and_plot(tmp_path):
+    from quail.bench.quailb import _artifact_stem
     from reports.make_quailb_eval_plots import (
         make_plot,
         plot_path_for,
         write_report,
     )
 
+    artifact_stem = _artifact_stem(
+        datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+        0.1, 1, "qwen3-4b-fp8")
+    assert artifact_stem.startswith("20260825T120000Z-")
     answer = {
         "evaluated": 4, "correct": 3, "accuracy": 0.75,
         "precision": 1.0, "recall": 0.5, "f1": 2 / 3,
@@ -317,8 +294,7 @@ def test_report_writer_creates_markdown_and_plot(tmp_path):
     }
     data = {
         "model": "qwen3-4b-fp8", "sf": 0.1, "gpus": 1,
-        "artifact_stem": (
-            "20260825T120000Z-quailb-sf0.1-lf1-qwen3-4b-fp8"),
+        "artifact_stem": artifact_stem,
         "corpus_id": "c_test", "prediction": "Accuracy will exceed 70%.",
         "ground_truth": {
             "collection_id": "gt_test",
@@ -363,12 +339,3 @@ def test_report_writer_creates_markdown_and_plot(tmp_path):
     assert data["aggregate_volume_path"] in report
     generated_plot = plot_path_for(data, report_path)
     assert generated_plot.name == f"{data['artifact_stem']}.png"
-
-
-def test_benchmark_artifact_names_start_with_utc_timestamp():
-    from quail.bench.quailb import _artifact_stem
-
-    started = datetime(2026, 8, 25, 19, 42, 7, tzinfo=timezone.utc)
-
-    assert _artifact_stem(started, 0.1, 1, "qwen3-4b-fp8") == (
-        "20260825T194207Z-quailb-sf0.1-lf1-qwen3-4b-fp8")

@@ -21,7 +21,7 @@ def _spec(key):
     return next(spec for spec in PREDICATES if spec.key == key)
 
 
-def test_predicate_keys_are_unique_and_do_not_depend_on_legacy_codes():
+def test_stable_ids_cover_predicate_semantics_and_inputs():
     assert len(PREDICATES) == 19
     assert len({spec.key for spec in PREDICATES}) == len(PREDICATES)
     original = PREDICATES[0]
@@ -29,13 +29,23 @@ def test_predicate_keys_are_unique_and_do_not_depend_on_legacy_codes():
     assert renamed.key == original.key
     assert predicate_version(renamed) == predicate_version(original)
 
+    join_spec = _spec("quailb.biodex.report.experienced_reaction")
+    changed_prompt = replace(join_spec, template=join_spec.template + "\n")
+    changed_roles = replace(join_spec, left_role="medical_report")
+    assert predicate_version(join_spec) != predicate_version(changed_prompt)
+    assert predicate_version(join_spec) != predicate_version(changed_roles)
 
-def test_predicate_version_changes_with_prompt_or_role_order():
-    original = _spec("quailb.biodex.report.experienced_reaction")
-    changed_prompt = replace(original, template=original.template + "\n")
-    changed_roles = replace(original, left_role="medical_report")
-    assert predicate_version(original) != predicate_version(changed_prompt)
-    assert predicate_version(original) != predicate_version(changed_roles)
+    left = {"role": "report", "table": "reports", "row_id": "rp0"}
+    right = {"role": "reaction", "table": "terms", "row_id": "tm0"}
+    example, full = example_identity("c_test", [left, right])
+    reversed_example, _ = example_identity("c_test", [right, left])
+    assert example != reversed_example
+    assert (judgment_identity("ls_one", full)
+            != judgment_identity("ls_two", full))
+
+    first = label_set_identity(original, "c_one", "1" * 64)
+    second = label_set_identity(original, "c_two", "2" * 64)
+    assert first["label_set_id"] != second["label_set_id"]
 
 
 def test_corpus_identity_uses_source_rows_and_order():
@@ -52,23 +62,6 @@ def test_corpus_identity_uses_source_rows_and_order():
             != _corpus_identity(reversed_rows, 0.1)["corpus_id"])
     assert (_corpus_identity(rows, 0.1)["corpus_id"]
             != _corpus_identity(changed, 0.1)["corpus_id"])
-
-
-def test_example_roles_are_ordered_and_judgments_include_label_set():
-    left = {"role": "report", "table": "reports", "row_id": "rp0"}
-    right = {"role": "reaction", "table": "terms", "row_id": "tm0"}
-    example, full = example_identity("c_test", [left, right])
-    reversed_example, _ = example_identity("c_test", [right, left])
-    assert example != reversed_example
-    assert (judgment_identity("ls_one", full)
-            != judgment_identity("ls_two", full))
-
-
-def test_label_set_changes_with_corpus():
-    spec = PREDICATES[0]
-    first = label_set_identity(spec, "c_one", "1" * 64)
-    second = label_set_identity(spec, "c_two", "2" * 64)
-    assert first["label_set_id"] != second["label_set_id"]
 
 
 def test_filter_and_join_prompts_use_the_engine_layout():
