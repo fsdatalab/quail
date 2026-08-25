@@ -10,12 +10,16 @@
 Both entry points return the same runnable Query: sess.sql() compiles
 AI SQL, sess.docs() starts the builder.
 
-What run() supports: filter-only queries, exists/anti gates, and the
-one full join - however many tables it spans, since an n-way join is
-a single cross-product stage (every document of a tuple in one
-prompt), never a chain of pairwise stages. The KV store and GPU
-snapshots are later steps; cpu_memory_gb is carried but not yet
-consumed.
+What run() supports: filter-only queries, exists/anti gates, and
+any connected set of full joins. Each join is one cross-product
+stage (every document of a tuple in one prompt). Consecutive stages
+that anchor on the same table run as one group over that table's
+kept KV; an anchor switch is a barrier - the live sets thin to the
+surviving pairs' documents, and on several GPUs the next anchor
+re-shards over the measured live set. The final tuples come from
+equi-joining every stage's surviving pairs on shared document ids.
+The plan is a node graph (issue #38); the worker executes the
+groups and barriers it names.
 """
 
 import hashlib
@@ -299,19 +303,22 @@ def _question_ids(session: Session, prompt) -> list:
 
 def _join_spec(session: Session, prompt, anchor: str,
                partners: list) -> dict:
-    """The executor's view of one join: per-partner block labels
-    (paid once per tuple, ahead of each partner document), the
-    anchor's naming line (written into kept KV once per anchor, so
-    the question's marker for it resolves), and the question (the
-    raw template, markers kept - paid once per tuple, after the last
-    block). Labels carry each table's own placeholder marker. The
-    engine preamble ships once as the payload's pre_ids."""
+    """The executor's view of one join stage: the compile-time anchor
+    and its partners, block labels and naming lines for EVERY table
+    (so a barrier-time anchor re-pick needs no re-tokenization), and
+    the question (the raw template, markers kept - paid once per
+    tuple, after the last block). The engine preamble ships once as
+    the payload's pre_ids. stage_for_anchor (coordinator) turns this
+    into the child-facing form - the chosen anchor's naming line as
+    the frame, partner labels only - for whichever anchor a round
+    uses."""
     tok = session.tokenizer
     slot = {r.alias: i for i, r in enumerate(prompt.args)}
+    aliases = [r.alias for r in prompt.args]
     return dict(
-        anchor=anchor, partners=list(partners),
-        frame=tok(join_anchor_note(slot[anchor])),
-        labels={p: tok(join_label(slot[p])) for p in partners},
+        anchor=anchor, partners=list(partners), aliases=aliases,
+        frames={a: tok(join_anchor_note(slot[a])) for a in aliases},
+        labels={a: tok(join_label(slot[a])) for a in aliases},
         tail=tok(render_join_question(prompt.template)))
 
 
@@ -387,24 +394,31 @@ class Query:
             docs[s.alias] = toks
         filter_qids = {}
         filter_writes = {}
-        for op in plan.operators:
-            if op["op"] != "FilterChain":
+        for node in plan.nodes:
+            if node["op"] != "FilterChain":
                 continue
-            alias = op["alias"]
+            alias = node["alias"]
             preds = filters[alias]
             filter_qids[alias] = [
                 _question_ids(sess, preds[st["written_pos"]].prompt)
-                for st in op["stages"]]
-            filter_writes[alias] = op["arena_writes"]
+                for st in node["stages"]]
+            filter_writes[alias] = node["arena_writes"]
+        # one spec per stage, in execution order (the JoinGroup nodes'
+        # stage_idxs index into this list)
         join_specs = []
-        for op in plan.operators:
-            if op["op"] != "JoinStage":
+        for node in plan.nodes:
+            if node["op"] != "JoinGroup":
                 continue
-            j = joins[op["written_pos"]]
-            spec = _join_spec(sess, j.predicate, op["anchor"],
-                              op["partners"])
-            spec["semantics"] = op["semantics"]
-            join_specs.append(spec)
+            for st in node["stages"]:
+                j = joins[st["written_pos"]]
+                spec = _join_spec(sess, j.predicate, st["anchor"],
+                                  st["partners"])
+                spec["semantics"] = st["semantics"]
+                # a one-stage group with no user override may re-pick
+                # its anchor at run time from measured live counts
+                spec["anchor_free"] = (j.anchor is None
+                                       and j.semantics == "full")
+                join_specs.append(spec)
         true_ids, false_ids = _true_false_ids(sess.tokenizer)
         store = None
         spec = sess.store_spec(self._hashes.values())
@@ -413,8 +427,17 @@ class Query:
                          min_doc_tokens=max(1,
                                             plan.store_min_doc_tokens),
                          hashes=dict(self._hashes))
-        shards = {op["alias"]: op["shards"] for op in plan.operators
-                  if op["op"] == "DocScan"}
+        shards = {node["alias"]: node["shards"] for node in plan.nodes
+                  if node["op"] == "DocScan"}
+        # the plan's node graph rides along so the worker executes the
+        # structure the planner emitted (groups, barriers) instead of
+        # re-deriving it; shard lists already ship separately
+        plan_nodes = []
+        for n in plan.nodes:
+            n = dict(n)
+            n.pop("shards", None)
+            n.pop("shard_token_loads", None)
+            plan_nodes.append(n)
         flush = sess._flush_next
         sess._flush_next = False
         return dict(
@@ -440,13 +463,14 @@ class Query:
             # written; run_filter requires it and never derives it
             filter_arena_writes=filter_writes,
             joins=join_specs,
+            plan_nodes=plan_nodes,
             store=store)
 
     # ---- sink: gate, replay-check, project ------------------------------
 
     def _assemble(self, plan, scans, filters, joins, out,
                   coordinator_wall) -> Result:
-        from quail.executor.pack import gate, matches
+        from quail.executor.pack import gate
 
         report = dict(
             wall_s=out["wall_s"], boot_s=out.get("boot_s"),
@@ -469,13 +493,13 @@ class Query:
         for s in scans:
             n = len(self._doc_tokens[s.alias])
             survivors[s.alias] = list(range(n))
-        for op in plan.operators:
-            if op["op"] != "FilterChain":
+        for node in plan.nodes:
+            if node["op"] != "FilterChain":
                 continue
-            alias = op["alias"]
+            alias = node["alias"]
             rows = out["filters"][alias]
-            n_stages = len(op["stages"])
-            for si, st in enumerate(op["stages"]):
+            n_stages = len(node["stages"])
+            for si, st in enumerate(node["stages"]):
                 answered = [d for d, row in rows.items()
                             if len(row) > si]
                 passed = [d for d in answered if rows[d][si]]
@@ -489,37 +513,45 @@ class Query:
                 d for d, row in rows.items()
                 if len(row) == n_stages and all(row))
 
-        # join stages: rows are over local indices; map through the
+        # join stages, in execution order (the plan's JoinGroup nodes
+        # flattened): rows are over local indices; map through the
         # index lists the worker reports. partner_index entries are
-        # index tuples, one global index per partner alias.
-        join_ops = [op for op in plan.operators
-                    if op["op"] == "JoinStage"]
-        full_stages = []
-        for op, jout in zip(join_ops, out["joins"]):
+        # index tuples, one global index per partner alias. The
+        # worker reports each stage's ACTUAL anchor (a barrier-time
+        # re-pick may differ from the compile-time one); the plan's
+        # stage dict is the fallback for executors that do not.
+        stage_plan = []
+        for node in plan.nodes:
+            if node["op"] == "JoinGroup":
+                stage_plan.extend(node["stages"])
+        full_rels = []
+        for st, jout in zip(stage_plan, out["joins"]):
+            anchor = jout.get("anchor", st["anchor"])
+            partners = list(jout.get("partners", st["partners"]))
             rows = jout["rows"]
             anchor_map = jout["anchor_index"]
             partner_map = jout["partner_index"]
             evaluated = sum(len(r) for r in rows.values())
             yes = sum(sum(r) for r in rows.values())
             report["stages"].append(dict(
-                op="join", anchor=op["anchor"],
-                partners=list(op["partners"]),
-                semantics=op["semantics"],
-                provided_selectivity=op["selectivity"],
+                op="join", anchor=anchor,
+                partners=partners,
+                semantics=st["semantics"],
+                provided_selectivity=st["selectivity"],
                 observed_selectivity=round(yes / max(1, evaluated), 4),
                 tuples=evaluated))
             global_rows = {anchor_map[a]: r for a, r in rows.items()}
-            if op["semantics"] == "full":
-                full_stages.append((op, global_rows, partner_map))
+            if st["semantics"] == "full":
+                full_rels.append((anchor, partners, global_rows,
+                                  partner_map))
             else:
                 keep = set(gate(global_rows))
-                alias = op["anchor"]
-                if op["semantics"] == "exists":
-                    survivors[alias] = [d for d in survivors[alias]
-                                        if d in keep]
+                if st["semantics"] == "exists":
+                    survivors[anchor] = [d for d in survivors[anchor]
+                                         if d in keep]
                 else:
-                    survivors[alias] = [d for d in survivors[alias]
-                                        if d not in keep]
+                    survivors[anchor] = [d for d in survivors[anchor]
+                                         if d not in keep]
 
         # ---- speed-of-light (issue #26): budgets.sol_seconds needs
         # two shapes of fresh work (see its docstring and
@@ -685,28 +717,67 @@ class Query:
             round(report["sol_s"] / report["wall_s"], 4)
             if report["wall_s"] else None)
 
-        # ---- output tuples: the one full join's TRUE rows, each
-        # member checked against its table's final survivor set (a
-        # gate written after the join still applies - order changes
-        # cost, never results)
+        # ---- output tuples: the full stages' TRUE rows, equi-joined
+        # on shared document ids (id matching only, no model calls),
+        # each member checked against its table's final survivor set
+        # (a gate written after a join still applies - order changes
+        # cost, never results). Each stage keys on its OWN anchor:
+        # stages in different groups anchor on different tables, and
+        # the join happens over whatever aliases a stage shares with
+        # the assignments built so far.
         cols = [f"{c.alias}.{c.column}" for c in
                 self.logical.root.columns]
-        if not full_stages:
+        if not full_rels:
             alias_order = [scans[0].alias]
             tuples = [(d,) for d in survivors[scans[0].alias]]
         else:
-            (op, rows, partner_map), = full_stages  # one by compile
-            alias_order = [op["anchor"]] + list(op["partners"])
+            alias_order = []
+            for anchor, partners, _, _ in full_rels:
+                for a in [anchor, *partners]:
+                    if a not in alias_order:
+                        alias_order.append(a)
             keep = {a: set(survivors[a]) for a in alias_order}
-            tuples = []
-            for a, ts in matches(rows).items():
-                if a not in keep[op["anchor"]]:
-                    continue
-                for ti in ts:
-                    member = partner_map[ti]
-                    if all(g in keep[al] for al, g in
-                           zip(op["partners"], member)):
-                        tuples.append((a, *member))
+            # one assignment (alias -> document) per candidate tuple,
+            # extended stage by stage. A stage's passing pairs become
+            # a relation over its tables; the relation is equi-joined
+            # onto the assignments over the aliases they share. An
+            # anchor document gated out mid-group has no rows in
+            # later stages, so its assignments extend to nothing and
+            # drop.
+            assigns = [dict()]
+            for anchor, partners, rows, partner_map in full_rels:
+                rel = []
+                for ga in sorted(rows):
+                    if ga not in keep[anchor]:
+                        continue
+                    for ti, bit in enumerate(rows[ga]):
+                        if not bit:
+                            continue
+                        entry = {anchor: ga}
+                        ok = True
+                        for al, gp in zip(partners, partner_map[ti]):
+                            if gp not in keep[al]:
+                                ok = False
+                                break
+                            entry[al] = gp
+                        if ok:
+                            rel.append(entry)
+                shared = [a for a in [anchor, *partners]
+                          if assigns and a in assigns[0]]
+                index = {}
+                for entry in rel:
+                    key = tuple(entry[a] for a in shared)
+                    index.setdefault(key, []).append(entry)
+                extended = []
+                for asg in assigns:
+                    key = tuple(asg[a] for a in shared)
+                    for entry in index.get(key, ()):
+                        new = dict(asg)
+                        new.update(entry)
+                        extended.append(new)
+                assigns = extended
+            tuples = [tuple(asg[a] for a in alias_order)
+                      for asg in assigns]
 
         proj_rows = []
         for tup in tuples:

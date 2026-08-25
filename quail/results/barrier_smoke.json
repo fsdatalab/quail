@@ -1,0 +1,169 @@
+{
+  "one_gpu": {
+    "gpus": 1,
+    "rows": 14,
+    "rows_match_brute_force": true,
+    "stage2_tuples": 48,
+    "thinned_candidates": 8,
+    "planted_thinned_candidates": 8,
+    "candidates_total": 12,
+    "planted_triples": 14,
+    "agree_with_planted": 14,
+    "stage1_observed_sel": 0.1667,
+    "stage2_observed_sel": 0.1667,
+    "report": {
+      "wall_s": 0.16,
+      "boot_s": 36.63,
+      "boot_kind": "cold",
+      "boot": {
+        "kind": "cold",
+        "load_model_s": 31.34,
+        "arena_s": 0.33,
+        "pipeline_s": 0.0,
+        "warm_kernels_s": 4.89,
+        "boot_s": 36.63
+      },
+      "coordinator_wall_s": 59.49,
+      "fresh_tokens": 11835,
+      "stages": [
+        {
+          "op": "filter",
+          "alias": "r",
+          "stage": 0,
+          "provided_selectivity": 0.7,
+          "observed_selectivity": 0.7,
+          "evaluated": 10
+        },
+        {
+          "op": "join",
+          "anchor": "r",
+          "partners": [
+            "c"
+          ],
+          "semantics": "full",
+          "provided_selectivity": 0.16666666666666666,
+          "observed_selectivity": 0.1667,
+          "tuples": 84
+        },
+        {
+          "op": "join",
+          "anchor": "g",
+          "partners": [
+            "c"
+          ],
+          "semantics": "full",
+          "provided_selectivity": 0.16666666666666666,
+          "observed_selectivity": 0.1667,
+          "tuples": 48
+        }
+      ],
+      "peak_gib": 64.44,
+      "store": {
+        "r": {
+          "restored_docs": 7,
+          "restored_tokens": 2660,
+          "stored_docs": 10,
+          "stored_tokens": 3800
+        },
+        "g": {
+          "restored_docs": 0,
+          "restored_tokens": 0,
+          "stored_docs": 6,
+          "stored_tokens": 54
+        }
+      },
+      "order_rule": "as_written",
+      "calibration": "calibrated",
+      "remarks": [
+        "kv_dtype=bf16 (always)",
+        "reports.report: tokenizer: bpe-qwen (parity-checked on sample)",
+        "cands.body: tokenizer: bpe-qwen (parity-checked on sample)",
+        "labels.label: tokenizer: bpe-qwen (parity-checked on sample)"
+      ]
+    }
+  },
+  "two_gpu": {
+    "gpus": 2,
+    "rows": 14,
+    "rows_match_brute_force": true,
+    "stage2_tuples": 48,
+    "thinned_candidates": 8,
+    "planted_thinned_candidates": 8,
+    "candidates_total": 12,
+    "planted_triples": 14,
+    "agree_with_planted": 14,
+    "stage1_observed_sel": 0.1667,
+    "stage2_observed_sel": 0.1667,
+    "report": {
+      "wall_s": 9.85,
+      "boot_s": 68.77,
+      "boot_kind": "cold",
+      "boot": {
+        "kind": "cold",
+        "load_model_s": 58.65,
+        "arena_s": 0.58,
+        "pipeline_s": 0.0,
+        "warm_kernels_s": 9.47,
+        "boot_s": 68.77
+      },
+      "coordinator_wall_s": 84.69,
+      "fresh_tokens": 11835,
+      "stages": [
+        {
+          "op": "filter",
+          "alias": "r",
+          "stage": 0,
+          "provided_selectivity": 0.7,
+          "observed_selectivity": 0.7,
+          "evaluated": 10
+        },
+        {
+          "op": "join",
+          "anchor": "r",
+          "partners": [
+            "c"
+          ],
+          "semantics": "full",
+          "provided_selectivity": 0.16666666666666666,
+          "observed_selectivity": 0.1667,
+          "tuples": 84
+        },
+        {
+          "op": "join",
+          "anchor": "g",
+          "partners": [
+            "c"
+          ],
+          "semantics": "full",
+          "provided_selectivity": 0.16666666666666666,
+          "observed_selectivity": 0.1667,
+          "tuples": 48
+        }
+      ],
+      "peak_gib": 64.44,
+      "store": {
+        "r": {
+          "restored_docs": 7,
+          "restored_tokens": 2660,
+          "stored_docs": 10,
+          "stored_tokens": 3800
+        },
+        "g": {
+          "restored_docs": 0,
+          "restored_tokens": 0,
+          "stored_docs": 6,
+          "stored_tokens": 54
+        }
+      },
+      "order_rule": "as_written",
+      "calibration": "calibrated",
+      "remarks": [
+        "kv_dtype=bf16 (always)",
+        "reports.report: tokenizer: bpe-qwen (parity-checked on sample)",
+        "cands.body: tokenizer: bpe-qwen (parity-checked on sample)",
+        "labels.label: tokenizer: bpe-qwen (parity-checked on sample)"
+      ]
+    }
+  },
+  "row_counts_match_across_gpu_counts": true
+}

@@ -54,7 +54,7 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
 # warm container keeps the loaded model, the arena, and the pinned KV
 # store across execute() calls, which is what makes a session's later
 # queries boot in milliseconds and restore instead of recompute.
-_BOOTED = {}      # model name -> dict(model, arena, pipeline, budget)
+_BOOTED = {}      # model name -> dict(model, arena, pipeline)
 _STORE = None     # one PinnedStore per container, shared
 
 
@@ -96,8 +96,8 @@ def execute(payload: dict) -> dict:
         # budgets.* is tiny CPU; fold into arena_s so the four phases
         # cover the cold-load span without a leftover residual
         t0 = time.perf_counter()
-        chunk = budgets.chunk_budget(spec, device)
-        arena_tok = budgets.arena_tokens(spec, device, chunk)
+        chunk_tokens = budgets.chunk_budget(spec, device)
+        arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
@@ -114,26 +114,24 @@ def execute(payload: dict) -> dict:
         boot["kind"] = "cold"
     model, arena, pipeline = (booted["model"], booted["arena"],
                               booted["pipeline"])
-    chunk = budgets.chunk_budget(spec, device)
     # the worker has no tokenizer: the TRUE/FALSE token ids ride in the
     # payload
     answerer = _PayloadAnswerer(torch, F, model, payload["true_ids"],
                                 payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
-    budget = min(chunk, pipeline.max_chunk_tokens,
-                 payload["chunk_tokens"])
+    chunk_tokens = payload["chunk_tokens"]
 
     if not booted["warmed"]:
         t0 = time.perf_counter()
         with torch.inference_mode():
             # boot-side warmup: the dense token sweep plus one
-            # budget-sized chunk, so every kernel configuration
+            # chunk_tokens-sized batch, so every kernel configuration
             # compiles outside measured walls
             first_alias = next(iter(docs))
             warm_q = (next(iter(payload["filters"].values()))[0]
                       if payload["filters"] else [1, 2, 3])
             warm_kernels(torch, arena, pipeline, async_ans,
-                         docs[first_alias], [warm_q], budget)
+                         docs[first_alias], [warm_q], chunk_tokens)
         torch.cuda.synchronize()
         kernel_cache.commit()   # keep the compiles even if the run dies
         boot["warm_kernels_s"] = time.perf_counter() - t0
@@ -146,8 +144,7 @@ def execute(payload: dict) -> dict:
         boot[k] = round(boot[k], 2)
     boot["boot_s"] = round(boot_s, 2)
     state = dict(model=model, arena=arena, pipeline=pipeline,
-                 spec=spec, chunk=chunk, torch=torch, F=F,
-                 store=_STORE)
+                 spec=spec, torch=torch, F=F, store=_STORE)
     report = _execute_single(state, payload)
     _STORE = state["store"]
     report["boot_s"] = boot["boot_s"]
@@ -166,13 +163,18 @@ def execute(payload: dict) -> dict:
 def _execute_single(state, payload: dict) -> dict:
     """The single-GPU execution core, shared by the ephemeral
     function (module-global state) and the snapshot worker class
-    (instance state). state: model, arena, pipeline, spec, chunk,
-    store, torch, F."""
+    (instance state). state: model, arena, pipeline, spec, store,
+    torch, F."""
     import torch.nn.functional as F  # noqa: F401 (state carries it)
 
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
     from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import AsyncAnswers, run_filter, run_join
+    from quail.planner.decide import pick_runtime_anchor
+    from quail.runtime.coordinator import (derive_plan_nodes,
+                                           filter_round_limit,
+                                           gate_group, stage_for_anchor,
+                                           thin_survivors)
 
     torch = state["torch"]
     spec = state["spec"]
@@ -185,8 +187,7 @@ def _execute_single(state, payload: dict) -> dict:
     answerer = _PayloadAnswerer(torch, state["F"], state["model"],
                                 payload["true_ids"], payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
-    budget = min(state["chunk"], pipeline.max_chunk_tokens,
-                 payload["chunk_tokens"])
+    chunk_tokens = payload["chunk_tokens"]
 
     store_cfg = payload.get("store")
     if store_cfg is not None and state.get("store") is None:
@@ -206,7 +207,9 @@ def _execute_single(state, payload: dict) -> dict:
     out_filters = {}
     store_stats = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
-    limit = payload.get("limit")
+    # None when the payload has joins: LIMIT caps output rows, and a
+    # join fans one survivor into zero or many rows (#39)
+    limit = filter_round_limit(payload)
 
     filter_writes = payload["filter_arena_writes"]
     t0 = time.perf_counter()
@@ -217,7 +220,7 @@ def _execute_single(state, payload: dict) -> dict:
             answers, _, tokens = run_filter(
                 torch, arena, pipeline, async_ans,
                 [pre + d for d in docs[alias]], qids,
-                budget,
+                chunk_tokens,
                 store=store if store_cfg else None,
                 store_hash=(store_cfg["hashes"][alias]
                             if store_cfg else None),
@@ -234,9 +237,28 @@ def _execute_single(state, payload: dict) -> dict:
                 if len(row) == len(qids) and all(row))
 
         out_joins = []
+        finished_full = []      # full stage outputs, for barriers
         pipeline.attention_mode = JOIN_ATTENTION
-        for group in _stage_groups(payload["joins"]):
-            anchor_alias = group[0]["anchor"]
+        nodes = payload.get("plan_nodes") or derive_plan_nodes(
+            payload["joins"])
+        for node in nodes:
+            if node["op"] == "Barrier":
+                # step 4.6 thinning; on one GPU there is no shard step
+                thin_survivors(finished_full, survivors)
+                continue
+            if node["op"] != "JoinGroup":
+                continue
+            specs = [payload["joins"][i] for i in node["stage_idxs"]]
+            anchor_alias = node["anchor"]
+            if len(specs) == 1 and specs[0].get("anchor_free"):
+                # a one-stage group re-picks its anchor from the
+                # measured live counts (issue #38, step 4.1)
+                anchor_alias = pick_runtime_anchor(
+                    specs[0],
+                    {a: [len(docs[a][g]) for g in survivors[a]]
+                     for a in specs[0]["aliases"]},
+                    len(pre), chunk_tokens)
+            group = [stage_for_anchor(s, anchor_alias) for s in specs]
             anchors_glob = list(survivors[anchor_alias])
             stage_suffixes = []
             tuple_globs = []
@@ -251,7 +273,7 @@ def _execute_single(state, payload: dict) -> dict:
             jstats = {}
             ans, _, tokens = run_join(
                 torch, arena, pipeline, async_ans, prefixes,
-                stage_suffixes, budget,
+                stage_suffixes, chunk_tokens,
                 stage_frames=[j.get("frame") or [] for j in group],
                 group_size=1 if len(group) > 1 else None,
                 store=store if store_cfg else None,
@@ -267,19 +289,18 @@ def _execute_single(state, payload: dict) -> dict:
                     agg[key] = agg.get(key, 0) + v
             total_tokens += tokens
             for si, j in enumerate(group):
-                out_joins.append(dict(
+                stage_out = dict(
                     rows={int(a): row for a, row in ans[si].items()},
                     anchor_index=anchors_glob,
-                    partner_index=tuple_globs[si]))
+                    partner_index=tuple_globs[si],
+                    anchor=anchor_alias,
+                    partners=list(j["partners"]))
+                out_joins.append(stage_out)
+                if j["semantics"] == "full":
+                    finished_full.append(stage_out)
             # gate the anchor set for stages after this group
-            last = ans[len(group) - 1]
-            kept = {anchors_glob[a] for a, row in last.items()
-                    if any(row)}
-            if group[-1]["semantics"] == "anti":
-                survivors[anchor_alias] = [
-                    a for a in anchors_glob if a not in kept]
-            else:
-                survivors[anchor_alias] = sorted(kept)
+            survivors[anchor_alias] = gate_group(
+                out_joins[-1], group[-1]["semantics"])
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
 
@@ -354,8 +375,8 @@ def _child_boot(state, sub):
         model = load_model(spec.hf_name)
         boot["load_model_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        chunk = budgets.chunk_budget(spec, device)
-        arena_tok = budgets.arena_tokens(spec, device, chunk)
+        chunk_tokens = budgets.chunk_budget(spec, device)
+        arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
         arena = KVArena(n_layers=spec.layers,
                         n_pages=arena_tok // budgets.PAGE_TOKENS,
                         page_tokens=budgets.PAGE_TOKENS,
@@ -368,14 +389,12 @@ def _child_boot(state, sub):
         boot["pipeline_s"] = time.perf_counter() - t0
         state.update(torch=torch, F=F, model=model, arena=arena,
                      pipeline=pipeline, spec=spec,
-                     chunk=chunk, warmed=False, store=None)
+                     warmed=False, store=None)
         boot["kind"] = "cold"
     answerer = _PayloadAnswerer(torch, F, state["model"],
                                 sub["true_ids"], sub["false_ids"])
     state["async_ans"] = AsyncAnswers(torch, answerer)
-    state["budget"] = min(state["chunk"],
-                          state["pipeline"].max_chunk_tokens,
-                          sub["chunk_tokens"])
+    state["chunk_tokens"] = sub["chunk_tokens"]
     if not state["warmed"]:
         docs = next((d for d in sub.get("docs", {}).values() if d),
                     None)
@@ -387,7 +406,7 @@ def _child_boot(state, sub):
         with torch.inference_mode():
             warm_kernels(torch, state["arena"], state["pipeline"],
                          state["async_ans"], docs, [warm_q],
-                         state["budget"])
+                         state["chunk_tokens"])
         torch.cuda.synchronize()
         kernel_cache.commit()
         boot["warm_kernels_s"] = time.perf_counter() - t0
@@ -442,7 +461,7 @@ def _child_filters(state, sub):
                 torch, state["arena"], state["pipeline"],
                 state["async_ans"],
                 [pre + d for d in sub["docs"][alias]], qids,
-                state["budget"],
+                state["chunk_tokens"],
                 store=state["store"] if store_cfg else None,
                 store_hash=(store_cfg["hashes"][alias]
                             if store_cfg else None),
@@ -477,63 +496,55 @@ def _child_joins(state, sub):
     pre = sub.get("pre_ids") or []
     anchors_glob = list(sub["anchor_index"])
     anchor_docs = sub["anchor_docs"]
-    live = list(range(len(anchors_glob)))     # local anchor positions
+    # one anchor group per round: the parent walks the plan's nodes,
+    # thins at barriers, and re-shards; the child just runs the group
+    group = sub["joins"]
     out_joins, tokens_total = [], 0
     store_stats = {}
     t0 = _time.perf_counter()
     with torch.inference_mode():
         state["pipeline"].attention_mode = JOIN_ATTENTION
-        for group in _stage_groups(sub["joins"]):
-            stage_suffixes, tuple_globs = [], []
-            for j in group:
-                # partner docs ride keyed by local position; tuples
-                # combine one local position per partner alias
-                locals_ = [range(len(sub["partners"][p]["index"]))
-                           for p in j["partners"]]
-                combos = list(itertools.product(*locals_))
-                tuple_globs.append(
-                    [[sub["partners"][p]["index"][c]
-                      for p, c in zip(j["partners"], combo)]
-                     for combo in combos])
-                part_docs = {p: sub["partners"][p]["docs"]
-                             for p in j["partners"]}
-                stage_suffixes.append(
-                    [_tuple_suffix(j, part_docs, combo)
-                     for combo in combos])
-            prefixes = [pre + anchor_docs[a] for a in live]
-            jstats = {}
-            ans, _, tokens = run_join(
-                torch, state["arena"], state["pipeline"],
-                state["async_ans"], prefixes, stage_suffixes,
-                state["budget"],
-                stage_frames=[j.get("frame") or [] for j in group],
-                group_size=1 if len(group) > 1 else None,
-                store=state["store"] if store_cfg else None,
-                store_hash=(store_cfg["hashes"][anchor_alias]
-                            if store_cfg else None),
-                store_min_tokens=(store_cfg["min_doc_tokens"]
-                                  if store_cfg else 1),
-                store_ids=[anchors_glob[live[a]]
-                           for a in range(len(live))],
-                stats=jstats)
-            if store_cfg:
-                agg = store_stats.setdefault(anchor_alias, {})
-                for key, v in jstats.items():
-                    agg[key] = agg.get(key, 0) + v
-            tokens_total += tokens
-            for si, j in enumerate(group):
-                out_joins.append(dict(
-                    rows={int(a): row for a, row in ans[si].items()},
-                    anchor_index=[anchors_glob[live[a]]
-                                  for a in range(len(live))],
-                    partner_index=tuple_globs[si]))
-            last = ans[len(group) - 1]
-            kept = {a for a, row in last.items() if any(row)}
-            if group[-1]["semantics"] == "anti":
-                live = [live[a] for a in range(len(live))
-                        if a not in kept]
-            else:
-                live = [live[a] for a in sorted(kept)]
+        stage_suffixes, tuple_globs = [], []
+        for j in group:
+            # partner docs ride keyed by local position; tuples
+            # combine one local position per partner alias
+            locals_ = [range(len(sub["partners"][p]["index"]))
+                       for p in j["partners"]]
+            combos = list(itertools.product(*locals_))
+            tuple_globs.append(
+                [[sub["partners"][p]["index"][c]
+                  for p, c in zip(j["partners"], combo)]
+                 for combo in combos])
+            part_docs = {p: sub["partners"][p]["docs"]
+                         for p in j["partners"]}
+            stage_suffixes.append(
+                [_tuple_suffix(j, part_docs, combo)
+                 for combo in combos])
+        prefixes = [pre + d for d in anchor_docs]
+        jstats = {}
+        ans, _, tokens = run_join(
+            torch, state["arena"], state["pipeline"],
+            state["async_ans"], prefixes, stage_suffixes,
+            state["chunk_tokens"],
+            stage_frames=[j.get("frame") or [] for j in group],
+            group_size=1 if len(group) > 1 else None,
+            store=state["store"] if store_cfg else None,
+            store_hash=(store_cfg["hashes"][anchor_alias]
+                        if store_cfg else None),
+            store_min_tokens=(store_cfg["min_doc_tokens"]
+                              if store_cfg else 1),
+            store_ids=anchors_glob,
+            stats=jstats)
+        if store_cfg:
+            agg = store_stats.setdefault(anchor_alias, {})
+            for key, v in jstats.items():
+                agg[key] = agg.get(key, 0) + v
+        tokens_total += tokens
+        for si, j in enumerate(group):
+            out_joins.append(dict(
+                rows={int(a): row for a, row in ans[si].items()},
+                anchor_index=anchors_glob,
+                partner_index=tuple_globs[si]))
     torch.cuda.synchronize()
     return dict(joins=out_joins, fresh_tokens=tokens_total,
                 store=store_stats,
@@ -570,28 +581,66 @@ def _round(kind, subs):
 def _execute_multi(payload: dict) -> dict:
     import time as _time
 
+    from quail.planner.decide import pick_runtime_anchor
     from quail.runtime import coordinator
 
     k = payload["workers"]
     shards = payload.get("shards", {})
     _ensure_children(k)
-    limit = payload.get("limit")
+    # None when the payload has joins: LIMIT caps output rows, and a
+    # join fans one survivor into zero or many rows (#39)
+    limit = coordinator.filter_round_limit(payload)
     t0 = _time.perf_counter()
     fouts = _round("filters",
                    coordinator.filter_round_payloads(payload, shards, k))
     merged = coordinator.merge_filter_round(fouts, limit=limit)
+    survivors = {a: list(v) for a, v in merged["survivors"].items()}
+    for alias, ds in payload["docs"].items():
+        survivors.setdefault(alias, list(range(len(ds))))
     out_joins = []
-    if payload["joins"]:
-        jsubs = coordinator.join_round_payloads(
-            payload, shards, k, merged["survivors"])
+    finished_full = []      # full stage outputs, for barriers
+    pre_len = len(payload.get("pre_ids") or [])
+    docs = payload["docs"]
+    nodes = payload.get("plan_nodes") or coordinator.derive_plan_nodes(
+        payload["joins"])
+    for node in nodes:
+        if node["op"] == "Barrier":
+            # step 4.6 thinning; the re-shard itself happens when the
+            # next group's payloads are built over the thinned sets
+            coordinator.thin_survivors(finished_full, survivors)
+            continue
+        if node["op"] != "JoinGroup":
+            continue
+        specs = [payload["joins"][i] for i in node["stage_idxs"]]
+        anchor = node["anchor"]
+        if len(specs) == 1 and specs[0].get("anchor_free"):
+            # a one-stage group re-picks its anchor from the measured
+            # live counts (issue #38, step 4.1)
+            anchor = pick_runtime_anchor(
+                specs[0],
+                {a: [len(docs[a][g]) for g in survivors[a]]
+                 for a in specs[0]["aliases"]},
+                pre_len, payload["chunk_tokens"])
+        group = [coordinator.stage_for_anchor(s, anchor)
+                 for s in specs]
+        jsubs = coordinator.join_group_payloads(payload, k, survivors,
+                                                group)
         jouts = _round("joins", jsubs)
-        out_joins = coordinator.merge_join_round(jouts)
+        stage_outs = coordinator.merge_join_round(jouts)
         merged["fresh_tokens"] += sum(o["fresh_tokens"] for o in jouts)
         for o in jouts:
             for alias, st in (o.get("store") or {}).items():
                 agg = merged["store"].setdefault(alias, {})
                 for key, v in st.items():
                     agg[key] = agg.get(key, 0) + v
+        for stage_out, j in zip(stage_outs, group):
+            stage_out["anchor"] = anchor
+            stage_out["partners"] = list(j["partners"])
+            out_joins.append(stage_out)
+            if j["semantics"] == "full":
+                finished_full.append(stage_out)
+        survivors[anchor] = coordinator.gate_group(
+            stage_outs[-1], group[-1]["semantics"])
     wall = _time.perf_counter() - t0
     boot_s = max(o["boot_s"] for o in fouts)
     # forward the breakdown from the child that owned the max boot
@@ -646,27 +695,6 @@ def _tuple_suffix(join, docs, member) -> list:
         out += docs[alias][g]
     out += join["tail"]
     return out
-
-
-def _stage_groups(joins):
-    """Consecutive full stages sharing an anchor run as one gated
-    multi-stage call; everything else runs alone. The anchor prefix
-    is [engine preamble + document] regardless of the stage's prompt
-    (task text rides in the suffix), so stages with different prompts
-    still share the anchor's KV."""
-    groups, current = [], []
-    for j in joins:
-        if (current and j["semantics"] == "full"
-                and current[-1]["semantics"] == "full"
-                and current[0]["anchor"] == j["anchor"]):
-            current.append(j)
-        else:
-            if current:
-                groups.append(current)
-            current = [j]
-    if current:
-        groups.append(current)
-    return groups
 
 
 class _PayloadAnswerer:

@@ -153,22 +153,45 @@ def _cross_tuples(join, live: dict, anchor: str) -> float:
     return tuples
 
 
-def _stage_tokens(join, live: dict, stats: dict, anchor: str,
-                  pre_tokens: int = 0) -> float:
-    """Token total of one join at the current live counts. The join
-    is the cross product under one prompt: the anchor prefix (engine
-    preamble, document, naming line - kept KV) is paid once per
-    anchor document; every partner document with its block label,
-    plus the rendered question, is paid once per tuple."""
+def _anchor_prefix_tokens(join, live: dict, stats: dict, anchor: str,
+                          pre_tokens: int = 0) -> float:
+    """The group-start charge: the anchor's KV - engine preamble,
+    document, naming line - paid once per live anchor document. Paid
+    only by the stage that opens a group; later same-anchor full
+    stages reuse the KV and pay _frame_only_tokens instead."""
+    labels = _label_counts(join)
+    return live[anchor] * (stats[anchor].mean_doc_tokens + pre_tokens
+                           + labels[anchor][1])
+
+
+def _frame_only_tokens(join, live: dict, anchor: str) -> float:
+    """A later stage of the same group rewrites only its naming line
+    (the stage frame) into the anchor's kept KV, once per live anchor
+    document - the document and preamble rows stay."""
+    labels = _label_counts(join)
+    return live[anchor] * labels[anchor][1]
+
+
+def _pair_tokens(join, live: dict, stats: dict, anchor: str) -> float:
+    """The per-tuple stream: every partner document behind its block
+    label, plus the rendered question, once per tuple."""
     labels = _label_counts(join)
     partners = [a for a in _join_aliases(join) if a != anchor]
-    tuples = _cross_tuples(join, live, anchor)
     per_tuple = _question_tokens(join.predicate)
     for p in partners:
         per_tuple += stats[p].mean_doc_tokens + labels[p][0]
-    return (live[anchor] * (stats[anchor].mean_doc_tokens + pre_tokens
-                            + labels[anchor][1])
-            + tuples * per_tuple)
+    return _cross_tuples(join, live, anchor) * per_tuple
+
+
+def _stage_tokens(join, live: dict, stats: dict, anchor: str,
+                  pre_tokens: int = 0) -> float:
+    """Token total of one join opening its own group at the current
+    live counts: the anchor prefix once per anchor document, every
+    partner document with its block label plus the question once per
+    tuple."""
+    return (_anchor_prefix_tokens(join, live, stats, anchor,
+                                  pre_tokens)
+            + _pair_tokens(join, live, stats, anchor))
 
 
 def _thin(live: dict, join, anchor: str) -> None:
@@ -195,59 +218,136 @@ def _thin(live: dict, join, anchor: str) -> None:
                         else live[anchor] - matched)
 
 
-def order_joins(joins, rule: str, stats: dict, anchors: dict,
-                pre_tokens: int = 0):
-    """Join order over the specs (the gates and the one full join):
-    enumerate the permutations (2-4 specs, trivial) and compare
-    survivor-thinned token totals. Every spec is self-contained - the
-    cross product over its own tables - so every order runs; order
-    changes cost, never results. All candidates run at the same rate,
-    so the comparison is pure token counting."""
-    if rule == "as_written" or len(joins) <= 1:
-        return list(joins)
+# ------------------------------ the joint (order x anchor) search
 
-    def total(order):
-        live = {a: float(s.n_docs) for a, s in stats.items()}
-        tokens = 0.0
-        for j in order:
-            anchor = anchors[id(j)]
-            tokens += _stage_tokens(j, live, stats, anchor, pre_tokens)
-            _thin(live, j, anchor)
-        return tokens
-
-    best, best_tokens = list(joins), total(list(joins))
-    for perm in itertools.permutations(joins):
-        t = total(list(perm))
-        if t < best_tokens:
-            best, best_tokens = list(perm), t
-    return best
+# Charged once per barrier, on top of the next anchor's fresh-KV
+# term (which the walk below prices exactly). The plumbing cost of a
+# re-shard - splitting payloads, shipping token ids - has not been
+# measured; set this when it is.
+RESHARD_OVERHEAD_TOKENS = 0.0
 
 
-# ---------------------------------------------- anchor (token arithmetic)
+def _anchor_candidates(join, honor_forced: bool = True) -> list:
+    """Anchors a stage may take. exists/anti always anchor their
+    outer table (the gate applies to its documents); a forced full
+    anchor is honored; otherwise any table of the join."""
+    if join.semantics != "full":
+        return [join.anchor]
+    if honor_forced and join.anchor is not None:
+        return [join.anchor]
+    return _join_aliases(join)
 
-def choose_anchor(join, stats: dict,
-                  pre_tokens: int = 0) -> tuple[str, list]:
-    """The table whose token total is smallest when the others stream
-    - in practice the side with the most document tokens anchors
-    (anchor tokens are paid once per document, partner tokens once
-    per tuple). A compile-time anchor (a user override, or the outer
-    table of an exists/anti gate) wins, with a remark when it prices
-    worse."""
-    aliases = _join_aliases(join)
-    live = {a: float(stats[a].n_docs) for a in aliases}
-    cost = {a: _stage_tokens(join, live, stats, a, pre_tokens)
-            for a in aliases}
-    planner_pick = min(aliases, key=lambda a: cost[a])
+
+def _walk(seq, live0: dict, stats: dict, pre_tokens: int = 0):
+    """Cost one (join, anchor) sequence: (total, per-stage records),
+    each record (expected tuples, stage tokens). A stage opening a
+    group pays the anchor prefix - plus the re-shard overhead when it
+    follows a group on a different anchor; a stage continuing a
+    same-anchor run of full stages pays only its naming line. Gates
+    never continue a group (their keep rule differs from the in-call
+    gate), so they always pay the full prefix."""
+    live = dict(live0)
+    total = 0.0
+    records = []
+    prev_join, prev_anchor = None, None
+    for j, anchor in seq:
+        same_group = (prev_join is not None and anchor == prev_anchor
+                      and j.semantics == "full"
+                      and prev_join.semantics == "full")
+        if same_group:
+            tokens = _frame_only_tokens(j, live, anchor)
+        else:
+            tokens = _anchor_prefix_tokens(j, live, stats, anchor,
+                                           pre_tokens)
+            if prev_anchor is not None and anchor != prev_anchor:
+                tokens += RESHARD_OVERHEAD_TOKENS
+        tokens += _pair_tokens(j, live, stats, anchor)
+        records.append((_cross_tuples(j, live, anchor), tokens))
+        total += tokens
+        _thin(live, j, anchor)
+        prev_join, prev_anchor = j, anchor
+    return total, records
+
+
+def plan_joins(joins, rule: str, stats: dict, live0: dict,
+               pre_tokens: int = 0):
+    """The joint search from issue #38: enumerate stage orders (only
+    the written order under as_written) times per-stage anchor
+    choices, cost each sequence with _walk, keep the cheapest.
+    Returns (sequence, remarks); the sequence is [(join, anchor)] in
+    execution order. Anchor switches in it become groups and barriers
+    at emission. The space is k! x (tables per stage): a few tens of
+    thousands of pure-arithmetic walks at six joins, and order
+    changes cost, never results - every sequence runs."""
+    if not joins:
+        return [], []
+
+    orders = [list(joins)]
+    if rule != "as_written" and len(joins) > 1:
+        orders = [list(p) for p in itertools.permutations(joins)]
+
+    def best_seq(honor_forced):
+        best, best_total = None, float("inf")
+        for order in orders:
+            for assign in itertools.product(
+                    *[_anchor_candidates(j, honor_forced)
+                      for j in order]):
+                seq = list(zip(order, assign))
+                total, _ = _walk(seq, live0, stats, pre_tokens)
+                if total < best_total:
+                    best, best_total = seq, total
+        return best, best_total
+
+    seq, total = best_seq(True)
     remarks = []
-    if join.anchor is not None:
-        if join.anchor != planner_pick \
-                and cost[join.anchor] > cost[planner_pick]:
+    forced = sorted({j.anchor for j in joins
+                     if j.anchor is not None and j.semantics == "full"})
+    if forced:
+        _, free_total = best_seq(False)
+        if free_total < total:
             remarks.append(
-                f"anchor {join.anchor!r} was forced; {planner_pick!r} "
-                f"prices lower ({cost[planner_pick]:,.0f} vs "
-                f"{cost[join.anchor]:,.0f} tuple tokens)")
-        return join.anchor, remarks
-    return planner_pick, remarks
+                f"anchors {forced} were forced; a free choice prices "
+                f"lower ({free_total:,.0f} vs {total:,.0f} tuple "
+                f"tokens)")
+    return seq, remarks
+
+
+def pick_runtime_anchor(spec: dict, live_doc_tokens: dict,
+                        pre_len: int, chunk_budget: int) -> str:
+    """Barrier-time anchor choice for a one-stage group, from
+    measured live counts (issue #38, step 4.1) - the payload-level
+    twin of the compile-time walk, kept here so decision code stays
+    in the planner. spec is the payload stage spec (aliases, labels,
+    frames, tail as token id lists); live_doc_tokens maps alias ->
+    token counts of its live documents. Only anchors whose worst-case
+    tuple fits the chunk budget are candidates; the compile-time
+    anchor always is (it passed the compile-time refusal check)."""
+    tail = len(spec["tail"])
+    counts = {a: len(t) for a, t in live_doc_tokens.items()}
+    means = {a: (sum(t) / len(t)) if t else 0.0
+             for a, t in live_doc_tokens.items()}
+    maxes = {a: max(t) if t else 0
+             for a, t in live_doc_tokens.items()}
+    aliases = spec["aliases"]
+
+    def need(a):
+        return (pre_len + maxes[a] + len(spec["frames"][a]) + tail
+                + sum(len(spec["labels"][p]) + maxes[p]
+                      for p in aliases if p != a))
+
+    def total(a):
+        tuples = 1.0
+        for al in aliases:
+            tuples *= counts[al]
+        per_tuple = tail + sum(len(spec["labels"][p]) + means[p]
+                               for p in aliases if p != a)
+        return (counts[a] * (means[a] + pre_len
+                             + len(spec["frames"][a]))
+                + tuples * per_tuple)
+
+    candidates = [a for a in aliases
+                  if a == spec["anchor"] or need(a) <= chunk_budget]
+    return min(candidates, key=total)
 
 
 # --------------------------------------------- sharding (token arithmetic)
@@ -355,14 +455,23 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     chunk = budgets.chunk_budget(model, device)
     pre = _preamble_tokens(filters, joins)
 
-    # anchors come before the chunk refusal: a join's atomic suffix
-    # (every partner document plus the question) depends on which
-    # table anchors
-    anchors = {}
-    for j in joins:
-        anchor, notes = choose_anchor(j, stats, pre)
-        anchors[id(j)] = anchor
-        remarks.extend(notes)
+    # ---- the order rule first: the joint search below needs it
+    rule, source = (order, f"user: order={order!r}") if order else \
+        default_order_rule(filters, joins)
+
+    # ---- the joint (order x anchor) search, seeded with post-filter
+    # live estimates. Anchors come before the chunk refusal: a join's
+    # atomic suffix (every partner document plus the question)
+    # depends on which table anchors.
+    live0 = {a: float(st.n_docs) for a, st in stats.items()}
+    for fs in filters.values():
+        surv = 1.0
+        for p in fs:
+            surv *= p.selectivity if p.selectivity is not None else 1.0
+        live0[_filter_alias(fs[0])] *= surv
+    seq, search_remarks = plan_joins(joins, rule, stats, live0, pre)
+    remarks.extend(search_remarks)
+    anchors = {id(j): a for j, a in seq}
 
     needs = []      # the largest single admission each operator makes
     for s in scans:
@@ -412,26 +521,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             constraint="store_needed_but_disabled",
             needed=working_set, available=admission, unit="tokens")
 
-    # ---- order
-    rule, source = (order, f"user: order={order!r}") if order else \
-        default_order_rule(filters, joins)
-    ordered_joins = order_joins(joins, rule, stats, anchors, pre)
-
     accesses = {s.alias: access_for_scan(stats[s.alias], model, cal,
                                          store) for s in scans}
-    live = {a: float(st.n_docs) for a, st in stats.items()}
-    for fs in filters.values():
-        surv = 1.0
-        for p in order_filters(fs, rule):
-            surv *= p.selectivity if p.selectivity is not None else 1.0
-        live[_filter_alias(fs[0])] *= surv
-    join_token_counts = []
-    for j in ordered_joins:
-        anchor = anchors[id(j)]
-        tuples = _cross_tuples(j, live, anchor)
-        tokens = _stage_tokens(j, live, stats, anchor, pre)
-        join_token_counts.append((tuples, tokens))
-        _thin(live, j, anchor)
+    _, stage_records = _walk(seq, live0, stats, pre)
 
     remarks.append("kv_dtype=bf16 (always)")
 
@@ -450,16 +542,22 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 f"documents stored, length threshold {store_min} "
                 f"(preamble included)")
 
-    # ---- operators, in execution order
-    operators = []
+    # ---- nodes: the dataflow graph, in execution order. ids_src
+    # tracks, per table, which node currently produces its live ids -
+    # that is the edge each consumer records.
+    nodes = []
+    ids_src = {}
     for s in scans:
         shards, loads = balanced_shards(doc_tokens[s.alias], workers)
-        operators.append(dict(
-            op="DocScan", alias=s.alias, provider=s.provider,
+        sid = f"scan:{s.alias}"
+        nodes.append(dict(
+            id=sid, op="DocScan", inputs=(),
+            alias=s.alias, provider=s.provider,
             column=s.column, access=accesses[s.alias],
             n_docs=stats[s.alias].n_docs,
             total_tokens=stats[s.alias].total_tokens,
             shards=shards, shard_token_loads=loads))
+        ids_src[s.alias] = (sid, f"ids:{s.alias}")
         if s.alias in filters:
             order_idx = order_filters_indexed(filters[s.alias], rule)
             n = stats[s.alias].n_docs
@@ -477,23 +575,100 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             # with no reader: later stages re-read it, store.save
             # copies it out, and nothing else ever touches it
             writes = len(stages) > 1 or store is not None
-            operators.append(dict(op="FilterChain", alias=s.alias,
-                                  arena_writes=writes, stages=stages))
+            fid = f"filter:{s.alias}"
+            nodes.append(dict(id=fid, op="FilterChain",
+                              inputs=(ids_src[s.alias],),
+                              alias=s.alias, arena_writes=writes,
+                              stages=tuple(stages)))
+            ids_src[s.alias] = (fid, f"ids:{s.alias}")
             if not writes:
                 remarks.append(
                     f"filter on {s.alias!r}: arena writes off (one "
                     f"stage, no store - nothing reads the KV again)")
+
+    # consecutive full stages on one anchor share a gated run_join
+    # call; a gate always runs alone (its keep rule differs from the
+    # in-call gate); an anchor switch between groups is a barrier
+    groups = []
+    for j, anchor in seq:
+        merge = (groups and j.semantics == "full" and groups[-1]["full"]
+                 and groups[-1]["anchor"] == anchor)
+        if merge:
+            groups[-1]["members"].append(j)
+        else:
+            groups.append(dict(anchor=anchor,
+                               full=(j.semantics == "full"),
+                               members=[j]))
+
     written = {id(j): i for i, j in enumerate(joins)}
-    for j, (tuples, tokens) in zip(ordered_joins, join_token_counts):
-        anchor = anchors[id(j)]
-        operators.append(dict(
-            op="JoinStage", written_pos=written[id(j)], anchor=anchor,
-            partners=[a for a in _join_aliases(j) if a != anchor],
-            semantics=j.semantics, selectivity=j.selectivity,
-            expected_tuples=round(tuples, 1),
-            tuple_tokens=round(tokens, 1)))
-    operators.append(dict(
-        op="Sink",
+    rec = iter(stage_records)
+    exec_idx = 0
+    barrier_n = 0
+    prev_anchor = None
+    pairs_edges = []     # every full stage's passing-pairs edge
+    out_aliases = []     # recombination's output order
+    for g, group in enumerate(groups):
+        anchor = group["anchor"]
+        if prev_anchor is not None and anchor != prev_anchor:
+            # the barrier thins every table the stages ahead touch
+            # (step 4.6), re-shards the new anchor over the measured
+            # live set, and is where run-time re-planning happens
+            ahead = []
+            for later in groups[g:]:
+                for j in later["members"]:
+                    for a in _join_aliases(j):
+                        if a not in ahead:
+                            ahead.append(a)
+            bid = f"barrier:{barrier_n}"
+            barrier_n += 1
+            nodes.append(dict(
+                id=bid, op="Barrier",
+                inputs=tuple(pairs_edges)
+                + tuple(ids_src[a] for a in ahead),
+                next_anchor=anchor, thins=tuple(ahead)))
+            for a in ahead:
+                ids_src[a] = (bid, f"ids:{a}")
+        gid = f"group:{g}"
+        stage_dicts = []
+        in_aliases = [anchor]
+        for j in group["members"]:
+            tuples, tokens = next(rec)
+            partners = [a for a in _join_aliases(j) if a != anchor]
+            stage_dicts.append(dict(
+                written_pos=written[id(j)], exec_idx=exec_idx,
+                anchor=anchor, partners=partners,
+                semantics=j.semantics, selectivity=j.selectivity,
+                expected_tuples=round(tuples, 1),
+                tuple_tokens=round(tokens, 1)))
+            exec_idx += 1
+            for a in partners:
+                if a not in in_aliases:
+                    in_aliases.append(a)
+            if j.semantics == "full":
+                pairs_edges.append((gid, f"pairs:{written[id(j)]}"))
+                for a in [anchor] + partners:
+                    if a not in out_aliases:
+                        out_aliases.append(a)
+        nodes.append(dict(
+            id=gid, op="JoinGroup",
+            inputs=tuple(ids_src[a] for a in in_aliases),
+            anchor=anchor,
+            stage_idxs=tuple(s["exec_idx"] for s in stage_dicts),
+            stages=tuple(stage_dicts)))
+        ids_src[anchor] = (gid, f"ids:{anchor}")
+        prev_anchor = anchor
+
+    if pairs_edges:
+        nodes.append(dict(
+            id="recombine", op="Recombine",
+            inputs=tuple(pairs_edges)
+            + tuple(ids_src[a] for a in out_aliases),
+            alias_order=tuple(out_aliases)))
+        sink_inputs = (("recombine", "tuples"),)
+    else:
+        sink_inputs = (ids_src[scans[0].alias],)
+    nodes.append(dict(
+        id="sink", op="Sink", inputs=sink_inputs,
         columns=[f"{c.alias}.{c.column}" for c in plan.root.columns]))
 
     return PhysicalPlan(
@@ -503,7 +678,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         calibration_source=cal.source,
         store_min_doc_tokens=store_min,
         limit=plan.root.limit,
-        operators=tuple(operators), remarks=tuple(remarks))
+        nodes=tuple(nodes), remarks=tuple(remarks))
 
 
 def _filter_alias(pred_or_list):
@@ -561,14 +736,18 @@ def explain(logical: LogicalPlan, physical) -> str:
                  "shared preamble)")
     lines.append(f"  order={physical.order_rule} ({physical.order_source})")
     lines.append(f"  calibration: {physical.calibration_source}")
-    for op in physical.operators:
-        parts = [f"  {op['op']}"]
-        for k, v in op.items():
-            if k in ("op", "shards", "shard_token_loads", "stages"):
+    for n in physical.nodes:
+        parts = [f"  {n['op']} {n['id']}"]
+        for k, v in n.items():
+            if k in ("op", "id", "inputs", "shards",
+                     "shard_token_loads", "stages"):
                 continue
             parts.append(f"{k}={v}")
+        if n.get("inputs"):
+            parts.append("<- " + ", ".join(
+                f"{src}[{port}]" for src, port in n["inputs"]))
         lines.append(" ".join(parts))
-        for st in op.get("stages", []):
+        for st in n.get("stages", []):
             lines.append(f"    stage {st}")
     for r in physical.remarks:
         lines.append(f"  remark: {r}")
