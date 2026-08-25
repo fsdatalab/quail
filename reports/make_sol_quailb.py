@@ -559,23 +559,6 @@ for qid, rec in queries.items():
             "t_compute": s.compute, "t_memory": s.memory,
             "sol_s": s.sol, "bound_by": s.bound_by}
 
-# The same arithmetic over a synthetic document, so the curve the 26
-# queries scatter around is drawn from the equations rather than
-# fitted to the points: one filter, one document of length d, a
-# 50-token question. The share does not depend on how many documents
-# there are, only on how long each one is.
-curve = {"document_tokens": [], "attention_share": {m.name: []
-                                                    for m in MODELS}}
-d = 4.0
-while d <= 40_000:
-    w = scan(PRE + d, 50)
-    curve["document_tokens"].append(round(d, 1))
-    for model in MODELS:
-        sec = seconds(w, model, H100_SXM, CHUNK[model.name])
-        curve["attention_share"][model.name].append(
-            round(100 * sec.attention / sec.compute, 4))
-    d *= 1.12
-
 hdr = (f"{'query':7} {'tokens':>11} {'pairs':>15} {'tuples':>8} "
        f"{'anchor':>7}  {'4B SoL':>9} {'att%':>5}  {'32B SoL':>9} "
        f"{'att%':>5} {'32B/4B':>7}")
@@ -603,7 +586,6 @@ json.dump({
                   "quail-results, qwen3-32b-fp8 answering",
         "tokenizer": "Qwen/Qwen3-4B-FP8, shared by every Qwen3 model"},
     "chunk_tokens": CHUNK,
-    "attention_share_curve": curve,
     "measured_inputs": {
         "preamble_tokens": PRE,
         "document_lengths": {
