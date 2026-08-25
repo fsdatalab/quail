@@ -56,39 +56,73 @@ def plot_sol_per_query():
     fig.savefig(OUT / "sol_quailb_per_query.png", dpi=150)
 
 
-def plot_attention_share():
-    """Where each query's compute goes, per query, on both models.
+# what each held column is called in the report's prose
+HELD_NAME = {"reviews.body": "reviews", "reports.report": "reports",
+             "claims.claim": "claims", "evidence.text": "evidence",
+             "citations.destination_context": "excerpts",
+             "citations.passage_text": "passages"}
 
-    Attention pairs are quadratic in the length of the document whose
-    KV is held, so the four BioDEX queries - 4,146-token reports -
-    spend a third to two fifths of their compute on attention where
-    everything else spends under seven percent. The 32B dot is always
-    below the 4B one because attention scales 3.56x with model size
-    where the dense projections scale 8.59x.
+
+def plot_attention_share():
+    """Where each query's compute goes, ordered by the length of the
+    documents whose KV is held.
+
+    Attention pairs are quadratic in that length, so the share climbs
+    left to right and jumps at BioDEX's 4,146-token reports. The 32B
+    dot is always below the 4B one: attention scales 3.56x with model
+    size where the dense projections scale 8.59x.
+
+    Held length is the x ordering rather than the x value. Twenty-one
+    of the 26 queries hold documents between 233 and 370 tokens, so
+    on a true length axis they stack into one band and their labels
+    cannot be read.
     """
-    fig, ax = plt.subplots(figsize=(10, 4.4))
-    x = list(range(len(ORDER)))
+    order = sorted(ORDER, key=lambda q: (Q[q]["held_mean_doc_tokens"], q))
+    x = list(range(len(order)))
 
     def share(q, model):
         m = Q[q]["models"][model]
         return 100 * m["t_attention"] / m["t_compute"]
 
-    lo = [share(q, "qwen3-32b-fp8") for q in ORDER]
-    hi = [share(q, "qwen3-4b-fp8") for q in ORDER]
-    ax.vlines(x, lo, hi, color=DARK, lw=0.7, alpha=0.35)
+    lo = [share(q, "qwen3-32b-fp8") for q in order]
+    hi = [share(q, "qwen3-4b-fp8") for q in order]
+
+    fig, ax = plt.subplots(figsize=(10, 5.2))
+    ax.vlines(x, lo, hi, color=DARK, lw=0.7, alpha=0.3)
     ax.scatter(x, hi, s=34, color=BLUE, label="Qwen3-4B-fp8", zorder=3)
     ax.scatter(x, lo, s=34, color=ORANGE, label="Qwen3-32B-fp8", zorder=3)
-    for i, q in enumerate(ORDER):
+    for i, q in enumerate(order):
         if q.startswith("BIO"):
-            ax.text(i, hi[i] + 1.6, f"{hi[i]:.0f}%", ha="center",
+            ax.text(i, hi[i] + 1.4, f"{hi[i]:.0f}%", ha="center",
                     fontsize=7.5, color=BLUE)
-            ax.text(i, lo[i] - 3.2, f"{lo[i]:.0f}%", ha="center",
+            ax.text(i, lo[i] - 3.4, f"{lo[i]:.0f}%", ha="center",
                     fontsize=7.5, color=ORANGE)
+
+    # one bracket per held corpus, with the length that puts it there
+    trans = ax.get_xaxis_transform()
+    start = 0
+    for i in range(len(order) + 1):
+        same = (i < len(order)
+                and Q[order[i]]["held_column"] == Q[order[start]]["held_column"])
+        if same:
+            continue
+        col = Q[order[start]]["held_column"]
+        mean = Q[order[start]]["held_mean_doc_tokens"]
+        mid = (start + i - 1) / 2
+        ax.plot([start - 0.35, i - 1 + 0.35], [-0.235, -0.235],
+                transform=trans, color=DARK, lw=0.7, alpha=0.5,
+                clip_on=False)
+        ax.text(mid, -0.30, f"{HELD_NAME[col]}\n{mean:,.0f} tokens",
+                transform=trans, ha="center", va="top", fontsize=7.5,
+                color=DARK)
+        start = i
     ax.set_xticks(x)
-    ax.set_xticklabels(ORDER, rotation=90, fontsize=7.5)
+    ax.set_xticklabels(order, rotation=90, fontsize=7.5)
     ax.set_ylabel("attention share of compute, percent")
+    ax.set_xlabel("queries, ordered by the length of the documents "
+                  "whose KV is held", labelpad=78)
     ax.set_ylim(-4, 47)
-    ax.legend(frameon=False, loc="upper right", fontsize=8.5)
+    ax.legend(frameon=False, loc="upper left", fontsize=8.5)
     fig.tight_layout()
     fig.savefig(OUT / "sol_quailb_attention_share.png", dpi=150)
 

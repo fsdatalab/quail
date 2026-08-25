@@ -168,7 +168,8 @@ The two compute terms grow differently. `T_dense` is linear in
 tokens; `T_attention` is quadratic in the length of the document
 whose KV is held, because a sequence of length `m` scores `T(m)`
 pairs. So the longer the held document, the larger attention's share
-of the work.
+of the work. The figure orders the 26 queries by that length, and
+the share climbs across it.
 
 The two terms also scale differently with model size. `T_dense`
 scales with the parameter count, 31,206,298,624 over 3,633,511,936
