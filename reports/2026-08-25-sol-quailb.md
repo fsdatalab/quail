@@ -43,6 +43,13 @@ one pass; `results/sol_quailb_sf0.1.json` holds both.
    on the stages before it. F1 passes 0.7746 of the reviews; F4 then
    passes 0.2486 of what F1 left.
 
+One thing is set rather than measured: the batch size the forward
+pass runs at, which decides how many times the weights are re-read.
+It is the fused kernels' 32-bit offset limit, `(2^31 - 1)` over the
+widest projection, so **110,376 tokens at 4B and 41,943 at 32B** -
+the 32B batch is a quarter of the 4B one, over a weight set 7.6x
+larger.
+
 ## How KV reuse enters the equations
 
 A document has a **prefix**, `p + d_i`: the shared preamble plus the
@@ -167,32 +174,25 @@ and lands at 6.6-7.0. The cause is document length: BioDEX reports
 average 4,146 tokens against IMDB's 299, and pairs are quadratic in
 length.
 
-Worth stating plainly, because it inverts the usual intuition: long
-documents make the big model relatively cheaper, not dearer.
+Long documents therefore make the big model relatively cheaper, not
+dearer.
 
 ## What this does not settle
 
 - **The floor is loose.** `max(T_compute, T_memory)` taken once at
   the top is weaker than taking it per kernel and summing. Both are
   lower bounds; the per-kernel one would be larger and tighter.
-- **Selectivity says how many documents survive, not which.**
+- **Selectivity fixes how many documents survive, not which.**
   `survivors()` keeps an evenly spaced slice of the length-sorted
-  pool, so the survivors have the pool's length distribution.
-  Counting the real survivors from the labels shows they are longer
-  than that - 3.5% more token mass after F1, 31% after three filters,
-  because these predicates prefer long documents. It moves SoL by
-  under 0.1%, because the first scan already paid for every prefix
-  and a later stage adds only about 50 tokens per survivor. It would
-  matter for a query whose later stages carry real work.
-- **The KV read count is a minimum.** Each anchor's context is
-  counted as read once per stage. An anchor whose tuples straddle a
-  chunk boundary is read twice. At these sizes that is a handful out
-  of thousands, and nothing here is memory bound, so it changes no
-  answer.
-- **LEP-5, LEP-6 and LEP-8 are the same number**, because LEP1
-  leaves 4 documents of 200 and LEP3 leaves none, so the later
-  stages and the join cost nothing. That is the data at sf=0.1, not
-  a bug, but those three queries carry no signal.
+  pool, so the survivors carry the pool's length distribution. A
+  predicate correlated with document length breaks that.
+- **The KV read count is a minimum**, one read per anchor per stage.
+  An anchor whose tuples straddle a chunk boundary is read twice.
+  Nothing here is memory bound, so it changes no answer.
+- **LEP-5, LEP-6 and LEP-8 are the same number.** LEP1 leaves 4
+  documents of 200 and LEP3 leaves none, so their later stages and
+  their joins cost nothing. Those three queries carry no signal at
+  sf=0.1.
 - **Nothing here is compared with a measured wall.** These are
   floors. What fraction of them the engine reaches is a separate
   question and a separate run.
