@@ -1,6 +1,11 @@
 """Plots for the QUAIL-B speed-of-light table.
 
-    uv run --with matplotlib python reports/make_sol_quailb_plots.py
+Reads the answers make_sol_quailb.py wrote. They live on the
+quail-results volume, so pull them into a workdir first:
+
+    W=<workdir>
+    modal volume get quail-results /sol/sol_quailb_sf0.1.json $W/
+    uv run --with matplotlib python reports/make_sol_quailb_plots.py $W
 """
 import json
 import sys
@@ -15,8 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = Path(__file__).parent / "plots"
 plt.style.use(Path(__file__).parent / "quail.mplstyle")
 
-Q = json.loads((ROOT / "results" / "sol_quailb_sf0.1.json").read_text()
-               )["queries"]
+W = Path(sys.argv[1])
+Q = json.loads((W / "sol_quailb_sf0.1.json").read_text())["queries"]
 ORDER = list(Q)
 
 
