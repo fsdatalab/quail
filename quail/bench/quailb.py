@@ -331,24 +331,22 @@ def register_sets(sess, data_dir):
 F1 = ("Judge strictly from the review above whether it mentions at "
       "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
       "answer TRUE if the review mentions at least one positive aspect "
-      "of the movie, FALSE otherwise.\nANSWER=")
+      "of the movie, FALSE otherwise.")
 
 F4 = ("Judge strictly from the review above whether it discusses the "
       "ending of the movie.\n\n{0}\n\nInstruction: answer TRUE if the "
-      "review discusses the ending of the movie, FALSE otherwise.\n"
-      "ANSWER=")
+      "review discusses the ending of the movie, FALSE otherwise.")
 
 F5 = ("Judge strictly from the review above whether it mentions any "
       "specific actor or actress by name.\n\n{0}\n\nInstruction: "
       "answer TRUE if the review mentions a specific actor or actress "
-      "by name, FALSE otherwise.\nANSWER=")
+      "by name, FALSE otherwise.")
 
 DISCUSS_ASPECT = ("Candidate movie aspects follow, one at a time. For "
                    "each, judge strictly from the review above whether "
                    "it discusses that aspect of the movie.\n\n{0}\n\n"
                    "ASPECT: {1}\nInstruction: answer TRUE if the review "
-                   "above discusses this aspect, FALSE otherwise.\n"
-                   "ANSWER=")
+                   "above discusses this aspect, FALSE otherwise.")
 
 # IMDB-9/IMDB-11 only: an engine stress test, not a meaningful
 # accuracy query - {0}/{1} here are short aspect phrases, not
@@ -361,7 +359,7 @@ ASPECT_RELATED = ("Judge strictly whether the second movie aspect "
                   "in the same review.\n\nFIRST ASPECT: {0}\n\n"
                   "SECOND ASPECT: {1}\nInstruction: answer TRUE if "
                   "the two aspects are commonly discussed together, "
-                  "FALSE otherwise.\nANSWER=")
+                  "FALSE otherwise.")
 
 # IMDB-8 only: a second question over the same aspects table, joined
 # under a second alias (a2) - a 2-join star, both joins anchored on
@@ -373,22 +371,21 @@ ASPECT_SENTIMENT = ("Candidate movie aspects follow, one at a time. "
                     "specifically about that aspect.\n\n{0}\n\n"
                     "ASPECT: {1}\nInstruction: answer TRUE if the "
                     "review above expresses positive sentiment about "
-                    "this aspect, FALSE otherwise.\nANSWER=")
+                    "this aspect, FALSE otherwise.")
 
 F7 = ("Judge strictly from the report above whether it describes a "
       "case involving a female patient.\n\n{0}\n\nInstruction: answer "
       "TRUE if the report describes a case involving a female patient, "
-      "FALSE otherwise.\nANSWER=")
+      "FALSE otherwise.")
 
 F8 = ("Judge strictly from the report above whether it describes "
       "combination drug therapy.\n\n{0}\n\nInstruction: answer TRUE if "
-      "the report describes combination drug therapy, FALSE otherwise.\n"
-      "ANSWER=")
+      "the report describes combination drug therapy, FALSE otherwise.")
 
 F9 = ("Judge strictly from the report above whether it describes a "
       "serious or life-threatening adverse event.\n\n{0}\n\n"
       "Instruction: answer TRUE if the report describes a serious or "
-      "life-threatening adverse event, FALSE otherwise.\nANSWER=")
+      "life-threatening adverse event, FALSE otherwise.")
 
 # Unchanged from the earlier design: after-document frame, neutral
 # wording. An earlier version with similar framing before the report
@@ -399,7 +396,7 @@ REACTION = ("Candidate medical reaction terms follow, one at a time. "
             "describes that reaction as something the patient "
             "experienced.\n\n{0}\n\nCANDIDATE REACTION: {1}\n"
             "Instruction: answer TRUE if the report above describes "
-            "this reaction, FALSE otherwise.\nANSWER=")
+            "this reaction, FALSE otherwise.")
 
 # BIO-6 only: a second question over the same terms table, joined
 # under a second alias (m2) - the 2-join "star" shape (the old B11),
@@ -412,30 +409,28 @@ REACTION_SEVERE = ("Candidate medical reaction terms follow, one at a "
                    "patient.\n\n{0}\n\nCANDIDATE REACTION: {1}\n"
                    "Instruction: answer TRUE if the report above "
                    "describes this reaction as serious or "
-                   "life-threatening, FALSE otherwise.\nANSWER=")
+                   "life-threatening, FALSE otherwise.")
 
 F11 = ("Judge strictly from the claim above whether it asserts "
        "something about a person, rather than an organization, place, "
        "or event.\n\n{0}\n\nInstruction: answer TRUE if the claim "
-       "asserts something about a person, FALSE otherwise.\nANSWER=")
+       "asserts something about a person, FALSE otherwise.")
 
 F12 = ("Judge strictly from the claim above whether it contains a "
        "specific date or year.\n\n{0}\n\nInstruction: answer TRUE if "
-       "the claim contains a specific date or year, FALSE otherwise.\n"
-       "ANSWER=")
+       "the claim contains a specific date or year, FALSE otherwise.")
 
 F14 = ("Judge strictly from the claim above whether it references a "
        "specific place (a city, country, or other named location).\n\n"
        "{0}\n\nInstruction: answer TRUE if the claim references a "
-       "specific place, FALSE otherwise.\nANSWER=")
+       "specific place, FALSE otherwise.")
 
 # Unchanged from the earlier design: same after-document fix as
 # REACTION, for the same reason.
 SUPPORT = ("Wikipedia passages follow, one at a time. For each, judge "
            "strictly from the claim above whether it supports that "
            "claim.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer TRUE if "
-           "the passage above supports this claim, FALSE otherwise.\n"
-           "ANSWER=")
+           "the passage above supports this claim, FALSE otherwise.")
 
 # FEV-7 only: a second question over the same evidence table, joined
 # under a second alias (e2) - IMDB-8/BIO-6's counterpart for FEVER, a
@@ -448,7 +443,7 @@ REFUTE = ("Wikipedia passages follow, one at a time. For each, judge "
          "strictly from the claim above whether it is refuted by "
          "that passage.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer "
          "TRUE if the passage above refutes or contradicts this "
-         "claim, FALSE otherwise.\nANSWER=")
+         "claim, FALSE otherwise.")
 
 # FEV-5 only: filters the evidence side of a join, not just the
 # anchor. Mirrors F11's "about a person" judgment so the join pairs
@@ -457,7 +452,7 @@ F13 = ("Judge strictly from the Wikipedia passage above whether it "
        "primarily describes a specific person (their life, actions, "
        "or role), rather than an organization, place, or event.\n\n"
        "{0}\n\nInstruction: answer TRUE if the passage primarily "
-       "describes a specific person, FALSE otherwise.\nANSWER=")
+       "describes a specific person, FALSE otherwise.")
 
 # LePaRD predicates: "excerpt" for destination_context throughout,
 # to avoid colliding with this dataset's own use of "passage" for
@@ -465,37 +460,34 @@ F13 = ("Judge strictly from the Wikipedia passage above whether it "
 LEP1 = ("Judge strictly from the excerpt above whether it argues that "
         "the cited case's reasoning does not apply here.\n\n{0}\n\n"
         "Instruction: answer TRUE if the excerpt argues the cited "
-        "case's reasoning does not apply here, FALSE otherwise.\n"
-        "ANSWER=")
+        "case's reasoning does not apply here, FALSE otherwise.")
 
 LEP2 = ("Judge strictly from the excerpt above whether it discusses a "
         "procedural or jurisdictional issue.\n\n{0}\n\nInstruction: "
         "answer TRUE if the excerpt discusses a procedural or "
-        "jurisdictional issue, FALSE otherwise.\nANSWER=")
+        "jurisdictional issue, FALSE otherwise.")
 
 LEP3 = ("Judge strictly from the excerpt above whether it treats the "
         "cited passage as binding precedent.\n\n{0}\n\nInstruction: "
         "answer TRUE if the excerpt treats the cited passage as "
-        "binding precedent, FALSE otherwise.\nANSWER=")
+        "binding precedent, FALSE otherwise.")
 
 LEP4 = ("Judge strictly from the excerpt above whether it cites the "
         "passage to support a conclusion about a party's liability or "
         "guilt.\n\n{0}\n\nInstruction: answer TRUE if the excerpt "
         "cites the passage to support a conclusion about a party's "
-        "liability or guilt, FALSE otherwise.\nANSWER=")
+        "liability or guilt, FALSE otherwise.")
 
 LEP5 = ("Judge strictly from the excerpt above whether it acknowledges "
         "disagreement between courts on the issue.\n\n{0}\n\n"
         "Instruction: answer TRUE if the excerpt acknowledges "
-        "disagreement between courts on the issue, FALSE otherwise.\n"
-        "ANSWER=")
+        "disagreement between courts on the issue, FALSE otherwise.")
 
 # LEP-7 only: filters the passage side of the self-join, not just the
 # excerpt (anchor) side.
 LEPS1 = ("Judge strictly from the passage above whether it states a "
          "general legal rule.\n\n{0}\n\nInstruction: answer TRUE if "
-         "the passage states a general legal rule, FALSE otherwise.\n"
-         "ANSWER=")
+         "the passage states a general legal rule, FALSE otherwise.")
 
 # The LEP-2..LEP-7 join predicate: real ground truth exists for this
 # one (passage_id, from the dataset itself, not a judge pass) - see
@@ -503,8 +495,7 @@ LEPS1 = ("Judge strictly from the passage above whether it states a "
 LEPJOIN = ("Judge strictly from the excerpt above whether the passage "
            "below is the one being cited.\n\n{0}\n\nPASSAGE:\n{1}\n"
            "Instruction: answer TRUE if the passage below is the one "
-           "being cited in the excerpt above, FALSE otherwise.\n"
-           "ANSWER=")
+           "being cited in the excerpt above, FALSE otherwise.")
 
 
 # ---------------------------------------------------------- queries
