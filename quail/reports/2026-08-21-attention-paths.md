@@ -22,15 +22,10 @@ parity corpus.
   `JOIN_ATTENTION`, and the worker reads those constants.
 - `split` - the pre-fusion implementation of the two-call pattern
   (same two FA3 calls, merge as plain PyTorch ops, separate
-  quantization) - was removed from the engine once the assignment
-  was settled. It lives on in `ablations/split_reference.py` as the
-  readable reference the fused merge kernel is checked against;
-  comparison cells install it through the pipeline's
-  `attention_override` hook. Its gather fallback (contiguous KV
-  copies instead of paged reads) was removed with it: the paged
-  read path is validated by the parity cells (bit-identical to a
-  contiguous causal call on every edge case), not by a runtime
-  fallback.
+  quantization) - was removed once the assignment was settled. The
+  historical measurements remain in this report and its result files.
+  The parity cells validate the paged read path against a contiguous
+  causal call on every edge case.
 - FlashInfer was measured and not adopted (details below).
 
 ## Kernel provenance
@@ -52,8 +47,7 @@ its open-source origin:
   for Large Language Model Serving with PagedAttention" (2023),
   [vllm-project/vllm](https://github.com/vllm-project/vllm).
 - **Online-softmax LSE merge** (the `sigmoid(lse_b - lse_a)`
-  formula; plain-torch form in `ablations/split_reference.py`, fused
-  form in `merge_attn_quant`): the standard two-pass merge of partial
+  formula, fused in `merge_attn_quant`): the standard two-pass merge of partial
   attention outputs using log-sum-exp statistics. From Milakov &
   Gimelshein, "Online normalizer calculation for softmax" (2018);
   reused inside FlashAttention for tiling.
@@ -127,37 +121,20 @@ change launch count; no novel attention algorithm is introduced.
 
 ## Why joins get `merge_quant`
 
-The unified path is structurally wrong for fan-out: one causal call
-per pair cannot share an anchor's KV across the many partner
-suffixes of a chunk, because a later pair's tokens would read the
-earlier pair's scattered KV. The only correct unified packing is one
-partner per anchor per chunk ("waves"), which re-reads the anchor's
-full KV once per pair instead of once per suffix group.
+Updated 2026-08-24: the original wave requirement in this section was
+wrong. See `reports/2026-08-24-packed-unified-joins.md`.
 
-Measured (`results/join_attention_paths_*.json`, BioDEX
-reports x reaction terms, TRUE/FALSE-framed corpus, us per fresh
-token):
+A single FA3 batch can hold every partner as an independent causal
+sequence. Each sequence shares the anchor's complete KV pages and
+gets private temporary pages for its suffix. This prevents one
+partner from reading another partner while keeping all partners in
+one forward pass.
 
-| Shape | split | merge_quant | unified (waves) |
-|---|---|---|---|
-| 10 x 256 | 11.95 | 11.29 | 31.00 (257 chunks) |
-| 1 x 2560 (high fan-out) | 12.87 | 12.05 | 373.76 (2,561 chunks) |
-| 100 x 256 (multi-chunk) | 11.59 | 10.83 | 13.16 (259 chunks) |
-
-merge_quant beats split by 5-7% on every shape (the fused merge).
-The unified waves match the prediction's direction and show how the
-penalty scales with the shape: at one anchor the wave is a 42-token
-chunk far below the 416-token compute knee and the anchor's KV is
-re-read 2,560 times, so the path collapses (29x slower); at 100
-anchors a wave is ~4,200 tokens and the penalty shrinks to 21% -
-still never ahead, and the answer-correctness constraint (one pair
-per anchor per causal call) is what forces the wave shape in the
-first place. Path answer disagreements on this corpus are tiny (0-8
-between the two-call paths per shape). The cell's TRUE counts sit
-near saturation (~2,554 of 2,560) because the 4B checkpoint answers
-TRUE to nearly every BioDEX reaction pair - the known model caveat,
-not an executor property; the planted-key join in the accuracy cell
-below is where join answers are graded against ground truth.
+The corrected 10 x 256 run used one forward pass for all 2,560 pairs.
+Packed unified took 11.88 microseconds per fresh token. `merge_quant` took
+11.04 microseconds per fresh token. Packed unified was 7.6% slower, so the
+selected path remains `merge_quant` for a measured performance reason.
+The committed summary is `results/packed_unified_join.json`.
 
 ## Accuracy against stock vLLM
 
@@ -366,7 +343,9 @@ Measured (all in `results/*_32b.json` / `*_64h.json`):
   | 1 x 2560 | 73.27 | 69.70 | 710.77 |
   | 100 x 256 | 69.61 | 66.87 | 83.69 |
 
-  merge_quant wins every shape by 4-5%. The waves penalty shrinks
+  merge_quant wins against split on every shape by 4-5%. This table
+  used the old waves implementation. Packed unified was not measured
+  on 32B. The waves penalty shrinks
   in relative terms (1.6x at 10 x 256 against 2.8x at 4B - the
   launch overhead is a smaller share of the 8x-larger per-token
   work) but stays decisive, and high fan-out still collapses it
@@ -431,20 +410,19 @@ on both in-scope models.
   instead of string literals. The mode argument is now required at
   construction (no default), and the engine ships only the two
   assigned paths.
-- The split path and its gather fallback removed from the engine;
-  the implementation moved to `ablations/split_reference.py`
-  (comparison cells install it through the new `attention_override`
-  hook). `KVArena.gather` deleted; the milestone probe's
+- The split path, its comparison override, and its gather fallback
+  were removed. `KVArena.gather` was deleted; the milestone probe's
   attention-math gate now checks the production merge_quant path,
   dequantized, against the fp32 reference.
 - `ablations/accuracy_vs_stock.py`: the stock-comparison cell (new).
 - `ablations/flashinfer_compare.py`: probe + benchmark (new).
-- `ablations/forward_pass.py`: join cell gained the unified-waves
-  variant and a fan-out sweep entrypoint; parity cells gained the
+- `ablations/forward_pass.py`: join cell gained the original
+  unified-waves comparison. The 2026-08-24 follow-up replaced it with
+  packed unified joins; parity cells gained the
   edge cases and the store round trip; the stale `yes_no_ids`
   import is fixed to `true_false_ids`.
 - `tests/test_attention_assignment.py`: the assignment names real
-  modes and joins are never unified (CPU test).
+  modes and keeps the measured faster path on joins (CPU test).
 - Wiki section 5.3 rewritten for the two shipped paths, the
   assignment, and the retired reference.
 

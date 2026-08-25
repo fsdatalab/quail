@@ -7,9 +7,9 @@ them. Two drivers over one substrate:
 - run_filter: continuous admission (FilterAdmission) - the filter
   chain as the degenerate join: anchor = the document, suffix = the
   question, stage j+1 attaches a fresh suffix to the same kept KV.
-  No question KV is ever written except the shared question preamble,
-  which joins the anchor KV after stage 1 (exactly what chain mode's
-  rewind kept resident).
+  Unified writes the current question KV for its causal call. Only the
+  shared question preamble remains after that call. It joins the anchor
+  KV after stage 1, exactly as KV rewind kept it resident.
 
 torch is imported lazily; this module runs only inside the Modal
 image.
@@ -160,9 +160,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     zero-suffix case of it). That only works with at most one suffix:
     two suffixes in one segment would attend to each other, and
     per-suffix prefix copies are the unshared reference this path
-    exists to avoid. Under unified attention a chunk is either all
-    paged (the one paged call covers every row) or all unpaged
-    (call A covers every row); mixing the two raises.
+    exists to avoid. A paged unified join gives every suffix its own
+    causal sequence. Full anchor pages are shared. The suffix gets
+    temporary pages, including a copy of the anchor's last partial
+    page when there is one. Under unified attention a chunk is either
+    all paged or all unpaged; mixing the two raises.
     """
     t = time.perf_counter() if timing is not None else 0.0
     # unified scatters every fresh row through its own src/dst map, so
@@ -173,7 +175,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     kv_writes, layout = [], []
     cross_keys, cross_used, cu_q = [], [], [0]
     max_q = 0
-    unified_specs = []
+    unified_groups = []
     for g in groups:
         fresh = g.get("prefix") is not None
         f = g["f"]
@@ -194,11 +196,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if paged and two_call:
                 kv_writes.append((key, row0, row0 + len(g["prefix"]),
                                   0))
+        prefix_end = len(ids)
         s_row0 = len(ids)
+        suffix_spans = []
         for si, suf in enumerate(g["suffixes"]):
             srow = len(ids)
             ids.extend(suf)
             pos.extend(range(f, f + len(suf)))
+            suffix_spans.append((srow, len(ids)))
             cu_a.append(len(ids))
             finals.append(len(ids) - 1)
             wst = g.get("write_suffix_tokens", 0)
@@ -218,13 +223,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             max_q = max(max_q, s_count)
         if attention_mode == "unified":
             if paged:
-                if len(g["suffixes"]) != 1:
-                    raise ValueError(
-                        "unified attention requires exactly one "
-                        "suffix per paged group")
-                logical_start = 0 if fresh else f
-                unified_specs.append(
-                    (key, row0, len(ids), logical_start, f + s_count))
+                unified_groups.append(dict(
+                    key=key, fresh=fresh, f=f, row0=row0,
+                    prefix_end=prefix_end, row1=len(ids),
+                    suffix_spans=suffix_spans))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "
@@ -242,7 +244,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             max_q=max_q, used=used,
             max_used=max(cross_used), table=table)
         # row -> its index in call B's output, -1 for prefix rows;
-        # the fused merge kernel's map (the split reference ignores it)
+        # the fused merge kernel's map
         source = [-1] * len(ids)
         for i, row in enumerate(suffix_rows):
             source[row] = i
@@ -254,38 +256,106 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # row pairs: the attention pass scatters them with a single kernel
     # launch per layer (kv_row_scatter)
     unified = None
-    if attention_mode == "unified" and unified_specs:
-        if len(unified_specs) != len(layout):
+    temporary_arena_keys = []
+    temporary_arena_pages = 0
+    temporary_arena_rows = 0
+    if attention_mode == "unified" and unified_groups:
+        if len(unified_groups) != len(layout):
             raise ValueError(
                 "a unified chunk cannot mix paged and unpaged "
                 "groups: the one paged call covers every row or "
                 "none (the fast path packs whole chunks unpaged)")
-        keys = []
+        page_rows = []
         used = []
         cu_full = [0]
-        dst = []
+        current_src = []
+        current_dst = []
+        arena_src = []
+        arena_dst = []
         max_full_q = 0
-        for key, r0, r1, logical_start, full_used in unified_specs:
-            count = r1 - r0
-            rows = arena._capacity_rows[key]
-            selected = rows[logical_start:logical_start + count]
-            if selected.numel() != count:
-                raise RuntimeError("unified attention cache capacity is short")
-            keys.append(key)
-            used.append(full_used)
-            dst.append(selected)
-            cu_full.append(cu_full[-1] + count)
-            max_full_q = max(max_full_q, count)
-        table, _ = arena.block_table(keys)
-        # every unified group spans its full row range and groups pack
-        # consecutively, so the source map is the identity
-        unified = dict(
-            src=_staged(torch, torch.arange(len(ids), dtype=torch.int64),
-                        torch.int64, pinned),
-            dst=_staged(torch, torch.cat(dst), torch.int64, pinned),
-            cu_q=_staged(torch, cu_full, torch.int32, pinned),
-            used=_staged(torch, used, torch.int32, pinned),
-            table=table, max_q=max_full_q, max_used=max(used))
+        from quail.executor.arena import private_suffix_layout
+
+        page_tokens = arena.accounting.page_tokens
+        try:
+            for spec in unified_groups:
+                key = spec["key"]
+                f = spec["f"]
+                r0, r1 = spec["row0"], spec["row1"]
+                spans = spec["suffix_spans"]
+                logical_start = 0 if spec["fresh"] else f
+                rows = arena._capacity_rows[key]
+                count = r1 - r0
+                direct = len(spans) == 1 \
+                    and logical_start + count <= rows.numel()
+                if direct:
+                    current_src.extend(range(r0, r1))
+                    current_dst.extend(
+                        rows[logical_start:logical_start + count].tolist())
+                    page_rows.append(arena.accounting.owned[key])
+                    used.append(f + sum(e - s for s, e in spans))
+                    cu_full.append(cu_full[-1] + count)
+                    max_full_q = max(max_full_q, count)
+                    continue
+
+                prefix_count = spec["prefix_end"] - r0
+                if prefix_count:
+                    current_src.extend(range(r0, spec["prefix_end"]))
+                    current_dst.extend(rows[:prefix_count].tolist())
+                    prefix_pages = arena.accounting.owned[key][
+                        :arena.accounting.pages_needed(f)]
+                    page_rows.append(prefix_pages)
+                    used.append(f)
+                    cu_full.append(cu_full[-1] + prefix_count)
+                    max_full_q = max(max_full_q, prefix_count)
+
+                anchor_pages = arena.accounting.owned[key]
+                for s0, s1 in spans:
+                    suffix_tokens = s1 - s0
+                    remainder = f % page_tokens
+                    got = arena.alloc_temporary(remainder + suffix_tokens)
+                    if got is None:
+                        raise RuntimeError(
+                            "unified suffix pages exceed the free KV arena; "
+                            "split the chunk")
+                    temp_key, temp_pages = got
+                    temporary_arena_keys.append(temp_key)
+                    temporary_arena_pages += len(temp_pages)
+                    temporary_arena_rows += remainder + suffix_tokens
+                    temp_rows = arena._capacity_rows[temp_key]
+                    current_src.extend(range(s0, s1))
+                    current_dst.extend(
+                        temp_rows[remainder:remainder + suffix_tokens]
+                        .tolist())
+                    if remainder:
+                        anchor_page = anchor_pages[f // page_tokens]
+                        base = anchor_page * page_tokens
+                        arena_src.extend(range(base, base + remainder))
+                        arena_dst.extend(temp_rows[:remainder].tolist())
+                    page_row, copied_rows = private_suffix_layout(
+                        anchor_pages, temp_pages, f, suffix_tokens,
+                        page_tokens)
+                    page_rows.append(page_row)
+                    if copied_rows != remainder:
+                        raise RuntimeError("temporary page layout changed")
+                    used.append(f + suffix_tokens)
+                    cu_full.append(cu_full[-1] + suffix_tokens)
+                    max_full_q = max(max_full_q, suffix_tokens)
+
+            table = arena.block_table_rows(page_rows)
+            unified = dict(
+                src=_staged(torch, current_src, torch.int64, pinned),
+                dst=_staged(torch, current_dst, torch.int64, pinned),
+                arena_src=(_staged(torch, arena_src, torch.int64, pinned)
+                           if arena_src else None),
+                arena_dst=(_staged(torch, arena_dst, torch.int64, pinned)
+                           if arena_dst else None),
+                cu_q=_staged(torch, cu_full, torch.int32, pinned),
+                used=_staged(torch, used, torch.int32, pinned),
+                table=table, max_q=max_full_q, max_used=max(used))
+        except Exception:
+            for key in temporary_arena_keys:
+                arena.free_key(key)
+            raise
 
     # All current KV writes use one scatter.
     kv_src = kv_dst = None
@@ -310,6 +380,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         positions=_staged(torch, pos, torch.int64, pinned),
         final_indices=_staged(torch, finals, torch.int64, pinned),
         meta=meta, tokens=len(ids), layout=layout)
+    if temporary_arena_keys:
+        out["temporary_arena_keys"] = temporary_arena_keys
+        out["temporary_arena_pages"] = temporary_arena_pages
+        out["temporary_arena_rows"] = temporary_arena_rows
     _tick(timing, "pack_h2d", t)
     return out
 
@@ -319,7 +393,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, group_size=None, store=None,
              store_hash=None, store_min_tokens=1, store_ids=None,
-             stats=None, stage_frames=None):
+             stats=None, stage_frames=None, temporary_stats=None):
     """The join driver: every stage streams a partner list against the
     anchor side; gated anchors advance between stages.
 
@@ -346,7 +420,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     so the GPU never drains. Answers travel as event-synced pinned
     copies (AsyncAnswers); an anchor's prefix KV is written to its
     arena pages exactly once and the pages free when its group leaves
-    its last stage. Suffix KV is never written anywhere.
+    its last stage. merge_quant does not write suffix KV. Unified
+    writes suffix KV into pages owned only by the current forward.
 
     store / store_hash / store_min_tokens / store_ids: the pinned KV
     store, exactly run_filter's contract. An anchor whose prefix is
@@ -358,6 +433,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     positions to stable store key ids (the anchor's global document
     index, the same key a filter scan of the same corpus uses).
     stats, when given, is filled with restored/stored counts.
+    temporary_stats, when given, records the largest temporary page
+    and used-row claims made by one chunk.
 
     Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
     partners, present only for anchors that reached stage j; spans =
@@ -370,6 +447,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         if stats is not None:
             stats.update(restored_docs=0, restored_tokens=0,
                          stored_docs=0, stored_tokens=0)
+        if temporary_stats is not None:
+            temporary_stats.update(pages_peak=0, rows_peak=0)
         return [dict() for _ in range(k)], [], 0
     group_size = n if group_size is None else group_size
     groups = [list(range(i, min(i + group_size, n)))
@@ -398,6 +477,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                      restored_tokens=sum(len(anchor_prefixes[a])
                                          for a in restored),
                      stored_docs=0, stored_tokens=0)
+    if temporary_stats is not None:
+        temporary_stats.update(pages_peak=0, rows_peak=0)
 
     def plan_stage(members, j):
         live = [a for a in members
@@ -477,6 +558,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     def launch(j, chunk):
         nonlocal tokens, save_after
         tokens += chunk["tokens"]
+        if temporary_stats is not None:
+            temporary_stats["pages_peak"] = max(
+                temporary_stats["pages_peak"],
+                chunk.get("temporary_arena_pages", 0))
+            temporary_stats["rows_peak"] = max(
+                temporary_stats["rows_peak"],
+                chunk.get("temporary_arena_rows", 0))
         for key, _ in chunk["layout"]:
             ev = load_events.pop(key, None)
             if ev is not None:

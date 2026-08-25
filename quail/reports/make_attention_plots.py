@@ -5,7 +5,7 @@ comparison.
     uv run --with matplotlib python reports/make_attention_plots.py
 
 Reads results/attention_paths.json,
-results/join_attention_paths_*.json, results/accuracy_vs_stock.json,
+results/packed_unified_join.json, results/accuracy_vs_stock.json,
 and results/flashinfer_bench.json; writes three PNGs into
 reports/plots/.
 """
@@ -26,12 +26,14 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY, GREEN, RED, DARK, ORANGE, TEAL
+from plot_colors import GRAY, GREEN, RED, DARK, ORANGE
 
-PATH_COLOR = {"split": BLUE, "merge_quant": ORANGE,
-              "unified": GREEN, "unified_waves": GREEN}
-PATH_LABEL = {"split": "split", "merge_quant": "merge_quant",
-              "unified": "unified", "unified_waves": "unified (waves)"}
+PATH_COLOR = {"merge_quant": ORANGE, "unified": GREEN,
+              "unified_packed": GREEN,
+              "unified_waves": GREEN}
+PATH_LABEL = {"merge_quant": "merge_quant", "unified": "unified",
+              "unified_packed": "unified (packed)",
+              "unified_waves": "unified (waves)"}
 
 
 def load(name):
@@ -47,15 +49,20 @@ def mean(rows, key):
 
 def fig_paths(tag="", model_label="Qwen3 4B fp8"):
     ap = load(f"attention_paths{tag}.json")
-    joins = {label: load(f"join_attention_paths{tag}_{label}.json")
-             for label in ("10x256", "1x2560", "100x256")}
+    if tag:
+        joins = {label: load(f"join_attention_paths{tag}_{label}.json")
+                 for label in ("10x256", "1x2560", "100x256")}
+        join_mode = "unified_waves"
+    else:
+        joins = load("packed_unified_join.json")["shapes"]
+        join_mode = "unified_packed"
 
     fig, (ax1, ax2) = plt.subplots(
         1, 2, figsize=(11.5, 3.8),
         gridspec_kw={"width_ratios": [1, 1.35]})
 
     # left: the filter workload
-    modes = ["split", "merge_quant", "unified"]
+    modes = ["merge_quant", "unified"]
     y = range(len(modes))
     us = [mean(ap["runs"][m], "us_per_token") for m in modes]
     walls = [mean(ap["runs"][m], "wall") for m in modes]
@@ -69,19 +76,20 @@ def fig_paths(tag="", model_label="Qwen3 4B fp8"):
     ax1.set_yticklabels([PATH_LABEL[m] for m in modes])
     ax1.invert_yaxis()
     ax1.set_xlim(0, max(us) * 1.6)
-    ax1.set_xlabel("us per fresh token (lower is better)")
+    ax1.set_xlabel("microseconds per fresh token (lower is better)")
     ax1.set_title(
         f"Filters: {ap['n_docs']:,} documents, 5 stages\n"
         f"assignment: unified", loc="left")
 
     # right: the join workload across fan-out shapes
     shapes = ["10x256", "1x2560", "100x256"]
-    shape_note = {"10x256": "10 anchors x 256 partners",
-                  "1x2560": "1 anchor x 2,560 (high fan-out)",
-                  "100x256": "100 anchors x 256 (multi-chunk)"}
-    jmodes = ["split", "merge_quant", "unified_waves"]
-    clip = 3.0 * max(mean(joins[s]["runs"]["split"], "us_per_token")
-                     for s in shapes)
+    shape_note = {"10x256": "10 anchors by 256 partners",
+                  "1x2560": "1 anchor by 2,560 partners",
+                  "100x256": "100 anchors by 256 partners (10 chunks)"}
+    jmodes = ["merge_quant", join_mode]
+    x_max = 1.52 * max(
+        mean(joins[s]["runs"][m], "us_per_token")
+        for s in shapes for m in jmodes)
     bar_h = 0.24
     yticks, ylabels = [], []
     for si, shape in enumerate(shapes):
@@ -91,37 +99,30 @@ def fig_paths(tag="", model_label="Qwen3 4B fp8"):
         for mi, m in enumerate(jmodes):
             u = mean(joins[shape]["runs"][m], "us_per_token")
             ypos = base + mi * bar_h
-            shown = min(u, clip)
-            ax2.barh(ypos, shown, height=bar_h * 0.82,
+            ax2.barh(ypos, u, height=bar_h * 0.82,
                      color=PATH_COLOR[m], edgecolor="white")
-            if u > clip:
-                label = (f"{u:.0f} us/token "
-                         f"({u / mq:.0f}x merge_quant)")
-                ax2.text(clip * 0.99, ypos, label, va="center",
-                         ha="right", fontsize=8.5, color="white",
-                         fontweight="bold")
+            if m == join_mode:
+                delta = 100.0 * (u / mq - 1.0)
+                label = (f"unified packed {u:.2f}  "
+                         f"(+{delta:.1f}% vs merge_quant)")
             else:
-                ax2.text(shown + 0.01 * clip, ypos, f"{u:.1f}",
-                         va="center", fontsize=8.5, color=DARK)
-        yticks.append(base + bar_h)
+                label = f"{PATH_LABEL[m]} {u:.2f}"
+            ax2.text(u + 0.01 * x_max, ypos, label,
+                     va="center", fontsize=8.5, color=DARK)
+        yticks.append(base + (len(jmodes) - 1) * bar_h / 2)
         ylabels.append(shape_note[shape])
     ax2.set_yticks(yticks)
     ax2.set_yticklabels(ylabels)
     ax2.invert_yaxis()
-    ax2.set_xlim(0, clip)
-    ax2.set_xlabel("us per fresh token (lower is better)")
-    ax2.set_title("Joins: BioDEX reports x terms\n"
+    ax2.set_xlim(0, x_max)
+    ax2.set_xlabel("microseconds per fresh token (lower is better)")
+    ax2.set_title("Joins: BioDEX reports by terms\n"
                   "assignment: merge_quant", loc="left")
-    handles = [plt.Rectangle((0, 0), 1, 1, color=PATH_COLOR[m])
-               for m in jmodes]
-    ax2.legend(handles, [PATH_LABEL[m] for m in jmodes],
-               loc="lower right")
-
     fig.suptitle(
         f"Attention paths by workload ({model_label}, one H100)",
         x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.94))
-    fig.savefig(OUT / f"attention_paths{tag}.png")
+    fig.savefig(OUT / f"attention_paths{tag}.png", dpi=150)
     print("wrote", OUT / f"attention_paths{tag}.png")
 
 
@@ -133,16 +134,15 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 3.9))
 
     # left: planted-truth accuracy, filters and the join task
-    entities = [("stock vLLM", GRAY), ("split", BLUE),
-                ("merge_quant", ORANGE), ("unified", GREEN)]
+    entities = [("stock vLLM", GRAY), ("merge_quant", ORANGE),
+                ("unified", GREEN)]
     flag_acc = {
         "stock vLLM": (sum(acc["stock_flag_accuracy"].values())
                        / len(acc["stock_flag_accuracy"])),
         **{m: acc["filters"][m]["flag_accuracy"]
-           for m in ("split", "merge_quant", "unified")}}
+           for m in ("merge_quant", "unified")}}
     key_acc = {
-        "stock vLLM": acc["join"]["split"]["key_accuracy_stock"],
-        "split": acc["join"]["split"]["key_accuracy_quail"],
+        "stock vLLM": acc["join"]["merge_quant"]["key_accuracy_stock"],
         "merge_quant": acc["join"]["merge_quant"]["key_accuracy_quail"],
         "unified": None}
 
@@ -161,7 +161,8 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
                      edgecolor="white")
             ax1.text(v * 100 + 1.2, ypos, f"{v * 100:.2f}%",
                      va="center", fontsize=8.5, color=DARK)
-        yticks.append(base + 1.5 * bar_h)
+        present = sum(series[ent] is not None for ent, _ in entities)
+        yticks.append(base + (present - 1) * bar_h / 2)
         ylabels.append(gname)
     ax1.set_yticks(yticks)
     ax1.set_yticklabels(ylabels)
@@ -172,16 +173,14 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
     ax1.set_title("Answer accuracy, both systems", loc="left")
     handles = [plt.Rectangle((0, 0), 1, 1, color=c)
                for _, c in entities]
-    ax1.legend(handles, [e for e, _ in entities], ncol=4,
+    ax1.legend(handles, [e for e, _ in entities], ncol=3,
                loc="upper center", bbox_to_anchor=(0.5, -0.22))
 
     # right: disagreement with stock, with the margin context
     rows = [
-        ("filters\nsplit", acc["filters"]["split"], BLUE),
         ("filters\nmerge_quant", acc["filters"]["merge_quant"],
          ORANGE),
         ("filters\nunified", acc["filters"]["unified"], GREEN),
-        ("join\nsplit", acc["join"]["split"], BLUE),
         ("join\nmerge_quant", acc["join"]["merge_quant"],
          ORANGE),
     ]
@@ -237,7 +236,7 @@ def fig_accuracy(tag="", model_label="Qwen3 4B fp8"):
         f"token streams, TRUE/FALSE constrained, temperature 0",
         x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0.03, 1, 0.93))
-    fig.savefig(OUT / f"accuracy_vs_stock{tag}.png")
+    fig.savefig(OUT / f"accuracy_vs_stock{tag}.png", dpi=150)
     print("wrote", OUT / f"accuracy_vs_stock{tag}.png")
 
 
@@ -256,7 +255,6 @@ def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
         ("join_fanout", "join, 1 anchor\nx 256 suffixes"),
     ]
     variants = [
-        ("fa3_split_plus_quant", "FA3 split + quant", BLUE),
         ("fa3_merge_quant", "FA3 merge_quant", ORANGE),
         ("fa3_unified_plus_quant", "FA3 unified + quant", GREEN),
         ("fi_best", "FlashInfer best config", RED),
@@ -310,7 +308,7 @@ def fig_flashinfer(tag="", geom_label="4B geometry: 32 query heads"):
     ax.legend(handles, [lab for _, lab, _ in variants],
               loc="lower right")
     fig.tight_layout()
-    fig.savefig(OUT / f"flashinfer_compare{tag}.png")
+    fig.savefig(OUT / f"flashinfer_compare{tag}.png", dpi=150)
     print("wrote", OUT / f"flashinfer_compare{tag}.png")
 
 

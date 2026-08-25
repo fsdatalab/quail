@@ -1,7 +1,5 @@
-"""The workload-to-path assignment: importable without torch, names
-real modes, and never puts a join on the unified path. The engine
-ships exactly these two modes; the retired split path lives in
-ablations/split_reference.py."""
+"""The workload-to-path assignment is importable without torch and
+names the two attention modes."""
 
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 
@@ -13,9 +11,7 @@ def test_assignment_names_real_modes():
     assert JOIN_ATTENTION in MODES
 
 
-def test_joins_never_unified():
-    # One causal call per pair cannot share an anchor's KV across the
-    # many partner suffixes of a chunk: a later pair's tokens would
-    # read the earlier pair's scattered KV. The join path must be a
-    # two-call mode.
-    assert JOIN_ATTENTION != "unified"
+def test_join_assignment_uses_measured_faster_path():
+    # Packed unified joins are correct, but the 10 x 256 confirming
+    # run measured merge_quant 7.4% faster.
+    assert JOIN_ATTENTION == "merge_quant"

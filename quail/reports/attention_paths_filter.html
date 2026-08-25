@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Packed forward pass: stock vLLM and the Quail attention paths</title>
+<style>
+  :root {
+    --gemm:  #dbeafe; --small: #f1f5f9; --fused: #dcfce7;
+    --fa3:   #ffedd5; --kv:    #ccfbf1; --read:  #e2e8f0; --p2: #fef3c7;
+    --ink:   #0f172a; --muted: #64748b; --line:  #cbd5e1;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+    color: var(--ink); background: #fff; padding: 14px 18px;
+  }
+  h1 { font-size: 21px; font-weight: 700; }
+  .sub { font-size: 13px; color: var(--muted); margin: 4px 0 12px; max-width: 1500px; }
+  .sub b { color: var(--ink); }
+
+  .cols {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-auto-rows: min-content;
+    gap: 3px 10px;
+    max-width: 1500px;
+  }
+
+  .col-head {
+    border: 1.5px solid var(--ink); border-radius: 7px;
+    padding: 7px 9px 6px; background: #fff;
+  }
+  .col-head .name { font-size: 15px; font-weight: 700; }
+  .col-head .tag {
+    display: inline-block; font-size: 9.5px; font-weight: 700;
+    border-radius: 3px; padding: 1px 6px; margin-left: 5px;
+    vertical-align: 2px; color: #fff;
+  }
+  .tag.ship { background: #16a34a; } .tag.base { background: #475569; }
+  .col-head .nums { font-size: 12px; margin-top: 4px; line-height: 1.4; }
+  .col-head .nums b { font-size: 13px; }
+  .col-head .delta { color: #16a34a; font-weight: 700; }
+
+  .band {
+    grid-column: 1 / -1; background: var(--ink); color: #fff;
+    font-size: 12px; font-weight: 700; padding: 3px 10px;
+    border-radius: 3px; margin-top: 2px;
+  }
+
+  .k {
+    border-radius: 5px; padding: 3px 8px 3px 28px; display: flex; align-items: center;
+    font-size: 13px; line-height: 1.3; border: 1px solid rgba(15,23,42,.18);
+    position: relative;
+  }
+  .k b { font-weight: 700; }
+  .k .idx {
+    position: absolute; left: 4px; top: 4px;
+    font-size: 10.5px; font-weight: 700; color: var(--muted);
+  }
+  .k sup { font-size: 9px; color: #b45309; font-weight: 700; margin-left: 3px; }
+  .gemm  { background: var(--gemm); }
+  .small { background: var(--small); }
+  .fused { background: var(--fused); }
+  .fa3   { background: var(--fa3); }
+  .kv    { background: var(--kv); }
+  .read  { background: var(--read); }
+  .attn { outline: 2.2px solid #f97316; outline-offset: 0.5px; z-index: 1; }
+  .hole { }
+
+  .col-foot {
+    border: 1.5px solid var(--ink); border-radius: 0 0 7px 7px;
+    border-top: 1px dashed var(--line);
+    padding: 6px 8px; font-size: 11.5px; line-height: 1.42;
+    background: #f8fafc;
+  }
+
+  .legend { display: flex; gap: 14px; font-size: 12px; margin: 9px 0 2px; flex-wrap: wrap; max-width:1500px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .sw { width: 12px; height: 12px; border-radius: 3px; border: 1px solid rgba(15,23,42,.25); display: inline-block; }
+
+  .merge-explainer {
+    max-width: 1500px; margin-top: 16px; padding-top: 12px;
+    border-top: 1.5px solid var(--ink);
+  }
+  .merge-explainer h2 { font-size: 18px; font-weight: 700; }
+  .merge-intro {
+    color: var(--muted); font-size: 12.5px; line-height: 1.45;
+    margin: 4px 0 6px; max-width: 1200px;
+  }
+  .path-label {
+    font-size: 14px; font-weight: 700; margin: 8px 0 1px;
+  }
+  .merge-diagram { display: block; width: 100%; height: auto; }
+  .merge-diagram text {
+    fill: var(--ink); font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  .merge-diagram .panel { stroke: var(--ink); stroke-width: 1.5; }
+  .merge-diagram .temp-panel { fill: var(--small); }
+  .merge-diagram .arena-panel { fill: var(--kv); }
+  .merge-diagram .kernel-panel { fill: var(--fa3); }
+  .merge-diagram .state-panel { fill: #fff; }
+  .merge-diagram .merge-panel { fill: var(--fused); }
+  .merge-diagram .p1 { fill: var(--gemm); }
+  .merge-diagram .p2 { fill: var(--p2); }
+  .merge-diagram .off { fill: #fff; }
+  .merge-diagram .cell, .merge-diagram .token-cell {
+    stroke: var(--ink); stroke-width: 1;
+  }
+  .merge-diagram .wire {
+    fill: none; stroke: var(--ink); stroke-width: 2;
+    marker-end: url(#merge-arrow);
+  }
+  .merge-diagram .wire-label {
+    font-size: 12px; font-weight: 700; fill: var(--muted);
+  }
+  .merge-diagram .box-title { font-size: 16px; font-weight: 700; }
+  .merge-diagram .box-copy { font-size: 11.5px; fill: var(--muted); }
+  .merge-diagram .token-name { font-size: 11px; font-weight: 700; }
+  .merge-diagram .token-values { font-size: 10.5px; }
+  .merge-diagram .lane-label { font-size: 12px; font-weight: 700; }
+  .merge-diagram .state-main { font-size: 15px; font-weight: 700; }
+  .merge-diagram .state-copy { font-size: 11px; fill: var(--muted); }
+  .diagram-source {
+    color: var(--muted); font-size: 10.5px; margin-top: 5px;
+  }
+  .diagram-source a { color: inherit; }
+  .footer { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; max-width: 1500px; }
+</style>
+</head>
+<body>
+
+<h1>Packed forward pass, with one attention path selected for each workload</h1>
+<div class="sub">
+  Filters and joins use the same packed forward pass. Filters select <b>unified</b>, while joins select <b>merge_quant</b>.
+  A filter chunk contains documents and filter questions. A join chunk contains anchors and partner suffixes.
+  The outlined attention section is the only part of the layer loop that changes. Kernel launch counts are per layer.
+  Rows are aligned across columns, and matching labels identify the same kernel. The number at the left of each chip is its launch order, not a kernel version.
+  A tall chip is one fused kernel spanning the rows of the kernels it replaces.
+</div>
+
+<div class="cols">
+
+<!-- row 1: headers -->
+<div class="col-head" style="grid-row:1">
+  <span class="name">Stock vLLM 0.26.0</span><span class="tag base">baseline</span>
+  <div class="nums">
+    One request per filter stage or join pair, with prefix caching on. <b>18 launches / layer</b> when uncompiled.
+  </div>
+</div>
+<div class="col-head" style="grid-row:1">
+  <span class="name">Quail unified path</span><span class="tag ship">selected for filters</span>
+  <div class="nums">
+    One causal paged attention call over kept and current KV. <b>11 launches / layer</b>.
+  </div>
+</div>
+<div class="col-head" style="grid-row:1">
+  <span class="name">Quail merge_quant path</span><span class="tag ship">selected for joins</span>
+  <div class="nums">
+    One causal call, one paged cross call, and a fused merge. <b>13 launches / layer</b>, or 12 with no arena pages.
+  </div>
+</div>
+
+<!-- row 2: embed -->
+<div class="k read" style="grid-row:2"><b>embed_tokens</b></div>
+<div class="k read" style="grid-row:2"><b>embed</b></div>
+<div class="k read" style="grid-row:2"><b>embed</b></div>
+
+<div class="band" style="grid-row:3">REPEAT FOR EVERY MODEL LAYER &mdash; the layer loop</div>
+
+<div class="k small" style="grid-row:4"><span class="idx">1</span><b>rms_norm</b> (layer 1) / <b>fused_add_rms_norm</b></div>
+<div class="k fused" style="grid-row:4 / span 2"><span class="idx">1</span><b>add_rms_norm_quant</b></div>
+<div class="k fused" style="grid-row:4 / span 2"><span class="idx">1</span><b>add_rms_norm_quant</b></div>
+
+<div class="k small" style="grid-row:5"><span class="idx">2</span><b>per-token-group FP8 quant</b></div>
+
+<div class="k gemm" style="grid-row:6"><span class="idx">3</span><b>fp8_gemm_nt</b> &mdash; qkv_proj</div>
+<div class="k gemm" style="grid-row:6"><span class="idx">2</span><b>fp8_gemm_nt</b> &mdash; qkv_proj</div>
+<div class="k gemm" style="grid-row:6"><span class="idx">2</span><b>fp8_gemm_nt</b> &mdash; qkv_proj</div>
+
+<div class="k small" style="grid-row:7"><span class="idx">4</span><b>contiguous copy</b> of q</div>
+<div class="k fused" style="grid-row:7 / span 4"><span class="idx">3</span><b>qk_norm_rope</b></div>
+<div class="k fused" style="grid-row:7 / span 4"><span class="idx">3</span><b>qk_norm_rope</b></div>
+<div class="k small" style="grid-row:8"><span class="idx">5</span><b>rms_norm</b> &mdash; q_norm per head</div>
+<div class="k small" style="grid-row:9"><span class="idx">6</span><b>rms_norm</b> &mdash; k_norm per head</div>
+<div class="k small" style="grid-row:10"><span class="idx">7</span><b>rotary_emb</b> (q, k)</div>
+
+<div class="k kv attn" style="grid-row:11"><span class="idx">8</span><b>reshape_and_cache_flash</b><sup>a</sup></div>
+<div class="k kv attn" style="grid-row:11"><span class="idx">4</span><b>kv_row_scatter</b></div>
+<div class="k kv attn" style="grid-row:11"><span class="idx">4</span><b>kv_row_scatter</b></div>
+
+<div class="k fa3 attn" style="grid-row:12"><span class="idx">9</span><b>FA3 varlen, causal</b></div>
+<div class="k fa3 attn" style="grid-row:12 / span 3"><span class="idx">5</span><b>ONE FA3 causal paged call</b><sup>b c</sup></div>
+<div class="k fa3 attn" style="grid-row:12"><span class="idx">5</span><b>FA3 call A: causal varlen</b></div>
+
+<div class="hole" style="grid-row:13"></div>
+<div class="k small attn" style="grid-row:13"><span class="idx">6</span><b>index_select</b> suffix query rows</div>
+
+<div class="hole" style="grid-row:14"></div>
+<div class="k fa3 attn" style="grid-row:14"><span class="idx">7</span><b>FA3 call B: non-causal paged cross</b><sup>d</sup></div>
+
+<div class="k small" style="grid-row:15"><span class="idx">10</span><b>per-token-group FP8 quant</b></div>
+<div class="k small" style="grid-row:15"><span class="idx">6</span><b>per-token-group FP8 quant</b></div>
+<div class="k fused attn" style="grid-row:15"><span class="idx">8</span><b>merge_attn_quant</b><sup>e</sup></div>
+
+<div class="k gemm" style="grid-row:16"><span class="idx">11</span><b>fp8_gemm_nt</b> &mdash; o_proj</div>
+<div class="k gemm" style="grid-row:16"><span class="idx">7</span><b>fp8_gemm_nt</b> &mdash; o_proj</div>
+<div class="k gemm" style="grid-row:16"><span class="idx">9</span><b>fp8_gemm_nt</b> &mdash; o_proj</div>
+
+<div class="k small" style="grid-row:17"><span class="idx">12</span><b>fused_add_rms_norm</b></div>
+<div class="k fused" style="grid-row:17 / span 2"><span class="idx">8</span><b>add_rms_norm_quant</b></div>
+<div class="k fused" style="grid-row:17 / span 2"><span class="idx">10</span><b>add_rms_norm_quant</b></div>
+
+<div class="k small" style="grid-row:18"><span class="idx">13</span><b>per-token-group FP8 quant</b></div>
+
+<div class="k gemm" style="grid-row:19"><span class="idx">14</span><b>fp8_gemm_nt</b> &mdash; gate_up_proj</div>
+<div class="k gemm" style="grid-row:19"><span class="idx">9</span><b>fp8_gemm_nt</b> &mdash; gate_up_proj</div>
+<div class="k gemm" style="grid-row:19"><span class="idx">11</span><b>fp8_gemm_nt</b> &mdash; gate_up_proj</div>
+
+<div class="k small" style="grid-row:20"><span class="idx">15</span><b>silu_and_mul</b></div>
+<div class="k fused" style="grid-row:20 / span 2"><span class="idx">10</span><b>silu_mul_quant</b></div>
+<div class="k fused" style="grid-row:20 / span 2"><span class="idx">12</span><b>silu_mul_quant</b></div>
+
+<div class="k small" style="grid-row:21"><span class="idx">16</span><b>per-token-group FP8 quant</b></div>
+
+<div class="k gemm" style="grid-row:22"><span class="idx">17</span><b>fp8_gemm_nt</b> &mdash; down_proj</div>
+<div class="k gemm" style="grid-row:22"><span class="idx">11</span><b>fp8_gemm_nt</b> &mdash; down_proj</div>
+<div class="k gemm" style="grid-row:22"><span class="idx">13</span><b>fp8_gemm_nt</b> &mdash; down_proj</div>
+
+<div class="band" style="grid-row:23">&#8617; hidden + residual into the next layer &mdash; after the last layer:</div>
+
+<div class="k read" style="grid-row:24"><b>final rms_norm &rarr; lm_head GEMM over all 151,936 vocab rows</b></div>
+<div class="k read" style="grid-row:24"><b>gather final rows &rarr; fused_add_rms_norm &rarr; 12-row lm_head</b></div>
+<div class="k read" style="grid-row:24"><b>gather final rows &rarr; fused_add_rms_norm &rarr; 12-row lm_head</b></div>
+
+<div class="col-foot" style="grid-row:25">
+  <b>a</b> Each filter stage or join pair runs as a separate request. Prefix caching can reuse the prefix, but each request still has its own launch stream.
+</div>
+<div class="col-foot" style="grid-row:25">
+  <b>b</b> The engine keeps the document KV and the question preamble shared by every filter stage. Each later stage replaces the previous question-specific KV at the same token positions and reads the kept KV with its own question. The engine does not process the document tokens again. <b>c</b> One causal attention call covers kept KV and current tokens, so no second call or merge is needed.
+</div>
+<div class="col-foot" style="grid-row:25">
+  <b>d</b> The anchor KV lives in arena pages, so partner suffixes use a second non-causal attention call. <b>e</b> The final kernel merges both attention results and quantizes them for the output projection. Packed unified is also correct on joins. The measured join selects this path because it is faster.
+</div>
+
+</div><!-- /cols -->
+
+<div class="legend">
+  <span><span class="sw" style="background:var(--gemm)"></span> FP8 GEMM (DeepGEMM fp8_gemm_nt &mdash; same kernel in all columns)</span>
+  <span><span class="sw" style="background:var(--small)"></span> small kernel (vLLM op or plain torch)</span>
+  <span><span class="sw" style="background:var(--fused)"></span> Quail fused Triton kernel</span>
+  <span><span class="sw" style="background:var(--fa3)"></span> FlashAttention-3 call</span>
+  <span><span class="sw" style="background:var(--kv)"></span> KV write into pages</span>
+  <span><span class="sw" style="background:var(--read)"></span> embed / readout</span>
+  <span style="border:2.2px solid #f97316; border-radius:4px; padding:0 5px;">attention path</span>
+</div>
+
+<section class="merge-explainer">
+  <h2>Unified and merge_quant on the same join</h2>
+  <div class="merge-intro">
+    Both paths put several suffixes for the same anchor in one forward pass.
+    Unified uses one paged FA3 call. merge_quant uses two attention calls and merges their results.
+  </div>
+
+  <div class="path-label">Packed unified on joins, several partners per anchor in one forward pass</div>
+
+  <svg class="merge-diagram" viewBox="0 0 1500 650" role="img" aria-labelledby="unified-title unified-desc">
+    <title id="unified-title">Packed unified join execution</title>
+    <desc id="unified-desc">The current layer produces temporary Q, K, and V. Q goes directly to FA3. K and V are copied into extra temporary KV pages in the arena. One row of arena page IDs describes the KV sequence for each suffix. One causal paged FA3 call reads the shared and temporary pages. After the forward is queued, the temporary pages return to the free page list.</desc>
+    <defs>
+      <marker id="unified-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink)"></path>
+      </marker>
+    </defs>
+
+    <!-- Current suffix activations. -->
+    <rect class="panel temp-panel" x="20" y="45" width="300" height="215" rx="6"></rect>
+    <text class="box-title" x="40" y="76">Temporary Q, K, and V</text>
+    <text class="box-copy" x="40" y="96">Current suffixes, one row per independent pair</text>
+    <text class="lane-label" x="40" y="145">suffix 1</text>
+    <rect class="token-cell p1" x="110" y="116" width="165" height="55" rx="3"></rect>
+    <text class="token-name" x="192" y="138" text-anchor="middle">p1,0  p1,1  question</text>
+    <text class="token-values" x="192" y="156" text-anchor="middle">Q  K  V for each token</text>
+    <text class="lane-label" x="40" y="220">suffix 2</text>
+    <rect class="token-cell p2" x="110" y="191" width="165" height="55" rx="3"></rect>
+    <text class="token-name" x="192" y="213" text-anchor="middle">p2,0  p2,1  question</text>
+    <text class="token-values" x="192" y="231" text-anchor="middle">Q  K  V for each token</text>
+
+    <!-- Q bypasses the arena. -->
+    <path d="M 320 110 H 965 V 205 H 1000" fill="none" stroke="var(--ink)" stroke-width="2" marker-end="url(#unified-arrow)"></path>
+    <text class="wire-label" x="525" y="99">Q goes directly to FA3</text>
+
+    <!-- K and V must be copied into paged storage. -->
+    <path d="M 320 230 H 370" fill="none" stroke="var(--ink)" stroke-width="2" marker-end="url(#unified-arrow)"></path>
+    <text class="wire-label" x="326" y="218">K, V</text>
+    <rect class="panel state-panel" x="370" y="185" width="210" height="90" rx="6"></rect>
+    <text class="state-main" x="475" y="218" text-anchor="middle">Copy K and V</text>
+    <text class="state-copy" x="475" y="242" text-anchor="middle">into newly claimed arena pages</text>
+    <text class="state-copy" x="475" y="260" text-anchor="middle">using the actual packed lengths</text>
+    <path d="M 475 275 V 390 H 465 V 438" fill="none" stroke="var(--ink)" stroke-width="2" marker-end="url(#unified-arrow)"></path>
+
+    <!-- The arena stores actual K and V. -->
+    <rect class="panel arena-panel" x="20" y="335" width="620" height="295" rx="6"></rect>
+    <text class="box-title" x="40" y="366">KV arena</text>
+
+    <text class="lane-label" x="40" y="425">Shared anchor pages</text>
+    <rect class="token-cell off" x="40" y="438" width="62" height="55" rx="3"></rect>
+    <text class="token-name" x="71" y="460" text-anchor="middle">A0</text>
+    <text class="token-values" x="71" y="478" text-anchor="middle">K V</text>
+    <rect class="token-cell off" x="110" y="438" width="62" height="55" rx="3"></rect>
+    <text class="token-name" x="141" y="460" text-anchor="middle">A1</text>
+    <text class="token-values" x="141" y="478" text-anchor="middle">K V</text>
+    <rect class="token-cell off" x="180" y="438" width="62" height="55" rx="3"></rect>
+    <text class="token-name" x="211" y="460" text-anchor="middle">A2</text>
+    <text class="token-values" x="211" y="478" text-anchor="middle">K V</text>
+    <text class="token-name" x="253" y="469">...</text>
+    <text class="box-copy" x="40" y="514">Remain allocated after this forward</text>
+
+    <text class="lane-label" x="305" y="425">Extra temporary suffix pages</text>
+    <rect class="token-cell p1" x="305" y="438" width="140" height="55" rx="3"></rect>
+    <text class="token-name" x="375" y="459" text-anchor="middle">T1 pages</text>
+    <text class="token-values" x="375" y="477" text-anchor="middle">anchor tail + suffix 1 K V</text>
+    <rect class="token-cell p2" x="455" y="438" width="140" height="55" rx="3"></rect>
+    <text class="token-name" x="525" y="459" text-anchor="middle">T2 pages</text>
+    <text class="token-values" x="525" y="477" text-anchor="middle">anchor tail + suffix 2 K V</text>
+    <text class="box-copy" x="305" y="514">Allocated for each suffix in this forward</text>
+
+    <path d="M 450 520 V 552" fill="none" stroke="var(--ink)" stroke-width="2" marker-end="url(#unified-arrow)"></path>
+    <text class="wire-label" x="465" y="544">after the forward is queued</text>
+    <rect class="token-cell off" x="305" y="558" width="290" height="48" rx="3"></rect>
+    <text class="token-name" x="450" y="579" text-anchor="middle">Free page list: T1 and T2 are returned</text>
+    <text class="token-values" x="450" y="596" text-anchor="middle">The same arena memory can be reused by a later forward</text>
+
+    <!-- FA3 receives the arena page IDs in logical token order. -->
+    <path d="M 640 465 H 665 V 355 H 690" fill="none" stroke="var(--ink)" stroke-width="2" marker-end="url(#unified-arrow)"></path>
+    <text class="wire-label" x="650" y="452">arena page IDs</text>
+    <rect class="panel temp-panel" x="690" y="185" width="260" height="235" rx="6"></rect>
+    <text class="box-title" x="710" y="216">KV page ID rows for FA3</text>
+    <text class="box-copy" x="710" y="236">One row of arena page IDs per suffix</text>
+    <text class="lane-label" x="710" y="276">suffix 1 row</text>
+    <rect class="token-cell p1" x="710" y="288" width="220" height="45" rx="3"></rect>
+    <text class="token-name" x="820" y="316" text-anchor="middle">[ A0, A1, A2, ... , T1 pages ]</text>
+    <text class="lane-label" x="710" y="358">suffix 2 row</text>
+    <rect class="token-cell p2" x="710" y="370" width="220" height="45" rx="3"></rect>
+    <text class="token-name" x="820" y="398" text-anchor="middle">[ A0, A1, A2, ... , T2 pages ]</text>
+
+    <path d="M 950 310 H 1000" fill="none" stroke="var(--ink)" stroke-width="2" marker-end="url(#unified-arrow)"></path>
+    <rect class="panel kernel-panel" x="1000" y="165" width="230" height="250" rx="6"></rect>
+    <text class="box-title" x="1115" y="205" text-anchor="middle">One causal paged FA3 call</text>
+    <text class="box-copy" x="1115" y="233" text-anchor="middle">Q is read directly from activations</text>
+    <text class="box-copy" x="1115" y="251" text-anchor="middle">K and V are read from arena pages</text>
+    <rect class="token-cell p1" x="1020" y="280" width="190" height="50" rx="3"></rect>
+    <text class="token-name" x="1115" y="310" text-anchor="middle">anchor + suffix 1</text>
+    <rect class="token-cell p2" x="1020" y="345" width="190" height="50" rx="3"></rect>
+    <text class="token-name" x="1115" y="375" text-anchor="middle">anchor + suffix 2</text>
+
+    <path d="M 1230 290 H 1270" fill="none" stroke="var(--ink)" stroke-width="2" marker-end="url(#unified-arrow)"></path>
+    <rect class="panel state-panel" x="1270" y="175" width="205" height="230" rx="6"></rect>
+    <text class="state-main" x="1372" y="218" text-anchor="middle">Packed attention output</text>
+    <text class="state-copy" x="1372" y="244" text-anchor="middle">one row per suffix token</text>
+    <path d="M 1300 266 H 1445" fill="none" stroke="var(--line)" stroke-width="1"></path>
+    <text class="state-copy" x="1372" y="304" text-anchor="middle">one per-token-group</text>
+    <text class="state-main" x="1372" y="332" text-anchor="middle">FP8 quant</text>
+    <path d="M 1300 350 H 1445" fill="none" stroke="var(--line)" stroke-width="1"></path>
+    <text class="state-main" x="1372" y="382" text-anchor="middle">FP8 rows into o_proj</text>
+  </svg>
+
+  <div class="path-label">merge_quant on joins, several partners per anchor in one chunk</div>
+
+  <svg class="merge-diagram" viewBox="0 0 1500 560" role="img" aria-labelledby="merge-title merge-desc">
+    <title id="merge-title">Token-level data flow through merge_quant</title>
+    <desc id="merge-desc">Temporary partner suffix Q, K, and V enter causal FA3 call A. Partner suffix Q and shared anchor K and V from the arena enter paged FA3 call B. The two partial attention results and their LSE values enter merge_attn_quant, which produces the final attention output for each suffix token and quantizes it for the output projection.</desc>
+    <defs>
+      <marker id="merge-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink)"></path>
+      </marker>
+    </defs>
+
+    <!-- Current suffix activations -->
+    <rect class="panel temp-panel" x="20" y="55" width="330" height="250" rx="6"></rect>
+    <text class="box-title" x="40" y="86">Temporary Q, K, and V</text>
+    <text class="box-copy" x="40" y="106">Current suffixes, one row per independent pair</text>
+
+    <text class="lane-label" x="40" y="155">suffix 1</text>
+    <g>
+      <rect class="token-cell p1" x="108" y="126" width="66" height="55" rx="3"></rect>
+      <text class="token-name" x="141" y="148" text-anchor="middle">p1,0</text>
+      <text class="token-values" x="141" y="166" text-anchor="middle">Q K V</text>
+      <rect class="token-cell p1" x="181" y="126" width="66" height="55" rx="3"></rect>
+      <text class="token-name" x="214" y="148" text-anchor="middle">p1,1</text>
+      <text class="token-values" x="214" y="166" text-anchor="middle">Q K V</text>
+      <rect class="token-cell p1" x="254" y="126" width="66" height="55" rx="3"></rect>
+      <text class="token-name" x="287" y="148" text-anchor="middle">question</text>
+      <text class="token-values" x="287" y="166" text-anchor="middle">Q K V</text>
+    </g>
+
+    <text class="lane-label" x="40" y="238">suffix 2</text>
+    <g>
+      <rect class="token-cell p2" x="108" y="209" width="66" height="55" rx="3"></rect>
+      <text class="token-name" x="141" y="231" text-anchor="middle">p2,0</text>
+      <text class="token-values" x="141" y="249" text-anchor="middle">Q K V</text>
+      <rect class="token-cell p2" x="181" y="209" width="66" height="55" rx="3"></rect>
+      <text class="token-name" x="214" y="231" text-anchor="middle">p2,1</text>
+      <text class="token-values" x="214" y="249" text-anchor="middle">Q K V</text>
+      <rect class="token-cell p2" x="254" y="209" width="66" height="55" rx="3"></rect>
+      <text class="token-name" x="287" y="231" text-anchor="middle">question</text>
+      <text class="token-values" x="287" y="249" text-anchor="middle">Q K V</text>
+    </g>
+
+    <!-- Shared anchor arena -->
+    <rect class="panel arena-panel" x="20" y="365" width="330" height="145" rx="6"></rect>
+    <text class="box-title" x="40" y="396">KV arena</text>
+    <text class="lane-label" x="40" y="423">Shared anchor pages</text>
+    <text class="lane-label" x="40" y="464">anchor</text>
+    <g>
+      <rect class="token-cell off" x="108" y="435" width="60" height="55" rx="3"></rect>
+      <text class="token-name" x="138" y="457" text-anchor="middle">a0</text>
+      <text class="token-values" x="138" y="475" text-anchor="middle">K V</text>
+      <rect class="token-cell off" x="175" y="435" width="60" height="55" rx="3"></rect>
+      <text class="token-name" x="205" y="457" text-anchor="middle">a1</text>
+      <text class="token-values" x="205" y="475" text-anchor="middle">K V</text>
+      <rect class="token-cell off" x="242" y="435" width="60" height="55" rx="3"></rect>
+      <text class="token-name" x="272" y="457" text-anchor="middle">a2</text>
+      <text class="token-values" x="272" y="475" text-anchor="middle">K V</text>
+      <text class="token-name" x="318" y="466">...</text>
+    </g>
+
+    <!-- Input routes -->
+    <path class="wire" d="M 350 180 H 470"></path>
+    <text class="wire-label" x="377" y="169">Q, K, V</text>
+    <path class="wire" d="M 350 255 H 406 V 390 H 470"></path>
+    <text class="wire-label" x="414" y="378">Q</text>
+    <path class="wire" d="M 350 462 H 470"></path>
+    <text class="wire-label" x="377" y="451">anchor K, V</text>
+
+    <!-- Call A -->
+    <rect class="panel kernel-panel" x="470" y="55" width="300" height="220" rx="6"></rect>
+    <text class="box-title" x="490" y="86">FA3 call A</text>
+    <text class="box-copy" x="490" y="106">Causal attention inside each suffix</text>
+    <text class="lane-label" x="544" y="137" text-anchor="middle">suffix 1</text>
+    <text class="lane-label" x="680" y="137" text-anchor="middle">suffix 2</text>
+
+    <g>
+      <rect class="cell p1" x="511" y="146" width="22" height="22"></rect>
+      <rect class="cell off" x="533" y="146" width="22" height="22"></rect>
+      <rect class="cell off" x="555" y="146" width="22" height="22"></rect>
+      <rect class="cell p1" x="511" y="168" width="22" height="22"></rect>
+      <rect class="cell p1" x="533" y="168" width="22" height="22"></rect>
+      <rect class="cell off" x="555" y="168" width="22" height="22"></rect>
+      <rect class="cell p1" x="511" y="190" width="22" height="22"></rect>
+      <rect class="cell p1" x="533" y="190" width="22" height="22"></rect>
+      <rect class="cell p1" x="555" y="190" width="22" height="22"></rect>
+    </g>
+    <g>
+      <rect class="cell p2" x="647" y="146" width="22" height="22"></rect>
+      <rect class="cell off" x="669" y="146" width="22" height="22"></rect>
+      <rect class="cell off" x="691" y="146" width="22" height="22"></rect>
+      <rect class="cell p2" x="647" y="168" width="22" height="22"></rect>
+      <rect class="cell p2" x="669" y="168" width="22" height="22"></rect>
+      <rect class="cell off" x="691" y="168" width="22" height="22"></rect>
+      <rect class="cell p2" x="647" y="190" width="22" height="22"></rect>
+      <rect class="cell p2" x="669" y="190" width="22" height="22"></rect>
+      <rect class="cell p2" x="691" y="190" width="22" height="22"></rect>
+    </g>
+    <text class="box-copy" x="620" y="237" text-anchor="middle">Lower triangle means each token reads earlier</text>
+    <text class="box-copy" x="620" y="253" text-anchor="middle">tokens from its own suffix, never another suffix</text>
+
+    <!-- Call B -->
+    <rect class="panel kernel-panel" x="470" y="320" width="300" height="220" rx="6"></rect>
+    <text class="box-title" x="490" y="351">FA3 call B</text>
+    <text class="box-copy" x="490" y="371">Every suffix Q reads the same paged anchor K and V</text>
+    <text class="lane-label" x="544" y="402" text-anchor="middle">suffix 1</text>
+    <text class="lane-label" x="680" y="402" text-anchor="middle">suffix 2</text>
+
+    <g>
+      <rect class="cell p1" x="511" y="411" width="22" height="22"></rect>
+      <rect class="cell p1" x="533" y="411" width="22" height="22"></rect>
+      <rect class="cell p1" x="555" y="411" width="22" height="22"></rect>
+      <rect class="cell p1" x="511" y="433" width="22" height="22"></rect>
+      <rect class="cell p1" x="533" y="433" width="22" height="22"></rect>
+      <rect class="cell p1" x="555" y="433" width="22" height="22"></rect>
+      <rect class="cell p1" x="511" y="455" width="22" height="22"></rect>
+      <rect class="cell p1" x="533" y="455" width="22" height="22"></rect>
+      <rect class="cell p1" x="555" y="455" width="22" height="22"></rect>
+    </g>
+    <g>
+      <rect class="cell p2" x="647" y="411" width="22" height="22"></rect>
+      <rect class="cell p2" x="669" y="411" width="22" height="22"></rect>
+      <rect class="cell p2" x="691" y="411" width="22" height="22"></rect>
+      <rect class="cell p2" x="647" y="433" width="22" height="22"></rect>
+      <rect class="cell p2" x="669" y="433" width="22" height="22"></rect>
+      <rect class="cell p2" x="691" y="433" width="22" height="22"></rect>
+      <rect class="cell p2" x="647" y="455" width="22" height="22"></rect>
+      <rect class="cell p2" x="669" y="455" width="22" height="22"></rect>
+      <rect class="cell p2" x="691" y="455" width="22" height="22"></rect>
+    </g>
+    <text class="box-copy" x="620" y="502" text-anchor="middle">Full rectangle means every suffix token reads</text>
+    <text class="box-copy" x="620" y="518" text-anchor="middle">every anchor token, with no partner-to-partner reads</text>
+
+    <!-- Partial attention states -->
+    <path class="wire" d="M 770 165 H 835"></path>
+    <rect class="panel state-panel" x="835" y="117" width="170" height="96" rx="6"></rect>
+    <text class="state-copy" x="920" y="144" text-anchor="middle">own suffix partial result</text>
+    <text class="state-main" x="920" y="172" text-anchor="middle">output A + LSE A</text>
+    <text class="state-copy" x="920" y="194" text-anchor="middle">one row per suffix token</text>
+
+    <path class="wire" d="M 770 428 H 835"></path>
+    <rect class="panel state-panel" x="835" y="380" width="170" height="96" rx="6"></rect>
+    <text class="state-copy" x="920" y="407" text-anchor="middle">anchor partial result</text>
+    <text class="state-main" x="920" y="435" text-anchor="middle">output B + LSE B</text>
+    <text class="state-copy" x="920" y="457" text-anchor="middle">one row per suffix token</text>
+
+    <!-- Merge and output -->
+    <path class="wire" d="M 1005 165 H 1038 V 265 H 1070"></path>
+    <path class="wire" d="M 1005 428 H 1038 V 335 H 1070"></path>
+    <rect class="panel merge-panel" x="1070" y="220" width="230" height="160" rx="6"></rect>
+    <text class="box-title" x="1185" y="253" text-anchor="middle">merge_attn_quant</text>
+    <text class="box-copy" x="1185" y="278" text-anchor="middle">Use both LSE values to weight</text>
+    <text class="box-copy" x="1185" y="296" text-anchor="middle">and add both partial results</text>
+    <text class="state-main" x="1185" y="329" text-anchor="middle">Final attention output</text>
+    <text class="box-copy" x="1185" y="349" text-anchor="middle">for every suffix token</text>
+    <text class="box-copy" x="1185" y="367" text-anchor="middle">Quantize the rows to FP8</text>
+
+    <path class="wire" d="M 1300 300 H 1350"></path>
+    <rect class="panel state-panel" x="1350" y="250" width="125" height="100" rx="6"></rect>
+    <text class="state-main" x="1412" y="279" text-anchor="middle">FP8</text>
+    <text class="state-copy" x="1412" y="302" text-anchor="middle">attention rows</text>
+    <text class="state-copy" x="1412" y="320" text-anchor="middle">input to</text>
+    <text class="state-main" x="1412" y="340" text-anchor="middle">o_proj</text>
+  </svg>
+
+  <div class="diagram-source">
+    The merge diagram follows FlashInfer's
+    <a href="https://flashinfer.ai/2024/02/02/cascade-inference.html">cascade inference flow</a>
+    and <a href="https://docs.flashinfer.ai/tutorials/recursive_attention.html">attention state merge</a>.
+    The packed unified diagram shows Quail's FA3 page-table layout.
+  </div>
+</section>
+
+<div class="footer">
+  Design and measurements: quail/reports/2026-08-21-attention-paths.md and quail/reports/2026-08-24-packed-unified-joins.md.
+  Kernel sequences verified against vLLM 0.26.0 source (model_executor/models/qwen3.py: qkv_proj &rarr; split &rarr; per-head q_norm/k_norm
+  &rarr; rotary_emb &rarr; attn &rarr; o_proj; models/qwen2.py: gate_up_proj &rarr; silu_and_mul &rarr; down_proj; layers/layernorm.py:
+  rms_norm / fused_add_rms_norm; layers/quantization/fp8.py + kernels/linear/scaled_mm/deep_gemm.py: dynamic per-token-group
+  activation quant + fp8_gemm_nt) and quail/executor/attention.py (Pipeline.forward_chunk, attention_unified, attention_merge_quant).
+  Chip numbers are per-layer kernel-launch order.
+</div>
+
+</body>
+</html>

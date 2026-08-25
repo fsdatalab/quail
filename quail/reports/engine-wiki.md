@@ -598,7 +598,7 @@ is the anchor document's tokens (present only if this is the first
 time the anchor is packed). The suffixes are the partner documents
 (for joins) or the question texts (for filters).
 
-The Pipeline has three attention implementations, selected per
+The Pipeline has two attention implementations, selected per
 workload by `attention_mode` (issue #24):
 
 - **`unified`** - one causal FlashAttention-3 paged call per layer.
@@ -606,9 +606,12 @@ workload by `attention_mode` (issue #24):
   arena pages first (the arena reserves capacity pages for the
   suffix beyond the document's logical length), then a single
   `causal=True` call with a block table covers retained plus current
-  KV. No second call, no merge. Requires exactly one suffix per
-  paged group, which the filter shape always satisfies. A chunk
-  whose groups own no pages at all (the single-stage fast path,
+  KV. No second call, no merge. A filter has one suffix per paged
+  group. A join can put several suffixes from the same anchor in one
+  batch. Each suffix is a separate causal sequence. Complete anchor
+  pages are shared. Each suffix gets temporary pages for the anchor's
+  last partial page and its own K and V. A chunk whose groups own no
+  pages at all (the single-stage fast path,
   section 5.6) runs one plain varlen causal call instead - same
   math, no scatter, no paged read; a chunk cannot mix paged and
   unpaged groups.
@@ -616,39 +619,30 @@ workload by `attention_mode` (issue #24):
   and the FP8 quantization for o_proj fused into one Triton kernel
   (`merge_attn_quant`), skipping the intermediate BF16 tensor.
 
-These two are the only modes the engine ships. The retired third
-path, **`split`** (the two-call pattern with the merge as ~9 PyTorch
-kernels and a separate FP8 quantization), lives in
-`ablations/split_reference.py`: it is the readable reference the
-fused merge kernel is checked against, and comparison cells install
-it through the pipeline's `attention_override` hook. Its gather
-fallback (contiguous KV copies instead of paged reads) was removed
-with it - the paged read path is validated by the parity cells
-(bit-identical to a contiguous causal call on every edge case)
-instead of by a runtime fallback.
+These two are the only attention modes. The parity cells validate the
+paged read path against a contiguous causal call on every edge case.
 
 The assignment, fixed in `attention.py` as `FILTER_ATTENTION =
 "unified"` and `JOIN_ATTENTION = "merge_quant"` and read by the
 worker:
 
 - **Filters run `unified`.** Fastest measured on the 10k-document
-  five-filter workload (8.45 us/token vs 8.68 merge_quant and 8.99
-  split on the TRUE/FALSE corpus; `results/attention_paths.json` -
-  where all three paths return identical, 100%-correct answers on
+  five-filter workload (8.45 us/token vs 8.68 merge_quant on the
+  TRUE/FALSE corpus; `results/attention_paths.json` - where both paths
+  return identical, 100%-correct answers on
   all 40,052 planted-flag questions), and bit-identical to a
   contiguous causal FlashAttention call
   (`results/attention_parity.json`, max_abs 0.0), so filter answers
   match full-prompt recompute exactly
   (`results/attention_end_to_end_parity.json`).
-- **Joins run `merge_quant`.** The unified path cannot share one
-  anchor's KV across the many partner suffixes of a chunk - each
-  pair needs its own causal view, so one causal call per pair would
-  read other pairs' scattered KV. Forcing correctness (one partner
-  per anchor per chunk) re-reads the anchor's KV once per pair and
-  is several-fold slower (`results/join_attention_paths_*.json`).
-  Between the two two-call modes, the fused merge wins (11.28 vs
-  11.86 us/token at 10x256).
-- **Every path is validated against stock vLLM on real queries**
+- **Joins run `merge_quant`.** Packed unified joins are correct and
+  can put every partner in the same forward pass. Each partner has a
+  separate page-table row made from shared anchor pages and private
+  suffix pages. On the 10 x 256 confirming run, packed unified took
+  11.88 microseconds per fresh token. `merge_quant` took 11.04
+  microseconds per fresh token, so packed unified was 7.6% slower
+  (`results/packed_unified_join.json`).
+- **Both paths are validated against stock vLLM on real queries**
   (`results/accuracy_vs_stock.json`): identical token streams
   answered by standard vLLM serving and by the packed executor.
   Planted-flag accuracy is 100% for every path; disagreements with
@@ -657,14 +651,13 @@ worker:
   a corpus median margin of 3.25); on joins, zero disagreements at
   decisive margins. The residual is the kernel stack (fp8 GEMMs,
   fused norms), not the attention path.
-- **The assignment holds on both in-scope models.** The same battery
-  on Qwen3 32B fp8 (`results/*_32b.json`, `results/*_64h.json`):
-  unified 59.94 us/token vs merge_quant 60.35 and split 61.60 on the
-  10k filter workload with identical answers across paths;
-  merge_quant ahead 4-5% on every join shape; kernel parity
-  bit-identical at 64 query heads; all paths exact against full
+- **The existing assignment also holds on Qwen3 32B fp8.** The
+  earlier battery (`results/*_32b.json`, `results/*_64h.json`):
+  unified 59.94 us/token vs merge_quant 60.35 on the 10k filter
+  workload with identical answers; kernel parity is bit-identical at
+  64 query heads; both paths are exact against full
   recompute; ~99% planted-key join accuracy for stock and Quail
-  alike.
+  alike. Packed unified joins have not yet been measured on 32B.
 - **FlashInfer (0.6.14, in the image) was evaluated and not
   adopted**: its paged causal kernel is 27% slower than the FA3
   unified call on the fresh filter chunk (2.4x on the cached
@@ -674,8 +667,8 @@ worker:
   came within the 5% adoption threshold
   (`results/flashinfer_tuned.json`).
 
-The two-call pattern (`merge_quant`; the retired `split` reference
-runs the same two calls) runs per layer as follows (`attention.py`):
+The `merge_quant` two-call pattern runs per layer as follows
+(`attention.py`):
 
 **Call A** (self-attention): causal attention over the segment
 boundaries. Each prefix attends to itself; each suffix attends to

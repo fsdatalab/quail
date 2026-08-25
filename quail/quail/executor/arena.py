@@ -4,13 +4,32 @@ One preallocated buffer per layer, sized to the admission budget,
 divided into fixed 16-token pages with a free list. A resident
 document owns a list of pages; the pages return to the free list the
 instant the document fails a stage or answers its last one. The paged
-attention kernels read this layout natively (block tables), so there
-are no copies and no compaction - and since admission never lets
-page-rounded resident tokens exceed the arena, allocation cannot fail.
+attention kernels read this layout natively through block tables, so
+there is no compaction. Admission makes persistent document claims fit.
+Packed unified joins also make short-lived claims while packing a
+chunk, so an oversized chunk can still need to be split.
 
 PageArena is the accounting (pure Python, CPU-tested); KVArena is the
 tensor backing and runs only where torch and a GPU exist.
 """
+
+
+def private_suffix_layout(anchor_pages, temporary_pages, kept_tokens,
+                          suffix_tokens, page_tokens):
+    """Build one suffix's page row and return its copied row count."""
+    full_pages, copied_rows = divmod(kept_tokens, page_tokens)
+    anchor_pages_needed = full_pages + bool(copied_rows)
+    if len(anchor_pages) < anchor_pages_needed:
+        raise ValueError(
+            f"anchor needs {anchor_pages_needed} pages, got "
+            f"{len(anchor_pages)}")
+    temporary_tokens = copied_rows + suffix_tokens
+    needed = -(-temporary_tokens // page_tokens)
+    if len(temporary_pages) != needed:
+        raise ValueError(
+            f"suffix needs {needed} temporary pages, got "
+            f"{len(temporary_pages)}")
+    return anchor_pages[:full_pages] + temporary_pages, copied_rows
 
 
 class PageArena:
@@ -112,6 +131,11 @@ class KVArena:
         self._rows[key] = cap[:tokens]
         return pages
 
+    def alloc_temporary(self, tokens: int):
+        key = object()
+        pages = self.alloc(key, tokens)
+        return None if pages is None else (key, pages)
+
     def free_key(self, key):
         self._rows.pop(key)
         self._capacity_rows.pop(key)
@@ -140,8 +164,17 @@ class KVArena:
         Built flat on the host and staged through pinned memory: the
         old per-key loop issued one tiny pageable H2D copy per key,
         which blocked the CPU behind the running chunk."""
-        torch = self.torch
         pages = [self.accounting.owned[k] for k in keys]
+        table = self.block_table_rows(pages, pad_to=pad_to)
+        torch = self.torch
+        used = torch.tensor([self.accounting.tokens[k] for k in keys],
+                            dtype=torch.int32, pin_memory=True) \
+            .to(self.device, non_blocking=True)
+        return table, used
+
+    def block_table_rows(self, pages, pad_to=None):
+        """A block table from explicit physical page rows."""
+        torch = self.torch
         width = max(len(p) for p in pages)
         if pad_to:
             width = max(width, pad_to)
@@ -150,9 +183,6 @@ class KVArena:
             flat.extend(p)
             flat.extend([0] * (width - len(p)))
         table = torch.tensor(flat, dtype=torch.int32,
-                             pin_memory=True).view(len(keys), width) \
+                             pin_memory=True).view(len(pages), width) \
             .to(self.device, non_blocking=True)
-        used = torch.tensor([self.accounting.tokens[k] for k in keys],
-                            dtype=torch.int32, pin_memory=True) \
-            .to(self.device, non_blocking=True)
-        return table, used
+        return table
