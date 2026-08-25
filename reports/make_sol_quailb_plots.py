@@ -60,11 +60,11 @@ def plot_sol_per_query():
 # put its label. The three middle clusters are ~20pt apart on a log
 # axis, so their labels sit at staggered heights to clear each other.
 CONTEXTS = {
-    11.4: ("FEVER claims", 6.0),
-    233.1: ("LePaRD excerpts", 11.0),
-    298.8: ("IMDB reviews", 18.0),
-    370.2: ("FEVER evidence", 25.0),
-    4146.0: ("BioDEX reports", 44.0),
+    11.4: ("FEVER", 6.0),
+    233.1: ("LePaRD", 11.0),
+    298.8: ("IMDB", 18.0),
+    370.2: ("FEVER", 25.0),
+    4146.0: ("BioDEX", 44.0),
 }
 
 
