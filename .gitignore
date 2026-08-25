@@ -9,6 +9,7 @@ logs/
 results/logs/
 # teed run logs are local artifacts; the result JSONs carry the numbers
 results/*.log
+results/**/*.log
 
 # generated benchmark corpora are rebuilt from seeds, never versioned
 results/quailb_data/
