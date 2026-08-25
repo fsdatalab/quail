@@ -290,6 +290,138 @@ def test_store_payload_and_warm_tracking(sess):
     assert scan["access"] == "restore"
 
 
+def _restore_session(tmp_path, name, doc_word_counts):
+    """A one-table session whose "reviews" documents have exactly the
+    given word counts (fake_tok splits on whitespace, so word count
+    == token count) - for tests that need to control document length
+    precisely, to distinguish "discounted by id" from "discounted by
+    length" restore accounting."""
+    s = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
+    s.register("reviews", quail.DocumentProvider.from_parquet(
+        _parquet(tmp_path / f"{name}.parquet", {
+            "id": [f"r{i}" for i in range(len(doc_word_counts))],
+            "review": [" ".join(f"w{i}_{j}" for j in range(n))
+                      for i, n in enumerate(doc_word_counts)],
+        }), id_col="id"))
+    return s
+
+
+RESTORE_SQL = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
+              "PROMPT('q1: {0}', r.review), {'selectivity': 0.5})")
+
+
+def test_restore_accounting_uses_exact_ids_not_largest_first(tmp_path):
+    """Adversarial-review regression (2026-08-26): the restore
+    correction used to guess "largest documents first" from only a
+    restored-token COUNT. That guess is wrong whenever the actually
+    restored documents aren't the longest ones in this query's own
+    batch (the store admits by a length threshold recomputed per
+    query - planner/decide.py - so a short document stored under an
+    earlier, lower threshold can be restored here while a long,
+    never-before-seen document in this same query has to be built
+    fresh). A fresh adversarial review reproduced sol_s collapsing
+    85% from what should have been a 9.5%-of-tokens restore this way.
+
+    One 5-document corpus (doc 0 long, docs 1-4 short), two runs that
+    only differ in WHICH ids the store reports as restored. If the
+    fix works, telling it "0 was restored" must discount far more
+    than telling it "1-4 were restored" - if it were still guessing
+    by length regardless of the ids given, both runs would discount
+    the same (largest) document and come out identical."""
+    truth = {"r": {"q1:": [1, 1, 1, 1, 1]}}
+    counts = [2000, 5, 5, 5, 5]
+    sess = _restore_session(tmp_path, "mixed", counts)
+
+    def restore(ids):
+        def _exec(payload):
+            out = make_executor(truth)(payload)
+            out["store"] = {"r": dict(restored_docs=len(ids),
+                                      restored_tokens=sum(counts[i]
+                                                          for i in ids),
+                                      restored_ids=list(ids))}
+            return out
+        return _exec
+
+    short_restored = sess.sql(RESTORE_SQL).run(_execute=restore([1, 2, 3, 4]))
+    long_restored = sess.sql(RESTORE_SQL).run(_execute=restore([0]))
+
+    ca_short_restored = (
+        short_restored.report["sol_breakdown"]["causal_attention"])
+    ca_long_restored = (
+        long_restored.report["sol_breakdown"]["causal_attention"])
+    # discounting the long document (id 0) must leave a cheaper
+    # remaining workload than discounting the four short ones - the
+    # old length-guessing code would strip document 0 in EITHER case
+    # and produce the same number for both.
+    assert ca_long_restored < ca_short_restored
+    assert not any("inconsistent" in r
+                  for r in short_restored.report["remarks"])
+    assert not any("inconsistent" in r
+                  for r in long_restored.report["remarks"])
+
+
+def test_restore_accounting_falls_back_to_guess_without_ids(tmp_path):
+    """A store stats dict with restored_tokens but no restored_ids
+    key (a caller that predates this fix, or a test double) still
+    gets a length-based guess rather than being ignored - but now
+    flagged as a guess in report["remarks"] instead of presented as
+    exact."""
+    truth = {"r": {"q1:": [1, 1, 1, 1, 1]}}
+    counts = [2000, 5, 5, 5, 5]
+    sess = _restore_session(tmp_path, "fallback", counts)
+
+    def with_store(payload):
+        out = make_executor(truth)(payload)
+        # deliberately small - the old guess pops the longest entry
+        # regardless of how small restored_tokens is, since one pop
+        # already exceeds it.
+        out["store"] = {"r": dict(restored_docs=1, restored_tokens=5)}
+        return out
+
+    res = sess.sql(RESTORE_SQL).run(_execute=with_store)
+    assert any("no restored document identities" in r
+              for r in res.report["remarks"])
+
+    long_restored = sess.sql(RESTORE_SQL).run(_execute=(
+        lambda payload: {**make_executor(truth)(payload),
+                         "store": {"r": dict(restored_docs=1,
+                                             restored_tokens=5,
+                                             restored_ids=[0])}}))
+    # the guess (pop the longest entry) landed on the same document
+    # the exact-id path would have picked given id 0 explicitly.
+    assert (res.report["sol_breakdown"]["causal_attention"]
+            == pytest.approx(
+                long_restored.report["sol_breakdown"]["causal_attention"]))
+
+
+def test_restore_accounting_flags_unknown_restored_id(tmp_path):
+    """restored_ids naming a document this walk never charged as a
+    causal-build candidate (the walk's bookkeeping and the store's
+    telemetry disagree about that alias) degrades safely - nothing is
+    removed for the unmatched id - and surfaces as a remark instead of
+    silently vanishing."""
+    truth = {"r": {"q1:": [1, 1, 1, 1, 1]}}
+    counts = [2000, 5, 5, 5, 5]
+    sess = _restore_session(tmp_path, "mismatch", counts)
+
+    baseline = sess.sql(RESTORE_SQL).run(_execute=make_executor(truth))
+
+    def with_store(payload):
+        out = make_executor(truth)(payload)
+        out["store"] = {"r": dict(restored_docs=1, restored_tokens=5,
+                                  restored_ids=[999])}
+        return out
+
+    res = sess.sql(RESTORE_SQL).run(_execute=with_store)
+    remarks = res.report["remarks"]
+    assert any("999" in r and "not found" in r for r in remarks)
+    # nothing matched, so nothing was discounted - same cost as no
+    # restore at all.
+    assert (res.report["sol_breakdown"]["causal_attention"]
+            == pytest.approx(
+                baseline.report["sol_breakdown"]["causal_attention"]))
+
+
 def test_store_disabled_when_no_cpu_memory(tmp_path):
     import quail
     from quail.planner.plan import EngineConfig

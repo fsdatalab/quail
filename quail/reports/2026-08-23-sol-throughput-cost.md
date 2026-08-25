@@ -854,3 +854,79 @@ compute knee, the causal-attention crossover, the two-regime scaling)
 are still covered in section 17's text and enforced by the property
 tests; only the standalone pictures are gone. No test depended on the
 removed script. 247 tests pass, unchanged.
+
+## 23. A third adversarial review: two real bugs, one of them the restore heuristic's last gap (2026-08-26)
+
+A third fresh review agent - same method as sections 12 and 16, not
+primed with this document's reasoning, asked to try to break the
+implementation rather than confirm it - found two real bugs beyond
+the `tokens_per_s_sol` cross-pass bug already fixed in section 20's
+addendum.
+
+**Bug 1 - a real zero read as "missing"**: `sol_report.py`'s
+`docs_per_s_sol`/`tokens_per_s_sol` guarded with `if docs and sol_s`,
+and `_sol_cost()` with `if not sol_s` - truthiness, not a `None`
+check. `0` is a real answer for a numerator (a query touching 0
+documents, or `sol_s`'s own designed `0.0` for an empty workload -
+section 17's `chunk == 0` short-circuit, covered by a property test),
+not "no data." Only `sol_s`, the divisor, needed the guard. Fixed;
+verified both paths directly (`docs=0, sol_s=0.2` now reports `0.0`
+rather than `None`; `_sol_cost(0.0, ...)` now returns `0.0`).
+
+**Bug 2 - the restore-correction heuristic's remaining gap**: section
+12 already flagged one edge case in the largest-first restore guess
+(Section 11) as low-severity and "not reachable." This review found a
+sharper, reachable one: the guess assumes restored documents are the
+longest ones in the current query's own batch, but the store's length
+threshold (`store_min_doc_tokens`) is recomputed per query
+(`planner/decide.py`), not fixed - a short document stored under an
+earlier query's lower threshold can be restored here while a long,
+never-before-seen document in this same query still has to be built
+fresh. The review reproduced it directly: 5 documents (one ~2,000
+tokens, four ~50 tokens), simulating that the four small ones were
+restored (`restored_tokens=210`). The old code removed the one large
+document instead (because it's largest), and `sol_s` collapsed 85% -
+far more than a 9.5%-of-tokens restore should ever discount, with no
+remark, since the old code only checked "did we remove enough total
+tokens," never "did we remove the right ones." Because the error only
+ever makes `sol_s` too *small*, it doesn't risk a false
+`SolViolation` (that only fires when `sol_s` is too large) - it just
+silently understates `sol_efficiency` and misprices the SOL-derived
+cost/throughput columns.
+
+The real fix, not another guess: `executor/loop.py`'s `run_filter`/
+`run_join` already compute the exact restored set (`restored = {a for
+a in range(n) if skey(a) in store}`) to produce the aggregate
+`restored_tokens` count - the identity was there, just thrown away.
+Both functions now also report `restored_ids` (the exact global
+document ids restored, mapped through `store_ids` the same way
+`skey()` already does). `runtime/session.py`'s causal-build buckets
+now carry `(doc_id, length)` pairs instead of bare lengths, and the
+restore-correction step removes exactly the ids the store reports,
+falling back to the old length-guess (now explicitly flagged as a
+guess in `report["remarks"]`) only when a caller reports
+`restored_tokens` with no `restored_ids` at all. A mismatched id
+(reported restored but not found among the walk's own candidates)
+still degrades safely and still surfaces as a remark - the same
+principle section 12's low-severity fix already established, now
+applied to the common case, not just the overflow case.
+
+Two merge sites in `runtime/worker.py` and one in `runtime/
+coordinator.py` aggregate per-shard/per-stage store stats with a
+plain `agg[key] = agg.get(key, 0) + v` - fine for counts, but `0 +
+list` raises for the new `restored_ids` field, and a plain `+` would
+duplicate an id two stages both restored. Pulled into one shared
+`coordinator.merge_store_stats()` (the coordinator is already "pure
+dict-and-list logic, CPU-tested," per its own module docstring) that
+unions `restored_ids` and adds everything else, used by all three
+call sites - `runtime/worker.py`'s single-GPU join stats, its
+multi-GPU child, and its multi-GPU round merge.
+
+5 new tests: three end-to-end through `runtime/session.py` (exact-id
+removal distinguishes which document was actually discounted rather
+than always stripping the largest; the no-`restored_ids` fallback
+lands on the same document the exact path would have picked, cross-
+checked against it directly; an unmatched id surfaces its remark and
+discounts nothing), plus two direct tests of `coordinator.
+merge_store_stats`/`merge_filter_round` unioning `restored_ids`
+instead of raising. 252 tests pass (247 + 5).

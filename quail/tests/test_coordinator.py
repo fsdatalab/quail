@@ -9,6 +9,7 @@ from quail.runtime.coordinator import (derive_plan_nodes,
                                        join_group_payloads,
                                        merge_filter_round,
                                        merge_join_round,
+                                       merge_store_stats,
                                        stage_for_anchor,
                                        thin_survivors)
 
@@ -58,6 +59,38 @@ def test_merge_filter_round():
     assert m["survivors"]["r"] == [0, 1, 3, 4]
     assert m["fresh_tokens"] == 150
     assert m["store"]["r"]["stored_docs"] == 6
+
+
+def test_merge_store_stats_sums_counts_unions_restored_ids():
+    """restored_ids (issue #26 follow-up, 2026-08-26: exact restored
+    document identity, not just a count) is a list, not a count - a
+    plain `+` (0 + list) raises, and would duplicate an id two shards
+    both restored anyway, so it unions instead."""
+    agg = {}
+    merge_store_stats(agg, dict(restored_docs=2, restored_tokens=30,
+                                restored_ids=[1, 2], stored_docs=0))
+    merge_store_stats(agg, dict(restored_docs=1, restored_tokens=10,
+                                restored_ids=[2, 3], stored_docs=1))
+    assert agg == dict(restored_docs=3, restored_tokens=40,
+                       restored_ids=[1, 2, 3], stored_docs=1)
+
+
+def test_merge_filter_round_unions_restored_ids_across_shards():
+    outs = [
+        dict(filters={"r": {0: [1]}}, survivors={"r": [0]},
+             fresh_tokens=10,
+             store={"r": dict(restored_docs=1, restored_tokens=5,
+                             restored_ids=[0])},
+             boot_s=0.0, wall_s=1.0, peak_gib=1),
+        dict(filters={"r": {1: [1]}}, survivors={"r": [1]},
+             fresh_tokens=10,
+             store={"r": dict(restored_docs=1, restored_tokens=5,
+                             restored_ids=[1])},
+             boot_s=0.0, wall_s=1.0, peak_gib=1),
+    ]
+    m = merge_filter_round(outs)
+    assert m["store"]["r"]["restored_ids"] == [0, 1]
+    assert m["store"]["r"]["restored_tokens"] == 10
 
 
 def test_join_group_anchors_follow_filter_shards():

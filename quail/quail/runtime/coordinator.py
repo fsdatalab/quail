@@ -72,6 +72,20 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
     return subs
 
 
+def merge_store_stats(agg: dict, updates: dict) -> None:
+    """Fold one shard/stage's loop.py store stats into a running
+    per-alias total, in place. Every key is a count except
+    restored_ids (the exact document ids restored, not just how many
+    - issue #26 follow-up, 2026-08-26): `0 + list` raises, and a
+    plain `+` would duplicate an id two shards both restored, so that
+    one key unions instead of adding."""
+    for key, v in updates.items():
+        if key == "restored_ids":
+            agg[key] = sorted(set(agg.get(key, [])) | set(v))
+        else:
+            agg[key] = agg.get(key, 0) + v
+
+
 def merge_filter_round(outs: list, limit: int | None = None) -> dict:
     """Merge the workers' filter answers (global-keyed), survivors,
     token counts, and store stats. When limit is set, each alias's
@@ -87,9 +101,7 @@ def merge_filter_round(outs: list, limit: int | None = None) -> dict:
         for alias, surv in out["survivors"].items():
             survivors.setdefault(alias, []).extend(surv)
         for alias, st in (out.get("store") or {}).items():
-            agg = store.setdefault(alias, {})
-            for key, v in st.items():
-                agg[key] = agg.get(key, 0) + v
+            merge_store_stats(store.setdefault(alias, {}), st)
     merged = {a: sorted(v) for a, v in survivors.items()}
     if limit is not None:
         merged = {a: v[:limit] for a, v in merged.items()}

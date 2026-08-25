@@ -624,9 +624,13 @@ class Query:
                     bucket = causal_by_alias.setdefault(alias, [])
                     for d in evaluated:
                         if d not in resident:
-                            bucket.append(
-                                pre_len + self._doc_tokens[alias][d]
-                                + suffix_lens[0])
+                            # (doc_id, length): the restore-correction
+                            # step below needs the id, not just the
+                            # length, to discount exactly the
+                            # documents the store actually restored.
+                            bucket.append((
+                                d, pre_len + self._doc_tokens[alias][d]
+                                + suffix_lens[0]))
                     resident.update(evaluated)
                 else:
                     for d in evaluated:
@@ -664,8 +668,8 @@ class Query:
             bucket = causal_by_alias.setdefault(anchor, [])
             for gd in anchor_map:
                 if gd not in resident:
-                    bucket.append(
-                        pre_len + self._doc_tokens[anchor][gd])
+                    bucket.append((
+                        gd, pre_len + self._doc_tokens[anchor][gd]))
                 # the frame (this stage's naming line) is written
                 # into the anchor's kept KV fresh every stage,
                 # even when the anchor's own prefix isn't -
@@ -698,29 +702,71 @@ class Query:
         store_stats = out.get("store") or {}
         causal_doc_lengths = []
         sol_remarks = []
-        for alias, lengths in causal_by_alias.items():
-            restored = store_stats.get(alias, {}).get("restored_tokens", 0)
-            if restored:
-                lengths = sorted(lengths, reverse=True)
-                removed = 0
-                while lengths and removed < restored:
-                    removed += lengths.pop(0)
-                if removed < restored:
-                    # store_stats reports more restored tokens for
-                    # this alias than this walk ever charged as
+        for alias, entries in causal_by_alias.items():
+            stats = store_stats.get(alias, {})
+            restored_ids = stats.get("restored_ids")
+            restored_tokens = stats.get("restored_tokens", 0)
+            if restored_ids is not None:
+                # exact identity (issue #26 follow-up, 2026-08-26):
+                # discount precisely the documents loop.py's own
+                # restore set reports, instead of guessing by length.
+                # The earlier version guessed "largest first," on the
+                # assumption that only long documents ever get
+                # stored - wrong whenever a document was stored under
+                # an EARLIER query's lower length threshold
+                # (store_min_doc_tokens is recomputed per query, see
+                # planner/decide.py) and restored here even though it
+                # isn't among THIS query's own longest candidates. A
+                # fresh adversarial review reproduced sol_s collapsing
+                # 85% from what should have been a 9.5%-of-tokens
+                # restore this way.
+                remaining = set(restored_ids)
+                lengths = []
+                for doc_id, length in entries:
+                    if doc_id in remaining:
+                        remaining.discard(doc_id)
+                    else:
+                        lengths.append(length)
+                if remaining:
+                    # the store reports these ids as restored for this
+                    # alias, but the walk never charged them as
                     # causal-build candidates - the two are tracking
                     # different things somewhere. Degrades safely
-                    # (every candidate is already gone, sol_s can't
-                    # go any lower from this), but it means the SOL
-                    # walk and the engine's own restore telemetry
-                    # disagree, which is worth seeing rather than
-                    # silently absorbing (flagged by an adversarial
-                    # review, 2026-08-24).
+                    # (nothing further is removed for an id this walk
+                    # can't find, so sol_s can't go any lower from
+                    # this), but worth seeing rather than silently
+                    # absorbing.
                     sol_remarks.append(
-                        f"sol_s: {alias!r} reports {restored} "
-                        f"restored_tokens but the walk only charged "
-                        f"{removed} - restore accounting may be "
-                        f"inconsistent for this alias")
+                        f"sol_s: {alias!r} reports restored ids "
+                        f"{sorted(remaining)} not found among this "
+                        f"walk's causal-build candidates - restore "
+                        f"accounting may be inconsistent for this "
+                        f"alias")
+            elif restored_tokens:
+                # fallback for a caller reporting a restore count with
+                # no identities (a payload built before this fix, or
+                # a test double) - the old length-based guess,
+                # flagged as a guess since it can misattribute which
+                # documents were actually restored.
+                lengths = sorted((length for _, length in entries),
+                                 reverse=True)
+                removed = 0
+                while lengths and removed < restored_tokens:
+                    removed += lengths.pop(0)
+                sol_remarks.append(
+                    f"sol_s: {alias!r} reports {restored_tokens} "
+                    f"restored_tokens with no restored document "
+                    f"identities - discounted the longest documents "
+                    f"by total tokens as a guess, not an exact match")
+                if removed < restored_tokens:
+                    sol_remarks.append(
+                        f"sol_s: {alias!r} reports more "
+                        f"restored_tokens than this walk charged as "
+                        f"causal-build candidates - restore "
+                        f"accounting may be inconsistent for this "
+                        f"alias")
+            else:
+                lengths = [length for _, length in entries]
             causal_doc_lengths.extend(lengths)
         report["remarks"] = list(report["remarks"]) + sol_remarks
         from quail.planner.budgets import sol_seconds_breakdown

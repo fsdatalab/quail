@@ -357,7 +357,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     returned only after the copy lands. store_ids maps anchor list
     positions to stable store key ids (the anchor's global document
     index, the same key a filter scan of the same corpus uses).
-    stats, when given, is filled with restored/stored counts.
+    stats, when given, is filled with restored/stored counts and
+    restored_ids (the exact global ids restored, not just how many).
 
     Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
     partners, present only for anchors that reached stage j; spans =
@@ -369,7 +370,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     if n == 0 or k == 0:
         if stats is not None:
             stats.update(restored_docs=0, restored_tokens=0,
-                         stored_docs=0, stored_tokens=0)
+                         restored_ids=[], stored_docs=0, stored_tokens=0)
         return [dict() for _ in range(k)], [], 0
     group_size = n if group_size is None else group_size
     groups = [list(range(i, min(i + group_size, n)))
@@ -397,6 +398,14 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         stats.update(restored_docs=len(restored),
                      restored_tokens=sum(len(anchor_prefixes[a])
                                          for a in restored),
+                     # exact identity, not just a count - lets the SOL
+                     # walk (runtime/session.py) discount exactly the
+                     # documents that were actually restored instead
+                     # of guessing by length (issue #26 follow-up,
+                     # 2026-08-26).
+                     restored_ids=sorted(
+                         store_ids[a] if store_ids else a
+                         for a in restored),
                      stored_docs=0, stored_tokens=0)
 
     def plan_stage(members, j):
@@ -689,9 +698,10 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     document leaving its last stage is copied out on the side stream
     when it is at least store_min_tokens long, its pages returned
     only after the copy lands. stats, when given, is filled with
-    restored/stored counts. store_ids maps local document positions
-    to stable store key ids (a sharded worker keys by global index,
-    so its store slice survives across queries).
+    restored/stored counts and restored_ids (the exact global ids
+    restored, not just how many). store_ids maps local document
+    positions to stable store key ids (a sharded worker keys by
+    global index, so its store slice survives across queries).
 
     timing: optional dict; when given, CPU seconds per loop phase
     (next_chunk, alloc, pack and its sub-phases, forward launch,
@@ -760,6 +770,11 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         stats.update(restored_docs=len(restored),
                      restored_tokens=sum(len(doc_ids[d])
                                          for d in restored),
+                     # exact identity, not just a count - see the same
+                     # field in run_join above.
+                     restored_ids=sorted(
+                         store_ids[d] if store_ids else d
+                         for d in restored),
                      stored_docs=0, stored_tokens=0)
 
     def to_spec(doc, stage, fresh):

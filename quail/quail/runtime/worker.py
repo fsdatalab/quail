@@ -173,7 +173,8 @@ def _execute_single(state, payload: dict) -> dict:
     from quail.planner.decide import pick_runtime_anchor
     from quail.runtime.coordinator import (derive_plan_nodes,
                                            filter_round_limit,
-                                           gate_group, stage_for_anchor,
+                                           gate_group, merge_store_stats,
+                                           stage_for_anchor,
                                            thin_survivors)
 
     torch = state["torch"]
@@ -284,9 +285,8 @@ def _execute_single(state, payload: dict) -> dict:
                 store_ids=anchors_glob,
                 stats=jstats)
             if store_cfg:
-                agg = store_stats.setdefault(anchor_alias, {})
-                for key, v in jstats.items():
-                    agg[key] = agg.get(key, 0) + v
+                merge_store_stats(
+                    store_stats.setdefault(anchor_alias, {}), jstats)
             total_tokens += tokens
             for si, j in enumerate(group):
                 stage_out = dict(
@@ -488,6 +488,7 @@ def _child_joins(state, sub):
 
     from quail.executor.attention import JOIN_ATTENTION
     from quail.executor.loop import run_join
+    from quail.runtime.coordinator import merge_store_stats
 
     _child_boot(state, sub)
     torch = state["torch"]
@@ -536,9 +537,8 @@ def _child_joins(state, sub):
             store_ids=anchors_glob,
             stats=jstats)
         if store_cfg:
-            agg = store_stats.setdefault(anchor_alias, {})
-            for key, v in jstats.items():
-                agg[key] = agg.get(key, 0) + v
+            merge_store_stats(
+                store_stats.setdefault(anchor_alias, {}), jstats)
         tokens_total += tokens
         for si, j in enumerate(group):
             out_joins.append(dict(
@@ -630,9 +630,8 @@ def _execute_multi(payload: dict) -> dict:
         merged["fresh_tokens"] += sum(o["fresh_tokens"] for o in jouts)
         for o in jouts:
             for alias, st in (o.get("store") or {}).items():
-                agg = merged["store"].setdefault(alias, {})
-                for key, v in st.items():
-                    agg[key] = agg.get(key, 0) + v
+                coordinator.merge_store_stats(
+                    merged["store"].setdefault(alias, {}), st)
         for stage_out, j in zip(stage_outs, group):
             stage_out["anchor"] = anchor
             stage_out["partners"] = list(j["partners"])
