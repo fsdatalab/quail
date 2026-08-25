@@ -114,11 +114,16 @@ def build_rows(suite: dict) -> list[dict]:
             tokens_per_s_warm=warm.get("tokens_per_s") if warm_ok else None,
             cost_cold=cold.get("cost_dollars") if cold_ok else None,
             cost_warm=warm.get("cost_dollars") if warm_ok else None,
+            # `docs`/`sol_tokens` are numerators here - 0 is a real
+            # answer (a query that touched no documents, or sol_s's
+            # own 0.0-for-an-empty-workload case), not "missing," so
+            # only sol_s (the divisor) gets a None/0 guard.
             docs_per_s_sol=(
-                round(docs / sol_s, 1) if docs and sol_s else None),
+                round(docs / sol_s, 1)
+                if docs is not None and sol_s else None),
             tokens_per_s_sol=(
                 round(sol_tokens / sol_s)
-                if sol_tokens and sol_s else None),
+                if sol_tokens is not None and sol_s else None),
             cost_sol=_sol_cost(sol_s, gpus, cpu_memory_gb),
         ))
     return rows
@@ -129,8 +134,14 @@ def _sol_cost(sol_s, gpus, cpu_memory_gb):
     speed (sol_s): the same gpu-seconds + memory-GiB-seconds
     arithmetic quailb._cost_dollars uses for the measured cost, with
     wall_s replaced by sol_s and boot_s=0 (boot is fixed setup time,
-    not part of the compute estimate)."""
-    if not sol_s:
+    not part of the compute estimate).
+
+    sol_s only ever multiplies here (no division), so sol_s == 0.0 -
+    a real, designed value for an empty workload, see budgets.py's
+    chunk == 0 short-circuits - correctly produces cost_sol == 0.0.
+    Only sol_s being missing entirely (None) means there's nothing to
+    compute."""
+    if sol_s is None:
         return None
     from quail.bench.quailb import _cost_dollars, _modal_rates
     return _cost_dollars(sol_s, 0.0, gpus, cpu_memory_gb, _modal_rates())
