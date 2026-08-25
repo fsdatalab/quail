@@ -225,7 +225,7 @@
           "sol_s": 1.1353,
           "sol_efficiency": 0.617,
           "tokens_per_s": 112434,
-          "docs_per_s": 85.3,
+          "docs_per_s": 31.0,
           "cost_dollars": 0.002345
         }
       ],
@@ -493,7 +493,7 @@
           "sol_s": 1.0559,
           "sol_efficiency": 0.5253,
           "tokens_per_s": 96143,
-          "docs_per_s": 78.1,
+          "docs_per_s": 28.4,
           "cost_dollars": 0.002562
         }
       ],

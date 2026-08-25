@@ -698,3 +698,82 @@ needed). Much tighter than docs/s across queries, because tokens/s
 is closer to a hardware property (roughly how fast the GPU forwards
 tokens) while docs/s also depends on how many tokens each query's
 documents happen to contain.
+
+## 20. Docs/s, tokens/s, and cost against the SOL number, not just wall time (2026-08-25)
+
+Section 6 reports `sol_s` and efficiency against wall time, but
+docs/s, tokens/s, and cost were still only ever the measured (warm)
+numbers - nothing in the report said what those three would be if the
+same workload ran at the floor. `sol_report.build_rows()` now adds
+three fields: `docs_per_s_sol_ceiling`, `tokens_per_s_sol_ceiling`,
+`cost_sol_floor`.
+
+**Floor or ceiling depends on which side of a division the number is
+on.** `sol_s` is a floor on time - nothing runs faster. Cost is
+`time x rate`, same direction, so `cost_sol_floor` is a floor too -
+nothing costs less. Throughput is `count / time` - a rate, the
+reciprocal of time - so the floor on time is a **ceiling** on rate:
+`docs_per_s_sol_ceiling` and `tokens_per_s_sol_ceiling` are the
+highest a query of this shape could ever hit, not the lowest. Calling
+a throughput number a "floor" would tell a reader the real number can
+only go up from here; for docs/s and tokens/s it can only go down.
+
+**What this is not**: a pre-execution predictor. `sol_s` is computed
+from the query's own real evaluated/restored counts after it runs
+(`runtime/session.py`'s SOL walk), not from the planner's selectivity
+estimate before running - `provided_selectivity` is null for every
+query in this benchmark's current corpus, so there is no selectivity
+model to predict from yet. These three fields are a best-case
+reference for a query of this shape and size that has already run,
+not a live estimate for one that hasn't.
+
+**A real bug this surfaced**: the first version of `docs_per_s_sol_
+ceiling` used `docs` (the cold-pass corpus size) as the numerator,
+while the already-shipped `docs_per_s_warm` field was computed by an
+older `run_suite()` from the warm pass's own `_docs_count()` call.
+For four of five queries these agree. For FEV-5 - the one two-sided
+query (a filter on both the join's anchor and a partner table) - they
+didn't: `results/sol_check_sf0.1_4b_corrected.json` was committed
+(`b3f9606`) before the `_docs_count` two-sided-summing bug fix
+(`3ec98d5`, an adversarial review two commits later), so its stored
+`docs_per_s` for FEV-5 was stale - 85.3/78.1 (cold/warm), computed
+from the old buggy sum of both tables' stage-0 counts (157), not the
+current, correct anchor-only count (57). The symptom was exactly what
+a stale value should produce: the "ceiling" came out *below* the
+measured rate (54 vs. a stale 78.1), which cannot happen once
+`sol_s <= wall_s` holds (section 12's invariant). Fixed the stale
+field directly in the committed JSON - same underlying raw data
+(`evaluated` counts, `wall_s`), recomputed with the current, already-
+fixed `_docs_count()` (31.0/28.4, cold/warm) - not a new measurement,
+a correction of a derived field the earlier fix never propagated to.
+`quailb.py`'s `suite = dict(...)` now also persists `cpu_memory_gb`
+(only `gpus` was saved before), so `cost_sol_floor` doesn't have to
+guess the container size for future runs; `build_rows()` falls back
+to 80 (the default every suite committed before this field existed
+actually ran with) when it's absent.
+
+| Query | Docs/s (warm) | Docs/s (SOL ceiling) | Tok/s (warm) | Tok/s (SOL ceiling) | Cost (warm) | Cost (SOL floor) |
+|---|---|---|---|---|---|---|
+| IMDB-1 | 303 | 490 | 107k | 174k | $0.0210 | $0.0130 |
+| IMDB-2 | 1,145 | 1,815 | 109k | 185k | $0.0668 | $0.0421 |
+| IMDB-5 | 242 | 426 | 106k | 236k | $0.0264 | $0.0150 |
+| BIO-2 | 860 | 1,400 | 79k | 129k | $0.1821 | $0.1118 |
+| FEV-5 | 28 | 54 | 96k | 196k | $0.0026 | $0.0013 |
+
+Figure: plots/sol_docs_per_s.png, plots/sol_tokens_per_s.png,
+plots/sol_cost_vs_floor.png
+
+The gap between measured and ceiling/floor tracks efficiency (section
+6) exactly, since the ceiling-to-measured ratio is just `1 /
+efficiency` (same `docs`/`tokens` divided by `sol_s` vs. `warm_s`).
+FEV-5 has both the lowest efficiency (53%) and the widest relative
+gap (28 measured vs. 54 ceiling docs/s, a 1.90x spread); IMDB-2 has
+the highest efficiency (63%) and the narrowest gap (1.59x). No
+query breaks that ordering.
+
+6 new tests (`docs_per_s_sol_ceiling`/`tokens_per_s_sol_ceiling`/
+`cost_sol_floor` computed correctly, the ceiling >= measured / floor
+<= measured invariant on real validated data, `cpu_memory_gb` read
+from the suite with the documented fallback, error rows return
+`None`, the new `render_sol_ceiling_table()`). 216 tests pass without
+matplotlib installed (6 more skip cleanly); 222 pass with it.

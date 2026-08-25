@@ -32,8 +32,8 @@ def _row(query, desc, evaluated_stage0, wall_s, sol_s, fresh_tokens,
                cost_dollars=round(wall_s * 0.001097, 6) if wall_s else None)
 
 
-def _suite(cold_rows, warm_rows):
-    return dict(sf=0.1, lf=1, gpus=1, model="qwen3-4b-fp8",
+def _suite(cold_rows, warm_rows, **extra):
+    return dict(sf=0.1, lf=1, gpus=1, model="qwen3-4b-fp8", **extra,
                passes=dict(cold=dict(queries=cold_rows, pass_wall_s=0.0),
                           warm=dict(queries=warm_rows, pass_wall_s=0.0)))
 
@@ -61,6 +61,69 @@ def test_build_rows_normal_query_uses_cold_size_warm_rate():
     assert r["tokens_per_s_warm"] == warm["tokens_per_s"]
     assert r["cost_cold"] == cold["cost_dollars"]
     assert r["cost_warm"] == warm["cost_dollars"]
+
+
+def test_build_rows_sol_ceiling_and_floor_are_correctly_directioned():
+    """Throughput (docs/s, tokens/s) is a RATE - the reciprocal of
+    time - so the SOL floor on time implies a CEILING on throughput
+    (real rate <= sol-derived rate), the opposite direction from cost
+    (real cost >= sol-derived cost, same direction as time). Using
+    the real validated IMDB-2 numbers (same row as the test below)
+    against quailb's own _cost_dollars so this doesn't duplicate the
+    cost arithmetic, only checks build_rows wires it up right."""
+    from quail.bench.quailb import _cost_dollars, _modal_rates
+
+    cold = _row("IMDB-2", "join only", 5000, 53.18, 35.5492, 6_124_233,
+               extra_stages=[{"op": "join", "anchor": "r",
+                              "partners": ["a"], "tuples": 60000}])
+    warm = _row("IMDB-2", "join only", 5000, 52.42, 33.0578, 5_690_657,
+               extra_stages=[{"op": "join", "anchor": "r",
+                              "partners": ["a"], "tuples": 60000}])
+    rows = sol_report.build_rows(_suite([cold], [warm]))
+    r = rows[0]
+
+    assert r["docs_per_s_sol_ceiling"] == round(r["docs"] / r["sol_s"], 1)
+    assert r["tokens_per_s_sol_ceiling"] == round(r["tokens"] / r["sol_s"])
+    assert r["cost_sol_floor"] == _cost_dollars(
+        r["sol_s"], 0.0, 1, 80, _modal_rates())
+
+    # the physical invariant: nothing beats sol_s, so nothing beats
+    # the rate/cost it implies either
+    assert r["docs_per_s_sol_ceiling"] >= r["docs_per_s_warm"]
+    assert r["tokens_per_s_sol_ceiling"] >= r["tokens_per_s_warm"]
+    assert r["cost_sol_floor"] <= r["cost_warm"]
+
+
+def test_build_rows_cpu_memory_gb_from_suite_not_hardcoded():
+    """A suite that records its own cpu_memory_gb (run_suite() started
+    persisting this alongside gpus) must use it for cost_sol_floor,
+    not silently fall back to the 80 GiB default meant only for older
+    suites that predate this field."""
+    from quail.bench.quailb import _cost_dollars, _modal_rates
+
+    warm = _row("IMDB-1", "filter only", 5000, 16.34, 10.195, 1_774_233)
+    cold = _row("IMDB-1", "filter only", 5000, 14.61, 10.195, 1_774_233)
+
+    default_suite = sol_report.build_rows(_suite([cold], [warm]))[0]
+    custom_suite = sol_report.build_rows(
+        _suite([cold], [warm], cpu_memory_gb=40))[0]
+
+    assert default_suite["cost_sol_floor"] == _cost_dollars(
+        10.195, 0.0, 1, 80, _modal_rates())
+    assert custom_suite["cost_sol_floor"] == _cost_dollars(
+        10.195, 0.0, 1, 40, _modal_rates())
+    assert default_suite["cost_sol_floor"] != custom_suite["cost_sol_floor"]
+
+
+def test_build_rows_error_row_has_none_ceiling_and_floor():
+    cold_error = dict(query="IMDB-1", desc="filter only",
+                      error="RefusalError: no store configured")
+    warm_error = dict(query="IMDB-1", desc="filter only",
+                      error="RefusalError: no store configured")
+    r = sol_report.build_rows(_suite([cold_error], [warm_error]))[0]
+    assert r["docs_per_s_sol_ceiling"] is None
+    assert r["tokens_per_s_sol_ceiling"] is None
+    assert r["cost_sol_floor"] is None
 
 
 def test_build_rows_real_validated_numbers():
@@ -274,6 +337,34 @@ def test_render_markdown_table_docs_none_renders_dash_not_python_none():
     table = sol_report.render_markdown_table(rows)
     assert "None" not in table
     assert "—" in table.splitlines()[2]
+
+
+# ---- render_sol_ceiling_table ------------------------------------------
+
+def test_render_sol_ceiling_table_shape_and_content():
+    cold = _row("IMDB-1", "filter only", 5000, 14.61, 10.195, 1_774_233)
+    warm = _row("IMDB-1", "filter only", 5000, 16.34, 10.195, 1_774_233)
+    rows = sol_report.build_rows(_suite([cold], [warm]))
+    table = sol_report.render_sol_ceiling_table(rows)
+    lines = table.splitlines()
+    assert len(lines) == 3   # header, separator, one data row
+    assert lines[0].count("|") == 8
+    assert lines[2].count("|") == 8
+    assert "IMDB-1" in lines[2]
+
+
+def test_render_sol_ceiling_table_error_row_visible_not_dropped():
+    cold_error = dict(query="FEV-7", desc="broken", error="Refusal: x")
+    warm_error = dict(query="FEV-7", desc="broken", error="Refusal: x")
+    rows = sol_report.build_rows(_suite([cold_error], [warm_error]))
+    table = sol_report.render_sol_ceiling_table(rows)
+    assert "FEV-7" in table
+    assert "ERROR" in table
+
+
+def test_render_sol_ceiling_table_empty_rows():
+    table = sol_report.render_sol_ceiling_table([])
+    assert table.splitlines()[0].startswith("| Query")
 
 
 # ---- plot_sol_comparison ---------------------------------------------

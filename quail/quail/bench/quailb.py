@@ -697,7 +697,8 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     qdefs = queries(sess)
     ids = [i for i in qdefs if only is None or i in only]
     rates = _modal_rates()
-    suite = dict(sf=sf, lf=lf, gpus=gpus, model=model, passes={})
+    suite = dict(sf=sf, lf=lf, gpus=gpus, model=model,
+                cpu_memory_gb=cpu_memory_gb, passes={})
     try:
         for pass_name in ("cold", "warm"):
             sess.set_store(pass_name == "warm")
