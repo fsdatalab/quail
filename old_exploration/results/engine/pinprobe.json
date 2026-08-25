@@ -1,9 +1,0 @@
-{
-  "size_gb": 4,
-  "unpinned_h2d_GBps": 9.69,
-  "alloc_pinned_ok": true,
-  "alloc_pinned_h2d_GBps": 55.44,
-  "alloc_pinned_48GB_ok": true,
-  "register_mmap_code": 0,
-  "kernel_after_register_ok": true
-}
