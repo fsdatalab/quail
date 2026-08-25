@@ -9,9 +9,14 @@ import math
 
 import pytest
 
-from quail.planner.sol import (Corpus, FilterStage, bound,
-                               filter_chain_sol, filter_chain_workload)
+from quail.sol import (Corpus, FilterStage, Workload, bound,
+                       filter_chain_sol, filter_chain_workload)
 from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+# The batch size the derivation ran the forward pass at. An input to
+# the bound, not something it derives: it sets how many times the
+# weights are re-read.
+CHUNK = 110_376
 
 # The corpus the hand derivation used, recovered from the two numbers
 # it reports for stage 1: 1,774,233 sequence tokens and 444,634,043
@@ -50,7 +55,7 @@ def test_single_filter_workload():
 
 
 def test_single_filter_bound():
-    b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1])
+    b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1], CHUNK)
     assert b.passes == 17
     assert b.t_dense == pytest.approx(6.4550, abs=5e-4)
     assert b.t_attention == pytest.approx(0.2650, abs=5e-4)
@@ -72,7 +77,7 @@ def test_two_filter_workload_matches_derivation():
 
 
 def test_two_filter_bound():
-    b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1, F4],
+    b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1, F4], CHUNK,
                          carry_question_kv=True)
     assert b.passes == 18
     assert b.t_dense == pytest.approx(7.1614, abs=5e-4)
@@ -127,28 +132,33 @@ def test_memory_bound_when_the_work_is_one_token_per_document():
     reads per pass stop being amortized long before the FLOPs do."""
     c = Corpus.from_doc_tokens([1] * 8)
     b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, c,
-                         [FilterStage(question_tokens=1)])
+                         [FilterStage(question_tokens=1)], CHUNK)
     assert b.bound_by == "memory"
     assert b.passes == 1
 
 
 def test_bound_is_linear_in_a_pure_workload_scale():
     w1 = filter_chain_workload(IMDB, [F1])
-    b1 = bound(QWEN3_4B_FP8, H100_SXM, w1, chunk_tokens=10 ** 9)
-    from quail.planner.sol import Workload
+    b1 = bound(QWEN3_4B_FP8, H100_SXM, w1, 10 ** 9)
     w2 = Workload(tokens=2 * w1.tokens, pairs=2 * w1.pairs,
                   kv_read_tokens=2 * w1.kv_read_tokens)
-    b2 = bound(QWEN3_4B_FP8, H100_SXM, w2, chunk_tokens=10 ** 9)
+    b2 = bound(QWEN3_4B_FP8, H100_SXM, w2, 10 ** 9)
     assert b2.t_dense == pytest.approx(2 * b1.t_dense)
     assert b2.t_attention == pytest.approx(2 * b1.t_attention)
 
 
 def test_passes_round_up():
-    from quail.planner.budgets import chunk_budget
-    c = chunk_budget(QWEN3_4B_FP8, H100_SXM)
     w = filter_chain_workload(IMDB, [F1])
-    b = bound(QWEN3_4B_FP8, H100_SXM, w)
-    assert b.passes == math.ceil(w.tokens / c)
+    b = bound(QWEN3_4B_FP8, H100_SXM, w, CHUNK)
+    assert b.passes == math.ceil(w.tokens / CHUNK)
+
+
+def test_chunk_tokens_has_no_default_and_must_be_positive():
+    w = filter_chain_workload(IMDB, [F1])
+    with pytest.raises(TypeError):
+        bound(QWEN3_4B_FP8, H100_SXM, w)
+    with pytest.raises(ValueError):
+        bound(QWEN3_4B_FP8, H100_SXM, w, 0)
 
 
 def test_attention_prices_against_the_bf16_peak():

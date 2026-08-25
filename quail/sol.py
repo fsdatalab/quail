@@ -6,9 +6,13 @@ and drops every source of loss. A run can approach it and never beat
 it, so the gap between a measured wall and SoL is the whole of what
 the engine could still win.
 
-Nothing in the planner reads this module. `planner/plan.py` states
-that no plan decision consumes an estimated wall; that still holds.
-SoL is an offline yardstick for reports.
+This module derives everything from the two spec structs and the
+query, and borrows nothing from the planner. It does not import
+`planner/budgets.py`, it reads no calibration constant, and no
+efficiency factor appears anywhere in it. That is what makes it a
+bound rather than an estimate: every number in it is a datasheet
+figure, a model dimension, or a count of work the query cannot
+avoid. Nothing in the planner reads it either.
 
 The formulas and their assumptions are `plans/sol_model.md`. This
 module implements the filter-chain case (sections 4-6). Joins are
@@ -22,7 +26,6 @@ arithmetic with no query shape in it. Each is checkable on its own.
 import math
 from dataclasses import dataclass
 
-from quail.planner.budgets import chunk_budget
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -176,7 +179,7 @@ def filter_chain_workload(corpus: Corpus, stages,
 
 
 def bound(model: ModelSpec, device: DeviceSpec, workload: Workload,
-          chunk_tokens: int | None = None) -> SoLBound:
+          chunk_tokens: int) -> SoLBound:
     """Seconds for a workload on one (model, device). Section 6 of
     `plans/sol_model.md`.
 
@@ -184,9 +187,15 @@ def bound(model: ModelSpec, device: DeviceSpec, workload: Workload,
     engines run at once and a floor may assume they overlap
     perfectly. Within compute the dense and attention terms are
     added, because they are separate kernels on the same SMs.
+
+    chunk_tokens is the batch size the forward pass runs at, and it
+    is an input with no default. It sets how many times the weights
+    are re-read, so a wrong value moves the answer, and the value the
+    engine happens to use is a planner decision this bound must not
+    reach into. State it at the call site.
     """
-    if chunk_tokens is None:
-        chunk_tokens = chunk_budget(model, device)
+    if chunk_tokens < 1:
+        raise ValueError("chunk_tokens must be at least 1")
     t_dense = 2.0 * model.params * workload.tokens / device.peak_flops
     pair_flops = 4.0 * model.n_q * model.d_head
     t_attention = (pair_flops * workload.pairs * model.layers
@@ -201,8 +210,7 @@ def bound(model: ModelSpec, device: DeviceSpec, workload: Workload,
 
 
 def filter_chain_sol(model: ModelSpec, device: DeviceSpec,
-                     corpus: Corpus, stages,
-                     chunk_tokens: int | None = None,
+                     corpus: Corpus, stages, chunk_tokens: int,
                      carry_question_kv: bool = False) -> SoLBound:
     """The two halves together, for the common case."""
     return bound(model, device,
