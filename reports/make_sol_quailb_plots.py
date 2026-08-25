@@ -56,11 +56,13 @@ def plot_sol_per_query():
     fig.savefig(OUT / "sol_quailb_per_query.png", dpi=150)
 
 
-# what each held column is called in the report's prose
-HELD_NAME = {"reviews.body": "reviews", "reports.report": "reports",
-             "claims.claim": "claims", "evidence.text": "evidence",
-             "citations.destination_context": "excerpts",
-             "citations.passage_text": "passages"}
+# the document set each held column belongs to. FEVER shows up
+# twice: FEV-1 filters claims and holds them, while the FEVER joins
+# hold the evidence passages instead.
+HELD_NAME = {"reviews.body": "IMDB", "reports.report": "BioDEX",
+             "claims.claim": "FEVER", "evidence.text": "FEVER",
+             "citations.destination_context": "LePaRD",
+             "citations.passage_text": "LePaRD"}
 
 
 def plot_attention_share():

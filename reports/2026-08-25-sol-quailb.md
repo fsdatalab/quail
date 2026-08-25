@@ -169,7 +169,9 @@ tokens; `T_attention` is quadratic in the length of the document
 whose KV is held, because a sequence of length `m` scores `T(m)`
 pairs. So the longer the held document, the larger attention's share
 of the work. The figure orders the 26 queries by that length, and
-the share climbs across it.
+the share climbs across it. FEVER appears at both ends: FEV-1
+filters claims and holds them at 11 tokens, while the FEVER joins
+hold the 370-token evidence passages instead.
 
 The two terms also scale differently with model size. `T_dense`
 scales with the parameter count, 31,206,298,624 over 3,633,511,936
