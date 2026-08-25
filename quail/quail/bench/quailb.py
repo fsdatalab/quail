@@ -1,4 +1,4 @@
-"""QUAIL-B: twenty-three queries over four document sets.
+"""QUAIL-B: twenty-six queries over four document sets.
 
 The design (`reports/query-design.md`): real filter and join
 predicates over real, unpadded, un-concatenated text, ground-truthed
@@ -27,6 +27,16 @@ FEVER-only among these three datasets.
 LePaRD adds seven queries over legal citation text. They cover a
 self-join, filter chains with depths from one to five, and filtering
 both sides before the join.
+
+Three queries are filter chains with no join at all: IMDB-6 (depth 2),
+IMDB-7 (depth 3), and LEP-8 (depth 5). Every other multi-filter query
+ends in a join, so the cost of stacking filters could not be measured
+on its own - a filter chain's later stages reuse the KV an earlier
+stage already built, and that saving was always mixed in with join
+work. Each of the three is exactly the filter prefix of an existing
+query (IMDB-4, IMDB-5, LEP-6 respectively), so subtracting one from
+the other isolates the join. No new predicates: they reuse the same
+prompts, in the same order, as the queries they are prefixes of.
 
 Deeper filter chains stand in for a second, dependent join (filter ->
 filter -> join -> join): two joins in one query, where the second
@@ -502,6 +512,12 @@ def queries(sess):
     q["IMDB-5"] = ("F1 -> F4 -> F5 -> J1, 3 filters then 1 join", make(
         "reviews", "r", "body", [F1, F4, F5],
         [("aspects", "a", "aspect", DISCUSS_ASPECT)], ["r.id", "a.id"]))
+    # filter chains with no join: IMDB-4 and IMDB-5 without their join,
+    # so the difference is the join's cost.
+    q["IMDB-6"] = ("F1 -> F4, 2 filters, no join", make(
+        "reviews", "r", "body", [F1, F4], [], ["r.id"]))
+    q["IMDB-7"] = ("F1 -> F4 -> F5, 3 filters, no join", make(
+        "reviews", "r", "body", [F1, F4, F5], [], ["r.id"]))
 
     # BioDEX: same five shapes (reports x terms).
     q["BIO-1"] = ("filter: F7 (female patient)", make(
@@ -577,6 +593,11 @@ def queries(sess):
         "citations", "d", "destination_context", [LEP1, LEP2],
         [("citations", "s", "passage_text", LEPJOIN, [LEPS1])],
         ["d.id", "s.id"]))
+    # LEP-6 without its join: the deepest filter chain in the suite,
+    # five stages of KV reuse with no join work mixed in.
+    q["LEP-8"] = ("LEP1..LEP5, 5 filters, no join", make(
+        "citations", "d", "destination_context",
+        [LEP1, LEP2, LEP3, LEP4, LEP5], [], ["d.id"]))
 
     return q
 
