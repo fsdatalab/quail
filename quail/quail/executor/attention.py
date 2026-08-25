@@ -534,10 +534,10 @@ class Pipeline:
         if unified["src"].numel():
             self.kv_row_scatter(k3, v3, unified["src"], unified["dst"],
                                 layer)
-        if unified.get("arena_src") is not None:
+        if unified["tail_src"] is not None:
             self.kv_row_scatter(
                 self.arena.k[layer], self.arena.v[layer],
-                unified["arena_src"], unified["arena_dst"], layer)
+                unified["tail_src"], unified["tail_dst"], layer)
         kp, vp = self.arena.paged_kv(layer)
         out, _ = self._fa(
             q3, kp, vp, unified["cu_q"], None,
@@ -552,7 +552,7 @@ class Pipeline:
         try:
             return self._forward_chunk(chunk)
         finally:
-            for key in chunk.pop("temporary_arena_keys", ()):
+            for key in chunk.pop("temporary_keys", ()):
                 self.arena.free_key(key)
 
     def _forward_chunk(self, chunk):

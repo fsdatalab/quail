@@ -256,26 +256,28 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # row pairs: the attention pass scatters them with a single kernel
     # launch per layer (kv_row_scatter)
     unified = None
-    temporary_arena_keys = []
-    temporary_arena_pages = 0
-    temporary_arena_rows = 0
+    temporary_keys = []
     if attention_mode == "unified" and unified_groups:
         if len(unified_groups) != len(layout):
             raise ValueError(
                 "a unified chunk cannot mix paged and unpaged "
                 "groups: the one paged call covers every row or "
                 "none (the fast path packs whole chunks unpaged)")
-        page_rows = []
-        used = []
-        cu_full = [0]
-        current_src = []
-        current_dst = []
-        arena_src = []
-        arena_dst = []
-        max_full_q = 0
-        from quail.executor.arena import private_suffix_layout
+        kv_page_rows = []
+        kv_lengths = []
+        cu_q = [0]
+        activation_src = []
+        kv_dst = []
+        tail_src = []
+        tail_dst = []
 
         page_tokens = arena.accounting.page_tokens
+
+        def add_sequence(pages, kv_tokens, query_tokens):
+            kv_page_rows.append(pages)
+            kv_lengths.append(kv_tokens)
+            cu_q.append(cu_q[-1] + query_tokens)
+
         try:
             for spec in unified_groups:
                 key = spec["key"]
@@ -288,25 +290,21 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 direct = len(spans) == 1 \
                     and logical_start + count <= rows.numel()
                 if direct:
-                    current_src.extend(range(r0, r1))
-                    current_dst.extend(
+                    activation_src.extend(range(r0, r1))
+                    kv_dst.extend(
                         rows[logical_start:logical_start + count].tolist())
-                    page_rows.append(arena.accounting.owned[key])
-                    used.append(f + sum(e - s for s, e in spans))
-                    cu_full.append(cu_full[-1] + count)
-                    max_full_q = max(max_full_q, count)
+                    add_sequence(
+                        arena.accounting.owned[key],
+                        f + sum(e - s for s, e in spans), count)
                     continue
 
                 prefix_count = spec["prefix_end"] - r0
                 if prefix_count:
-                    current_src.extend(range(r0, spec["prefix_end"]))
-                    current_dst.extend(rows[:prefix_count].tolist())
+                    activation_src.extend(range(r0, spec["prefix_end"]))
+                    kv_dst.extend(rows[:prefix_count].tolist())
                     prefix_pages = arena.accounting.owned[key][
                         :arena.accounting.pages_needed(f)]
-                    page_rows.append(prefix_pages)
-                    used.append(f)
-                    cu_full.append(cu_full[-1] + prefix_count)
-                    max_full_q = max(max_full_q, prefix_count)
+                    add_sequence(prefix_pages, f, prefix_count)
 
                 anchor_pages = arena.accounting.owned[key]
                 for s0, s1 in spans:
@@ -318,42 +316,37 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                             "unified suffix pages exceed the free KV arena; "
                             "split the chunk")
                     temp_key, temp_pages = got
-                    temporary_arena_keys.append(temp_key)
-                    temporary_arena_pages += len(temp_pages)
-                    temporary_arena_rows += remainder + suffix_tokens
+                    temporary_keys.append(temp_key)
                     temp_rows = arena._capacity_rows[temp_key]
-                    current_src.extend(range(s0, s1))
-                    current_dst.extend(
+                    activation_src.extend(range(s0, s1))
+                    kv_dst.extend(
                         temp_rows[remainder:remainder + suffix_tokens]
                         .tolist())
                     if remainder:
                         anchor_page = anchor_pages[f // page_tokens]
                         base = anchor_page * page_tokens
-                        arena_src.extend(range(base, base + remainder))
-                        arena_dst.extend(temp_rows[:remainder].tolist())
-                    page_row, copied_rows = private_suffix_layout(
-                        anchor_pages, temp_pages, f, suffix_tokens,
-                        page_tokens)
-                    page_rows.append(page_row)
-                    if copied_rows != remainder:
-                        raise RuntimeError("temporary page layout changed")
-                    used.append(f + suffix_tokens)
-                    cu_full.append(cu_full[-1] + suffix_tokens)
-                    max_full_q = max(max_full_q, suffix_tokens)
+                        tail_src.extend(range(base, base + remainder))
+                        tail_dst.extend(temp_rows[:remainder].tolist())
+                    full_pages = f // page_tokens
+                    add_sequence(
+                        anchor_pages[:full_pages] + temp_pages,
+                        f + suffix_tokens, suffix_tokens)
 
-            table = arena.block_table_rows(page_rows)
+            table = arena.block_table_rows(kv_page_rows)
             unified = dict(
-                src=_staged(torch, current_src, torch.int64, pinned),
-                dst=_staged(torch, current_dst, torch.int64, pinned),
-                arena_src=(_staged(torch, arena_src, torch.int64, pinned)
-                           if arena_src else None),
-                arena_dst=(_staged(torch, arena_dst, torch.int64, pinned)
-                           if arena_dst else None),
-                cu_q=_staged(torch, cu_full, torch.int32, pinned),
-                used=_staged(torch, used, torch.int32, pinned),
-                table=table, max_q=max_full_q, max_used=max(used))
+                src=_staged(torch, activation_src, torch.int64, pinned),
+                dst=_staged(torch, kv_dst, torch.int64, pinned),
+                tail_src=(_staged(torch, tail_src, torch.int64, pinned)
+                          if tail_src else None),
+                tail_dst=(_staged(torch, tail_dst, torch.int64, pinned)
+                          if tail_dst else None),
+                cu_q=_staged(torch, cu_q, torch.int32, pinned),
+                used=_staged(torch, kv_lengths, torch.int32, pinned),
+                table=table,
+                max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])),
+                max_used=max(kv_lengths))
         except Exception:
-            for key in temporary_arena_keys:
+            for key in temporary_keys:
                 arena.free_key(key)
             raise
 
@@ -380,10 +373,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         positions=_staged(torch, pos, torch.int64, pinned),
         final_indices=_staged(torch, finals, torch.int64, pinned),
         meta=meta, tokens=len(ids), layout=layout)
-    if temporary_arena_keys:
-        out["temporary_arena_keys"] = temporary_arena_keys
-        out["temporary_arena_pages"] = temporary_arena_pages
-        out["temporary_arena_rows"] = temporary_arena_rows
+    if temporary_keys:
+        out["temporary_keys"] = temporary_keys
     _tick(timing, "pack_h2d", t)
     return out
 
@@ -393,7 +384,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, group_size=None, store=None,
              store_hash=None, store_min_tokens=1, store_ids=None,
-             stats=None, stage_frames=None, temporary_stats=None):
+             stats=None, stage_frames=None):
     """The join driver: every stage streams a partner list against the
     anchor side; gated anchors advance between stages.
 
@@ -433,9 +424,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     positions to stable store key ids (the anchor's global document
     index, the same key a filter scan of the same corpus uses).
     stats, when given, is filled with restored/stored counts.
-    temporary_stats, when given, records the largest temporary page
-    and used-row claims made by one chunk.
-
     Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
     partners, present only for anchors that reached stage j; spans =
     (stage, start_event, end_event) per forward for GPU-time sums;
@@ -447,8 +435,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         if stats is not None:
             stats.update(restored_docs=0, restored_tokens=0,
                          stored_docs=0, stored_tokens=0)
-        if temporary_stats is not None:
-            temporary_stats.update(pages_peak=0, rows_peak=0)
         return [dict() for _ in range(k)], [], 0
     group_size = n if group_size is None else group_size
     groups = [list(range(i, min(i + group_size, n)))
@@ -477,9 +463,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                      restored_tokens=sum(len(anchor_prefixes[a])
                                          for a in restored),
                      stored_docs=0, stored_tokens=0)
-    if temporary_stats is not None:
-        temporary_stats.update(pages_peak=0, rows_peak=0)
-
     def plan_stage(members, j):
         live = [a for a in members
                 if j == 0 or any(ans[j - 1].get(a, []))]
@@ -558,13 +541,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     def launch(j, chunk):
         nonlocal tokens, save_after
         tokens += chunk["tokens"]
-        if temporary_stats is not None:
-            temporary_stats["pages_peak"] = max(
-                temporary_stats["pages_peak"],
-                chunk.get("temporary_arena_pages", 0))
-            temporary_stats["rows_peak"] = max(
-                temporary_stats["rows_peak"],
-                chunk.get("temporary_arena_rows", 0))
         for key, _ in chunk["layout"]:
             ev = load_events.pop(key, None)
             if ev is not None:

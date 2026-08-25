@@ -6,7 +6,7 @@ import random
 
 import pytest
 
-from quail.executor.arena import PageArena, private_suffix_layout
+from quail.executor.arena import PageArena
 
 
 def test_alloc_free_roundtrip():
@@ -56,36 +56,6 @@ def test_capacity_reserves_pages_without_extending_logical_length():
     assert a.tokens["d"] == 5
     assert len(a.row_indices("d")) == 5
     assert len(a.row_indices("d", 10)) == 10
-
-
-def test_private_suffix_layout_with_aligned_anchor():
-    row, copied = private_suffix_layout(
-        [3, 7], [11], kept_tokens=32, suffix_tokens=9,
-        page_tokens=16)
-    assert row == [3, 7, 11]
-    assert copied == 0
-
-
-def test_private_suffix_layout_copies_only_partial_anchor_page():
-    row, copied = private_suffix_layout(
-        [3, 7, 9], [11], kept_tokens=34, suffix_tokens=9,
-        page_tokens=16)
-    assert row == [3, 7, 11]
-    assert copied == 2
-
-
-def test_private_suffix_layout_checks_exact_temporary_pages():
-    with pytest.raises(ValueError):
-        private_suffix_layout(
-            [3], [11], kept_tokens=15, suffix_tokens=9,
-            page_tokens=16)
-
-
-def test_private_suffix_layout_checks_anchor_capacity():
-    with pytest.raises(ValueError):
-        private_suffix_layout(
-            [3], [11], kept_tokens=18, suffix_tokens=9,
-            page_tokens=16)
 
 
 def test_no_page_shared_between_documents():

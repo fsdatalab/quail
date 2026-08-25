@@ -814,11 +814,10 @@ def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
     def run_mode(mode):
         pipeline.attention_mode = (
             "unified" if mode == "unified_packed" else mode)
-        path_stats = {}
         answers, spans, tokens = run_join(
             torch, arena, pipeline, async_answers, prefixes,
-            [suffixes], budget, temporary_stats=path_stats)
-        return answers[0], len(spans), tokens, path_stats
+            [suffixes], budget)
+        return answers[0], len(spans), tokens
 
     outputs = {}
     for mode in modes:
@@ -831,7 +830,7 @@ def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
             for rep in range(reps):
                 torch.cuda.reset_peak_memory_stats()
                 start = time.perf_counter()
-                answers, n_chunks, tokens, path_stats = run_mode(mode)
+                answers, n_chunks, tokens = run_mode(mode)
                 torch.cuda.synchronize()
                 wall = time.perf_counter() - start
                 flat = [bit for anchor in range(n_reports)
@@ -841,8 +840,6 @@ def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
                     fresh_tokens=tokens,
                     us_per_token=round(wall * 1e6 / tokens, 3),
                     chunks=n_chunks, yes=sum(flat),
-                    temporary_pages_peak=path_stats["pages_peak"],
-                    temporary_rows_peak=path_stats["rows_peak"],
                     peak_gib=round(
                         torch.cuda.max_memory_allocated() / 2**30, 2))
                 rows.append(row)

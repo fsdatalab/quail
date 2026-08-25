@@ -13,25 +13,6 @@ PageArena is the accounting (pure Python, CPU-tested); KVArena is the
 tensor backing and runs only where torch and a GPU exist.
 """
 
-
-def private_suffix_layout(anchor_pages, temporary_pages, kept_tokens,
-                          suffix_tokens, page_tokens):
-    """Build one suffix's page row and return its copied row count."""
-    full_pages, copied_rows = divmod(kept_tokens, page_tokens)
-    anchor_pages_needed = full_pages + bool(copied_rows)
-    if len(anchor_pages) < anchor_pages_needed:
-        raise ValueError(
-            f"anchor needs {anchor_pages_needed} pages, got "
-            f"{len(anchor_pages)}")
-    temporary_tokens = copied_rows + suffix_tokens
-    needed = -(-temporary_tokens // page_tokens)
-    if len(temporary_pages) != needed:
-        raise ValueError(
-            f"suffix needs {needed} temporary pages, got "
-            f"{len(temporary_pages)}")
-    return anchor_pages[:full_pages] + temporary_pages, copied_rows
-
-
 class PageArena:
     """Page accounting: a free list and per-document page lists."""
 
