@@ -83,11 +83,30 @@ class FilterStage:
 
     `question_tokens` is everything the stage appends per live
     document: the engine's task instruction, the user's question, and
-    the answer cue. `selectivity` is the fraction of the documents
-    entering this stage that pass it.
+    the answer cue.
+
+    What survives the stage can be given two ways. `selectivity` is
+    the fraction of entering documents that pass, and the surviving
+    token mass is then inferred by scaling - the random-survivor
+    assumption. `surviving_docs` and `surviving_prefix` are the
+    measured counts, and when both are given they are used instead
+    and no assumption is made.
+
+    Prefer the measured pair wherever labels exist. The assumption is
+    not a rounding error: on QUAIL-B's F4 (discusses the ending) the
+    survivors average 391 prefix tokens against the 312 of the pool
+    they came from, because long reviews discuss endings more often,
+    and scaling by selectivity undercounts their token mass by 20%.
     """
     question_tokens: int
     selectivity: float = 1.0
+    surviving_docs: float | None = None
+    surviving_prefix: float | None = None
+
+    @property
+    def measured(self) -> bool:
+        return (self.surviving_docs is not None
+                and self.surviving_prefix is not None)
 
 
 @dataclass(frozen=True)
@@ -155,12 +174,12 @@ def filter_chain_workload(corpus: Corpus, stages,
     to the retained prefix (a rectangle) and to each other (a small
     triangle).
 
-    Selectivity thins the live set between stages. The surviving
-    documents are taken to be a uniform random sample of the ones
-    that entered, so a stage's surviving token mass is its survival
-    factor times the whole corpus. Nothing enforces that - a filter
-    that prefers long documents breaks it - and it is the one
-    assumption here that the length distribution can violate.
+    Each stage thins the live set. A stage carrying measured
+    `surviving_docs` and `surviving_prefix` sets both exactly; a
+    stage carrying only a selectivity scales both by it, which
+    assumes the survivors are a uniform random sample of what
+    entered. That assumption is the only one here the data can
+    violate, and it does: see `FilterStage`.
 
     carry_question_kv counts each stage's question tokens as part of
     the prefix that later stages read back and attend over. The
@@ -174,7 +193,8 @@ def filter_chain_workload(corpus: Corpus, stages,
     n, B = corpus.n_docs, corpus.sum_prefix
     tokens = pairs = kv_read = 0.0
     per_stage = []
-    survival = 1.0          # fraction of the corpus entering this stage
+    live_n, live_B = float(n), float(B)   # documents and prefix mass
+    #                                       entering the current stage
     carried = 0             # question tokens folded into the prefix
     for s, st in enumerate(stages):
         q = st.question_tokens
@@ -187,15 +207,19 @@ def filter_chain_workload(corpus: Corpus, stages,
             st_pairs = (sum_l_sq + sum_l) / 2
             st_read = 0.0
         else:
-            prefix = survival * (B + n * carried)
-            st_tokens = survival * n * q
-            st_pairs = q * prefix + survival * n * q * (q + 1) / 2
+            prefix = live_B + live_n * carried
+            st_tokens = live_n * q
+            st_pairs = q * prefix + live_n * q * (q + 1) / 2
             st_read = prefix
         tokens += st_tokens
         pairs += st_pairs
         kv_read += st_read
         per_stage.append((st_tokens, st_pairs, st_read))
-        survival *= st.selectivity
+        if st.measured:
+            live_n, live_B = st.surviving_docs, st.surviving_prefix
+        else:
+            live_n *= st.selectivity
+            live_B *= st.selectivity
         if carry_question_kv:
             carried += q
     return Workload(tokens=tokens, pairs=pairs, kv_read_tokens=kv_read,

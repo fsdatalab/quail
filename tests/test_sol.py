@@ -31,15 +31,27 @@ _GT = json.loads(
 N_DOCS = _GT["corpus"]["n_docs"]
 Q_F1 = _GT["question_tokens"]["F1"]
 Q_F4 = _GT["question_tokens"]["F4"]
-# Not measurable from anything committed here: it comes from a
-# labelled run and is carried over from the derivation.
-SEL_F1 = 0.8262
+Q_F5 = _GT["question_tokens"]["F5"]
+_S = _GT["survivors"]
 IMDB = Corpus(n_docs=N_DOCS,
               sum_prefix=float(_GT["prefix_tokens"]["sum"]),
               sum_prefix_sq=float(_GT["prefix_tokens"]["sum_sq"]))
 
-F1 = FilterStage(question_tokens=Q_F1, selectivity=SEL_F1)
-F4 = FilterStage(question_tokens=Q_F4)
+# Ground truth: the QUAIL-B label sets, counted per document. Each
+# stage carries what actually survived it, so no selectivity scaling
+# happens anywhere in the headline numbers.
+F1 = FilterStage(question_tokens=Q_F1,
+                 surviving_docs=_S["F1"]["surviving_docs"],
+                 surviving_prefix=_S["F1"]["surviving_prefix"])
+F4 = FilterStage(question_tokens=Q_F4,
+                 surviving_docs=_S["F4_given_F1"]["surviving_docs"],
+                 surviving_prefix=_S["F4_given_F1"]["surviving_prefix"])
+F5 = FilterStage(question_tokens=Q_F5)
+# The 4B engine run's own observed selectivity, kept only to
+# reproduce the derivation: a 4B run's workload is set by the 4B
+# model's answers, and 0.8262 is 4131 of 5000. Ground truth is the
+# 32B model's 0.7746.
+SEL_F1_4B_RUN = _GT["engine_run_4b"]["IMDB-1"]["observed_selectivity"]
 
 
 def test_dense_params_matches_the_published_counts():
@@ -86,33 +98,52 @@ def test_single_filter_bound():
 
 
 def test_two_filter_workload():
-    """IMDB-6: F1 then F4. F4's question is 48 tokens measured, where
-    the derivation used 47, so the totals sit just above its
-    1,968,390 tokens and 518,189,748 pairs."""
-    w = filter_chain_workload(IMDB, [F1, F4], carry_question_kv=True)
-    assert w.tokens == pytest.approx(1_972_521, abs=1)
-    assert w.pairs == pytest.approx(519_853_922, abs=1)
-    assert w.kv_read_tokens == pytest.approx(1_465_871, abs=1)
+    """IMDB-6: F1 then F4 on ground truth, with the engine's rewind.
+    3,873 documents carrying 1,206,884 prefix tokens reach F4."""
+    w = filter_chain_workload(IMDB, [F1, F4])
+    assert w.tokens == pytest.approx(1_960_137, abs=1)
+    assert w.pairs == pytest.approx(507_119_123, abs=1)
+    assert w.kv_read_tokens == _S["F1"]["surviving_prefix"] == 1_206_884
 
 
 def test_two_filter_bound():
-    b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1, F4], CHUNK,
-                         carry_question_kv=True)
+    b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1, F4], CHUNK)
     assert b.passes == 18
-    assert b.t_dense == pytest.approx(7.2432, abs=5e-4)
-    assert b.t_attention == pytest.approx(0.3099, abs=5e-4)
-    assert b.t_memory == pytest.approx(0.1755, abs=5e-4)
+    assert b.t_dense == pytest.approx(7.1978, abs=5e-4)
+    assert b.t_attention == pytest.approx(0.3023, abs=5e-4)
+    assert b.t_memory == pytest.approx(0.1636, abs=5e-4)
+    assert b.seconds == pytest.approx(7.5000, abs=5e-4)
+
+
+def test_three_filter_bound():
+    """IMDB-7: F1 then F4 then F5, every survivor count counted."""
+    b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1, F4, F5], CHUNK)
+    assert b.passes == 19
+    assert b.workload.tokens == pytest.approx(2_010_213, abs=1)
+    assert b.workload.pairs == pytest.approx(528_044_209, abs=1)
+    assert b.seconds == pytest.approx(7.6964, abs=5e-4)
+
+
+def test_reproduces_the_derivation_with_its_own_inputs():
+    """The derivation used the 4B run's selectivity and folded F1's
+    question into the prefix. Both together give 7.5531 s, against
+    its own 7.5366 s; the gap is F4's 48th token."""
+    b = filter_chain_sol(
+        QWEN3_4B_FP8, H100_SXM, IMDB,
+        [FilterStage(Q_F1, SEL_F1_4B_RUN), FilterStage(Q_F4)], CHUNK,
+        carry_question_kv=True)
+    assert b.workload.tokens == pytest.approx(1_972_521, abs=1)
     assert b.seconds == pytest.approx(7.5531, abs=5e-4)
 
 
 def test_rewinding_the_question_kv_is_cheaper():
     """What the engine actually does: F1's question KV is dropped, so
-    F4 reads back and attends over 270,000 fewer prefix tokens."""
+    F4 reads back and attends over 54 fewer tokens per survivor."""
     kept = filter_chain_workload(IMDB, [F1, F4], carry_question_kv=True)
     rewound = filter_chain_workload(IMDB, [F1, F4])
     assert rewound.tokens == kept.tokens          # same tokens computed
     assert rewound.kv_read_tokens == pytest.approx(
-        kept.kv_read_tokens - SEL_F1 * N_DOCS * Q_F1)
+        kept.kv_read_tokens - _S["F1"]["surviving_docs"] * Q_F1)
     assert rewound.pairs < kept.pairs
 
 
@@ -188,3 +219,44 @@ def test_attention_prices_against_the_bf16_peak():
 def test_empty_chain_refuses():
     with pytest.raises(ValueError):
         filter_chain_workload(IMDB, [])
+
+
+def test_measured_survivors_override_the_selectivity_scaling():
+    """With ground-truth labels a stage carries its surviving document
+    count and prefix mass, and nothing is assumed."""
+    gt = _GT["survivors"]["F1"]
+    assumed = FilterStage(Q_F1, selectivity=gt["selectivity"])
+    assert F1.measured and not assumed.measured
+    q4 = FilterStage(Q_F4)
+    wa = filter_chain_workload(IMDB, [assumed, q4])
+    wm = filter_chain_workload(IMDB, [F1, q4])
+    assert wa.kv_read_tokens == pytest.approx(
+        gt["random_survivor_prefix"], abs=1)
+    assert wm.kv_read_tokens == gt["surviving_prefix"]
+    # same documents survive either way, so the token count matches;
+    # only the mass they carry differs
+    assert wa.tokens == pytest.approx(wm.tokens)
+    assert wm.pairs > wa.pairs
+
+
+def test_the_random_survivor_assumption_undercounts_but_barely_moves_sol():
+    """Scaling by selectivity misses 3.5% of F1's surviving mass, and
+    still lands within 0.1% on SoL: stage 1 owns the wall."""
+    gt = _GT["survivors"]["F1"]
+    assert gt["random_survivor_prefix"] / gt["surviving_prefix"] == (
+        pytest.approx(0.9654, abs=5e-4))
+    q4 = FilterStage(Q_F4)
+    a = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB,
+                         [FilterStage(Q_F1, gt["selectivity"]), q4], CHUNK)
+    m = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1, q4], CHUNK)
+    assert abs(m.seconds / a.seconds - 1) < 1e-3
+
+
+def test_survivors_are_longer_than_the_pool_they_came_from():
+    """The reason the assumption undercounts: these predicates prefer
+    long reviews, and F4 prefers them hard."""
+    for key in ("F1", "F4_given_F1", "F5_given_F1_F4"):
+        gt = _GT["survivors"][key]
+        assert gt["mean_prefix_survivors"] > gt["mean_prefix_pool"]
+    f4 = _GT["survivors"]["F4_given_F1"]
+    assert f4["mean_prefix_survivors"] / f4["mean_prefix_pool"] > 1.2

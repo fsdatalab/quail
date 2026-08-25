@@ -98,12 +98,21 @@ Two derived quantities:
 Write `Sigma_s = prod_{t < s} sigma_t` for the fraction of the corpus
 still live entering stage `s`, so `Sigma_1 = 1`.
 
-**The random-survivor assumption.** A stage's surviving documents are
-treated as a uniform random sample of the ones that entered it, so
-the surviving token mass entering stage `s` is `Sigma_s * B`. This is
-the one assumption here that the data can violate: a filter that
-prefers long documents makes the true mass larger. Nothing in the
-engine enforces it.
+**Survivors: measured, or assumed.** What a stage passes on is two
+numbers - how many documents survive, and how much prefix mass they
+carry. Given labels, both are counted and nothing is assumed. Given
+only a selectivity `sigma_s`, both are scaled by it, which treats
+the survivors as a uniform random sample of what entered.
+
+That assumption is wrong on this data, measurably. Section 7.2 has
+the numbers: scaling undercuts the true surviving mass by 3.5% after
+one filter and 31% after three, because these predicates prefer long
+reviews. It moves SoL by less than 0.1% anyway, for a reason worth
+knowing - stage 1 computes every prefix, and later stages add about
+50 tokens per surviving document, so the mass the assumption gets
+wrong is nearly free. Expect it to matter where later stages carry
+real work: a join streaming partners against an anchor, or a chain
+run memory-bound.
 
 ## 3. What each stage computes
 
@@ -192,13 +201,17 @@ Both are lower bounds, so both are safe; this one is the more
 conservative. Tightening it later changes section 6 only and leaves
 sections 4 and 5 untouched.
 
-## 7. The two worked exercises, against the measured corpus
+## 7. The exercises, on measured inputs
 
 Qwen3-4B-fp8, one H100, the 5,000 reviews QUAIL-B builds at sf=0.1.
-Nothing here is taken on trust from the derivation: the corpus was
-rebuilt from the pinned IMDB revision at seed 20260818 and tokenized
-with the Qwen3-4B-FP8 tokenizer, and the moments are committed in
-`results/sol_imdb_corpus.json`.
+Nothing below is taken on trust. The corpus was rebuilt from the
+pinned IMDB revision at seed 20260818 and tokenized with the
+Qwen3-4B-FP8 tokenizer; all 5,000 documents match the
+`left_content_sha256` in the QUAIL-B label sets, so the token
+lengths and the labels describe the same documents. Everything is
+committed to `results/sol_imdb_corpus.json`; the raw label sets are
+`/results/ground_truth/quailb/schema_v1/label_sets/imdb/` on
+`quail-results`.
 
 | measured input | value |
 |---|---|
@@ -207,89 +220,133 @@ with the Qwen3-4B-FP8 tokenizer, and the moments are committed in
 | `p` (`SHARED_PRE`) | 2 tokens |
 | `B = sum b_i` | 1,504,233 |
 | `sum b_i^2` | 710,456,689 |
-| F1 question | 54 tokens |
-| F4 question | 48 tokens |
+| F1, F4, F5 questions | 54, 48, 52 tokens |
 
-One input is not measured. F1's selectivity 0.8262 comes from a
-labelled run and appears in no committed summary, so it is carried
-over from the derivation as given.
+Survivors come from the ground truth - the QUAIL-B label sets, one
+TRUE/FALSE per document - so each stage carries a counted document
+count and a counted prefix mass, and no selectivity is scaled
+anywhere:
 
-**IMDB-1**, one filter:
+| after | documents | prefix mass |
+|---|---|---|
+| F1 | 3,873 | 1,206,884 |
+| F1, F4 | 963 | 376,886 |
+| F1, F4, F5 | 628 | 272,514 |
+
+**IMDB-1**, one filter. No survivors are involved: one stage
+computes every document once.
 
 | quantity | value |
 |---|---|
 | tokens | 1,774,233 |
 | pairs | 444,634,043 |
 | forward passes | 17 |
-| bytes moved | 3.381e11 |
 | `T_dense` | 6.5151 s |
 | `T_attention` | 0.2650 s |
 | `T_memory` | 0.1009 s |
 | **SoL** | **6.7801 s**, compute bound |
 
-**IMDB-6**, F1 then F4, keeping the derivation's choice to fold F1's
-question into the retained prefix:
+**IMDB-6**, F1 then F4:
 
 | quantity | value |
 |---|---|
-| tokens | 1,972,521 |
-| pairs | 519,853,922 |
-| KV read back | 1,465,871 tokens |
+| tokens | 1,960,137 |
+| pairs | 507,119,123 |
+| KV read back | 1,206,884 tokens |
 | forward passes | 18 |
-| bytes moved | 5.880e11 |
-| `T_dense` | 7.2432 s |
-| `T_attention` | 0.3099 s |
-| `T_memory` | 0.1755 s |
-| **SoL** | **7.5531 s**, compute bound |
+| `T_dense` | 7.1978 s |
+| `T_attention` | 0.3023 s |
+| `T_memory` | 0.1636 s |
+| **SoL** | **7.5000 s**, compute bound |
 
-### What the check found
+**IMDB-7**, F1 then F4 then F5: 2,010,213 tokens, 528,044,209 pairs,
+19 passes, **SoL 7.6964 s**.
 
-The derivation's stage-1 totals are exactly right. Tokenizing the
+### 7.1 Against the derivation
+
+The derivation's stage-1 totals are exactly right: tokenizing the
 real corpus gives 1,774,233 tokens and 444,634,043 causal pairs, to
 the digit, which also confirms the 2-token preamble and the 54-token
-F1 question. Its final answers, 6.7798 s and 7.5366 s, are within
-0.05% and 0.3% of the numbers above.
+F1 question. Feeding it its own two inputs - selectivity 0.8262 and
+F1's question folded into the retained prefix - reproduces 7.5531 s
+against its stated 7.5366 s.
 
-Three smaller things came out of the check.
+Four things came out of the check.
 
 1. **`P` is 3,633,511,936, not 3.6e9.** `T_dense` in the derivation
    is 0.93% above what `P = 3.6e9` gives, by the same factor in both
-   exercises. That factor is exactly the ratio between Qwen3-4B's
-   real non-embedding parameter count and the rounded 3.6e9 that
-   `specs/qwen3_4b.py` carries: 3,633,511,936 / 3.6e9 = 1.00931. So
-   the derivation used the real count and annotated it with the
-   rounded one. Counting from the model dimensions reproduces its
-   `T_dense` to five figures (6.5151 s against 6.5148 s, 7.2281 s
-   against 7.2277 s). `quail/sol.py` therefore counts `P` with
-   `dense_params()` and never reads `ModelSpec.params`, which is
-   0.93% low at 4B and 0.02% low at 32B.
-2. **F4's question is 48 tokens, not 47.** One token per surviving
-   document, which moves IMDB-6 by 4,131 tokens. `bind_prompt`
-   counts 48 for `Prompt.tail_tokens`.
-3. **Folding F1's question into the prefix over-counts**, because
-   the engine rewinds it. Dropping it gives 509,146,370 pairs,
-   1,242,797 KV read tokens and SoL 7.5467 s, 0.08% below the folded
-   number. Small at two stages and growing with chain depth, so
-   `quail/sol.py` defaults to the rewound count and takes
-   `carry_question_kv=True` to reproduce the derivation.
+   exercises, and that factor is exactly Qwen3-4B's real
+   non-embedding parameter count over the rounded 3.6e9 that
+   `specs/qwen3_4b.py` carries. So the derivation used the real
+   count and annotated it with the rounded one; the stated 1.979e15
+   divisor was right all along. Counting from the model dimensions
+   reproduces its `T_dense` to five figures (6.5151 s against
+   6.5148 s, 7.2281 s against 7.2277 s).
+2. **0.8262 is the 4B run's own answer rate**, 4,131 of 5,000
+   (`/results/sol_check_sf0.1_4b.json` on `quail-results`), not a
+   ground-truth selectivity. The ground truth is the 32B model's
+   labels, which put F1 at 3,873 of 5,000. The tables above use the
+   ground truth.
+3. **F4's question is 48 tokens, not 47.** `bind_prompt` counts 48
+   for `Prompt.tail_tokens`.
+4. **Folding F1's question into the prefix over-counts**, because
+   the engine rewinds it. On ground truth it costs 0.08%: 7.5060 s
+   folded against 7.5000 s rewound. `carry_question_kv=True`
+   reproduces the folded form.
 
-A fourth thing is worth writing down because it is easy to get
-wrong. `bind_prompt` splits a filter prompt into a preamble, a frame
-(the user's text before the placeholder) and a tail. The frame is
-**not** paid by a filter: `runtime/session._question_ids` sends
+A fifth thing is worth writing down because it is easy to get wrong.
+`bind_prompt` splits a filter prompt into a preamble, a frame (the
+user's text before the placeholder) and a tail. The frame is **not**
+paid by a filter: `runtime/session._question_ids` sends
 `prompt.tail` only, and `stage_frames` is a `run_join` argument. So
 F1 costs 54 tokens per document, not the 73 that tail plus frame
 would suggest. Counting the frame would have inflated IMDB-1 by
 95,000 tokens.
 
-**A sanity anchor.** SoL 6.7801 s for 1,774,233 tokens is 262,000
-tokens/s. The ceiling with attention set to zero is
-`R_dense / 2 dense_params`, which is 272,325 tokens/s. SoL is 96% of
-that, which is what it should be for a query whose attention term is
-4% of compute. Both numbers come from the specs alone, so this
-checks the arithmetic and nothing else. Checking the bound against
-reality means measuring a wall on an H100 and comparing; that has
-not been done yet.
+### 7.2 What the labels say about the assumption
+
+With per-document labels the surviving mass is counted, so section
+2's assumption can be tested rather than trusted. Scaling by
+selectivity instead:
+
+| after | counted | scaled by selectivity | error | mean length, survivors vs pool |
+|---|---|---|---|---|
+| F1 | 1,206,884 | 1,165,179 | -3.5% | 311.6 vs 300.8 |
+| F1, F4 | 376,886 | 289,715 | -23.1% | 391.4 vs 311.6 |
+| F1, F4, F5 | 272,514 | 188,932 | -30.7% | 433.9 vs 391.4 |
+
+The survivors are consistently longer than the pool they came from,
+and F4 is the worst: long reviews discuss endings, short ones do
+not. The error compounds down a chain.
+
+It barely moves SoL. IMDB-6 is 7.5000 s counted against 7.4988 s
+scaled, IMDB-7 7.6964 s against 7.6925 s - under 0.1% both times,
+against a mass 23% and 31% wrong. Stage 1 computes every prefix
+once and later stages add about 50 tokens per surviving document,
+so the mass the assumption gets wrong is nearly free here. Expect
+it to bite where later stages carry real work: a join streaming
+partners against an anchor, or a chain run memory-bound. Use the
+counted pair wherever labels exist; it costs nothing.
+
+### 7.3 Against a real wall
+
+The 4B run measured IMDB-1 at 15.06 seconds of query time, boot
+excluded. SoL says 6.7801 seconds. The engine is at 0.45 of the
+floor, so a little over half the wall is loss this bound does not
+price. That ratio is the number the whole document exists to
+produce.
+
+Two cross-checks on the arithmetic itself. SoL 6.7801 s for
+1,774,233 tokens is 262,000 tokens/s, against 272,325 tokens/s for
+`R_dense / 2 dense_params` with attention set to zero: SoL is 96% of
+it, right for a query whose attention term is 4% of compute. And the
+run's own recorded rate, 117,811 tokens/s, is 0.45 of 262,000 - the
+same ratio arrived at from the other side.
+
+`sol_check_sf0.1_4b.json` also carries a `sol_s` of 10.195 s for
+this query, from a calculation that is not in this repository. It
+does not agree with 6.7801 s and I could not find what produced it,
+so it is flagged rather than reconciled.
 
 ## 8. Joins: proposed, not implemented
 
