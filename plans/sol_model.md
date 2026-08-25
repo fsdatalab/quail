@@ -16,31 +16,41 @@ to.
 
 ## 1. Notation
 
-| symbol | meaning | at 4B |
-|---|---|---|
-| `p` | shared preamble tokens, on every document | 2 |
-| `d_i` | tokens in document `i` | mean 299 (IMDB) |
-| `q_s` | tokens in stage `s`'s question | 40 to 62 |
-| `A_s` | documents alive entering stage `s` | `A_1` is all of them |
-| `T(n)` | `n(n+1)/2`, a causal sequence attending to itself | |
-| `P` | dense parameters per token | 3,633,511,936 |
-| `L` | layers | 36 |
-| `n_q`, `d_head` | query heads, head dimension | 32, 128 |
-| `kappa` | KV bytes per token, `2 L n_kv d_head 2` | 147,456 |
-| `W` | resident weight bytes | 4.5e9 |
-| `R_dense` | fp8 dense peak, FLOP/s | 1.979e15 |
-| `R_attn` | bf16 dense peak, FLOP/s | 0.9895e15 |
-| `BW` | HBM bandwidth, bytes/s | 3.35e12 |
-| `C` | tokens per forward pass | 110,376 |
+| symbol | meaning | Qwen3-4B-fp8 | Qwen3-32B-fp8 |
+|---|---|---|---|
+| `p` | shared preamble tokens, on every document | 2 | 2 |
+| `d_i` | tokens in document `i` | from the corpus | from the corpus |
+| `q_s` | tokens in stage `s`'s question | 40 to 62 | 40 to 62 |
+| `A_s` | documents alive entering stage `s` | `A_1` is all | `A_1` is all |
+| `T(n)` | `n(n+1)/2`, a causal sequence attending to itself | | |
+| `P` | dense parameters per token | 3,633,511,936 | 31,206,298,624 |
+| `L` | layers | 36 | 64 |
+| `n_q`, `d_head` | query heads, head dimension | 32, 128 | 64, 128 |
+| `kappa` | KV bytes per token, `2 L n_kv d_head 2` | 147,456 | 262,144 |
+| `W` | resident weight bytes | 4.5e9 | 34.37e9 |
+| `R_dense` | fp8 dense peak, FLOP/s | 1.979e15 | 1.979e15 |
+| `R_attn` | bf16 dense peak, FLOP/s | 0.9895e15 | 0.9895e15 |
+| `BW` | HBM bandwidth, bytes/s | 3.35e12 | 3.35e12 |
+| `C` | tokens per forward pass | 110,376 | 41,943 |
 
-`P` is counted from the model dimensions, not read off
-`ModelSpec.params`, which is rounded to 3.6e9 - 0.93% low, straight
-onto the largest term. `R_dense` and `R_attn` are the H100 datasheet
+`p`, `d_i` and `q_s` are the same for both models because every
+Qwen3 model shares one tokenizer. The hardware rows are the same
+because it is the same H100. Everything else differs.
+
+`C` is a batch size the planner picks, not a property of the
+hardware, so it is an input to the bound with no default. Both
+values above are the fused kernels' 32-bit offset limit,
+`(2^31 - 1)` over the widest projection: 19,456 columns at 4B and
+51,200 at 32B. The 32B batch is a quarter of the 4B one, which is
+why the same query takes more forward passes and re-reads a
+7.6x larger weight set more often.
+
+`P` is counted from the model dimensions rather than quoted, since a
+rounded parameter count lands straight on the largest term of the
+bound. `R_dense` and `R_attn` are the H100 datasheet
 figures halved, because the datasheet quotes them with 2:1 sparsity
 and we run dense. The projections are fp8 and attention is bf16
 (FlashAttention-3 over bf16 KV), which is why there are two peaks.
-`C` is a batch size the planner picks, so it is an input here with
-no default.
 
 ## 2. The KV rule
 
@@ -52,9 +62,8 @@ used for that one evaluation, and dropped (`executor/pack.py`:
 suffix KV is never cached).
 
 So a document is read once however many questions get asked about
-it. That single fact is what section 3 has to encode correctly, and
-it shows up in exactly one place: whether `d_i` appears in the token
-count, or only inside a rectangle.
+it. In the equations below that shows up in one place: whether `d_i`
+appears in the token count, or only inside a rectangle.
 
 ## 3. Counting the work
 
@@ -132,12 +141,11 @@ minimum for a tuple stream longer than one chunk, which every join
 here is.
 
 **Which side anchors.** Anchoring the long side costs one prefix per
-document. Anchoring the short side puts a full copy of every long
-document in every tuple. The planner keeps the cheaper side, so the
-bound prices both and keeps the cheaper too, or it is not a bound on
-what runs. On FEVER the query is written against claims, but claims
-average 11 tokens and evidence 370, so evidence anchors; getting
-that backwards costs 5.2x. On BioDEX it costs 46x.
+document; anchoring the short side puts a full copy of every long
+document into every tuple. The planner keeps the cheaper side, so
+the bound prices both orientations and keeps the cheaper one. The
+choice is not a detail: the two orientations differ by 5.2x on
+FEVER and 46x on BioDEX.
 
 ## 4. Seconds
 
@@ -184,19 +192,15 @@ carry section 3:
 
 ## 6. What the bound assumes
 
-- **Selectivity says how many documents survive, not which.**
+- **Selectivity fixes how many documents survive, not which.**
   `survivors()` keeps an evenly spaced slice of the length-sorted
-  pool, so the survivors carry the pool's length distribution. The
-  QUAIL-B predicates prefer long documents, so the real survivors
-  carry more: 3.5% more token mass after one filter, 31% after
-  three. It moves SoL by under 0.1%, because stage 1 already paid
-  for every prefix and a later stage adds only its question. It
-  would matter where later stages carry real work.
-- **KV read is a minimum**, once per anchor per stage. An anchor
+  pool, so the survivors carry the pool's length distribution. A
+  predicate correlated with document length breaks that.
+- **KV read is a minimum**, one read per anchor per stage. An anchor
   whose tuples straddle a chunk boundary is read twice.
-- **Perfect overlap** of compute and memory, per the `max` above.
+- **Compute and memory overlap perfectly**, per the `max` above.
 - **Nothing is charged** for the tokenizer, the host, scheduling,
-  kernel efficiency, or launch gaps. That is the point.
+  kernel efficiency, or launch gaps. That is what makes it a floor.
 
 ## 7. Every QUAIL-B query
 

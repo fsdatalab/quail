@@ -54,10 +54,9 @@ from quail.specs import DeviceSpec, ModelSpec
 def dense_params(model: ModelSpec) -> int:
     """Parameters every token passes through.
 
-    Counted from the model dimensions, not read off
-    `ModelSpec.params`, which is rounded: 3.6e9 where Qwen3-4B's real
-    non-embedding count is 3,633,511,936. That 0.93% lands straight
-    on the largest term of the bound.
+    Counted rather than quoted: `ModelSpec.params` is rounded to
+    3.6e9 against Qwen3-4B's real 3,633,511,936, and that 0.93%
+    lands straight on the largest term of the bound.
 
     Assumes the Qwen3 block: q/k/v/o projections with no bias, a
     gated MLP, two RMS norms per layer, and q/k head norms.
@@ -173,13 +172,9 @@ def survivors(lengths, selectivity: float):
     evenly spaced slice of the length-sorted list, so the survivors
     carry the same length distribution as the pool they came from.
 
-    That is an assumption, and it is visible here rather than hidden
-    in a scaling factor. It is also wrong in a known direction: the
-    QUAIL-B predicates prefer long documents, so the real survivors
-    carry more tokens than this (up to 31% more after three filters).
-    It changes the bound by under 0.1%, because a later stage adds
-    only about 50 tokens per surviving document while the first scan
-    already paid for every prefix.
+    A predicate correlated with document length breaks that: its
+    survivors are longer than the slice, and the bound undercounts
+    their token mass.
     """
     keep = round(len(lengths) * selectivity)
     if keep <= 0:
