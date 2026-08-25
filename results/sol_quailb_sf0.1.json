@@ -1,0 +1,1031 @@
+{
+ "what": "Speed-of-light bound for all 26 QUAIL-B queries at sf=0.1, on Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100 each. Aggregates only.",
+ "method": "plans/sol_model.md; computed by quail/sol.py",
+ "inputs": {
+  "corpora": "/quailb_data/sf0.1 on quail-results (seed 20260818)",
+  "labels": "/ground_truth/quailb/schema_v1/label_sets on quail-results, qwen3-32b-fp8. Survivor counts and token masses are counted per document, never scaled by a selectivity.",
+  "tokenizer": "Qwen/Qwen3-4B-FP8, shared by every Qwen3 model",
+  "chunk_tokens": {
+   "qwen3-4b-fp8": 110376,
+   "qwen3-32b-fp8": 41943
+  },
+  "preamble_tokens": 2,
+  "filter_question_tokens": {
+   "F1": 54,
+   "F4": 48,
+   "F5": 52,
+   "F7": 50,
+   "F8": 44,
+   "F9": 52,
+   "F11": 56,
+   "F12": 48,
+   "F13": 65,
+   "LEP1": 57,
+   "LEP2": 50,
+   "LEP3": 50,
+   "LEP4": 64,
+   "LEP5": 50,
+   "LEPS1": 46
+  },
+  "join_prompt_tokens": {
+   "DISCUSS_ASPECT": {
+    "tail": 68,
+    "partner_label": 6,
+    "anchor_note": 9
+   },
+   "REACTION": {
+    "tail": 75,
+    "partner_label": 6,
+    "anchor_note": 9
+   },
+   "SUPPORT": {
+    "tail": 64,
+    "partner_label": 6,
+    "anchor_note": 9
+   },
+   "LEPJOIN": {
+    "tail": 62,
+    "partner_label": 6,
+    "anchor_note": 9
+   }
+  },
+  "columns": {
+   "reviews.body": {
+    "n": 5000,
+    "total": 1494233,
+    "total_sq": 704459757
+   },
+   "aspects.aspect": {
+    "n": 12,
+    "total": 27,
+    "total_sq": 63
+   },
+   "reports.report": {
+    "n": 200,
+    "total": 829199,
+    "total_sq": 4675467001
+   },
+   "terms.term": {
+    "n": 614,
+    "total": 2848,
+    "total_sq": 15402
+   },
+   "claims.claim": {
+    "n": 100,
+    "total": 1142,
+    "total_sq": 14692
+   },
+   "evidence.text": {
+    "n": 57,
+    "total": 21099,
+    "total_sq": 11406847
+   },
+   "citations.destination_context": {
+    "n": 200,
+    "total": 46619,
+    "total_sq": 16973201
+   },
+   "citations.passage_text": {
+    "n": 200,
+    "total": 16589,
+    "total_sq": 1660907
+   }
+  }
+ },
+ "validation": {
+  "what": "Token counts against the engine's own fresh_tokens from /results/sol_check_sf0.1_4b.json on quail-results. IMDB-1, IMDB-2 and BIO-2 do not depend on any model's answers, so they must match exactly. IMDB-5 and FEV-5 do: that run was 4B answering, these numbers are the 32B ground truth.",
+  "queries": {
+   "IMDB-1": {
+    "engine_fresh_tokens": 1774233,
+    "sol_tokens": 1774233,
+    "ratio": 1.0,
+    "engine_wall_s": 15.06,
+    "sol_s_4b": 6.7801,
+    "fraction_of_sol": 0.4502
+   },
+   "IMDB-2": {
+    "engine_fresh_tokens": 6124233,
+    "sol_tokens": 6124233,
+    "ratio": 1.0,
+    "engine_wall_s": 53.18,
+    "sol_s_4b": 23.6593,
+    "fraction_of_sol": 0.4449
+   },
+   "IMDB-5": {
+    "engine_fresh_tokens": 2767445,
+    "sol_tokens": 2590485,
+    "ratio": 0.9361,
+    "engine_wall_s": 23.94,
+    "sol_s_4b": 9.9936,
+    "fraction_of_sol": 0.4174
+   },
+   "BIO-2": {
+    "engine_fresh_tokens": 11347799,
+    "sol_tokens": 11347799,
+    "ratio": 1.0,
+    "engine_wall_s": 140.31,
+    "sol_s_4b": 69.3995,
+    "fraction_of_sol": 0.4946
+   },
+   "FEV-5": {
+    "engine_fresh_tokens": 206879,
+    "sol_tokens": 209867,
+    "ratio": 1.0144,
+    "engine_wall_s": 1.84,
+    "sol_s_4b": 0.8205,
+    "fraction_of_sol": 0.4459
+   }
+  }
+ },
+ "queries": {
+  "IMDB-1": {
+   "tokens": 1774233.0,
+   "pairs": 444634043.0,
+   "kv_read_tokens": 0.0,
+   "docs_in": 5000,
+   "survivors_after_filters": 3873,
+   "tuples": 0,
+   "anchor": null,
+   "anchor_tokens_both_ways": {},
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 17,
+     "bytes_moved": 338121301248.0,
+     "t_dense": 6.515105389333085,
+     "t_attention": 0.265038736511806,
+     "t_compute": 6.780144125844891,
+     "t_memory": 0.1009317317158209,
+     "sol_s": 6.780144125844891,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 43,
+     "bytes_moved": 1943014535552.0,
+     "t_dense": 55.95476991061687,
+     "t_attention": 0.9423599520419768,
+     "t_compute": 56.89712986265884,
+     "t_memory": 0.5800043389707462,
+     "sol_s": 56.89712986265884,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "IMDB-2": {
+   "tokens": 6124233.0,
+   "pairs": 1964006753.0,
+   "kv_read_tokens": 1549233.0,
+   "docs_in": 5000,
+   "survivors_after_filters": 5000,
+   "tuples": 60000,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 6124233.0,
+    "right": 22370955.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 56,
+     "bytes_moved": 1383498602496.0,
+     "t_dense": 22.488604046836876,
+     "t_attention": 1.1707107822955756,
+     "t_compute": 23.65931482913245,
+     "t_memory": 0.41298465746149254,
+     "sol_s": 23.65931482913245,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 147,
+     "bytes_moved": 7063943071104.0,
+     "t_dense": 193.14264157751936,
+     "t_attention": 4.162527225939824,
+     "t_compute": 197.30516880345917,
+     "t_memory": 2.108639722717612,
+     "sol_s": 197.30516880345917,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "IMDB-3": {
+   "tokens": 5352885.0,
+   "pairs": 1728746738.0,
+   "kv_read_tokens": 1241741.0,
+   "docs_in": 5000,
+   "survivors_after_filters": 3873,
+   "tuples": 46476,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 3578652.0,
+    "right": 17829039.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 49,
+     "bytes_moved": 1192917171456.0,
+     "t_dense": 19.65616123247636,
+     "t_attention": 1.0304763173260354,
+     "t_compute": 20.686637549802395,
+     "t_memory": 0.35609467804656714,
+     "sol_s": 20.686637549802395,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 128,
+     "bytes_moved": 6128101638144.0,
+     "t_dense": 168.81629894889363,
+     "t_attention": 3.6639157949370147,
+     "t_compute": 172.48021474383066,
+     "t_memory": 1.8292840710877611,
+     "sol_s": 172.48021474383066,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "IMDB-4": {
+   "tokens": 2849949.0,
+   "pairs": 897370736.0,
+   "kv_read_tokens": 1592437.0,
+   "docs_in": 5000,
+   "survivors_after_filters": 963,
+   "tuples": 11556,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 889812.0,
+    "right": 5354823.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 26,
+     "bytes_moved": 772056470016.0,
+     "t_dense": 10.465208396656154,
+     "t_attention": 0.5349073238913229,
+     "t_compute": 11.000115720547477,
+     "t_memory": 0.23046461791522388,
+     "sol_s": 11.000115720547477,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 68,
+     "bytes_moved": 3501704835584.0,
+     "t_dense": 89.88010061361311,
+     "t_attention": 1.901892707169148,
+     "t_compute": 91.78199332078226,
+     "t_memory": 1.0452850255474626,
+     "sol_s": 91.78199332078226,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "IMDB-5": {
+   "tokens": 2590485.0,
+   "pairs": 807242389.0,
+   "kv_read_tokens": 1861936.0,
+   "docs_in": 5000,
+   "survivors_after_filters": 628,
+   "tuples": 7536,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 580272.0,
+    "right": 3812919.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 24,
+     "bytes_moved": 764536190976.0,
+     "t_dense": 9.51243877466292,
+     "t_attention": 0.48118336013091056,
+     "t_compute": 9.993622134793831,
+     "t_memory": 0.22821975850029852,
+     "sol_s": 9.993622134793831,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 62,
+     "bytes_moved": 3298115450624.0,
+     "t_dense": 81.69726982414618,
+     "t_attention": 1.7108741693543486,
+     "t_compute": 83.40814399350053,
+     "t_memory": 0.9845120748131343,
+     "sol_s": 83.40814399350053,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "IMDB-6": {
+   "tokens": 1960137.0,
+   "pairs": 507119123.0,
+   "kv_read_tokens": 1206884.0,
+   "docs_in": 5000,
+   "survivors_after_filters": 963,
+   "tuples": 0,
+   "anchor": null,
+   "anchor_tokens_both_ways": {},
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 18,
+     "bytes_moved": 547996248576.0,
+     "t_dense": 7.1977576409249435,
+     "t_attention": 0.3022850223389106,
+     "t_compute": 7.500042663263854,
+     "t_memory": 0.1635809697241791,
+     "sol_s": 7.500042663263854,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 47,
+     "bytes_moved": 2445605553024.0,
+     "t_dense": 61.81770648403384,
+     "t_attention": 1.0747911905383487,
+     "t_compute": 62.89249767457219,
+     "t_memory": 0.7300315083653731,
+     "sol_s": 62.89249767457219,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "IMDB-7": {
+   "tokens": 2010213.0,
+   "pairs": 528044209.0,
+   "kv_read_tokens": 1583770.0,
+   "docs_in": 5000,
+   "survivors_after_filters": 628,
+   "tuples": 0,
+   "anchor": null,
+   "anchor_tokens_both_ways": {},
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 19,
+     "bytes_moved": 615454357248.0,
+     "t_dense": 7.38164015098774,
+     "t_attention": 0.31475810765964224,
+     "t_compute": 7.696398258647382,
+     "t_memory": 0.18371771858149255,
+     "sol_s": 7.696398258647382,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 48,
+     "bytes_moved": 2591901079552.0,
+     "t_dense": 63.39697541773311,
+     "t_attention": 1.1191399383453946,
+     "t_compute": 64.5161153560785,
+     "t_memory": 0.7737018147916418,
+     "sol_s": 64.5161153560785,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "BIO-1": {
+   "tokens": 839599.0,
+   "pairs": 2381542048.0,
+   "kv_read_tokens": 0.0,
+   "docs_in": 200,
+   "survivors_after_filters": 119,
+   "tuples": 0,
+   "anchor": null,
+   "anchor_tokens_both_ways": {},
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 8,
+     "bytes_moved": 159803910144.0,
+     "t_dense": 3.0830651722624194,
+     "t_attention": 1.4195964193224375,
+     "t_compute": 4.502661591584857,
+     "t_memory": 0.04770265974447761,
+     "sol_s": 4.502661591584857,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 21,
+     "bytes_moved": 941865840256.0,
+     "t_dense": 26.47880456635854,
+     "t_attention": 5.047453935368667,
+     "t_compute": 31.526258501727206,
+     "t_memory": 0.28115398216597015,
+     "sol_s": 31.526258501727206,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "BIO-2": {
+   "tokens": 11347799.0,
+   "pairs": 46519686107.0,
+   "kv_read_tokens": 831399.0,
+   "docs_in": 200,
+   "survivors_after_filters": 200,
+   "tuples": 122800,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 11347799.0,
+    "right": 519084588.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 103,
+     "bytes_moved": 2259395820288.0,
+     "t_dense": 41.66989703267192,
+     "t_attention": 27.729588012506486,
+     "t_compute": 69.39948504517841,
+     "t_memory": 0.674446513518806,
+     "sol_s": 69.39948504517841,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 271,
+     "bytes_moved": 12506973680512.0,
+     "t_dense": 357.88055009512743,
+     "t_attention": 98.59409071113417,
+     "t_compute": 456.4746408062616,
+     "t_memory": 3.7334249792573133,
+     "sol_s": 456.4746408062616,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "BIO-3": {
+   "tokens": 7097928.0,
+   "pairs": 29275554081.0,
+   "kv_read_tokens": 506224.0,
+   "docs_in": 200,
+   "survivors_after_filters": 119,
+   "tuples": 73066,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 6258329.0,
+    "right": 315945758.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 65,
+     "bytes_moved": 1413777837312.0,
+     "t_dense": 26.064078937714612,
+     "t_attention": 17.45065630143683,
+     "t_compute": 43.51473523915144,
+     "t_memory": 0.42202323501850747,
+     "sol_s": 43.51473523915144,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 170,
+     "bytes_moved": 7836282821888.0,
+     "t_dense": 223.85049093446293,
+     "t_attention": 62.046777960664286,
+     "t_compute": 285.89726889512724,
+     "t_memory": 2.3391889020561196,
+     "sol_s": 285.89726889512724,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "BIO-4": {
+   "tokens": 5157297.0,
+   "pairs": 21068654453.0,
+   "kv_read_tokens": 856504.0,
+   "docs_in": 200,
+   "survivors_after_filters": 82,
+   "tuples": 50348,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 4312462.0,
+    "right": 219263476.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 47,
+     "bytes_moved": 1098271040256.0,
+     "t_dense": 18.93794866801111,
+     "t_attention": 12.55866401625697,
+     "t_compute": 31.49661268426808,
+     "t_memory": 0.3278421015689552,
+     "sol_s": 31.49661268426808,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 123,
+     "bytes_moved": 5803991849344.0,
+     "t_dense": 162.64795378944854,
+     "t_attention": 44.65302761335812,
+     "t_compute": 207.30098140280666,
+     "t_memory": 1.732534880401194,
+     "sol_s": 207.30098140280666,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "BIO-5": {
+   "tokens": 3794195.0,
+   "pairs": 14591662099.0,
+   "kv_read_tokens": 1084737.0,
+   "docs_in": 200,
+   "survivors_after_filters": 56,
+   "tuples": 34384,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 2945096.0,
+    "right": 143004676.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 35,
+     "bytes_moved": 876927796992.0,
+     "t_dense": 13.932544537656918,
+     "t_attention": 8.697839824032922,
+     "t_compute": 22.630384361689842,
+     "t_memory": 0.261769491639403,
+     "sol_s": 22.630384361689842,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 91,
+     "bytes_moved": 4406652750208.0,
+     "t_dense": 119.65920384809266,
+     "t_attention": 30.92565270767261,
+     "t_compute": 150.58485655576527,
+     "t_memory": 1.3154187314053731,
+     "sol_s": 150.58485655576527,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "FEV-1": {
+   "tokens": 6942.0,
+   "pairs": 245253.0,
+   "kv_read_tokens": 0.0,
+   "docs_in": 100,
+   "survivors_after_filters": 59,
+   "tuples": 0,
+   "anchor": null,
+   "anchor_tokens_both_ways": {},
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 1,
+     "bytes_moved": 5523639552.0,
+     "t_dense": 0.02549150061618191,
+     "t_attention": 0.0001461911121495705,
+     "t_compute": 0.025637691728331483,
+     "t_memory": 0.0016488476274626866,
+     "sol_s": 0.025637691728331483,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 1,
+     "bytes_moved": 36189803648.0,
+     "t_dense": 0.21893292071531884,
+     "t_attention": 0.0005197906209762507,
+     "t_compute": 0.2194527113362951,
+     "t_memory": 0.010802926462089552,
+     "sol_s": 0.2194527113362951,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "FEV-2": {
+   "tokens": 485820.0,
+   "pairs": 202015265.0,
+   "kv_read_tokens": 21726.0,
+   "docs_in": 100,
+   "survivors_after_filters": 100,
+   "tuples": 5700,
+   "anchor": "right",
+   "anchor_tokens_both_ways": {
+    "left": 2511142.0,
+    "right": 485820.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 5,
+     "bytes_moved": 97340702976.0,
+     "t_dense": 1.783964394893906,
+     "t_attention": 0.12041783897257201,
+     "t_compute": 1.904382233866478,
+     "t_memory": 0.029056926261492536,
+     "sol_s": 1.904382233866478,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 12,
+     "bytes_moved": 545490138624.0,
+     "t_dense": 15.321519957060818,
+     "t_attention": 0.4281523163469227,
+     "t_compute": 15.749672273407741,
+     "t_memory": 0.16283287720119402,
+     "sol_s": 15.749672273407741,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "FEV-3": {
+   "tokens": 302382.0,
+   "pairs": 121823123.0,
+   "kv_read_tokens": 21726.0,
+   "docs_in": 100,
+   "survivors_after_filters": 59,
+   "tuples": 3363,
+   "anchor": "right",
+   "anchor_tokens_both_ways": {
+    "left": 1480782.0,
+    "right": 295440.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 3,
+     "bytes_moved": 61291669248.0,
+     "t_dense": 1.1103674646099566,
+     "t_attention": 0.07261667680682365,
+     "t_compute": 1.1829841414167803,
+     "t_memory": 0.018296020671044775,
+     "sol_s": 1.1829841414167803,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 8,
+     "bytes_moved": 359922967552.0,
+     "t_dense": 9.536354715030186,
+     "t_attention": 0.25819262864648407,
+     "t_compute": 9.794547343676669,
+     "t_memory": 0.10743969180656716,
+     "sol_s": 9.794547343676669,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "FEV-4": {
+   "tokens": 80862.0,
+   "pairs": 27280988.0,
+   "kv_read_tokens": 22516.0,
+   "docs_in": 100,
+   "survivors_after_filters": 10,
+   "tuples": 570,
+   "anchor": "right",
+   "anchor_tokens_both_ways": {
+    "left": 250980.0,
+    "right": 71088.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 1,
+     "bytes_moved": 19743706368.0,
+     "t_dense": 0.2969308157340394,
+     "t_attention": 0.016261729627197574,
+     "t_compute": 0.313192545361237,
+     "t_memory": 0.005893643691940298,
+     "sol_s": 0.313192545361237,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 2,
+     "bytes_moved": 95839922432.0,
+     "t_dense": 2.550180615799786,
+     "t_attention": 0.05781948311892471,
+     "t_compute": 2.6080000989187107,
+     "t_memory": 0.02860893206925373,
+     "sol_s": 2.6080000989187107,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "FEV-5": {
+   "tokens": 209867.0,
+   "pairs": 83590328.0,
+   "kv_read_tokens": 14291.0,
+   "docs_in": 100,
+   "survivors_after_filters": 59,
+   "tuples": 2183,
+   "anchor": "right",
+   "anchor_tokens_both_ways": {
+    "left": 972497.0,
+    "right": 178007.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 2,
+     "bytes_moved": 42053442048.0,
+     "t_dense": 0.7706460328170914,
+     "t_attention": 0.0498267626298858,
+     "t_compute": 0.8204727954469773,
+     "t_memory": 0.012553266282985075,
+     "sol_s": 0.8204727954469773,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 6,
+     "bytes_moved": 264981674752.0,
+     "t_dense": 6.618668290371913,
+     "t_attention": 0.1771618226840384,
+     "t_compute": 6.795830113055951,
+     "t_memory": 0.07909900738865672,
+     "sol_s": 6.795830113055951,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "FEV-6": {
+   "tokens": 67067.0,
+   "pairs": 21517933.0,
+   "kv_read_tokens": 15081.0,
+   "docs_in": 100,
+   "survivors_after_filters": 10,
+   "tuples": 370,
+   "anchor": "right",
+   "anchor_tokens_both_ways": {
+    "left": 164830.0,
+    "right": 32375.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 1,
+     "bytes_moved": 16613215488.0,
+     "t_dense": 0.24627462861213947,
+     "t_attention": 0.012826471262043457,
+     "t_compute": 0.25910109987418295,
+     "t_memory": 0.0049591688023880596,
+     "sol_s": 0.25910109987418295,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 2,
+     "bytes_moved": 90274605312.0,
+     "t_dense": 2.115121606686011,
+     "t_attention": 0.04560523115393229,
+     "t_compute": 2.160726837839943,
+     "t_memory": 0.02694764337671642,
+     "sol_s": 2.160726837839943,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "LEP-1": {
+   "tokens": 58419.0,
+   "pairs": 11614431.0,
+   "kv_read_tokens": 0.0,
+   "docs_in": 200,
+   "survivors_after_filters": 4,
+   "tuples": 0,
+   "anchor": null,
+   "anchor_tokens_both_ways": {},
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 1,
+     "bytes_moved": 13114232064.0,
+     "t_dense": 0.21451857886729056,
+     "t_attention": 0.006923163365481556,
+     "t_compute": 0.2214417422327721,
+     "t_memory": 0.003914696138507463,
+     "sol_s": 0.2214417422327721,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 2,
+     "bytes_moved": 84054190336.0,
+     "t_dense": 1.8423858103238564,
+     "t_attention": 0.024615691966156646,
+     "t_compute": 1.867001502290013,
+     "t_memory": 0.025090803085373134,
+     "sol_s": 1.867001502290013,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "LEP-2": {
+   "tokens": 6086619.0,
+   "pairs": 1970032710.0,
+   "kv_read_tokens": 48819.0,
+   "docs_in": 200,
+   "survivors_after_filters": 200,
+   "tuples": 40000,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 6086619.0,
+    "right": 12062589.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 56,
+     "bytes_moved": 1156707145728.0,
+     "t_dense": 22.350482856376335,
+     "t_attention": 1.1743027520394542,
+     "t_compute": 23.52478560841579,
+     "t_memory": 0.3452857151426866,
+     "sol_s": 23.52478560841579,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 146,
+     "bytes_moved": 6626388259072.0,
+     "t_dense": 191.95639224306444,
+     "t_attention": 4.17529867391806,
+     "t_compute": 196.1316909169825,
+     "t_memory": 1.9780263459916418,
+     "sol_s": 196.1316909169825,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "LEP-3": {
+   "tokens": 179211.0,
+   "pairs": 72332511.0,
+   "kv_read_tokens": 1688.0,
+   "docs_in": 200,
+   "survivors_after_filters": 4,
+   "tuples": 800,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 120792.0,
+    "right": 401989.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 2,
+     "bytes_moved": 35674642944.0,
+     "t_dense": 0.658075096071244,
+     "t_attention": 0.043116170761055075,
+     "t_compute": 0.7011912668322992,
+     "t_memory": 0.010649147147462687,
+     "sol_s": 0.7011912668322992,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 5,
+     "bytes_moved": 219271587456.0,
+     "t_dense": 5.651856475700519,
+     "t_attention": 0.1533019404837514,
+     "t_compute": 5.805158416184271,
+     "t_memory": 0.06545420521074627,
+     "sol_s": 5.805158416184271,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "LEP-4": {
+   "tokens": 149213.0,
+   "pairs": 56515939.0,
+   "kv_read_tokens": 2894.0,
+   "docs_in": 200,
+   "survivors_after_filters": 3,
+   "tuples": 600,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 90594.0,
+    "right": 301389.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 2,
+     "bytes_moved": 31429089792.0,
+     "t_dense": 0.5479203805016352,
+     "t_attention": 0.033688183127575544,
+     "t_compute": 0.5816085636292108,
+     "t_memory": 0.009381817848358209,
+     "sol_s": 0.5816085636292108,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 4,
+     "bytes_moved": 177353937408.0,
+     "t_dense": 4.705796297708855,
+     "t_attention": 0.11978020667582415,
+     "t_compute": 4.82557650438468,
+     "t_memory": 0.05294147385313433,
+     "sol_s": 4.82557650438468,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "LEP-5": {
+   "tokens": 58769.0,
+   "pairs": 11766706.0,
+   "kv_read_tokens": 2867.0,
+   "docs_in": 200,
+   "survivors_after_filters": 0,
+   "tuples": 0,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 0.0,
+    "right": 0.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 1,
+     "bytes_moved": 13588598016.0,
+     "t_dense": 0.21580380289720466,
+     "t_attention": 0.007013931884531582,
+     "t_compute": 0.22281773478173625,
+     "t_memory": 0.0040562979152238806,
+     "sol_s": 0.22281773478173625,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 2,
+     "bytes_moved": 84897507584.0,
+     "t_dense": 1.8534239149407337,
+     "t_attention": 0.02493842447833451,
+     "t_compute": 1.8783623394190683,
+     "t_memory": 0.025342539577313434,
+     "sol_s": 1.8783623394190683,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "LEP-6": {
+   "tokens": 58769.0,
+   "pairs": 11766706.0,
+   "kv_read_tokens": 2867.0,
+   "docs_in": 200,
+   "survivors_after_filters": 0,
+   "tuples": 0,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 0.0,
+    "right": 0.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 1,
+     "bytes_moved": 13588598016.0,
+     "t_dense": 0.21580380289720466,
+     "t_attention": 0.007013931884531582,
+     "t_compute": 0.22281773478173625,
+     "t_memory": 0.0040562979152238806,
+     "sol_s": 0.22281773478173625,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 2,
+     "bytes_moved": 84897507584.0,
+     "t_dense": 1.8534239149407337,
+     "t_attention": 0.02493842447833451,
+     "t_compute": 1.8783623394190683,
+     "t_memory": 0.025342539577313434,
+     "sol_s": 1.8783623394190683,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "LEP-7": {
+   "tokens": 175402.0,
+   "pairs": 58386159.0,
+   "kv_read_tokens": 2894.0,
+   "docs_in": 200,
+   "survivors_after_filters": 3,
+   "tuples": 600,
+   "anchor": "left",
+   "anchor_tokens_both_ways": {
+    "left": 90594.0,
+    "right": 284400.0
+   },
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 2,
+     "bytes_moved": 35290814976.0,
+     "t_dense": 0.6440881865571217,
+     "t_attention": 0.0348029892329621,
+     "t_compute": 0.6788911757900838,
+     "t_memory": 0.010534571634626866,
+     "sol_s": 0.6788911757900838,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 5,
+     "bytes_moved": 218589226624.0,
+     "t_dense": 5.531730360027133,
+     "t_attention": 0.12374396171719859,
+     "t_compute": 5.6554743217443315,
+     "t_memory": 0.06525051541014926,
+     "sol_s": 5.6554743217443315,
+     "bound_by": "compute"
+    }
+   }
+  },
+  "LEP-8": {
+   "tokens": 58769.0,
+   "pairs": 11766706.0,
+   "kv_read_tokens": 2867.0,
+   "docs_in": 200,
+   "survivors_after_filters": 0,
+   "tuples": 0,
+   "anchor": null,
+   "anchor_tokens_both_ways": {},
+   "models": {
+    "qwen3-4b-fp8": {
+     "passes": 1,
+     "bytes_moved": 13588598016.0,
+     "t_dense": 0.21580380289720466,
+     "t_attention": 0.007013931884531582,
+     "t_compute": 0.22281773478173625,
+     "t_memory": 0.0040562979152238806,
+     "sol_s": 0.22281773478173625,
+     "bound_by": "compute"
+    },
+    "qwen3-32b-fp8": {
+     "passes": 2,
+     "bytes_moved": 84897507584.0,
+     "t_dense": 1.8534239149407337,
+     "t_attention": 0.02493842447833451,
+     "t_compute": 1.8783623394190683,
+     "t_memory": 0.025342539577313434,
+     "sol_s": 1.8783623394190683,
+     "bound_by": "compute"
+    }
+   }
+  }
+ }
+}

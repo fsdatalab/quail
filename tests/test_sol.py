@@ -15,8 +15,9 @@ from pathlib import Path
 
 import pytest
 
-from quail.sol import (Corpus, FilterStage, Workload, bound, dense_params,
-                       filter_chain_sol, filter_chain_workload)
+from quail.sol import (Corpus, FilterStage, JoinSide, JoinStage, Workload,
+                       bound, dense_params, filter_chain_sol,
+                       filter_chain_workload, join_workload)
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 # The batch size the derivation ran the forward pass at. An input to
@@ -260,3 +261,96 @@ def test_survivors_are_longer_than_the_pool_they_came_from():
         assert gt["mean_prefix_survivors"] > gt["mean_prefix_pool"]
     f4 = _GT["survivors"]["F4_given_F1"]
     assert f4["mean_prefix_survivors"] / f4["mean_prefix_pool"] > 1.2
+
+
+# ---- joins, and the whole QUAIL-B table
+
+_QB = json.loads(
+    (Path(__file__).resolve().parents[1]
+     / "results" / "sol_quailb_sf0.1.json").read_text())
+
+
+def test_join_tuple_count_is_the_cross_product():
+    j = JoinStage(anchor=JoinSide.from_lengths([100, 200]),
+                  suffix=JoinSide.from_lengths([10, 10, 10]))
+    assert j.tuples == 6
+
+
+def test_opening_join_pairs_are_the_anchor_triangle_plus_tuples():
+    """One anchor of 100 tokens, no naming line, two partners of 10:
+    the anchor is a full triangle, each suffix a rectangle over 100
+    plus its own small triangle."""
+    j = JoinStage(anchor=JoinSide.from_lengths([100]),
+                  suffix=JoinSide.from_lengths([10, 10]),
+                  note_tokens=0, opens_anchor=True)
+    w = join_workload(j)
+    assert w.tokens == 100 + 20
+    assert w.pairs == 100 * 101 / 2 + 2 * (10 * 100 + 10 * 11 / 2)
+    assert w.kv_read_tokens == 100
+
+
+def test_resident_anchor_only_pays_the_naming_line():
+    """After a filter the anchor prefixes are already computed, so the
+    join adds the naming line and the tuple suffixes, nothing else."""
+    opened = join_workload(JoinStage(
+        anchor=JoinSide.from_lengths([100]),
+        suffix=JoinSide.from_lengths([10]), note_tokens=4,
+        opens_anchor=True))
+    resident = join_workload(JoinStage(
+        anchor=JoinSide.from_lengths([100]),
+        suffix=JoinSide.from_lengths([10]), note_tokens=4,
+        opens_anchor=False))
+    assert opened.tokens - resident.tokens == 100
+    assert resident.tokens == 4 + 10
+
+
+def test_workloads_add():
+    a = Workload(1.0, 2.0, 3.0)
+    b = Workload(10.0, 20.0, 30.0)
+    assert (a + b).tokens == 11.0
+    assert (a + b).pairs == 22.0
+    assert (a + b).kv_read_tokens == 33.0
+
+
+def test_every_quailb_query_has_a_bound_for_both_models():
+    assert len(_QB["queries"]) == 26
+    for qid, r in _QB["queries"].items():
+        for m in ("qwen3-4b-fp8", "qwen3-32b-fp8"):
+            assert r["models"][m]["sol_s"] > 0, qid
+
+
+def test_token_counts_match_the_engine_where_answers_cannot_differ():
+    """IMDB-1, IMDB-2 and BIO-2 push a token count no model's answers
+    can change - one filter over the whole corpus, or a join with no
+    filter in front of it. Those must match the engine exactly. The
+    other two ran on 4B's own answers, not the 32B ground truth."""
+    v = _QB["validation"]["queries"]
+    for qid in ("IMDB-1", "IMDB-2", "BIO-2"):
+        assert v[qid]["ratio"] == 1.0, qid
+    for qid in ("IMDB-5", "FEV-5"):
+        assert 0.9 < v[qid]["ratio"] < 1.1, qid
+
+
+def test_the_engine_runs_at_a_steady_fraction_of_the_floor():
+    """Five measured walls, three corpora, filters and joins, 1.8 to
+    140 seconds: all of them land between 0.41 and 0.50 of SoL."""
+    f = [q["fraction_of_sol"] for q in _QB["validation"]["queries"].values()]
+    assert min(f) > 0.41 and max(f) < 0.50
+
+
+def test_32b_costs_more_but_not_uniformly():
+    """The dense term scales 8.6x (parameter counts) and the attention
+    term 3.6x (f_pair x L), so a query whose attention share is large
+    scales by less. BIO's 4,146-token reports are that query."""
+    def ratio(q):
+        m = _QB["queries"][q]["models"]
+        return m["qwen3-32b-fp8"]["sol_s"] / m["qwen3-4b-fp8"]["sol_s"]
+
+    def attn_share(q):
+        m = _QB["queries"][q]["models"]["qwen3-4b-fp8"]
+        return m["t_attention"] / m["t_compute"]
+
+    assert attn_share("BIO-2") > 0.35 and attn_share("IMDB-2") < 0.10
+    assert ratio("BIO-2") < ratio("IMDB-2")
+    assert 6.5 < ratio("BIO-2") < 6.7
+    assert 8.3 < ratio("IMDB-2") < 8.4

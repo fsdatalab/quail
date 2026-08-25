@@ -15,8 +15,8 @@ figure, a model dimension, or a count of work the query cannot
 avoid. Nothing in the planner reads it either.
 
 The formulas and their assumptions are `plans/sol_model.md`. This
-module implements the filter-chain case (sections 4-6). Joins are
-section 8 of that document and are a proposal, not implemented here.
+module implements the filter-chain case (sections 4-6) and joins
+(section 8).
 
 The split is deliberate: `filter_chain_workload` is query-shape
 arithmetic with no hardware in it, and `bound` is hardware
@@ -124,6 +124,14 @@ class Workload:
     kv_read_tokens: float
     per_stage: tuple = ()    # one (tokens, pairs, kv_read) per stage
 
+    def __add__(self, other: "Workload") -> "Workload":
+        """Two parts of one query. Legal because the three counts are
+        counts: a query's work is the work of its stages."""
+        return Workload(self.tokens + other.tokens,
+                        self.pairs + other.pairs,
+                        self.kv_read_tokens + other.kv_read_tokens,
+                        self.per_stage + other.per_stage)
+
 
 @dataclass(frozen=True)
 class SoLBound:
@@ -224,6 +232,78 @@ def filter_chain_workload(corpus: Corpus, stages,
             carried += q
     return Workload(tokens=tokens, pairs=pairs, kv_read_tokens=kv_read,
                     per_stage=tuple(per_stage))
+
+
+@dataclass(frozen=True)
+class JoinSide:
+    """One side of a join, as the two moments of a length."""
+    n: int
+    total: float        # sum of lengths
+    total_sq: float     # sum of squared lengths
+
+    @classmethod
+    def from_lengths(cls, lengths, add: int = 0):
+        v = [float(x) + add for x in lengths]
+        return cls(len(v), sum(v), sum(x * x for x in v))
+
+
+@dataclass(frozen=True)
+class JoinStage:
+    """One join: every live anchor against every live partner.
+
+    `anchor` holds the live anchors' prefix lengths, `SHARED_PRE` plus
+    the document. `suffix` holds one length per live partner: that
+    partner's block label, its document, and the question tail, which
+    together are what a tuple appends. Both are per side, not per
+    tuple, because a full cross product makes the tuple sums separable
+    - `sum over tuples of u * c` is `sum_p u` times `sum_a c`. A gated
+    or deduped tuple set is not separable and this does not model it.
+
+    `note_tokens` is the anchor naming line, written into each
+    anchor's kept KV once per stage. `opens_anchor` is False when a
+    filter on the anchor table already computed the prefixes, which is
+    every QUAIL-B query with a filter before its join; then only the
+    naming line is fresh.
+    """
+    anchor: JoinSide
+    suffix: JoinSide
+    note_tokens: int = 0
+    opens_anchor: bool = True
+
+    @property
+    def tuples(self) -> int:
+        return self.anchor.n * self.suffix.n
+
+
+def join_workload(stage: JoinStage) -> Workload:
+    """Tokens, pairs and KV read-backs for one join. Section 8 of
+    `plans/sol_model.md`.
+
+    The anchor context each tuple attends to is the prefix plus the
+    naming line. A tuple's suffix is atomic: its tokens attend to that
+    context and to each other, never to another tuple's
+    (`executor/pack.py`), so it is one rectangle and one triangle per
+    tuple, the same shape as a filter's question.
+    """
+    f, n_a = stage.note_tokens, stage.anchor.n
+    # context = prefix + naming line, first two moments
+    ctx1 = stage.anchor.total + n_a * f
+    ctx2 = (stage.anchor.total_sq + 2 * f * stage.anchor.total
+            + n_a * f * f)
+    su1, su2 = stage.suffix.total, stage.suffix.total_sq
+    if stage.opens_anchor:
+        tokens = ctx1
+        pairs = (ctx2 + ctx1) / 2
+    else:
+        # only the naming line is computed, over a resident prefix
+        tokens = n_a * f
+        pairs = f * stage.anchor.total + n_a * f * (f + 1) / 2
+    tokens += n_a * su1
+    pairs += su1 * ctx1 + n_a * (su2 + su1) / 2
+    # every anchor's context is read back at least once: its tuple
+    # stream always outruns one chunk at these sizes
+    return Workload(tokens=tokens, pairs=pairs, kv_read_tokens=ctx1,
+                    per_stage=((tokens, pairs, ctx1),))
 
 
 def bound(model: ModelSpec, device: DeviceSpec, workload: Workload,
