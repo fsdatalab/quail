@@ -57,45 +57,38 @@ def plot_sol_per_query():
 
 
 def plot_attention_share():
-    """Where the time goes, against the length of the documents whose
-    KV is held. Attention pairs are quadratic in that length, so the
-    longer the held document, the more of the compute is attention.
+    """Where each query's compute goes, per query, on both models.
 
-    The curves are the same equations applied to a synthetic single
-    document, so they are drawn from the model rather than fitted to
-    the 26 points. The points sit off the curve where a query's join
-    streams extra tokens past the held documents."""
-    fig, ax = plt.subplots(figsize=(7.6, 4.5))
-    curve = D["attention_share_curve"]
-    cx = curve["document_tokens"]
-    for model, colour, label in (("qwen3-4b-fp8", BLUE, "Qwen3-4B-fp8"),
-                                 ("qwen3-32b-fp8", ORANGE,
-                                  "Qwen3-32B-fp8")):
-        ax.plot(cx, curve["attention_share"][model], color=colour,
-                lw=1.2, alpha=0.55)
-        ax.scatter([Q[q]["held_mean_doc_tokens"] for q in ORDER],
-                   [100 * Q[q]["models"][model]["t_attention"]
-                    / Q[q]["models"][model]["t_compute"] for q in ORDER],
-                   s=30, color=colour, label=label, zorder=3)
-    for corpus, xt, yt, dx, dy in (
-            ("claims, 11 tokens", 11.4, 0.6, 4, 12),
-            ("excerpts, 233", 233.1, 3.7, -46, -12),
-            ("reviews, 299", 298.8, 4.9, 8, 12),
-            ("evidence, 370", 370.2, 6.3, 52, 2),
-            ("reports, 4,146", 4146.0, 40.0, -22, 10)):
-        ax.annotate(corpus, (xt, yt), textcoords="offset points",
-                    xytext=(dx, dy), fontsize=7.5, color=DARK,
-                    ha="center")
-    ax.set_xscale("log")
-    ax.set_xlim(5, 40_000)
-    ax.set_ylim(-3, 62)
-    ax.set_xlabel("mean length of the documents whose KV is held, "
-                  "tokens (log scale)")
+    Attention pairs are quadratic in the length of the document whose
+    KV is held, so the four BioDEX queries - 4,146-token reports -
+    spend a third to two fifths of their compute on attention where
+    everything else spends under seven percent. The 32B dot is always
+    below the 4B one because attention scales 3.56x with model size
+    where the dense projections scale 8.59x.
+    """
+    fig, ax = plt.subplots(figsize=(10, 4.4))
+    x = list(range(len(ORDER)))
+
+    def share(q, model):
+        m = Q[q]["models"][model]
+        return 100 * m["t_attention"] / m["t_compute"]
+
+    lo = [share(q, "qwen3-32b-fp8") for q in ORDER]
+    hi = [share(q, "qwen3-4b-fp8") for q in ORDER]
+    ax.vlines(x, lo, hi, color=DARK, lw=0.7, alpha=0.35)
+    ax.scatter(x, hi, s=34, color=BLUE, label="Qwen3-4B-fp8", zorder=3)
+    ax.scatter(x, lo, s=34, color=ORANGE, label="Qwen3-32B-fp8", zorder=3)
+    for i, q in enumerate(ORDER):
+        if q.startswith("BIO"):
+            ax.text(i, hi[i] + 1.6, f"{hi[i]:.0f}%", ha="center",
+                    fontsize=7.5, color=BLUE)
+            ax.text(i, lo[i] - 3.2, f"{lo[i]:.0f}%", ha="center",
+                    fontsize=7.5, color=ORANGE)
+    ax.set_xticks(x)
+    ax.set_xticklabels(ORDER, rotation=90, fontsize=7.5)
     ax.set_ylabel("attention share of compute, percent")
-    ax.legend(frameon=False, loc="upper left", fontsize=8.5)
-    ax.text(6000, 4, "lines: the same equations over one\n"
-                     "synthetic document\npoints: the 26 QUAIL-B queries",
-            fontsize=7.5, color=DARK, va="bottom")
+    ax.set_ylim(-4, 47)
+    ax.legend(frameon=False, loc="upper right", fontsize=8.5)
     fig.tight_layout()
     fig.savefig(OUT / "sol_quailb_attention_share.png", dpi=150)
 
