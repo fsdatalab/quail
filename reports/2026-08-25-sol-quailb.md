@@ -25,16 +25,19 @@ one pass, and writes both to `/sol/sol_quailb_sf0.1.json` on the
    tokenizer, kept as a length histogram so nothing is lost and no
    per-document record is committed.
 
-   | column | documents | tokens | mean |
-   |---|---|---|---|
-   | reviews.body | 5,000 | 1,494,233 | 298.8 |
-   | reports.report | 200 | 829,199 | 4,146.0 |
-   | claims.claim | 100 | 1,142 | 11.4 |
-   | evidence.text | 57 | 21,099 | 370.2 |
-   | citations.destination_context | 200 | 46,619 | 233.1 |
-   | citations.passage_text | 200 | 16,589 | 82.9 |
-   | terms.term | 614 | 2,848 | 4.6 |
-   | aspects.aspect | 12 | 27 | 2.25 |
+   | set | side | documents | tokens | mean |
+   |---|---|---|---|---|
+   | IMDB | documents | 5,000 | 1,494,233 | 298.8 |
+   | IMDB | partner | 12 | 27 | 2.25 |
+   | BioDEX | documents | 200 | 829,199 | 4,146.0 |
+   | BioDEX | partner | 614 | 2,848 | 4.6 |
+   | FEVER | documents | 100 | 1,142 | 11.4 |
+   | FEVER | partner | 57 | 21,099 | 370.2 |
+   | LePaRD | documents | 200 | 46,619 | 233.1 |
+   | LePaRD | partner | 200 | 16,589 | 82.9 |
+
+   "Documents" is the set a query is written against; "partner" is
+   the set its join runs against.
 
 2. **Prompt lengths.** The shared preamble is 2 tokens. Each
    filter's question is 40 to 62 tokens. Each join carries a partner
@@ -42,7 +45,7 @@ one pass, and writes both to `/sol/sol_quailb_sf0.1.json` on the
 
 3. **Selectivities.** From the QUAIL-B ground truth labels - the 32B
    model's TRUE/FALSE per document - taken per stage and conditional
-   on the stages before it. F1 passes 0.7746 of the reviews; F4 then
+   on the stages before it. F1 passes 0.7746 of IMDB's documents; F4 then
    passes 0.2486 of what F1 left.
 
 One thing is set rather than measured: the batch size the forward
@@ -84,9 +87,9 @@ new tokens attending over the resident prefix - never as a triangle
 over itself. Without reuse, stage `s > 1` would be another stage 1.
 
 Read straight off the table below: IMDB-1 is one filter over 5,000
-reviews at 1,774,233 tokens. IMDB-6 adds a second filter and comes
-to 1,960,137. The difference is 185,904, which is exactly 3,873
-surviving reviews times F4's 48-token question. The reviews are not
+IMDB documents at 1,774,233 tokens. IMDB-6 adds a second filter and
+comes to 1,960,137. The difference is 185,904, which is exactly the
+3,873 surviving documents times F4's 48-token question. Nothing is
 scanned again.
 
 A join is the same shape with a longer suffix. One side anchors -
@@ -106,35 +109,35 @@ Figure: plots/sol_quailb_per_query.png
 | query | shape | tokens | pairs | tuples | anchor | 4B SoL | 32B SoL | 32B/4B |
 |---|---|---|---|---|---|---|---|---|
 | IMDB-1 | 1F | 1,774,233 | 4.45e8 | - | - | 6.78 s | 56.90 s | 8.39 |
-| IMDB-2 | 1J | 6,124,233 | 1.96e9 | 60,000 | reviews | 23.66 s | 197.31 s | 8.34 |
-| IMDB-3 | 1F+1J | 5,352,885 | 1.69e9 | 46,476 | reviews | 20.66 s | 172.40 s | 8.34 |
-| IMDB-4 | 2F+1J | 2,849,949 | 8.14e8 | 11,556 | reviews | 10.95 s | 91.61 s | 8.37 |
-| IMDB-5 | 3F+1J | 2,590,485 | 7.22e8 | 7,536 | reviews | 9.94 s | 83.23 s | 8.37 |
+| IMDB-2 | 1J | 6,124,233 | 1.96e9 | 60,000 | documents | 23.66 s | 197.31 s | 8.34 |
+| IMDB-3 | 1F+1J | 5,352,885 | 1.69e9 | 46,476 | documents | 20.66 s | 172.40 s | 8.34 |
+| IMDB-4 | 2F+1J | 2,849,949 | 8.14e8 | 11,556 | documents | 10.95 s | 91.61 s | 8.37 |
+| IMDB-5 | 3F+1J | 2,590,485 | 7.22e8 | 7,536 | documents | 9.94 s | 83.23 s | 8.37 |
 | IMDB-6 | 2F | 1,960,137 | 5.05e8 | - | - | 7.50 s | 62.89 s | 8.39 |
 | IMDB-7 | 3F | 2,010,213 | 5.21e8 | - | - | 7.69 s | 64.50 s | 8.39 |
 | BIO-1 | 1F | 839,599 | 2.38e9 | - | - | 4.50 s | 31.53 s | 7.00 |
-| BIO-2 | 1J | 11,347,799 | 4.65e10 | 122,800 | reports | 69.40 s | 456.48 s | 6.58 |
-| BIO-3 | 1F+1J | 7,097,928 | 2.83e10 | 73,066 | reports | 42.93 s | 283.82 s | 6.61 |
-| BIO-4 | 2F+1J | 5,157,297 | 1.99e10 | 50,348 | reports | 30.81 s | 204.84 s | 6.65 |
-| BIO-5 | 3F+1J | 3,794,195 | 1.41e10 | 34,384 | reports | 22.33 s | 149.50 s | 6.70 |
+| BIO-2 | 1J | 11,347,799 | 4.65e10 | 122,800 | documents | 69.40 s | 456.48 s | 6.58 |
+| BIO-3 | 1F+1J | 7,097,928 | 2.83e10 | 73,066 | documents | 42.93 s | 283.82 s | 6.61 |
+| BIO-4 | 2F+1J | 5,157,297 | 1.99e10 | 50,348 | documents | 30.81 s | 204.84 s | 6.65 |
+| BIO-5 | 3F+1J | 3,794,195 | 1.41e10 | 34,384 | documents | 22.33 s | 149.50 s | 6.70 |
 | FEV-1 | 1F | 6,942 | 2.45e5 | - | - | 0.026 s | 0.22 s | 8.56 |
-| FEV-2 | 1J | 485,820 | 2.02e8 | 5,700 | evidence | 1.90 s | 15.75 s | 8.27 |
-| FEV-3 | 1F+1J | 301,926 | 1.22e8 | 3,363 | evidence | 1.18 s | 9.78 s | 8.28 |
-| FEV-4 | 2F+1J | 77,499 | 2.57e7 | 570 | evidence | 0.30 s | 2.50 s | 8.33 |
-| FEV-5 | 2F+1J two-sided | 209,571 | 7.94e7 | 2,183 | evidence | 0.82 s | 6.78 s | 8.30 |
-| FEV-6 | 3F+1J two-sided | 64,884 | 1.98e7 | 370 | evidence | 0.25 s | 2.09 s | 8.35 |
+| FEV-2 | 1J | 485,820 | 2.02e8 | 5,700 | partner | 1.90 s | 15.75 s | 8.27 |
+| FEV-3 | 1F+1J | 301,926 | 1.22e8 | 3,363 | partner | 1.18 s | 9.78 s | 8.28 |
+| FEV-4 | 2F+1J | 77,499 | 2.57e7 | 570 | partner | 0.30 s | 2.50 s | 8.33 |
+| FEV-5 | 2F+1J two-sided | 209,571 | 7.94e7 | 2,183 | partner | 0.82 s | 6.78 s | 8.30 |
+| FEV-6 | 3F+1J two-sided | 64,884 | 1.98e7 | 370 | partner | 0.25 s | 2.09 s | 8.35 |
 | LEP-1 | 1F | 58,419 | 1.16e7 | - | - | 0.22 s | 1.87 s | 8.43 |
-| LEP-2 | 1J | 6,086,619 | 1.97e9 | 40,000 | excerpts | 23.53 s | 196.13 s | 8.34 |
-| LEP-3 | 1F+1J | 179,211 | 4.29e7 | 800 | excerpts | 0.68 s | 5.74 s | 8.40 |
-| LEP-4 | 2F+1J | 149,213 | 2.85e7 | 600 | excerpts | 0.57 s | 4.77 s | 8.44 |
-| LEP-5 | 3F+1J | 58,769 | 1.17e7 | 0 | excerpts | 0.22 s | 1.88 s | 8.43 |
-| LEP-6 | 5F+1J | 58,769 | 1.17e7 | 0 | excerpts | 0.22 s | 1.88 s | 8.43 |
-| LEP-7 | 2F+1J two-sided | 175,402 | 3.04e7 | 600 | excerpts | 0.66 s | 5.60 s | 8.45 |
+| LEP-2 | 1J | 6,086,619 | 1.97e9 | 40,000 | documents | 23.53 s | 196.13 s | 8.34 |
+| LEP-3 | 1F+1J | 179,211 | 4.29e7 | 800 | documents | 0.68 s | 5.74 s | 8.40 |
+| LEP-4 | 2F+1J | 149,213 | 2.85e7 | 600 | documents | 0.57 s | 4.77 s | 8.44 |
+| LEP-5 | 3F+1J | 58,769 | 1.17e7 | 0 | documents | 0.22 s | 1.88 s | 8.43 |
+| LEP-6 | 5F+1J | 58,769 | 1.17e7 | 0 | documents | 0.22 s | 1.88 s | 8.43 |
+| LEP-7 | 2F+1J two-sided | 175,402 | 3.04e7 | 600 | documents | 0.66 s | 5.60 s | 8.45 |
 | LEP-8 | 5F | 58,769 | 1.17e7 | - | - | 0.22 s | 1.88 s | 8.43 |
 
 Every query on both models is compute bound. The largest
 `T_memory` in the suite is FEV-1's at 6.4% of its `T_compute`, and
-FEV-1 is the smallest query here - 100 claims of 11 tokens.
+FEV-1 is the smallest query here - 100 documents of 11 tokens.
 Everything else pushes enough tokens per pass that the weight reads
 amortize away.
 
@@ -147,15 +150,15 @@ cheaper, because that is what the engine does.
 
 | join | side held | side streamed | tokens as run | tokens the other way | cost of choosing wrong |
 |---|---|---|---|---|---|
-| IMDB-2 | reviews, 299 tokens | aspects, 2 | 6,124,233 | 22,370,955 | 3.7x |
-| BIO-2 | reports, 4,146 | terms, 5 | 11,347,799 | 519,084,588 | 45.7x |
-| FEV-2 | evidence, 370 | claims, 11 | 485,820 | 2,511,142 | 5.2x |
-| FEV-5 | evidence, 370 | claims, 11 | 177,711 | 922,878 | 5.2x |
-| LEP-2 | excerpts, 233 | passages, 83 | 6,086,619 | 12,062,589 | 2.0x |
+| IMDB-2 | documents, 299 tokens | partner, 2 | 6,124,233 | 22,370,955 | 3.7x |
+| BIO-2 | documents, 4,146 | partner, 5 | 11,347,799 | 519,084,588 | 45.7x |
+| FEV-2 | partner, 370 | documents, 11 | 485,820 | 2,511,142 | 5.2x |
+| FEV-5 | partner, 370 | documents, 11 | 177,711 | 922,878 | 5.2x |
+| LEP-2 | documents, 233 | partner, 83 | 6,086,619 | 12,062,589 | 2.0x |
 
-FEVER is the one that inverts. The query is written against claims,
-but claims average 11 tokens and evidence 370, so the join holds
-evidence and streams the claims past it - the opposite of how it
+FEVER is the one that inverts. Its documents average 11 tokens and
+its partner set 370, so the join holds the partner and streams the
+documents past it - the opposite of how the query
 reads. BioDEX is the extreme, because a 4,146-token report copied
 into each of 122,800 tuples is 46 times the cost of holding 200 of
 them.
@@ -171,13 +174,13 @@ not care: it is 2 P FLOPs per token whatever the context.
 earlier tokens scores `m` pairs, which makes it quadratic in
 document length once a whole document is scanned.
 
-So a query's mix is set by the documents it holds in context. A
-token attending over a 4,146-token BioDEX report does 377 times the
-attention work of one attending over an 11-token FEVER claim, while
-both do identical dense work. FEVER sits at both ends of the figure
-for exactly this reason: FEV-1 filters claims, so its context is an
-11-token claim, while the FEVER joins put the 370-token evidence
-passage in context and stream the claims past it.
+So a query's mix is set by what it holds in context. A token
+attending over a 4,146-token BioDEX document does 377 times the
+attention work of one attending over an 11-token FEVER document,
+while both do identical dense work. FEVER sits at both ends of the
+figure for exactly this reason: FEV-1 is a filter, so its context is
+an 11-token document, while the FEVER joins hold the 370-token
+partner in context and stream the documents past it.
 
 The two terms also scale differently with model size. `T_dense`
 scales with the parameter count, 31,206,298,624 over 3,633,511,936
@@ -187,7 +190,7 @@ bf16 peak.
 
 Put together: a query's cost multiplier from 4B to 32B lies between
 3.56 and 8.59, at whatever its mix is. The five BioDEX queries hold
-4,146-token reports and spend 32 to 40% of their compute on
+4,146-token documents and spend 32 to 40% of their compute on
 attention, so they multiply by 6.6 to 7.0. Every other query holds
 documents of 11 to 370 tokens, spends under 7% on attention, and
 multiplies by 8.3 to 8.6.
