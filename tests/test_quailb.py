@@ -44,8 +44,11 @@ def test_all_queries_compile_and_plan(tmp_path):
     qdefs = queries(sess)
     expected = {
         *(f"IMDB-{i}" for i in range(1, 8)),
+        "IMDB-9", "IMDB-11",
         *(f"BIO-{i}" for i in range(1, 6)),
+        "BIO-C", "BIO-D",
         *(f"FEV-{i}" for i in range(1, 7)),
+        "FEV-C", "FEV-D",
         *(f"LEP-{i}" for i in range(1, 9)),
     }
     assert set(qdefs) == expected
