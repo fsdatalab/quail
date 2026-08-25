@@ -56,72 +56,77 @@ def plot_sol_per_query():
     fig.savefig(OUT / "sol_quailb_per_query.png", dpi=150)
 
 
-# the document set each held column belongs to. FEVER shows up
-# twice: FEV-1 filters claims and holds them, while the FEVER joins
-# hold the evidence passages instead.
-HELD_NAME = {"reviews.body": "IMDB", "reports.report": "BioDEX",
-             "claims.claim": "FEVER", "evidence.text": "FEVER",
-             "citations.destination_context": "LePaRD",
-             "citations.passage_text": "LePaRD"}
+# Where each cluster's labels go: (label x, first label y, y step,
+# text alignment). Twenty-one of the 26 queries hold documents
+# between 233 and 370 tokens, so their dots pile into one narrow band
+# and the labels have to sit out in the empty space with a leader
+# line back. The two free regions are left of 233 and right of 370.
+LABEL_SLOTS = {
+    11.4: (15.0, 8.0, 0.0, "left"),
+    233.1: (17.0, 11.0, 5.6, "left"),
+    298.8: (760.0, 8.5, 4.6, "left"),
+    370.2: (2300.0, 9.0, 5.2, "left"),
+    4146.0: (7000.0, 30.0, 3.6, "left"),
+}
 
 
 def plot_attention_share():
-    """Where each query's compute goes, ordered by the length of the
+    """Where each query's compute goes, against the length of the
     documents whose KV is held.
 
     Attention pairs are quadratic in that length, so the share climbs
-    left to right and jumps at BioDEX's 4,146-token reports. The 32B
-    dot is always below the 4B one: attention scales 3.56x with model
-    size where the dense projections scale 8.59x.
+    with it and jumps at BioDEX's 4,146-token reports. The 32B dot
+    sits below the 4B one everywhere: attention scales 3.56x with
+    model size where the dense projections scale 8.59x.
 
-    Held length is the x ordering rather than the x value. Twenty-one
-    of the 26 queries hold documents between 233 and 370 tokens, so
-    on a true length axis they stack into one band and their labels
-    cannot be read.
+    Queries whose dots coincide share a label. LEP-1, LEP-5, LEP-6
+    and LEP-8 land on the same point because LEP1 leaves 4 documents
+    of 200 and LEP3 leaves none, so their later stages and joins cost
+    nothing.
     """
-    order = sorted(ORDER, key=lambda q: (Q[q]["held_mean_doc_tokens"], q))
-    x = list(range(len(order)))
-
     def share(q, model):
         m = Q[q]["models"][model]
         return 100 * m["t_attention"] / m["t_compute"]
 
-    lo = [share(q, "qwen3-32b-fp8") for q in order]
-    hi = [share(q, "qwen3-4b-fp8") for q in order]
+    fig, ax = plt.subplots(figsize=(10, 5.0))
+    ax.vlines([Q[q]["held_mean_doc_tokens"] for q in ORDER],
+              [share(q, "qwen3-32b-fp8") for q in ORDER],
+              [share(q, "qwen3-4b-fp8") for q in ORDER],
+              color=DARK, lw=0.7, alpha=0.25)
+    for model, colour, label in (("qwen3-4b-fp8", BLUE, "Qwen3-4B-fp8"),
+                                 ("qwen3-32b-fp8", ORANGE,
+                                  "Qwen3-32B-fp8")):
+        ax.scatter([Q[q]["held_mean_doc_tokens"] for q in ORDER],
+                   [share(q, model) for q in ORDER],
+                   s=34, color=colour, label=label, zorder=3)
 
-    fig, ax = plt.subplots(figsize=(10, 5.2))
-    ax.vlines(x, lo, hi, color=DARK, lw=0.7, alpha=0.3)
-    ax.scatter(x, hi, s=34, color=BLUE, label="Qwen3-4B-fp8", zorder=3)
-    ax.scatter(x, lo, s=34, color=ORANGE, label="Qwen3-32B-fp8", zorder=3)
-    for i, q in enumerate(order):
-        if q.startswith("BIO"):
-            ax.text(i, hi[i] + 1.4, f"{hi[i]:.0f}%", ha="center",
-                    fontsize=7.5, color=BLUE)
-            ax.text(i, lo[i] - 3.4, f"{lo[i]:.0f}%", ha="center",
-                    fontsize=7.5, color=ORANGE)
+    # one label per distinct dot, listing every query that lands on it
+    for held, (lx, ly, dy, ha) in LABEL_SLOTS.items():
+        here = [q for q in ORDER
+                if abs(Q[q]["held_mean_doc_tokens"] - held) < 0.05]
+        # merge only dots that genuinely coincide, so LEP-1, 5, 6 and
+        # 8 share a label but IMDB-2 and IMDB-3 keep their own
+        merged = []
+        for q in sorted(here, key=lambda q: share(q, "qwen3-4b-fp8")):
+            y = share(q, "qwen3-4b-fp8")
+            if merged and y - merged[-1][0] < 0.05:
+                merged[-1][1].append(q)
+            else:
+                merged.append((y, [q]))
+        for j, (y, qs) in enumerate(merged):
+            ty = ly + j * dy
+            ax.annotate(", ".join(qs), xy=(held, y), xytext=(lx, ty),
+                        fontsize=7.5, color=DARK, ha=ha, va="center",
+                        arrowprops=dict(arrowstyle="-", color=DARK,
+                                        lw=0.5, alpha=0.4,
+                                        shrinkA=0, shrinkB=4))
 
-    # one bracket per held corpus, with the length that puts it there
-    trans = ax.get_xaxis_transform()
-    start = 0
-    for i in range(len(order) + 1):
-        held = Q[order[start]]["held_column"]
-        if i < len(order) and Q[order[i]]["held_column"] == held:
-            continue
-        mean = Q[order[start]]["held_mean_doc_tokens"]
-        mid = (start + i - 1) / 2
-        ax.plot([start - 0.35, i - 1 + 0.35], [-0.235, -0.235],
-                transform=trans, color=DARK, lw=0.7, alpha=0.5,
-                clip_on=False)
-        ax.text(mid, -0.30, f"{HELD_NAME[held]}\n{mean:,.0f} tokens",
-                transform=trans, ha="center", va="top", fontsize=7.5,
-                color=DARK)
-        start = i
-    ax.set_xticks(x)
-    ax.set_xticklabels(order, rotation=90, fontsize=7.5)
+    ax.set_xscale("log")
+    ax.set_xlim(8, 26_000)
+    ax.set_ylim(-2, 46)
+    ax.set_xlabel("mean length of the documents whose KV is held, "
+                  "tokens (log scale)")
     ax.set_ylabel("attention share of compute, percent")
-    ax.set_xlabel("queries, ordered by the length of the documents "
-                  "whose KV is held", labelpad=78)
-    ax.set_ylim(-4, 47)
     ax.legend(frameon=False, loc="upper left", fontsize=8.5)
     fig.tight_layout()
     fig.savefig(OUT / "sol_quailb_attention_share.png", dpi=150)
