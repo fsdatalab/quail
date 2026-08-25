@@ -378,6 +378,17 @@ data_image = (
     .add_local_python_source("quail")
 )
 
+# Building the corpus reads the source datasets off HuggingFace, so it
+# needs more than parquet - but not vllm. Its own image keeps
+# prepare_corpus light, where data_image is only enough to read parquet
+# back.
+corpus_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("numpy", "pyarrow", "pandas", "huggingface_hub",
+                 "datasets")
+    .add_local_python_source("quail")
+)
+
 # Experiment cells attach to this existing app so its caches remain useful.
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
@@ -914,8 +925,9 @@ def _fever_source_label(claim: dict, passage: dict):
 
 
 @app.function(
-    image=data_image, memory=4096, timeout=1800,
-    volumes={"/results": results_vol})
+    image=corpus_image, memory=4096, timeout=1800,
+    volumes={"/root/.cache/huggingface": hf_cache,
+             "/results": results_vol})
 def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
     """Build the corpus once, and report whether the collection these
     templates imply is already on the volume.
