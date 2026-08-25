@@ -9,10 +9,8 @@ Nothing in it is fitted or measured on a GPU. It uses the datasheet,
 the model dimensions, and a count of the query's work, and it
 borrows no cost model the engine already carries: no roofline out of
 `planner/budgets.py`, no calibration constant, no efficiency factor.
-`quail/sol.py` imports only `quail.specs`, which is how the rule is
-kept. A bound built on a fitted constant is an estimate wearing a
-bound's name, and it cannot judge the thing the constant was fitted
-to.
+A bound built on a fitted constant is an estimate wearing a bound's
+name, and it cannot judge the thing the constant was fitted to.
 
 ## 1. Notation
 
@@ -178,8 +176,9 @@ and tighter, and both are lower bounds.
 
 ## 5. The code
 
-`quail/sol.py` is these equations and nothing else. Three functions
-carry section 3:
+`reports/make_sol_quailb.py` is these equations, plus the
+measurement of the three inputs they need. Three functions carry
+section 3:
 
 | function | equation |
 |---|---|
@@ -188,7 +187,8 @@ carry section 3:
 | `stream(prefix, suffixes)` | a join's tuples: `ask` per suffix, one prefix read |
 
 `filter_chain`, `join` and `cheaper_anchor` compose them, and
-`seconds()` is section 4.
+`seconds()` is section 4. Nothing in the engine imports any of it:
+this is analysis, not a plan input.
 
 ## 6. What the bound assumes
 
@@ -208,5 +208,5 @@ carry section 3:
 queries at sf=0.1 on Qwen3-4B-fp8 and Qwen3-32B-fp8, from measured
 document lengths, measured prompt lengths, and ground-truth
 selectivities. `reports/make_sol_quailb.py` is the one script that
-produces it, and `results/sol_quailb_sf0.1.json` holds both those
-inputs and the answers.
+produces it, and it writes both those inputs and the answers to
+`/sol/sol_quailb_sf0.1.json` on the `quail-results` volume.
