@@ -363,6 +363,18 @@ ASPECT_RELATED = ("Judge strictly whether the second movie aspect "
                   "the two aspects are commonly discussed together, "
                   "FALSE otherwise.\nANSWER=")
 
+# IMDB-8 only: a second question over the same aspects table, joined
+# under a second alias (a2) - a 2-join star, both joins anchored on
+# reviews so the second stage runs over whatever DISCUSS_ASPECT
+# already kept.
+ASPECT_SENTIMENT = ("Candidate movie aspects follow, one at a time. "
+                    "For each, judge strictly from the review above "
+                    "whether it expresses positive sentiment "
+                    "specifically about that aspect.\n\n{0}\n\n"
+                    "ASPECT: {1}\nInstruction: answer TRUE if the "
+                    "review above expresses positive sentiment about "
+                    "this aspect, FALSE otherwise.\nANSWER=")
+
 F7 = ("Judge strictly from the report above whether it describes a "
       "case involving a female patient.\n\n{0}\n\nInstruction: answer "
       "TRUE if the report describes a case involving a female patient, "
@@ -389,6 +401,19 @@ REACTION = ("Candidate medical reaction terms follow, one at a time. "
             "Instruction: answer TRUE if the report above describes "
             "this reaction, FALSE otherwise.\nANSWER=")
 
+# BIO-6 only: a second question over the same terms table, joined
+# under a second alias (m2) - the 2-join "star" shape (the old B11),
+# both joins anchored on reports so the second stage runs over
+# whatever REACTION already kept.
+REACTION_SEVERE = ("Candidate medical reaction terms follow, one at a "
+                   "time. For each, judge strictly from the report "
+                   "above whether it describes that reaction as a "
+                   "serious or life-threatening occurrence for the "
+                   "patient.\n\n{0}\n\nCANDIDATE REACTION: {1}\n"
+                   "Instruction: answer TRUE if the report above "
+                   "describes this reaction as serious or "
+                   "life-threatening, FALSE otherwise.\nANSWER=")
+
 F11 = ("Judge strictly from the claim above whether it asserts "
        "something about a person, rather than an organization, place, "
        "or event.\n\n{0}\n\nInstruction: answer TRUE if the claim "
@@ -411,6 +436,19 @@ SUPPORT = ("Wikipedia passages follow, one at a time. For each, judge "
            "claim.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer TRUE if "
            "the passage above supports this claim, FALSE otherwise.\n"
            "ANSWER=")
+
+# FEV-7 only: a second question over the same evidence table, joined
+# under a second alias (e2) - IMDB-8/BIO-6's counterpart for FEVER, a
+# 2-join star, both joins anchored on claims so the second stage runs
+# over whatever SUPPORT already kept. Genuinely meaningful (not an
+# engine-stress predicate): FEVER's real labels are support/refute/
+# not-enough-info, so asking whether a second passage refutes the
+# claim is a real question, not a synthetic one.
+REFUTE = ("Wikipedia passages follow, one at a time. For each, judge "
+         "strictly from the claim above whether it is refuted by "
+         "that passage.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer "
+         "TRUE if the passage above refutes or contradicts this "
+         "claim, FALSE otherwise.\nANSWER=")
 
 # FEV-5 only: filters the evidence side of a join, not just the
 # anchor. Mirrors F11's "about a person" judgment so the join pairs
@@ -575,6 +613,17 @@ def queries(sess):
     q["IMDB-11"] = ("engine stress: F1 filter -> 3J real chain "
                     "r-a1-a2-a3, free anchor search", imdb11)
 
+    # IMDB-8: the star shape - A joins B and A joins C, same anchor
+    # throughout, a barrier between the two stages but no switch (the
+    # old B11's shape). Contrast with IMDB-9/11's path shape, where
+    # the switch is structurally forced.
+    q["IMDB-8"] = ("2J, same anchor: J1 (DISCUSS_ASPECT) -> J2 "
+                   "(ASPECT_SENTIMENT), reviews x aspects x aspects",
+                   make("reviews", "r", "body", [],
+                       [("aspects", "a", "aspect", DISCUSS_ASPECT),
+                        ("aspects", "a2", "aspect", ASPECT_SENTIMENT)],
+                       ["r.id", "a.id", "a2.id"]))
+
     # BioDEX: same five shapes (reports x terms).
     q["BIO-1"] = ("filter: F7 (female patient)", make(
         "reports", "r", "report", [F7], [], ["r.id"]))
@@ -636,6 +685,16 @@ def queries(sess):
                 .select("r1.id", "m1.id", "r2.id", "m2.id"))
     q["BIO-D"] = ("engine stress: F7 filter -> 3J real chain "
                  "r1-m1-r2-m2, free anchor search", bioD)
+
+    # BIO-6: the star shape - both joins anchored on reports, a
+    # barrier between the two stages but no switch (the old B11's
+    # shape, IMDB-8's counterpart for BioDEX).
+    q["BIO-6"] = ("2J, same anchor: J1 (REACTION) -> J2 "
+                 "(REACTION_SEVERE), reports x terms x terms", make(
+        "reports", "r", "report", [],
+        [("terms", "m", "term", REACTION),
+         ("terms", "m2", "term", REACTION_SEVERE)],
+        ["r.id", "m.id", "m2.id"]))
 
     # FEVER: filter alone, join alone, then a filter chain to depth 2
     # only (depth 3 hit 0 rows - see the module docstring), plus the
@@ -706,6 +765,17 @@ def queries(sess):
                 .select("c1.id", "e1.id", "c2.id", "e2.id"))
     q["FEV-D"] = ("engine stress: F11 filter -> 3J real chain "
                  "c1-e1-c2-e2, free anchor search", fevD)
+
+    # FEV-7: the star shape - both joins anchored on claims, a
+    # barrier between the two stages but no switch (IMDB-8/BIO-6's
+    # counterpart for FEVER). Meaningful, not synthetic: FEVER's real
+    # labels are support/refute/not-enough-info.
+    q["FEV-7"] = ("2J, same anchor: J1 (SUPPORT) -> J2 (REFUTE), "
+                 "claims x evidence x evidence", make(
+        "claims", "c", "claim", [],
+        [("evidence", "e", "text", SUPPORT),
+         ("evidence", "e2", "text", REFUTE)],
+        ["c.id", "e.id", "e2.id"]))
 
     # LePaRD: one table, `citations`, self-joined - the anchor alias
     # ("d") reads destination_context, the partner alias ("s") reads
