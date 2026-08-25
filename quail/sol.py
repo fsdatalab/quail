@@ -29,6 +29,30 @@ from dataclasses import dataclass
 from quail.specs import DeviceSpec, ModelSpec
 
 
+def dense_params(model: ModelSpec) -> int:
+    """Parameters every token passes through, counted from the model
+    dimensions rather than read off `ModelSpec.params`.
+
+    `params` is a rounded stand-in - 3.6e9 where Qwen3-4B's real
+    non-embedding count is 3,633,511,936, which is 0.93% higher and
+    moves T_dense by the same 0.93%. A bound cannot round its
+    largest term, so it counts instead.
+
+    The count assumes the Qwen3 block: q/k/v/o projections with no
+    bias, a gated MLP (gate, up, down over `intermediate`), two RMS
+    norms per layer, and q/k head norms. Embeddings are excluded on
+    purpose - a token touches its own row and nothing else, so they
+    are not 2 FLOPs per parameter per token. The lm_head is excluded
+    for the same reason plus a second one: a filter reads logits at
+    one position per evaluation, not at every token.
+    """
+    h, dh = model.hidden, model.d_head
+    attn = h * model.n_q * dh + 2 * h * model.n_kv * dh + model.n_q * dh * h
+    mlp = 3 * h * model.intermediate
+    norms = 2 * h + 2 * dh          # 2 RMS norms, q norm, k norm
+    return (attn + mlp + norms) * model.layers + h
+
+
 @dataclass(frozen=True)
 class Corpus:
     """The base document set, reduced to what the bound needs.
@@ -196,7 +220,8 @@ def bound(model: ModelSpec, device: DeviceSpec, workload: Workload,
     """
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be at least 1")
-    t_dense = 2.0 * model.params * workload.tokens / device.peak_flops
+    t_dense = (2.0 * dense_params(model) * workload.tokens
+               / device.peak_flops)
     pair_flops = 4.0 * model.n_q * model.d_head
     t_attention = (pair_flops * workload.pairs * model.layers
                    / device.attn_flops)

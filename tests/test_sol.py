@@ -1,42 +1,62 @@
-"""The SoL bound, checked against the hand derivation.
+"""The SoL bound, checked against the measured corpus.
 
-The two exercises are IMDB-1 and IMDB-6 over 5,000 IMDB reviews at
-Qwen3-4B-fp8 on one H100. The derivation is `plans/sol_model.md`
-section 7.
+The two exercises are IMDB-1 and IMDB-6 over the 5,000 reviews
+QUAIL-B builds at sf=0.1. The corpus numbers are measured, not taken
+from the derivation: `results/sol_imdb_corpus.json` holds the token
+moments produced by tokenizing the pinned IMDB revision with the
+Qwen3-4B-FP8 tokenizer, so the token and pair totals below are a
+real check rather than a restatement. The derivation is
+`plans/sol_model.md` section 7.
 """
 
+import json
 import math
+from pathlib import Path
 
 import pytest
 
-from quail.sol import (Corpus, FilterStage, Workload, bound,
+from quail.sol import (Corpus, FilterStage, Workload, bound, dense_params,
                        filter_chain_sol, filter_chain_workload)
-from quail.specs import H100_SXM, QWEN3_4B_FP8
+from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 # The batch size the derivation ran the forward pass at. An input to
 # the bound, not something it derives: it sets how many times the
 # weights are re-read.
 CHUNK = 110_376
 
-# The corpus the hand derivation used, recovered from the two numbers
-# it reports for stage 1: 1,774,233 sequence tokens and 444,634,043
-# causal pairs over 5,000 documents, with F1's 54 question tokens
-# already inside both. Inverting sum l(l+1)/2 gives the second moment,
-# and shifting by q1 moves both moments off the sequence and onto the
-# prefix (preamble + document), which is what Corpus holds.
-N_DOCS = 5000
-Q_F1 = 54
-Q_F4 = 47
+_GT = json.loads(
+    (Path(__file__).resolve().parents[1]
+     / "results" / "sol_imdb_corpus.json").read_text())
+
+N_DOCS = _GT["corpus"]["n_docs"]
+Q_F1 = _GT["question_tokens"]["F1"]
+Q_F4 = _GT["question_tokens"]["F4"]
+# Not measurable from anything committed here: it comes from a
+# labelled run and is carried over from the derivation.
 SEL_F1 = 0.8262
-_SUM_L = 1_774_233
-_SUM_L_SQ = 2 * 444_634_043 - _SUM_L
-_SUM_B = _SUM_L - N_DOCS * Q_F1
-IMDB = Corpus(n_docs=N_DOCS, sum_prefix=float(_SUM_B),
-              sum_prefix_sq=float(_SUM_L_SQ - 2 * Q_F1 * _SUM_B
-                                  - N_DOCS * Q_F1 ** 2))
+IMDB = Corpus(n_docs=N_DOCS,
+              sum_prefix=float(_GT["prefix_tokens"]["sum"]),
+              sum_prefix_sq=float(_GT["prefix_tokens"]["sum_sq"]))
 
 F1 = FilterStage(question_tokens=Q_F1, selectivity=SEL_F1)
 F4 = FilterStage(question_tokens=Q_F4)
+
+
+def test_dense_params_matches_the_published_counts():
+    """Qwen3-4B is 4.02B total and 3.63B non-embedding; Qwen3-32B is
+    32.8B total and 31.2B non-embedding. The embedding is
+    vocab x hidden at a 151,936 vocab."""
+    emb = 151_936 * QWEN3_4B_FP8.hidden
+    assert dense_params(QWEN3_4B_FP8) == 3_633_511_936
+    assert dense_params(QWEN3_4B_FP8) + emb == 4_022_468_096
+    assert dense_params(QWEN3_32B_FP8) == 31_206_298_624
+
+
+def test_spec_params_is_the_rounded_stand_in():
+    """The bound must not use it: at 4B it is 0.93% low, which lands
+    straight on T_dense, the largest term."""
+    assert dense_params(QWEN3_4B_FP8) / QWEN3_4B_FP8.params == (
+        pytest.approx(1.0093, abs=5e-5))
 
 
 def test_corpus_from_doc_tokens_matches_moments():
@@ -47,32 +67,31 @@ def test_corpus_from_doc_tokens_matches_moments():
 
 
 def test_single_filter_workload():
-    """IMDB-1: one filter, nothing rewound, nothing read back."""
+    """IMDB-1: one filter, nothing rewound, nothing read back. Both
+    totals come out of the measured length distribution."""
     w = filter_chain_workload(IMDB, [F1])
-    assert w.tokens == pytest.approx(1_774_233)
-    assert w.pairs == pytest.approx(444_634_043)
+    assert w.tokens == _GT["stage1_totals"]["tokens"] == 1_774_233
+    assert w.pairs == _GT["stage1_totals"]["causal_pairs"] == 444_634_043
     assert w.kv_read_tokens == 0.0
 
 
 def test_single_filter_bound():
     b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1], CHUNK)
     assert b.passes == 17
-    assert b.t_dense == pytest.approx(6.4550, abs=5e-4)
+    assert b.t_dense == pytest.approx(6.5151, abs=5e-4)
     assert b.t_attention == pytest.approx(0.2650, abs=5e-4)
     assert b.t_memory == pytest.approx(0.1009, abs=5e-4)
-    assert b.seconds == pytest.approx(6.7200, abs=5e-4)
+    assert b.seconds == pytest.approx(6.7801, abs=5e-4)
     assert b.bound_by == "compute"
 
 
-def test_two_filter_workload_matches_derivation():
-    """IMDB-6: F1 then F4. The derivation folded F1's question into
-    the retained prefix, so this reproduces it with the same flag."""
+def test_two_filter_workload():
+    """IMDB-6: F1 then F4. F4's question is 48 tokens measured, where
+    the derivation used 47, so the totals sit just above its
+    1,968,390 tokens and 518,189,748 pairs."""
     w = filter_chain_workload(IMDB, [F1, F4], carry_question_kv=True)
-    assert w.tokens == pytest.approx(1_968_390)
-    # 444,634,043 stage 1 + 68,895,951 streaming + 4,659,768 within
-    # F4's own question. The derivation wrote 68,895,937 because it
-    # rounded the surviving token count to a whole token first.
-    assert w.pairs == pytest.approx(518_189_762, abs=1)
+    assert w.tokens == pytest.approx(1_972_521, abs=1)
+    assert w.pairs == pytest.approx(519_853_922, abs=1)
     assert w.kv_read_tokens == pytest.approx(1_465_871, abs=1)
 
 
@@ -80,10 +99,10 @@ def test_two_filter_bound():
     b = filter_chain_sol(QWEN3_4B_FP8, H100_SXM, IMDB, [F1, F4], CHUNK,
                          carry_question_kv=True)
     assert b.passes == 18
-    assert b.t_dense == pytest.approx(7.1614, abs=5e-4)
-    assert b.t_attention == pytest.approx(0.3089, abs=5e-4)
-    assert b.t_memory == pytest.approx(0.1753, abs=5e-4)
-    assert b.seconds == pytest.approx(7.4703, abs=5e-4)
+    assert b.t_dense == pytest.approx(7.2432, abs=5e-4)
+    assert b.t_attention == pytest.approx(0.3099, abs=5e-4)
+    assert b.t_memory == pytest.approx(0.1755, abs=5e-4)
+    assert b.seconds == pytest.approx(7.5531, abs=5e-4)
 
 
 def test_rewinding_the_question_kv_is_cheaper():
