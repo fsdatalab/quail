@@ -29,7 +29,7 @@ and that is still true.
 
 | symbol | meaning | source | 4B / H100 |
 |---|---|---|---|
-| `P` | dense parameters used on every token | `ModelSpec.params` | 3.6e9 |
+| `P` | dense parameters used on every token | `sol.dense_params`, counted from the model dimensions | 3,633,511,936 |
 | `L` | layers | `ModelSpec.layers` | 36 |
 | `n_q` | query heads | `ModelSpec.n_q` | 32 |
 | `n_kv` | KV heads | `ModelSpec.n_kv` | 8 |
@@ -42,10 +42,17 @@ and that is still true.
 | `BW` | HBM bandwidth, bytes/s | `DeviceSpec.hbm_bw` | 3.35e12 |
 | `C` | tokens per forward pass (the batch size) | an input, stated at the call site | 110,376 |
 
-Three of these need a sentence.
+Four of these need a sentence.
 
 - `2` FLOPs per parameter per token: every weight does one multiply
   and one add.
+- `P` is counted from the model dimensions rather than read off
+  `ModelSpec.params`, which is a rounded stand-in: 3.6e9 against a
+  real non-embedding count of 3,633,511,936, 0.93% low. That lands
+  straight on the largest term of the bound. Embeddings and the
+  lm_head are excluded: a token touches one embedding row, not 2
+  FLOPs per parameter, and a filter reads logits at one position per
+  evaluation.
 - `f_pair = 4 * n_q * d_head`: for one (query token, key token) pair
   in one head, the QK dot product runs over `d_head` dimensions, so
   `2 * d_head` FLOPs, and multiplying the attention weight into V
@@ -185,12 +192,27 @@ Both are lower bounds, so both are safe; this one is the more
 conservative. Tightening it later changes section 6 only and leaves
 sections 4 and 5 untouched.
 
-## 7. The two worked exercises
+## 7. The two worked exercises, against the measured corpus
 
-Qwen3-4B-fp8, one H100, 5,000 IMDB reviews. Stage 1 sequences total
-1,774,233 tokens and 444,634,043 causal pairs, which puts the mean
-document at 301 tokens including the preamble. F1's question is 54
-tokens and passes 0.8262 of the documents; F4's is 47 tokens.
+Qwen3-4B-fp8, one H100, the 5,000 reviews QUAIL-B builds at sf=0.1.
+Nothing here is taken on trust from the derivation: the corpus was
+rebuilt from the pinned IMDB revision at seed 20260818 and tokenized
+with the Qwen3-4B-FP8 tokenizer, and the moments are committed in
+`results/sol_imdb_corpus.json`.
+
+| measured input | value |
+|---|---|
+| documents | 5,000 |
+| `sum d_i` | 1,494,233 tokens, mean 298.8, max 2,135 |
+| `p` (`SHARED_PRE`) | 2 tokens |
+| `B = sum b_i` | 1,504,233 |
+| `sum b_i^2` | 710,456,689 |
+| F1 question | 54 tokens |
+| F4 question | 48 tokens |
+
+One input is not measured. F1's selectivity 0.8262 comes from a
+labelled run and appears in no committed summary, so it is carried
+over from the derivation as given.
 
 **IMDB-1**, one filter:
 
@@ -200,54 +222,74 @@ tokens and passes 0.8262 of the documents; F4's is 47 tokens.
 | pairs | 444,634,043 |
 | forward passes | 17 |
 | bytes moved | 3.381e11 |
-| `T_dense` | 6.4550 s |
+| `T_dense` | 6.5151 s |
 | `T_attention` | 0.2650 s |
 | `T_memory` | 0.1009 s |
-| **SoL** | **6.7201 s**, compute bound |
+| **SoL** | **6.7801 s**, compute bound |
 
-**IMDB-6**, F1 then F4, reproducing the derivation's own choice to
-fold F1's question into the retained prefix:
+**IMDB-6**, F1 then F4, keeping the derivation's choice to fold F1's
+question into the retained prefix:
 
 | quantity | value |
 |---|---|
-| tokens | 1,968,390 |
-| pairs | 518,189,762 |
+| tokens | 1,972,521 |
+| pairs | 519,853,922 |
 | KV read back | 1,465,871 tokens |
 | forward passes | 18 |
-| bytes moved | 5.874e11 |
-| `T_dense` | 7.1614 s |
-| `T_attention` | 0.3089 s |
-| `T_memory` | 0.1753 s |
-| **SoL** | **7.4703 s**, compute bound |
+| bytes moved | 5.880e11 |
+| `T_dense` | 7.2432 s |
+| `T_attention` | 0.3099 s |
+| `T_memory` | 0.1755 s |
+| **SoL** | **7.5531 s**, compute bound |
 
-Three differences from the hand derivation, all of them small:
+### What the check found
 
-1. `T_dense` came out 6.5148 s and 7.2277 s by hand, against 6.4550 s
-   and 7.1614 s here. Both hand numbers are 0.93% high, the same
-   factor, and back out to a divisor of 1.9608e15 rather than the
-   1.979e15 the derivation states. Every other line matches, so this
-   reads as one mistyped divisor carried through both exercises. The
-   final answers move from 6.7798 s to 6.7201 s and from 7.5366 s to
-   7.4703 s.
-2. The streaming pair term came out 68,895,937 by hand and
-   68,895,951 here, because the surviving token count 1,465,871.3 was
-   rounded down to a whole token first. The derivation marks that
-   term approximate.
-3. Folding F1's 54 question tokens into the prefix that F4 reads back
-   over-counts, because the engine rewinds them. Dropping them gives
-   507,705,284 pairs, 1,242,797 KV read tokens, and SoL 7.4640 s -
-   0.08% off the folded number. Not worth arguing about at two
-   stages; it grows with chain depth, so `quail/sol.py` defaults to
-   the rewound count and takes `carry_question_kv=True` to reproduce
-   the derivation.
+The derivation's stage-1 totals are exactly right. Tokenizing the
+real corpus gives 1,774,233 tokens and 444,634,043 causal pairs, to
+the digit, which also confirms the 2-token preamble and the 54-token
+F1 question. Its final answers, 6.7798 s and 7.5366 s, are within
+0.05% and 0.3% of the numbers above.
 
-**A sanity anchor.** SoL 6.7201 s for 1,774,233 tokens is 264,000
-tokens/s. The ceiling with attention set to zero is `R_dense / 2P`,
-which is 274,861 tokens/s. SoL is 96% of that, which is what it
-should be for a query whose attention term is 4% of compute. Both
-numbers come from the specs alone, so this checks the arithmetic and
-nothing else. Checking the bound against reality means measuring a
-wall on an H100 and comparing; that has not been done yet.
+Three smaller things came out of the check.
+
+1. **`P` is 3,633,511,936, not 3.6e9.** `T_dense` in the derivation
+   is 0.93% above what `P = 3.6e9` gives, by the same factor in both
+   exercises. That factor is exactly the ratio between Qwen3-4B's
+   real non-embedding parameter count and the rounded 3.6e9 that
+   `specs/qwen3_4b.py` carries: 3,633,511,936 / 3.6e9 = 1.00931. So
+   the derivation used the real count and annotated it with the
+   rounded one. Counting from the model dimensions reproduces its
+   `T_dense` to five figures (6.5151 s against 6.5148 s, 7.2281 s
+   against 7.2277 s). `quail/sol.py` therefore counts `P` with
+   `dense_params()` and never reads `ModelSpec.params`, which is
+   0.93% low at 4B and 0.02% low at 32B.
+2. **F4's question is 48 tokens, not 47.** One token per surviving
+   document, which moves IMDB-6 by 4,131 tokens. `bind_prompt`
+   counts 48 for `Prompt.tail_tokens`.
+3. **Folding F1's question into the prefix over-counts**, because
+   the engine rewinds it. Dropping it gives 509,146,370 pairs,
+   1,242,797 KV read tokens and SoL 7.5467 s, 0.08% below the folded
+   number. Small at two stages and growing with chain depth, so
+   `quail/sol.py` defaults to the rewound count and takes
+   `carry_question_kv=True` to reproduce the derivation.
+
+A fourth thing is worth writing down because it is easy to get
+wrong. `bind_prompt` splits a filter prompt into a preamble, a frame
+(the user's text before the placeholder) and a tail. The frame is
+**not** paid by a filter: `runtime/session._question_ids` sends
+`prompt.tail` only, and `stage_frames` is a `run_join` argument. So
+F1 costs 54 tokens per document, not the 73 that tail plus frame
+would suggest. Counting the frame would have inflated IMDB-1 by
+95,000 tokens.
+
+**A sanity anchor.** SoL 6.7801 s for 1,774,233 tokens is 262,000
+tokens/s. The ceiling with attention set to zero is
+`R_dense / 2 dense_params`, which is 272,325 tokens/s. SoL is 96% of
+that, which is what it should be for a query whose attention term is
+4% of compute. Both numbers come from the specs alone, so this
+checks the arithmetic and nothing else. Checking the bound against
+reality means measuring a wall on an H100 and comparing; that has
+not been done yet.
 
 ## 8. Joins: proposed, not implemented
 
