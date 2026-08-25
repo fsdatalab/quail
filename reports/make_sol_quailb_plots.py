@@ -102,17 +102,15 @@ def plot_attention_share():
     trans = ax.get_xaxis_transform()
     start = 0
     for i in range(len(order) + 1):
-        same = (i < len(order)
-                and Q[order[i]]["held_column"] == Q[order[start]]["held_column"])
-        if same:
+        held = Q[order[start]]["held_column"]
+        if i < len(order) and Q[order[i]]["held_column"] == held:
             continue
-        col = Q[order[start]]["held_column"]
         mean = Q[order[start]]["held_mean_doc_tokens"]
         mid = (start + i - 1) / 2
         ax.plot([start - 0.35, i - 1 + 0.35], [-0.235, -0.235],
                 transform=trans, color=DARK, lw=0.7, alpha=0.5,
                 clip_on=False)
-        ax.text(mid, -0.30, f"{HELD_NAME[col]}\n{mean:,.0f} tokens",
+        ax.text(mid, -0.30, f"{HELD_NAME[held]}\n{mean:,.0f} tokens",
                 transform=trans, ha="center", va="top", fontsize=7.5,
                 color=DARK)
         start = i
