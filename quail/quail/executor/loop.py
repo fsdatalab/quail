@@ -673,28 +673,18 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     every token count at which the chosen configuration can change.
     This pass runs the generator's full list up to the budget - the
     sweep's GPU compute is the price of provable coverage, and this
-    pass runs once ever, so the price does not matter. The guessed
-    grid remains only as a fallback if the vLLM import breaks.
+    pass runs once ever, so the price does not matter.
 
     After the sweep, _forward_warm builds every attention-path shape
     as real forward passes, including one join chunk."""
+    from vllm.model_executor.warmup.deep_gemm_warmup import (
+        _generate_optimal_warmup_m_values)
     layer = pipeline.layers[0]
     linears = (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
                layer.mlp.gate_up_proj, layer.mlp.down_proj)
-    fallback = sorted({m for m in range(64, 4097, 256)}
-                      | {m for m in range(4096, 32769, 1024)}
-                      | {m for m in range(32768, budget + 1, 2048)}
-                      | {budget})
-
-    def sizes(lin):
-        try:
-            from vllm.model_executor.warmup.deep_gemm_warmup import (
-                _generate_optimal_warmup_m_values)
-            return _generate_optimal_warmup_m_values(
-                budget, lin.weight.shape[0], torch.device("cuda"))
-        except Exception:            # noqa: BLE001  version drift
-            return fallback
-    work = [(m, lin) for lin in linears for m in sizes(lin)]
+    work = [(m, lin) for lin in linears
+            for m in _generate_optimal_warmup_m_values(
+                budget, lin.weight.shape[0], torch.device("cuda"))]
     try:
         from tqdm import tqdm
         work = tqdm(work, desc="quail kernel compile pass",
