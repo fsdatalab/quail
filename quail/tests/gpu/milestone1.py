@@ -451,8 +451,8 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
     from quail.executor.loop import warm_kernels
     t_warm = time.perf_counter()
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
     torch.cuda.synchronize()
     kernel_cache.commit()    # keep the compiles even if the run dies
     report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
@@ -572,8 +572,8 @@ def filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
     # measured paths compile before the first rep
     t_warm = time.perf_counter()
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
     torch.cuda.synchronize()
     kernel_cache.commit()
     report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
@@ -783,8 +783,8 @@ def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
     from quail.executor.loop import warm_kernels
     t_warm = time.perf_counter()
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
     torch.cuda.synchronize()
     kernel_cache.commit()
 
@@ -850,8 +850,8 @@ def profile_filter_run(n_docs: int = 3000) -> str:
      exec_budget, arena_tok) = _boot(FILTER_ATTENTION)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
         run_filter(torch, arena, pipeline, async_ans, body_ids, q_ids,
                    exec_budget, arena_writes=True)  # unprofiled reference
     torch.cuda.synchronize()
@@ -972,30 +972,34 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
 
 
 @app.function(timeout=5400, **GPU_KW)
-def baseline_filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
+def baseline_filter1_run(n_docs: int = 10000, reps: int = 2,
+                         model: str = "qwen3-4b-fp8") -> str:
     """Stock vLLM on the single-stage filter workload (one question,
     10,000 documents): one request per document, prefix caching on,
-    bf16 KV, document-cap admission.
+    bf16 KV, document-cap admission. model picks the spec; a
+    non-default model writes to a suffixed file.
 
     PREDICTION: 3.5M fresh tokens (no prefix sharing - each document
     is unique). At the five-stage baseline's measured ~101k fresh
-    tok/s, ~34-36 s. Single-stage has less scheduling overhead
+    tok/s, ~34-36 s (4B). Single-stage has less scheduling overhead
     (10k requests vs 23k) but no cross-stage prefix sharing."""
     from baselines.stock import run_filter_chain
-    from corpus import MODEL, build_corpus
+    from corpus import build_corpus
     from vllm import SamplingParams
     from quail.executor.loop import true_false_ids
+    from quail.specs import MODELS
 
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    hf_name = MODELS[model].hf_name
+    tokenizer = AutoTokenizer.from_pretrained(hf_name)
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs,
                                           n_filters=1)
     true, false = true_false_ids(tokenizer)
 
     from baselines.stock_boot import time_llm_boot
     llm, boot = time_llm_boot(
-        model=MODEL, max_num_batched_tokens=25_305,
+        model=hf_name, max_num_batched_tokens=25_305,
         max_num_seqs=2648, gpu_memory_utilization=0.92,
         enable_prefix_caching=True, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
@@ -1005,7 +1009,8 @@ def baseline_filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
     budget = 374_891
     prediction = ("~34-36 s (3.5M fresh tokens at the five-stage "
                   "baseline's ~101k tok/s)")
-    report = dict(cell="baseline_filter1", n_docs=n_docs,
+    report = dict(cell="baseline_filter1", model=model,
+                  n_docs=n_docs,
                   submission="separate requests per document, "
                              "document-cap admission",
                   budget_tokens=budget, step_tokens=25_305,
@@ -1025,7 +1030,8 @@ def baseline_filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
                    survivors=len(r["survivors"]))
         report["runs"].append(row)
         print(f"[baseline_filter1] {row}", flush=True)
-    return _write(report, "baseline_filter1")
+    suffix = "" if model == "qwen3-4b-fp8" else "_32b"
+    return _write(report, f"baseline_filter1{suffix}")
 
 
 @app.function(timeout=5400, **GPU_KW)
@@ -1259,8 +1265,12 @@ def run_baseline_filter(n_docs: int = 10000, reps: int = 2,
 
 @app.local_entrypoint()
 def run_baseline_filter1(n_docs: int = 10000, reps: int = 2,
-                         out: str = "results/baseline_filter1.json"):
-    _save(baseline_filter1_run.remote(n_docs, reps), out)
+                         model: str = "qwen3-4b-fp8",
+                         out: str = ""):
+    out = out or ("results/baseline_filter1.json"
+                  if model == "qwen3-4b-fp8"
+                  else "results/baseline_filter1_32b.json")
+    _save(baseline_filter1_run.remote(n_docs, reps, model), out)
 
 
 @app.local_entrypoint()

@@ -581,78 +581,206 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 
 
 # ------------------------------------------------------------- warmup
+#
+# Three cost tiers, and which pass pays each:
+#
+#   1. nvcc/Triton compile of a kernel configuration (~2.4 s each for
+#      DeepGEMM): paid once ever per (software stack, GPU, model,
+#      budget), by compile_kernels. Artifacts persist on the kernel
+#      cache (DG_CACHE_DIR / TRITON_CACHE_DIR, a Modal volume); a
+#      marker file next to them records that the pass ran.
+#   2. loading a cached binary into the process (milliseconds per
+#      configuration): paid once per container, by touch_kernels,
+#      which runs each hot kernel once so the loads land at boot
+#      instead of inside the first measured query.
+#   3. the launch itself (microseconds): every call, unavoidable.
+#
+# Every kernel here keys on token counts and model constants, never
+# on token values - so both passes run on synthetic ids and nothing
+# about warmup depends on the query.
 
-def warm_kernels(torch, arena, pipeline, async_ans, doc_ids,
-                 question_ids, budget):
-    """Compile every kernel configuration a run can hit, at boot,
-    outside measured walls (the protocol measures with kernels
-    compiled).
+# Chunk sizes (tokens) the tiny-chunk warmup ladder builds. A gated
+# chain's trailing chunks are 100-500 tokens - a shape neither the
+# GEMM sweep's bare matmuls nor the full-size warm chunks build as an
+# actual forward pass - and each such shape paid a 0.7-9.3 s one-time
+# kernel compile mid-run (measured in the 2026-08-24 packing sweep).
+# A warm tiny chunk costs ~20-30 ms, so the ladder runs in both
+# passes.
+TINY_WARM_TOKENS = (64, 128, 256, 512, 1024, 2048)
 
-    DeepGEMM picks a kernel configuration per token count and
-    JIT-compiles each one on first sight (~3-10 s per configuration).
-    The configuration (its JIT-debug log shows block widths like 112)
-    varies with the token count FINER than powers of two - a
-    geometric sweep left ~41 s of compile lumps inside the first
-    measured run - so the sweep is dense at small counts and steps
-    at large ones, the same reason vLLM's DeepGEMM warmup iterates
-    the token dimension. Compiled artifacts land in the kernel cache
-    (a volume in the Modal images), so all of this costs real time
-    once per software stack, ever.
+# Bump when either pass covers a different set of shapes. A bumped
+# version invalidates every marker, so the next boot re-runs the
+# compile pass and re-commits the cache.
+WARMUP_VERSION = 1
 
-    After the sweep, one budget-sized chunk warms the Triton kernels
-    and the attention path. doc_ids are cycled, so small corpora
-    still warm full-size shapes."""
-    layer = pipeline.layers[0]
-    linears = (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
-               layer.mlp.gate_up_proj, layer.mlp.down_proj)
-    # granular at every size, including the big ones: DeepGEMM's
-    # config choice (its debug log shows block widths like 112)
-    # tracks the token count finer than powers of two, and the
-    # measured lumps came from mid-size drain chunks, so there is no
-    # "big sizes are covered by the sweep" shortcut
-    sizes = sorted(
-        {m for m in range(64, 4097, 256)}
-        | {m for m in range(4096, 32769, 1024)}
-        | {m for m in range(32768, budget + 1, 2048)}
-        | {budget})
-    work = [(m, lin) for m in sizes for lin in linears]
-    try:
-        from tqdm import tqdm
-        work = tqdm(work, desc="quail kernel warmup", unit="gemm")
-    except ImportError:
-        pass
-    with torch.inference_mode():
-        for m, lin in work:
-            x = torch.randn(m, lin.weight.shape[1], device="cuda",
-                            dtype=torch.bfloat16)
-            q, s = pipeline.quant(x)
-            pipeline.gemm(q, s, lin)
-        torch.cuda.synchronize()
 
-    q_max = max(len(q) for q in question_ids)
+def _warm_inputs(budget):
+    """Synthetic warmup tokens: a 512-id document and a 16-id
+    question suffix, cycled to any length the passes need. Fixed
+    small ids; only the counts matter to the kernels."""
+    doc = [10 + (i % 500) for i in range(512)]
+    question = list(range(10, 26))
+    q_max = len(question)
     warm_docs, used = [], 0
-    i = 0
-    while doc_ids:
-        d = doc_ids[i % len(doc_ids)]
-        if used + len(d) + q_max > budget:
-            break
-        warm_docs.append(d)
-        used += len(d) + q_max
-        i += 1
+    while used + len(doc) + q_max <= budget:
+        warm_docs.append(doc)
+        used += len(doc) + q_max
+    return warm_docs or [doc[:max(8, budget - q_max)]], question, doc
+
+
+def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
+                  join_chunk):
+    """Real forward passes over every attention path the engine has:
+    a budget-sized chunk and the tiny ladder under both attention
+    modes (arena writes on, so the paged machinery - scatter, paged
+    reads, the merge kernel - runs), then the single-stage fast
+    path's unpaged causal shape. join_chunk adds one run_join so the
+    join driver's packing runs end to end (compile pass only; it
+    launches no kernel the filter chunks have not already built)."""
+    warm_docs, question, doc = _warm_inputs(budget)
+    q_max = len(question)
     original_mode = pipeline.attention_mode
     for mode in (FILTER_ATTENTION, JOIN_ATTENTION):
         pipeline.attention_mode = mode
-        # arena_writes=True keeps the warmup on the paged machinery
-        # (scatter, paged reads, the merge kernel) even when the
-        # query itself will take the single-stage fast path
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
-                   question_ids, budget, arena_writes=True)
+                   [question], budget, arena_writes=True)
+        # tiny chunks, one document each: the trailing-chunk shapes
+        # of gated multi-stage runs (see TINY_WARM_TOKENS)
+        for t in TINY_WARM_TOKENS:
+            if t >= budget:
+                continue
+            body = (doc * (t // len(doc) + 1))[:max(8, t - q_max)]
+            run_filter(torch, arena, pipeline, async_ans, [body],
+                       [question], budget, arena_writes=True)
+    if join_chunk:
+        pipeline.attention_mode = JOIN_ATTENTION
+        run_join(torch, arena, pipeline, async_ans, warm_docs,
+                 [[question] * 8], budget)
     pipeline.attention_mode = original_mode
-    if len(question_ids) == 1:
-        # the fast path's own shape: one causal segment per group,
-        # no paging, under the session's configured mode
-        run_filter(torch, arena, pipeline, async_ans, warm_docs,
-                   question_ids, budget, arena_writes=False)
+    run_filter(torch, arena, pipeline, async_ans, warm_docs,
+               [question], budget, arena_writes=False)
+
+
+def compile_kernels(torch, arena, pipeline, async_ans, budget):
+    """The compile pass: build every kernel configuration a run can
+    hit, once per (software stack, GPU, model, budget).
+
+    DeepGEMM picks a configuration per token count and JIT-compiles
+    each on first sight (~2.4 s of nvcc per configuration, measured
+    2026-08-24). The configuration tracks the token count finer than
+    powers of two, so guessed grids leave holes: vLLM ships a
+    generator mirroring DeepGEMM's own config heuristic, yielding
+    every token count at which the chosen configuration can change.
+    This pass runs the generator's full list up to the budget - the
+    sweep's GPU compute is the price of provable coverage, and this
+    pass runs once ever, so the price does not matter.
+
+    After the sweep, _forward_warm builds every attention-path shape
+    as real forward passes, including one join chunk."""
+    from vllm.model_executor.warmup.deep_gemm_warmup import (
+        _generate_optimal_warmup_m_values)
+    layer = pipeline.layers[0]
+    linears = (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
+               layer.mlp.gate_up_proj, layer.mlp.down_proj)
+    work = [(m, lin) for lin in linears
+            for m in _generate_optimal_warmup_m_values(
+                budget, lin.weight.shape[0], torch.device("cuda"))]
+    try:
+        from tqdm import tqdm
+        work = tqdm(work, desc="quail kernel compile pass",
+                    unit="gemm")
+    except ImportError:
+        pass
+    with torch.inference_mode():
+        # one buffer per linear, row-sliced per call (row slices stay
+        # contiguous): the sweep only needs each kernel LAUNCHED
+        # once, and a fresh randn per item was most of the sweep's
+        # cost at 1,024 items
+        cur, buf = None, None
+        for m, lin in work:
+            if lin is not cur:
+                buf = torch.randn(budget, lin.weight.shape[1],
+                                  device="cuda",
+                                  dtype=torch.bfloat16)
+                cur = lin
+            q, s = pipeline.quant(buf[:m])
+            pipeline.gemm(q, s, lin)
+        buf = None
+        torch.cuda.synchronize()
+    _forward_warm(torch, arena, pipeline, async_ans, budget,
+                  join_chunk=True)
+
+
+def touch_kernels(torch, arena, pipeline, async_ans, budget):
+    """The touch pass: run each hot kernel once per container so
+    cached binaries load into the process at boot. No GEMM sweep -
+    with the compile pass's marker present every configuration is a
+    cache hit, and a mid-run cache-hit load costs milliseconds, so
+    only the shapes the first chunks hit need touching."""
+    _forward_warm(torch, arena, pipeline, async_ans, budget,
+                  join_chunk=False)
+
+
+def _marker_path(model_name, budget):
+    import os
+    dg = os.environ.get("DG_CACHE_DIR")
+    root = (os.path.dirname(dg) if dg
+            else os.path.expanduser("~/.cache/quail-kernels"))
+    safe = model_name.replace("/", "--")
+    return os.path.join(root, f"quail-warm-{safe}-{int(budget)}.json")
+
+
+def _marker_identity(torch, model_name, budget):
+    try:
+        import vllm
+        vllm_version = vllm.__version__
+    except ImportError:
+        vllm_version = None
+    return dict(warmup_version=WARMUP_VERSION, model=model_name,
+                budget=int(budget), vllm=vllm_version,
+                torch=torch.__version__, cuda=torch.version.cuda,
+                gpu=torch.cuda.get_device_name())
+
+
+def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
+                 model_name, force_compile=False):
+    """Boot-time warmup policy: the compile pass once ever, the touch
+    pass every container after that.
+
+    The marker file (next to the kernel caches, so one volume commit
+    persists both) records the exact identity the compile pass ran
+    for. Identity match -> touch pass; mismatch or no marker ->
+    compile pass, then write the marker. Two containers racing the
+    first compile both run it and write identical markers - wasteful
+    once, never wrong.
+
+    Returns dict(tier="compile"|"touch", warm_s=seconds). The caller
+    owns committing the cache volume."""
+    import json
+    import os
+
+    path = _marker_path(model_name, budget)
+    identity = _marker_identity(torch, model_name, budget)
+    on_disk = None
+    try:
+        with open(path) as f:
+            on_disk = json.load(f)
+    except (OSError, ValueError):
+        pass
+    t0 = time.perf_counter()
+    if force_compile or on_disk != identity:
+        compile_kernels(torch, arena, pipeline, async_ans, budget)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(identity, f, indent=1)
+        os.replace(tmp, path)
+        tier = "compile"
+    else:
+        touch_kernels(torch, arena, pipeline, async_ans, budget)
+        tier = "touch"
+    torch.cuda.synchronize()
+    return dict(tier=tier, warm_s=round(time.perf_counter() - t0, 2))
 
 
 # ---------------------------------------------------------- the filter

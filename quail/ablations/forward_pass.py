@@ -290,8 +290,8 @@ def packed_rungs(n_docs: int = 10000, reps: int = 2) -> str:
     # Triton kernels and the attention path
     t_warm = time.perf_counter()
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
     torch.cuda.synchronize()
     kernel_cache.commit()
     report["warmup_s"] = round(time.perf_counter() - t_warm, 2)
@@ -1012,8 +1012,8 @@ def attention_paths(n_docs: int = 10000, reps: int = 2,
           flush=True)
 
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=spec.hf_name)
     torch.cuda.synchronize()
     kernel_cache.commit()
 
@@ -1140,8 +1140,8 @@ def profile_packed(n_docs: int = 3000) -> str:
     body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
 
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, exec_budget)
+        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
+                     model_name=MODEL)
     torch.cuda.synchronize()
     kernel_cache.commit()
 

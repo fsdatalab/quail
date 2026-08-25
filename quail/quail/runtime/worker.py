@@ -124,17 +124,17 @@ def execute(payload: dict) -> dict:
     if not booted["warmed"]:
         t0 = time.perf_counter()
         with torch.inference_mode():
-            # boot-side warmup: the dense token sweep plus one
-            # chunk_tokens-sized batch, so every kernel configuration
-            # compiles outside measured walls
-            first_alias = next(iter(docs))
-            warm_q = (next(iter(payload["filters"].values()))[0]
-                      if payload["filters"] else [1, 2, 3])
-            warm_kernels(torch, arena, pipeline, async_ans,
-                         docs[first_alias], [warm_q], chunk_tokens)
+            # boot-side warmup on synthetic tokens: the compile pass
+            # once ever per stack+model+budget (marker on the kernel
+            # cache volume), the millisecond-loads touch pass on
+            # every container after that
+            warm = warm_kernels(torch, arena, pipeline, async_ans,
+                                chunk_tokens,
+                                model_name=spec.hf_name)
         torch.cuda.synchronize()
         kernel_cache.commit()   # keep the compiles even if the run dies
         boot["warm_kernels_s"] = time.perf_counter() - t0
+        boot["warm_tier"] = warm["tier"]
         booted["warmed"] = True
         boot["kind"] = "cold"
 
@@ -396,20 +396,17 @@ def _child_boot(state, sub):
     state["async_ans"] = AsyncAnswers(torch, answerer)
     state["chunk_tokens"] = sub["chunk_tokens"]
     if not state["warmed"]:
-        docs = next((d for d in sub.get("docs", {}).values() if d),
-                    None)
-        if docs is None:
-            docs = sub.get("anchor_docs") or [[1, 2, 3]]
-        warm_q = (next(iter(sub["filters"].values()))[0]
-                  if sub.get("filters") else [1, 2, 3])
         t0 = time.perf_counter()
         with torch.inference_mode():
-            warm_kernels(torch, state["arena"], state["pipeline"],
-                         state["async_ans"], docs, [warm_q],
-                         state["chunk_tokens"])
+            warm = warm_kernels(torch, state["arena"],
+                                state["pipeline"],
+                                state["async_ans"],
+                                state["chunk_tokens"],
+                                model_name=state["spec"].hf_name)
         torch.cuda.synchronize()
         kernel_cache.commit()
         boot["warm_kernels_s"] = time.perf_counter() - t0
+        boot["warm_tier"] = warm["tier"]
         state["warmed"] = True
         boot["kind"] = "cold"
     for k in ("load_model_s", "arena_s", "pipeline_s",

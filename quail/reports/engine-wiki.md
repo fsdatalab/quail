@@ -788,7 +788,7 @@ answers. This overlaps GPU compute with answer readback.
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
 | `run_filter` | `loop.py:462` | The filter chain execution loop |
 | `run_join` | `loop.py:241` | The join execution loop (one cross-product stage per join; multi-stage gating stays available to GPU cells) |
-| `warm_kernels` | `loop.py:387` | Pre-compile all DeepGEMM and Triton kernel configs |
+| `warm_kernels` | `loop.py` | Boot warmup policy: compile pass once ever (marker on the kernel-cache volume), touch pass per container |
 | `Answerer` | `loop.py:60` | TRUE/FALSE scoring from final hidden states |
 | `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
 
@@ -1271,10 +1271,31 @@ volume, so each configuration compiles once per software stack.
   quantization.
 - `qk_norm_rope`: fused QK-norm and rotary position embedding.
 
-**Kernel warmup** (`loop.py:347`): before any measured run, the
-warmup function sweeps DeepGEMM across a dense set of token counts
-(every 256 tokens up to 4,096, every 1,024 up to 32,768, every
-2,048 up to the budget) for each of the four linear projections.
-After the GEMM sweep, one budget-sized filter chunk warms the Triton
-kernels and attention path. This ensures no JIT compilation occurs
-during measured walls.
+**Kernel warmup** (`loop.py`, warmup section): boot warmup is
+tiered by cost, and nothing in it depends on the query - every
+kernel keys on token counts and model constants, never token
+values, so both passes run on synthetic ids.
+
+- **Compile pass** (`compile_kernels`), once per (software stack,
+  GPU, model, budget): sweeps DeepGEMM over the full list of token
+  counts from vLLM's config-boundary generator up to the budget
+  (guessed grid only as an import fallback), for each of the four
+  linear projections, then builds every attention-path shape as
+  real forward passes: a budget-sized chunk and the tiny-chunk
+  ladder (`TINY_WARM_TOKENS`) under both attention modes, one join
+  chunk, and the fast path's unpaged causal shape. A marker file
+  next to the kernel caches records the identity
+  (`WARMUP_VERSION`, model, budget, vLLM/torch/CUDA versions, GPU
+  name); one volume commit persists compiled kernels and marker
+  together.
+- **Touch pass** (`touch_kernels`), every container whose marker
+  matches: the same forward passes without the GEMM sweep and
+  without the join chunk. Each hot kernel runs once so cached
+  binaries load into the process (milliseconds each) at boot
+  instead of inside the first measured query.
+
+`warm_kernels(torch, arena, pipeline, async_ans, budget,
+model_name=...)` is the policy wrapper: marker match runs the
+touch pass, mismatch or `force_compile=True` runs the compile pass
+and writes the marker. This keeps JIT compilation out of measured
+walls once ever, and keeps per-container boot at touch-pass cost.

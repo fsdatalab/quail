@@ -1,7 +1,9 @@
-"""Boot-time breakdown plot (Quail vs stock vLLM).
+"""Tiered-boot plots.
 
-Reads results/boot_profile.json (3-trial mean/median from
-tests/gpu/boot_profile.py) and writes reports/plots/boot_profile.png.
+Reads results/boot_tiered.json (tests/gpu/boot_profile.py), the old
+results/boot_profile.json (the swept-warmup boot this change
+replaces), results/m1_filter1.json and results/baseline_filter1.json
+(the query references), and writes reports/plots/boot_tiered.png.
 
     uv run --with matplotlib python reports/make_boot_plots.py
 """
@@ -23,98 +25,181 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY, GREEN, TEAL, ORANGE, DARK
+from plot_colors import BLUE, GRAY, GREEN, ORANGE, RED, TEAL, DARK
+
+# boot phases from the profiler-off control: py-spy adds ~4.6 s to
+# the warm phase
+nospy = json.load(open(RESULTS / "boot_tiered_nospy.json"))
+stock_q = json.load(open(RESULTS / "baseline_filter1.json"))
+
+new_cold = nospy["touch"]["cold"]
 
 
-def load(name):
-    with open(RESULTS / name) as f:
-        return json.load(f)
+def mean_s(agg, key):
+    return agg[key]["mean"]
 
 
-data = load("boot_profile.json")
-q_cold = data["quail"]["cold"]
-s_cold = data["stock"]["cold"]
+PHASES = [("load_model", "load_model_s", BLUE),
+          ("arena", "arena_s", TEAL),
+          ("warm_kernels", "warm_kernels_s", ORANGE)]
 
+fig, (ax_boot, ax_q) = plt.subplots(
+    1, 2, figsize=(10.5, 3.4),
+    gridspec_kw={"width_ratios": [1.5, 1]})
 
-def mean_s(side, key):
-    return side[key]["mean"]
-
-
-phases = [
-    ("load_model", mean_s(q_cold, "load_model_s"), BLUE),
-    ("arena", mean_s(q_cold, "arena_s"), TEAL),
-    ("warm_kernels", mean_s(q_cold, "warm_kernels_s"), ORANGE),
-]
-q_total = mean_s(q_cold, "boot_s")
-s_total = mean_s(s_cold, "boot_s")
-
-fig, (ax_q, ax_cmp) = plt.subplots(
-    1, 2, figsize=(10.5, 3.2),
-    gridspec_kw={"width_ratios": [1.4, 1]},
-)
-
-# ---- left: Quail cold boot phases -----------------------------------
+# ---- left: what a cold container boot spends its time on ------------
 left = 0.0
-for name, val, color in phases:
-    if val <= 0:
+for name, key, color in PHASES:
+    val = mean_s(new_cold, key)
+    if not val:
         continue
-    ax_q.barh(0, val, left=left, height=0.4, color=color)
-    if val >= 3.0:
-        ax_q.text(left + val / 2, 0, f"{val:.1f} s",
-                  ha="center", va="center", fontsize=10.5,
+    ax_boot.barh(0, val, left=left, height=0.42, color=color)
+    if val >= 2.5:
+        ax_boot.text(left + val / 2, 0, f"{val:.1f}",
+                     ha="center", va="center", fontsize=9.5,
+                     color="white", fontweight="bold")
+    left += val
+total = mean_s(new_cold, "boot_s")
+ax_boot.text(total + 0.6, 0, f"{total:.1f} s", va="center",
+             fontsize=10, color=DARK, fontweight="bold")
+
+ax_boot.set_xlim(0, total * 1.22)
+ax_boot.set_ylim(-0.45, 0.75)
+ax_boot.set_yticks([])
+ax_boot.set_xlabel("cold container boot (seconds, trial mean)")
+ax_boot.legend(
+    handles=[Patch(facecolor=c, label=n) for n, _, c in PHASES],
+    loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=3,
+    fontsize=8.5, handlelength=1.1)
+
+# ---- right: first query after boot vs stock vLLM --------------------
+best = nospy["query"]["best_wall"]["no_arena"]
+stock_wall = min(r["wall"] for r in stock_q["runs"])
+bars = ax_q.bar(["Quail", "stock vLLM"], [best, stock_wall],
+                color=[GREEN, GRAY], width=0.45)
+for bar, v in zip(bars, [best, stock_wall]):
+    ax_q.text(bar.get_x() + bar.get_width() / 2, v + 0.5,
+              f"{v:.1f}", ha="center", fontsize=10,
+              fontweight="bold", color=DARK)
+ax_q.text(bars[1].get_x() + bars[1].get_width() / 2,
+          stock_wall / 2, f"+{(stock_wall / best - 1) * 100:.0f}%",
+          ha="center", fontsize=9.5, color="white",
+          fontweight="bold")
+ax_q.set_ylim(0, stock_wall * 1.18)
+ax_q.set_ylabel("filter query wall (seconds)")
+ax_q.set_title("10k-document single-stage filter", fontsize=10,
+               loc="left")
+
+fig.tight_layout()
+fig.savefig(OUT / "boot_tiered.png", dpi=150, bbox_inches="tight")
+print(f"wrote {OUT / 'boot_tiered.png'}")
+
+
+# ---- figure 2: inside the touch pass (py-spy timeline) --------------
+tl = json.load(open(RESULTS / "boot_touch_timeline.json"))
+
+CAT_COLORS = {
+    "waiting for the GPU (warm chunk running)": BLUE,
+    "gemm + quant kernel launches": ORANGE,
+    "attention + triton kernel launches": GREEN,
+    "deepgemm cache reads (disk)": RED,
+    "packing + admission (cpu)": GRAY,
+    "other": DARK,
+}
+
+for model, entry in tl["models"].items():
+    timeline = entry["timeline"]
+    if timeline is None:
+        continue
+    cats = timeline["categories"]
+    bin_s = timeline["bin_s"]
+    n = timeline["n_bins"]
+    xs = [i * bin_s for i in range(n)]
+    fig2, ax = plt.subplots(figsize=(10.5, 3.0))
+    bottom = [0.0] * n
+    for c in cats:
+        vals = [v / bin_s for v in timeline["matrix"][c]]
+        if not any(vals):
+            continue
+        ax.bar(xs, vals, width=bin_s, bottom=bottom, align="edge",
+               color=CAT_COLORS[c], label=c, linewidth=0)
+        bottom = [b + v for b, v in zip(bottom, vals)]
+    ax.set_xlim(0, n * bin_s)
+    ax.set_ylim(0, 1.15)
+    ax.set_yticks([0, 0.5, 1.0])
+    ax.set_ylabel("share of each 0.1 s bin")
+    note = ("recorded under py-spy, which slows it: this phase is "
+            "3.6 s without the profiler" if model == "qwen3-4b-fp8"
+            else "recorded under py-spy; 11-22 s without it, "
+                 "host-speed dependent")
+    ax.set_xlabel(
+        f"seconds into the touch pass, {model} ({note})")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.32),
+              ncol=3, fontsize=8, handlelength=1.1)
+    fig2.tight_layout()
+    suffix = "" if model == "qwen3-4b-fp8" else "_32b"
+    fig2.savefig(OUT / f"boot_touch_timeline{suffix}.png", dpi=150,
+                 bbox_inches="tight")
+    print(f"wrote {OUT / f'boot_touch_timeline{suffix}.png'}")
+
+
+# ---- figure 3: 32B, same layout as figure 1 -------------------------
+# Left: one representative container (the fast one the timeline
+# figure profiles; slow containers load weights in up to 6 min and
+# the report carries all three). Right: the same query vs stock.
+t32spy = json.load(open(RESULTS / "boot_tiered_32b_spy.json"))
+t32 = json.load(open(RESULTS / "boot_tiered_32b.json"))
+stock32 = json.load(open(RESULTS / "baseline_filter1_32b.json"))
+cold32 = t32spy["touch"]["trials"][0]["cold"]
+
+fig3, (ax_b, ax_q2) = plt.subplots(
+    1, 2, figsize=(10.5, 3.4),
+    gridspec_kw={"width_ratios": [1.5, 1]})
+
+left = 0.0
+total32 = cold32["boot_s"]
+for name, key, color in PHASES:
+    val = cold32[key]
+    if not val:
+        continue
+    ax_b.barh(0, val, left=left, height=0.42, color=color)
+    if val >= total32 * 0.08:
+        ax_b.text(left + val / 2, 0, f"{val:.1f}",
+                  ha="center", va="center", fontsize=9.5,
                   color="white", fontweight="bold")
     left += val
+ax_b.text(total32 + 2, 0, f"{total32:.0f} s", va="center",
+          fontsize=10, color=DARK, fontweight="bold")
+ax_b.set_xlim(0, total32 * 1.22)
+ax_b.set_ylim(-0.45, 0.75)
+ax_b.set_yticks([])
+ax_b.set_xlabel(
+    "cold container boot, qwen3-32b-fp8 (seconds; a fast container "
+    "- slow ones load weights in up to 6 min)")
+ax_b.legend(
+    handles=[Patch(facecolor=c, label=n) for n, _, c in PHASES],
+    loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=3,
+    fontsize=8.5, handlelength=1.1)
 
-ax_q.set_xlim(0, q_total * 1.08)
-ax_q.set_ylim(-0.45, 0.45)
-ax_q.set_yticks([])
-ax_q.set_xticks([])
-ax_q.set_title(
-    f"Quail cold phases  ·  {q_total:.1f} s total",
-    fontsize=11, loc="left")
+best32 = t32["query"]["best_wall"]["no_arena"]
+stock32_wall = min(r["wall"] for r in stock32["runs"])
+bars = ax_q2.bar(["Quail", "stock vLLM"], [best32, stock32_wall],
+                 color=[GREEN, GRAY], width=0.45)
+for bar, v in zip(bars, [best32, stock32_wall]):
+    ax_q2.text(bar.get_x() + bar.get_width() / 2, v + 3,
+               f"{v:.1f}", ha="center", fontsize=10,
+               fontweight="bold", color=DARK)
+ax_q2.text(bars[1].get_x() + bars[1].get_width() / 2,
+           stock32_wall / 2,
+           f"+{(stock32_wall / best32 - 1) * 100:.0f}%",
+           ha="center", fontsize=9.5, color="white",
+           fontweight="bold")
+ax_q2.set_ylim(0, stock32_wall * 1.18)
+ax_q2.set_ylabel("filter query wall (seconds)")
+ax_q2.set_title("10k-document single-stage filter (32B)",
+                fontsize=10, loc="left")
 
-handles = [
-    Patch(facecolor=c,
-          label=(f"{n}  {v:.2f} s" if v < 1 else f"{n}  {v:.1f} s"))
-    for n, v, c in phases
-]
-ax_q.legend(handles=handles, loc="upper center",
-            bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=8.5,
-            handlelength=1.1)
-
-# ---- right: total cold boot comparison ------------------------------
-speedup = s_total / q_total
-bars = ax_cmp.bar(
-    ["Quail", "Stock vLLM"], [q_total, s_total],
-    color=[GREEN, GRAY], width=0.45,
-)
-
-ax_cmp.text(
-    bars[0].get_x() + bars[0].get_width() / 2,
-    q_total + s_total * 0.03,
-    f"{q_total:.1f} s  ({speedup:.0f}x faster)",
-    ha="center", va="bottom", fontsize=10, fontweight="bold",
-    color=GREEN,
-)
-ax_cmp.text(
-    bars[1].get_x() + bars[1].get_width() / 2,
-    s_total + s_total * 0.03,
-    f"{s_total:.1f} s",
-    ha="center", va="bottom", fontsize=10, fontweight="bold",
-    color=DARK,
-)
-
-ax_cmp.set_ylim(0, s_total * 1.18)
-ax_cmp.set_yticks([])
-ax_cmp.set_title("Cold boot total", fontsize=11, loc="left")
-ax_cmp.text(
-    0.5, -0.15,
-    "warm boot = 0.0 s on both  ·  3 H100 SXM trials",
-    transform=ax_cmp.transAxes, ha="center", fontsize=8,
-    color="#999999",
-)
-
-fig.subplots_adjust(bottom=0.22, wspace=0.3)
-out = OUT / "boot_profile.png"
-fig.savefig(out)
-print("wrote", out)
+fig3.tight_layout()
+fig3.savefig(OUT / "boot_tiered_32b.png", dpi=150,
+             bbox_inches="tight")
+print(f"wrote {OUT / 'boot_tiered_32b.png'}")

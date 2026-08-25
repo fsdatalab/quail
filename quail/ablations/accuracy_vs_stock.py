@@ -385,8 +385,8 @@ def quail_side(n_docs: int = 1000,
     budget = min(chunk, pipeline.max_chunk_tokens)
 
     with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, body_ids,
-                     q_ids, budget)
+        warm_kernels(torch, arena, pipeline, async_ans, budget,
+                     model_name=spec.hf_name)
     torch.cuda.synchronize()
     kernel_cache.commit()
 
