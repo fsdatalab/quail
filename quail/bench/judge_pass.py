@@ -154,6 +154,74 @@ PREDICATES = (
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
 
 
+# Which predicates each workload owns, and the batch sizes the pass
+# runs them at. One GPU container takes one workload, so the four run
+# side by side; the batch sizes are unchanged from the serial pass.
+#
+# The split is by workload rather than by predicate because a
+# container boots the 32B model once (~107 s) and then amortizes it
+# over everything it judges. BioDEX is 48% of the work on its own, so
+# it sets the wall time; splitting finer only helps if its join is
+# sharded too, which would mean merging partial label sets.
+WORKLOAD_PLAN = {
+    "imdb": {
+        "filters": ((("reviews", 256), (
+            "quailb.imdb.review.mentions_positive_aspect",
+            "quailb.imdb.review.discusses_ending",
+            "quailb.imdb.review.mentions_named_actor")),),
+        "join": ("quailb.imdb.review.discusses_aspect",
+                 "reviews", "aspects", 64),
+    },
+    "biodex": {
+        "filters": ((("reports", 8), (
+            "quailb.biodex.report.involves_female_patient",
+            "quailb.biodex.report.describes_combination_therapy",
+            "quailb.biodex.report.describes_serious_adverse_event")),),
+        "join": ("quailb.biodex.report.experienced_reaction",
+                 "reports", "terms", 4),
+    },
+    "fever": {
+        "filters": ((("claims", 100), (
+            "quailb.fever.claim.about_person",
+            "quailb.fever.claim.contains_date")),
+                    (("evidence", 57), (
+            "quailb.fever.passage.about_person",))),
+        "join": ("quailb.fever.passage.supports_claim",
+                 "claims", "evidence", 20),
+        "source_label": "fever",
+    },
+    "lepard": {
+        "filters": ((("citations", 50), (
+            "quailb.lepard.excerpt.reasoning_does_not_apply",
+            "quailb.lepard.excerpt.procedural_or_jurisdictional",
+            "quailb.lepard.excerpt.treats_passage_as_binding",
+            "quailb.lepard.excerpt.supports_liability_or_guilt",
+            "quailb.lepard.excerpt.acknowledges_court_disagreement")),
+                    (("citations", 100), (
+            "quailb.lepard.passage.states_general_rule",))),
+        # LePaRD's join labels come from the dataset's own passage_id,
+        # not from the judge, so it needs no model call
+        "source_join": ("quailb.lepard.excerpt.cites_passage",
+                        "citations", "citations"),
+    },
+}
+WORKLOADS = tuple(WORKLOAD_PLAN)
+
+
+def workload_specs(workload: str) -> tuple:
+    return tuple(p for p in PREDICATES if p.workload == workload)
+
+
+def _load_corpus(corpus_id: str) -> tuple[Path, dict, dict]:
+    """Read a corpus already materialized on the volume. Workers use
+    this instead of _materialize_corpus so the corpus is built once
+    rather than once per container."""
+    target = VOLUME_ROOT / "corpora" / corpus_id
+    with open(target / "manifest.json") as f:
+        manifest = json.load(f)
+    return target, manifest, _read_rows(target)
+
+
 def _canonical(value) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False).encode("utf-8")
@@ -608,15 +676,20 @@ class VerificationSample:
 
 def _saved_verification_sample(
         corpus_rows: dict[str, list[dict]],
-        identities: dict[str, dict]) -> VerificationSample:
+        identities: dict[str, dict],
+        specs: tuple | None = None) -> VerificationSample:
+    # read PREDICATES at call time, not as a default: the module
+    # attribute is patchable and a default would freeze it
     import pyarrow.parquet as pq
+
+    specs = PREDICATES if specs is None else specs
 
     rows_by_table = {
         table: {str(row["id"]): row for row in rows}
         for table, rows in corpus_rows.items()
     }
     verification = VerificationSample()
-    for spec in PREDICATES:
+    for spec in specs:
         identity = identities[spec.key]
         for part in sorted((_label_dir(spec, identity) / "parts").glob(
                 "part_*.parquet")):
@@ -841,22 +914,19 @@ def _fever_source_label(claim: dict, passage: dict):
 
 
 @app.function(
-    image=image, gpu="H100!", memory=98304, timeout=7200,
-    volumes={"/root/.cache/huggingface": hf_cache,
-             "/root/.cache/kernels": kernel_cache,
-             "/results": results_vol})
-def run_judge_pass(sf: float = SCALE_FACTOR) -> str:
+    image=data_image, memory=4096, timeout=1800,
+    volumes={"/results": results_vol})
+def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
+    """Build the corpus once, and report whether the collection these
+    templates imply is already on the volume.
+
+    Returning that flag lets the caller skip booting four GPUs for a
+    pass that has nothing left to do."""
     if sf != SCALE_FACTOR:
         raise ValueError("the ground-truth pass is fixed at sf=0.1")
-
-    print(f"PREDICTION: {PREDICTION}", flush=True)
-    t_total = time.perf_counter()
     results_vol.reload()
-    corpus_dir, corpus_manifest, rows = _materialize_corpus(sf)
+    _, corpus_manifest, _ = _materialize_corpus(sf)
     results_vol.commit()
-    print(f"[judge] corpus {corpus_manifest['corpus_id']} at {corpus_dir}",
-          flush=True)
-
     identities = {
         spec.key: label_set_identity(
             spec, corpus_manifest["corpus_id"],
@@ -864,27 +934,47 @@ def run_judge_pass(sf: float = SCALE_FACTOR) -> str:
         for spec in PREDICATES
     }
     collection = _collection_identity(corpus_manifest, identities)
-    collection_dir = (VOLUME_ROOT / "collections"
-                      / collection["collection_id"])
-    collection_manifest_path = collection_dir / "manifest.json"
-    if collection_manifest_path.exists():
-        with open(collection_manifest_path) as f:
-            existing = json.load(f)
-        if existing.get("status") == "complete":
-            _activate_collection(
-                corpus_manifest["corpus_id"], collection["collection_id"])
-            results_vol.commit()
-            print(f"[judge] collection already complete: "
-                  f"{collection['collection_id']}", flush=True)
-            return json.dumps(existing["summary"], sort_keys=True)
+    path = (VOLUME_ROOT / "collections" / collection["collection_id"]
+            / "manifest.json")
+    complete = False
+    if path.exists():
+        with open(path) as f:
+            complete = json.load(f).get("status") == "complete"
+    print(f"[judge] corpus {corpus_manifest['corpus_id']}, collection "
+          f"{collection['collection_id']}, complete={complete}", flush=True)
+    return json.dumps({"corpus": corpus_manifest,
+                       "collection_id": collection["collection_id"],
+                       "complete": complete}, sort_keys=True)
 
-    for spec in PREDICATES:
-        identity = identities[spec.key]
-        label_dir = _label_dir(spec, identity)
+
+@app.function(
+    image=image, gpu="H100!", memory=98304, timeout=7200,
+    volumes={"/root/.cache/huggingface": hf_cache,
+             "/root/.cache/kernels": kernel_cache,
+             "/results": results_vol})
+def judge_workload(corpus_id: str, workload: str) -> str:
+    """Label one workload's predicates on one GPU.
+
+    Every part file is written under a content-addressed path and
+    skipped when it already exists, so a container that dies part way
+    resumes where it stopped."""
+    plan = WORKLOAD_PLAN[workload]
+    specs = workload_specs(workload)
+    t_total = time.perf_counter()
+    results_vol.reload()
+    corpus_dir, corpus_manifest, rows = _load_corpus(corpus_id)
+    identities = {
+        spec.key: label_set_identity(
+            spec, corpus_manifest["corpus_id"],
+            corpus_manifest["corpus_full_hash"])
+        for spec in specs
+    }
+    for spec in specs:
+        label_dir = _label_dir(spec, identities[spec.key])
         label_dir.mkdir(parents=True, exist_ok=True)
         if not (label_dir / "manifest.json").exists():
             _atomic_json(label_dir / "manifest.json", {
-                **identity,
+                **identities[spec.key],
                 "status": "running",
                 "predicate": asdict(spec),
                 "expected_rows": _expected_rows(spec, rows),
@@ -894,79 +984,89 @@ def run_judge_pass(sf: float = SCALE_FACTOR) -> str:
     t_boot = time.perf_counter()
     judge = ModelJudge()
     boot_s = time.perf_counter() - t_boot
-    print(f"[judge] model ready in {boot_s:.1f} seconds", flush=True)
+    print(f"[judge] {workload}: model ready in {boot_s:.1f} seconds",
+          flush=True)
     verification = VerificationSample()
 
-    filter_groups = (
-        ("reviews", [PREDICATE_BY_KEY[k] for k in (
-            "quailb.imdb.review.mentions_positive_aspect",
-            "quailb.imdb.review.discusses_ending",
-            "quailb.imdb.review.mentions_named_actor")], 256),
-        ("reports", [PREDICATE_BY_KEY[k] for k in (
-            "quailb.biodex.report.involves_female_patient",
-            "quailb.biodex.report.describes_combination_therapy",
-            "quailb.biodex.report.describes_serious_adverse_event")], 8),
-        ("claims", [PREDICATE_BY_KEY[k] for k in (
-            "quailb.fever.claim.about_person",
-            "quailb.fever.claim.contains_date")], 100),
-        ("evidence", [PREDICATE_BY_KEY[
-            "quailb.fever.passage.about_person"]], 57),
-        ("citations", [PREDICATE_BY_KEY[k] for k in (
-            "quailb.lepard.excerpt.reasoning_does_not_apply",
-            "quailb.lepard.excerpt.procedural_or_jurisdictional",
-            "quailb.lepard.excerpt.treats_passage_as_binding",
-            "quailb.lepard.excerpt.supports_liability_or_guilt",
-            "quailb.lepard.excerpt.acknowledges_court_disagreement")], 50),
-        ("citations", [PREDICATE_BY_KEY[
-            "quailb.lepard.passage.states_general_rule"]], 100),
-    )
-    for table, specs, batch_rows in filter_groups:
-        _write_filter_parts(judge, verification, rows[table], specs,
-                            identities, corpus_manifest["corpus_id"],
-                            batch_rows)
+    for (table, batch_rows), keys in plan["filters"]:
+        _write_filter_parts(
+            judge, verification, rows[table],
+            [PREDICATE_BY_KEY[k] for k in keys], identities,
+            corpus_manifest["corpus_id"], batch_rows)
 
-    imdb_join = PREDICATE_BY_KEY[
-        "quailb.imdb.review.discusses_aspect"]
-    _write_qwen_join_parts(
-        judge, verification, imdb_join, rows["reviews"], rows["aspects"],
-        identities[imdb_join.key], corpus_manifest["corpus_id"], 64)
+    if "join" in plan:
+        key, left, right, anchor_batch = plan["join"]
+        spec = PREDICATE_BY_KEY[key]
+        _write_qwen_join_parts(
+            judge, verification, spec, rows[left], rows[right],
+            identities[key], corpus_manifest["corpus_id"], anchor_batch,
+            source_label=(_fever_source_label
+                          if plan.get("source_label") == "fever" else None))
+    if "source_join" in plan:
+        key, left, right = plan["source_join"]
+        _write_lepard_source(
+            PREDICATE_BY_KEY[key], rows[left], rows[right],
+            identities[key], corpus_manifest["corpus_id"])
 
-    bio_join = PREDICATE_BY_KEY[
-        "quailb.biodex.report.experienced_reaction"]
-    _write_qwen_join_parts(
-        judge, verification, bio_join, rows["reports"], rows["terms"],
-        identities[bio_join.key], corpus_manifest["corpus_id"], 4)
-
-    fever_join = PREDICATE_BY_KEY[
-        "quailb.fever.passage.supports_claim"]
-    _write_qwen_join_parts(
-        judge, verification, fever_join, rows["claims"], rows["evidence"],
-        identities[fever_join.key], corpus_manifest["corpus_id"], 20,
-        source_label=_fever_source_label)
-
-    lep_join = PREDICATE_BY_KEY[
-        "quailb.lepard.excerpt.cites_passage"]
-    _write_lepard_source(
-        lep_join, rows["citations"], rows["citations"],
-        identities[lep_join.key], corpus_manifest["corpus_id"])
-
-    manifests = {}
-    for spec in PREDICATES:
-        manifests[spec.key] = _complete_manifest(
-            spec, identities[spec.key], _expected_rows(spec, rows))
+    manifests = {spec.key: _complete_manifest(
+        spec, identities[spec.key], _expected_rows(spec, rows))
+        for spec in specs}
     results_vol.commit()
 
-    verification = _saved_verification_sample(rows, identities)
-    deterministic = verification.run(judge)
+    saved = _saved_verification_sample(rows, identities, specs)
+    deterministic = saved.run(judge)
+    kernel_cache.commit()
+    partial = {
+        "workload": workload,
+        "manifests": manifests,
+        "boot_s": round(boot_s, 2),
+        "model_wall_s": round(judge.model_wall_s, 2),
+        "total_wall_s": round(time.perf_counter() - t_total, 2),
+        "prompt_tokens_submitted_this_call": judge.prompt_tokens,
+        "model_requests_this_call_including_verification": judge.requests,
+        "deterministic_rerun": deterministic,
+    }
+    print(f"[judge] {workload} done in {partial['total_wall_s']:.1f}s",
+          flush=True)
+    return json.dumps(partial, sort_keys=True)
 
-    qwen_rows = sum(
-        manifest["source_rows"].get(MODEL_NAME, 0)
-        for manifest in manifests.values())
-    source_rows = sum(
-        manifest["rows"] - manifest["source_rows"].get(MODEL_NAME, 0)
-        for manifest in manifests.values())
-    total_rows = sum(manifest["rows"] for manifest in manifests.values())
-    total_s = time.perf_counter() - t_total
+
+@app.function(
+    image=data_image, memory=4096, timeout=1200,
+    volumes={"/results": results_vol})
+def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
+    """Assemble the four workloads into one collection and make it the
+    active ground truth for this corpus.
+
+    Activation is the overwrite: `evaluate.py` reads
+    `corpora/<corpus_id>/active_collection.json` whenever it is not
+    given an explicit collection id. The corpus is unchanged, so this
+    repoints the same file at the new collection. Superseded
+    collections stay on the volume under their own content-addressed
+    ids and are simply no longer active."""
+    results_vol.reload()
+    _, corpus_manifest, _ = _load_corpus(corpus_id)
+    identities = {
+        spec.key: label_set_identity(
+            spec, corpus_manifest["corpus_id"],
+            corpus_manifest["corpus_full_hash"])
+        for spec in PREDICATES
+    }
+    collection = _collection_identity(corpus_manifest, identities)
+    collection_dir = (VOLUME_ROOT / "collections"
+                      / collection["collection_id"])
+
+    by_workload = json.loads(partials)
+    manifests = {}
+    for partial in by_workload.values():
+        manifests.update(partial["manifests"])
+    missing = [spec.key for spec in PREDICATES if spec.key not in manifests]
+    if missing:
+        raise ValueError(f"no label set reported for: {missing}")
+
+    qwen_rows = sum(m["source_rows"].get(MODEL_NAME, 0)
+                    for m in manifests.values())
+    total_rows = sum(m["rows"] for m in manifests.values())
     summary = {
         "cell": "quailb_judge_pass",
         "prediction": PREDICTION,
@@ -976,50 +1076,92 @@ def run_judge_pass(sf: float = SCALE_FACTOR) -> str:
         "model": MODEL_NAME,
         "model_revision": MODEL_REVISION,
         "qwen_judgments": qwen_rows,
-        "source_labels": source_rows,
+        "source_labels": total_rows - qwen_rows,
         "total_labels": total_rows,
         "predicate_count": len(PREDICATES),
-        "boot_s": round(boot_s, 2),
-        "model_wall_s": round(judge.model_wall_s, 2),
-        "total_wall_s": round(total_s, 2),
-        "prompt_tokens_submitted_this_call": judge.prompt_tokens,
-        "model_requests_this_call_including_verification": judge.requests,
-        "deterministic_rerun": deterministic,
+        "workloads": {
+            name: {k: partial[k] for k in (
+                "boot_s", "model_wall_s", "total_wall_s",
+                "prompt_tokens_submitted_this_call",
+                "model_requests_this_call_including_verification",
+                "deterministic_rerun")}
+            for name, partial in sorted(by_workload.items())},
+        "wall_s_sum_over_workloads": round(
+            sum(p["total_wall_s"] for p in by_workload.values()), 2),
+        "wall_s_slowest_workload": round(
+            max(p["total_wall_s"] for p in by_workload.values()), 2),
+        "deterministic_rerun": {
+            "compared": sum(p["deterministic_rerun"]["compared"]
+                            for p in by_workload.values()),
+            "answer_differences": sum(
+                p["deterministic_rerun"]["answer_differences"]
+                for p in by_workload.values()),
+            "submission_order": "reverse of first pass"},
         "label_sets": {
-            key: {
-                "label_set_id": manifest["label_set_id"],
-                "rows": manifest["rows"],
-                "true_rows": manifest["true_rows"],
-                "source_rows": manifest["source_rows"],
-            }
-            for key, manifest in sorted(manifests.items())
-        },
+            key: {"label_set_id": m["label_set_id"], "rows": m["rows"],
+                  "true_rows": m["true_rows"],
+                  "source_rows": m["source_rows"]}
+            for key, m in sorted(manifests.items())},
         "volume_path": str(collection_dir),
     }
-    collection_manifest = {
-        **collection,
-        "status": "complete",
-        "corpus_manifest": str(corpus_dir / "manifest.json"),
-        "summary": summary,
-    }
-    _atomic_json(collection_manifest_path, collection_manifest)
+    _atomic_json(collection_dir / "manifest.json", {
+        **collection, "status": "complete",
+        "corpus_manifest": str(
+            VOLUME_ROOT / "corpora" / corpus_id / "manifest.json"),
+        "summary": summary})
     _atomic_json(collection_dir / "summary.json", summary)
-    _activate_collection(
-        corpus_manifest["corpus_id"], collection["collection_id"])
+    _activate_collection(corpus_manifest["corpus_id"],
+                         collection["collection_id"])
     results_vol.commit()
-    kernel_cache.commit()
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
     return json.dumps(summary, sort_keys=True)
 
 
 @app.local_entrypoint()
-def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None):
+def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
+         only: str | None = None):
+    """Run the four workloads side by side, then activate the result.
+
+    `--only imdb,fever` restricts the pass to those workloads; the
+    finalize step then refuses, because a collection needs all
+    nineteen label sets. Use it to re-label one workload before a full
+    run picks the rest up from the volume."""
     if compact_collection:
-        function_call = compact_ground_truth.spawn(compact_collection)
-        print(f"function call id: {function_call.object_id}", flush=True)
-        print(function_call.get(), flush=True)
+        call = compact_ground_truth.spawn(compact_collection)
+        print(f"function call id: {call.object_id}", flush=True)
+        print(call.get(), flush=True)
         return
     print(f"PREDICTION: {PREDICTION}", flush=True)
-    function_call = run_judge_pass.spawn(sf)
-    print(f"function call id: {function_call.object_id}", flush=True)
-    print(function_call.get(), flush=True)
+
+    call = prepare_corpus.spawn(sf)
+    print(f"function call id (prepare_corpus): {call.object_id}", flush=True)
+    prepared = json.loads(call.get())
+    corpus_id = prepared["corpus"]["corpus_id"]
+    if prepared["complete"] and not only:
+        print(f"collection {prepared['collection_id']} is already complete",
+              flush=True)
+
+    names = ([w.strip() for w in only.split(",")] if only
+             else list(WORKLOADS))
+    unknown = [w for w in names if w not in WORKLOAD_PLAN]
+    if unknown:
+        raise ValueError(f"unknown workloads: {unknown}")
+
+    calls = {w: judge_workload.spawn(corpus_id, w) for w in names}
+    for w, c in calls.items():
+        print(f"function call id (judge_workload {w}): {c.object_id}",
+              flush=True)
+    partials = {}
+    for w, c in calls.items():
+        partials[w] = json.loads(c.get())
+        print(f"[main] {w} finished in "
+              f"{partials[w]['total_wall_s']:.1f}s", flush=True)
+
+    if only:
+        print("--only was given, so the collection is not finalized",
+              flush=True)
+        return
+    call = finalize_collection.spawn(sf, corpus_id, json.dumps(partials))
+    print(f"function call id (finalize_collection): {call.object_id}",
+          flush=True)
+    print(call.get(), flush=True)
