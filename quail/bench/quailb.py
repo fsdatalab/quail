@@ -350,6 +350,31 @@ DISCUSS_ASPECT = ("Candidate movie aspects follow, one at a time. For "
                    "above discusses this aspect, FALSE otherwise.\n"
                    "ANSWER=")
 
+# IMDB-9/IMDB-11 only: an engine stress test, not a meaningful
+# accuracy query - {0}/{1} here are short aspect phrases, not
+# documents worth judging on their own. Purpose is structural: a real
+# chain of 3 joins across 4 distinct table positions (no table spans
+# all 3 edges), so the free anchor search cannot collapse it to one
+# group.
+ASPECT_RELATED = ("Judge strictly whether the second movie aspect "
+                  "below is commonly discussed alongside the first "
+                  "in the same review.\n\nFIRST ASPECT: {0}\n\n"
+                  "SECOND ASPECT: {1}\nInstruction: answer TRUE if "
+                  "the two aspects are commonly discussed together, "
+                  "FALSE otherwise.\nANSWER=")
+
+# IMDB-8 only: a second question over the same aspects table, joined
+# under a second alias (a2) - a 2-join star, both joins anchored on
+# reviews so the second stage runs over whatever DISCUSS_ASPECT
+# already kept.
+ASPECT_SENTIMENT = ("Candidate movie aspects follow, one at a time. "
+                    "For each, judge strictly from the review above "
+                    "whether it expresses positive sentiment "
+                    "specifically about that aspect.\n\n{0}\n\n"
+                    "ASPECT: {1}\nInstruction: answer TRUE if the "
+                    "review above expresses positive sentiment about "
+                    "this aspect, FALSE otherwise.\nANSWER=")
+
 F7 = ("Judge strictly from the report above whether it describes a "
       "case involving a female patient.\n\n{0}\n\nInstruction: answer "
       "TRUE if the report describes a case involving a female patient, "
@@ -376,6 +401,19 @@ REACTION = ("Candidate medical reaction terms follow, one at a time. "
             "Instruction: answer TRUE if the report above describes "
             "this reaction, FALSE otherwise.\nANSWER=")
 
+# BIO-6 only: a second question over the same terms table, joined
+# under a second alias (m2) - the 2-join "star" shape (the old B11),
+# both joins anchored on reports so the second stage runs over
+# whatever REACTION already kept.
+REACTION_SEVERE = ("Candidate medical reaction terms follow, one at a "
+                   "time. For each, judge strictly from the report "
+                   "above whether it describes that reaction as a "
+                   "serious or life-threatening occurrence for the "
+                   "patient.\n\n{0}\n\nCANDIDATE REACTION: {1}\n"
+                   "Instruction: answer TRUE if the report above "
+                   "describes this reaction as serious or "
+                   "life-threatening, FALSE otherwise.\nANSWER=")
+
 F11 = ("Judge strictly from the claim above whether it asserts "
        "something about a person, rather than an organization, place, "
        "or event.\n\n{0}\n\nInstruction: answer TRUE if the claim "
@@ -398,6 +436,19 @@ SUPPORT = ("Wikipedia passages follow, one at a time. For each, judge "
            "claim.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer TRUE if "
            "the passage above supports this claim, FALSE otherwise.\n"
            "ANSWER=")
+
+# FEV-7 only: a second question over the same evidence table, joined
+# under a second alias (e2) - IMDB-8/BIO-6's counterpart for FEVER, a
+# 2-join star, both joins anchored on claims so the second stage runs
+# over whatever SUPPORT already kept. Genuinely meaningful (not an
+# engine-stress predicate): FEVER's real labels are support/refute/
+# not-enough-info, so asking whether a second passage refutes the
+# claim is a real question, not a synthetic one.
+REFUTE = ("Wikipedia passages follow, one at a time. For each, judge "
+         "strictly from the claim above whether it is refuted by "
+         "that passage.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer "
+         "TRUE if the passage above refutes or contradicts this "
+         "claim, FALSE otherwise.\nANSWER=")
 
 # FEV-5 only: filters the evidence side of a join, not just the
 # anchor. Mirrors F11's "about a person" judgment so the join pairs
@@ -512,6 +563,67 @@ def queries(sess):
     q["IMDB-7"] = ("F1 -> F4 -> F5, 3 filters, no join", make(
         "reviews", "r", "body", [F1, F4, F5], [], ["r.id"]))
 
+    # IMDB-9/IMDB-11: real anchor-switch chains. A path of 3 joins
+    # across 4 table positions (r-a1-a2-a3) where no table spans all
+    # 3 edges, so the free anchor search structurally cannot collapse
+    # it to one group - a barrier is unavoidable regardless of which
+    # anchors the cost search picks. Uses raw ai_join calls since
+    # make()'s {0} is always the original doc_alias, so it can't
+    # express a path graph.
+    def imdb9():
+        r = sess.docs("reviews").alias("r")
+        a1 = sess.docs("aspects").alias("a1")
+        a2 = sess.docs("aspects").alias("a2")
+        a3 = sess.docs("aspects").alias("a3")
+        return (r
+                .ai_join(a1, quail.prompt(DISCUSS_ASPECT,
+                                          quail.col("r.body"),
+                                          quail.col("a1.aspect")))
+                .ai_join(a2, quail.prompt(ASPECT_RELATED,
+                                          quail.col("a1.aspect"),
+                                          quail.col("a2.aspect")))
+                .ai_join(a3, quail.prompt(ASPECT_RELATED,
+                                          quail.col("a2.aspect"),
+                                          quail.col("a3.aspect")))
+                .select("r.id", "a1.id", "a2.id", "a3.id"))
+    q["IMDB-9"] = ("engine stress: 3J real chain r-a1-a2-a3, free "
+                  "anchor search - no table spans all 3 edges, so "
+                  ">=1 barrier is unavoidable", imdb9)
+
+    def imdb11():
+        # IMDB-9's chain with an F1 filter on reviews run first -
+        # tests filter -> multi-join chain with a forced anchor
+        # switch together, not separately.
+        r = sess.docs("reviews").alias("r").ai_filter(
+            quail.prompt(F1, quail.col("r.body")))
+        a1 = sess.docs("aspects").alias("a1")
+        a2 = sess.docs("aspects").alias("a2")
+        a3 = sess.docs("aspects").alias("a3")
+        return (r
+                .ai_join(a1, quail.prompt(DISCUSS_ASPECT,
+                                          quail.col("r.body"),
+                                          quail.col("a1.aspect")))
+                .ai_join(a2, quail.prompt(ASPECT_RELATED,
+                                          quail.col("a1.aspect"),
+                                          quail.col("a2.aspect")))
+                .ai_join(a3, quail.prompt(ASPECT_RELATED,
+                                          quail.col("a2.aspect"),
+                                          quail.col("a3.aspect")))
+                .select("r.id", "a1.id", "a2.id", "a3.id"))
+    q["IMDB-11"] = ("engine stress: F1 filter -> 3J real chain "
+                    "r-a1-a2-a3, free anchor search", imdb11)
+
+    # IMDB-8: the star shape - A joins B and A joins C, same anchor
+    # throughout, a barrier between the two stages but no switch (the
+    # old B11's shape). Contrast with IMDB-9/11's path shape, where
+    # the switch is structurally forced.
+    q["IMDB-8"] = ("2J, same anchor: J1 (DISCUSS_ASPECT) -> J2 "
+                   "(ASPECT_SENTIMENT), reviews x aspects x aspects",
+                   make("reviews", "r", "body", [],
+                       [("aspects", "a", "aspect", DISCUSS_ASPECT),
+                        ("aspects", "a2", "aspect", ASPECT_SENTIMENT)],
+                       ["r.id", "a.id", "a2.id"]))
+
     # BioDEX: same five shapes (reports x terms).
     q["BIO-1"] = ("filter: F7 (female patient)", make(
         "reports", "r", "report", [F7], [], ["r.id"]))
@@ -527,6 +639,62 @@ def queries(sess):
     q["BIO-5"] = ("F7 -> F8 -> F9 -> J1, 3 filters then 1 join", make(
         "reports", "r", "report", [F7, F8, F9],
         [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
+
+    # BIO-C/BIO-D: IMDB-9/11's counterpart for BioDEX. `terms` is a
+    # fixed ~2,560-row table, not tied to sf, so a direct term-to-term
+    # chain (like IMDB's aspect-to-aspect chain) risks a cardinality
+    # blowup. Alternates back through `reports` (which does shrink
+    # with sf) instead - still a real 3-edge path with no table
+    # spanning all 3 edges, so a switch is still structural.
+    def bioC():
+        r1 = sess.docs("reports").alias("r1")
+        m1 = sess.docs("terms").alias("m1")
+        r2 = sess.docs("reports").alias("r2")
+        m2 = sess.docs("terms").alias("m2")
+        return (r1
+                .ai_join(m1, quail.prompt(REACTION,
+                                          quail.col("r1.report"),
+                                          quail.col("m1.term")))
+                .ai_join(r2, quail.prompt(REACTION,
+                                          quail.col("r2.report"),
+                                          quail.col("m1.term")))
+                .ai_join(m2, quail.prompt(REACTION,
+                                          quail.col("r2.report"),
+                                          quail.col("m2.term")))
+                .select("r1.id", "m1.id", "r2.id", "m2.id"))
+    q["BIO-C"] = ("engine stress: 3J real chain r1-m1-r2-m2, free "
+                 "anchor search", bioC)
+
+    def bioD():
+        # BIO-C with an F7 filter on r1 first.
+        r1 = sess.docs("reports").alias("r1").ai_filter(
+            quail.prompt(F7, quail.col("r1.report")))
+        m1 = sess.docs("terms").alias("m1")
+        r2 = sess.docs("reports").alias("r2")
+        m2 = sess.docs("terms").alias("m2")
+        return (r1
+                .ai_join(m1, quail.prompt(REACTION,
+                                          quail.col("r1.report"),
+                                          quail.col("m1.term")))
+                .ai_join(r2, quail.prompt(REACTION,
+                                          quail.col("r2.report"),
+                                          quail.col("m1.term")))
+                .ai_join(m2, quail.prompt(REACTION,
+                                          quail.col("r2.report"),
+                                          quail.col("m2.term")))
+                .select("r1.id", "m1.id", "r2.id", "m2.id"))
+    q["BIO-D"] = ("engine stress: F7 filter -> 3J real chain "
+                 "r1-m1-r2-m2, free anchor search", bioD)
+
+    # BIO-6: the star shape - both joins anchored on reports, a
+    # barrier between the two stages but no switch (the old B11's
+    # shape, IMDB-8's counterpart for BioDEX).
+    q["BIO-6"] = ("2J, same anchor: J1 (REACTION) -> J2 "
+                 "(REACTION_SEVERE), reports x terms x terms", make(
+        "reports", "r", "report", [],
+        [("terms", "m", "term", REACTION),
+         ("terms", "m2", "term", REACTION_SEVERE)],
+        ["r.id", "m.id", "m2.id"]))
 
     # FEVER: filter alone, join alone, then a filter chain to depth 2
     # only (depth 3 hit 0 rows - see the module docstring), plus the
@@ -553,6 +721,61 @@ def queries(sess):
                   make(
         "claims", "c", "claim", [F11, F12],
         [("evidence", "e", "text", SUPPORT, [F13])], ["c.id", "e.id"]))
+
+    # FEV-C/FEV-D: IMDB-9/11's and BIO-C/D's counterpart for FEVER.
+    # claims/evidence both scale with sf (no fixed-large table like
+    # terms), so a direct chain works without BIO-9's risk. Same
+    # 3-edge, no-table-spans-all-edges shape as the other two.
+    def fevC():
+        c1 = sess.docs("claims").alias("c1")
+        e1 = sess.docs("evidence").alias("e1")
+        c2 = sess.docs("claims").alias("c2")
+        e2 = sess.docs("evidence").alias("e2")
+        return (c1
+                .ai_join(e1, quail.prompt(SUPPORT,
+                                          quail.col("c1.claim"),
+                                          quail.col("e1.text")))
+                .ai_join(c2, quail.prompt(SUPPORT,
+                                          quail.col("c2.claim"),
+                                          quail.col("e1.text")))
+                .ai_join(e2, quail.prompt(SUPPORT,
+                                          quail.col("c2.claim"),
+                                          quail.col("e2.text")))
+                .select("c1.id", "e1.id", "c2.id", "e2.id"))
+    q["FEV-C"] = ("engine stress: 3J real chain c1-e1-c2-e2, free "
+                 "anchor search", fevC)
+
+    def fevD():
+        # FEV-C with an F11 filter on c1 first.
+        c1 = sess.docs("claims").alias("c1").ai_filter(
+            quail.prompt(F11, quail.col("c1.claim")))
+        e1 = sess.docs("evidence").alias("e1")
+        c2 = sess.docs("claims").alias("c2")
+        e2 = sess.docs("evidence").alias("e2")
+        return (c1
+                .ai_join(e1, quail.prompt(SUPPORT,
+                                          quail.col("c1.claim"),
+                                          quail.col("e1.text")))
+                .ai_join(c2, quail.prompt(SUPPORT,
+                                          quail.col("c2.claim"),
+                                          quail.col("e1.text")))
+                .ai_join(e2, quail.prompt(SUPPORT,
+                                          quail.col("c2.claim"),
+                                          quail.col("e2.text")))
+                .select("c1.id", "e1.id", "c2.id", "e2.id"))
+    q["FEV-D"] = ("engine stress: F11 filter -> 3J real chain "
+                 "c1-e1-c2-e2, free anchor search", fevD)
+
+    # FEV-7: the star shape - both joins anchored on claims, a
+    # barrier between the two stages but no switch (IMDB-8/BIO-6's
+    # counterpart for FEVER). Meaningful, not synthetic: FEVER's real
+    # labels are support/refute/not-enough-info.
+    q["FEV-7"] = ("2J, same anchor: J1 (SUPPORT) -> J2 (REFUTE), "
+                 "claims x evidence x evidence", make(
+        "claims", "c", "claim", [],
+        [("evidence", "e", "text", SUPPORT),
+         ("evidence", "e2", "text", REFUTE)],
+        ["c.id", "e.id", "e2.id"]))
 
     # LePaRD: one table, `citations`, self-joined - the anchor alias
     # ("d") reads destination_context, the partner alias ("s") reads
