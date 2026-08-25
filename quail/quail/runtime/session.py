@@ -563,10 +563,10 @@ class Query:
         # filter's later stages; every join partner, which always
         # reads its anchor's cached prefix - KV rewind's whole
         # point). `built` tracks which (alias, doc) pairs already
-        # have resident KV as plan.operators is walked in its actual
-        # order, so an alias a join anchors after a preceding filter
-        # already scanned it is not charged for its prefix build
-        # twice.
+        # have resident KV as plan.nodes is walked in its actual
+        # (topological) order, so an alias a join anchors after a
+        # preceding filter already scanned it is not charged for its
+        # prefix build twice.
         #
         # KV store restores (issue #6's PinnedStore): a restored
         # document's prefix costs nothing real. Charging it anyway
@@ -587,90 +587,114 @@ class Query:
         # plan.store_min_doc_tokens, so restores skew toward the
         # longer end of whatever's left unbuilt) before flattening
         # into the list sol_seconds() actually sees.
+        # plan.operators (a flat list) became plan.nodes (the dataflow
+        # graph - DocScan/FilterChain/Barrier/JoinGroup/Recombine/Sink,
+        # see planner/plan.py) when multi-join landed. FilterChain
+        # nodes carry the same "alias"/"stages" shape operators did.
+        # A JoinGroup now holds one or more join STAGES sharing an
+        # anchor (multi-join sharing one anchor), so this flattens
+        # every group's stages into the same execution-order list
+        # _assemble's own full_rels loop below builds independently
+        # (stage_plan there) - out["joins"] is one flat list, one
+        # entry per stage in that same order, not per group, so both
+        # walks zip against it the same way.
         pre_len = len(self.session.tokenizer(SHARED_PRE))
         built: dict = {}
         causal_by_alias: dict = {}
         streaming_chunks_contexts = []
-        join_i = 0
-        for op in plan.operators:
-            if op["op"] == "FilterChain":
-                alias = op["alias"]
-                rows = out["filters"][alias]
-                preds = filters[alias]
-                suffix_lens = [
-                    len(_question_ids(self.session,
-                                      preds[st["written_pos"]].prompt))
-                    for st in op["stages"]]
-                cum_before, running = [], 0
-                for L in suffix_lens:
-                    cum_before.append(running)
-                    running += L
-                resident = built.setdefault(alias, set())
-                for si in range(len(op["stages"])):
-                    evaluated = [d for d, row in rows.items()
-                                if len(row) > si]
-                    if si == 0:
-                        bucket = causal_by_alias.setdefault(alias, [])
-                        for d in evaluated:
-                            if d not in resident:
-                                bucket.append(
-                                    pre_len + self._doc_tokens[alias][d]
-                                    + suffix_lens[0])
-                        resident.update(evaluated)
-                    else:
-                        for d in evaluated:
-                            context = (pre_len
-                                      + self._doc_tokens[alias][d]
-                                      + cum_before[si])
-                            streaming_chunks_contexts.append(
-                                (suffix_lens[si], context))
-            elif op["op"] == "JoinStage":
-                jout = out["joins"][join_i]
-                join_i += 1
-                anchor = op["anchor"]
-                j = joins[op["written_pos"]]
-                spec = _join_spec(self.session, j.predicate, anchor,
-                                  op["partners"])
-                frame_len = len(spec["frame"])
-                tail_len = len(spec["tail"])
-                label_lens = {p: len(spec["labels"][p])
-                              for p in op["partners"]}
-                resident = built.setdefault(anchor, set())
-                anchor_map = jout["anchor_index"]
-                bucket = causal_by_alias.setdefault(anchor, [])
-                for gd in anchor_map:
-                    if gd not in resident:
-                        bucket.append(
-                            pre_len + self._doc_tokens[anchor][gd])
-                    # the frame (this stage's naming line) is written
-                    # into the anchor's kept KV fresh every stage,
-                    # even when the anchor's own prefix isn't -
-                    # "a later stage's frame overwrites the earlier
-                    # one's rows" (loop.py's pack_chunk docstring).
-                    # Missed by the first draft of this walk (caught
-                    # by an adversarial review, 2026-08-24): frame_len
-                    # was already used as part of the partner suffixes'
-                    # CONTEXT below, but the write that puts it there
-                    # was never charged its own chunk of work.
-                    if frame_len:
-                        streaming_chunks_contexts.append((
-                            frame_len,
-                            pre_len + self._doc_tokens[anchor][gd]))
-                resident.update(anchor_map)
-                tuples = jout["partner_index"]
-                suffix_lens = [
-                    sum(label_lens[p] for p in op["partners"])
-                    + sum(self._doc_tokens[p][g] for p, g in
-                          zip(op["partners"], t))
-                    + tail_len
-                    for t in tuples]
-                for local_a, row in jout["rows"].items():
-                    context = (pre_len
-                              + self._doc_tokens[anchor][anchor_map[local_a]]
-                              + frame_len)
-                    for pi in range(len(row)):
+        for node in plan.nodes:
+            if node["op"] != "FilterChain":
+                continue
+            alias = node["alias"]
+            rows = out["filters"][alias]
+            preds = filters[alias]
+            suffix_lens = [
+                len(_question_ids(self.session,
+                                  preds[st["written_pos"]].prompt))
+                for st in node["stages"]]
+            cum_before, running = [], 0
+            for L in suffix_lens:
+                cum_before.append(running)
+                running += L
+            resident = built.setdefault(alias, set())
+            for si in range(len(node["stages"])):
+                evaluated = [d for d, row in rows.items()
+                            if len(row) > si]
+                if si == 0:
+                    bucket = causal_by_alias.setdefault(alias, [])
+                    for d in evaluated:
+                        if d not in resident:
+                            bucket.append(
+                                pre_len + self._doc_tokens[alias][d]
+                                + suffix_lens[0])
+                    resident.update(evaluated)
+                else:
+                    for d in evaluated:
+                        context = (pre_len
+                                  + self._doc_tokens[alias][d]
+                                  + cum_before[si])
                         streaming_chunks_contexts.append(
-                            (suffix_lens[pi], context))
+                            (suffix_lens[si], context))
+
+        sol_join_stage_plan = []
+        for node in plan.nodes:
+            if node["op"] == "JoinGroup":
+                sol_join_stage_plan.extend(node["stages"])
+        for st, jout in zip(sol_join_stage_plan, out["joins"]):
+            # the worker reports each stage's ACTUAL anchor - a
+            # barrier-time re-pick may differ from the plan's
+            # compile-time one - falling back to the plan's own
+            # anchor for an executor that doesn't report it, same
+            # convention _assemble's own full_rels loop uses below.
+            anchor = jout.get("anchor", st["anchor"])
+            partners = list(jout.get("partners", st["partners"]))
+            j = joins[st["written_pos"]]
+            spec = _join_spec(self.session, j.predicate, anchor,
+                              partners)
+            # _join_spec keeps a naming-line "frame" per table (not
+            # just the anchor's) so a barrier-time anchor re-pick
+            # doesn't need re-tokenization - coordinator.py's
+            # stage_for_anchor picks spec["frames"][anchor] the same
+            # way at execution time.
+            frame_len = len(spec["frames"][anchor])
+            tail_len = len(spec["tail"])
+            label_lens = {p: len(spec["labels"][p]) for p in partners}
+            resident = built.setdefault(anchor, set())
+            anchor_map = jout["anchor_index"]
+            bucket = causal_by_alias.setdefault(anchor, [])
+            for gd in anchor_map:
+                if gd not in resident:
+                    bucket.append(
+                        pre_len + self._doc_tokens[anchor][gd])
+                # the frame (this stage's naming line) is written
+                # into the anchor's kept KV fresh every stage,
+                # even when the anchor's own prefix isn't -
+                # "a later stage's frame overwrites the earlier
+                # one's rows" (loop.py's pack_chunk docstring).
+                # Missed by the first draft of this walk (caught
+                # by an adversarial review, 2026-08-24): frame_len
+                # was already used as part of the partner suffixes'
+                # CONTEXT below, but the write that puts it there
+                # was never charged its own chunk of work.
+                if frame_len:
+                    streaming_chunks_contexts.append((
+                        frame_len,
+                        pre_len + self._doc_tokens[anchor][gd]))
+            resident.update(anchor_map)
+            tuples = jout["partner_index"]
+            suffix_lens = [
+                sum(label_lens[p] for p in partners)
+                + sum(self._doc_tokens[p][g] for p, g in
+                      zip(partners, t))
+                + tail_len
+                for t in tuples]
+            for local_a, row in jout["rows"].items():
+                context = (pre_len
+                          + self._doc_tokens[anchor][anchor_map[local_a]]
+                          + frame_len)
+                for pi in range(len(row)):
+                    streaming_chunks_contexts.append(
+                        (suffix_lens[pi], context))
         store_stats = out.get("store") or {}
         causal_doc_lengths = []
         sol_remarks = []
