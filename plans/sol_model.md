@@ -2,9 +2,9 @@
 
 Status: formalization of the hand derivation for Qwen3-4B-fp8 on one
 H100, written so each line can be checked. Sections 1 to 7 are the
-derivation made precise and are implemented in
-`quail/planner/sol.py`, tested in `tests/test_sol.py`. Section 8 is
-a proposal for joins and is not implemented.
+derivation made precise and are implemented in `quail/sol.py`,
+tested in `tests/test_sol.py`. Section 8 is a proposal for joins and
+is not implemented.
 
 Speed of light (SoL) is the smallest wall time the hardware allows
 for a query. It counts the arithmetic and the memory traffic the
@@ -12,7 +12,16 @@ work cannot be done without, and counts nothing else. A run can
 approach SoL and can never beat it, so the gap between a measured
 wall and SoL is all of what the engine could still win.
 
-SoL is not a prediction and nothing in the planner reads it.
+SoL stands on its own. It is derived here from the datasheet, the
+model dimensions, and a count of the query's work, and it reuses no
+cost model the engine already carries: no roofline out of
+`planner/budgets.py`, no calibration constant, no efficiency factor.
+That independence is the point. A bound built on a fitted constant
+is an estimate wearing a bound's name, and it cannot be used to
+judge the thing the constant was fitted to. `quail/sol.py` imports
+only `quail.specs`, which is how the rule is kept.
+
+SoL is not a prediction and nothing in the planner reads it either.
 `planner/plan.py` says no plan decision consumes an estimated wall,
 and that is still true.
 
@@ -31,7 +40,7 @@ and that is still true.
 | `R_dense` | fp8 dense peak, FLOP/s | `DeviceSpec.peak_flops` | 1.979e15 |
 | `R_attn` | bf16 dense peak, FLOP/s | `DeviceSpec.attn_flops` | 0.9895e15 |
 | `BW` | HBM bandwidth, bytes/s | `DeviceSpec.hbm_bw` | 3.35e12 |
-| `C` | chunk budget: tokens per forward pass | `budgets.chunk_budget` | 110,376 |
+| `C` | tokens per forward pass (the batch size) | an input, stated at the call site | 110,376 |
 
 Three of these need a sentence.
 
@@ -50,11 +59,17 @@ Three of these need a sentence.
 The dense projections and attention price against different peaks
 because they run in different dtypes. The projections are fp8
 (DeepGEMM `fp8_gemm_nt`, `executor/attention.py`). Attention is bf16
-(FlashAttention-3 over bf16 KV, `executor/attention.py:_fa`); KV is
-bf16 and is the only stored dtype. `budgets.py` prices attention
-against `peak_flops` instead, which is the fp8 number; that is the
-one place the existing roofline and this document disagree, and this
-document is the one that matches the kernels.
+(FlashAttention-3 over bf16 KV, `executor/attention.py:_fa`), and KV
+is bf16, the only stored dtype. Pricing attention against the fp8
+peak would halve the attention term and make the bound wrong in the
+unsafe direction: too low, so a run could appear to beat it.
+
+`C` is the one input here that is neither a datasheet figure nor a
+model dimension. It is a batch size, it decides how many times the
+weights are re-read, and what the engine picks for it is a planner
+decision. So it is an input to the bound with no default, stated at
+the call site, and the exercises below state 110,376 because that is
+what the derivation used.
 
 ## 2. What a query contributes
 
@@ -129,7 +144,7 @@ Pi = sum_i l_i * (l_i + 1) / 2                        stage 1
 The triangle term is quadratic in length, so the corpus cannot be
 summarized by its total alone. `sum_i l_i^2` has to come from the
 length distribution; the mean cannot produce it. `Corpus` in
-`planner/sol.py` therefore carries `sum_i b_i` and `sum_i b_i^2`.
+`quail/sol.py` therefore carries `sum_i b_i` and `sum_i b_i^2`.
 
 ## 6. Seconds
 
@@ -163,11 +178,12 @@ run at the same time and a floor is allowed to assume they overlap
 perfectly. Inside `T_compute` the two terms are added, because the
 dense and attention kernels are separate launches on the same SMs.
 
-Taking `max` at the top makes this floor looser than taking it per
-kernel and summing, which is what `budgets.py` does for a single
-chunk. Both are lower bounds; the per-kernel one is larger and
-therefore tighter. If a tighter floor is wanted later, that is the
-change to make, and it does not touch sections 4 and 5.
+Taking `max` once at the top is the loosest honest choice. Taking
+it per kernel and summing gives a larger, tighter floor, because it
+stops a memory-bound kernel from hiding behind a compute-bound one.
+Both are lower bounds, so both are safe; this one is the more
+conservative. Tightening it later changes section 6 only and leaves
+sections 4 and 5 untouched.
 
 ## 7. The two worked exercises
 
@@ -221,18 +237,17 @@ Three differences from the hand derivation, all of them small:
    over-counts, because the engine rewinds them. Dropping them gives
    507,705,284 pairs, 1,242,797 KV read tokens, and SoL 7.4640 s -
    0.08% off the folded number. Not worth arguing about at two
-   stages; it grows with chain depth, so `planner/sol.py` defaults to
+   stages; it grows with chain depth, so `quail/sol.py` defaults to
    the rewound count and takes `carry_question_kv=True` to reproduce
    the derivation.
 
 **A sanity anchor.** SoL 6.7201 s for 1,774,233 tokens is 264,000
-tokens/s. The dense-only ceiling `R_dense / 2P` is 274,861 tokens/s,
-and the measured serving rate at 4B/H100 is 96,000 to 121,000
-tokens/s (`plans/engine_design.md` section 8). So SoL sits just under
-the pure-GEMM ceiling, as it should for a workload whose attention
-term is 4% of the total, and the engine currently runs at 0.36 to
-0.46 of it. That is the same efficiency factor engine_design already
-reports, which is the check that the two numbers are consistent.
+tokens/s. The ceiling with attention set to zero is `R_dense / 2P`,
+which is 274,861 tokens/s. SoL is 96% of that, which is what it
+should be for a query whose attention term is 4% of compute. Both
+numbers come from the specs alone, so this checks the arithmetic and
+nothing else. Checking the bound against reality means measuring a
+wall on an H100 and comparing; that has not been done yet.
 
 ## 8. Joins: proposed, not implemented
 
@@ -265,7 +280,7 @@ block label length `lab_p`:
   reason this section is a proposal.
 
 The open questions are whether the anchor prefix is really read once
-per chunk group rather than once per stage, whether `_pair_tokens` in
-`planner/decide.py` should be the source of `u` so the two agree by
-construction, and what to do when the planner picks the anchor side
-rather than the query.
+per chunk group rather than once per stage, and what the anchor side
+should be when the query does not name one. Both are answerable from
+the executor's packing behaviour, which is mechanism and countable;
+neither needs a cost model.
