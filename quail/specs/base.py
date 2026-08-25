@@ -61,3 +61,15 @@ class DeviceSpec:
     mem_bytes: float     # M: physical memory
     hbm_bw: float        # BW: memory bandwidth, bytes/s
     peak_flops: float    # R_D at the executor's compute dtype
+    bf16_flops: float = 0.0    # dense bf16 peak. Attention runs in
+    #                            bf16 (FlashAttention-3 over bf16 KV),
+    #                            so the pair FLOPs price against this,
+    #                            not against the fp8 ceiling. 0 falls
+    #                            back to half of peak_flops, the fp8-
+    #                            to-bf16 ratio on every tensor core
+    #                            generation we run on.
+
+    @property
+    def attn_flops(self) -> float:
+        """Dense peak for the attention kernels, FLOP/s."""
+        return self.bf16_flops or self.peak_flops / 2

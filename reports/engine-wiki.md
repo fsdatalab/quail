@@ -24,6 +24,7 @@ payload to the worker, which calls the executor.
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
+| `planner/sol.py` | Speed-of-light floor for one query (offline; no plan reads it) | specs, budgets |
 | `planner/calibration.py` | Measured constants (a, a2) and scaling | specs |
 | `planner/calibrate.py` | Length-sweep measure of a and a2 | calibration, executor |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
