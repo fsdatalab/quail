@@ -56,76 +56,64 @@ def plot_sol_per_query():
     fig.savefig(OUT / "sol_quailb_per_query.png", dpi=150)
 
 
-# Where each cluster's labels go: (label x, first label y, y step,
-# text alignment). Twenty-one of the 26 queries hold documents
-# between 233 and 370 tokens, so their dots pile into one narrow band
-# and the labels have to sit out in the empty space with a leader
-# line back. The two free regions are left of 233 and right of 370.
-LABEL_SLOTS = {
-    11.4: (15.0, 8.0, 0.0, "left"),
-    233.1: (17.0, 11.0, 5.6, "left"),
-    298.8: (760.0, 8.5, 4.6, "left"),
-    370.2: (2300.0, 9.0, 5.2, "left"),
-    4146.0: (7000.0, 30.0, 3.6, "left"),
+# Each context length, the document set it comes from, and where to
+# put its label. The three middle clusters are ~20pt apart on a log
+# axis, so their labels sit at staggered heights to clear each other.
+CONTEXTS = {
+    11.4: ("FEVER claims", 6.0),
+    233.1: ("LePaRD excerpts", 11.0),
+    298.8: ("IMDB reviews", 18.0),
+    370.2: ("FEVER evidence", 25.0),
+    4146.0: ("BioDEX reports", 44.0),
 }
 
 
 def plot_attention_share():
-    """Where each query's compute goes, against the length of the
-    documents whose KV is held.
+    """Attention's share of the compute, against the context each new
+    token attends over.
 
-    Attention pairs are quadratic in that length, so the share climbs
-    with it and jumps at BioDEX's 4,146-token reports. The 32B dot
-    sits below the 4B one everywhere: attention scales 3.56x with
+    A token attending over a 4,146-token report scores 4,146 pairs; a
+    token attending over an 11-token claim scores 11. So the longer
+    the context, the more of the work is attention. The 32B dot sits
+    below the 4B one everywhere, because attention scales 3.56x with
     model size where the dense projections scale 8.59x.
 
-    Queries whose dots coincide share a label. LEP-1, LEP-5, LEP-6
-    and LEP-8 land on the same point because LEP1 leaves 4 documents
-    of 200 and LEP3 leaves none, so their later stages and joins cost
-    nothing.
+    Points are not labelled by query. Twenty-one of the 26 queries
+    share three context lengths and four of them land on one point,
+    so per-query labels need leader lines long enough to obscure the
+    data. The report's table gives the per-query numbers.
     """
     def share(q, model):
         m = Q[q]["models"][model]
         return 100 * m["t_attention"] / m["t_compute"]
 
-    fig, ax = plt.subplots(figsize=(10, 5.0))
-    ax.vlines([Q[q]["held_mean_doc_tokens"] for q in ORDER],
-              [share(q, "qwen3-32b-fp8") for q in ORDER],
+    x = [Q[q]["held_mean_doc_tokens"] for q in ORDER]
+    fig, ax = plt.subplots(figsize=(8.4, 4.6))
+    ax.vlines(x, [share(q, "qwen3-32b-fp8") for q in ORDER],
               [share(q, "qwen3-4b-fp8") for q in ORDER],
               color=DARK, lw=0.7, alpha=0.25)
     for model, colour, label in (("qwen3-4b-fp8", BLUE, "Qwen3-4B-fp8"),
                                  ("qwen3-32b-fp8", ORANGE,
                                   "Qwen3-32B-fp8")):
-        ax.scatter([Q[q]["held_mean_doc_tokens"] for q in ORDER],
-                   [share(q, model) for q in ORDER],
-                   s=34, color=colour, label=label, zorder=3)
+        ax.scatter(x, [share(q, model) for q in ORDER], s=34,
+                   color=colour, label=label, zorder=3)
 
-    # one label per distinct dot, listing every query that lands on it
-    for held, (lx, ly, dy, ha) in LABEL_SLOTS.items():
-        here = [q for q in ORDER
-                if abs(Q[q]["held_mean_doc_tokens"] - held) < 0.05]
-        # merge only dots that genuinely coincide, so LEP-1, 5, 6 and
-        # 8 share a label but IMDB-2 and IMDB-3 keep their own
-        merged = []
-        for q in sorted(here, key=lambda q: share(q, "qwen3-4b-fp8")):
-            y = share(q, "qwen3-4b-fp8")
-            if merged and y - merged[-1][0] < 0.05:
-                merged[-1][1].append(q)
-            else:
-                merged.append((y, [q]))
-        for j, (y, qs) in enumerate(merged):
-            ty = ly + j * dy
-            ax.annotate(", ".join(qs), xy=(held, y), xytext=(lx, ty),
-                        fontsize=7.5, color=DARK, ha=ha, va="center",
-                        arrowprops=dict(arrowstyle="-", color=DARK,
-                                        lw=0.5, alpha=0.4,
-                                        shrinkA=0, shrinkB=4))
+    for ctx, (name, ty) in CONTEXTS.items():
+        top = max(share(q, "qwen3-4b-fp8") for q in ORDER
+                  if abs(Q[q]["held_mean_doc_tokens"] - ctx) < 0.05)
+        n = sum(1 for q in ORDER
+                if abs(Q[q]["held_mean_doc_tokens"] - ctx) < 0.05)
+        ax.vlines(ctx, top + 0.8, ty - 1.6, color=DARK, lw=0.6,
+                  alpha=0.35)
+        ax.text(ctx, ty, f"{name}\n{ctx:,.0f} tokens, "
+                         f"{n} quer{'y' if n == 1 else 'ies'}",
+                ha="center", va="bottom", fontsize=7.5, color=DARK)
 
     ax.set_xscale("log")
-    ax.set_xlim(8, 26_000)
-    ax.set_ylim(-2, 46)
-    ax.set_xlabel("mean length of the documents whose KV is held, "
-                  "tokens (log scale)")
+    ax.set_xlim(7, 9000)
+    ax.set_ylim(-2, 50)
+    ax.set_xlabel("mean context each new token attends over, tokens "
+                  "(log scale)")
     ax.set_ylabel("attention share of compute, percent")
     ax.legend(frameon=False, loc="upper left", fontsize=8.5)
     fig.tight_layout()

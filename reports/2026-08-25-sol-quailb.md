@@ -164,16 +164,20 @@ them.
 
 Figure: plots/sol_quailb_attention_share.png
 
-The two compute terms grow differently. `T_dense` is linear in
-tokens; `T_attention` is quadratic in the length of the document
-whose KV is held, because a sequence of length `m` scores `T(m)`
-pairs. So the longer the held document, the larger attention's share
-of the work. The figure plots every query against that length.
-FEVER appears at both ends of it: FEV-1 filters claims and holds
-them at 11 tokens, while the FEVER joins hold the 370-token
-evidence passages instead. LEP-1, LEP-5, LEP-6 and LEP-8 land on
-one point, because LEP1 leaves 4 documents of 200 and LEP3 leaves
-none, so their later stages and joins cost nothing.
+The two compute terms grow differently with **context length** -
+how many earlier tokens each new token attends over. `T_dense` does
+not care: it is 2 P FLOPs per token whatever the context.
+`T_attention` is linear in it, since a token attending over `m`
+earlier tokens scores `m` pairs, which makes it quadratic in
+document length once a whole document is scanned.
+
+So a query's mix is set by the documents it holds in context. A
+token attending over a 4,146-token BioDEX report does 377 times the
+attention work of one attending over an 11-token FEVER claim, while
+both do identical dense work. FEVER sits at both ends of the figure
+for exactly this reason: FEV-1 filters claims, so its context is an
+11-token claim, while the FEVER joins put the 370-token evidence
+passage in context and stream the claims past it.
 
 The two terms also scale differently with model size. `T_dense`
 scales with the parameter count, 31,206,298,624 over 3,633,511,936
