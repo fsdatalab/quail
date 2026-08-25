@@ -2,9 +2,10 @@
 
 Status: formalization of the hand derivation for Qwen3-4B-fp8 on one
 H100, written so each line can be checked. Sections 1 to 7 are the
-derivation made precise and are implemented in `quail/sol.py`,
-tested in `tests/test_sol.py`. Section 8 is a proposal for joins and
-is not implemented.
+derivation made precise. Section 8 adds joins, which the derivation
+did not cover. All of it is implemented in `quail/sol.py` and tested
+in `tests/test_sol.py`; section 9 points at the whole QUAIL-B
+table.
 
 Speed of light (SoL) is the smallest wall time the hardware allows
 for a query. It counts the arithmetic and the memory traffic the
@@ -348,38 +349,69 @@ this query, from a calculation that is not in this repository. It
 does not agree with 6.7801 s and I could not find what produced it,
 so it is flagged rather than reconciled.
 
-## 8. Joins: proposed, not implemented
+## 8. Joins
 
-Everything above is filter chains, which is what the derivation
-covered. A join needs one more shape, and this section is a proposal
-to confirm before it is written down in code.
+A join keeps the same two pieces as a filter chain and changes what
+goes in the suffix. The engine already treats a filter chain as the
+degenerate join (`executor/loop.py`): anchor equals the document,
+suffix equals the question.
 
-The engine already treats a filter chain as the degenerate join
-(`executor/loop.py`): anchor equals the document, suffix equals the
-question. A real join keeps the same two pieces and changes what goes
-in the suffix.
+One side **anchors**: its KV is held and every tuple attends to it.
+The other side **streams**: a copy of each of its documents rides in
+every tuple's suffix. Per tuple the suffix is that partner's block
+label, its document, and the question tail. One suffix's tokens
+attend to each other but never to another suffix's, and a suffix is
+never split across chunks (`executor/pack.py`).
 
-For a join of an anchor table `A` against partner tables `p in Q`,
-with `T` surviving tuples, question length `q_J`, and per-partner
-block label length `lab_p`:
+Write `c_a` for an anchor's prefix (`SHARED_PRE` plus its document),
+`f` for the anchor naming line written into its kept KV once per
+stage, and `u_p` for a partner's suffix length. Every live anchor
+pairs with every live partner, so the tuple sums separate: a sum
+over tuples of `u * c` is `sum_p u` times `sum_a c`. That is why
+`JoinStage` takes two sides rather than a tuple list. A gated or
+deduped tuple set does not separate and is not modelled.
 
-- Suffix length per tuple:
-  `u = q_J + sum_p (mean_doc_tokens(p) + lab_p)`.
-- Tokens: `Sigma_A * B_A` if this stage opens the anchor (the anchor
-  prefix is computed here rather than inherited from a filter that
-  ran before it), plus `T * u`.
-- Pairs: `T * (u * anchor_prefix_len + u * (u + 1) / 2)`, plus the
-  anchor's own causal triangle if this stage opens it. One suffix's
-  tokens attend to each other but never to another suffix's, and a
-  suffix is never split across chunks (`executor/pack.py`), so it is
-  one rectangle and one triangle per tuple, as in section 5.
-- KV read back: the anchor prefix once per chunk group its suffixes
-  span, which is `ceil` of the tuple stream against the chunk budget,
-  not once per stage. This is the part I am least sure of and the
-  reason this section is a proposal.
+```
+context   = c_a + f                              per anchor
 
-The open questions are whether the anchor prefix is really read once
-per chunk group rather than once per stage, and what the anchor side
-should be when the query does not name one. Both are answerable from
-the executor's packing behaviour, which is mechanism and countable;
-neither needs a cost model.
+tokens    = sum_a context        (opening)       or   n_A * f
+          + n_A * sum_p u_p
+
+pairs     = sum_a context(context+1)/2  (opening)
+          or f * sum_a c_a + n_A * f(f+1)/2
+          + (sum_p u_p)(sum_a context)
+          + n_A * sum_p u_p(u_p+1)/2
+
+kv read   = sum_a context
+```
+
+**Opening.** A join opens the anchor when no filter on that side
+already computed its prefixes. After a filter they are resident, so
+the join adds only the naming line per anchor.
+
+**Which side anchors.** The planner keeps whichever side is cheaper
+and streams the other, and the bound has to make the same choice or
+it is not a bound on what runs. Anchoring the long side costs one
+prefix per document; anchoring the short side costs a full copy of
+every long document in every tuple. On FEVER the difference is
+5.5x - claims average 11 tokens and evidence 370, so evidence
+anchors even though claims are the table the query is written
+against. `reports/2026-08-25-sol-quailb.md` prices both ways per
+query and keeps the smaller.
+
+**KV read-back** counts each anchor's context once per stage. That
+is the minimum for a tuple stream longer than one chunk, which every
+join here is. It is an undercount when an anchor's suffixes straddle
+a chunk boundary; at these sizes that is a handful of anchors out of
+thousands, and every query in the suite is compute bound by more
+than an order of magnitude, so it changes no answer.
+
+## 9. Every QUAIL-B query
+
+`reports/2026-08-25-sol-quailb.md` applies all of the above to the
+26 queries at sf=0.1 on both models, with measured corpora and
+ground-truth survivors. Three of the five queries with a measured
+wall have a token count no model's answers can change, and the bound
+reproduces all three exactly, including two joins on corpora of
+opposite shape. The engine runs at 0.42 to 0.49 of the floor across
+every query with a measured wall.
