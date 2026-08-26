@@ -194,6 +194,10 @@ def run_baseline(model: str = "qwen3-4b", query_id: str | None = None,
     executing inside a live invocation of that same app."""
     from quail.bench.quailb import build_sets
 
+    if gpu != WorkerH100.GPU:
+        raise ValueError(
+            f"vLLM-opbench requires gpu={WorkerH100.GPU!r}; got {gpu!r}")
+
     build_sets(DATA_DIR, SF)
     tokenizer = _tokenizer_for(MODEL_NAMES[model])
     true_ids, false_ids = operators.true_false_ids(tokenizer)

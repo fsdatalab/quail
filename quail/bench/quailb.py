@@ -854,7 +854,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         raw_volume_path=f"/results/{raw_root}",
         aggregate_volume_path=f"/results/{aggregate_volume_path}",
         pricing=dict(
-            gpu="H100",
+            gpu="H100!",
             h100_usd_per_hour=h100_usd_per_hour,
             gpu_count=gpus,
             price_source=H100_PRICE_SOURCE,
