@@ -604,30 +604,23 @@ class Query:
                       answer_rows=answer_rows)
 
     def _sol_workload(self, plan, filters, joins, out):
-        """`(tokens, pairs, context_reads)` for sol_seconds() (see
-        quail/planner/sol.py): every forward pass this query actually
-        ran reduces to one of two shapes.
+        """(tokens, pairs, context_reads) for sol_seconds() (see
+        quail/planner/sol.py).
 
-        Causal: a document's first-ever pass through the model -
-        self-attention only, quadratic pairs, no shared context. A
-        filter chain's stage 0, or a join anchor not already resident
-        from an earlier operator in this same query (`built` tracks
-        residency per alias across both loops below, in plan order,
-        so a filter-then-join query doesn't charge an anchor's prefix
-        build twice).
+        Every forward pass reduces to one of two shapes. Causal: a
+        document's first-ever pass - self-attention only, quadratic
+        pairs, no shared context (a filter chain's stage 0, or a join
+        anchor not already resident from an earlier operator; `built`
+        tracks residency per alias so a filter-then-join query doesn't
+        charge a prefix build twice). Streaming: a few new tokens
+        reading an already-resident cached prefix - linear pairs
+        (chunk * context), context length also charged as
+        `context_reads`.
 
-        Streaming: a few new tokens reading an already-resident cached
-        prefix - a filter's later stage, or a join partner tuple's
-        suffix reading its anchor's kept KV. Linear pairs
-        (chunk * context), and the context length is charged again as
-        `context_reads` (T_memory's extra KV-read traffic on top of
-        writing the new tokens' own KV).
-
-        Does not net out KV-store restores (a restored document still
-        gets charged its full causal build here) or charge a join
-        stage's anchor-frame write separately - both stated as known
-        simplifications, not bugs; see quail/planner/sol.py's
-        docstring."""
+        Does not net out KV-store restores or charge a join stage's
+        anchor-frame write separately - known simplifications, not
+        bugs; see quail/planner/sol.py's docstring.
+        """
         pre_len = len(self.session.tokenizer(SHARED_PRE))
         built: dict = {}
         causal_lengths: list = []

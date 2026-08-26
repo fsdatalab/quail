@@ -1,11 +1,7 @@
 """Speed-of-light (SOL): the minimum possible wall time for a query's
-real workload, if every kernel ran at peak rate. A lower bound, not a
-prediction - real runs are always slower. `sol_efficiency = sol_s /
-wall_s` should never exceed 1.0; if it does, either the wall-time
-measurement or this estimate is wrong.
+real workload, if every kernel ran at peak rate.
 
-Three equations, ported directly from a research note's roofline
-derivation (not re-derived here):
+Three equations:
 
     T_dense     = 2 * P * tokens / fp8_peak_flops
     T_attention = 4 * n_q * d_head * pairs * layers / bf16_peak_flops
@@ -13,19 +9,16 @@ derivation (not re-derived here):
                   / hbm_bw
     SOL         = max(T_dense + T_attention, T_memory)
 
-T_dense and T_attention use different peak rates because FlashAttention
-runs bf16 even when the GEMMs run fp8 - on Hopper that's half the fp8
-rate. `tokens`, `pairs`, and `context_reads` are workload-shape
-numbers, not spec constants: see runtime/session.py's per-query walk
-for how they're built from what a query actually ran.
+T_dense and T_attention use different peak rates: FlashAttention runs
+bf16 even when the GEMMs run fp8, half the fp8 rate on Hopper.
+`tokens`, `pairs`, and `context_reads` come from a query's real
+workload, not a spec constant - see runtime/session.py's per-query
+walk.
 
-Deliberately simpler than the causal/streaming split in
-quail/planner/budgets.py's roofline section: this aggregates all
-compute into one max() against all memory traffic, rather than pricing
-each kernel with its own max() and summing. It does not net out KV
-store restores or price a join stage's "frame" write separately - see
-reports/shipped_features/ for the stated caveats that follow from
-that.
+Simpler than quail/planner/budgets.py's roofline section: one max()
+over aggregate compute vs. memory, not per-kernel maxes summed. Does
+not net out KV store restores or price a join stage's frame write
+separately - see reports/shipped_features/ for the stated caveats.
 """
 
 import math
