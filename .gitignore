@@ -10,6 +10,9 @@ results/logs/
 # teed run logs are local artifacts; the result JSONs carry the numbers
 results/*.log
 results/**/*.log
+# pointer to the log the current run is teeing to, written by whoever
+# started it so a watcher can find it
+results/benchmark/.current_label_log
 
 # generated benchmark corpora are rebuilt from seeds, never versioned
 results/quailb_data/

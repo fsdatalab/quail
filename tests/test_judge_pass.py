@@ -94,11 +94,13 @@ def test_saved_verification_sample_covers_completed_parts_after_resume(
         "label_source": MODEL_NAME,
         "left_id": f"rv{i}",
         "right_id": None,
-    } for i in range(20)]
-    pq.write_table(pa.Table.from_pylist(saved), parts / "part_000.parquet")
+    } for i in range(85)]
+    # only the first of two parts is on disk, the resume case
+    pq.write_table(pa.Table.from_pylist(saved),
+                   parts / "part_000000_000085.parquet")
     corpus = {
         "reviews": [{"id": f"rv{i}", "body": f"review {i}"}
-                    for i in range(20)]
+                    for i in range(170)]
     }
 
     sample = _saved_verification_sample(
@@ -113,15 +115,22 @@ def test_compact_label_parts_keeps_every_saved_row(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    parts = tmp_path / "parts"
-    parts.mkdir()
+    parts_dir = tmp_path / "parts"
+    parts_dir.mkdir()
     pq.write_table(pa.table({"id": ["a", "b"], "answer": [True, False]}),
-                   parts / "part_000000_000002.parquet")
+                   parts_dir / "part_000000_000002.parquet")
     pq.write_table(pa.table({"id": ["c"], "answer": [True]}),
-                   parts / "part_000002_000003.parquet")
+                   parts_dir / "part_000002_000003.parquet")
+    # a leftover generation of boundaries, which the caller does not
+    # name and compaction must therefore ignore
+    pq.write_table(pa.table({"id": ["a", "b", "c"],
+                             "answer": [True, False, True]}),
+                   parts_dir / "part_000000_000003.parquet")
+    parts = [parts_dir / "part_000000_000002.parquet",
+             parts_dir / "part_000002_000003.parquet"]
 
-    path, rows = _compact_label_parts(tmp_path)
-    second_path, second_rows = _compact_label_parts(tmp_path)
+    path, rows = _compact_label_parts(tmp_path, parts)
+    second_path, second_rows = _compact_label_parts(tmp_path, parts)
 
     assert rows == second_rows == 3
     assert path == second_path == tmp_path / "labels.parquet"

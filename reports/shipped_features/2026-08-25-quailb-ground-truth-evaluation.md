@@ -30,7 +30,7 @@ are added or changed.
 ## Files
 
 - `quail/bench/README.md` explains full, one-query, and new-label runs.
-- `reports/old/2026-08-25-quailb-qwen32b-ground-truth.md` records the labeling
+- The superseded 2026-08-25 labeling report recorded the labeling
   experiment and measured cost.
 - `results/benchmark/20260825T082145Z-quailb-qwen32b-ground-truth-sf0.1.json`
   is the committed aggregate summary.
