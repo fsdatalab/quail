@@ -4,15 +4,17 @@ BIO-6's two join stages before and after the severe_terms revert, and
 what relabelling under the current join prompts did to every join
 predicate's TRUE rate.
 
-Pull the two collection summaries into a workdir first (the volume
-lives in the fsdatalab Modal workspace):
+Pull the inputs into a workdir first (the volume lives in the
+fsdatalab Modal workspace):
 
     W=$(mktemp -d)
     C=/ground_truth/quailb/schema_v1/collections
+    A=gt_04231c5de83cdf9e7e68fc03849959d6
     modal volume get quail-results \
         $C/gt_306dac4fc83883c7a5bcc86f4d103f32/summary.json $W/before.json
+    modal volume get quail-results $C/$A/summary.json $W/after.json
     modal volume get quail-results \
-        $C/gt_04231c5de83cdf9e7e68fc03849959d6/summary.json $W/after.json
+        /ablations/join_relabel_diff_$A.json $W/relabel_diff.json
     uv run --with matplotlib python reports/make_bio6_full_terms_plots.py $W
 """
 
@@ -46,9 +48,9 @@ stages = ["J1\nREACTION", "J2\nREACTION_SEVERE"]
 was = [before[J1]["rows"], before[J2]["rows"]]
 now = [after[J1]["rows"], after[J2]["rows"]]
 
-fig, ax = plt.subplots(figsize=(6.4, 3.6))
+fig, ax = plt.subplots(figsize=(6.0, 3.6))
 x = range(len(stages))
-width = 0.38
+width = 0.3
 ax.bar([i - width / 2 for i in x], was, width, color=GRAY,
        label="with severe_terms (64 terms)")
 ax.bar([i + width / 2 for i in x], now, width, color=BLUE,
@@ -62,37 +64,41 @@ ax.annotate(f"{growth:.0f}x more pairs in the second stage",
             ha="left", va="bottom", color=BLUE)
 ax.set_xticks(list(x))
 ax.set_xticklabels(stages)
+ax.set_xlim(-0.6, len(stages) - 0.4)
 ax.set_ylabel("report-term pairs judged")
-ax.set_ylim(0, max(now) * 1.28)
+ax.set_ylim(0, max(now) * 1.30)
+ax.yaxis.set_major_formatter(
+    matplotlib.ticker.FuncFormatter(lambda v, _pos: f"{int(v):,}"))
 ax.legend(frameon=False, loc="upper left")
 fig.tight_layout()
 path = OUT / "20260826-bio6-stage-sizes.png"
 fig.savefig(path, dpi=150)
 print(f"wrote {path}")
 
-# ---- what relabelling did to every join predicate ---------------------
-joins = [k for k in sorted(after) if after[k]["source_rows"].get(
-    "qwen3-32b-fp8", 0) and k in before and before[k]["rows"] > 1000]
-rate = lambda entry: 100.0 * entry["true_rows"] / entry["rows"]
-joins = [k for k in joins if k != J2]  # J2 changed size, not just prompt
-joins.sort(key=lambda k: rate(after[k]))
-labels = [k.split(".", 2)[2].replace("_", " ") for k in joins]
+# ---- what relabelling actually changed --------------------------------
+with open(W / "relabel_diff.json") as f:
+    diff = json.load(f)["predicates"]
 
-fig, ax = plt.subplots(figsize=(7.2, 0.55 * len(joins) + 1.6))
-y = range(len(joins))
-for i, key in enumerate(joins):
-    a, b = rate(before[key]), rate(after[key])
-    ax.plot([a, b], [i, i], color=GRAY, zorder=1)
-    ax.scatter([a], [i], color=GRAY, zorder=2)
-    ax.scatter([b], [i], color=ORANGE, zorder=2)
-    ax.text(max(a, b) + 0.4, i, f"{a:.1f}% to {b:.1f}%", va="center")
+compared = {code: d for code, d in diff.items() if d["compared"]}
+order = sorted(compared, key=lambda c: compared[c]["answer_differences"]
+               / compared[c]["pairs"])
+
+fig, ax = plt.subplots(figsize=(7.0, 0.5 * len(order) + 1.7))
+y = range(len(order))
+rates = [100.0 * compared[c]["answer_differences"] / compared[c]["pairs"]
+         for c in order]
+ax.barh(list(y), rates, color=ORANGE, height=0.55)
+for i, code in enumerate(order):
+    d = compared[code]
+    ax.text(rates[i] + max(rates) * 0.02, i,
+            f"{d['answer_differences']:,} of {d['pairs']:,}",
+            va="center")
 ax.set_yticks(list(y))
-ax.set_yticklabels(labels)
-ax.set_xlabel("TRUE labels (% of predicate rows); grey is the superseded "
-              "collection, orange is this run")
-ax.set_xlim(0, max(max(rate(before[k]), rate(after[k]))
-                   for k in joins) * 1.45)
+ax.set_yticklabels(order)
+ax.set_xlim(0, max(rates) * 1.45)
+ax.set_xlabel("answers that changed when the predicate was relabelled "
+              "(% of pairs)")
 fig.tight_layout()
-path = OUT / "20260826-join-true-rate-shift.png"
+path = OUT / "20260826-join-relabel-answer-diffs.png"
 fig.savefig(path, dpi=150)
 print(f"wrote {path}")

@@ -1,8 +1,5 @@
 # BIO-6 back to the full terms table, and a judge identity that only hashes what changes an answer
 
-Status: the labeling pass is running. Setup and prediction below are
-fixed; the Result section is filled in from the measured run.
-
 ## Problem
 
 The ground-truth labeling job crashed on BIO-6's second join:
@@ -96,7 +93,119 @@ Stated before the run, from `judge_pass.PREDICTION`:
 
 ## Result
 
-To be filled in from the run.
+The collection is `gt_04231c5de83cdf9e7e68fc03849959d6` and is now the
+active ground truth for corpus `c_df45ef585738f42e4a7a731306f1b9fc`.
+Every number below is from its `summary.json` on the `quail-results`
+volume, at
+`/results/ground_truth/quailb/schema_v1/collections/gt_04231c5de83cdf9e7e68fc03849959d6/summary.json`.
+
+| | predicted | measured |
+|---|---|---|
+| total labels | 434,201 | 434,201 |
+| Qwen3 32B judgments | 394,138 | 394,138 |
+| source labels | 40,063 | 40,063 |
+| deterministic rerun differences | 0 | 0 of 352 compared |
+| out-of-memory crash at 0.85 | none | none |
+| slowest workload | 27 to 35 minutes | 50.6 minutes |
+| cost | $5 to $9 | about $7 |
+
+The label counts landed exactly. `REACTION_SEVERE` was judged at
+122,800 pairs, the case that crashed at `gpu_memory_utilization=0.92`,
+with no out-of-memory error. That was the question the run existed to
+settle, and it is settled.
+
+Figure: plots/20260826-bio6-stage-sizes.png
+
+Cost is 5,348.75 GPU-seconds summed over the four workloads, 1.486
+H100-hours at $3.9492 per hour, so $5.87 of GPU plus $1.14 of host
+memory at 96 GiB per container.
+
+### The wall-clock prediction was wrong, and not for the reason I first gave
+
+I predicted 27 to 35 minutes and measured 50.6. While the run was going
+I said the likely cause was my own change: dropping
+`gpu_memory_utilization` from 0.92 to 0.85 shrinks the KV reservation,
+so fewer sequences run at once. **That was wrong.** The per-workload
+breakdown says the opposite.
+
+| | requests | boot s | model s | other s | ms per request |
+|---|---|---|---|---|---|
+| biodex, previous pass | 57,088 | 229.3 | 508.9 | 318.6 | 8.91 |
+| biodex, this pass | 245,680 | 210.8 | 2,043.8 | 782.6 | 8.32 |
+| imdb, this pass | 120,240 | 208.1 | 355.6 | 938.8 | 2.96 |
+
+Model time per request went **down** at 0.85, from 8.91 ms to 8.32 ms.
+The memory setting cost nothing measurable.
+
+Two things actually explain the miss:
+
+1. **The baseline I scaled from was a resume, not a full pass.** The
+   previous biodex run issued 57,088 model requests because most of its
+   parts already existed on the volume and were skipped. I read its
+   1,056-second wall as the cost of 136,200 prompts. It was not.
+2. **Volume commits, not the GPU, dominate.** `_write_filter_parts`,
+   `_write_qwen_join_parts` and `_write_lepard_source` each call
+   `results_vol.commit()` after every part. Non-model, non-boot time is
+   782.6 seconds over biodex's 400 parts and 938.8 seconds over imdb's
+   479 parts - 1.96 seconds per part in both cases, the same constant.
+   That is 26% of biodex's wall time and 62% of imdb's.
+
+imdb is the clearest case: 355.6 seconds of GPU work inside a
+1,502.5-second workload. The judge pass is I/O bound, not compute
+bound, and no amount of GPU tuning touches that.
+
+### Relabelling the joins reproduced the answers it replaced
+
+The 8 join predicates had to be relabelled because PR #52 and PR #56
+moved their `predicate_version`, which invalidates a label set by
+identity. Whether the answers themselves moved is a separate question,
+and it is worth knowing because the relabel cost most of the $7.
+
+Comparing this collection against `gt_306dac4fc83883c7a5bcc86f4d103f32`
+pair by pair on `(left_id, right_id)`: **379 of 233,644 answers
+changed, 0.16%**. Data at
+`/results/ablations/join_relabel_diff_gt_04231c5de83cdf9e7e68fc03849959d6.json`,
+produced by `ablations/join_relabel_diff.py`.
+
+Figure: plots/20260826-join-relabel-answer-diffs.png
+
+`REACTION` accounts for 374 of the 379. Four of the remaining five are
+in `DISCUSS_ASPECT`, one in `ASPECT_SENTIMENT`, and `SUPPORT`,
+`REFUTE`, `ASPECT_RELATED` and `LEPJOIN` are identical. The
+deterministic rerun reports 0 differences on 352 resubmitted prompts,
+so this is not sampling noise in the judge - these are real
+prompt-driven differences, and there are very few of them.
+
+The reading: PR #52 changed the fields `predicate_payload` hashes
+(`SHARED_PRE` and the render mode) without materially changing the text
+the model sees. The invalidation was correct as a conservative rule and
+wasteful in fact. Hashing the *rendered* prompt for a fixed example,
+rather than the inputs used to construct it, would have kept these
+labels valid. That is a follow-up, not part of this change.
+
+### What BIO-6's second join looks like at full size
+
+`REACTION_SEVERE` on the 64 most common terms was 10.68% TRUE. On the
+full 614-term table it is 5.02%. Truncating to the head of the
+frequency distribution roughly doubled the apparent selectivity, which
+is what made the 64-term table look like a harmless simplification. It
+was not: the number it produced was a property of the truncation.
+
+`REACTION` is 4.00% TRUE over the same 122,800 pairs, so the two BIO-6
+stages now have comparable selectivity, as the star shape intends.
+
+## Follow-ups
+
+Neither is part of this change.
+
+1. **Batch the volume commits.** Committing every part costs about 2
+   seconds and is 62% of imdb's wall time. Committing every N parts
+   would trade resume granularity for wall time; at N=20 imdb would
+   drop from roughly 1,500 seconds to roughly 610.
+2. **Hash the rendered prompt, not its construction inputs.** A
+   refactor that leaves the prompt text unchanged should not invalidate
+   ground truth. This run spent most of $7 reproducing 233,644 answers
+   to change 379 of them.
 
 ## Rehash: what moved without the model
 

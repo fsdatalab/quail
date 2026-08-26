@@ -62,9 +62,21 @@ The 434,201 figure is 394,138 Qwen3 32B judgments plus 40,063 source labels
 (40,000 from LePaRD passage ids, 63 from FEVER annotations), across 23
 predicates at scale factor 0.1.
 
-## Not measured yet
+## Measured
 
-No labeling run has been made since this change, so the prediction that 0.85
-clears the out-of-memory crash is a calculation, not a result. The
-`quail-results` volume currently holds no `ground_truth/` tree at all, so
-the full collection has to be regenerated rather than migrated in place.
+The labeling pass ran and the collection is
+`gt_04231c5de83cdf9e7e68fc03849959d6`, now active for corpus
+`c_df45ef585738f42e4a7a731306f1b9fc`.
+
+- `REACTION_SEVERE` judged at 122,800 pairs with no out-of-memory error at
+  `gpu_memory_utilization=0.85`. That is the case that crashed at 0.92.
+- 434,201 labels, 394,138 Qwen3 32B judgments, 40,063 source labels - the
+  predicted counts exactly.
+- 0 answer differences on 352 resubmitted prompts.
+- The rehash saved 15 filter predicates and 17,057 labels from being
+  relabelled.
+- 0.85 cost no throughput: biodex ran at 8.32 ms per model request against
+  8.91 ms in the previous pass.
+
+Full numbers, including why the wall-clock prediction was wrong, in
+`reports/2026-08-26-bio6-full-terms-and-judge-identity.md`.
