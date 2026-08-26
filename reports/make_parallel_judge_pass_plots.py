@@ -1,7 +1,8 @@
 """Parallel judge-pass plots.
 
-Reads results/parallel_judge_pass_sf0.1.json and writes
-reports/plots/judge_pass_selectivity.png and
+Reads results/parallel_judge_pass_sf0.1.json, and the previous
+collection's summary that file names in before_label_sets_file, and
+writes reports/plots/judge_pass_selectivity.png and
 reports/plots/judge_pass_wall.png.
 
     uv run --with matplotlib python reports/make_parallel_judge_pass_plots.py
@@ -26,25 +27,46 @@ from plot_colors import BLUE, GRAY, LIGHT_GRAY, ORANGE, DARK
 
 DATA = json.loads(
     (ROOT / "results" / "parallel_judge_pass_sf0.1.json").read_text())
+BEFORE = json.loads((ROOT / DATA["before_label_sets_file"]).read_text())
 
 WORKLOAD_NAME = {"imdb": "IMDB", "biodex": "BioDEX",
                  "fever": "FEVER", "lepard": "LePaRD"}
+
+
+def selectivity_rows():
+    """Join this run's positive counts onto the previous collection's.
+
+    The predicate name, workload and before counts are stored once, in
+    the previous collection's summary, so this run's file carries only
+    what it measured."""
+    after = DATA["after_label_sets"]
+    rows = []
+    for b in BEFORE["label_sets"]:
+        a = after[b["predicate_key"]]
+        rows.append({
+            "legacy_code": b["legacy_code"],
+            "workload": b["workload"],
+            # counts, not percents: the two files round the percent to
+            # different places, so equal rates can compare unequal
+            "moved": a["true_rows"] != b["true_rows"],
+            "true_percent_before": b["true_percent"],
+            "true_percent_after": a["true_percent"]})
+    return rows
 
 
 def selectivity_plot():
     """Positive rate per predicate, before and after the trailing
     ANSWER= cue was removed. Dots rather than bars: the axis is
     logarithmic, where bar length no longer encodes the value."""
-    rows = DATA["selectivity_before_and_after_stripping_the_cue"]
     # LePaRD's citation join is labelled from the dataset's passage ids,
     # so no prompt reaches the model and it cannot move
-    rows = [r for r in rows if r["legacy_code"] != "LEPJOIN"]
+    rows = [r for r in selectivity_rows() if r["legacy_code"] != "LEPJOIN"]
     rows.sort(key=lambda r: r["true_percent_after"])
 
     fig, ax = plt.subplots(figsize=(7.4, 7.0))
     for i, r in enumerate(rows):
         before, after = r["true_percent_before"], r["true_percent_after"]
-        if after != before:
+        if r["moved"]:
             ax.plot([before, after], [i, i], color=LIGHT_GRAY, lw=2.4,
                     zorder=1, solid_capstyle="round")
             ax.plot([before], [i], "o", color=GRAY, ms=6, zorder=2)

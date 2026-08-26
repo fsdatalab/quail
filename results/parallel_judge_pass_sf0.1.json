@@ -2,7 +2,6 @@
   "date": "2026-08-26",
   "benchmark": "quailb",
   "cell": "quailb_judge_pass",
-  "what_changed": "The judge pass runs one Modal container per workload instead of one container for all four, and the QUAIL-B templates no longer carry a trailing ANSWER= cue (PR #56).",
   "setup": {
     "scale_factor": 0.1,
     "data_seed": 20260818,
@@ -39,257 +38,40 @@
     "gpu_seconds_parallel": 3848.29,
     "gpu_seconds_serial_reconstructed": 2579.62
   },
-  "serial_reconstruction_method": "One boot (the least contended, LePaRD's 279.27 s) plus every workload's model time. The measured serial run it replaces stopped and resumed, so its 58.2 min is not a clean baseline.",
+  "serial_reconstruction_method": "One boot (the least contended, LePaRD's 279.27 s) plus every workload's wall time after boot. The measured serial run it replaces stopped and resumed, so its 58.2 min is not a clean baseline.",
   "deterministic_rerun": {
     "answer_differences": 0,
     "compared": 288,
     "submission_order": "reverse of first pass"
   },
   "workloads": {
-    "biodex": {
-      "boot_s": 656.34,
-      "model_wall_s": 1198.17,
-      "total_wall_s": 2030.69,
-      "prompt_tokens_submitted_this_call": 523198750,
-      "model_requests_this_call_including_verification": 123464,
-      "wall_minus_boot_s": 1374.35
-    },
-    "fever": {
-      "boot_s": 331.38,
-      "model_wall_s": 163.58,
-      "total_wall_s": 518.86,
-      "prompt_tokens_submitted_this_call": 2626195,
-      "model_requests_this_call_including_verification": 5958,
-      "wall_minus_boot_s": 187.48
-    },
-    "imdb": {
-      "boot_s": 280.95,
-      "model_wall_s": 529.78,
-      "total_wall_s": 988.81,
-      "prompt_tokens_submitted_this_call": 28114568,
-      "model_requests_this_call_including_verification": 75064,
-      "wall_minus_boot_s": 707.86
-    },
-    "lepard": {
-      "boot_s": 279.27,
-      "model_wall_s": 7.42,
-      "total_wall_s": 309.93,
-      "prompt_tokens_submitted_this_call": 338395,
-      "model_requests_this_call_including_verification": 1296,
-      "wall_minus_boot_s": 30.66
-    }
+    "biodex": {"boot_s": 656.34, "total_wall_s": 2030.69, "wall_minus_boot_s": 1374.35},
+    "fever": {"boot_s": 331.38, "total_wall_s": 518.86, "wall_minus_boot_s": 187.48},
+    "imdb": {"boot_s": 280.95, "total_wall_s": 988.81, "wall_minus_boot_s": 707.86},
+    "lepard": {"boot_s": 279.27, "total_wall_s": 309.93, "wall_minus_boot_s": 30.66}
   },
-  "selectivity_before_and_after_stripping_the_cue": [
-    {
-      "predicate_key": "quailb.lepard.excerpt.reasoning_does_not_apply",
-      "legacy_code": "LEP1",
-      "workload": "lepard",
-      "kind": "filter",
-      "rows": 200,
-      "true_rows_before": 4,
-      "true_rows_after": 4,
-      "true_percent_before": 2.0,
-      "true_percent_after": 2.0
-    },
-    {
-      "predicate_key": "quailb.fever.passage.supports_claim",
-      "legacy_code": "SUPPORT",
-      "workload": "fever",
-      "kind": "join",
-      "rows": 5700,
-      "true_rows_before": 36,
-      "true_rows_after": 149,
-      "true_percent_before": 0.632,
-      "true_percent_after": 2.614
-    },
-    {
-      "predicate_key": "quailb.lepard.excerpt.acknowledges_court_disagreement",
-      "legacy_code": "LEP5",
-      "workload": "lepard",
-      "kind": "filter",
-      "rows": 200,
-      "true_rows_before": 6,
-      "true_rows_after": 7,
-      "true_percent_before": 3.0,
-      "true_percent_after": 3.5
-    },
-    {
-      "predicate_key": "quailb.imdb.review.discusses_aspect",
-      "legacy_code": "DISCUSS_ASPECT",
-      "workload": "imdb",
-      "kind": "join",
-      "rows": 60000,
-      "true_rows_before": 1137,
-      "true_rows_after": 3324,
-      "true_percent_before": 1.895,
-      "true_percent_after": 5.54
-    },
-    {
-      "predicate_key": "quailb.lepard.excerpt.supports_liability_or_guilt",
-      "legacy_code": "LEP4",
-      "workload": "lepard",
-      "kind": "filter",
-      "rows": 200,
-      "true_rows_before": 13,
-      "true_rows_after": 18,
-      "true_percent_before": 6.5,
-      "true_percent_after": 9.0
-    },
-    {
-      "predicate_key": "quailb.lepard.excerpt.treats_passage_as_binding",
-      "legacy_code": "LEP3",
-      "workload": "lepard",
-      "kind": "filter",
-      "rows": 200,
-      "true_rows_before": 10,
-      "true_rows_after": 19,
-      "true_percent_before": 5.0,
-      "true_percent_after": 9.5
-    },
-    {
-      "predicate_key": "quailb.biodex.report.experienced_reaction",
-      "legacy_code": "REACTION",
-      "workload": "biodex",
-      "kind": "join",
-      "rows": 122800,
-      "true_rows_before": 81,
-      "true_rows_after": 19777,
-      "true_percent_before": 0.066,
-      "true_percent_after": 16.105
-    },
-    {
-      "predicate_key": "quailb.fever.claim.contains_date",
-      "legacy_code": "F12",
-      "workload": "fever",
-      "kind": "filter",
-      "rows": 100,
-      "true_rows_before": 18,
-      "true_rows_after": 18,
-      "true_percent_before": 18.0,
-      "true_percent_after": 18.0
-    },
-    {
-      "predicate_key": "quailb.lepard.excerpt.cites_passage",
-      "legacy_code": "LEPJOIN",
-      "workload": "lepard",
-      "kind": "join",
-      "rows": 40000,
-      "true_rows_before": 9626,
-      "true_rows_after": 9626,
-      "true_percent_before": 24.065,
-      "true_percent_after": 24.065
-    },
-    {
-      "predicate_key": "quailb.imdb.review.discusses_ending",
-      "legacy_code": "F4",
-      "workload": "imdb",
-      "kind": "filter",
-      "rows": 5000,
-      "true_rows_before": 1155,
-      "true_rows_after": 1218,
-      "true_percent_before": 23.1,
-      "true_percent_after": 24.36
-    },
-    {
-      "predicate_key": "quailb.lepard.excerpt.procedural_or_jurisdictional",
-      "legacy_code": "LEP2",
-      "workload": "lepard",
-      "kind": "filter",
-      "rows": 200,
-      "true_rows_before": 103,
-      "true_rows_after": 108,
-      "true_percent_before": 51.5,
-      "true_percent_after": 54.0
-    },
-    {
-      "predicate_key": "quailb.imdb.review.mentions_named_actor",
-      "legacy_code": "F5",
-      "workload": "imdb",
-      "kind": "filter",
-      "rows": 5000,
-      "true_rows_before": 2839,
-      "true_rows_after": 2854,
-      "true_percent_before": 56.78,
-      "true_percent_after": 57.08
-    },
-    {
-      "predicate_key": "quailb.biodex.report.involves_female_patient",
-      "legacy_code": "F7",
-      "workload": "biodex",
-      "kind": "filter",
-      "rows": 200,
-      "true_rows_before": 119,
-      "true_rows_after": 123,
-      "true_percent_before": 59.5,
-      "true_percent_after": 61.5
-    },
-    {
-      "predicate_key": "quailb.biodex.report.describes_serious_adverse_event",
-      "legacy_code": "F9",
-      "workload": "biodex",
-      "kind": "filter",
-      "rows": 200,
-      "true_rows_before": 126,
-      "true_rows_after": 128,
-      "true_percent_before": 63.0,
-      "true_percent_after": 64.0
-    },
-    {
-      "predicate_key": "quailb.fever.claim.about_person",
-      "legacy_code": "F11",
-      "workload": "fever",
-      "kind": "filter",
-      "rows": 100,
-      "true_rows_before": 59,
-      "true_rows_after": 64,
-      "true_percent_before": 59.0,
-      "true_percent_after": 64.0
-    },
-    {
-      "predicate_key": "quailb.fever.passage.about_person",
-      "legacy_code": "F13",
-      "workload": "fever",
-      "kind": "filter",
-      "rows": 57,
-      "true_rows_before": 37,
-      "true_rows_after": 37,
-      "true_percent_before": 64.912,
-      "true_percent_after": 64.912
-    },
-    {
-      "predicate_key": "quailb.biodex.report.describes_combination_therapy",
-      "legacy_code": "F8",
-      "workload": "biodex",
-      "kind": "filter",
-      "rows": 200,
-      "true_rows_before": 136,
-      "true_rows_after": 140,
-      "true_percent_before": 68.0,
-      "true_percent_after": 70.0
-    },
-    {
-      "predicate_key": "quailb.imdb.review.mentions_positive_aspect",
-      "legacy_code": "F1",
-      "workload": "imdb",
-      "kind": "filter",
-      "rows": 5000,
-      "true_rows_before": 3873,
-      "true_rows_after": 4004,
-      "true_percent_before": 77.46,
-      "true_percent_after": 80.08
-    },
-    {
-      "predicate_key": "quailb.lepard.passage.states_general_rule",
-      "legacy_code": "LEPS1",
-      "workload": "lepard",
-      "kind": "filter",
-      "rows": 200,
-      "true_rows_before": 200,
-      "true_rows_after": 200,
-      "true_percent_before": 100.0,
-      "true_percent_after": 100.0
-    }
-  ],
+  "before_label_sets_file": "results/benchmark/20260825T082145Z-quailb-qwen32b-ground-truth-sf0.1.json",
+  "after_label_sets": {
+    "quailb.biodex.report.describes_combination_therapy": {"true_rows": 140, "true_percent": 70.0},
+    "quailb.biodex.report.describes_serious_adverse_event": {"true_rows": 128, "true_percent": 64.0},
+    "quailb.biodex.report.experienced_reaction": {"true_rows": 19777, "true_percent": 16.105},
+    "quailb.biodex.report.involves_female_patient": {"true_rows": 123, "true_percent": 61.5},
+    "quailb.fever.claim.about_person": {"true_rows": 64, "true_percent": 64.0},
+    "quailb.fever.claim.contains_date": {"true_rows": 18, "true_percent": 18.0},
+    "quailb.fever.passage.about_person": {"true_rows": 37, "true_percent": 64.912},
+    "quailb.fever.passage.supports_claim": {"true_rows": 149, "true_percent": 2.614},
+    "quailb.imdb.review.discusses_aspect": {"true_rows": 3324, "true_percent": 5.54},
+    "quailb.imdb.review.discusses_ending": {"true_rows": 1218, "true_percent": 24.36},
+    "quailb.imdb.review.mentions_named_actor": {"true_rows": 2854, "true_percent": 57.08},
+    "quailb.imdb.review.mentions_positive_aspect": {"true_rows": 4004, "true_percent": 80.08},
+    "quailb.lepard.excerpt.acknowledges_court_disagreement": {"true_rows": 7, "true_percent": 3.5},
+    "quailb.lepard.excerpt.cites_passage": {"true_rows": 9626, "true_percent": 24.065},
+    "quailb.lepard.excerpt.procedural_or_jurisdictional": {"true_rows": 108, "true_percent": 54.0},
+    "quailb.lepard.excerpt.reasoning_does_not_apply": {"true_rows": 4, "true_percent": 2.0},
+    "quailb.lepard.excerpt.supports_liability_or_guilt": {"true_rows": 18, "true_percent": 9.0},
+    "quailb.lepard.excerpt.treats_passage_as_binding": {"true_rows": 19, "true_percent": 9.5},
+    "quailb.lepard.passage.states_general_rule": {"true_rows": 200, "true_percent": 100.0}
+  },
   "volume_paths": {
     "collection": "/results/ground_truth/quailb/schema_v1/collections/gt_80e7582534b349bc61c087595f2e0a51",
     "corpus": "/results/ground_truth/quailb/schema_v1/corpora/c_df45ef585738f42e4a7a731306f1b9fc",

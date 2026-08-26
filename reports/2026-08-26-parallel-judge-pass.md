@@ -24,8 +24,12 @@ the cause.
 The new collection is
 `gt_80e7582534b349bc61c087595f2e0a51` and is the active ground truth for
 corpus `c_df45ef585738f42e4a7a731306f1b9fc`. The committed summary is
-`results/parallel_judge_pass_sf0.1.json`. The 245,557 labels themselves
-are on the `quail-results` volume at
+`results/parallel_judge_pass_sf0.1.json`, and it holds this run's
+positive counts only. The before counts below come from the previous
+run's summary, already committed at
+`results/benchmark/20260825T082145Z-quailb-qwen32b-ground-truth-sf0.1.json`.
+The new file names that path, so the plot script reads both. The
+245,557 labels themselves are on the `quail-results` volume at
 `/results/ground_truth/quailb/schema_v1/collections/gt_80e7582534b349bc61c087595f2e0a51`.
 
 ## Setup
