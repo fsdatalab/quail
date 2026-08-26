@@ -38,10 +38,10 @@ The corpora and the per-document ground-truth labels are raw data
 and live on the quail-results volume, so pull them first. The
 answers go back to the volume too:
 
-    W=<workdir>; C=c_df45ef585738f42e4a7a731306f1b9fc
+    W=<workdir>; SF=0.1; C=<corpus id for that scale factor>
     G=/ground_truth/quailb/schema_v1
     mkdir -p $W/data $W/allabels
-    modal volume get quail-results /quailb_data/sf0.1 $W/data/
+    modal volume get quail-results /quailb_data/sf$SF $W/data/
     modal volume get quail-results $G/label_sets $W/allabels/
     modal volume get quail-results $G/corpora/$C/active_collection.json \
         $W/active_collection.json
@@ -49,9 +49,14 @@ answers go back to the volume too:
     modal volume get quail-results $G/collections/$GT/manifest.json \
         $W/collection_manifest.json
     uv run --with transformers --with pyarrow \
-        python reports/make_sol_quailb.py $W
-    modal volume put quail-results $W/sol_quailb_sf0.1.json \
-        /sol/sol_quailb_sf0.1.json
+        python reports/make_sol_quailb.py $W $SF
+    modal volume put quail-results $W/sol_quailb_sf$SF.json \
+        /sol/sol_quailb_sf$SF.json
+
+The scale factor defaults to 0.1. Each one has its own corpus and its
+own label collection, so `modal volume ls quail-results $G/corpora`
+gives the corpus ids; the run stops if the collection you pulled is
+for a different scale factor than the one you asked for.
 
 The report is reports/2026-08-26-sol-quailb.md.
 """
@@ -74,7 +79,26 @@ from quail.specs import (H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, DeviceSpec,
                          ModelSpec)
 
 W = Path(sys.argv[1])
+SF = float(sys.argv[2]) if len(sys.argv) > 2 else 0.1
+# "%g" so 0.1 stays "0.1" and 0.01 stays "0.01", matching the volume's
+# own directory names
+TAG = f"sf{SF:g}"
+OUT = W / f"sol_quailb_{TAG}.json"
 ROOT = Path(__file__).resolve().parents[1]
+
+# check the workdir holds this scale factor before tokenizing anything:
+# both of these otherwise surface much later as a missing parquet file
+if not (W / "data" / TAG).is_dir():
+    raise SystemExit(f"no corpus at {W / 'data' / TAG}: pull "
+                     f"/quailb_data/{TAG} off the volume")
+COLLECTION = json.load(open(W / "collection_manifest.json"))
+if COLLECTION["scale_factor"] != SF:
+    raise SystemExit(
+        f"the collection in {W} is scale factor "
+        f"{COLLECTION['scale_factor']:g}, not {SF:g}: pull the labels for "
+        f"the corpus you are asking about")
+COLLECTION_ID = COLLECTION["collection_id"]
+CORPUS_ID = COLLECTION["corpus_id"]
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-FP8")
 encode = lambda t: tok(t, add_special_tokens=False)["input_ids"]
 length = lambda t: len(encode(t))
@@ -390,7 +414,7 @@ COLUMNS = {
 # 1. document lengths -------------------------------------------------
 lengths = {}        # column -> {doc id: token count}
 for key, (table, col) in COLUMNS.items():
-    t = pq.read_table(W / "data" / "sf0.1" / f"{table}.parquet",
+    t = pq.read_table(W / "data" / TAG / f"{table}.parquet",
                       columns=["id", col])
     lengths[key] = {i: length(x) for i, x in
                     zip(t.column("id").to_pylist(), t.column(col).to_pylist())}
@@ -418,8 +442,7 @@ join_prompt = {c: {"question": length(render_join_question(t)),
 # active_collection.json names the current collection, and that
 # collection names one label set per predicate; anything else is a
 # superseded run and must not be read.
-ACTIVE = set(json.load(open(W / "collection_manifest.json"))
-             ["label_sets"].values())
+ACTIVE = set(COLLECTION["label_sets"].values())
 labels = {}
 for m in glob.glob(str(W / "allabels/label_sets/*/*/*/manifest.json")):
     if Path(m).parent.name not in ACTIVE:
@@ -590,13 +613,15 @@ for qid, r in rows.items():
 
 
 json.dump({
-    "what": "Speed of light for all 26 QUAIL-B queries at sf=0.1, on "
+    "what": f"Speed of light for all 26 QUAIL-B queries at sf={SF:g}, on "
             "Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100 each. A floor on "
             "wall time: no measured or fitted constant is used.",
     "method": "plans/sol_model.md, computed by reports/make_sol_quailb.py",
-    "scale_factor": 0.1,
+    "scale_factor": SF,
+    "corpus_id": CORPUS_ID,
+    "collection_id": COLLECTION_ID,
     "sources": {
-        "corpora": "/quailb_data/sf0.1 on quail-results, seed 20260818",
+        "corpora": f"/quailb_data/{TAG} on quail-results, seed 20260818",
         "labels": "/ground_truth/quailb/schema_v1/label_sets on "
                   "quail-results, qwen3-32b-fp8 answering",
         "tokenizer": "Qwen/Qwen3-4B-FP8, shared by every Qwen3 model"},
@@ -613,9 +638,7 @@ json.dump({
             "partner_filters": rec.get("partner_filters", [])}
             for qid, rec in queries.items()}},
     "queries": rows,
-}, open(W / "sol_quailb_sf0.1.json", "w"), indent=1)
-print(f"\nwrote {W / 'sol_quailb_sf0.1.json'}\n"
+}, open(OUT, "w"), indent=1)
+print(f"\nwrote {OUT}\n"
       "put it on the volume:\n"
-      f"  modal volume put quail-results "
-      f"{W / 'sol_quailb_sf0.1.json'} "
-      "/sol/sol_quailb_sf0.1.json")
+      f"  modal volume put quail-results {OUT} /sol/{OUT.name}")

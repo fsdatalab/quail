@@ -19,7 +19,10 @@ enough to check by hand.
 Every number below comes from exactly three measured things.
 `reports/make_sol_quailb.py` measures them and computes the table in
 one pass, and writes both to `/sol/sol_quailb_sf0.1.json` on the
-`quail-results` volume.
+`quail-results` volume. The scale factor is the script's second
+argument and defaults to 0.1; everything below is sf=0.1. Each scale
+factor has its own corpus and its own label collection, and the script
+stops if the two it is given disagree.
 
 1. **Document lengths.** Each corpus tokenized with the Qwen3
    tokenizer, kept as a length histogram so nothing is lost and no
