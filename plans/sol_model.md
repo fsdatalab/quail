@@ -18,7 +18,9 @@ name, and it cannot judge the thing the constant was fitted to.
 |---|---|---|---|
 | `p` | shared preamble tokens, on every document | 2 | 2 |
 | `d_i` | tokens in document `i` | from the corpus | from the corpus |
-| `q_s` | tokens in stage `s`'s question | 40 to 62 | 40 to 62 |
+| `q_s` | tokens in filter stage `s`'s question | 41 to 62 | 41 to 62 |
+| `f_a` | join frame tokens after anchor `a` | 36 to 42 | 36 to 42 |
+| `u_b` | one join tuple suffix for partner `b` | from the prompt and corpus | from the prompt and corpus |
 | `A_s` | documents alive entering stage `s` | `A_1` is all | `A_1` is all |
 | `T(n)` | `n(n+1)/2`, a causal sequence attending to itself | | |
 | `P` | dense parameters per token | 3,633,511,936 | 31,206,298,624 |
@@ -54,10 +56,12 @@ and we run dense. The projections are fp8 and attention is bf16
 
 Every document has a **prefix**, `p + d_i`: the shared preamble plus
 the document text. Its KV is computed once and stays resident.
-Anything attached after it is a **suffix** - a filter's question, or
-a join's partner block plus question - and suffix KV is computed,
-used for that one evaluation, and dropped (`executor/pack.py`:
-suffix KV is never cached).
+Anything attached after it is a **suffix**. A filter suffix is its
+question. A join first attaches an anchor frame, which contains the
+anchor note and complete question. Each join tuple then attaches the
+partner label, partner document, and answer cue. Suffix KV is computed,
+used for one evaluation, and dropped. The code in `executor/pack.py`
+never caches suffix KV.
 
 So a document is read once however many questions get asked about
 it. In the equations below that shows up in one place: whether `d_i`
@@ -94,38 +98,39 @@ attending over the resident prefix - never as a triangle over
 itself. Without reuse, stage `s > 1` would be another stage 1:
 `p + d_i + q_s` tokens and `T(p + d_i + q_s)` pairs.
 
-Over 5,000 IMDB reviews, one filter is 1,774,233 tokens. A second
-filter adds 185,904 - one 48-token question per surviving document.
-Rescanning would have added another 1.5 million.
+Over 5,000 IMDB reviews, one filter is 1,759,233 tokens. A second
+filter adds 180,180 tokens. The added work is one 45 token question
+for each of the 4,004 surviving documents. Rescanning would have added
+another 1.2 million document and preamble tokens.
 
-`|A_s|` comes from the selectivities: `A_1` is the whole corpus and
-`|A_{s+1}| = sigma_s * |A_s|`. Which documents survive matters as
-well, because `d_i` is in the pairs line; see section 6.
+The active ground truth labels determine the exact document IDs in
+`A_s`. The code does not estimate `A_s` from selectivity, because the
+surviving document lengths affect the attention count.
 
 ### A join
 
-One side **anchors**: its prefixes are held and every tuple attends
-to them. The other **streams**: a copy of each of its documents
-rides in every tuple's suffix. Write `note` for the anchor naming
-line, written into each anchor's kept KV once for the stage, and
-`u_b = label + d_b + question` for one tuple's suffix.
+One side **anchors**. Its prefixes are held and every tuple attends
+to them. The other side **streams**. A copy of each partner document
+appears in its tuple suffix. Write `f_a` for the anchor frame, which
+contains the anchor note and complete question. Write
+`u_b = label + d_b + answer cue` for one tuple suffix.
 
 ```
 JOIN - anchors a, partners b, every a against every b
 
-  per anchor, opening it (no filter ran on that side):
-    tokens += p + d_a + note
-    pairs  += T(p + d_a + note)
+  per anchor, opening it when no filter ran on that side:
+    tokens += p + d_a + f_a
+    pairs  += T(p + d_a + f_a)
 
-  per anchor, already resident (a filter ran on that side):
-    tokens += note
-    pairs  += note * (p + d_a) + T(note)
+  per anchor, already resident when a filter ran on that side:
+    tokens += f_a
+    pairs  += f_a * (p + d_a) + T(f_a)
 
   per anchor, then per partner:
     tokens += u_b
-    pairs  += u_b * (p + d_a + note) + T(u_b)
+    pairs  += u_b * (p + d_a + f_a) + T(u_b)
 
-  kv read  = sum over a of (p + d_a + note)
+  kv read  = sum over a of (p + d_a + f_a)
 ```
 
 The tuple lines are the `stage s > 1` shape again: a rectangle over
@@ -139,11 +144,11 @@ minimum for a tuple stream longer than one chunk, which every join
 here is.
 
 **Which side anchors.** Anchoring the long side costs one prefix per
-document; anchoring the short side puts a full copy of every long
+document. Anchoring the short side puts a full copy of every long
 document into every tuple. The planner keeps the cheaper side, so
-the bound prices both orientations and keeps the cheaper one. The
-choice is not a detail: the two orientations differ by 5.3x on
-FEVER and 47x on BioDEX.
+the calculation prices both choices and keeps the cheaper one. The
+join token counts differ by 14.9 times on FEV-2 and 193.7 times on
+BIO-2.
 
 ## 4. Speed of light
 
@@ -192,10 +197,6 @@ this is analysis, not a plan input.
 
 ## 6. What the bound assumes
 
-- **Selectivity fixes how many documents survive, not which.**
-  `survivors()` keeps an evenly spaced slice of the length-sorted
-  pool, so the survivors carry the pool's length distribution. A
-  predicate correlated with document length breaks that.
 - **KV read is a minimum**, one read per anchor per stage. An anchor
   whose tuples straddle a chunk boundary is read twice.
 - **Compute and memory overlap perfectly**, per the `max` above.
@@ -206,7 +207,6 @@ this is analysis, not a plan input.
 
 `reports/2026-08-26-sol-quailb.md` applies all of this to the 26
 queries at sf=0.1 on Qwen3-4B-fp8 and Qwen3-32B-fp8, from measured
-document lengths, measured prompt lengths, and ground-truth
-selectivities. `reports/make_sol_quailb.py` is the one script that
-produces it, and it writes both those inputs and the answers to
-`/sol/sol_quailb_sf0.1.json` on the `quail-results` volume.
+document lengths, measured prompt lengths, and exact active ground
+truth labels. `reports/make_sol_quailb.py` produces the report data.
+The mounted volume path is `/results/sol/sol_quailb_sf0.1.json`.
