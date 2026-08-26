@@ -20,6 +20,7 @@ def _standin_sets(tmp_path):
     write("aspects", "aspect", ASPECTS)
     write("reports", "report", [f"medical report {i}" for i in range(8)])
     write("terms", "term", [f"reaction {i}" for i in range(6)])
+    write("severe_terms", "term", [f"reaction {i}" for i in range(4)])
     pq.write_table(pa.table({
         "id": [f"cl{i}" for i in range(6)],
         "claim": [f"claim {i}" for i in range(6)],
