@@ -29,6 +29,11 @@ prediction cannot be compared directly because the first command stopped
 on duplicate part validation and the corrected command resumed its saved
 parts.
 
+The model specific anchor correction predicted that all 35 current queries
+would keep the same orientations and SoL values. The prediction matched. The
+correction changes how the calculation is performed and stored, but it does
+not change any number in the result table.
+
 ## Ground truth setup and result
 
 The labels were generated on Modal with four `H100!` requests and one
@@ -159,6 +164,12 @@ relations at the barrier to remove documents that cannot appear in the
 final result. It then computes the new anchor prefix once and continues
 with the smaller document sets.
 
+The calculation builds the physical plan separately for 4B and 32B. A free
+join chooses its runtime anchor with that model's chunk limit, which is
+110,376 tokens for 4B and 41,943 tokens for 32B. Work counts, stage details,
+and anchor choices are stored separately for each model. The current 35
+queries choose the same orientations on both models.
+
 For example, IMDB-9 evaluates 60,000 review and aspect pairs in its first
 join. The first join leaves all 12 aspect values live for the next stage,
 so the next two joins evaluate 144 pairs each. The total is 60,288 pair
@@ -233,8 +244,10 @@ amortize away.
 
 A join has to pick a side to anchor. Anchoring the long side costs
 one prefix per document; anchoring the short side copies every long
-document into every tuple. The bound prices both and keeps the
-cheaper, because that is what the engine does.
+document into every tuple. The bound prices both feasible choices for
+each model and keeps the cheaper one, because that is what the engine
+does. Both models make the same choices for every join in the current
+suite, so one orientation is shown below.
 
 | join | side held | side streamed | join tokens as run | join tokens the other way | cost of choosing wrong |
 |---|---|---|---|---|---|
@@ -258,6 +271,7 @@ Figure: plots/sol_quailb_attention_share.png
 The attention share figure contains the 26 queries with no more than one
 join. The nine queries with several joins can use more than one anchor
 context, so one context length would not describe their work correctly.
+Each plotted point uses the anchor context chosen for that model.
 
 The two compute terms grow differently with **context length** -
 how many earlier tokens each new token attends over. `T_dense` does
