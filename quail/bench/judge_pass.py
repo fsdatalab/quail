@@ -43,11 +43,16 @@ VOLUME_ROOT = Path("/results/ground_truth/quailb/schema_v1")
 
 PREDICTION = (
     "sf=0.1, 23 predicates: 434,201 labels - 394,138 Qwen3 32B "
-    "judgments and 40,063 source labels; four H100s side by side, one "
-    "per workload; biodex is the long pole with 245,600 report-length "
-    "join prompts; 30-50 minutes wall clock and $10-$16 at current "
-    "Modal prices; 0 answer differences on the deterministic rerun "
-    "sample; no out-of-memory crash at gpu_memory_utilization=0.85"
+    "judgments and 40,063 source labels. The 15 filter predicates "
+    "(17,057 labels) already sit on the volume under their current "
+    "ids, so this pass writes the 8 joins: 377,081 model judgments, "
+    "63 FEVER annotation labels and LePaRD's 40,000 source labels. "
+    "Four H100s side by side, one per workload; biodex is the long "
+    "pole with 245,600 report-length prompts, 1.8x the 136,200 it ran "
+    "in 1,056 seconds last pass, so 27-35 minutes including boot; "
+    "$5-$9 at current Modal prices; 0 answer differences on the "
+    "deterministic rerun sample; no out-of-memory crash at "
+    "gpu_memory_utilization=0.85"
 )
 
 
