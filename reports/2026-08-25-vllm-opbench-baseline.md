@@ -1,143 +1,171 @@
-# vllm-opbench: a second, more instrumented stock-vLLM baseline
+# Shared join prompts and vLLM baselines
 
-Date: 2026-08-25. One H100 on Modal, Qwen3 4B and 32B, fp8. sf=0.1.
+Date: 2026-08-26. The runs used sf=0.1, Qwen3 4B fp8 or Qwen3 32B
+fp8, and one exact `H100!` request per model copy on Modal.
 
-## How it works
+## Result
 
-`baselines/vllm_opbench/` runs quail's own document sets and
-predicates (`quail/bench/quailb.py`) through plain vLLM, not through
-quail's engine, so we get an honest "how fast is generic vLLM"
-number to compare against. For each query it:
-
-1. Reads the same parquet tables quail's engine reads and builds one
-   prompt per document (filter) or per document pair (join), using
-   quail's own predicate templates.
-2. Submits every prompt for the query in one batched
-   `llm.generate()` call - not one request at a time.
-3. Constrains decoding to a single TRUE/FALSE token
-   (`allowed_token_ids` + `max_tokens=1`), the same convention
-   quail's own engine uses, so there's no free-text answer to parse
-   or get wrong.
-4. Records vLLM's own Prometheus metrics and a KV-cache "oracle
-   regret" (how many prefix-cache blocks an infinite, never-evicting
-   cache would have hit, vs. what vLLM's real cache hit) on every run.
-
-It differs from the existing `baselines/stock.py` in two ways:
-
-|  | checkpoint | client |
-|---|---|---|
-| `baselines/stock.py` | quail's own pre-quantized Qwen3-\*-FP8 | one request per (doc, stage) or per pair |
-| `baselines/vllm_opbench/` | base checkpoint, fp8 quantized at vLLM load time | one batched call per query, all prompts at once |
-
-Four queries, each mirroring an existing quailb query:
-
-| Query | Mirrors | Shape |
-|---|---|---|
-| filter-reports | BIO-1 | F7 filter, 200 reports |
-| join-reports | BIO-2 | REACTION join, 200 reports x 614 terms = 122,800 pairs |
-| join-claims | FEV-2 | SUPPORT join, 100 claims x 57 evidence = 5,700 pairs |
-| join-imdb | IMDB-2 | DISCUSS_ASPECT join, 5,000 reviews x 12 aspects = 60,000 pairs |
-
-Both baselines are naive in the sense that neither uses quail's own
-optimizations (pipelining, token-based admission, KV rewind).
-
-## Is it correct?
-
-- Every query's row/pair count matches quailb's own count exactly -
-  same document tables, same predicate templates, same schema.
-- Zero null or dropped answers across every query in this report -
-  guaranteed by the constrained decode, not just observed.
-- A line-by-line review, then a separate adversarial pass, found and
-  fixed 6 bugs. The two that mattered: results now save after every
-  query instead of only at the end (a crash used to silently drop
-  already-computed results), and every saved answer now records
-  which document, or document pair, it came from.
-
-Two style questions came up during review and are being left as-is:
-a new Modal app name for this baseline (`config.py`), and one
-function that reimplements a few lines of quail's own token-id logic
-instead of importing it (`operators.true_false_ids`). Neither affects
-correctness.
-
-## Measured result
+Quail was faster than both vLLM baselines on all six join comparisons.
+The largest difference was BIO-2 at 4B. Quail took 31.12 seconds,
+compared with 187.17 seconds for naive vLLM and 261.38 seconds for
+stock vLLM.
 
 Figure: plots/vllm_opbench_vs_quail.png
 
-| Query | Model | quail wall_s | vllm-opbench generate_s |
-|---|---|---:|---:|
-| filter-reports | 4B | 9.0 – 10.1 | 10.75 |
-| filter-reports | 32B | 53.8 – 55.7 | 74.05 |
-| join-reports | 4B | 138.6 – 155 | 217.69 |
-| join-reports | 32B | 812.2 (cold) | 468.11 |
-| join-claims | 4B | 4.9 | 22.87 |
-| join-claims | 32B | 13.5 | 175.61 |
-| join-imdb | 4B | 52.4 – 58.6 | 33.43 |
-| join-imdb | 32B | 358.1 (cold) | 250.68 |
+The plot uses a log scale because the measured times span more than two
+orders of magnitude.
 
-join-claims at 32B is the one clean case: quail is faster, 13.5s vs
-175.6s. join-reports' build step is CPU tokenization (each of 200
-reports gets re-encoded once per partner term - 122,800 encode
-calls), not GPU time, and it's noisy run to run (850-1,497s); a real
-cost of the naive approach, not a bug.
+| Model | Query | Pairs | Quail (s) | Naive vLLM (s) | Compared with Quail | Stock vLLM (s) | Compared with Quail |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 4B | BIO-2 | 122,800 | 31.12 | 187.17 | 6.01 times slower | 261.38 | 8.40 times slower |
+| 4B | FEV-2 | 5,700 | 1.29 | 2.16 | 1.67 times slower | 3.10 | 2.40 times slower |
+| 4B | IMDB-2 | 60,000 | 20.55 | 24.36 | 1.19 times slower | 31.32 | 1.52 times slower |
+| 32B | BIO-2 | 122,800 | 181.05 | 302.96 | 1.67 times slower | 265.80 | 1.47 times slower |
+| 32B | FEV-2 | 5,700 | 8.47 | 12.27 | 1.45 times slower | 11.20 | 1.32 times slower |
+| 32B | IMDB-2 | 60,000 | 139.88 | 187.93 | 1.34 times slower | 155.58 | 1.11 times slower |
 
-join-imdb is the one query all three baselines (quail, `stock.py`,
-this one) have run:
+For Quail, the table uses the cold pass and excludes model load time. For
+both vLLM baselines, the table uses the time inside `llm.generate()`. CPU
+prompt building and the Modal call are outside that timer.
 
-Figure: plots/vllm_opbench_join_imdb_3way.png
+## The join prompt fix
 
-| | 4B | 32B |
-|---|---:|---:|
-| quail | 52.4 – 58.6 s | 358.1 s (cold) |
-| stock vLLM (quail's own checkpoint) | 34.6 s | 206.7 s |
-| vllm-opbench (base checkpoint, load-time fp8) | 33.4 s | 250.7 s |
+The old Quail join prompt put the complete static question after every
+partner document. Quail therefore processed the same question again for
+every pair. The new order is:
 
-## Accuracy against ground truth
+```text
+DOCUMENT:
+<anchor document>
 
-Two of quail's own committed join-query reference runs (join-reports,
-join-imdb) disagreed with each other by a lot. `tests/gpu/join_rerun.py`
-reruns each query cold and warm and checks answers against QUAIL-B
-ground truth (collection `gt_80e7582534b349bc61c087595f2e0a51`, pinned
-explicitly - see the script's comment), explaining why:
+(The document above is DOCUMENT {0}.)
 
-| Model | Query | wall_s (cold/warm) | selectivity | accuracy | precision | recall |
-|---|---|---:|---:|---:|---:|---:|
-| 4B | filter-reports (F7) | 8.8 / 11.1 | 55.5% | 94.0% | 100% | 90.2% |
-| 4B | join-imdb | 51.9 / 56.0 | 99.99% | 5.55% | 5.54% | 100% |
-| 4B | join-reports | 137.1 / 135.1 | 100% | 16.1% | 16.1% | 100% |
-| 32B (pending recheck) | join-imdb | 358.1 (cold) | 2.1% | 98.5% | 59.0% | 65.2% |
-| 32B (pending recheck) | join-reports | 812.2 (cold) | 0.05% | 99.96% | 77.6% | 55.6% |
+Evaluate TRUE or FALSE for the following question: <join question>
 
-4B answers TRUE on almost every pair for both joins (99.99-100%
-selectivity) - 100% recall, low precision, not a real judgment. It's
-not broken generally: on filter-reports, checked the same way, it
-scores 100% precision and 90.2% recall. The join instability is
-specific to these two predicates, not to 4B across the board.
+DOCUMENT {1}:
+<partner document>
+ANSWER:
+```
 
-32B's row is marked pending: those numbers predate a QUAIL-B relabel
-that fixed a template bug (`reports/2026-08-26-parallel-judge-pass.md`),
-moving REACTION's positive rate from 0.07% to 16.11%. 32B answered
-TRUE on only 0.05% of join-reports pairs under the old labels; against
-a target that's actually 16.11% positive, recall should drop sharply
-once rechecked - so treat 32B's numbers above as not yet confirmed,
-not as settled.
+The new order has the following effects:
 
-## What this means
+- Quail processes the anchor note and complete question once per anchor.
+- Each pair adds only the partner label, partner document, and answer cue.
+- Quail, stock vLLM, and naive vLLM now use the exact same token IDs for
+  every complete prompt.
+- Tests compare the exact token IDs when either input is the anchor. A
+  separate test covers a join with three inputs.
 
-- **vllm-opbench's own code is correct**: right prompts, right
-  decoding, honest and internally consistent numbers.
-- **4B's join instability is explained**: it defaults to TRUE on
-  these two join predicates specifically, not on filters in general.
-- **32B's accuracy claim is still open** and, by the arithmetic
-  above, likely to move once rechecked - not yet a settled result.
+For `merge_quant`, the suffix is the partner label, the partner document,
+and `ANSWER:`. The persistent document KV contains `DOCUMENT:\n` and the
+anchor document. The active kept KV during the join also contains the
+anchor note and complete question. `merge_quant` does not save suffix KV.
 
-## Raw data
+## Planner accounting
 
-Per-query raw results (not committed, per house rules) are on the
-`quail-results` Modal volume:
+The planner now counts the prompt in the same order that the runtime uses.
+For a two input join, it computes:
 
-- `/results/vllm_opbench/<timestamp>/summary.json` - `run.py`'s wall-time
-  grid (measured result table above).
-- `/results/benchmarks/quailb/runs/<run_id>/` - `join_rerun.py`'s
-  accuracy runs (accuracy table above).
+```text
+anchors * (shared preamble + anchor document + anchor note + question)
++ pairs * (partner label + partner document + answer cue)
+```
 
-Committed summary: `results/vllm_opbench_vs_quail.json`.
+The Quail runs matched the predicted fresh token counts exactly:
+
+| Query | Predicted fresh tokens | Measured fresh tokens | Change from the old prompt |
+|---|---:|---:|---:|
+| BIO-2 | 2,635,599 | 2,635,599 | 76 percent fewer than 10,979,399 |
+| IMDB-2 | 2,419,233 | 2,419,233 | 59 percent fewer than 5,944,233 |
+| FEV-2 | 145,359 | 145,359 | The evidence input is the anchor |
+
+The vLLM prefix cache processed slightly more fresh tokens because it reuses
+complete 16 token blocks. It processed 2,675,146 fresh tokens for BIO-2,
+2,438,148 for IMDB-2, and 152,994 for FEV-2.
+
+## Baseline settings
+
+Both baselines use the same driver and the same complete prompt token IDs.
+They differ only in how vLLM loads the model weights:
+
+| Configuration | Model weights | Quantization setting |
+|---|---|---|
+| Naive vLLM | Base Qwen3 checkpoint | vLLM converts weights to fp8 at load time |
+| Stock vLLM | Qwen3 FP8 checkpoint | vLLM loads the checkpoint as provided |
+
+Both baselines used these settings:
+
+- The Modal request was `gpu="H100!"`.
+- vLLM was version 0.26.0 with CUDA 13.0.1.
+- Each model used one GPU and one model copy.
+- Prefix caching was enabled with 16 token blocks.
+- `max_num_seqs` was 4,096.
+- `max_num_batched_tokens` was 25,305.
+- The model context limit remained 40,960 tokens. The value 4,096 controls
+  the number of admitted requests, not the prompt length.
+- Each join submitted its complete cross product in one `llm.generate()`
+  call. BIO-2 submitted 122,800 requests, FEV-2 submitted 5,700 requests,
+  and IMDB-2 submitted 60,000 requests.
+
+The two saved Quail files have `H100` in an old pricing label. The actual
+Modal worker decorator requested `H100!`. Commit `002ce3c` changes the saved
+label to `H100!` and makes the baseline reject any other GPU request.
+
+## Predictions
+
+The predictions were recorded before the final runs:
+
+- Naive 4B predicted 180 to 205 seconds for BIO-2, 2 to 3 seconds for
+  FEV-2, and 22 to 25 seconds for IMDB-2. All three measurements were
+  inside those ranges.
+- Naive 32B predicted 260 to 300 seconds for BIO-2, 10 to 13 seconds for
+  FEV-2, and 180 to 220 seconds for IMDB-2. BIO-2 took 302.96 seconds,
+  which was 2.96 seconds above the range. The other two were inside.
+- Stock 4B was expected to be close to naive 4B. The prediction was wrong.
+  Stock 4B took 74.21 seconds longer on BIO-2 and 6.96 seconds longer on
+  IMDB-2.
+- Stock 32B predicted 240 to 300 seconds for BIO-2, 10 to 13 seconds for
+  FEV-2, and 160 to 210 seconds for IMDB-2. BIO-2 and FEV-2 were inside
+  those ranges. IMDB-2 took 155.58 seconds, which was 4.42 seconds below
+  the range.
+- The filter prediction was 9 to 12 seconds at 4B and 65 to 75 seconds at
+  32B. Naive 4B took 10.04 seconds, stock 4B took 10.27 seconds, and naive
+  32B took 71.31 seconds. Stock 32B took 61.19 seconds, which was below the
+  predicted range.
+
+## What the measurements mean
+
+The earlier comparison used different join prompt orders. It also made
+Quail process the static question once per pair. The corrected comparison
+uses the same token IDs for every system, and Quail is faster on every join
+tested here.
+
+The 4B stock checkpoint was slower than the base checkpoint converted to
+fp8 at load time. The prompt, batch order, and vLLM settings were the same,
+so prompt formatting does not explain that difference. This experiment did
+not isolate the checkpoint difference further.
+
+The performance reruns did not measure accuracy. The join prompt changed,
+so accuracy from the old prompt is not valid for this report. New ground
+truth and new accuracy runs are required before reporting accuracy.
+
+## Source data
+
+The raw result files are on the `quail-results` Modal volume:
+
+- Quail 4B, function call `fc-01M0YBGJBC4KSB3JZF5089YRDQ`:
+  `/results/benchmarks/quailb/runs/qb_20260826T061917Z_2a6a3ed0/20260826T061917Z-quailb-sf0.1-lf1-qwen3-4b-fp8.json`
+- Quail 32B, function call `fc-01M0YBRJZT1JB4X8FX4W6X0SR1`:
+  `/results/benchmarks/quailb/runs/qb_20260826T062254Z_9843d222/20260826T062254Z-quailb-sf0.1-lf1-qwen3-32b-fp8.json`
+- Naive vLLM 4B, function call `fc-01M0YESS2J9D5Z9VMY43PDNPPV`:
+  `/results/vllm_opbench/2026-08-26_071748/summary.json`
+- Naive vLLM 32B, function call `fc-01M0YESR04Y51JJWTRCZTN822S`:
+  `/results/vllm_opbench/2026-08-26_071907/summary.json`
+- Stock vLLM 4B, function call `fc-01M0YESR36G9ZSSQQZ2973HCTB`:
+  `/results/vllm_opbench/2026-08-26_071911/summary.json`
+- Stock vLLM 32B, function call `fc-01M0YESXBW6PEWVK0MZM5KSJGW`:
+  `/results/vllm_opbench/2026-08-26_071944/summary.json`
+
+The plot script takes a work directory as its first argument and contains
+the six `modal volume get` commands needed to rebuild the figure. No raw
+experiment data is committed.

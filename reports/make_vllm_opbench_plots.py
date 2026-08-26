@@ -1,136 +1,140 @@
-"""vllm-opbench baseline plots.
+"""Make the join performance plot for the vLLM baseline report.
 
-Reads the numbers embedded below (sourced from the tee'd Modal run
-logs and quail's own committed benchmark logs - see
-2026-08-25-vllm-opbench-baseline.md for exact source lines) and
-writes two PNGs to reports/plots/.
+Pull the six source files into one work directory, then pass that directory
+as the first argument to this script. For example, with ``W=/tmp/quail-pr52``:
 
-    uv run --with matplotlib python reports/make_vllm_opbench_plots.py
+    modal volume get quail-results /results/benchmarks/quailb/runs/qb_20260826T061917Z_2a6a3ed0/20260826T061917Z-quailb-sf0.1-lf1-qwen3-4b-fp8.json $W/quail-4b.json
+    modal volume get quail-results /results/benchmarks/quailb/runs/qb_20260826T062254Z_9843d222/20260826T062254Z-quailb-sf0.1-lf1-qwen3-32b-fp8.json $W/quail-32b.json
+    modal volume get quail-results /results/vllm_opbench/2026-08-26_071748/summary.json $W/naive-4b.json
+    modal volume get quail-results /results/vllm_opbench/2026-08-26_071907/summary.json $W/naive-32b.json
+    modal volume get quail-results /results/vllm_opbench/2026-08-26_071911/summary.json $W/stock-4b.json
+    modal volume get quail-results /results/vllm_opbench/2026-08-26_071944/summary.json $W/stock-32b.json
+    uv run --with matplotlib python reports/make_vllm_opbench_plots.py $W
 """
 
+import json
 import sys
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "plots"
-OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY, RED, DARK, ORANGE
+from plot_colors import BLUE, DARK, ORANGE, RED  # noqa: E402
 
-# ---------------------------------------------------------------- data
-# quail wall_s: (point_estimate, other_observed_or_None) - point
-# estimate is the "full run" log in both cases; the second value is
-# an independent rerun of the identical query, kept as a range
-# whisker where the two disagree (join queries only; filters agreed
-# closely and quail_range collapses to a point).
-QUERIES = ["filter-reports", "join-reports", "join-claims", "join-imdb"]
-LABELS = {"filter-reports": "filter-reports\n(F7, 200 reports)",
-          "join-reports": "join-reports\n(REACTION, 122.8k pairs)",
-          "join-claims": "join-claims\n(SUPPORT, 5.7k pairs)",
-          "join-imdb": "join-imdb\n(DISCUSS_ASPECT, 60k pairs)"}
-
-quail = {
-    "filter-reports": {"4b": (9.03, 10.14), "32b": (55.72, 53.8)},
-    # join-reports/join-imdb: fresh rerun on current code (2026-08-25),
-    # checked against ground truth - see the report's Stability
-    # section. Replaces two disagreeing Aug-20 reference numbers. 32B
-    # warm passes never ran (Modal client heartbeat bug right after
-    # both cold passes finished) - 32B values here are cold-only.
-    "join-reports": {"4b": (138.6, 140.7), "32b": (812.2, None)},
-    "join-claims": {"4b": (4.86, None), "32b": (13.46, None)},
-    "join-imdb": {"4b": (52.4, 55.0), "32b": (358.1, None)},
+QUERY_IDS = ["BIO-2", "FEV-2", "IMDB-2"]
+OPERATORS = {
+    "BIO-2": "REACTION",
+    "FEV-2": "SUPPORT",
+    "IMDB-2": "DISCUSS_ASPECT",
+}
+QUERY_LABELS = {
+    "BIO-2": "BIO-2\n122,800 pairs",
+    "FEV-2": "FEV-2\n5,700 pairs",
+    "IMDB-2": "IMDB-2\n60,000 pairs",
 }
 
-# vllm-opbench generate-only wall (GPU serving time, no CPU build,
-# no Modal RPC overhead) - the number comparable to quail's own
-# wall_s in spirit, since quail's wall_s is also GPU-serving time.
-vllm_opbench = {
-    "filter-reports": {"4b": 10.75, "32b": 74.05},
-    "join-reports": {"4b": 217.69, "32b": 468.11},   # clean, post-OOM-fix reruns
-    "join-claims": {"4b": 22.87, "32b": 175.61},
-    "join-imdb": {"4b": 33.43, "32b": 250.68},
-}
 
-fig, axes = plt.subplots(1, 4, figsize=(13, 3.6))
-model_x = np.arange(2)
-width = 0.32
+def load_json(path: Path) -> dict:
+    with path.open() as source:
+        return json.load(source)
 
-for ax, q in zip(axes, QUERIES):
-    q_vals = [quail[q]["4b"][0], quail[q]["32b"][0]]
-    q_range = [quail[q]["4b"][1], quail[q]["32b"][1]]
-    v_vals = [vllm_opbench[q]["4b"], vllm_opbench[q]["32b"]]
 
-    b1 = ax.bar(model_x - width / 2, q_vals, width, color=BLUE,
-               label="quail")
-    b2 = ax.bar(model_x + width / 2, v_vals, width, color=RED,
-               label="vllm-opbench")
+def load_quail(path: Path, expected_model: str) -> dict[str, float]:
+    data = load_json(path)
+    if data["model"] != expected_model or data["sf"] != 0.1:
+        raise ValueError(f"unexpected Quail result metadata in {path}")
+    cold = {row["query"]: row for row in data["passes"]["cold"]["queries"]}
+    return {query_id: cold[query_id]["wall_s"] for query_id in QUERY_IDS}
 
-    for i, (v, r) in enumerate(zip(q_vals, q_range)):
-        if r is not None and abs(r - v) > 0.01:
-            lo, hi = sorted([v, r])
-            ax.plot([model_x[i] - width / 2] * 2, [lo, hi],
-                   color=DARK, linewidth=1.2)
-            ax.plot([model_x[i] - width / 2 - 0.06,
-                     model_x[i] - width / 2 + 0.06], [hi, hi],
-                   color=DARK, linewidth=1.2)
 
-    for bars in (b1, b2):
-        for bar in bars:
-            h = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width() / 2, h * 1.02,
-                   f"{h:.0f}", ha="center", va="bottom", fontsize=8,
-                   color=DARK)
+def load_baseline(path: Path, expected_model: str) -> dict[str, float]:
+    data = load_json(path)
+    if data["model"] != expected_model or data["sf"] != 0.1:
+        raise ValueError(f"unexpected vLLM result metadata in {path}")
+    if data["gpu"] != "H100!":
+        raise ValueError(f"expected gpu='H100!' in {path}, got {data['gpu']!r}")
+    by_operator = {row["operator"]: row for row in data["queries"]}
+    return {
+        query_id: by_operator[OPERATORS[query_id]]["generate_wall_time_s"]
+        for query_id in QUERY_IDS
+    }
 
-    ax.set_xticks(model_x)
-    ax.set_xticklabels(["4B", "32B"])
-    ax.set_title(LABELS[q], fontsize=9.5)
-    ax.set_ylabel("wall time (s)" if q == QUERIES[0] else "")
 
-axes[0].legend(loc="upper left", fontsize=8.5)
-fig.suptitle(
-    "quail vs vllm-opbench, generate-only wall time (sf=0.1, H100)\n"
-    "join-reports/join-imdb 4B whiskers: cold vs. warm pass of a fresh "
-    "rerun, now stable. Both queries at 32B: fresh cold-only rerun "
-    "(warm pass never ran - Modal client heartbeat bug), checked "
-    "against ground truth instead - see report.",
-    fontsize=9, y=1.08)
-fig.savefig(OUT / "vllm_opbench_vs_quail.png")
-plt.close(fig)
+def main(workdir: Path) -> None:
+    results = {
+        "4B": {
+            "Quail": load_quail(workdir / "quail-4b.json", "qwen3-4b-fp8"),
+            "Naive vLLM": load_baseline(
+                workdir / "naive-4b.json", "qwen3-4b"),
+            "Stock vLLM": load_baseline(
+                workdir / "stock-4b.json", "qwen3-4b-stock"),
+        },
+        "32B": {
+            "Quail": load_quail(
+                workdir / "quail-32b.json", "qwen3-32b-fp8"),
+            "Naive vLLM": load_baseline(
+                workdir / "naive-32b.json", "qwen3-32b"),
+            "Stock vLLM": load_baseline(
+                workdir / "stock-32b.json", "qwen3-32b-stock"),
+        },
+    }
 
-# ------------------------------------------- join-imdb, 3-way, both models
-fig2, ax2 = plt.subplots(figsize=(6, 3.8))
-systems = ["quail", "stock vLLM\n(quail's checkpoint,\nsync client)",
-          "vllm-opbench\n(base checkpoint,\nload-time fp8)"]
-colors = [BLUE, ORANGE, RED]
-data_4b = [quail["join-imdb"]["4b"][0], 34.59, vllm_opbench["join-imdb"]["4b"]]
-data_32b = [quail["join-imdb"]["32b"][0], 206.74,
-           vllm_opbench["join-imdb"]["32b"]]
+    systems = ["Quail", "Naive vLLM", "Stock vLLM"]
+    colors = [BLUE, RED, ORANGE]
+    x = np.arange(len(QUERY_IDS))
+    width = 0.24
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), sharey=True)
 
-x = np.arange(3)
-w = 0.32
-b1 = ax2.bar(x - w / 2, data_4b, w, color=colors, alpha=1.0)
-b2 = ax2.bar(x + w / 2, data_32b, w, color=colors, alpha=0.55,
-            hatch="//")
-for bars in (b1, b2):
-    for bar in bars:
-        h = bar.get_height()
-        ax2.text(bar.get_x() + bar.get_width() / 2, h + 6, f"{h:.0f}",
-                ha="center", va="bottom", fontsize=8.5, color=DARK)
-ax2.set_xticks(x)
-ax2.set_xticklabels(systems, fontsize=8.5)
-ax2.set_ylabel("wall time (s)")
-ax2.set_title(
-    "join-imdb (DISCUSS_ASPECT, 5000x12=60k pairs)\nsolid = 4B, "
-    "hatched = 32B", fontsize=10)
-fig2.savefig(OUT / "vllm_opbench_join_imdb_3way.png")
-plt.close(fig2)
+    for ax, (model, model_results) in zip(axes, results.items()):
+        quail_values = model_results["Quail"]
+        for index, (system, color) in enumerate(zip(systems, colors)):
+            values = [model_results[system][query_id]
+                      for query_id in QUERY_IDS]
+            bars = ax.bar(x + (index - 1) * width, values, width,
+                          color=color, label=system)
+            for bar, query_id, value in zip(bars, QUERY_IDS, values):
+                label = f"{value:.1f}s"
+                if system != "Quail":
+                    ratio = value / quail_values[query_id]
+                    label += f"\n{ratio:.1f}× Quail"
+                ax.annotate(
+                    label,
+                    (bar.get_x() + bar.get_width() / 2, value),
+                    xytext=((-6 if system == "Naive vLLM" else
+                             6 if system == "Stock vLLM" else 0), 4),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7.5,
+                    color=DARK,
+                )
 
-print(f"wrote {OUT / 'vllm_opbench_vs_quail.png'}")
-print(f"wrote {OUT / 'vllm_opbench_join_imdb_3way.png'}")
+        ax.set_yscale("log")
+        ax.set_ylim(0.8, 650)
+        ax.set_xticks(x)
+        ax.set_xticklabels([QUERY_LABELS[query_id]
+                            for query_id in QUERY_IDS])
+        ax.set_title(model)
+        ax.set_ylabel("Generate time (seconds, log scale)")
+
+    axes[1].set_ylabel("")
+    axes[0].legend(loc="upper right", ncols=1)
+    OUT.mkdir(exist_ok=True)
+    output = OUT / "vllm_opbench_vs_quail.png"
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
+    print(f"wrote {output}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: make_vllm_opbench_plots.py WORKDIR")
+    main(Path(sys.argv[1]))

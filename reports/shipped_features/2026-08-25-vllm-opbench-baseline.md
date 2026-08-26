@@ -1,43 +1,35 @@
-# vllm-opbench: a second stock-vLLM baseline
+# Shared join prompts and vLLM baselines
 
 ## What changed
 
-Added `baselines/vllm_opbench/`, a second stock-vLLM baseline
-alongside the existing `baselines/stock.py`. It runs quail's own
-document sets and predicates through plain vLLM: offline batched
-`llm.generate()` (not one request at a time), the base checkpoint
-quantized to fp8 at vLLM load time (not quail's own pre-quantized
-checkpoint), and Prometheus metrics plus a KV-cache "oracle regret"
-calculation on every run.
+Quail, stock vLLM, and naive vLLM now build the exact same join prompt token
+IDs. The prompt puts the anchor document and complete question in the shared
+prefix. Each pair adds the partner document and answer cue.
+
+The planner now counts the complete question once per anchor. It counts the
+partner label, partner document, and answer cue once per pair. Tests compare
+the exact prompts for either anchor choice and for a join with three inputs.
+
+Both vLLM baselines submit the complete join in one batch. They use
+`max_num_seqs=4096`, `max_num_batched_tokens=25305`, prefix caching, and the
+exact Modal request `gpu="H100!"`.
 
 ## Why
 
-A second reference point for "how fast is generic vLLM," varying a
-different thing than `stock.py` does: `stock.py` keeps quail's own
-checkpoint and varies only the serving code; vllm-opbench also varies
-the checkpoint, the way most vLLM users would actually run it.
+The old prompt repeated the complete question once for every document pair.
+The three systems also did not use the same prompt order, so the old timing
+comparison was not controlled.
 
-## Fixes made during review
+## Measured change
 
-A line-by-line review, then an adversarial pass, found and fixed 6
-bugs. The two that mattered: results now save after every query
-instead of only at the end (a crash used to silently drop
-already-computed results), and every saved answer now records which
-document, or document pair, it came from.
+At sf=0.1, Quail processed 2,635,599 fresh tokens for BIO-2, which was 76
+percent fewer than the old prompt. Quail processed 2,419,233 fresh tokens for
+IMDB-2, which was 59 percent fewer.
 
-## Before/after (full report: `2026-08-25-vllm-opbench-baseline.md`)
+Quail was faster than both vLLM baselines on all six join comparisons. At 4B,
+BIO-2 took 31.12 seconds in Quail, compared with 187.17 seconds in naive vLLM
+and 261.38 seconds in stock vLLM. At 32B, BIO-2 took 181.05 seconds in Quail,
+compared with 302.96 seconds in naive vLLM and 265.80 seconds in stock vLLM.
 
-All 4 queries now run successfully at both 4B and 32B, fp8, sf=0.1.
-This baseline's own correctness (right documents, right predicates,
-right answers) is verified.
-
-A rerun against QUAIL-B ground truth explains an earlier instability
-in quail's own join-query reference numbers: 4B answers ~99-100% TRUE
-on both join predicates regardless of serving path (near-zero
-precision, not a real judgment) - but is fine on filters, scoring
-100% precision / 90.2% recall on filter-reports (F7), so the
-instability is specific to these two join predicates, not to 4B in
-general. 32B has not been rechecked against the current ground truth
-yet; its 98.5% accuracy figure predates a template fix that moved the
-label rate it's scored against, and is expected to look worse once
-rechecked.
+The full setup and all six Modal volume paths are in
+`reports/2026-08-25-vllm-opbench-baseline.md`.
