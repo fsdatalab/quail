@@ -828,7 +828,10 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                                rows=len(res.rows),
                                peak_gib=res.report.get("peak_gib"),
                                stages=res.report["stages"],
-                               store=res.report.get("store"))
+                               store=res.report.get("store"),
+                               sol_s=res.report.get("sol_s"),
+                               sol_efficiency=res.report.get(
+                                   "sol_efficiency"))
                     if evaluator is not None:
                         evaluation = evaluator.evaluate(query, res)
                         add_query_metrics(

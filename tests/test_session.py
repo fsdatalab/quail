@@ -132,6 +132,54 @@ def test_join_query_pairs(sess):
     jstage = [s for s in res.report["stages"] if s["op"] == "join"][0]
     assert jstage["tuples"] == 12
     assert jstage["provided_selectivity"] == 0.25
+    assert res.report["sol_s"] > 0
+    assert res.report["sol_efficiency"] <= 1.0
+
+
+def test_sol_workload_no_double_charge_on_filter_then_join(sess):
+    """A document that's both filtered (stage 0 builds its causal KV)
+    and then a join anchor must have that causal build charged once,
+    not once per operator that touches it."""
+    from quail.planner.decide import _collect
+
+    join = {("r", "p"): lambda a, p: 1 if (a + p) % 4 == 0 else 0}
+    join_only_sql = """
+        SELECT r.id, p.asin FROM reviews r
+        JOIN products p
+          ON AI_FILTER(PROMPT('match {0} {1}', r.review,
+                              p.description), {'selectivity': 0.25})
+    """
+    filter_then_join_sql = join_only_sql + """
+        WHERE AI_FILTER(PROMPT('q1: {0}', r.review),
+                        {'selectivity': 0.5})
+    """
+    truth_all_pass = {"r": {"q1:": [1, 1, 1, 1, 1, 1]}}
+
+    def workload(sql, filter_truth):
+        query = sess.sql(sql)
+        plan = query.plan()
+        scans, filters, joins = _collect(query.logical)
+        payload = query._payload(plan, scans, filters, joins)
+        out = make_executor(filter_truth, join)(payload)
+        return query._sol_workload(plan, filters, joins, out)
+
+    tokens_a, pairs_a, ctx_a = workload(join_only_sql, {})
+    tokens_b, pairs_b, ctx_b = workload(filter_then_join_sql,
+                                        truth_all_pass)
+
+    # every r document is an anchor in both queries (the filter passes
+    # all 6), so the join side of the workload is identical - the only
+    # difference should be the filter's own new question tokens (6
+    # docs' "q1:" tail, each becoming its own causal build's suffix -
+    # a few tens of tokens total), not a second copy of r's causal
+    # prefix build (6 docs x ~22-word review, an order of magnitude
+    # bigger, which a double-charge bug would add on top of the
+    # first). context_reads is untouched - it only comes from the
+    # join partners' streaming reads, unchanged between the two
+    # queries.
+    assert ctx_a == ctx_b
+    assert 0 < tokens_b - tokens_a < 100
+    assert 0 < pairs_b - pairs_a < 5000
 
 
 def test_anti_join_keeps_unmatched(sess):

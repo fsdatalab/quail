@@ -60,4 +60,10 @@ class DeviceSpec:
     name: str
     mem_bytes: float     # M: physical memory
     hbm_bw: float        # BW: memory bandwidth, bytes/s
-    peak_flops: float    # R_D at the executor's compute dtype
+    peak_flops: float    # R_D at the executor's compute dtype (fp8)
+    bf16_peak_flops: float  # attention's own ceiling: even when the
+    #                         GEMMs run fp8, FlashAttention runs bf16,
+    #                         so it gets half the fp8 rate on Hopper.
+    #                         A flat spec field, not peak_flops / 2,
+    #                         so a future device that doesn't halve
+    #                         this way isn't silently wrong.

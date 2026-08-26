@@ -15,6 +15,7 @@ from quail.planner.calibration import channel_bandwidths
 from quail.planner.decide import _collect, explain, plan_query
 from quail.planner.plan import (EngineConfig, Refusal, StoreSpec,
                                 resolve_model)
+from quail.planner.sol import sol_seconds
 from quail.specs import DEVICES
 
 STORE_HEADROOM_GB = 16    # container memory the store must leave for
@@ -589,5 +590,115 @@ class Query:
         # can produce more rows than survivors, so truncate here
         if plan.limit is not None:
             proj_rows = proj_rows[:plan.limit]
+
+        tokens, pairs, context_reads = self._sol_workload(
+            plan, filters, joins, out)
+        report["sol_s"] = round(sol_seconds(
+            self.session.model, self.session.device, tokens=tokens,
+            pairs=pairs, context_reads=context_reads), 4)
+        report["sol_efficiency"] = (
+            round(report["sol_s"] / report["wall_s"], 4)
+            if report["wall_s"] else None)
+
         return Result(columns=cols, rows=proj_rows, report=report,
                       answer_rows=answer_rows)
+
+    def _sol_workload(self, plan, filters, joins, out):
+        """`(tokens, pairs, context_reads)` for sol_seconds() (see
+        quail/planner/sol.py): every forward pass this query actually
+        ran reduces to one of two shapes.
+
+        Causal: a document's first-ever pass through the model -
+        self-attention only, quadratic pairs, no shared context. A
+        filter chain's stage 0, or a join anchor not already resident
+        from an earlier operator in this same query (`built` tracks
+        residency per alias across both loops below, in plan order,
+        so a filter-then-join query doesn't charge an anchor's prefix
+        build twice).
+
+        Streaming: a few new tokens reading an already-resident cached
+        prefix - a filter's later stage, or a join partner tuple's
+        suffix reading its anchor's kept KV. Linear pairs
+        (chunk * context), and the context length is charged again as
+        `context_reads` (T_memory's extra KV-read traffic on top of
+        writing the new tokens' own KV).
+
+        Does not net out KV-store restores (a restored document still
+        gets charged its full causal build here) or charge a join
+        stage's anchor-frame write separately - both stated as known
+        simplifications, not bugs; see quail/planner/sol.py's
+        docstring."""
+        pre_len = len(self.session.tokenizer(SHARED_PRE))
+        built: dict = {}
+        causal_lengths: list = []
+        streaming: list = []
+
+        for node in plan.nodes:
+            if node["op"] != "FilterChain":
+                continue
+            alias = node["alias"]
+            rows = out["filters"][alias]
+            preds = filters[alias]
+            suffix_lens = [
+                len(_question_ids(self.session,
+                                  preds[st["written_pos"]].prompt))
+                for st in node["stages"]]
+            cum_before, running = [], 0
+            for L in suffix_lens:
+                cum_before.append(running)
+                running += L
+            resident = built.setdefault(alias, set())
+            for si in range(len(node["stages"])):
+                evaluated = [d for d, row in rows.items()
+                            if len(row) > si]
+                if si == 0:
+                    for d in evaluated:
+                        if d not in resident:
+                            causal_lengths.append(
+                                pre_len + self._doc_tokens[alias][d]
+                                + suffix_lens[0])
+                    resident.update(evaluated)
+                else:
+                    for d in evaluated:
+                        context = (pre_len
+                                  + self._doc_tokens[alias][d]
+                                  + cum_before[si])
+                        streaming.append((suffix_lens[si], context))
+
+        stage_plan = []
+        for node in plan.nodes:
+            if node["op"] == "JoinGroup":
+                stage_plan.extend(node["stages"])
+        for st, jout in zip(stage_plan, out["joins"]):
+            anchor = jout.get("anchor", st["anchor"])
+            partners = list(jout.get("partners", st["partners"]))
+            j = joins[st["written_pos"]]
+            spec = _join_spec(self.session, j.predicate, anchor,
+                              partners)
+            tail_len = len(spec["tail"])
+            label_lens = {p: len(spec["labels"][p]) for p in partners}
+            resident = built.setdefault(anchor, set())
+            anchor_map = jout["anchor_index"]
+            for gd in anchor_map:
+                if gd not in resident:
+                    causal_lengths.append(
+                        pre_len + self._doc_tokens[anchor][gd])
+            resident.update(anchor_map)
+            tuples = jout["partner_index"]
+            suffix_lens = [
+                sum(label_lens[p] for p in partners)
+                + sum(self._doc_tokens[p][g] for p, g in
+                      zip(partners, t))
+                + tail_len
+                for t in tuples]
+            for local_a, row in jout["rows"].items():
+                context = (pre_len
+                          + self._doc_tokens[anchor][anchor_map[local_a]])
+                for pi in range(len(row)):
+                    streaming.append((suffix_lens[pi], context))
+
+        tokens = sum(causal_lengths) + sum(c for c, _ in streaming)
+        pairs = (sum(L * (L + 1) // 2 for L in causal_lengths)
+                 + sum(c * s for c, s in streaming))
+        context_reads = sum(s for _, s in streaming)
+        return tokens, pairs, context_reads

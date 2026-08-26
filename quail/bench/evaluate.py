@@ -616,6 +616,17 @@ def add_query_metrics(row: dict, evaluation: dict,
             if key not in ("input_document_rows", "unique_input_documents")
         },
     })
+    sol_s = row.get("sol_s")
+    if sol_s is not None:
+        sol_cost = sol_s * gpu_rate / 3600
+        row.update({
+            "tokens_per_second_sol": round(_divide(tokens, sol_s), 2),
+            "documents_per_second_sol": round(
+                _divide(input_rows, sol_s), 4),
+            "sol_cost_usd": round(sol_cost, 8),
+            "sol_cost_per_million_tokens_usd": round(
+                _divide(sol_cost, tokens) * 1_000_000, 6),
+        })
     return row
 
 
@@ -661,4 +672,26 @@ def summarize_queries(rows: list[dict], h100_usd_per_hour: float,
         "cost_with_boot_per_million_tokens_usd": round(
             _divide(cost_with_boot, tokens) * 1_000_000, 6),
         "answer_accuracy": counts.as_dict(),
+        **_summarize_sol(good, tokens, input_rows, h100_usd_per_hour, gpus),
+    }
+
+
+def _summarize_sol(good: list[dict], tokens: int, input_rows: int,
+                   h100_usd_per_hour: float, gpus: int) -> dict:
+    """Suite-level SOL totals, mirroring the measured fields above.
+    Empty when no row carries `sol_s` (accuracy=False runs never call
+    add_query_metrics, so `sol_s` never lands in a row's derived
+    fields at all)."""
+    with_sol = [row for row in good if row.get("sol_s") is not None]
+    if not with_sol:
+        return {}
+    sol_s = sum(float(row["sol_s"]) for row in with_sol)
+    sol_cost = sol_s * h100_usd_per_hour * gpus / 3600
+    return {
+        "sol_s": round(sol_s, 4),
+        "tokens_per_second_sol": round(_divide(tokens, sol_s), 2),
+        "documents_per_second_sol": round(_divide(input_rows, sol_s), 4),
+        "sol_cost_usd": round(sol_cost, 8),
+        "sol_cost_per_million_tokens_usd": round(
+            _divide(sol_cost, tokens) * 1_000_000, 6),
     }
