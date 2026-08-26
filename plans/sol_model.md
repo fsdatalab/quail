@@ -196,17 +196,18 @@ and tighter, and both are lower bounds.
 The reported cost and throughput metrics are derived from SoL:
 
 ```
-cost per query = SoL / 3600 * H100! price in dollars per hour
+cost per query at SoL = SoL / 3600 * H100! price in dollars per hour
 
-filter only documents per second = input document rows / SoL
+filter only documents per second at SoL = input document rows / SoL
 
-join document pairs per second = sum of evaluated pairs across all
-                                 join stages / SoL
+join document pairs per second at SoL = sum of evaluated pairs across all
+                                        join stages / SoL
 ```
 
 The cost uses the benchmark's H100! price of $3.9492 per hour. The
-throughput denominator is the complete query time, including any filter
-stages before a join.
+throughput denominator is the complete SoL time, including any filter stages
+before a join. The calculated values are metrics at SoL. They are not measured
+Quail metrics.
 
 ## 5. The code
 
