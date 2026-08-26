@@ -182,6 +182,75 @@ def test_sol_workload_no_double_charge_on_filter_then_join(sess):
     assert 0 < pairs_b - pairs_a < 5000
 
 
+def test_sol_computation_imdb1_and_imdb2(sess, tmp_path):
+    """SOL computed against the real catalog shapes, using the actual
+    F1 and DISCUSS_ASPECT predicates from quail.bench.quailb (not a
+    synthetic template): IMDB-1 (a single filter, no join - matches
+    the "Exercise 1" shape in the research notes this feature is
+    ported from) and IMDB-2 (a pure join, no filter)."""
+    from quail.bench.quailb import DISCUSS_ASPECT, F1
+    from quail.planner import sol
+    from quail.planner.decide import _collect
+
+    sess.register("aspects", quail.DocumentProvider.from_parquet(
+        _parquet(tmp_path / "a.parquet", {
+            "id": [f"a{i}" for i in range(3)],
+            "aspect": ["acting", "plot pacing", "cinematography style"],
+        }), id_col="id"))
+
+    def build_imdb1():
+        return sess.docs("reviews").alias("r").ai_filter(
+            quail.prompt(F1, quail.col("r.review"))).select("r.id")
+
+    def build_imdb2():
+        return sess.docs("reviews").alias("r").ai_join(
+            sess.docs("aspects").alias("a"),
+            quail.prompt(DISCUSS_ASPECT, quail.col("r.review"),
+                        quail.col("a.aspect"))).select("r.id", "a.id")
+
+    # F1's real question tail tokenizes (under the fake whitespace
+    # tokenizer) to a list starting "Evaluate TRUE or FALSE for the
+    # following question: Judge strictly ..." - "Evaluate" is the key
+    # make_executor's fake judge matches on.
+    truth1 = {"r": {"Evaluate": [1, 1, 0, 1, 0, 1]}}
+    join2 = {("r", "a"): lambda ri, ai: 1 if (ri + ai) % 2 == 0 else 0}
+
+    def workload(query, filter_truth, join_truth=None):
+        plan = query.plan()
+        scans, filters, joins = _collect(query.logical)
+        payload = query._payload(plan, scans, filters, joins)
+        out = make_executor(filter_truth, join_truth)(payload)
+        return query._sol_workload(plan, filters, joins, out)
+
+    res1 = build_imdb1().run(_execute=make_executor(truth1))
+    assert res1.report["sol_s"] > 0
+    assert res1.report["sol_efficiency"] <= 1.0
+    tokens1, pairs1, ctx1 = workload(build_imdb1(), truth1)
+    # single filter, no join: every forward is a document's own causal
+    # build, nothing streams against an already-cached prefix -
+    # matches the research notes' Exercise 1 (context_reads == 0).
+    assert ctx1 == 0
+    # report["sol_s"] is rounded to 4 decimals; compare at that
+    # precision rather than the raw float.
+    assert res1.report["sol_s"] == pytest.approx(
+        sol.sol_seconds(sess.model, sess.device, tokens=tokens1,
+                        pairs=pairs1, context_reads=ctx1), abs=1e-4)
+
+    res2 = build_imdb2().run(_execute=make_executor({}, join2))
+    assert res2.report["sol_s"] > 0
+    assert res2.report["sol_efficiency"] <= 1.0
+    tokens2, pairs2, ctx2 = workload(build_imdb2(), {}, join2)
+    # a pure join: partners stream against the anchor's cached prefix,
+    # so this workload does have shared-context reads, unlike IMDB-1.
+    assert ctx2 > 0
+    assert res2.report["sol_s"] == pytest.approx(
+        sol.sol_seconds(sess.model, sess.device, tokens=tokens2,
+                        pairs=pairs2, context_reads=ctx2), abs=1e-4)
+
+    # more documents to build causally should never lower the floor
+    assert tokens2 > 0 and pairs2 > 0
+
+
 def test_anti_join_keeps_unmatched(sess):
     sql = """
         SELECT r.id FROM reviews r
