@@ -99,9 +99,9 @@ def merge_filter_round(outs: list, limit: int | None = None) -> dict:
 
 def stage_for_anchor(spec: dict, anchor: str) -> dict:
     """A child-facing copy of one join stage spec with its anchor
-    decided: partners in placeholder order, the anchor's naming line
-    as the frame, block labels for the partners only. The payload
-    spec carries labels and naming lines for every table, so a
+    decided: partners in placeholder order, the anchor's complete
+    frame, and block labels for the partners only. The payload spec
+    carries labels and frames for every table, so a
     barrier-time anchor re-pick needs no re-tokenization. A spec
     without the per-table maps (a hand-built payload) is already
     materialized and passes through unchanged."""

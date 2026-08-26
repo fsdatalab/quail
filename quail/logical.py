@@ -34,18 +34,12 @@ class CompileError(ValueError):
 # lives in the suffix, after the document.
 SHARED_PRE = "DOCUMENT:\n"
 
-# The join prompt's fixed strings. A join renders each tuple as
-# labeled document blocks followed by the user's template as the
-# question, appended VERBATIM - the placeholders stay in it as
-# written ({0}, {1}, ...) and nothing is ever substituted into it.
-# Each partner block is labeled with the same marker ("DOCUMENT
-# {1}:"), so a marker in the question resolves to its block. The
-# anchor's block keeps the bare SHARED_PRE label (so its KV is
-# byte-identical to a filter scan of the same document and the store
-# serves both); the naming line written right after it - into kept
-# KV, once per anchor, never per tuple - maps the top block to its
-# marker. Like SHARED_PRE the block labels are formatting labels,
-# not instructions.
+# The join prompt's fixed strings. A join renders the anchor under
+# SHARED_PRE, then writes the anchor marker and the whole static
+# question into kept KV once. Partner blocks and the answer cue are
+# the only per-tuple text. Placeholders stay in the question and name
+# the labeled document blocks; document text is never substituted
+# into the question.
 #
 # Every question (filter and join) gets a fixed instruction and
 # answer cue from the engine; the user's template is always a
@@ -53,8 +47,8 @@ SHARED_PRE = "DOCUMENT:\n"
 #   "Evaluate TRUE or FALSE for the following question: <template>"
 #   "\nANSWER:"
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
-JOIN_ANCHOR_NOTE = "\n\n(The document above is {}.)"
-JOIN_QUESTION_SEP = "\n\n"                 # blocks -> question
+JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"
+JOIN_QUESTION_SEP = "\n\n"                 # anchor note -> question
 TASK_INSTRUCTION = "Evaluate TRUE or FALSE for the following question: "
 ANSWER_CUE = "\nANSWER:"
 
@@ -72,12 +66,69 @@ def join_anchor_note(placeholder: int) -> str:
 
 
 def render_join_question(template: str) -> str:
-    """The per-tuple question text: a fixed TRUE/FALSE instruction
-    followed by the user's template exactly as written - braces kept,
-    nothing filled in - behind the separator that ends the block
-    list, with the answer cue at the end."""
-    return (JOIN_QUESTION_SEP + TASK_INSTRUCTION + template
-            + ANSWER_CUE)
+    """The static join question written once into each anchor's KV."""
+    return JOIN_QUESTION_SEP + TASK_INSTRUCTION + template
+
+
+def render_join_frame(template: str, placeholder: int) -> str:
+    """The complete anchor frame, tokenized as one string."""
+    return join_anchor_note(placeholder) + render_join_question(template)
+
+
+def join_anchor_prefix_ids(prompt, placeholder: int, document_ids,
+                           tokenizer) -> list:
+    """The canonical token prefix shared by every tuple of an anchor."""
+    if placeholder < 0 or placeholder >= len(prompt.args):
+        raise ValueError(f"join anchor placeholder {placeholder} is out of range")
+    return (list(tokenizer(prompt.preamble)) + list(document_ids)
+            + list(tokenizer(render_join_frame(prompt.template,
+                                               placeholder))))
+
+
+def join_tuple_suffix_ids(prompt, partners, tokenizer) -> list:
+    """The canonical per-tuple partner blocks and answer cue.
+
+    partners is an iterable of (placeholder, document_token_ids) in
+    placeholder order, excluding the anchor.
+    """
+    out = []
+    for placeholder, document_ids in partners:
+        if placeholder < 0 or placeholder >= len(prompt.args):
+            raise ValueError(
+                f"join partner placeholder {placeholder} is out of range")
+        out += tokenizer(join_label(placeholder))
+        out += list(document_ids)
+    out += tokenizer(prompt.tail)
+    return out
+
+
+def render_join_prompt_ids(prompt, documents, anchor: int,
+                           tokenizer) -> list:
+    """The complete canonical token ids for one join tuple."""
+    if len(documents) != len(prompt.args):
+        raise ValueError(
+            f"join has {len(prompt.args)} placeholders but received "
+            f"{len(documents)} documents")
+    prefix = join_anchor_prefix_ids(prompt, anchor, documents[anchor],
+                                    tokenizer)
+    partners = [(i, ids) for i, ids in enumerate(documents) if i != anchor]
+    return prefix + join_tuple_suffix_ids(prompt, partners, tokenizer)
+
+
+def render_join_prompt_text(prompt, documents, anchor: int) -> str:
+    """The complete canonical text for one join tuple."""
+    if len(documents) != len(prompt.args):
+        raise ValueError(
+            f"join has {len(prompt.args)} placeholders but received "
+            f"{len(documents)} documents")
+    if anchor < 0 or anchor >= len(prompt.args):
+        raise ValueError(f"join anchor placeholder {anchor} is out of range")
+    out = prompt.preamble + documents[anchor]
+    out += render_join_frame(prompt.template, anchor)
+    for i, document in enumerate(documents):
+        if i != anchor:
+            out += join_label(i) + document
+    return out + prompt.tail
 
 
 def render_filter_question(tail: str) -> str:
@@ -109,13 +160,12 @@ class Prompt:
     and `frame` is the user's pre-document text, relocated after the
     document and carried at the head of each stage's question.
 
-    Joins (bind_join_prompt): the template is never filled in - it is
-    the per-tuple question, appended verbatim after the labeled
-    document blocks; its {0}, {1}, ... markers stay in it and refer
-    to the blocks. `preamble` is still SHARED_PRE (the anchor block's
-    label), `tail` is the question, `labels` carries each
-    placeholder's block-label and naming-line token counts, and
-    `frame` is empty.
+    Joins (bind_join_prompt): the template is never filled in. Its
+    {0}, {1}, ... markers refer to labeled document blocks. `frame`
+    is the static question written once per anchor, `tail` is only
+    the answer cue paid per tuple, and `labels` carries each
+    placeholder's partner-label and complete anchor-frame token
+    counts.
 
     Token counts are filled at bind time when a tokenizer is
     available; None means the planner must be given counts."""
@@ -128,10 +178,11 @@ class Prompt:
     frame: str = ""
     frame_tokens: Optional[int] = None
     # join prompts only: per placeholder, in order,
-    # (alias, label_tokens, note_tokens) - the partner block label
-    # "\n\nDOCUMENT {i}:\n" and the anchor naming line for that
-    # placeholder, counted at bind time so the planner prices any
-    # anchor choice without a tokenizer. Empty for filter prompts.
+    # (alias, label_tokens, anchor_frame_tokens) - the partner block
+    # label and the complete anchor note plus static question for
+    # that placeholder. Each complete frame is counted as one string
+    # because token counts are not additive across string boundaries.
+    # Empty for filter prompts.
     labels: tuple = ()
 
 
@@ -337,23 +388,20 @@ def bind_join_prompt(template: str, args: tuple,
     """Build a join Prompt: one prompt over the whole tuple, one
     placeholder per table, evaluated on the cross product.
 
-    The template is never filled in: at run time each tuple renders
-    as labeled document blocks (the anchor's block first, under the
-    bare SHARED_PRE label plus its naming line; each partner under
-    "DOCUMENT {i}:", its own placeholder marker) followed by this
-    template as the question, verbatim - the {0}, {1}, ... markers
-    stay in it and refer to the blocks. So:
+    The template is never filled in. At run time the anchor renders
+    first, followed by its anchor note and the static question. Each
+    partner then renders under "DOCUMENT {i}:" and the answer cue
+    ends the tuple. The {0}, {1}, ... markers stay in the question
+    and refer to the blocks. So:
 
         preamble      SHARED_PRE - the anchor block's label, paid
                       once per anchor document (and byte-identical to
                       a filter scan's stored prefix, which is what
                       lets the store serve both)
-        tail          the question (separator + raw template), paid
-                      once per tuple
-        labels        (alias, label_tokens, note_tokens) per
-                      placeholder, in order: a partner block's label
-                      is paid once per tuple, the anchor's naming
-                      line once per anchor
+        frame         the static question, paid once per anchor
+        tail          the answer cue, paid once per tuple
+        labels        (alias, label_tokens, anchor_frame_tokens) per
+                      placeholder, in order
 
     Each placeholder must name a distinct table (one block per
     table)."""
@@ -373,12 +421,12 @@ def bind_join_prompt(template: str, args: tuple,
     labels = tuple((a, None, None) for a in aliases)
     if tokenizer is not None:
         pre_tok = len(tokenizer(SHARED_PRE))
-        tail_tok = len(tokenizer(question))
-        frame_tok = 0
+        tail_tok = len(tokenizer(ANSWER_CUE))
+        frame_tok = len(tokenizer(question))
         labels = tuple((a, len(tokenizer(join_label(i))),
-                        len(tokenizer(join_anchor_note(i))))
+                        len(tokenizer(render_join_frame(template, i))))
                        for i, a in enumerate(aliases))
     return Prompt(template=template, args=tuple(args),
-                  preamble=SHARED_PRE, tail=question,
+                  preamble=SHARED_PRE, tail=ANSWER_CUE,
                   preamble_tokens=pre_tok, tail_tokens=tail_tok,
-                  frame="", frame_tokens=frame_tok, labels=labels)
+                  frame=question, frame_tokens=frame_tok, labels=labels)

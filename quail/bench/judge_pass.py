@@ -31,7 +31,7 @@ import modal
 
 from quail.bench import quailb
 from quail.logical import (ColumnRef, SHARED_PRE, bind_join_prompt,
-                           bind_prompt, join_anchor_note, join_label)
+                           bind_prompt, render_join_prompt_text)
 
 
 SCHEMA_VERSION = 1
@@ -358,8 +358,7 @@ def render_join_prompt(spec: PredicateSpec, left: str, right: str) -> str:
     left_ref = ColumnRef("left", spec.left_table, spec.left_column)
     right_ref = ColumnRef("right", spec.right_table, spec.right_column)
     prompt = bind_join_prompt(spec.template, (left_ref, right_ref))
-    return (prompt.preamble + left + join_anchor_note(0)
-            + join_label(1) + right + prompt.tail)
+    return render_join_prompt_text(prompt, (left, right), anchor=0)
 
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"

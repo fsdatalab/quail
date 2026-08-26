@@ -175,8 +175,8 @@ class _Binder:
     def parse_ai_filter(self, node, allowed: set, scope=None,
                         join=None):
         """(prompt, options, provider aliases referenced). join: True
-        binds the join layout (labeled document blocks, the template
-        as the per-tuple question), False the filter layout, None
+        binds the join layout (a static question in the anchor frame
+        and labeled partner blocks), False the filter layout, None
         decides by how many providers the prompt references."""
         if not _is_call(node, "AI_FILTER"):
             raise CompileError(

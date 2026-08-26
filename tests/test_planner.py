@@ -378,12 +378,11 @@ def test_store_threshold_includes_preamble(catalog):
     assert plan.store_min_doc_tokens == 300 + pre
 
 
-def test_join_tokens_note_per_anchor_labels_per_tuple(catalog):
-    # the anchor's naming line is written into kept KV once per
-    # anchor document; a partner's block label and the rendered
-    # question ride in every tuple's suffix
-    from quail.logical import (SHARED_PRE, join_anchor_note,
-                               join_label, render_join_question)
+def test_join_tokens_frame_per_anchor_labels_per_tuple(catalog):
+    # the complete question frame is written into kept KV once per
+    # anchor document; a partner's block label and the answer cue
+    # ride in every tuple's suffix
+    from quail.logical import SHARED_PRE, join_label, render_join_frame
 
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "products", tok).alias("p"),
@@ -396,14 +395,16 @@ def test_join_tokens_note_per_anchor_labels_per_tuple(catalog):
                       doc_tokens=toks)
     stage = join_stages(plan)[0]
     pre = len(tok(SHARED_PRE))
-    # r is placeholder 0 (the anchor's naming line), p is placeholder
+    # r is placeholder 0 (the anchor frame), p is placeholder
     # 1 (its block label)
-    note = len(tok(join_anchor_note(0)))
     label = len(tok(join_label(1)))
     pred = logical.root.input.predicate
-    question = len(tok(render_join_question(pred.template)))
-    expect = 4 * (100 + pre + note) + 12 * (10 + label + question)
+    frame = len(tok(render_join_frame(pred.template, 0)))
+    tail = len(tok(pred.tail))
+    expect = 4 * (100 + pre + frame) + 12 * (10 + label + tail)
     assert stage["tuple_tokens"] == pytest.approx(expect)
+    assert stage["anchor_frame_tokens"] == frame
+    assert stage["pair_tail_tokens"] == tail
     assert stage["expected_tuples"] == 12
 
 

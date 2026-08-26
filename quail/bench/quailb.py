@@ -327,14 +327,10 @@ def register_sets(sess, data_dir):
 
 # ---------------------------------------------------------- predicates
 #
-# Same shape as the REACTION/SUPPORT templates this replaces: the
-# instruction text is written before {0}, and the engine relocates it
-# to just after the document (`split_frame` in `quail/logical.py`) so
-# it's paid once per anchor's kept KV, not once per pair. Frame sits
-# right before the candidate/question, which is where the 4B model is
-# sensitive to wording - neutral, "judge strictly" phrasing throughout,
-# the fix already validated on the original REACTION predicate (see
-# query-design.md).
+# Join templates name labeled documents instead of inserting document
+# text. The engine writes the complete question into each anchor's KV
+# once, then streams the labeled partner document and answer cue for
+# each tuple.
 #
 # None of these have been through the judge pass. Wording may need to
 # change once that pass runs and some predicate misses the 90%
@@ -354,11 +350,8 @@ F5 = ("Judge strictly from the review above whether it mentions any "
       "answer TRUE if the review mentions a specific actor or actress "
       "by name, FALSE otherwise.")
 
-DISCUSS_ASPECT = ("Candidate movie aspects follow, one at a time. For "
-                   "each, judge strictly from the review above whether "
-                   "it discusses that aspect of the movie.\n\n{0}\n\n"
-                   "ASPECT: {1}\nInstruction: answer TRUE if the review "
-                   "above discusses this aspect, FALSE otherwise.")
+DISCUSS_ASPECT = ("Does the review in DOCUMENT {0} discuss the movie "
+                  "aspect in DOCUMENT {1}?")
 
 # IMDB-9/IMDB-11 only: an engine stress test, not a meaningful
 # accuracy query - {0}/{1} here are short aspect phrases, not
@@ -366,24 +359,15 @@ DISCUSS_ASPECT = ("Candidate movie aspects follow, one at a time. For "
 # chain of 3 joins across 4 distinct table positions (no table spans
 # all 3 edges), so the free anchor search cannot collapse it to one
 # group.
-ASPECT_RELATED = ("Judge strictly whether the second movie aspect "
-                  "below is commonly discussed alongside the first "
-                  "in the same review.\n\nFIRST ASPECT: {0}\n\n"
-                  "SECOND ASPECT: {1}\nInstruction: answer TRUE if "
-                  "the two aspects are commonly discussed together, "
-                  "FALSE otherwise.")
+ASPECT_RELATED = ("Are the movie aspects in DOCUMENT {0} and DOCUMENT "
+                  "{1} commonly discussed together in the same review?")
 
 # IMDB-8 only: a second question over the same aspects table, joined
 # under a second alias (a2) - a 2-join star, both joins anchored on
 # reviews so the second stage runs over whatever DISCUSS_ASPECT
 # already kept.
-ASPECT_SENTIMENT = ("Candidate movie aspects follow, one at a time. "
-                    "For each, judge strictly from the review above "
-                    "whether it expresses positive sentiment "
-                    "specifically about that aspect.\n\n{0}\n\n"
-                    "ASPECT: {1}\nInstruction: answer TRUE if the "
-                    "review above expresses positive sentiment about "
-                    "this aspect, FALSE otherwise.")
+ASPECT_SENTIMENT = ("Does the review in DOCUMENT {0} express positive "
+                    "sentiment about the movie aspect in DOCUMENT {1}?")
 
 F7 = ("Judge strictly from the report above whether it describes a "
       "case involving a female patient.\n\n{0}\n\nInstruction: answer "
@@ -399,30 +383,18 @@ F9 = ("Judge strictly from the report above whether it describes a "
       "Instruction: answer TRUE if the report describes a serious or "
       "life-threatening adverse event, FALSE otherwise.")
 
-# Unchanged from the earlier design: after-document frame, neutral
-# wording. An earlier version with similar framing before the report
-# measured selectivity 0.76 (biased toward YES); this version measured
-# 0.287.
-REACTION = ("Candidate medical reaction terms follow, one at a time. "
-            "For each, judge strictly from the report above whether it "
-            "describes that reaction as something the patient "
-            "experienced.\n\n{0}\n\nCANDIDATE REACTION: {1}\n"
-            "Instruction: answer TRUE if the report above describes "
-            "this reaction, FALSE otherwise.")
+REACTION = ("Does the medical report in DOCUMENT {0} describe the "
+            "reaction in DOCUMENT {1} as something the patient "
+            "experienced?")
 
 # BIO-6 only: a second question, joined against severe_terms (a
 # 64-term subset of the terms table, not the full ~614) under a
 # second alias (m2) - the 2-join "star" shape (the old B11), both
 # joins anchored on reports so the second stage runs over whatever
 # REACTION already kept.
-REACTION_SEVERE = ("Candidate medical reaction terms follow, one at a "
-                   "time. For each, judge strictly from the report "
-                   "above whether it describes that reaction as a "
-                   "serious or life-threatening occurrence for the "
-                   "patient.\n\n{0}\n\nCANDIDATE REACTION: {1}\n"
-                   "Instruction: answer TRUE if the report above "
-                   "describes this reaction as serious or "
-                   "life-threatening, FALSE otherwise.")
+REACTION_SEVERE = ("Does the medical report in DOCUMENT {0} describe "
+                   "the reaction in DOCUMENT {1} as serious or life "
+                   "threatening for the patient?")
 
 F11 = ("Judge strictly from the claim above whether it asserts "
        "something about a person, rather than an organization, place, "
@@ -438,12 +410,8 @@ F14 = ("Judge strictly from the claim above whether it references a "
        "{0}\n\nInstruction: answer TRUE if the claim references a "
        "specific place, FALSE otherwise.")
 
-# Unchanged from the earlier design: same after-document fix as
-# REACTION, for the same reason.
-SUPPORT = ("Wikipedia passages follow, one at a time. For each, judge "
-           "strictly from the claim above whether it supports that "
-           "claim.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer TRUE if "
-           "the passage above supports this claim, FALSE otherwise.")
+SUPPORT = ("Does the Wikipedia passage in DOCUMENT {1} support the "
+           "claim in DOCUMENT {0}?")
 
 # FEV-7 only: a second question over the same evidence table, joined
 # under a second alias (e2) - IMDB-8/BIO-6's counterpart for FEVER, a
@@ -452,11 +420,8 @@ SUPPORT = ("Wikipedia passages follow, one at a time. For each, judge "
 # engine-stress predicate): FEVER's real labels are support/refute/
 # not-enough-info, so asking whether a second passage refutes the
 # claim is a real question, not a synthetic one.
-REFUTE = ("Wikipedia passages follow, one at a time. For each, judge "
-         "strictly from the claim above whether it is refuted by "
-         "that passage.\n\n{0}\n\nPASSAGE:\n{1}\nInstruction: answer "
-         "TRUE if the passage above refutes or contradicts this "
-         "claim, FALSE otherwise.")
+REFUTE = ("Does the Wikipedia passage in DOCUMENT {1} refute or "
+          "contradict the claim in DOCUMENT {0}?")
 
 # FEV-5 only: filters the evidence side of a join, not just the
 # anchor. Mirrors F11's "about a person" judgment so the join pairs
@@ -505,10 +470,8 @@ LEPS1 = ("Judge strictly from the passage above whether it states a "
 # The LEP-2..LEP-7 join predicate: real ground truth exists for this
 # one (passage_id, from the dataset itself, not a judge pass) - see
 # judge_pass.py's LEP probe.
-LEPJOIN = ("Judge strictly from the excerpt above whether the passage "
-           "below is the one being cited.\n\n{0}\n\nPASSAGE:\n{1}\n"
-           "Instruction: answer TRUE if the passage below is the one "
-           "being cited in the excerpt above, FALSE otherwise.")
+LEPJOIN = ("Is the passage in DOCUMENT {1} cited by the legal excerpt "
+           "in DOCUMENT {0}?")
 
 
 # ---------------------------------------------------------- queries
@@ -891,7 +854,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         raw_volume_path=f"/results/{raw_root}",
         aggregate_volume_path=f"/results/{aggregate_volume_path}",
         pricing=dict(
-            gpu="H100",
+            gpu="H100!",
             h100_usd_per_hour=h100_usd_per_hour,
             gpu_count=gpus,
             price_source=H100_PRICE_SOURCE,

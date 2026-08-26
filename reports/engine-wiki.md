@@ -159,12 +159,13 @@ runs as:
 [SHARED_PRE] [document] [frame] [question suffix]
 ```
 
-and a join renders each tuple as the anchor block, its naming line,
-then one labeled block per partner and the question:
+and a join writes the static question into the anchor's kept KV before
+the labeled partner blocks:
 
 ```
-[SHARED_PRE] [anchor document] [naming line: (The document above is {0}.)]
-[DOCUMENT {1}:] [partner document] ... [instruction + question with {0},{1},... markers kept]
+[SHARED_PRE] [anchor document]
+[(The document above is DOCUMENT {0}.)] [instruction + question]
+[DOCUMENT {1}:] [partner document] ... [ANSWER:]
 ```
 
 `SHARED_PRE` is `"DOCUMENT:\n"`, defined once in `logical.py`. It is
@@ -182,7 +183,7 @@ false." dropped observed selectivity from 0.398 to 0.074, and "You
 will read a document and answer a yes-or-no question about it."
 dropped it to 0.0014. `"DOCUMENT:\n"` left it at 0.397. Long
 documents (B4) were immune to all three. Task text therefore lives
-after the document, in the frame and the suffix.
+after the document. For a join, the task text is in the anchor frame.
 
 A filter's `PROMPT('template {0} ...', col)` is canonicalized at
 bind time (`split_frame` in `logical.py`). Any user text before the
@@ -193,23 +194,16 @@ is document-only: `[SHARED_PRE + document]`. The frame is not
 stored.
 
 A filter carries the frame at the head of each stage's question
-suffix. A join prompt is bound differently (`bind_join_prompt`):
-the template is never inlined - each tuple renders as labeled
-document blocks (the anchor first, under the bare `SHARED_PRE`
-label) followed by the template as the question, appended verbatim
-with its `{0}`, `{1}`, ... placeholder markers kept as written.
-Each partner block is labeled with its own marker
-(`DOCUMENT {1}:`, `DOCUMENT {2}:`, etc.), so a marker in the
-question resolves to its block. The anchor's naming line -
-"(The document above is {0}.)" - is written into its kept KV
-once per anchor (`write_suffix_tokens`, the same mechanism the
-old frame used), mapping the top block to its marker so the
-question can reference it without paying those tokens per tuple.
-Partner block labels and the question ride in every tuple's
-suffix.
+suffix. A join prompt is bound differently (`bind_join_prompt`). The
+template stays unchanged, and its `{0}`, `{1}`, ... markers refer to
+labeled document blocks. The engine writes the anchor note and the
+complete static question into kept KV once per anchor. Each partner
+block uses its own label, such as `DOCUMENT {1}:`. The per tuple tail
+contains the partner blocks and `ANSWER:`.
 
-The planner prices the preamble once per document, the naming line
-once per join anchor, and labels + question once per tuple. See
+The planner prices the preamble and complete frame once per join
+anchor. It prices partner labels, partner documents, and the answer
+cue once per tuple. See
 `logical.py` (`SHARED_PRE`, `split_frame`, `bind_prompt`,
 `bind_join_prompt`) and the suite writeup
 `2026-08-19-shared-preamble-join-store.md`.
@@ -309,14 +303,14 @@ its outer table, a forced anchor is honored with a remark when it
 prices worse) and walks each one's cost with live counts:
 
 - a stage opening a group pays the anchor's KV once per live anchor
-  document (preamble + document + naming line), plus a fixed
+  document (preamble + document + complete question frame), plus a fixed
   re-shard overhead when it follows a group on a different anchor
   (`RESHARD_OVERHEAD_TOKENS`, 0 until measured - the fresh-KV term
   is the real cost);
 - a stage continuing a same-anchor run of full stages pays only its
-  naming line (the frame rewrite into kept KV);
+  complete question frame;
 - every stage pays its pair stream: each partner document behind its
-  block label, plus the question, once per tuple;
+  block label, plus the answer cue, once per tuple;
 - after each stage the live counts thin by
   `n * (1 - (1-s)^partner_tuples)` (`_surviving_docs`).
 
@@ -351,12 +345,12 @@ sort predicates by cost (stable, so ties keep written order)
 ```
 for each table of the join:
     compute tuple_tokens(table as anchor) =
-        n_anchor_docs                                (prefix + naming
-        * (mean_anchor_tokens + pre + note_tokens)    line, once each)
+        n_anchor_docs                                (prefix + question
+        * (mean_anchor_tokens + pre + frame_tokens)   frame, once each)
       + product of every table's n_docs              (number of tuples)
         * (sum over partners of
              (label_tokens + mean_partner_tokens)
-           + question_tokens)                        (suffix, once each)
+           + answer_cue_tokens)                      (suffix, once each)
 pick the table with the fewest tuple_tokens as anchor
 ```
 
@@ -975,11 +969,11 @@ prefix tokens.
 # the join: anchor B, partners A and C, one prompt per tuple
 tuples = cross product of surviving A indices x surviving C indices
 suffixes = for each tuple:
-    label_A + doc_A + label_C + doc_C + question
+    label_A + doc_A + label_C + doc_C + answer_cue
 plan = pack_stream(anchors, suffixes, budget)
 for each chunk in plan:
-    # each anchor's first group writes the naming line into its
-    # kept KV (write_suffix_tokens), then its tuples stream
+    # each stage writes its complete question frame into the anchor's
+    # kept KV, then its tuples stream
     build, launch, collect answers
 
 # an exists/anti gate is the two-table case of the same stage,

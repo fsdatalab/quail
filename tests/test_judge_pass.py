@@ -72,7 +72,7 @@ def test_filter_and_join_prompts_use_the_engine_layout():
 
     join_prompt = render_join_prompt(PREDICATES[3], "review", "aspect")
     assert join_prompt.startswith("DOCUMENT:\nreview")
-    assert "(The document above is {0}.)" in join_prompt
+    assert "(The document above is DOCUMENT {0}.)" in join_prompt
     assert "DOCUMENT {1}:\naspect" in join_prompt
     assert join_prompt.endswith("\nANSWER:")
 
