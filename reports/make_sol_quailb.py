@@ -38,16 +38,22 @@ The corpora and the per-document ground-truth labels are raw data
 and live on the quail-results volume, so pull them first. The
 answers go back to the volume too:
 
-    W=<workdir>
+    W=<workdir>; C=c_df45ef585738f42e4a7a731306f1b9fc
+    G=/ground_truth/quailb/schema_v1
+    mkdir -p $W/data $W/allabels
     modal volume get quail-results /quailb_data/sf0.1 $W/data/
-    modal volume get quail-results \
-        /ground_truth/quailb/schema_v1/label_sets $W/allabels/
+    modal volume get quail-results $G/label_sets $W/allabels/
+    modal volume get quail-results $G/corpora/$C/active_collection.json \
+        $W/active_collection.json
+    GT=$(grep -o 'gt_[0-9a-f]*' $W/active_collection.json)
+    modal volume get quail-results $G/collections/$GT/manifest.json \
+        $W/collection_manifest.json
     uv run --with transformers --with pyarrow \
         python reports/make_sol_quailb.py $W
     modal volume put quail-results $W/sol_quailb_sf0.1.json \
         /sol/sol_quailb_sf0.1.json
 
-The report is reports/2026-08-25-sol-quailb.md.
+The report is reports/2026-08-26-sol-quailb.md.
 """
 import collections
 import glob
@@ -407,8 +413,17 @@ join_prompt = {c: {"question": length(render_join_question(t)),
                for c, t in JOIN_TEMPLATES.items()}
 
 # 3. labels -----------------------------------------------------------
+# A predicate keeps one label set per template it has been judged
+# under, so the volume holds several at once. The corpus's
+# active_collection.json names the current collection, and that
+# collection names one label set per predicate; anything else is a
+# superseded run and must not be read.
+ACTIVE = set(json.load(open(W / "collection_manifest.json"))
+             ["label_sets"].values())
 labels = {}
 for m in glob.glob(str(W / "allabels/label_sets/*/*/*/manifest.json")):
+    if Path(m).parent.name not in ACTIVE:
+        continue
     meta = json.load(open(m))["predicate"]
     if meta["kind"] != "filter":
         continue

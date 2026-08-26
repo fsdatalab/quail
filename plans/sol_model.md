@@ -204,7 +204,7 @@ this is analysis, not a plan input.
 
 ## 7. Every QUAIL-B query
 
-`reports/2026-08-25-sol-quailb.md` applies all of this to the 26
+`reports/2026-08-26-sol-quailb.md` applies all of this to the 26
 queries at sf=0.1 on Qwen3-4B-fp8 and Qwen3-32B-fp8, from measured
 document lengths, measured prompt lengths, and ground-truth
 selectivities. `reports/make_sol_quailb.py` is the one script that
