@@ -24,6 +24,8 @@ W = Path(sys.argv[1])
 D = json.loads((W / "sol_quailb_sf0.1.json").read_text())
 Q = D["queries"]
 ORDER = list(Q)
+ATTENTION_ORDER = [query_id for query_id in ORDER
+                   if len(Q[query_id]["join_stages"]) <= 1]
 
 
 def sol(q, model):
@@ -33,7 +35,7 @@ def sol(q, model):
 def plot_sol_per_query():
     """Both models on one log axis: the suite spans four orders of
     magnitude, so a linear axis would show only BIO-2."""
-    fig, ax = plt.subplots(figsize=(11, 4.6))
+    fig, ax = plt.subplots(figsize=(14, 4.8))
     x = range(len(ORDER))
     w = 0.4
     a = [sol(q, "qwen3-4b-fp8") for q in ORDER]
@@ -46,11 +48,11 @@ def plot_sol_per_query():
         ax.text(i + w / 2, vb * 1.12, f"{vb:.3g}", ha="center", fontsize=6,
                 color=ORANGE, rotation=90)
     ax.set_yscale("log")
-    ax.set_ylabel("speed of light, seconds on one H100 "
+    ax.set_ylabel("speed of light, seconds on one H100! request "
                   "(log scale, 4 orders of magnitude)")
     ax.set_xticks(list(x))
     ax.set_xticklabels(ORDER, rotation=90, fontsize=7)
-    ax.set_ylim(0.015, 3000)
+    ax.set_ylim(0.015, 600)
     ax.legend(frameon=False, loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(OUT / "sol_quailb_per_query.png", dpi=150)
@@ -78,30 +80,30 @@ def plot_attention_share():
     below the 4B one everywhere, because attention scales 3.56x with
     model size where the dense projections scale 8.59x.
 
-    Points are not labelled by query. Twenty-one of the 26 queries
-    share three context lengths and four of them land on one point,
-    so per-query labels need leader lines long enough to obscure the
-    data. The report's table gives the per-query numbers.
+    Multi join queries are omitted because they can use more than one
+    anchor context. Points are not labelled by query because many
+    queries share the same context length. The report's table gives
+    the per-query numbers.
     """
     def share(q, model):
         m = Q[q]["models"][model]
         return 100 * m["t_attention"] / m["t_compute"]
 
-    x = [Q[q]["held_mean_doc_tokens"] for q in ORDER]
+    x = [Q[q]["held_mean_doc_tokens"] for q in ATTENTION_ORDER]
     fig, ax = plt.subplots(figsize=(8.4, 4.6))
-    ax.vlines(x, [share(q, "qwen3-32b-fp8") for q in ORDER],
-              [share(q, "qwen3-4b-fp8") for q in ORDER],
+    ax.vlines(x, [share(q, "qwen3-32b-fp8") for q in ATTENTION_ORDER],
+              [share(q, "qwen3-4b-fp8") for q in ATTENTION_ORDER],
               color=DARK, lw=0.7, alpha=0.25)
     for model, colour, label in (("qwen3-4b-fp8", BLUE, "Qwen3-4B-fp8"),
                                  ("qwen3-32b-fp8", ORANGE,
                                   "Qwen3-32B-fp8")):
-        ax.scatter(x, [share(q, model) for q in ORDER], s=34,
+        ax.scatter(x, [share(q, model) for q in ATTENTION_ORDER], s=34,
                    color=colour, label=label, zorder=3)
 
     for ctx, (name, ty) in CONTEXTS.items():
-        top = max(share(q, "qwen3-4b-fp8") for q in ORDER
+        top = max(share(q, "qwen3-4b-fp8") for q in ATTENTION_ORDER
                   if abs(Q[q]["held_mean_doc_tokens"] - ctx) < 0.05)
-        n = sum(1 for q in ORDER
+        n = sum(1 for q in ATTENTION_ORDER
                 if abs(Q[q]["held_mean_doc_tokens"] - ctx) < 0.05)
         ax.vlines(ctx, top + 0.8, ty - 1.6, color=DARK, lw=0.6,
                   alpha=0.35)
