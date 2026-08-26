@@ -289,14 +289,6 @@ F5 = ("Judge strictly from the review above whether it mentions any "
 DISCUSS_ASPECT = ("Does the review in DOCUMENT {0} discuss the movie "
                   "aspect in DOCUMENT {1}?")
 
-# IMDB-9/IMDB-11 only: an engine stress test, not a meaningful
-# accuracy query - {0}/{1} here are short aspect phrases, not
-# documents worth judging on their own. Purpose is structural: a real
-# chain of 3 joins across 4 distinct table positions (no table spans
-# all 3 edges), so the free anchor search cannot collapse it to one
-# group.
-ASPECT_RELATED = ("Are the movie aspects in DOCUMENT {0} and DOCUMENT "
-                  "{1} commonly discussed together in the same review?")
 
 # IMDB-8 only: a second question over the same aspects table, joined
 # under a second alias (a2) - a 2-join star, both joins anchored on
@@ -457,51 +449,47 @@ def queries(sess):
     q["IMDB-7"] = ("F1 -> F4 -> F5, 3 filters, no join", make(
         "reviews", "r", "body", [F1, F4, F5], [], ["r.id"]))
 
-    # IMDB-9/IMDB-11: 3-join path (r-a1-a2-a3). No table spans all
-    # 3 edges, so at least one barrier is unavoidable. Uses raw
-    # ai_join calls because make()'s {0} is always doc_alias.
+    # IMDB-9/IMDB-10: 3-join chain r1-a1-r2-a2. Two reviews that
+    # discuss the same aspect; what other aspect does the second
+    # review feel positively about?
     def imdb9():
-        r = sess.docs("reviews").alias("r")
+        r1 = sess.docs("reviews").alias("r1")
         a1 = sess.docs("aspects").alias("a1")
+        r2 = sess.docs("reviews").alias("r2")
         a2 = sess.docs("aspects").alias("a2")
-        a3 = sess.docs("aspects").alias("a3")
-        return (r
+        return (r1
                 .ai_join(a1, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r.body"),
+                                          quail.col("r1.body"),
                                           quail.col("a1.aspect")))
-                .ai_join(a2, quail.prompt(ASPECT_RELATED,
-                                          quail.col("a1.aspect"),
+                .ai_join(r2, quail.prompt(DISCUSS_ASPECT,
+                                          quail.col("r2.body"),
+                                          quail.col("a1.aspect")))
+                .ai_join(a2, quail.prompt(ASPECT_SENTIMENT,
+                                          quail.col("r2.body"),
                                           quail.col("a2.aspect")))
-                .ai_join(a3, quail.prompt(ASPECT_RELATED,
-                                          quail.col("a2.aspect"),
-                                          quail.col("a3.aspect")))
-                .select("r.id", "a1.id", "a2.id", "a3.id"))
-    q["IMDB-9"] = ("engine stress: 3J real chain r-a1-a2-a3, free "
-                  "anchor search - no table spans all 3 edges, so "
-                  ">=1 barrier is unavoidable", imdb9)
+                .select("r1.id", "a1.id", "r2.id", "a2.id"))
+    q["IMDB-9"] = ("3J chain r1-a1-r2-a2: two reviews discuss the "
+                   "same aspect, second review positive about another",
+                   imdb9)
 
-    def imdb11():
-        # IMDB-9's chain with an F1 filter on reviews run first -
-        # tests filter -> multi-join chain with a forced anchor
-        # switch together, not separately.
-        r = sess.docs("reviews").alias("r").ai_filter(
-            quail.prompt(F1, quail.col("r.body")))
+    def imdb10():
+        r1 = sess.docs("reviews").alias("r1").ai_filter(
+            quail.prompt(F1, quail.col("r1.body")))
         a1 = sess.docs("aspects").alias("a1")
+        r2 = sess.docs("reviews").alias("r2")
         a2 = sess.docs("aspects").alias("a2")
-        a3 = sess.docs("aspects").alias("a3")
-        return (r
+        return (r1
                 .ai_join(a1, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r.body"),
+                                          quail.col("r1.body"),
                                           quail.col("a1.aspect")))
-                .ai_join(a2, quail.prompt(ASPECT_RELATED,
-                                          quail.col("a1.aspect"),
+                .ai_join(r2, quail.prompt(DISCUSS_ASPECT,
+                                          quail.col("r2.body"),
+                                          quail.col("a1.aspect")))
+                .ai_join(a2, quail.prompt(ASPECT_SENTIMENT,
+                                          quail.col("r2.body"),
                                           quail.col("a2.aspect")))
-                .ai_join(a3, quail.prompt(ASPECT_RELATED,
-                                          quail.col("a2.aspect"),
-                                          quail.col("a3.aspect")))
-                .select("r.id", "a1.id", "a2.id", "a3.id"))
-    q["IMDB-11"] = ("engine stress: F1 filter -> 3J real chain "
-                    "r-a1-a2-a3, free anchor search", imdb11)
+                .select("r1.id", "a1.id", "r2.id", "a2.id"))
+    q["IMDB-10"] = ("F1 -> 3J chain r1-a1-r2-a2", imdb10)
 
     # IMDB-8: star shape - A joins B and A joins C, same anchor
     # throughout, barrier between stages but no anchor switch.
@@ -528,10 +516,10 @@ def queries(sess):
         "reports", "r", "report", [F7, F8, F9],
         [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
 
-    # BIO-C/BIO-D: 3-join path for BioDEX. `terms` is ~2,560 rows
-    # regardless of sf, so the chain alternates through `reports`
-    # (which scales with sf) to avoid cardinality blowup.
-    def bioC():
+    # BIO-7/BIO-8: 3-join chain r1-m1-r2-m2. Report r1 experienced
+    # reaction m1; reaction m1 was severe in report r2; report r2
+    # also experienced a different reaction m2.
+    def bio7():
         r1 = sess.docs("reports").alias("r1")
         m1 = sess.docs("terms").alias("m1")
         r2 = sess.docs("reports").alias("r2")
@@ -540,18 +528,18 @@ def queries(sess):
                 .ai_join(m1, quail.prompt(REACTION,
                                           quail.col("r1.report"),
                                           quail.col("m1.term")))
-                .ai_join(r2, quail.prompt(REACTION,
+                .ai_join(r2, quail.prompt(REACTION_SEVERE,
                                           quail.col("r2.report"),
                                           quail.col("m1.term")))
                 .ai_join(m2, quail.prompt(REACTION,
                                           quail.col("r2.report"),
                                           quail.col("m2.term")))
                 .select("r1.id", "m1.id", "r2.id", "m2.id"))
-    q["BIO-C"] = ("engine stress: 3J real chain r1-m1-r2-m2, free "
-                 "anchor search", bioC)
+    q["BIO-7"] = ("3J chain r1-m1-r2-m2: shared reaction, severe in "
+                  "second report, second report has another reaction",
+                  bio7)
 
-    def bioD():
-        # BIO-C with an F7 filter on r1 first.
+    def bio8():
         r1 = sess.docs("reports").alias("r1").ai_filter(
             quail.prompt(F7, quail.col("r1.report")))
         m1 = sess.docs("terms").alias("m1")
@@ -561,15 +549,14 @@ def queries(sess):
                 .ai_join(m1, quail.prompt(REACTION,
                                           quail.col("r1.report"),
                                           quail.col("m1.term")))
-                .ai_join(r2, quail.prompt(REACTION,
+                .ai_join(r2, quail.prompt(REACTION_SEVERE,
                                           quail.col("r2.report"),
                                           quail.col("m1.term")))
                 .ai_join(m2, quail.prompt(REACTION,
                                           quail.col("r2.report"),
                                           quail.col("m2.term")))
                 .select("r1.id", "m1.id", "r2.id", "m2.id"))
-    q["BIO-D"] = ("engine stress: F7 filter -> 3J real chain "
-                 "r1-m1-r2-m2, free anchor search", bioD)
+    q["BIO-8"] = ("F7 -> 3J chain r1-m1-r2-m2", bio8)
 
     # BIO-6: star shape, both joins anchored on reports, both over
     # the full terms table under two aliases. IMDB-8's counterpart.
@@ -604,9 +591,10 @@ def queries(sess):
         "claims", "c", "claim", [F11, F12],
         [("evidence", "e", "text", SUPPORT, [F13])], ["c.id", "e.id"]))
 
-    # FEV-C/FEV-D: 3-join path for FEVER. Both claims and evidence
-    # scale with sf, so a direct chain works.
-    def fevC():
+    # FEV-8/FEV-9: 3-join chain c1-e1-c2-e2. Evidence e1 supports
+    # claim c1 but refutes claim c2; claim c2 is supported by
+    # different evidence e2.
+    def fev8():
         c1 = sess.docs("claims").alias("c1")
         e1 = sess.docs("evidence").alias("e1")
         c2 = sess.docs("claims").alias("c2")
@@ -615,18 +603,18 @@ def queries(sess):
                 .ai_join(e1, quail.prompt(SUPPORT,
                                           quail.col("c1.claim"),
                                           quail.col("e1.text")))
-                .ai_join(c2, quail.prompt(SUPPORT,
+                .ai_join(c2, quail.prompt(REFUTE,
                                           quail.col("c2.claim"),
                                           quail.col("e1.text")))
                 .ai_join(e2, quail.prompt(SUPPORT,
                                           quail.col("c2.claim"),
                                           quail.col("e2.text")))
                 .select("c1.id", "e1.id", "c2.id", "e2.id"))
-    q["FEV-C"] = ("engine stress: 3J real chain c1-e1-c2-e2, free "
-                 "anchor search", fevC)
+    q["FEV-8"] = ("3J chain c1-e1-c2-e2: evidence supports c1 but "
+                  "refutes c2, c2 supported by different evidence",
+                  fev8)
 
-    def fevD():
-        # FEV-C with an F11 filter on c1 first.
+    def fev9():
         c1 = sess.docs("claims").alias("c1").ai_filter(
             quail.prompt(F11, quail.col("c1.claim")))
         e1 = sess.docs("evidence").alias("e1")
@@ -636,15 +624,14 @@ def queries(sess):
                 .ai_join(e1, quail.prompt(SUPPORT,
                                           quail.col("c1.claim"),
                                           quail.col("e1.text")))
-                .ai_join(c2, quail.prompt(SUPPORT,
+                .ai_join(c2, quail.prompt(REFUTE,
                                           quail.col("c2.claim"),
                                           quail.col("e1.text")))
                 .ai_join(e2, quail.prompt(SUPPORT,
                                           quail.col("c2.claim"),
                                           quail.col("e2.text")))
                 .select("c1.id", "e1.id", "c2.id", "e2.id"))
-    q["FEV-D"] = ("engine stress: F11 filter -> 3J real chain "
-                 "c1-e1-c2-e2, free anchor search", fevD)
+    q["FEV-9"] = ("F11 -> 3J chain c1-e1-c2-e2", fev9)
 
     # FEV-7: star shape, both joins anchored on claims.
     q["FEV-7"] = ("2J, same anchor: J1 (SUPPORT) -> J2 (REFUTE), "

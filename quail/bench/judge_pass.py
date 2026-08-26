@@ -97,11 +97,6 @@ PREDICATES = (
         quailb.ASPECT_SENTIMENT,
         "review", "reviews", "body", "aspect", "aspects", "aspect"),
     PredicateSpec(
-        "quailb.imdb.aspect.related_to_aspect", "ASPECT_RELATED", "imdb",
-        "aspect_related_to_aspect", "join", quailb.ASPECT_RELATED,
-        "first_aspect", "aspects", "aspect",
-        "second_aspect", "aspects", "aspect"),
-    PredicateSpec(
         "quailb.biodex.report.involves_female_patient", "F7", "biodex",
         "report_involves_female_patient", "filter", quailb.F7,
         "report", "reports", "report"),
