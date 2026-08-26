@@ -31,8 +31,7 @@ either number: `rows_per_call` caps a single submission at 256 prompts for
 filters and 614 for the reports-by-terms joins. The knob is not what was
 constraining memory.
 
-The earlier fix (see `reports/old/2026-08-26-bio6-severe-terms-fix.md`) cut
-BIO-6's second join from 614 terms to 64. That changed the benchmark to fit
+The earlier fix cut BIO-6's second join from 614 terms to 64. That changed the benchmark to fit
 the labeling job, and it cut the second stage 10x, which is the part of the
 query that pipelining and token-based admission exist to speed up. It has
 been reverted.

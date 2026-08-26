@@ -14,8 +14,8 @@ The fix that shipped in PR #58 cut BIO-6's second join from the full
 pairs to 12,800. That changed the benchmark to fit the labeling job.
 It also cut the stage 10x in the one dimension pipelining and
 token-based admission exist to speed up, which flatters our own
-numbers. It has been reverted. See
-`reports/old/2026-08-26-bio6-severe-terms-fix.md`.
+numbers. It has been reverted, and the report that described it is
+deleted rather than archived, per the reports policy in AGENTS.md.
 
 Three things were wrong with the original diagnosis:
 
@@ -93,8 +93,9 @@ Stated before the run, from `judge_pass.PREDICTION`:
 
 ## Result
 
-The collection is `gt_04231c5de83cdf9e7e68fc03849959d6` and is now the
-active ground truth for corpus `c_df45ef585738f42e4a7a731306f1b9fc`.
+The collection is `gt_04231c5de83cdf9e7e68fc03849959d6`, status
+`complete`, 23 of 23 label sets, and it is now the active ground truth
+for corpus `c_df45ef585738f42e4a7a731306f1b9fc`.
 Every number below is from its `summary.json` on the `quail-results`
 volume, at
 `/results/ground_truth/quailb/schema_v1/collections/gt_04231c5de83cdf9e7e68fc03849959d6/summary.json`.
