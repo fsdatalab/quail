@@ -170,7 +170,6 @@ class FilterAdmission:
         page_tokens: Tokens per arena page.
         kept_extra_tokens: Extra tokens per document that must fit in
             pages (shared preamble plus tail room).
-        restored: Documents whose KV is already resident in the arena.
         limit: Stop after this many survivors.
 
     Survivor suffixes pack before fresh admissions. Pages are granted
@@ -179,7 +178,7 @@ class FilterAdmission:
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
                  arena_pages, page_tokens, kept_extra_tokens=0,
-                 restored=(), limit=None):
+                 limit=None):
         self.doc_tokens = list(doc_tokens)
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
@@ -192,10 +191,6 @@ class FilterAdmission:
         # kept_extra_tokens: the shared question preamble that joins
         # the document's kept KV after stage 1, so pages must cover it
         self.kept_extra = kept_extra_tokens
-        # restored: documents whose KV is already resident, so nothing
-        # recomputes it - their admission claims the same pages but
-        # their chunk cost is the first question only
-        self.restored = set(restored)
         for d, t in enumerate(self.doc_tokens):
             need = t + max(stage_tokens)
             if need > chunk_budget:
@@ -248,8 +243,7 @@ class FilterAdmission:
                     self.pending.appendleft(doc)
                     blocked_pages = True
                     break
-            cost = self.stage_tokens[0] + (
-                0 if doc in self.restored else self.doc_tokens[doc])
+            cost = self.stage_tokens[0] + self.doc_tokens[doc]
             if cost > room:
                 skipped.append(doc)   # chunk room only; retry next chunk
                 continue
@@ -265,12 +259,11 @@ class FilterAdmission:
 
     # ---- gating --------------------------------------------------------
 
-    def report(self, doc, stage, passed, release=True):
+    def report(self, doc, stage, passed):
         """Record one answer. Frees pages on FALSE or last stage;
         otherwise queues the next-stage suffix.
 
-        Returns docs whose pages were freed. release=False keeps
-        pages held; free them later with release()."""
+        Returns docs whose pages were freed."""
         self.in_flight.discard(doc)
         self.answers.setdefault(doc, []).append(1 if passed else 0)
         last = stage == len(self.stage_tokens) - 1
@@ -279,15 +272,10 @@ class FilterAdmission:
         if passed and not last:
             self.ready.append((doc, stage + 1))
             return ()
-        if release and self.free_pages is not None:
+        if self.free_pages is not None:
             self.free_pages += self.resident.pop(doc)
             return (doc,)
         return ()
-
-    def release(self, doc):
-        """Return a document's pages after a deferred release."""
-        if self.free_pages is not None:
-            self.free_pages += self.resident.pop(doc)
 
     # ---- progress ------------------------------------------------------
 

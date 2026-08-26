@@ -23,11 +23,11 @@ Removed:
   coordinator payloads.
 - The benchmark's cold/warm protocol. QUAIL-B now runs each query
   once.
-
-Kept on purpose: the `restored` parameter of `FilterAdmission` in
-`pack.py` and its tests. If KV persistence in GPU memory is added
-later, that is how the scheduler learns a document's KV is already
-in the arena.
+- The `restored` parameter and the deferred page release in
+  `FilterAdmission` (`pack.py`). Both existed only for the store,
+  and nothing called them any more. If KV persistence in GPU memory
+  is added later, the scheduler hook gets rebuilt for the arena's
+  semantics (a resident document already owns pages).
 
 ## Why
 
