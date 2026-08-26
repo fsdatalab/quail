@@ -85,7 +85,6 @@ def test_saved_verification_sample_covers_completed_parts_after_resume(
 
     spec = _spec("quailb.imdb.review.discusses_ending")
     identity = {"label_set_id": "ls_test"}
-    monkeypatch.setattr(judge_pass, "PREDICATES", (spec,))
     monkeypatch.setattr(judge_pass, "VOLUME_ROOT", tmp_path)
     parts = (tmp_path / "label_sets" / spec.workload / spec.slug
              / identity["label_set_id"] / "parts")
@@ -102,7 +101,8 @@ def test_saved_verification_sample_covers_completed_parts_after_resume(
                     for i in range(20)]
     }
 
-    sample = _saved_verification_sample(corpus, {spec.key: identity})
+    sample = _saved_verification_sample(
+        corpus, {spec.key: identity}, specs=(spec,))
 
     assert len(sample.rows[spec.key]) == 16
     assert sample.rows[spec.key][0] == (

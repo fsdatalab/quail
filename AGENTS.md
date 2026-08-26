@@ -59,15 +59,14 @@ change needs one of them, say so instead of quietly adding it back.
   function call id (the `fc-...` Modal assigns to one invocation)
   and keep that id in the tee file. When you need the result, pull
   it with `modal.FunctionCall.from_id("<id>").get()`.
-- Raw experiment data (per-item records, per-question answers,
-  anything an aggregation step reads) lives on the `quail-results`
-  Modal volume. Do not commit it. Reports cite it by volume path:
-  `/results/ablations/<file>.json`.
-- Commit only the aggregated summary a report's numbers and plot
-  script read, to `results/`: totals, means, percentiles,
-  per-configuration rows - never one record per item. Committed
-  summaries keep plots and review working without Modal access and
-  pin the numbers to the commit.
+- Experiment data lives on the `quail-results` Modal volume, summaries
+  as well as per-item records. Do not commit it. Reports cite it by
+  volume path: `/results/ablations/<file>.json`.
+- A plot script reads its numbers from the volume. Take the workdir
+  holding the pulled files as its first argument, and put the
+  `modal volume get` commands in its docstring so the figure can be
+  rebuilt from the report alone. Derive percentages, ratios and other
+  computed values in the script rather than storing them.
 - State the prediction before the run, then report what happened
   against it.
 - Compute from measured constants first; run one confirming cell, not
@@ -84,9 +83,8 @@ All experiment and feature reports live under `reports/`.
 - Every PR that includes an experiment must produce a report in
   `reports/`. Name the file `YYYY-MM-DD-<short-slug>.md`.
   The report states the setup, the prediction, the measured result,
-  and what the numbers mean. Reference committed summary files in
-  `results/` by path, and raw data by its `quail-results` volume
-  path.
+  and what the numbers mean. Cite the data by its `quail-results`
+  volume path.
 - When a report is superseded or its numbers are no longer current,
   move it to `reports/old/`. Do not delete old reports.
 - When a PR ships a new feature (a code change that lands on main),
@@ -120,8 +118,11 @@ Every report with measured results should include at least one plot.
   `old/`, its PNGs move to `old/plots/`.
 - Reference plots in the report by relative path:
   `"Figure: plots/<name>.png"`.
-- Each script should be runnable standalone from the repository root:
-  `uv run --with matplotlib python reports/make_<slug>_plots.py`.
+- Each script should be runnable from the repository root, given a
+  workdir holding the files pulled off the volume:
+  `uv run --with matplotlib python reports/make_<slug>_plots.py $W`.
+- The PNGs are committed; the numbers behind them are not. That is
+  what lets a PR body embed a figure by raw GitHub URL.
 
 ## Style
 
