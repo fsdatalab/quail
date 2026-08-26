@@ -298,32 +298,31 @@ def test_payload_carries_true_false_and_join_spec(sess):
     """
     seen = {}
     join = {("r", "p"): lambda a, p: 0}
-    sess.sql(sql).run(_execute=make_executor({}, join, seen=seen))
+    query = sess.sql(sql)
+    query.run(_execute=make_executor({}, join, seen=seen))
+    pred = query.logical.root.input.predicate
     payload = seen["payload"]
     assert payload["true_ids"] and payload["false_ids"]
     # the engine preamble ships once, not inside any join segment
-    from quail.logical import (SHARED_PRE, join_anchor_note,
-                               join_label, render_join_question)
+    from quail.logical import (SHARED_PRE, join_label,
+                               render_join_frame)
     assert payload["pre_ids"] == fake_tok(SHARED_PRE)
     j = payload["joins"][0]
     assert "pre" not in j
     assert j["anchor"] == "r" and j["partners"] == ["p"]
     assert j["aliases"] == ["r", "p"]
-    # naming lines and block labels ship for EVERY table, so a
+    # anchor frames and block labels ship for EVERY table, so a
     # barrier-time anchor re-pick needs no re-tokenization; the round
-    # builder (stage_for_anchor) picks the chosen anchor's naming
-    # line as the frame and the partners' labels. r is placeholder 0,
+    # builder (stage_for_anchor) picks the chosen anchor's complete
+    # frame and the partners' labels. r is placeholder 0,
     # p is placeholder 1.
-    assert j["frames"] == {"r": fake_tok(join_anchor_note(0)),
-                           "p": fake_tok(join_anchor_note(1))}
+    assert j["frames"] == {
+        "r": fake_tok(render_join_frame(pred.template, 0)),
+        "p": fake_tok(render_join_frame(pred.template, 1)),
+    }
     assert j["labels"] == {"r": fake_tok(join_label(0)),
                            "p": fake_tok(join_label(1))}
-    assert j["tail"] == fake_tok(
-        "\n\nEvaluate TRUE or FALSE for the following question: "
-        "Does {0} match {1}? Answer.\nANSWER:")
-    logical = sess.sql(sql).logical
-    pred = logical.root.input.predicate
-    assert j["tail"] == fake_tok(render_join_question(pred.template))
+    assert j["tail"] == fake_tok("\nANSWER:")
 
 
 def test_three_way_join_tuples_and_gate(sess, tmp_path):

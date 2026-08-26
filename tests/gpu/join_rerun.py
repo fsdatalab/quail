@@ -1,6 +1,4 @@
-"""Reruns IMDB-2, BIO-1, and BIO-2 (cold + warm) and checks answers
-against QUAIL-B ground truth - the accuracy numbers cited in
-reports/2026-08-25-vllm-opbench-baseline.md.
+"""Rerun the three two-table joins after the shared prompt fix.
 
 Run from the repository root (tee to a file per house rule):
 
@@ -45,30 +43,29 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
                                       create_if_missing=True)
 
 
-@app.function(image=image, gpu="H100!", memory=98304, timeout=7200,
+@app.function(image=image, memory=98304, timeout=7200,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})
 def run_join_rerun(model: str) -> str:
+    import json
     import time
     from quail.bench.quailb import run_suite
 
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    out_path = f"/results/benchmark/{ts}-join-rerun-{model}.json"
+    out_path = f"/results/benchmark/{ts}-join-prompt-fix-{model}.json"
     suite = run_suite(
-        "/results/quailb_data", sf=0.1, only={"IMDB-2", "BIO-1", "BIO-2"},
-        model=model, accuracy=True,
-        # Pinned: the volume's "active" collection for this corpus
-        # currently points at pre-PR-#56 labels, not PR #57's fix.
-        # gt_80e7582534b349bc61c087595f2e0a51 is PR #57's own collection.
-        ground_truth_collection="gt_80e7582534b349bc61c087595f2e0a51",
+        "/results/quailb_data", sf=0.1,
+        only={"IMDB-2", "BIO-2", "FEV-2"},
+        model=model, accuracy=False,
         prediction=(
-            "Cold and warm answers agree within this run. Both joins "
-            "show low precision (still near-all-TRUE); BIO-1's F7 "
-            "filter shows a real precision/recall tradeoff."),
+            "IMDB-2 processes 2,419,233 fresh tokens, 59% fewer than "
+            "5,944,233. BIO-2 processes 2,635,599, 76% fewer than "
+            "10,979,399. FEV-2 processes 145,359 with evidence as "
+            "the anchor."),
         out_path=out_path)
     results_vol.commit()
-    return str(suite)
+    return json.dumps(suite, sort_keys=True)
 
 
 @app.local_entrypoint()

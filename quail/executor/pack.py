@@ -12,7 +12,7 @@ Two schedulers live here:
   page-rounded tokens fit the free list.
 
 Length units are tokens everywhere. A "suffix" is one partner document
-plus the question tail (join) or one question (filter); suffixes are
+plus the answer cue (join) or one question (filter); suffixes are
 atomic - a suffix's tokens attend to each other, so one suffix never
 splits across two chunks.
 """

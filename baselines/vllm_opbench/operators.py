@@ -4,16 +4,11 @@ build_sets/register_sets) and predicates - so vLLM-opbench measures
 the same documents and the same questions quail's own engine does,
 with only the serving strategy different.
 
-Prompts are raw prompt_token_ids (matching baselines/stock.py
-and quail's own worker.py), not chat-template text - a plain
-str.format() substitution into the predicate template, then a plain
-tokenizer.encode() of the whole rendered string per request. This is
-deliberately the naive approach stock vLLM would take: quail's own
-engine relocates a predicate's instruction text to just after the
-document so it's paid once per anchor's kept KV rather than once per
-pair (see quailb.py's module docstring) - that relocation is quail's
-own optimization, and reproducing it here would defeat the point of
-this baseline.
+Prompts are raw prompt_token_ids, matching baselines/stock.py and
+quail's worker. Joins use the same canonical token builder as Quail
+and stock vLLM. The baseline still materializes every full request on
+the CPU and submits one batch to vLLM, but prompt layout is no longer
+a difference between the three systems.
 
 The answer is a constrained TRUE/FALSE token id, matching quail's own
 engine's convention (quail/runtime/session.py's
@@ -27,6 +22,9 @@ serving strategy rather than decoding convention.
 from pathlib import Path
 
 import pyarrow.parquet as pq
+
+from baselines.stock import build_join_grouped_inputs
+from quail.logical import ColumnRef, bind_join_prompt
 
 
 def true_false_ids(tokenizer) -> tuple[list[int], list[int]]:
@@ -68,22 +66,38 @@ class Filter:
 
 
 class Join:
-    """Full cross product of one predicate over two tables, anchor-
-    major order (all of one left-side row's pairs consecutive) -
-    matching baselines/stock.py's run_join_grouped: this is the
-    order that lets vLLM's own prefix cache re-serve an anchor's KV
-    across its whole partner stream, without any explicit padding."""
+    """Full cross product of one predicate over two tables.
 
-    def __init__(self, name: str, template: str):
+    Requests use anchor-major order, which lets vLLM reuse the
+    canonical anchor prefix across its partner stream.
+    """
+
+    def __init__(self, name: str, template: str, anchor: int = 0):
         self.name = name
         self.template = template
+        self.anchor = anchor
 
     def build_prompts(self, left_texts: list[str], right_texts: list[str],
                       tokenizer) -> tuple[list[list[int]], list[tuple[int, int]]]:
+        def tok(text):
+            return tokenizer.encode(text, add_special_tokens=False)
+
+        args = (ColumnRef("left", "left", "document"),
+                ColumnRef("right", "right", "document"))
+        prompt = bind_join_prompt(self.template, args, tok)
+        documents = (
+            [tok(text) for text in left_texts],
+            [tok(text) for text in right_texts],
+        )
+        prefixes, suffixes, members = build_join_grouped_inputs(
+            prompt, documents, self.anchor, tok)
+        partner = 1 - self.anchor
         prompts, pairs = [], []
-        for li, lt in enumerate(left_texts):
-            for ri, rt in enumerate(right_texts):
-                prompts.append(tokenizer.encode(
-                    self.template.format(lt, rt), add_special_tokens=False))
-                pairs.append((li, ri))
+        for anchor_idx, prefix in enumerate(prefixes):
+            for suffix, member in zip(suffixes, members):
+                indices = [None, None]
+                indices[self.anchor] = anchor_idx
+                indices[partner] = member[0]
+                prompts.append(prefix + suffix)
+                pairs.append((indices[0], indices[1]))
         return prompts, pairs

@@ -19,11 +19,9 @@ scoped:
 
 import os
 
-# House rule elsewhere in this project is "never create a new Modal app
-# name" for anything that stays deployed; this is a new name, but
-# ephemeral (app.run(), same lifecycle as every other quail cell) -
-# no `modal deploy`, nothing left running once a call returns.
-APP_NAME = "vllm-opbench"
+# GPU benchmark cells attach to the existing milestone app so they
+# reuse its caches and warm state.
+APP_NAME = "quail-milestone1"
 
 # Base (non-FP8) checkpoints - fp8 quantization happens at vLLM load
 # time via `quantization="fp8"`, not by loading a pre-quantized
@@ -33,6 +31,8 @@ APP_NAME = "vllm-opbench"
 MODEL_NAMES = {
     "qwen3-4b": "Qwen/Qwen3-4B",
     "qwen3-32b": "Qwen/Qwen3-32B",
+    "qwen3-4b-stock": "Qwen/Qwen3-4B-FP8",
+    "qwen3-32b-stock": "Qwen/Qwen3-32B-FP8",
 }
 
 # GPU x quantization cells to sweep. "H100!" pins the exact SKU so

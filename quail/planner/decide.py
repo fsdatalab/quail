@@ -57,10 +57,12 @@ def _collect(plan: LogicalPlan):
 
 
 def _question_tokens(prompt) -> int:
-    """The token count of a stage's question suffix per evaluation:
-    the template text after the document placeholder. The engine
-    preamble (before the placeholder) is paid once per KV-owning
-    document, not per evaluation - see _preamble_tokens."""
+    """The token count of a stage's per-evaluation tail.
+
+    A filter tail contains its question and answer cue. A join tail
+    contains only its answer cue because the question is in the
+    anchor frame.
+    """
     if prompt.tail_tokens is None or prompt.preamble_tokens is None:
         raise ValueError(
             "prompts were bound without a tokenizer; the planner "
@@ -135,8 +137,8 @@ def _join_aliases(join) -> list:
 
 
 def _label_counts(join) -> dict:
-    """alias -> (block label tokens, anchor naming-line tokens), from
-    the bind-time counts the prompt carries."""
+    """alias -> (block label tokens, anchor frame tokens), from the
+    bind-time counts the prompt carries."""
     out = {a: (lt, nt) for a, lt, nt in join.predicate.labels}
     if any(lt is None for lt, _ in out.values()):
         raise ValueError(
@@ -155,26 +157,27 @@ def _cross_tuples(join, live: dict, anchor: str) -> float:
 
 def _anchor_prefix_tokens(join, live: dict, stats: dict, anchor: str,
                           pre_tokens: int = 0) -> float:
-    """The group-start charge: the anchor's KV - engine preamble,
-    document, naming line - paid once per live anchor document. Paid
-    only by the stage that opens a group; later same-anchor full
-    stages reuse the KV and pay _frame_only_tokens instead."""
+    """The group-start charge for the anchor's kept KV.
+
+    The engine preamble, document, and complete anchor frame are paid
+    once per live anchor document. A later stage on the same anchor
+    reuses the document KV and pays only _frame_only_tokens.
+    """
     labels = _label_counts(join)
     return live[anchor] * (stats[anchor].mean_doc_tokens + pre_tokens
                            + labels[anchor][1])
 
 
 def _frame_only_tokens(join, live: dict, anchor: str) -> float:
-    """A later stage of the same group rewrites only its naming line
-    (the stage frame) into the anchor's kept KV, once per live anchor
-    document - the document and preamble rows stay."""
+    """A later stage on the same anchor writes its complete frame once
+    per live anchor document. The document and preamble rows stay."""
     labels = _label_counts(join)
     return live[anchor] * labels[anchor][1]
 
 
 def _pair_tokens(join, live: dict, stats: dict, anchor: str) -> float:
-    """The per-tuple stream: every partner document behind its block
-    label, plus the rendered question, once per tuple."""
+    """The per-tuple stream contains each labeled partner document and
+    the answer cue."""
     labels = _label_counts(join)
     partners = [a for a in _join_aliases(join) if a != anchor]
     per_tuple = _question_tokens(join.predicate)
@@ -187,7 +190,7 @@ def _stage_tokens(join, live: dict, stats: dict, anchor: str,
                   pre_tokens: int = 0) -> float:
     """Token total of one join opening its own group at the current
     live counts: the anchor prefix once per anchor document, every
-    partner document with its block label plus the question once per
+    partner document with its block label plus the answer cue once per
     tuple."""
     return (_anchor_prefix_tokens(join, live, stats, anchor,
                                   pre_tokens)
@@ -243,7 +246,7 @@ def _walk(seq, live0: dict, stats: dict, pre_tokens: int = 0):
     each record (expected tuples, stage tokens). A stage opening a
     group pays the anchor prefix - plus the re-shard overhead when it
     follows a group on a different anchor; a stage continuing a
-    same-anchor run of full stages pays only its naming line. Gates
+    same-anchor run of full stages pays only its complete frame. Gates
     never continue a group (their keep rule differs from the in-call
     gate), so they always pay the full prefix."""
     live = dict(live0)
@@ -461,7 +464,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
     # ---- the joint (order x anchor) search, seeded with post-filter
     # live estimates. Anchors come before the chunk refusal: a join's
-    # atomic suffix (every partner document plus the question)
+    # atomic suffix (every partner document plus the answer cue)
     # depends on which table anchors.
     live0 = {a: float(st.n_docs) for a, st in stats.items()}
     for fs in filters.values():
@@ -634,11 +637,14 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         for j in group["members"]:
             tuples, tokens = next(rec)
             partners = [a for a in _join_aliases(j) if a != anchor]
+            stage_labels = _label_counts(j)
             stage_dicts.append(dict(
                 written_pos=written[id(j)], exec_idx=exec_idx,
                 anchor=anchor, partners=partners,
                 semantics=j.semantics, selectivity=j.selectivity,
                 expected_tuples=round(tuples, 1),
+                anchor_frame_tokens=stage_labels[anchor][1],
+                pair_tail_tokens=_question_tokens(j.predicate),
                 tuple_tokens=round(tokens, 1)))
             exec_idx += 1
             for a in partners:

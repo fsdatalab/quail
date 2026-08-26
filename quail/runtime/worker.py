@@ -7,10 +7,10 @@ the raw answer rows. The coordinator assembles tuples and projects -
 it never sees a tensor.
 
 A join stage is the cross product under one prompt: each anchor
-document's KV is computed once (kept, with the naming line written
-after it), and every tuple of the partner tables streams against it
-as one suffix - every partner document behind its block label, then
-the question. exists/anti gates run the same way over one partner
+document's KV is computed once, then the complete static question is
+written into its kept KV. Every tuple of the partner tables streams
+against it as one suffix with labeled partner documents and the answer
+cue. exists/anti gates run the same way over one partner
 table and apply the keep rule to the answers; their early-stop
 optimization is not built yet, so they stream the full list.
 """
@@ -684,7 +684,7 @@ def execute_8(payload: dict) -> dict:
 
 def _tuple_suffix(join, docs, member) -> list:
     """One tuple's stream: every partner document behind its block
-    label, then the rendered question. `member` holds one document
+    label, then the answer cue. `member` holds one document
     index per partner alias, in the join's partner order."""
     out = []
     for alias, g in zip(join["partners"], member):

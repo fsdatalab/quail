@@ -142,25 +142,25 @@ def test_three_way_forms_compile_equal(catalog):
 
 
 def test_join_prompt_keeps_markers_and_labels_blocks():
-    from quail.logical import (bind_join_prompt, join_anchor_note,
-                               join_label, render_join_question)
+    from quail.logical import (ANSWER_CUE, bind_join_prompt, join_label,
+                               render_join_frame, render_join_question)
     from quail.logical import ColumnRef
     args = (ColumnRef("a", "reviews", "review"),
             ColumnRef("b", "threads", "thread"))
     p = bind_join_prompt("Does {0} praise {1}?", args, tok)
     assert p.template == "Does {0} praise {1}?"
     assert p.preamble == SHARED_PRE
-    # the question is the template verbatim - markers kept, nothing
-    # filled in; the blocks above carry the matching labels
-    assert p.tail == ("\n\nEvaluate TRUE or FALSE for the following "
-                      "question: Does {0} praise {1}?\nANSWER:")
+    # the static question is in the anchor frame; only the answer cue
+    # is paid per tuple
+    assert p.frame == ("\n\nEvaluate TRUE or FALSE for the following "
+                       "question: Does {0} praise {1}?")
+    assert p.tail == ANSWER_CUE
     assert p.tail_tokens == len(tok(p.tail))
     assert join_label(1) == "\n\nDOCUMENT {1}:\n"
-    assert "{0}" in join_anchor_note(0)
     assert [a for a, _, _ in p.labels] == ["a", "b"]
     assert p.labels[1][1] == len(tok(join_label(1)))
-    assert p.labels[0][2] == len(tok(join_anchor_note(0)))
-    assert render_join_question(p.template) == p.tail
+    assert p.labels[0][2] == len(tok(render_join_frame(p.template, 0)))
+    assert render_join_question(p.template) == p.frame
 
 
 TWO_ONS = """

@@ -1,11 +1,7 @@
 """vLLM-opbench worker — offline batched-inference vLLM on Modal (H100).
 
-Ephemeral - app.run(), the same lifecycle every other quail Modal cell
-uses (see run.py's run(), which opens this module's `app` for the
-life of one call). Its app name ("vllm-opbench") is still new relative
-to quail-engine/quail-milestone1, but nothing stays running once the
-call that opened it returns - no `modal deploy`, no persistent app to
-tear down later.
+The worker attaches to the existing "quail-milestone1" Modal app and
+uses the same app lifecycle as the other benchmark cells.
 
 Ported from SQPE's vllm_worker.py (/Users/adhariya/SQPE, a separate
 benchmarking project), with two deliberate departures:
@@ -53,10 +49,10 @@ from . import gpu_profiling
 app = modal.App(APP_NAME)
 
 vllm_image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04",
+    modal.Image.from_registry("nvidia/cuda:13.0.1-devel-ubuntu24.04",
                               add_python="3.12")
     .entrypoint([])
-    .uv_pip_install("vllm>=0.16.1", "transformers>=5.2.0",
+    .uv_pip_install("vllm==0.26.0", "transformers>=5.2.0",
                     "huggingface_hub[hf_transfer]")
     .apt_install("wget", "gnupg")
     .run_commands(

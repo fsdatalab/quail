@@ -16,7 +16,43 @@ Plain synchronous loops against the vLLM v1 LLMEngine surface; no
 asyncio anywhere.
 """
 
+import itertools
 import time
+
+from quail.logical import join_anchor_prefix_ids, join_tuple_suffix_ids
+
+
+def build_join_grouped_inputs(prompt, documents, anchor: int, tokenizer):
+    """Build canonical join token parts for stock vLLM.
+
+    documents contains one list of tokenized documents per prompt
+    placeholder. The returned prefixes are in anchor document order.
+    The returned suffixes are in the Cartesian order of the remaining
+    placeholders. `members` records each suffix's partner indices in
+    placeholder order, excluding the anchor.
+    """
+    if len(documents) != len(prompt.args):
+        raise ValueError(
+            f"join has {len(prompt.args)} placeholders but received "
+            f"{len(documents)} document tables")
+    if anchor < 0 or anchor >= len(documents):
+        raise ValueError(f"join anchor placeholder {anchor} is out of range")
+    partner_slots = [i for i in range(len(documents)) if i != anchor]
+    members = list(itertools.product(
+        *(range(len(documents[i])) for i in partner_slots)))
+    prefixes = [
+        join_anchor_prefix_ids(prompt, anchor, ids, tokenizer)
+        for ids in documents[anchor]
+    ]
+    suffixes = [
+        join_tuple_suffix_ids(
+            prompt,
+            [(slot, documents[slot][member[j]])
+             for j, slot in enumerate(partner_slots)],
+            tokenizer)
+        for member in members
+    ]
+    return prefixes, suffixes, members
 
 
 def _true_bit(out, true_ids=None):

@@ -1,9 +1,8 @@
 """vLLM-opbench orchestrator: drives WorkerH100 (see worker.py) over
 queries built from quail's own document sets and predicates. Runs
-entirely on Modal - both the CPU-side prep (build_sets, tokenizing,
-building prompts) and the GPU-side generation happen remotely, in
-the same "vllm-opbench" app as WorkerH100. No local Python execution
-is needed to launch this.
+entirely on Modal. Both CPU preparation and GPU generation happen
+remotely in the existing "quail-milestone1" app. No local Python
+execution is needed to launch this.
 
 Four queries, mirroring an existing quailb.py query each so the
 numbers are directly comparable - one filter shape, one join shape
@@ -81,11 +80,14 @@ def build_queries(data_dir: str, sf: float):
     return {
         "filter-reports": ("filter", operators.Filter("F7", F7),
                           (report_ids, report_texts)),
-        "join-reports": ("join", operators.Join("REACTION", REACTION),
+        "join-reports": ("join", operators.Join("REACTION", REACTION,
+                                                  anchor=0),
                         (report_ids, report_texts, term_ids, term_texts)),
-        "join-claims": ("join", operators.Join("SUPPORT", SUPPORT),
+        "join-claims": ("join", operators.Join("SUPPORT", SUPPORT,
+                                                 anchor=1),
                        (claim_ids, claim_texts, evidence_ids, evidence_texts)),
-        "join-imdb": ("join", operators.Join("DISCUSS_ASPECT", DISCUSS_ASPECT),
+        "join-imdb": ("join", operators.Join("DISCUSS_ASPECT",
+                                               DISCUSS_ASPECT, anchor=0),
                      (review_ids, review_texts, aspect_ids, aspect_texts)),
     }
 
@@ -134,6 +136,7 @@ def call_operator(worker, kind, op, data, tokenizer, true_ids, false_ids,
                           - result["oracle_regret"]["oracle_hit_tokens"])
     entry = dict(
         operator=op.name, kind=kind, n_prompts=n,
+        anchor=(op.anchor if kind == "join" else None),
         # rpc_wall_time_s: time.time() around worker.generate_batch.remote()
         # from the orchestrator - includes Modal RPC/scheduling overhead.
         # generate_wall_time_s: result["wall_time_s"], timed inside the

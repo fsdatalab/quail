@@ -30,8 +30,7 @@ from dataclasses import dataclass, field
 
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (SHARED_PRE, CompileError, LogicalPlan,
-                           join_anchor_note, join_label,
-                           render_join_question)
+                           join_label, render_join_frame)
 from quail.planner.calibration import channel_bandwidths
 from quail.planner.decide import _collect, explain, plan_query
 from quail.planner.plan import (EngineConfig, Refusal, StoreSpec,
@@ -304,22 +303,21 @@ def _question_ids(session: Session, prompt) -> list:
 def _join_spec(session: Session, prompt, anchor: str,
                partners: list) -> dict:
     """The executor's view of one join stage: the compile-time anchor
-    and its partners, block labels and naming lines for EVERY table
+    and its partners, block labels and anchor frames for EVERY table
     (so a barrier-time anchor re-pick needs no re-tokenization), and
-    the question (the raw template, markers kept - paid once per
-    tuple, after the last block). The engine preamble ships once as
-    the payload's pre_ids. stage_for_anchor (coordinator) turns this
-    into the child-facing form - the chosen anchor's naming line as
-    the frame, partner labels only - for whichever anchor a round
+    the answer cue paid once per tuple. The engine preamble ships once
+    as the payload's pre_ids. stage_for_anchor (coordinator) turns
+    this into the child-facing form for whichever anchor a round
     uses."""
     tok = session.tokenizer
     slot = {r.alias: i for i, r in enumerate(prompt.args)}
     aliases = [r.alias for r in prompt.args]
     return dict(
         anchor=anchor, partners=list(partners), aliases=aliases,
-        frames={a: tok(join_anchor_note(slot[a])) for a in aliases},
+        frames={a: tok(render_join_frame(prompt.template, slot[a]))
+                for a in aliases},
         labels={a: tok(join_label(slot[a])) for a in aliases},
-        tail=tok(render_join_question(prompt.template)))
+        tail=tok(prompt.tail))
 
 
 class Query:
