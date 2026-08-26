@@ -406,8 +406,6 @@ Is the passage in DOCUMENT {1} cited by the legal excerpt in DOCUMENT
   selectivity with another predicate on the same table.
 - Join-first (filtering a join's output) and a second, *dependent*
   join (filter -> filter -> join -> join, one join's output feeding
-  another) are not implemented in this catalog, on purpose - both
-  need a filter or a join to run after a join, which today's query
-  builder can't express (`quailb.py`'s `queries()` module docstring).
-  If a query needs either shape, that's a deliberate addition, not an
-  automatic extension of this catalog.
+  another) are not implemented in this catalog. If a query needs
+  either shape, that's a deliberate addition, not an automatic
+  extension of this catalog.
