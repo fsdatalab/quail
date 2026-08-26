@@ -1,6 +1,6 @@
-"""Make the join performance plot for the vLLM baseline report.
+"""Make the join performance and SoL plot for the vLLM baseline report.
 
-Pull the six source files into one work directory, then pass that directory
+Pull the seven source files into one work directory, then pass that directory
 as the first argument to this script. For example, with ``W=/tmp/quail-pr52``:
 
     modal volume get quail-results /results/benchmarks/quailb/runs/qb_20260826T061917Z_2a6a3ed0/20260826T061917Z-quailb-sf0.1-lf1-qwen3-4b-fp8.json $W/quail-4b.json
@@ -9,6 +9,7 @@ as the first argument to this script. For example, with ``W=/tmp/quail-pr52``:
     modal volume get quail-results /results/vllm_opbench/2026-08-26_071907/summary.json $W/naive-32b.json
     modal volume get quail-results /results/vllm_opbench/2026-08-26_071911/summary.json $W/stock-4b.json
     modal volume get quail-results /results/vllm_opbench/2026-08-26_071944/summary.json $W/stock-32b.json
+    modal volume get quail-results /sol/sol_quailb_sf0.1.json $W/sol.json
     uv run --with matplotlib python reports/make_vllm_opbench_plots.py $W
 """
 
@@ -27,7 +28,7 @@ OUT = HERE / "plots"
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, DARK, ORANGE, RED  # noqa: E402
+from plot_colors import BLUE, DARK, GRAY, ORANGE, RED  # noqa: E402
 
 QUERY_IDS = ["BIO-2", "FEV-2", "IMDB-2"]
 OPERATORS = {
@@ -68,9 +69,21 @@ def load_baseline(path: Path, expected_model: str) -> dict[str, float]:
     }
 
 
+def load_sol(path: Path, expected_model: str) -> dict[str, float]:
+    data = load_json(path)
+    if data["scale_factor"] != 0.1:
+        raise ValueError(f"unexpected SoL result metadata in {path}")
+    return {
+        query_id: data["queries"][query_id]["models"][expected_model]["sol_s"]
+        for query_id in QUERY_IDS
+    }
+
+
 def main(workdir: Path) -> None:
     results = {
         "4B": {
+            "SoL estimate": load_sol(
+                workdir / "sol.json", "qwen3-4b-fp8"),
             "Quail": load_quail(workdir / "quail-4b.json", "qwen3-4b-fp8"),
             "Naive vLLM": load_baseline(
                 workdir / "naive-4b.json", "qwen3-4b"),
@@ -78,6 +91,8 @@ def main(workdir: Path) -> None:
                 workdir / "stock-4b.json", "qwen3-4b-stock"),
         },
         "32B": {
+            "SoL estimate": load_sol(
+                workdir / "sol.json", "qwen3-32b-fp8"),
             "Quail": load_quail(
                 workdir / "quail-32b.json", "qwen3-32b-fp8"),
             "Naive vLLM": load_baseline(
@@ -87,29 +102,24 @@ def main(workdir: Path) -> None:
         },
     }
 
-    systems = ["Quail", "Naive vLLM", "Stock vLLM"]
-    colors = [BLUE, RED, ORANGE]
+    systems = ["SoL estimate", "Quail", "Naive vLLM", "Stock vLLM"]
+    colors = [GRAY, BLUE, RED, ORANGE]
     x = np.arange(len(QUERY_IDS))
-    width = 0.24
+    width = 0.19
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), sharey=True)
 
     for ax, (model, model_results) in zip(axes, results.items()):
-        quail_values = model_results["Quail"]
         for index, (system, color) in enumerate(zip(systems, colors)):
             values = [model_results[system][query_id]
                       for query_id in QUERY_IDS]
-            bars = ax.bar(x + (index - 1) * width, values, width,
+            bars = ax.bar(x + (index - 1.5) * width, values, width,
                           color=color, label=system)
             for bar, query_id, value in zip(bars, QUERY_IDS, values):
                 label = f"{value:.1f}s"
-                if system != "Quail":
-                    ratio = value / quail_values[query_id]
-                    label += f"\n{ratio:.1f}× Quail"
                 ax.annotate(
                     label,
                     (bar.get_x() + bar.get_width() / 2, value),
-                    xytext=((-6 if system == "Naive vLLM" else
-                             6 if system == "Stock vLLM" else 0), 4),
+                    xytext=(0, 4),
                     textcoords="offset points",
                     ha="center",
                     va="bottom",
@@ -118,15 +128,15 @@ def main(workdir: Path) -> None:
                 )
 
         ax.set_yscale("log")
-        ax.set_ylim(0.8, 650)
+        ax.set_ylim(0.35, 650)
         ax.set_xticks(x)
         ax.set_xticklabels([QUERY_LABELS[query_id]
                             for query_id in QUERY_IDS])
         ax.set_title(model)
-        ax.set_ylabel("Generate time (seconds, log scale)")
+        ax.set_ylabel("Time (seconds, log scale)")
 
     axes[1].set_ylabel("")
-    axes[0].legend(loc="upper right", ncols=1)
+    axes[0].legend(loc="upper right", ncols=2)
     OUT.mkdir(exist_ok=True)
     output = OUT / "vllm_opbench_vs_quail.png"
     fig.savefig(output, dpi=150)
