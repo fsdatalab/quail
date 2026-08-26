@@ -19,6 +19,9 @@ engineers talking to each other at a whiteboard. No jargon.
 - When something failed or is uncertain, say so directly and say what
   would settle it.
 - Code comments state constraints the code cannot show; nothing else.
+- Docstrings follow Google style: one-line summary, blank line, then
+  optional Args/Returns/Raises sections. Keep them short — say what
+  the code does, not why it was written or what it replaced.
 - Call the KV cache "KV". Do not rename it with analogies like "notes".
 - Never say "arm" or "arms" for the runs of an experiment. Say
   "run", "configuration", or name the method being run.
