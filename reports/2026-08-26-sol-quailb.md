@@ -1,8 +1,8 @@
-# Speed of light for all 26 QUAIL-B queries, 4B and 32B
+# Speed of light for all 35 QUAIL-B queries, 4B and 32B
 
 ## What this is
 
-The least time each QUAIL-B query at sf=0.1 can take on one H100,
+The least time each QUAIL-B query at sf=0.1 can take on one H100! request,
 for Qwen3-4B-fp8 and Qwen3-32B-fp8. Only three things are counted:
 the dense projection FLOPs, the attention pair FLOPs, and the bytes
 moved. Everything a real run also pays - kernel efficiency, launch
@@ -37,7 +37,8 @@ FEVER, and LePaRD. LePaRD's citation join uses source passage IDs. FEVER
 uses its source annotation for 63 support pairs. Qwen judged the remaining
 rows.
 
-The completed collection has 324,201 labels across 23 predicates. Its
+The completed collection has 324,201 labels across 23 predicates. The
+collection includes all eight join predicates used by the 35 queries. Its
 summary is at
 `/results/ground_truth/quailb/schema_v1/collections/gt_306dac4fc83883c7a5bcc86f4d103f32/summary.json`
 on the `quail-results` volume. The finalizer function call was
@@ -63,6 +64,7 @@ stops if the two it is given disagree.
    | IMDB | partner | 12 | 27 | 2.25 |
    | BioDEX | documents | 200 | 829,199 | 4,146.0 |
    | BioDEX | partner | 614 | 2,848 | 4.6 |
+   | BioDEX | severe partner | 64 | 236 | 3.7 |
    | FEVER | documents | 100 | 1,142 | 11.4 |
    | FEVER | partner | 57 | 21,099 | 370.2 |
    | LePaRD | documents | 200 | 46,619 | 233.1 |
@@ -145,38 +147,80 @@ other.
 The equations in full, joins included, are `plans/sol_model.md`
 section 3.
 
+## How queries with several joins are counted
+
+The calculation follows the physical plan stage by stage. It uses the
+saved TRUE and FALSE pair labels to determine which documents reach each
+later join. Consecutive stages with the same anchor reuse the document KV
+and write a new complete question once per surviving anchor.
+
+An anchor change creates a barrier. The calculation uses the passing pair
+relations at the barrier to remove documents that cannot appear in the
+final result. It then computes the new anchor prefix once and continues
+with the smaller document sets.
+
+For example, IMDB-9 evaluates 60,000 review and aspect pairs in its first
+join. The first join leaves all 12 aspect values live for the next stage,
+so the next two joins evaluate 144 pairs each. The total is 60,288 pair
+evaluations. BIO-C evaluates 122,800 pairs, then 108,200 pairs after its
+first barrier, then 117,888 pairs after the next gate. The total is
+348,888 pair evaluations.
+
+The SoL work is the sum of all filter and join stages. For a query with a
+join, document pairs per second is the sum of evaluated pairs across its
+join stages divided by the complete query time. For a filter only query,
+documents per second is the number of input document rows divided by the
+complete query time. Dollars per query uses $3.9492 per GPU hour for an
+H100! request, which
+is the same price used by the benchmark evaluation code. Modal lists the
+same price as $0.001097 per second on its
+[pricing page](https://modal.com/pricing).
+
 ## Result
 
 Figure: plots/sol_quailb_per_query.png
 
-| query | shape | tokens | pairs | tuples | anchor | 4B SoL | 32B SoL | 32B/4B |
-|---|---|---|---|---|---|---|---|---|
-| IMDB-1 | 1F | 1,759,233 | 4.39e8 | - | - | 6.72 s | 56.41 s | 8.39 |
-| IMDB-2 | 1J | 2,419,233 | 6.66e8 | 60,000 | documents | 9.28 s | 77.71 s | 8.37 |
-| IMDB-3 | 1F+1J | 2,491,965 | 6.95e8 | 48,048 | documents | 9.56 s | 80.06 s | 8.37 |
-| IMDB-4 | 2F+1J | 2,127,537 | 5.80e8 | 12,336 | documents | 8.16 s | 68.33 s | 8.38 |
-| IMDB-5 | 3F+1J | 2,112,212 | 5.78e8 | 8,028 | documents | 8.10 s | 67.84 s | 8.37 |
-| IMDB-6 | 2F | 1,939,413 | 4.99e8 | - | - | 7.42 s | 62.22 s | 8.39 |
-| IMDB-7 | 3F | 1,989,785 | 5.20e8 | - | - | 7.62 s | 63.86 s | 8.38 |
-| BIO-1 | 1F | 838,999 | 2.38e9 | - | - | 4.50 s | 31.50 s | 7.00 |
-| BIO-2 | 1J | 2,635,599 | 9.92e9 | 122,800 | documents | 15.59 s | 104.15 s | 6.68 |
-| BIO-3 | 1F+1J | 1,949,689 | 7.25e9 | 75,522 | documents | 11.48 s | 76.86 s | 6.69 |
-| BIO-4 | 2F+1J | 1,647,712 | 5.99e9 | 54,646 | documents | 9.62 s | 64.66 s | 6.72 |
-| BIO-5 | 3F+1J | 1,390,203 | 4.65e9 | 36,840 | documents | 7.88 s | 53.71 s | 6.82 |
-| FEV-1 | 1F | 6,642 | 2.25e5 | - | - | 0.025 s | 0.21 s | 8.56 |
-| FEV-2 | 1J | 145,359 | 5.78e7 | 5,700 | partner | 0.57 s | 4.71 s | 8.28 |
-| FEV-3 | 1F+1J | 107,313 | 3.93e7 | 3,648 | partner | 0.42 s | 3.47 s | 8.31 |
-| FEV-4 | 2F+1J | 47,949 | 1.33e7 | 570 | partner | 0.18 s | 1.54 s | 8.37 |
-| FEV-5 | 2F+1J two-sided | 82,967 | 2.93e7 | 2,368 | partner | 0.32 s | 2.68 s | 8.32 |
-| FEV-6 | 3F+1J two-sided | 45,443 | 1.22e7 | 370 | partner | 0.17 s | 1.46 s | 8.38 |
-| LEP-1 | 1F | 57,819 | 1.14e7 | - | - | 0.22 s | 1.85 s | 8.43 |
-| LEP-2 | 1J | 3,772,219 | 1.23e9 | 40,000 | documents | 14.58 s | 121.56 s | 8.34 |
-| LEP-3 | 1F+1J | 132,323 | 4.90e7 | 800 | documents | 0.52 s | 4.28 s | 8.30 |
-| LEP-4 | 2F+1J | 113,885 | 3.93e7 | 600 | documents | 0.44 s | 3.67 s | 8.32 |
-| LEP-5 | 3F+1J | 76,774 | 2.26e7 | 200 | documents | 0.30 s | 2.47 s | 8.36 |
-| LEP-6 | 5F+1J | 58,209 | 1.16e7 | - | documents | 0.22 s | 1.86 s | 8.43 |
-| LEP-7 | 3F+1J two-sided | 139,474 | 4.11e7 | 600 | documents | 0.54 s | 4.49 s | 8.36 |
-| LEP-8 | 5F | 58,209 | 1.16e7 | - | - | 0.22 s | 1.86 s | 8.43 |
+The dollar value is a lower bound on GPU cost per query because SoL is a
+lower bound on time. The throughput value is an upper bound. The cost does
+not include CPU or memory charges.
+
+| Query | Stages | Work units | 4B SoL | 4B $/query floor | 4B docs/s or pairs/s ceiling | 32B SoL | 32B $/query floor | 32B docs/s or pairs/s ceiling |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| IMDB-1 | 1F | 5,000 documents | 6.722 s | $0.00737 | 743.8 | 56.413 s | $0.06188 | 88.6 |
+| IMDB-2 | 1J | 60,000 pairs | 9.281 s | $0.01018 | 6,465.1 | 77.708 s | $0.08525 | 772.1 |
+| IMDB-3 | 1F + 1J | 48,048 pairs | 9.565 s | $0.01049 | 5,023.4 | 80.063 s | $0.08783 | 600.1 |
+| IMDB-4 | 2F + 1J | 12,336 pairs | 8.158 s | $0.00895 | 1,512.1 | 68.327 s | $0.07495 | 180.5 |
+| IMDB-5 | 3F + 1J | 8,028 pairs | 8.101 s | $0.00889 | 991.0 | 67.840 s | $0.07442 | 118.3 |
+| IMDB-6 | 2F | 5,000 documents | 7.419 s | $0.00814 | 673.9 | 62.223 s | $0.06826 | 80.4 |
+| IMDB-7 | 3F | 5,000 documents | 7.617 s | $0.00836 | 656.4 | 63.856 s | $0.07005 | 78.3 |
+| IMDB-9 | 3J | 60,288 pairs | 9.297 s | $0.01020 | 6,484.4 | 77.852 s | $0.08540 | 774.4 |
+| IMDB-11 | 1F + 3J | 48,336 pairs | 9.582 s | $0.01051 | 5,044.6 | 80.207 s | $0.08799 | 602.6 |
+| IMDB-8 | 2J | 115,224 pairs | 12.602 s | $0.01382 | 9,143.3 | 105.337 s | $0.11555 | 1,093.9 |
+| BIO-1 | 1F | 200 documents | 4.499 s | $0.00494 | 44.5 | 31.502 s | $0.03456 | 6.3 |
+| BIO-2 | 1J | 122,800 pairs | 15.592 s | $0.01710 | 7,875.9 | 104.147 s | $0.11425 | 1,179.1 |
+| BIO-3 | 1F + 1J | 75,522 pairs | 11.482 s | $0.01260 | 6,577.5 | 76.857 s | $0.08431 | 982.6 |
+| BIO-4 | 2F + 1J | 54,646 pairs | 9.620 s | $0.01055 | 5,680.5 | 64.656 s | $0.07093 | 845.2 |
+| BIO-5 | 3F + 1J | 36,840 pairs | 7.879 s | $0.00864 | 4,675.7 | 53.707 s | $0.05892 | 685.9 |
+| BIO-C | 3J | 348,888 pairs | 40.293 s | $0.04420 | 8,658.7 | 268.574 s | $0.29463 | 1,299.0 |
+| BIO-D | 1F + 3J | 290,610 pairs | 35.110 s | $0.03852 | 8,277.2 | 234.256 s | $0.25698 | 1,240.6 |
+| BIO-6 | 2J | 135,088 pairs | 16.663 s | $0.01828 | 8,107.3 | 111.222 s | $0.12201 | 1,214.6 |
+| FEV-1 | 1F | 100 documents | 0.025 s | $0.00003 | 4,077.7 | 0.210 s | $0.00023 | 476.3 |
+| FEV-2 | 1J | 5,700 pairs | 0.568 s | $0.00062 | 10,031.2 | 4.707 s | $0.00516 | 1,211.0 |
+| FEV-3 | 1F + 1J | 3,648 pairs | 0.417 s | $0.00046 | 8,738.5 | 3.468 s | $0.00380 | 1,052.0 |
+| FEV-4 | 2F + 1J | 570 pairs | 0.184 s | $0.00020 | 3,098.0 | 1.540 s | $0.00169 | 370.0 |
+| FEV-5 | 2F + 1J | 2,368 pairs | 0.322 s | $0.00035 | 7,351.5 | 2.679 s | $0.00294 | 884.0 |
+| FEV-6 | 3F + 1J | 370 pairs | 0.174 s | $0.00019 | 2,124.4 | 1.459 s | $0.00160 | 253.6 |
+| FEV-C | 3J | 9,896 pairs | 1.011 s | $0.00111 | 9,784.4 | 8.384 s | $0.00920 | 1,180.4 |
+| FEV-D | 1F + 3J | 6,431 pairs | 0.739 s | $0.00081 | 8,700.3 | 6.140 s | $0.00674 | 1,047.4 |
+| FEV-7 | 2J | 7,296 pairs | 0.791 s | $0.00087 | 9,228.1 | 6.554 s | $0.00719 | 1,113.2 |
+| LEP-1 | 1F | 200 documents | 0.219 s | $0.00024 | 912.7 | 1.848 s | $0.00203 | 108.2 |
+| LEP-2 | 1J | 40,000 pairs | 14.582 s | $0.01600 | 2,743.1 | 121.563 s | $0.13335 | 329.0 |
+| LEP-3 | 1F + 1J | 800 pairs | 0.515 s | $0.00057 | 1,553.0 | 4.277 s | $0.00469 | 187.0 |
+| LEP-4 | 2F + 1J | 600 pairs | 0.442 s | $0.00048 | 1,358.7 | 3.675 s | $0.00403 | 163.3 |
+| LEP-5 | 3F + 1J | 200 pairs | 0.295 s | $0.00032 | 677.1 | 2.469 s | $0.00271 | 81.0 |
+| LEP-6 | 5F + 1J | 0 pairs | 0.221 s | $0.00024 | 0.0 | 1.860 s | $0.00204 | 0.0 |
+| LEP-7 | 3F + 1J | 600 pairs | 0.537 s | $0.00059 | 1,118.1 | 4.486 s | $0.00492 | 133.8 |
+| LEP-8 | 5F | 200 documents | 0.221 s | $0.00024 | 906.3 | 1.860 s | $0.00204 | 107.5 |
 
 Every query on both models is compute bound. The largest
 `T_memory` in the suite is FEV-1's at 6.7% of its `T_compute`, and
@@ -210,6 +254,10 @@ them.
 
 Figure: plots/sol_quailb_attention_share.png
 
+The attention share figure contains the 26 queries with no more than one
+join. The nine queries with several joins can use more than one anchor
+context, so one context length would not describe their work correctly.
+
 The two compute terms grow differently with **context length** -
 how many earlier tokens each new token attends over. `T_dense` does
 not care: it is 2 P FLOPs per token whatever the context.
@@ -232,9 +280,9 @@ against 589,824 or 3.56x, and both models price it against the same
 bf16 peak.
 
 Put together: a query's cost multiplier from 4B to 32B lies between
-3.56 and 8.59, at whatever its mix is. The five BioDEX queries hold
+3.56 and 8.59, at whatever its mix is. The five plotted BioDEX queries hold
 4,146-token documents and spend 35 to 38% of their compute on
-attention, so they multiply by 6.7 to 7.0. Every other query holds
+attention, so they multiply by 6.7 to 7.0. Every other plotted query holds
 documents of 11 to 370 tokens, spends under 7% on attention, and
 multiplies by 8.3 to 8.6.
 
@@ -255,6 +303,10 @@ filter is correlated with document length.
 
 ## What this does not settle
 
+- **The nine queries with several joins have not been checked against a
+  measured Quail run.** Their token counts follow the physical plan and the
+  exact saved labels, but this report does not yet compare those counts with
+  the engine's measured fresh token count.
 - **The floor is loose.** `max(T_compute, T_memory)` taken once at
   the top is weaker than taking it per kernel and summing. Both are
   lower bounds; the per-kernel one would be larger and tighter.
