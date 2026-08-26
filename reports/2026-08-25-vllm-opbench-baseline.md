@@ -17,8 +17,7 @@ measured system.
 
 Figure: plots/vllm_opbench_vs_quail.png
 
-The plot uses a log scale because the measured times span more than two
-orders of magnitude.
+Both panels use the same linear time axis.
 
 | Model | Query | Pairs | SoL (s) | Quail (s) | Quail / SoL | Naive vLLM (s) | Compared with Quail | Stock vLLM (s) | Compared with Quail |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
