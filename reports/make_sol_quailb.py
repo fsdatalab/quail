@@ -316,7 +316,6 @@ COLUMNS = {
     "aspects.aspect": ("aspects", "aspect"),
     "reports.report": ("reports", "report"),
     "terms.term": ("terms", "term"),
-    "severe_terms.term": ("severe_terms", "term"),
     "claims.claim": ("claims", "claim"),
     "evidence.text": ("evidence", "text"),
     "citations.destination_context": ("citations", "destination_context"),
