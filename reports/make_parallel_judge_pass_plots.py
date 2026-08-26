@@ -107,14 +107,15 @@ def wall_plot():
     serial = DATA["result"]["wall_s_serial_reconstructed"] / 60
     extra = w[order[top]]["boot_s"] / 60 - base_load
     ax.axvline(parallel, color=DARK, lw=0.8, ls=":", ymax=0.82)
+    judging = sum(v["wall_minus_boot_s"] for v in w.values())
+    share = 100 * w["biodex"]["wall_minus_boot_s"] / judging
     ax.text(0, -1.35,
             f"All four finish at {parallel:.1f} min. One container doing the "
             f"same work would take {serial:.1f} min, so the split is worth "
             f"{DATA['result']['speedup_over_serial']:.2f}x.\n"
-            f"BioDEX sets the wall time: it is "
-            f"{100 * w['biodex']['wall_minus_boot_s'] / sum(v['wall_minus_boot_s'] for v in w.values()):.0f}%"
-            f" of the judging, and {extra:.1f} min of its load is four "
-            f"containers pulling one checkpoint at once.",
+            f"BioDEX sets the wall time: it is {share:.0f}% of the judging, "
+            f"and {extra:.1f} min of its load is four containers pulling "
+            f"one checkpoint at once.",
             fontsize=8.5, color="#555555", va="top")
 
     ax.set_yticks(range(len(order)))
