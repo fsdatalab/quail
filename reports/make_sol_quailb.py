@@ -1,6 +1,6 @@
 """Speed of light for every QUAIL-B query, on Qwen3-4B and Qwen3-32B.
 
-The least time each query can take on one H100. Three things cost
+The least time each query can take on one H100! request. Three things cost
 time and nothing else is counted:
 
   1. the dense projections - 2 FLOPs per parameter per token
@@ -9,8 +9,9 @@ time and nothing else is counted:
   3. moving bytes - the weights once per forward pass, KV once per
      token written, and KV again wherever a later stage reads it back
 
-No measured or fitted constant appears anywhere, which is what makes
-the answer a floor: a run can approach it and can never beat it.
+No measured or fitted performance constant appears in the time bound,
+which is what makes the answer a floor: a run can approach it and can
+never beat it. The dollar metric uses Modal's published H100! price.
 The equations are plans/sol_model.md; this file is them, plus the
 measurement of the three inputs they need.
 
@@ -63,6 +64,7 @@ The report is reports/2026-08-26-sol-quailb.md.
 """
 import collections
 import glob
+import itertools
 import json
 import math
 import sys
@@ -72,9 +74,14 @@ from pathlib import Path
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
+import quail
 from quail.bench import quailb as Q
+from quail.bench.evaluate import H100_PRICE_SOURCE, H100_USD_PER_HOUR
 from quail.logical import (ColumnRef, SHARED_PRE, bind_join_prompt,
                            bind_prompt)
+from quail.planner.decide import _collect
+from quail.planner.plan import EngineConfig, Refusal
+from quail.runtime.coordinator import thin_survivors
 from quail.specs import (H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, DeviceSpec,
                          ModelSpec)
 
@@ -229,80 +236,6 @@ def stream(prefix: float, suffixes) -> Work:
                 kv_read=prefix)
 
 
-# ---------------------------------------------------------------- 3
-# Whole queries
-
-
-def filter_chain(doc_tokens, preamble: int, stages, answers):
-    """A filter chain using the exact document ids that reach each stage.
-
-    ``doc_tokens`` maps document id to token count. Each stage names its
-    question and predicate code. ``answers`` maps that code and document id
-    to the saved ground truth answer.
-    """
-    live = list(doc_tokens)
-    work = Work()
-    for i, stage in enumerate(stages):
-        q = stage["question_tokens"]
-        step = scan if i == 0 else ask
-        for doc_id in live:
-            work = work + step(preamble + doc_tokens[doc_id], q)
-        live = [doc_id for doc_id in live
-                if answers[stage["code"]][doc_id]]
-    return work, live
-
-
-def join(anchor_tokens, partner_tokens, preamble: int, frame: int,
-         label: int, tail: int, anchor_resident: bool) -> Work:
-    """Every live anchor against every live partner.
-
-    One side anchors: its KV is held and every tuple attends to it.
-    The other streams: a copy of each of its documents rides in every
-    tuple's suffix, alongside that block's label and the answer cue.
-
-    ``frame`` is the anchor note and complete static question. The runtime
-    writes the frame into each anchor's kept KV once for this stage.
-    ``anchor_resident`` is true when a filter on the anchor side already
-    computed the document prefix. The join then adds only the frame before
-    evaluating the partner suffixes.
-    """
-    suffixes = [label + p + tail for p in partner_tokens]
-    work = Work()
-    for a in anchor_tokens:
-        prefix = preamble + a
-        if anchor_resident:
-            work = work + ask(prefix, frame)
-        else:
-            work = work + scan(prefix, frame)
-        work = work + stream(prefix + frame, suffixes)
-    return work
-
-
-def cheaper_anchor(left, right, preamble, left_frame, right_frame,
-                   left_label, right_label, tail,
-                   left_resident, right_resident):
-    """Both orientations of a join, and the one the engine would run.
-
-    The planner keeps whichever side is cheaper to hold and streams
-    the other, so the bound has to make the same choice or it is not
-    a bound on what runs. Anchoring the long side costs one prefix
-    per document; anchoring the short side copies every long document
-    into every tuple. On FEVER, where claims average 11 tokens and
-    evidence 370, that is a 5.5x difference.
-
-    Returns (work, "left" | "right", {orientation: tokens}).
-    """
-    if not left or not right:
-        return Work(), "left", {"left": 0.0, "right": 0.0}
-    a = join(left, right, preamble, left_frame, right_label, tail,
-             left_resident)
-    b = join(right, left, preamble, right_frame, left_label, tail,
-             right_resident)
-    pick = "left" if a.tokens <= b.tokens else "right"
-    return ({"left": a, "right": b}[pick], pick,
-            {"left": a.tokens, "right": b.tokens})
-
-
 # ---------------------------------------------------------------- 4
 # Speed of light
 
@@ -383,6 +316,7 @@ COLUMNS = {
     "aspects.aspect": ("aspects", "aspect"),
     "reports.report": ("reports", "report"),
     "terms.term": ("terms", "term"),
+    "severe_terms.term": ("severe_terms", "term"),
     "claims.claim": ("claims", "claim"),
     "evidence.text": ("evidence", "text"),
     "citations.destination_context": ("citations", "destination_context"),
@@ -404,8 +338,9 @@ for key, (table, col) in COLUMNS.items():
 FILTER_TEMPLATES = {c: getattr(Q, c) for c in (
     "F1", "F4", "F5", "F7", "F8", "F9", "F11", "F12", "F13",
     "LEP1", "LEP2", "LEP3", "LEP4", "LEP5", "LEPS1")}
-JOIN_TEMPLATES = {"DISCUSS_ASPECT": Q.DISCUSS_ASPECT, "REACTION": Q.REACTION,
-                  "SUPPORT": Q.SUPPORT, "LEPJOIN": Q.LEPJOIN}
+JOIN_TEMPLATES = {c: getattr(Q, c) for c in (
+    "DISCUSS_ASPECT", "ASPECT_SENTIMENT", "ASPECT_RELATED", "REACTION",
+    "REACTION_SEVERE", "SUPPORT", "REFUTE", "LEPJOIN")}
 col_ref = (ColumnRef("x", "t", "c"),)
 question = {c: bind_prompt(t, col_ref, encode).tail_tokens
             for c, t in FILTER_TEMPLATES.items()}
@@ -429,138 +364,317 @@ for code, template in JOIN_TEMPLATES.items():
 # collection names one label set per predicate; anything else is a
 # superseded run and must not be read.
 ACTIVE = set(COLLECTION["label_sets"].values())
-labels = {}
+filter_answers = {}
+join_answers = {}
+predicate_meta = {}
+template_codes = {}
 for m in glob.glob(str(W / "allabels/label_sets/*/*/*/manifest.json")):
     if Path(m).parent.name not in ACTIVE:
         continue
     meta = json.load(open(m))["predicate"]
-    if meta["kind"] != "filter":
-        continue
     rows = pq.read_table(Path(m).parent / "labels.parquet",
-                         columns=["left_id", "answer"]).to_pylist()
-    labels[meta["legacy_code"]] = {r["left_id"]: r["answer"] for r in rows}
+                         columns=["left_id", "right_id",
+                                  "answer"]).to_pylist()
+    code = meta["legacy_code"]
+    predicate_meta[code] = meta
+    left_ref = ColumnRef("left", meta["left_table"], meta["left_column"])
+    if meta["kind"] == "filter":
+        prompt = bind_prompt(meta["template"], (left_ref,), encode)
+        filter_answers[code] = {
+            str(row["left_id"]): bool(row["answer"]) for row in rows}
+    else:
+        right_ref = ColumnRef(
+            "right", meta["right_table"], meta["right_column"])
+        prompt = bind_join_prompt(
+            meta["template"], (left_ref, right_ref), encode)
+        join_answers[code] = {
+            (str(row["left_id"]), str(row["right_id"])):
+                bool(row["answer"])
+            for row in rows}
+    if prompt.template in template_codes:
+        raise ValueError(f"duplicate prompt template for {code}")
+    template_codes[prompt.template] = code
 
-# (document column, filter codes, (partner column, partner filters, join))
-QUERIES = {
- "IMDB-1": ("reviews.body", ["F1"], None),
- "IMDB-2": ("reviews.body", [], ("aspects.aspect", [], "DISCUSS_ASPECT")),
- "IMDB-3": ("reviews.body", ["F1"], ("aspects.aspect", [], "DISCUSS_ASPECT")),
- "IMDB-4": ("reviews.body", ["F1", "F4"],
-            ("aspects.aspect", [], "DISCUSS_ASPECT")),
- "IMDB-5": ("reviews.body", ["F1", "F4", "F5"],
-            ("aspects.aspect", [], "DISCUSS_ASPECT")),
- "IMDB-6": ("reviews.body", ["F1", "F4"], None),
- "IMDB-7": ("reviews.body", ["F1", "F4", "F5"], None),
- "BIO-1": ("reports.report", ["F7"], None),
- "BIO-2": ("reports.report", [], ("terms.term", [], "REACTION")),
- "BIO-3": ("reports.report", ["F7"], ("terms.term", [], "REACTION")),
- "BIO-4": ("reports.report", ["F7", "F8"], ("terms.term", [], "REACTION")),
- "BIO-5": ("reports.report", ["F7", "F8", "F9"],
-           ("terms.term", [], "REACTION")),
- "FEV-1": ("claims.claim", ["F11"], None),
- "FEV-2": ("claims.claim", [], ("evidence.text", [], "SUPPORT")),
- "FEV-3": ("claims.claim", ["F11"], ("evidence.text", [], "SUPPORT")),
- "FEV-4": ("claims.claim", ["F11", "F12"], ("evidence.text", [], "SUPPORT")),
- "FEV-5": ("claims.claim", ["F11"], ("evidence.text", ["F13"], "SUPPORT")),
- "FEV-6": ("claims.claim", ["F11", "F12"],
-           ("evidence.text", ["F13"], "SUPPORT")),
- "LEP-1": ("citations.destination_context", ["LEP1"], None),
- "LEP-2": ("citations.destination_context", [],
-           ("citations.passage_text", [], "LEPJOIN")),
- "LEP-3": ("citations.destination_context", ["LEP1"],
-           ("citations.passage_text", [], "LEPJOIN")),
- "LEP-4": ("citations.destination_context", ["LEP1", "LEP2"],
-           ("citations.passage_text", [], "LEPJOIN")),
- "LEP-5": ("citations.destination_context", ["LEP1", "LEP2", "LEP3"],
-           ("citations.passage_text", [], "LEPJOIN")),
- "LEP-6": ("citations.destination_context",
-           ["LEP1", "LEP2", "LEP3", "LEP4", "LEP5"],
-           ("citations.passage_text", [], "LEPJOIN")),
- "LEP-7": ("citations.destination_context", ["LEP1", "LEP2"],
-           ("citations.passage_text", ["LEPS1"], "LEPJOIN")),
- "LEP-8": ("citations.destination_context",
-           ["LEP1", "LEP2", "LEP3", "LEP4", "LEP5"], None),
-}
+if len(predicate_meta) != len(ACTIVE):
+    raise ValueError(
+        f"loaded {len(predicate_meta)} active predicates, expected "
+        f"{len(ACTIVE)}")
 
 
-def stage_selectivities(column, codes):
-    """Each stage's selectivity conditional on the stages before it:
-    how many of the documents that reach this filter pass it."""
-    live = set(lengths[column])
-    out = []
-    for c in codes:
-        passed = {i for i in live if labels[c][i]}
-        out.append({"code": c, "question_tokens": question[c],
-                    "evaluated": len(live),
-                    "selectivity": round(len(passed) / len(live), 6)
-                                   if live else 0.0})
-        live = passed
-    return out
+def prompt_code(prompt) -> str:
+    try:
+        return template_codes[prompt.template]
+    except KeyError as error:
+        raise KeyError("query prompt has no active ground truth") from error
 
 
-queries = {}
-for qid, (column, codes, joined) in QUERIES.items():
-    rec = {"document_column": column, "filters": stage_selectivities(column,
-                                                                     codes)}
-    if joined:
-        partner_column, partner_codes, join_code = joined
-        rec["partner_column"] = partner_column
-        rec["partner_filters"] = stage_selectivities(partner_column,
-                                                     partner_codes)
-        rec["join"] = {"code": join_code, **join_prompt[join_code]}
-    queries[qid] = rec
+def prompt_answer(prompt, assignment, aliases) -> bool:
+    code = prompt_code(prompt)
+    ids = [str(aliases[arg.alias]["ids"][assignment[arg.alias]])
+           for arg in prompt.args]
+    if len(ids) == 1:
+        return filter_answers[code][ids[0]]
+    if len(ids) == 2:
+        return join_answers[code][(ids[0], ids[1])]
+    raise NotImplementedError("SoL supports prompts with one or two documents")
 
 
-def query_work(rec):
-    """One query: its filter chain, its partner's filter chain if it
-    has one, and its join."""
-    docs = lengths[rec["document_column"]]
-    stages = rec["filters"]
-    work, live_ids = filter_chain(docs, PRE, stages, labels)
-    if "join" not in rec:
-        return work, None, {}, live_ids, []
-    partners = lengths[rec["partner_column"]]
-    pstages = rec["partner_filters"]
-    partner_work, partner_live_ids = filter_chain(
-        partners, PRE, pstages, labels)
-    work = work + partner_work
-    j = rec["join"]
-    jwork, anchor, both = cheaper_anchor(
-        [docs[doc_id] for doc_id in live_ids],
-        [partners[doc_id] for doc_id in partner_live_ids],
-        preamble=PRE,
-        left_frame=j["left_frame"], right_frame=j["right_frame"],
-        left_label=j["left_label"], right_label=j["right_label"],
-        tail=j["tail"],
-        left_resident=bool(stages), right_resident=bool(pstages))
-    return work + jwork, anchor, both, live_ids, partner_live_ids
+def prompt_token_counts(prompt):
+    labels_by_alias = {
+        alias: {"label": label_tokens, "frame": frame_tokens}
+        for alias, label_tokens, frame_tokens in prompt.labels}
+    return labels_by_alias, prompt.tail_tokens
+
+
+def join_stage_work(anchor, partners, aliases, survivors, prompt,
+                    resident: bool) -> Work:
+    labels_by_alias, tail = prompt_token_counts(prompt)
+    partner_rows = list(itertools.product(
+        *[survivors[alias] for alias in partners]))
+    suffixes = [
+        tail + sum(labels_by_alias[alias]["label"]
+                   + aliases[alias]["tokens"][row]
+                   for alias, row in zip(partners, partner_row))
+        for partner_row in partner_rows
+    ]
+    frame = labels_by_alias[anchor]["frame"]
+    work = Work()
+    for row in survivors[anchor]:
+        prefix = PRE + aliases[anchor]["tokens"][row]
+        work = work + (ask(prefix, frame) if resident
+                       else scan(prefix, frame))
+        work = work + stream(prefix + frame, suffixes)
+    return work
+
+
+def runtime_anchor(join, compiled_anchor, aliases, survivors):
+    prompt = join.predicate
+    labels_by_alias, tail = prompt_token_counts(prompt)
+    candidates = [arg.alias for arg in prompt.args]
+    counts = {alias: len(survivors[alias]) for alias in candidates}
+    means = {
+        alias: (sum(aliases[alias]["tokens"][row]
+                    for row in survivors[alias]) / counts[alias])
+        if counts[alias] else 0.0
+        for alias in candidates}
+    maxes = {
+        alias: max((aliases[alias]["tokens"][row]
+                    for row in survivors[alias]), default=0)
+        for alias in candidates}
+
+    def need(anchor):
+        return (PRE + maxes[anchor] + labels_by_alias[anchor]["frame"]
+                + tail
+                + sum(labels_by_alias[alias]["label"] + maxes[alias]
+                      for alias in candidates if alias != anchor))
+
+    def total(anchor):
+        tuples = math.prod(counts.values())
+        per_tuple = tail + sum(
+            labels_by_alias[alias]["label"] + means[alias]
+            for alias in candidates if alias != anchor)
+        return (counts[anchor]
+                * (means[anchor] + PRE
+                   + labels_by_alias[anchor]["frame"])
+                + tuples * per_tuple)
+
+    chunk = min(CHUNK.values())
+    feasible = [alias for alias in candidates
+                if alias == compiled_anchor or need(alias) <= chunk]
+    return min(feasible, key=total)
+
+
+def simulate_query(query):
+    plan = query.plan()
+    if isinstance(plan, Refusal):
+        raise ValueError(f"SoL query was refused: {plan.reasons}")
+    scans, filters, joins = _collect(query.logical)
+    aliases = {}
+    for scan_node in scans:
+        key = f"{scan_node.provider}.{scan_node.column}"
+        ids = list(lengths[key])
+        aliases[scan_node.alias] = {
+            "column": key,
+            "ids": ids,
+            "tokens": [lengths[key][doc_id] for doc_id in ids],
+        }
+    survivors = {
+        alias: list(range(len(data["ids"])))
+        for alias, data in aliases.items()}
+    work = Work()
+    resident = set()
+    filter_stages = []
+    filter_evaluations = 0
+
+    for node in plan.nodes_by_op("FilterChain"):
+        alias = node["alias"]
+        live = survivors[alias]
+        for stage_index, stage in enumerate(node["stages"]):
+            predicate = filters[alias][stage["written_pos"]]
+            code = prompt_code(predicate.prompt)
+            qtokens = predicate.prompt.tail_tokens
+            operation = scan if stage_index == 0 else ask
+            for row in live:
+                prefix = PRE + aliases[alias]["tokens"][row]
+                work = work + operation(prefix, qtokens)
+            passed = [
+                row for row in live
+                if prompt_answer(predicate.prompt, {alias: row}, aliases)
+            ]
+            filter_evaluations += len(live)
+            filter_stages.append({
+                "alias": alias,
+                "code": code,
+                "question_tokens": qtokens,
+                "evaluated": len(live),
+                "passed": len(passed),
+                "selectivity": (round(len(passed) / len(live), 6)
+                                if live else 0.0),
+            })
+            live = passed
+        survivors[alias] = live
+        resident.add(alias)
+
+    post_filter_counts = {
+        alias: len(rows) for alias, rows in survivors.items()}
+    finished_full = []
+    join_stages = []
+    join_pair_evaluations = 0
+    single_join_options = {}
+
+    for node in plan.nodes:
+        if node["op"] == "Barrier":
+            thin_survivors(finished_full, survivors)
+            continue
+        if node["op"] != "JoinGroup":
+            continue
+        stage_defs = [joins[stage["written_pos"]]
+                      for stage in node["stages"]]
+        anchor = node["anchor"]
+        if len(stage_defs) == 1 and stage_defs[0].anchor is None:
+            anchor = runtime_anchor(
+                stage_defs[0], anchor, aliases, survivors)
+
+        for stage_index, join in enumerate(stage_defs):
+            prompt = join.predicate
+            code = prompt_code(prompt)
+            stage_aliases = [arg.alias for arg in prompt.args]
+            partners = [alias for alias in stage_aliases if alias != anchor]
+            anchor_rows = list(survivors[anchor])
+            partner_rows = list(itertools.product(
+                *[survivors[alias] for alias in partners]))
+            anchor_resident = anchor in resident or stage_index > 0
+
+            if len(joins) == 1:
+                single_join_options = {
+                    candidate: join_stage_work(
+                        candidate,
+                        [alias for alias in stage_aliases
+                         if alias != candidate],
+                        aliases, survivors, prompt,
+                        candidate in resident).tokens
+                    for candidate in stage_aliases}
+
+            stage_work = join_stage_work(
+                anchor, partners, aliases, survivors, prompt,
+                anchor_resident)
+            work = work + stage_work
+            rows = {}
+            kept = []
+            passing_pairs = 0
+            for local_anchor, anchor_row in enumerate(anchor_rows):
+                answers = []
+                for partner_row in partner_rows:
+                    assignment = {anchor: anchor_row}
+                    assignment.update(zip(partners, partner_row))
+                    answer = prompt_answer(prompt, assignment, aliases)
+                    answers.append(answer)
+                    passing_pairs += int(answer)
+                rows[local_anchor] = answers
+                if any(answers):
+                    kept.append(anchor_row)
+            evaluated = len(anchor_rows) * len(partner_rows)
+            join_pair_evaluations += evaluated
+            stage_out = {
+                "anchor": anchor,
+                "partners": partners,
+                "anchor_index": anchor_rows,
+                "partner_index": partner_rows,
+                "rows": rows,
+            }
+            finished_full.append(stage_out)
+            survivors[anchor] = kept
+            resident.add(anchor)
+            join_stages.append({
+                "code": code,
+                "anchor": anchor,
+                "partners": partners,
+                "evaluated_pairs": evaluated,
+                "passing_pairs": passing_pairs,
+                "fresh_tokens": stage_work.tokens,
+            })
+
+    first_alias = scans[0].alias
+    input_document_rows = sum(
+        len(aliases[scan_node.alias]["ids"]) for scan_node in scans)
+    held_alias = (join_stages[0]["anchor"] if join_stages else first_alias)
+    anchor = None
+    both = {}
+    if len(joins) == 1:
+        stage_aliases = [arg.alias for arg in joins[0].predicate.args]
+        anchor = ("left" if join_stages[0]["anchor"] == stage_aliases[0]
+                  else "right")
+        both = {
+            "left": single_join_options[stage_aliases[0]],
+            "right": single_join_options[stage_aliases[1]],
+        }
+    elif joins:
+        anchor = ",".join(stage["anchor"] for stage in join_stages)
+
+    return {
+        "work": work,
+        "document_column": aliases[first_alias]["column"],
+        "partner_column": (aliases[scans[1].alias]["column"]
+                           if len(scans) > 1 else None),
+        "documents": len(aliases[first_alias]["ids"]),
+        "documents_after_filters": post_filter_counts[first_alias],
+        "input_document_rows": input_document_rows,
+        "filter_evaluations": filter_evaluations,
+        "join_pair_evaluations": join_pair_evaluations,
+        "filter_stages": filter_stages,
+        "join_stages": join_stages,
+        "anchor": anchor,
+        "anchor_tokens_both_ways": both,
+        "held_column": aliases[held_alias]["column"],
+    }
 
 
 # ================================================================
 # PART 3: every query, on both models
 # ================================================================
 
+session = quail.Session(
+    EngineConfig(gpus=1, cpu_memory_gb=80, model="qwen3-4b-fp8"),
+    tokenizer=encode)
+Q.register_sets(session, W / "data" / TAG)
+query_defs = Q.queries(session)
 rows = {}
-for qid, rec in queries.items():
-    work, anchor, both, live_ids, partner_live_ids = query_work(rec)
-    docs = lengths[rec["document_column"]]
+query_inputs = {}
+for qid, (description, build) in query_defs.items():
+    simulated = simulate_query(build())
+    work = simulated.pop("work")
     rows[qid] = {
-        "documents": len(docs),
-        "documents_after_filters": len(live_ids),
-        "tuples": (len(live_ids) * len(partner_live_ids)
-                   if "join" in rec else 0),
-        "document_column": rec["document_column"],
-        "partner_column": rec.get("partner_column"),
-        "anchor": anchor, "anchor_tokens_both_ways": both,
-        # mean length of the documents whose KV is held: the context
-        # every question and every tuple attends over, so the thing
-        # that decides how much of the compute is attention
-        "held_column": (rec["document_column"] if anchor != "right"
-                        else rec["partner_column"]),
+        "description": description,
+        **simulated,
+        "tuples": simulated["join_pair_evaluations"],
         "tokens": work.tokens, "pairs": work.pairs,
         "kv_written": work.kv_written, "kv_read": work.kv_read,
         "models": {}}
-    held = rows[qid]["held_column"]
+    query_inputs[qid] = {
+        "filters": simulated["filter_stages"],
+        "joins": simulated["join_stages"],
+    }
+    held = simulated["held_column"]
     rows[qid]["held_mean_doc_tokens"] = (
         sum(lengths[held].values()) / len(lengths[held]))
     for model in MODELS:
@@ -569,17 +683,26 @@ for qid, rec in queries.items():
             "passes": s.passes, "bytes_moved": s.bytes_moved,
             "t_dense": s.dense, "t_attention": s.attention,
             "t_compute": s.compute, "t_memory": s.memory,
-            "sol_s": s.seconds, "bound_by": s.bound_by}
+            "sol_s": s.seconds, "bound_by": s.bound_by,
+            "cost_usd_per_query": (
+                s.seconds * H100_USD_PER_HOUR / 3600),
+            "documents_per_second": (
+                simulated["input_document_rows"] / s.seconds
+                if not simulated["join_stages"] and s.seconds else None),
+            "document_pairs_per_second": (
+                simulated["join_pair_evaluations"] / s.seconds
+                if simulated["join_stages"] and s.seconds else None),
+        }
 
-hdr = (f"{'query':7} {'tokens':>11} {'pairs':>15} {'tuples':>8} "
-       f"{'anchor':>7}  {'4B SoL':>9} {'att%':>5}  {'32B SoL':>9} "
+hdr = (f"{'query':7} {'tokens':>11} {'pairs':>15} {'tuples':>10} "
+       f"{'anchor':>15}  {'4B SoL':>9} {'att%':>5}  {'32B SoL':>9} "
        f"{'att%':>5} {'32B/4B':>7}")
 print(hdr)
 print("-" * len(hdr))
 for qid, r in rows.items():
     a, b = r["models"]["qwen3-4b-fp8"], r["models"]["qwen3-32b-fp8"]
     print(f"{qid:7} {r['tokens']:>11,.0f} {r['pairs']:>15,.0f} "
-          f"{r['tuples']:>8,} {str(r['anchor'] or '-'):>7}  "
+          f"{r['tuples']:>10,} {str(r['anchor'] or '-'):>15}  "
           f"{a['sol_s']:>9.3f} {100 * a['t_attention'] / a['t_compute']:>5.1f}"
           f"  {b['sol_s']:>9.3f} "
           f"{100 * b['t_attention'] / b['t_compute']:>5.1f} "
@@ -587,13 +710,32 @@ for qid, r in rows.items():
 
 
 json.dump({
-    "what": f"Speed of light for all 26 QUAIL-B queries at sf={SF:g}, on "
-            "Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100 each. A floor on "
+    "what": f"Speed of light for all {len(rows)} QUAIL-B queries at "
+            f"sf={SF:g}, on "
+            "Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100! request each. "
+            "A floor on "
             "wall time: no measured or fitted constant is used.",
     "method": "plans/sol_model.md, computed by reports/make_sol_quailb.py",
     "scale_factor": SF,
+    "query_count": len(rows),
     "corpus_id": CORPUS_ID,
     "collection_id": COLLECTION_ID,
+    "pricing": {
+        "gpu": "H100!",
+        "h100_usd_per_hour": H100_USD_PER_HOUR,
+        "price_source": H100_PRICE_SOURCE,
+        "method": "SoL seconds multiplied by the H100! price per second",
+    },
+    "metric_definitions": {
+        "cost_usd_per_query": (
+            "lower bound on GPU cost; SoL seconds times the H100! price"),
+        "documents_per_second": (
+            "upper bound for filter only queries; input document rows "
+            "divided by SoL seconds"),
+        "document_pairs_per_second": (
+            "upper bound for join queries; evaluated pairs summed across "
+            "join stages and divided by SoL seconds"),
+    },
     "sources": {
         "corpora": f"/results/quailb_data/{TAG}, seed 20260818",
         "labels": "/results/ground_truth/quailb/schema_v1/label_sets on "
@@ -607,10 +749,7 @@ json.dump({
             for k, v in lengths.items()},
         "filter_question_tokens": question,
         "join_prompt_tokens": join_prompt,
-        "selectivities": {qid: {
-            "filters": rec["filters"],
-            "partner_filters": rec.get("partner_filters", [])}
-            for qid, rec in queries.items()}},
+        "query_stages": query_inputs},
     "queries": rows,
 }, open(OUT, "w"), indent=1)
 print(f"\nwrote {OUT}\n"

@@ -35,7 +35,7 @@ name, and it cannot judge the thing the constant was fitted to.
 
 `p`, `d_i` and `q_s` are the same for both models because every
 Qwen3 model shares one tokenizer. The hardware rows are the same
-because it is the same H100. Everything else differs.
+because it is the same H100! request. Everything else differs.
 
 `C` is a batch size the planner picks, not a property of the
 hardware, so it is an input to the bound with no default. Both
@@ -150,6 +150,20 @@ the calculation prices both choices and keeps the cheaper one. The
 join token counts differ by 14.9 times on FEV-2 and 193.7 times on
 BIO-2.
 
+### Several joins
+
+The calculation follows the physical plan one join stage at a time.
+Consecutive stages with the same anchor reuse the document KV. Each
+stage writes its own complete frame once per live anchor. The TRUE and
+FALSE pair labels from one stage determine which anchor documents reach
+the next stage.
+
+An anchor change creates a barrier. At the barrier, the calculation
+uses the saved passing pairs to remove documents that cannot appear in
+the final result. It then computes the new anchor prefix once and counts
+the next stage over the smaller document sets. The query work is the sum
+of the filter work and every join stage's work.
+
 ## 4. Speed of light
 
 ```
@@ -179,6 +193,21 @@ kernels are separate launches on the same SMs. Taking `max` once at
 the top is the loosest honest choice - per kernel it would be larger
 and tighter, and both are lower bounds.
 
+The reported cost and throughput metrics are derived from SoL:
+
+```
+cost per query = SoL / 3600 * H100! price in dollars per hour
+
+filter only documents per second = input document rows / SoL
+
+join document pairs per second = sum of evaluated pairs across all
+                                 join stages / SoL
+```
+
+The cost uses the benchmark's H100! price of $3.9492 per hour. The
+throughput denominator is the complete query time, including any filter
+stages before a join.
+
 ## 5. The code
 
 `reports/make_sol_quailb.py` is these equations, plus the
@@ -191,9 +220,12 @@ section 3:
 | `ask(prefix, suffix)` | stage `s > 1`: `suffix` tokens, `suffix * prefix + T(suffix)` pairs |
 | `stream(prefix, suffixes)` | a join's tuples: `ask` per suffix, one prefix read |
 
-`filter_chain`, `join` and `cheaper_anchor` compose them, and
-`speed_of_light()` is section 4. Nothing in the engine imports any of it:
-this is analysis, not a plan input.
+`simulate_query()` follows the physical plan. It applies the exact saved
+labels after every filter and join stage. `join_stage_work()` counts one
+stage for the anchor and partner sets that remain, and `runtime_anchor()`
+uses the same token arithmetic as the runtime anchor choice.
+`speed_of_light()` is section 4. Nothing in the engine imports this
+calculation. It is analysis and is not a planner input.
 
 ## 6. What the bound assumes
 
@@ -205,7 +237,7 @@ this is analysis, not a plan input.
 
 ## 7. Every QUAIL-B query
 
-`reports/2026-08-26-sol-quailb.md` applies all of this to the 26
+`reports/2026-08-26-sol-quailb.md` applies all of this to the 35
 queries at sf=0.1 on Qwen3-4B-fp8 and Qwen3-32B-fp8, from measured
 document lengths, measured prompt lengths, and exact active ground
 truth labels. `reports/make_sol_quailb.py` produces the report data.
