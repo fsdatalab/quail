@@ -10,8 +10,7 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
   input comes from them.
 - `quail/planner/` has the budget arithmetic, calibration loading
   and measurement, the physical plan, and the planner decisions
-  (stage order, anchor choice, sharding, access method). KV is
-  always bf16.
+  (stage order, anchor choice, sharding). KV is always bf16.
 - `quail/calibration/` has the measured constants per (model, device)
   pair: `a`, `a2`, and the host channel bandwidth table.
 - `quail/catalog.py`, `quail/logical.py`, `quail/sqlfront/`, and
@@ -54,14 +53,13 @@ Modal volume. Teed logs stay local and are not committed.
 
 ## Calibration
 
-The planner's restore break-even uses two measured constants per
-(model, device) pair. The constants are stored in
+Two measured constants per (model, device) pair are stored in
 `quail/calibration/{model}_{device}.json`:
 
 - `a_s_per_token`: wall seconds per fresh token in the packed loop
   (the serving rate, with all overhead included).
-- `a2_s_per_token2`: the quadratic attention coefficient. It bends
-  the restore break-even for long documents.
+- `a2_s_per_token2`: the quadratic attention coefficient for long
+  documents.
 
 A pair without a calibration file gets defaults scaled from the anchor
 measurement (Qwen3 4B on H100) using spec ratios. The plan's
@@ -77,8 +75,7 @@ The measure step (`quail.planner.calibrate.measure`) does the following:
 
 - It sweeps document length (256, 1,024, 4,096, and 8,192 tokens,
   about 1.5M fresh tokens per point) through the packed filter and
-  fits `t(h) = a + a2*h` by least squares. The planner's crossover
-  formulas use the same form.
+  fits `t(h) = a + a2*h` by least squares.
 - It re-probes the host copy channels (pinned and unpinned, both
   directions, 2 GiB timed copies) for comparison against
   `quail/calibration/channels.json`.

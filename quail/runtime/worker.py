@@ -38,11 +38,10 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
 
 
 # Process-global state: the container IS the session-side cache. A
-# warm container keeps the loaded model, the arena, and the pinned KV
-# store across execute() calls, which is what makes a session's later
-# queries boot in milliseconds and restore instead of recompute.
+# warm container keeps the loaded model and the arena across
+# execute() calls, which is what makes a session's later queries boot
+# in milliseconds.
 _BOOTED = {}      # model name -> dict(model, arena, pipeline)
-_STORE = None     # one PinnedStore per container, shared
 
 
 @app.function(image=image, gpu="H100!", timeout=7200, memory=98304,
@@ -51,13 +50,11 @@ _STORE = None     # one PinnedStore per container, shared
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})
 def execute(payload: dict) -> dict:
-    global _STORE
     import torch
     import torch.nn.functional as F
 
     from quail.executor.arena import KVArena
     from quail.executor.attention import FILTER_ATTENTION, Pipeline
-    from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
                                      run_join, warm_kernels)
     from quail.planner import budgets
@@ -69,7 +66,6 @@ def execute(payload: dict) -> dict:
 
     spec = MODELS[payload["model"]]
     device = DEVICES["h100-sxm"]
-    docs = payload["docs"]
 
     t_boot = time.perf_counter()
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
@@ -131,9 +127,8 @@ def execute(payload: dict) -> dict:
         boot[k] = round(boot[k], 2)
     boot["boot_s"] = round(boot_s, 2)
     state = dict(model=model, arena=arena, pipeline=pipeline,
-                 spec=spec, torch=torch, F=F, store=_STORE)
+                 spec=spec, torch=torch, F=F)
     report = _execute_single(state, payload)
-    _STORE = state["store"]
     report["boot_s"] = boot["boot_s"]
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
@@ -151,13 +146,12 @@ def _execute_single(state, payload: dict) -> dict:
     """Single-GPU execution core.
 
     Args:
-        state: Dict with model, arena, pipeline, spec, store, torch, F.
+        state: Dict with model, arena, pipeline, spec, torch, F.
         payload: The coordinator's payload dict.
     """
     import torch.nn.functional as F  # noqa: F401 (state carries it)
 
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
-    from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import AsyncAnswers, run_filter, run_join
     from quail.planner.decide import pick_runtime_anchor
     from quail.runtime.coordinator import (derive_plan_nodes,
@@ -166,35 +160,19 @@ def _execute_single(state, payload: dict) -> dict:
                                            thin_survivors)
 
     torch = state["torch"]
-    spec = state["spec"]
     arena, pipeline = state["arena"], state["pipeline"]
     docs = payload["docs"]
     # the engine preamble: prepended to every KV-owning document
-    # (filter scans, join anchors) so their stored KV is identical
-    # across operators; a partner document rides in the suffix raw
+    # (filter scans, join anchors) so their KV is identical across
+    # operators; a partner document rides in the suffix raw
     pre = payload.get("pre_ids") or []
     answerer = _PayloadAnswerer(torch, state["F"], state["model"],
                                 payload["true_ids"], payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
     chunk_tokens = payload["chunk_tokens"]
 
-    store_cfg = payload.get("store")
-    if store_cfg is not None and state.get("store") is None:
-        max_doc = max((len(d) for ds in docs.values() for d in ds),
-                      default=0)
-        state["store"] = PinnedStore(
-            capacity_tokens=int(store_cfg["capacity_bytes"]
-                                // spec.kappa),
-            n_layers=spec.layers, n_kv=spec.n_kv, d_head=spec.d_head,
-            max_doc_tokens=max(max_doc + len(pre), 4096),
-            dtype=torch.bfloat16)
-    store = state.get("store")
-    if payload.get("store_flush") and store is not None:
-        store.flush()
-
     total_tokens = 0
     out_filters = {}
-    store_stats = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
     # None when the payload has joins: LIMIT caps output rows, and a
     # join fans one survivor into zero or many rows
@@ -205,19 +183,11 @@ def _execute_single(state, payload: dict) -> dict:
     with torch.inference_mode():
         pipeline.attention_mode = FILTER_ATTENTION
         for alias, qids in payload["filters"].items():
-            stats = {}
             answers, _, tokens = run_filter(
                 torch, arena, pipeline, async_ans,
                 [pre + d for d in docs[alias]], qids,
-                chunk_tokens,
-                store=store if store_cfg else None,
-                store_hash=(store_cfg["hashes"][alias]
-                            if store_cfg else None),
-                store_min_tokens=(store_cfg["min_doc_tokens"]
-                                  if store_cfg else 1),
-                stats=stats, limit=limit,
+                chunk_tokens, limit=limit,
                 arena_writes=filter_writes[alias])
-            store_stats[alias] = stats
             total_tokens += tokens
             out_filters[alias] = {int(d): row
                                   for d, row in answers.items()}
@@ -259,23 +229,11 @@ def _execute_single(state, payload: dict) -> dict:
                     [_tuple_suffix(j, docs, t) for t in tuples])
             prefixes = [pre + docs[anchor_alias][a]
                         for a in anchors_glob]
-            jstats = {}
             ans, _, tokens = run_join(
                 torch, arena, pipeline, async_ans, prefixes,
                 stage_suffixes, chunk_tokens,
                 stage_frames=[j.get("frame") or [] for j in group],
-                group_size=1 if len(group) > 1 else None,
-                store=store if store_cfg else None,
-                store_hash=(store_cfg["hashes"][anchor_alias]
-                            if store_cfg else None),
-                store_min_tokens=(store_cfg["min_doc_tokens"]
-                                  if store_cfg else 1),
-                store_ids=anchors_glob,
-                stats=jstats)
-            if store_cfg:
-                agg = store_stats.setdefault(anchor_alias, {})
-                for key, v in jstats.items():
-                    agg[key] = agg.get(key, 0) + v
+                group_size=1 if len(group) > 1 else None)
             total_tokens += tokens
             for si, j in enumerate(group):
                 stage_out = dict(
@@ -296,7 +254,6 @@ def _execute_single(state, payload: dict) -> dict:
     return dict(filters=out_filters, joins=out_joins,
                 wall_s=round(wall, 2),
                 fresh_tokens=total_tokens,
-                store=(store_stats if store_cfg else None),
                 peak_gib=round(
                     torch.cuda.max_memory_allocated() / 2**30, 2))
 
@@ -305,12 +262,12 @@ def _execute_single(state, payload: dict) -> dict:
 # ------------------------------------------------- multi-GPU dispatch
 #
 # One executor per GPU, as its own child process (its own CUDA
-# context, arena, and store slice). The parent is the in-container
-# coordinator: it splits the payload with quail.runtime.coordinator,
-# runs the filter round, merges survivors, runs the join round, and
-# merges the answers - no network hop anywhere between rounds.
-# Children persist across execute calls, so their models stay loaded
-# and their store slices stay warm for the whole session.
+# context and arena). The parent is the in-container coordinator: it
+# splits the payload with quail.runtime.coordinator, runs the filter
+# round, merges survivors, runs the join round, and merges the
+# answers - no network hop anywhere between rounds. Children persist
+# across execute calls, so their models stay loaded for the whole
+# session.
 
 _CHILDREN = []      # [(process, connection)] in GPU order
 
@@ -342,7 +299,6 @@ def _child_boot(state, sub):
 
     from quail.executor.arena import KVArena
     from quail.executor.attention import FILTER_ATTENTION, Pipeline
-    from quail.executor.kvstore import PinnedStore
     from quail.executor.loop import AsyncAnswers, warm_kernels
     from quail.executor.model import load_model
     from quail.planner import budgets
@@ -371,8 +327,7 @@ def _child_boot(state, sub):
                             attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
         state.update(torch=torch, F=F, model=model, arena=arena,
-                     pipeline=pipeline, spec=spec,
-                     warmed=False, store=None)
+                     pipeline=pipeline, spec=spec, warmed=False)
         boot["kind"] = "cold"
     answerer = _PayloadAnswerer(torch, F, state["model"],
                                 sub["true_ids"], sub["false_ids"])
@@ -397,20 +352,6 @@ def _child_boot(state, sub):
         boot[k] = round(boot[k], 2)
     boot["boot_s"] = round(time.perf_counter() - t_boot, 2)
     state["boot"] = boot
-    store_cfg = sub.get("store")
-    if store_cfg is not None and state.get("store") is None:
-        pre_len = len(sub.get("pre_ids") or [])
-        max_doc = max(
-            [len(d) for ds in sub.get("docs", {}).values() for d in ds]
-            + [len(d) for d in sub.get("anchor_docs", [])] + [0])
-        state["store"] = PinnedStore(
-            capacity_tokens=int(store_cfg["capacity_bytes"]
-                                // state["spec"].kappa
-                                // sub.get("workers", 1)),
-            n_layers=state["spec"].layers, n_kv=state["spec"].n_kv,
-            d_head=state["spec"].d_head,
-            max_doc_tokens=max(max_doc + pre_len, 4096),
-            dtype=torch.bfloat16)
 
 
 def _child_filters(state, sub):
@@ -422,10 +363,7 @@ def _child_filters(state, sub):
     _child_boot(state, sub)
     boot = state["boot"]
     torch = state["torch"]
-    store_cfg = sub.get("store")
-    if sub.get("store_flush") and state.get("store") is not None:
-        state["store"].flush()
-    out = dict(filters={}, survivors={}, fresh_tokens=0, store={},
+    out = dict(filters={}, survivors={}, fresh_tokens=0,
                boot_s=boot["boot_s"], boot_kind=boot["kind"],
                boot=boot)
     pre = sub.get("pre_ids") or []
@@ -435,21 +373,13 @@ def _child_filters(state, sub):
     with torch.inference_mode():
         state["pipeline"].attention_mode = FILTER_ATTENTION
         for alias, qids in sub["filters"].items():
-            stats = {}
             index = sub["doc_index"][alias]
             answers, _, tokens = run_filter(
                 torch, state["arena"], state["pipeline"],
                 state["async_ans"],
                 [pre + d for d in sub["docs"][alias]], qids,
-                state["chunk_tokens"],
-                store=state["store"] if store_cfg else None,
-                store_hash=(store_cfg["hashes"][alias]
-                            if store_cfg else None),
-                store_min_tokens=(store_cfg["min_doc_tokens"]
-                                  if store_cfg else 1),
-                stats=stats, store_ids=index, limit=limit,
+                state["chunk_tokens"], limit=limit,
                 arena_writes=filter_writes[alias])
-            out["store"][alias] = stats
             out["fresh_tokens"] += tokens
             out["filters"][alias] = {index[d]: row
                                      for d, row in answers.items()}
@@ -471,8 +401,6 @@ def _child_joins(state, sub):
 
     _child_boot(state, sub)
     torch = state["torch"]
-    store_cfg = sub.get("store")
-    anchor_alias = sub["anchor_alias"]
     pre = sub.get("pre_ids") or []
     anchors_glob = list(sub["anchor_index"])
     anchor_docs = sub["anchor_docs"]
@@ -480,7 +408,6 @@ def _child_joins(state, sub):
     # thins at barriers, and re-shards; the child just runs the group
     group = sub["joins"]
     out_joins, tokens_total = [], 0
-    store_stats = {}
     t0 = _time.perf_counter()
     with torch.inference_mode():
         state["pipeline"].attention_mode = JOIN_ATTENTION
@@ -501,24 +428,12 @@ def _child_joins(state, sub):
                 [_tuple_suffix(j, part_docs, combo)
                  for combo in combos])
         prefixes = [pre + d for d in anchor_docs]
-        jstats = {}
         ans, _, tokens = run_join(
             torch, state["arena"], state["pipeline"],
             state["async_ans"], prefixes, stage_suffixes,
             state["chunk_tokens"],
             stage_frames=[j.get("frame") or [] for j in group],
-            group_size=1 if len(group) > 1 else None,
-            store=state["store"] if store_cfg else None,
-            store_hash=(store_cfg["hashes"][anchor_alias]
-                        if store_cfg else None),
-            store_min_tokens=(store_cfg["min_doc_tokens"]
-                              if store_cfg else 1),
-            store_ids=anchors_glob,
-            stats=jstats)
-        if store_cfg:
-            agg = store_stats.setdefault(anchor_alias, {})
-            for key, v in jstats.items():
-                agg[key] = agg.get(key, 0) + v
+            group_size=1 if len(group) > 1 else None)
         tokens_total += tokens
         for si, j in enumerate(group):
             out_joins.append(dict(
@@ -527,7 +442,6 @@ def _child_joins(state, sub):
                 partner_index=tuple_globs[si]))
     torch.cuda.synchronize()
     return dict(joins=out_joins, fresh_tokens=tokens_total,
-                store=store_stats,
                 wall_s=round(_time.perf_counter() - t0, 2))
 
 
@@ -607,11 +521,6 @@ def _execute_multi(payload: dict) -> dict:
         jouts = _round("joins", jsubs)
         stage_outs = coordinator.merge_join_round(jouts)
         merged["fresh_tokens"] += sum(o["fresh_tokens"] for o in jouts)
-        for o in jouts:
-            for alias, st in (o.get("store") or {}).items():
-                agg = merged["store"].setdefault(alias, {})
-                for key, v in st.items():
-                    agg[key] = agg.get(key, 0) + v
         for stage_out, j in zip(stage_outs, group):
             stage_out["anchor"] = anchor
             stage_out["partners"] = list(j["partners"])
@@ -630,7 +539,6 @@ def _execute_multi(payload: dict) -> dict:
                   boot_kind=slowest.get("boot_kind"),
                   boot=slowest.get("boot"),
                   fresh_tokens=merged["fresh_tokens"],
-                  store=merged["store"] or None,
                   peak_gib=max(o["peak_gib"] for o in fouts))
     results_vol.commit()
     kernel_cache.commit()

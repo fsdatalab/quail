@@ -33,7 +33,6 @@ payload to the worker, which calls the executor.
 | `executor/pack.py` | Chunk packing (pack_stream, FilterAdmission) | nothing |
 | `executor/loop.py` | Execution loops (run_filter, run_join, warm_kernels) | arena, attention, pack |
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
-| `executor/kvstore.py` | Pinned CPU KV store (save, load, extent allocation) | nothing (torch lazy) |
 | `runtime/session.py` | Session, Query, tokenization, payload assembly | catalog, logical, planner, sqlfront, builder |
 | `runtime/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `runtime/worker.py` | Modal worker (boot, execute, multi-GPU dispatch) | executor, planner, coordinator |
@@ -96,10 +95,9 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
 5. The planner produces a `PhysicalPlan`: a dataflow graph of nodes
    (DocScan, FilterChain, JoinGroup, Barrier, Recombine, Sink) whose
    edges carry either a table's live document ids or one stage's
-   passing pairs - plus the chunk budget, admission budget,
-   sharding, and a store length threshold. Stage order and anchors
-   come from one joint search. KV is always bf16. No wall-time
-   prediction is produced.
+   passing pairs - plus the chunk budget, admission budget, and
+   sharding. Stage order and anchors come from one joint search. KV
+   is always bf16. No wall-time prediction is produced.
 6. The session builds a payload (token id lists, planned settings,
    and the plan's node graph) and ships it to a Modal worker over
    RPC.
@@ -172,10 +170,8 @@ the labeled partner blocks:
 engine-owned and identical for every operator, every query, and
 every document. Because it is one fixed string, the KV of
 `[SHARED_PRE + document]` is the same wherever that document
-appears. The KV store keys extents by (content hash, document
-index) and folds `SHARED_PRE` into the hash, so a filter-scanned
-document can be restored as a join anchor and the other way around.
-Changing the preamble text invalidates every stored extent.
+appears - a filter scan and a join anchor build identical document
+KV.
 
 The wording is a formatting label, not an instruction. Measured on
 B1 (short reviews): "Evaluate whether the following is true or
@@ -189,9 +185,9 @@ A filter's `PROMPT('template {0} ...', col)` is canonicalized at
 bind time (`split_frame` in `logical.py`). Any user text before the
 first placeholder is stripped out and becomes the frame. The
 canonical template is `SHARED_PRE`, then `{0}` (the document the
-engine owns), then the frame, then the rest. The stored KV extent
-is document-only: `[SHARED_PRE + document]`. The frame is not
-stored.
+engine owns), then the frame, then the rest. The document's KV
+prefix is `[SHARED_PRE + document]`; the frame rides in the
+question suffix.
 
 A filter carries the frame at the head of each stage's question
 suffix. A join prompt is bound differently (`bind_join_prompt`). The
@@ -205,8 +201,7 @@ The planner prices the preamble and complete frame once per join
 anchor. It prices partner labels, partner documents, and the answer
 cue once per tuple. See
 `logical.py` (`SHARED_PRE`, `split_frame`, `bind_prompt`,
-`bind_join_prompt`) and the suite writeup
-`2026-08-19-shared-preamble-join-store.md`.
+`bind_join_prompt`).
 
 ### AI SQL front end
 
@@ -387,34 +382,18 @@ size. About 12,200 tokens at 4B/H100. Below this, the chunk is a
 GEMM problem (we say "prefill dominated"); above it, the quadratic
 attention term dominates.
 
-### Decisions that use calibration constants
-
-One decision compares compute cost against byte-transfer cost and
-therefore needs measured constants.
-
-**Access per scan** (`decide.py:314`): `read` (compute the
-document's KV from scratch) or `restore` (load KV from the pinned
-host store). Restore wins when the store's bandwidth beats
-`kappa / a` (the serving rate expressed as KV bytes per second), or
-when the corpus's documents are past the a2-refined crossover.
-
-The crossover is: solve `kappa / bw = a + a2 * h` for `h`, where
-`h` is document length in tokens. At the measured pinned-memory
-bandwidth of 55 GB/s, restore wins at every document length for the
-4B model.
-
 KV is always bf16. The planner does not choose a KV dtype and does
 not model a conversion tax.
 
 ## 4. Calibration
 
-The planner's restore break-even uses two measured constants per
-(model, device) pair, stored as JSON in `calibration/`:
+Two measured constants per (model, device) pair are stored as JSON
+in `calibration/`:
 
 | Constant | Meaning |
 |---|---|
 | `a` (s/token) | Wall seconds per fresh token in the packed loop, efficiency included |
-| `a2` (s/token^2) | The quadratic attention coefficient; bends the restore break-even for long documents |
+| `a2` (s/token^2) | The quadratic attention coefficient for long documents |
 
 A model/device pair without a calibration file gets defaults scaled
 from the anchor measurement (Qwen3 4B on H100) using spec ratios: a
@@ -426,11 +405,7 @@ device with a higher FLOP ceiling costs proportionally less
 `quail/runtime/calibrate.py`) sweeps document length through the
 packed filter and fits `t(h) = a + a2 * h` by least squares. It
 also probes the host copy channels (pinned and unpinned, both
-directions) for the store break-even.
-
-Additionally, `calibration/channels.json` stores host-memory
-bandwidth measurements (pinned device-to-host, host-to-device, etc.)
-that the store break-even arithmetic consumes.
+directions); those measurements land in `calibration/channels.json`.
 
 ## 5. The packed executor
 
@@ -448,8 +423,6 @@ single forward pass, sharing KV across them through a paged arena.
 | `plan_joins` | `decide.py` | The joint (order x anchor) search: cost every sequence, keep the cheapest |
 | `pick_runtime_anchor` | `decide.py` | Re-pick a one-stage group's anchor at a barrier, from measured live counts |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
-| `access_for_scan` | `decide.py` | Decide read vs restore for a scanned corpus |
-| `store_length_threshold` | `decide.py` | Length cutoff for which documents to store |
 | `chunk_budget` | `budgets.py` | Tokens per forward pass (min of memory and kernel bounds) |
 | `arena_tokens` | `budgets.py` | KV residency budget (device memory minus weights and activations) |
 | `load_calibration` | `calibration.py` | Load or spec-scale the calibration constants |
@@ -786,28 +759,26 @@ There are two loop drivers, one for each query shape:
 **`run_filter`** (`loop.py:437`): the filter chain. A while loop
 that runs until `FilterAdmission.done()`:
 1. Build a chunk from the scheduler's `next_chunk()`.
-2. Allocate arena pages for fresh documents. If a document is in the
-   store, load its KV asynchronously.
+2. Allocate arena pages for fresh documents.
 3. Pack the chunk (`pack_chunk`), run the forward pass, submit the
    answers asynchronously.
 4. While the GPU runs the current chunk, read the previous chunk's
    answers and gate: documents that answered NO have their pages
    freed immediately; survivors advance to their next stage.
-5. Documents leaving their last stage (or failing) are saved to the
-   KV store if they meet the length threshold.
+   Documents leaving their last stage free their pages too.
 
-Single-stage queries (one question, no store) skip the arena
-entirely: no later stage reads any document's KV, so the alloc, the
-per-layer KV scatter, and the paged attention read serve no one.
-The planner makes the call, and only the planner - the FilterChain
-operator carries an `arena_writes` field (False exactly when one
-stage runs with no store), it shows in `explain()`, and the payload
-forwards it to `run_filter`. `run_filter` requires the argument and
-never derives it; direct callers (warmups, calibration, the GPU
-cells, the ablation scripts) state their intent explicitly, and
-False against a later reader raises. Each [document | question]
-packs as ONE causal segment and admission runs on the token budget
-alone (`FilterAdmission` with `arena_pages=None`).
+Single-stage queries (one question) skip the arena entirely: no
+later stage reads any document's KV, so the alloc, the per-layer KV
+scatter, and the paged attention read serve no one. The planner
+makes the call, and only the planner - the FilterChain operator
+carries an `arena_writes` field (False exactly when one stage
+runs), it shows in `explain()`, and the payload forwards it to
+`run_filter`. `run_filter` requires the argument and never derives
+it; direct callers (warmups, calibration, the GPU cells, the
+ablation scripts) state their intent explicitly, and False against
+a later reader raises. Each [document | question] packs as ONE
+causal segment and admission runs on the token budget alone
+(`FilterAdmission` with `arena_pages=None`).
 
 This is strictly less work than stock vLLM does for the same
 prompt. Stock vLLM also writes every prompt token's KV into its
@@ -833,11 +804,8 @@ Between stages, answers are gated: anchors with no surviving pairs
 are dropped, and their pages are freed. The driver also prefetches
 the next group's stage-0 chunk while waiting on the current group's
 gate (which cannot be planned past until answers arrive), keeping the
-GPU fed across gate boundaries. Anchors already in the KV store
-restore instead of recomputing. Anchors leaving their last stage
-are saved if they meet the length threshold. A per-stage frame, if
-present, is written into the anchor's kept KV once after the
-document rows.
+GPU fed across gate boundaries. A per-stage frame, if present, is
+written into the anchor's kept KV once after the document rows.
 
 ### 5.7 KV rewind (chain mode)
 
@@ -870,11 +838,8 @@ while scheduler is not done:
 
     for each fresh document in groups:
         allocate arena pages
-        if document is in the store:
-            start async KV load from host memory
 
     pack the chunk (build GPU tensors from group specs)
-    wait for any pending KV loads to finish
     record start event
     run forward pass (pipeline.forward_chunk)
     record end event
@@ -884,14 +849,9 @@ while scheduler is not done:
     while more than one chunk is in flight:
         wait for the oldest chunk's answer event
         gate those answers
-        for documents leaving (NO or last stage):
-            if store enabled and document is long enough:
-                start async save to host memory (pages held until done)
-            else:
-                free pages immediately
+        free pages for documents leaving (NO or last stage)
 
 drain remaining in-flight chunks
-wait for pending store saves
 ```
 
 ### Pseudocode: KV rewind across filter stages
@@ -984,115 +944,13 @@ for each chunk in plan:
 #   final gates, emit (B, A, C)
 ```
 
-## 7. The KV store
-
-The KV store (`executor/kvstore.py`) is a pinned CPU memory pool that
-saves document KV across queries within a session. When a document's
-KV is in the store and the planner says `access=restore`, the
-document's KV is loaded from host memory into the arena instead of
-being recomputed.
-
-### Layout
-
-The store is a list of 8 GiB pinned slabs (a single large
-`cudaHostAlloc` failed at 280 GB; chunked slabs pin fine). Each slab
-is a flat tensor of token rows, where each row is every layer's K and
-V for one token (row width = `n_layers * 2 * n_kv * d_head`). A
-document is a contiguous extent of rows within one slab.
-
-### Save and load protocol
-
-**Save** (`kvstore.py`): runs on a CUDA side stream after the
-compute event that wrote the document's arena pages. For each layer,
-it gathers the document's K and V rows from the arena into a GPU
-staging buffer, then copies the staging buffer to the pinned host
-slab. The event the caller waits on fires after the gather, so
-arena pages can be freed while the host copy continues. Staging
-buffers grow on demand; large documents get 2 slots so the buffers
-do not claim tens of gigabytes next to the arena.
-
-**Load** (`kvstore.py:205`): copies from the host slab to the GPU
-staging buffer, then scatters into the document's arena pages. The
-calling chunk must wait on the load's completion event before
-launching its forward pass.
-
-### Extent allocation
-
-`ExtentAllocator` (`kvstore.py:61`): first-fit contiguous allocation
-with free-list coalescing. When the pool is full, `alloc_with_reclaim`
-evicts other datasets' extents (shortest documents first, because
-they have the least recompute value), but never evicts the running
-query's own dataset (that is where LRU-style thrashing comes from).
-
-### Length threshold
-
-The planner decides which documents to store using a length
-threshold (`decide.py:222`): keep the longest documents whose KV
-fits the capacity. Recompute cost per stored byte rises with document
-length, so the longest documents are worth the most per byte. A
-length threshold cannot be thrashed by a scanning query the way LRU
-can.
-
-### Break-even
-
-The store break-even bandwidth (`budgets.py:160`) is `kappa / a`:
-the KV bytes per token divided by the serving rate. At 4B/H100, this
-is 7 to 9 GB/s. Pinned host memory achieves 55 GB/s (measured), so
-the store clears the break-even. Disk and volumes do not.
-
-### Pseudocode: store save and load
-
-```
-# save (runs on side CUDA stream, after the forward's compute event):
-for each layer:
-    gather document's K rows from arena pages into staging buffer
-    gather document's V rows from arena pages into staging buffer
-copy staging buffer to pinned host slab (non-blocking)
-record completion event
-# caller frees arena pages after the gather; the host copy continues
-
-# load (runs on side CUDA stream, before the chunk's forward):
-copy from pinned host slab to staging buffer (non-blocking)
-for each layer:
-    scatter staging buffer rows into document's arena pages
-record completion event
-# the chunk's forward waits on this event before launching
-```
-
-### Pseudocode: store length threshold
-
-```
-sort all document lengths in descending order
-budget = capacity_bytes / kappa    (capacity in tokens)
-taken = 0
-threshold = 0
-for each length h (longest first):
-    if taken + h > budget:
-        stop
-    taken += h
-    threshold = h
-# documents with length >= threshold are stored
-# shorter documents are recomputed
-```
-
-### Key functions: KV store
-
-| Function | File | What it does |
-|---|---|---|
-| `PinnedStore.save` | `kvstore.py:165` | Async copy of document KV from arena to host |
-| `PinnedStore.load` | `kvstore.py:205` | Async copy of document KV from host to arena |
-| `PinnedStore.flush` | `kvstore.py:231` | Drop all stored KV (cold pass) |
-| `ExtentAllocator.alloc` | `kvstore.py:69` | First-fit contiguous extent allocation |
-| `ExtentAllocator.free` | `kvstore.py:83` | Free extent with coalescing |
-| `alloc_with_reclaim` | `kvstore.py:29` | Allocate with cross-dataset eviction |
-
-## 8. Multi-GPU dispatch
+## 7. Multi-GPU dispatch
 
 The coordinator (`runtime/coordinator.py`) splits work across GPU
 workers and merges answers. Each worker is a child process with its
-own CUDA context, arena, and store slice. The parent process (inside
-the same Modal container) sends payloads over pipes, so there is no
-network hop between rounds.
+own CUDA context and arena. The parent process (inside the same
+Modal container) sends payloads over pipes, so there is no network
+hop between rounds.
 
 ### Rounds follow the plan's node graph
 
@@ -1101,9 +959,9 @@ Sharding is by token count (the planner's `balanced_shards`). After
 this round, the parent merges survivors.
 
 **One join round per JoinGroup node**: anchors follow the alias's
-filter shard when one exists (their KV may be in that GPU's store
-slice); an anchor with no filter shard - it was a partner before the
-barrier - gets fresh balanced shards over its live documents. That
+filter shard when one exists (locality); an anchor with no filter
+shard - it was a partner before the barrier - gets fresh balanced
+shards over its live documents. That
 re-shard moves no KV: partners never owned any, so the parent ships
 token ids (which every round does anyway) and each GPU computes its
 new anchor slice's KV. Every worker sees every surviving partner
@@ -1177,7 +1035,7 @@ The measured scaling on two GPUs: filter 1.99x, join 2.02x
 (`dispatch_gate.json`). Modal functions are defined for 2, 4, and 8
 GPUs (`worker.py:495-519`).
 
-## 9. The benchmark (QUAIL-B)
+## 8. The benchmark (QUAIL-B)
 
 QUAIL-B (`bench/quailb.py`) is a benchmark of 15 queries over five
 document sets, built from real text (IMDB reviews, BioDEX patient
@@ -1219,25 +1077,19 @@ concatenating real text.
 | B10 | 2 joins (chain) | Gating, dedup, and replay |
 | B11 | 2 joins (star) | Kept anchors read by two stages |
 | B12 | 1 filter + 1 join | Two-sided pushdown |
-| B13 | 5 filters (rerun) | Warm-pass scan restore (new questions) |
-| B14 | 1 join (rerun) | Warm-pass anchor restore |
 | B15 | 1 filter + 2 joins | Everything at once |
 
-### Cold/warm protocol
+### Single-pass protocol
 
-The benchmark runs two passes in one session:
-- **Cold pass**: the KV store is flushed and disabled. Every
-  document's KV is computed from scratch.
-- **Warm pass**: the KV store is enabled. Documents whose KV was
-  saved during the cold pass (or the warm pass itself) can be
-  restored instead of recomputed.
+The benchmark runs each query once in one session. Every document's
+KV is computed from scratch; nothing persists between queries.
 
 Each query reports both the provided selectivity (what the planner
 was told) and the observed selectivity (what the model actually
 returned), which serves as an instrument check for selectivity
 drift.
 
-## 10. Weight loading and kernel infrastructure
+## 9. Weight loading and kernel infrastructure
 
 **Model loading** (`executor/model.py`): Quail loads the model
 checkpoint through vLLM's `get_model` function, which gives the

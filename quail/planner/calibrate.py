@@ -117,7 +117,7 @@ def measure(model: ModelSpec, device: DeviceSpec,
         body_ids = [stream[i * h:(i + 1) * h] for i in range(n_docs)]
         t0 = time.perf_counter()
         with torch.inference_mode():
-            # single stage, no store: matches the fast path
+            # single stage: matches the fast path
             _, spans, tokens = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
                 exec_budget, arena_writes=False)

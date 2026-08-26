@@ -2,7 +2,6 @@
 arithmetic) from model and device specs.
 """
 
-from quail.executor.kvstore import PinnedStore
 from quail.specs import DeviceSpec, ModelSpec
 
 POOL_FRACTION = 0.92    # fraction of device memory the executor claims
@@ -12,7 +11,6 @@ INT32_MAX = 2**31 - 1
 ACT_BYTES = 2           # bf16 activations, bytes per element
 ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
 #                         the arena for overlapped chunk construction
-STORE_KV_BYTES = 2.0    # pinned store staging tensors are always bf16
 
 
 def tensor_parallel(model: ModelSpec, device: DeviceSpec) -> int:
@@ -45,24 +43,17 @@ def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     return max(b, int(compute_knee(model, device)))
 
 
-def store_staging_bytes(model: ModelSpec) -> float:
-    """Device memory bytes reserved for the pinned KV store's staging ring."""
-    return (PinnedStore.STAGING_BUDGET_TOKENS
-            * model.kv_elements_per_token * STORE_KV_BYTES)
-
-
 def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None) -> int:
     """Admission budget: tokens of document KV that can be resident at once.
 
-    Computed from the memory left after weights, activation reservation,
-    and store staging reservation.
+    Computed from the memory left after weights and the activation
+    reservation.
     """
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
     free = (device.mem_bytes * POOL_FRACTION - model.W_mem
-            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token
-            - store_staging_bytes(model))
+            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
     return int(free // model.kappa)
 
 
@@ -136,14 +127,6 @@ def attention_crossover(model: ModelSpec, device: DeviceSpec,
 
 # ---- rows that consume a calibration constant
 
-def store_break_even_bytes_per_s(model: ModelSpec,
-                                 a_s_per_token: float) -> float:
-    """Bandwidth (bytes/s) a KV store must exceed for restore to beat
-    recompute: kappa / a.
-    """
-    return model.kappa / a_s_per_token
-
-
 def derived_table(model: ModelSpec, device: DeviceSpec,
                   a_s_per_token: float) -> dict:
     """Return all derived budget quantities as a dict."""
@@ -156,7 +139,5 @@ def derived_table(model: ModelSpec, device: DeviceSpec,
         "chunk_budget": chunk,
         "compute_knee": compute_knee(model, device),
         "attention_crossover": attention_crossover(model, device, chunk),
-        "store_break_even_bytes_per_s":
-            store_break_even_bytes_per_s(model, a_s_per_token),
         "serving_rate_tokens_per_s": 1.0 / a_s_per_token,
     }

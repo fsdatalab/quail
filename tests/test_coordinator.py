@@ -21,7 +21,7 @@ def payload():
         filter_arena_writes={"r": True},
         joins=[dict(anchor="r", partners=["p"], semantics="full",
                     labels={"p": [2]}, frame=[8], tail=[3])],
-        store=None, workers=2,
+        workers=2,
         shards={"r": ((0, 2, 4), (1, 3, 5)), "p": ((0, 1), (2, 3))})
 
 
@@ -43,11 +43,11 @@ def test_merge_filter_round():
     outs = [
         dict(filters={"r": {0: [1], 2: [0], 4: [1]}},
              survivors={"r": [0, 4]},
-             fresh_tokens=100, store={"r": dict(stored_docs=3)},
+             fresh_tokens=100,
              boot_s=1.0, wall_s=2.0, peak_gib=10),
         dict(filters={"r": {1: [1], 3: [1], 5: [0]}},
              survivors={"r": [1, 3]},
-             fresh_tokens=50, store={"r": dict(stored_docs=3)},
+             fresh_tokens=50,
              boot_s=1.5, wall_s=2.0, peak_gib=11),
     ]
     m = merge_filter_round(outs)
@@ -55,7 +55,6 @@ def test_merge_filter_round():
                                  4: [1], 5: [0]}
     assert m["survivors"]["r"] == [0, 1, 3, 4]
     assert m["fresh_tokens"] == 150
-    assert m["store"]["r"]["stored_docs"] == 6
     limited = merge_filter_round(outs, limit=3)
     assert limited["survivors"]["r"] == [0, 1, 3]
 
@@ -104,16 +103,13 @@ def test_join_group_reshards_an_unfiltered_anchor_over_its_live_set():
     # test_join_group_anchors_follow_filter_shards above
 
 
-def test_join_group_carries_pre_and_store():
+def test_join_group_carries_pre():
     # the join round needs the engine preamble (anchor prefixes are
-    # pre + doc) and the store config (anchors restore and save)
+    # pre + doc)
     p = payload()
-    p["store"] = dict(capacity_bytes=1e9, min_doc_tokens=5,
-                      hashes={"r": "h"})
     subs = join_group_payloads(p, 2, {"r": [0, 1, 3, 4]}, p["joins"])
     for s in subs:
         assert s["pre_ids"] == [9]
-        assert s["store"]["hashes"]["r"] == "h"
         assert s["anchor_alias"] == "r"
 
 

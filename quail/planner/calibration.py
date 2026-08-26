@@ -25,12 +25,6 @@ class Calibration:
         return 1.0 / self.a_s_per_token
 
 
-def channel_bandwidths() -> dict:
-    """Return channel name -> bandwidth in bytes/s."""
-    with open(CALIBRATION_DIR / "channels.json") as f:
-        return json.load(f)["bandwidth_bytes_per_s"]
-
-
 def fit_affine(points) -> tuple[float, float]:
     """Least-squares fit of t = a + a2*h over (h, t) points.
 

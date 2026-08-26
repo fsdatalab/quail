@@ -36,7 +36,7 @@ uv run python -m quail.bench.quailb \
   2>&1 | tee results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-IMDB-4.log
 ```
 
-Each command runs a cold pass and a warm pass. It reads ground truth before
+Each command runs every selected query once. It reads ground truth before
 the timers start. It reports runtime, H100 cost, tokens, documents per second,
 answer accuracy, and final-row precision, recall, and F1.
 

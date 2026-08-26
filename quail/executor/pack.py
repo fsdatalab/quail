@@ -166,11 +166,11 @@ class FilterAdmission:
         stage_tokens: Per-stage question suffix token counts.
         chunk_budget: Tokens per forward pass.
         arena_pages: Page budget for admission. None disables page
-            accounting (single-stage, no store).
+            accounting (single-stage).
         page_tokens: Tokens per arena page.
         kept_extra_tokens: Extra tokens per document that must fit in
             pages (shared preamble plus tail room).
-        restored: Documents whose KV loads from the store.
+        restored: Documents whose KV is already resident in the arena.
         limit: Stop after this many survivors.
 
     Survivor suffixes pack before fresh admissions. Pages are granted
@@ -192,9 +192,9 @@ class FilterAdmission:
         # kept_extra_tokens: the shared question preamble that joins
         # the document's kept KV after stage 1, so pages must cover it
         self.kept_extra = kept_extra_tokens
-        # restored: documents whose KV loads from the store instead of
-        # computing - their admission claims the same pages but their
-        # chunk cost is the first question only
+        # restored: documents whose KV is already resident, so nothing
+        # recomputes it - their admission claims the same pages but
+        # their chunk cost is the first question only
         self.restored = set(restored)
         for d, t in enumerate(self.doc_tokens):
             need = t + max(stage_tokens)
@@ -270,7 +270,7 @@ class FilterAdmission:
         otherwise queues the next-stage suffix.
 
         Returns docs whose pages were freed. release=False keeps
-        pages held for a pending store copy."""
+        pages held; free them later with release()."""
         self.in_flight.discard(doc)
         self.answers.setdefault(doc, []).append(1 if passed else 0)
         last = stage == len(self.stage_tokens) - 1
@@ -285,7 +285,7 @@ class FilterAdmission:
         return ()
 
     def release(self, doc):
-        """Return a document's pages after a deferred store save."""
+        """Return a document's pages after a deferred release."""
         if self.free_pages is not None:
             self.free_pages += self.resident.pop(doc)
 

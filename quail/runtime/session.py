@@ -2,8 +2,6 @@
 compiling queries, planning, and executing on Modal.
 """
 
-import hashlib
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -11,15 +9,9 @@ from dataclasses import dataclass, field
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (SHARED_PRE, CompileError, LogicalPlan,
                            join_label, render_join_frame)
-from quail.planner.calibration import channel_bandwidths
 from quail.planner.decide import _collect, explain, plan_query
-from quail.planner.plan import (EngineConfig, Refusal, StoreSpec,
-                                resolve_model)
+from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.specs import DEVICES
-
-STORE_HEADROOM_GB = 16    # container memory the store must leave for
-#                           weights loading, activations paging, and
-#                           the Python process itself
 
 
 class RefusalError(RuntimeError):
@@ -76,23 +68,10 @@ class Session:
         self._fast_tried = False
         self.notes = []            # tokenizer picks etc., for reports
         self._scan_cache = {}      # (source, column) -> token lists
-        self._warm_hashes = set()  # content hashes stored by earlier
-        #                            runs in this session
         self._app_ctx = None       # the Modal app held open for the
         #                            session, so the worker container
-        #                            (its booted model and its store)
-        #                            survives between run() calls
-        self.store_enabled = True  # the benchmark's cold pass runs
-        #                            with the store disabled
-        self._flush_next = False
-
-    def set_store(self, enabled: bool) -> None:
-        self.store_enabled = enabled
-
-    def flush_store(self) -> None:
-        """Mark the store for flushing on the next run."""
-        self._flush_next = True
-        self._warm_hashes.clear()
+        #                            (its booted model) survives
+        #                            between run() calls
 
     def worker(self):
         """Return the worker module, opening this session's Modal app if needed."""
@@ -113,33 +92,6 @@ class Session:
 
     def __exit__(self, *exc):
         self.close()
-
-    def store_spec(self, hashes=()) -> StoreSpec | None:
-        """Build a StoreSpec for the planner, or None if the store is disabled."""
-        if not self.store_enabled:
-            return None
-        if self.config.cpu_memory_gb <= STORE_HEADROOM_GB:
-            return None
-        capacity = (self.config.cpu_memory_gb
-                    - STORE_HEADROOM_GB) * 1e9
-        warm = bool(hashes) and all(h in self._warm_hashes
-                                    for h in hashes)
-        return StoreSpec(read_bw=channel_bandwidths()["pinned_h2d"],
-                         warm=warm, capacity_bytes=capacity)
-
-    def content_hash(self, provider_name: str, column: str) -> str:
-        """Return a store key prefix for one scanned column.
-
-        Derived from (provider data, column, model, preamble). File
-        identity uses (path, size, mtime).
-        """
-        provider = self.catalog.get(provider_name)
-        ident = [provider.kind, provider.source, column,
-                 self.model.name, SHARED_PRE]
-        if provider.kind == "parquet" and os.path.exists(provider.source):
-            st = os.stat(provider.source)
-            ident += [str(st.st_size), str(int(st.st_mtime))]
-        return hashlib.sha256(":".join(ident).encode()).hexdigest()[:16]
 
     def register(self, name: str, provider: DocumentProvider) -> None:
         self.catalog.register(name, provider)
@@ -292,18 +244,14 @@ class Query:
         if self._plan is None:
             scans, _, _ = _collect(self.logical)
             self._doc_tokens = {}
-            self._hashes = {}
             for s in scans:
                 _, _, toks = self.session.scan(s.provider, s.column)
                 self._doc_tokens[s.alias] = [len(t) for t in toks]
-                self._hashes[s.alias] = self.session.content_hash(
-                    s.provider, s.column)
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
                 doc_tokens=self._doc_tokens,
                 gpus=self.session.config.gpus,
-                store=self.session.store_spec(self._hashes.values()),
                 order=self.order)
         return self._plan
 
@@ -378,13 +326,6 @@ class Query:
                                        and j.semantics == "full")
                 join_specs.append(spec)
         true_ids, false_ids = _true_false_ids(sess.tokenizer)
-        store = None
-        spec = sess.store_spec(self._hashes.values())
-        if spec is not None:
-            store = dict(capacity_bytes=spec.capacity_bytes,
-                         min_doc_tokens=max(1,
-                                            plan.store_min_doc_tokens),
-                         hashes=dict(self._hashes))
         shards = {node["alias"]: node["shards"] for node in plan.nodes
                   if node["op"] == "DocScan"}
         # the plan's node graph rides along so the worker executes the
@@ -396,10 +337,7 @@ class Query:
             n.pop("shards", None)
             n.pop("shard_token_loads", None)
             plan_nodes.append(n)
-        flush = sess._flush_next
-        sess._flush_next = False
         return dict(
-            store_flush=flush,
             model=sess.model.name,
             kv_dtype=plan.kv_dtype,
             chunk_tokens=plan.chunk_tokens,
@@ -421,8 +359,7 @@ class Query:
             # written; run_filter requires it and never derives it
             filter_arena_writes=filter_writes,
             joins=join_specs,
-            plan_nodes=plan_nodes,
-            store=store)
+            plan_nodes=plan_nodes)
 
     # ---- sink: gate, replay-check, project ------------------------------
 
@@ -437,13 +374,9 @@ class Query:
             coordinator_wall_s=round(coordinator_wall, 2),
             fresh_tokens=out["fresh_tokens"], stages=[],
             peak_gib=out.get("peak_gib"),
-            store=out.get("store"),
             order_rule=plan.order_rule,
             calibration=plan.calibration_source,
             remarks=list(plan.remarks) + list(self.session.notes))
-        if getattr(self, "_hashes", None) and out.get("store"):
-            # later runs of this session may now plan access=restore
-            self.session._warm_hashes.update(self._hashes.values())
         answer_rows = dict(filters=out["filters"], joins=out["joins"])
 
         # filter survivors + observed selectivities

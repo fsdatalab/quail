@@ -647,33 +647,6 @@ def attention_end_to_end_parity(n_docs: int = 256,
                 torch, arena, pipeline, async_answers,
                 body_ids, question_ids, budget, arena_writes=True)
         outputs["full_prompt"] = full_prompt_reference()
-
-        # store round trip under the filter assignment: pass 1 saves
-        # every document's KV, pass 2 restores instead of computing.
-        # Restored KV is a byte copy of computed KV, so pass 2 must
-        # reproduce the no-store answers exactly - this covers the
-        # restore path's interaction with unified scattering and the
-        # preamble rewind.
-        from quail.executor.kvstore import PinnedStore
-        n_store = min(64, n_docs)
-        store_docs = body_ids[:n_store]
-        store = PinnedStore(
-            capacity_tokens=sum(len(d) for d in store_docs) + 4096,
-            n_layers=spec.layers, n_kv=spec.n_kv, d_head=spec.d_head,
-            max_doc_tokens=max(len(d) for d in store_docs) + 256,
-            dtype=torch.bfloat16)
-        pipeline.attention_mode = "unified"
-        baseline_store, _, _ = run_filter(
-            torch, arena, pipeline, async_answers, store_docs,
-            question_ids, budget, arena_writes=True)
-        run_filter(torch, arena, pipeline, async_answers, store_docs,
-                   question_ids, budget, store=store, store_hash="p",
-                   store_min_tokens=1, arena_writes=True)
-        stats = {}
-        restored_answers, _, _ = run_filter(
-            torch, arena, pipeline, async_answers, store_docs,
-            question_ids, budget, store=store, store_hash="p",
-            store_min_tokens=1, stats=stats, arena_writes=True)
     torch.cuda.synchronize()
 
     comparisons = {}
@@ -690,10 +663,6 @@ def attention_end_to_end_parity(n_docs: int = 256,
     comparisons["merge_quant_vs_unified"] = dict(
         disagreements=merge_unified,
         disagreements_by_stage=merge_unified_by_stage)
-    store_diff, _ = _disagreements(restored_answers, baseline_store)
-    comparisons["unified_store_restore"] = dict(
-        disagreements=store_diff, restored_docs=stats["restored_docs"],
-        of_docs=n_store)
     report = dict(
         cell="attention_end_to_end_parity", model=spec.name,
         n_docs=n_docs,
@@ -701,9 +670,7 @@ def attention_end_to_end_parity(n_docs: int = 256,
             "Every document and stage recomputes the complete document plus "
             "question as one causal sequence without paging or an LSE merge."),
         comparisons=comparisons,
-        pass_unified=comparisons["unified"]["disagreements"] == 0,
-        pass_store=(store_diff == 0
-                    and stats["restored_docs"] == n_store))
+        pass_unified=comparisons["unified"]["disagreements"] == 0)
     tag = "" if spec.name == "qwen3-4b-fp8" else "_32b"
     return _write(report, f"attention_end_to_end_parity{tag}")
 

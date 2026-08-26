@@ -102,8 +102,7 @@ def main():
     print(json.dumps(summary["filter"], indent=2), flush=True)
 
     # the same query again: if the worker container stayed warm, the
-    # second run restores every document from the container's store
-    # (the session now plans access=restore) and skips the boot
+    # second run skips the boot
     res2 = fq2 = sess.sql(f"""
         SELECT d.id FROM docs d
         WHERE AI_FILTER(PROMPT('{{0}}{q1_text}', d.body),

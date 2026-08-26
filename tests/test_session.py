@@ -167,34 +167,21 @@ def test_order_by_cost_reorders_payload(sess):
     assert "q1:" in seen2["payload"]["filters"]["r"][0]
 
 
-def test_payload_carries_filter_arena_writes(sess, tmp_path):
-    # the default session has a store (cpu_memory_gb=64), so even a
-    # single-stage filter keeps writes on: store.save reads the arena
+def test_payload_carries_filter_arena_writes(sess):
+    # one stage: nothing reads the KV again - the planner turns
+    # writes off
     truth = {"r": {"q1:": [1, 0, 1, 0, 1, 0]}}
     sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
            "PROMPT('q1: {0}', r.review), {'selectivity': 0.5})")
     seen = {}
     sess.sql(sql).run(_execute=make_executor(truth, seen=seen))
-    assert seen["payload"]["filter_arena_writes"] == {"r": True}
-
-    # no store and one stage: the planner turns writes off
-    s = quail.Session(EngineConfig(cpu_memory_gb=0),
-                      tokenizer=fake_tok)
-    s.register("reviews", quail.DocumentProvider.from_parquet(
-        _parquet(tmp_path / "r2.parquet", {
-            "id": [f"r{i}" for i in range(6)],
-            "review": [f"review {i} " + "pad " * 20
-                       for i in range(6)],
-        }), id_col="id"))
-    seen = {}
-    s.sql(sql).run(_execute=make_executor(truth, seen=seen))
     assert seen["payload"]["filter_arena_writes"] == {"r": False}
-    assert "arena_writes=False" in s.sql(sql).explain()
+    assert "arena_writes=False" in sess.sql(sql).explain()
 
-    # a second stage re-reads survivors' KV, store or not
+    # a second stage re-reads survivors' KV
     truth2 = {"r": {"q1:": [1] * 6, "q2:": [1] * 6}}
     seen = {}
-    s.sql(FILTER_SQL).run(_execute=make_executor(truth2, seen=seen))
+    sess.sql(FILTER_SQL).run(_execute=make_executor(truth2, seen=seen))
     assert seen["payload"]["filter_arena_writes"] == {"r": True}
 
 
@@ -230,34 +217,6 @@ def test_pick_corpus_tokenizer_parity_guard():
     broken = lambda t: t.split()[:-1]       # noqa: E731
     tok, note = pick_corpus_tokenizer(primary, broken, texts)
     assert tok is primary and "failed parity" in note
-
-
-def test_store_payload_and_warm_tracking(sess):
-    truth = {"r": {"q1:": [1, 0, 1, 0, 1, 0]}}
-    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
-           "PROMPT('q1: {0}', r.review), {'selectivity': 0.5})")
-    seen = {}
-    res = sess.sql(sql).run(_execute=make_executor(truth, seen=seen))
-    store = seen["payload"]["store"]
-    # default config: 64 GB container minus 16 GB headroom
-    assert store is not None
-    assert store["capacity_bytes"] == pytest.approx(48e9)
-    assert store["min_doc_tokens"] == 1     # everything fits
-    assert "r" in store["hashes"] and len(store["hashes"]["r"]) == 16
-    assert res.report["store"] is None      # fake executor has none
-
-    # a fake executor that reports store activity marks the session
-    # warm, so the NEXT plan chooses restore
-    def with_store(payload):
-        out = make_executor(truth)(payload)
-        out["store"] = {"r": dict(stored_docs=6, restored_docs=0)}
-        return out
-
-    sess.sql(sql).run(_execute=with_store)
-    q2 = sess.sql(sql)
-    plan = q2.plan()
-    scan = plan.nodes_by_op("DocScan")[0]
-    assert scan["access"] == "restore"
 
 
 def test_payload_carries_workers_and_shards(tmp_path):

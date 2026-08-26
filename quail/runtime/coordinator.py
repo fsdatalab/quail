@@ -40,16 +40,14 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
         sub.update(docs=docs, doc_index=index,
                    filters=payload["filters"],
                    filter_arena_writes=payload["filter_arena_writes"],
-                   store=payload.get("store"),
-                   store_flush=payload.get("store_flush", False),
                    worker=w, workers=k)
         subs.append(sub)
     return subs
 
 
 def merge_filter_round(outs: list, limit: int | None = None) -> dict:
-    """Merge workers' filter answers, survivors, token counts, and store stats."""
-    filters, survivors, store = {}, {}, {}
+    """Merge workers' filter answers, survivors, and token counts."""
+    filters, survivors = {}, {}
     tokens = 0
     for out in outs:
         tokens += out["fresh_tokens"]
@@ -57,15 +55,11 @@ def merge_filter_round(outs: list, limit: int | None = None) -> dict:
             filters.setdefault(alias, {}).update(rows)
         for alias, surv in out["survivors"].items():
             survivors.setdefault(alias, []).extend(surv)
-        for alias, st in (out.get("store") or {}).items():
-            agg = store.setdefault(alias, {})
-            for key, v in st.items():
-                agg[key] = agg.get(key, 0) + v
     merged = {a: sorted(v) for a, v in survivors.items()}
     if limit is not None:
         merged = {a: v[:limit] for a, v in merged.items()}
     return dict(filters=filters, survivors=merged,
-                fresh_tokens=tokens, store=store)
+                fresh_tokens=tokens)
 
 
 def stage_for_anchor(spec: dict, anchor: str) -> dict:
@@ -205,7 +199,6 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
                    anchor_docs=[payload["docs"][anchor_alias][g]
                                 for g in anchor_shards[w]],
                    partners=partners,
-                   store=payload.get("store"),
                    worker=w, workers=k)
         subs.append(sub)
     return subs
