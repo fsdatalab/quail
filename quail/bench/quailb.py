@@ -37,7 +37,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 DATA_SEED = 20260818
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3  # bumped: added severe_terms.parquet
 
 # Exact source snapshots for the benchmark corpus.  The row selection below
 # is deterministic only when the upstream revisions are fixed as well as the
@@ -277,6 +277,18 @@ def build_sets(data_dir, sf, lf=1):
     }), d / "reports.parquet")
     terms = _vocab_table(bio, 1, cap=2_560)
     write("terms", [f"tm{i}" for i in range(len(terms))], "term", terms)
+    # severe_terms: BIO-6's second join only, a 64-term subset (already
+    # frequency-sorted by _vocab_table, so this is the 64 most common
+    # reaction terms). Full `terms` x `reports` for a second predicate
+    # asks "was this a severe occurrence" about terms most reports
+    # never mention at all - mostly meaningless, and reproducibly
+    # OOM'd the ground-truth labeling job (200 reports x ~614 terms
+    # long-document prompts, all admitted at once). Cutting to the
+    # most common terms keeps the join meaningful and the labeling
+    # job's cross product small.
+    severe_terms = terms[:64]
+    write("severe_terms", [f"sv{i}" for i in range(len(severe_terms))],
+          "term", severe_terms)
 
     # claims + evidence: real FEVER claims and only the Wikipedia
     # pages those claims reference
@@ -307,7 +319,7 @@ def build_sets(data_dir, sf, lf=1):
 
 def register_sets(sess, data_dir):
     from quail.catalog import DocumentProvider
-    for name in ("reviews", "aspects", "reports", "terms",
+    for name in ("reviews", "aspects", "reports", "terms", "severe_terms",
                 "claims", "evidence", "citations"):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
@@ -398,10 +410,11 @@ REACTION = ("Candidate medical reaction terms follow, one at a time. "
             "Instruction: answer TRUE if the report above describes "
             "this reaction, FALSE otherwise.")
 
-# BIO-6 only: a second question over the same terms table, joined
-# under a second alias (m2) - the 2-join "star" shape (the old B11),
-# both joins anchored on reports so the second stage runs over
-# whatever REACTION already kept.
+# BIO-6 only: a second question, joined against severe_terms (a
+# 64-term subset of the terms table, not the full ~614) under a
+# second alias (m2) - the 2-join "star" shape (the old B11), both
+# joins anchored on reports so the second stage runs over whatever
+# REACTION already kept.
 REACTION_SEVERE = ("Candidate medical reaction terms follow, one at a "
                    "time. For each, judge strictly from the report "
                    "above whether it describes that reaction as a "
@@ -679,12 +692,14 @@ def queries(sess):
 
     # BIO-6: the star shape - both joins anchored on reports, a
     # barrier between the two stages but no switch (the old B11's
-    # shape, IMDB-8's counterpart for BioDEX).
+    # shape, IMDB-8's counterpart for BioDEX). J2 uses severe_terms
+    # (the 64 most common reaction terms), not the full terms table -
+    # see the comment where severe_terms is built in build_sets.
     q["BIO-6"] = ("2J, same anchor: J1 (REACTION) -> J2 "
-                 "(REACTION_SEVERE), reports x terms x terms", make(
+                 "(REACTION_SEVERE), reports x terms x severe_terms", make(
         "reports", "r", "report", [],
         [("terms", "m", "term", REACTION),
-         ("terms", "m2", "term", REACTION_SEVERE)],
+         ("severe_terms", "m2", "term", REACTION_SEVERE)],
         ["r.id", "m.id", "m2.id"]))
 
     # FEVER: filter alone, join alone, then a filter chain to depth 2
