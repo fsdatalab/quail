@@ -86,7 +86,9 @@ All experiment and feature reports live under `reports/`.
   and what the numbers mean. Cite the data by its `quail-results`
   volume path.
 - When a report is superseded or its numbers are no longer current,
-  move it to `reports/old/`. Do not delete old reports.
+  delete it and its plot script. Before starting a new task, scan
+  `reports/` for reports whose results have been replaced by newer
+  runs or whose code no longer exists, and delete them.
 - When a PR ships a new feature (a code change that lands on main),
   add a short description in `reports/shipped_features/`.
   Name the file `YYYY-MM-DD-<short-slug>.md`. It should say what
@@ -114,8 +116,8 @@ Every report with measured results should include at least one plot.
 
 - One script per report (or per group of related reports), named
   `make_<slug>_plots.py`, in `reports/`.
-- Output PNGs go to `reports/plots/`. When a report moves to
-  `old/`, its PNGs move to `old/plots/`.
+- Output PNGs go to `reports/plots/`. Delete a report's PNGs when
+  the report is deleted.
 - Reference plots in the report by relative path:
   `"Figure: plots/<name>.png"`.
 - Each script should be runnable from the repository root, given a
