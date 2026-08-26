@@ -30,3 +30,9 @@ file:
 | script | ran | what it did |
 |---|---|---|
 | `rehash_judge_identity.py` | 2026-08-26 | Moved 15 filter label sets, 17,057 labels, to new `label_set_id`s after the scheduler capacity knobs left `JUDGE_SPEC`. No model calls. |
+| `join_relabel_diff.py` | 2026-08-26 | Checked what the 8 join predicates' forced relabel actually changed: 379 of 233,644 answers, 0.16%. Reads two collections, writes nothing to them. |
+
+A migration that only reads and reports, like `join_relabel_diff.py`,
+belongs here too: it answers whether a forced relabel was worth its
+cost, which is a question about the volume's data, not about the
+engine.

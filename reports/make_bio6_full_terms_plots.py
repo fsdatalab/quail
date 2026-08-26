@@ -14,7 +14,7 @@ fsdatalab Modal workspace):
         $C/gt_306dac4fc83883c7a5bcc86f4d103f32/summary.json $W/before.json
     modal volume get quail-results $C/$A/summary.json $W/after.json
     modal volume get quail-results \
-        /ablations/join_relabel_diff_$A.json $W/relabel_diff.json
+        /migrations/join_relabel_diff_$A.json $W/relabel_diff.json
     uv run --with matplotlib python reports/make_bio6_full_terms_plots.py $W
 """
 

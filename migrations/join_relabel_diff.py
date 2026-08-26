@@ -1,4 +1,4 @@
-"""Did relabelling under changed join prompts actually change answers?
+"""Check whether relabelling under changed join prompts changed answers.
 
 PR #52 reworked how join prompts are built, which moved every join
 predicate's `predicate_version` and so invalidated its labels. That
@@ -9,12 +9,12 @@ pair by pair on (left_id, right_id).
 Run from the repository root and keep the function call id in the tee
 file:
 
-    uv run modal run -m ablations.join_relabel_diff \
+    uv run modal run migrations/join_relabel_diff.py \
         --before-id gt_306dac4fc83883c7a5bcc86f4d103f32 \
         --after-id gt_04231c5de83cdf9e7e68fc03849959d6 \
         2>&1 | tee results/join_relabel_diff.log
 
-Writes /results/ablations/join_relabel_diff_<after_id>.json on the
+Writes /results/migrations/join_relabel_diff_<after_id>.json on the
 quail-results volume. Predicates whose row count changed between the
 two collections are reported as skipped rather than compared.
 """
@@ -79,7 +79,7 @@ def compare(before_id: str, after_id: str) -> str:
         "after_collection_id": after_id,
         "predicates": predicates,
     }
-    out = VOLUME_ROOT.parent.parent.parent / "ablations"
+    out = VOLUME_ROOT.parent.parent.parent / "migrations"
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{NAME}_{after_id}.json"
     with open(path, "w") as f:

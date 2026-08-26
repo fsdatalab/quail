@@ -165,8 +165,8 @@ and it is worth knowing because the relabel cost most of the $7.
 Comparing this collection against `gt_306dac4fc83883c7a5bcc86f4d103f32`
 pair by pair on `(left_id, right_id)`: **379 of 233,644 answers
 changed, 0.16%**. Data at
-`/results/ablations/join_relabel_diff_gt_04231c5de83cdf9e7e68fc03849959d6.json`,
-produced by `ablations/join_relabel_diff.py`.
+`/results/migrations/join_relabel_diff_gt_04231c5de83cdf9e7e68fc03849959d6.json`,
+produced by `migrations/join_relabel_diff.py`.
 
 Figure: plots/20260826-join-relabel-answer-diffs.png
 
