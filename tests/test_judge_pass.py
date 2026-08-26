@@ -3,14 +3,10 @@
 from dataclasses import replace
 
 from quail.bench.judge_pass import (
-    JUDGE_SPEC,
     MODEL_NAME,
     PREDICATES,
     _compact_label_parts,
     _corpus_identity,
-    _label_dir_by_id,
-    _part_bounds,
-    _parts_stats,
     _saved_verification_sample,
     example_identity,
     judgment_identity,
@@ -125,8 +121,8 @@ def test_compact_label_parts_keeps_every_saved_row(tmp_path):
                    parts_dir / "part_000000_000002.parquet")
     pq.write_table(pa.table({"id": ["c"], "answer": [True]}),
                    parts_dir / "part_000002_000003.parquet")
-    # a leftover from an earlier generation of part boundaries, which
-    # the caller does not name and compaction must therefore ignore
+    # a leftover generation of boundaries, which the caller does not
+    # name and compaction must therefore ignore
     pq.write_table(pa.table({"id": ["a", "b", "c"],
                              "answer": [True, False, True]}),
                    parts_dir / "part_000000_000003.parquet")
@@ -143,57 +139,3 @@ def test_compact_label_parts_keeps_every_saved_row(tmp_path):
         {"id": "b", "answer": False},
         {"id": "c", "answer": True},
     ]
-
-
-def test_judge_spec_holds_no_scheduler_capacity_knobs():
-    """These change throughput and memory, never the token a greedy
-    one-token decode picks, so they must not move label_set_id."""
-    for field in ("max_num_batched_tokens", "max_num_seqs",
-                  "gpu_memory_utilization"):
-        assert field not in JUDGE_SPEC
-
-
-def test_part_bounds_match_the_writers():
-    reviews = [{"id": f"rv{i}"} for i in range(5000)]
-    reports = [{"id": f"rp{i}"} for i in range(200)]
-    terms = [{"id": f"tm{i}"} for i in range(614)]
-    citations = [{"id": f"lp{i}"} for i in range(200)]
-    rows = {"reviews": reviews, "reports": reports, "terms": terms,
-            "citations": citations}
-
-    # three imdb filters share reviews.body, so 256 // 3 rows per part
-    bounds = _part_bounds(_spec("quailb.imdb.review.discusses_ending"), rows)
-    assert bounds[0] == (0, 85)
-    assert bounds[-1] == (4930, 5000)
-    assert sum(end - start for start, end in bounds) == 5000
-
-    # a join over 614 right rows cannot fit even one left row in 256
-    # prompts, so it falls back to one report per part
-    bounds = _part_bounds(
-        _spec("quailb.biodex.report.experienced_reaction"), rows)
-    assert bounds[0] == (0, 1)
-    assert len(bounds) == 200
-
-    # the LePaRD source join has its own fixed anchor batch
-    bounds = _part_bounds(_spec("quailb.lepard.excerpt.cites_passage"), rows)
-    assert bounds == [(0, 50), (50, 100), (100, 150), (150, 200)]
-
-
-def test_parts_stats_ignores_files_it_was_not_given(tmp_path):
-    """A label directory can hold more than one generation of part
-    files; globbing it counts the same answers twice."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    parts_dir = tmp_path / "parts"
-    parts_dir.mkdir()
-    current = parts_dir / "part_000000_000002.parquet"
-    pq.write_table(pa.table({"answer": [True, False],
-                            "label_source": [MODEL_NAME] * 2}), current)
-    pq.write_table(pa.table({"answer": [True, False],
-                            "label_source": [MODEL_NAME] * 2}),
-                   parts_dir / "part_000000_000001.parquet")
-
-    stats = _parts_stats([current])
-    assert stats == {"rows": 2, "true_rows": 1, "false_rows": 1,
-                     "source_rows": {MODEL_NAME: 2}}

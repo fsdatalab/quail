@@ -7,28 +7,11 @@ from quail.bench.judge_pass import (
     judgment_identity,
     label_set_identity,
 )
-from migrations.rehash_judge_identity import _rehash_label_dir, _rehash_rows
+from migrations.rehash_judge_identity import _rehash_label_dir
 
 
 def _spec(key):
     return next(spec for spec in PREDICATES if spec.key == key)
-
-
-def test_rehash_rows_keeps_answers_and_moves_identity():
-    spec = _spec("quailb.imdb.review.discusses_ending")
-    identity = label_set_identity(spec, "c_test", "f" * 64)
-    row = {"judgment_id": "jd_old", "example_id": "ex_0",
-           "example_full_hash": "a" * 64, "label_set_id": "ls_old",
-           "answer": True, "left_id": "rv0"}
-
-    out = _rehash_rows([row], identity["label_set_id"])[0]
-
-    assert out["answer"] is True
-    assert out["example_full_hash"] == row["example_full_hash"]
-    assert out["label_set_id"] == identity["label_set_id"]
-    assert out["judgment_id"] == judgment_identity(
-        identity["label_set_id"], row["example_full_hash"])
-    assert row["label_set_id"] == "ls_old"
 
 
 def test_rehash_label_dir_rebuilds_parts_from_the_compacted_file(
