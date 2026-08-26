@@ -3,12 +3,12 @@
 Pull the seven source files into one work directory, then pass that directory
 as the first argument to this script. For example, with ``W=/tmp/quail-pr52``:
 
-    modal volume get quail-results /results/benchmarks/quailb/runs/qb_20260826T061917Z_2a6a3ed0/20260826T061917Z-quailb-sf0.1-lf1-qwen3-4b-fp8.json $W/quail-4b.json
-    modal volume get quail-results /results/benchmarks/quailb/runs/qb_20260826T062254Z_9843d222/20260826T062254Z-quailb-sf0.1-lf1-qwen3-32b-fp8.json $W/quail-32b.json
-    modal volume get quail-results /results/vllm_opbench/2026-08-26_071748/summary.json $W/naive-4b.json
-    modal volume get quail-results /results/vllm_opbench/2026-08-26_071907/summary.json $W/naive-32b.json
-    modal volume get quail-results /results/vllm_opbench/2026-08-26_071911/summary.json $W/stock-4b.json
-    modal volume get quail-results /results/vllm_opbench/2026-08-26_071944/summary.json $W/stock-32b.json
+    modal volume get quail-results /benchmarks/quailb/runs/qb_20260826T061917Z_2a6a3ed0/20260826T061917Z-quailb-sf0.1-lf1-qwen3-4b-fp8.json $W/quail-4b.json
+    modal volume get quail-results /benchmarks/quailb/runs/qb_20260826T062254Z_9843d222/20260826T062254Z-quailb-sf0.1-lf1-qwen3-32b-fp8.json $W/quail-32b.json
+    modal volume get quail-results /vllm_opbench/2026-08-26_071748/summary.json $W/naive-4b.json
+    modal volume get quail-results /vllm_opbench/2026-08-26_071907/summary.json $W/naive-32b.json
+    modal volume get quail-results /vllm_opbench/2026-08-26_071911/summary.json $W/stock-4b.json
+    modal volume get quail-results /vllm_opbench/2026-08-26_071944/summary.json $W/stock-32b.json
     modal volume get quail-results /sol/sol_quailb_sf0.1.json $W/sol.json
     uv run --with matplotlib python reports/make_vllm_opbench_plots.py $W
 """
@@ -29,6 +29,12 @@ OUT = HERE / "plots"
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
 from plot_colors import BLUE, DARK, GRAY, ORANGE, RED  # noqa: E402
+
+OUTPUT_SCALE = 2
+for key in ("font.size", "axes.labelsize", "axes.titlesize",
+            "axes.titlepad", "xtick.labelsize", "ytick.labelsize",
+            "legend.fontsize"):
+    plt.rcParams[key] = float(plt.rcParams[key]) * OUTPUT_SCALE
 
 QUERY_IDS = ["BIO-2", "FEV-2", "IMDB-2"]
 OPERATORS = {
@@ -106,7 +112,9 @@ def main(workdir: Path) -> None:
     colors = [GRAY, BLUE, RED, ORANGE]
     x = np.arange(len(QUERY_IDS))
     width = 0.19
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), sharey=True)
+    fig, axes = plt.subplots(
+        1, 2, figsize=(10.5 * OUTPUT_SCALE, 4.2 * OUTPUT_SCALE),
+        sharey=True)
 
     for ax, (model, model_results) in zip(axes, results.items()):
         for index, (system, color) in enumerate(zip(systems, colors)):
@@ -119,11 +127,11 @@ def main(workdir: Path) -> None:
                 ax.annotate(
                     label,
                     (bar.get_x() + bar.get_width() / 2, value),
-                    xytext=(0, 4),
+                    xytext=(0, 4 * OUTPUT_SCALE),
                     textcoords="offset points",
                     ha="center",
                     va="bottom",
-                    fontsize=7.5,
+                    fontsize=7.5 * OUTPUT_SCALE,
                     color=DARK,
                 )
 
