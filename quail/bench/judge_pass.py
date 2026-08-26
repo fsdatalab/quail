@@ -88,6 +88,17 @@ PREDICATES = (
         "review_discusses_aspect", "join", quailb.DISCUSS_ASPECT,
         "review", "reviews", "body", "aspect", "aspects", "aspect"),
     PredicateSpec(
+        "quailb.imdb.review.positive_sentiment_about_aspect",
+        "ASPECT_SENTIMENT", "imdb",
+        "review_positive_sentiment_about_aspect", "join",
+        quailb.ASPECT_SENTIMENT,
+        "review", "reviews", "body", "aspect", "aspects", "aspect"),
+    PredicateSpec(
+        "quailb.imdb.aspect.related_to_aspect", "ASPECT_RELATED", "imdb",
+        "aspect_related_to_aspect", "join", quailb.ASPECT_RELATED,
+        "first_aspect", "aspects", "aspect",
+        "second_aspect", "aspects", "aspect"),
+    PredicateSpec(
         "quailb.biodex.report.involves_female_patient", "F7", "biodex",
         "report_involves_female_patient", "filter", quailb.F7,
         "report", "reports", "report"),
@@ -103,6 +114,12 @@ PREDICATES = (
         "quailb.biodex.report.experienced_reaction", "REACTION", "biodex",
         "report_experienced_reaction", "join", quailb.REACTION,
         "report", "reports", "report", "reaction", "terms", "term"),
+    PredicateSpec(
+        "quailb.biodex.report.experienced_severe_reaction",
+        "REACTION_SEVERE", "biodex",
+        "report_experienced_severe_reaction", "join",
+        quailb.REACTION_SEVERE,
+        "report", "reports", "report", "reaction", "severe_terms", "term"),
     PredicateSpec(
         "quailb.fever.claim.about_person", "F11", "fever",
         "claim_about_person", "filter", quailb.F11,
@@ -120,6 +137,10 @@ PREDICATES = (
         "passage_supports_claim", "join", quailb.SUPPORT,
         "claim", "claims", "claim", "passage", "evidence", "text",
         "fever_annotation_then_qwen3_32b"),
+    PredicateSpec(
+        "quailb.fever.passage.refutes_claim", "REFUTE", "fever",
+        "passage_refutes_claim", "join", quailb.REFUTE,
+        "claim", "claims", "claim", "passage", "evidence", "text"),
     PredicateSpec(
         "quailb.lepard.excerpt.reasoning_does_not_apply", "LEP1", "lepard",
         "excerpt_reasoning_does_not_apply", "filter", quailb.LEP1,
@@ -382,6 +403,13 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
                                       create_if_missing=True)
 
 
+# severe_terms (BIO-6's second join table, see quailb.py) is deliberately
+# not listed here: every table listed feeds corpus_id (see
+# _corpus_identity below), so adding one changes corpus_id and would
+# invalidate every already-labeled predicate's identity, forcing a full
+# relabel. severe_terms is a fixed slice of terms under the same tracked
+# seed, so it's read separately in judge_workload instead - see the
+# comment there.
 CORPUS_COLUMNS = {
     "reviews": ("id", "body"),
     "aspects": ("id", "aspect"),
@@ -961,6 +989,13 @@ def judge_workload(corpus_id: str, workload: str) -> str:
     t_total = time.perf_counter()
     results_vol.reload()
     corpus_dir, corpus_manifest, rows = _load_corpus(corpus_id)
+    if workload == "biodex":
+        # severe_terms is added here, not via CORPUS_COLUMNS - see the
+        # comment on CORPUS_COLUMNS for why.
+        import pyarrow.parquet as pq
+        rows["severe_terms"] = pq.read_table(
+            corpus_dir / "severe_terms.parquet",
+            columns=["id", "term"]).to_pylist()
     identities = {
         spec.key: label_set_identity(
             spec, corpus_manifest["corpus_id"],

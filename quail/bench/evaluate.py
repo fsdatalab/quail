@@ -19,6 +19,10 @@ RESULTS_VOLUME = "quail-results"
 H100_USD_PER_HOUR = 3.9492
 H100_PRICE_SOURCE = "https://modal.com/pricing"
 
+# Must match quail.bench.judge_pass.CORPUS_COLUMNS exactly - this is used
+# to recompute corpus_id for verification, and severe_terms is
+# deliberately excluded there (see that module's comment) to avoid
+# changing corpus_id and invalidating every already-labeled predicate.
 CORPUS_COLUMNS = {
     "reviews": ("id", "body"),
     "aspects": ("id", "aspect"),
