@@ -10,19 +10,24 @@ The largest difference was BIO-2 at 4B. Quail took 31.12 seconds,
 compared with 187.17 seconds for naive vLLM and 261.38 seconds for
 stock vLLM.
 
+Quail took 1.74 to 2.27 times the SoL estimate. The SoL estimate is a
+hardware lower bound computed from the exact prompt tokens, attention
+pairs, model specifications, and H100 specifications. It is not a
+measured system.
+
 Figure: plots/vllm_opbench_vs_quail.png
 
 The plot uses a log scale because the measured times span more than two
 orders of magnitude.
 
-| Model | Query | Pairs | Quail (s) | Naive vLLM (s) | Compared with Quail | Stock vLLM (s) | Compared with Quail |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 4B | BIO-2 | 122,800 | 31.12 | 187.17 | 6.01 times slower | 261.38 | 8.40 times slower |
-| 4B | FEV-2 | 5,700 | 1.29 | 2.16 | 1.67 times slower | 3.10 | 2.40 times slower |
-| 4B | IMDB-2 | 60,000 | 20.55 | 24.36 | 1.19 times slower | 31.32 | 1.52 times slower |
-| 32B | BIO-2 | 122,800 | 181.05 | 302.96 | 1.67 times slower | 265.80 | 1.47 times slower |
-| 32B | FEV-2 | 5,700 | 8.47 | 12.27 | 1.45 times slower | 11.20 | 1.32 times slower |
-| 32B | IMDB-2 | 60,000 | 139.88 | 187.93 | 1.34 times slower | 155.58 | 1.11 times slower |
+| Model | Query | Pairs | SoL (s) | Quail (s) | Quail / SoL | Naive vLLM (s) | Compared with Quail | Stock vLLM (s) | Compared with Quail |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4B | BIO-2 | 122,800 | 15.59 | 31.12 | 2.00 times | 187.17 | 6.01 times slower | 261.38 | 8.40 times slower |
+| 4B | FEV-2 | 5,700 | 0.57 | 1.29 | 2.27 times | 2.16 | 1.67 times slower | 3.10 | 2.40 times slower |
+| 4B | IMDB-2 | 60,000 | 9.28 | 20.55 | 2.21 times | 24.36 | 1.19 times slower | 31.32 | 1.52 times slower |
+| 32B | BIO-2 | 122,800 | 104.15 | 181.05 | 1.74 times | 302.96 | 1.67 times slower | 265.80 | 1.47 times slower |
+| 32B | FEV-2 | 5,700 | 4.71 | 8.47 | 1.80 times | 12.27 | 1.45 times slower | 11.20 | 1.32 times slower |
+| 32B | IMDB-2 | 60,000 | 77.71 | 139.88 | 1.80 times | 187.93 | 1.34 times slower | 155.58 | 1.11 times slower |
 
 For Quail, the table uses the cold pass and excludes model load time. For
 both vLLM baselines, the table uses the time inside `llm.generate()`. CPU
@@ -82,6 +87,13 @@ The Quail runs matched the predicted fresh token counts exactly:
 The vLLM prefix cache processed slightly more fresh tokens because it reuses
 complete 16 token blocks. It processed 2,675,146 fresh tokens for BIO-2,
 2,438,148 for IMDB-2, and 152,994 for FEV-2.
+
+The SoL calculation matches Quail's fresh token counts exactly. It writes the
+complete join question once per anchor. Each tuple adds only the partner label,
+partner document, and answer cue. It also uses the exact active ground truth
+document IDs for queries with filters. The three queries in this comparison
+have no filters, so regenerating ground truth did not change which rows reach
+their joins and does not require another timing run.
 
 ## Baseline settings
 
@@ -145,9 +157,11 @@ fp8 at load time. The prompt, batch order, and vLLM settings were the same,
 so prompt formatting does not explain that difference. This experiment did
 not isolate the checkpoint difference further.
 
-The performance reruns did not measure accuracy. The join prompt changed,
-so accuracy from the old prompt is not valid for this report. New ground
-truth and new accuracy runs are required before reporting accuracy.
+The performance reruns did not measure accuracy. Ground truth has now been
+regenerated with the shared prompt layout. Collection
+`gt_306dac4fc83883c7a5bcc86f4d103f32` contains 324,201 labels. Its
+deterministic check repeated 352 judgments with 0 answer differences. An
+accuracy evaluation is still required before this report can state accuracy.
 
 ## Source data
 
@@ -165,7 +179,12 @@ The raw result files are on the `quail-results` Modal volume:
   `/results/vllm_opbench/2026-08-26_071911/summary.json`
 - Stock vLLM 32B, function call `fc-01M0YESXBW6PEWVK0MZM5KSJGW`:
   `/results/vllm_opbench/2026-08-26_071944/summary.json`
+- SoL estimate:
+  `/results/sol/sol_quailb_sf0.1.json`
+- Ground truth collection, finalizer function call
+  `fc-01M0YKBGBF09HSDAF5FSA533AX`:
+  `/results/ground_truth/quailb/schema_v1/collections/gt_306dac4fc83883c7a5bcc86f4d103f32/summary.json`
 
 The plot script takes a work directory as its first argument and contains
-the six `modal volume get` commands needed to rebuild the figure. No raw
+the seven `modal volume get` commands needed to rebuild the figure. No raw
 experiment data is committed.

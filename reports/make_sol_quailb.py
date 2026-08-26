@@ -17,9 +17,10 @@ measurement of the three inputs they need.
 KV reuse, the part that has to be right
 ---------------------------------------
 Every document has a PREFIX: the shared preamble plus the document
-text. Its KV is computed once and stays resident. Anything attached
-after it is a SUFFIX - a filter's question, or a join's partner
-block plus question - and suffix KV is computed, used once, and
+text. Its KV is computed once and stays resident. A filter attaches
+its question. A join attaches one anchor frame, then many tuple
+suffixes. Each tuple suffix contains the partner label, partner
+document, and answer cue. Suffix KV is computed, used once, and
 dropped (`executor/pack.py`: suffix KV is never cached).
 
 So a document is read once however many questions get asked about
@@ -72,9 +73,8 @@ import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
 from quail.bench import quailb as Q
-from quail.logical import (ColumnRef, SHARED_PRE, bind_prompt,
-                           join_anchor_note, join_label,
-                           render_join_question)
+from quail.logical import (ColumnRef, SHARED_PRE, bind_join_prompt,
+                           bind_prompt)
 from quail.specs import (H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, DeviceSpec,
                          ModelSpec)
 
@@ -233,77 +233,53 @@ def stream(prefix: float, suffixes) -> Work:
 # Whole queries
 
 
-def survivors(lengths, selectivity: float):
-    """Which documents pass a filter.
+def filter_chain(doc_tokens, preamble: int, stages, answers):
+    """A filter chain using the exact document ids that reach each stage.
 
-    A selectivity says how many survive, not which. This keeps an
-    evenly spaced slice of the length-sorted list, so the survivors
-    carry the same length distribution as the pool they came from.
-
-    A predicate correlated with document length breaks that: its
-    survivors are longer than the slice, and the bound undercounts
-    their token mass.
-    """
-    keep = round(len(lengths) * selectivity)
-    if keep <= 0:
-        return []
-    if keep >= len(lengths):
-        return list(lengths)
-    order = sorted(lengths)
-    step = len(order) / keep
-    return [order[min(len(order) - 1, int(i * step))] for i in range(keep)]
-
-
-def filter_chain(doc_tokens, preamble: int, questions, selectivities):
-    """A chain of filters over one document set.
-
-    The first stage scans every document. Every later stage rewinds
-    to the end of the document and asks its own question of whatever
-    survived so far.
-
-    doc_tokens: one token count per document.
-    questions: one question length per stage.
-    selectivities: one per stage, the fraction of the documents
-    entering that stage that pass it. The last one is never used.
+    ``doc_tokens`` maps document id to token count. Each stage names its
+    question and predicate code. ``answers`` maps that code and document id
+    to the saved ground truth answer.
     """
     live = list(doc_tokens)
     work = Work()
-    for i, q in enumerate(questions):
+    for i, stage in enumerate(stages):
+        q = stage["question_tokens"]
         step = scan if i == 0 else ask
-        for d in live:
-            work = work + step(preamble + d, q)
-        if i + 1 < len(questions):
-            live = survivors(live, selectivities[i])
-    return work
+        for doc_id in live:
+            work = work + step(preamble + doc_tokens[doc_id], q)
+        live = [doc_id for doc_id in live
+                if answers[stage["code"]][doc_id]]
+    return work, live
 
 
-def join(anchor_tokens, partner_tokens, preamble: int, note: int,
-         label: int, question: int, anchor_resident: bool) -> Work:
+def join(anchor_tokens, partner_tokens, preamble: int, frame: int,
+         label: int, tail: int, anchor_resident: bool) -> Work:
     """Every live anchor against every live partner.
 
     One side anchors: its KV is held and every tuple attends to it.
     The other streams: a copy of each of its documents rides in every
-    tuple's suffix, alongside that block's label and the question.
+    tuple's suffix, alongside that block's label and the answer cue.
 
-    `note` is the anchor naming line, written into each anchor's kept
-    KV once for this stage. `anchor_resident` is True when a filter
-    on the anchor side already computed the prefixes, which is every
-    query here with a filter before its join; then the join adds the
-    naming line and the tuples, and nothing else.
+    ``frame`` is the anchor note and complete static question. The runtime
+    writes the frame into each anchor's kept KV once for this stage.
+    ``anchor_resident`` is true when a filter on the anchor side already
+    computed the document prefix. The join then adds only the frame before
+    evaluating the partner suffixes.
     """
-    suffixes = [label + p + question for p in partner_tokens]
+    suffixes = [label + p + tail for p in partner_tokens]
     work = Work()
     for a in anchor_tokens:
         prefix = preamble + a
         if anchor_resident:
-            work = work + ask(prefix, note)
+            work = work + ask(prefix, frame)
         else:
-            work = work + scan(prefix, note)
-        work = work + stream(prefix + note, suffixes)
+            work = work + scan(prefix, frame)
+        work = work + stream(prefix + frame, suffixes)
     return work
 
 
-def cheaper_anchor(left, right, preamble, note, label, question,
+def cheaper_anchor(left, right, preamble, left_frame, right_frame,
+                   left_label, right_label, tail,
                    left_resident, right_resident):
     """Both orientations of a join, and the one the engine would run.
 
@@ -318,8 +294,10 @@ def cheaper_anchor(left, right, preamble, note, label, question,
     """
     if not left or not right:
         return Work(), "left", {"left": 0.0, "right": 0.0}
-    a = join(left, right, preamble, note, label, question, left_resident)
-    b = join(right, left, preamble, note, label, question, right_resident)
+    a = join(left, right, preamble, left_frame, right_label, tail,
+             left_resident)
+    b = join(right, left, preamble, right_frame, left_label, tail,
+             right_resident)
     pick = "left" if a.tokens <= b.tokens else "right"
     return ({"left": a, "right": b}[pick], pick,
             {"left": a.tokens, "right": b.tokens})
@@ -431,10 +409,18 @@ JOIN_TEMPLATES = {"DISCUSS_ASPECT": Q.DISCUSS_ASPECT, "REACTION": Q.REACTION,
 col_ref = (ColumnRef("x", "t", "c"),)
 question = {c: bind_prompt(t, col_ref, encode).tail_tokens
             for c, t in FILTER_TEMPLATES.items()}
-join_prompt = {c: {"question": length(render_join_question(t)),
-                   "partner_label": length(join_label(1)),
-                   "anchor_note": length(join_anchor_note(0))}
-               for c, t in JOIN_TEMPLATES.items()}
+join_refs = (ColumnRef("left", "left_table", "text"),
+             ColumnRef("right", "right_table", "text"))
+join_prompt = {}
+for code, template in JOIN_TEMPLATES.items():
+    prompt = bind_join_prompt(template, join_refs, encode)
+    join_prompt[code] = {
+        "left_frame": prompt.labels[0][2],
+        "right_frame": prompt.labels[1][2],
+        "left_label": prompt.labels[0][1],
+        "right_label": prompt.labels[1][1],
+        "tail": prompt.tail_tokens,
+    }
 
 # 3. labels -----------------------------------------------------------
 # A predicate keeps one label set per template it has been judged
@@ -525,39 +511,29 @@ for qid, (column, codes, joined) in QUERIES.items():
     queries[qid] = rec
 
 
-def doc_lengths(column):
-    """One token count per document in that column."""
-    return list(lengths[column].values())
-
-
-def after(lengths, stages):
-    """The documents left once every stage in `stages` has run."""
-    for st in stages:
-        lengths = survivors(lengths, st["selectivity"])
-    return lengths
-
-
 def query_work(rec):
     """One query: its filter chain, its partner's filter chain if it
     has one, and its join."""
-    docs = doc_lengths(rec["document_column"])
+    docs = lengths[rec["document_column"]]
     stages = rec["filters"]
-    work = filter_chain(docs, PRE, [s["question_tokens"] for s in stages],
-                        [s["selectivity"] for s in stages])
+    work, live_ids = filter_chain(docs, PRE, stages, labels)
     if "join" not in rec:
-        return work, None, {}
-    partners = doc_lengths(rec["partner_column"])
+        return work, None, {}, live_ids, []
+    partners = lengths[rec["partner_column"]]
     pstages = rec["partner_filters"]
-    work = work + filter_chain(
-        partners, PRE, [s["question_tokens"] for s in pstages],
-        [s["selectivity"] for s in pstages])
+    partner_work, partner_live_ids = filter_chain(
+        partners, PRE, pstages, labels)
+    work = work + partner_work
     j = rec["join"]
     jwork, anchor, both = cheaper_anchor(
-        after(docs, stages), after(partners, pstages),
-        preamble=PRE, note=j["anchor_note"], label=j["partner_label"],
-        question=j["question"],
+        [docs[doc_id] for doc_id in live_ids],
+        [partners[doc_id] for doc_id in partner_live_ids],
+        preamble=PRE,
+        left_frame=j["left_frame"], right_frame=j["right_frame"],
+        left_label=j["left_label"], right_label=j["right_label"],
+        tail=j["tail"],
         left_resident=bool(stages), right_resident=bool(pstages))
-    return work + jwork, anchor, both
+    return work + jwork, anchor, both, live_ids, partner_live_ids
 
 
 # ================================================================
@@ -566,14 +542,12 @@ def query_work(rec):
 
 rows = {}
 for qid, rec in queries.items():
-    work, anchor, both = query_work(rec)
-    docs = doc_lengths(rec["document_column"])
-    live = after(docs, rec["filters"])
+    work, anchor, both, live_ids, partner_live_ids = query_work(rec)
+    docs = lengths[rec["document_column"]]
     rows[qid] = {
         "documents": len(docs),
-        "documents_after_filters": len(live),
-        "tuples": (len(live) * len(after(doc_lengths(rec["partner_column"]),
-                                         rec["partner_filters"]))
+        "documents_after_filters": len(live_ids),
+        "tuples": (len(live_ids) * len(partner_live_ids)
                    if "join" in rec else 0),
         "document_column": rec["document_column"],
         "partner_column": rec.get("partner_column"),
@@ -621,8 +595,8 @@ json.dump({
     "corpus_id": CORPUS_ID,
     "collection_id": COLLECTION_ID,
     "sources": {
-        "corpora": f"/quailb_data/{TAG} on quail-results, seed 20260818",
-        "labels": "/ground_truth/quailb/schema_v1/label_sets on "
+        "corpora": f"/results/quailb_data/{TAG}, seed 20260818",
+        "labels": "/results/ground_truth/quailb/schema_v1/label_sets on "
                   "quail-results, qwen3-32b-fp8 answering",
         "tokenizer": "Qwen/Qwen3-4B-FP8, shared by every Qwen3 model"},
     "chunk_tokens": CHUNK,
