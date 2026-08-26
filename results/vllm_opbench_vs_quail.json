@@ -1,0 +1,111 @@
+{
+  "sf": 0.1,
+  "note": "Field names: rpc_wall_s (Modal RPC round trip around worker.generate_batch.remote(), includes network/scheduling overhead), generate_wall_s (pure llm.generate() time inside the worker, no RPC), build_s (CPU-side prompt tokenization on the orchestrator, separate container from the worker). fresh_tokens = total_prompt_tokens minus oracle_regret's cache-hit token count (vLLM's own prefix cache, enabled by default). quail_wall_s is a [value, other_observed_value_or_null] pair where quail has two independent committed reference runs of the identical query; see 2026-08-25-vllm-opbench-baseline.md for the ground-truth accuracy comparison that explains the join-query gap between those pairs.",
+  "queries": [
+    {
+      "label": "filter-reports: F7 filter, 200 reports (mirrors BIO-1)",
+      "model": "qwen3-4b-fp8",
+      "quail_wall_s": [9.03, 10.14],
+      "quail_fresh_tokens": 839599,
+      "vllm_opbench_build_s": 1.7,
+      "vllm_opbench_rpc_wall_s": 13.5,
+      "vllm_opbench_generate_wall_s": 10.75,
+      "vllm_opbench_total_wall_s": 12.45,
+      "vllm_opbench_fresh_tokens": 833438,
+      "vllm_opbench_total_prompt_tokens": 836622
+    },
+    {
+      "label": "filter-reports: F7 filter, 200 reports (mirrors BIO-1)",
+      "model": "qwen3-32b-fp8",
+      "quail_wall_s": [55.72, 53.8],
+      "quail_fresh_tokens": 839599,
+      "vllm_opbench_build_s": 1.6,
+      "vllm_opbench_rpc_wall_s": 79.3,
+      "vllm_opbench_generate_wall_s": 74.05,
+      "vllm_opbench_total_wall_s": 75.65,
+      "vllm_opbench_fresh_tokens": 833438,
+      "vllm_opbench_total_prompt_tokens": 836622
+    },
+    {
+      "label": "join-reports: REACTION join, 200 reports x 614 terms = 122,800 pairs (mirrors BIO-2)",
+      "model": "qwen3-4b-fp8",
+      "quail_wall_s": [154.86, 151.22],
+      "quail_fresh_tokens": [11347799, 10957062],
+      "vllm_opbench_build_s": 1496.5,
+      "vllm_opbench_rpc_wall_s": 742.7,
+      "vllm_opbench_generate_wall_s": 217.69,
+      "vllm_opbench_total_wall_s": 1714.19,
+      "vllm_opbench_fresh_tokens": 4492044,
+      "vllm_opbench_total_prompt_tokens": 516684508,
+      "run_note": "build_s for this query varies a lot run to run (850-1500s across measurements), likely orchestrator CPU contention - not a fixed number. quail's own fresh rerun on current code (2026-08-25): 138.6/140.7s cold/warm, 98.6% selectivity both times, but only 1.5% accuracy against ground truth (4B model, near-total precision collapse - see report)."
+    },
+    {
+      "label": "join-reports: REACTION join, 200 reports x 614 terms = 122,800 pairs (mirrors BIO-2)",
+      "model": "qwen3-32b-fp8",
+      "quail_wall_s": [860.1, 354.78],
+      "quail_fresh_tokens": [11347799, 4843992],
+      "vllm_opbench_build_s": 1135.3,
+      "vllm_opbench_rpc_wall_s": 977.4,
+      "vllm_opbench_generate_wall_s": 468.11,
+      "vllm_opbench_total_wall_s": 2112.7,
+      "vllm_opbench_fresh_tokens": 4492044,
+      "vllm_opbench_total_prompt_tokens": 516684508,
+      "run_note": "build_s for this query varies a lot run to run (850-1500s across measurements), likely orchestrator CPU contention - not a fixed number. quail's own fresh rerun on current code (2026-08-25): 812.2s cold (warm pass never ran - hit a known Modal client heartbeat bug right after both cold passes finished, same as documented in tests/gpu/quailb_bio2_32b.py's docstring), 0.05% selectivity, 99.96% accuracy against ground truth (32B model, precision 77.6%, recall 55.6% - see report)."
+    },
+    {
+      "label": "join-claims: SUPPORT join, 100 claims x 57 evidence = 5,700 pairs (mirrors FEV-2)",
+      "model": "qwen3-4b-fp8",
+      "quail_wall_s": [4.86, null],
+      "quail_fresh_tokens": 485820,
+      "vllm_opbench_build_s": 5.6,
+      "vllm_opbench_rpc_wall_s": 26.2,
+      "vllm_opbench_generate_wall_s": 22.87,
+      "vllm_opbench_total_wall_s": 28.47,
+      "vllm_opbench_fresh_tokens": 2252499,
+      "vllm_opbench_total_prompt_tokens": 2437251
+    },
+    {
+      "label": "join-claims: SUPPORT join, 100 claims x 57 evidence = 5,700 pairs (mirrors FEV-2)",
+      "model": "qwen3-32b-fp8",
+      "quail_wall_s": [13.46, null],
+      "quail_fresh_tokens": 218889,
+      "vllm_opbench_build_s": 4.4,
+      "vllm_opbench_rpc_wall_s": 184.8,
+      "vllm_opbench_generate_wall_s": 175.61,
+      "vllm_opbench_total_wall_s": 180.01,
+      "vllm_opbench_fresh_tokens": 2252499,
+      "vllm_opbench_total_prompt_tokens": 2437251,
+      "run_note": "only one quail reference run exists for this query at 32B; quail is clearly faster here"
+    },
+    {
+      "label": "join-imdb: DISCUSS_ASPECT join, 5,000 reviews x 12 aspects = 60,000 pairs (mirrors IMDB-2)",
+      "model": "qwen3-4b-fp8",
+      "quail_wall_s": [58.62, 57.48],
+      "quail_fresh_tokens": [6124233, 5690657],
+      "vllm_opbench_build_s": 52.8,
+      "vllm_opbench_rpc_wall_s": 51.9,
+      "vllm_opbench_generate_wall_s": 33.43,
+      "vllm_opbench_total_wall_s": 86.23,
+      "vllm_opbench_fresh_tokens": 3196328,
+      "vllm_opbench_total_prompt_tokens": 21072024,
+      "stock_vllm_wall_s": 34.59,
+      "stock_vllm_source": "results/stock_join_imdb_4b.log (baselines/stock.py, quail's own checkpoint)",
+      "run_note": "quail's own fresh rerun on current code (2026-08-25): 52.4/55.0s cold/warm, 98.9% selectivity both times, but only 3.0% accuracy against ground truth (4B model, near-total precision collapse - see report)."
+    },
+    {
+      "label": "join-imdb: DISCUSS_ASPECT join, 5,000 reviews x 12 aspects = 60,000 pairs (mirrors IMDB-2)",
+      "model": "qwen3-32b-fp8",
+      "quail_wall_s": [375.53, 192.93],
+      "quail_fresh_tokens": [6124233, 3224232],
+      "vllm_opbench_build_s": 40.2,
+      "vllm_opbench_rpc_wall_s": 280.3,
+      "vllm_opbench_generate_wall_s": 250.68,
+      "vllm_opbench_total_wall_s": 290.88,
+      "vllm_opbench_fresh_tokens": 3196328,
+      "vllm_opbench_total_prompt_tokens": 21072024,
+      "stock_vllm_wall_s": 206.74,
+      "stock_vllm_source": "results/stock_join_imdb_32b.log (baselines/stock.py, quail's own checkpoint)",
+      "run_note": "quail's own fresh rerun on current code (2026-08-25): 358.1s cold, 2.1% selectivity, 98.5% accuracy against ground truth (32B model - the ground truth's own labeling model - with a real precision/recall tradeoff of 59%/65%, not a collapse). Warm pass never ran - hit a known Modal client heartbeat bug right after both cold passes finished (same bug documented in tests/gpu/quailb_bio2_32b.py's docstring); not rerun since the cold-pass accuracy evidence is already conclusive on its own."
+    }
+  ]
+}

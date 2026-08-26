@@ -13,6 +13,10 @@ results/**/*.log
 
 # generated benchmark corpora are rebuilt from seeds, never versioned
 results/quailb_data/
+# vllm_opbench per-run raw dumps (one record per document/pair) - these
+# belong on the quail-results Modal volume only, never committed; the
+# aggregated comparison lives in results/vllm_opbench_vs_quail.json
+results/vllm_opbench/
 # process ID files and profiler traces are local artifacts
 results/*.pid
 results/torchprof_*.json.gz
