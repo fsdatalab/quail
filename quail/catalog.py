@@ -1,14 +1,7 @@
 """DocumentProvider and the catalog.
 
-A provider is a named source of rows, where each row has an id and one
-or more text columns. There is no text_col at registration: the
-provider does not decide which column is "the document" - the query
-does, through the column its PROMPT references.
-
-Registration is cheap on purpose: it binds the name and reads the
-schema (parquet metadata / dataset features), never the data.
-Tokenization is not registration work; it happens at the first
-DocScan of a column and is cached under a content hash.
+A provider is a named source of rows with an id and one or more text
+columns. Registration reads the schema only, never the data.
 """
 
 from dataclasses import dataclass, field
@@ -51,8 +44,7 @@ class DocumentProvider:
                    columns=cols, hf_split=split, hf_config=config)
 
     def read_column(self, column: str) -> tuple[list, list]:
-        """(ids, texts) for one column. The executor's DocScan calls
-        this; registration never does."""
+        """Return (ids, texts) for one column."""
         if column not in self.columns:
             raise CompileError(
                 f"column {column!r} not in schema {self.columns}")

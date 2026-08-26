@@ -1,21 +1,4 @@
-"""The dispatch gate: the same queries on 1 GPU and on 2, through the
-full Session path (plan -> shards -> container coordinator -> GPU
-children -> merge -> sink).
-
-PREDICTIONS, stated before the runs:
-- filter (the milestone 10k five-filter corpus): gpus=1 near the
-  measured 39.4 s driver wall; gpus=2 near half plus dispatch
-  overhead (each child sees ~1.6M corpus tokens), so ~20-25 s.
-- join (60 synthetic reports x 1,200 candidates = 72,000 pairs,
-  ~2.6M pair tokens): gpus=2 near half of gpus=1 (anchors split by
-  token count, partners replicated).
-- answers identical across GPU counts up to knife-edge flips (the
-  chunks pack differently per shard).
-
-Run from the quail/ directory:
-
-    uv run python tests/gpu/dispatch_gate.py 2>&1 | tee results/dispatch_gate.log
-"""
+"""Dispatch gate: run the same filter and join queries on 1 GPU and 2, comparing wall time and answers."""
 
 import json
 import sys
@@ -41,8 +24,7 @@ COLORS = ("blue", "red", "green", "yellow", "purple", "orange")
 
 
 def build_filter_parquet(path, n_docs=10000):
-    """The milestone corpus, built locally: same seeds, same planted
-    flags, byte-identical bodies."""
+    """Build the IMDB filter corpus as a parquet file with planted flag lines."""
     texts = []
     for split in ("train", "test"):
         f = hf_hub_download(

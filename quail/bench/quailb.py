@@ -1,26 +1,7 @@
-"""QUAIL-B: twenty-six queries over four document sets.
+"""QUAIL-B: twenty-six queries over four document sets (IMDB, BioDEX,
+FEVER, LePaRD).
 
-Real filter and join predicates over real, unpadded, un-concatenated
-text, rather than planted flags. Selectivity hints are omitted
-throughout, so the planner falls back to `as_written` ordering
-instead of guessing (`planner/decide.py`).
-
-Build the data and run:
-
-    mkdir -p results/benchmark
-    run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb.log"
-    uv run python -m quail.bench.quailb --sf 0.1 \
-        --model qwen3-4b-fp8 --gpus 1 \
-        --prediction "State the expected runtime and accuracy here" \
-        2>&1 | tee "$run_log"
-
-Omitting `--only` runs all twenty-six queries.
-
-The command reads the matching ground truth from the `quail-results`
-Modal volume. It writes the aggregate JSON summary and Markdown report
-under `results/benchmark/`. It writes the PNG plot under
-`reports/plots/benchmark/`. Raw returned rows and model answers stay on
-the Modal volume. The aggregate JSON is also saved on that volume.
+    uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8 --gpus 1
 """
 
 import argparse
@@ -54,8 +35,7 @@ SOURCE_REVISIONS = {
 
 # Base document counts at sf=1. Only these three scale with sf; the
 # partner tables (aspects, terms) are fixed vocabulary and evidence is
-# bounded by whichever claims get sampled (see the FEVER open item in
-# query-design.md).
+# bounded by whichever claims get sampled.
 SETS = {
     "reviews": 50_000,
     "reports": 2_000,
@@ -111,12 +91,8 @@ def _biodex_rows(n):
 
 
 def _fever_data(n_claims):
-    """FEVER claims (SUPPORTS/REFUTES only - those carry a real
-    annotated evidence page) and the small pool of Wikipedia pages
-    those claims actually reference. The evidence pool is bounded by
-    the sampled claims - a full join against all 5M wiki pages is not
-    the query under test (see the FEVER open item in
-    query-design.md)."""
+    """FEVER claims (SUPPORTS/REFUTES only) and the Wikipedia pages they
+    reference. The evidence pool is bounded by the sampled claims."""
     from huggingface_hub import hf_hub_download
     f = hf_hub_download("fever/fever", "v1.0/labelled_dev/0000.parquet",
                         repo_type="dataset",
@@ -150,20 +126,9 @@ def _fever_data(n_claims):
 
 
 def _lepard_rows(n):
-    """Real LePaRD citation events, unpadded: (destination_context,
-    canonical passage text, passage_id) per row, one row per distinct
-    dest_id (a citing case can quote several passages; one keeps the
-    sample from packing near-duplicate excerpts under different
-    passage_ids).
-
-    Passage text comes from passage_dict.json's canonical entry for
-    that passage_id, not the CSV's own `quote` column - `quote` is
-    often just the isolated cited clause, sometimes with OCR noise
-    and no surrounding grammar (e.g. "foster[s] an excessive
-    government entanglement with religion."); passage_dict gives the
-    fuller paragraph it was drawn from - real numbers, measured on
-    this file: destination_context averages 709 chars, raw `quote`
-    132, the canonical passage 242 - long enough to actually read."""
+    """LePaRD citation events: (destination_context, canonical passage
+    text, passage_id) per row, one row per distinct dest_id. Passage
+    text comes from passage_dict.json, not the CSV's own quote column."""
     import json as _json
 
     from huggingface_hub import hf_hub_download
@@ -207,18 +172,11 @@ def _vocab_table(rows, idx, cap=None):
 
 
 def _build_citations(d, sf, force=False):
-    """citations.parquet, idempotent: real LePaRD citation events,
-    self-joined against itself - one table, one row per citing case,
-    its own excerpt (destination_context) and its own actually-cited
-    passage (passage_dict.json text) on the same row. A join query
-    reads this same table under two aliases with two different
-    columns - see LEP-2 in queries() below.
+    """Build citations.parquet from LePaRD data, idempotent.
 
-    Called from both branches of build_sets (cache hit and full
-    build) rather than gated behind the one whole-directory DONE
-    marker, so adding a table later backfills existing sf caches
-    instead of silently no-op'ing against a stale marker - exactly
-    what broke the first time this table was added."""
+    Called from both branches of build_sets so adding a new table
+    backfills existing sf caches.
+    """
     path = d / "citations.parquet"
     if path.exists() and not force:
         return
@@ -326,15 +284,6 @@ def register_sets(sess, data_dir):
 
 
 # ---------------------------------------------------------- predicates
-#
-# Join templates name labeled documents instead of inserting document
-# text. The engine writes the complete question into each anchor's KV
-# once, then streams the labeled partner document and answer cue for
-# each tuple.
-#
-# None of these have been through the judge pass. Wording may need to
-# change once that pass runs and some predicate misses the 90%
-# agreement floor or clusters selectivity with another predicate.
 
 F1 = ("Judge strictly from the review above whether it mentions at "
       "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
@@ -388,10 +337,7 @@ REACTION = ("Does the medical report in DOCUMENT {0} describe the "
             "experienced?")
 
 # BIO-6 only: a second question, joined against severe_terms (a
-# 64-term subset of the terms table, not the full ~614) under a
-# second alias (m2) - the 2-join "star" shape (the old B11), both
-# joins anchored on reports so the second stage runs over whatever
-# REACTION already kept.
+# 64-term subset of the terms table) under alias m2.
 REACTION_SEVERE = ("Does the medical report in DOCUMENT {0} describe "
                    "the reaction in DOCUMENT {1} as serious or life "
                    "threatening for the patient?")
@@ -414,12 +360,7 @@ SUPPORT = ("Does the Wikipedia passage in DOCUMENT {1} support the "
            "claim in DOCUMENT {0}?")
 
 # FEV-7 only: a second question over the same evidence table, joined
-# under a second alias (e2) - IMDB-8/BIO-6's counterpart for FEVER, a
-# 2-join star, both joins anchored on claims so the second stage runs
-# over whatever SUPPORT already kept. Genuinely meaningful (not an
-# engine-stress predicate): FEVER's real labels are support/refute/
-# not-enough-info, so asking whether a second passage refutes the
-# claim is a real question, not a synthetic one.
+# under alias e2.
 REFUTE = ("Does the Wikipedia passage in DOCUMENT {1} refute or "
           "contradict the claim in DOCUMENT {0}?")
 
@@ -467,9 +408,8 @@ LEPS1 = ("Judge strictly from the passage above whether it states a "
          "general legal rule.\n\n{0}\n\nInstruction: answer TRUE if "
          "the passage states a general legal rule, FALSE otherwise.")
 
-# The LEP-2..LEP-7 join predicate: real ground truth exists for this
-# one (passage_id, from the dataset itself, not a judge pass) - see
-# judge_pass.py's LEP probe.
+# The LEP-2..LEP-7 join predicate. Ground truth comes from the
+# dataset's own passage_id, not a judge pass.
 LEPJOIN = ("Is the passage in DOCUMENT {1} cited by the legal excerpt "
            "in DOCUMENT {0}?")
 
@@ -530,13 +470,9 @@ def queries(sess):
     q["IMDB-7"] = ("F1 -> F4 -> F5, 3 filters, no join", make(
         "reviews", "r", "body", [F1, F4, F5], [], ["r.id"]))
 
-    # IMDB-9/IMDB-11: real anchor-switch chains. A path of 3 joins
-    # across 4 table positions (r-a1-a2-a3) where no table spans all
-    # 3 edges, so the free anchor search structurally cannot collapse
-    # it to one group - a barrier is unavoidable regardless of which
-    # anchors the cost search picks. Uses raw ai_join calls since
-    # make()'s {0} is always the original doc_alias, so it can't
-    # express a path graph.
+    # IMDB-9/IMDB-11: 3-join path (r-a1-a2-a3). No table spans all
+    # 3 edges, so at least one barrier is unavoidable. Uses raw
+    # ai_join calls because make()'s {0} is always doc_alias.
     def imdb9():
         r = sess.docs("reviews").alias("r")
         a1 = sess.docs("aspects").alias("a1")
@@ -580,10 +516,8 @@ def queries(sess):
     q["IMDB-11"] = ("engine stress: F1 filter -> 3J real chain "
                     "r-a1-a2-a3, free anchor search", imdb11)
 
-    # IMDB-8: the star shape - A joins B and A joins C, same anchor
-    # throughout, a barrier between the two stages but no switch (the
-    # old B11's shape). Contrast with IMDB-9/11's path shape, where
-    # the switch is structurally forced.
+    # IMDB-8: star shape - A joins B and A joins C, same anchor
+    # throughout, barrier between stages but no anchor switch.
     q["IMDB-8"] = ("2J, same anchor: J1 (DISCUSS_ASPECT) -> J2 "
                    "(ASPECT_SENTIMENT), reviews x aspects x aspects",
                    make("reviews", "r", "body", [],
@@ -607,12 +541,9 @@ def queries(sess):
         "reports", "r", "report", [F7, F8, F9],
         [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
 
-    # BIO-C/BIO-D: IMDB-9/11's counterpart for BioDEX. `terms` is a
-    # fixed ~2,560-row table, not tied to sf, so a direct term-to-term
-    # chain (like IMDB's aspect-to-aspect chain) risks a cardinality
-    # blowup. Alternates back through `reports` (which does shrink
-    # with sf) instead - still a real 3-edge path with no table
-    # spanning all 3 edges, so a switch is still structural.
+    # BIO-C/BIO-D: 3-join path for BioDEX. `terms` is ~2,560 rows
+    # regardless of sf, so the chain alternates through `reports`
+    # (which scales with sf) to avoid cardinality blowup.
     def bioC():
         r1 = sess.docs("reports").alias("r1")
         m1 = sess.docs("terms").alias("m1")
@@ -653,11 +584,8 @@ def queries(sess):
     q["BIO-D"] = ("engine stress: F7 filter -> 3J real chain "
                  "r1-m1-r2-m2, free anchor search", bioD)
 
-    # BIO-6: the star shape - both joins anchored on reports, a
-    # barrier between the two stages but no switch (the old B11's
-    # shape, IMDB-8's counterpart for BioDEX). J2 uses severe_terms
-    # (the 64 most common reaction terms), not the full terms table -
-    # see the comment where severe_terms is built in build_sets.
+    # BIO-6: star shape, both joins anchored on reports. J2 uses
+    # severe_terms (64 rows), not the full terms table.
     q["BIO-6"] = ("2J, same anchor: J1 (REACTION) -> J2 "
                  "(REACTION_SEVERE), reports x terms x severe_terms", make(
         "reports", "r", "report", [],
@@ -665,10 +593,8 @@ def queries(sess):
          ("severe_terms", "m2", "term", REACTION_SEVERE)],
         ["r.id", "m.id", "m2.id"]))
 
-    # FEVER: filter alone, join alone, then a filter chain to depth 2
-    # only (depth 3 hit 0 rows - see the module docstring), plus the
-    # two-sided FEV-5/FEV-6 pushdown, the shape that actually tests
-    # joins under independent filtering on both sides.
+    # FEVER: filter alone, join alone, filter chain to depth 2 only
+    # (depth 3 yields 0 rows), plus two-sided FEV-5/FEV-6 pushdown.
     q["FEV-1"] = ("filter: F11 (about a person)", make(
         "claims", "c", "claim", [F11], [], ["c.id"]))
     q["FEV-2"] = ("join: J3 (claims x evidence)", make(
@@ -691,10 +617,8 @@ def queries(sess):
         "claims", "c", "claim", [F11, F12],
         [("evidence", "e", "text", SUPPORT, [F13])], ["c.id", "e.id"]))
 
-    # FEV-C/FEV-D: IMDB-9/11's and BIO-C/D's counterpart for FEVER.
-    # claims/evidence both scale with sf (no fixed-large table like
-    # terms), so a direct chain works without BIO-9's risk. Same
-    # 3-edge, no-table-spans-all-edges shape as the other two.
+    # FEV-C/FEV-D: 3-join path for FEVER. Both claims and evidence
+    # scale with sf, so a direct chain works.
     def fevC():
         c1 = sess.docs("claims").alias("c1")
         e1 = sess.docs("evidence").alias("e1")
@@ -735,10 +659,7 @@ def queries(sess):
     q["FEV-D"] = ("engine stress: F11 filter -> 3J real chain "
                  "c1-e1-c2-e2, free anchor search", fevD)
 
-    # FEV-7: the star shape - both joins anchored on claims, a
-    # barrier between the two stages but no switch (IMDB-8/BIO-6's
-    # counterpart for FEVER). Meaningful, not synthetic: FEVER's real
-    # labels are support/refute/not-enough-info.
+    # FEV-7: star shape, both joins anchored on claims.
     q["FEV-7"] = ("2J, same anchor: J1 (SUPPORT) -> J2 (REFUTE), "
                  "claims x evidence x evidence", make(
         "claims", "c", "claim", [],
@@ -746,11 +667,8 @@ def queries(sess):
          ("evidence", "e2", "text", REFUTE)],
         ["c.id", "e.id", "e2.id"]))
 
-    # LePaRD: one table, `citations`, self-joined - the anchor alias
-    # ("d") reads destination_context, the partner alias ("s") reads
-    # passage_text, both from the same registered provider. Same
-    # five-shape pattern as IMDB/BioDEX, plus a 5-filter chain
-    # (LEP-6) and the two-sided pushdown (LEP-7, matching FEV-5/6).
+    # LePaRD: one table (`citations`), self-joined. Alias "d" reads
+    # destination_context, alias "s" reads passage_text.
     q["LEP-1"] = ("filter: LEP1 (reasoning does not apply)", make(
         "citations", "d", "destination_context", [LEP1], [], ["d.id"]))
     q["LEP-2"] = ("join: self-join (citations x citations)", make(
@@ -799,10 +717,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
               accuracy=True, ground_truth_collection=None,
               h100_usd_per_hour=3.9492, ground_truth_files=None,
               prediction=None, artifact_stem=None):
-    """cpu_memory_gb defaults to what the 96 GB worker container
-    holds: a 64 GB store (8 slabs). The corpus KV usually exceeds it,
-    so the length threshold keeps the longest documents - partial
-    restores are the capacity arithmetic working, not a bug."""
+    """Run all (or selected) QUAIL-B queries through the engine."""
     import quail
     from quail.bench.evaluate import (
         BenchmarkEvaluator,

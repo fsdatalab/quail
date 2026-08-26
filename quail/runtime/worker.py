@@ -1,18 +1,5 @@
-"""The Modal worker: one container, one H100, one executor.
-
-Takes the coordinator's payload (token ids and the planned settings,
-nothing else), runs the filter chains and the join stages on the
-packed executor, gates between stages next to the GPU, and returns
-the raw answer rows. The coordinator assembles tuples and projects -
-it never sees a tensor.
-
-A join stage is the cross product under one prompt: each anchor
-document's KV is computed once, then the complete static question is
-written into its kept KV. Every tuple of the partner tables streams
-against it as one suffix with labeled partner documents and the answer
-cue. exists/anti gates run the same way over one partner
-table and apply the keep rule to the answers; their early-stop
-optimization is not built yet, so they stream the full list.
+"""Modal worker: runs filter chains and join stages on the GPU,
+returns raw answer rows.
 """
 
 import itertools
@@ -161,10 +148,12 @@ def execute(payload: dict) -> dict:
 
 
 def _execute_single(state, payload: dict) -> dict:
-    """The single-GPU execution core, shared by the ephemeral
-    function (module-global state) and the snapshot worker class
-    (instance state). state: model, arena, pipeline, spec, store,
-    torch, F."""
+    """Single-GPU execution core.
+
+    Args:
+        state: Dict with model, arena, pipeline, spec, store, torch, F.
+        payload: The coordinator's payload dict.
+    """
     import torch.nn.functional as F  # noqa: F401 (state carries it)
 
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
@@ -208,7 +197,7 @@ def _execute_single(state, payload: dict) -> dict:
     store_stats = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
     # None when the payload has joins: LIMIT caps output rows, and a
-    # join fans one survivor into zero or many rows (#39)
+    # join fans one survivor into zero or many rows
     limit = filter_round_limit(payload)
 
     filter_writes = payload["filter_arena_writes"]
@@ -243,7 +232,7 @@ def _execute_single(state, payload: dict) -> dict:
             payload["joins"])
         for node in nodes:
             if node["op"] == "Barrier":
-                # step 4.6 thinning; on one GPU there is no shard step
+                # barrier thinning; on one GPU there is no shard step
                 thin_survivors(finished_full, survivors)
                 continue
             if node["op"] != "JoinGroup":
@@ -252,7 +241,7 @@ def _execute_single(state, payload: dict) -> dict:
             anchor_alias = node["anchor"]
             if len(specs) == 1 and specs[0].get("anchor_free"):
                 # a one-stage group re-picks its anchor from the
-                # measured live counts (issue #38, step 4.1)
+                # measured live counts
                 anchor_alias = pick_runtime_anchor(
                     specs[0],
                     {a: [len(docs[a][g]) for g in survivors[a]]
@@ -312,12 +301,6 @@ def _execute_single(state, payload: dict) -> dict:
                     torch.cuda.max_memory_allocated() / 2**30, 2))
 
 
-# GPU memory snapshots were tried here and removed: the measured
-# restore segfaulted in a background thread (exit 139) and the
-# full-arena snapshot took ~6 minutes to write. The design's named
-# fallback - cold boots and warm containers - is what runs, and only
-# the session-start convenience is lost. Revisit when Modal's GPU
-# snapshots harden; results/snapshot_gate.log holds the evidence.
 
 # ------------------------------------------------- multi-GPU dispatch
 #
@@ -562,8 +545,7 @@ def _ensure_children(k):
 
 
 def _round(kind, subs):
-    """Send one round to the children and collect, failing loudly
-    with the child's traceback."""
+    """Send one round to children and collect results."""
     for (_, conn), sub in zip(_CHILDREN, subs):
         conn.send((kind, sub))
     outs = []
@@ -585,7 +567,7 @@ def _execute_multi(payload: dict) -> dict:
     shards = payload.get("shards", {})
     _ensure_children(k)
     # None when the payload has joins: LIMIT caps output rows, and a
-    # join fans one survivor into zero or many rows (#39)
+    # join fans one survivor into zero or many rows
     limit = coordinator.filter_round_limit(payload)
     t0 = _time.perf_counter()
     fouts = _round("filters",
@@ -602,7 +584,7 @@ def _execute_multi(payload: dict) -> dict:
         payload["joins"])
     for node in nodes:
         if node["op"] == "Barrier":
-            # step 4.6 thinning; the re-shard itself happens when the
+            # barrier thinning; the re-shard itself happens when the
             # next group's payloads are built over the thinned sets
             coordinator.thin_survivors(finished_full, survivors)
             continue
@@ -612,7 +594,7 @@ def _execute_multi(payload: dict) -> dict:
         anchor = node["anchor"]
         if len(specs) == 1 and specs[0].get("anchor_free"):
             # a one-stage group re-picks its anchor from the measured
-            # live counts (issue #38, step 4.1)
+            # live counts
             anchor = pick_runtime_anchor(
                 specs[0],
                 {a: [len(docs[a][g]) for g in survivors[a]]
@@ -683,9 +665,7 @@ def execute_8(payload: dict) -> dict:
 
 
 def _tuple_suffix(join, docs, member) -> list:
-    """One tuple's stream: every partner document behind its block
-    label, then the answer cue. `member` holds one document
-    index per partner alias, in the join's partner order."""
+    """Build one tuple's suffix: partner documents with block labels, then the answer cue."""
     out = []
     for alias, g in zip(join["partners"], member):
         out += join["labels"][alias]
@@ -695,8 +675,7 @@ def _tuple_suffix(join, docs, member) -> list:
 
 
 class _PayloadAnswerer:
-    """The Answerer, built from TRUE/FALSE token ids shipped in the
-    payload instead of a tokenizer."""
+    """Answerer using TRUE/FALSE token ids from the payload."""
 
     def __init__(self, torch, F, model, true_ids, false_ids):
         self.F = F

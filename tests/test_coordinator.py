@@ -1,6 +1,4 @@
-"""The coordinator's split and merge arithmetic: what the container
-parent runs between its GPU children - per-group join rounds, the
-barrier's thinning, and the re-shard. Pure CPU."""
+"""Tests for the coordinator's filter/join round splitting, merging, gating, and thinning."""
 
 from quail.runtime.coordinator import (derive_plan_nodes,
                                        filter_round_limit,

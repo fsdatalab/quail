@@ -1,11 +1,4 @@
-"""The warmup marker: path layout and identity stability.
-
-The marker decides whether a boot runs the compile pass (once ever
-per stack+model+budget) or the touch pass (every container). A wrong
-path or an unstable identity silently recompiles every boot or never
-compiles at all, so both are pinned here. No GPU: the identity
-builder takes the torch module as a parameter, so a stub stands in.
-"""
+"""Tests for warmup marker path layout and identity stability."""
 
 from types import SimpleNamespace
 

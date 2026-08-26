@@ -1,21 +1,7 @@
-"""The measured constants the planner's break-even decision consumes.
+"""Load and manage calibration constants (a, a2) per (model, device) pair.
 
-Exactly two numbers per (model, device) pair, written offline by
-`quail.planner.calibrate.measure` (Modal entry: quail/runtime/calibrate.py)
-and checked into quail/calibration/:
-
-    a      seconds per fresh token in the packed loop (1/rate; embeds
-           the measured efficiency factor)
-    a2     seconds per token-pair of attention (the quadratic
-           coefficient; refines the restore break-even at long
-           documents)
-
-Plus one host table, model-independent: the channel bandwidths from
-the pinprobe protocol.
-
-Nothing is ever measured at plan time. A pair without a file gets
-spec-ratio-scaled defaults from the anchor measurement (4B/H100), and
-the Calibration says so in `source` so explain() can print it.
+Constants are stored in quail/calibration/ as JSON. A pair without a
+file gets spec-ratio-scaled defaults from the anchor measurement.
 """
 
 import json
@@ -40,15 +26,16 @@ class Calibration:
 
 
 def channel_bandwidths() -> dict:
-    """Channel name -> bytes/s, from the host table."""
+    """Return channel name -> bandwidth in bytes/s."""
     with open(CALIBRATION_DIR / "channels.json") as f:
         return json.load(f)["bandwidth_bytes_per_s"]
 
 
 def fit_affine(points) -> tuple[float, float]:
-    """Least-squares (a, a2) for t = a + a2*h over (h, t) points -
-    measure()'s fit, kept here so it is CPU-testable. Needs at least
-    two distinct lengths."""
+    """Least-squares fit of t = a + a2*h over (h, t) points.
+
+    Needs at least two distinct lengths.
+    """
     n = len(points)
     sx = sum(h for h, _ in points)
     sy = sum(t for _, t in points)
@@ -69,10 +56,7 @@ def _load_file(path: Path) -> dict:
 
 def _scale(model: ModelSpec, device: DeviceSpec,
            anchor_model: ModelSpec, anchor_device: DeviceSpec) -> float:
-    """Spec-ratio scaling of per-token compute cost from the anchor: a
-    model with more params costs proportionally more per token, a
-    device with a higher ceiling proportionally less. The measured
-    efficiency is assumed to travel; the absolute rates do not."""
+    """Spec-ratio scaling factor from the anchor pair to the target pair."""
     return ((model.params / anchor_model.params)
             * (anchor_device.peak_flops / device.peak_flops))
 
@@ -99,7 +83,7 @@ def make_record(model: ModelSpec, device: DeviceSpec,
                 a: float, a2: float,
                 points: list, channels: dict, loaded: Calibration,
                 lengths, tokens_per_point: int) -> dict:
-    """The JSON the measure step returns and --commit writes from."""
+    """Build the JSON record that measure() returns."""
     return dict(
         model=model.name, device=device.name,
         a_s_per_token=a, a2_s_per_token2=a2,

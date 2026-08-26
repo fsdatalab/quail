@@ -1,15 +1,8 @@
-"""The two structs every planner input derives from.
-
-All byte quantities are decimal. `kv_bytes` is bytes per stored KV
-element. KV is always bf16 (2 bytes). `with_kv_bytes` is only for
-kappa arithmetic in tests.
-"""
+"""Model and device spec structs for the planner."""
 
 from dataclasses import dataclass, replace
 
-# Peak per-token activation bytes per hidden dim. The MLP gate and up
-# intermediates dominate (~82 KB per token at 4B). An architecture
-# estimate carried over from the exploration, not yet measured.
+# Peak per-token activation bytes per hidden dim.
 ACT_BYTES_PER_HIDDEN = 32
 
 

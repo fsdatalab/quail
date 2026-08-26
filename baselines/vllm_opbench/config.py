@@ -1,21 +1,4 @@
-"""vLLM-opbench tunables. No GPU/Modal side effects on import - safe to
-read from both the orchestrator and the worker.
-
-Ported from /Users/adhariya/SQPE (a separate benchmarking project),
-scoped down to Filter and Join only (no Classify/Extract - outside
-this project's stated scope) and repointed at quail's own document
-sets and predicates (quail/bench/quailb.py) instead of SQPE's
-IMDb Spoiler dataset.
-
-Two deliberate departures from SQPE, both requested when this port was
-scoped:
-  - Checkpoint: the base Qwen3 checkpoint, quantized to fp8 at runtime
-    by vLLM (SQPE's original approach) - not quail's own pre-quantized
-    -FP8 checkpoints.
-  - Answer decoding: constrained TRUE/FALSE token ids (matching quail's
-    own engine and the existing baselines/stock.py), not SQPE's
-    original free-text "true"/"false" prefix parsing.
-"""
+"""vLLM-opbench tunables. No GPU/Modal side effects on import."""
 
 import os
 
@@ -25,9 +8,7 @@ APP_NAME = "quail-milestone1"
 
 # Base (non-FP8) checkpoints - fp8 quantization happens at vLLM load
 # time via `quantization="fp8"`, not by loading a pre-quantized
-# checkpoint. This is SQPE's original approach, kept deliberately: it
-# isolates "generic vLLM usage" from quail's own choice to load
-# pre-quantized weights.
+# checkpoint.
 MODEL_NAMES = {
     "qwen3-4b": "Qwen/Qwen3-4B",
     "qwen3-32b": "Qwen/Qwen3-32B",

@@ -1,47 +1,4 @@
-"""The builder entry point: mirrors AI SQL construct for construct.
-
-Both entry points collect the same QueryDesc and assemble through the
-same function, so a query translates line by line between them and the
-two LogicalPlans compare equal.
-
-    from quail.builder import col, docs, prompt
-
-    plan = (docs(catalog, "reviews", tokenizer).alias("r")
-            .ai_filter(prompt("This review is negative: {0}",
-                              col("r.review")), selectivity=0.3)
-            .ai_join(docs(catalog, "products").alias("p"),
-                     prompt("Review {0} discusses product {1}",
-                            col("r.review"), col("p.description")),
-                     selectivity=0.05)
-            .select("r.id", "p.id"))
-
-One ai_join call is one predicate, however many tables it spans: pass
-a list as the right side and a prompt with one placeholder per table,
-and every tuple of the cross product is judged by that single prompt
-(all the documents in one model call):
-
-    .ai_join([docs(catalog, "products").alias("p"),
-              docs(catalog, "terms").alias("m")],
-             prompt("Document {0} discusses the product in {1} and "
-                    "mentions the term in {2}.",
-                    col("r.review"), col("p.description"),
-                    col("m.term")),
-             selectivity=0.01)
-
-Chained ai_join calls compose separate pairwise joins - one JoinSpec
-each. Each call's prompt must reference every table that call joins
-and at least one table already in the query, so the joins connect:
-
-    .ai_join(docs(catalog, "products").alias("p"),
-             prompt("m1 {0} {1}", col("r.review"),
-                    col("p.description")))
-    .ai_join(docs(catalog, "recalls").alias("c"),
-             prompt("m2 {0} {1}", col("p.description"),
-                    col("c.notice")))
-
-The order you chain calls is the order that runs - nothing is ever
-reordered behind your back (the builder is always `as_written`).
-"""
+"""Python builder that mirrors AI SQL construct for construct."""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -159,15 +116,15 @@ class Query:
                 selectivity: Optional[float] = None,
                 anchor: Optional[str] = None,
                 semantics: str = "full") -> "Query":
-        """Join one or more tables with a single prompt: every tuple
-        of the cross product is judged by one model call holding all
-        the documents. `others` is one docs(...) query or a list of
-        them; `p` needs one placeholder per table it references -
-        every table this call joins, plus at least one table already
-        in the query (the first call references this query's own
-        table). Chained calls add one pairwise join each. exists/anti
-        take exactly one other table and gate this side's documents
-        instead of producing tuples."""
+        """Join one or more tables with a single prompt.
+
+        Args:
+            others: One docs() query or a list of them.
+            p: Prompt with one placeholder per table it references.
+            selectivity: Fraction of tuples expected to pass.
+            anchor: Table alias whose KV is kept across tuples.
+            semantics: "full", "exists", or "anti".
+        """
         if semantics not in ("full", "exists", "anti"):
             raise CompileError(f"semantics must be full, exists, or "
                                f"anti, got {semantics!r}")

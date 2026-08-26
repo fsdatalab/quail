@@ -1,21 +1,5 @@
-"""The planner's decisions, exactly the section-4 list and exactly
-their inputs: token counts, provided selectivities, the two spec
-structs, and the calibration constants - nothing else.
-
-Grouped by input:
-
-- Decisions from token arithmetic alone (the serving rate cancels out
-  of every comparison, so these survive any miscalibration): filter
-  order, join stage order, anchor per stage, sharding.
-- Settings from the spec structs alone: the admission budget and the
-  chunk budget (quail.planner.budgets).
-- Decisions that compare compute against bytes (the only consumers of
-  measured constants): access per scan. KV is always bf16.
-
-Pushdown is not a decision at all: filters attach above their scans in
-the logical plan, so a filter always runs before the joins its
-provider feeds. There is no selectivity estimation and no runtime
-re-ordering.
+"""Planner decisions: filter order, join order, anchor choice,
+sharding, and access mode from a logical plan and corpus token counts.
 """
 
 import itertools
@@ -32,11 +16,7 @@ from quail.specs import DeviceSpec, ModelSpec
 # ---------------------------------------------------------- tree walk
 
 def _collect(plan: LogicalPlan):
-    """(scans, filters_by_alias, join_specs_in_written_order).
-
-    Each join's first input is the accumulated tree (assemble_plan
-    folds specs in written order), so an in-order walk recovers
-    written order."""
+    """Return (scans, filters_by_alias, joins_in_written_order)."""
     scans, filters, joins = [], {}, []
 
     def walk(node):
@@ -57,12 +37,7 @@ def _collect(plan: LogicalPlan):
 
 
 def _question_tokens(prompt) -> int:
-    """The token count of a stage's per-evaluation tail.
-
-    A filter tail contains its question and answer cue. A join tail
-    contains only its answer cue because the question is in the
-    anchor frame.
-    """
+    """Token count of the prompt's per-evaluation tail."""
     if prompt.tail_tokens is None or prompt.preamble_tokens is None:
         raise ValueError(
             "prompts were bound without a tokenizer; the planner "
@@ -71,8 +46,7 @@ def _question_tokens(prompt) -> int:
 
 
 def _preamble_tokens(filters, joins) -> int:
-    """The engine preamble's token count. The canonical layout makes
-    it identical on every prompt, so any bound prompt supplies it."""
+    """Return the engine preamble's token count from any bound prompt."""
     for fs in filters.values():
         for p in fs:
             if p.prompt.preamble_tokens is not None:
@@ -86,8 +60,8 @@ def _preamble_tokens(filters, joins) -> int:
 # ------------------------------------------------ order (token arithmetic)
 
 def default_order_rule(filters, joins) -> tuple[str, str]:
-    """(rule, source). by_cost iff every gated predicate carries a
-    selectivity, as_written otherwise."""
+    """Return (rule, source). 'by_cost' when every predicate has a
+    selectivity, 'as_written' otherwise."""
     preds = [p for fs in filters.values() for p in fs]
     sels = [p.selectivity for p in preds] + [j.selectivity for j in joins]
     if sels and all(s is not None for s in sels):
@@ -96,11 +70,11 @@ def default_order_rule(filters, joins) -> tuple[str, str]:
 
 
 def order_filters_indexed(predicates, rule: str):
-    """Written positions of the predicates in execution order. by_cost
-    sorts by cost per killed document: question tokens over
-    (1 - selectivity). A selectivity of 1 kills nothing and goes last.
-    Stable, so ties keep written order. Order changes cost, never
-    results."""
+    """Return written positions of predicates in execution order.
+
+    'by_cost' sorts by question_tokens / (1 - selectivity). Stable
+    sort, so ties keep written order.
+    """
     idx = list(range(len(predicates)))
     if rule == "as_written":
         return idx
@@ -122,8 +96,7 @@ def order_filters(predicates, rule: str):
 
 def _surviving_docs(n_docs: float, n_partners: float,
                     tuple_selectivity: float) -> float:
-    """Expected distinct documents left with at least one matching
-    tuple: n * (1 - (1-s)^partner_tuples)."""
+    """Expected distinct documents with at least one matching tuple."""
     if tuple_selectivity is None:
         return n_docs
     return n_docs * (1.0 - (1.0 - tuple_selectivity)
@@ -131,14 +104,12 @@ def _surviving_docs(n_docs: float, n_partners: float,
 
 
 def _join_aliases(join) -> list:
-    """The join's table aliases, placeholder order (each placeholder
-    names a distinct table, checked at bind time)."""
+    """Return the join's table aliases in placeholder order."""
     return [r.alias for r in join.predicate.args]
 
 
 def _label_counts(join) -> dict:
-    """alias -> (block label tokens, anchor frame tokens), from the
-    bind-time counts the prompt carries."""
+    """Return alias -> (block_label_tokens, anchor_frame_tokens)."""
     out = {a: (lt, nt) for a, lt, nt in join.predicate.labels}
     if any(lt is None for lt, _ in out.values()):
         raise ValueError(
@@ -157,11 +128,8 @@ def _cross_tuples(join, live: dict, anchor: str) -> float:
 
 def _anchor_prefix_tokens(join, live: dict, stats: dict, anchor: str,
                           pre_tokens: int = 0) -> float:
-    """The group-start charge for the anchor's kept KV.
-
-    The engine preamble, document, and complete anchor frame are paid
-    once per live anchor document. A later stage on the same anchor
-    reuses the document KV and pays only _frame_only_tokens.
+    """Total prefix tokens for the anchor: preamble + document + frame,
+    summed over live anchor documents.
     """
     labels = _label_counts(join)
     return live[anchor] * (stats[anchor].mean_doc_tokens + pre_tokens
@@ -169,15 +137,13 @@ def _anchor_prefix_tokens(join, live: dict, stats: dict, anchor: str,
 
 
 def _frame_only_tokens(join, live: dict, anchor: str) -> float:
-    """A later stage on the same anchor writes its complete frame once
-    per live anchor document. The document and preamble rows stay."""
+    """Frame-only tokens for a later stage continuing the same anchor."""
     labels = _label_counts(join)
     return live[anchor] * labels[anchor][1]
 
 
 def _pair_tokens(join, live: dict, stats: dict, anchor: str) -> float:
-    """The per-tuple stream contains each labeled partner document and
-    the answer cue."""
+    """Total tokens for partner documents and answer cues across all tuples."""
     labels = _label_counts(join)
     partners = [a for a in _join_aliases(join) if a != anchor]
     per_tuple = _question_tokens(join.predicate)
@@ -188,19 +154,14 @@ def _pair_tokens(join, live: dict, stats: dict, anchor: str) -> float:
 
 def _stage_tokens(join, live: dict, stats: dict, anchor: str,
                   pre_tokens: int = 0) -> float:
-    """Token total of one join opening its own group at the current
-    live counts: the anchor prefix once per anchor document, every
-    partner document with its block label plus the answer cue once per
-    tuple."""
+    """Total tokens for one join stage at the current live counts."""
     return (_anchor_prefix_tokens(join, live, stats, anchor,
                                   pre_tokens)
             + _pair_tokens(join, live, stats, anchor))
 
 
 def _thin(live: dict, join, anchor: str) -> None:
-    """Update live counts past one join, for cost enumeration only.
-    full thins every table to the documents expected in some passing
-    tuple; exists keeps matched anchors; anti keeps unmatched ones."""
+    """Update live document counts after one join's selectivity."""
     sel = join.selectivity
     aliases = _join_aliases(join)
 
@@ -223,17 +184,16 @@ def _thin(live: dict, join, anchor: str) -> None:
 
 # ------------------------------ the joint (order x anchor) search
 
-# Charged once per barrier, on top of the next anchor's fresh-KV
-# term (which the walk below prices exactly). The plumbing cost of a
-# re-shard - splitting payloads, shipping token ids - has not been
-# measured; set this when it is.
+# Token overhead per anchor-switch barrier. Not yet measured.
 RESHARD_OVERHEAD_TOKENS = 0.0
 
 
 def _anchor_candidates(join, honor_forced: bool = True) -> list:
-    """Anchors a stage may take. exists/anti always anchor their
-    outer table (the gate applies to its documents); a forced full
-    anchor is honored; otherwise any table of the join."""
+    """Return candidate anchor aliases for a join stage.
+
+    exists/anti always anchor the outer table. A forced full anchor
+    is honored. Otherwise any table of the join is a candidate.
+    """
     if join.semantics != "full":
         return [join.anchor]
     if honor_forced and join.anchor is not None:
@@ -242,13 +202,12 @@ def _anchor_candidates(join, honor_forced: bool = True) -> list:
 
 
 def _walk(seq, live0: dict, stats: dict, pre_tokens: int = 0):
-    """Cost one (join, anchor) sequence: (total, per-stage records),
-    each record (expected tuples, stage tokens). A stage opening a
-    group pays the anchor prefix - plus the re-shard overhead when it
-    follows a group on a different anchor; a stage continuing a
-    same-anchor run of full stages pays only its complete frame. Gates
-    never continue a group (their keep rule differs from the in-call
-    gate), so they always pay the full prefix."""
+    """Cost one (join, anchor) sequence.
+
+    Returns:
+        (total_tokens, records) where each record is
+        (expected_tuples, stage_tokens).
+    """
     live = dict(live0)
     total = 0.0
     records = []
@@ -274,14 +233,9 @@ def _walk(seq, live0: dict, stats: dict, pre_tokens: int = 0):
 
 def plan_joins(joins, rule: str, stats: dict, live0: dict,
                pre_tokens: int = 0):
-    """The joint search from issue #38: enumerate stage orders (only
-    the written order under as_written) times per-stage anchor
-    choices, cost each sequence with _walk, keep the cheapest.
-    Returns (sequence, remarks); the sequence is [(join, anchor)] in
-    execution order. Anchor switches in it become groups and barriers
-    at emission. The space is k! x (tables per stage): a few tens of
-    thousands of pure-arithmetic walks at six joins, and order
-    changes cost, never results - every sequence runs."""
+    """Enumerate stage-order x anchor-choice combinations, return the
+    cheapest as ([(join, anchor)], remarks).
+    """
     if not joins:
         return [], []
 
@@ -317,14 +271,19 @@ def plan_joins(joins, rule: str, stats: dict, live0: dict,
 
 def pick_runtime_anchor(spec: dict, live_doc_tokens: dict,
                         pre_len: int, chunk_budget: int) -> str:
-    """Barrier-time anchor choice for a one-stage group, from
-    measured live counts (issue #38, step 4.1) - the payload-level
-    twin of the compile-time walk, kept here so decision code stays
-    in the planner. spec is the payload stage spec (aliases, labels,
-    frames, tail as token id lists); live_doc_tokens maps alias ->
-    token counts of its live documents. Only anchors whose worst-case
-    tuple fits the chunk budget are candidates; the compile-time
-    anchor always is (it passed the compile-time refusal check)."""
+    """Choose the cheapest anchor at barrier time using live token counts.
+
+    Args:
+        spec: Payload stage spec (aliases, labels, frames, tail as
+            token id lists).
+        live_doc_tokens: alias -> list of per-document token counts.
+        pre_len: Preamble length in tokens.
+        chunk_budget: Maximum tokens per chunk.
+
+    Returns:
+        The alias to anchor on. Only anchors whose worst-case tuple
+        fits chunk_budget are candidates.
+    """
     tail = len(spec["tail"])
     counts = {a: len(t) for a, t in live_doc_tokens.items()}
     means = {a: (sum(t) / len(t)) if t else 0.0
@@ -356,10 +315,7 @@ def pick_runtime_anchor(spec: dict, live_doc_tokens: dict,
 # --------------------------------------------- sharding (token arithmetic)
 
 def balanced_shards(doc_tokens, workers: int):
-    """Greedy balance by token count: makespan is the slowest shard.
-    Filters split documents; joins split anchor documents (every pair
-    belongs to exactly one anchor, so gating, dedup, and the next
-    stage's pair list stay local to the GPU holding the anchor)."""
+    """Greedily partition documents into shards balanced by token count."""
     order = sorted(range(len(doc_tokens)), key=lambda i: -doc_tokens[i])
     loads = [0] * workers
     shards = [[] for _ in range(workers)]
@@ -374,10 +330,10 @@ def balanced_shards(doc_tokens, workers: int):
 
 def restore_crossover_tokens(model: ModelSpec, cal: Calibration,
                              read_bw: float) -> float:
-    """The document length past which loading KV beats recomputing it:
-    solve kappa/bw = a + a2*h for h. 0 means the channel beats
-    recompute at every length (bandwidth above kappa/a - the store
-    break-even); a2 moves the crossover down for long documents."""
+    """Document length (tokens) past which loading KV beats recomputing.
+
+    Returns 0 when bandwidth beats recompute at every length.
+    """
     per_token_load = model.kappa / read_bw
     if per_token_load <= cal.a_s_per_token:
         return 0.0
@@ -385,15 +341,11 @@ def restore_crossover_tokens(model: ModelSpec, cal: Calibration,
 
 
 def store_length_threshold(doc_tokens, capacity_bytes, kappa) -> int:
-    """The store-or-not length cutoff under a capacity: keep the
-    LONGEST documents whose KV fits. Recompute cost per byte rises
-    with document length, so the top of the length list is worth the
-    most per stored byte - and a length threshold cannot be thrashed
-    by a scanning query the way LRU can.
+    """Length cutoff for KV store: keep the longest documents that fit.
 
-    Returns 1 when capacity holds everything, 0 when nothing fits.
-    At a boundary tie the threshold moves up so the stored set never
-    exceeds the capacity."""
+    Returns:
+        1 when capacity holds everything, 0 when nothing fits.
+    """
     if capacity_bytes is None:
         return 1
     budget_tok = int(capacity_bytes / kappa)
@@ -416,9 +368,9 @@ def store_length_threshold(doc_tokens, capacity_bytes, kappa) -> int:
 
 def access_for_scan(stats: CorpusStats, model: ModelSpec,
                     cal: Calibration, store) -> str:
-    """read | restore. Restore wins when the warm store's bandwidth
-    beats kappa x the serving rate, or when the corpus's documents sit
-    past the a2-refined crossover."""
+    """Return 'read' or 'restore' based on whether loading KV from
+    the store beats recomputing it.
+    """
     if store is None or not store.warm:
         return "read"
     crossover = restore_crossover_tokens(model, cal, store.read_bw)
@@ -432,10 +384,11 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                store: StoreSpec | None = None,
                order: str | None = None,
                calibration: Calibration | None = None):
-    """LogicalPlan + corpus token counts -> PhysicalPlan | Refusal.
+    """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
-    doc_tokens: alias -> per-document token counts (from the cached
-    tokenization of each scan's column)."""
+    Args:
+        doc_tokens: alias -> list of per-document token counts.
+    """
     cal = calibration or load_calibration(model, device)
     scans, filters, joins = _collect(plan)
     stats = {a: CorpusStats.from_doc_tokens(t)
@@ -445,8 +398,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             raise ValueError(f"no doc_tokens for alias {s.alias!r}")
     remarks = []
 
-    # ---- refusals first: infeasible configurations are named, not
-    # planned around
+    # ---- refusals first
     tp = budgets.tensor_parallel(model, device)
     if tp > gpus:
         return Refusal(
@@ -462,10 +414,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(filters, joins)
 
-    # ---- the joint (order x anchor) search, seeded with post-filter
-    # live estimates. Anchors come before the chunk refusal: a join's
-    # atomic suffix (every partner document plus the answer cue)
-    # depends on which table anchors.
+    # ---- joint (order x anchor) search, seeded with post-filter live
+    # estimates
     live0 = {a: float(st.n_docs) for a, st in stats.items()}
     for fs in filters.values():
         surv = 1.0
@@ -545,9 +495,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 f"documents stored, length threshold {store_min} "
                 f"(preamble included)")
 
-    # ---- nodes: the dataflow graph, in execution order. ids_src
-    # tracks, per table, which node currently produces its live ids -
-    # that is the edge each consumer records.
+    # ---- build the dataflow graph; ids_src tracks each table's
+    # current producer node
     nodes = []
     ids_src = {}
     for s in scans:
@@ -574,9 +523,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                     selectivity=p.selectivity,
                     expected_docs=round(n * surv, 1)))
                 surv *= p.selectivity if p.selectivity is not None else 1.0
-            # a lone stage with no store leaves every document's KV
-            # with no reader: later stages re-read it, store.save
-            # copies it out, and nothing else ever touches it
+            # arena writes only needed when multiple stages or a store
+            # will read the KV back
             writes = len(stages) > 1 or store is not None
             fid = f"filter:{s.alias}"
             nodes.append(dict(id=fid, op="FilterChain",
@@ -589,9 +537,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                     f"filter on {s.alias!r}: arena writes off (one "
                     f"stage, no store - nothing reads the KV again)")
 
-    # consecutive full stages on one anchor share a gated run_join
-    # call; a gate always runs alone (its keep rule differs from the
-    # in-call gate); an anchor switch between groups is a barrier
+    # group consecutive full stages on the same anchor; gates run
+    # alone; anchor switches become barriers
     groups = []
     for j, anchor in seq:
         merge = (groups and j.semantics == "full" and groups[-1]["full"]
@@ -613,9 +560,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     for g, group in enumerate(groups):
         anchor = group["anchor"]
         if prev_anchor is not None and anchor != prev_anchor:
-            # the barrier thins every table the stages ahead touch
-            # (step 4.6), re-shards the new anchor over the measured
-            # live set, and is where run-time re-planning happens
+            # barrier: thin tables the remaining stages touch, re-shard
+            # the new anchor over the live set
             ahead = []
             for later in groups[g:]:
                 for j in later["members"]:
@@ -695,8 +641,7 @@ def _filter_alias(pred_or_list):
 # ------------------------------------------------------------- explain
 
 def explain(logical: LogicalPlan, physical) -> str:
-    """The logical tree, the chosen physical plan, per-operator
-    settings and token counts - no run needed."""
+    """Format the logical and physical plan as a human-readable string."""
     lines = ["logical:"]
 
     def render(node, depth):

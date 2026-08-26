@@ -1,6 +1,4 @@
-"""PageArena accounting: pages out, pages back, rows where they
-should be. The tensor-backed KVArena runs only on GPU and is covered
-by the milestone 1 parity probe."""
+"""Tests for PageArena page allocation, freeing, and row indexing."""
 
 import random
 

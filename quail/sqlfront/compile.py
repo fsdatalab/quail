@@ -1,33 +1,4 @@
-"""The AI SQL front end: sqlglot (Snowflake dialect), a validator, a
-binder.
-
-sqlglot parses AI_FILTER(...) and PROMPT(...) as generic function
-nodes (exp.Anonymous). We match them by name in the two legal
-positions - WHERE conjuncts and JOIN ON - plus the [NOT] EXISTS form,
-and reject everything else by node class: the rejection list below is
-literally a list of forbidden sqlglot classes, so new SQL surface
-cannot creep in silently.
-
-Each multi-table AI_FILTER(PROMPT(...)) is one join predicate,
-evaluated over the cross product of the tables its prompt references
-with every document in one model call. A query may have several. A
-predicate is written either Snowflake style (on a JOIN's ON; a bare
-JOIN leaves its table to another predicate) or BigQuery style (tables
-comma-joined or CROSS JOINed in FROM, the predicate a WHERE term):
-
-    FROM reviews a JOIN threads b JOIN products c
-      ON AI_FILTER(PROMPT('... {0} ... {1} ... {2}',
-                          a.review, b.thread, c.description))
-
-    FROM reviews a, threads b, products c
-    WHERE AI_FILTER(PROMPT('... {0} ... {1}', a.review, b.thread))
-      AND AI_FILTER(PROMPT('... {0} ... {1}', b.thread, c.description))
-
-Coverage rule: every JOINed table must appear in at least one join
-predicate, and the predicates' tables must form one connected graph
-with the FROM table - otherwise some table would never be compared
-with the rest of the query.
-"""
+"""AI SQL front end: parse Snowflake-dialect SQL into a LogicalPlan."""
 
 import sqlglot
 from sqlglot import exp
@@ -174,10 +145,7 @@ class _Binder:
 
     def parse_ai_filter(self, node, allowed: set, scope=None,
                         join=None):
-        """(prompt, options, provider aliases referenced). join: True
-        binds the join layout (a static question in the anchor frame
-        and labeled partner blocks), False the filter layout, None
-        decides by how many providers the prompt references."""
+        """Parse an AI_FILTER node into (prompt, options, aliases)."""
         if not _is_call(node, "AI_FILTER"):
             raise CompileError(
                 f"only AI_FILTER(PROMPT(...)) predicates are "
@@ -222,8 +190,7 @@ def _from_clause(select):
 
 
 def _where_terms(where) -> list:
-    """Flatten the WHERE conjunction; anything not reachable through
-    AND alone is rejected by the term handlers."""
+    """Flatten the WHERE conjunction into a list of terms."""
     if where is None:
         return []
     terms, stack = [], [where.this]
@@ -238,9 +205,7 @@ def _where_terms(where) -> list:
 
 
 def _parse_limit(tree) -> int | None:
-    """Extract a plain LIMIT N from the parse tree. ORDER BY ... LIMIT
-    is rejected by the FORBIDDEN list (ORDER BY is still forbidden), so
-    this only handles the early-termination case."""
+    """Extract a plain LIMIT N from the parse tree."""
     limit_node = tree.args.get("limit")
     if limit_node is None:
         return None
@@ -255,9 +220,7 @@ def _parse_limit(tree) -> int | None:
 
 def compile_sql(sql: str, catalog: Catalog,
                 tokenizer=None) -> LogicalPlan:
-    """AI SQL text -> LogicalPlan, or CompileError. `tokenizer` is any
-    callable text -> token list, used once at bind time to split and
-    count each prompt's preamble and tail."""
+    """Compile AI SQL text into a LogicalPlan."""
     try:
         tree = sqlglot.parse_one(sql, dialect="snowflake")
     except sqlglot.errors.ParseError as e:
@@ -369,11 +332,8 @@ def compile_sql(sql: str, catalog: Catalog,
 
 
 def _check_join_coverage(b: _Binder, joined_aliases: list) -> None:
-    """The coverage rule: every JOINed table must appear in at least
-    one join predicate, and the predicates' tables must form one
-    connected graph with the FROM table. A table outside that graph
-    would never be compared with the rest of the query, so its cross
-    product would pass through unfiltered."""
+    """Check that every JOINed table appears in a join predicate and
+    all predicates form one connected graph with the FROM table."""
     if not joined_aliases:
         return
     preds = [{r.alias for r in j.prompt.args}

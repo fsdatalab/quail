@@ -1,13 +1,5 @@
-"""The paged KV arena.
-
-One preallocated buffer per layer, sized to the admission budget,
-divided into fixed 16-token pages with a free list. A resident
-document owns a list of pages; the pages return to the free list the
-instant the document fails a stage or answers its last one. The paged
-attention kernels read this layout natively through block tables, so
-there is no compaction. Admission makes persistent document claims fit.
-Packed unified joins also make short-lived claims while packing a
-chunk, so an oversized chunk can still need to be split.
+"""Paged KV arena: preallocated per-layer buffers divided into
+fixed-size pages with a free list and block-table access.
 
 PageArena is the accounting (pure Python, CPU-tested); KVArena is the
 tensor backing and runs only where torch and a GPU exist.
@@ -89,10 +81,8 @@ class KVArena:
                   for _ in range(n_layers)]
         self.v = [torch.empty(shape, dtype=dtype, device=device)
                   for _ in range(n_layers)]
-        # row indices stay on the host: a fresh document used to pay
-        # one small pageable H2D copy here, and pageable copies block
-        # the CPU behind whatever the stream is running - with ~200
-        # admissions per chunk that was the loop's dominant CPU cost
+        # row indices stay on the host: pageable H2D copies block the
+        # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU
         self._capacity_rows = {}  # key -> every row in the claimed pages
         self._rows_dev = {}   # key -> device copy, built on first use
@@ -139,12 +129,9 @@ class KVArena:
         return self.k[layer].view(shape), self.v[layer].view(shape)
 
     def block_table(self, keys, pad_to=None):
-        """(block_table int32 (len(keys), max_pages), seqused_k int32)
-        for the groups reading these documents' KV, in order.
-
-        Built flat on the host and staged through pinned memory: the
-        old per-key loop issued one tiny pageable H2D copy per key,
-        which blocked the CPU behind the running chunk."""
+        """Block table and seqused_k for the groups reading these
+        documents' KV, built flat on the host and staged through
+        pinned memory."""
         pages = [self.accounting.owned[k] for k in keys]
         table = self.block_table_rows(pages, pad_to=pad_to)
         torch = self.torch

@@ -1,51 +1,20 @@
-"""The packed forward pass: DeepGEMM matmuls, five Triton fused
-kernels, FlashAttention-3 varlen self-attention, paged cross-attention
-against the arena, and the softmax-state (LSE) merge. Provenance of
-every kernel and algorithm: reports/2026-08-21-attention-paths.md,
-"Kernel provenance".
+"""Packed forward pass: DeepGEMM matmuls, fused Triton kernels,
+FlashAttention-3 varlen self-attention, paged cross-attention against
+the arena, and softmax-state merge.
 
-A chunk is [group_1 | group_2 | ...] where each group is
-[prefix? | suffix_1 .. suffix_k]. Two attention paths ship, one per
-workload. merge_quant: call A is causal over the segment
-boundaries (each prefix over itself, each suffix over itself), call B
-is non-causal - every suffix token against its group's kept context,
-which lives in the arena's pages (fresh prefixes are scattered into
-their pages in the same layer, before call B reads them) - and one
-Triton kernel merges the two by softmax state and quantizes for
-o_proj. unified: every current token is scattered into a cache slot
-first, then a single causal paged call covers kept plus current KV.
-On joins, every suffix has a separate page-table row. Full anchor
-pages are shared, while suffix rows use temporary pages. Suffix
-positions start at the kept-context length, identical to standalone
-requests, so answers are comparable to per-pair prompts.
+Two attention paths: merge_quant (two FA3 calls merged with a fused
+kernel) and unified (one causal paged FA3 call after scattering
+current KV into the arena). A chunk with no arena pages skips the
+arena and runs one causal varlen call per group.
 
-A chunk whose groups own no arena pages (a single-stage filter with
-no store: nothing ever reads the KV again) skips the arena in both
-modes: each group packs [prefix | suffix] as one causal segment and
-call A alone is the whole answer - no scatter, no paged read, no
-merge.
-
-Pipeline(kernels="vllm") swaps three of the five Triton kernels (norm,
-qk, silu) for the engine's own ops (fused-add rms_norm + separate
-quantize, silu_and_mul + separate quantize, per-head norms + rotary
-module) - the ablation ladder's A2 rung. Everything else in the pass
-is identical.
-
-Everything here imports torch lazily: the module only runs inside the
-Modal image.
+Pipeline(kernels="vllm") swaps the fused Triton kernels for vLLM's
+unfused equivalents. torch is imported lazily.
 """
 
 GROUP = 128            # fp8 quant group size, matches the engine
 
-# The workload-to-path assignment (issue #24). Filters run "unified":
-# one causal paged FlashAttention call over kept plus current KV -
-# fastest on the filter shape and bit-identical to a contiguous
-# causal call, so filter answers match full recompute exactly. Joins
-# run "merge_quant": the two-call pattern with the fused merge+quant
-# kernel. A unified join can share the anchor's full pages while each
-# suffix gets temporary private pages. The benchmark decides which
-# path ships. Evidence: results/attention_paths.json,
-# results/join_attention_paths_*.json, results/accuracy_vs_stock.json.
+# Filters run "unified" (one causal paged FA3 call); joins run
+# "merge_quant" (two-call pattern with fused merge+quant kernel).
 FILTER_ATTENTION = "unified"
 JOIN_ATTENTION = "merge_quant"
 
@@ -79,9 +48,7 @@ class Pipeline:
         self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
         self.fp8 = torch.float8_e4m3fn
         # The fused kernels compute element offsets in 32-bit ints,
-        # so a chunk needs rows x widest_row < 2^31. Derived from the
-        # loaded weights so it holds for any checkpoint; the budget
-        # arithmetic derives the same cap from ffn_width in the spec.
+        # so a chunk needs rows x widest_row < 2^31.
         widest = max(max(layer.self_attn.qkv_proj.weight.shape[0],
                          layer.mlp.gate_up_proj.weight.shape[0])
                      for layer in self.layers)
@@ -149,10 +116,7 @@ class Pipeline:
         return hidden, residual
 
     # ---- the Triton fused kernels -----------------------------------
-    # All five are written for this project; each fuses a sequence of
-    # vLLM ops into one launch (the kernels="vllm" path runs the
-    # unfused sequence for comparison). Full provenance:
-    # reports/2026-08-21-attention-paths.md, "Kernel provenance".
+    # Each fuses a sequence of vLLM ops into one kernel launch.
 
     def _triton_kernels(self):
         if hasattr(self, "_kernels"):
@@ -384,9 +348,8 @@ class Pipeline:
             HD=self.head_dim, HALF=self.head_dim // 2)
         return q, k
 
-    # ---- the vLLM-kernel path (kernels="vllm", ablation rung A2) -----
-    # the same ops the engine's compiled graph runs, called eagerly;
-    # the exploration's experiment 2 ran exactly this sequence
+    # ---- the vLLM-kernel path (kernels="vllm") ----------------------
+    # The same ops the engine's compiled graph runs, called eagerly.
 
     def vllm_norm_quant(self, hidden, norm, residual):
         """fused-add rms_norm, then a separate quantize: two kernels
@@ -396,9 +359,7 @@ class Pipeline:
         return self.quant(normed)
 
     def vllm_silu_quant(self, gate_up):
-        """silu_and_mul, then a separate quantize. The op call is what
-        the engine's SiluAndMul module dispatches to (0.26.0 moved it
-        off vllm._custom_ops)."""
+        """silu_and_mul, then a separate quantize."""
         out = self.torch.empty(
             (gate_up.shape[0], gate_up.shape[1] // 2),
             dtype=gate_up.dtype, device=gate_up.device)
@@ -406,9 +367,8 @@ class Pipeline:
         return self.quant(out)
 
     def vllm_qk_norm_rope(self, qkv, positions, attn):
-        """Per-head q/k norms plus rotary as the attention module runs
-        them: two contiguous copies, two rms_norm calls, one rotary -
-        five kernels where custom_qk_norm_rope is one."""
+        """Per-head q/k norms plus rotary: two contiguous copies, two
+        rms_norm calls, one rotary (five kernels total)."""
         n = qkv.shape[0]
         qw = self.num_q_heads * self.head_dim
         kw = self.num_kv_heads * self.head_dim
@@ -420,10 +380,8 @@ class Pipeline:
         return self.rotary(positions, q, k)
 
     def kv_row_scatter(self, k3, v3, src, dst, layer):
-        """Fresh KV rows into the arena's pages: one kernel per layer
-        for the whole chunk. Replaces gather + index_copy_ (4 launches
-        per layer, two passes over the bytes); the profile measured
-        that pair at 0.50 us/token, launch-bound."""
+        """Scatter fresh KV rows from the packed chunk into the arena's
+        pages. One kernel launch per layer."""
         assert k3.is_contiguous() and v3.is_contiguous()
         n = src.shape[0]
         row = self.num_kv_heads * self.head_dim
@@ -458,9 +416,8 @@ class Pipeline:
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None):
-        # FlashAttention-3 (Dao et al. 2024) via vLLM's vendored fork;
-        # block_table + seqused_k is FA3's paged-KV API (the paged
-        # cache design is vLLM's PagedAttention, Kwon et al. 2023)
+        # FlashAttention-3 via vLLM's vendored fork; block_table +
+        # seqused_k is FA3's paged-KV API
         from vllm.vllm_flash_attn import flash_attn_varlen_func
         return flash_attn_varlen_func(
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
@@ -506,18 +463,10 @@ class Pipeline:
 
     def attention_unified(self, q, k, v, meta):
         """Write every current token into its cache slot, then run one
-        causal paged attention call over retained and current KV.
+        causal paged FA3 call over retained and current KV.
 
-        No new kernel: the same FA3 paged varlen call as call B in the
-        two-call paths, causal, with the fresh rows scattered first.
-
-        A chunk with no arena pages at all (meta["unified"] is None:
-        the single-stage filter fast path, where every group packed
-        [prefix | suffix] as one causal segment) runs the plain
-        varlen causal call instead - no scatter, no paged read. The
-        kernel-parity cells measured the paged causal call
-        bit-identical to this contiguous one, so the two shapes of a
-        filter chunk answer identically."""
+        When meta["unified"] is None (no arena pages), falls back to
+        a plain varlen causal call with no scatter or paged read."""
         n = q.shape[0]
         H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
         q3 = q.view(n, H, D)

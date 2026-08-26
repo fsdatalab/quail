@@ -1,19 +1,6 @@
-"""The strongest stock vLLM clients the exploration built, carried
-over unchanged in substance:
+"""Stock vLLM filter and join clients.
 
-- run_filter_chain: one request per (document, stage), gated
-  client-side, admission by the SAME token budget the plan derives -
-  the committed pipelined client (42.9 s vs chain's 39.8 s at 10k
-  documents; the gap is block-boundary recompute and request-count
-  overhead, not a handicapped client).
-
-- run_join_grouped: one request per pair, ordered anchor-major so
-  vLLM's prefix cache re-serves each anchor's KV across its whole
-  partner stream (the arbitrary-order variant measured 1.87x worse
-  and is never run).
-
-Plain synchronous loops against the vLLM v1 LLMEngine surface; no
-asyncio anywhere.
+Synchronous loops against the vLLM v1 LLMEngine surface.
 """
 
 import itertools
@@ -25,11 +12,16 @@ from quail.logical import join_anchor_prefix_ids, join_tuple_suffix_ids
 def build_join_grouped_inputs(prompt, documents, anchor: int, tokenizer):
     """Build canonical join token parts for stock vLLM.
 
-    documents contains one list of tokenized documents per prompt
-    placeholder. The returned prefixes are in anchor document order.
-    The returned suffixes are in the Cartesian order of the remaining
-    placeholders. `members` records each suffix's partner indices in
-    placeholder order, excluding the anchor.
+    Args:
+        prompt: Bound join prompt.
+        documents: One list of tokenized documents per placeholder.
+        anchor: Index of the anchor placeholder.
+        tokenizer: Tokenizer for encoding.
+
+    Returns:
+        Tuple of (prefixes, suffixes, members). Prefixes are in anchor
+        document order, suffixes in Cartesian order of the remaining
+        placeholders. members records each suffix's partner indices.
     """
     if len(documents) != len(prompt.args):
         raise ValueError(
@@ -56,11 +48,7 @@ def build_join_grouped_inputs(prompt, documents, anchor: int, tokenizer):
 
 
 def _true_bit(out, true_ids=None):
-    """The answer bit. Under the one-token constrained sampler
-    (allowed_token_ids = TRUE|FALSE ids, max_tokens=1) this is a
-    token-id check, identical to the packed executor's answerer. The
-    text scan below is the fallback for unconstrained models that
-    restate the flag line or chatter - first decisive word wins."""
+    """Extract the TRUE/FALSE answer bit from one vLLM output."""
     if true_ids is not None:
         toks = out.outputs[0].token_ids
         if toks:
@@ -75,16 +63,12 @@ def _true_bit(out, true_ids=None):
 
 def run_filter_chain(engine, sampling_params, body_ids, q_ids,
                      budget_tokens, tag="q", true_ids=None):
-    """The stock filter baseline, the committed client's admission
-    exactly: the token budget expressed as a DOCUMENT cap of
-    budget // (mean document + longest question), and a document
-    holds its slot from first stage to last verdict. Between a
-    document's stages the engine serves other documents, so whether
-    its KV is still resident is up to the prefix cache - that is the
-    baseline the packed executor's kept KV replaces.
+    """Run a filter chain over stock vLLM with token-budget admission.
 
-    Returns wall, per-(doc, stage) answers (stages 1-indexed),
-    survivors, and the request/token counters."""
+    Returns:
+        Dict with wall time, per-(doc, stage) answers (stages 1-indexed),
+        survivors, and request/token counters.
+    """
     n = len(q_ids)
     mean_req = (sum(len(b) for b in body_ids) // max(1, len(body_ids))
                 + max(len(q) for q in q_ids))
@@ -134,10 +118,7 @@ def run_filter_chain(engine, sampling_params, body_ids, q_ids,
 
 def run_join_grouped(llm, sampling_params, prefixes, suffixes,
                      true_ids):
-    """The stock join baseline: one request per pair, anchor-major
-    order (all of an anchor's pairs consecutive), prefix caching left
-    to the engine. One generate() over the full list - the join has
-    no gating, so nothing needs the pipelined client."""
+    """Run a join over stock vLLM in anchor-major order."""
     pair_prompts = [{"prompt_token_ids": p + s}
                     for p in prefixes for s in suffixes]
     t0 = time.time()

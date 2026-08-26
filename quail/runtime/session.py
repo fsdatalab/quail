@@ -1,25 +1,5 @@
-"""Session: the user surface from the design's section 2.
-
-    sess = quail.Session(EngineConfig(gpus=1))
-    sess.register("reviews", DocumentProvider.from_parquet(...))
-    q = sess.sql("SELECT r.id FROM reviews r WHERE AI_FILTER(...)")
-    q.explain()   # logical tree + chosen physical plan, no run
-    res = q.run() # plans (the optimization), executes on Modal,
-                  # replay-checks, applies the projection
-
-Both entry points return the same runnable Query: sess.sql() compiles
-AI SQL, sess.docs() starts the builder.
-
-What run() supports: filter-only queries, exists/anti gates, and
-any connected set of full joins. Each join is one cross-product
-stage (every document of a tuple in one prompt). Consecutive stages
-that anchor on the same table run as one group over that table's
-kept KV; an anchor switch is a barrier - the live sets thin to the
-surviving pairs' documents, and on several GPUs the next anchor
-re-shards over the measured live set. The final tuples come from
-equi-joining every stage's surviving pairs on shared document ids.
-The plan is a node graph (issue #38); the worker executes the
-groups and barriers it names.
+"""Session and Query: the user-facing API for registering documents,
+compiling queries, planning, and executing on Modal.
 """
 
 import hashlib
@@ -43,7 +23,7 @@ STORE_HEADROOM_GB = 16    # container memory the store must leave for
 
 
 class RefusalError(RuntimeError):
-    """run() on a refused plan. The Refusal rides along."""
+    """Raised when run() is called on a refused plan."""
 
     def __init__(self, refusal: Refusal):
         self.refusal = refusal
@@ -66,11 +46,11 @@ class Result:
 
 
 def pick_corpus_tokenizer(primary, fast, texts, sample=25):
-    """The corpus tokenizer for one scanned column: the fast one when
-    it matches the primary on a sample of the column's real texts,
-    the primary otherwise. bpe-qwen's own README warns that some
-    multi-byte UTF-8 is mishandled, so the fast path earns each
-    column instead of being trusted."""
+    """Pick the corpus tokenizer for one column.
+
+    Returns the fast tokenizer if it matches the primary on a sample,
+    otherwise the primary.
+    """
     if fast is None:
         return primary, "tokenizer: transformers"
     for t in texts[:sample]:
@@ -110,16 +90,12 @@ class Session:
         self.store_enabled = enabled
 
     def flush_store(self) -> None:
-        """The next run tells the worker to flush its store first -
-        the benchmark's cold pass is a store flush, not a restart."""
+        """Mark the store for flushing on the next run."""
         self._flush_next = True
         self._warm_hashes.clear()
 
     def worker(self):
-        """The worker module, inside this session's long-lived app
-        context. One app per session is what keeps the container -
-        and with it the loaded model and the pinned store - warm
-        across queries."""
+        """Return the worker module, opening this session's Modal app if needed."""
         from quail.runtime import worker
         if self._app_ctx is None:
             self._app_ctx = worker.app.run()
@@ -127,8 +103,7 @@ class Session:
         return worker
 
     def close(self):
-        """End the session: the app stops, the container scales down,
-        the store is gone. A new session starts cold."""
+        """Stop the Modal app and release the container."""
         if self._app_ctx is not None:
             self._app_ctx.__exit__(None, None, None)
             self._app_ctx = None
@@ -140,9 +115,7 @@ class Session:
         self.close()
 
     def store_spec(self, hashes=()) -> StoreSpec | None:
-        """The planner's view of the KV store: pinned bandwidth,
-        capacity from the config, warm when every scanned content
-        hash was stored by an earlier run of this session."""
+        """Build a StoreSpec for the planner, or None if the store is disabled."""
         if not self.store_enabled:
             return None
         if self.config.cpu_memory_gb <= STORE_HEADROOM_GB:
@@ -155,12 +128,11 @@ class Session:
                          warm=warm, capacity_bytes=capacity)
 
     def content_hash(self, provider_name: str, column: str) -> str:
-        """The store key prefix for one scanned column: provenance of
-        (provider data, column, tokenizer, engine preamble). File
-        identity is (path, size, mtime) - cheaper than hashing the
-        bytes, and a rewritten file changes it. The preamble is part
-        of every stored prefix, so changing its text must invalidate
-        every stored extent."""
+        """Return a store key prefix for one scanned column.
+
+        Derived from (provider data, column, model, preamble). File
+        identity uses (path, size, mtime).
+        """
         provider = self.catalog.get(provider_name)
         ident = [provider.kind, provider.source, column,
                  self.model.name, SHARED_PRE]
@@ -189,7 +161,7 @@ class Session:
 
     @property
     def tokenizer(self):
-        """The exact tokenizer: prompts, TRUE/FALSE ids, parity samples."""
+        """Return the primary tokenizer, loading from HuggingFace if needed."""
         if self._tok is None:
             from transformers import AutoTokenizer
             hf = AutoTokenizer.from_pretrained(self.model.hf_name)
@@ -198,8 +170,7 @@ class Session:
         return self._tok
 
     def _fast_tokenizer(self):
-        """bpe-qwen when installed (measured 12.8x on corpus text);
-        None when unavailable or when a test injected its own."""
+        """Return the bpe-qwen fast tokenizer, or None if unavailable."""
         if self._tok_injected:
             return None
         if not self._fast_tried:
@@ -215,9 +186,7 @@ class Session:
         return self._fast
 
     def scan(self, provider_name: str, column: str):
-        """(ids, texts, token lists) for one provider column, the
-        tokenization cached per session (the design's content-hash
-        cache; in-memory for now)."""
+        """Return (ids, texts, token lists) for one provider column, cached."""
         provider = self.catalog.get(provider_name)
         key = ("scan", provider.source, column)
         if key not in self._scan_cache:
@@ -230,7 +199,7 @@ class Session:
         return self._scan_cache[key]
 
     def column_values(self, provider_name: str, column: str) -> list:
-        """One column's values, for the projection - never tokenized."""
+        """Return one column's raw values (not tokenized), cached."""
         provider = self.catalog.get(provider_name)
         key = ("vals", provider.source, column)
         if key not in self._scan_cache:
@@ -240,8 +209,7 @@ class Session:
 
 
 class BoundBuilder:
-    """sess.docs(...): the builder, returning a runnable Query at
-    select() instead of a bare LogicalPlan."""
+    """Builder wrapper that returns a runnable Query from select()."""
 
     def __init__(self, session: Session, inner):
         self._session = session
@@ -270,15 +238,13 @@ class BoundBuilder:
         return self
 
     def select(self, *cols) -> "Query":
-        # the builder is always as_written: the order you chain calls
-        # is the order that runs (design section 2.5)
+        # builder order is always as_written
         return Query(self._session, self._inner.select(*cols),
                      order="as_written")
 
 
 def _true_false_ids(tok):
-    """First-token ids of the TRUE/FALSE spellings, from the session's
-    tokenizer callable (same rule as the executor's true_false_ids)."""
+    """Return (true_ids, false_ids) first-token ids for TRUE/FALSE spellings."""
     true, false = set(), set()
     for w in ("TRUE", " TRUE", "True", " True"):
         ids = tok(w)
@@ -292,23 +258,14 @@ def _true_false_ids(tok):
 
 
 def _question_ids(session: Session, prompt) -> list:
-    """The question suffix the executor attaches after the document:
-    the template text from the first placeholder on, placeholders
-    excluded. The engine preamble (before the placeholder) ships once
-    as the payload's pre_ids, never inside a question."""
+    """Return token ids for the question suffix after the document."""
     text = re.sub(r"\{\d+\}", "", prompt.tail)
     return session.tokenizer(text)
 
 
 def _join_spec(session: Session, prompt, anchor: str,
                partners: list) -> dict:
-    """The executor's view of one join stage: the compile-time anchor
-    and its partners, block labels and anchor frames for EVERY table
-    (so a barrier-time anchor re-pick needs no re-tokenization), and
-    the answer cue paid once per tuple. The engine preamble ships once
-    as the payload's pre_ids. stage_for_anchor (coordinator) turns
-    this into the child-facing form for whichever anchor a round
-    uses."""
+    """Build one join stage spec with tokenized frames and labels for all tables."""
     tok = session.tokenizer
     slot = {r.alias: i for i, r in enumerate(prompt.args)}
     aliases = [r.alias for r in prompt.args]
@@ -356,9 +313,12 @@ class Query:
     # ---- execution -----------------------------------------------------
 
     def run(self, _execute=None) -> Result:
-        """Plan, execute, project. _execute is the worker seam: None
-        ships to the Modal worker; tests inject a callable
-        payload -> worker output."""
+        """Plan, execute on Modal, and project results.
+
+        Args:
+            _execute: Optional callable(payload) -> output for testing.
+                None sends to the Modal worker.
+        """
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)

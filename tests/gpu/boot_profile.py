@@ -1,46 +1,4 @@
-"""Tiered boot verification: compile pass, touch pass, py-spy, query.
-
-The boot strategy under test (quail/executor/loop.py): the compile
-pass builds every kernel configuration once per (software stack, GPU,
-model, budget) and records a marker on the kernel-cache volume; every
-later container boots with the touch pass, which only runs each hot
-kernel once so cached binaries load into the process outside measured
-walls. Nothing in warmup depends on the query.
-
-This cell measures, on Qwen3 4B fp8 / H100 SXM:
-
-1. one compile-pass boot (force_compile=True), py-spy recorded;
-2. `touch_trials` fresh containers booting with the touch pass,
-   py-spy recorded, phase-timed;
-3. in each touch container, the single-stage filter query from
-   m1_filter1 (10,000 IMDB documents, one question), both the arena
-   path and the fast path, `reps` repetitions each - so the boot
-   change is checked against the committed query numbers.
-
-Stock vLLM boot rows are reused from the committed
-results/boot_profile.json (the stock side did not change); rerun
-them with --stock-trials N if wanted. The stock QUERY comparison
-runs separately (same corpus, submission = separate requests per
-document):
-
-    uv run modal run tests/gpu/milestone1.py::run_baseline_filter1 \\
-        2>&1 | tee results/baseline_filter1.log
-
-PREDICTION (stated before the run): the compile-pass boot pays the
-generator's full sweep plus any configurations the shared volume has
-not seen (minutes on a volume that predates the generator sizes);
-the touch boot's warm_kernels_s is 2-4 s (three budget-sized chunks
-at ~1 s each, plus two tiny-chunk ladders at ~0.2 s), against
-3.7-4.9 s for the swept warmup in the committed boot_profile.json;
-cold boot_s stays load_model-dominated (28-38 s). The query matches
-the committed m1_filter1 numbers within noise (best fast-path wall
-28.3 s +-3%, 0 wrong), and stays under stock's 33.4 s.
-
-Run from the quail/ directory (tee per house rule):
-
-    uv run modal run tests/gpu/boot_profile.py \\
-        2>&1 | tee results/boot_tiered.log
-"""
+"""Boot profiling: compile pass, touch pass, py-spy recording, and query timing on GPU."""
 
 from __future__ import annotations
 
@@ -109,13 +67,7 @@ REFERENCE = dict(
 # ------------------------------------------------------------- py-spy
 
 def _pyspy_start(out_path: str):
-    """Attach py-spy to this process; returns stop() -> status dict.
-
-    Sampling at 100 Hz with --idle so blocking waits (weight reads,
-    cuda synchronize) stay attributed to the Python frame that made
-    them. If attach fails (ptrace policy), the run continues and the
-    status carries the error - phase timers still cover the boot.
-    """
+    """Attach py-spy to this process. Returns a stop() callable that yields a status dict."""
     import signal
     import subprocess
 
@@ -153,12 +105,7 @@ def _pyspy_start(out_path: str):
 
 def _speedscope_top(path: str, n: int = 15,
                     thread: str = "MainThread") -> dict:
-    """Top-n functions by self time from a py-spy speedscope file.
-
-    Restricted to profiles whose name contains `thread` (all threads
-    if none match): with --idle every parked helper thread samples
-    too, and summing across threads buries the boot work under
-    threading.wait and selector polls."""
+    """Extract top-n functions by self time from a py-spy speedscope file."""
     with open(path) as f:
         data = json.load(f)
     frames = data["shared"]["frames"]
@@ -200,7 +147,7 @@ def _round_boot(boot: dict) -> dict:
 def _quail_boot_once(*, reuse: dict | None,
                      force_compile: bool = False,
                      model_key: str = "qwen3-4b-fp8") -> tuple[dict, dict]:
-    """One Quail boot. reuse=None is cold; reuse=state is warm skip."""
+    """Run one Quail boot. reuse=None is cold; reuse=state is warm."""
     import torch
     import torch.nn.functional as F
 
@@ -274,8 +221,7 @@ def _quail_boot_once(*, reuse: dict | None,
 def _profiled_boot(tag: str, *, force_compile: bool,
                    spy: bool = True,
                    model_key: str = "qwen3-4b-fp8") -> tuple[dict, dict]:
-    """Cold boot, py-spy attached unless spy=False (the profiler
-    costs real wall; the no-spy control isolates it)."""
+    """Cold boot with optional py-spy profiling."""
     if not spy:
         state, cold = _quail_boot_once(reuse=None,
                                        force_compile=force_compile,
@@ -304,7 +250,7 @@ def _profiled_boot(tag: str, *, force_compile: bool,
 @app.function(timeout=7200, **GPU_KW)
 def compile_trial(model_key: str = "qwen3-4b-fp8",
                   spy: bool = True) -> dict:
-    """The one-time compile pass, forced, timed, py-spy recorded."""
+    """Run the one-time compile pass with timing and py-spy recording."""
     _, row = _profiled_boot(f"{model_key}-compile",
                             force_compile=True, spy=spy,
                             model_key=model_key)
@@ -317,8 +263,7 @@ def compile_trial(model_key: str = "qwen3-4b-fp8",
 def touch_trial(trial: int = 0, reps: int = 2,
                 spy: bool = True,
                 model_key: str = "qwen3-4b-fp8") -> dict:
-    """One fresh container: touch-pass boot, warm reuse, then the
-    m1_filter1 query on both paths."""
+    """Run one touch-pass boot trial with warm reuse and a filter query on both paths."""
     from corpus import build_corpus
     from quail.executor.attention import FILTER_ATTENTION
     from quail.executor.loop import run_filter
@@ -365,7 +310,7 @@ def touch_trial(trial: int = 0, reps: int = 2,
 @app.function(timeout=3600, max_containers=8, **GPU_KW)
 def stock_boot_trial(trial: int = 0,
                      model_key: str = "qwen3-4b-fp8") -> dict:
-    """One container: cold LLM(...), then warm reuse dict."""
+    """Run one stock vLLM boot trial: cold LLM init, then warm reuse."""
     from baselines.stock_boot import time_llm_boot, warm_boot_dict
     from quail.specs import MODELS
 
@@ -399,10 +344,7 @@ def main(touch_trials: int = 3, reps: int = 2,
          skip_compile: bool = False,
          name: str = "boot_tiered",
          model: str = "qwen3-4b-fp8"):
-    """Compile pass first (so touch trials see the marker), then
-    touch trials in parallel; stock boot rows rerun only on request.
-    --skip-compile with --no-spy is the profiler-off control against
-    an already-written marker."""
+    """Run the compile pass, then touch trials in parallel, with optional stock boot trials."""
     print(f"[boot_tiered] prediction: {PREDICTION}", flush=True)
 
     if skip_compile:

@@ -1,19 +1,10 @@
 """Build the sf=0.1 QUAIL-B ground-truth collection on Modal.
 
-Qwen3 32B labels every predicate without complete source truth.  BioDEX's
-reaction field is comparison data only because it is known to be incorrect.
-FEVER supplies the one annotated claim-page pair per claim, and LePaRD's
-passage ids supply its complete citation-pair truth.
+Qwen3 32B labels every predicate. FEVER and LePaRD supply source truth
+where available. The run uses stable label-set IDs and skips completed
+Parquet parts.
 
-Run from quail/ and keep the function call id in the tee file:
-
-    mkdir -p results/benchmark
-    uv run modal run -m quail.bench.judge_pass \
-        2>&1 | tee results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-label.log
-
-The run uses stable label-set IDs and skips completed Parquet parts. When a
-new benchmark predicate is added, running this command again labels only its
-missing rows and makes the resulting collection active.
+    uv run modal run -m quail.bench.judge_pass
 """
 
 from __future__ import annotations
@@ -175,11 +166,7 @@ PREDICATES = (
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
 
 
-# One call to the model is one Parquet part, so this sets the resume
-# granularity, not the GPU batch size: vLLM re-chunks whatever it is
-# handed against max_num_batched_tokens and max_num_seqs. Left rows
-# per call is derived from how many prompts each left row produces --
-# one per predicate in a filter group, one per partner row in a join.
+# One model call is one Parquet part, setting the resume granularity.
 PROMPTS_PER_CALL = 256
 
 
@@ -201,10 +188,7 @@ def workload_specs(workload: str) -> tuple:
 
 
 def filter_groups(specs) -> list:
-    """Filter predicates grouped by the column they read, in spec
-    order. Predicates over one column are judged together, so each
-    prompt batch carries one document and every question asked of
-    it."""
+    """Filter predicates grouped by the column they read, in spec order."""
     groups: dict = {}
     for spec in specs:
         if spec.kind == "filter":
@@ -219,9 +203,7 @@ def join_specs(specs) -> tuple:
 
 
 def _load_corpus(corpus_id: str) -> tuple[Path, dict, dict]:
-    """Read a corpus already materialized on the volume. Workers use
-    this instead of _materialize_corpus so the corpus is built once
-    rather than once per container."""
+    """Read a corpus already materialized on the volume."""
     target = VOLUME_ROOT / "corpora" / corpus_id
     with open(target / "manifest.json") as f:
         manifest = json.load(f)
@@ -402,13 +384,8 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
                                       create_if_missing=True)
 
 
-# severe_terms (BIO-6's second join table, see quailb.py) is deliberately
-# not listed here: every table listed feeds corpus_id (see
-# _corpus_identity below), so adding one changes corpus_id and would
-# invalidate every already-labeled predicate's identity, forcing a full
-# relabel. severe_terms is a fixed slice of terms under the same tracked
-# seed, so it's read separately in judge_workload instead - see the
-# comment there.
+# severe_terms is not listed here: adding a table changes corpus_id,
+# invalidating all label-set identities. It is read in judge_workload.
 CORPUS_COLUMNS = {
     "reviews": ("id", "body"),
     "aspects": ("id", "aspect"),
@@ -941,11 +918,8 @@ def _fever_source_label(claim: dict, passage: dict):
     volumes={"/root/.cache/huggingface": hf_cache,
              "/results": results_vol})
 def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
-    """Build the corpus once, and report whether the collection these
-    templates imply is already on the volume.
-
-    Returning that flag lets the caller skip booting four GPUs for a
-    pass that has nothing left to do."""
+    """Build the corpus and report whether the implied collection is
+    already complete on the volume."""
     if sf != SCALE_FACTOR:
         raise ValueError("the ground-truth pass is fixed at sf=0.1")
     results_vol.reload()
@@ -1067,15 +1041,8 @@ def judge_workload(corpus_id: str, workload: str) -> str:
     image=data_image, memory=4096, timeout=1200,
     volumes={"/results": results_vol})
 def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
-    """Assemble the four workloads into one collection and make it the
-    active ground truth for this corpus.
-
-    Activation is the overwrite: `evaluate.py` reads
-    `corpora/<corpus_id>/active_collection.json` whenever it is not
-    given an explicit collection id. The corpus is unchanged, so this
-    repoints the same file at the new collection. Superseded
-    collections stay on the volume under their own content-addressed
-    ids and are simply no longer active."""
+    """Assemble the four workloads into one collection and activate it as
+    the ground truth for this corpus."""
     results_vol.reload()
     _, corpus_manifest, _ = _load_corpus(corpus_id)
     identities = {
@@ -1154,10 +1121,9 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
          only: str | None = None):
     """Run the four workloads side by side, then activate the result.
 
-    `--only imdb,fever` restricts the pass to those workloads; the
-    finalize step then refuses, because a collection needs all
-    nineteen label sets. Use it to re-label one workload before a full
-    run picks the rest up from the volume."""
+    ``--only imdb,fever`` restricts the pass to those workloads; the
+    finalize step is skipped because a collection needs all label sets.
+    """
     if compact_collection:
         call = compact_ground_truth.spawn(compact_collection)
         print(f"function call id: {call.object_id}", flush=True)

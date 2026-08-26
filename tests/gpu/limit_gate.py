@@ -1,25 +1,4 @@
-"""Gate for LIMIT N early termination: run the same filter query with
-and without a limit on the real Modal worker. Measures that the limited
-run processes fewer tokens.
-
-Uses 3000 IMDB reviews with a sentiment question. The store is disabled
-so both runs are cold (access=read) and the comparison is fair.
-
-Prediction:
-- 3000 IMDB reviews, one filter: "Is this review negative?"
-- IMDB is ~50/50 positive/negative; the model's TRUE rate will be in
-  the 40-60% range.
-- chunk_tokens budget is ~110k; each doc is ~200-400 tokens + 30 tokens
-  of suffix, so maybe 300-400 docs per chunk.
-- With LIMIT 10 and ~50% pass rate on a single-stage filter,
-  FilterAdmission hits 10 survivors in the first chunk's answers and
-  stops admitting for subsequent chunks.
-- fresh_tokens with LIMIT should be well under half.
-
-Run from the quail/ directory:
-
-    uv run python tests/gpu/limit_gate.py 2>&1 | tee results/limit_gate.log
-"""
+"""LIMIT N early-termination gate: verify that a limited filter query processes fewer tokens than an unlimited one."""
 
 import json
 import sys

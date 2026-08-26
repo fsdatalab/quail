@@ -1,7 +1,4 @@
-"""The store's CPU logic: extent allocation, the length threshold,
-and the admission scheduler's restore/deferred-release behavior. The
-pinned pool and the transfers are GPU-side and covered by the
-milestone store gate."""
+"""Tests for extent allocation, length thresholds, and admission restore/deferred-release."""
 
 import random
 

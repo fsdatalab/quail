@@ -1,10 +1,5 @@
-"""Time stock vLLM's LLM(...) constructor.
-
-The request-loop clients in stock.py take a live engine and do not
-own construction. This helper times the cold constructor wall and,
-when vLLM's INFO logs expose them, splits weight loading from KV
-cache profiling. Warm reuse is a zeroed dict for the kept instance.
-"""
+"""Time stock vLLM's LLM(...) constructor, splitting weight loading
+from KV cache profiling when log markers are available."""
 
 from __future__ import annotations
 
@@ -29,7 +24,7 @@ _KV_MARK = re.compile(
 
 
 class _StartupStamp(logging.Handler):
-    """Record wall times when known startup messages appear."""
+    """Logging handler that records wall times for startup messages."""
 
     def __init__(self, t0: float):
         super().__init__(level=logging.DEBUG)
@@ -52,10 +47,7 @@ class _StartupStamp(logging.Handler):
 
 
 def _attach_stamp(stamp: _StartupStamp) -> list[tuple[logging.Logger, int]]:
-    """Raise vLLM loggers to INFO and attach the stamp handler.
-
-    Returns prior levels so the caller can restore them.
-    """
+    """Attach the stamp handler to vLLM loggers. Returns prior levels."""
     names = ("vllm", "vllm.engine", "vllm.worker",
              "vllm.worker.worker", "vllm.v1", "vllm.v1.engine",
              "vllm.v1.core", "vllm.model_executor")
@@ -77,18 +69,17 @@ def _detach_stamp(stamp: _StartupStamp,
 
 
 def warm_boot_dict() -> dict:
-    """Boot breakdown when LLM is already alive in this process."""
+    """Return a zeroed boot dict for a warm (already-alive) LLM."""
     return dict(kind="warm", llm_init_s=0.0, weight_load_s=None,
                 kv_profile_s=None, boot_s=0.0)
 
 
 def time_llm_boot(**llm_kwargs: Any) -> tuple[Any, dict]:
-    """Cold-construct vLLM's LLM(...). Returns (llm, boot_dict).
+    """Cold-construct vLLM's LLM(...).
 
-    Always records the full constructor wall. weight_load_s and
-    kv_profile_s are filled from log markers when present; otherwise
-    they stay null (vLLM does not expose sub-timers on the public
-    surface).
+    Returns:
+        Tuple of (llm, boot_dict). weight_load_s and kv_profile_s are
+        filled from log markers when present, otherwise null.
     """
     from vllm import LLM
 

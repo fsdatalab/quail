@@ -1,15 +1,9 @@
-"""The overlapped chunk loop: pack on CPU while the GPU runs, gate the
-moment answers land, free pages the instant nothing later can read
-them. Two drivers over one substrate:
+"""The overlapped chunk loop: pack on CPU while the GPU runs, gate
+answers, free pages immediately.
 
-- run_join: a known pair list, brim-packed by pack_stream (the
-  exploration's measured join loop, arena-backed).
-- run_filter: continuous admission (FilterAdmission) - the filter
-  chain as the degenerate join: anchor = the document, suffix = the
-  question, stage j+1 attaches a fresh suffix to the same kept KV.
-  Unified writes the current question KV for its causal call. Only the
-  shared question preamble remains after that call. It joins the anchor
-  KV after stage 1, exactly as KV rewind kept it resident.
+- run_join: a known pair list, brim-packed by pack_stream.
+- run_filter: continuous admission with FilterAdmission, pages freed
+  on FALSE or after the last stage.
 
 torch is imported lazily; this module runs only inside the Modal
 image.
@@ -28,17 +22,9 @@ def _tick(timing, key, t0):
 
 
 def _staged(torch, data, dtype, pinned=True):
-    """Host data -> device through pinned memory, non-blocking.
+    """Host data to device through pinned memory, non-blocking.
 
-    torch.tensor(list, device='cuda') from pageable memory blocks the
-    CPU until the stream drains the chunk still running; the pinned
-    stage never does. The pinned tensor may be dropped right away:
-    the caching host allocator defers its reuse until the copy's
-    stream event fires.
-
-    pinned=False reverts to the pageable blocking copies - the
-    ablation ladder's pre-#12 rung (issue #9 measured what the pinned
-    stage is worth)."""
+    pinned=False reverts to pageable blocking copies."""
     if torch.is_tensor(data):
         if pinned:
             return data.pin_memory().to("cuda", non_blocking=True)
@@ -50,10 +36,7 @@ def _staged(torch, data, dtype, pinned=True):
 
 
 def true_false_ids(tok):
-    """The token ids that mean TRUE and FALSE. Constraining the answer
-    to their union makes every stage answer in exactly one token: the
-    answer is read from the prefill pass and no decode step ever
-    runs."""
+    """The token ids that mean TRUE and FALSE."""
     true, false = set(), set()
     for w in ("TRUE", " TRUE", "True", " True"):
         ids = tok(w, add_special_tokens=False)["input_ids"]
@@ -99,11 +82,9 @@ class Answerer:
 
 
 class AsyncAnswers:
-    """TRUE/FALSE readout that does not stall the stream: submit()
-    computes the bits on GPU, enqueues a copy to pinned host memory,
-    and records an event; result() waits only for that event - ops
-    enqueued after the event (the next chunk's forward) keep the GPU
-    busy while the CPU reads the answers."""
+    """Non-blocking TRUE/FALSE readout. submit() returns an event and
+    pinned host buffer; result() waits on the event and reads the
+    answers without stalling the GPU stream."""
 
     def __init__(self, torch, answerer):
         self.torch = torch
@@ -133,38 +114,20 @@ class AsyncAnswers:
 
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                attention_mode):
-    """Tensors for one chunk, built from groups in chunk order.
+    """Build tensors for one chunk from groups in chunk order.
 
-    Each group is a dict:
-      key       arena key for KV writes and kept-context reads
-      prefix    fresh prefix token list, packed into the chunk - or
-                None when the key's KV is already in the arena
-      f         kept-context length: suffix positions start here, and
-                call B reads this many arena rows (for a fresh group
-                this is len(prefix); for a kept group, whatever the
-                arena holds for the key - document plus any kept
-                preamble)
-      suffixes  list of suffix token lists (may be empty for a
-                cache-only group)
-      write_suffix_tokens   scatter this many leading rows of the
-                FIRST suffix into the key's pages at offset
-                len(prefix): the shared question preamble joining the
-                anchor KV after stage 1
+    Each group is a dict with keys:
+      key       Arena key for KV reads/writes.
+      prefix    Fresh prefix token list, or None when KV is resident.
+      f         Kept-context length (suffix positions start here).
+      suffixes  List of suffix token lists.
+      write_suffix_tokens  Leading rows of the first suffix to scatter
+                into the key's pages at offset len(prefix).
 
-    A fresh prefix is scattered into its pages when the key owns pages
-    (allocated by the caller before packing). A fresh group WITHOUT
-    pages touches no arena state at all: its [prefix | suffix] packs
-    as ONE causal segment, so the suffix reads the prefix through
-    call A alone - no scatter, no cross read (the single-stage
-    filter's fast path; the probe's unpacked reference is the
-    zero-suffix case of it). That only works with at most one suffix:
-    two suffixes in one segment would attend to each other, and
-    per-suffix prefix copies are the unshared reference this path
-    exists to avoid. A paged unified join gives every suffix its own
-    causal sequence. Full anchor pages are shared. The suffix gets
-    temporary pages, including a copy of the anchor's last partial
-    page when there is one. Under unified attention a chunk is either
-    all paged or all unpaged; mixing the two raises.
+    A fresh group without arena pages packs [prefix | suffix] as one
+    causal segment (no scatter, no paged read). This only works with
+    at most one suffix. Under unified attention a chunk is either all
+    paged or all unpaged.
     """
     t = time.perf_counter() if timing is not None else 0.0
     # unified scatters every fresh row through its own src/dst map, so
@@ -385,49 +348,26 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, group_size=None, store=None,
              store_hash=None, store_min_tokens=1, store_ids=None,
              stats=None, stage_frames=None):
-    """The join driver: every stage streams a partner list against the
-    anchor side; gated anchors advance between stages.
+    """The join driver: stream partner lists against anchors, gating
+    survivors between stages.
 
-    anchor_prefixes: anchor id (list index) -> prefix token list.
-    stage_suffixes: per stage, the partner suffix token lists.
-    budget: the chunk token budget.
-    group_size: anchors gated together between stages; None = all
-    anchors in one group (right for one stage, where no gate runs).
-    stage_frames: per stage, the task framing token list, written
-    into each anchor's kept KV right after the document rows (the
-    filter's shared-question-preamble mechanism). Every pair suffix
-    of that stage reads the frame from KV instead of carrying its
-    tokens, so framing costs tokens per anchor, not per pair. A
-    later stage's frame overwrites the earlier one's rows - each
-    stage's pairs attend only their own frame. The frame rows are
-    NOT part of the stored prefix, so the store stays
-    query-independent.
+    Args:
+        anchor_prefixes: Anchor id (list index) -> prefix token list.
+        stage_suffixes: Per stage, the partner suffix token lists.
+        budget: Chunk token budget.
+        group_size: Anchors gated together between stages. None = all.
+        store: Pinned KV store for cross-query reuse.
+        store_hash: Content hash for store keys.
+        store_min_tokens: Minimum prefix length to store.
+        store_ids: Maps anchor positions to stable store key ids.
+        stats: Filled with restored/stored counts when given.
+        stage_frames: Per stage, task framing token list written into
+            each anchor's kept KV after the document rows.
 
-    Pipelining, one rule: while the GPU runs a chunk, the CPU builds
-    the next buildable one. Within a stage that is the next chunk of
-    the plan; at a gate, whose next chunk cannot be built until the
-    group's answers arrive, it is the next group's stage-0 chunk
-    (which depends on nothing) - launched before the gate resolves,
-    so the GPU never drains. Answers travel as event-synced pinned
-    copies (AsyncAnswers); an anchor's prefix KV is written to its
-    arena pages exactly once and the pages free when its group leaves
-    its last stage. merge_quant does not write suffix KV. Unified
-    writes suffix KV into pages owned only by the current forward.
-
-    store / store_hash / store_min_tokens / store_ids: the pinned KV
-    store, exactly run_filter's contract. An anchor whose prefix is
-    already stored restores into its pages instead of computing (its
-    chunks carry only partner suffixes); an anchor leaving its last
-    stage - gated out or finished - is copied out on the side stream
-    when its prefix is at least store_min_tokens long, its pages
-    returned only after the copy lands. store_ids maps anchor list
-    positions to stable store key ids (the anchor's global document
-    index, the same key a filter scan of the same corpus uses).
-    stats, when given, is filled with restored/stored counts.
-    Returns (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
-    partners, present only for anchors that reached stage j; spans =
-    (stage, start_event, end_event) per forward for GPU-time sums;
-    tokens = fresh tokens packed.
+    Returns:
+        (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
+        partners; spans = (stage, start_event, end_event) per forward;
+        tokens = fresh tokens packed.
     """
     k = len(stage_suffixes)
     n = len(anchor_prefixes)
@@ -514,13 +454,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     load_events[key] = store.load(skey(key), arena, key)
             sufs = stage_suffixes[j][start:end]
             if frame and start == 0 and sufs:
-                # the anchor's first group of this stage: the frame
-                # gets its own entry whose rows are written after the
-                # document (dest = f, overwriting any earlier stage's
-                # frame), and the pair entry in the same chunk reads
-                # doc + frame - the same write-then-read the fresh
-                # document + question path already does. The frame
-                # entry's answer bit is skipped by scatter().
+                # frame entry: scatter the frame into KV after the
+                # document rows. The pair entry reads doc + frame.
+                # The frame entry's answer bit is skipped by scatter().
                 specs.append(dict(
                     key=key,
                     prefix=anchor_prefixes[key] if carried else None,
@@ -605,10 +541,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             def finish(handle, t):
                 scatter(j, idx, plan[t], async_ans.result(handle))
                 if j == k - 1:
-                    # a cut anchor's pages have no reader past its
-                    # last chunk of its final stage; freeing at stage
-                    # end instead held ~76 anchors' KV (the measured
-                    # 48.3 GiB peak in the exploration)
+                    # free pages at the earliest point no later
+                    # reader needs them
                     for a_l, _, _, _ in plan[t]:
                         if last_chunk[a_l] == t:
                             free_if_owned(idx[a_l])
@@ -646,30 +580,21 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 
 # ------------------------------------------------------------- warmup
 #
-# Three cost tiers, and which pass pays each:
+# Three cost tiers:
+#   1. JIT compile (nvcc/Triton) of a kernel configuration: paid once
+#      ever per (software stack, GPU, model, budget) by compile_kernels.
+#      Cached on the kernel cache volume (DG_CACHE_DIR / TRITON_CACHE_DIR);
+#      a marker file records that the pass ran.
+#   2. Loading a cached binary into the process: paid once per container
+#      by touch_kernels.
+#   3. The launch itself: every call, unavoidable.
 #
-#   1. nvcc/Triton compile of a kernel configuration (~2.4 s each for
-#      DeepGEMM): paid once ever per (software stack, GPU, model,
-#      budget), by compile_kernels. Artifacts persist on the kernel
-#      cache (DG_CACHE_DIR / TRITON_CACHE_DIR, a Modal volume); a
-#      marker file next to them records that the pass ran.
-#   2. loading a cached binary into the process (milliseconds per
-#      configuration): paid once per container, by touch_kernels,
-#      which runs each hot kernel once so the loads land at boot
-#      instead of inside the first measured query.
-#   3. the launch itself (microseconds): every call, unavoidable.
-#
-# Every kernel here keys on token counts and model constants, never
-# on token values - so both passes run on synthetic ids and nothing
-# about warmup depends on the query.
+# Kernels key on token counts and model constants, never on token
+# values, so both passes run on synthetic ids.
 
 # Chunk sizes (tokens) the tiny-chunk warmup ladder builds. A gated
-# chain's trailing chunks are 100-500 tokens - a shape neither the
-# GEMM sweep's bare matmuls nor the full-size warm chunks build as an
-# actual forward pass - and each such shape paid a 0.7-9.3 s one-time
-# kernel compile mid-run (measured in the 2026-08-24 packing sweep).
-# A warm tiny chunk costs ~20-30 ms, so the ladder runs in both
-# passes.
+# chain's trailing chunks are 100-500 tokens, a shape the full-size
+# warm chunks do not cover, so each needs its own compile.
 TINY_WARM_TOKENS = (64, 128, 256, 512, 1024, 2048)
 
 # Bump when either pass covers a different set of shapes. A bumped
@@ -694,13 +619,9 @@ def _warm_inputs(budget):
 
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                   join_chunk):
-    """Real forward passes over every attention path the engine has:
-    a budget-sized chunk and the tiny ladder under both attention
-    modes (arena writes on, so the paged machinery - scatter, paged
-    reads, the merge kernel - runs), then the single-stage fast
-    path's unpaged causal shape. join_chunk adds one run_join so the
-    join driver's packing runs end to end (compile pass only; it
-    launches no kernel the filter chunks have not already built)."""
+    """Run real forward passes over every attention path: both modes
+    with arena writes, plus the unpaged causal fast path. join_chunk
+    adds one run_join call."""
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
     original_mode = pipeline.attention_mode
@@ -726,21 +647,12 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
 
 
 def compile_kernels(torch, arena, pipeline, async_ans, budget):
-    """The compile pass: build every kernel configuration a run can
-    hit, once per (software stack, GPU, model, budget).
+    """Build every DeepGEMM kernel configuration up to the budget,
+    then run forward passes over every attention-path shape.
 
-    DeepGEMM picks a configuration per token count and JIT-compiles
-    each on first sight (~2.4 s of nvcc per configuration, measured
-    2026-08-24). The configuration tracks the token count finer than
-    powers of two, so guessed grids leave holes: vLLM ships a
-    generator mirroring DeepGEMM's own config heuristic, yielding
-    every token count at which the chosen configuration can change.
-    This pass runs the generator's full list up to the budget - the
-    sweep's GPU compute is the price of provable coverage, and this
-    pass runs once ever, so the price does not matter.
-
-    After the sweep, _forward_warm builds every attention-path shape
-    as real forward passes, including one join chunk."""
+    Runs once per (software stack, GPU, model, budget). Uses vLLM's
+    config heuristic generator to enumerate every token count at
+    which the chosen GEMM configuration changes."""
     from vllm.model_executor.warmup.deep_gemm_warmup import (
         _generate_optimal_warmup_m_values)
     layer = pipeline.layers[0]
@@ -756,10 +668,8 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     except ImportError:
         pass
     with torch.inference_mode():
-        # one buffer per linear, row-sliced per call (row slices stay
-        # contiguous): the sweep only needs each kernel LAUNCHED
-        # once, and a fresh randn per item was most of the sweep's
-        # cost at 1,024 items
+        # one buffer per linear, row-sliced per call; the sweep only
+        # needs each kernel launched once
         cur, buf = None, None
         for m, lin in work:
             if lin is not cur:
@@ -776,11 +686,8 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
 
 
 def touch_kernels(torch, arena, pipeline, async_ans, budget):
-    """The touch pass: run each hot kernel once per container so
-    cached binaries load into the process at boot. No GEMM sweep -
-    with the compile pass's marker present every configuration is a
-    cache hit, and a mid-run cache-hit load costs milliseconds, so
-    only the shapes the first chunks hit need touching."""
+    """Run each hot kernel once per container so cached binaries load
+    at boot instead of mid-run."""
     _forward_warm(torch, arena, pipeline, async_ans, budget,
                   join_chunk=False)
 
@@ -808,18 +715,13 @@ def _marker_identity(torch, model_name, budget):
 
 def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                  model_name, force_compile=False):
-    """Boot-time warmup policy: the compile pass once ever, the touch
-    pass every container after that.
+    """Boot-time warmup: compile pass once per (stack, GPU, model,
+    budget), touch pass every container after that.
 
-    The marker file (next to the kernel caches, so one volume commit
-    persists both) records the exact identity the compile pass ran
-    for. Identity match -> touch pass; mismatch or no marker ->
-    compile pass, then write the marker. Two containers racing the
-    first compile both run it and write identical markers - wasteful
-    once, never wrong.
+    A marker file records the identity the compile pass ran for.
+    Identity match -> touch; mismatch or absent -> compile.
 
-    Returns dict(tier="compile"|"touch", warm_s=seconds). The caller
-    owns committing the cache volume."""
+    Returns dict(tier="compile"|"touch", warm_s=seconds)."""
     import json
     import os
 
@@ -850,8 +752,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
 # ---------------------------------------------------------- the filter
 
 def _shared_preamble_tokens(question_ids):
-    """Longest common token prefix across the stage questions - the
-    part chain mode kept resident between rewinds."""
+    """Longest common token prefix across the stage questions."""
     if len(question_ids) < 2:
         return 0
     p = 0
@@ -866,49 +767,28 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                store_hash=None, store_min_tokens=1, stats=None,
                store_ids=None, timing=None, pinned=True,
                limit=None, *, arena_writes):
-    """The filter chain on the packed executor: continuous admission,
-    survivor priority, pages freed on FALSE or after the last stage.
+    """The filter chain: continuous admission, survivor priority, pages
+    freed on FALSE or after the last stage.
 
-    doc_ids: per-document token lists (the planted flag line included).
-    question_ids: per-stage question token lists, planner order.
-    trace: optional list; when given, one dict of chunk composition
-    (tokens, groups, fresh admissions) is appended per chunk, aligned
-    with spans - the shape data for chasing per-chunk anomalies.
+    Args:
+        doc_ids: Per-document token lists.
+        question_ids: Per-stage question token lists.
+        budget: Chunk token budget.
+        trace: When given, one dict per chunk is appended with tokens,
+            groups, and fresh admission counts.
+        store: Pinned KV store for cross-query reuse.
+        store_hash: Content hash for store keys.
+        store_min_tokens: Minimum prefix length to store.
+        store_ids: Maps local document positions to stable store key ids.
+        stats: Filled with restored/stored counts when given.
+        timing: CPU seconds per loop phase accumulate into it.
+        pinned: False for pageable blocking copies.
+        arena_writes: Whether document KV is written to the arena.
+            Must be True with multiple stages or a store.
 
-    store / store_hash / store_min_tokens: the pinned KV store. A
-    document already in the store restores into its pages instead of
-    computing (its stage-1 chunk carries only the question); a
-    document leaving its last stage is copied out on the side stream
-    when it is at least store_min_tokens long, its pages returned
-    only after the copy lands. stats, when given, is filled with
-    restored/stored counts. store_ids maps local document positions
-    to stable store key ids (a sharded worker keys by global index,
-    so its store slice survives across queries).
-
-    timing: optional dict; when given, CPU seconds per loop phase
-    (next_chunk, alloc, pack and its sub-phases, forward launch,
-    submit, report wait/scatter, drain_saves) accumulate into it.
-    Timing is host-side only and does not change what runs.
-
-    pinned: pass False to build chunk tensors with pageable blocking
-    copies (the pre-#12 path; the ablation ladder's staging rung).
-
-    arena_writes (required): whether document KV is written into the
-    arena. The rule lives in the planner alone: plan_query sets it
-    per filter chain (the FilterChain operator's arena_writes field,
-    forwarded through the payload) - False when one stage runs with
-    no store, because nothing ever reads the KV again. With False,
-    the arena alloc, the per-layer KV scatter, and the paged
-    attention read are all skipped, [document | question] packs as
-    one causal segment, and admission runs on the token budget
-    alone. Direct callers (warmups, calibration, ablation cells)
-    state their intent explicitly; this function never derives the
-    value. False with multiple stages or a store raises - store.save
-    and later stages read the arena - so a wrong caller fails loudly
-    instead of dropping KV a later pass needs.
-
-    Returns (answers, spans, tokens): answers[d] = 0/1 list up to the
-    first FALSE (gated); spans and tokens as in run_join.
+    Returns:
+        (answers, spans, tokens): answers[d] = 0/1 list up to the
+        first FALSE; spans and tokens as in run_join.
     """
     p = _shared_preamble_tokens(question_ids)
     stage_tokens = [len(question_ids[0])] \

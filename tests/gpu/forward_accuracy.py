@@ -1,21 +1,4 @@
-"""Forward-pass parity against stock vLLM: same pairs, both engines.
-
-The packed executor's answers are compared against stock vLLM running
-the same [prefix | suffix] prompts one pair per request. Both use the
-same checkpoint, the same bf16 KV dtype, and the same constrained
-TRUE/FALSE readout. The gate is 0 answer disagreements and a small hidden
-gap, not a speed comparison.
-
-What this catches that the probe (milestone1.py::probe) does not: the
-probe compares the packed path against itself (shared vs unshared,
-paged vs gather). This cell compares against an independent engine, so
-a systematic kernel bug (wrong RoPE phase, wrong norm, wrong merge)
-shows up as disagreement with stock.
-
-Run from the quail/ directory (tee to a file per house rule):
-
-    uv run modal run tests/gpu/forward_accuracy.py::run 2>&1 | tee results/forward_accuracy.log
-"""
+"""Forward-pass parity test: compare the packed executor's answers against stock vLLM on the same pairs."""
 
 import json
 import os

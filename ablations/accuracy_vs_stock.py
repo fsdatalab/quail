@@ -1,60 +1,10 @@
-"""Accuracy validation of both attention paths against stock vLLM
-(issue #24, part 1 - the most important part).
+"""Accuracy validation of both attention paths against stock vLLM.
 
-The comparison: the same token streams answered by two systems.
+Same token streams answered by stock vLLM and Quail's packed executor
+under each attention path. Stock's own pass-to-pass flip rate (shuffled
+submission order) is the yardstick for judging disagreements.
 
-- Stock side: standard vLLM serving (v1 LLM engine, bf16 KV, prefix
-  caching on, the committed client's batch settings), one request per
-  (document, stage) for filters and one request per pair for joins,
-  TRUE/FALSE constrained to one token at temperature 0. Every
-  (document, stage) runs unconditionally, so stock defines a complete
-  answer function; per-answer TRUE-FALSE logprob margins ride along.
-  A second pass in shuffled submission order measures stock's own
-  run-to-run flip rate - continuous batching changes batch
-  composition, which changes kernel reduction order, which flips
-  answers whose margins sit near zero. That self-flip band is the
-  yardstick for judging Quail-vs-stock disagreements.
-- Quail side: the packed executor's real loops (run_filter, run_join)
-  under each attention path, on the same token id lists. A final
-  round runs the production sequence (filters on FILTER_ATTENTION,
-  then joins on JOIN_ATTENTION, same arena) to check the mode switch
-  between rounds changes nothing.
-
-The corpus (built identically in both containers from seeded IMDB):
-
-- 1,000 documents with planted [FLAGS] lines in TRUE/FALSE form,
-  including 12 long documents (8 reviews concatenated, hundreds of
-  16-token pages), 25 very short documents (~30 tokens), and 5
-  documents whose body is only the flags line.
-- 5 filter stages: four flag questions (selectivity 0.9/0.9/0.9/0.8,
-  planted ground truth) and one natural sentiment question (no
-  planted truth), all in the engine's real framing (SHARED_PRE +
-  document, then "Evaluate TRUE or FALSE...": logical.py's
-  render_filter_question).
-- A join: 24 anchors (6 reviews + [KEYS] X=k line) x 48 partners
-  (1 review + [KEY] X=k line, 8 of them carrying an X no anchor
-  has), planted key-equality truth, rendered exactly as the engine
-  renders joins (naming line in kept KV, labeled partner block,
-  verbatim template question).
-
-Predictions, stated before the run (house rule):
-
-- Flag-question accuracy is high for both systems (the TRUE/FALSE
-  framing matches the readout; the old 27%-wrong figure came from
-  YES/NO-planted flags read through TRUE/FALSE ids).
-- unified vs stock disagrees least: the unified path is bit-identical
-  to a contiguous causal FA3 call (results/attention_parity.json),
-  so its differences from stock are kernel-stack differences (fp8
-  GEMMs, fused norms), not attention-path differences.
-- Both paths' disagreement rates land within a small multiple of
-  stock's own pass-to-pass flip rate, and disagreements concentrate
-  at |margin| near zero. Disagreements at decisive margins (say
-  |margin| > 1.0) are the red flag; the target for those is zero.
-
-Run from the quail/ directory (tee per house rule):
-
-    uv run modal run ablations/accuracy_vs_stock.py::run_all \
-        2>&1 | tee results/accuracy_vs_stock.log
+    uv run modal run ablations/accuracy_vs_stock.py::run_all
 """
 
 import json
@@ -130,8 +80,7 @@ FILTER_STAGES = (
 
 
 def _draw_flags(n_docs):
-    """The seeded flag matrix: the planted truth, drawn identically
-    by the GPU corpus builders and the CPU combine cell."""
+    """Seeded flag matrix: the planted truth for the corpus."""
     import numpy as np
     rng = np.random.default_rng(CORPUS_SEED)
     return (rng.random((n_docs, len(FLAG_SELECTIVITY)))
@@ -297,8 +246,7 @@ def stock_side(n_docs: int = 1000,
         return [b for b, _ in pairs], [m for _, m in pairs], wall
 
     def run_shuffled(prompts, seed, tag):
-        """The pass-to-pass control: the same prompts in a shuffled
-        submission order, answers unscrambled back to prompt order."""
+        """Run the same prompts in shuffled order, unscramble answers."""
         order = list(range(len(prompts)))
         np.random.default_rng(seed).shuffle(order)
         bits_s, margins_s, wall = run_prompts(
@@ -612,8 +560,7 @@ def run_combine(n_docs: int = 1000, model: str = "qwen3-4b-fp8"):
 
 @app.local_entrypoint()
 def run_quail_only(n_docs: int = 1000, model: str = "qwen3-4b-fp8"):
-    """Re-run the Quail side against an already-written stock raw
-    file, then combine."""
+    """Re-run only the Quail side, then combine with existing stock results."""
     qh = quail_side.spawn(n_docs, model)
     print(f"quail fc: {qh.object_id}", flush=True)
     qh.get()
