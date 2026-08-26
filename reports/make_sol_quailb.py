@@ -326,11 +326,11 @@ def cheaper_anchor(left, right, preamble, note, label, question,
 
 
 # ---------------------------------------------------------------- 4
-# Seconds
+# Speed of light
 
 
 @dataclass(frozen=True)
-class Seconds:
+class SpeedOfLight:
     """The bound, with every term it was built from."""
     work: Work
     passes: int
@@ -341,7 +341,7 @@ class Seconds:
     memory: float
 
     @property
-    def sol(self) -> float:
+    def seconds(self) -> float:
         return max(self.compute, self.memory)
 
     @property
@@ -361,12 +361,12 @@ class Seconds:
             f"T_attention    {self.attention:>18.4f} s",
             f"T_compute      {self.compute:>18.4f} s",
             f"T_memory       {self.memory:>18.4f} s",
-            f"SoL            {self.sol:>18.4f} s ({self.bound_by} bound)",
+            f"SoL            {self.seconds:>18.4f} s ({self.bound_by} bound)",
         ])
 
 
-def seconds(work: Work, model: ModelSpec, device: DeviceSpec,
-            chunk_tokens: int) -> Seconds:
+def speed_of_light(work: Work, model: ModelSpec, device: DeviceSpec,
+                   chunk_tokens: int) -> SpeedOfLight:
     """Turn the four counts into a floor on wall time.
 
     `chunk_tokens` is the batch size the forward pass runs at. It
@@ -390,10 +390,10 @@ def seconds(work: Work, model: ModelSpec, device: DeviceSpec,
     passes = math.ceil(work.tokens / chunk_tokens) if work.tokens else 0
     moved = (model.W_mem * passes
              + kv_bytes_per_token(model) * (work.kv_written + work.kv_read))
-    return Seconds(work=work, passes=passes, bytes_moved=moved,
-                   dense=dense, attention=attention,
-                   compute=dense + attention,
-                   memory=moved / device.hbm_bw)
+    return SpeedOfLight(work=work, passes=passes, bytes_moved=moved,
+                        dense=dense, attention=attention,
+                        compute=dense + attention,
+                        memory=moved / device.hbm_bw)
 
 
 # ================================================================
@@ -590,12 +590,12 @@ for qid, rec in queries.items():
     rows[qid]["held_mean_doc_tokens"] = (
         sum(lengths[held].values()) / len(lengths[held]))
     for model in MODELS:
-        s = seconds(work, model, H100_SXM, CHUNK[model.name])
+        s = speed_of_light(work, model, H100_SXM, CHUNK[model.name])
         rows[qid]["models"][model.name] = {
             "passes": s.passes, "bytes_moved": s.bytes_moved,
             "t_dense": s.dense, "t_attention": s.attention,
             "t_compute": s.compute, "t_memory": s.memory,
-            "sol_s": s.sol, "bound_by": s.bound_by}
+            "sol_s": s.seconds, "bound_by": s.bound_by}
 
 hdr = (f"{'query':7} {'tokens':>11} {'pairs':>15} {'tuples':>8} "
        f"{'anchor':>7}  {'4B SoL':>9} {'att%':>5}  {'32B SoL':>9} "
