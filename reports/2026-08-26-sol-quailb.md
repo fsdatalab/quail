@@ -48,11 +48,13 @@ stops if the two it is given disagree.
 
 3. **Selectivities.** From the QUAIL-B ground truth labels - the 32B
    model's TRUE/FALSE per document - taken per stage and conditional
-   on the stages before it. F1 passes 0.8008 of IMDB's documents; F4 then
-   passes 0.2567 of what F1 left.
+   on the stages before it. F1 passes 0.7746 of IMDB's documents; F4 then
+   passes 0.2486 of what F1 left.
 
-   These come from collection `gt_80e7582534b349bc61c087595f2e0a51`,
+   These come from collection `gt_76bc95a8a8dfee478bc8546e5b6154da`,
    the labels active for corpus `c_df45ef585738f42e4a7a731306f1b9fc`.
+   **These labels are known to be wrong for 19 of their 23
+   predicates** - see "The labels this was computed against" below.
    A predicate keeps one label set per template it has been judged
    under, and superseded ones stay on the volume, so the script reads
    the corpus's `active_collection.json` and takes only the label
@@ -98,8 +100,8 @@ over itself. Without reuse, stage `s > 1` would be another stage 1.
 
 Read straight off the table below: IMDB-1 is one filter over 5,000
 IMDB documents at 1,759,233 tokens. IMDB-6 adds a second filter and
-comes to 1,939,413. The difference is 180,180, which is exactly the
-4,004 surviving documents times F4's 45-token question. Nothing is
+comes to 1,933,518. The difference is 174,285, which is exactly the
+3,873 surviving documents times F4's 45-token question. Nothing is
 scanned again.
 
 A join is the same shape with a longer suffix. One side anchors -
@@ -119,31 +121,31 @@ Figure: plots/sol_quailb_per_query.png
 | query | shape | tokens | pairs | tuples | anchor | 4B SoL | 32B SoL | 32B/4B |
 |---|---|---|---|---|---|---|---|---|
 | IMDB-1 | 1F | 1,759,233 | 4.39e8 | - | - | 6.72 s | 56.41 s | 8.39 |
-| IMDB-2 | 1J | 5,944,233 | 1.89e9 | 60,000 | documents | 22.96 s | 191.48 s | 8.34 |
-| IMDB-3 | 1F+1J | 5,314,785 | 1.67e9 | 48,048 | documents | 20.51 s | 171.16 s | 8.34 |
-| IMDB-4 | 2F+1J | 2,852,277 | 8.13e8 | 12,336 | documents | 10.96 s | 91.68 s | 8.37 |
-| IMDB-5 | 3F+1J | 2,583,857 | 7.19e8 | 8,028 | documents | 9.92 s | 83.01 s | 8.37 |
-| IMDB-6 | 2F | 1,939,413 | 4.98e8 | - | - | 7.42 s | 62.22 s | 8.39 |
-| IMDB-7 | 3F | 1,989,785 | 5.14e8 | - | - | 7.61 s | 63.84 s | 8.39 |
+| IMDB-2 | 1J | 3,669,233 | 1.07e9 | 60,000 | documents | 14.11 s | 117.98 s | 8.36 |
+| IMDB-3 | 1F+1J | 3,436,242 | 9.90e8 | 46,476 | documents | 13.21 s | 110.47 s | 8.36 |
+| IMDB-4 | 2F+1J | 2,350,497 | 6.32e8 | 11,556 | documents | 9.01 s | 75.47 s | 8.38 |
+| IMDB-5 | 3F+1J | 2,252,629 | 6.00e8 | 7,536 | documents | 8.63 s | 72.31 s | 8.38 |
+| IMDB-6 | 2F | 1,933,518 | 4.96e8 | - | - | 7.40 s | 62.03 s | 8.39 |
+| IMDB-7 | 3F | 1,980,705 | 5.11e8 | - | - | 7.58 s | 63.55 s | 8.39 |
 | BIO-1 | 1F | 838,999 | 2.38e9 | - | - | 4.50 s | 31.50 s | 7.00 |
-| BIO-2 | 1J | 10,979,399 | 4.50e10 | 122,800 | documents | 67.12 s | 441.54 s | 6.58 |
-| BIO-3 | 1F+1J | 7,081,126 | 2.82e10 | 75,522 | documents | 42.81 s | 283.08 s | 6.61 |
-| BIO-4 | 2F+1J | 5,360,703 | 2.08e10 | 54,646 | documents | 32.07 s | 213.10 s | 6.64 |
-| BIO-5 | 3F+1J | 3,893,343 | 1.46e10 | 36,840 | documents | 22.97 s | 153.63 s | 6.69 |
+| BIO-2 | 1J | 6,190,399 | 2.47e10 | 122,800 | documents | 37.48 s | 247.68 s | 6.61 |
+| BIO-3 | 1F+1J | 4,028,675 | 1.55e10 | 73,066 | documents | 24.05 s | 159.95 s | 6.65 |
+| BIO-4 | 2F+1J | 3,041,806 | 1.13e10 | 50,348 | documents | 17.89 s | 119.83 s | 6.70 |
+| BIO-5 | 3F+1J | 2,348,920 | 8.33e9 | 34,384 | documents | 13.59 s | 91.73 s | 6.75 |
 | FEV-1 | 1F | 6,642 | 2.25e5 | - | - | 0.025 s | 0.21 s | 8.56 |
-| FEV-2 | 1J | 468,720 | 1.94e8 | 5,700 | partner | 1.84 s | 15.19 s | 8.27 |
-| FEV-3 | 1F+1J | 313,995 | 1.26e8 | 3,648 | partner | 1.23 s | 10.17 s | 8.28 |
-| FEV-4 | 2F+1J | 75,594 | 2.49e7 | 570 | partner | 0.29 s | 2.44 s | 8.33 |
-| FEV-5 | 2F+1J two-sided | 217,129 | 8.23e7 | 2,368 | partner | 0.85 s | 7.02 s | 8.30 |
-| FEV-6 | 3F+1J two-sided | 63,388 | 1.92e7 | 370 | partner | 0.24 s | 2.04 s | 8.35 |
+| FEV-2 | 1J | 274,977 | 1.09e8 | 5,700 | partner | 1.07 s | 8.90 s | 8.29 |
+| FEV-3 | 1F+1J | 177,252 | 6.65e7 | 3,363 | partner | 0.69 s | 5.73 s | 8.30 |
+| FEV-4 | 2F+1J | 55,989 | 1.64e7 | 570 | partner | 0.22 s | 1.80 s | 8.36 |
+| FEV-5 | 2F+1J two-sided | 128,366 | 4.50e7 | 2,183 | partner | 0.50 s | 4.14 s | 8.32 |
+| FEV-6 | 3F+1J two-sided | 50,583 | 1.39e7 | 370 | partner | 0.19 s | 1.62 s | 8.37 |
 | LEP-1 | 1F | 57,819 | 1.14e7 | - | - | 0.22 s | 1.85 s | 8.43 |
-| LEP-2 | 1J | 5,966,619 | 1.92e9 | 40,000 | documents | 23.06 s | 192.25 s | 8.34 |
-| LEP-3 | 1F+1J | 176,211 | 4.19e7 | 800 | documents | 0.67 s | 5.65 s | 8.40 |
-| LEP-4 | 2F+1J | 146,801 | 2.79e7 | 600 | documents | 0.56 s | 4.69 s | 8.44 |
-| LEP-5 | 3F+1J | 87,746 | 1.45e7 | 200 | documents | 0.33 s | 2.80 s | 8.46 |
-| LEP-6 | 5F+1J | 58,209 | 1.15e7 | 0 | documents | 0.22 s | 1.86 s | 8.43 |
-| LEP-7 | 3F+1J two-sided | 172,390 | 2.97e7 | 600 | documents | 0.65 s | 5.50 s | 8.45 |
-| LEP-8 | 5F | 58,209 | 1.15e7 | - | - | 0.22 s | 1.86 s | 8.43 |
+| LEP-2 | 1J | 4,726,819 | 1.46e9 | 40,000 | documents | 18.23 s | 152.17 s | 8.35 |
+| LEP-3 | 1F+1J | 151,415 | 3.43e7 | 800 | documents | 0.58 s | 4.85 s | 8.41 |
+| LEP-4 | 2F+1J | 128,204 | 2.35e7 | 600 | documents | 0.48 s | 4.09 s | 8.44 |
+| LEP-5 | 3F+1J | 58,148 | 1.15e7 | 0 | documents | 0.22 s | 1.86 s | 8.43 |
+| LEP-6 | 5F+1J | 58,148 | 1.15e7 | 0 | documents | 0.22 s | 1.86 s | 8.43 |
+| LEP-7 | 3F+1J two-sided | 153,793 | 2.53e7 | 600 | documents | 0.58 s | 4.90 s | 8.46 |
+| LEP-8 | 5F | 58,148 | 1.15e7 | - | - | 0.22 s | 1.86 s | 8.43 |
 
 Every query on both models is compute bound. The largest
 `T_memory` in the suite is FEV-1's at 6.7% of its `T_compute`, and
@@ -160,17 +162,17 @@ cheaper, because that is what the engine does.
 
 | join | side held | side streamed | tokens as run | tokens the other way | cost of choosing wrong |
 |---|---|---|---|---|---|
-| IMDB-2 | documents, 299 tokens | partner, 2 | 5,944,233 | 22,190,955 | 3.7x |
-| BIO-2 | documents, 4,146 | partner, 5 | 10,979,399 | 518,716,188 | 47.2x |
-| FEV-2 | partner, 370 | documents, 11 | 468,720 | 2,494,042 | 5.3x |
-| FEV-5 | partner, 370 | documents, 11 | 185,740 | 993,984 | 5.4x |
-| LEP-2 | documents, 233 | partner, 83 | 5,966,619 | 11,942,589 | 2.0x |
+| IMDB-2 | documents, 299 tokens | partner, 2 | 3,669,233 | 19,910,967 | 5.4x |
+| BIO-2 | documents, 4,146 | partner, 5 | 6,190,399 | 513,927,602 | 83.0x |
+| FEV-2 | partner, 370 | documents, 11 | 274,977 | 2,300,342 | 8.4x |
+| FEV-5 | partner, 370 | documents, 11 | 96,977 | 842,166 | 8.7x |
+| LEP-2 | documents, 233 | partner, 83 | 4,726,819 | 10,702,789 | 2.3x |
 
 FEVER is the one that inverts. Its documents average 11 tokens and
 its partner set 370, so the join holds the partner and streams the
 documents past it - the opposite of how the query
 reads. BioDEX is the extreme, because a 4,146-token report copied
-into each of 122,800 tuples is 47 times the cost of holding 200 of
+into each of 122,800 tuples is 83 times the cost of holding 200 of
 them.
 
 ## Document length decides the mix, and the mix decides the model gap
@@ -200,13 +202,42 @@ bf16 peak.
 
 Put together: a query's cost multiplier from 4B to 32B lies between
 3.56 and 8.59, at whatever its mix is. The five BioDEX queries hold
-4,146-token documents and spend 31 to 40% of their compute on
+4,146-token documents and spend 31 to 39% of their compute on
 attention, so they multiply by 6.6 to 7.0. Every other query holds
 documents of 11 to 370 tokens, spends under 7% on attention, and
 multiplies by 8.3 to 8.6.
 
 Long documents therefore make the big model relatively cheaper, not
 dearer.
+
+## The labels this was computed against
+
+The selectivities above come from collection
+`gt_76bc95a8a8dfee478bc8546e5b6154da`, which is what
+`active_collection.json` points at for this corpus. For 19 of its 23
+predicates it names the same label files as the run that predates
+PR #57 - identical label set ids, not re-judged. Those labels were
+produced with templates that carried a duplicated `ANSWER=` cue, which
+PR #57 measured as pushing the model toward `FALSE` on 14 of 19
+predicates. BioDEX's reaction join reads 81 true pairs out of 122,800
+here; without the cue it is 19,777.
+
+So the filter and join arithmetic below is current, and the
+selectivities feeding it are not. Concretely:
+
+- **Token and pair counts for a single-stage query are unaffected.**
+  IMDB-1, BIO-1, FEV-1 and LEP-1 scan every document whatever the
+  labels say.
+- **Every multi-stage query is affected**, because how many documents
+  reach stage two is exactly what the labels decide.
+- **The join costs are affected twice over**: once through how many
+  documents survive to be joined, and once through the prompt change
+  in PR #52, which is real and is the larger of the two.
+
+What would settle it is one judge-pass run against current `main`, so
+all 23 predicates get labels from the cue-free templates. That is about
+34 minutes on four H100s. Until then, read the join arithmetic and the
+anchor choice as current, and every absolute second as provisional.
 
 ## What this does not settle
 
@@ -220,11 +251,10 @@ dearer.
 - **The KV read count is a minimum**, one read per anchor per stage.
   An anchor whose tuples straddle a chunk boundary is read twice.
   Nothing here is memory bound, so it changes no answer.
-- **LEP-6 and LEP-8 are the same number.** LEP1 leaves 4 documents
-  of 200, LEP2 leaves 3, LEP3 leaves 1, and LEP4 leaves none, so the
-  fourth and fifth stages of both queries and LEP-6's join cost
-  nothing. Those two carry no signal at sf=0.1. LEP-5 stops after
-  LEP3, so its one surviving document does reach the join.
+- **LEP-5, LEP-6 and LEP-8 are the same number.** LEP1 leaves 4
+  documents of 200, LEP2 leaves 3 and LEP3 leaves none, so their
+  later stages and their joins cost nothing. Those three carry no
+  signal at sf=0.1.
 - **Nothing here is compared with a measured wall.** These are
   floors. What fraction of them the engine reaches is a separate
   question and a separate run.
