@@ -236,7 +236,7 @@ def _text_hash(value: str) -> str:
 
 def predicate_payload(spec: PredicateSpec) -> dict:
     render = ("filter_document_then_question_v1" if spec.kind == "filter"
-              else "join_arg0_anchor_then_arg1_v1")
+              else "join_anchor_question_then_partners_v2")
     return {
         "schema_version": SCHEMA_VERSION,
         "predicate_key": spec.key,

@@ -11,6 +11,7 @@ from quail.bench.judge_pass import (
     example_identity,
     judgment_identity,
     label_set_identity,
+    predicate_payload,
     predicate_version,
     render_filter_prompt,
     render_join_prompt,
@@ -30,6 +31,8 @@ def test_stable_ids_cover_predicate_semantics_and_inputs():
     assert predicate_version(renamed) == predicate_version(original)
 
     join_spec = _spec("quailb.biodex.report.experienced_reaction")
+    assert (predicate_payload(join_spec)["render"]
+            == "join_anchor_question_then_partners_v2")
     changed_prompt = replace(join_spec, template=join_spec.template + "\n")
     changed_roles = replace(join_spec, left_role="medical_report")
     assert predicate_version(join_spec) != predicate_version(changed_prompt)
