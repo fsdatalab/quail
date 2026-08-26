@@ -1185,6 +1185,7 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
     if prepared["complete"] and not only:
         print(f"collection {prepared['collection_id']} is already complete",
               flush=True)
+        return
 
     names = ([w.strip() for w in only.split(",")] if only
              else list(WORKLOADS))
