@@ -66,6 +66,8 @@ vllm_image = (
         "echo 'nsys install failed -- gpu_profiling.py will no-op if "
         "PROFILE_GPU is set'")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1",
+         # FlashInfer reserves another 1.5 GiB after vLLM sizes the KV cache.
+         "VLLM_USE_FLASHINFER_SAMPLER": "0",
          # Without this, PyTorch's CUDA caching allocator needs an exact
          # contiguous block and can fail even when enough total free
          # memory exists, just fragmented - the allocator OOM warnings
