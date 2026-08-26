@@ -432,7 +432,7 @@ def _generate_batch_impl(llm, gpu, quantization, max_num_seqs,
              NSYS_OUTPUT_DIR: nsys_traces_vol},
 )
 class WorkerH100:
-    GPU = "H100"
+    GPU = "H100!"
     model: str = modal.parameter(default="qwen3-4b")   # key into MODEL_NAMES
     quantization: str = modal.parameter(default="fp8")
     enable_prefix_caching: bool = modal.parameter(default=True)
