@@ -54,7 +54,10 @@ TENSOR_PARALLEL_SIZE = 1
 MAX_NUM_BATCHED_TOKENS = 25_305     # matches the bf16-KV stock knobs
 #                                     already committed in
 #                                     tests/gpu/milestone1.py
-MAX_NUM_SEQS_BY_GPU = {"H100!": 2648, "H100": 2648}
+# The tested stock join needs 4,096 so short suffix requests can fill
+# max_num_batched_tokens. The filter submits only 200 requests here, so
+# this upper bound does not change its effective admission.
+MAX_NUM_SEQS_BY_GPU = {"H100!": 4096, "H100": 4096}
 GPU_MEMORY_UTILIZATION = 0.92       # matches quail's own POOL_FRACTION
 #                                     (budgets.py) - the fraction of
 #                                     device memory the baseline may
