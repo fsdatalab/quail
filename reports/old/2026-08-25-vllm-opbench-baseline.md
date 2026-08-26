@@ -1,5 +1,9 @@
 # Shared join prompts and vLLM baselines
 
+This report is superseded by
+`reports/2026-08-26-stock-vllm-joins.md`. Its stock series came from the
+instrumented vLLM opbench path, not `baselines.stock.run_join_grouped`.
+
 Date: 2026-08-26. The runs used sf=0.1, Qwen3 4B fp8 or Qwen3 32B
 fp8, and one exact `H100!` request per model copy on Modal.
 
