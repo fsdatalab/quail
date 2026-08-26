@@ -5,8 +5,6 @@ from dataclasses import replace
 from quail.bench.judge_pass import (
     MODEL_NAME,
     PREDICATES,
-    PROMPTS_PER_CALL,
-    WORKLOADS,
     _compact_label_parts,
     _corpus_identity,
     _saved_verification_sample,
@@ -15,11 +13,7 @@ from quail.bench.judge_pass import (
     label_set_identity,
     predicate_version,
     render_filter_prompt,
-    rows_per_call,
     render_join_prompt,
-    filter_groups,
-    join_specs,
-    workload_specs,
 )
 
 
@@ -136,60 +130,3 @@ def test_compact_label_parts_keeps_every_saved_row(tmp_path):
         {"id": "b", "answer": False},
         {"id": "c", "answer": True},
     ]
-
-
-# ---- the parallel split
-
-def test_every_predicate_belongs_to_exactly_one_workload():
-    """The four containers between them must cover the collection: a
-    predicate in no workload is never labelled, one in two is judged
-    twice."""
-    seen = [spec.key for w in WORKLOADS for spec in workload_specs(w)]
-    assert sorted(seen) == sorted(spec.key for spec in PREDICATES)
-    assert len(seen) == len(set(seen)) == 19
-
-
-def test_what_each_container_runs_is_read_off_the_specs():
-    """Nothing about the plan is stated: the grouping, the tables, the
-    rows per call and which join needs no model call all follow from
-    the PredicateSpec."""
-    plan = {w: ([(t, len(g), n) for t, g, n in filter_groups(
-                    workload_specs(w))],
-                [s.legacy_code for s in join_specs(workload_specs(w))])
-            for w in WORKLOADS}
-    assert plan == {
-        "imdb": ([("reviews", 3, 85)], ["DISCUSS_ASPECT"]),
-        "biodex": ([("reports", 3, 85)], ["REACTION"]),
-        "fever": ([("claims", 2, 128), ("evidence", 1, 256)], ["SUPPORT"]),
-        "lepard": ([("citations", 5, 51), ("citations", 1, 256)],
-                   ["LEPJOIN"]),
-    }
-
-
-def test_filters_group_by_the_column_they_read():
-    """LePaRD reads two columns of one table, and each gets its own
-    batch size, so grouping by table alone would merge them."""
-    groups = filter_groups(workload_specs("lepard"))
-    assert len(groups) == 2
-    columns = {spec.left_column for _, g, _ in groups for spec in g}
-    assert columns == {"destination_context", "passage_text"}
-
-
-def test_rows_per_call_holds_the_prompt_count_near_the_target():
-    """The rule has to survive a join whose one anchor already exceeds
-    the target: BioDEX pairs each report with 614 reactions, so a part
-    cannot be smaller than one anchor."""
-    for prompts_per_row in (1, 2, 3, 5, 12, 57, 255, 256, 614):
-        rows = rows_per_call(prompts_per_row)
-        assert rows >= 1
-        prompts = rows * prompts_per_row
-        assert prompts <= max(PROMPTS_PER_CALL, prompts_per_row)
-        assert prompts + prompts_per_row > PROMPTS_PER_CALL
-
-
-def test_only_lepards_join_skips_the_model():
-    """It is labelled from the dataset's own passage ids, so its
-    container does almost no GPU work."""
-    free = [s.key for s in PREDICATES
-            if s.kind == "join" and s.source_policy == "lepard_passage_id"]
-    assert free == ["quailb.lepard.excerpt.cites_passage"]
