@@ -7,7 +7,8 @@ __pycache__/
 .venv/
 logs/
 results/logs/
-# teed run logs are local artifacts; the result JSONs carry the numbers
+# teed run logs are local artifacts; the result JSONs carry the numbers.
+# The glob needs ** because runs tee into subdirectories.
 results/*.log
 results/**/*.log
 # pointer to the log the current run is teeing to, written by whoever
@@ -23,3 +24,6 @@ results/vllm_opbench/
 # process ID files and profiler traces are local artifacts
 results/*.pid
 results/torchprof_*.json.gz
+
+# subagent git worktrees, created and removed per run
+.claude/worktrees/
