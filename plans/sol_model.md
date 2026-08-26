@@ -142,10 +142,10 @@ here is.
 document; anchoring the short side puts a full copy of every long
 document into every tuple. The planner keeps the cheaper side, so
 the bound prices both orientations and keeps the cheaper one. The
-choice is not a detail: the two orientations differ by 5.2x on
-FEVER and 46x on BioDEX.
+choice is not a detail: the two orientations differ by 5.3x on
+FEVER and 47x on BioDEX.
 
-## 4. Seconds
+## 4. Speed of light
 
 ```
 T_dense     = 2 * P * tokens / R_dense
@@ -187,7 +187,7 @@ section 3:
 | `stream(prefix, suffixes)` | a join's tuples: `ask` per suffix, one prefix read |
 
 `filter_chain`, `join` and `cheaper_anchor` compose them, and
-`seconds()` is section 4. Nothing in the engine imports any of it:
+`speed_of_light()` is section 4. Nothing in the engine imports any of it:
 this is analysis, not a plan input.
 
 ## 6. What the bound assumes
