@@ -22,17 +22,23 @@ and 2,419,233 for IMDB-2. It did. The earlier SoL code counted the
 complete question once per pair, so it was expected to overstate all
 three join floors.
 
-The ground truth pass predicted 284,138 Qwen3 32B labels, 40,063 source
-labels, and 0 answer differences in a 352 judgment deterministic check.
-All three predictions matched. The 30 to 45 minute and $4 to $6 run
-prediction cannot be compared directly because the first command stopped
-on duplicate part validation and the corrected command resumed its saved
-parts.
+The replacement ground truth pass predicted 394,138 Qwen3 32B labels,
+40,063 source labels, and 0 answer differences in a 352 judgment check.
+All three label predictions matched. The pass predicted 27 to 35 minutes
+for the slowest workload and measured 50.6 minutes. It predicted $5 to $9
+and measured about $7.
 
 The model specific anchor correction predicted that all 35 current queries
-would keep the same orientations and SoL values. The prediction matched. The
-correction changes how the calculation is performed and stored, but it does
-not change any number in the result table.
+would choose the same orientation on 4B and 32B. The new calculation matched
+the prediction. The output still stores the plan and orientation separately
+for each model.
+
+Before the regeneration, I predicted that BIO-6 would increase the most
+because its second join now uses all 614 terms instead of 64 terms. BIO-6
+increased from 135,088 to 240,074 evaluated pairs. Its SoL increased from
+16.663 to 26.033 seconds for 4B and from 111.222 to 173.157 seconds for 32B.
+BIO-C and BIO-D changed by less than 0.3 percent because the new REACTION
+labels removed a slightly different set of rows before their later joins.
 
 ## Ground truth setup and result
 
@@ -42,12 +48,12 @@ FEVER, and LePaRD. LePaRD's citation join uses source passage IDs. FEVER
 uses its source annotation for 63 support pairs. Qwen judged the remaining
 rows.
 
-The completed collection has 324,201 labels across 23 predicates. The
+The completed collection has 434,201 labels across 23 predicates. The
 collection includes all eight join predicates used by the 35 queries. Its
 summary is at
-`/results/ground_truth/quailb/schema_v1/collections/gt_306dac4fc83883c7a5bcc86f4d103f32/summary.json`
-on the `quail-results` volume. The finalizer function call was
-`fc-01M0YKBGBF09HSDAF5FSA533AX`.
+`/results/ground_truth/quailb/schema_v1/collections/gt_04231c5de83cdf9e7e68fc03849959d6/summary.json`
+on the `quail-results` volume. The collection is active for corpus
+`c_df45ef585738f42e4a7a731306f1b9fc`.
 
 ## The three inputs
 
@@ -69,7 +75,6 @@ stops if the two it is given disagree.
    | IMDB | partner | 12 | 27 | 2.25 |
    | BioDEX | documents | 200 | 829,199 | 4,146.0 |
    | BioDEX | partner | 614 | 2,848 | 4.6 |
-   | BioDEX | severe partner | 64 | 236 | 3.7 |
    | FEVER | documents | 100 | 1,142 | 11.4 |
    | FEVER | partner | 57 | 21,099 | 370.2 |
    | LePaRD | documents | 200 | 46,619 | 233.1 |
@@ -88,9 +93,9 @@ stops if the two it is given disagree.
    The selectivity is only a summary of those answers. F1 passes 0.8008 of
    IMDB's documents. F4 then passes 0.2567 of what F1 left.
 
-   These come from collection `gt_306dac4fc83883c7a5bcc86f4d103f32`,
+   These come from collection `gt_04231c5de83cdf9e7e68fc03849959d6`,
    the labels active for corpus `c_df45ef585738f42e4a7a731306f1b9fc`.
-   The collection has 324,201 labels. Its deterministic check repeated
+   The collection has 434,201 labels. Its deterministic check repeated
    352 Qwen judgments with 0 answer differences.
    A predicate keeps one label set per template it has been judged
    under, and superseded ones stay on the volume, so the script reads
@@ -173,9 +178,9 @@ queries choose the same orientations on both models.
 For example, IMDB-9 evaluates 60,000 review and aspect pairs in its first
 join. The first join leaves all 12 aspect values live for the next stage,
 so the next two joins evaluate 144 pairs each. The total is 60,288 pair
-evaluations. BIO-C evaluates 122,800 pairs, then 108,200 pairs after its
-first barrier, then 117,888 pairs after the next gate. The total is
-348,888 pair evaluations.
+evaluations. BIO-C evaluates 122,800 pairs, then 107,800 pairs after its
+first barrier, then 117,274 pairs after the next gate. The total is
+347,874 pair evaluations.
 
 The SoL work is the sum of all filter and join stages. For a query with a
 join, document pairs per second at SoL is the sum of evaluated pairs across
@@ -213,9 +218,9 @@ does not include CPU or memory charges.
 | BIO-3 | 1F + 1J | 75,522 pairs | 11.482 s | $0.01260 | 6,577.5 | 76.857 s | $0.08431 | 982.6 |
 | BIO-4 | 2F + 1J | 54,646 pairs | 9.620 s | $0.01055 | 5,680.5 | 64.656 s | $0.07093 | 845.2 |
 | BIO-5 | 3F + 1J | 36,840 pairs | 7.879 s | $0.00864 | 4,675.7 | 53.707 s | $0.05892 | 685.9 |
-| BIO-C | 3J | 348,888 pairs | 40.293 s | $0.04420 | 8,658.7 | 268.574 s | $0.29463 | 1,299.0 |
-| BIO-D | 1F + 3J | 290,610 pairs | 35.110 s | $0.03852 | 8,277.2 | 234.256 s | $0.25698 | 1,240.6 |
-| BIO-6 | 2J | 135,088 pairs | 16.663 s | $0.01828 | 8,107.3 | 111.222 s | $0.12201 | 1,214.6 |
+| BIO-C | 3J | 347,874 pairs | 40.195 s | $0.04409 | 8,654.7 | 267.945 s | $0.29394 | 1,298.3 |
+| BIO-D | 1F + 3J | 289,596 pairs | 35.021 s | $0.03842 | 8,269.2 | 233.692 s | $0.25636 | 1,239.2 |
+| BIO-6 | 2J | 240,074 pairs | 26.033 s | $0.02856 | 9,221.9 | 173.157 s | $0.18995 | 1,386.5 |
 | FEV-1 | 1F | 100 documents | 0.025 s | $0.00003 | 4,077.7 | 0.210 s | $0.00023 | 476.3 |
 | FEV-2 | 1J | 5,700 pairs | 0.568 s | $0.00062 | 10,031.2 | 4.707 s | $0.00516 | 1,211.0 |
 | FEV-3 | 1F + 1J | 3,648 pairs | 0.417 s | $0.00046 | 8,738.5 | 3.468 s | $0.00380 | 1,052.0 |
@@ -307,10 +312,10 @@ dearer.
 ## Ground truth labels
 
 The selectivities above come from active collection
-`gt_306dac4fc83883c7a5bcc86f4d103f32`. All 23 predicates use the current
+`gt_04231c5de83cdf9e7e68fc03849959d6`. All 23 predicates use the current
 prompt layout. All 8 joins use renderer
 `join_anchor_question_then_partners_v2`. The compact files contain
-284,138 Qwen3 32B labels and 40,063 source labels.
+394,138 Qwen3 32B labels and 40,063 source labels.
 
 The calculation uses the exact document IDs that pass each filter. It
 does not infer survivor lengths from selectivity. This matters when a
