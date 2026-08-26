@@ -1,4 +1,4 @@
-"""QUAIL-B: twenty-six queries over four document sets (IMDB, BioDEX,
+"""QUAIL-B: thirty-five queries over four document sets (IMDB, BioDEX,
 FEVER, LePaRD).
 
     uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8 --gpus 1
