@@ -32,15 +32,22 @@ MODEL_REVISION = "aa55da1ecc13d006e8b8e4f54579b1ea8c3db2df"
 MODEL_NAME = "qwen3-32b-fp8"
 MAX_MODEL_LEN = 32_768
 MAX_BATCH_TOKENS = 25_305
-MAX_SEQS = 2_648
+MAX_SEQS = 4_096
+# The 32B judge needs more free memory than the 4B engine runs do: at
+# 0.92 the KV reservation left 5.38 GiB free on an 80 GiB H100 and a
+# 5.41 GiB prefill activation then failed to allocate.
+GPU_MEMORY_UTILIZATION = 0.85
 VERIFY_PER_PREDICATE = 16
 
 VOLUME_ROOT = Path("/results/ground_truth/quailb/schema_v1")
 
 PREDICTION = (
-    "sf=0.1: 205,457 Qwen3 32B judgments and 40,100 source labels; "
-    "one H100; 30-45 minutes including boot; $3-$5 at current Modal "
-    "prices; 0 answer differences on the deterministic rerun sample"
+    "sf=0.1, 23 predicates: 434,201 labels - 394,138 Qwen3 32B "
+    "judgments and 40,063 source labels; four H100s side by side, one "
+    "per workload; biodex is the long pole with 245,600 report-length "
+    "join prompts; 30-50 minutes wall clock and $10-$16 at current "
+    "Modal prices; 0 answer differences on the deterministic rerun "
+    "sample; no out-of-memory crash at gpu_memory_utilization=0.85"
 )
 
 
@@ -110,7 +117,7 @@ PREDICATES = (
         "REACTION_SEVERE", "biodex",
         "report_experienced_severe_reaction", "join",
         quailb.REACTION_SEVERE,
-        "report", "reports", "report", "reaction", "severe_terms", "term"),
+        "report", "reports", "report", "reaction", "terms", "term"),
     PredicateSpec(
         "quailb.fever.claim.about_person", "F11", "fever",
         "claim_about_person", "filter", quailb.F11,
@@ -251,6 +258,13 @@ def predicate_version(spec: PredicateSpec) -> tuple[str, str]:
     return _named_id("pv", full), full
 
 
+# Only fields that can change the model's answer belong in this hash:
+# it flows into JUDGE_ID, then label_set_id, then every label path, so
+# any field added here invalidates all existing labels. Scheduler
+# capacity knobs (max_num_batched_tokens, max_num_seqs,
+# gpu_memory_utilization) change throughput and memory, not the token
+# a greedy 1-token decode picks, so they stay out. They used to be in
+# here, which made an out-of-memory fix cost a full relabel.
 JUDGE_SPEC = {
     "model_repo": MODEL_REPO,
     "model_revision": MODEL_REVISION,
@@ -262,8 +276,6 @@ JUDGE_SPEC = {
     "allowed_answers": ["TRUE", "FALSE"],
     "prefix_caching": True,
     "max_model_len": MAX_MODEL_LEN,
-    "max_num_batched_tokens": MAX_BATCH_TOKENS,
-    "max_num_seqs": MAX_SEQS,
 }
 JUDGE_FULL_HASH = _full_hash(JUDGE_SPEC)
 JUDGE_ID = _named_id("j", JUDGE_FULL_HASH)
@@ -384,8 +396,8 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
                                       create_if_missing=True)
 
 
-# severe_terms is not listed here: adding a table changes corpus_id,
-# invalidating all label-set identities. It is read in judge_workload.
+# Every table here feeds corpus_id, so adding or removing one
+# invalidates every label-set identity and forces a full relabel.
 CORPUS_COLUMNS = {
     "reviews": ("id", "body"),
     "aspects": ("id", "aspect"),
@@ -617,7 +629,7 @@ class ModelJudge:
             max_model_len=MAX_MODEL_LEN,
             max_num_batched_tokens=MAX_BATCH_TOKENS,
             max_num_seqs=MAX_SEQS,
-            gpu_memory_utilization=0.92,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
             enable_prefix_caching=True,
             disable_log_stats=True)
         self.sampling = SamplingParams(
@@ -961,14 +973,7 @@ def judge_workload(corpus_id: str, workload: str) -> str:
         raise ValueError(f"no predicates for workload {workload!r}")
     t_total = time.perf_counter()
     results_vol.reload()
-    corpus_dir, corpus_manifest, rows = _load_corpus(corpus_id)
-    if workload == "biodex":
-        # severe_terms is added here, not via CORPUS_COLUMNS - see the
-        # comment on CORPUS_COLUMNS for why.
-        import pyarrow.parquet as pq
-        rows["severe_terms"] = pq.read_table(
-            corpus_dir / "severe_terms.parquet",
-            columns=["id", "term"]).to_pylist()
+    _, corpus_manifest, rows = _load_corpus(corpus_id)
     identities = {
         spec.key: label_set_identity(
             spec, corpus_manifest["corpus_id"],

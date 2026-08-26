@@ -1,7 +1,7 @@
 """Plot Qwen3 32B ground-truth selectivity for the 4 predicates added to
 support the new multi-join queries (IMDB-8/9/11, BIO-6, FEV-7/C/D).
 
-    uv run --with matplotlib python reports/make_new_multijoin_predicates_plots.py
+    uv run --with matplotlib python reports/old/make_new_multijoin_predicates_plots.py
 """
 
 import json
@@ -13,13 +13,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE.parents[1]
 OUT = HERE / "plots"
 OUT.mkdir(parents=True, exist_ok=True)
 ARTIFACT_STEM = "20260826T040743Z-new-multijoin-predicates-ground-truth"
 
-plt.style.use(HERE / "quail.mplstyle")
-sys.path.insert(0, str(HERE))
+plt.style.use(HERE.parent / "quail.mplstyle")
+sys.path.insert(0, str(HERE.parent))
 from plot_colors import BLUE, GREEN, ORANGE
 
 WORKLOAD_COLORS = {"imdb": BLUE, "biodex": ORANGE, "fever": GREEN}

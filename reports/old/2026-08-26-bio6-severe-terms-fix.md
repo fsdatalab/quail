@@ -1,5 +1,19 @@
 # BIO-6's REACTION_SEVERE join: a smaller terms table to fix ground-truth OOM
 
+**Superseded on 2026-08-26.** The fix described here was the wrong one and
+has been reverted. Shrinking BIO-6's second join to 64 terms changed the
+benchmark to work around a limit in the offline labeling job. The
+out-of-memory crash came from the judge's vLLM settings, which were copied
+from the 4B engine runs: `gpu_memory_utilization=0.92` left 5.38 GiB free on
+an 80 GiB H100 while a 5.41 GiB prefill activation needed room. The judge now
+runs at 0.85 and BIO-6's second join is back to the full 614-term table. The
+diagnosis below ("the real cause was scale") is wrong: `rows_per_call(614)`
+is 1, so the batch-halving test it cites never changed anything, and vLLM
+re-chunks whatever it is handed anyway, so the 122,800 pairs were never
+resident on the GPU at once. See
+`reports/shipped_features/2026-08-26-judge-identity-and-bio6-full-terms.md`.
+
+
 ## Result
 
 `REACTION_SEVERE` (BIO-6's second join) now has ground truth, and all 4 predicates needed for the new multi-join queries are labeled: `ASPECT_SENTIMENT`, `ASPECT_RELATED`, `REACTION_SEVERE`, `REFUTE`.
