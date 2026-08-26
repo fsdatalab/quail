@@ -5,6 +5,14 @@ in this repository. The old exploration files are available in Git
 history at commit `e617c512dc40989deaeff66614af4b706a0a4be4`.
 The engine does not depend on those experiment scripts.
 
+Update (2026-08-26): the pinned CPU KV store described below was
+removed (issue #32). Document KV now lives only in the GPU arena,
+for the duration of one query, and QUAIL-B runs a single pass
+instead of a cold and a warm pass. Sections that mention the store,
+restore, `cpu_memory_gb`, or the warm pass describe the original
+design, not the current engine. `reports/engine-wiki.md` is the
+current reference.
+
 Scope: AI_FILTER and AI_JOIN only. Qwen3 4B fp8 is the first model,
 H100 workers on Modal the first device — but the optimizer is built
 against model/device structs from day one (§8), not against our

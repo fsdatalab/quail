@@ -28,6 +28,12 @@ Removed:
   and nothing called them any more. If KV persistence in GPU memory
   is added later, the scheduler hook gets rebuilt for the arena's
   semantics (a resident document already owns pages).
+- The store-era reports (`2026-08-18-milestone1-vs-stock-vllm`,
+  `2026-08-18-quailb-sf0.1`, `2026-08-19-quailb-sf0.1`), their plot
+  script `make_plots.py`, and their two PNGs. Their cold/warm
+  numbers describe removed behavior. `plans/engine_design.md` keeps
+  its original store sections with a note that they no longer
+  describe the engine.
 
 ## Why
 
