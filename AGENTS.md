@@ -86,9 +86,10 @@ All experiment and feature reports live under `reports/`.
   and what the numbers mean. Cite the data by its `quail-results`
   volume path.
 - When a report is superseded or its numbers are no longer current,
-  delete it and its plot script. Before starting a new task, scan
-  `reports/` for reports whose results have been replaced by newer
-  runs or whose code no longer exists, and delete them.
+  delete the report, its plot script, and its PNGs from
+  `reports/plots/`. Before starting a new task, scan `reports/`
+  for outdated reports, orphaned plot scripts, and PNGs not
+  referenced by any current report, and delete them all.
 - When a PR ships a new feature (a code change that lands on main),
   add a short description in `reports/shipped_features/`.
   Name the file `YYYY-MM-DD-<short-slug>.md`. It should say what
