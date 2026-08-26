@@ -145,10 +145,11 @@ here is.
 
 **Which side anchors.** Anchoring the long side costs one prefix per
 document. Anchoring the short side puts a full copy of every long
-document into every tuple. The planner keeps the cheaper side, so
-the calculation prices both choices and keeps the cheaper one. The
-join token counts differ by 14.9 times on FEV-2 and 193.7 times on
-BIO-2.
+document into every tuple. The planner keeps the cheaper feasible side,
+so the calculation prices both choices and checks each one against the
+model's chunk limit. The physical plan and runtime anchor choice are
+computed separately for 4B and 32B. The join token counts differ by 14.9
+times on FEV-2 and 193.7 times on BIO-2.
 
 ### Several joins
 
@@ -224,7 +225,8 @@ section 3:
 `simulate_query()` follows the physical plan. It applies the exact saved
 labels after every filter and join stage. `join_stage_work()` counts one
 stage for the anchor and partner sets that remain, and `runtime_anchor()`
-uses the same token arithmetic as the runtime anchor choice.
+uses the same token arithmetic as the runtime anchor choice. The script calls
+both functions separately for each model and passes that model's chunk limit.
 `speed_of_light()` is section 4. Nothing in the engine imports this
 calculation. It is analysis and is not a planner input.
 

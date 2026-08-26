@@ -447,7 +447,8 @@ def join_stage_work(anchor, partners, aliases, survivors, prompt,
     return work
 
 
-def runtime_anchor(join, compiled_anchor, aliases, survivors):
+def runtime_anchor(join, compiled_anchor, aliases, survivors,
+                   chunk_tokens: int):
     prompt = join.predicate
     labels_by_alias, tail = prompt_token_counts(prompt)
     candidates = [arg.alias for arg in prompt.args]
@@ -478,13 +479,13 @@ def runtime_anchor(join, compiled_anchor, aliases, survivors):
                    + labels_by_alias[anchor]["frame"])
                 + tuples * per_tuple)
 
-    chunk = min(CHUNK.values())
     feasible = [alias for alias in candidates
-                if alias == compiled_anchor or need(alias) <= chunk]
+                if alias == compiled_anchor
+                or need(alias) <= chunk_tokens]
     return min(feasible, key=total)
 
 
-def simulate_query(query):
+def simulate_query(query, chunk_tokens: int):
     plan = query.plan()
     if isinstance(plan, Refusal):
         raise ValueError(f"SoL query was refused: {plan.reasons}")
@@ -553,7 +554,7 @@ def simulate_query(query):
         anchor = node["anchor"]
         if len(stage_defs) == 1 and stage_defs[0].anchor is None:
             anchor = runtime_anchor(
-                stage_defs[0], anchor, aliases, survivors)
+                stage_defs[0], anchor, aliases, survivors, chunk_tokens)
 
         for stage_index, join in enumerate(stage_defs):
             prompt = join.predicate
@@ -653,33 +654,41 @@ def simulate_query(query):
 # PART 3: every query, on both models
 # ================================================================
 
-session = quail.Session(
-    EngineConfig(gpus=1, cpu_memory_gb=80, model="qwen3-4b-fp8"),
-    tokenizer=encode)
-Q.register_sets(session, W / "data" / TAG)
-query_defs = Q.queries(session)
+query_defs_by_model = {}
+for model in MODELS:
+    session = quail.Session(
+        EngineConfig(gpus=1, cpu_memory_gb=80, model=model.name),
+        tokenizer=encode)
+    Q.register_sets(session, W / "data" / TAG)
+    query_defs_by_model[model.name] = Q.queries(session)
+
+query_ids = list(query_defs_by_model[MODELS[0].name])
+if any(list(query_defs_by_model[model.name]) != query_ids for model in MODELS):
+    raise ValueError("4B and 32B query definitions do not have the same ids")
+
 rows = {}
 query_inputs = {}
-for qid, (description, build) in query_defs.items():
-    simulated = simulate_query(build())
-    work = simulated.pop("work")
-    rows[qid] = {
-        "description": description,
-        **simulated,
-        "tuples": simulated["join_pair_evaluations"],
-        "tokens": work.tokens, "pairs": work.pairs,
-        "kv_written": work.kv_written, "kv_read": work.kv_read,
-        "models": {}}
-    query_inputs[qid] = {
-        "filters": simulated["filter_stages"],
-        "joins": simulated["join_stages"],
-    }
-    held = simulated["held_column"]
-    rows[qid]["held_mean_doc_tokens"] = (
-        sum(lengths[held].values()) / len(lengths[held]))
+for qid in query_ids:
+    descriptions = {
+        query_defs_by_model[model.name][qid][0] for model in MODELS}
+    if len(descriptions) != 1:
+        raise ValueError(f"model query descriptions differ for {qid}")
+    rows[qid] = {"description": descriptions.pop(), "models": {}}
+    query_inputs[qid] = {}
     for model in MODELS:
+        _, build = query_defs_by_model[model.name][qid]
+        simulated = simulate_query(build(), CHUNK[model.name])
+        work = simulated.pop("work")
+        held = simulated["held_column"]
         s = speed_of_light(work, model, H100_SXM, CHUNK[model.name])
         rows[qid]["models"][model.name] = {
+            **simulated,
+            "chunk_tokens": CHUNK[model.name],
+            "tuples": simulated["join_pair_evaluations"],
+            "tokens": work.tokens, "pairs": work.pairs,
+            "kv_written": work.kv_written, "kv_read": work.kv_read,
+            "held_mean_doc_tokens": (
+                sum(lengths[held].values()) / len(lengths[held])),
             "passes": s.passes, "bytes_moved": s.bytes_moved,
             "t_dense": s.dense, "t_attention": s.attention,
             "t_compute": s.compute, "t_memory": s.memory,
@@ -693,19 +702,21 @@ for qid, (description, build) in query_defs.items():
                 simulated["join_pair_evaluations"] / s.seconds
                 if simulated["join_stages"] and s.seconds else None),
         }
+        query_inputs[qid][model.name] = {
+            "filters": simulated["filter_stages"],
+            "joins": simulated["join_stages"],
+        }
 
-hdr = (f"{'query':7} {'tokens':>11} {'pairs':>15} {'tuples':>10} "
-       f"{'anchor':>15}  {'4B SoL':>9} {'att%':>5}  {'32B SoL':>9} "
-       f"{'att%':>5} {'32B/4B':>7}")
+hdr = (f"{'query':7} {'4B tokens':>11} {'4B anchor':>15} {'4B SoL':>9} "
+       f"{'32B tokens':>11} {'32B anchor':>15} {'32B SoL':>9} "
+       f"{'32B/4B':>7}")
 print(hdr)
 print("-" * len(hdr))
 for qid, r in rows.items():
     a, b = r["models"]["qwen3-4b-fp8"], r["models"]["qwen3-32b-fp8"]
-    print(f"{qid:7} {r['tokens']:>11,.0f} {r['pairs']:>15,.0f} "
-          f"{r['tuples']:>10,} {str(r['anchor'] or '-'):>15}  "
-          f"{a['sol_s']:>9.3f} {100 * a['t_attention'] / a['t_compute']:>5.1f}"
-          f"  {b['sol_s']:>9.3f} "
-          f"{100 * b['t_attention'] / b['t_compute']:>5.1f} "
+    print(f"{qid:7} {a['tokens']:>11,.0f} {str(a['anchor'] or '-'):>15} "
+          f"{a['sol_s']:>9.3f} {b['tokens']:>11,.0f} "
+          f"{str(b['anchor'] or '-'):>15} {b['sol_s']:>9.3f} "
           f"{b['sol_s'] / a['sol_s']:>7.2f}")
 
 
@@ -749,7 +760,7 @@ json.dump({
             for k, v in lengths.items()},
         "filter_question_tokens": question,
         "join_prompt_tokens": join_prompt,
-        "query_stages": query_inputs},
+        "query_stages_by_model": query_inputs},
     "queries": rows,
 }, open(OUT, "w"), indent=1)
 print(f"\nwrote {OUT}\n"

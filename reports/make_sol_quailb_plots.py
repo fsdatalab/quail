@@ -24,8 +24,10 @@ W = Path(sys.argv[1])
 D = json.loads((W / "sol_quailb_sf0.1.json").read_text())
 Q = D["queries"]
 ORDER = list(Q)
+MODELS = ("qwen3-4b-fp8", "qwen3-32b-fp8")
 ATTENTION_ORDER = [query_id for query_id in ORDER
-                   if len(Q[query_id]["join_stages"]) <= 1]
+                   if all(len(Q[query_id]["models"][model]["join_stages"])
+                          <= 1 for model in MODELS)]
 
 
 def sol(q, model):
@@ -76,9 +78,9 @@ def plot_attention_share():
 
     A token attending over a 4,146-token report scores 4,146 pairs; a
     token attending over an 11-token claim scores 11. So the longer
-    the context, the more of the work is attention. The 32B dot sits
-    below the 4B one everywhere, because attention scales 3.56x with
-    model size where the dense projections scale 8.59x.
+    the context, the more of the work is attention. Each model uses
+    the context selected by its own plan and runtime anchor choice.
+    A line connects the two model results for one query.
 
     Multi join queries are omitted because they can use more than one
     anchor context. Points are not labelled by query because many
@@ -89,22 +91,31 @@ def plot_attention_share():
         m = Q[q]["models"][model]
         return 100 * m["t_attention"] / m["t_compute"]
 
-    x = [Q[q]["held_mean_doc_tokens"] for q in ATTENTION_ORDER]
+    x_by_model = {
+        model: [Q[q]["models"][model]["held_mean_doc_tokens"]
+                for q in ATTENTION_ORDER]
+        for model in MODELS}
     fig, ax = plt.subplots(figsize=(8.4, 4.6))
-    ax.vlines(x, [share(q, "qwen3-32b-fp8") for q in ATTENTION_ORDER],
-              [share(q, "qwen3-4b-fp8") for q in ATTENTION_ORDER],
-              color=DARK, lw=0.7, alpha=0.25)
+    for index, query_id in enumerate(ATTENTION_ORDER):
+        ax.plot([x_by_model[model][index] for model in MODELS],
+                [share(query_id, model) for model in MODELS],
+                color=DARK, lw=0.7, alpha=0.25)
     for model, colour, label in (("qwen3-4b-fp8", BLUE, "Qwen3-4B-fp8"),
                                  ("qwen3-32b-fp8", ORANGE,
                                   "Qwen3-32B-fp8")):
-        ax.scatter(x, [share(q, model) for q in ATTENTION_ORDER], s=34,
-                   color=colour, label=label, zorder=3)
+        ax.scatter(x_by_model[model],
+                   [share(q, model) for q in ATTENTION_ORDER],
+                   s=34, color=colour, label=label, zorder=3)
 
     for ctx, (name, ty) in CONTEXTS.items():
-        top = max(share(q, "qwen3-4b-fp8") for q in ATTENTION_ORDER
-                  if abs(Q[q]["held_mean_doc_tokens"] - ctx) < 0.05)
-        n = sum(1 for q in ATTENTION_ORDER
-                if abs(Q[q]["held_mean_doc_tokens"] - ctx) < 0.05)
+        matching = [
+            (query_id, model)
+            for query_id in ATTENTION_ORDER
+            for model in MODELS
+            if abs(Q[query_id]["models"][model]["held_mean_doc_tokens"]
+                   - ctx) < 0.05]
+        top = max(share(query_id, model) for query_id, model in matching)
+        n = len({query_id for query_id, _ in matching})
         ax.vlines(ctx, top + 0.8, ty - 1.6, color=DARK, lw=0.6,
                   alpha=0.35)
         ax.text(ctx, ty, f"{name}\n{ctx:,.0f} tokens, "
