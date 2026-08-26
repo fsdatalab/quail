@@ -1,6 +1,11 @@
 """Plot Qwen3 32B ground-truth selectivity for QUAIL-B at sf=0.1.
 
-    uv run --with matplotlib python reports/make_quailb_ground_truth_plots.py
+Superseded: these selectivities predate PR #56, which removed a
+duplicated ANSWER= cue from the templates. Kept so the old report's
+figure can be rebuilt.
+
+    uv run --with matplotlib python \
+        reports/old/make_quailb_ground_truth_plots.py
 """
 
 import json
@@ -12,13 +17,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE.parents[1]
 OUT = HERE / "plots" / "benchmark"
 OUT.mkdir(parents=True, exist_ok=True)
 ARTIFACT_STEM = "20260825T082145Z-quailb-qwen32b-ground-truth-sf0.1"
 
-plt.style.use(HERE / "quail.mplstyle")
-sys.path.insert(0, str(HERE))
+plt.style.use(HERE.parent / "quail.mplstyle")
+sys.path.insert(0, str(HERE.parent))
 from plot_colors import BLUE, GREEN, ORANGE, TEAL
 
 with open(ROOT / "results" / "benchmark"

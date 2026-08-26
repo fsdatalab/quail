@@ -1,3 +1,10 @@
+> Superseded by `reports/2026-08-26-parallel-judge-pass.md`. The
+> selectivities below were measured with templates that carried a
+> duplicated `ANSWER=` cue, removed in PR #56. Relabelling moved 14
+> of the 19 predicates, the BioDEX reaction join by a factor of 244.
+> The collection described here, `gt_42674891c824e01c6d966eb48c9cf8c7`,
+> is no longer active.
+
 # QUAIL-B Qwen3 32B ground truth at scale factor 0.1
 
 ## Result
