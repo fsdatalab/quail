@@ -57,7 +57,7 @@ def plot_sol_per_query():
     ax.set_ylim(0.015, 600)
     ax.legend(frameon=False, loc="upper right", fontsize=8)
     fig.tight_layout()
-    fig.savefig(OUT / "sol_quailb_per_query.png", dpi=150)
+    fig.savefig(OUT / "sol_quailb_per_query.png", dpi=300)
 
 
 # Each context length, the document set it comes from, and where to
@@ -130,7 +130,7 @@ def plot_attention_share():
     ax.set_ylabel("attention share of compute, percent")
     ax.legend(frameon=False, loc="upper left", fontsize=8.5)
     fig.tight_layout()
-    fig.savefig(OUT / "sol_quailb_attention_share.png", dpi=150)
+    fig.savefig(OUT / "sol_quailb_attention_share.png", dpi=300)
 
 
 OUT.mkdir(exist_ok=True)

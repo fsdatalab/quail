@@ -150,7 +150,7 @@ def main(workdir: Path) -> None:
     axes[0].legend(loc="upper right", ncols=2)
     OUT.mkdir(exist_ok=True)
     output = OUT / "stock_vllm_vs_quail.png"
-    fig.savefig(output, dpi=150)
+    fig.savefig(output, dpi=300)
     plt.close(fig)
     print(f"wrote {output}")
 

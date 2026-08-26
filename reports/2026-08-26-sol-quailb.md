@@ -5,9 +5,14 @@
 The least time each QUAIL-B query at sf=0.1 can take on one H100! request,
 for Qwen3-4B-fp8 and Qwen3-32B-fp8. Only three things are counted:
 the dense projection FLOPs, the attention pair FLOPs, and the bytes
-moved. Everything a real run also pays - kernel efficiency, launch
-gaps, scheduling, the host - is left out, so a run can approach
-these numbers and can never beat them.
+moved. The calculation leaves out kernel efficiency, launch gaps,
+scheduling, and host work.
+
+For joins, the calculation checks every feasible left deep relation order,
+every order for predicates that connect the new relation, and every anchor
+choice. A left deep plan adds one relation to the current result at each
+step. The search runs separately for 4B and 32B on one H100! because the two
+models have different batch limits and different work costs.
 
 Nothing here is fitted or measured on a GPU. The equations are
 `plans/sol_model.md`, and `reports/make_sol_quailb.py` is those
@@ -28,17 +33,24 @@ All three label predictions matched. The pass predicted 27 to 35 minutes
 for the slowest workload and measured 50.6 minutes. It predicted $5 to $9
 and measured about $7.
 
-The model specific anchor correction predicted that all 35 current queries
-would choose the same orientation on 4B and 32B. The new calculation matched
-the prediction. The output still stores the plan and orientation separately
-for each model.
+Before adding the join optimizer, I predicted three results:
 
-Before the regeneration, I predicted that BIO-6 would increase the most
-because its second join now uses all 614 terms instead of 64 terms. BIO-6
-increased from 135,088 to 240,074 evaluated pairs. Its SoL increased from
-16.663 to 26.033 seconds for 4B and from 111.222 to 173.157 seconds for 32B.
-BIO-C and BIO-D changed by less than 0.3 percent because the new REACTION
-labels removed a slightly different set of rows before their later joins.
+1. Filter only queries and queries with one join would not change.
+2. Some queries with several joins would improve because the current planner
+   does not check every left deep order using exact ground truth survivors.
+3. The subset DP pruning rule would match complete enumeration in a small
+   controlled test.
+
+All three predictions matched. The 26 queries with at most one join are
+unchanged. Seven of the nine queries with several joins improve. Two are
+unchanged. The largest improvement is FEV-8. Its 4B estimate decreases from
+0.900 seconds with the current planner to 0.787 seconds with the best left
+deep plan. Its 32B estimate decreases from 7.460 seconds to 6.520 seconds.
+
+The unit test for the DP matches complete enumeration. The production SoL run
+does not repeat complete enumeration. The output stores the best plan
+separately for 4B and 32B. It also stores the current planner result so the
+difference remains visible.
 
 ## Ground truth setup and result
 
@@ -48,9 +60,9 @@ FEVER, and LePaRD. LePaRD's citation join uses source passage IDs. FEVER
 uses its source annotation for 63 support pairs. Qwen judged the remaining
 rows.
 
-The completed collection has 434,201 labels across 23 predicates. The
-collection includes all eight join predicates used by the 35 queries. Its
-summary is at
+The completed collection has 434,201 labels across 23 predicates. The current
+35 queries use 22 of those predicates, including seven join predicates. The
+remaining predicate is the retired `ASPECT_RELATED` join. The summary is at
 `/results/ground_truth/quailb/schema_v1/collections/gt_04231c5de83cdf9e7e68fc03849959d6/summary.json`
 on the `quail-results` volume. The collection is active for corpus
 `c_df45ef585738f42e4a7a731306f1b9fc`.
@@ -159,28 +171,47 @@ section 3.
 
 ## How queries with several joins are counted
 
-The calculation follows the physical plan stage by stage. It uses the
-saved TRUE and FALSE pair labels to determine which documents reach each
-later join. Consecutive stages with the same anchor reuse the document KV
-and write a new complete question once per surviving anchor.
+All filters run before the join search. The first filter on an alias computes
+its document prefix KV. Later filters on the same alias reuse that KV. Every
+surviving document from a filtered alias is therefore already available in
+KV when joins start.
 
-An anchor change creates a barrier. The calculation uses the passing pair
-relations at the barrier to remove documents that cannot appear in the
-final result. It then computes the new anchor prefix once and continues
-with the smaller document sets.
+The join search uses a subset DP. A DP state contains two sets:
 
-The calculation builds the physical plan separately for 4B and 32B. A free
-join chooses its runtime anchor with that model's chunk limit, which is
-110,376 tokens for 4B and 41,943 tokens for 32B. Work counts, stage details,
-and anchor choices are stored separately for each model. The current 35
-queries choose the same orientations on both models.
+1. The aliases already joined.
+2. The aliases whose document prefix KV is available.
 
-For example, IMDB-9 evaluates 60,000 review and aspect pairs in its first
-join. The first join leaves all 12 aspect values live for the next stage,
-so the next two joins evaluate 144 pairs each. The total is 60,288 pair
-evaluations. BIO-C evaluates 122,800 pairs, then 107,800 pairs after its
-first barrier, then 117,274 pairs after the next gate. The total is
-347,874 pair evaluations.
+The second set is needed because anchor choices change future work. The model
+assumes unlimited KV capacity. Once an alias enters the second set, it stays
+there. Only document prefix KV is reusable. Partner suffix KV is not reusable.
+An alias with no filter enters the set the first time it is used as an anchor.
+
+For each state, the DP tries every relation that has a join predicate to the
+current subset. It tries every order for predicates that connect the new
+relation. It tries both ends of every binary predicate as the anchor. Each
+choice includes the exact anchor marker, partner marker, join question,
+partner document, and answer cue token counts.
+
+The saved TRUE and FALSE labels give the exact rows that survive each logical
+intermediate. A join graph without a cycle uses repeated exact filtering over
+its edges. A join graph with a cycle uses exact assignment checks because
+pairwise filtering alone can keep rows that do not occur in any complete
+result.
+
+Several work records can reach the same state. A record is removed only when
+another record is no larger in fresh tokens, attention pairs, KV writes, and
+KV reads. Compute time and memory time are combined only after the final plan
+is known.
+
+The search runs separately with the 4B and 32B batch limits. A small unit test
+compares the DP result with complete enumeration. The QUAIL-B calculation runs
+only the DP.
+
+For example, the best IMDB-9 plan evaluates 60,000 pairs, then 44,412 pairs,
+then 60,000 pairs. The total is 164,412 pair evaluations, compared with
+175,224 for the current planner. The best BIO-7 plan evaluates 122,800 pairs,
+then 92,400 pairs, then 110,520 pairs. The total is 325,720 pairs, compared
+with 341,120 for the current planner.
 
 The SoL work is the sum of all filter and join stages. For a query with a
 join, document pairs per second at SoL is the sum of evaluated pairs across
@@ -201,6 +232,10 @@ time. They are not measured Quail metrics. Measured Quail metrics require the
 wall time from an engine run. The cost at SoL includes GPU time only, so it
 does not include CPU or memory charges.
 
+For queries with several joins, the table reports the best left deep plan.
+The JSON file also contains the current planner result and its ratio to this
+minimum.
+
 | Query | Stages | Work units | 4B SoL | 4B $/query at SoL | 4B docs/s or pairs/s at SoL | 32B SoL | 32B $/query at SoL | 32B docs/s or pairs/s at SoL |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | IMDB-1 | 1F | 5,000 documents | 6.722 s | $0.00737 | 743.8 | 56.413 s | $0.06188 | 88.6 |
@@ -210,26 +245,26 @@ does not include CPU or memory charges.
 | IMDB-5 | 3F + 1J | 8,028 pairs | 8.101 s | $0.00889 | 991.0 | 67.840 s | $0.07442 | 118.3 |
 | IMDB-6 | 2F | 5,000 documents | 7.419 s | $0.00814 | 673.9 | 62.223 s | $0.06826 | 80.4 |
 | IMDB-7 | 3F | 5,000 documents | 7.617 s | $0.00836 | 656.4 | 63.856 s | $0.07005 | 78.3 |
-| IMDB-9 | 3J | 60,288 pairs | 9.297 s | $0.01020 | 6,484.4 | 77.852 s | $0.08540 | 774.4 |
-| IMDB-11 | 1F + 3J | 48,336 pairs | 9.582 s | $0.01051 | 5,044.6 | 80.207 s | $0.08799 | 602.6 |
-| IMDB-8 | 2J | 115,224 pairs | 12.602 s | $0.01382 | 9,143.3 | 105.337 s | $0.11555 | 1,093.9 |
+| IMDB-9 | 3J | 164,412 pairs | 21.253 s | $0.02331 | 7,736.0 | 177.781 s | $0.19503 | 924.8 |
+| IMDB-10 | 1F + 3J | 152,460 pairs | 21.537 s | $0.02363 | 7,078.9 | 180.136 s | $0.19761 | 846.4 |
+| IMDB-8 | 2J | 104,412 pairs | 11.972 s | $0.01313 | 8,721.1 | 100.073 s | $0.10978 | 1,043.4 |
 | BIO-1 | 1F | 200 documents | 4.499 s | $0.00494 | 44.5 | 31.502 s | $0.03456 | 6.3 |
 | BIO-2 | 1J | 122,800 pairs | 15.592 s | $0.01710 | 7,875.9 | 104.147 s | $0.11425 | 1,179.1 |
 | BIO-3 | 1F + 1J | 75,522 pairs | 11.482 s | $0.01260 | 6,577.5 | 76.857 s | $0.08431 | 982.6 |
 | BIO-4 | 2F + 1J | 54,646 pairs | 9.620 s | $0.01055 | 5,680.5 | 64.656 s | $0.07093 | 845.2 |
 | BIO-5 | 3F + 1J | 36,840 pairs | 7.879 s | $0.00864 | 4,675.7 | 53.707 s | $0.05892 | 685.9 |
-| BIO-C | 3J | 347,874 pairs | 40.195 s | $0.04409 | 8,654.7 | 267.945 s | $0.29394 | 1,298.3 |
-| BIO-D | 1F + 3J | 289,596 pairs | 35.021 s | $0.03842 | 8,269.2 | 233.692 s | $0.25636 | 1,239.2 |
-| BIO-6 | 2J | 240,074 pairs | 26.033 s | $0.02856 | 9,221.9 | 173.157 s | $0.18995 | 1,386.5 |
+| BIO-7 | 3J | 325,720 pairs | 38.261 s | $0.04197 | 8,513.0 | 255.351 s | $0.28012 | 1,275.6 |
+| BIO-8 | 1F + 3J | 282,228 pairs | 34.346 s | $0.03768 | 8,217.1 | 229.302 s | $0.25154 | 1,230.8 |
+| BIO-6 | 2J | 233,320 pairs | 25.395 s | $0.02786 | 9,187.7 | 169.052 s | $0.18545 | 1,380.2 |
 | FEV-1 | 1F | 100 documents | 0.025 s | $0.00003 | 4,077.7 | 0.210 s | $0.00023 | 476.3 |
 | FEV-2 | 1J | 5,700 pairs | 0.568 s | $0.00062 | 10,031.2 | 4.707 s | $0.00516 | 1,211.0 |
 | FEV-3 | 1F + 1J | 3,648 pairs | 0.417 s | $0.00046 | 8,738.5 | 3.468 s | $0.00380 | 1,052.0 |
 | FEV-4 | 2F + 1J | 570 pairs | 0.184 s | $0.00020 | 3,098.0 | 1.540 s | $0.00169 | 370.0 |
 | FEV-5 | 2F + 1J | 2,368 pairs | 0.322 s | $0.00035 | 7,351.5 | 2.679 s | $0.00294 | 884.0 |
 | FEV-6 | 3F + 1J | 370 pairs | 0.174 s | $0.00019 | 2,124.4 | 1.459 s | $0.00160 | 253.6 |
-| FEV-C | 3J | 9,896 pairs | 1.011 s | $0.00111 | 9,784.4 | 8.384 s | $0.00920 | 1,180.4 |
-| FEV-D | 1F + 3J | 6,431 pairs | 0.739 s | $0.00081 | 8,700.3 | 6.140 s | $0.00674 | 1,047.4 |
-| FEV-7 | 2J | 7,296 pairs | 0.791 s | $0.00087 | 9,228.1 | 6.554 s | $0.00719 | 1,113.2 |
+| FEV-8 | 3J | 7,211 pairs | 0.787 s | $0.00086 | 9,160.4 | 6.520 s | $0.00715 | 1,105.9 |
+| FEV-9 | 1F + 3J | 5,576 pairs | 0.672 s | $0.00074 | 8,296.9 | 5.585 s | $0.00613 | 998.5 |
+| FEV-7 | 2J | 7,011 pairs | 0.769 s | $0.00084 | 9,116.5 | 6.375 s | $0.00699 | 1,099.7 |
 | LEP-1 | 1F | 200 documents | 0.219 s | $0.00024 | 912.7 | 1.848 s | $0.00203 | 108.2 |
 | LEP-2 | 1J | 40,000 pairs | 14.582 s | $0.01600 | 2,743.1 | 121.563 s | $0.13335 | 329.0 |
 | LEP-3 | 1F + 1J | 800 pairs | 0.515 s | $0.00057 | 1,553.0 | 4.277 s | $0.00469 | 187.0 |
@@ -249,10 +284,10 @@ amortize away.
 
 A join has to pick a side to anchor. Anchoring the long side costs
 one prefix per document; anchoring the short side copies every long
-document into every tuple. The bound prices both feasible choices for
-each model and keeps the cheaper one, because that is what the engine
-does. Both models make the same choices for every join in the current
-suite, so one orientation is shown below.
+document into every tuple. The search prices both feasible choices for
+each model and keeps the one that contributes to the best complete plan.
+Both models make the same choices for every join in the current suite, so
+one orientation is shown below.
 
 | join | side held | side streamed | join tokens as run | join tokens the other way | cost of choosing wrong |
 |---|---|---|---|---|---|
@@ -312,21 +347,22 @@ dearer.
 ## Ground truth labels
 
 The selectivities above come from active collection
-`gt_04231c5de83cdf9e7e68fc03849959d6`. All 23 predicates use the current
-prompt layout. All 8 joins use renderer
-`join_anchor_question_then_partners_v2`. The compact files contain
+`gt_04231c5de83cdf9e7e68fc03849959d6`. The 22 predicates used by the current
+queries have the current prompt layout. The active collection also contains
+the retired `ASPECT_RELATED` labels as its 23rd predicate. All join labels use
+renderer `join_anchor_question_then_partners_v2`. The compact files contain
 394,138 Qwen3 32B labels and 40,063 source labels.
 
-The calculation uses the exact document IDs that pass each filter. It
-does not infer survivor lengths from selectivity. This matters when a
-filter is correlated with document length.
+The calculation uses the exact document IDs that pass each filter. It does
+not infer survivor lengths from selectivity. This matters when a filter is
+correlated with document length.
 
 ## What this does not settle
 
 - **The nine queries with several joins have not been checked against a
-  measured Quail run.** Their token counts follow the physical plan and the
-  exact saved labels, but this report does not yet compare those counts with
-  the engine's measured fresh token count.
+  measured Quail run.** Their token counts describe the best left deep plan
+  under the stated unlimited KV rules. The current engine may use a different
+  plan. This report does not compare those counts with measured fresh tokens.
 - **The floor is loose.** `max(T_compute, T_memory)` taken once at
   the top is weaker than taking it per kernel and summing. Both are
   lower bounds; the per-kernel one would be larger and tighter.

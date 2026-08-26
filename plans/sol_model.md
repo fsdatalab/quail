@@ -145,25 +145,37 @@ here is.
 
 **Which side anchors.** Anchoring the long side costs one prefix per
 document. Anchoring the short side puts a full copy of every long
-document into every tuple. The planner keeps the cheaper feasible side,
-so the calculation prices both choices and checks each one against the
-model's chunk limit. The physical plan and runtime anchor choice are
-computed separately for 4B and 32B. The join token counts differ by 14.9
-times on FEV-2 and 193.7 times on BIO-2.
+document into every tuple. The calculation checks both feasible choices
+and checks each one against the model's chunk limit. The search runs
+separately for 4B and 32B. The join token counts differ by 14.9 times on
+FEV-2 and 193.7 times on BIO-2.
 
 ### Several joins
 
-The calculation follows the physical plan one join stage at a time.
-Consecutive stages with the same anchor reuse the document KV. Each
-stage writes its own complete frame once per live anchor. The TRUE and
-FALSE pair labels from one stage determine which anchor documents reach
-the next stage.
+All filters run before joins. A filtered alias has reusable document prefix
+KV when the join search starts. An unfiltered alias gets reusable document
+prefix KV the first time it is an anchor. The model assumes unlimited KV
+capacity, so reusable prefixes are never removed. Partner suffix KV is never
+reusable.
 
-An anchor change creates a barrier. At the barrier, the calculation
-uses the saved passing pairs to remove documents that cannot appear in
-the final result. It then computes the new anchor prefix once and counts
-the next stage over the smaller document sets. The query work is the sum
-of the filter work and every join stage's work.
+The calculation checks every feasible left deep plan. A left deep plan starts
+with one alias and adds one alias at each step. If several predicates connect
+the new alias to the current result, it checks every order for those
+predicates. It also checks both aliases of every binary predicate as the
+anchor.
+
+The subset DP state is `(S, K)`. `S` is the set of aliases already joined.
+`K` is the set of aliases whose document prefix KV is available. Several work
+records can reach the same state. A record is removed only if another record
+is no larger in tokens, attention pairs, KV writes, and KV reads.
+
+The active ground truth labels give the exact logical rows for each
+intermediate. Join graphs without cycles use repeated filtering over their
+edges. Join graphs with cycles use exact assignment checks. The query work is
+the sum of all filter work and every join stage's work.
+
+A unit test compares the DP with complete enumeration on a small controlled
+query. The QUAIL-B calculation runs only the DP.
 
 ## 4. Speed of light
 
@@ -222,11 +234,14 @@ section 3:
 | `ask(prefix, suffix)` | stage `s > 1`: `suffix` tokens, `suffix * prefix + T(suffix)` pairs |
 | `stream(prefix, suffixes)` | a join's tuples: `ask` per suffix, one prefix read |
 
-`simulate_query()` follows the physical plan. It applies the exact saved
-labels after every filter and join stage. `join_stage_work()` counts one
-stage for the anchor and partner sets that remain, and `runtime_anchor()`
-uses the same token arithmetic as the runtime anchor choice. The script calls
-both functions separately for each model and passes that model's chunk limit.
+`simulate_optimal_left_deep()` builds the exact join relations from the saved
+labels. `join_stage_work()` counts one stage for each anchor choice.
+`optimize_left_deep()` searches relation subsets and KV availability. A unit
+test compares its result with complete enumeration on a small query.
+
+`simulate_query()` still follows the current physical planner. Its result is
+stored beside the optimum for comparison. The script calls both simulations
+separately for each model and passes that model's chunk limit.
 `speed_of_light()` is section 4. Nothing in the engine imports this
 calculation. It is analysis and is not a planner input.
 
@@ -234,6 +249,8 @@ calculation. It is analysis and is not a planner input.
 
 - **KV read is a minimum**, one read per anchor per stage. An anchor
   whose tuples straddle a chunk boundary is read twice.
+- **KV capacity is unlimited.** Every document prefix computed by a filter
+  or anchor remains available for later stages.
 - **Compute and memory overlap perfectly**, per the `max` above.
 - **Nothing is charged** for the tokenizer, the host, scheduling,
   kernel efficiency, or launch gaps. That is what makes it a floor.
