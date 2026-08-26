@@ -159,4 +159,6 @@ effectiveness research:
   categories need two colors, not five.
 - Use a log scale only when the data spans more than one order of
   magnitude. Say so in the axis label.
-- 300 DPI PNGs. No SVG (reports are markdown, rendered on GitHub).
+- Use 300 DPI PNG files. No SVG.
+- Make the canvas large enough that text and data marks remain sharp when
+  viewed on GitHub.
