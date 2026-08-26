@@ -194,6 +194,30 @@ def workload_specs(workload: str) -> tuple:
     return tuple(p for p in PREDICATES if p.workload == workload)
 
 
+def parse_function_calls(value: str) -> dict[str, str]:
+    calls = {}
+    for item in value.split(","):
+        try:
+            workload, function_call_id = item.split("=", 1)
+        except ValueError as exc:
+            raise ValueError(
+                "function calls must use workload=fc-id") from exc
+        workload = workload.strip()
+        function_call_id = function_call_id.strip()
+        if workload in calls:
+            raise ValueError(f"duplicate workload {workload!r}")
+        calls[workload] = function_call_id
+    missing = set(WORKLOADS) - set(calls)
+    unknown = set(calls) - set(WORKLOADS)
+    if missing or unknown:
+        raise ValueError(
+            f"function calls have missing={sorted(missing)}, "
+            f"unknown={sorted(unknown)}")
+    if any(not value.startswith("fc-") for value in calls.values()):
+        raise ValueError("every function call id must start with fc-")
+    return calls
+
+
 def filter_groups(specs) -> list:
     """Filter predicates grouped by the column they read, in spec order."""
     groups: dict = {}
@@ -1165,7 +1189,7 @@ def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
 
 @app.local_entrypoint()
 def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
-         only: str | None = None):
+         only: str | None = None, finalize_from: str | None = None):
     """Run the four workloads side by side, then activate the result.
 
     ``--only imdb,fever`` restricts the pass to those workloads; the
@@ -1182,6 +1206,23 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
     print(f"function call id (prepare_corpus): {call.object_id}", flush=True)
     prepared = json.loads(call.get())
     corpus_id = prepared["corpus"]["corpus_id"]
+    if finalize_from:
+        partials = {}
+        for workload, function_call_id in parse_function_calls(
+                finalize_from).items():
+            result = modal.FunctionCall.from_id(function_call_id).get()
+            partial = json.loads(result)
+            if partial["workload"] != workload:
+                raise ValueError(
+                    f"{function_call_id} returned workload "
+                    f"{partial['workload']!r}, expected {workload!r}")
+            partials[workload] = partial
+        call = finalize_collection.spawn(
+            sf, corpus_id, json.dumps(partials))
+        print(f"function call id (finalize_collection): {call.object_id}",
+              flush=True)
+        print(call.get(), flush=True)
+        return
     if prepared["complete"] and not only:
         print(f"collection {prepared['collection_id']} is already complete",
               flush=True)

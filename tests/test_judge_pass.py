@@ -11,6 +11,7 @@ from quail.bench.judge_pass import (
     example_identity,
     judgment_identity,
     label_set_identity,
+    parse_function_calls,
     predicate_payload,
     predicate_version,
     render_filter_prompt,
@@ -20,6 +21,17 @@ from quail.bench.judge_pass import (
 
 def _spec(key):
     return next(spec for spec in PREDICATES if spec.key == key)
+
+
+def test_parse_function_calls_requires_every_workload():
+    calls = parse_function_calls(
+        "imdb=fc-imdb,biodex=fc-bio,fever=fc-fever,lepard=fc-lepard")
+    assert calls == {
+        "imdb": "fc-imdb",
+        "biodex": "fc-bio",
+        "fever": "fc-fever",
+        "lepard": "fc-lepard",
+    }
 
 
 def test_stable_ids_cover_predicate_semantics_and_inputs():
