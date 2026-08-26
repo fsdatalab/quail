@@ -1,11 +1,21 @@
 """Parallel judge-pass plots.
 
-Reads results/parallel_judge_pass_sf0.1.json, and the previous
-collection's summary that file names in before_label_sets_file, and
-writes reports/plots/judge_pass_selectivity.png and
-reports/plots/judge_pass_wall.png.
+Reads the two ground-truth collection summaries off the quail-results
+volume and writes reports/plots/judge_pass_selectivity.png and
+reports/plots/judge_pass_wall.png. Everything else on the plots is
+derived here: percentages, wall time after boot, and the serial
+reconstruction.
 
-    uv run --with matplotlib python reports/make_parallel_judge_pass_plots.py
+    W=<workdir>; C=/ground_truth/quailb/schema_v1/collections
+    mkdir -p $W
+    modal volume get quail-results \
+        $C/gt_80e7582534b349bc61c087595f2e0a51/summary.json $W/after.json
+    modal volume get quail-results \
+        $C/gt_42674891c824e01c6d966eb48c9cf8c7/summary.json $W/before.json
+    uv run --with matplotlib python \
+        reports/make_parallel_judge_pass_plots.py $W
+
+The report is reports/2026-08-26-parallel-judge-pass.md.
 """
 
 import json
@@ -23,35 +33,48 @@ OUT.mkdir(exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(ROOT))
 from plot_colors import BLUE, GRAY, LIGHT_GRAY, ORANGE, DARK
+from quail.bench.judge_pass import PREDICATE_BY_KEY
 
-DATA = json.loads(
-    (ROOT / "results" / "parallel_judge_pass_sf0.1.json").read_text())
-BEFORE = json.loads((ROOT / DATA["before_label_sets_file"]).read_text())
+W = Path(sys.argv[1])
+AFTER = json.loads((W / "after.json").read_text())
+BEFORE = json.loads((W / "before.json").read_text())
 
 WORKLOAD_NAME = {"imdb": "IMDB", "biodex": "BioDEX",
                  "fever": "FEVER", "lepard": "LePaRD"}
 
 
 def selectivity_rows():
-    """Join this run's positive counts onto the previous collection's.
-
-    The predicate name, workload and before counts are stored once, in
-    the previous collection's summary, so this run's file carries only
-    what it measured."""
-    after = DATA["after_label_sets"]
+    """Join the two collections on the predicate key. The display name
+    comes from the PredicateSpec rather than either summary, because
+    the summaries carry counts and the spec carries names."""
     rows = []
-    for b in BEFORE["label_sets"]:
-        a = after[b["predicate_key"]]
+    for key, b in BEFORE["label_sets"].items():
+        a = AFTER["label_sets"][key]
+        spec = PREDICATE_BY_KEY[key]
         rows.append({
-            "legacy_code": b["legacy_code"],
-            "workload": b["workload"],
-            # counts, not percents: the two files round the percent to
-            # different places, so equal rates can compare unequal
+            "legacy_code": spec.legacy_code,
+            "workload": spec.workload,
+            # compare counts, not percentages: rounding a rate to two
+            # places can make two equal rates compare unequal
             "moved": a["true_rows"] != b["true_rows"],
-            "true_percent_before": b["true_percent"],
-            "true_percent_after": a["true_percent"]})
+            "true_percent_before": 100 * b["true_rows"] / b["rows"],
+            "true_percent_after": 100 * a["true_rows"] / a["rows"]})
     return rows
+
+
+def workload_times():
+    """boot, judging and total seconds per workload, plus the serial
+    time one container would have taken: one model load, the least
+    contended, and then every workload's judging back to back."""
+    w = {k: {"boot_s": v["boot_s"], "total_wall_s": v["total_wall_s"],
+             "judging_s": v["total_wall_s"] - v["boot_s"]}
+         for k, v in AFTER["workloads"].items()}
+    parallel = max(v["total_wall_s"] for v in w.values())
+    serial = (min(v["boot_s"] for v in w.values())
+              + sum(v["judging_s"] for v in w.values()))
+    return w, parallel, serial
 
 
 def selectivity_plot():
@@ -100,14 +123,14 @@ def selectivity_plot():
 def wall_plot():
     """Where the 33.8 minutes went, and why four containers bought less
     than four times the speed."""
-    w = DATA["workloads"]
+    w, parallel_s, serial_s = workload_times()
     order = sorted(w, key=lambda k: w[k]["total_wall_s"])
     base_load = min(v["boot_s"] for v in w.values()) / 60
 
     fig, ax = plt.subplots(figsize=(7.4, 3.6))
     for i, k in enumerate(order):
         load = w[k]["boot_s"] / 60
-        judging = w[k]["wall_minus_boot_s"] / 60
+        judging = w[k]["judging_s"] / 60
         ax.barh(i, base_load, 0.55, color=GRAY)
         ax.barh(i, load - base_load, 0.55, left=base_load, color=ORANGE)
         ax.barh(i, judging, 0.55, left=load, color=BLUE)
@@ -121,20 +144,19 @@ def wall_plot():
     for x, dy, align, text, color in (
             (0, 0.5, "left", "model load", "#777777"),
             (slowest_load, 1.0, "right", "contention", ORANGE),
-            (slowest_load + w[order[top]]["wall_minus_boot_s"] / 120,
+            (slowest_load + w[order[top]]["judging_s"] / 120,
              0.5, "center", "judging", BLUE)):
         ax.text(x, top + dy, text, ha=align, fontsize=8, color=color)
 
-    parallel = DATA["result"]["wall_s_parallel"] / 60
-    serial = DATA["result"]["wall_s_serial_reconstructed"] / 60
+    parallel, serial = parallel_s / 60, serial_s / 60
     extra = w[order[top]]["boot_s"] / 60 - base_load
     ax.axvline(parallel, color=DARK, lw=0.8, ls=":", ymax=0.82)
-    judging = sum(v["wall_minus_boot_s"] for v in w.values())
-    share = 100 * w["biodex"]["wall_minus_boot_s"] / judging
+    judging = sum(v["judging_s"] for v in w.values())
+    share = 100 * w["biodex"]["judging_s"] / judging
     ax.text(0, -1.35,
             f"All four finish at {parallel:.1f} min. One container doing the "
             f"same work would take {serial:.1f} min, so the split is worth "
-            f"{DATA['result']['speedup_over_serial']:.2f}x.\n"
+            f"{serial / parallel:.2f}x.\n"
             f"BioDEX sets the wall time: it is {share:.0f}% of the judging, "
             f"and {extra:.1f} min of its load is four containers pulling "
             f"one checkpoint at once.",

@@ -23,14 +23,12 @@ the cause.
 
 The new collection is
 `gt_80e7582534b349bc61c087595f2e0a51` and is the active ground truth for
-corpus `c_df45ef585738f42e4a7a731306f1b9fc`. The committed summary is
-`results/parallel_judge_pass_sf0.1.json`, and it holds this run's
-positive counts only. The before counts below come from the previous
-run's summary, already committed at
-`results/benchmark/20260825T082145Z-quailb-qwen32b-ground-truth-sf0.1.json`.
-The new file names that path, so the plot script reads both. The
-245,557 labels themselves are on the `quail-results` volume at
-`/results/ground_truth/quailb/schema_v1/collections/gt_80e7582534b349bc61c087595f2e0a51`.
+corpus `c_df45ef585738f42e4a7a731306f1b9fc`. Every number below comes
+from that collection's `summary.json` on the `quail-results` volume,
+and the before counts from the superseded collection's, at
+`/results/ground_truth/quailb/schema_v1/collections/<collection_id>/summary.json`.
+The 245,557 labels themselves sit beside them under the same collection
+directories.
 
 ## Setup
 
@@ -179,7 +177,17 @@ Two fixes worth making before the next full relabel:
     uv run modal run -m quail.bench.judge_pass \
         2>&1 | tee results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-label.log
 
-    uv run --with matplotlib python reports/make_parallel_judge_pass_plots.py
+The plots read the two collections' summaries off the volume; the
+commands to pull them are in the plot script's docstring.
+
+    W=<workdir>; C=/ground_truth/quailb/schema_v1/collections
+    mkdir -p $W
+    modal volume get quail-results \
+        $C/gt_80e7582534b349bc61c087595f2e0a51/summary.json $W/after.json
+    modal volume get quail-results \
+        $C/gt_42674891c824e01c6d966eb48c9cf8c7/summary.json $W/before.json
+    uv run --with matplotlib python \
+        reports/make_parallel_judge_pass_plots.py $W
 
 Superseded collection, kept on the volume:
 `/results/ground_truth/quailb/schema_v1/collections/gt_42674891c824e01c6d966eb48c9cf8c7`.
