@@ -167,11 +167,11 @@ first barrier, then 117,888 pairs after the next gate. The total is
 348,888 pair evaluations.
 
 The SoL work is the sum of all filter and join stages. For a query with a
-join, document pairs per second is the sum of evaluated pairs across its
-join stages divided by the complete query time. For a filter only query,
-documents per second is the number of input document rows divided by the
-complete query time. Dollars per query uses $3.9492 per GPU hour for an
-H100! request, which
+join, document pairs per second at SoL is the sum of evaluated pairs across
+its join stages divided by the complete SoL time. For a filter only query,
+documents per second at SoL is the number of input document rows divided by
+the complete SoL time. Dollars per query at SoL uses $3.9492 per GPU hour for
+an H100! request, which
 is the same price used by the benchmark evaluation code. Modal lists the
 same price as $0.001097 per second on its
 [pricing page](https://modal.com/pricing).
@@ -180,11 +180,12 @@ same price as $0.001097 per second on its
 
 Figure: plots/sol_quailb_per_query.png
 
-The dollar value is a lower bound on GPU cost per query because SoL is a
-lower bound on time. The throughput value is an upper bound. The cost does
-not include CPU or memory charges.
+The cost and throughput columns apply the benchmark metric formulas to SoL
+time. They are not measured Quail metrics. Measured Quail metrics require the
+wall time from an engine run. The cost at SoL includes GPU time only, so it
+does not include CPU or memory charges.
 
-| Query | Stages | Work units | 4B SoL | 4B $/query floor | 4B docs/s or pairs/s ceiling | 32B SoL | 32B $/query floor | 32B docs/s or pairs/s ceiling |
+| Query | Stages | Work units | 4B SoL | 4B $/query at SoL | 4B docs/s or pairs/s at SoL | 32B SoL | 32B $/query at SoL | 32B docs/s or pairs/s at SoL |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | IMDB-1 | 1F | 5,000 documents | 6.722 s | $0.00737 | 743.8 | 56.413 s | $0.06188 | 88.6 |
 | IMDB-2 | 1J | 60,000 pairs | 9.281 s | $0.01018 | 6,465.1 | 77.708 s | $0.08525 | 772.1 |

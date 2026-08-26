@@ -684,12 +684,12 @@ for qid, (description, build) in query_defs.items():
             "t_dense": s.dense, "t_attention": s.attention,
             "t_compute": s.compute, "t_memory": s.memory,
             "sol_s": s.seconds, "bound_by": s.bound_by,
-            "cost_usd_per_query": (
+            "cost_usd_per_query_at_sol": (
                 s.seconds * H100_USD_PER_HOUR / 3600),
-            "documents_per_second": (
+            "documents_per_second_at_sol": (
                 simulated["input_document_rows"] / s.seconds
                 if not simulated["join_stages"] and s.seconds else None),
-            "document_pairs_per_second": (
+            "document_pairs_per_second_at_sol": (
                 simulated["join_pair_evaluations"] / s.seconds
                 if simulated["join_stages"] and s.seconds else None),
         }
@@ -727,14 +727,14 @@ json.dump({
         "method": "SoL seconds multiplied by the H100! price per second",
     },
     "metric_definitions": {
-        "cost_usd_per_query": (
-            "lower bound on GPU cost; SoL seconds times the H100! price"),
-        "documents_per_second": (
-            "upper bound for filter only queries; input document rows "
-            "divided by SoL seconds"),
-        "document_pairs_per_second": (
-            "upper bound for join queries; evaluated pairs summed across "
-            "join stages and divided by SoL seconds"),
+        "cost_usd_per_query_at_sol": (
+            "GPU cost at SoL; SoL seconds times the H100! price"),
+        "documents_per_second_at_sol": (
+            "filter only throughput at SoL; input document rows divided "
+            "by SoL seconds"),
+        "document_pairs_per_second_at_sol": (
+            "join throughput at SoL; evaluated pairs summed across join "
+            "stages and divided by SoL seconds"),
     },
     "sources": {
         "corpora": f"/results/quailb_data/{TAG}, seed 20260818",
