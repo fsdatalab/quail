@@ -336,4 +336,4 @@ filter is correlated with document length.
 - **LEP-6 and LEP-8 are nearly the same number.** LEP1 leaves 4
   documents, LEP2 leaves 3, LEP3 leaves 1, and LEP4 leaves none.
 - **The separate baseline report compares six of these floors with
-  measured wall time.** See `reports/2026-08-25-vllm-opbench-baseline.md`.
+  measured wall time.** See `reports/2026-08-26-stock-vllm-joins.md`.
