@@ -34,6 +34,13 @@ it. Three operations follow:
 `ask` and `stream` never charge for the document again; `scan` is
 the only one that does.
 
+Join search
+-----------
+All filters run first. The join search then checks every feasible left
+deep relation order and anchor choice. Its state is the joined alias set
+and the aliases with reusable document prefix KV. KV capacity is unlimited.
+The search runs separately for 4B and 32B.
+
 Running it
 ----------
 The corpora and the per-document ground-truth labels are raw data
@@ -77,6 +84,13 @@ from transformers import AutoTokenizer
 import quail
 from quail.bench import quailb as Q
 from quail.bench.evaluate import H100_PRICE_SOURCE, H100_USD_PER_HOUR
+from quail.bench.sol_dp import (
+    Extension,
+    PairRelation,
+    Work,
+    exact_live_rows,
+    optimize_left_deep,
+)
 from quail.logical import (ColumnRef, SHARED_PRE, bind_join_prompt,
                            bind_prompt)
 from quail.planner.decide import _collect
@@ -107,8 +121,16 @@ if COLLECTION["scale_factor"] != SF:
 COLLECTION_ID = COLLECTION["collection_id"]
 CORPUS_ID = COLLECTION["corpus_id"]
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-FP8")
-encode = lambda t: tok(t, add_special_tokens=False)["input_ids"]
-length = lambda t: len(encode(t))
+
+
+def encode(text):
+    return tok(text, add_special_tokens=False)["input_ids"]
+
+
+def length(text):
+    return len(encode(text))
+
+
 PRE = length(SHARED_PRE)   # the engine preamble, 2 tokens
 
 # The batch size each model's forward pass runs at: (2^31 - 1) over
@@ -168,25 +190,6 @@ def triangle(n: float) -> float:
     """A causal sequence attending to itself: token 1 sees 1 key,
     token 2 sees 2, and so on. 1 + 2 + ... + n."""
     return n * (n + 1) / 2
-
-
-@dataclass(frozen=True)
-class Work:
-    """Four counts. No seconds and no hardware in here."""
-    tokens: float = 0.0       # tokens pushed through the forward pass
-    pairs: float = 0.0        # scored (query, key) pairs, per layer
-    kv_written: float = 0.0   # KV rows written
-    kv_read: float = 0.0      # KV rows read back out of the arena
-
-    def __add__(self, o: "Work") -> "Work":
-        return Work(self.tokens + o.tokens, self.pairs + o.pairs,
-                    self.kv_written + o.kv_written,
-                    self.kv_read + o.kv_read)
-
-    def __mul__(self, k: float) -> "Work":
-        """The same work done k times."""
-        return Work(self.tokens * k, self.pairs * k,
-                    self.kv_written * k, self.kv_read * k)
 
 
 def scan(prefix: float, suffix: float) -> Work:
@@ -338,7 +341,7 @@ FILTER_TEMPLATES = {c: getattr(Q, c) for c in (
     "F1", "F4", "F5", "F7", "F8", "F9", "F11", "F12", "F13",
     "LEP1", "LEP2", "LEP3", "LEP4", "LEP5", "LEPS1")}
 JOIN_TEMPLATES = {c: getattr(Q, c) for c in (
-    "DISCUSS_ASPECT", "ASPECT_SENTIMENT", "ASPECT_RELATED", "REACTION",
+    "DISCUSS_ASPECT", "ASPECT_SENTIMENT", "REACTION",
     "REACTION_SEVERE", "SUPPORT", "REFUTE", "LEPJOIN")}
 col_ref = (ColumnRef("x", "t", "c"),)
 question = {c: bind_prompt(t, col_ref, encode).tail_tokens
@@ -484,7 +487,22 @@ def runtime_anchor(join, compiled_anchor, aliases, survivors,
     return min(feasible, key=total)
 
 
-def simulate_query(query, chunk_tokens: int):
+@dataclass
+class QueryInputs:
+    plan: object
+    scans: list
+    filters: dict
+    joins: list
+    aliases: dict
+    survivors: dict
+    work: Work
+    resident: set
+    filter_stages: list
+    filter_evaluations: int
+    post_filter_counts: dict
+
+
+def prepare_query(query) -> QueryInputs:
     plan = query.plan()
     if isinstance(plan, Refusal):
         raise ValueError(f"SoL query was refused: {plan.reasons}")
@@ -537,6 +555,33 @@ def simulate_query(query, chunk_tokens: int):
 
     post_filter_counts = {
         alias: len(rows) for alias, rows in survivors.items()}
+    return QueryInputs(
+        plan=plan,
+        scans=scans,
+        filters=filters,
+        joins=joins,
+        aliases=aliases,
+        survivors=survivors,
+        work=work,
+        resident=resident,
+        filter_stages=filter_stages,
+        filter_evaluations=filter_evaluations,
+        post_filter_counts=post_filter_counts,
+    )
+
+
+def simulate_query(query, chunk_tokens: int):
+    prepared = prepare_query(query)
+    plan = prepared.plan
+    scans = prepared.scans
+    joins = prepared.joins
+    aliases = prepared.aliases
+    survivors = prepared.survivors
+    work = prepared.work
+    resident = prepared.resident
+    filter_stages = prepared.filter_stages
+    filter_evaluations = prepared.filter_evaluations
+    post_filter_counts = prepared.post_filter_counts
     finished_full = []
     join_stages = []
     join_pair_evaluations = 0
@@ -649,6 +694,255 @@ def simulate_query(query, chunk_tokens: int):
     }
 
 
+def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
+    """Find the best exact left deep join plan for this model."""
+
+    prepared = prepare_query(query)
+    scans = prepared.scans
+    joins = prepared.joins
+    aliases = prepared.aliases
+    base_rows = {
+        alias: tuple(rows) for alias, rows in prepared.survivors.items()}
+    alias_order = tuple(scan.alias for scan in scans)
+
+    edge_relations = []
+    edge_aliases = []
+    for edge_index, join in enumerate(joins):
+        stage_aliases = tuple(arg.alias for arg in join.predicate.args)
+        if join.semantics != "full":
+            raise NotImplementedError(
+                "optimal SoL join search requires full join semantics")
+        if len(stage_aliases) != 2:
+            raise NotImplementedError(
+                "optimal SoL join search requires binary predicates")
+        left, right = stage_aliases
+        passing = frozenset(
+            (left_row, right_row)
+            for left_row in base_rows[left]
+            for right_row in base_rows[right]
+            if prompt_answer(
+                join.predicate,
+                {left: left_row, right: right_row},
+                aliases,
+            )
+        )
+        edge_relations.append(PairRelation(left, right, passing))
+        edge_aliases.append(frozenset((left, right)))
+
+    logical_cache = {}
+
+    def live_for(active_edges: frozenset[int]):
+        if active_edges not in logical_cache:
+            logical_cache[active_edges] = exact_live_rows(
+                base_rows,
+                tuple(edge_relations[index]
+                      for index in sorted(active_edges)),
+            )
+        return logical_cache[active_edges]
+
+    def active_inside(relations: frozenset[str]) -> frozenset[int]:
+        return frozenset(
+            index for index, endpoints in enumerate(edge_aliases)
+            if endpoints <= relations
+        )
+
+    def anchor_fits(prompt, anchor, stage_aliases, live) -> bool:
+        labels_by_alias, tail = prompt_token_counts(prompt)
+        anchor_max = max(
+            (aliases[anchor]["tokens"][row] for row in live[anchor]),
+            default=0,
+        )
+        partners = [alias for alias in stage_aliases if alias != anchor]
+        prefix = (PRE + anchor_max
+                  + labels_by_alias[anchor]["frame"])
+        if not live[anchor] or any(not live[partner] for partner in partners):
+            return prefix <= chunk_tokens
+        return (
+            prefix
+            + tail
+            + sum(
+                labels_by_alias[partner]["label"]
+                + max(
+                    (aliases[partner]["tokens"][row]
+                     for row in live[partner]),
+                    default=0,
+                )
+                for partner in partners
+            )
+            <= chunk_tokens
+        )
+
+    extension_cache = {}
+
+    def extend(relations: frozenset[str], cached: frozenset[str], added: str):
+        cache_key = (relations, cached, added)
+        if cache_key in extension_cache:
+            return extension_cache[cache_key]
+        crossing = tuple(
+            index for index, endpoints in enumerate(edge_aliases)
+            if added in endpoints and endpoints & relations
+        )
+        if not crossing:
+            extension_cache[cache_key] = ()
+            return ()
+
+        initial_edges = active_inside(relations)
+        extensions = []
+
+        def visit_edges(order, position, active_edges, live, live_cache,
+                        work, steps):
+            if position == len(order):
+                extensions.append(Extension(
+                    work=work,
+                    cached=live_cache,
+                    steps=tuple(steps),
+                ))
+                return
+
+            edge_index = order[position]
+            join = joins[edge_index]
+            relation = edge_relations[edge_index]
+            stage_aliases = tuple(arg.alias for arg in join.predicate.args)
+            for anchor in stage_aliases:
+                if not anchor_fits(
+                        join.predicate, anchor, stage_aliases, live):
+                    continue
+                partners = [alias for alias in stage_aliases
+                            if alias != anchor]
+                stage_work = join_stage_work(
+                    anchor,
+                    partners,
+                    aliases,
+                    live,
+                    join.predicate,
+                    anchor in live_cache,
+                )
+                next_edges = active_edges | {edge_index}
+                next_live = live_for(next_edges)
+                next_cache = live_cache | {anchor}
+                evaluated = math.prod(
+                    len(live[alias]) for alias in stage_aliases)
+                passing = sum(
+                    1
+                    for left_row in live[relation.left]
+                    for right_row in live[relation.right]
+                    if (left_row, right_row) in relation.pairs
+                )
+                step = {
+                    "code": prompt_code(join.predicate),
+                    "added_alias": added,
+                    "anchor": anchor,
+                    "partners": partners,
+                    "evaluated_pairs": evaluated,
+                    "passing_pairs": passing,
+                    "fresh_tokens": stage_work.tokens,
+                    "cached_prefixes_after": sorted(next_cache),
+                }
+                visit_edges(
+                    order,
+                    position + 1,
+                    next_edges,
+                    next_live,
+                    next_cache,
+                    work + stage_work,
+                    steps + [step],
+                )
+
+        for order in itertools.permutations(crossing):
+            visit_edges(
+                order,
+                0,
+                initial_edges,
+                live_for(initial_edges),
+                cached,
+                Work(),
+                [],
+            )
+        extension_cache[cache_key] = tuple(extensions)
+        return extension_cache[cache_key]
+
+    search = optimize_left_deep(
+        alias_order,
+        prepared.resident,
+        prepared.work,
+        extend,
+    )
+    if not search.candidates:
+        raise ValueError("query join graph has no connected left deep plan")
+
+    def candidate_seconds(candidate):
+        return speed_of_light(
+            candidate.work, model, H100_SXM, chunk_tokens).seconds
+
+    best = min(
+        search.candidates,
+        key=lambda candidate: (
+            candidate_seconds(candidate),
+            candidate.work.tokens,
+            candidate.work.pairs,
+            candidate.work.kv_written,
+            candidate.work.kv_read,
+            candidate.relation_order,
+        ),
+    )
+
+    first_alias = scans[0].alias
+    join_stages = list(best.steps)
+    input_document_rows = sum(
+        len(aliases[scan.alias]["ids"]) for scan in scans)
+    held_alias = join_stages[0]["anchor"] if join_stages else first_alias
+    anchor = None
+    both = {}
+    if len(joins) == 1:
+        stage_aliases = [arg.alias for arg in joins[0].predicate.args]
+        anchor = ("left" if join_stages[0]["anchor"] == stage_aliases[0]
+                  else "right")
+        start_live = live_for(frozenset())
+        both = {
+            side: join_stage_work(
+                candidate,
+                [alias for alias in stage_aliases if alias != candidate],
+                aliases,
+                start_live,
+                joins[0].predicate,
+                candidate in prepared.resident,
+            ).tokens
+            for side, candidate in zip(("left", "right"), stage_aliases)
+            if anchor_fits(
+                joins[0].predicate, candidate, stage_aliases, start_live)
+        }
+    elif joins:
+        anchor = ",".join(stage["anchor"] for stage in join_stages)
+
+    return {
+        "work": best.work,
+        "document_column": aliases[first_alias]["column"],
+        "partner_column": (aliases[scans[1].alias]["column"]
+                           if len(scans) > 1 else None),
+        "documents": len(aliases[first_alias]["ids"]),
+        "documents_after_filters": prepared.post_filter_counts[first_alias],
+        "input_document_rows": input_document_rows,
+        "filter_evaluations": prepared.filter_evaluations,
+        "join_pair_evaluations": sum(
+            stage["evaluated_pairs"] for stage in join_stages),
+        "filter_stages": prepared.filter_stages,
+        "join_stages": join_stages,
+        "anchor": anchor,
+        "anchor_tokens_both_ways": both,
+        "held_column": aliases[held_alias]["column"],
+        "optimizer": {
+            "plan_space": "all feasible left deep plans",
+            "relation_order": list(best.relation_order),
+            "cached_prefixes": sorted(best.cached),
+            "persistent_kv_capacity": "unlimited",
+            "gpu_count": 1,
+            "dp_states": search.state_count,
+            "dp_records_generated": search.generated_count,
+            "dp_final_records": len(search.candidates),
+        },
+    }
+
+
 # ================================================================
 # PART 3: every query, on both models
 # ================================================================
@@ -665,6 +959,43 @@ query_ids = list(query_defs_by_model[MODELS[0].name])
 if any(list(query_defs_by_model[model.name]) != query_ids for model in MODELS):
     raise ValueError("4B and 32B query definitions do not have the same ids")
 
+
+def add_sol_metrics(simulated, model: ModelSpec):
+    """Add the one H100! time, cost, and throughput to a simulation."""
+
+    simulated = dict(simulated)
+    work = simulated.pop("work")
+    held = simulated["held_column"]
+    s = speed_of_light(work, model, H100_SXM, CHUNK[model.name])
+    return {
+        **simulated,
+        "chunk_tokens": CHUNK[model.name],
+        "tuples": simulated["join_pair_evaluations"],
+        "tokens": work.tokens,
+        "pairs": work.pairs,
+        "kv_written": work.kv_written,
+        "kv_read": work.kv_read,
+        "held_mean_doc_tokens": (
+            sum(lengths[held].values()) / len(lengths[held])),
+        "passes": s.passes,
+        "bytes_moved": s.bytes_moved,
+        "t_dense": s.dense,
+        "t_attention": s.attention,
+        "t_compute": s.compute,
+        "t_memory": s.memory,
+        "sol_s": s.seconds,
+        "bound_by": s.bound_by,
+        "cost_usd_per_query_at_sol": (
+            s.seconds * H100_USD_PER_HOUR / 3600),
+        "documents_per_second_at_sol": (
+            simulated["input_document_rows"] / s.seconds
+            if not simulated["join_stages"] and s.seconds else None),
+        "document_pairs_per_second_at_sol": (
+            simulated["join_pair_evaluations"] / s.seconds
+            if simulated["join_stages"] and s.seconds else None),
+    }
+
+
 rows = {}
 query_inputs = {}
 for qid in query_ids:
@@ -676,34 +1007,29 @@ for qid in query_ids:
     query_inputs[qid] = {}
     for model in MODELS:
         _, build = query_defs_by_model[model.name][qid]
-        simulated = simulate_query(build(), CHUNK[model.name])
-        work = simulated.pop("work")
-        held = simulated["held_column"]
-        s = speed_of_light(work, model, H100_SXM, CHUNK[model.name])
-        rows[qid]["models"][model.name] = {
-            **simulated,
-            "chunk_tokens": CHUNK[model.name],
-            "tuples": simulated["join_pair_evaluations"],
-            "tokens": work.tokens, "pairs": work.pairs,
-            "kv_written": work.kv_written, "kv_read": work.kv_read,
-            "held_mean_doc_tokens": (
-                sum(lengths[held].values()) / len(lengths[held])),
-            "passes": s.passes, "bytes_moved": s.bytes_moved,
-            "t_dense": s.dense, "t_attention": s.attention,
-            "t_compute": s.compute, "t_memory": s.memory,
-            "sol_s": s.seconds, "bound_by": s.bound_by,
-            "cost_usd_per_query_at_sol": (
-                s.seconds * H100_USD_PER_HOUR / 3600),
-            "documents_per_second_at_sol": (
-                simulated["input_document_rows"] / s.seconds
-                if not simulated["join_stages"] and s.seconds else None),
-            "document_pairs_per_second_at_sol": (
-                simulated["join_pair_evaluations"] / s.seconds
-                if simulated["join_stages"] and s.seconds else None),
-        }
+        current_planner = add_sol_metrics(
+            simulate_query(build(), CHUNK[model.name]), model)
+        optimal = add_sol_metrics(
+            simulate_optimal_left_deep(
+                build(), model, CHUNK[model.name]),
+            model,
+        )
+        optimal["current_planner"] = current_planner
+        optimal["current_planner_slowdown_vs_optimal"] = (
+            current_planner["sol_s"] / optimal["sol_s"]
+            if optimal["sol_s"] else None
+        )
+        rows[qid]["models"][model.name] = optimal
         query_inputs[qid][model.name] = {
-            "filters": simulated["filter_stages"],
-            "joins": simulated["join_stages"],
+            "optimal_left_deep": {
+                "filters": optimal["filter_stages"],
+                "joins": optimal["join_stages"],
+                "optimizer": optimal["optimizer"],
+            },
+            "current_planner": {
+                "filters": current_planner["filter_stages"],
+                "joins": current_planner["join_stages"],
+            },
         }
 
 hdr = (f"{'query':7} {'4B tokens':>11} {'4B anchor':>15} {'4B SoL':>9} "
@@ -723,8 +1049,8 @@ json.dump({
     "what": f"Speed of light for all {len(rows)} QUAIL-B queries at "
             f"sf={SF:g}, on "
             "Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100! request each. "
-            "A floor on "
-            "wall time: no measured or fitted constant is used.",
+            "Every feasible left deep order and anchor choice is considered. "
+            "No measured or fitted constant is used.",
     "method": "plans/sol_model.md, computed by reports/make_sol_quailb.py",
     "scale_factor": SF,
     "query_count": len(rows),
@@ -745,6 +1071,18 @@ json.dump({
         "document_pairs_per_second_at_sol": (
             "join throughput at SoL; evaluated pairs summed across join "
             "stages and divided by SoL seconds"),
+    },
+    "optimizer": {
+        "gpu_count_per_model": 1,
+        "plan_space": "all feasible left deep plans",
+        "dp_state": "joined alias set and cached prefix alias set",
+        "work_frontier": (
+            "keep every record not larger in all four work categories"),
+        "survivors": "exact ground truth survivors",
+        "persistent_kv_capacity": "unlimited",
+        "cached_values": "document prefixes used by filters or as anchors",
+        "streamed_partner_kv": "not reusable",
+        "validation": "unit tests compare DP with complete enumeration",
     },
     "sources": {
         "corpora": f"/results/quailb_data/{TAG}, seed 20260818",
