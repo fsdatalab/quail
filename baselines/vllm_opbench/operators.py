@@ -6,9 +6,9 @@ with only the serving strategy different.
 
 Prompts are raw prompt_token_ids, matching baselines/stock.py and
 quail's worker. Joins use the same canonical token builder as Quail
-and stock vLLM. The baseline still materializes every full request on
-the CPU and submits one batch to vLLM, but prompt layout is no longer
-a difference between the three systems.
+and stock vLLM. The CPU orchestrator sends the canonical prefix and
+suffix parts to the GPU worker. The worker materializes every full
+request there, then submits one batch to vLLM.
 
 The answer is a constrained TRUE/FALSE token id, matching quail's own
 engine's convention (quail/runtime/session.py's
@@ -79,18 +79,8 @@ class Join:
 
     def build_prompts(self, left_texts: list[str], right_texts: list[str],
                       tokenizer) -> tuple[list[list[int]], list[tuple[int, int]]]:
-        def tok(text):
-            return tokenizer.encode(text, add_special_tokens=False)
-
-        args = (ColumnRef("left", "left", "document"),
-                ColumnRef("right", "right", "document"))
-        prompt = bind_join_prompt(self.template, args, tok)
-        documents = (
-            [tok(text) for text in left_texts],
-            [tok(text) for text in right_texts],
-        )
-        prefixes, suffixes, members = build_join_grouped_inputs(
-            prompt, documents, self.anchor, tok)
+        prefixes, suffixes, members = self.build_grouped_inputs(
+            left_texts, right_texts, tokenizer)
         partner = 1 - self.anchor
         prompts, pairs = [], []
         for anchor_idx, prefix in enumerate(prefixes):
@@ -101,3 +91,17 @@ class Join:
                 prompts.append(prefix + suffix)
                 pairs.append((indices[0], indices[1]))
         return prompts, pairs
+
+    def build_grouped_inputs(self, left_texts: list[str],
+                             right_texts: list[str], tokenizer):
+        def tok(text):
+            return tokenizer.encode(text, add_special_tokens=False)
+
+        args = (ColumnRef("left", "left", "document"),
+                ColumnRef("right", "right", "document"))
+        prompt = bind_join_prompt(self.template, args, tok)
+        documents = (
+            [tok(text) for text in left_texts],
+            [tok(text) for text in right_texts],
+        )
+        return build_join_grouped_inputs(prompt, documents, self.anchor, tok)

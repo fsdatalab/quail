@@ -476,3 +476,21 @@ class WorkerH100:
             prompt_token_ids, true_ids, false_ids, max_tokens,
             poll_interval_s, do_profile, profile_name,
             block_size=self._resolved_block_size)
+
+    @modal.method()
+    def generate_join_batch(self, prefixes: list[list[int]],
+                            suffixes: list[list[int]],
+                            true_ids: list[int], false_ids: list[int],
+                            max_tokens: int = 1,
+                            poll_interval_s: float = 0.05,
+                            do_profile: bool = False,
+                            profile_name: str | None = None):
+        # Building the full cross product in the CPU orchestrator makes
+        # Modal serialize hundreds of millions of repeated token ids.
+        prompt_token_ids = [prefix + suffix
+                            for prefix in prefixes for suffix in suffixes]
+        return _generate_batch_impl(
+            self.llm, self.GPU, self.quantization, self.max_num_seqs,
+            prompt_token_ids, true_ids, false_ids, max_tokens,
+            poll_interval_s, do_profile, profile_name,
+            block_size=self._resolved_block_size)

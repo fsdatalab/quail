@@ -106,25 +106,38 @@ def call_operator(worker, kind, op, data, tokenizer, true_ids, false_ids,
         print(f"[vllm_opbench] {op.name} ({kind}): building "
               f"{len(left_texts)}x{len(right_texts)}="
               f"{len(left_texts) * len(right_texts)} prompts...", flush=True)
-        prompts, pairs = op.build_prompts(left_texts, right_texts, tokenizer)
-        # per_request[i] corresponds to prompts[i] by construction (both
-        # come from the same build order), but nothing on disk said so -
-        # doc_ids makes that explicit instead of leaving it as an
-        # unstated positional assumption for whoever reads the .jsonl.
+        prefixes, suffixes, members = op.build_grouped_inputs(
+            left_texts, right_texts, tokenizer)
+        partner = 1 - op.anchor
+        pairs = []
+        for anchor_idx in range(len(prefixes)):
+            for member in members:
+                indices = [None, None]
+                indices[op.anchor] = anchor_idx
+                indices[partner] = member[0]
+                pairs.append((indices[0], indices[1]))
         doc_ids = [(left_ids[li], right_ids[ri]) for li, ri in pairs]
+        n_prompts = len(prefixes) * len(suffixes)
     build_s = time.time() - build_t0
-    print(f"[vllm_opbench] {op.name} ({kind}): built {len(prompts)} prompts "
+    if kind == "filter":
+        n_prompts = len(prompts)
+    print(f"[vllm_opbench] {op.name} ({kind}): built {n_prompts} prompts "
           f"in {build_s:.1f}s, submitting to worker...", flush=True)
 
     t0 = time.time()
-    result = worker.generate_batch.remote(
-        prompts, true_ids, false_ids, FILTER_MAX_TOKENS,
-        do_profile=do_profile, profile_name=op.name)
+    if kind == "filter":
+        result = worker.generate_batch.remote(
+            prompts, true_ids, false_ids, FILTER_MAX_TOKENS,
+            do_profile=do_profile, profile_name=op.name)
+    else:
+        result = worker.generate_join_batch.remote(
+            prefixes, suffixes, true_ids, false_ids, FILTER_MAX_TOKENS,
+            do_profile=do_profile, profile_name=op.name)
     rpc_wall_s = time.time() - t0
     print(f"[vllm_opbench] {op.name} ({kind}): worker call returned after "
           f"{rpc_wall_s:.1f}s, post-processing...", flush=True)
 
-    n = len(prompts)
+    n = n_prompts
     total_prompt_tokens = sum(r["prompt_tokens"] for r in result["per_request"])
     total_output_tokens = sum(r["output_tokens"] for r in result["per_request"])
     # "fresh" = tokens vLLM's own prefix cache didn't already have resident,
