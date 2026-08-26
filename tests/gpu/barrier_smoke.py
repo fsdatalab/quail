@@ -1,32 +1,4 @@
-"""End-to-end smoke of the barrier path on the real Modal worker:
-two full joins forced onto DIFFERENT anchors, so the plan has two
-JoinGroup nodes with a Barrier between them (issue #38, PR #42).
-
-Chain: reports r x candidates c (anchor r), candidates c x labels g
-(anchor g), with one planted filter on r. Runs once on 1 GPU
-(the worker's plan-node walk and thinning) and once on 2 GPUs (the
-coordinator's per-group rounds, merge, and parent-side thinning).
-
-What this smoke gates, and what it does not:
-
-- HARD: the returned rows equal a CPU brute-force recombination of
-  the answer rows the worker reports - correctness of the barrier
-  plumbing, independent of model accuracy.
-- HARD: stage 2 evaluated n_labels x (candidates with at least one
-  stage-1 match) tuples - the barrier's thinning is visible. Reports
-  draw from only four of the six colors while candidates cover all
-  six, so at least two candidates can match no report and the count
-  check cannot pass vacuously; a run where every candidate survives
-  the barrier fails outright.
-- Informational: agreement with the planted truth. Stage 1 is the
-  content-style color predicate the session smoke proved on the 4B;
-  stage 2 compares two short color statements, a shape the session
-  smoke warns can over-answer TRUE.
-
-Run from the quail/ directory:
-
-    uv run python tests/gpu/barrier_smoke.py 2>&1 | tee results/barrier_smoke.log
-"""
+"""Barrier-path smoke test on GPU: two joins with different anchors, verified on 1 and 2 GPUs."""
 
 import json
 import sys
@@ -113,9 +85,7 @@ def build_query(sess):
 
 
 def brute_force_rows(res):
-    """Recombine the reported answer rows on CPU: filter survivors of
-    r, then the two stages' TRUE pairs equi-joined on c. This is what
-    res.rows must equal, whatever the model answered."""
+    """Recombine answer rows on CPU as a brute-force reference for the engine's output."""
     frows = res.answer_rows["filters"]["r"]
     keep_r = {d for d, row in frows.items()
               if len(row) == 1 and all(row)}

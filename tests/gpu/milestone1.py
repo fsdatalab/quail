@@ -1,41 +1,4 @@
-"""Milestone 1: the committed filter and join results, reproduced on
-the new executor. Three cells, run in order; a failed gate stops the
-milestone and reopens the design's executor section.
-
-  probe    correctness gates before any timed run: attention math vs
-           an fp32 reference, packed answers vs unpacked per-pair
-           references, kept-KV replay, multi-group and mixed
-           fresh/kept chunks, and a rate read at the large-chunk
-           geometry. Every parity gate requires 0 disagreements.
-           Cells run the production path assignment (probe and joins
-           on merge_quant, filters on unified); the committed
-           reference walls predate the assignment and their bands
-           hold.
-
-  filter   the committed 10k-document five-filter workload on the
-           TRUE/FALSE corpus (re-banked 2026-08-23; the gate counts
-           match results/attention_paths.json: survivors 4645,
-           0 wrong of 40,052 answered, ~4.10M fresh tokens). The
-           committed results/m1_filter.json still holds the YES/NO-
-           era run (survivors 1807) that the 2026-08-18 reports pin.
-           PREDICTION: ~35 s wall, survivors 4645 exactly, 0 wrong.
-
-  join     the committed 256k-pair 2-way BioDEX join (join2way.json
-           packed wall 103.5-103.6 s, 8,417,425 fresh tokens, 77
-           chunks). The TRUE/FALSE corpus conversion and the
-           merge_quant join path moved the TRUE count from 177,831
-           to 254,208 (re-banked 2026-08-23); the committed
-           results/m1_join.json still holds the YES/NO-era run.
-           PREDICTION: within 10% of 103.6 s, yes count near 254,208.
-
-Run from the quail/ directory (tee to a file per house rule):
-
-    uv run modal run tests/gpu/milestone1.py::run_probe   2>&1 | tee results/m1_probe.log
-    uv run modal run tests/gpu/milestone1.py::run_filter  2>&1 | tee results/m1_filter.log
-    uv run modal run tests/gpu/milestone1.py::run_filter1 2>&1 | tee results/m1_filter1.log
-    uv run modal run tests/gpu/milestone1.py::run_join    2>&1 | tee results/m1_join.log
-    uv run modal run tests/gpu/milestone1.py::run_join3   2>&1 | tee results/m1_join3.log
-"""
+"""Milestone 1 cells on Modal: probe (correctness gates), filter, single-stage filter, join, 3-way join, store, and baselines."""
 
 import json
 import os
@@ -86,9 +49,7 @@ GPU_KW = dict(image=image, gpu="H100!", memory=65536,
 
 
 def _boot(attention_mode):
-    """Model, pipeline, arena, answerers - the one executor, sized by
-    the plan arithmetic (chunk budget at the kernel cap, arena from
-    the admission budget, bf16 KV)."""
+    """Initialize model, pipeline, arena, and answerers for the given attention mode."""
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
@@ -415,10 +376,7 @@ def probe() -> str:
 @app.function(timeout=3600, **GPU_KW)
 def filter_run(n_docs: int = 10000, reps: int = 2,
                budget: int = 0, timing: bool = False) -> str:
-    """budget overrides the chunk budget: the reference cell at the
-    ladder's largest measured point (25,305) tells a rate change at
-    large chunks apart from a slow loop. timing adds a per-phase CPU
-    breakdown of run_filter to each rep (host-side timers only)."""
+    """Run the five-filter workload. budget overrides the chunk budget; timing adds per-phase CPU breakdown."""
     import time
 
     from corpus import build_corpus
@@ -510,35 +468,7 @@ def filter_run(n_docs: int = 10000, reps: int = 2,
 
 @app.function(timeout=3600, **GPU_KW)
 def filter1_run(n_docs: int = 10000, reps: int = 2) -> str:
-    """Issue #6: the single-stage fast path. One boolean question, no
-    store: no later stage reads any document's KV, so the arena
-    alloc, the per-layer KV scatter, and the paged attention read
-    are skipped - [document | question] packs as one causal segment
-    and admission runs on the token budget alone.
-
-    A/B in one cell: arena_writes=True is the configured baseline
-    (the same documents through the arena on the production unified
-    path), arena_writes=False the fast path. Same corpus, same
-    budget, both paths warmed.
-
-    PREDICTION, from measured constants: ~3.23M fresh tokens (3.20M
-    corpus + 10k one-question suffixes). The unified filter path ran
-    8.45 us/token at the five-stage geometry
-    (results/attention_paths.json), which puts the arena run near
-    27-28 s. The fast path removes the per-layer scatter of every
-    current token (the fused kv_row_scatter), the paged-KV
-    indirection inside the attention read, and the per-chunk
-    block-table build and page alloc on the CPU (mostly hidden
-    behind the GPU): a 2-5% cut. Unified already avoids call B and the
-    LSE merge, so the remaining difference is smaller.
-
-    Answers: the kernel-parity cells measured the unified paged
-    causal call bit-identical to the contiguous causal call
-    (results/attention_parity.json, max_abs 0.0 on every case), and
-    the fast path IS the contiguous call over the same
-    [document | question] rows at the same positions. The gate is
-    therefore exact: 0 answer flips between the two paths.
-    """
+    """Single-stage fast-path A/B: arena vs no-arena on one boolean question, gated on 0 answer flips."""
     import time
 
     from corpus import build_corpus
@@ -677,9 +607,7 @@ def join_run(n_reports: int = 100, reps: int = 2) -> str:
 
 @app.function(timeout=7200, **GPU_KW)
 def join3_run() -> str:
-    """The replay gate: the committed planted 3-way chain. Gating and
-    dedup on the new executor must reproduce the nested-loop reference
-    exactly, and stage-2 pairs must equal survivors x |C|."""
+    """Three-way planted chain: gating and dedup must match the nested-loop reference exactly."""
     import time
 
     from corpus import N_B, N_C, nway_corpus, nway_truth
@@ -739,19 +667,7 @@ def join3_run() -> str:
                        "/results": results_vol})
 def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
                      warm_reps: int = 2) -> str:
-    """The store gate: the five-filter workload cold (with offload),
-    then warm (restore instead of recompute).
-
-    PREDICTION, from the committed persist result (chain 10k: 44.3 s
-    cold offload pass, 16.3 s per warm pass, 1.9-2.1x): at 5,000
-    documents (~1.6M corpus tokens, ~236 GB of bf16 KV) the cold pass
-    lands near half the 10k wall (~20 s) plus the offload tail, and
-    the warm passes land near half the cold wall - restore streams on
-    the side channel while the question chunks compute.
-
-    bf16 at 10k docs needs ~472 GB of pinned host memory, past this
-    container's 320 GB, so the gate runs at 5,000 documents - the
-    same per-token economics, a corpus the pool holds whole."""
+    """Store gate: cold pass with KV offload, then warm passes with KV restore."""
     import time
 
     from corpus import build_corpus
@@ -828,12 +744,7 @@ def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
 
 @app.function(timeout=3600, **GPU_KW)
 def profile_filter_run(n_docs: int = 3000) -> str:
-    """Torch-profile a steady-state filter run to name the ~1.3
-    us/token gap between the executor (9.9 us/token measured) and the
-    no-KV ladder ceiling (8.26). KV writes, paged reads, and the LSE
-    merge only account for ~0.2 of it; this trace decides among:
-    GEMMs under peak at our shapes, oversized elementwise chains, or
-    scheduling gaps (kernel sum well under region wall)."""
+    """Torch-profile a filter run and break GPU time into kernel categories."""
     import time
 
     from corpus import build_corpus
@@ -909,14 +820,7 @@ def run_profile_filter(n_docs: int = 3000,
 
 @app.function(timeout=5400, **GPU_KW)
 def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
-    """Stock vLLM on the committed five-filter workload: the
-    pipelined per-(document, stage) client under the plan's token
-    budget, prefix caching on - the strongest stock client the
-    exploration built.
-
-    PREDICTION: the committed stock band, 39.2-43.2 s per rep
-    (bf16 40.8/39.2/39.5; fp8 42.8-43.2), against the packed
-    executor's measured 39.4-39.9 s."""
+    """Stock vLLM baseline on the five-filter workload with pipelined submission and prefix caching."""
     from baselines.stock import run_filter_chain
     from corpus import MODEL, build_corpus
     from vllm import SamplingParams
@@ -968,15 +872,7 @@ def baseline_filter_run(n_docs: int = 10000, reps: int = 2) -> str:
 @app.function(timeout=5400, **GPU_KW)
 def baseline_filter1_run(n_docs: int = 10000, reps: int = 2,
                          model: str = "qwen3-4b-fp8") -> str:
-    """Stock vLLM on the single-stage filter workload (one question,
-    10,000 documents): one request per document, prefix caching on,
-    bf16 KV, document-cap admission. model picks the spec; a
-    non-default model writes to a suffixed file.
-
-    PREDICTION: 3.5M fresh tokens (no prefix sharing - each document
-    is unique). At the five-stage baseline's measured ~101k fresh
-    tok/s, ~34-36 s (4B). Single-stage has less scheduling overhead
-    (10k requests vs 23k) but no cross-stage prefix sharing."""
+    """Stock vLLM baseline on the single-stage filter workload with prefix caching."""
     from baselines.stock import run_filter_chain
     from corpus import build_corpus
     from vllm import SamplingParams
@@ -1031,17 +927,7 @@ def baseline_filter1_run(n_docs: int = 10000, reps: int = 2,
 @app.function(timeout=5400, **GPU_KW)
 def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
                       reps: int = 2) -> str:
-    """Stock vLLM on the dispatch gate's 72k-pair synthetic join:
-    one request per pair, anchor-major, prefix caching on,
-    max_num_seqs=4096.
-
-    PREDICTION: the previous run used max_num_seqs=366 (derived from
-    the KV budget divided by full pair length, ignoring prefix cache
-    sharing). That throttled the GPU to ~4,400 fresh tokens per step
-    (17% of the 25,305 budget). With 4,096 the scheduler can fill
-    steps properly. Expect a faster wall than the previous 90-93 s;
-    fresh tokens should stay ~1.01M (same pairs, same prefix caching).
-    Quail's measured wall on this shape is 31.1 s."""
+    """Stock vLLM baseline on a 72k-pair synthetic join with prefix caching."""
     from baselines.stock import run_join_grouped
     from corpus import MODEL
     from vllm import SamplingParams
@@ -1110,16 +996,7 @@ def baseline_join_run(n_reports: int = 60, n_cands: int = 1200,
 
 @app.function(timeout=1800, **GPU_KW)
 def debug_join() -> str:
-    """Pair-predicate diagnostic: the same pairs through the
-    trivially-correct single-segment causal path vs the packed
-    multi-group path. Disagreement would mean an executor bug on this
-    shape; agreement means the answers are the model's.
-
-    Measured twice (plain question and few-shot example): the 4B
-    answers TRUE to every constrained one-token equality judgment on
-    BOTH paths, 0 disagreements - the executor is exonerated, the
-    checkpoint cannot judge symbolic equality. Content-style
-    predicates (the BioDEX shape) discriminate."""
+    """Diagnostic: compare single-segment causal answers against packed multi-group answers on the same pairs."""
     import torch
 
     from quail.executor.loop import pack_chunk

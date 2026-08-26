@@ -1,31 +1,7 @@
-"""vLLM-opbench orchestrator: drives WorkerH100 (see worker.py) over
-queries built from quail's own document sets and predicates. Runs
-entirely on Modal. Both CPU preparation and GPU generation happen
-remotely in the existing "quail-milestone1" app. No local Python
-execution is needed to launch this.
+"""vLLM-opbench orchestrator: drives WorkerH100 over queries built from
+Quail's document sets and predicates. Runs entirely on Modal.
 
-Four queries, mirroring an existing quailb.py query each so the
-numbers are directly comparable - one filter shape, one join shape
-per dataset (IMDB, BioDEX, FEVER):
-    filter-reports   - BIO-1's shape: F7 alone, over `reports`.
-    join-reports     - BIO-2's shape: REACTION, reports x terms.
-    join-claims      - FEV-2's shape: SUPPORT, claims x evidence.
-    join-imdb        - IMDB-2's shape: DISCUSS_ASPECT, reviews x aspects.
-
-Run (from the repository root; tee to a file per house rule):
-
-    uv run modal run -m baselines.vllm_opbench.run::main \\
-        2>&1 | tee results/vllm_opbench_run.log
-
-    # one query only:
-    uv run modal run -m baselines.vllm_opbench.run::main \\
-        --query join-reports 2>&1 | tee results/vllm_opbench_run.log
-
-Spawn, not remote: the function call id prints before anything waits
-on the result, so a dropped local connection doesn't lose the run -
-re-fetch with modal.FunctionCall.from_id("<id>").get(). Results land
-on the "quail-results" volume under /results/vllm_opbench/<timestamp>/,
-not in any local JSON file.
+    uv run modal run -m baselines.vllm_opbench.run::main
 """
 
 import json
@@ -140,24 +116,14 @@ def call_operator(worker, kind, op, data, tokenizer, true_ids, false_ids,
     n = n_prompts
     total_prompt_tokens = sum(r["prompt_tokens"] for r in result["per_request"])
     total_output_tokens = sum(r["output_tokens"] for r in result["per_request"])
-    # "fresh" = tokens vLLM's own prefix cache didn't already have resident,
-    # i.e. total prompt tokens minus the oracle's cache-hit token count.
-    # total_prompt_tokens alone (pre-discount) is NOT fresh_tokens - printing
-    # it under that name previously understated the baseline's actual cache
-    # effectiveness whenever there were real hits.
+    # "fresh" = total prompt tokens minus oracle cache-hit tokens.
     fresh_prompt_tokens = (total_prompt_tokens
                           - result["oracle_regret"]["oracle_hit_tokens"])
     entry = dict(
         operator=op.name, kind=kind, n_prompts=n,
         anchor=(op.anchor if kind == "join" else None),
-        # rpc_wall_time_s: time.time() around worker.generate_batch.remote()
-        # from the orchestrator - includes Modal RPC/scheduling overhead.
-        # generate_wall_time_s: result["wall_time_s"], timed inside the
-        # worker around llm.generate() alone - no RPC overhead. The two are
-        # not interchangeable; a prior hand-built comparison (vllm_opbench_
-        # vs_quail.json) used rpc_wall_time_s under a "worker_wall_s" label,
-        # which reads as the tighter generate-only number - see cleanup note
-        # in that file's regenerating script.
+        # rpc_wall_time_s includes Modal RPC overhead.
+        # generate_wall_time_s is llm.generate() alone, no RPC overhead.
         rpc_wall_time_s=rpc_wall_s, generate_wall_time_s=result["wall_time_s"],
         build_s=build_s,
         total_prompt_tokens=total_prompt_tokens,
@@ -186,12 +152,7 @@ def call_operator(worker, kind, op, data, tokenizer, true_ids, false_ids,
 def run_baseline(model: str = "qwen3-4b", query_id: str | None = None,
                  gpu: str = "H100!", quantization: str = "fp8",
                  profile: bool = False) -> dict:
-    """CPU-side prep (build_sets, tokenizing, prompt building) plus
-    driving WorkerH100 for each query - all inside one Modal function
-    on the "vllm-opbench" app, so instantiating WorkerH100 and calling
-    its .remote() methods here works the same way it would from local
-    code with an open app.run() context: this function is already
-    executing inside a live invocation of that same app."""
+    """Build prompts and drive WorkerH100 for each query."""
     from quail.bench.quailb import build_sets
 
     if gpu != WorkerH100.GPU:

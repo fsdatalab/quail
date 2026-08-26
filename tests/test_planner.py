@@ -1,5 +1,4 @@
-"""The planner's decisions: ordering, anchor, sharding, the two
-break-evens, and the refusals - all CPU, no GPU anywhere."""
+"""Tests for the planner's ordering, anchor selection, sharding, break-evens, and refusals."""
 
 from dataclasses import replace
 
@@ -24,8 +23,7 @@ def filter_chain(plan, alias=None):
 
 
 def join_stages(plan):
-    """Every join stage in execution order, across the plan's
-    JoinGroup nodes."""
+    """Return every join stage in execution order across JoinGroup nodes."""
     return [st for n in plan.nodes if n["op"] == "JoinGroup"
             for st in n["stages"]]
 
@@ -180,7 +178,7 @@ def test_three_way_anchor_and_tuple_count(catalog):
 
 
 def _chain(catalog, sels=(0.1, 0.1), anchors=(None, None)):
-    """Two pairwise joins sharing table t: ai(r, t), ai(t, p)."""
+    """Build a two-join chain sharing table t: ai(r, t), ai(t, p)."""
     return (docs(catalog, "reviews", tok).alias("r")
             .ai_join(docs(catalog, "threads", tok).alias("t"),
                      prompt("m1 {0} {1}", col("r.review"),

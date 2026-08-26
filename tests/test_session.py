@@ -1,6 +1,4 @@
-"""Session end to end with a fake executor in the worker seam: the
-coordinator's gating, tuple assembly, replay check, projection, and
-report - everything except the GPU."""
+"""End-to-end Session tests with a fake executor: gating, tuple assembly, projection, and report."""
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -37,12 +35,7 @@ def sess(tmp_path):
 
 
 def make_executor(filter_truth, join_truth=None, seen=None):
-    """filter_truth: alias -> {question keyword -> [bit per doc]}.
-    The keyword is matched against the question token list (any token
-    that starts with it). join_truth: (anchor alias, *partner aliases)
-    -> f(anchor_idx, *partner_idxs) -> bit, one call per cross-product
-    tuple - the worker contract. seen: dict to capture the payload
-    for order assertions."""
+    """Build a fake executor from filter and join truth tables. Optionally captures the payload in `seen`."""
     import itertools
 
     def _match_key(alias, q):
@@ -361,10 +354,7 @@ def _register_tags(sess, tmp_path):
 
 
 def _chain_query(sess, limit=None):
-    """Two pairwise joins sharing p: ai(r, p), ai(p, g). Anchors are
-    forced onto p, the shared table, so both stages run as one group
-    whatever the cost model prefers - the shared-anchor shape these
-    tests exercise. The barrier shape has its own test below."""
+    """Build a two-join chain sharing table p with both anchors forced onto p."""
     q = (sess.docs("reviews").alias("r")
          .ai_join(sess.docs("products").alias("p"),
                   quail.prompt("m1 {0} {1}", quail.col("r.review"),

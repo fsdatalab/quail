@@ -1,61 +1,10 @@
-"""The forward-pass ablation ladder: stock vLLM to the current packed
-executor, one change per rung, all on the committed 10,000-document
-five-filter workload (~3.83M fresh tokens).
+"""Forward-pass ablation ladder: stock vLLM to the current packed executor,
+one change per rung, on the 10,000-document five-filter workload.
 
-  A0  stock vLLM, fp8 KV - the committed production setting:
-      pipelined per-(document, stage) client, prefix caching on,
-      25,305 step tokens, constrained TRUE/FALSE sampler
-  A1  stock vLLM, bf16 KV - isolates the fp8 KV conversion tax
-      (the ladder measured 96,946 -> 102,820 tok/s from dtype alone)
-  A2  packed executor with vLLM's own between-GEMM kernels: "no
-      engine" and the kept-KV machinery (arena with the host-index
-      cache, paged cross-attention, LSE merge, 12-row TRUE/FALSE
-      readout), 110,376-token chunks, pinned-memory staging - the
-      current executor in every respect except the kernels
-  A3  A2 + our three Triton kernels (norm+add+quantize,
-      silu+mul+quantize, qk-norm+rope) - the current executor
+Rungs A0/A1 are stock vLLM (fp8/bf16 KV). A2 is the packed executor with
+vLLM's own between-GEMM kernels. A3 adds our three Triton kernels.
 
-Pinned staging is part of the packed base configuration, not a rung:
-issue #12 already measured 39.6 s before the change and 34.6 s after
-it. The arena host-index cache saved about 4 s, and staging saved about
-1.4 s. See the 2026-08-19 report.
-
-Predictions, stated before the run (house rule), from banked numbers:
-
-  A0  42.8-43.2 s (the exploration's committed fp8 stock band).
-      Config note: the admission budget stays at the bf16 value
-      (374,891 tokens) so dtype is the only variable against A1; the
-      plan-derived fp8 budget (749,782) oversubscribes the measured
-      ~473k-token fp8 pool 1.6x and thrashes (47-79 s, banked in
-      baseline_filter3.json).
-  A1  38.7-39.0 s (banked: results/baseline_filter4.json)
-  A2  ~42.9 s: 43.9 s measured before the direct KV write
-      (kv_row_scatter); the write fix is worth ~1.0 s.
-  A3  ~33.5 s: 34.5 s before the fix; the filter gate with the fix
-      measured 33.5/33.6 s (results/m1_filter_kvscatter.json).
-
-Container discipline: the packed rungs share one boot, so their
-difference carries no container drift. Each stock rung has its own
-container - the v1 engine core is a separate process that holds the
-GPU until it exits, so two engine boots in one container fail
-(measured: 1.34 GiB free at the second boot). Stock-to-packed
-comparisons carry the +/-3% container band.
-
-Gates: A3 must reproduce the banked current-executor counts exactly
-(4,645 survivors, 0 wrong of 40,052 answered on the TRUE/FALSE
-corpus; results/attention_paths.json). A2 runs different quant kernels, so its
-answers are reported against A3's, not gated to zero: this
-checkpoint's TRUE/FALSE margins are thin, and the exploration
-measured 1,768 flipped answers per 10,000 from one silu-kernel swap,
-so low-thousands disagreement at 10k documents is the expected band.
-(The banked bands predate the 2026-08-21 YES/NO to TRUE/FALSE corpus
-conversion; A3's gate counts were re-banked on the converted
-corpus.)
-Every rung reports wrong answers against the planted flags.
-
-Run from the quail/ directory (tee to a file per house rule):
-
-    uv run modal run ablations/forward_pass.py::run_all 2>&1 | tee results/ablation_forward.log
+    uv run modal run ablations/forward_pass.py::run_all
 """
 
 import json
@@ -138,11 +87,8 @@ STOCK_PREDICTIONS = {
 @app.function(timeout=5400, **GPU_KW)
 def stock_rung(rung: str, kv_dtype: str, n_docs: int = 10000,
                reps: int = 2) -> str:
-    """One stock rung in its own container: the pipelined stock client
-    over the five-filter workload. kv_dtype is "fp8" for A0 and "auto"
-    for A1 - "auto" follows the model dtype, which is bf16 KV for this
-    checkpoint (vLLM has no literal "bf16" kv_cache_dtype value).
-    Everything else is identical between the two."""
+    """One stock rung: the pipelined stock client over the five-filter
+    workload. kv_dtype is "fp8" for A0 and "auto" (bf16) for A1."""
     import sys
 
     sys.path.insert(0, "/root/gpu_tests")
@@ -207,7 +153,7 @@ def stock_rung(rung: str, kv_dtype: str, n_docs: int = 10000,
 
 # name, Pipeline kernels, pinned staging, the change the rung adds.
 # Pinned staging is on in both rungs: it is part of the packed base
-# configuration (issue #12 banked its worth), not a rung.
+# configuration, not a rung variable.
 PACKED_RUNGS = (
     ("A2", "vllm", True,
      "packed executor, vLLM's between-GEMM kernels, kept KV, "
@@ -365,9 +311,8 @@ ATTENTION_PATHS = (
 
 
 def _boot_executor(model):
-    """The production boot arithmetic, shared by the attention-path
-    cells: spec, tokenizer, arena, pipeline, answerer, async answers,
-    chunk budget, arena tokens."""
+    """Boot the packed executor and return (spec, tokenizer, arena,
+    pipeline, answerer, async_answers, budget, arena_tokens)."""
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
@@ -399,9 +344,11 @@ def _boot_executor(model):
 
 
 def _disagreements(left, right, n_stages=None):
-    """Answer differences between two {doc: bits} maps. Rows of
-    unequal length count every unmatched trailing bit. Returns
-    (total, by_stage); by_stage is [] unless n_stages is given."""
+    """Count answer differences between two {doc: bits} maps.
+
+    Returns:
+        (total, by_stage); by_stage is [] unless n_stages is given.
+    """
     total = 0
     by_stage = [0] * (n_stages or 0)
     for d in set(left) | set(right):
@@ -417,14 +364,9 @@ def _disagreements(left, right, n_stages=None):
 
 @app.function(timeout=1200, **GPU_KW)
 def attention_parity(q_heads: int = 32) -> str:
-    """Compare unified attention with a contiguous reference.
+    """Compare unified paged attention with a contiguous reference.
 
-    The cases cover fresh and retained prefixes, page boundaries, several
-    groups in one call, and noncontiguous physical pages. The contiguous
-    reference uses the same FlashAttention call without a block table, so a
-    unified versus reference difference isolates the paged mapping and mask.
-    q_heads=32 is the 4B geometry (4:1 GQA); q_heads=64 is the 32B
-    geometry (8:1 GQA).
+    q_heads=32 is the 4B geometry; q_heads=64 is the 32B geometry.
     """
     import math
     from types import SimpleNamespace
@@ -616,10 +558,9 @@ def attention_parity(q_heads: int = 32) -> str:
         safe_case("fresh_page_edges", [(15, 1), (16, 7), (17, 11)], True),
         safe_case("cached_page_edges", [(15, 1), (16, 7), (17, 11)], False),
         safe_case("cached_long", [(63, 32), (129, 13), (511, 7)], False),
-        # issue #24 edge cases: documents spanning hundreds of pages,
-        # documents shorter than the suffix, one-token documents, a
-        # wide chunk of small groups, and (last: it may legitimately
-        # be refused) the empty document
+        # Edge cases: documents spanning hundreds of pages, documents
+        # shorter than the suffix, one-token documents, a wide chunk
+        # of small groups, and (last: may be refused) empty document.
         safe_case("cached_many_pages", [(2049, 37), (4097, 15)], False),
         safe_case("fresh_many_pages", [(2049, 37)], True),
         safe_case("tiny_docs", [(1, 5), (2, 30), (3, 3)], False),
@@ -771,18 +712,7 @@ def attention_end_to_end_parity(n_docs: int = 256,
 def join_attention_paths(n_reports: int = 10, n_terms: int = 256,
                          reps: int = 1,
                          model: str = "qwen3-4b-fp8") -> str:
-    """Both attention paths on the join workload.
-
-    Both paths run the same production join loop. Packed unified
-    gives every suffix a separate FA3 sequence in the same batch. Its
-    page-table row shares the anchor's full pages and uses temporary
-    pages for the anchor remainder and suffix K and V.
-
-    Prediction, stated before the run: packed unified removes the
-    many-small-wave failure. It should be close to merge_quant. Its
-    one attention call avoids the merge kernel, but copying partial
-    anchor rows and using more page-table rows may cost more.
-    """
+    """Compare both attention paths on the join workload."""
     import sys
     import time
 
@@ -1048,16 +978,7 @@ def _categorize(name):
 
 @app.function(timeout=3600, **GPU_KW)
 def profile_packed(n_docs: int = 3000) -> str:
-    """Per-kernel-category GPU time for A2 and A3 in one container,
-    at the 110k-chunk geometry. Answers why A2 (vLLM's small kernels)
-    is slower than A1 (stock engine): the stock kernel composition is
-    banked (10.77 us/token at 25,305-token steps: 5.52 GEMM, 0.81
-    attention, 0.43 KV write, 4.00 the small kernels); this profile
-    measures the same buckets for our loop at 110,376-token chunks.
-
-    Prediction: A2's small-kernel buckets (vllm_elementwise + quant)
-    exceed the stock 4.00 us/token; GEMM and attention match A3.
-    """
+    """Per-kernel-category GPU time for A2 and A3 in one container."""
     import sys
 
     sys.path.insert(0, "/root/gpu_tests")
@@ -1178,12 +1099,7 @@ def run_profile(out: str = "results/ablation_profile.json"):
 
 @app.function(timeout=900, **GPU_KW)
 def probe_attention_api() -> str:
-    """Report the cache-attention entry points in the exact vLLM image.
-
-    The upstream FlashAttention API changes often.  Inspect the package in
-    the measurement container before the attention-path ablation depends on
-    a particular Python wrapper or operator schema.
-    """
+    """Report the cache-attention entry points in the vLLM image."""
     import importlib
     import inspect
 
@@ -1263,10 +1179,7 @@ def run_packed_unified_join_parity(n_reports: int = 10,
 
 @app.local_entrypoint()
 def run_join_paths_sweep(model: str = "qwen3-4b-fp8"):
-    """The three fan-out shapes of the join ablation: the committed
-    10x256 sample, one anchor at full fan-out, and the 100-anchor
-    multi-chunk scale. The sweep is the point here - the join
-    assignment must hold across fan-out, not at one shape."""
+    """Run the join ablation at three fan-out shapes."""
     handles = [(n_r, n_t,
                 join_attention_paths.spawn(n_r, n_t, reps, model))
                for n_r, n_t, reps in

@@ -1,19 +1,4 @@
-"""Modal entry for quail.planner.calibrate.measure.
-
-Attached to quail-engine (same app as the worker). No new app name.
-
-    uv run modal run quail/runtime/calibrate.py --model qwen3-4b-fp8 \
-        --device h100-sxm 2>&1 | tee results/calibrate.log
-
---commit writes quail/calibration/{model}_{device}.json, where
-load_calibration reads. Without it the measurement only lands in
-results/. The local process loads the previous constants so the
-container does not need the JSON files, and so loaded_before is the
-prediction the house rule wants printed next to the fresh fit.
-
-This function is wired to H100. A new device spec is not enough:
-the gpu= decorator has to match the hardware.
-"""
+"""Modal entry point for running calibration measurements on H100."""
 
 import json
 import os

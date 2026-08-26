@@ -1,39 +1,26 @@
 """Chunk packing and admission - no GPU, no torch, unit-tested.
 
-Two schedulers live here:
-
-- pack_stream and friends: brim-packing a known pair list into chunks
-  (the join path, ported from the exploration's joinlogic).
-- FilterAdmission: continuous admission for filter chains - a pending
-  queue and a resident set, nothing in lockstep, no barriers. Each
-  chunk fills from two sources in priority order: next-stage suffixes
-  of resident survivors (every one completed moves a document toward
-  freeing its pages), then fresh documents admitted whenever their
+- pack_stream: brim-packing a known pair list into chunks (join path).
+- FilterAdmission: continuous admission for filter chains. Survivors
+  pack before fresh admissions; fresh documents admit when their
   page-rounded tokens fit the free list.
 
-Length units are tokens everywhere. A "suffix" is one partner document
-plus the answer cue (join) or one question (filter); suffixes are
-atomic - a suffix's tokens attend to each other, so one suffix never
-splits across two chunks.
+Length units are tokens. Suffixes are atomic and never split across
+chunks.
 """
 
 from collections import deque
 
 
 def orient(mean_left_tokens, mean_right_tokens):
-    """Which side anchors: the longer one. Anchor tokens are paid
-    once per document plus a cheap shared read; partner tokens are
-    paid once per pair, so the short side must stream."""
+    """Which side anchors: the longer one. Anchor tokens are paid once
+    per document; partner tokens are paid once per pair."""
     return "left" if mean_left_tokens >= mean_right_tokens else "right"
 
 
 def plan_groups(prefix_tokens, suffix_tokens, budget):
-    """Split one anchor's suffix stream into consecutive chunk groups.
-
-    Each group is a (start, end) slice of the suffix list whose
-    tokens fit under `budget` together with one copy of the prefix
-    (the prefix is recomputed - or read from kept KV - at the head of
-    every group)."""
+    """Split one anchor's suffix stream into (start, end) chunk groups
+    that fit under `budget` together with the prefix."""
     room = budget - prefix_tokens
     if room <= 0:
         raise ValueError(
@@ -55,25 +42,19 @@ def plan_groups(prefix_tokens, suffix_tokens, budget):
 
 
 def pack_stream(anchors, budget, keep=(), already_kept=()):
-    """Brim-pack a whole pair list into chunks, keeping cut prefixes.
+    """Brim-pack a pair list into chunks, keeping cut prefixes in the
+    arena.
 
-    anchors: list of (prefix_tokens, [suffix_tokens]) in run order.
-    keep: anchor indices whose prefix KV a later stage needs.
-    already_kept: anchor indices whose prefix KV is already resident
-    from an earlier stage; their groups never pack prefix tokens.
+    Args:
+        anchors: List of (prefix_tokens, [suffix_tokens]) in run order.
+        keep: Anchor indices whose prefix KV a later stage needs.
+        already_kept: Anchors whose prefix KV is already resident.
 
-    Returns (chunks, kv_to_cache). Each chunk is a list of groups
-    (anchor_index, start, end, carried); carried means the group
-    packs a fresh copy of the anchor's prefix tokens ahead of
-    suffixes start..end. An anchor's prefix is packed at most once,
-    ever: when the budget cuts its stream, the anchor continues in
-    the next chunk with carried False, and its suffixes read the
-    prefix KV from the arena instead. kv_to_cache is the set of
-    anchors whose prefix KV must be written to the arena - their
-    stream is cut mid-chunk, or a later stage needs them (keep).
-    Suffix KV is never cached anywhere. Cuts happen only at suffix
-    boundaries; when an anchor's stream ends mid-chunk, the next
-    anchor starts in the same chunk.
+    Returns:
+        (chunks, kv_to_cache). Each chunk is a list of
+        (anchor_index, start, end, carried); carried means the group
+        packs the anchor's prefix tokens. kv_to_cache is the set of
+        anchors whose prefix KV must be written to the arena.
     """
     keep, already = set(keep), set(already_kept)
     chunks, chunk, used = [], [], 0
@@ -143,15 +124,11 @@ def matches(answer_rows):
 
 
 def assemble(ans1_rows, ans2_rows):
-    """Output triples of two pairwise join stages sharing one anchor,
-    from recorded answers: the reference semantics for the session's
-    recombination (_assemble generalizes this to k stages and adds
-    the survivor-set checks) and the milestone-1 replay cell.
+    """Output triples from two pairwise join stages sharing one anchor.
 
     ans1_rows: b -> row of 0/1 over A (stage 1, anchored on b).
     ans2_rows: b -> row of 0/1 over C, present only for gated
-    survivors. Triples fan out from each surviving b's matched a's
-    crossed with its matched c's - no model calls."""
+    survivors."""
     m1, m2 = matches(ans1_rows), matches(ans2_rows)
     out = []
     for b in sorted(ans2_rows):
@@ -162,10 +139,7 @@ def assemble(ans1_rows, ans2_rows):
 
 
 def brute_force_triples(ans1_rows, ans2_rows):
-    """The nested-loop reference over the same recorded answers: no
-    gating, no dedup. Short-circuit order means a gated b - whose
-    stage-2 row was never recorded - is never looked up, because its
-    stage-1 row has no TRUE."""
+    """Nested-loop reference over recorded answers without gating."""
     out = []
     for b, row1 in sorted(ans1_rows.items()):
         for a, v1 in enumerate(row1):
@@ -179,37 +153,28 @@ def brute_force_triples(ans1_rows, ans2_rows):
 # --------------------------------------------- continuous admission
 
 def pages_for(tokens: int, page_tokens: int) -> int:
-    """Page-rounded residency: only document tokens occupy pages;
-    suffix KV never exists."""
+    """Pages needed for `tokens` rows (suffix KV is never paged)."""
     return -(-tokens // page_tokens)
 
 
 class FilterAdmission:
-    """The filter chain's scheduler: which groups go in the next
-    chunk, and what the arena holds.
+    """Filter chain scheduler: builds chunk groups and tracks arena
+    residency.
 
-    doc_tokens: per-document token counts.
-    stage_tokens: per-stage question suffix token counts.
-    chunk_budget: tokens per forward pass (one bin).
-    arena_pages / page_tokens: the admission budget (the other bin).
-    arena_pages=None removes the page bin: the driver never writes
-    the arena (a single-stage query with no store has no later
-    reader of any document's KV), so admission is the token budget
-    alone and no page accounting happens at all.
+    Args:
+        doc_tokens: Per-document token counts.
+        stage_tokens: Per-stage question suffix token counts.
+        chunk_budget: Tokens per forward pass.
+        arena_pages: Page budget for admission. None disables page
+            accounting (single-stage, no store).
+        page_tokens: Tokens per arena page.
+        kept_extra_tokens: Extra tokens per document that must fit in
+            pages (shared preamble plus tail room).
+        restored: Documents whose KV loads from the store.
+        limit: Stop after this many survivors.
 
-    Rules, from the design:
-    - survivor suffixes pack before fresh admissions, so residency
-      drains monotonically;
-    - a document's pages are claimed at admission and returned the
-      instant it fails a stage or answers its last one;
-    - pages are granted in queue order (a document that cannot fit
-      its pages blocks later page claims, so its wait is bounded -
-      pages only ever flow back), but chunk ROOM may be skipped:
-      a document too big for what is left of this chunk does not
-      stop smaller work from filling it;
-    - a document that could not fit even into an empty arena or an
-      empty chunk was refused at plan time, so there is no deadlock
-      case here.
+    Survivor suffixes pack before fresh admissions. Pages are granted
+    in queue order; chunk room may be skipped.
     """
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
@@ -225,8 +190,7 @@ class FilterAdmission:
         self.limit = limit
         self._survivor_count = 0
         # kept_extra_tokens: the shared question preamble that joins
-        # the document's kept KV after stage 1 (chain mode kept it
-        # resident; so do we), so pages must cover it
+        # the document's kept KV after stage 1, so pages must cover it
         self.kept_extra = kept_extra_tokens
         # restored: documents whose KV loads from the store instead of
         # computing - their admission claims the same pages but their
@@ -250,10 +214,10 @@ class FilterAdmission:
     # ---- chunk building ------------------------------------------------
 
     def next_chunk(self):
-        """Groups for the next chunk: [(doc, stage, fresh)], fresh
-        meaning the document's tokens ride along and its KV is written
-        to its pages. Empty list means nothing is buildable right now
-        (answers are still in flight)."""
+        """Groups for the next chunk: [(doc, stage, fresh)].
+
+        fresh means the document's tokens are packed and its KV is
+        written to its pages. Returns [] when nothing is buildable."""
         if self._limit_reached():
             return []
         room = self.chunk_budget
@@ -302,15 +266,11 @@ class FilterAdmission:
     # ---- gating --------------------------------------------------------
 
     def report(self, doc, stage, passed, release=True):
-        """One landed answer. Frees pages on FALSE or on the last
-        stage; otherwise the next-stage suffix becomes ready.
-        Returns the docs whose pages were freed (at most this one),
-        so the caller frees their arena keys too - the same protocol
-        as drain_ready.
+        """Record one answer. Frees pages on FALSE or last stage;
+        otherwise queues the next-stage suffix.
 
-        release=False keeps a leaving document's pages held (the store
-        is copying them out); the caller returns them with release()
-        when the copy completes."""
+        Returns docs whose pages were freed. release=False keeps
+        pages held for a pending store copy."""
         self.in_flight.discard(doc)
         self.answers.setdefault(doc, []).append(1 if passed else 0)
         last = stage == len(self.stage_tokens) - 1
@@ -342,10 +302,8 @@ class FilterAdmission:
                 and not self.in_flight)
 
     def drain_ready(self):
-        """Free the pages of docs still queued when the limit ended
-        the run early. Returns the drained docs so the caller frees
-        their arena keys too - none under arena_pages=None, where no
-        document owns pages or an arena key."""
+        """Free pages of docs still queued when the limit ends the
+        run early. Returns drained docs for arena key cleanup."""
         out = []
         while self.ready:
             doc, _ = self.ready.popleft()

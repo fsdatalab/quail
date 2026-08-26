@@ -1,14 +1,4 @@
-"""B16 (FEVER): the new real-data join added to QUAIL-B - claims
-joined against the Wikipedia evidence pages they actually reference,
-scored against the real FEVER label instead of a planted flag. This
-cell exists to confirm the loader and the query run end to end on
-GPU, not to reproduce a committed number.
-
-Run from the quail/ directory (tee to a file per house rule):
-
-    uv run modal run tests/gpu/fever_query.py::run_fever \
-        2>&1 | tee results/fever_b16.log
-"""
+"""GPU smoke test for the FEVER join query: runs the loader and query end to end."""
 
 import modal
 

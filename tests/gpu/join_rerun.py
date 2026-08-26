@@ -1,16 +1,4 @@
-"""Rerun the three two-table joins after the shared prompt fix.
-
-Run from the repository root (tee to a file per house rule):
-
-    uv run modal run tests/gpu/join_rerun.py::main \\
-        --model qwen3-4b-fp8 2>&1 | tee results/join_rerun_4b.log
-    uv run modal run tests/gpu/join_rerun.py::main \\
-        --model qwen3-32b-fp8 2>&1 | tee results/join_rerun_32b.log
-
-Spawn, not remote: the function call id prints before anything waits
-on the result, so a dropped local connection doesn't lose the run -
-re-fetch with modal.FunctionCall.from_id("<id>").get().
-"""
+"""Rerun the three two-table joins after the shared prompt fix."""
 
 import modal
 

@@ -1,28 +1,8 @@
-"""vLLM-opbench worker — offline batched-inference vLLM on Modal (H100).
+"""vLLM-opbench worker: offline batched-inference vLLM on Modal (H100).
 
-The worker attaches to the existing "quail-milestone1" Modal app and
-uses the same app lifecycle as the other benchmark cells.
-
-Ported from SQPE's vllm_worker.py (/Users/adhariya/SQPE, a separate
-benchmarking project), with two deliberate departures:
-
-  - Prompts are raw prompt_token_ids (matching quail's own engine and
-    baselines/stock.py), not chat-template text via llm.chat().
-    SQPE's chat-template-based shared-prefix padding (the vLLM issue
-    #40696 block-boundary workaround) is NOT ported - it's a text/
-    chat-template-specific mechanism, and doesn't carry over cleanly
-    to raw-token prompts. Prefix-cache reuse here relies on vLLM's own
-    cache plus request ordering (anchor-major for joins, same as
-    stock.py's run_join_grouped), not explicit block padding. This is
-    a known simplification versus SQPE's original - full parity would
-    mean re-deriving the padding math in token space, not text space.
-  - The answer is a constrained TRUE/FALSE token id (allowed_token_ids
-    + max_tokens=1), not free-text "true"/"false" parsing.
-
-Prometheus metric snapshot/diff, the gauge-polling timeseries, the
-KV-cache regret oracle, and the nsys hookup are otherwise a straight
-port - all of that is generic vLLM-introspection code with no
-SQPE-specific coupling.
+Prompts are raw prompt_token_ids with constrained TRUE/FALSE token ids.
+Prefix-cache reuse relies on vLLM's own cache plus anchor-major request
+ordering for joins.
 """
 
 import time
@@ -68,18 +48,11 @@ vllm_image = (
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1",
          # FlashInfer reserves another 1.5 GiB after vLLM sizes the KV cache.
          "VLLM_USE_FLASHINFER_SAMPLER": "0",
-         # Without this, PyTorch's CUDA caching allocator needs an exact
-         # contiguous block and can fail even when enough total free
-         # memory exists, just fragmented - the allocator OOM warnings
-         # seen at large batch sizes (60k+ pending requests) regardless
-         # of model size. stock_join_imdb.py's baseline already sets
-         # this; vllm_opbench's image was missing it.
+         # Without this, PyTorch's CUDA caching allocator fails on
+         # fragmented memory at large batch sizes.
          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     # add_local_* must be last: Modal requires it after every build step.
-    # config.py/gpu_profiling.py are submodules of the baselines package
-    # here (unlike SQPE's original flat repo layout), so the whole
-    # package needs mounting, not the two files by their bare names -
-    # matching how quail/runtime/worker.py mounts "quail" whole.
+    # The whole baselines package is mounted, not individual files.
     .add_local_python_source("baselines")
 )
 
@@ -93,11 +66,7 @@ nsys_traces_vol = modal.Volume.from_name(NSYS_VOLUME_NAME,
 # --------------------------------------------------- Prometheus snapshot/diff
 
 def snapshot_vllm_metrics(llm) -> dict:
-    """Normalize vLLM's typed metric objects into
-    {sample_name: [{labels, value}]}. Captures every object
-    llm.get_metrics() returns, including Info/config-style metrics
-    (e.g. vllm:cache_config_info) via the generic else branch, so
-    nothing get_metrics() exposes is dropped."""
+    """Normalize all vLLM metric objects into {sample_name: [{labels, value}]}."""
     from vllm.v1.metrics.reader import Counter, Gauge, Histogram, Vector
 
     snapshot = {}
@@ -125,10 +94,7 @@ def snapshot_vllm_metrics(llm) -> dict:
 
 
 def snapshot_gauge_metrics(llm) -> dict:
-    """Gauge-only snapshot: the one metric type whose useful signal is
-    an instantaneous, mid-batch value (queue depth, KV occupancy),
-    invisible to a before/after diff since the engine reads idle at
-    both of those instants."""
+    """Gauge-only snapshot for mid-batch values like queue depth and KV occupancy."""
     from vllm.v1.metrics.reader import Gauge
 
     snapshot = {}
@@ -192,9 +158,7 @@ def _get_resolved_block_size(llm) -> int:
 # ------------------------------------------------------ KV-cache regret oracle
 
 def _chain_hashes(token_ids: list[int], block_size: int) -> list:
-    """One rolling hash per whole block boundary in token_ids - the
-    same chain-hash structure vLLM's own prefix cache uses to key a
-    block on everything that precedes it, not just its own contents."""
+    """Rolling hash per block boundary, matching vLLM's prefix-cache keying."""
     chain = []
     h = 0
     for i in range(0, len(token_ids) - len(token_ids) % block_size, block_size):
@@ -205,17 +169,11 @@ def _chain_hashes(token_ids: list[int], block_size: int) -> list:
 
 def _compute_oracle_regret_from_token_ids(all_token_ids: list[list[int]],
                                           block_size: int) -> dict:
-    """How many prefix-cache blocks WOULD hit under an infinite,
-    never-evicting cache, vs. how many vLLM's real (finite, arrival-
-    order) cache actually hit. Takes the REAL token id sequences
-    straight from each output's own o.prompt_token_ids, not a
-    re-tokenization - o.prompt_token_ids is the literal sequence the
-    engine already processed, no reconstruction risk.
+    """Prefix-cache hit count under an infinite cache versus the real cache.
 
-    With an infinite cache, processing order doesn't change the total
-    hit count - each unique block-hash-chain is computed once (a
-    miss) regardless of which request reaches it first, so this only
-    needs one pass in arrival order, not a search over orderings."""
+    Uses each output's own prompt_token_ids directly. Processing order
+    does not affect the infinite-cache hit count.
+    """
     seen: set = set()
     per_request = []
     total_hit_blocks = 0
@@ -299,9 +257,7 @@ def _reset_impl(llm) -> dict:
 
 
 def _poll_metrics_loop(llm, t0, stop_event, poll_interval_s, timeseries):
-    """Background thread, gauge-only metrics every poll_interval_s -
-    the only way queue depth / KV occupancy get seen mid-batch (the
-    before/after snapshot sees the engine idle at both instants)."""
+    """Background thread: sample gauge metrics every poll_interval_s."""
     while not stop_event.is_set():
         try:
             snap = snapshot_gauge_metrics(llm)

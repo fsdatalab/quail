@@ -1,58 +1,9 @@
-"""FlashInfer versus FlashAttention-3 on Quail's attention shapes
-(issue #24, "evaluate off-the-shelf alternatives").
+"""FlashInfer versus FlashAttention-3 on Quail's attention shapes.
 
-Two cells:
+Times per-layer attention including KV scatter, merge, and FP8
+quantization on synthetic tensors matching real workload geometry.
 
-- probe_flashinfer: report the FlashInfer version and API surface in
-  the exact vLLM 0.26.0 image, before any benchmark depends on a
-  wrapper name or signature. Ran 2026-08-21: flashinfer 0.6.14 is in
-  the image (results/flashinfer_probe.json).
-- bench: time the attention paths on synthetic tensors shaped like
-  the real workloads, FA3 against FlashInfer, isolated from the rest
-  of the forward pass. Each timing includes everything downstream
-  that differs between paths (KV scatter, merge, FP8 quantization),
-  so the numbers compare what o_proj actually waits for.
-
-The decision rule from the issue: if an off-the-shelf kernel is
-within 5% of our path, prefer the off-the-shelf one for
-maintainability.
-
-Shapes (Qwen3 4B: 32 q heads, 8 kv heads, head_dim 128, page 16):
-
-- filter_fresh: 340 groups of (fresh document 180-460 tokens +
-  question 32 tokens), ~110k fresh tokens - the stage-1 filter chunk,
-  where ~90% of all filter tokens are spent.
-- filter_cached: the same groups with the documents already resident,
-  question suffixes only - the stage-2+ rewind chunk.
-- join: 10 anchors of 3,530 resident tokens, 26 suffixes of 42 tokens
-  each - the BioDEX 10x256 chunk geometry.
-- join_fanout: 1 anchor, 256 suffixes - the high-fan-out join. This
-  shape also fits FlashInfer's cascade wrapper (their two-level
-  shared-prefix decomposition), which needs one prefix shared by
-  every query in the batch, so it cannot run the multi-anchor shapes.
-
-Prediction, stated before the run: FlashInfer's prefill kernels and
-FA3 are the same class of Hopper tensor-core kernel, so expect the
-two-call stacks within tens of percent of each other; our unified
-path is a single FA3 call with no merge, so on the filter shapes
-FlashInfer has to beat one FA3 kernel launch outright to displace
-it. Cascade should behave like our two-call path (it is the same
-decomposition) with a different merge implementation.
-
-A third cell, bench_tuned, is the fairness pass: the same shapes
-with every backend string the wrappers accept forced in turn
-(instead of "auto"), plus a hybrid variant whose two FlashInfer
-attention calls are merged by our fused merge_quant kernel, so
-kernel quality is measured separately from fusion.
-
-Run from the quail/ directory (tee per house rule):
-
-    uv run modal run ablations/flashinfer_compare.py::run_probe \
-        2>&1 | tee results/flashinfer_probe.log
-    uv run modal run ablations/flashinfer_compare.py::run_bench \
-        2>&1 | tee results/flashinfer_bench.log
-    uv run modal run ablations/flashinfer_compare.py::run_bench_tuned \
-        2>&1 | tee results/flashinfer_tuned.log
+    uv run modal run ablations/flashinfer_compare.py::run_bench
 """
 
 import json
@@ -180,9 +131,8 @@ def _median_ms(torch, fn, iters=20):
 
 
 def _case_builder(q_heads):
-    """The synthetic chunk builder at the engine's geometry. Shared
-    by bench and bench_tuned so both cells time identical tensors
-    (same seeds, same arena layout)."""
+    """Synthetic chunk builder at the engine's geometry, shared by bench
+    and bench_tuned."""
     from types import SimpleNamespace
 
     import numpy as np
@@ -549,13 +499,9 @@ def run_bench(q_heads: int = 32):
 
 @app.function(timeout=3600, **GPU_KW)
 def bench_tuned(q_heads: int = 32) -> str:
-    """Give FlashInfer its best configuration (issue #24 follow-up):
-    force each backend string the 0.6.14 wrappers accept instead of
-    "auto", and add a hybrid two-call variant whose two FlashInfer
-    attention calls are merged by our fused merge_quant Triton
-    kernel - separating kernel quality from fusion. Page size stays
-    16 on both stacks: it is an arena property the engine sets, and
-    both sides run the same value."""
+    """Force each FlashInfer backend string and add a hybrid variant
+    using our fused merge_quant kernel, separating kernel quality from
+    fusion."""
     import numpy as np
     import torch
 

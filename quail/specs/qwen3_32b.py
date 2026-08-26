@@ -13,7 +13,5 @@ QWEN3_32B_FP8 = ModelSpec(
     w_bytes=1.0,           # fp8 weights
     hf_name="Qwen/Qwen3-32B-FP8",
     w_mem_bytes=34.37e9,   # measured footprint: fp8 weights + bf16
-    #                        embeddings + block scales (torch.cuda.
-    #                        memory_allocated() right after load_model(),
-    #                        before any arena/activation allocation)
+    #                        embeddings + block scales
 )

@@ -1,30 +1,4 @@
-"""End-to-end smoke of the Session surface on the real Modal worker:
-synthetic planted corpora, one filter query and one join query, run
-through sess.sql(...).run().
-
-What this smoke gates, measured:
-- filter: 200 documents, two planted flags at rates 0.6 and 0.5. The
-  value-completion question style works on the 4B (measured 76/76
-  agreement with planted survivors); gating structure and the
-  provided-vs-observed report are the checks.
-- join: 12 reports x 36 candidates = 432 pairs. The PLUMBING is the
-  gate here (pair count, projection, report), NOT accuracy: the 4B
-  answers TRUE to essentially every constrained one-token equality
-  judgment. Measured twice through a trivially-correct causal
-  reference path (milestone1.py::run_debug_join, with and without a
-  few-shot example): all-TRUE both times, 0 disagreements against the
-  packed executor. Content-style predicates (the BioDEX shape) discriminate;
-  symbolic equality does not. QUAIL-B's join predicates must use a
-  checkpoint-verified phrasing.
-- walls are compile-dominated: a single-rep smoke pays the DeepGEMM
-  and Triton JIT for its shapes inside the measured wall. Each run()
-  boots its own container today; a warm session-held worker is a
-  later step.
-
-Run from the quail/ directory:
-
-    uv run python tests/gpu/session_smoke.py 2>&1 | tee results/session_smoke.log
-"""
+"""Session smoke test on GPU: filter and join queries on synthetic planted corpora."""
 
 import json
 import sys
@@ -64,12 +38,7 @@ COLORS = ("blue", "red", "green", "yellow", "purple", "orange")
 
 
 def make_join_parquets(rdir, cdir, n_reports=12, n_cands=36):
-    """Single-lookup predicate, the shape the join findings proved the
-    4B can answer: the report states one fact (its dominant color),
-    the candidate names one color, the question compares them. The
-    two-planted-key form (X=<k> on both sides) is known to fail - the
-    committed nway3 run measured the model answering TRUE to nearly
-    every such pair."""
+    """Build report and candidate parquets with planted color matches, returning a truth dict."""
     keys = len(COLORS)
     reports = []
     for i in range(n_reports):

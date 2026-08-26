@@ -1,14 +1,5 @@
-"""Measure a and a2 for a (model, device) pair on the packed loop.
-
-This is the onboard step for a new model or device: run the packed
-filter at a few document lengths, fit t(h) = a + a2*h, and probe
-the host copy channels.
-
-Nothing here talks to Modal. The GPU entry that calls measure() is
-quail/runtime/calibrate.py, attached to the quail-engine app.
-
-    uv run modal run quail/runtime/calibrate.py --model qwen3-4b-fp8 \
-        --device h100-sxm --commit 2>&1 | tee results/calibrate.log
+"""Measure calibration constants (a, a2) for a (model, device) pair
+by sweeping document lengths through the packed filter loop.
 """
 
 from quail.planner import budgets
@@ -42,7 +33,7 @@ def _token_ids(tokenizer, n: int) -> list[int]:
 
 
 def _boot(spec: ModelSpec, device: DeviceSpec):
-    """Model, pipeline, arena, answerers, sized by the plan arithmetic."""
+    """Load the model and build the pipeline, arena, and answerers."""
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
@@ -70,7 +61,7 @@ def _boot(spec: ModelSpec, device: DeviceSpec):
 
 
 def _probe_channels(torch) -> dict:
-    """2 GiB timed copies, pinned and unpinned, both directions."""
+    """Measure host-device copy bandwidth, pinned and unpinned."""
     import time
 
     channels = {}
@@ -99,12 +90,10 @@ def measure(model: ModelSpec, device: DeviceSpec,
             tokens_per_point: int = TOKENS_PER_POINT,
             lengths: tuple[int, ...] = LENGTHS,
             loaded: Calibration | None = None) -> dict:
-    """Sweep document length through the packed filter and fit a, a2.
+    """Sweep document lengths through the packed filter and fit a, a2.
 
-    Needs a GPU and the executor. Call from the Modal entry, not from
-    the coordinator. `loaded` is the previous constants (anchor or
-    spec-scaled); the Modal entry passes them in so the container
-    does not have to read the JSON files.
+    Runs on GPU. `loaded` supplies the previous calibration constants
+    so this function does not need to read the JSON files itself.
     """
     import time
 
@@ -128,8 +117,7 @@ def measure(model: ModelSpec, device: DeviceSpec,
         body_ids = [stream[i * h:(i + 1) * h] for i in range(n_docs)]
         t0 = time.perf_counter()
         with torch.inference_mode():
-            # one stage, no store: the production shape for this
-            # query is the fast path, so the constants measure it
+            # single stage, no store: matches the fast path
             _, spans, tokens = run_filter(
                 torch, arena, pipeline, async_ans, body_ids, q_ids,
                 exec_budget, arena_writes=False)

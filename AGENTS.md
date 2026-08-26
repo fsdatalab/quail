@@ -19,6 +19,9 @@ engineers talking to each other at a whiteboard. No jargon.
 - When something failed or is uncertain, say so directly and say what
   would settle it.
 - Code comments state constraints the code cannot show; nothing else.
+- Docstrings follow Google style: one-line summary, blank line, then
+  optional Args/Returns/Raises sections. Keep them short — say what
+  the code does, not why it was written or what it replaced.
 - Call the KV cache "KV". Do not rename it with analogies like "notes".
 - Never say "arm" or "arms" for the runs of an experiment. Say
   "run", "configuration", or name the method being run.
@@ -86,7 +89,10 @@ All experiment and feature reports live under `reports/`.
   and what the numbers mean. Cite the data by its `quail-results`
   volume path.
 - When a report is superseded or its numbers are no longer current,
-  move it to `reports/old/`. Do not delete old reports.
+  delete the report, its plot script, and its PNGs from
+  `reports/plots/`. Before starting a new task, scan `reports/`
+  for outdated reports, orphaned plot scripts, and PNGs not
+  referenced by any current report, and delete them all.
 - When a PR ships a new feature (a code change that lands on main),
   add a short description in `reports/shipped_features/`.
   Name the file `YYYY-MM-DD-<short-slug>.md`. It should say what
@@ -114,8 +120,8 @@ Every report with measured results should include at least one plot.
 
 - One script per report (or per group of related reports), named
   `make_<slug>_plots.py`, in `reports/`.
-- Output PNGs go to `reports/plots/`. When a report moves to
-  `old/`, its PNGs move to `old/plots/`.
+- Output PNGs go to `reports/plots/`. Delete a report's PNGs when
+  the report is deleted.
 - Reference plots in the report by relative path:
   `"Figure: plots/<name>.png"`.
 - Each script should be runnable from the repository root, given a

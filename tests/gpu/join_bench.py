@@ -1,31 +1,4 @@
-"""Two measured cells for issue #38's benchmark slice, on planted
-corpora (colors drawn independently and uniformly, so the per-pair
-selectivity is exactly 1/6 and the gate formula's independence
-assumption holds exactly):
-
-1. THE GATE. A star of three joins on one shared table b (at two
-   joins, chain and star are the same graph - issue #38 - so one
-   shape covers both; three stages give two gate checkpoints). All
-   stages share anchor b, one group, no barrier. Measured live
-   anchors after each gate vs the formula n(1-(1-s)^partners), and
-   measured stage tokens vs the plan's arithmetic.
-
-2. THE RE-SHARD. A chain ai(a,b), ai(b,c) where a's documents are
-   ~3,000 tokens and b, c are short. Baseline: anchors forced onto
-   the shared table b - the only plan the engine could run before
-   PR #42, configured explicitly per the house rule. Free: the
-   planner picks; the cost model says anchoring a and paying the
-   barrier beats streaming a's documents once per pair.
-
-Both cells run in one session (one boot), single H100, qwen3-4b-fp8,
-store disabled (cpu_memory_gb=0) so run order cannot contaminate the
-comparison. Builder queries pin the stage order (as_written), so the
-runs measure execution, not the order search (CPU-tested).
-
-Run from the quail/ directory:
-
-    uv run python tests/gpu/join_bench.py 2>&1 | tee results/join_bench.log
-"""
+"""Join benchmark: a three-stage gate cell and a re-shard cell on planted color corpora."""
 
 import json
 import sys
@@ -139,11 +112,7 @@ def live_anchors(res, stage):
 
 
 def planted_gate(t):
-    """The conditional prediction, exact given the drawn corpus: with
-    only 4 partner documents, the closed-form expectation over
-    partner draws has wide variance (a draw can land on 2 distinct
-    colors instead of ~3.1), so the realized truth is also computed
-    and recorded. Knowable before the run - it uses only the seed."""
+    """Compute the planted gate survival counts and per-stage selectivities from the drawn corpus."""
     set1, set2 = set(t["p1"]), set(t["p2"])
     live1 = [c for c in t["bstar"] if c in set1]
     live2 = [c for c in live1 if c in set2]
@@ -161,12 +130,7 @@ def planted_gate(t):
 
 
 def planted_reshard(t):
-    """The re-shard corpus's exact planted truth, from the seed: the
-    two stage selectivities and the final triple count. Both runs ask
-    the same planted question, so both should land here up to model
-    noise - a per-stage gap between the two configurations is
-    orientation sensitivity (issue #43), not an engine difference
-    (recombination is checked against brute force elsewhere)."""
+    """Compute the planted stage selectivities and triple count for the re-shard corpus."""
     a, b, c = t["along"], t["bmid"], t["cmid"]
     s1 = sum(1 for x in a for y in b if x == y)
     s2 = sum(1 for y in b for z in c if y == z)

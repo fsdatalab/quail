@@ -1,16 +1,4 @@
-"""The milestone 1 corpora.
-
-Two workloads ported from the exploration (same seeds, same
-truncation). 2026-08-21: the planted values and answer instructions
-changed from YES/NO to TRUE/FALSE to match the engine's constrained
-readout (true_false_ids), so answer counts no longer compare against
-pre-change artifacts; walls still do (token counts move by a few
-tokens per document):
-
-- the 10,000-document five-filter IMDB corpus with planted [FLAGS]
-  lines (filter_cells.json / filter_cells_bf16.json);
-- the BioDEX 100-report x 2,560-term join sample (join2way.json).
-"""
+"""Milestone 1 corpora: the IMDB five-filter corpus and the BioDEX join sample."""
 
 MODEL = "Qwen/Qwen3-4B-FP8"
 WORKLOAD_SEED = 20260731
@@ -28,9 +16,7 @@ PREAMBLE = ("You will be shown a patient report and one candidate "
 # ------------------------------------------------------ the filter set
 
 def build_pool(n_docs):
-    """The seeded 10,000-document IMDB sample, truncated to n_docs.
-    Fixed by WORKLOAD_SEED, so every run sees the same documents in
-    the same order."""
+    """Return the first n_docs documents from the seeded 10,000-document IMDB sample."""
     import numpy as np
     import pandas as pd
     from huggingface_hub import hf_hub_download
@@ -55,20 +41,14 @@ def flags_line(flags):
 
 
 def question(j):
-    """Filter j's question. Every question shares a 33-token preamble;
-    the executor keeps its KV with the document after stage 1, the way
-    chain mode's rewind kept it resident."""
+    """Return the prompt text for filter question j."""
     return (f"\n\nExample: if the line said [FLAGS] FLAG_9=FALSE, then "
             f"FLAG_9 has value FALSE.\nInstruction: output only the value "
             f"of FLAG_{j} from the [FLAGS] line above.\nFLAG_{j}=")
 
 
 def build_corpus(tok, n_docs, seed_offset=100, n_filters=None):
-    """Tokenized documents with their planted flag lines, the
-    tokenized questions, and the flag truth table. The default keeps
-    every 5-filter corpus byte-identical to the committed cells.
-
-    Returns (body_ids, q_ids, flags)."""
+    """Build the tokenized filter corpus. Returns (body_ids, q_ids, flags)."""
     import numpy as np
 
     n = n_filters or N_FILTERS
@@ -106,9 +86,7 @@ def nway_truth():
 
 
 def nway_corpus(tokenizer):
-    """Three planted collections from the IMDB pool: B documents are
-    ~4k tokens (12 reviews concatenated), A and C single reviews.
-    Byte-identical to the committed nway3 corpus."""
+    """Build the three-way planted corpus (A, B, C) with key lines, tokenized."""
     reviews = build_pool(1500)
     a_docs = [f"{reviews[j]}\n\n[KEY] X={j % X_VALUES}"
               for j in range(N_A)]
@@ -146,10 +124,7 @@ def pair_suffix_text(term):
 
 def biodex_sample(tokenizer, n_reports=100, vocab_cap=3718,
                   max_report_tokens=3500, seed=DATA_SEED):
-    """Reports and the reaction-term vocabulary, tokenized. Streamed:
-    the pool is the first 2,000 usable rows in dataset order, the
-    reports a seeded choice from it. The committed run's pool yields
-    2,560 distinct terms under the cap, so pairs = 100 x 2,560."""
+    """Return tokenized BioDEX reports and the reaction-term vocabulary."""
     import numpy as np
     from datasets import load_dataset
 

@@ -1,5 +1,4 @@
-"""The section-8 table at 4B/H100, asserted against the numbers the
-exploration repo measured and derived."""
+"""Tests for model specs, budget calculations, and calibration on Qwen3-4B / H100."""
 
 from dataclasses import replace
 

@@ -1,6 +1,4 @@
-"""pack.py against brute force, on randomized shapes. The pack_stream
-half is the exploration's test suite carried over; the FilterAdmission
-half is the brute-force simulator the design calls for."""
+"""Tests for pack_stream, FilterAdmission, and gate/assemble against brute force."""
 
 import random
 
@@ -104,10 +102,7 @@ def test_gate_matches_assemble_vs_brute_force():
 # ------------------------------------------- the admission simulator
 
 def _drive(sched, truth, deliver_lag=1, rng=None):
-    """Run the scheduler to completion the way loop.py will: build a
-    chunk, then deliver answers for chunks launched `deliver_lag` ago
-    (answers land while later chunks run). Returns per-chunk group
-    lists for the invariant checks."""
+    """Drive the scheduler to completion, delivering answers with the given lag. Returns per-chunk group lists."""
     chunks, outstanding = [], []
     idle = 0
     while not sched.done():
@@ -246,8 +241,7 @@ def test_admission_limit_drain_ready_returns_stranded():
 
 
 def test_admission_limit_reduces_work():
-    """Run the same corpus with and without a limit. The limited run
-    should admit fewer documents and build fewer chunks."""
+    """Verify that a limit reduces admitted documents and chunks compared to an unlimited run."""
     rng = random.Random(42)
     n_docs = 80
     n_stages = 3

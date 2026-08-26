@@ -1,23 +1,7 @@
 """Nsight Systems (nsys) profiling for the vLLM-opbench worker.
 
-Ported near-verbatim from /Users/adhariya/SQPE/gpu_profiling.py - this
-module is entirely generic (no SQPE-specific coupling beyond its
-config imports), so the port is a straight copy with vllm_opbench's
-own config module.
-
-Runs the Modal container runtime under `nsys profile` and uses CUDA
-profiler API capture ranges so that ONLY a bounded, steady-state
-window of one generate_batch() call is recorded - not the whole
-container lifetime, and not the cold-start ramp-up of the batch
-itself.
-
-Important Modal-specific detail: the re-exec below launches
-
-    python -m modal._container_entrypoint
-
-NOT the file path directly - the file path form inserts /pkg/modal at
-the front of sys.path, which makes modal/types.py shadow the standard
-library's types.py and breaks Modal startup.
+Re-execs the Modal container under `nsys profile` and uses CUDA profiler
+API capture ranges to record a bounded steady-state window.
 """
 
 import os

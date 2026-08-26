@@ -1,23 +1,7 @@
-"""The coordinator's arithmetic: splitting a plan payload across GPU
-workers and merging their answers back. Pure dict-and-list logic, no
-torch, CPU-tested - the worker's parent process calls it between its
-children, so the split and the merge never cross a network hop.
+"""Coordinator: split plan payloads across GPU workers and merge answers.
 
-The sharding contract, from the design: filters split documents by
-token count; joins split by anchor document, so gating and each
-anchor's tuple stream stay local to the GPU holding the anchor.
-Shards are deterministic for a given corpus, which is what lets each
-GPU's store slice serve the same documents query after query.
-
-Rounds per query, following the plan's node graph:
-
-  round 1 (filters): every worker filters its shard of every alias.
-  one join round per JoinGroup node: anchors follow the alias's
-  filter shard when one exists (that GPU's store slice may hold
-  their KV); every worker sees every surviving partner. A Barrier
-  node between groups thins the live sets from the finished stages'
-  passing pairs (step 4.6 of issue #38) and re-shards the next
-  anchor over the measured live set.
+Pure dict-and-list logic (no torch). Called by the worker's parent
+process between child GPUs.
 """
 
 COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "true_ids",
@@ -25,30 +9,21 @@ COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "true_ids",
 
 
 def filter_round_limit(payload: dict):
-    """The limit the filter round may enforce: the payload's limit
-    for a filter-only query, None when the payload has joins.
-
-    LIMIT counts output rows. A filter-only query yields one row per
-    surviving document, so stopping at `limit` survivors is correct
-    and saves work. A join turns one document into zero or many
-    output rows, so cutting survivor lists would drop rows (#39);
-    join queries are capped once, on the final tuples, in _assemble.
-    The session already sends limit=None for join queries; this
-    guard makes the rule hold for any payload."""
+    """Return the filter round's limit: the payload's limit for filter-only
+    queries, None when joins are present.
+    """
     if payload.get("joins"):
         return None
     return payload.get("limit")
 
 
 def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
-    """Per-worker sub-payloads for the filter round. shards:
-    alias -> one tuple of global document indices per worker.
+    """Build per-worker sub-payloads for the filter round.
 
-    Only aliases WITH filters ship documents in this round: an
-    unfiltered partner's documents would otherwise cross the parent-
-    child pipe twice (sharded here, replicated in the join round) for
-    no work at all. Its survivors default to everything at the join
-    round."""
+    Args:
+        shards: alias -> tuple of global document indices per worker.
+        k: Number of workers.
+    """
     subs = []
     for w in range(k):
         docs, index = {}, {}
@@ -73,11 +48,7 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
 
 
 def merge_filter_round(outs: list, limit: int | None = None) -> dict:
-    """Merge the workers' filter answers (global-keyed), survivors,
-    token counts, and store stats. When limit is set, each alias's
-    merged survivor list is truncated to that count. The session
-    sends a limit only for pure filter queries (join queries get
-    None) and _assemble applies the final output-row cap."""
+    """Merge workers' filter answers, survivors, token counts, and store stats."""
     filters, survivors, store = {}, {}, {}
     tokens = 0
     for out in outs:
@@ -98,13 +69,7 @@ def merge_filter_round(outs: list, limit: int | None = None) -> dict:
 
 
 def stage_for_anchor(spec: dict, anchor: str) -> dict:
-    """A child-facing copy of one join stage spec with its anchor
-    decided: partners in placeholder order, the anchor's complete
-    frame, and block labels for the partners only. The payload spec
-    carries labels and frames for every table, so a
-    barrier-time anchor re-pick needs no re-tokenization. A spec
-    without the per-table maps (a hand-built payload) is already
-    materialized and passes through unchanged."""
+    """Return a child-facing copy of one join stage spec with the given anchor."""
     if "frames" not in spec:
         return spec
     partners = [a for a in spec["aliases"] if a != anchor]
@@ -116,11 +81,10 @@ def stage_for_anchor(spec: dict, anchor: str) -> dict:
 
 
 def derive_plan_nodes(joins: list) -> list:
-    """JoinGroup/Barrier nodes reconstructed from bare stage specs,
-    for payloads built without a planner (ablation cells, direct
-    worker calls). The executor's grouping rule: consecutive full
-    stages with one anchor share a gated call, a gate runs alone,
-    and an anchor switch inserts a Barrier."""
+    """Reconstruct JoinGroup/Barrier nodes from bare stage specs.
+
+    Used for payloads built without a planner.
+    """
     nodes = []
     cur = None
     n_groups = n_barriers = 0
@@ -154,10 +118,10 @@ def derive_plan_nodes(joins: list) -> list:
 
 
 def gate_group(stage_out: dict, semantics: str) -> list:
-    """Anchor survivors after one group, from its LAST stage's rows.
-    Full and exists keep anchors with any TRUE; anti keeps the
-    evaluated anchors with none. An anchor gated out mid-group has no
-    last-stage row, so it drops from a full group automatically."""
+    """Return surviving anchor indices after one group's last stage.
+
+    Full/exists keep anchors with any TRUE; anti keeps those with none.
+    """
     evaluated = list(stage_out["anchor_index"])
     kept = {evaluated[a] for a, row in stage_out["rows"].items()
             if any(row)}
@@ -167,13 +131,12 @@ def gate_group(stage_out: dict, semantics: str) -> list:
 
 
 def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
-    """The barrier's thinning (issue #38, step 4.6): a document stays
-    live only if every finished full stage touching its table has it
-    in at least one surviving pair - a YES answer of an anchor still
-    in its table's current survivor set. Cost only: a document
-    dropped here appears in no output tuple anyway (recombination's
-    keep sets enforce results), so thinning changes what later stages
-    evaluate, never what the query returns."""
+    """Thin survivor lists at a barrier.
+
+    A document stays live only if every finished full stage touching
+    its table has it in at least one surviving pair. Affects what later
+    stages evaluate, never the final query result.
+    """
     for out in full_stage_outs:
         anchor, partners = out["anchor"], out["partners"]
         alive = set(survivors.get(anchor, out["anchor_index"]))
@@ -201,16 +164,11 @@ def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
 
 def join_group_payloads(payload: dict, k: int, survivors: dict,
                         group: list) -> list:
-    """Per-worker sub-payloads for ONE anchor group's round. Every
-    stage in `group` shares the group's anchor (materialize each with
-    stage_for_anchor first). An anchor that ran the filter round
-    follows its filter shard - the live subset of a balanced shard
-    stays roughly balanced, and that GPU's store slice may hold the
-    anchor's KV from the filter round. An anchor with no filter round
-    has no KV anywhere to stay near, so its shards are balanced fresh
-    over the live documents (the re-shard). Partners are the full
-    surviving lists, identical on every worker so the partner index
-    space matches at the merge."""
+    """Build per-worker sub-payloads for one anchor group's join round.
+
+    Anchors follow their filter shards when available, otherwise are
+    re-sharded over the live set. Partners are replicated to all workers.
+    """
     if not group:
         return []
     anchor_alias = group[0]["anchor"]
@@ -254,9 +212,7 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
 
 
 def merge_join_round(outs: list) -> list:
-    """Concatenate the workers' per-stage answer rows. Anchors are
-    disjoint across workers; partner index lists are identical, so
-    the merged rows read exactly like a single worker's."""
+    """Merge workers' per-stage join answer rows."""
     if not outs:
         return []
     n_stages = len(outs[0]["joins"])

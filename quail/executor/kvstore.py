@@ -1,23 +1,14 @@
-"""The pinned CPU KV store: cross-query document KV, one pool per
-container.
+"""Pinned CPU KV store: document-prefix KV across queries, one pool
+per container.
 
-What it holds: document-prefix KV only, in the arena's dtype, keyed by
-(content hash, document index). The kept question preamble is NOT
-stored - it belongs to a query, not a document - so a warm query with
-new questions still restores every document.
+Stores document-prefix KV only (not the question preamble), keyed by
+(content hash, document index). Layout: one pinned host tensor of
+token rows per slab, each row holding every layer's K and V for that
+token. A document is one contiguous extent, transferred through a GPU
+staging ring on a side stream.
 
-Layout: one pinned host tensor of token rows, each row = every
-layer's K and V for that token (row width = kv_elements_per_token).
-A document is one contiguous extent of rows, so save and restore are
-ONE transfer per document staged through a GPU ring buffer on a side
-stream - the plain path, no connector indirection (stock vLLM's
-connector ran 10 of 55 GB/s; the committed batched path restored at
-~15 GB/s effective end to end).
-
-Eviction is a length threshold decided at plan time, never LRU: a
-scanning query thrashes LRU; it cannot thrash a length cutoff. When
-the pool is full or fragmented, save simply skips - the store is a
-cache, correctness never depends on it.
+Eviction is a length threshold, never LRU. When the pool is full,
+save skips; correctness never depends on the store.
 
 ExtentAllocator is pure Python (CPU-tested); PinnedStore runs only
 where torch and a GPU exist.
@@ -27,14 +18,10 @@ import bisect
 
 
 def alloc_with_reclaim(allocs, extents, tokens, keep_hash):
-    """An extent for a new document, reclaiming idle datasets' space
-    when the pool is full. Pure accounting, CPU-tested.
+    """Allocate an extent, reclaiming other datasets' space if needed.
 
-    The rule that keeps the store scan-proof: the running query's own
-    corpus (keep_hash) is NEVER evicted - that is where LRU-style
-    thrash lives. Other datasets' extents are dead capital while this
-    dataset queries; they yield, shortest documents first (least
-    recompute value lost), and re-store if their dataset returns.
+    The running query's own corpus (keep_hash) is never evicted.
+    Other datasets yield shortest-first.
 
     Returns (slab, offset) or None."""
     def try_alloc():
@@ -102,13 +89,10 @@ class ExtentAllocator:
 
 
 class PinnedStore:
-    """The pinned host pool plus the staged transfers.
+    """Pinned host pool with staged GPU transfers.
 
-    The pool is a list of 8 GiB pinned slabs, not one slab: a single
-    280 GB cudaHostAlloc failed with cudaErrorMemoryAllocation where
-    the committed persist run's chunked pool pinned 242 GB fine. A
-    document's extent never spans slabs (a document is at most ~2 GB
-    of KV even at 4x document length)."""
+    The pool is a list of 8 GiB pinned slabs (a single large
+    cudaHostAlloc can fail). A document's extent never spans slabs."""
 
     STAGING_SLOTS = 4
     STAGING_MIN_TOKENS = 4096
@@ -148,10 +132,8 @@ class PinnedStore:
 
 
     def _alloc_staging(self, tokens):
-        """The device staging ring: slot count is derived from
-        STAGING_BUDGET_TOKENS so total staging GPU memory is capped.
-        Small documents get up to STAGING_SLOTS slots; large ones
-        get fewer (down to 1) so the budget holds."""
+        """Allocate the device staging ring. Slot count is derived from
+        STAGING_BUDGET_TOKENS so total GPU memory is capped."""
         torch = self.torch
         tokens = min(max(tokens, self.STAGING_MIN_TOKENS),
                      self.STAGING_BUDGET_TOKENS)
@@ -172,10 +154,8 @@ class PinnedStore:
         return i
 
     def _ensure_staging(self, tokens):
-        """Grow the staging buffers to hold `tokens` rows, up to the
-        budget cap. Returns False when `tokens` exceeds
-        STAGING_BUDGET_TOKENS (even 1 slot would blow the reservation);
-        the caller skips the save."""
+        """Grow staging buffers to hold `tokens` rows, up to the budget
+        cap. Returns False when `tokens` exceeds STAGING_BUDGET_TOKENS."""
         if tokens <= self._staging[0].shape[0]:
             return True
         if tokens > self.STAGING_BUDGET_TOKENS:
@@ -197,19 +177,13 @@ class PinnedStore:
     def save(self, key, arena, arena_key, tokens, after_event):
         """Copy a document's first `tokens` arena rows to the pool.
 
-        Runs on the side stream after `after_event` (the compute that
-        wrote the pages). Returns the event after which the caller
-        may free the document's pages, or None when the pool has no
-        room even after reclaiming other datasets' extents (the cache
-        skips, correctness never depends on it).
+        Runs on the side stream after `after_event`. Returns an event
+        the caller must await before freeing the document's pages, or
+        None when the pool has no room.
 
         The returned event fires after the on-device gather into the
-        staging buffer, NOT after the copy to host memory: the pages
-        are only read by the gather, and holding them through the
-        slow host copy stalled admission (measured: warm B6 paid
-        10.5 s to store 256 threads). The staging slot's own event
-        still covers the host copy, so slot reuse and later loads of
-        the same extent stay ordered on the side stream."""
+        staging buffer, not after the host copy. The staging slot's
+        event covers the host copy separately."""
         torch = self.torch
         if key in self.extents:
             return None
@@ -271,8 +245,7 @@ class PinnedStore:
         return done
 
     def flush(self) -> None:
-        """Drop everything (the benchmark's cold pass is a store
-        flush, not a restart)."""
+        """Drop all stored extents."""
         self.torch.cuda.synchronize()
         self.extents.clear()
         self.allocs = [ExtentAllocator(self.slab_tokens)

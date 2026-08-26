@@ -1,17 +1,4 @@
-"""PhysicalPlan and Refusal: what planning produces.
-
-A PhysicalPlan is global settings plus a dataflow graph of node
-dicts. Each node names its inputs as (producer node id, port) pairs,
-so every edge the execution follows is written down: which ids a
-join group consumes, where a barrier's thinned sets come from, what
-recombination reads. Exactly two things flow on edges - a table's
-live document ids ("ids:<alias>" ports) and one stage's passing
-pairs ("pairs:<written_pos>" ports). Per-node token counts are
-arithmetic the decisions already produced, so they come free. There
-is no wall prediction anywhere: every decision either needs no
-constants at all or reduces to a break-even inequality, and nothing
-in the system consumes an estimated wall.
-"""
+"""Data structures produced by planning: PhysicalPlan and Refusal."""
 
 import json
 from dataclasses import dataclass
@@ -37,9 +24,7 @@ class CorpusStats:
 
 @dataclass(frozen=True)
 class StoreSpec:
-    """A pinned host KV store: measured read bandwidth, bytes/s.
-    `warm` means KV for this corpus is already saved from an earlier
-    query. capacity_bytes caps what it may hold (None = unbounded)."""
+    """A pinned host KV store's parameters for planning."""
     read_bw: float
     warm: bool = False
     capacity_bytes: Optional[float] = None
@@ -47,9 +32,7 @@ class StoreSpec:
 
 @dataclass(frozen=True)
 class Refusal:
-    """The answer when this configuration cannot execute the query:
-    the violated constraint, what was needed, what was available -
-    instead of running something degraded."""
+    """Returned when a configuration cannot execute the query."""
     reasons: tuple
     constraint: str    # "weights_need_more_cards" | "suffix_over_chunk"
     #                    | "store_needed_but_disabled" | "unknown_model"
@@ -74,10 +57,8 @@ class PhysicalPlan:
     #                                  length use the KV store; 0 =
     #                                  no store, 1 = everything stores
     limit: int | None = None   # output row cap; None = no limit
-    nodes: tuple = ()          # the dataflow graph in execution
-    #                            (topological) order: node dicts with
-    #                            "id", "op", and "inputs" - a tuple of
-    #                            (producer node id, port) - JSON-able
+    nodes: tuple = ()          # dataflow graph in topological order;
+    #                            each node dict has "id", "op", "inputs"
     remarks: tuple = ()
 
     def node(self, node_id: str) -> dict:
@@ -105,7 +86,7 @@ class PhysicalPlan:
 
 
 def resolve_model(name: str):
-    """A registered ModelSpec, or the unknown-model Refusal."""
+    """Return a ModelSpec by name, or a Refusal if unknown."""
     from quail.specs import MODELS
     if name in MODELS:
         return MODELS[name]
@@ -117,7 +98,7 @@ def resolve_model(name: str):
 
 @dataclass(frozen=True)
 class EngineConfig:
-    """The three knobs, mapping directly onto Modal resources."""
+    """Top-level engine configuration: GPU count, host memory, model."""
     gpus: int = 1
     cpu_memory_gb: int = 64
     model: str = "qwen3-4b-fp8"

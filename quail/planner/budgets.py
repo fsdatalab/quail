@@ -1,49 +1,22 @@
-"""Every derived quantity in the design's spec table (engine_design.md
-section 8). Pure arithmetic over the two spec structs; the only
-measured inputs are the calibration constants, and only the
-restore break-even row consumes them.
-
-The two token budgets, and why neither makes the GPU faster:
-
-- The chunk budget is the batch size: tokens per forward pass. It
-  keeps the per-chunk fixed cost amortized; the rate is flat past the
-  compute knee, so we run at the kernel index cap because bigger is
-  free, not because it is needed.
-- The admission budget (arena tokens) is KV residency. It guarantees
-  no document token is ever computed twice: a preallocated,
-  never-oversubscribed arena turns "computed once" from a cache
-  policy into a certainty.
+"""Derived budget quantities (chunk budget, admission budget, roofline
+arithmetic) from model and device specs.
 """
 
 from quail.executor.kvstore import PinnedStore
 from quail.specs import DeviceSpec, ModelSpec
 
-POOL_FRACTION = 0.92    # the fraction of device memory the executor
-#                         may claim (gpu_memory_utilization we ship)
-CHUNK_SLACK = 2         # declared slack on the activation bound: it
-#                         carries the unmeasured activation estimate
+POOL_FRACTION = 0.92    # fraction of device memory the executor claims
+CHUNK_SLACK = 2         # slack factor on the activation bound
 PAGE_TOKENS = 16        # KV arena page size, tokens
 INT32_MAX = 2**31 - 1
 ACT_BYTES = 2           # bf16 activations, bytes per element
 ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
-#                         the arena: chunk construction overlaps the
-#                         previous chunk's forward pass, and the
-#                         caching allocator fragments across variable
-#                         chunk shapes. Measured, not guessed: the
-#                         single-chunk reservation OOMed the milestone
-#                         filter run with 4.7 GiB reserved-but-
-#                         unallocated on top of the live set.
-STORE_KV_BYTES = 2.0    # the pinned store's staging tensors are always
-#                         bf16, independent of a model's own kv_bytes
-#                         (kept only for the arena's synthetic-fp8
-#                         test): PinnedStore._alloc_staging never asks
-#                         the model, it hardcodes torch.bfloat16.
+#                         the arena for overlapped chunk construction
+STORE_KV_BYTES = 2.0    # pinned store staging tensors are always bf16
 
 
 def tensor_parallel(model: ModelSpec, device: DeviceSpec) -> int:
-    """Smallest power-of-two card count whose pooled memory holds the
-    weights. The caller (the planner) refuses when this exceeds the
-    configured GPU count."""
+    """Smallest power-of-two GPU count whose pooled memory holds the weights."""
     tp = 1
     while model.W_mem > device.mem_bytes * POOL_FRACTION * tp:
         tp *= 2
@@ -51,46 +24,40 @@ def tensor_parallel(model: ModelSpec, device: DeviceSpec) -> int:
 
 
 def kernel_index_cap(model: ModelSpec) -> int:
-    """The fused kernels compute element offsets in 32-bit ints, so a
-    chunk needs rows x widest_row < 2^31. Model-dependent through
-    ffn_width; never hardcoded (a 421,750-token chunk died with an
-    illegal address in the MLP before this cap existed)."""
+    """Max tokens per chunk from the int32 element-offset limit.
+
+    Constraint: rows x ffn_width < 2^31.
+    """
     return INT32_MAX // model.ffn_width
 
 
 def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
-    """Tokens per chunk the activation memory allows, over the
-    declared slack: (M x fraction - weights) / act bytes per token."""
+    """Tokens per chunk the activation memory allows, with slack."""
     free = device.mem_bytes * POOL_FRACTION - model.W_mem
     return int(free // model.act_per_token) // CHUNK_SLACK
 
 
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
-    """min(memory bound, kernel index cap), floored at the compute
-    knee. At 4B/H100 the index cap binds: 110,376."""
+    """Effective chunk budget: min(memory bound, kernel index cap),
+    floored at the compute knee.
+    """
     b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
     return max(b, int(compute_knee(model, device)))
 
 
 def store_staging_bytes(model: ModelSpec) -> float:
-    """Device memory the pinned KV store's staging ring can hold at
-    once: STAGING_BUDGET_TOKENS total token-rows, in bf16. Reserved
-    unconditionally (not just when a query's payload asks for a
-    store): the arena is built once per warm container and outlives
-    any single query, so a later query turning the store on must not
-    be able to blow past what the first query's boot already
-    committed."""
+    """Device memory bytes reserved for the pinned KV store's staging ring."""
     return (PinnedStore.STAGING_BUDGET_TOKENS
             * model.kv_elements_per_token * STORE_KV_BYTES)
 
 
 def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None) -> int:
-    """The admission budget: tokens of document KV resident at once.
-    What is left after weights, the chunk's activation reservation,
-    and the store's staging reservation, in KV bytes. Token-based,
-    never a document count (a count cannot see length; the 4,096-seq
-    default thrashed at 2.40x reads)."""
+    """Admission budget: tokens of document KV that can be resident at once.
+
+    Computed from the memory left after weights, activation reservation,
+    and store staging reservation.
+    """
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
     free = (device.mem_bytes * POOL_FRACTION - model.W_mem
@@ -99,11 +66,10 @@ def arena_tokens(model: ModelSpec, device: DeviceSpec,
     return int(free // model.kappa)
 
 
-# ---- roofline arithmetic (ported from the exploration's roofline.py)
+# ---- roofline arithmetic
 
 def _projection_shapes(model: ModelSpec):
-    """(in_dim, out_dim) of every dense projection in a layer. Gate
-    and up share an input, so they fuse into one GEMM of ffn_width."""
+    """Return (in_dim, out_dim) of every dense projection in a layer."""
     qkv_out = (model.n_q + 2 * model.n_kv) * model.d_head
     inter = model.intermediate
     return ((model.hidden, qkv_out),
@@ -113,11 +79,9 @@ def _projection_shapes(model: ModelSpec):
 
 
 def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
-    """The chunk size where the dense projections cross the roofline
-    ridge and go compute-bound. Combined over all projections:
-    intensity = ridge solved for B. ~416 tokens at 4B/H100; the
-    measured knee (fixed cost over per-token cost) was 283 - same
-    story from the other side."""
+    """Chunk size (tokens) where the dense projections cross the
+    roofline ridge and become compute-bound.
+    """
     ridge = device.peak_flops / device.hbm_bw
     tot_p = tot_io = 0.0
     for din, dout in _projection_shapes(model):
@@ -131,8 +95,7 @@ def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
 
 def _projection_time(model: ModelSpec, device: DeviceSpec,
                      chunk: int) -> float:
-    """Ideal seconds for all dense projections in one chunk, all
-    layers: each GEMM takes max(math, memory)."""
+    """Ideal seconds for all dense projections in one chunk, all layers."""
     t = 0.0
     for din, dout in _projection_shapes(model):
         params = din * dout
@@ -145,9 +108,7 @@ def _projection_time(model: ModelSpec, device: DeviceSpec,
 
 def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
-    """Ideal seconds for the attention kernels in one chunk, all
-    layers: 4 * B * S * n_q * d_head FLOPs against the KV read plus
-    Q/O traffic."""
+    """Ideal seconds for the attention kernels in one chunk, all layers."""
     flops = 4.0 * chunk * context * model.n_q * model.d_head
     moved = (context * model.kappa / model.layers
              + 2.0 * chunk * model.n_q * model.d_head * ACT_BYTES)
@@ -157,11 +118,9 @@ def _attention_time(model: ModelSpec, device: DeviceSpec,
 
 def attention_crossover(model: ModelSpec, device: DeviceSpec,
                         chunk_tokens: int | None = None) -> float:
-    """The document length where attention pair work overtakes the
-    dense projections at the same chunk size. Below it the chunk is a
-    GEMM problem ("prefill dominated" holds); above it the quadratic
-    term owns the wall. ~12,200 tokens at 4B/H100 at the kernel-cap
-    chunk."""
+    """Document length (tokens) where attention work overtakes dense
+    projections at the given chunk size.
+    """
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
     t_dense = _projection_time(model, device, chunk_tokens)
@@ -179,16 +138,15 @@ def attention_crossover(model: ModelSpec, device: DeviceSpec,
 
 def store_break_even_bytes_per_s(model: ModelSpec,
                                  a_s_per_token: float) -> float:
-    """The bandwidth a KV store must beat for restore to win over
-    recompute: kappa x the serving rate. About 18 GB/s at 4B/H100
-    bf16 KV and the packed rate; pinned host memory's 55 GB/s
-    clears it, disk and volumes do not."""
+    """Bandwidth (bytes/s) a KV store must exceed for restore to beat
+    recompute: kappa / a.
+    """
     return model.kappa / a_s_per_token
 
 
 def derived_table(model: ModelSpec, device: DeviceSpec,
                   a_s_per_token: float) -> dict:
-    """The full section-8 table, for explain() and the tests."""
+    """Return all derived budget quantities as a dict."""
     chunk = chunk_budget(model, device)
     return {
         "tensor_parallel": tensor_parallel(model, device),

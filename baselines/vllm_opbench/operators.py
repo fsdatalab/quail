@@ -1,22 +1,9 @@
-"""Filter/Join operators for vLLM-opbench, built directly over quail's
-own document tables (schema from quail/bench/quailb.py's
-build_sets/register_sets) and predicates - so vLLM-opbench measures
-the same documents and the same questions quail's own engine does,
-with only the serving strategy different.
+"""Filter/Join operators for vLLM-opbench.
 
-Prompts are raw prompt_token_ids, matching baselines/stock.py and
-quail's worker. Joins use the same canonical token builder as Quail
-and stock vLLM. The CPU orchestrator sends the canonical prefix and
-suffix parts to the GPU worker. The worker materializes every full
-request there, then submits one batch to vLLM.
-
-The answer is a constrained TRUE/FALSE token id, matching quail's own
-engine's convention (quail/runtime/session.py's
-_true_false_ids): predicate text instructs YES/NO, but the actual
-constrained decode always picks between TRUE/FALSE token ids - the
-same mismatch-tolerant convention quail's engine already uses (see
-c1f619f in this repo's history), kept here for a fair comparison of
-serving strategy rather than decoding convention.
+Built over Quail's own document tables and predicates so the baseline
+measures the same documents and questions with only the serving strategy
+different. Prompts are raw prompt_token_ids with constrained TRUE/FALSE
+token ids.
 """
 
 from pathlib import Path
@@ -28,9 +15,7 @@ from quail.logical import ColumnRef, bind_join_prompt
 
 
 def true_false_ids(tokenizer) -> tuple[list[int], list[int]]:
-    """First-token ids of the TRUE/FALSE spellings - same rule as
-    quail's own _true_false_ids, reimplemented here so vLLM-opbench
-    doesn't reach into quail's runtime internals."""
+    """First-token ids of the TRUE/FALSE spellings."""
     true, false = set(), set()
     for w in ("TRUE", " TRUE", "True", " True"):
         ids = tokenizer.encode(w, add_special_tokens=False)
@@ -45,9 +30,8 @@ def true_false_ids(tokenizer) -> tuple[list[int], list[int]]:
 
 def read_table(data_dir: str, sf: float, name: str, id_col: str,
               text_col: str) -> tuple[list, list]:
-    """(ids, texts) for one quailb.py parquet table, sf-scaled. Reads
-    the same on-disk parquet quail's own engine reads - quailb.build_
-    sets(data_dir, sf) must have already been called to produce it."""
+    """Read (ids, texts) from one quailb parquet table. build_sets() must
+    have been called first."""
     path = Path(data_dir) / f"sf{sf}" / f"{name}.parquet"
     t = pq.read_table(path)
     return t.column(id_col).to_pylist(), t.column(text_col).to_pylist()
