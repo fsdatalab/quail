@@ -106,6 +106,12 @@ def main(workdir: Path) -> None:
     colors = [GRAY, BLUE, RED, ORANGE]
     x = np.arange(len(QUERY_IDS))
     width = 0.19
+    max_time = max(
+        value
+        for model_results in results.values()
+        for system_results in model_results.values()
+        for value in system_results.values()
+    )
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), sharey=True)
 
     for ax, (model, model_results) in zip(axes, results.items()):
@@ -127,13 +133,12 @@ def main(workdir: Path) -> None:
                     color=DARK,
                 )
 
-        ax.set_yscale("log")
-        ax.set_ylim(0.35, 650)
+        ax.set_ylim(0, max_time * 1.15)
         ax.set_xticks(x)
         ax.set_xticklabels([QUERY_LABELS[query_id]
                             for query_id in QUERY_IDS])
         ax.set_title(model)
-        ax.set_ylabel("Time (seconds, log scale)")
+        ax.set_ylabel("Time (seconds)")
 
     axes[1].set_ylabel("")
     axes[0].legend(loc="upper right", ncols=2)
