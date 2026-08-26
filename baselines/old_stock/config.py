@@ -12,8 +12,8 @@ APP_NAME = "quail-milestone1"
 MODEL_NAMES = {
     "qwen3-4b": "Qwen/Qwen3-4B",
     "qwen3-32b": "Qwen/Qwen3-32B",
-    "qwen3-4b-stock": "Qwen/Qwen3-4B-FP8",
-    "qwen3-32b-stock": "Qwen/Qwen3-32B-FP8",
+    "qwen3-4b-fp8": "Qwen/Qwen3-4B-FP8",
+    "qwen3-32b-fp8": "Qwen/Qwen3-32B-FP8",
 }
 
 # GPU x quantization cells to sweep. "H100!" pins the exact SKU so
