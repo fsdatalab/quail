@@ -445,6 +445,7 @@ def test_filter_keep_makes_the_join_anchor_resident(catalog):
     # them
     assert chain["arena_writes"] is True
     assert chain["keep_kv"] is True
+    assert chain["keep_min_doc_tokens"] == 1     # everything fits
     group = plan.nodes_by_op("JoinGroup")[0]
     assert group["anchor"] == "r"
     assert group["anchor_resident"] == "filter"
@@ -510,6 +511,7 @@ def test_keep_capped_by_arena_length_threshold(catalog):
                       doc_tokens=toks)
     chain = filter_chain(plan)
     assert chain["keep_kv"] is True
+    assert chain["keep_min_doc_tokens"] == 3000
     assert any("survivors of 3000+ tokens" in r for r in plan.remarks)
     group = plan.nodes_by_op("JoinGroup")[0]
     assert group["anchor_resident"] == "filter"

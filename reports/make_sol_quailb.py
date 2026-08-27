@@ -258,7 +258,9 @@ def prompt_token_counts(prompt):
 
 
 def join_stage_work(anchor, partners, aliases, survivors, prompt,
-                    resident: bool) -> Work:
+                    resident_rows) -> Work:
+    """One stage's Work. Anchor rows in resident_rows have their
+    prefix KV in the arena and pay the frame only; the rest scan."""
     labels_by_alias, tail = prompt_token_counts(prompt)
     partner_rows = list(itertools.product(
         *[survivors[alias] for alias in partners]))
@@ -269,20 +271,22 @@ def join_stage_work(anchor, partners, aliases, survivors, prompt,
         for partner_row in partner_rows
     ]
     frame = labels_by_alias[anchor]["frame"]
+    resident_rows = set(resident_rows)
     work = Work()
     for row in survivors[anchor]:
         prefix = PRE + aliases[anchor]["tokens"][row]
-        work = work + (ask(prefix, frame) if resident
+        work = work + (ask(prefix, frame) if row in resident_rows
                        else scan(prefix, frame))
         work = work + stream(prefix + frame, suffixes)
     return work
 
 
 def runtime_anchor(join, compiled_anchor, aliases, survivors,
-                   chunk_tokens: int):
+                   chunk_tokens: int, resident_rows_by_alias=None):
     prompt = join.predicate
     labels_by_alias, tail = prompt_token_counts(prompt)
     candidates = [arg.alias for arg in prompt.args]
+    resident_rows_by_alias = resident_rows_by_alias or {}
     counts = {alias: len(survivors[alias]) for alias in candidates}
     means = {
         alias: (sum(aliases[alias]["tokens"][row]
@@ -292,6 +296,11 @@ def runtime_anchor(join, compiled_anchor, aliases, survivors,
     maxes = {
         alias: max((aliases[alias]["tokens"][row]
                     for row in survivors[alias]), default=0)
+        for alias in candidates}
+    resident = {
+        alias: sum(PRE + aliases[alias]["tokens"][row]
+                   for row in resident_rows_by_alias.get(alias, ())
+                   if row in set(survivors[alias]))
         for alias in candidates}
 
     def need(anchor):
@@ -305,9 +314,10 @@ def runtime_anchor(join, compiled_anchor, aliases, survivors,
         per_tuple = tail + sum(
             labels_by_alias[alias]["label"] + means[alias]
             for alias in candidates if alias != anchor)
-        return (counts[anchor]
-                * (means[anchor] + PRE
-                   + labels_by_alias[anchor]["frame"])
+        fresh = max(0.0, counts[anchor] * (means[anchor] + PRE)
+                    - resident[anchor])
+        return (fresh
+                + counts[anchor] * labels_by_alias[anchor]["frame"]
                 + tuples * per_tuple)
 
     feasible = [alias for alias in candidates
@@ -407,11 +417,25 @@ def simulate_query(query, chunk_tokens: int):
     aliases = prepared.aliases
     survivors = prepared.survivors
     work = prepared.work
-    # the engine keeps KV only where the plan says so: filter chains
-    # with keep_kv, and join groups with keep_anchor_kv
-    resident = {node["alias"]
-                for node in plan.nodes_by_op("FilterChain")
-                if node.get("keep_kv")}
+    # the engine keeps KV only where the plan says so: a keep_kv
+    # filter chain keeps survivors at or above the plan's length
+    # threshold (the runtime keeps more while pages allow; this is
+    # the capacity-planned account), a keep_anchor_kv group keeps
+    # every gate survivor
+    filter_keep = {
+        node["alias"]: max(1, node.get("keep_min_doc_tokens") or 1)
+        for node in plan.nodes_by_op("FilterChain")
+        if node.get("keep_kv")}
+    kept_anchors = set()
+
+    def resident_rows(alias):
+        if alias in kept_anchors:
+            return set(survivors[alias])
+        threshold = filter_keep.get(alias)
+        if threshold is None:
+            return set()
+        return {row for row in survivors[alias]
+                if aliases[alias]["tokens"][row] >= threshold}
     filter_stages = prepared.filter_stages
     filter_evaluations = prepared.filter_evaluations
     post_filter_counts = prepared.post_filter_counts
@@ -430,8 +454,13 @@ def simulate_query(query, chunk_tokens: int):
                       for stage in node["stages"]]
         anchor = node["anchor"]
         if len(stage_defs) == 1 and stage_defs[0].anchor is None:
+            spec_aliases = [arg.alias
+                            for arg in stage_defs[0].predicate.args]
             anchor = runtime_anchor(
-                stage_defs[0], anchor, aliases, survivors, chunk_tokens)
+                stage_defs[0], anchor, aliases, survivors, chunk_tokens,
+                resident_rows_by_alias={
+                    alias: resident_rows(alias)
+                    for alias in spec_aliases})
 
         keep_after = (node.get("keep_anchor_kv")
                       and anchor == node["anchor"])
@@ -443,7 +472,8 @@ def simulate_query(query, chunk_tokens: int):
             anchor_rows = list(survivors[anchor])
             partner_rows = list(itertools.product(
                 *[survivors[alias] for alias in partners]))
-            anchor_resident = anchor in resident or stage_index > 0
+            stage_resident = (set(anchor_rows) if stage_index > 0
+                              else resident_rows(anchor))
 
             if len(joins) == 1:
                 single_join_options = {
@@ -452,12 +482,12 @@ def simulate_query(query, chunk_tokens: int):
                         [alias for alias in stage_aliases
                          if alias != candidate],
                         aliases, survivors, prompt,
-                        candidate in resident).tokens
+                        resident_rows(candidate)).tokens
                     for candidate in stage_aliases}
 
             stage_work = join_stage_work(
                 anchor, partners, aliases, survivors, prompt,
-                anchor_resident)
+                stage_resident)
             work = work + stage_work
             rows = {}
             kept = []
@@ -492,10 +522,11 @@ def simulate_query(query, chunk_tokens: int):
                 "passing_pairs": passing_pairs,
                 "fresh_tokens": stage_work.tokens,
             })
+        filter_keep.pop(anchor, None)    # the group consumed the keep
         if keep_after:
-            resident.add(anchor)
+            kept_anchors.add(anchor)
         else:
-            resident.discard(anchor)
+            kept_anchors.discard(anchor)
 
     first_alias = scans[0].alias
     input_document_rows = sum(
@@ -653,7 +684,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
                     aliases,
                     live,
                     join.predicate,
-                    anchor in live_cache,
+                    live[anchor] if anchor in live_cache else (),
                 )
                 next_edges = active_edges | {edge_index}
                 next_live = live_for(next_edges)
@@ -743,7 +774,8 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
                 aliases,
                 start_live,
                 joins[0].predicate,
-                candidate in prepared.resident,
+                start_live[candidate]
+                if candidate in prepared.resident else (),
             ).tokens
             for side, candidate in zip(("left", "right"), stage_aliases)
             if anchor_fits(
