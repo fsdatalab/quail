@@ -72,7 +72,7 @@ results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
 )
 class KalypsoWorker:
     GPU = "H100!"
-    model: str = modal.parameter(default="qwen3-4b")
+    model: str = modal.parameter(default="qwen3-4b-fp8")
 
     @modal.enter()
     def start_server(self):
@@ -82,7 +82,6 @@ class KalypsoWorker:
             "--model", model_name,
             "--port", str(SERVER_PORT),
             "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
-            "--quantization", "fp8",
             "--tensor-parallel-size", "1",
         ]
         if ENABLE_PREFIX_CACHING:

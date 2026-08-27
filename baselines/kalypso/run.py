@@ -94,7 +94,7 @@ def build_join_queries():
     },
 )
 def run_baseline(
-    model: str = "qwen3-4b",
+    model: str = "qwen3-4b-fp8",
     query_id: str | None = None,
 ) -> dict:
     from quail.bench.quailb import build_sets
@@ -165,7 +165,7 @@ def run_baseline(
 
 
 @app.local_entrypoint()
-def main(model: str = "qwen3-4b", query: str = ""):
+def main(model: str = "qwen3-4b-fp8", query: str = ""):
     fc = run_baseline.spawn(model=model, query_id=(query or None))
     print(f"function call id: {fc.object_id}")
     print(fc.get())

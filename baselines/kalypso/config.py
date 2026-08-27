@@ -3,8 +3,8 @@
 APP_NAME = "quail-milestone1"
 
 MODEL_NAMES = {
-    "qwen3-4b": "Qwen/Qwen3-4B",
-    "qwen3-32b": "Qwen/Qwen3-32B",
+    "qwen3-4b-fp8": "Qwen/Qwen3-4B-FP8",
+    "qwen3-32b-fp8": "Qwen/Qwen3-32B-FP8",
 }
 
 GPU_MEMORY_UTILIZATION = 0.92
