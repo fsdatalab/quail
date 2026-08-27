@@ -30,23 +30,22 @@ kalypso_image = (
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12"
     )
     .entrypoint([])
-    .apt_install("git", "cmake", "ninja-build", "wget")
+    .apt_install("git")
     .run_commands(
         "git clone --depth 1 https://github.com/goodluck-hojae/kalypso.git"
         " /opt/kalypso"
     )
-    .run_commands(
-        "pip install -r /opt/kalypso/requirements/build.txt",
+    .pip_install(
+        "vllm==0.28.0",
+        "huggingface_hub[hf_transfer]",
     )
     .run_commands(
-        "pip install -r /opt/kalypso/requirements/cuda.txt",
+        "VLLM_SITE=$(python -c"
+        " \"import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent)\")"
+        " && cp -r /opt/kalypso/vllm/kalypso $VLLM_SITE/kalypso"
+        " && cp /opt/kalypso/vllm/entrypoints/openai/api_server.py"
+        "    $VLLM_SITE/entrypoints/openai/api_server.py",
     )
-    .run_commands(
-        "cd /opt/kalypso && TORCH_CUDA_ARCH_LIST='9.0a' MAX_JOBS=8"
-        " pip install -e . --no-build-isolation",
-        gpu="H100!",
-    )
-    .pip_install("huggingface_hub[hf_transfer]")
     .env(
         {
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
