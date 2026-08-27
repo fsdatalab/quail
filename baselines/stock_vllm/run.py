@@ -1,8 +1,7 @@
-"""vLLM-opbench orchestrator: drives WorkerH100 over all 26 QUAIL-B
-queries built from Quail's document sets and predicates. Runs entirely
-on Modal.
+"""Stock vLLM baseline: drives WorkerH100 over all 35 QUAIL-B queries.
+Runs entirely on Modal.
 
-    uv run modal run -m baselines.vllm_opbench.run::main
+    uv run modal run -m baselines.stock_vllm.run::main
 
 Each query is a pipeline of filter and join steps executed naively on
 stock vLLM. Filters run each stage as a separate generate_batch call;
@@ -18,9 +17,9 @@ from pathlib import Path
 
 import modal
 
-from . import operators
-from .config import DATA_DIR, FILTER_MAX_TOKENS, MODEL_NAMES, SF
-from .worker import WorkerH100, app, hf_cache_vol
+from baselines.old_stock import operators
+from baselines.old_stock.config import DATA_DIR, FILTER_MAX_TOKENS, MODEL_NAMES, SF
+from baselines.old_stock.worker import WorkerH100, app, hf_cache_vol
 
 orchestrator_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -51,7 +50,7 @@ def _tokenizer_for(model_name: str):
 
 
 def define_all_queries():
-    """All 26 QUAIL-B queries for the stock vLLM baseline.
+    """All 35 QUAIL-B queries for the stock vLLM baseline.
 
     Each query is a dict with:
         aliases: {alias: (table_name, text_col)}
@@ -230,8 +229,7 @@ def _load_alias_data(data_dir, sf, aliases):
 
     Returns:
         {alias: (ids_list, texts_list)}. Aliases that share the same
-        (table, text_col) get the same list objects (no copy needed
-        since we never mutate them).
+        (table, text_col) get the same list objects.
     """
     cache = {}
     result = {}
@@ -253,9 +251,7 @@ def run_query(worker, qid, query_def, data_dir, sf, tokenizer,
     Join survivors thin both sides for subsequent steps.
 
     Returns:
-        (summary_entry, per_request_rows) where summary_entry is a dict
-        with aggregate stats and per_request_rows is a list of dicts for
-        the JSONL file.
+        (summary_entry, per_request_rows)
     """
     alias_data = _load_alias_data(data_dir, sf, query_def["aliases"])
     live = {a: list(range(len(data[1])))
@@ -330,7 +326,7 @@ def run_query(worker, qid, query_def, data_dir, sf, tokenizer,
                     timeseries=result["timeseries"],
                     doc_ids=doc_ids))
 
-                print(f"[vllm_opbench] {qid} filter({alias}): "
+                print(f"[stock_vllm] {qid} filter({alias}): "
                       f"{n_in}->{len(new_live)} "
                       f"wall={result['wall_time_s']:.2f}s "
                       f"ptok={ptok}", flush=True)
@@ -367,7 +363,7 @@ def run_query(worker, qid, query_def, data_dir, sf, tokenizer,
             build_s = time.time() - build_t0
             n_pairs = len(prefixes) * len(suffixes)
 
-            print(f"[vllm_opbench] {qid} join({left_a}x{right_a}): "
+            print(f"[stock_vllm] {qid} join({left_a}x{right_a}): "
                   f"{nl}x{nr}={n_pairs} pairs, submitting...",
                   flush=True)
 
@@ -437,7 +433,7 @@ def run_query(worker, qid, query_def, data_dir, sf, tokenizer,
                 timeseries=result["timeseries"],
                 doc_ids=doc_ids))
 
-            print(f"[vllm_opbench] {qid} join({left_a}x{right_a}): "
+            print(f"[stock_vllm] {qid} join({left_a}x{right_a}): "
                   f"{n_true}/{n_pairs} TRUE "
                   f"wall={result['wall_time_s']:.2f}s "
                   f"ptok={ptok}", flush=True)
@@ -467,12 +463,12 @@ def run_query(worker, qid, query_def, data_dir, sf, tokenizer,
 def run_baseline(model: str = "qwen3-4b", query_id: str | None = None,
                  gpu: str = "H100!", quantization: str = "fp8",
                  profile: bool = False) -> dict:
-    """Build prompts and drive WorkerH100 for QUAIL-B queries."""
+    """Build prompts and drive WorkerH100 for all QUAIL-B queries."""
     from quail.bench.quailb import build_sets
 
     if gpu != WorkerH100.GPU:
         raise ValueError(
-            f"vLLM-opbench requires gpu={WorkerH100.GPU!r}; got {gpu!r}")
+            f"stock_vllm requires gpu={WorkerH100.GPU!r}; got {gpu!r}")
 
     build_sets(DATA_DIR, SF)
     tokenizer = _tokenizer_for(MODEL_NAMES[model])
@@ -490,17 +486,17 @@ def run_baseline(model: str = "qwen3-4b", query_id: str | None = None,
         ids = [qid for qid in QUERY_ORDER if qid in all_queries]
 
     worker = WorkerH100(model=model, quantization=quantization)
-    print(f"[vllm_opbench] warming up {model} on {gpu} ({quantization})",
+    print(f"[stock_vllm] warming up {model} on {gpu} ({quantization})",
           flush=True)
     worker.warmup.remote(true_ids, false_ids)
 
-    out_dir = Path("/results/vllm_opbench") / time.strftime(
+    out_dir = Path("/results/stock_vllm") / time.strftime(
         "%Y-%m-%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     summary_queries = []
     for qid in ids:
-        print(f"\n[vllm_opbench] === {qid} ===", flush=True)
+        print(f"\n[stock_vllm] === {qid} ===", flush=True)
         qdef = all_queries[qid]
         try:
             entry, per_req = run_query(
@@ -510,7 +506,7 @@ def run_baseline(model: str = "qwen3-4b", query_id: str | None = None,
             entry = dict(query=qid,
                          error=f"{type(e).__name__}: {e}")
             per_req = []
-            print(f"[vllm_opbench] {qid} ERROR: {e}", flush=True)
+            print(f"[stock_vllm] {qid} ERROR: {e}", flush=True)
 
         summary_queries.append(entry)
 
@@ -525,7 +521,7 @@ def run_baseline(model: str = "qwen3-4b", query_id: str | None = None,
                 sf=SF, queries=summary_queries), f, indent=2)
         results_vol.commit()
 
-    print(f"\n[vllm_opbench] saved {out_dir}/summary.json "
+    print(f"\n[stock_vllm] saved {out_dir}/summary.json "
           f"({len(summary_queries)} queries)", flush=True)
     return dict(out_dir=str(out_dir), n_queries=len(summary_queries))
 

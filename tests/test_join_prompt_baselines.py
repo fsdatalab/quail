@@ -3,7 +3,7 @@ import itertools
 import pytest
 
 from baselines.stock import build_join_grouped_inputs
-from baselines.vllm_opbench.operators import Join
+from baselines.old_stock.operators import Join
 from quail.logical import (ColumnRef, bind_join_prompt,
                            render_join_prompt_ids)
 
