@@ -42,12 +42,12 @@ def test_subset_dp_matches_complete_enumeration():
                 continue
             write = 0 if anchor in cached else 10
             options.append(Extension(
-                Work(tokens=write + ord(anchor),
-                     pairs=300 - ord(anchor),
-                     kv_written=write,
-                     kv_read=len(cached)),
-                cached | {anchor},
-                ({"added": added, "anchor": anchor},),
+                work=Work(tokens=write + ord(anchor),
+                          pairs=300 - ord(anchor),
+                          kv_written=write,
+                          kv_read=len(cached)),
+                state_property=cached | {anchor},
+                steps=({"added": added, "anchor": anchor},),
             ))
         return options
 
@@ -57,7 +57,7 @@ def test_subset_dp_matches_complete_enumeration():
             candidate.work.kv_written + candidate.work.kv_read,
         )
     dynamic = optimize_left_deep(
-        ("a", "b", "c"), (), Work(tokens=5), extend)
+        ("a", "b", "c"), frozenset(), Work(tokens=5), extend)
 
     complete = []
     all_aliases = frozenset(("a", "b", "c"))
@@ -70,7 +70,7 @@ def test_subset_dp_matches_complete_enumeration():
             for extension in extend(relations, cached, added):
                 visit(
                     relations | {added},
-                    extension.cached,
+                    extension.state_property,
                     work + extension.work,
                 )
 

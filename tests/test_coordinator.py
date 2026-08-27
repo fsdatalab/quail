@@ -335,6 +335,22 @@ def test_join_group_prior_shards_align_kept_anchors():
     assert subs[1]["anchor_index"] == [3]
 
 
+def test_join_group_prior_shards_add_documents_missing_from_kv():
+    p = payload()
+    survivors = {"r": [0, 1, 3, 4], "p": [0, 1, 2, 3]}
+    prior = {"r": [[0], [3]]}
+
+    subs = join_group_payloads(p, 2, survivors, p["joins"],
+                               prior_shards=prior)
+
+    assert 0 in subs[0]["anchor_index"]
+    assert 3 in subs[1]["anchor_index"]
+    assigned = [document for sub in subs
+                for document in sub["anchor_index"]]
+    assert sorted(assigned) == survivors["r"]
+    assert len(assigned) == len(set(assigned))
+
+
 def test_search_specs_counts_from_token_lists():
     from quail.runtime.coordinator import search_specs
 

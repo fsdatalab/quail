@@ -241,6 +241,15 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
     if prior_shards and anchor_alias in prior_shards:
         anchor_shards = [[g for g in shard if g in alive]
                          for shard in prior_shards[anchor_alias]]
+        placed = {g for shard in anchor_shards for g in shard}
+        missing = [g for g in live if g not in placed]
+        if missing:
+            from quail.planner.decide import balanced_shards
+            toks = payload["docs"][anchor_alias]
+            idx_shards, _ = balanced_shards(
+                [len(toks[g]) for g in missing], k)
+            for worker, shard in enumerate(idx_shards):
+                anchor_shards[worker].extend(missing[i] for i in shard)
     elif anchor_alias in payload["filters"] and anchor_alias in shards:
         anchor_shards = [[g for g in shard if g in alive]
                          for shard in shards[anchor_alias]]

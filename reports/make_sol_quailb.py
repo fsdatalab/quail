@@ -44,9 +44,10 @@ All filters run first. Two searches follow, separately for 4B and
   choice, with exact ground-truth survivors at every step and
   unlimited KV. This is the floor.
 - The engine mirror (simulate_query): the same search the worker
-  runs (quail.planner.joins.search_joins) on the exact filter
-  survivors, then its chosen stages, with the plan's retention
-  decisions and no eviction pressure assumed.
+  runs (quail.planner.joins.search_joins), first on the exact filter
+  survivors and then again after every join group. The search state
+  records the individual document prefixes still in KV and applies
+  the arena's page limit and victim rule.
 
 Running it
 ----------
@@ -92,8 +93,9 @@ import quail
 from quail.bench import quailb as Q
 from quail.bench.evaluate import H100_PRICE_SOURCE, H100_USD_PER_HOUR
 from quail.bench.sol_dp import PairRelation, exact_live_rows
+from quail.planner import budgets
 from quail.planner.decide import join_specs
-from quail.planner.joins import search_joins
+from quail.planner.joins import fit_resident_documents, search_joins
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.sol import (Work, ask, scan, speed_of_light,
                                stream)
@@ -374,13 +376,12 @@ def prepare_query(query) -> QueryInputs:
 
 
 def simulate_query(query, model: ModelSpec, chunk_tokens: int):
-    """Follow the engine: the runtime join search on the exact filter
-    survivors, then the stages it chose, with the retention lifecycle.
+    """Follow the engine's repeated search and KV retention decisions.
 
-    Residency assumes no eviction pressure: the arena's minimum-loss
-    eviction depends on the packing order this simulation does not
-    run, so every retained prefix counts as resident. Where eviction
-    fires on the real run, this underestimates the fresh tokens.
+    The simulation uses exact saved answers after every join group.
+    At group boundaries it applies the arena's page limit and the
+    same minimum loss victim choice. It does not reproduce temporary
+    overlap between packed GPU chunks.
     """
     prepared = prepare_query(query)
     plan = prepared.plan
@@ -406,10 +407,25 @@ def simulate_query(query, model: ModelSpec, chunk_tokens: int):
     join_pair_evaluations = 0
     single_join_options = {}
 
-    # the same search the worker runs, on the same inputs
-    found = None
-    if joins:
-        specs = join_specs(joins)
+    all_specs = join_specs(joins)
+    markers = [dict(semantics=j.semantics, written_pos=i)
+               for i, j in enumerate(joins)]
+    remaining = set(range(len(joins)))
+    search_runs = []
+    search_sequence = []
+
+    def possible_anchors(indices):
+        out = set()
+        for index in indices:
+            spec = all_specs[index]
+            if spec["semantics"] == "full" and spec.get("anchor_free"):
+                out.update(spec["aliases"])
+            else:
+                out.add(spec["anchor"])
+        return out
+
+    def next_group():
+        specs = [all_specs[i] for i in sorted(remaining)]
         involved = sorted({a for spec in specs
                            for a in spec["aliases"]})
         found = search_joins(
@@ -420,36 +436,43 @@ def simulate_query(query, model: ModelSpec, chunk_tokens: int):
             {a: {i for i, row in enumerate(survivors[a])
                  if row in resident_rows[a]} for a in involved},
             PRE, chunk_tokens, model, H100_SXM,
-            fixed_order=(plan.order_rule == "as_written"))
-    if found is None:
-        nodes = [node for node in plan.nodes
-                 if node["op"] in ("Barrier", "JoinGroup")]
-    else:
-        markers = [dict(semantics=j.semantics, written_pos=i)
-                   for i, j in enumerate(joins)]
-        nodes = runtime_nodes(found["seq"], markers)
-    join_groups_ahead = [node for node in nodes
-                         if node["op"] == "JoinGroup"]
+            fixed_order=(plan.order_rule == "as_written"),
+            arena_tokens=plan.admission_tokens,
+            page_tokens=budgets.PAGE_TOKENS)
+        if found is not None:
+            search_runs.append(found)
+            nodes = runtime_nodes(found["seq"], markers)
+            node = next(node for node in nodes
+                        if node["op"] == "JoinGroup")
+            records = {record["written_pos"]: record
+                       for record in found["records"]}
+            return node, records
 
-    for node in nodes:
-        if node["op"] == "Barrier":
-            thin_survivors(finished_full, survivors)
-            for alias, rows in survivors.items():
-                resident_rows[alias] &= set(rows)
-            continue
-        if node["op"] != "JoinGroup":
-            continue
-        join_groups_ahead = join_groups_ahead[1:]
-        if found is None:
-            stage_defs = [joins[stage["written_pos"]]
-                          for stage in node["stages"]]
-        else:
-            stage_defs = [joins[i] for i in node["stage_idxs"]]
+        ordered = sorted(remaining)
+        first = ordered[0]
+        anchor = all_specs[first]["anchor"]
+        group = [first]
+        if all_specs[first]["semantics"] == "full":
+            for index in ordered[1:]:
+                spec = all_specs[index]
+                if spec["semantics"] != "full" \
+                        or spec["anchor"] != anchor:
+                    break
+                group.append(index)
+        return (dict(op="JoinGroup", anchor=anchor,
+                     stage_idxs=tuple(group)), {})
+
+    while remaining:
+        node, priced_records = next_group()
+        search_sequence.extend((index, node["anchor"])
+                               for index in node["stage_idxs"])
+        stage_defs = [joins[i] for i in node["stage_idxs"]]
         anchor = node["anchor"]
-        future_anchors = {later["anchor"]
-                          for later in join_groups_ahead}
+        remaining.difference_update(node["stage_idxs"])
+        future_anchors = possible_anchors(remaining)
         group_semantics = stage_defs[-1].semantics
-        for stage_index, join in enumerate(stage_defs):
+        for stage_index, (join_index, join) in enumerate(
+                zip(node["stage_idxs"], stage_defs)):
             prompt = join.predicate
             code = prompt_code(prompt)
             stage_aliases = [arg.alias for arg in prompt.args]
@@ -457,9 +480,15 @@ def simulate_query(query, model: ModelSpec, chunk_tokens: int):
             anchor_rows = list(survivors[anchor])
             partner_rows = list(itertools.product(
                 *[survivors[alias] for alias in partners]))
-            stage_resident = (set(anchor_rows) if stage_index > 0
-                              else resident_rows[anchor]
-                              & set(anchor_rows))
+            if stage_index > 0:
+                stage_resident = set(anchor_rows)
+            elif join_index in priced_records:
+                positions = priced_records[join_index][
+                    "resident_positions"]
+                stage_resident = {anchor_rows[position]
+                                  for position in positions}
+            else:
+                stage_resident = resident_rows[anchor] & set(anchor_rows)
 
             if len(joins) == 1:
                 single_join_options = {
@@ -519,6 +548,16 @@ def simulate_query(query, model: ModelSpec, chunk_tokens: int):
             resident_rows[anchor] = set(survivors[anchor])
         else:
             resident_rows[anchor] = set()
+        thin_survivors(finished_full, survivors)
+        for alias, rows in survivors.items():
+            resident_rows[alias] &= set(rows)
+            if alias not in future_anchors:
+                resident_rows[alias].clear()
+        resident_rows = fit_resident_documents(
+            resident_rows,
+            {alias: aliases[alias]["tokens"] for alias in aliases},
+            PRE, model, H100_SXM, plan.admission_tokens,
+            budgets.PAGE_TOKENS)
 
     first_alias = scans[0].alias
     input_document_rows = sum(
@@ -552,9 +591,11 @@ def simulate_query(query, model: ModelSpec, chunk_tokens: int):
         "anchor": anchor,
         "anchor_tokens_both_ways": both,
         "held_column": aliases[held_alias]["column"],
-        "runtime_search": (None if found is None else dict(
-            states=found["states"], generated=found["generated"],
-            sequence=[list(step) for step in found["seq"]])),
+        "runtime_search": (None if not search_runs else dict(
+            states=sum(run["states"] for run in search_runs),
+            generated=sum(run["generated"] for run in search_runs),
+            replans=len(search_runs),
+            sequence=[list(step) for step in search_sequence])),
     }
 
 
@@ -658,7 +699,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
             if position == len(order):
                 extensions.append(Extension(
                     work=work,
-                    cached=live_cache,
+                    state_property=live_cache,
                     steps=tuple(steps),
                 ))
                 return
@@ -798,7 +839,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
         "optimizer": {
             "plan_space": "all feasible left deep plans",
             "relation_order": list(best.relation_order),
-            "cached_prefixes": sorted(best.cached),
+            "cached_prefixes": sorted(best.state_property),
             "persistent_kv_capacity": "unlimited",
             "gpu_count": 1,
             "dp_states": search.state_count,
