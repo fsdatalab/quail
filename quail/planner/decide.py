@@ -538,40 +538,43 @@ def _keep_timeline(seq, keep_plan, stats, doc_tokens,
                    live0, pre, page_tokens, workers: int):
     """Peak expected resident tokens per worker across the plan.
 
-    Points: the end of the filter round (every kept alias resident),
-    then each join group (kept aliases not yet past their last
-    consuming group, plus the group's own live anchor set when its
-    stages hold anchors across gating).
+    A point per group boundary: the end of the filter round holds
+    every kept alias's filter mass; after each group, kept filter
+    masses not yet anchored plus the gate-survivor mass of anchors a
+    later group re-uses (keep_anchor_kv holds every gate survivor,
+    not just the filter's length-thresholded keep). Within a group,
+    anchors run one at a time (run_join gates per anchor), so the
+    per-anchor working set is the headroom the caller adds.
     """
     groups = _group_seq(seq)
-    last_use = {}
+    first_use, last_use, frames = {}, {}, {}
     for g, (anchor, members) in enumerate(groups):
+        first_use.setdefault(anchor, g)
         last_use[anchor] = g
+        frame = max(_label_counts(j)[anchor][1] for j in members)
+        frames[anchor] = max(frames.get(anchor, 0), frame)
 
-    def kept_mass(alias):
-        return keep_plan[alias]["kept_expected_tokens"]
-
-    def anchor_mass(alias, live_frac, frame):
-        return live_frac * sum(
-            _page_round(pre + t + frame, page_tokens)
+    def survivor_mass(alias, live_count):
+        frac = live_count / max(1.0, float(stats[alias].n_docs))
+        return frac * sum(
+            _page_round(pre + t + frames[alias], page_tokens)
             for t in doc_tokens[alias])
 
     live = dict(live0)
-    points = [sum(kept_mass(a) for a in keep_plan)]
+    points = [sum(k["kept_expected_tokens"]
+                  for k in keep_plan.values())]
     for g, (anchor, members) in enumerate(groups):
-        pending = sum(kept_mass(a) for a in keep_plan
-                      if last_use.get(a, -1) >= g and a != anchor)
-        working = 0.0
-        if len(members) > 1 or last_use.get(anchor, g) > g:
-            frame = max(_label_counts(j)[anchor][1] for j in members)
-            live_frac = live[anchor] / max(1.0, float(
-                stats[anchor].n_docs))
-            working = anchor_mass(anchor, live_frac, frame)
-        elif anchor in keep_plan:
-            working = kept_mass(anchor)
-        points.append(pending + working)
         for j in members:
             _thin(live, j, anchor)
+        point = 0.0
+        for alias in set(keep_plan) | set(first_use):
+            if alias in keep_plan and first_use.get(
+                    alias, len(groups)) > g:
+                point += keep_plan[alias]["kept_expected_tokens"]
+            elif first_use.get(alias, g + 1) <= g \
+                    < last_use.get(alias, -1):
+                point += survivor_mass(alias, live[alias])
+        points.append(point)
     return max(points) / workers
 
 
@@ -723,51 +726,58 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
     # ---- keep candidates, then the joint (order x anchor) search
     keep_budget = max(0.0, float(admission - headroom)) * workers
-    keep_plan = plan_keeps(joins, filters, doc_tokens, pre,
-                           keep_budget, budgets.PAGE_TOKENS)
+    candidates = plan_keeps(joins, filters, doc_tokens, pre,
+                            keep_budget, budgets.PAGE_TOKENS)
+
+    def consumed_keeps(seq, records, plan):
+        """The keeps the sequence anchors while their filter KV is
+        still resident; the rest have no reader and are dropped."""
+        used = {a for (j, a), r in zip(seq, records)
+                if r["resident"] == "filter"}
+        return {a: k for a, k in plan.items() if a in used}
+
+    def trim(seq, plan):
+        """Raise thresholds until the peak expected resident tokens
+        per worker fit the arena beside the working headroom. The
+        shortest kept documents go first, wherever they are."""
+        plan = dict(plan)
+        while plan:
+            peak = _keep_timeline(seq, plan, stats, doc_tokens,
+                                  live0, pre, budgets.PAGE_TOKENS,
+                                  workers)
+            if peak + headroom <= admission:
+                break
+            alias = min(
+                plan,
+                key=lambda a: min(t for t in doc_tokens[a]
+                                  if t >= max(1, plan[a]
+                                              ["min_doc_tokens"])))
+            split = _raise_threshold(plan[alias], doc_tokens[alias],
+                                     budgets.PAGE_TOKENS)
+            if split is None:
+                del plan[alias]
+            else:
+                split["frame_tokens"] = plan[alias]["frame_tokens"]
+                plan[alias] = split
+        return plan
+
     seq, search_remarks = plan_joins(
         joins, rule, stats, live0, pre, chunk=chunk,
-        keep_plan=keep_plan, rank=rank)
-    remarks.extend(search_remarks)
-    _, stage_records = _walk(seq, live0, stats, pre, keep_plan)
-
-    # ---- trim the keeps to the aliases the plan anchors while their
-    # filter KV is still resident, then re-check the joint capacity
-    consumed = {a for (j, a), r in zip(seq, stage_records)
-                if r["resident"] == "filter"}
-    trimmed = {a: k for a, k in keep_plan.items() if a in consumed}
-    while trimmed:
-        peak = _keep_timeline(seq, trimmed, stats, doc_tokens,
-                              live0, pre, budgets.PAGE_TOKENS,
-                              workers)
-        if peak + headroom <= admission:
-            break
-        # over budget: the shortest kept documents go first, wherever
-        # they are
-        alias = min(
-            trimmed,
-            key=lambda a: min(t for t in doc_tokens[a]
-                              if t >= max(1, trimmed[a]
-                                          ["min_doc_tokens"])))
-        split = _raise_threshold(trimmed[alias], doc_tokens[alias],
-                                 budgets.PAGE_TOKENS)
-        if split is None:
-            del trimmed[alias]
-        else:
-            split["frame_tokens"] = trimmed[alias]["frame_tokens"]
-            trimmed[alias] = split
-    if trimmed != keep_plan:
-        # residency credit changed: search once more against what the
-        # arena can actually hold
-        keep_plan = trimmed
+        keep_plan=candidates, rank=rank)
+    _, stage_records = _walk(seq, live0, stats, pre, candidates)
+    kept0 = consumed_keeps(seq, stage_records, candidates)
+    keep_plan = trim(seq, kept0)
+    if keep_plan != kept0:
+        # the credited residency shrank: search once more against
+        # what the arena can actually hold
         seq, search_remarks = plan_joins(
             joins, rule, stats, live0, pre, chunk=chunk,
             keep_plan=keep_plan, rank=rank)
         _, stage_records = _walk(seq, live0, stats, pre, keep_plan)
-        consumed = {a for (j, a), r in zip(seq, stage_records)
-                    if r["resident"] == "filter"}
-        keep_plan = {a: k for a, k in keep_plan.items()
-                     if a in consumed}
+        keep_plan = trim(seq, consumed_keeps(seq, stage_records,
+                                             keep_plan))
+        _, stage_records = _walk(seq, live0, stats, pre, keep_plan)
+    remarks.extend(search_remarks)
 
     for alias, k in sorted(keep_plan.items()):
         what = ("all survivors" if k["min_doc_tokens"] <= 1 else
