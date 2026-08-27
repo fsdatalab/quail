@@ -17,18 +17,63 @@ def filter_round_limit(payload: dict):
     return payload.get("limit")
 
 
-def filter_keep_map(payload: dict) -> dict:
-    """alias -> dict(keep, frame_tokens) from the plan's FilterChain
-    nodes. Empty without joins or without a planner-built payload."""
-    out = {}
+def retain_aliases(payload: dict) -> set:
+    """Aliases whose filter survivors keep their KV for the joins,
+    from the plan's FilterChain keep_kv flags. Empty without joins or
+    without a planner-built payload."""
     if not payload.get("joins"):
-        return out
-    for n in payload.get("plan_nodes") or ():
-        if n.get("op") == "FilterChain":
-            out[n["alias"]] = dict(
-                keep=bool(n.get("keep_kv")),
-                frame_tokens=int(n.get("keep_frame_tokens") or 0))
+        return set()
+    return {n["alias"] for n in payload.get("plan_nodes") or ()
+            if n.get("op") == "FilterChain" and n.get("keep_kv")}
+
+
+def search_specs(joins: list) -> list:
+    """The payload's join specs in the shared search's count form."""
+    out = []
+    for i, j in enumerate(joins):
+        out.append(dict(
+            written_pos=j.get("written_pos", i),
+            aliases=list(j["aliases"]),
+            anchor=j.get("anchor"),
+            anchor_free=bool(j.get("anchor_free")),
+            semantics=j["semantics"],
+            selectivity=j.get("selectivity"),
+            frame_tokens={a: len(t) for a, t in j["frames"].items()},
+            label_tokens={a: len(t) for a, t in j["labels"].items()},
+            tail_tokens=len(j["tail"])))
     return out
+
+
+def runtime_nodes(sequence, joins: list) -> list:
+    """JoinGroup/Barrier nodes for a searched (written_pos, anchor)
+    sequence. stage_idxs index into the payload's join list; gates
+    run alone and anchor switches become barriers, the same grouping
+    the planner emits."""
+    pos_to_idx = {j.get("written_pos", i): i
+                  for i, j in enumerate(joins)}
+    groups = []
+    for wp, anchor in sequence:
+        idx = pos_to_idx[wp]
+        full = joins[idx]["semantics"] == "full"
+        if groups and full and groups[-1]["full"] \
+                and groups[-1]["anchor"] == anchor:
+            groups[-1]["idxs"].append(idx)
+        else:
+            groups.append(dict(anchor=anchor, full=full, idxs=[idx]))
+    nodes = []
+    barriers = 0
+    prev = None
+    for i, g in enumerate(groups):
+        if prev is not None and prev != g["anchor"]:
+            nodes.append(dict(id=f"runtime-barrier:{barriers}",
+                              op="Barrier", inputs=(),
+                              next_anchor=g["anchor"], thins=()))
+            barriers += 1
+        nodes.append(dict(id=f"runtime-group:{i}", op="JoinGroup",
+                          inputs=(), anchor=g["anchor"],
+                          stage_idxs=tuple(g["idxs"]), stages=()))
+        prev = g["anchor"]
+    return nodes
 
 
 def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
@@ -54,7 +99,7 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
         sub.update(docs=docs, doc_index=index,
                    filters=payload["filters"],
                    filter_arena_writes=payload["filter_arena_writes"],
-                   filter_keep=filter_keep_map(payload),
+                   retain_aliases=sorted(retain_aliases(payload)),
                    worker=w, workers=k)
         subs.append(sub)
     return subs
