@@ -17,6 +17,20 @@ def filter_round_limit(payload: dict):
     return payload.get("limit")
 
 
+def filter_keep_map(payload: dict) -> dict:
+    """alias -> dict(keep, frame_tokens) from the plan's FilterChain
+    nodes. Empty without joins or without a planner-built payload."""
+    out = {}
+    if not payload.get("joins"):
+        return out
+    for n in payload.get("plan_nodes") or ():
+        if n.get("op") == "FilterChain":
+            out[n["alias"]] = dict(
+                keep=bool(n.get("keep_kv")),
+                frame_tokens=int(n.get("keep_frame_tokens") or 0))
+    return out
+
+
 def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
     """Build per-worker sub-payloads for the filter round.
 
@@ -40,6 +54,7 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
         sub.update(docs=docs, doc_index=index,
                    filters=payload["filters"],
                    filter_arena_writes=payload["filter_arena_writes"],
+                   filter_keep=filter_keep_map(payload),
                    worker=w, workers=k)
         subs.append(sub)
     return subs
@@ -157,11 +172,13 @@ def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
 
 
 def join_group_payloads(payload: dict, k: int, survivors: dict,
-                        group: list) -> list:
+                        group: list, prior_shards: dict | None = None) -> list:
     """Build per-worker sub-payloads for one anchor group's join round.
 
-    Anchors follow their filter shards when available, otherwise are
-    re-sharded over the live set. Partners are replicated to all workers.
+    Anchors follow the shards their KV already sits on - the shards of
+    an earlier group that kept the anchor's KV (prior_shards), else
+    their filter shards - otherwise they are re-sharded over the live
+    set. Partners are replicated to all workers.
     """
     if not group:
         return []
@@ -175,8 +192,11 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
 
     live = surv(anchor_alias)
     shards = payload.get("shards") or {}
-    if anchor_alias in payload["filters"] and anchor_alias in shards:
-        alive = set(live)
+    alive = set(live)
+    if prior_shards and anchor_alias in prior_shards:
+        anchor_shards = [[g for g in shard if g in alive]
+                         for shard in prior_shards[anchor_alias]]
+    elif anchor_alias in payload["filters"] and anchor_alias in shards:
         anchor_shards = [[g for g in shard if g in alive]
                          for shard in shards[anchor_alias]]
     else:

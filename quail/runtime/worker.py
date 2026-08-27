@@ -155,6 +155,7 @@ def _execute_single(state, payload: dict) -> dict:
     from quail.executor.loop import AsyncAnswers, run_filter, run_join
     from quail.planner.decide import pick_runtime_anchor
     from quail.runtime.coordinator import (derive_plan_nodes,
+                                           filter_keep_map,
                                            filter_round_limit,
                                            gate_group, stage_for_anchor,
                                            thin_survivors)
@@ -179,15 +180,29 @@ def _execute_single(state, payload: dict) -> dict:
     limit = filter_round_limit(payload)
 
     filter_writes = payload["filter_arena_writes"]
+    filter_keep = filter_keep_map(payload)
+    kept = {}    # alias -> {global doc id: prefix tokens held}
+    sweep_kept_keys(arena)    # a dead earlier query may have left KV
     t0 = time.perf_counter()
     with torch.inference_mode():
         pipeline.attention_mode = FILTER_ATTENTION
         for alias, qids in payload["filters"].items():
+            fkeep = filter_keep.get(alias) or {}
+            keep = bool(fkeep.get("keep"))
+            kept_ids = []
             answers, _, tokens = run_filter(
                 torch, arena, pipeline, async_ans,
                 [pre + d for d in docs[alias]], qids,
                 chunk_tokens, limit=limit,
+                keys=[("kv", alias, g)
+                      for g in range(len(docs[alias]))],
+                keep=keep,
+                keep_extra_tokens=fkeep.get("frame_tokens", 0),
+                kept_out=kept_ids,
                 arena_writes=filter_writes[alias])
+            if keep:
+                kept[alias] = {g: len(pre) + len(docs[alias][g])
+                               for g in kept_ids}
             total_tokens += tokens
             out_filters[alias] = {int(d): row
                                   for d, row in answers.items()}
@@ -200,6 +215,7 @@ def _execute_single(state, payload: dict) -> dict:
         pipeline.attention_mode = JOIN_ATTENTION
         nodes = payload.get("plan_nodes") or derive_plan_nodes(
             payload["joins"])
+        join_nodes_ahead = [n for n in nodes if n["op"] == "JoinGroup"]
         for node in nodes:
             if node["op"] == "Barrier":
                 # barrier thinning; on one GPU there is no shard step
@@ -207,18 +223,29 @@ def _execute_single(state, payload: dict) -> dict:
                 continue
             if node["op"] != "JoinGroup":
                 continue
+            join_nodes_ahead = join_nodes_ahead[1:]
             specs = [payload["joins"][i] for i in node["stage_idxs"]]
             anchor_alias = node["anchor"]
             if len(specs) == 1 and specs[0].get("anchor_free"):
                 # a one-stage group re-picks its anchor from the
-                # measured live counts
+                # measured live counts, crediting KV already resident
+                resident = {
+                    a: float(sum(kept.get(a, {}).get(g, 0)
+                                 for g in survivors[a]))
+                    for a in specs[0]["aliases"]}
                 anchor_alias = pick_runtime_anchor(
                     specs[0],
                     {a: [len(docs[a][g]) for g in survivors[a]]
                      for a in specs[0]["aliases"]},
-                    len(pre), chunk_tokens)
+                    len(pre), chunk_tokens,
+                    resident_tokens=resident)
             group = [stage_for_anchor(s, anchor_alias) for s in specs]
             anchors_glob = list(survivors[anchor_alias])
+            # kept KV of documents a barrier already thinned away has
+            # no reader left
+            free_kept(arena, kept, anchor_alias,
+                      drop=set(kept.get(anchor_alias, ()))
+                      - set(anchors_glob))
             stage_suffixes = []
             tuple_globs = []
             for j in group:
@@ -229,11 +256,29 @@ def _execute_single(state, payload: dict) -> dict:
                     [_tuple_suffix(j, docs, t) for t in tuples])
             prefixes = [pre + docs[anchor_alias][a]
                         for a in anchors_glob]
+            keep_sem = (group[-1]["semantics"]
+                        if node.get("keep_anchor_kv")
+                        and anchor_alias == node["anchor"] else None)
             ans, _, tokens = run_join(
                 torch, arena, pipeline, async_ans, prefixes,
                 stage_suffixes, chunk_tokens,
                 stage_frames=[j.get("frame") or [] for j in group],
-                group_size=1 if len(group) > 1 else None)
+                group_size=1 if len(group) > 1 else None,
+                anchor_keys=[("kv", anchor_alias, g)
+                             for g in anchors_glob],
+                keep_semantics=keep_sem,
+                evict=make_evict(arena, kept, anchor_alias))
+            if keep_sem:
+                kept[anchor_alias] = {
+                    g: len(prefixes[i])
+                    for i, g in enumerate(anchors_glob)
+                    if ("kv", anchor_alias, g) in arena.accounting.owned}
+            else:
+                kept.pop(anchor_alias, None)
+            # kept KV whose consumer groups are all behind us is done
+            ahead = {n2["anchor"] for n2 in join_nodes_ahead}
+            for alias in [a for a in kept if a not in ahead]:
+                free_kept(arena, kept, alias)
             total_tokens += tokens
             for si, j in enumerate(group):
                 stage_out = dict(
@@ -248,6 +293,8 @@ def _execute_single(state, payload: dict) -> dict:
             # gate the anchor set for stages after this group
             survivors[anchor_alias] = gate_group(
                 out_joins[-1], group[-1]["semantics"])
+        for alias in list(kept):
+            free_kept(arena, kept, alias)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
 
@@ -363,23 +410,38 @@ def _child_filters(state, sub):
     _child_boot(state, sub)
     boot = state["boot"]
     torch = state["torch"]
-    out = dict(filters={}, survivors={}, fresh_tokens=0,
+    # a new query begins: nothing kept for the previous one may stay
+    sweep_kept_keys(state["arena"])
+    state["kept"] = {}
+    out = dict(filters={}, survivors={}, kept={}, fresh_tokens=0,
                boot_s=boot["boot_s"], boot_kind=boot["kind"],
                boot=boot)
     pre = sub.get("pre_ids") or []
     limit = sub.get("limit")
     filter_writes = sub["filter_arena_writes"]
+    filter_keep = sub.get("filter_keep") or {}
     t0 = _time.perf_counter()
     with torch.inference_mode():
         state["pipeline"].attention_mode = FILTER_ATTENTION
         for alias, qids in sub["filters"].items():
             index = sub["doc_index"][alias]
+            fkeep = filter_keep.get(alias) or {}
+            kept_ids = []
             answers, _, tokens = run_filter(
                 torch, state["arena"], state["pipeline"],
                 state["async_ans"],
                 [pre + d for d in sub["docs"][alias]], qids,
                 state["chunk_tokens"], limit=limit,
+                keys=[("kv", alias, g) for g in index],
+                keep=bool(fkeep.get("keep")),
+                keep_extra_tokens=fkeep.get("frame_tokens", 0),
+                kept_out=kept_ids,
                 arena_writes=filter_writes[alias])
+            if fkeep.get("keep"):
+                state["kept"][alias] = {
+                    index[d]: len(pre) + len(sub["docs"][alias][d])
+                    for d in kept_ids}
+                out["kept"][alias] = sorted(state["kept"][alias])
             out["fresh_tokens"] += tokens
             out["filters"][alias] = {index[d]: row
                                      for d, row in answers.items()}
@@ -402,11 +464,21 @@ def _child_joins(state, sub):
     _child_boot(state, sub)
     torch = state["torch"]
     pre = sub.get("pre_ids") or []
+    anchor_alias = sub["anchor_alias"]
     anchors_glob = list(sub["anchor_index"])
     anchor_docs = sub["anchor_docs"]
+    kept = state.setdefault("kept", {})
+    # kept KV whose consumer groups are behind us, and kept anchors a
+    # barrier thinned away, have no reader left
+    for alias in sub.get("drop_kept") or ():
+        free_kept(state["arena"], kept, alias)
+    free_kept(state["arena"], kept, anchor_alias,
+              drop=set(kept.get(anchor_alias, ()))
+              - set(anchors_glob))
     # one anchor group per round: the parent walks the plan's nodes,
     # thins at barriers, and re-shards; the child just runs the group
     group = sub["joins"]
+    keep_sem = sub.get("keep_semantics")
     out_joins, tokens_total = [], 0
     t0 = _time.perf_counter()
     with torch.inference_mode():
@@ -433,13 +505,28 @@ def _child_joins(state, sub):
             state["async_ans"], prefixes, stage_suffixes,
             state["chunk_tokens"],
             stage_frames=[j.get("frame") or [] for j in group],
-            group_size=1 if len(group) > 1 else None)
+            group_size=1 if len(group) > 1 else None,
+            anchor_keys=[("kv", anchor_alias, g)
+                         for g in anchors_glob],
+            keep_semantics=keep_sem,
+            evict=make_evict(state["arena"], kept, anchor_alias))
+        if keep_sem:
+            kept[anchor_alias] = {
+                g: len(prefixes[i])
+                for i, g in enumerate(anchors_glob)
+                if ("kv", anchor_alias, g)
+                in state["arena"].accounting.owned}
+        else:
+            kept.pop(anchor_alias, None)
         tokens_total += tokens
         for si, j in enumerate(group):
             out_joins.append(dict(
                 rows={int(a): row for a, row in ans[si].items()},
                 anchor_index=anchors_glob,
                 partner_index=tuple_globs[si]))
+    if sub.get("final_group"):
+        for alias in list(kept):
+            free_kept(state["arena"], kept, alias)
     torch.cuda.synchronize()
     return dict(joins=out_joins, fresh_tokens=tokens_total,
                 wall_s=round(_time.perf_counter() - t0, 2))
@@ -490,12 +577,19 @@ def _execute_multi(payload: dict) -> dict:
     survivors = {a: list(v) for a, v in merged["survivors"].items()}
     for alias, ds in payload["docs"].items():
         survivors.setdefault(alias, list(range(len(ds))))
+    # global ids of documents whose KV the children hold
+    kept = {}
+    for out in fouts:
+        for alias, ids in (out.get("kept") or {}).items():
+            kept.setdefault(alias, set()).update(ids)
     out_joins = []
     finished_full = []      # full stage outputs, for barriers
     pre_len = len(payload.get("pre_ids") or [])
     docs = payload["docs"]
     nodes = payload.get("plan_nodes") or coordinator.derive_plan_nodes(
         payload["joins"])
+    join_nodes_ahead = [n for n in nodes if n["op"] == "JoinGroup"]
+    prior_shards = {}    # alias -> anchor shards its kept KV sits on
     for node in nodes:
         if node["op"] == "Barrier":
             # barrier thinning; the re-shard itself happens when the
@@ -504,20 +598,38 @@ def _execute_multi(payload: dict) -> dict:
             continue
         if node["op"] != "JoinGroup":
             continue
+        join_nodes_ahead = join_nodes_ahead[1:]
         specs = [payload["joins"][i] for i in node["stage_idxs"]]
         anchor = node["anchor"]
         if len(specs) == 1 and specs[0].get("anchor_free"):
             # a one-stage group re-picks its anchor from the measured
-            # live counts
+            # live counts, crediting KV the children already hold
+            resident = {
+                a: float(sum(pre_len + len(docs[a][g])
+                             for g in survivors[a]
+                             if g in kept.get(a, ())))
+                for a in specs[0]["aliases"]}
             anchor = pick_runtime_anchor(
                 specs[0],
                 {a: [len(docs[a][g]) for g in survivors[a]]
                  for a in specs[0]["aliases"]},
-                pre_len, payload["chunk_tokens"])
+                pre_len, payload["chunk_tokens"],
+                resident_tokens=resident)
         group = [coordinator.stage_for_anchor(s, anchor)
                  for s in specs]
-        jsubs = coordinator.join_group_payloads(payload, k, survivors,
-                                                group)
+        keep_sem = (group[-1]["semantics"]
+                    if node.get("keep_anchor_kv")
+                    and anchor == node["anchor"] else None)
+        ahead = {n2["anchor"] for n2 in join_nodes_ahead}
+        drop = [a for a in kept if a not in ahead and a != anchor]
+        jsubs = coordinator.join_group_payloads(
+            payload, k, survivors, group, prior_shards=prior_shards)
+        for sub in jsubs:
+            sub["keep_semantics"] = keep_sem
+            sub["drop_kept"] = drop
+            sub["final_group"] = not join_nodes_ahead
+        for a in drop:
+            kept.pop(a, None)
         jouts = _round("joins", jsubs)
         stage_outs = coordinator.merge_join_round(jouts)
         merged["fresh_tokens"] += sum(o["fresh_tokens"] for o in jouts)
@@ -529,6 +641,14 @@ def _execute_multi(payload: dict) -> dict:
                 finished_full.append(stage_out)
         survivors[anchor] = coordinator.gate_group(
             stage_outs[-1], group[-1]["semantics"])
+        if keep_sem and join_nodes_ahead:
+            kept[anchor] = set(survivors[anchor])
+            prior_shards[anchor] = [list(sub["anchor_index"])
+                                    for sub in jsubs]
+        else:
+            kept.pop(anchor, None)
+        if not join_nodes_ahead:
+            kept.clear()
     wall = _time.perf_counter() - t0
     boot_s = max(o["boot_s"] for o in fouts)
     # forward the breakdown from the child that owned the max boot
@@ -580,6 +700,80 @@ def _tuple_suffix(join, docs, member) -> list:
         out += docs[alias][g]
     out += join["tail"]
     return out
+
+
+# ------------------------------------------------- kept KV management
+#
+# Document KV kept across operators lives in the arena under
+# ("kv", alias, global doc id) keys. The filter round keeps survivor
+# KV for aliases the plan will anchor; a join group keeps its
+# surviving anchors when a later group re-uses the table. Everything
+# kept is freed the moment its last reader is behind us, and swept
+# defensively at the start of the next query - the arena outlives a
+# query, kept KV must not.
+
+def _pages(arena):
+    """The page accounting: KVArena nests it, PageArena is it."""
+    return getattr(arena, "accounting", arena)
+
+
+def sweep_kept_keys(arena):
+    """Free any ("kv", alias, doc) keys an earlier query left resident."""
+    for key in [k for k in list(_pages(arena).owned)
+                if isinstance(k, tuple) and len(k) == 3
+                and k[0] == "kv"]:
+        arena.free_key(key)
+
+
+def free_kept(arena, kept, alias, drop=None):
+    """Free one alias's kept KV, or just the given global doc ids."""
+    held = kept.get(alias)
+    if not held:
+        kept.pop(alias, None)
+        return
+    ids = list(held) if drop is None else [g for g in drop
+                                           if g in held]
+    for g in ids:
+        key = ("kv", alias, g)
+        if key in _pages(arena).owned:
+            arena.free_key(key)
+        held.pop(g, None)
+    if not held:
+        kept.pop(alias, None)
+
+
+def make_evict(arena, kept, current_alias):
+    """Eviction under arena pressure, for run_join's anchor allocs.
+
+    Victims accumulate smallest first - freed pages are linear in
+    document length while the recompute a later group then pays grows
+    faster - then any victim the later, larger ones made redundant is
+    dropped again, so no document is evicted for pages the allocation
+    does not need."""
+    def evict(pages_needed):
+        candidates = sorted(
+            (tokens, alias, g)
+            for alias, held in kept.items() if alias != current_alias
+            for g, tokens in held.items()
+            if ("kv", alias, g) in _pages(arena).owned)
+        victims, total = [], 0
+        for tokens, alias, g in candidates:
+            pages = len(_pages(arena).owned[("kv", alias, g)])
+            victims.append((pages, alias, g))
+            total += pages
+            if total >= pages_needed:
+                break
+        for entry in list(victims):
+            if total - entry[0] >= pages_needed:
+                victims.remove(entry)
+                total -= entry[0]
+        for _, alias, g in victims:
+            arena.free_key(("kv", alias, g))
+            kept[alias].pop(g, None)
+            if not kept[alias]:
+                kept.pop(alias)
+        return bool(victims)
+    return evict
 
 
 class _PayloadAnswerer:

@@ -294,3 +294,77 @@ def test_merge_join_round_disjoint_anchors():
     assert stage["partner_index"] == [[1, 0], [2, 0], [3, 1]]
     assert stage["rows"] == {0: [1, 0, 1], 1: [0, 0, 1],
                              2: [0, 1, 0]}
+
+
+# ------------------------------------------------ kept KV threading
+
+def test_filter_keep_map_reads_plan_nodes():
+    from quail.runtime.coordinator import filter_keep_map
+
+    p = payload()
+    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True,
+                            keep_frame_tokens=12, arena_writes=True)]
+    assert filter_keep_map(p) == {
+        "r": dict(keep=True, frame_tokens=12)}
+    # without joins there is nothing to keep the KV for
+    p["joins"] = []
+    assert filter_keep_map(p) == {}
+
+
+def test_filter_round_carries_keep():
+    p = payload()
+    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True,
+                            keep_frame_tokens=12)]
+    subs = filter_round_payloads(p, p["shards"], 2)
+    for sub in subs:
+        assert sub["filter_keep"] == {
+            "r": dict(keep=True, frame_tokens=12)}
+
+
+def test_join_group_prior_shards_align_kept_anchors():
+    # an anchor kept by an earlier group stays on the workers that
+    # hold its KV, thinned to the live set, instead of re-sharding
+    p = payload()
+    survivors = {"r": [0, 3, 4], "p": [0, 1, 2, 3]}
+    prior = {"r": [[0, 4, 5], [1, 2, 3]]}
+    subs = join_group_payloads(p, 2, survivors, p["joins"],
+                               prior_shards=prior)
+    assert subs[0]["anchor_index"] == [0, 4]
+    assert subs[1]["anchor_index"] == [3]
+    # without prior shards the anchor follows its filter shards
+    subs = join_group_payloads(p, 2, survivors, p["joins"])
+    assert subs[0]["anchor_index"] == [0, 4]
+    assert subs[1]["anchor_index"] == [3]
+
+
+def test_kept_kv_helpers_free_sweep_and_evict():
+    from quail.executor.arena import PageArena
+    from quail.runtime.worker import (free_kept, make_evict,
+                                      sweep_kept_keys)
+
+    arena = PageArena(n_pages=20, page_tokens=16)
+    kept = {}
+    for alias, g, tokens in (("r", 0, 100), ("r", 1, 60),
+                             ("t", 5, 30)):
+        arena.alloc(("kv", alias, g), tokens)
+        kept.setdefault(alias, {})[g] = tokens
+
+    # dropping named ids frees their pages and prunes empty aliases
+    free_kept(arena, kept, "t", drop={5})
+    assert "t" not in kept
+    assert ("kv", "t", 5) not in arena.owned
+
+    # eviction never touches the current table and never evicts a
+    # document the allocation does not need: freeing r0 (7 pages)
+    # covers 5, so r1 stays
+    evict = make_evict(arena, kept, "p")
+    assert evict(5) is True
+    assert kept == {"r": {1: 60}}
+    assert ("kv", "r", 0) not in arena.owned
+    # nothing evictable for the current table itself
+    assert make_evict(arena, kept, "r")(5) is False
+
+    # the sweep clears every kept key, and only kept keys
+    arena.alloc("scratch", 32)
+    sweep_kept_keys(arena)
+    assert list(arena.owned) == ["scratch"]
