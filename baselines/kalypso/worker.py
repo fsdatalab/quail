@@ -42,8 +42,12 @@ kalypso_image = (
         "pip install -r /opt/kalypso/requirements/cuda.txt",
     )
     .run_commands(
-        "cd /opt/kalypso && VLLM_USE_PRECOMPILED=1"
-        " pip install . --no-build-isolation",
+        "cd /opt/kalypso && VLLM_USE_PRECOMPILED=1 VLLM_TARGET_DEVICE=cuda"
+        " pip install . --no-build-isolation 2>&1"
+        " && python -c '"
+        "import vllm; print(\"vllm at:\", vllm.__file__);"
+        "import vllm._C; print(\"_C loaded OK\")"
+        "'",
     )
     .pip_install("huggingface_hub[hf_transfer]")
     .env(
