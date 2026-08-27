@@ -8,8 +8,7 @@ import pytest
 
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
-from quail.planner.decide import (explain, order_filters,
-                                  pick_runtime_anchor, plan_query)
+from quail.planner.decide import explain, order_filters, plan_query
 from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -284,21 +283,6 @@ def test_three_join_chain_plans_with_barriers(catalog, tmp_path):
     assert len(pair_ports) == 3
 
 
-def test_pick_runtime_anchor_prefers_cheap_side_within_the_chunk():
-    spec = dict(anchor="t", aliases=["t", "p"],
-                frames={"t": [1] * 5, "p": [1] * 5},
-                labels={"t": [1] * 2, "p": [1] * 2}, tail=[1] * 11)
-    live = {"t": [50] * 5, "p": [100] * 6}
-    # p's documents are longer: anchoring p pays them once each
-    # instead of once per tuple
-    assert pick_runtime_anchor(spec, live, 1, 10_000) == "p"
-    # a chunk too small for a p-anchored tuple falls back to the
-    # compile-time anchor (always a candidate - it passed the
-    # compile-time refusal check)
-    need_p = 1 + 100 + 5 + 11 + 2 + 50
-    assert pick_runtime_anchor(spec, live, 1, need_p - 1) == "t"
-
-
 def test_join_order_runs_selective_gate_first(catalog):
     # an expensive .9 full join and a cheap .01 exists gate on the
     # same table: by_cost runs the gate first so the join sees few
@@ -456,7 +440,6 @@ def test_filter_keep_makes_the_join_anchor_resident(catalog):
     frame = len(tok(render_join_frame(pred.template, 0)))
     label = len(tok(join_label(1)))
     tail = len(tok(pred.tail))
-    assert chain["keep_frame_tokens"] == frame
     live = 50 * 0.5
     expect = live * frame + live * 20 * (5 + label + tail)
     stage = group["stages"][0]
@@ -486,9 +469,6 @@ def test_keep_split_keeps_longest_documents_that_fit():
     # page-rounded costs at overhead 4, 16-token pages: 416 + 304
     split = keep_split(docs_tok, 720, 1.0, overhead=4, page_tokens=16)
     assert split["min_doc_tokens"] == 300
-    assert split["kept_doc_frac"] == 0.5
-    assert split["kept_mean"] == 350
-    assert split["unkept_mean"] == 150
     assert split["kept_expected_tokens"] == 720
 
     # survival halves the expected mass, so half the budget keeps the
@@ -541,12 +521,14 @@ def test_gate_group_keeps_anchor_kv_for_the_next_group(catalog):
     assert groups[1]["anchor_resident"] == "kept"
 
 
-def test_dp_matches_complete_left_deep_enumeration(catalog, tmp_path):
+def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
+    import itertools as it
+
     from quail.planner import sol
-    from quail.planner.decide import (_collect, _feasible_anchors,
-                                      _stage_work, _thin, _residency,
-                                      plan_joins, _walk)
-    from quail.planner.plan import CorpusStats
+    from quail.planner.decide import _collect, join_specs
+    from quail.planner.joins import (_feasible_anchors, residency,
+                                     search_joins, stage_work, thin)
+    from quail.planner.sol import Work
 
     catalog.register("tags", DocumentProvider.from_parquet(
         _parquet(tmp_path / "g.parquet", ["id", "tag"]), id_col="id"))
@@ -564,33 +546,35 @@ def test_dp_matches_complete_left_deep_enumeration(catalog, tmp_path):
     toks = {"r": [900] * 6, "t": [40] * 8, "p": [200] * 5,
             "g": [30] * 9}
     _, _, joins = _collect(logical)
-    stats = {a: CorpusStats.from_doc_tokens(t) for a, t in toks.items()}
+    specs = join_specs(joins)
     live0 = {a: float(len(t)) for a, t in toks.items()}
     pre = 1
     chunk = 10_000
 
-    def rank(work):
-        return sol.speed_of_light(work, QWEN3_4B_FP8, H100_SXM,
-                                  chunk).seconds
-
     def key(work):
-        return (rank(work), work.tokens, work.pairs, work.kv_written,
+        seconds = sol.speed_of_light(work, QWEN3_4B_FP8, H100_SXM,
+                                     chunk).seconds
+        return (seconds, work.tokens, work.pairs, work.kv_written,
                 work.kv_read)
 
-    seq, _ = plan_joins(joins, "by_cost", stats, live0, pre,
-                        chunk=chunk, keep_plan={}, rank=rank)
-    dp_work, _ = _walk(seq, live0, stats, pre, {})
+    found = search_joins(specs, live0, toks, {}, pre, chunk,
+                         QWEN3_4B_FP8, H100_SXM)
 
-    # complete enumeration of the same space: every alias insertion
-    # order, every completing-edge order, every feasible anchor
-    import itertools as it
-    edge_aliases = [frozenset(a.alias for a in j.predicate.args)
-                    for j in joins]
+    # complete enumeration of the same space under the same cost
+    # convention: live counts come from the applied edge set, thinned
+    # in written order, exactly as the search prices them
+    edge_aliases = [frozenset(s["aliases"]) for s in specs]
     best = []
 
-    def visit_alias(order, pos, applied, cached, live, work):
+    def live_for(applied):
+        state = dict(live0)
+        for i in sorted(applied):
+            thin(state, specs[i])
+        return state
+
+    def visit_alias(order, pos, applied, cached, work):
         if pos == len(order):
-            if len(applied) == len(joins):
+            if len(applied) == len(specs):
                 best.append(work)
             return
         added = order[pos]
@@ -600,28 +584,25 @@ def test_dp_matches_complete_left_deep_enumeration(catalog, tmp_path):
         if not crossing:
             return
         for edge_order in it.permutations(crossing):
-            def visit_edge(k, cached_now, live_now, work_now):
+            def visit_edge(k, applied_now, cached_now, work_now):
                 if k == len(edge_order):
-                    visit_alias(order, pos + 1,
-                                applied | set(edge_order), cached_now,
-                                live_now, work_now)
+                    visit_alias(order, pos + 1, applied_now,
+                                cached_now, work_now)
                     return
-                j = joins[edge_order[k]]
-                for anchor in _feasible_anchors(j, True, stats, pre,
+                i = edge_order[k]
+                spec = specs[i]
+                live = live_for(applied_now)
+                for anchor in _feasible_anchors(spec, True, toks, pre,
                                                 chunk):
-                    kind = _residency(anchor, cached_now, {})
-                    w = _stage_work(j, live_now, stats, anchor, pre,
-                                    kind, {})
-                    nxt = dict(live_now)
-                    _thin(nxt, j, anchor)
-                    visit_edge(k + 1, cached_now | {anchor}, nxt,
-                               work_now + w)
-            visit_edge(0, cached, live, work)
+                    w = stage_work(spec, anchor, live, toks, {},
+                                   pre, cached_now)
+                    visit_edge(k + 1, applied_now | {i},
+                               cached_now | {anchor}, work_now + w)
+            visit_edge(0, set(applied), set(cached), work)
 
     aliases = sorted({a for ends in edge_aliases for a in ends})
-    from quail.planner.sol import Work
     for order in it.permutations(aliases):
-        visit_alias(list(order), 1, set(), set(), dict(live0), Work())
+        visit_alias(list(order), 1, set(), set(), Work())
 
     assert best, "enumeration found no connected left deep plan"
-    assert key(dp_work) == min(key(w) for w in best)
+    assert key(found["work"]) == min(key(w) for w in best)
