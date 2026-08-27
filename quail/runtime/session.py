@@ -343,6 +343,9 @@ class Query:
             model=sess.model.name,
             kv_dtype=plan.kv_dtype,
             chunk_tokens=plan.chunk_tokens,
+            # the worker re-runs the join search on actual survivors
+            # under the same order rule
+            order_rule=plan.order_rule,
             workers=plan.workers,
             # the payload limit is the per-filter admission cap. With
             # joins, capping a table's filter would drop join inputs

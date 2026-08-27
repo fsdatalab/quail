@@ -298,27 +298,25 @@ def test_merge_join_round_disjoint_anchors():
 
 # ------------------------------------------------ kept KV threading
 
-def test_filter_keep_map_reads_plan_nodes():
-    from quail.runtime.coordinator import filter_keep_map
+def test_retain_aliases_reads_plan_nodes():
+    from quail.runtime.coordinator import retain_aliases
 
     p = payload()
-    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True,
-                            keep_frame_tokens=12, arena_writes=True)]
-    assert filter_keep_map(p) == {
-        "r": dict(keep=True, frame_tokens=12)}
+    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True),
+                       dict(op="FilterChain", alias="p",
+                            keep_kv=False)]
+    assert retain_aliases(p) == {"r"}
     # without joins there is nothing to keep the KV for
     p["joins"] = []
-    assert filter_keep_map(p) == {}
+    assert retain_aliases(p) == set()
 
 
-def test_filter_round_carries_keep():
+def test_filter_round_carries_retain_aliases():
     p = payload()
-    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True,
-                            keep_frame_tokens=12)]
+    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True)]
     subs = filter_round_payloads(p, p["shards"], 2)
     for sub in subs:
-        assert sub["filter_keep"] == {
-            "r": dict(keep=True, frame_tokens=12)}
+        assert sub["retain_aliases"] == ["r"]
 
 
 def test_join_group_prior_shards_align_kept_anchors():
@@ -337,34 +335,33 @@ def test_join_group_prior_shards_align_kept_anchors():
     assert subs[1]["anchor_index"] == [3]
 
 
-def test_kept_kv_helpers_free_sweep_and_evict():
-    from quail.executor.arena import PageArena
-    from quail.runtime.worker import (free_kept, make_evict,
-                                      sweep_kept_keys)
+def test_search_specs_counts_from_token_lists():
+    from quail.runtime.coordinator import search_specs
 
-    arena = PageArena(n_pages=20, page_tokens=16)
-    kept = {}
-    for alias, g, tokens in (("r", 0, 100), ("r", 1, 60),
-                             ("t", 5, 30)):
-        arena.alloc(("kv", alias, g), tokens)
-        kept.setdefault(alias, {})[g] = tokens
+    specs = search_specs([dict(
+        aliases=["r", "p"], anchor="r", anchor_free=True,
+        semantics="full", selectivity=0.1, written_pos=2,
+        frames={"r": [1] * 5, "p": [1] * 4},
+        labels={"r": [1] * 2, "p": [1] * 3}, tail=[1] * 7)])
+    assert specs == [dict(
+        written_pos=2, aliases=["r", "p"], anchor="r",
+        anchor_free=True, semantics="full", selectivity=0.1,
+        frame_tokens={"r": 5, "p": 4},
+        label_tokens={"r": 2, "p": 3}, tail_tokens=7)]
 
-    # dropping named ids frees their pages and prunes empty aliases
-    free_kept(arena, kept, "t", drop={5})
-    assert "t" not in kept
-    assert ("kv", "t", 5) not in arena.owned
 
-    # eviction never touches the current table and never evicts a
-    # document the allocation does not need: freeing r0 (7 pages)
-    # covers 5, so r1 stays
-    evict = make_evict(arena, kept, "p")
-    assert evict(5) is True
-    assert kept == {"r": {1: 60}}
-    assert ("kv", "r", 0) not in arena.owned
-    # nothing evictable for the current table itself
-    assert make_evict(arena, kept, "r")(5) is False
+def test_runtime_nodes_group_and_barrier_like_the_planner():
+    from quail.runtime.coordinator import runtime_nodes
 
-    # the sweep clears every kept key, and only kept keys
-    arena.alloc("scratch", 32)
-    sweep_kept_keys(arena)
-    assert list(arena.owned) == ["scratch"]
+    joins = [dict(semantics="full", written_pos=0),
+             dict(semantics="full", written_pos=1),
+             dict(semantics="exists", written_pos=2)]
+    # two fulls share anchor r and merge; the gate runs alone and
+    # its anchor switch to p becomes a barrier
+    nodes = runtime_nodes([(1, "r"), (0, "r"), (2, "p")], joins)
+    assert [n["op"] for n in nodes] == ["JoinGroup", "Barrier",
+                                       "JoinGroup"]
+    assert nodes[0]["anchor"] == "r"
+    assert nodes[0]["stage_idxs"] == (1, 0)
+    assert nodes[1]["next_anchor"] == "p"
+    assert nodes[2]["stage_idxs"] == (2,)
