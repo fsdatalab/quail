@@ -320,8 +320,10 @@ class Query:
                 spec = _join_spec(sess, j.predicate, st["anchor"],
                                   st["partners"])
                 spec["semantics"] = st["semantics"]
-                # a one-stage group with no user override may re-pick
-                # its anchor at run time from measured live counts
+                spec["selectivity"] = j.selectivity
+                spec["written_pos"] = st["written_pos"]
+                # a full join without a user override lets the post-filter
+                # join DP choose either orientation
                 spec["anchor_free"] = (j.anchor is None
                                        and j.semantics == "full")
                 join_specs.append(spec)
@@ -375,6 +377,9 @@ class Query:
             fresh_tokens=out["fresh_tokens"], stages=[],
             peak_gib=out.get("peak_gib"),
             order_rule=plan.order_rule,
+            join_optimizer=out.get("join_optimizer"),
+            kv_manager=out.get("kv_manager"),
+            result_volume_path=out.get("result_volume_path"),
             remarks=list(plan.remarks) + list(self.session.notes))
         answer_rows = dict(filters=out["filters"], joins=out["joins"])
 
@@ -418,6 +423,8 @@ class Query:
         for st, jout in zip(stage_plan, out["joins"]):
             anchor = jout.get("anchor", st["anchor"])
             partners = list(jout.get("partners", st["partners"]))
+            semantics = jout.get("semantics", st["semantics"])
+            selectivity = jout.get("selectivity", st["selectivity"])
             rows = jout["rows"]
             anchor_map = jout["anchor_index"]
             partner_map = jout["partner_index"]
@@ -426,17 +433,17 @@ class Query:
             report["stages"].append(dict(
                 op="join", anchor=anchor,
                 partners=partners,
-                semantics=st["semantics"],
-                provided_selectivity=st["selectivity"],
+                semantics=semantics,
+                provided_selectivity=selectivity,
                 observed_selectivity=round(yes / max(1, evaluated), 4),
                 tuples=evaluated))
             global_rows = {anchor_map[a]: r for a, r in rows.items()}
-            if st["semantics"] == "full":
+            if semantics == "full":
                 full_rels.append((anchor, partners, global_rows,
                                   partner_map))
             else:
                 keep = set(gate(global_rows))
-                if st["semantics"] == "exists":
+                if semantics == "exists":
                     survivors[anchor] = [d for d in survivors[anchor]
                                          if d in keep]
                 else:

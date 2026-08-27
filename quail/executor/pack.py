@@ -170,39 +170,32 @@ class FilterAdmission:
         page_tokens: Tokens per arena page.
         kept_extra_tokens: Extra tokens per document that must fit in
             pages (shared preamble plus tail room).
-        keep_survivors: Hold survivors' pages after their last stage
-            instead of freeing them, so a join can anchor on the KV.
         limit: Stop after this many survivors.
 
     Survivor suffixes pack before fresh admissions. Pages are granted
-    in queue order; chunk room may be skipped. When kept survivors
-    starve a fresh admission, evict_for_pending frees the smallest
-    kept documents the admission actually needs: recompute cost - a
-    dense term linear in length plus an attention term quadratic in
-    it, both counted - rises with length, so the smallest kept KV
-    costs the least to pay back.
+    in queue order; chunk room may be skipped.
     """
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
                  arena_pages, page_tokens, kept_extra_tokens=0,
-                 keep_survivors=False, limit=None):
+                 limit=None, available_pages=None):
         self.doc_tokens = list(doc_tokens)
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
         self.page_tokens = page_tokens
         # None: no page bin - nothing is ever written to the arena,
         # so there is nothing to account
-        self.free_pages = arena_pages
+        self.free_pages = (arena_pages if available_pages is None
+                           else available_pages)
+        if (arena_pages is not None
+                and not 0 <= self.free_pages <= arena_pages):
+            raise ValueError("available_pages must fit inside arena_pages")
+        self.blocked_pages = 0
         self.limit = limit
         self._survivor_count = 0
         # kept_extra_tokens: the shared question preamble that joins
-        # the document's kept KV after stage 1 (and, when survivors
-        # are kept, the join frame allowance), so pages must cover it
+        # the document's kept KV after stage 1, so pages must cover it
         self.kept_extra = kept_extra_tokens
-        self.keep_survivors = keep_survivors
-        if keep_survivors and arena_pages is None:
-            raise ValueError("keeping survivors needs page accounting "
-                             "(arena_writes)")
         for d, t in enumerate(self.doc_tokens):
             need = t + max(stage_tokens)
             if need > chunk_budget:
@@ -216,7 +209,6 @@ class FilterAdmission:
         self.ready = deque()       # (doc, stage) gated TRUE, next suffix
         self.in_flight = set()     # docs inside a launched chunk
         self.resident = {}         # doc -> pages held
-        self.kept = set()          # survivors whose pages are held
         self.answers = {}          # doc -> [0/1 per answered stage]
 
     # ---- chunk building ------------------------------------------------
@@ -228,6 +220,7 @@ class FilterAdmission:
         written to its pages. Returns [] when nothing is buildable."""
         if self._limit_reached():
             return []
+        self.blocked_pages = 0
         room = self.chunk_budget
         groups = []
         # 1) survivor suffixes, oldest first; one live stage per doc
@@ -254,6 +247,7 @@ class FilterAdmission:
                     # pages are granted in order: put it back and stop
                     # claiming pages behind it
                     self.pending.appendleft(doc)
+                    self.blocked_pages = need_pages - self.free_pages
                     blocked_pages = True
                     break
             cost = self.stage_tokens[0] + self.doc_tokens[doc]
@@ -272,10 +266,9 @@ class FilterAdmission:
 
     # ---- gating --------------------------------------------------------
 
-    def report(self, doc, stage, passed):
+    def report(self, doc, stage, passed, release=True):
         """Record one answer. Frees pages on FALSE or last stage;
-        otherwise queues the next-stage suffix. In keep mode a
-        survivor's pages stay held after its last stage.
+        otherwise queues the next-stage suffix.
 
         Returns docs whose pages were freed."""
         self.in_flight.discard(doc)
@@ -283,51 +276,20 @@ class FilterAdmission:
         last = stage == len(self.stage_tokens) - 1
         if passed and last:
             self._survivor_count += 1
-            if self.keep_survivors:
-                self.kept.add(doc)
-                return ()
         if passed and not last:
             self.ready.append((doc, stage + 1))
             return ()
-        if self.free_pages is not None:
+        if release and self.free_pages is not None:
             self.free_pages += self.resident.pop(doc)
             return (doc,)
         return ()
 
-    def evict_for_pending(self):
-        """Free kept survivors so the head of the admission queue fits.
+    def add_free_pages(self, pages):
+        """Add pages released by retained KV outside this chain."""
 
-        Victims accumulate smallest first - the least recompute for
-        the join to pay back later - then any victim the later,
-        larger ones made redundant is dropped again, so a document is
-        never evicted for pages the admission does not need.
-        Smallest-first alone is not enough: without the second pass a
-        large victim can make an earlier small one pointless.
-
-        Returns the evicted docs (their arena keys must be freed by
-        the caller). Empty when nothing is pending, nothing is kept,
-        or the head already fits."""
-        if not self.pending or self.free_pages is None:
-            return ()
-        head = self.pending[0]
-        need = pages_for(self.doc_tokens[head] + self.kept_extra,
-                         self.page_tokens) - self.free_pages
-        if need <= 0:
-            return ()
-        victims, total = [], 0
-        for doc in sorted(self.kept, key=lambda d: self.doc_tokens[d]):
-            victims.append(doc)
-            total += self.resident[doc]
-            if total >= need:
-                break
-        for doc in list(victims):
-            if total - self.resident[doc] >= need:
-                victims.remove(doc)
-                total -= self.resident[doc]
-        for doc in victims:
-            self.kept.discard(doc)
-            self.free_pages += self.resident.pop(doc)
-        return tuple(victims)
+        if pages < 0 or self.free_pages is None:
+            raise ValueError("invalid external page release")
+        self.free_pages += pages
 
     # ---- progress ------------------------------------------------------
 
