@@ -294,12 +294,14 @@ is used.
 in `planner/joins.py`): stage order and per-stage anchors are
 decided together, because they interact - anchors set what an order
 is worth, and order sets which stages can reuse an anchor's KV
-(issue #38). The search is the left deep subset DP
-(`planner/leftdeep.py`). The state records the joined alias set and
-the current anchor group. The resident document prefixes are a read
-only input for the next group. Each step adds one connected alias
-and applies every predicate that completes, in every order, with
-every feasible anchor. Under `order=as_written`
+(issue #38). The search is a left deep subset DP. DP means that the
+search saves the best partial plans for each state instead of
+repeating the same work. The state records the joined alias set, the
+completed join predicates, and the current anchor group. The
+resident document prefixes are a read only input for the next group.
+Each step applies one ready predicate with every feasible anchor. A
+ready predicate is either within the joined alias set or adds exactly
+one connected alias. Under `order=as_written`
 the written stage order is kept and only anchors are searched. A
 gate's anchor is fixed to its outer table; a forced anchor is
 honored, with a remark at plan time when a free choice prices lower.
@@ -307,24 +309,30 @@ honored, with a remark at plan time when a free choice prices lower.
 The same function runs whenever new answers can change the decision:
 
 - **Plan time** (`plan_query`): expected live counts from
-  selectivities, the corpus length lists, the keep credit as the
+  selectivities, summary length statistics, the keep credit as the
   resident set. The output is the predicted plan - explain(), the
   refusal checks, and sharding run off it.
 - **At runtime** (the worker; the parent process on several GPUs):
-  the actual survivor counts and lengths, and the document positions
-  whose KV is actually resident in the arena. The worker executes one
-  join group, applies its answers, and searches the remaining joins
-  again. It does not search between chunks inside one group.
+  the actual survivor counts and summary length statistics, including
+  the count and total length of documents whose KV is resident. The
+  worker executes one join group, applies its answers, and searches
+  the remaining joins again. The next search starts with the aliases
+  joined by every completed group. For example, after joining B and C,
+  both A-B and C-D are legal next predicates. It does not search
+  between chunks inside one group.
 
 Each stage is costed as a `Work` record (`planner/sol.py`: tokens,
-attention pairs, KV written, KV read), per document over the live
-length list: a resident anchor prefix (retained by the filter
-round) pays only its question frame (`ask`). Consecutive stages in
-one open anchor group also reuse the prefix. Other later groups are
-priced without predicted reuse. The worker searches again after the
-current group, so its next call sees the actual finite KV state. A
-stage can price some current anchor documents as KV hits and the rest
-as recomputations.
+attention pairs, KV written, KV read). Each alias is summarized once.
+The summary has the document count, total length, squared length,
+maximum length, and the same values for resident documents. Those
+sums give the exact stage cost used by the previous per-document
+calculation. A DP candidate therefore takes constant time, regardless
+of the document count. A resident anchor prefix pays only its question
+frame (`ask`). Consecutive stages in one open anchor group also reuse
+the prefix. Other later groups are priced without predicted reuse.
+The worker searches again after the current group, so its next call
+sees the actual finite KV state. A stage can price some current anchor
+documents as KV hits and the rest as recomputations.
 Every tuple then carries partner labels, partner documents, and the
 answer cue over the resident anchor context. After each stage the
 live counts thin by `n * (1 - (1-s)^partner_tuples)`. Per state,
@@ -481,7 +489,7 @@ single forward pass, sharing KV across them through a paged arena.
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
-| `search_joins` | `joins.py` | The join search: order and anchors from live counts, lengths, and document KV; called at plan time and after every completed runtime group |
+| `search_joins` | `joins.py` | The join search: order and anchors from live counts, length summaries, document KV summaries, and aliases joined by completed groups; called at plan time and after every completed runtime group |
 | `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: which survivors to price as resident, longest documents first |
 | `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the least saved recompute work per page |
 | `minimum_loss_victims` | `executor/retention.py` | Exact small-instance oracle used only by tests |

@@ -9,13 +9,12 @@ Costs are Work records priced by counted constants; no calibration
 constant is read anywhere.
 """
 
-from quail.logical import (LogicalPlan, Project, Scan, SemanticFilter,
-                           SemanticJoin)
-from quail.planner import budgets, joins as joinsearch, sol
+from quail.logical import LogicalPlan, Project, Scan, SemanticFilter, SemanticJoin
+from quail.planner import budgets, sol
+from quail.planner import joins as joinsearch
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.sol import Work
 from quail.specs import DeviceSpec, ModelSpec
-
 
 # ---------------------------------------------------------- tree walk
 
@@ -149,19 +148,29 @@ def _page_round(tokens: float, page_tokens: int) -> float:
     return -(-tokens // page_tokens) * page_tokens
 
 
+def _length_stats(doc_tokens) -> joinsearch.AliasStats:
+    if isinstance(doc_tokens, joinsearch.AliasStats):
+        return doc_tokens
+    return joinsearch.summarize_alias(doc_tokens)
+
+
 def _split_at(doc_tokens, threshold: int, survivor_frac: float,
               overhead: int, page_tokens: int) -> dict | None:
     """The keep record for one alias at a given length threshold:
     documents at or above it are credited as resident."""
-    lengths = [int(t) for t in doc_tokens]
-    kept = [t for t in lengths if t >= max(1, threshold)]
+    stats = _length_stats(doc_tokens)
+    minimum = max(1, threshold)
+    kept = [(length, count) for length, count in stats.histogram
+            if length >= minimum]
     if not kept:
         return None
-    unkept = [t for t in lengths if t < max(1, threshold)]
+    has_unkept = any(length < minimum
+                     for length, _ in stats.histogram)
     return dict(
-        min_doc_tokens=1 if not unkept else threshold,
+        min_doc_tokens=1 if not has_unkept else threshold,
         kept_expected_tokens=survivor_frac * sum(
-            _page_round(t + overhead, page_tokens) for t in kept),
+            count * _page_round(length + overhead, page_tokens)
+            for length, count in kept),
         survivor_frac=survivor_frac,
         overhead=overhead)
 
@@ -169,9 +178,11 @@ def _split_at(doc_tokens, threshold: int, survivor_frac: float,
 def _raise_threshold(split: dict, doc_tokens, page_tokens: int):
     """Drop the shortest kept length class: the next split up, or
     None when only the longest class was left."""
-    boundary = min(t for t in doc_tokens
-                   if t >= max(1, split["min_doc_tokens"]))
-    higher = sorted({int(t) for t in doc_tokens if t > boundary})
+    stats = _length_stats(doc_tokens)
+    boundary = min(length for length, _ in stats.histogram
+                   if length >= max(1, split["min_doc_tokens"]))
+    higher = [length for length, _ in stats.histogram
+              if length > boundary]
     if not higher:
         return None
     return _split_at(doc_tokens, higher[0], split["survivor_frac"],
@@ -208,16 +219,17 @@ def keep_split(doc_tokens, budget_tokens: float, survivor_frac: float,
         None when not even the longest document fits, else the
         _split_at record; min_doc_tokens is 1 when everything fits.
     """
-    lengths = sorted((int(t) for t in doc_tokens), reverse=True)
-    if not lengths:
+    stats = _length_stats(doc_tokens)
+    if not stats.count:
         return None
     taken, threshold = 0.0, 0
-    for t in lengths:
-        cost = survivor_frac * _page_round(t + overhead, page_tokens)
+    for length, count in reversed(stats.histogram):
+        cost = (survivor_frac * count
+                * _page_round(length + overhead, page_tokens))
         if taken + cost > budget_tokens:
             break
         taken += cost
-        threshold = t
+        threshold = length
     if threshold == 0:
         return None
     split = _split_at(doc_tokens, threshold, survivor_frac, overhead,
@@ -290,9 +302,11 @@ def _keep_timeline(seq, keep_plan, doc_tokens, live0, pre,
         last_use[anchor] = g
 
     def survivor_mass(alias, live_count):
-        frac = live_count / max(1.0, float(len(doc_tokens[alias])))
-        return frac * sum(_page_round(pre + t, page_tokens)
-                          for t in doc_tokens[alias])
+        stats = _length_stats(doc_tokens[alias])
+        frac = live_count / max(1.0, float(stats.count))
+        return frac * sum(
+            count * _page_round(pre + length, page_tokens)
+            for length, count in stats.histogram)
 
     live = dict(live0)
     points = [sum(k["kept_expected_tokens"]
@@ -316,6 +330,8 @@ def _keep_timeline(seq, keep_plan, doc_tokens, live0, pre,
 
 def balanced_shards(doc_tokens, workers: int):
     """Greedily partition documents into shards balanced by token count."""
+    if workers == 1:
+        return (tuple(range(len(doc_tokens))),), [sum(doc_tokens)]
     order = sorted(range(len(doc_tokens)), key=lambda i: -doc_tokens[i])
     loads = [0] * workers
     shards = [[] for _ in range(workers)]
@@ -337,8 +353,13 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         doc_tokens: alias -> list of per-document token counts.
     """
     scans, filters, joins = _collect(plan)
-    stats = {a: CorpusStats.from_doc_tokens(t)
-             for a, t in doc_tokens.items()}
+    length_stats = {a: joinsearch.summarize_alias(t)
+                    for a, t in doc_tokens.items()}
+    stats = {
+        a: CorpusStats(n_docs=s.count, total_tokens=s.total,
+                       max_doc_tokens=s.maximum)
+        for a, s in length_stats.items()
+    }
     for s in scans:
         if s.alias not in stats:
             raise ValueError(f"no doc_tokens for alias {s.alias!r}")
@@ -393,17 +414,20 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
     # ---- keep credit candidates, then the search on expectations
     keep_budget = max(0.0, float(admission - headroom)) * workers
-    candidates = plan_keeps(specs, filters, doc_tokens, pre,
+    candidates = plan_keeps(specs, filters, length_stats, pre,
                             keep_budget, budgets.PAGE_TOKENS)
 
     def resident_from(plan_keep):
-        return {alias: {i for i, t in enumerate(doc_tokens[alias])
-                        if t >= max(1, k["min_doc_tokens"])}
-                for alias, k in plan_keep.items()}
+        return {
+            alias: summary.with_resident_min(
+                max(1, plan_keep[alias]["min_doc_tokens"]))
+            if alias in plan_keep else summary
+            for alias, summary in length_stats.items()
+        }
 
     def run_search(plan_keep, honor_forced=True):
         found = joinsearch.search_joins(
-            specs, live0, doc_tokens, resident_from(plan_keep), pre,
+            specs, live0, resident_from(plan_keep), {}, pre,
             chunk, model, device, base_work=base_work,
             fixed_order=fixed, honor_forced=honor_forced,
             arena_tokens=float(admission) * workers,
@@ -413,7 +437,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             # no connected left deep order exists, so cost the written
             # order directly
             found = joinsearch.search_joins(
-                specs, live0, doc_tokens, resident_from(plan_keep),
+                specs, live0, resident_from(plan_keep), {},
                 pre, chunk, model, device, base_work=base_work,
                 fixed_order=True, honor_forced=honor_forced,
                 arena_tokens=float(admission) * workers,
@@ -437,17 +461,18 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         plan_keep = dict(plan_keep)
         while plan_keep:
             peak = _keep_timeline(spec_seq(found), plan_keep,
-                                  doc_tokens, live0, pre,
+                                  length_stats, live0, pre,
                                   budgets.PAGE_TOKENS, workers)
             if peak + headroom <= admission:
                 break
             alias = min(
                 plan_keep,
-                key=lambda a: min(t for t in doc_tokens[a]
-                                  if t >= max(1, plan_keep[a]
-                                              ["min_doc_tokens"])))
+                key=lambda a: min(
+                    length for length, _ in length_stats[a].histogram
+                    if length >= max(
+                        1, plan_keep[a]["min_doc_tokens"])))
             split = _raise_threshold(plan_keep[alias],
-                                     doc_tokens[alias],
+                                     length_stats[alias],
                                      budgets.PAGE_TOKENS)
             if split is None:
                 del plan_keep[alias]

@@ -8,14 +8,18 @@ model and multi-GPU coordination, and sol-computation-math's
 retention runtime and post-filter planning.
 
 1. **One production join search** (`quail/planner/joins.py`): the
-   left deep subset DP records the joined alias set and the current
-   anchor group. The actual resident document prefixes are a read
-   only input for the next group. The search does not predict later
-   evictions. The worker searches again after every group, so the
-   next call sees the real resident set. Stage costs are `Work` records
-   (tokens, attention pairs, KV written, KV read) built per document
-   over the live length lists: a resident anchor prefix pays its
-   question frame only, the rest scan preamble + document + frame.
+   left deep subset DP records the joined alias set, completed join
+   predicates, and the current anchor group. The actual resident
+   document prefixes are a read only input for the next group. The
+   search does not predict later evictions. The worker searches again
+   after every group, so the next call sees the real resident set and
+   starts from the aliases joined by completed groups. Stage costs are
+   `Work` records (tokens, attention pairs, KV written, KV read). Each
+   alias is summarized once with document count, total length, squared
+   length, maximum length, and resident totals. Those sums preserve the
+   previous per-document cost exactly while making each DP candidate
+   constant time in the document count. A resident anchor prefix pays
+   its question frame only. The rest scan preamble + document + frame.
    Gates and n-ary predicates are searched like everything else;
    forced anchors are honored; candidates rank by speed-of-light
    seconds from counted model constants and the device datasheet. No
@@ -25,9 +29,11 @@ retention runtime and post-filter planning.
    live counts and the keep credit, and emits the predicted plan -
    explain(), refusals, and sharding run off it.
    After the filter round the worker calls the same function with
-   the actual survivors and the KV actually resident. It executes
-   one join group, applies the answers, and searches the remaining
-   joins again. The parent process does the same on several GPUs.
+   summaries of the actual survivors and the KV actually resident. It
+   executes one join group, applies the answers, and searches the
+   remaining joins again. For example, after joining B and C, the next
+   search starts from `{B, C}` and can choose either A-B or C-D. The
+   parent process does the same on several GPUs.
    The runtime search uses every answer available at that point, and
    the old `pick_runtime_anchor` heuristic is deleted. Stage
    outputs carry written_pos, semantics, and selectivity, so a
@@ -120,3 +126,9 @@ The SoL floor does not change. The exact values for all 35 queries
 and both models match the previous output field by field. The SoL
 script no longer calls or simulates the production planner. Its
 full local run decreased from 59.13 seconds to 18.01 seconds.
+
+The aggregate production search was also checked with one million
+documents per alias and three joins. Summarizing one alias took 0.408
+seconds on the local CPU. The DP then took 0.0015 seconds, with 20
+states and 48 generated candidates. These are local CPU times, not an
+H100! measurement.
