@@ -405,7 +405,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         found = joinsearch.search_joins(
             specs, live0, doc_tokens, resident_from(plan_keep), pre,
             chunk, model, device, base_work=base_work,
-            fixed_order=fixed, honor_forced=honor_forced)
+            fixed_order=fixed, honor_forced=honor_forced,
+            arena_tokens=float(admission) * workers,
+            page_tokens=budgets.PAGE_TOKENS)
         if found is None:
             # a join predicate with no alias in common with the rest:
             # no connected left deep order exists, so cost the written
@@ -413,7 +415,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             found = joinsearch.search_joins(
                 specs, live0, doc_tokens, resident_from(plan_keep),
                 pre, chunk, model, device, base_work=base_work,
-                fixed_order=True, honor_forced=honor_forced)
+                fixed_order=True, honor_forced=honor_forced,
+                arena_tokens=float(admission) * workers,
+                page_tokens=budgets.PAGE_TOKENS)
         return found
 
     def consumed_keeps(records, plan_keep):

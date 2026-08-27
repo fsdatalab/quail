@@ -289,44 +289,42 @@ documents it kills (1 minus selectivity). A selectivity of 1 (kills
 nothing) goes last. When any filter lacks a selectivity, `as_written`
 is used.
 
-**Join order and anchors, one search, two calls** (`search_joins`
+**Join order and anchors, one search, repeated calls** (`search_joins`
 in `planner/joins.py`): stage order and per-stage anchors are
 decided together, because they interact - anchors set what an order
 is worth, and order sets which stages can reuse an anchor's KV
 (issue #38). The search is the left deep subset DP
-(`planner/leftdeep.py`, the same search the SoL estimate runs): the
-state is (joined alias set, cached prefix alias set), each step adds
-one connected alias and applies every predicate that completes, in
-every order, with every feasible anchor. Under `order=as_written`
+(`planner/leftdeep.py`, the same search the SoL estimate runs). The
+state records the joined alias set, every document prefix still in
+KV, and the current anchor group. Each step adds one connected alias
+and applies every predicate that completes, in every order, with
+every feasible anchor. Under `order=as_written`
 the written stage order is kept and only anchors are searched. A
 gate's anchor is fixed to its outer table; a forced anchor is
 honored, with a remark at plan time when a free choice prices lower.
 
-The same function runs twice per query with different inputs:
+The same function runs whenever new answers can change the decision:
 
 - **Plan time** (`plan_query`): expected live counts from
   selectivities, the corpus length lists, the keep credit as the
   resident set. The output is the predicted plan - explain(), the
   refusal checks, sharding, and the SoL comparison run off it.
-- **After the filter round** (the worker; the parent process on
-  several GPUs): the actual survivor counts and lengths, and the
-  positions whose KV is actually resident in the arena. The output
-  is the executed plan. It wins wherever the two disagree, because
-  it has real data. Barriers reuse its answer - no order-relevant
-  information arrives below a stage boundary, so there is nothing
-  to re-decide per chunk.
+- **At runtime** (the worker; the parent process on several GPUs):
+  the actual survivor counts and lengths, and the document positions
+  whose KV is actually resident in the arena. The worker executes one
+  join group, applies its answers, and searches the remaining joins
+  again. It does not search between chunks inside one group.
 
 Each stage is costed as a `Work` record (`planner/sol.py`: tokens,
 attention pairs, KV written, KV read), per document over the live
 length list: a resident anchor prefix (retained by the filter
 round, or anchored earlier in the candidate sequence) pays only its
 question frame (`ask`), the rest scan preamble + document + frame.
-The residency credit assumes retained KV survives until the group
-that reads it; under arena pressure eviction can deny that, which
-misestimates a candidate's cost but never its correctness - the
-evicted document is recomputed. A credit that models eviction under
-each candidate plan is future work;
-every tuple then carries partner labels, partner documents, and the
+The search applies the arena page limit to every candidate. It calls
+the same minimum loss victim selector as the runtime and carries the
+remaining document keys into the next DP state. A stage can therefore
+price some anchor documents as KV hits and the rest as recomputations.
+Every tuple then carries partner labels, partner documents, and the
 answer cue over the resident anchor context. After each stage the
 live counts thin by `n * (1 - (1-s)^partner_tuples)`. Per state,
 records survive unless another is no larger in all four work
@@ -364,8 +362,9 @@ KV outlives its operator wherever a later one will read it.
   running operator) are untouchable.
 - The plan-time half is the *credit*: `keep_split` prices in the
   expected resident fraction the arena can hold, longest documents
-  first (a fractional knapsack in expectation - see the docstring
-  for why that is exact), and `_keep_timeline` trims the credit
+  first. The byte calculation is fractional, while the arena
+  allocates whole pages, so the split is an estimate. The
+  `_keep_timeline` function trims the credit
   until the peak expected resident tokens fit beside the working
   headroom. The runtime is not bound by the threshold; the credit
   keeps the prediction and the SoL comparison honest.
@@ -452,12 +451,12 @@ single forward pass, sharing KV across them through a paged arena.
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
-| `search_joins` | `joins.py` | The join search: order and anchors from live counts, lengths, and resident KV; called at plan time and again in the worker |
+| `search_joins` | `joins.py` | The join search: order and anchors from live counts, lengths, and document KV; called at plan time and after every completed runtime group |
 | `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: which survivors to price as resident, longest documents first |
 | `minimum_loss_victims` | `executor/retention.py` | The eviction cover: least recompute-seconds set freeing the needed pages |
 | `prefix_recompute_seconds` | `sol.py` | The retention value of one prefix, counted constants only |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
-| `optimize_left_deep` | `leftdeep.py` | Subset DP over (joined aliases, cached prefix aliases) with a nondominated Work frontier |
+| `optimize_left_deep` | `leftdeep.py` | Subset DP over joined aliases and a caller supplied physical property, with a nondominated Work frontier |
 | `scan` / `ask` / `stream` | `sol.py` | The three KV operations as Work records |
 | `speed_of_light` | `sol.py` | Work -> seconds floor from counted constants; ranks candidate plans |
 | `chunk_budget` | `budgets.py` | Tokens per forward pass (min of memory and kernel bounds) |

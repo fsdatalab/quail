@@ -8,8 +8,10 @@ model and multi-GPU coordination, and sol-computation-math's
 retention runtime and post-filter planning.
 
 1. **One join search** (`quail/planner/joins.py`): the left deep
-   subset DP over (joined alias set, cached prefix alias set), the
-   same search the SoL estimate runs. Stage costs are `Work` records
+   subset DP records the joined alias set and the individual
+   document prefixes still in KV. It also records the current anchor
+   group so consecutive stages on one anchor can share KV without a
+   barrier. The SoL estimate runs the same search. Stage costs are `Work` records
    (tokens, attention pairs, KV written, KV read) built per document
    over the live length lists: a resident anchor prefix pays its
    question frame only, the rest scan preamble + document + frame.
@@ -18,16 +20,15 @@ retention runtime and post-filter planning.
    seconds from counted model constants and the device datasheet. No
    calibration constant is read anywhere.
 
-2. **Called twice per query.** `plan_query` calls it with expected
+2. **Called again when answers arrive.** `plan_query` calls it with expected
    live counts and the keep credit, and emits the predicted plan -
    explain(), refusals, sharding, and the SoL comparison run off it.
-   After the filter round the worker (the parent process on several
-   GPUs) calls the same function with the actual survivors and the
-   KV actually resident, and executes its answer. The runtime call
-   wins wherever they disagree, because it has real data. Barriers
-   reuse its answer: no order-relevant information arrives below a
-   stage boundary, so nothing is re-decided per chunk, and the old
-   `pick_runtime_anchor` heuristic is deleted as subsumed. Stage
+   After the filter round the worker calls the same function with
+   the actual survivors and the KV actually resident. It executes
+   one join group, applies the answers, and searches the remaining
+   joins again. The parent process does the same on several GPUs.
+   The runtime search uses every answer available at that point, and
+   the old `pick_runtime_anchor` heuristic is deleted. Stage
    outputs carry written_pos, semantics, and selectivity, so a
    runtime-chosen order assembles into results correctly.
 
@@ -63,10 +64,10 @@ operator - are untouchable.
 
 At plan time the same idea appears as a credit, not a rule:
 `keep_split` prices in the expected resident fraction the arena can
-hold, longest documents first, which is the exact fractional
-knapsack answer because survival is fractional in expectation. The
-runtime is not bound by the threshold; the credit keeps the
-prediction and the SoL comparison honest.
+hold, longest documents first. The byte calculation is fractional,
+while the arena allocates whole pages, so the split is an estimate.
+The runtime is not bound by the threshold. The runtime tracks each
+document and uses the exact page count.
 
 ## Why
 
@@ -79,8 +80,9 @@ multi-join queries improve under the exact left deep search, FEV-8
 most, 0.900 s to 0.787 s at 4B and 7.460 s to 6.520 s at 32B. The
 engine now performs the reuse the model assumed, and decides its
 join plan from the same search with the best information available
-at each moment: estimates before anything runs, exact survivors
-after the filters.
+at each moment. It uses estimates before anything runs, exact
+survivors after the filters, and new exact survivors after every
+join group.
 
 ## Numbers
 
@@ -98,11 +100,9 @@ and matched a separate CPU recombination row for row
 (`reports/2026-08-26-filter-join-kv-retention.md`, data at
 `/results/runs/run_1787795777696587173.json`). That check ran the
 lifecycle this branch ports verbatim, under the worker it was built
-in; the merged worker re-integrates it and needs its own run. Two
-more things no run has measured: the search's residency credit is
-optimistic when eviction pressure denies a retained prefix before
-its consuming group, and the eviction cover's CPU cost under a full
-arena. The join cells
+in. The merged worker re-integrates it and needs its own run. No run
+has measured the CPU cost of the document level search and the
+victim selector under a full arena. The join cells
 (`tests/gpu/join_bench.py`, the QUAIL-B evaluation) are the next
 step, and the run report's new `kv_manager` block (retained counts,
 anchor hits and misses, evictions with their summed value) and
@@ -110,11 +110,8 @@ anchor hits and misses, evictions with their summed value) and
 check against the prediction.
 
 The SoL floor does not change. `simulate_query` in
-`reports/make_sol_quailb.py` now runs the worker's own search on the
-exact filter survivors and follows its retention lifecycle (no
-eviction pressure assumed - stated in the JSON), so the
-current-planner column is the engine's behavior by construction.
-The plan-choice part of its gap to the optimal should close on
-regeneration; what remains is expectation error inside the runtime
-search's later-stage thinning and any eviction pressure the
-simulation does not model.
+`reports/make_sol_quailb.py` now runs the worker's search after the
+filters and after every join group. It uses the saved answers, the
+individual resident documents, the page limit, and the same victim
+rule. The simulation does not reproduce temporary overlap between
+packed GPU chunks.

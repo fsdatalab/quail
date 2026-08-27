@@ -526,9 +526,8 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
 
     from quail.planner import sol
     from quail.planner.decide import _collect, join_specs
-    from quail.planner.joins import (_feasible_anchors, residency,
-                                     search_joins, stage_work, thin)
-    from quail.planner.sol import Work
+    from quail.planner.joins import (_feasible_anchors, search_joins,
+                                     walk)
 
     catalog.register("tags", DocumentProvider.from_parquet(
         _parquet(tmp_path / "g.parquet", ["id", "tag"]), id_col="id"))
@@ -550,6 +549,7 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
     live0 = {a: float(len(t)) for a, t in toks.items()}
     pre = 1
     chunk = 10_000
+    arena = 2_500
 
     def key(work):
         seconds = sol.speed_of_light(work, QWEN3_4B_FP8, H100_SXM,
@@ -558,7 +558,8 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
                 work.kv_read)
 
     found = search_joins(specs, live0, toks, {}, pre, chunk,
-                         QWEN3_4B_FP8, H100_SXM)
+                         QWEN3_4B_FP8, H100_SXM,
+                         arena_tokens=arena, page_tokens=16)
 
     # complete enumeration of the same space under the same cost
     # convention: live counts come from the applied edge set, thinned
@@ -566,15 +567,13 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
     edge_aliases = [frozenset(s["aliases"]) for s in specs]
     best = []
 
-    def live_for(applied):
-        state = dict(live0)
-        for i in sorted(applied):
-            thin(state, specs[i])
-        return state
-
-    def visit_alias(order, pos, applied, cached, work):
+    def visit_alias(order, pos, applied, sequence):
         if pos == len(order):
             if len(applied) == len(specs):
+                work, _ = walk(
+                    sequence, live0, toks, {}, pre,
+                    QWEN3_4B_FP8, H100_SXM,
+                    arena_tokens=arena, page_tokens=16)
                 best.append(work)
             return
         added = order[pos]
@@ -584,25 +583,62 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
         if not crossing:
             return
         for edge_order in it.permutations(crossing):
-            def visit_edge(k, applied_now, cached_now, work_now):
+            def visit_edge(k, applied_now, sequence_now):
                 if k == len(edge_order):
                     visit_alias(order, pos + 1, applied_now,
-                                cached_now, work_now)
+                                sequence_now)
                     return
                 i = edge_order[k]
                 spec = specs[i]
-                live = live_for(applied_now)
                 for anchor in _feasible_anchors(spec, True, toks, pre,
                                                 chunk):
-                    w = stage_work(spec, anchor, live, toks, {},
-                                   pre, cached_now)
                     visit_edge(k + 1, applied_now | {i},
-                               cached_now | {anchor}, work_now + w)
-            visit_edge(0, set(applied), set(cached), work)
+                               sequence_now + [(spec, anchor)])
+            visit_edge(0, set(applied), list(sequence))
 
     aliases = sorted({a for ends in edge_aliases for a in ends})
     for order in it.permutations(aliases):
-        visit_alias(list(order), 1, set(), set(), Work())
+        visit_alias(list(order), 1, set(), [])
 
     assert best, "enumeration found no connected left deep plan"
     assert key(found["work"]) == min(key(w) for w in best)
+
+
+def _join_search_spec(position, aliases, anchor):
+    return dict(
+        written_pos=position,
+        aliases=list(aliases),
+        anchor=anchor,
+        anchor_free=False,
+        semantics="full",
+        selectivity=None,
+        frame_tokens={alias: 5 for alias in aliases},
+        label_tokens={alias: 4 for alias in aliases},
+        tail_tokens=6,
+    )
+
+
+def test_join_search_prices_partial_document_residency():
+    from quail.planner.joins import search_joins
+
+    specs = [
+        _join_search_spec(0, ("a", "b"), "a"),
+        _join_search_spec(1, ("b", "c"), "b"),
+        _join_search_spec(2, ("a", "c"), "a"),
+    ]
+    live = {"a": 3.0, "b": 3.0, "c": 2.0}
+    lengths = {"a": [90, 100, 110], "b": [400] * 3,
+               "c": [50] * 2}
+
+    unlimited = search_joins(
+        specs, live, lengths, {}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM, fixed_order=True)
+    finite = search_joins(
+        specs, live, lengths, {}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM, fixed_order=True,
+        arena_tokens=41 * 16, page_tokens=16)
+
+    assert unlimited["records"][2]["resident_positions"] == (0, 1, 2)
+    assert finite["records"][2]["resident_positions"] == (1, 2)
+    assert finite["records"][2]["resident_docs"] == 2
+    assert finite["work"].tokens > unlimited["work"].tokens
