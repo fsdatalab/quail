@@ -1,25 +1,11 @@
-"""Tests for model specs, budget calculations, and calibration on Qwen3-4B / H100."""
+"""Tests for model specs and budget calculations on Qwen3-4B / H100."""
 
 from dataclasses import replace
 
 import pytest
 
 from quail.planner import budgets
-from quail.planner.calibrate import resolve_pair
-from quail.planner.calibration import (Calibration, commit_calibration,
-                                       fit_affine, load_calibration,
-                                       make_record)
 from quail.specs import H100_SXM, QWEN3_4B_FP8
-
-
-def test_fit_affine_recovers_line_and_rejects_one_length():
-    a, a2 = 8.6e-6, 4.9e-10
-    points = [(h, a + a2 * h) for h in (256, 1024, 4096, 8192)]
-    got_a, got_a2 = fit_affine(points)
-    assert got_a == pytest.approx(a, rel=1e-9)
-    assert got_a2 == pytest.approx(a2, rel=1e-9)
-    with pytest.raises(ValueError):
-        fit_affine([(4096, 1e-5), (4096, 1.1e-5)])
 
 
 def test_model_widths_and_budget_limits():
@@ -57,55 +43,9 @@ def test_compute_knee_and_attention_crossover():
     assert 11_000 <= s <= 13_500
 
 
-def test_calibration_anchor_and_derived_table():
-    cal = load_calibration(QWEN3_4B_FP8, H100_SXM)
-    assert cal.source == "calibrated"
-    assert cal.rate_tokens_per_s == pytest.approx(121_045, rel=1e-3)
-    assert cal.a2_s_per_token2 == pytest.approx(4.9336e-10, rel=1e-3)
-    table = budgets.derived_table(QWEN3_4B_FP8, H100_SXM,
-                                  cal.a_s_per_token)
+def test_derived_table():
+    table = budgets.derived_table(QWEN3_4B_FP8, H100_SXM)
     assert table["tensor_parallel"] == 1
     assert table["chunk_budget"] == 110_376
-    assert table["serving_rate_tokens_per_s"] == pytest.approx(
-        121_045, rel=1e-3)
-
-
-def test_spec_scaled_defaults_for_uncalibrated_pair():
-    double = replace(QWEN3_4B_FP8, name="qwen3-8b-ish", params=7.2e9)
-    cal = load_calibration(double, H100_SXM)
-    anchor = load_calibration(QWEN3_4B_FP8, H100_SXM)
-    assert cal.source.startswith("spec-scaled")
-    assert cal.a_s_per_token == pytest.approx(
-        2 * anchor.a_s_per_token, rel=1e-6)
-    assert cal.a2_s_per_token2 == pytest.approx(
-        2 * anchor.a2_s_per_token2, rel=1e-6)
-
-
-def test_resolve_pair_known_and_unknown():
-    spec, device = resolve_pair("qwen3-4b-fp8", "h100-sxm")
-    assert spec is QWEN3_4B_FP8
-    assert device is H100_SXM
-    with pytest.raises(ValueError, match="unknown model"):
-        resolve_pair("not-a-model", "h100-sxm")
-    with pytest.raises(ValueError, match="unknown device"):
-        resolve_pair("qwen3-4b-fp8", "not-a-device")
-
-
-def test_make_record_and_commit(tmp_path):
-    loaded = Calibration(a_s_per_token=8e-6, a2_s_per_token2=5e-10,
-                         source="calibrated")
-    rec = make_record(QWEN3_4B_FP8, H100_SXM, 9e-6, 6e-10,
-                      points=[{"doc_tokens": 256}],
-                      channels={"pinned_h2d": 1.0},
-                      loaded=loaded, lengths=(256, 1024),
-                      tokens_per_point=1000)
-    assert rec["model"] == "qwen3-4b-fp8"
-    assert rec["device"] == "h100-sxm"
-    assert rec["loaded_before"]["a"] == 8e-6
-    assert "q_kv" not in rec
-    assert "q_kv" not in rec["provenance"]
-    dest = commit_calibration(rec, dest=tmp_path / "pair.json")
-    written = dest.read_text()
-    assert "a_s_per_token" in written
-    assert "points" not in written
-    assert "channels_measured_bytes_per_s" not in written
+    assert table["arena_tokens"] == budgets.arena_tokens(
+        QWEN3_4B_FP8, H100_SXM)

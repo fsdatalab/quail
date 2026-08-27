@@ -375,7 +375,6 @@ class Query:
             fresh_tokens=out["fresh_tokens"], stages=[],
             peak_gib=out.get("peak_gib"),
             order_rule=plan.order_rule,
-            calibration=plan.calibration_source,
             remarks=list(plan.remarks) + list(self.session.notes))
         answer_rows = dict(filters=out["filters"], joins=out["joins"])
 
