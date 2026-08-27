@@ -24,10 +24,8 @@ payload to the worker, which calls the executor.
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
-| `planner/calibration.py` | Measured constants (a, a2) and scaling | specs |
-| `planner/calibrate.py` | Length-sweep measure of a and a2 | calibration, executor |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
-| `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, calibration, plan |
+| `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, plan |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
 | `executor/pack.py` | Chunk packing (pack_stream, FilterAdmission) | nothing |
@@ -36,7 +34,6 @@ payload to the worker, which calls the executor.
 | `runtime/session.py` | Session, Query, tokenization, payload assembly | catalog, logical, planner, sqlfront, builder |
 | `runtime/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `runtime/worker.py` | Modal worker (boot, execute, multi-GPU dispatch) | executor, planner, coordinator |
-| `runtime/calibrate.py` | Modal entry for measure, on quail-engine | planner, worker |
 | `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
 
 ### Data flow
@@ -51,7 +48,7 @@ Session (runtime/session.py)
   |
   v
 plan_query (planner/decide.py)
-  reads: specs, calibration, budgets
+  reads: specs, budgets
   produces: PhysicalPlan
   |
   v
@@ -278,8 +275,8 @@ the chunk budget") rather than a degraded execution.
 ### Decisions from token arithmetic alone
 
 These decisions compare token counts and selectivities. Because they
-compare things running at the same rate, the serving rate cancels out,
-so they survive any miscalibration.
+compare things running at the same rate, the serving rate cancels
+out; no wall-clock constant is needed.
 
 **Filter order** (`decide.py:81`): when every filter carries a
 selectivity, `by_cost` sorts by cost per killed document. The cost of
@@ -385,29 +382,7 @@ attention term dominates.
 KV is always bf16. The planner does not choose a KV dtype and does
 not model a conversion tax.
 
-## 4. Calibration
-
-Two measured constants per (model, device) pair are stored as JSON
-in `calibration/`:
-
-| Constant | Meaning |
-|---|---|
-| `a` (s/token) | Wall seconds per fresh token in the packed loop, efficiency included |
-| `a2` (s/token^2) | The quadratic attention coefficient for long documents |
-
-A model/device pair without a calibration file gets defaults scaled
-from the anchor measurement (Qwen3 4B on H100) using spec ratios: a
-model with more parameters costs proportionally more per token, a
-device with a higher FLOP ceiling costs proportionally less
-(`calibration.py:70-77`).
-
-`quail.planner.calibrate.measure` (Modal entry:
-`quail/runtime/calibrate.py`) sweeps document length through the
-packed filter and fits `t(h) = a + a2 * h` by least squares. It
-also probes the host copy channels (pinned and unpinned, both
-directions); those measurements land in `calibration/channels.json`.
-
-## 5. The packed executor
+## 4. The packed executor
 
 The packed executor is Quail's core contribution. Instead of sending
 one request per document or per pair through a serving engine (the
@@ -425,11 +400,8 @@ single forward pass, sharing KV across them through a paged arena.
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
 | `chunk_budget` | `budgets.py` | Tokens per forward pass (min of memory and kernel bounds) |
 | `arena_tokens` | `budgets.py` | KV residency budget (device memory minus weights and activations) |
-| `load_calibration` | `calibration.py` | Load or spec-scale the calibration constants |
-| `measure` | `calibrate.py` | Length sweep + affine fit of a, a2 (GPU) |
-| `commit_calibration` | `calibration.py` | Write the two constants to the pair file |
 
-### 5.1 Chunk packing
+### 4.1 Chunk packing
 
 There are two packing strategies, one for each query shape:
 
@@ -517,7 +489,7 @@ for each anchor a in order:
         mark a's KV for arena write
 ```
 
-### 5.2 The paged KV arena
+### 4.2 The paged KV arena
 
 The KV arena (`executor/arena.py`) is a preallocated buffer on the
 GPU, sized to the admission budget, divided into fixed 16-token pages
@@ -557,7 +529,7 @@ Key operations:
 | `KVArena.block_table` | `arena.py:125` | Build the block table for paged attention (flat on the host, one staged copy) |
 | `KVArena.paged_kv` | `arena.py:118` | Reshape the flat pool for FlashAttention's block input |
 
-### 5.3 The attention paths and the workload assignment
+### 4.3 The attention paths and the workload assignment
 
 Each chunk is a sequence of groups: `[group_1 | group_2 | ...]`,
 where each group is `[prefix? | suffix_1 ... suffix_k]`. The prefix
@@ -579,7 +551,7 @@ workload by `attention_mode` (issue #24):
   pages are shared. Each suffix gets temporary pages for the anchor's
   last partial page and its own K and V. A chunk whose groups own no
   pages at all (the single-stage fast path,
-  section 5.6) runs one plain varlen causal call instead - same
+  section 4.6) runs one plain varlen causal call instead - same
   math, no scatter, no paged read; a chunk cannot mix paged and
   unpaged groups.
 - **`merge_quant`** - the two-call pattern below, with the LSE merge
@@ -694,7 +666,7 @@ After the batched KV-write fix, all of a chunk's writes are
 concatenated into one gather and one scatter per layer (4 kernel
 launches per layer instead of the previous ~20,000).
 
-### 5.4 The forward pass
+### 4.4 The forward pass
 
 `Pipeline.forward_chunk` (`attention.py:348`) runs the full
 transformer forward pass for one chunk:
@@ -717,7 +689,7 @@ After the last layer, only the final-position hidden states (one per
 suffix, at the last token of each suffix) are extracted and
 RMS-normalized. These are the inputs to the answer readout.
 
-### 5.5 Answer readout
+### 4.5 Answer readout
 
 The `Answerer` (`loop.py:60`) scores the final hidden states against
 only the TRUE and FALSE token embeddings (not the full vocabulary). It
@@ -752,7 +724,7 @@ answers. This overlaps GPU compute with answer readback.
 | `Answerer` | `loop.py:60` | TRUE/FALSE scoring from final hidden states |
 | `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
 
-### 5.6 The overlapped execution loop
+### 4.6 The overlapped execution loop
 
 There are two loop drivers, one for each query shape:
 
@@ -774,8 +746,8 @@ makes the call, and only the planner - the FilterChain operator
 carries an `arena_writes` field (False exactly when one stage
 runs), it shows in `explain()`, and the payload forwards it to
 `run_filter`. `run_filter` requires the argument and never derives
-it; direct callers (warmups, calibration, the GPU cells, the
-ablation scripts) state their intent explicitly, and False against
+it; direct callers (warmups, the GPU cells, the ablation
+scripts) state their intent explicitly, and False against
 a later reader raises. Each [document | question] packs as ONE
 causal segment and admission runs on the token budget alone
 (`FilterAdmission` with `arena_pages=None`).
@@ -807,7 +779,7 @@ gate (which cannot be planned past until answers arrive), keeping the
 GPU fed across gate boundaries. A per-stage frame, if present, is
 written into the anchor's kept KV once after the document rows.
 
-### 5.7 KV rewind (chain mode)
+### 4.7 KV rewind (chain mode)
 
 In a multi-stage filter chain, each stage asks a different question
 about the same document. KV rewind means the document's KV is
@@ -874,7 +846,7 @@ at stage j > 1 (survivor suffix):
     no document tokens are recomputed
 ```
 
-## 6. Joins
+## 5. Joins
 
 ### Packed joins
 
@@ -944,7 +916,7 @@ for each chunk in plan:
 #   final gates, emit (B, A, C)
 ```
 
-## 7. Multi-GPU dispatch
+## 6. Multi-GPU dispatch
 
 The coordinator (`runtime/coordinator.py`) splits work across GPU
 workers and merges answers. Each worker is a child process with its
@@ -1035,7 +1007,7 @@ The measured scaling on two GPUs: filter 1.99x, join 2.02x
 (`dispatch_gate.json`). Modal functions are defined for 2, 4, and 8
 GPUs (`worker.py:495-519`).
 
-## 8. The benchmark (QUAIL-B)
+## 7. The benchmark (QUAIL-B)
 
 QUAIL-B (`bench/quailb.py`) is a benchmark of 15 queries over five
 document sets, built from real text (IMDB reviews, BioDEX patient
@@ -1089,7 +1061,7 @@ was told) and the observed selectivity (what the model actually
 returned), which serves as an instrument check for selectivity
 drift.
 
-## 9. Weight loading and kernel infrastructure
+## 8. Weight loading and kernel infrastructure
 
 **Model loading** (`executor/model.py`): Quail loads the model
 checkpoint through vLLM's `get_model` function, which gives the

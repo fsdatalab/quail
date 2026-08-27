@@ -16,8 +16,6 @@ image = (
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
     .add_local_python_source("quail")
-    .add_local_dir("quail/calibration",
-                   remote_path="/root/quail/calibration")
 )
 
 # House rule: never create new Modal app names - this cell attaches

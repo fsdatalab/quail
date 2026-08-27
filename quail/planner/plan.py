@@ -43,7 +43,6 @@ class PhysicalPlan:
     admission_tokens: int      # KV residency (the arena)
     order_rule: str            # "as_written" | "by_cost"
     order_source: str          # which rule chose it, for explain()
-    calibration_source: str    # "calibrated" | "spec-scaled from ..."
     limit: int | None = None   # output row cap; None = no limit
     nodes: tuple = ()          # dataflow graph in topological order;
     #                            each node dict has "id", "op", "inputs"

@@ -125,10 +125,7 @@ def attention_crossover(model: ModelSpec, device: DeviceSpec,
     return (lo + hi) / 2
 
 
-# ---- rows that consume a calibration constant
-
-def derived_table(model: ModelSpec, device: DeviceSpec,
-                  a_s_per_token: float) -> dict:
+def derived_table(model: ModelSpec, device: DeviceSpec) -> dict:
     """Return all derived budget quantities as a dict."""
     chunk = chunk_budget(model, device)
     return {
@@ -139,5 +136,4 @@ def derived_table(model: ModelSpec, device: DeviceSpec,
         "chunk_budget": chunk,
         "compute_knee": compute_knee(model, device),
         "attention_crossover": attention_crossover(model, device, chunk),
-        "serving_rate_tokens_per_s": 1.0 / a_s_per_token,
     }

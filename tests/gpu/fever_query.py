@@ -16,10 +16,6 @@ image = (
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
     .add_local_python_source("quail")
-    # the package's data files: add_local_python_source ships only
-    # .py, and the engine reads the calibration anchor JSON in-container
-    .add_local_dir("quail/calibration",
-                   remote_path="/root/quail/calibration")
 )
 
 # House rule: never create new Modal app names - this cell attaches

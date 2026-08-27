@@ -26,8 +26,6 @@ image = (
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
     .add_local_python_source("quail", "corpus", "baselines")
-    .add_local_dir("quail/calibration",
-                   remote_path="/root/quail/calibration")
 )
 
 # House rule: attach to the existing milestone1 app; never invent a
