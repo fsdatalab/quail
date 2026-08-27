@@ -42,7 +42,9 @@ kalypso_image = (
         "pip install -r /opt/kalypso/requirements/cuda.txt",
     )
     .run_commands(
-        "cd /opt/kalypso && pip install -e . --no-build-isolation",
+        "cd /opt/kalypso && TORCH_CUDA_ARCH_LIST='9.0a' MAX_JOBS=8"
+        " pip install -e . --no-build-isolation",
+        gpu="H100!",
     )
     .pip_install("huggingface_hub[hf_transfer]")
     .env(
