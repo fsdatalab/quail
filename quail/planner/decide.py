@@ -194,7 +194,10 @@ def keep_split(doc_tokens, budget_tokens: float, survivor_frac: float,
     heuristic is that survival is unknown per document at plan time:
     the expected kept mass is the survivor fraction of the kept
     lengths' mass, a fractional knapsack, where taking by value per
-    byte is optimal.
+    byte is optimal. Page rounding blurs that at the margins - a
+    document just past a page boundary has a lower value per PAGE
+    than a slightly shorter one - so the split is exact in bytes and
+    approximate within one page per document.
 
     The runtime is not bound by the threshold: it retains every
     passing survivor and evicts by recompute value under pressure.
