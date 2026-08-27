@@ -89,7 +89,20 @@ Planner-predicted, from the cost model on a 50-document,
 `test_filter_keep_makes_the_join_anchor_resident`): the join stage
 costs 4,425 fresh tokens with the retained KV against 23,900
 without it - the difference is the 25 surviving documents'
-prefixes. No engine run measures this yet; the join cells
+prefixes.
+
+Measured, on the source branch of the retention runtime: one H100!
+check of a filter followed by two joins retained all 7 filter
+survivors, hit all 7 at the report-anchored join, evicted nothing,
+and matched a separate CPU recombination row for row
+(`reports/2026-08-26-filter-join-kv-retention.md`, data at
+`/results/runs/run_1787795777696587173.json`). That check ran the
+lifecycle this branch ports verbatim, under the worker it was built
+in; the merged worker re-integrates it and needs its own run. Two
+more things no run has measured: the search's residency credit is
+optimistic when eviction pressure denies a retained prefix before
+its consuming group, and the eviction cover's CPU cost under a full
+arena. The join cells
 (`tests/gpu/join_bench.py`, the QUAIL-B evaluation) are the next
 step, and the run report's new `kv_manager` block (retained counts,
 anchor hits and misses, evictions with their summed value) and

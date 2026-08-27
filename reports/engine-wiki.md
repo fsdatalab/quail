@@ -320,7 +320,12 @@ Each stage is costed as a `Work` record (`planner/sol.py`: tokens,
 attention pairs, KV written, KV read), per document over the live
 length list: a resident anchor prefix (retained by the filter
 round, or anchored earlier in the candidate sequence) pays only its
-question frame (`ask`), the rest scan preamble + document + frame;
+question frame (`ask`), the rest scan preamble + document + frame.
+The residency credit assumes retained KV survives until the group
+that reads it; under arena pressure eviction can deny that, which
+misestimates a candidate's cost but never its correctness - the
+evicted document is recomputed. A credit that models eviction under
+each candidate plan is future work;
 every tuple then carries partner labels, partner documents, and the
 answer cue over the resident anchor context. After each stage the
 live counts thin by `n * (1 - (1-s)^partner_tuples)`. Per state,
