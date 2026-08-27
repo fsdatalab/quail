@@ -84,6 +84,7 @@ def run_query_chunk(
     run_label: str,
     prediction: str,
     ground_truth_collection: str | None,
+    ground_truth_workload: str | None,
 ) -> str:
     from quail.bench.quailb import run_suite
     from quail.runtime.worker import _execute_payload
@@ -104,6 +105,7 @@ def run_query_chunk(
         model=model,
         accuracy=True,
         ground_truth_collection=ground_truth_collection,
+        ground_truth_workload=ground_truth_workload,
         prediction=prediction,
         artifact_stem=f"{run_label}-chunk-{chunk_index}",
         execute=_execute_payload,
@@ -197,6 +199,7 @@ def main(
     containers: int = 4,
     prediction: str = "",
     ground_truth_collection: str = "",
+    ground_truth_workload: str = "",
 ):
     from quail.bench.quailb import QUERY_ORDER, split_query_ids
 
@@ -234,6 +237,7 @@ def main(
             run_label=run_label,
             prediction=prediction,
             ground_truth_collection=(ground_truth_collection or None),
+            ground_truth_workload=(ground_truth_workload or None),
         )
         calls.append(call)
         call_ids.append(call.object_id)

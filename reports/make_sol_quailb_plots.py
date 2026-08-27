@@ -63,13 +63,13 @@ def plot_sol_per_query():
 # Each context length, the document set it comes from, and where to
 # put its label. The three middle clusters are ~20pt apart on a log
 # axis, so their labels sit at staggered heights to clear each other.
-CONTEXTS = {
-    11.4: ("FEVER", 6.0),
-    233.1: ("LePaRD", 11.0),
-    298.8: ("IMDB", 18.0),
-    370.2: ("FEVER", 25.0),
-    4146.0: ("BioDEX", 44.0),
-}
+CONTEXTS = (
+    ("FEVER", "FEV-1", 6.0),
+    ("LePaRD", "LEP-1", 11.0),
+    ("IMDB", "IMDB-1", 18.0),
+    ("FEVER", "FEV-2", 25.0),
+    ("BioDEX", "BIO-1", 44.0),
+)
 
 
 def plot_attention_share():
@@ -107,7 +107,9 @@ def plot_attention_share():
                    [share(q, model) for q in ATTENTION_ORDER],
                    s=34, color=colour, label=label, zorder=3)
 
-    for ctx, (name, ty) in CONTEXTS.items():
+    for name, representative, ty in CONTEXTS:
+        ctx = Q[representative]["models"][MODELS[0]][
+            "held_mean_doc_tokens"]
         matching = [
             (query_id, model)
             for query_id in ATTENTION_ORDER

@@ -156,8 +156,10 @@ COLUMNS = {
     "terms.term": ("terms", "term"),
     "claims.claim": ("claims", "claim"),
     "evidence.text": ("evidence", "text"),
-    "citations.destination_context": ("citations", "destination_context"),
-    "citations.passage_text": ("citations", "passage_text"),
+    "citation_contexts.destination_context":
+        ("citation_contexts", "destination_context"),
+    "citation_passages.passage_text":
+        ("citation_passages", "passage_text"),
 }
 
 # 1. document lengths -------------------------------------------------

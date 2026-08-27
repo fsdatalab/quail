@@ -12,7 +12,7 @@ import matplotlib.colors as mcolors
 
 plt.style.use(Path(__file__).parent / "quail.mplstyle")
 
-from plot_colors import BLUE, ORANGE, DARK, TEAL, GREEN, RED
+from plot_colors import BLUE, DARK, ORANGE  # noqa: E402
 
 FILTER_BASE = BLUE
 JOIN_BASE = ORANGE
@@ -44,7 +44,7 @@ SELECTIVITIES = {
     "support": 0.006, "refute": 0.035,
     "LEP1": 0.020, "LEP2": 0.515, "LEP3": 0.050,
     "LEP4": 0.065, "LEP5": 0.030,
-    "LEPS1": 1.000, "cites": 0.241,
+    "LEPS1": 1.000, "cites": 500 / 216_500,
 }
 
 
@@ -164,24 +164,28 @@ Q("FEV-9", "FEVER", Join("support",
     Scan("evidence", "e2")))
 
 # LePaRD
-Q("LEP-1", "LePaRD", _fchain(["LEP1"], "citations", "d"))
+Q("LEP-1", "LePaRD", _fchain(["LEP1"], "citation_contexts", "d"))
 Q("LEP-2", "LePaRD", Join("cites",
-    Scan("citations", "d"), Scan("citations", "s")))
+    Scan("citation_contexts", "d"), Scan("citation_passages", "s")))
 Q("LEP-3", "LePaRD", Join("cites",
-    _fchain(["LEP1"], "citations", "d"), Scan("citations", "s")))
+    _fchain(["LEP1"], "citation_contexts", "d"),
+    Scan("citation_passages", "s")))
 Q("LEP-4", "LePaRD", Join("cites",
-    _fchain(["LEP1", "LEP2"], "citations", "d"), Scan("citations", "s")))
+    _fchain(["LEP1", "LEP2"], "citation_contexts", "d"),
+    Scan("citation_passages", "s")))
 Q("LEP-5", "LePaRD", Join("cites",
-    _fchain(["LEP1", "LEP2", "LEP3"], "citations", "d"),
-    Scan("citations", "s")))
+    _fchain(["LEP1", "LEP2", "LEP3"], "citation_contexts", "d"),
+    Scan("citation_passages", "s")))
 Q("LEP-6", "LePaRD", Join("cites",
-    _fchain(["LEP1", "LEP2", "LEP3", "LEP4", "LEP5"], "citations", "d"),
-    Scan("citations", "s")))
+    _fchain(["LEP1", "LEP2", "LEP3", "LEP4", "LEP5"],
+            "citation_contexts", "d"),
+    Scan("citation_passages", "s")))
 Q("LEP-8", "LePaRD",
-    _fchain(["LEP1", "LEP2", "LEP3", "LEP4", "LEP5"], "citations", "d"))
+    _fchain(["LEP1", "LEP2", "LEP3", "LEP4", "LEP5"],
+            "citation_contexts", "d"))
 Q("LEP-7", "LePaRD", Join("cites",
-    _fchain(["LEP1", "LEP2"], "citations", "d"),
-    _fchain(["LEPS1"], "citations", "s")))
+    _fchain(["LEP1", "LEP2"], "citation_contexts", "d"),
+    _fchain(["LEPS1"], "citation_passages", "s")))
 
 
 # ---- layout engine (top-down: root at top, leaves at bottom) ----
@@ -345,7 +349,7 @@ ax.legend(handles=legend_patches, loc="upper right", fontsize=8,
           frameon=False, ncol=3, bbox_to_anchor=(1.0, 1.0))
 
 ax.set_title(
-    "QUAIL-B: 35 queries, 22 predicates, 4 domains, 7 tables (sf = 0.1)",
+    "QUAIL-B: 35 queries, 22 predicates, 4 domains, 8 tables (sf = 0.1)",
     fontsize=12, fontweight="bold", color=DARK, pad=16)
 
 ax.set_xlim(-0.5, max_w + 1.5)

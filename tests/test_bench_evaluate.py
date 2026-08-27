@@ -250,6 +250,13 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
     saved = json.loads((tmp_path / "benchmarks/quailb/runs/qb_test"
                         / "query.json").read_text())
     assert saved == {"query": "TEST-1"}
+    answer_table = pa.table({"document": [0, 1],
+                             "answer": [True, False]})
+    files.write_parquet(
+        "benchmarks/quailb/runs/qb_test/answers.parquet", answer_table)
+    assert pq.read_table(
+        tmp_path / "benchmarks/quailb/runs/qb_test/answers.parquet"
+    ).equals(answer_table)
 
 
 def test_corpus_identity_matches_judge_pass_implementation():

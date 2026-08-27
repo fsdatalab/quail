@@ -12,7 +12,11 @@ image.
 import time
 
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
-from quail.executor.pack import FilterAdmission, pack_stream
+from quail.executor.pack import (
+    FilterAdmission,
+    pack_stream,
+    partition_anchor_groups,
+)
 
 
 def _tick(timing, key, t0):
@@ -33,6 +37,38 @@ def _staged(torch, data, dtype, pinned=True):
         return torch.tensor(data, dtype=dtype, pin_memory=True).to(
             "cuda", non_blocking=True)
     return torch.tensor(data, dtype=dtype, device="cuda")
+
+
+def _token_parts(sequence):
+    parts = getattr(sequence, "token_parts", None)
+    if parts is None or (len(parts) == 1 and parts[0] is sequence):
+        yield sequence
+        return
+    for part in parts:
+        yield from _token_parts(part)
+
+
+def _staged_token_parts(torch, sequences, total, pinned=True):
+    """Copy Arrow token views into one GPU input tensor."""
+    host = torch.empty(total, dtype=torch.int64, pin_memory=pinned)
+    offset = 0
+    for sequence in sequences:
+        for part in _token_parts(sequence):
+            count = len(part)
+            if not count:
+                continue
+            if hasattr(part, "arrow_array"):
+                source = torch.from_dlpack(part.arrow_array)
+            elif torch.is_tensor(part):
+                source = part
+            else:
+                source = torch.as_tensor(part)
+            host[offset:offset + count].copy_(source)
+            offset += count
+    if offset != total:
+        raise AssertionError(
+            f"packed {offset} token ids into a {total}-token chunk")
+    return host.to("cuda", non_blocking=pinned)
 
 
 def true_false_ids(tok):
@@ -133,7 +169,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # unified scatters every fresh row through its own src/dst map, so
     # the cross and kv_writes bookkeeping below is two-call only
     two_call = attention_mode != "unified"
-    ids, pos, cu_a, finals = [], [], [0], []
+    id_parts, token_count = [], 0
+    pos, cu_a, finals = [], [0], []
     suffix_rows = []
     kv_writes, layout = [], []
     cross_keys, cross_used, cu_q = [], [], [0]
@@ -144,7 +181,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         f = g["f"]
         key = g["key"]
         paged = key in arena.accounting.owned
-        row0 = len(ids)
+        row0 = token_count
         if fresh:
             if not paged and len(g["suffixes"]) > 1:
                 raise ValueError(
@@ -152,23 +189,25 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     f"[prefix | suffix] as one causal segment, which "
                     f"only one suffix may join - allocate pages or "
                     f"split the group")
-            ids.extend(g["prefix"])
+            id_parts.append(g["prefix"])
+            token_count += len(g["prefix"])
             pos.extend(range(len(g["prefix"])))
             if paged or not g["suffixes"]:
-                cu_a.append(len(ids))
+                cu_a.append(token_count)
             if paged and two_call:
                 kv_writes.append((key, row0, row0 + len(g["prefix"]),
                                   0))
-        prefix_end = len(ids)
-        s_row0 = len(ids)
+        prefix_end = token_count
+        s_row0 = token_count
         suffix_spans = []
         for si, suf in enumerate(g["suffixes"]):
-            srow = len(ids)
-            ids.extend(suf)
+            srow = token_count
+            id_parts.append(suf)
+            token_count += len(suf)
             pos.extend(range(f, f + len(suf)))
-            suffix_spans.append((srow, len(ids)))
-            cu_a.append(len(ids))
-            finals.append(len(ids) - 1)
+            suffix_spans.append((srow, token_count))
+            cu_a.append(token_count)
+            finals.append(token_count - 1)
             wst = g.get("write_suffix_tokens", 0)
             if si == 0 and wst and paged and two_call:
                 # the shared question preamble joins the kept KV right
@@ -176,10 +215,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 # after a kept document's f rows
                 dest = len(g["prefix"]) if fresh else f
                 kv_writes.append((key, srow, srow + wst, dest))
-        s_count = len(ids) - s_row0
+        s_count = token_count - s_row0
         layout.append((key, len(g["suffixes"])))
         if s_count and f and paged and two_call:
-            suffix_rows.extend(range(s_row0, len(ids)))
+            suffix_rows.extend(range(s_row0, token_count))
             cu_q.append(cu_q[-1] + s_count)
             cross_keys.append(key)
             cross_used.append(f)
@@ -188,7 +227,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if paged:
                 unified_groups.append(dict(
                     key=key, fresh=fresh, f=f, row0=row0,
-                    prefix_end=prefix_end, row1=len(ids),
+                    prefix_end=prefix_end, row1=token_count,
                     suffix_spans=suffix_spans))
             elif not fresh:
                 raise ValueError(
@@ -208,7 +247,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             max_used=max(cross_used), table=table)
         # row -> its index in call B's output, -1 for prefix rows;
         # the fused merge kernel's map
-        source = [-1] * len(ids)
+        source = [-1] * token_count
         for i, row in enumerate(suffix_rows):
             source[row] = i
         cross["source"] = _staged(
@@ -335,10 +374,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         cu_a=_staged(torch, cu_a, torch.int32, pinned),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = dict(
-        input_ids=_staged(torch, ids, torch.int64, pinned),
+        input_ids=_staged_token_parts(
+            torch, id_parts, token_count, pinned),
         positions=_staged(torch, pos, torch.int64, pinned),
         final_indices=_staged(torch, finals, torch.int64, pinned),
-        meta=meta, tokens=len(ids), layout=layout)
+        meta=meta, tokens=token_count, layout=layout)
     if temporary_keys:
         out["temporary_keys"] = temporary_keys
     _tick(timing, "pack_h2d", t)
@@ -357,7 +397,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         anchor_prefixes: Anchor id (list index) -> prefix token list.
         stage_suffixes: Per stage, the partner suffix token lists.
         budget: Chunk token budget.
-        group_size: Anchors gated together between stages. None = all.
+        group_size: Maximum anchors gated together between stages. None
+            uses only the KV capacity limit.
         stage_frames: Per stage, task framing token list written into
             each anchor's kept KV after the document rows.
         anchor_keys: Stable arena key for each anchor. List positions are
@@ -374,15 +415,23 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     n = len(anchor_prefixes)
     if n == 0 or k == 0:
         return [dict() for _ in range(k)], [], 0
-    group_size = n if group_size is None else group_size
-    groups = [list(range(i, min(i + group_size, n)))
-              for i in range(0, n, group_size)]
     suffix_lens = [[len(s) for s in sufs] for sufs in stage_suffixes]
     frames = stage_frames or [[] for _ in range(k)]
     keys = list(range(n)) if anchor_keys is None else list(anchor_keys)
     if len(keys) != n:
         raise ValueError("anchor_keys must match anchor_prefixes")
     frame_max = max(len(f) for f in frames)
+    groups = partition_anchor_groups(
+        [len(prefix) for prefix in anchor_prefixes],
+        arena.accounting.n_pages,
+        arena.accounting.page_tokens,
+        extra_tokens=frame_max,
+        max_group_size=group_size)
+    group_pages = [sum(
+        arena.accounting.pages_needed(
+            len(anchor_prefixes[a]) + frame_max)
+        for a in members)
+        for members in groups]
     ans = [dict() for _ in range(k)]
     spans = []
     tokens = 0
@@ -467,6 +516,12 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     prefetch = None     # (idx, plan, handle0) of the next group's
     #                     stage 0, chunk 0 already launched
     for g, members in enumerate(groups):
+        # Every resident key named by this group must remain available
+        # while missing group keys evict unrelated retained KV.
+        for a in members:
+            key = keys[a]
+            if key in arena.accounting.owned:
+                arena.pin(key)
         for j in range(k):
             if j == 0 and prefetch is not None:
                 idx, plan, h0 = prefetch
@@ -496,7 +551,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                         completed.add(anchor)
 
             handles = [(h0, 0)]
-            if j == 0 and k > 1 and g + 1 < len(groups):
+            if (j == 0 and k > 1 and g + 1 < len(groups)
+                    and group_pages[g] + group_pages[g + 1]
+                    <= arena.accounting.n_pages):
                 # the gate below cannot be planned past; keep the
                 # GPU fed with the next group's gate-free stage 0
                 nidx, nplan, _ = plan_stage(groups[g + 1], 0)
