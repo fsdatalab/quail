@@ -94,7 +94,6 @@ class KalypsoWorker:
             cmd,
             stdout=sys.stdout,
             stderr=sys.stderr,
-            cwd="/opt/kalypso",
         )
 
         health_url = f"http://localhost:{SERVER_PORT}/v1/semantic/healthz"
