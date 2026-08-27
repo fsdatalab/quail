@@ -1,4 +1,4 @@
-"""Tests for the planner's ordering, anchor selection, sharding, break-evens, and refusals."""
+"""Planner ordering, anchor selection, sharding, break-evens, and refusals."""
 
 from dataclasses import replace
 
@@ -497,9 +497,7 @@ def test_keep_capped_by_arena_length_threshold(catalog):
     assert group["anchor_resident"] == "filter"
 
 
-def test_gate_group_keeps_anchor_kv_for_the_next_group(catalog):
-    # an exists gate on r, then a full join on r: the gate group holds
-    # the surviving anchors' KV so the full group reuses it
+def test_gate_group_retains_anchor_for_runtime_replan(catalog):
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "products", tok).alias("p"),
                         prompt("m {0} {1}", col("r.review"),
@@ -518,7 +516,7 @@ def test_gate_group_keeps_anchor_kv_for_the_next_group(catalog):
     assert [g["anchor"] for g in groups] == ["r", "r"]
     assert groups[0]["keep_anchor_kv"] is True
     assert groups[1]["keep_anchor_kv"] is False
-    assert groups[1]["anchor_resident"] == "kept"
+    assert groups[1]["anchor_resident"] == "none"
 
 
 def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
@@ -526,8 +524,7 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
 
     from quail.planner import sol
     from quail.planner.decide import _collect, join_specs
-    from quail.planner.joins import (_feasible_anchors, search_joins,
-                                     walk)
+    from quail.planner.joins import _feasible_anchors, search_joins, walk
 
     catalog.register("tags", DocumentProvider.from_parquet(
         _parquet(tmp_path / "g.parquet", ["id", "tag"]), id_col="id"))
@@ -618,7 +615,7 @@ def _join_search_spec(position, aliases, anchor):
     )
 
 
-def test_join_search_prices_partial_document_residency():
+def test_join_search_prices_current_partial_document_residency():
     from quail.planner.joins import search_joins
 
     specs = [
@@ -630,15 +627,15 @@ def test_join_search_prices_partial_document_residency():
     lengths = {"a": [90, 100, 110], "b": [400] * 3,
                "c": [50] * 2}
 
-    unlimited = search_joins(
-        specs, live, lengths, {}, 10, 100_000,
+    current = search_joins(
+        specs, live, lengths, {"a": {1, 2}}, 10, 100_000,
         QWEN3_4B_FP8, H100_SXM, fixed_order=True)
-    finite = search_joins(
-        specs, live, lengths, {}, 10, 100_000,
+    with_capacity = search_joins(
+        specs, live, lengths, {"a": {1, 2}}, 10, 100_000,
         QWEN3_4B_FP8, H100_SXM, fixed_order=True,
         arena_tokens=41 * 16, page_tokens=16)
 
-    assert unlimited["records"][2]["resident_positions"] == (0, 1, 2)
-    assert finite["records"][2]["resident_positions"] == (1, 2)
-    assert finite["records"][2]["resident_docs"] == 2
-    assert finite["work"].tokens > unlimited["work"].tokens
+    assert current["records"][0]["resident_positions"] == (1, 2)
+    assert current["records"][2]["resident_positions"] == ()
+    assert with_capacity["records"] == current["records"]
+    assert with_capacity["work"] == current["work"]

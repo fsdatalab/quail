@@ -295,9 +295,9 @@ in `planner/joins.py`): stage order and per-stage anchors are
 decided together, because they interact - anchors set what an order
 is worth, and order sets which stages can reuse an anchor's KV
 (issue #38). The search is the left deep subset DP
-(`planner/leftdeep.py`, the same search the SoL estimate runs). The
-state records the joined alias set, every document prefix still in
-KV, and the current anchor group. Each step adds one connected alias
+(`planner/leftdeep.py`). The state records the joined alias set and
+the current anchor group. The resident document prefixes are a read
+only input for the next group. Each step adds one connected alias
 and applies every predicate that completes, in every order, with
 every feasible anchor. Under `order=as_written`
 the written stage order is kept and only anchors are searched. A
@@ -309,7 +309,7 @@ The same function runs whenever new answers can change the decision:
 - **Plan time** (`plan_query`): expected live counts from
   selectivities, the corpus length lists, the keep credit as the
   resident set. The output is the predicted plan - explain(), the
-  refusal checks, sharding, and the SoL comparison run off it.
+  refusal checks, and sharding run off it.
 - **At runtime** (the worker; the parent process on several GPUs):
   the actual survivor counts and lengths, and the document positions
   whose KV is actually resident in the arena. The worker executes one
@@ -319,12 +319,12 @@ The same function runs whenever new answers can change the decision:
 Each stage is costed as a `Work` record (`planner/sol.py`: tokens,
 attention pairs, KV written, KV read), per document over the live
 length list: a resident anchor prefix (retained by the filter
-round, or anchored earlier in the candidate sequence) pays only its
-question frame (`ask`), the rest scan preamble + document + frame.
-The search applies the arena page limit to every candidate. It calls
-the same minimum loss victim selector as the runtime and carries the
-remaining document keys into the next DP state. A stage can therefore
-price some anchor documents as KV hits and the rest as recomputations.
+round) pays only its question frame (`ask`). Consecutive stages in
+one open anchor group also reuse the prefix. Other later groups are
+priced without predicted reuse. The worker searches again after the
+current group, so its next call sees the actual finite KV state. A
+stage can price some current anchor documents as KV hits and the rest
+as recomputations.
 Every tuple then carries partner labels, partner documents, and the
 answer cue over the resident anchor context. After each stage the
 live counts thin by `n * (1 - (1-s)^partner_tuples)`. Per state,
@@ -355,12 +355,14 @@ KV outlives its operator wherever a later one will read it.
   is a computation the query requires; only retention is optional,
   and retaining an already-resident document costs nothing to
   start. When retained KV starves a required admission, the arena
-  evicts the minimum-loss victim set (`executor/retention.py`): the
-  least total recompute-seconds cover for exactly the pages needed.
+  evicts document prefixes in increasing saved recompute work per
+  page. The arena stores that order in a heap.
   Recompute value is `prefix_recompute_seconds` - dense work linear
   in length against the fp8 peak plus the causal attention triangle
   against the bf16 peak, both counted. Pinned keys (in use by the
-  running operator) are untouchable.
+  running operator) are not eviction candidates. The exact minimum
+  loss calculation is a minimum knapsack cover problem. Its solver
+  remains only as a small test oracle in `executor/retention.py`.
 - The plan-time half is the *credit*: `keep_split` prices in the
   expected resident fraction the arena can hold, longest documents
   first. The byte calculation is fractional, while the arena
@@ -481,7 +483,8 @@ single forward pass, sharing KV across them through a paged arena.
 | `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
 | `search_joins` | `joins.py` | The join search: order and anchors from live counts, lengths, and document KV; called at plan time and after every completed runtime group |
 | `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: which survivors to price as resident, longest documents first |
-| `minimum_loss_victims` | `executor/retention.py` | The eviction cover: least recompute-seconds set freeing the needed pages |
+| `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the least saved recompute work per page |
+| `minimum_loss_victims` | `executor/retention.py` | Exact small-instance oracle used only by tests |
 | `prefix_recompute_seconds` | `sol.py` | The retention value of one prefix, counted constants only |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
 | `optimize_left_deep` | `leftdeep.py` | Subset DP over joined aliases and a caller supplied physical property, with a nondominated Work frontier |
@@ -833,9 +836,9 @@ that runs until `FilterAdmission.done()`:
    is retained instead (`arena.retain`): rewound to preamble +
    document, held under its stable `(alias, doc)` key at its counted
    recompute value. If retained KV starves a fresh admission, the
-   arena evicts the minimum-loss victim set and hands the pages back
-   to the scheduler; evicted documents are simply recomputed by the
-   join later.
+   arena evicts retained prefixes in increasing saved work per page
+   and hands the pages back to the scheduler. The join recomputes an
+   evicted document if it uses that document as an anchor later.
 
 Single-stage queries (one question) skip the arena entirely: no
 later stage reads any document's KV, so the alloc, the per-layer KV
@@ -885,8 +888,8 @@ without row room for this run's frame are freed and recomputed (a
 runtime anchor re-pick can land on an alias whose filter reserved a
 smaller frame). With `keep_semantics` set, the group's gate
 survivors keep their pages at the end for a later group on the same
-table; under allocation pressure an evict hook frees other tables'
-kept KV, smallest documents first minus redundant victims. The
+table. Under allocation pressure the arena frees retained prefixes
+in increasing saved recompute work per page. The
 worker frees every kept key the moment its last consumer group is
 behind, and sweeps kept keys at query start and end - the arena
 outlives a query, kept KV must not.

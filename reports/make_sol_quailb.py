@@ -37,17 +37,10 @@ the only one that does.
 
 Join search
 -----------
-All filters run first. Two searches follow, separately for 4B and
-32B:
-
-- The optimal: every feasible left deep relation order and anchor
-  choice, with exact ground-truth survivors at every step and
-  unlimited KV. This is the floor.
-- The engine mirror (simulate_query): the same search the worker
-  runs (quail.planner.joins.search_joins), first on the exact filter
-  survivors and then again after every join group. The search state
-  records the individual document prefixes still in KV and applies
-  the arena's page limit and victim rule.
+All filters run first. The script then checks every feasible left
+deep relation order and anchor choice. It uses exact ground-truth
+survivors at every step and unlimited KV. The search runs separately
+for 4B and 32B. It does not call or simulate the production planner.
 
 Running it
 ----------
@@ -84,6 +77,7 @@ import json
 import math
 import sys
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -93,20 +87,20 @@ import quail
 from quail.bench import quailb as Q
 from quail.bench.evaluate import H100_PRICE_SOURCE, H100_USD_PER_HOUR
 from quail.bench.sol_dp import PairRelation, exact_live_rows
+from quail.logical import SHARED_PRE, ColumnRef, bind_join_prompt, bind_prompt
 from quail.planner import budgets
-from quail.planner.decide import join_specs
+from quail.planner.decide import (
+    _collect,
+    default_order_rule,
+    join_specs,
+    order_filters_indexed,
+)
 from quail.planner.joins import fit_resident_documents, search_joins
 from quail.planner.leftdeep import Extension, optimize_left_deep
-from quail.planner.sol import (Work, ask, scan, speed_of_light,
-                               stream)
-from quail.runtime.coordinator import runtime_nodes
-from quail.logical import (ColumnRef, SHARED_PRE, bind_join_prompt,
-                           bind_prompt)
-from quail.planner.decide import _collect
 from quail.planner.plan import EngineConfig, Refusal
-from quail.runtime.coordinator import thin_survivors
-from quail.specs import (H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, DeviceSpec,
-                         ModelSpec)
+from quail.planner.sol import Work, ask, scan, speed_of_light
+from quail.runtime.coordinator import runtime_nodes, thin_survivors
+from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 
 W = Path(sys.argv[1])
 SF = float(sys.argv[2]) if len(sys.argv) > 2 else 0.1
@@ -132,8 +126,9 @@ CORPUS_ID = COLLECTION["corpus_id"]
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-FP8")
 
 
+@cache
 def encode(text):
-    return tok(text, add_special_tokens=False)["input_ids"]
+    return tuple(tok(text, add_special_tokens=False)["input_ids"])
 
 
 def length(text):
@@ -281,6 +276,9 @@ def join_stage_work(anchor, partners, aliases, survivors, prompt,
                    for alias, row in zip(partners, partner_row))
         for partner_row in partner_rows
     ]
+    suffix_tokens = sum(suffixes)
+    suffix_triangles = sum(suffix * (suffix + 1) / 2
+                           for suffix in suffixes)
     frame = labels_by_alias[anchor]["frame"]
     resident_rows = set(resident_rows)
     work = Work()
@@ -288,7 +286,13 @@ def join_stage_work(anchor, partners, aliases, survivors, prompt,
         prefix = PRE + aliases[anchor]["tokens"][row]
         work = work + (ask(prefix, frame) if row in resident_rows
                        else scan(prefix, frame))
-        work = work + stream(prefix + frame, suffixes)
+        anchor_prefix = prefix + frame
+        work = work + Work(
+            tokens=suffix_tokens,
+            pairs=anchor_prefix * suffix_tokens + suffix_triangles,
+            kv_written=suffix_tokens,
+            kv_read=anchor_prefix,
+        )
     return work
 
 
@@ -307,11 +311,23 @@ class QueryInputs:
     post_filter_counts: dict
 
 
-def prepare_query(query) -> QueryInputs:
-    plan = query.plan()
-    if isinstance(plan, Refusal):
-        raise ValueError(f"SoL query was refused: {plan.reasons}")
+def prepare_query(query, plan=None) -> QueryInputs:
     scans, filters, joins = _collect(query.logical)
+    if isinstance(plan, Refusal):
+        raise ValueError(f"query was refused: {plan.reasons}")
+    if plan is None:
+        rule = (query.order if query.order is not None else
+                default_order_rule(filters, joins)[0])
+        filter_orders = {
+            alias: order_filters_indexed(predicates, rule)
+            for alias, predicates in filters.items()
+        }
+    else:
+        filter_orders = {
+            node["alias"]: [stage["written_pos"]
+                            for stage in node["stages"]]
+            for node in plan.nodes_by_op("FilterChain")
+        }
     aliases = {}
     for scan_node in scans:
         key = f"{scan_node.provider}.{scan_node.column}"
@@ -329,11 +345,10 @@ def prepare_query(query) -> QueryInputs:
     filter_stages = []
     filter_evaluations = 0
 
-    for node in plan.nodes_by_op("FilterChain"):
-        alias = node["alias"]
+    for alias, order in filter_orders.items():
         live = survivors[alias]
-        for stage_index, stage in enumerate(node["stages"]):
-            predicate = filters[alias][stage["written_pos"]]
+        for stage_index, written_pos in enumerate(order):
+            predicate = filters[alias][written_pos]
             code = prompt_code(predicate.prompt)
             qtokens = predicate.prompt.tail_tokens
             operation = scan if stage_index == 0 else ask
@@ -375,15 +390,18 @@ def prepare_query(query) -> QueryInputs:
     )
 
 
-def simulate_query(query, model: ModelSpec, chunk_tokens: int):
-    """Follow the engine's repeated search and KV retention decisions.
+def simulate_production_planner(query, model: ModelSpec,
+                                chunk_tokens: int):
+    """Optional diagnostic for the production planner.
 
     The simulation uses exact saved answers after every join group.
     At group boundaries it applies the arena's page limit and the
-    same minimum loss victim choice. It does not reproduce temporary
+    same value-per-page victim order. It does not reproduce temporary
     overlap between packed GPU chunks.
+
+    The SoL output does not call this function.
     """
-    prepared = prepare_query(query)
+    prepared = prepare_query(query, query.plan())
     plan = prepared.plan
     scans = prepared.scans
     joins = prepared.joins
@@ -768,7 +786,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
 
     search = optimize_left_deep(
         alias_order,
-        prepared.resident,
+        frozenset(prepared.resident),
         prepared.work,
         extend,
     )
@@ -913,18 +931,10 @@ for qid in query_ids:
     query_inputs[qid] = {}
     for model in MODELS:
         _, build = query_defs_by_model[model.name][qid]
-        current_planner = add_sol_metrics(
-            simulate_query(build(), model, CHUNK[model.name]),
-            model)
         optimal = add_sol_metrics(
             simulate_optimal_left_deep(
                 build(), model, CHUNK[model.name]),
             model,
-        )
-        optimal["current_planner"] = current_planner
-        optimal["current_planner_slowdown_vs_optimal"] = (
-            current_planner["sol_s"] / optimal["sol_s"]
-            if optimal["sol_s"] else None
         )
         rows[qid]["models"][model.name] = optimal
         query_inputs[qid][model.name] = {
@@ -932,10 +942,6 @@ for qid in query_ids:
                 "filters": optimal["filter_stages"],
                 "joins": optimal["join_stages"],
                 "optimizer": optimal["optimizer"],
-            },
-            "current_planner": {
-                "filters": current_planner["filter_stages"],
-                "joins": current_planner["join_stages"],
             },
         }
 

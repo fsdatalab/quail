@@ -16,28 +16,20 @@ datasheet. No measured constant.
 import itertools
 from dataclasses import dataclass
 
-from quail.executor.retention import Retained, minimum_loss_victims
 from quail.planner import sol
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.sol import Work
-
 
 DocumentKey = tuple[str, int]
 
 
 @dataclass(frozen=True)
 class KVState:
-    """Document prefixes retained after completed anchor groups.
+    """The small physical state needed for guaranteed group reuse."""
 
-    pending_anchor is the group that produced the preceding stage.
-    The search finalizes its surviving document prefixes when the
-    next stage changes groups. group_open is true only when another
-    full stage on the same anchor can continue without a barrier.
-    """
-
-    resident: frozenset[DocumentKey]
     pending_anchor: str | None = None
     group_open: bool = False
+    at_start: bool = True
 
 
 def _mean(lengths) -> float:
@@ -122,133 +114,36 @@ def _document_keys(resident: dict) -> frozenset[DocumentKey]:
     )
 
 
-def _prefix_pages(key: DocumentKey, lengths: dict, pre: int,
-                  page_tokens: int) -> int:
-    alias, position = key
-    return -(-(pre + lengths[alias][position]) // page_tokens)
-
-
-def _retained(key: DocumentKey, lengths: dict, pre: int,
-              page_tokens: int, model, device) -> Retained:
-    alias, position = key
-    tokens = pre + lengths[alias][position]
-    return Retained(
-        key=key,
-        pages=-(-tokens // page_tokens),
-        value=sol.prefix_recompute_seconds(tokens, model, device),
-    )
-
-
-def _fit_residents(keys, capacity_pages: int | None, lengths: dict,
-                   pre: int, page_tokens: int, model, device):
-    """Keep the highest value document set that fits the page budget."""
-    kept = frozenset(keys)
-    if capacity_pages is None:
-        return kept
-    entries = tuple(
-        _retained(key, lengths, pre, page_tokens, model, device)
-        for key in sorted(kept)
-    )
-    excess = sum(entry.pages for entry in entries) - capacity_pages
-    if excess <= 0:
-        return kept
-    victims = minimum_loss_victims(entries, excess)
-    if victims is None:
-        return frozenset()
-    return kept - frozenset(victims.keys)
-
-
 def fit_resident_documents(resident: dict, lengths: dict, pre: int,
                            model, device, arena_tokens: float | None,
                            page_tokens: int = 16) -> dict:
-    """Fit document positions into KV with the runtime victim rule."""
-    capacity_pages = (None if arena_tokens is None else
-                      max(0, int(arena_tokens) // page_tokens))
-    kept = _fit_residents(
-        _document_keys(resident), capacity_pages, lengths, pre,
-        page_tokens, model, device)
+    """Apply the runtime value-per-page eviction order to a snapshot."""
+
+    keys = _document_keys(resident)
+    if arena_tokens is None:
+        kept = keys
+    else:
+        capacity_pages = max(0, int(arena_tokens) // page_tokens)
+        entries = []
+        total_pages = 0
+        for key in keys:
+            alias, position = key
+            tokens = pre + lengths[alias][position]
+            pages = -(-tokens // page_tokens)
+            value = sol.prefix_recompute_seconds(tokens, model, device)
+            entries.append((value / pages, key, pages))
+            total_pages += pages
+        kept = set(keys)
+        for _, key, pages in sorted(entries):
+            if total_pages <= capacity_pages:
+                break
+            kept.remove(key)
+            total_pages -= pages
     return {
         alias: {position for key_alias, position in kept
                 if key_alias == alias}
         for alias in lengths
     }
-
-
-def _make_working_room(keys, anchor: str, lengths: dict, pre: int,
-                       frame: int, capacity_pages: int | None,
-                       page_tokens: int, model, device):
-    """Evict retained documents until any one anchor can be active.
-
-    A resident anchor already owns its prefix pages, so only its frame
-    can require more pages. A missing anchor needs its full prefix and
-    frame allocation. Rechecking after each victim choice accounts for
-    an anchor document becoming a miss because it was itself evicted.
-    """
-    kept = _fit_residents(keys, capacity_pages, lengths, pre,
-                          page_tokens, model, device)
-    if capacity_pages is None or not lengths.get(anchor):
-        return kept
-    while True:
-        used = sum(_prefix_pages(key, lengths, pre, page_tokens)
-                   for key in kept)
-        free = capacity_pages - used
-        required = 0
-        for position, doc in enumerate(lengths[anchor]):
-            active = -(-(pre + doc + frame) // page_tokens)
-            key = (anchor, position)
-            extra = active
-            if key in kept:
-                extra -= _prefix_pages(key, lengths, pre, page_tokens)
-            required = max(required, extra)
-        shortage = required - free
-        if shortage <= 0:
-            return kept
-        entries = tuple(
-            _retained(key, lengths, pre, page_tokens, model, device)
-            for key in sorted(kept)
-        )
-        victims = minimum_loss_victims(entries, shortage)
-        if victims is None:
-            return frozenset()
-        next_kept = kept - frozenset(victims.keys)
-        if next_kept == kept:
-            return kept
-        kept = next_kept
-
-
-def _live_positions(alias: str, live: dict, lengths: dict) -> tuple[int, ...]:
-    """Positions used for an expected live count.
-
-    Runtime calls provide one length per actual survivor, so every
-    position is returned there. Plan time can provide a fractional
-    count. Even spacing keeps that estimate from depending on input
-    row order more than necessary.
-    """
-    size = len(lengths.get(alias, ()))
-    count = max(0, min(size, int(round(live.get(alias, 0.0)))))
-    if count == 0:
-        return ()
-    if count == size:
-        return tuple(range(size))
-    return tuple(min(size - 1, int((i + 0.5) * size / count))
-                 for i in range(count))
-
-
-def _prepare_group(state: KVState, anchor: str, live: dict,
-                   lengths: dict, pre: int, frame: int,
-                   needed_aliases: set[str], capacity_pages: int | None,
-                   page_tokens: int, model, device) -> KVState:
-    """Finish the prior group and make room for the next group."""
-    keys = {key for key in state.resident
-            if key[0] in needed_aliases}
-    if state.pending_anchor in needed_aliases:
-        keys.update((state.pending_anchor, position)
-                    for position in _live_positions(
-                        state.pending_anchor, live, lengths))
-    keys = _make_working_room(
-        keys, anchor, lengths, pre, frame, capacity_pages,
-        page_tokens, model, device)
-    return KVState(frozenset(keys))
 
 
 def residency(anchor: str, state: KVState,
@@ -257,12 +152,26 @@ def residency(anchor: str, state: KVState,
     """Name the source of the KV credit recorded for one stage."""
     if same_group:
         return "kept"
-    hits = {key for key in state.resident if key[0] == anchor}
-    if not hits:
-        return "none"
-    if hits <= initially_resident:
+    if state.at_start and any(
+            key_alias == anchor for key_alias, _ in initially_resident):
         return "filter"
-    return "kept"
+    return "none"
+
+
+def resident_positions(anchor: str, state: KVState,
+                       initially_resident: frozenset[DocumentKey],
+                       length_count: int,
+                       same_group: bool = False) -> tuple[int, ...]:
+    """Document positions guaranteed resident for the next stage."""
+
+    if same_group:
+        return tuple(range(length_count))
+    if not state.at_start:
+        return ()
+    return tuple(sorted(
+        position for key_alias, position in initially_resident
+        if key_alias == anchor
+    ))
 
 
 def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
@@ -316,45 +225,28 @@ def walk(seq, live0: dict, lengths: dict, resident: dict, pre: int,
     """
     live = dict(live0)
     initial = _document_keys(resident)
-    state = KVState(initial)
-    capacity_pages = (None if arena_tokens is None else
-                      max(0, int(arena_tokens) // page_tokens))
+    state = KVState()
     total = Work()
     records = []
-    for pos, (spec, anchor) in enumerate(seq):
+    for spec, anchor in seq:
         same_group = (state.group_open
                       and state.pending_anchor == anchor
                       and spec["semantics"] == "full")
-        if not same_group:
-            needed = {
-                candidate
-                for later, _ in seq[pos:]
-                for candidate in anchor_candidates(later)
-            }
-            state = _prepare_group(
-                state, anchor, live, lengths, pre,
-                spec["frame_tokens"][anchor], needed,
-                capacity_pages, page_tokens, model, device)
         kind = residency(anchor, state, initial, same_group)
-        w = stage_work(spec, anchor, live, lengths, state.resident,
+        positions = resident_positions(
+            anchor, state, initial, len(lengths[anchor]), same_group)
+        resident_keys = frozenset((anchor, i) for i in positions)
+        w = stage_work(spec, anchor, live, lengths, resident_keys,
                        pre, same_group)
-        hit_count = (len(lengths[anchor]) if same_group else
-                     sum((anchor, i) in state.resident
-                         for i in range(len(lengths[anchor]))))
-        hit_positions = (tuple(range(len(lengths[anchor])))
-                         if same_group else tuple(
-                             i for i in range(len(lengths[anchor]))
-                             if (anchor, i) in state.resident))
         records.append(dict(written_pos=spec["written_pos"],
                             anchor=anchor, resident=kind,
-                            resident_docs=hit_count,
-                            resident_positions=hit_positions,
+                            resident_docs=len(positions),
+                            resident_positions=positions,
                             tuples=cross_tuples(spec, live),
                             tokens=w.tokens))
         total = total + w
         thin(live, spec)
-        state = KVState(state.resident, anchor,
-                        spec["semantics"] == "full")
+        state = KVState(anchor, spec["semantics"] == "full", False)
     return total, records
 
 
@@ -376,9 +268,10 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
         lengths: alias -> live documents' token lengths.
         resident: alias -> positions into lengths[alias] whose prefix
             KV is resident.
-        arena_tokens: Total KV capacity available to this search.
-            None keeps every document prefix.
-        page_tokens: Number of token rows in one KV page.
+        arena_tokens: Accepted for caller compatibility. The resident
+            input already records the finite KV state at this planning
+            point. The search does not predict later evictions.
+        page_tokens: Accepted for caller compatibility.
         base_work: Work outside the joins (the filter round), so
             candidates rank by whole-query predicted seconds.
         fixed_order: keep the written stage order (order=as_written);
@@ -426,10 +319,7 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
             if a not in aliases:
                 aliases.append(a)
     edge_aliases = [frozenset(s["aliases"]) for s in specs]
-    by_pos = {s["written_pos"]: s for s in specs}
     live_cache = {}
-    capacity_pages = (None if arena_tokens is None else
-                      max(0, int(arena_tokens) // page_tokens))
     initial_keys = _document_keys(resident)
 
     def live_for(applied: frozenset):
@@ -439,17 +329,6 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
                 thin(state, specs[i])
             live_cache[applied] = state
         return dict(live_cache[applied])
-
-    claimable_cache = {}
-
-    def claimable_for(applied: frozenset) -> set[str]:
-        if applied not in claimable_cache:
-            out = set()
-            for i, spec in enumerate(specs):
-                if i not in applied:
-                    out.update(anchor_candidates(spec, honor_forced))
-            claimable_cache[applied] = frozenset(out)
-        return set(claimable_cache[applied])
 
     extension_cache = {}
 
@@ -485,37 +364,23 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
                     and state_now.pending_anchor == anchor
                     and spec["semantics"] == "full"
                 )
-                prepared = state_now
-                if not same_group:
-                    prepared = _prepare_group(
-                        state_now, anchor, live_now, lengths, pre,
-                        spec["frame_tokens"][anchor],
-                        claimable_for(applied), capacity_pages,
-                        page_tokens, model, device)
-                kind = residency(anchor, prepared, initial_keys,
+                kind = residency(anchor, state_now, initial_keys,
                                  same_group)
+                positions = resident_positions(
+                    anchor, state_now, initial_keys,
+                    len(lengths[anchor]), same_group)
+                resident_keys = frozenset(
+                    (anchor, position) for position in positions)
                 w = stage_work(spec, anchor, live_now, lengths,
-                               prepared.resident, pre, same_group)
-                hit_count = (len(lengths[anchor]) if same_group else
-                             sum((anchor, position) in prepared.resident
-                                 for position in range(
-                                     len(lengths[anchor]))))
-                hit_positions = (
-                    tuple(range(len(lengths[anchor])))
-                    if same_group else tuple(
-                        position for position in range(
-                            len(lengths[anchor]))
-                        if (anchor, position) in prepared.resident)
-                )
+                               resident_keys, pre, same_group)
                 step = dict(written_pos=spec["written_pos"],
                             anchor=anchor, resident=kind,
-                            resident_docs=hit_count,
-                            resident_positions=hit_positions,
+                            resident_docs=len(positions),
+                            resident_positions=positions,
                             tuples=cross_tuples(spec, live_now),
                             tokens=w.tokens)
                 next_state = KVState(
-                    prepared.resident, anchor,
-                    spec["semantics"] == "full")
+                    anchor, spec["semantics"] == "full", False)
                 visit(order, pos + 1, applied | {i}, next_state,
                       work + w,
                       steps + [step])
@@ -526,7 +391,7 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
         return extension_cache[cache_key]
 
     search = optimize_left_deep(
-        aliases, KVState(initial_keys), Work(), extend)
+        aliases, KVState(), Work(), extend)
     if not search.candidates:
         return None
     best = min(search.candidates,

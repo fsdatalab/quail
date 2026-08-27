@@ -241,13 +241,11 @@ labels. `join_stage_work()` counts one stage for each anchor choice.
 subsets and KV availability. A unit test compares its result with complete
 enumeration on a small query.
 
-`simulate_query()` still follows the current physical planner, including the
-KV the plan actually keeps (its `keep_kv` and `keep_anchor_kv` fields). Its
-result is stored beside the optimum for comparison. The script calls both
-simulations separately for each model and passes that model's chunk limit.
-`speed_of_light()` is section 4. The planner imports the same equations to
-rank its candidate join plans; the exact-label simulation here remains
-analysis.
+The SoL script does not call or simulate the production planner. It runs the
+exact search separately for each model and passes that model's chunk limit.
+`speed_of_light()` is section 4. The production planner imports the same work
+equations to rank its candidates, but its search and finite KV policy are
+separate from this exact analysis.
 
 ## 6. What the bound assumes
 
