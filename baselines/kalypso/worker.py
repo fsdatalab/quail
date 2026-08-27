@@ -45,7 +45,7 @@ kalypso_image = (
         "cd /opt/kalypso && TORCH_CUDA_ARCH_LIST='9.0a' MAX_JOBS=8"
         " pip install . --no-build-isolation"
         " && python -c 'import vllm._C; print(\"_C OK\")'",
-        gpu="any",
+        gpu="H100!",
     )
     .pip_install("huggingface_hub[hf_transfer]")
     .env(
