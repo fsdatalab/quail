@@ -1,4 +1,4 @@
-"""GPU KV retention decisions made from counted recomputation work."""
+"""Exact small-instance oracle for KV victim policy tests."""
 
 from dataclasses import dataclass
 from math import inf

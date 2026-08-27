@@ -5,6 +5,9 @@ PageArena is the accounting (pure Python, CPU-tested); KVArena is the
 tensor backing and runs only where torch and a GPU exist.
 """
 
+import heapq
+
+
 class PageArena:
     """Page accounting: a free list and per-document page lists."""
 
@@ -16,6 +19,9 @@ class PageArena:
         self.tokens = {}      # key -> resident token count
         self.pinned = set()    # current operators depend on these keys
         self.retained = {}     # key -> ideal seconds saved at next use
+        self._retained_heap = []
+        self._retained_versions = {}
+        self._retention_version = 0
 
     def pages_needed(self, tokens: int) -> int:
         return -(-tokens // self.page_tokens)
@@ -42,6 +48,7 @@ class PageArena:
         self.tokens.pop(key)
         self.pinned.discard(key)
         self.retained.pop(key, None)
+        self._retained_versions.pop(key, None)
         self.free.extend(pages)
         return len(pages)
 
@@ -51,6 +58,7 @@ class PageArena:
         if key not in self.owned:
             raise KeyError(key)
         self.retained.pop(key, None)
+        self._retained_versions.pop(key, None)
         self.pinned.add(key)
 
     def retain(self, key, value: float) -> None:
@@ -62,6 +70,27 @@ class PageArena:
             raise ValueError("retention value must be nonnegative")
         self.pinned.discard(key)
         self.retained[key] = value
+        self._retention_version += 1
+        version = self._retention_version
+        self._retained_versions[key] = version
+        pages = len(self.owned[key])
+        heapq.heappush(
+            self._retained_heap,
+            (value / pages, version, key, pages, value),
+        )
+
+    def pop_retained_victim(self):
+        """Remove and return the lowest saved work per KV page."""
+
+        while self._retained_heap:
+            _, version, key, pages, value = heapq.heappop(
+                self._retained_heap)
+            if self._retained_versions.get(key) != version:
+                continue
+            self._retained_versions.pop(key)
+            self.retained.pop(key)
+            return key, pages, value
+        return None
 
     def rewind(self, key, tokens: int) -> int:
         """Keep the first tokens and return unused trailing pages."""
@@ -183,23 +212,24 @@ class KVArena:
         self.accounting.retain(key, value)
 
     def evict_retained(self, pages_needed: int) -> tuple:
-        """Evict the minimum value set that frees pages_needed pages."""
+        """Evict retained prefixes with the least saved work per page."""
 
-        from quail.executor.retention import Retained, minimum_loss_victims
-
-        entries = (
-            Retained(key, len(self.accounting.owned[key]), value)
-            for key, value in self.accounting.retained.items()
-        )
-        victims = minimum_loss_victims(entries, pages_needed)
-        if victims is None:
-            return ()
-        self.evicted_keys += len(victims.keys)
-        self.evicted_pages += victims.pages
-        self.evicted_value += victims.value
-        for key in victims.keys:
+        keys = []
+        pages = 0
+        value = 0.0
+        while pages < pages_needed:
+            victim = self.accounting.pop_retained_victim()
+            if victim is None:
+                break
+            key, victim_pages, victim_value = victim
+            keys.append(key)
+            pages += victim_pages
+            value += victim_value
             self.free_key(key)
-        return victims.keys
+        self.evicted_keys += len(keys)
+        self.evicted_pages += pages
+        self.evicted_value += value
+        return tuple(keys)
 
     def activate(self, key, tokens: int, capacity_tokens: int | None = None):
         """Make a prefix active, evicting retained KV when required."""

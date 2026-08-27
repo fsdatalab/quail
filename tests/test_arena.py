@@ -82,3 +82,22 @@ def test_grow_uses_only_free_pages():
     a.alloc("doc", 4)
     assert a.grow("doc", 12) == 2
     assert a.grow("doc", 16) is None
+
+
+def test_retained_victim_uses_saved_work_per_page():
+    a = PageArena(n_pages=4, page_tokens=16)
+    a.alloc("one-page", 16)
+    a.alloc("two-pages", 17)
+    a.retain("one-page", 10.0)
+    a.retain("two-pages", 15.0)
+
+    assert a.pop_retained_victim() == ("two-pages", 2, 15.0)
+
+
+def test_pinned_stale_heap_entry_is_not_a_victim():
+    a = PageArena(n_pages=2, page_tokens=16)
+    a.alloc("doc", 16)
+    a.retain("doc", 3.0)
+    a.pin("doc")
+
+    assert a.pop_retained_victim() is None

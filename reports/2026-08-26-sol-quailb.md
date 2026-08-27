@@ -49,8 +49,8 @@ deep plan. Its 32B estimate decreases from 7.460 seconds to 6.520 seconds.
 
 The unit test for the DP matches complete enumeration. The production SoL run
 does not repeat complete enumeration. The output stores the best plan
-separately for 4B and 32B. It also stores the current planner result so the
-difference remains visible.
+separately for 4B and 32B. The planner comparison above was computed during
+development. It is not part of the SoL output.
 
 ## Ground truth setup and result
 
@@ -233,8 +233,7 @@ wall time from an engine run. The cost at SoL includes GPU time only, so it
 does not include CPU or memory charges.
 
 For queries with several joins, the table reports the best left deep plan.
-The JSON file also contains the current planner result and its ratio to this
-minimum.
+The JSON file contains only the unlimited KV SoL result.
 
 | Query | Stages | Work units | 4B SoL | 4B $/query at SoL | 4B docs/s or pairs/s at SoL | 32B SoL | 32B $/query at SoL | 32B docs/s or pairs/s at SoL |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
