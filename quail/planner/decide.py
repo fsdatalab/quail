@@ -190,13 +190,14 @@ def keep_split(doc_tokens, budget_tokens: float, survivor_frac: float,
     two terms, so length orders the documents; the rise comes from
     the attention term and is small below the dense/attention
     crossover (about 12,300 tokens at 4B), where the linear dense
-    term dominates. Survival is unknown per document at plan time,
-    so the credited mass is the survivor fraction of the kept
-    lengths' mass - a fractional knapsack, taken by value per byte.
-    That take is optimal in bytes, but the arena allocates whole
-    pages, and a document just past a page boundary has a lower
-    value per page than a slightly shorter one. The split is
-    therefore an estimate, off by up to one page per document.
+    term dominates. What makes longest-first exact rather than a
+    heuristic is that survival is unknown per document at plan time:
+    the expected kept mass is the survivor fraction of the kept
+    lengths' mass, a fractional knapsack, where taking by value per
+    byte is optimal. Page rounding blurs that at the margins - a
+    document just past a page boundary has a lower value per PAGE
+    than a slightly shorter one - so the split is exact in bytes and
+    approximate within one page per document.
 
     The runtime is not bound by the threshold: it retains every
     passing survivor and evicts by recompute value under pressure.
@@ -404,9 +405,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         found = joinsearch.search_joins(
             specs, live0, doc_tokens, resident_from(plan_keep), pre,
             chunk, model, device, base_work=base_work,
-            fixed_order=fixed, honor_forced=honor_forced,
-            arena_tokens=float(admission) * workers,
-            page_tokens=budgets.PAGE_TOKENS)
+            fixed_order=fixed, honor_forced=honor_forced)
         if found is None:
             # a join predicate with no alias in common with the rest:
             # no connected left deep order exists, so cost the written
@@ -414,9 +413,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             found = joinsearch.search_joins(
                 specs, live0, doc_tokens, resident_from(plan_keep),
                 pre, chunk, model, device, base_work=base_work,
-                fixed_order=True, honor_forced=honor_forced,
-                arena_tokens=float(admission) * workers,
-                page_tokens=budgets.PAGE_TOKENS)
+                fixed_order=True, honor_forced=honor_forced)
         return found
 
     def consumed_keeps(records, plan_keep):

@@ -74,23 +74,16 @@ def anchor_candidates(spec: dict, honor_forced: bool = True) -> list:
     return list(spec["aliases"])
 
 
-def tuple_need(spec: dict, anchor: str, lengths: dict,
-               pre: int) -> float:
-    """Tokens of the worst live tuple anchored here: the working set
-    one admission pins beside whatever the arena is holding. Zero
-    when any side has no live documents."""
-    if any(not lengths[a] for a in spec["aliases"]):
-        return 0.0
-    return (pre + max(lengths[anchor]) + spec["frame_tokens"][anchor]
-            + spec["tail_tokens"]
-            + sum(spec["label_tokens"][p] + max(lengths[p])
-                  for p in spec["aliases"] if p != anchor))
-
-
 def anchor_fits(spec: dict, anchor: str, lengths: dict, pre: int,
                 chunk_tokens: int) -> bool:
     """Whether the worst live tuple anchored here fits one chunk."""
-    return tuple_need(spec, anchor, lengths, pre) <= chunk_tokens
+    if any(not lengths[a] for a in spec["aliases"]):
+        return True
+    need = (pre + max(lengths[anchor]) + spec["frame_tokens"][anchor]
+            + spec["tail_tokens"]
+            + sum(spec["label_tokens"][p] + max(lengths[p])
+                  for p in spec["aliases"] if p != anchor))
+    return need <= chunk_tokens
 
 
 def _feasible_anchors(spec, honor_forced, lengths, pre, chunk) -> list:
@@ -100,41 +93,6 @@ def _feasible_anchors(spec, honor_forced, lengths, pre, chunk) -> list:
     fits = [a for a in cands
             if anchor_fits(spec, a, lengths, pre, chunk)]
     return fits or cands
-
-
-def hold_tokens(live: dict, lengths: dict, resident: dict, cached,
-                pre: int, page_tokens: int) -> float:
-    """Expected resident tokens the priced plan holds at this stage.
-
-    Earlier-anchored aliases count their full live sets; a
-    filter-retained alias not yet anchored counts its resident
-    positions. Live fractions scale the page-rounded per-document
-    masses. Callers pass only aliases some remaining stage can still
-    anchor - retained KV with no later reader is freed, not held -
-    and add the current stage's tuple_need for the working set.
-    """
-    total = 0.0
-    for a in set(cached) | set(resident):
-        rows = lengths.get(a) or ()
-        if not rows:
-            continue
-        frac = live[a] / len(rows)
-        if a in cached:
-            total += frac * sum(
-                -(-(pre + t) // page_tokens) * page_tokens
-                for t in rows)
-        elif resident[a]:
-            total += frac * sum(
-                -(-(pre + rows[i]) // page_tokens) * page_tokens
-                for i in resident[a])
-    return total
-
-
-# Marker stored in the search's cached-alias state set: some earlier
-# stage's assumed-resident mass exceeded the arena. It rides the
-# state (not a flag) so extension caching and the Pareto frontier
-# keep overflowed and non-overflowed paths apart.
-OVERFLOWED = "!hold-overflow"
 
 
 def residency(anchor: str, cached, resident: dict) -> str:
@@ -188,17 +146,8 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
     return total
 
 
-def walk(seq, live0: dict, lengths: dict, resident: dict, pre: int,
-         arena_tokens: float | None = None, page_tokens: int = 16):
+def walk(seq, live0: dict, lengths: dict, resident: dict, pre: int):
     """Cost one [(spec, anchor)] sequence.
-
-    Residency credit needs the arena to have held everything the
-    plan relies on: retained aliases a remaining stage still
-    anchors (KV with no later reader is freed, not held), beside
-    the largest tuple the current stage admits. From the first
-    stage where that exceeds arena_tokens onward, every prefix
-    prices as a scan: something was evicted, the search does not
-    model what, so it stops assuming. None disables the check.
 
     Returns (work, records): per stage, the written position, the
     anchor, the residency its cost assumed, and expected tuples and
@@ -206,23 +155,12 @@ def walk(seq, live0: dict, lengths: dict, resident: dict, pre: int,
     """
     live = dict(live0)
     cached = set()
-    overflowed = False
     total = Work()
     records = []
-    for k, (spec, anchor) in enumerate(seq):
-        if not overflowed and arena_tokens is not None:
-            ahead = {a for _, a in seq[k:]}
-            hold = hold_tokens(
-                live, lengths,
-                {a: p for a, p in resident.items() if a in ahead},
-                cached & ahead, pre, page_tokens)
-            overflowed = hold + tuple_need(
-                spec, anchor, lengths, pre) > arena_tokens
-        use_resident = {} if overflowed else resident
-        use_cached = set() if overflowed else cached
-        kind = residency(anchor, use_cached, use_resident)
-        w = stage_work(spec, anchor, live, lengths, use_resident,
-                       pre, use_cached)
+    for spec, anchor in seq:
+        kind = residency(anchor, cached, resident)
+        w = stage_work(spec, anchor, live, lengths, resident, pre,
+                       cached)
         records.append(dict(written_pos=spec["written_pos"],
                             anchor=anchor, resident=kind,
                             tuples=cross_tuples(spec, live),
@@ -236,9 +174,7 @@ def walk(seq, live0: dict, lengths: dict, resident: dict, pre: int,
 def search_joins(specs, live: dict, lengths: dict, resident: dict,
                  pre: int, chunk_tokens: int, model, device, *,
                  base_work: Work = Work(), fixed_order: bool = False,
-                 honor_forced: bool = True,
-                 arena_tokens: float | None = None,
-                 page_tokens: int = 16):
+                 honor_forced: bool = True):
     """Search stage order and anchor choice; return the cheapest.
 
     Args:
@@ -256,13 +192,6 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
         fixed_order: keep the written stage order (order=as_written);
             anchors are still chosen.
         honor_forced: honor forced full-join anchors.
-        arena_tokens: KV capacity in tokens for the residency
-            check. Credit is granted only while what a candidate
-            plan holds - retained aliases some remaining stage can
-            still anchor, beside the stage's largest tuple - fits
-            this budget; past a plan's first stage over it, every
-            prefix prices as a scan. None disables the check.
-        page_tokens: arena page size, for rounding held masses.
 
     Returns:
         None when the join graph has no connected left deep order,
@@ -281,8 +210,7 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
 
     def run_walk(order_specs, assign):
         seq = list(zip(order_specs, assign))
-        work, records = walk(seq, live, lengths, resident, pre,
-                             arena_tokens, page_tokens)
+        work, records = walk(seq, live, lengths, resident, pre)
         return work, records, seq
 
     if fixed_order or len(specs) == 1:
@@ -315,19 +243,6 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
             live_cache[applied] = state
         return dict(live_cache[applied])
 
-    claimable_cache = {}
-
-    def claimable_for(applied: frozenset):
-        """Aliases an unapplied stage could still anchor - the only
-        ones whose retained KV a candidate plan keeps holding."""
-        if applied not in claimable_cache:
-            out = set()
-            for j, s in enumerate(specs):
-                if j not in applied:
-                    out.update(anchor_candidates(s, honor_forced))
-            claimable_cache[applied] = frozenset(out)
-        return claimable_cache[applied]
-
     extension_cache = {}
 
     def extend(relations, cached, added):
@@ -357,28 +272,15 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
             state = live_for(applied)
             for anchor in _feasible_anchors(
                     spec, honor_forced, lengths, pre, chunk_tokens):
-                denied = OVERFLOWED in cached_now
-                if not denied and arena_tokens is not None:
-                    ahead = claimable_for(applied)
-                    hold = hold_tokens(
-                        state, lengths,
-                        {a: p for a, p in resident.items()
-                         if a in ahead},
-                        cached_now & ahead, pre, page_tokens)
-                    denied = hold + tuple_need(
-                        spec, anchor, lengths, pre) > arena_tokens
-                use_resident = {} if denied else resident
-                use_cached = set() if denied else cached_now
-                kind = residency(anchor, use_cached, use_resident)
+                kind = residency(anchor, cached_now, resident)
                 w = stage_work(spec, anchor, state, lengths,
-                               use_resident, pre, use_cached)
+                               resident, pre, cached_now)
                 step = dict(written_pos=spec["written_pos"],
                             anchor=anchor, resident=kind,
                             tuples=cross_tuples(spec, state),
                             tokens=w.tokens)
                 visit(order, pos + 1, applied | {i},
-                      {OVERFLOWED} if denied
-                      else cached_now | {anchor}, work + w,
+                      cached_now | {anchor}, work + w,
                       steps + [step])
 
         for order in itertools.permutations(crossing):
