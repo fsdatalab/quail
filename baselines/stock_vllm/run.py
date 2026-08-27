@@ -48,8 +48,8 @@ GPU_KW = dict(image=image, gpu="H100!", memory=65536,
 DATA_DIR = "/results/quailb_data"
 
 MODELS = {
-    "qwen3-4b": "Qwen/Qwen3-4B",
-    "qwen3-32b": "Qwen/Qwen3-32B",
+    "qwen3-4b": "Qwen/Qwen3-4B-FP8",
+    "qwen3-32b": "Qwen/Qwen3-32B-FP8",
 }
 
 QUERY_ORDER = [
@@ -404,8 +404,7 @@ def run_stock_baseline(model: str = "qwen3-4b", sf: float = 0.1,
         max_num_seqs=4096,
         gpu_memory_utilization=0.92,
         enable_prefix_caching=True,
-        disable_log_stats=True,
-        quantization="fp8")
+        disable_log_stats=True)
     sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
                         allowed_token_ids=allowed)
     print(f"[stock_vllm] boot: {boot}", flush=True)
@@ -449,6 +448,7 @@ def run_stock_baseline(model: str = "qwen3-4b", sf: float = 0.1,
                   boot=boot, reps=reps,
                   submission="separate generate() per filter stage, "
                              "full cross product per join",
+                  checkpoint="pre-quantized FP8",
                   max_num_seqs=4096, max_num_batched_tokens=25_305,
                   gpu_memory_utilization=0.92,
                   enable_prefix_caching=True,
