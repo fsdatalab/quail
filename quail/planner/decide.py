@@ -7,7 +7,6 @@ import itertools
 from quail.logical import (LogicalPlan, Project, Scan, SemanticFilter,
                            SemanticJoin)
 from quail.planner import budgets
-from quail.planner.calibration import Calibration, load_calibration
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -329,14 +328,12 @@ def balanced_shards(doc_tokens, workers: int):
 
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-               order: str | None = None,
-               calibration: Calibration | None = None):
+               order: str | None = None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
     Args:
         doc_tokens: alias -> list of per-document token counts.
     """
-    cal = calibration or load_calibration(model, device)
     scans, filters, joins = _collect(plan)
     stats = {a: CorpusStats.from_doc_tokens(t)
              for a, t in doc_tokens.items()}
@@ -545,7 +542,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         model=model.name, device=device.name, workers=workers,
         tensor_parallel=tp, kv_dtype="bf16", chunk_tokens=chunk,
         admission_tokens=admission, order_rule=rule, order_source=source,
-        calibration_source=cal.source,
         limit=plan.root.limit,
         nodes=tuple(nodes), remarks=tuple(remarks))
 
@@ -603,7 +599,6 @@ def explain(logical: LogicalPlan, physical) -> str:
                  "suffix (preamble_tokens per stage below count the "
                  "shared preamble)")
     lines.append(f"  order={physical.order_rule} ({physical.order_source})")
-    lines.append(f"  calibration: {physical.calibration_source}")
     for n in physical.nodes:
         parts = [f"  {n['op']} {n['id']}"]
         for k, v in n.items():

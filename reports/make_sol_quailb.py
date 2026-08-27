@@ -950,7 +950,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
 query_defs_by_model = {}
 for model in MODELS:
     session = quail.Session(
-        EngineConfig(gpus=1, cpu_memory_gb=80, model=model.name),
+        EngineConfig(gpus=1, model=model.name),
         tokenizer=encode)
     Q.register_sets(session, W / "data" / TAG)
     query_defs_by_model[model.name] = Q.queries(session)

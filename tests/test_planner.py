@@ -412,7 +412,7 @@ def test_explain_prints_tree_settings_and_source(catalog):
     text = explain(logical, plan)
     assert "Scan reviews as r" in text
     assert "order=by_cost" in text
-    assert "calibration: calibrated" in text
+    assert "calibration" not in text
     assert "FilterChain" in text
     assert isinstance(plan, PhysicalPlan)
     assert plan.to_json()      # JSON-able
