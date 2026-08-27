@@ -11,7 +11,7 @@ predicates. Ground truth is saved per predicate, document, or document pair.
 
 ## Run the benchmark
 
-Run all 30 queries with Qwen3 4B:
+Run all 30 queries with Qwen3 4B in one H100! container:
 
 ```bash
 mkdir -p results/benchmark
@@ -41,6 +41,25 @@ uv run python -m quail.bench.quailb \
 Each command runs every selected query once. It reads ground truth before
 the timers start. It reports runtime, H100 cost, tokens, documents per second,
 answer accuracy, and final-row precision, recall, and F1.
+
+To match the stock vLLM parallel run, split the queries across four H100!
+containers. Each container loads one model and runs 7 or 8 queries. The four
+containers use the same query chunks as stock vLLM.
+
+```bash
+run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
+
+uv run modal run -m quail.bench.quailb_parallel \
+  --sf 0.1 \
+  --model qwen3-4b-fp8 \
+  --containers 4 \
+  --prediction "State the expected runtime and accuracy." \
+  2>&1 | tee "$run_log"
+```
+
+The command prints the Modal function call ID for each query chunk. Each chunk
+runs as one Modal call, so its model stays loaded until every query in that
+chunk finishes. Quail clears query KV before the next query starts.
 
 The local JSON and Markdown files use the same UTC timestamp prefix under
 `results/benchmark/`. The PNG uses that prefix under

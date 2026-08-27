@@ -44,12 +44,7 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
 _BOOTED = {}      # model name -> dict(model, arena, pipeline)
 
 
-@app.function(image=image, gpu="H100!", timeout=7200, memory=98304,
-              scaledown_window=300, max_containers=1,
-              volumes={"/root/.cache/huggingface": hf_cache,
-                       "/root/.cache/kernels": kernel_cache,
-                       "/results": results_vol})
-def execute(payload: dict) -> dict:
+def _execute_payload(payload: dict) -> dict:
     import torch
     import torch.nn.functional as F
 
@@ -147,6 +142,15 @@ def execute(payload: dict) -> dict:
     results_vol.commit()
     kernel_cache.commit()    # persist any JIT artifacts this run built
     return report
+
+
+@app.function(image=image, gpu="H100!", timeout=7200, memory=98304,
+              scaledown_window=300, max_containers=1,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/root/.cache/kernels": kernel_cache,
+                       "/results": results_vol})
+def execute(payload: dict) -> dict:
+    return _execute_payload(payload)
 
 
 def _execute_single(state, payload: dict) -> dict:

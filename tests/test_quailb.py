@@ -5,7 +5,14 @@ import pyarrow.parquet as pq
 
 import quail
 from quail.bench.quailb import (
-    ASPECTS, SCENARIOS, SETS, queries, register_privacy_sets, register_sets,
+    ASPECTS,
+    QUERY_ORDER,
+    SCENARIOS,
+    SETS,
+    queries,
+    register_privacy_sets,
+    register_sets,
+    split_query_ids,
 )
 from quail.planner.plan import EngineConfig, Refusal
 
@@ -59,6 +66,7 @@ def test_all_queries_compile_and_plan(tmp_path):
         "PRIV-1", "PRIV-2",
     }
     assert set(qdefs) == expected
+    assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
     for qid, (_, build) in qdefs.items():
         query = build()
         plan = query.plan()
@@ -76,3 +84,12 @@ def test_set_table_matches_design():
     }
     assert len(ASPECTS) == 12
     assert len(SCENARIOS) == 100
+
+
+def test_parallel_query_split_matches_stock_vllm():
+    assert split_query_ids(QUERY_ORDER, 4) == (
+        QUERY_ORDER[0:8],
+        QUERY_ORDER[8:16],
+        QUERY_ORDER[16:23],
+        QUERY_ORDER[23:30],
+    )
