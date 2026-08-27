@@ -92,6 +92,7 @@ import quail
 from quail.bench import quailb as Q
 from quail.bench.evaluate import H100_PRICE_SOURCE, H100_USD_PER_HOUR
 from quail.bench.sol_dp import PairRelation, exact_live_rows
+from quail.planner import budgets
 from quail.planner.decide import join_specs
 from quail.planner.joins import search_joins
 from quail.planner.leftdeep import Extension, optimize_left_deep
@@ -377,7 +378,9 @@ def simulate_query(query, model: ModelSpec, chunk_tokens: int):
     """Follow the engine: the runtime join search on the exact filter
     survivors, then the stages it chose, with the retention lifecycle.
 
-    Residency assumes no eviction pressure: the arena's minimum-loss
+    The search prices residency only while the mass its plan holds
+    fits the arena, matching the worker. The stage accounting below
+    still assumes no eviction pressure: the arena's minimum-loss
     eviction depends on the packing order this simulation does not
     run, so every retained prefix counts as resident. Where eviction
     fires on the real run, this underestimates the fresh tokens.
@@ -420,7 +423,10 @@ def simulate_query(query, model: ModelSpec, chunk_tokens: int):
             {a: {i for i, row in enumerate(survivors[a])
                  if row in resident_rows[a]} for a in involved},
             PRE, chunk_tokens, model, H100_SXM,
-            fixed_order=(plan.order_rule == "as_written"))
+            fixed_order=(plan.order_rule == "as_written"),
+            arena_tokens=float(budgets.arena_tokens(
+                model, H100_SXM, chunk_tokens)),
+            page_tokens=budgets.PAGE_TOKENS)
     if found is None:
         nodes = [node for node in plan.nodes
                  if node["op"] in ("Barrier", "JoinGroup")]

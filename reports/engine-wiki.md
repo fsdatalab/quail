@@ -321,13 +321,23 @@ attention pairs, KV written, KV read), per document over the live
 length list: a resident anchor prefix (retained by the filter
 round, or anchored earlier in the candidate sequence) pays only its
 question frame (`ask`), the rest scan preamble + document + frame.
-The residency credit assumes retained KV survives until the group
-that reads it; under arena pressure eviction can deny that, which
-misestimates a candidate's cost but never its correctness - the
-evicted document is recomputed. A credit that models eviction under
-each candidate plan is future work;
-every tuple then carries partner labels, partner documents, and the
-answer cue over the resident anchor context. After each stage the
+Residency credit is capacity-checked per candidate: at each stage
+the search sums the page-rounded mass its plan is holding (filter
+keeps and survivors of earlier anchors that some remaining stage
+can still anchor - retained KV with no later reader is freed, not
+held) plus the largest single tuple the stage admits, and grants
+credit only while that fits the arena. From a candidate's first
+stage over budget onward, every prefix prices as a scan -
+something would have been evicted, and the search does not model
+what. So an A - B - A order pays for recomputing A when A could
+not have stayed resident through the B group, and the search
+prefers orders that never overflow. The check is deliberately
+all-or-nothing past the overflow; modeling which victim the
+minimum-loss eviction picks under each candidate is future work. A
+wrong grant misestimates a candidate's cost but never its
+correctness - an evicted document is recomputed. Every tuple then
+carries partner labels, partner documents, and the answer cue over
+the resident anchor context. After each stage the
 live counts thin by `n * (1 - (1-s)^partner_tuples)`. Per state,
 records survive unless another is no larger in all four work
 categories, and the final candidates rank by predicted seconds -
@@ -364,8 +374,9 @@ KV outlives its operator wherever a later one will read it.
   running operator) are untouchable.
 - The plan-time half is the *credit*: `keep_split` prices in the
   expected resident fraction the arena can hold, longest documents
-  first (a fractional knapsack in expectation - see the docstring
-  for why that is exact), and `_keep_timeline` trims the credit
+  first (a fractional knapsack in expectation; optimal in bytes,
+  but page rounding makes the split an estimate, off by up to one
+  page per document), and `_keep_timeline` trims the credit
   until the peak expected resident tokens fit beside the working
   headroom. The runtime is not bound by the threshold; the credit
   keeps the prediction and the SoL comparison honest.
