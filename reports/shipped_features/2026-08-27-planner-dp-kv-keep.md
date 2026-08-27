@@ -63,16 +63,10 @@ operator - are untouchable.
 
 At plan time the same idea appears as a credit, not a rule:
 `keep_split` prices in the expected resident fraction the arena can
-hold, longest documents first - the fractional knapsack take, since
-survival is fractional in expectation; optimal in bytes, an
-estimate under page rounding. The runtime is not bound by the
-threshold; the credit keeps the prediction and the SoL comparison
-honest. The search itself grants residency credit only while what
-a candidate plan holds - retained aliases some remaining stage can
-still anchor, beside the stage's largest tuple - fits the arena:
-past a plan's first stage over that budget, every prefix prices as
-a scan, so re-using an anchor after an intervening group that
-could not have kept it is not priced too cheaply.
+hold, longest documents first, which is the exact fractional
+knapsack answer because survival is fractional in expectation. The
+runtime is not bound by the threshold; the credit keeps the
+prediction and the SoL comparison honest.
 
 ## Why
 
@@ -105,11 +99,10 @@ and matched a separate CPU recombination row for row
 `/results/runs/run_1787795777696587173.json`). That check ran the
 lifecycle this branch ports verbatim, under the worker it was built
 in; the merged worker re-integrates it and needs its own run. Two
-more things no run has measured: the search's capacity check on
-residency credit is all-or-nothing past a plan's first overflow (it
-does not model which victim the minimum-loss eviction picks, so
-under mild pressure it can still misprice in either direction), and
-the eviction cover's CPU cost under a full arena. The join cells
+more things no run has measured: the search's residency credit is
+optimistic when eviction pressure denies a retained prefix before
+its consuming group, and the eviction cover's CPU cost under a full
+arena. The join cells
 (`tests/gpu/join_bench.py`, the QUAIL-B evaluation) are the next
 step, and the run report's new `kv_manager` block (retained counts,
 anchor hits and misses, evictions with their summed value) and
