@@ -469,12 +469,19 @@ def keep_split(doc_tokens, budget_tokens: float, survivor_frac: float,
                overhead: int, page_tokens: int) -> dict | None:
     """Which survivors of one alias stay resident for a later join.
 
-    Longest documents first: resident KV saves the document's
-    recompute, which grows faster than the linear bytes it occupies,
-    so per byte the longest documents are worth the most. Survival is
-    unknown per document at plan time, so the expected kept KV is the
-    survivor fraction of the kept lengths' mass - a fractional
-    knapsack, where taking by density is exact.
+    Longest documents first. Resident KV of length L saves L dense
+    tokens (2 FLOPs per parameter each, against the fp8 peak) plus
+    L(L+1)/2 attention pairs (against the bf16 peak) - both counted,
+    no measured constant - while occupying kappa * L bytes. Saved
+    work per byte rises with L under any positive weighting of the
+    two terms, so length orders the documents; the rise comes from
+    the attention term and is small below the dense/attention
+    crossover (about 12,300 tokens at 4B), where the linear dense
+    term dominates. What makes longest-first exact rather than a
+    heuristic is that survival is unknown per document at plan time:
+    the expected kept mass is the survivor fraction of the kept
+    lengths' mass, a fractional knapsack, where taking by value per
+    byte is optimal.
 
     Args:
         overhead: Tokens added to each kept document (engine preamble
@@ -867,6 +874,13 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 keep_kv=keep is not None,
                 keep_frame_tokens=(keep["frame_tokens"]
                                    if keep else 0),
+                # the expected-capacity length threshold: the cost
+                # model credited documents at or above it as kept.
+                # The runtime keeps every survivor while pages last
+                # and evicts under pressure; this records what the
+                # plan priced
+                keep_min_doc_tokens=(keep["min_doc_tokens"]
+                                     if keep else 0),
                 stages=tuple(stages)))
             ids_src[s.alias] = (fid, f"ids:{s.alias}")
             if not writes:

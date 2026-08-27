@@ -36,12 +36,19 @@ The arena is smaller than some corpora, so keeping is a choice.
 
 - The planner picks what to keep with a length threshold
   (`keep_split`): keep the longest survivors that fit. Resident KV
-  saves the document's recompute - a dense term linear in length
-  plus an attention term quadratic in it - while occupying bytes
-  linear in length, so per byte the longest documents are worth the
-  most. Survival is unknown per document at plan time, so the
-  expected kept mass is fractional, and taking longest-first is the
-  exact fractional-knapsack answer.
+  of length L saves L dense tokens against the fp8 peak plus
+  L(L+1)/2 attention pairs against the bf16 peak - both counted
+  from the architecture and the datasheet, no measured constant -
+  while occupying bytes linear in L. Saved work per byte rises with
+  L under any positive weighting of the two terms, which is what
+  orders documents by length; the rise comes from the attention
+  term and is small below the dense/attention crossover (about
+  12,320 prefix tokens at 4B, 29,760 at 32B - most benchmark
+  documents are shorter), so the ordering matters more than the
+  spread. What makes longest-first exact rather than a heuristic:
+  survival is unknown per document at plan time, so the expected
+  kept mass is fractional, and for a fractional knapsack taking by
+  value per byte is optimal.
 - The runtime never evicts to admit something into the cache.
   Every admission is a computation the query requires; only
   retention is optional, and retaining a document that is already
@@ -77,8 +84,18 @@ costs 4,425 fresh tokens with the kept KV against 23,900 without it
 - the difference is the 25 expected surviving documents' prefixes.
 No engine run measures this yet; the join cells
 (`tests/gpu/join_bench.py`, the QUAIL-B evaluation) are the next
-step, and the next SoL regeneration refreshes the
-current-planner-vs-optimal columns, which should now be near 1.0.
+step.
+
+The SoL floor itself does not change: the optimal column is the
+same exact-label, unlimited-KV left deep search as before. What
+changes on the next SoL regeneration is the current-planner column,
+because it simulates whatever plan the planner emits and the
+planner changed. The plan-choice part of the gap (seven of nine
+multi-join queries) should close, since both searches now cover the
+same space. The ratio stays above 1.0 wherever the planner's
+selectivity expectations and mean lengths miss the exact survivors,
+and wherever arena capacity denies a keep the unlimited-KV optimum
+assumes.
 
 `simulate_query` in `reports/make_sol_quailb.py` follows the plan's
 keep decisions (`keep_kv`, `keep_anchor_kv`) instead of assuming

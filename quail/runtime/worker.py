@@ -745,11 +745,12 @@ def free_kept(arena, kept, alias, drop=None):
 def make_evict(arena, kept, current_alias):
     """Eviction under arena pressure, for run_join's anchor allocs.
 
-    Victims accumulate smallest first - freed pages are linear in
-    document length while the recompute a later group then pays grows
-    faster - then any victim the later, larger ones made redundant is
-    dropped again, so no document is evicted for pages the allocation
-    does not need."""
+    Victims accumulate smallest first - the least recompute for a
+    later group to pay back: a dense term linear in length plus an
+    attention term quadratic in it, both counted, rising with length
+    under any positive weighting - then any victim the larger ones
+    made redundant is dropped again, so no document is evicted for
+    pages the allocation does not need."""
     def evict(pages_needed):
         candidates = sorted(
             (tokens, alias, g)

@@ -760,7 +760,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             caller that keeps KV across operators passes stable keys.
         keep: Hold survivors' KV in the arena after the chain so a
             join can anchor on it. When kept KV starves a fresh
-            admission, the smallest kept documents are evicted first.
+            admission, the smallest kept documents the admission
+            needs are evicted (minus any a larger victim makes
+            redundant) and recomputed by the join.
         keep_extra_tokens: Page and row allowance past the document
             for the widest join frame a kept survivor may host.
         kept_out: When given, extended with the kept local doc ids.
@@ -835,9 +837,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             if outstanding:
                 report(outstanding.pop(0))
                 continue
-            # kept survivors starve the head of the queue: the
-            # smallest kept KV is the cheapest to recompute, so it
-            # goes first
+            # kept survivors starve the head of the queue; the
+            # eviction rule is evict_for_pending's
             evicted = sched.evict_for_pending()
             assert evicted, "nothing buildable and nothing in flight"
             for d in evicted:

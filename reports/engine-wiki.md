@@ -341,12 +341,16 @@ operator.
   that is already there instead of recomputing every document.
 - When the expected kept mass exceeds the arena minus the largest
   single admission, the shortest documents are dropped from the
-  keep first (`keep_split`): resident KV saves the document's
-  recompute - a linear dense term plus a quadratic attention term -
-  while occupying bytes linear in length, so per byte the longest
-  documents are worth the most. Survival is fractional in
-  expectation, which makes keeping the longest the exact fractional
-  knapsack answer. The remark names the resulting length threshold.
+  keep first (`keep_split`): resident KV of length L saves L dense
+  tokens against the fp8 peak plus L(L+1)/2 attention pairs against
+  the bf16 peak, while occupying bytes linear in L, so saved work
+  per byte rises with length under any positive weighting of the
+  two counted terms. The rise comes from the attention term and is
+  small below the dense/attention crossover (about 12,320 prefix
+  tokens at 4B), where the dense term dominates. Survival is
+  fractional in expectation, which is what makes keeping the
+  longest the exact fractional knapsack answer. The remark names
+  the resulting length threshold.
 - A join group whose anchor a later group re-uses keeps its
   surviving anchors' KV (`keep_anchor_kv` on the JoinGroup node),
   so a gate between two same-anchor stages no longer forces a
@@ -823,8 +827,9 @@ that runs until `FilterAdmission.done()`:
    the chain runs in keep mode (the plan's `keep_kv`), where
    survivors' pages stay held for the join that will anchor on
    them, under stable `("kv", alias, doc)` arena keys. If kept KV
-   starves a fresh admission, the smallest kept documents are
-   evicted (minus any a larger victim makes redundant) and simply
+   starves a fresh admission, the smallest kept documents the
+   admission needs are evicted (minus any a larger victim makes
+   redundant - smallest-first alone can over-evict) and simply
    recomputed by the join later.
 
 Single-stage queries (one question) skip the arena entirely: no

@@ -177,7 +177,10 @@ class FilterAdmission:
     Survivor suffixes pack before fresh admissions. Pages are granted
     in queue order; chunk room may be skipped. When kept survivors
     starve a fresh admission, evict_for_pending frees the smallest
-    kept documents - the cheapest KV to recompute per page freed.
+    kept documents the admission actually needs: recompute cost - a
+    dense term linear in length plus an attention term quadratic in
+    it, both counted - rises with length, so the smallest kept KV
+    costs the least to pay back.
     """
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
@@ -294,10 +297,12 @@ class FilterAdmission:
     def evict_for_pending(self):
         """Free kept survivors so the head of the admission queue fits.
 
-        Victims accumulate smallest first - the cheapest KV to
-        recompute per page freed - then any victim the later, larger
-        ones made redundant is dropped again, so a document is never
-        evicted for pages the admission does not need.
+        Victims accumulate smallest first - the least recompute for
+        the join to pay back later - then any victim the later,
+        larger ones made redundant is dropped again, so a document is
+        never evicted for pages the admission does not need.
+        Smallest-first alone is not enough: without the second pass a
+        large victim can make an earlier small one pointless.
 
         Returns the evicted docs (their arena keys must be freed by
         the caller). Empty when nothing is pending, nothing is kept,
