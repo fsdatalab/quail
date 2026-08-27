@@ -419,3 +419,207 @@ def test_explain_prints_tree_settings_and_source(catalog):
     refusal = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                          doc_tokens={"r": [150_000]})
     assert "refusal: suffix_over_chunk" in explain(logical, refusal)
+
+
+# ------------------------------------------------ KV keep (residency)
+
+def _filtered_join(catalog, doc_sel=0.5, join_sel=0.1):
+    return (docs(catalog, "reviews", tok).alias("r")
+            .ai_filter(prompt("about food: {0}", col("r.review")),
+                       selectivity=doc_sel)
+            .ai_join(docs(catalog, "products", tok).alias("p"),
+                     prompt("m {0} {1}", col("r.review"),
+                            col("p.description")),
+                     selectivity=join_sel)
+            .select("r.id"))
+
+
+def test_filter_keep_makes_the_join_anchor_resident(catalog):
+    from quail.logical import join_label, render_join_frame
+
+    logical = _filtered_join(catalog)
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [300] * 50, "p": [5] * 20})
+    chain = filter_chain(plan)
+    # one stage would normally turn arena writes off; the keep needs
+    # them
+    assert chain["arena_writes"] is True
+    assert chain["keep_kv"] is True
+    group = plan.nodes_by_op("JoinGroup")[0]
+    assert group["anchor"] == "r"
+    assert group["anchor_resident"] == "filter"
+    assert group["keep_anchor_kv"] is False    # nothing consumes r later
+
+    # resident anchors pay the frame only - no preamble, no document
+    pred = logical.root.input.predicate
+    frame = len(tok(render_join_frame(pred.template, 0)))
+    label = len(tok(join_label(1)))
+    tail = len(tok(pred.tail))
+    assert chain["keep_frame_tokens"] == frame
+    live = 50 * 0.5
+    expect = live * frame + live * 20 * (5 + label + tail)
+    stage = group["stages"][0]
+    assert stage["anchor_resident"] == "filter"
+    assert stage["tuple_tokens"] == pytest.approx(expect)
+    assert any("keep KV on 'r'" in r for r in plan.remarks)
+
+
+def test_unfiltered_anchor_is_not_resident(catalog):
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.1)
+               .select("r.id"))
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [300] * 50, "p": [5] * 20})
+    group = plan.nodes_by_op("JoinGroup")[0]
+    assert group["anchor_resident"] == "none"
+    assert not any("keep KV" in r for r in plan.remarks)
+
+
+def test_keep_split_keeps_longest_documents_that_fit():
+    from quail.planner.decide import keep_split
+
+    docs_tok = [100, 200, 300, 400]
+    # page-rounded costs at overhead 4, 16-token pages: 416 + 304
+    split = keep_split(docs_tok, 720, 1.0, overhead=4, page_tokens=16)
+    assert split["min_doc_tokens"] == 300
+    assert split["kept_doc_frac"] == 0.5
+    assert split["kept_mean"] == 350
+    assert split["unkept_mean"] == 150
+    assert split["kept_expected_tokens"] == 720
+
+    # survival halves the expected mass, so half the budget keeps the
+    # same documents
+    half = keep_split(docs_tok, 360, 0.5, overhead=4, page_tokens=16)
+    assert half["min_doc_tokens"] == 300
+    assert half["kept_expected_tokens"] == 360
+
+    # everything fits -> threshold 1; nothing fits -> None
+    assert keep_split(docs_tok, 1e9, 1.0, 4, 16)["min_doc_tokens"] == 1
+    assert keep_split(docs_tok, 100, 1.0, 4, 16) is None
+
+
+def test_keep_capped_by_arena_length_threshold(catalog):
+    # 3,000-token documents fill the arena; only the long half of the
+    # survivors stays resident and the remark names the threshold
+    toks = {"r": [3000] * 100 + [1000] * 100, "p": [5] * 20}
+    plan = plan_query(_filtered_join(catalog, doc_sel=1.0),
+                      model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks)
+    chain = filter_chain(plan)
+    assert chain["keep_kv"] is True
+    assert any("survivors of 3000+ tokens" in r for r in plan.remarks)
+    group = plan.nodes_by_op("JoinGroup")[0]
+    assert group["anchor_resident"] == "filter"
+
+
+def test_gate_group_keeps_anchor_kv_for_the_next_group(catalog):
+    # an exists gate on r, then a full join on r: the gate group holds
+    # the surviving anchors' KV so the full group reuses it
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.9)
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("t.thread")),
+                        selectivity=0.01, semantics="exists")
+               .select("r.id"))
+    toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks)
+    groups = plan.nodes_by_op("JoinGroup")
+    assert len(groups) == 2
+    assert [g["anchor"] for g in groups] == ["r", "r"]
+    assert groups[0]["keep_anchor_kv"] is True
+    assert groups[1]["keep_anchor_kv"] is False
+    assert groups[1]["anchor_resident"] == "kept"
+
+
+def test_dp_matches_complete_left_deep_enumeration(catalog, tmp_path):
+    from quail.planner import sol
+    from quail.planner.decide import (_collect, _feasible_anchors,
+                                      _stage_work, _thin, _residency,
+                                      plan_joins, _walk)
+    from quail.planner.plan import CorpusStats
+
+    catalog.register("tags", DocumentProvider.from_parquet(
+        _parquet(tmp_path / "g.parquet", ["id", "tag"]), id_col="id"))
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("m1 {0} {1}", col("r.review"),
+                               col("t.thread")), selectivity=0.2)
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m2 {0} {1}", col("t.thread"),
+                               col("p.description")), selectivity=0.05)
+               .ai_join(docs(catalog, "tags", tok).alias("g"),
+                        prompt("m3 {0} {1}", col("p.description"),
+                               col("g.tag")), selectivity=0.5)
+               .select("r.id"))
+    toks = {"r": [900] * 6, "t": [40] * 8, "p": [200] * 5,
+            "g": [30] * 9}
+    _, _, joins = _collect(logical)
+    stats = {a: CorpusStats.from_doc_tokens(t) for a, t in toks.items()}
+    live0 = {a: float(len(t)) for a, t in toks.items()}
+    pre = 1
+    chunk = 10_000
+
+    def rank(work):
+        return sol.speed_of_light(work, QWEN3_4B_FP8, H100_SXM,
+                                  chunk).seconds
+
+    def key(work):
+        return (rank(work), work.tokens, work.pairs, work.kv_written,
+                work.kv_read)
+
+    seq, _ = plan_joins(joins, "by_cost", stats, live0, pre,
+                        chunk=chunk, keep_plan={}, rank=rank)
+    dp_work, _ = _walk(seq, live0, stats, pre, {})
+
+    # complete enumeration of the same space: every alias insertion
+    # order, every completing-edge order, every feasible anchor
+    import itertools as it
+    edge_aliases = [frozenset(a.alias for a in j.predicate.args)
+                    for j in joins]
+    best = []
+
+    def visit_alias(order, pos, applied, cached, live, work):
+        if pos == len(order):
+            if len(applied) == len(joins):
+                best.append(work)
+            return
+        added = order[pos]
+        crossing = [i for i, ends in enumerate(edge_aliases)
+                    if added in ends and i not in applied
+                    and ends <= set(order[:pos + 1])]
+        if not crossing:
+            return
+        for edge_order in it.permutations(crossing):
+            def visit_edge(k, cached_now, live_now, work_now):
+                if k == len(edge_order):
+                    visit_alias(order, pos + 1,
+                                applied | set(edge_order), cached_now,
+                                live_now, work_now)
+                    return
+                j = joins[edge_order[k]]
+                for anchor in _feasible_anchors(j, True, stats, pre,
+                                                chunk):
+                    kind = _residency(anchor, cached_now, {})
+                    w = _stage_work(j, live_now, stats, anchor, pre,
+                                    kind, {})
+                    nxt = dict(live_now)
+                    _thin(nxt, j, anchor)
+                    visit_edge(k + 1, cached_now | {anchor}, nxt,
+                               work_now + w)
+            visit_edge(0, cached, live, work)
+
+    aliases = sorted({a for ends in edge_aliases for a in ends})
+    from quail.planner.sol import Work
+    for order in it.permutations(aliases):
+        visit_alias(list(order), 1, set(), set(), dict(live0), Work())
+
+    assert best, "enumeration found no connected left deep plan"
+    assert key(dp_work) == min(key(w) for w in best)
