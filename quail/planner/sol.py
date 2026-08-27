@@ -99,6 +99,26 @@ def kv_bytes_per_token(model: ModelSpec) -> float:
     return model.kappa
 
 
+def prefix_recompute_seconds(prefix_tokens: int, model: ModelSpec,
+                             device: DeviceSpec) -> float:
+    """Ideal compute time avoided by retaining one document prefix.
+
+    A miss writes the prefix KV and a hit reads it, so the prefix
+    moves the same KV bytes either way. The avoided work is the
+    dense work for the fresh prefix (linear in length, against the
+    fp8 peak) plus its causal attention triangle (quadratic, against
+    the bf16 peak). This is the value of retained KV everywhere
+    eviction weighs it.
+    """
+    if prefix_tokens < 0:
+        raise ValueError("prefix_tokens must be nonnegative")
+    dense = (2.0 * dense_params(model) * prefix_tokens
+             / device.peak_flops)
+    attention = (flops_per_pair(model) * triangle(prefix_tokens)
+                 * model.layers / device.attn_flops)
+    return dense + attention
+
+
 # ------------------------------------------------ the three operations
 # What the GPU is asked to do.
 
