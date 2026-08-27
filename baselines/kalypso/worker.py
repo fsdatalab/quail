@@ -43,7 +43,7 @@ kalypso_image = (
     )
     .run_commands(
         "cd /opt/kalypso && VLLM_USE_PRECOMPILED=1"
-        " pip install -e . --no-build-isolation",
+        " pip install . --no-build-isolation",
     )
     .pip_install("huggingface_hub[hf_transfer]")
     .env(
@@ -94,7 +94,6 @@ class KalypsoWorker:
             cmd,
             stdout=sys.stdout,
             stderr=sys.stderr,
-            cwd="/opt/kalypso",
         )
 
         health_url = f"http://localhost:{SERVER_PORT}/v1/semantic/healthz"
