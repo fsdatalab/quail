@@ -1,14 +1,11 @@
-"""Stock vLLM baseline: drives WorkerH100 over all 35 QUAIL-B queries.
-Runs entirely on Modal.
+"""Stock vLLM baseline for all 35 QUAIL-B queries.
+
+Runs on a single H100 via Modal. Each filter stage is a separate
+llm.generate() call. Each join runs the full cross product via
+run_join_grouped(). Multi-step queries feed survivors from one step
+to the next.
 
     uv run modal run -m baselines.stock_vllm.run::main
-
-Each query is a pipeline of filter and join steps executed naively on
-stock vLLM. Filters run each stage as a separate generate_batch call;
-survivors feed the next stage. Joins run the full cross product of
-surviving documents via generate_join_batch. Multi-join queries
-(star and chain shapes) run each join sequentially, thinning both
-sides between steps so later joins see fewer documents.
 """
 
 import json
@@ -17,20 +14,43 @@ from pathlib import Path
 
 import modal
 
-from baselines.old_stock import operators
-from baselines.old_stock.config import DATA_DIR, FILTER_MAX_TOKENS, MODEL_NAMES, SF
-from baselines.old_stock.worker import WorkerH100, app, hf_cache_vol
+app = modal.App("quail-milestone1")
 
-orchestrator_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("huggingface_hub[hf_transfer]", "pandas", "pyarrow",
-                "numpy", "datasets", "transformers")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
-    .add_local_python_source("quail")
-    .add_local_python_source("baselines")
+IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
+
+image = (
+    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
+    .entrypoint([])
+    .pip_install("vllm==0.26.0", "huggingface_hub[hf_transfer]",
+                 "transformers>=5.2.0", "pandas", "pyarrow",
+                 "numpy", "datasets")
+    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+          "VLLM_USE_FLASHINFER_SAMPLER": "0",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+          "HF_HUB_ENABLE_HF_TRANSFER": "1",
+          "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+          "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+          "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
+    .add_local_python_source("quail", "baselines")
 )
 
-results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
+hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+results_vol = modal.Volume.from_name("quail-results",
+                                     create_if_missing=True)
+kernel_cache = modal.Volume.from_name("quail-kernel-cache",
+                                      create_if_missing=True)
+
+GPU_KW = dict(image=image, gpu="H100!", memory=65536,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/root/.cache/kernels": kernel_cache,
+                       "/results": results_vol})
+
+DATA_DIR = "/results/quailb_data"
+
+MODELS = {
+    "qwen3-4b": "Qwen/Qwen3-4B",
+    "qwen3-32b": "Qwen/Qwen3-32B",
+}
 
 QUERY_ORDER = [
     "IMDB-1", "IMDB-2", "IMDB-3", "IMDB-4", "IMDB-5",
@@ -44,26 +64,14 @@ QUERY_ORDER = [
 ]
 
 
-def _tokenizer_for(model_name: str):
-    from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(model_name)
-
-
 def define_all_queries():
-    """All 35 QUAIL-B queries for the stock vLLM baseline.
+    """All 35 QUAIL-B queries.
 
     Each query is a dict with:
         aliases: {alias: (table_name, text_col)}
-            Maps each alias to the parquet table and text column it reads.
         steps: list of step tuples, each either
             ("filter", alias, [template, ...])
-                Run each template as a separate filter batch on the alias's
-                live documents. Survivors of stage N feed stage N+1.
             ("join", template, left_alias, right_alias, anchor)
-                Run the cross product of left and right live documents.
-                anchor=0 means left is the prefix (cached); anchor=1 means
-                right is the prefix. Both sides are thinned to indices that
-                appear in at least one TRUE pair.
     """
     from quail.bench.quailb import (
         F1, F4, F5, F7, F8, F9, F11, F12, F13,
@@ -85,7 +93,6 @@ def define_all_queries():
     Q = {}
 
     # ---- IMDB ----
-
     Q["IMDB-1"] = dict(aliases={"r": rv},
                        steps=[("filter", "r", [F1])])
     Q["IMDB-2"] = dict(aliases={"r": rv, "a": asp},
@@ -103,11 +110,9 @@ def define_all_queries():
                        steps=[("filter", "r", [F1, F4])])
     Q["IMDB-7"] = dict(aliases={"r": rv},
                        steps=[("filter", "r", [F1, F4, F5])])
-    # 2-join star: both joins anchored on reviews
     Q["IMDB-8"] = dict(aliases={"r": rv, "a": asp, "a2": asp},
                        steps=[("join", DISCUSS_ASPECT, "r", "a", 0),
                               ("join", ASPECT_SENTIMENT, "r", "a2", 0)])
-    # 3-join chain: r1-a1-r2-a2
     Q["IMDB-9"] = dict(
         aliases={"r1": rv, "a1": asp, "r2": rv, "a2": asp},
         steps=[("join", DISCUSS_ASPECT, "r1", "a1", 0),
@@ -121,7 +126,6 @@ def define_all_queries():
                ("join", ASPECT_SENTIMENT, "r2", "a2", 0)])
 
     # ---- BioDEX ----
-
     Q["BIO-1"] = dict(aliases={"r": rp},
                       steps=[("filter", "r", [F7])])
     Q["BIO-2"] = dict(aliases={"r": rp, "m": tm},
@@ -135,11 +139,9 @@ def define_all_queries():
     Q["BIO-5"] = dict(aliases={"r": rp, "m": tm},
                       steps=[("filter", "r", [F7, F8, F9]),
                              ("join", REACTION, "r", "m", 0)])
-    # 2-join star: both joins anchored on reports
     Q["BIO-6"] = dict(aliases={"r": rp, "m": tm, "m2": tm},
                       steps=[("join", REACTION, "r", "m", 0),
                              ("join", REACTION_SEVERE, "r", "m2", 0)])
-    # 3-join chain: r1-m1-r2-m2
     Q["BIO-7"] = dict(
         aliases={"r1": rp, "m1": tm, "r2": rp, "m2": tm},
         steps=[("join", REACTION, "r1", "m1", 0),
@@ -153,8 +155,6 @@ def define_all_queries():
                ("join", REACTION, "r2", "m2", 0)])
 
     # ---- FEVER ----
-    # anchor=1 throughout: evidence pages are longer than claims
-
     Q["FEV-1"] = dict(aliases={"c": cl},
                       steps=[("filter", "c", [F11])])
     Q["FEV-2"] = dict(aliases={"c": cl, "e": ev},
@@ -165,7 +165,6 @@ def define_all_queries():
     Q["FEV-4"] = dict(aliases={"c": cl, "e": ev},
                       steps=[("filter", "c", [F11, F12]),
                              ("join", SUPPORT, "c", "e", 1)])
-    # Two-sided pushdown: filter both sides before the join
     Q["FEV-5"] = dict(aliases={"c": cl, "e": ev},
                       steps=[("filter", "c", [F11]),
                              ("filter", "e", [F13]),
@@ -174,11 +173,9 @@ def define_all_queries():
                       steps=[("filter", "c", [F11, F12]),
                              ("filter", "e", [F13]),
                              ("join", SUPPORT, "c", "e", 1)])
-    # 2-join star: both joins anchored on claims
     Q["FEV-7"] = dict(aliases={"c": cl, "e": ev, "e2": ev},
                       steps=[("join", SUPPORT, "c", "e", 1),
                              ("join", REFUTE, "c", "e2", 1)])
-    # 3-join chain: c1-e1-c2-e2
     Q["FEV-8"] = dict(
         aliases={"c1": cl, "e1": ev, "c2": cl, "e2": ev},
         steps=[("join", SUPPORT, "c1", "e1", 1),
@@ -192,9 +189,6 @@ def define_all_queries():
                ("join", SUPPORT, "c2", "e2", 1)])
 
     # ---- LePaRD ----
-    # Self-join: same table, two text columns. anchor=0 (destination_context
-    # is the excerpt, typically longer than the quoted passage).
-
     Q["LEP-1"] = dict(aliases={"d": dc},
                       steps=[("filter", "d", [LEP1])])
     Q["LEP-2"] = dict(aliases={"d": dc, "s": pt},
@@ -212,7 +206,6 @@ def define_all_queries():
                       steps=[("filter", "d",
                               [LEP1, LEP2, LEP3, LEP4, LEP5]),
                              ("join", LEPJOIN, "d", "s", 0)])
-    # Two-sided pushdown: filter excerpts and passages separately
     Q["LEP-7"] = dict(aliases={"d": dc, "s": pt},
                       steps=[("filter", "d", [LEP1, LEP2]),
                              ("filter", "s", [LEPS1]),
@@ -224,119 +217,123 @@ def define_all_queries():
     return Q
 
 
-def _load_alias_data(data_dir, sf, aliases):
-    """Load table data for each alias in a query.
+def _read_table(data_dir, sf, name, text_col):
+    import pyarrow.parquet as pq
+    path = Path(data_dir) / f"sf{sf}" / f"{name}.parquet"
+    t = pq.read_table(path)
+    return t.column("id").to_pylist(), t.column(text_col).to_pylist()
 
-    Returns:
-        {alias: (ids_list, texts_list)}. Aliases that share the same
-        (table, text_col) get the same list objects.
-    """
+
+def _load_alias_data(data_dir, sf, aliases):
     cache = {}
     result = {}
     for alias, (table, text_col) in aliases.items():
         key = (table, text_col)
         if key not in cache:
-            cache[key] = operators.read_table(
-                data_dir, sf, table, "id", text_col)
+            cache[key] = _read_table(data_dir, sf, table, text_col)
         result[alias] = cache[key]
     return result
 
 
-def run_query(worker, qid, query_def, data_dir, sf, tokenizer,
-              true_ids, false_ids, do_profile=False):
-    """Execute one multi-step QUAIL-B query on stock vLLM.
+def _run_filter_stage(llm, sp, true_set, template, texts, tokenizer):
+    """Run one filter template over a list of texts.
 
-    Each filter template and each join is a separate worker call.
-    Filter survivors thin the document set for subsequent steps.
-    Join survivors thin both sides for subsequent steps.
-
-    Returns:
-        (summary_entry, per_request_rows)
+    Returns list of indices (into texts) that answered TRUE.
     """
+    prompts = [{"prompt_token_ids":
+                tokenizer.encode(template.format(t),
+                                 add_special_tokens=False)}
+               for t in texts]
+    outputs = llm.generate(prompts, sp, use_tqdm=False)
+    return [i for i, o in enumerate(outputs)
+            if o.outputs[0].token_ids
+            and int(o.outputs[0].token_ids[0]) in true_set]
+
+
+def _run_join(llm, sp, true_set, template, left_texts, right_texts,
+              anchor, tokenizer):
+    """Run one join as a full cross product.
+
+    Returns (result_dict, n_pairs, surviving_left_set,
+    surviving_right_set, n_true).
+    """
+    from baselines.stock import build_join_grouped_inputs, run_join_grouped
+    from quail.logical import ColumnRef, bind_join_prompt
+
+    tok = lambda text: tokenizer.encode(text, add_special_tokens=False)
+    args = (ColumnRef("left", "left", "document"),
+            ColumnRef("right", "right", "document"))
+    bound = bind_join_prompt(template, args, tok)
+    documents = ([tok(t) for t in left_texts],
+                 [tok(t) for t in right_texts])
+    prefixes, suffixes, members = build_join_grouped_inputs(
+        bound, documents, anchor, tok)
+    n_pairs = len(prefixes) * len(suffixes)
+
+    result = run_join_grouped(llm, sp, prefixes, suffixes, true_set)
+
+    surviving_left, surviving_right = set(), set()
+    n_true = 0
+    idx = 0
+    for anc_idx in range(len(prefixes)):
+        for member in members:
+            if result["answers"][idx] == 1:
+                if anchor == 0:
+                    surviving_left.add(anc_idx)
+                    surviving_right.add(member[0])
+                else:
+                    surviving_right.add(anc_idx)
+                    surviving_left.add(member[0])
+                n_true += 1
+            idx += 1
+
+    return result, n_pairs, surviving_left, surviving_right, n_true
+
+
+def run_query(llm, sp, true_set, tokenizer, qid, query_def,
+              data_dir, sf):
+    """Execute one multi-step query. Returns a summary dict."""
     alias_data = _load_alias_data(data_dir, sf, query_def["aliases"])
     live = {a: list(range(len(data[1])))
             for a, data in alias_data.items()}
 
-    step_entries = []
-    per_request_rows = []
+    step_results = []
     step_n = 0
 
     for step in query_def["steps"]:
         if step[0] == "filter":
             _, alias, templates = step
-            ids_all, texts_all = alias_data[alias]
+            _, texts_all = alias_data[alias]
 
             for tmpl in templates:
                 live_idx = live[alias]
                 n_in = len(live_idx)
                 if n_in == 0:
-                    step_entries.append(dict(
-                        kind="filter", alias=alias,
-                        n_in=0, n_out=0,
-                        generate_wall_time_s=0,
-                        total_prompt_tokens=0,
-                        total_output_tokens=0))
+                    step_results.append(dict(
+                        kind="filter", step=step_n, alias=alias,
+                        n_in=0, n_out=0, wall_s=0))
                     step_n += 1
                     continue
 
                 live_texts = [texts_all[i] for i in live_idx]
-                filt = operators.Filter(
-                    f"{qid}-s{step_n}", tmpl)
-                build_t0 = time.time()
-                prompts = filt.build_prompts(live_texts, tokenizer)
-                build_s = time.time() - build_t0
-
                 t0 = time.time()
-                result = worker.generate_batch.remote(
-                    prompts, true_ids, false_ids, FILTER_MAX_TOKENS,
-                    do_profile=(do_profile and step_n == 0))
-                rpc_s = time.time() - t0
+                survivors = _run_filter_stage(
+                    llm, sp, true_set, tmpl, live_texts, tokenizer)
+                wall = time.time() - t0
+                new_live = [live_idx[i] for i in survivors]
 
-                new_live = [live_idx[j]
-                            for j, req in
-                            enumerate(result["per_request"])
-                            if req["answer"] == 1]
-
-                ptok = sum(r["prompt_tokens"]
-                           for r in result["per_request"])
-                otok = sum(r["output_tokens"]
-                           for r in result["per_request"])
-                fresh = ptok - result["oracle_regret"][
-                    "oracle_hit_tokens"]
-
-                entry = dict(
-                    kind="filter", alias=alias,
-                    n_in=n_in, n_out=len(new_live),
-                    build_s=build_s,
-                    rpc_wall_time_s=rpc_s,
-                    generate_wall_time_s=result["wall_time_s"],
-                    total_prompt_tokens=ptok,
-                    fresh_prompt_tokens=fresh,
-                    total_output_tokens=otok,
-                    oracle_regret=result["oracle_regret"],
-                    vllm_metrics=result["vllm_metrics"],
-                    trace_path=result.get("trace_path"),
-                )
-                step_entries.append(entry)
-
-                doc_ids = [ids_all[i] for i in live_idx]
-                per_request_rows.append(dict(
-                    entry=entry,
-                    per_request=result["per_request"],
-                    timeseries=result["timeseries"],
-                    doc_ids=doc_ids))
-
-                print(f"[stock_vllm] {qid} filter({alias}): "
-                      f"{n_in}->{len(new_live)} "
-                      f"wall={result['wall_time_s']:.2f}s "
-                      f"ptok={ptok}", flush=True)
+                step_results.append(dict(
+                    kind="filter", step=step_n, alias=alias,
+                    n_in=n_in, n_out=len(new_live), wall_s=wall))
+                print(f"  filter({alias}): {n_in}->{len(new_live)} "
+                      f"wall={wall:.2f}s", flush=True)
                 live[alias] = new_live
                 step_n += 1
 
         elif step[0] == "join":
             _, template, left_a, right_a, anchor = step
-            left_ids_all, left_texts_all = alias_data[left_a]
-            right_ids_all, right_texts_all = alias_data[right_a]
+            _, left_texts_all = alias_data[left_a]
+            _, right_texts_all = alias_data[right_a]
             left_live = live[left_a]
             right_live = live[right_a]
             left_texts = [left_texts_all[i] for i in left_live]
@@ -344,193 +341,133 @@ def run_query(worker, qid, query_def, data_dir, sf, tokenizer,
             nl, nr = len(left_texts), len(right_texts)
 
             if nl == 0 or nr == 0:
-                step_entries.append(dict(
-                    kind="join", left=left_a, right=right_a,
-                    anchor=anchor, n_left=nl, n_right=nr,
-                    n_pairs=0, n_true=0,
-                    generate_wall_time_s=0,
-                    total_prompt_tokens=0,
-                    total_output_tokens=0))
+                step_results.append(dict(
+                    kind="join", step=step_n, left=left_a,
+                    right=right_a, n_left=nl, n_right=nr,
+                    n_pairs=0, n_true=0, wall_s=0))
                 step_n += 1
                 continue
 
-            join_op = operators.Join(
-                f"{qid}-s{step_n}", template, anchor=anchor)
-            build_t0 = time.time()
-            prefixes, suffixes, members = \
-                join_op.build_grouped_inputs(
-                    left_texts, right_texts, tokenizer)
-            build_s = time.time() - build_t0
-            n_pairs = len(prefixes) * len(suffixes)
-
-            print(f"[stock_vllm] {qid} join({left_a}x{right_a}): "
-                  f"{nl}x{nr}={n_pairs} pairs, submitting...",
-                  flush=True)
+            print(f"  join({left_a}x{right_a}): {nl}x{nr}="
+                  f"{nl * nr} pairs...", flush=True)
 
             t0 = time.time()
-            result = worker.generate_join_batch.remote(
-                prefixes, suffixes, true_ids, false_ids,
-                FILTER_MAX_TOKENS,
-                do_profile=(do_profile and step_n == 0))
-            rpc_s = time.time() - t0
+            result, n_pairs, surv_l, surv_r, n_true = _run_join(
+                llm, sp, true_set, template, left_texts,
+                right_texts, anchor, tokenizer)
+            wall = time.time() - t0
 
-            surviving_left, surviving_right = set(), set()
-            n_true = 0
-            idx = 0
-            for anc_idx in range(len(prefixes)):
-                for member in members:
-                    if result["per_request"][idx]["answer"] == 1:
-                        if anchor == 0:
-                            surviving_left.add(anc_idx)
-                            surviving_right.add(member[0])
-                        else:
-                            surviving_right.add(anc_idx)
-                            surviving_left.add(member[0])
-                        n_true += 1
-                    idx += 1
+            live[left_a] = sorted(left_live[i] for i in surv_l)
+            live[right_a] = sorted(right_live[i] for i in surv_r)
 
-            live[left_a] = sorted(
-                left_live[i] for i in surviving_left)
-            live[right_a] = sorted(
-                right_live[i] for i in surviving_right)
-
-            ptok = sum(r["prompt_tokens"]
-                       for r in result["per_request"])
-            otok = sum(r["output_tokens"]
-                       for r in result["per_request"])
-            fresh = ptok - result["oracle_regret"][
-                "oracle_hit_tokens"]
-
-            doc_ids = []
-            for anc_idx in range(len(prefixes)):
-                for member in members:
-                    if anchor == 0:
-                        li, ri = anc_idx, member[0]
-                    else:
-                        li, ri = member[0], anc_idx
-                    doc_ids.append((
-                        left_ids_all[left_live[li]],
-                        right_ids_all[right_live[ri]]))
-
-            entry = dict(
-                kind="join", left=left_a, right=right_a,
-                anchor=anchor, n_left=nl, n_right=nr,
+            step_results.append(dict(
+                kind="join", step=step_n, left=left_a,
+                right=right_a, anchor=anchor,
+                n_left=nl, n_right=nr,
                 n_pairs=n_pairs, n_true=n_true,
-                build_s=build_s,
-                rpc_wall_time_s=rpc_s,
-                generate_wall_time_s=result["wall_time_s"],
-                total_prompt_tokens=ptok,
-                fresh_prompt_tokens=fresh,
-                total_output_tokens=otok,
-                oracle_regret=result["oracle_regret"],
-                vllm_metrics=result["vllm_metrics"],
-                trace_path=result.get("trace_path"),
-            )
-            step_entries.append(entry)
-            per_request_rows.append(dict(
-                entry=entry,
-                per_request=result["per_request"],
-                timeseries=result["timeseries"],
-                doc_ids=doc_ids))
-
-            print(f"[stock_vllm] {qid} join({left_a}x{right_a}): "
+                wall_s=wall,
+                fresh_tokens=result["fresh_tokens"],
+                prompt_tokens=result["prompt_tokens"],
+                cached_tokens=result["cached_tokens"]))
+            print(f"  join({left_a}x{right_a}): "
                   f"{n_true}/{n_pairs} TRUE "
-                  f"wall={result['wall_time_s']:.2f}s "
-                  f"ptok={ptok}", flush=True)
+                  f"wall={wall:.2f}s "
+                  f"fresh={result['fresh_tokens']}", flush=True)
             step_n += 1
 
-    gen_wall = sum(s["generate_wall_time_s"] for s in step_entries)
-    total_ptok = sum(s["total_prompt_tokens"] for s in step_entries)
-    total_fresh = sum(s.get("fresh_prompt_tokens", 0)
-                      for s in step_entries)
-    total_otok = sum(s.get("total_output_tokens", 0)
-                     for s in step_entries)
-
-    summary = dict(
-        query=qid, n_steps=len(step_entries),
-        steps=step_entries,
-        generate_wall_time_s=gen_wall,
-        total_prompt_tokens=total_ptok,
-        fresh_prompt_tokens=total_fresh,
-        total_output_tokens=total_otok,
-    )
-    return summary, per_request_rows
+    total_wall = sum(s["wall_s"] for s in step_results)
+    return dict(query=qid, steps=step_results,
+                total_wall_s=total_wall)
 
 
-@app.function(image=orchestrator_image, timeout=7200,
-             volumes={"/root/.cache/huggingface": hf_cache_vol,
-                      "/results": results_vol})
-def run_baseline(model: str = "qwen3-4b", query_id: str | None = None,
-                 gpu: str = "H100!", quantization: str = "fp8",
-                 profile: bool = False) -> dict:
-    """Build prompts and drive WorkerH100 for all QUAIL-B queries."""
+@app.function(timeout=7200, **GPU_KW)
+def run_stock_baseline(model: str = "qwen3-4b", sf: float = 0.1,
+                       query_id: str = "",
+                       reps: int = 1) -> str:
+    """Run all 35 QUAIL-B queries on stock vLLM."""
+    from baselines.stock_boot import time_llm_boot
     from quail.bench.quailb import build_sets
+    from quail.executor.loop import true_false_ids
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
 
-    if gpu != WorkerH100.GPU:
-        raise ValueError(
-            f"stock_vllm requires gpu={WorkerH100.GPU!r}; got {gpu!r}")
+    hf_name = MODELS[model]
+    build_sets(DATA_DIR, sf)
 
-    build_sets(DATA_DIR, SF)
-    tokenizer = _tokenizer_for(MODEL_NAMES[model])
-    true_ids, false_ids = operators.true_false_ids(tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(hf_name)
+    true, false = true_false_ids(tokenizer)
+    allowed = sorted(true | false)
 
-    all_queries = define_all_queries()
+    llm, boot = time_llm_boot(
+        model=hf_name,
+        max_num_batched_tokens=25_305,
+        max_num_seqs=4096,
+        gpu_memory_utilization=0.92,
+        enable_prefix_caching=True,
+        disable_log_stats=True,
+        quantization="fp8")
+    sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
+                        allowed_token_ids=allowed)
+    print(f"[stock_vllm] boot: {boot}", flush=True)
+
+    llm.generate([{"prompt_token_ids": allowed}], sp, use_tqdm=False)
+
+    queries = define_all_queries()
     if query_id:
         ids = [q.strip() for q in query_id.split(",")]
         for qid in ids:
-            if qid not in all_queries:
+            if qid not in queries:
                 raise ValueError(
                     f"unknown query {qid!r}; available: "
-                    f"{sorted(all_queries)}")
+                    f"{sorted(queries)}")
     else:
-        ids = [qid for qid in QUERY_ORDER if qid in all_queries]
-
-    worker = WorkerH100(model=model, quantization=quantization)
-    print(f"[stock_vllm] warming up {model} on {gpu} ({quantization})",
-          flush=True)
-    worker.warmup.remote(true_ids, false_ids)
+        ids = [qid for qid in QUERY_ORDER if qid in queries]
 
     out_dir = Path("/results/stock_vllm") / time.strftime(
         "%Y-%m-%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    summary_queries = []
-    for qid in ids:
-        print(f"\n[stock_vllm] === {qid} ===", flush=True)
-        qdef = all_queries[qid]
-        try:
-            entry, per_req = run_query(
-                worker, qid, qdef, DATA_DIR, SF, tokenizer,
-                true_ids, false_ids, do_profile=profile)
-        except Exception as e:                              # noqa: BLE001
-            entry = dict(query=qid,
-                         error=f"{type(e).__name__}: {e}")
-            per_req = []
-            print(f"[stock_vllm] {qid} ERROR: {e}", flush=True)
+    all_results = []
+    for rep in range(reps):
+        print(f"\n[stock_vllm] === rep {rep} ===", flush=True)
+        if rep > 0:
+            llm.reset_prefix_cache()
+        rep_results = []
+        for qid in ids:
+            print(f"\n[stock_vllm] {qid}", flush=True)
+            try:
+                entry = run_query(llm, sp, true, tokenizer,
+                                  qid, queries[qid], DATA_DIR, sf)
+            except Exception as e:                          # noqa: BLE001
+                entry = dict(query=qid,
+                             error=f"{type(e).__name__}: {e}")
+                print(f"  ERROR: {e}", flush=True)
+            rep_results.append(entry)
+        all_results.append(rep_results)
 
-        summary_queries.append(entry)
+    report = dict(model=model, hf_name=hf_name, sf=sf,
+                  boot=boot, reps=reps,
+                  submission="separate generate() per filter stage, "
+                             "full cross product per join",
+                  max_num_seqs=4096, max_num_batched_tokens=25_305,
+                  gpu_memory_utilization=0.92,
+                  enable_prefix_caching=True,
+                  results=all_results)
 
-        if per_req:
-            with open(out_dir / f"{qid}.jsonl", "w") as f:
-                for row in per_req:
-                    f.write(json.dumps(row) + "\n")
+    out_path = out_dir / "summary.json"
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=2)
+    results_vol.commit()
 
-        with open(out_dir / "summary.json", "w") as f:
-            json.dump(dict(
-                model=model, gpu=gpu, quantization=quantization,
-                sf=SF, queries=summary_queries), f, indent=2)
-        results_vol.commit()
-
-    print(f"\n[stock_vllm] saved {out_dir}/summary.json "
-          f"({len(summary_queries)} queries)", flush=True)
-    return dict(out_dir=str(out_dir), n_queries=len(summary_queries))
+    print(f"\n[stock_vllm] saved {out_path} "
+          f"({len(ids)} queries x {reps} reps)", flush=True)
+    return json.dumps(report)
 
 
 @app.local_entrypoint()
-def main(model: str = "qwen3-4b", query: str = "", gpu: str = "H100!",
-        quantization: str = "fp8", profile: bool = False):
-    fc = run_baseline.spawn(
-        model=model, query_id=(query or None), gpu=gpu,
-        quantization=quantization, profile=profile)
+def main(model: str = "qwen3-4b", sf: float = 0.1,
+         query: str = "", reps: int = 1):
+    fc = run_stock_baseline.spawn(
+        model=model, sf=sf, query_id=query, reps=reps)
     print(f"function call id: {fc.object_id}")
     print(fc.get())
