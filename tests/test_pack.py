@@ -333,3 +333,74 @@ def test_admission_no_page_bin_with_limit():
     assert len(sched.survivors()) >= limit
     assert admitted < n_docs
     assert sched.free_pages is None and not sched.resident
+
+
+# ------------------------------------------------ keep mode (join KV)
+
+def test_admission_keep_holds_survivor_pages():
+    sched = FilterAdmission([100, 100], [10], 400, arena_pages=100,
+                            page_tokens=16, keep_survivors=True)
+    assert sched.next_chunk() == [(0, 0, True), (1, 0, True)]
+    free_before = sched.free_pages
+    assert sched.report(0, 0, True) == ()      # survivor: pages held
+    assert sched.report(1, 0, False) == (1,)   # FALSE frees as before
+    assert sched.kept == {0}
+    assert 0 in sched.resident
+    assert sched.free_pages == free_before + pages_for(100, 16)
+    assert sched.done()
+
+
+def test_admission_keep_evicts_a_minimal_cover():
+    # arena holds two documents; both early docs survive and are
+    # kept, starving the third. The 160-token doc must go to free 10
+    # pages; once it goes, evicting the 60-token doc too would free
+    # pages nothing needs, so it stays
+    sched = FilterAdmission([160, 60, 160], [10], 400,
+                            arena_pages=pages_for(160, 16)
+                            + pages_for(60, 16),
+                            page_tokens=16, keep_survivors=True)
+    assert sched.next_chunk() == [(0, 0, True), (1, 0, True)]
+    sched.report(0, 0, True)
+    sched.report(1, 0, True)
+    assert sched.kept == {0, 1}
+    assert sched.next_chunk() == []            # doc 2 starved
+    assert sched.evict_for_pending() == (0,)
+    assert sched.kept == {1}
+    assert sched.next_chunk() == [(2, 0, True)]
+    sched.report(2, 0, True)
+    assert sched.kept == {1, 2}
+    assert sched.done()
+
+
+def test_admission_keep_evicts_smallest_when_several_must_go():
+    # four 60-token survivors block a 190-token admission: three of
+    # them cover the 12 needed pages (4 pages each), and none of the
+    # three is redundant, so the largest kept doc stays
+    sched = FilterAdmission([60, 60, 60, 60, 190], [10], 400,
+                            arena_pages=4 * pages_for(60, 16),
+                            page_tokens=16, keep_survivors=True)
+    chunk = sched.next_chunk()
+    assert [g[0] for g in chunk] == [0, 1, 2, 3]
+    for doc in range(4):
+        sched.report(doc, 0, True)
+    assert sched.kept == {0, 1, 2, 3}
+    assert sched.next_chunk() == []            # doc 4 starved
+    assert sched.evict_for_pending() == (0, 1, 2)
+    assert sched.kept == {3}
+    assert sched.next_chunk() == [(4, 0, True)]
+
+
+def test_admission_keep_extra_reserves_frame_room():
+    # the frame allowance counts against pages at admission time
+    sched = FilterAdmission([100], [10], 400, arena_pages=100,
+                            page_tokens=16, kept_extra_tokens=30,
+                            keep_survivors=True)
+    sched.next_chunk()
+    assert sched.resident[0] == pages_for(130, 16)
+
+
+def test_admission_keep_requires_page_accounting():
+    import pytest
+    with pytest.raises(ValueError):
+        FilterAdmission([100], [10], 400, arena_pages=None,
+                        page_tokens=16, keep_survivors=True)
