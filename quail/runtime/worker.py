@@ -246,7 +246,10 @@ def _execute_single(state, payload: dict) -> dict:
                      if (a, g) in arena.accounting.owned}
                  for a in involved},
                 len(pre), chunk_tokens, model_spec, device,
-                fixed_order=payload.get("order_rule") == "as_written")
+                fixed_order=payload.get("order_rule") == "as_written",
+                arena_tokens=float(arena.accounting.n_pages
+                                   * arena.accounting.page_tokens),
+                page_tokens=arena.accounting.page_tokens)
         if found is None:
             nodes = payload.get("plan_nodes") or derive_plan_nodes(
                 payload["joins"])
@@ -665,6 +668,7 @@ def _round(kind, subs):
 def _execute_multi(payload: dict) -> dict:
     import time as _time
 
+    from quail.planner import budgets
     from quail.planner.joins import search_joins
     from quail.runtime import coordinator
     from quail.specs import DEVICES, MODELS
@@ -707,7 +711,10 @@ def _execute_multi(payload: dict) -> dict:
             {a: {i for i, g in enumerate(survivors[a])
                  if g in retained.get(a, ())} for a in involved},
             pre_len, payload["chunk_tokens"], model_spec, device,
-            fixed_order=payload.get("order_rule") == "as_written")
+            fixed_order=payload.get("order_rule") == "as_written",
+            arena_tokens=float(budgets.arena_tokens(
+                model_spec, device, payload["chunk_tokens"])) * k,
+            page_tokens=budgets.PAGE_TOKENS)
     if found is None:
         nodes = payload.get("plan_nodes") or             coordinator.derive_plan_nodes(payload["joins"])
     else:
