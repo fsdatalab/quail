@@ -687,7 +687,7 @@ def _artifact_stem(started, sf, lf, model):
 
 
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
-              out_path=None, cpu_memory_gb=80, model="qwen3-4b-fp8",
+              out_path=None, model="qwen3-4b-fp8",
               accuracy=True, ground_truth_collection=None,
               h100_usd_per_hour=3.9492, ground_truth_files=None,
               prediction=None, artifact_stem=None):
@@ -721,8 +721,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                 f"benchmark corpus {corpus['corpus_id']} does not match "
                 f"ground truth {truth.corpus_id}")
         evaluator = BenchmarkEvaluator(truth, corpus_rows)
-    sess = quail.Session(EngineConfig(gpus=gpus, model=model,
-                                      cpu_memory_gb=cpu_memory_gb))
+    sess = quail.Session(EngineConfig(gpus=gpus, model=model))
     register_sets(sess, d)
     qdefs = queries(sess)
     ids = [i for i in qdefs if only is None or i in only]
@@ -780,58 +779,53 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             if truth else None),
         passes={})
     try:
-        for pass_name in ("cold", "warm"):
-            sess.set_store(pass_name == "warm")
-            if pass_name == "cold":
-                sess.flush_store()
-            rows = []
-            t_pass = time.time()
-            for qid in ids:
-                desc, build = qdefs[qid]
-                print(f"[quailb] {pass_name} {qid}: {desc}",
-                      flush=True)
-                try:
-                    query = build()
-                    res = query.run()
-                    row = dict(query=qid, desc=desc,
-                               wall_s=res.report["wall_s"],
-                               boot_s=res.report["boot_s"],
-                               boot_kind=res.report.get("boot_kind"),
-                               boot=res.report.get("boot"),
-                               fresh_tokens=res.report["fresh_tokens"],
-                               rows=len(res.rows),
-                               peak_gib=res.report.get("peak_gib"),
-                               stages=res.report["stages"],
-                               store=res.report.get("store"))
-                    if evaluator is not None:
-                        evaluation = evaluator.evaluate(query, res)
-                        add_query_metrics(
-                            row, evaluation, h100_usd_per_hour, gpus)
-                        raw_path = f"{raw_root}/{pass_name}/{qid}.json"
-                        result_files.write_json(raw_path, {
-                            "run_id": run_id,
-                            "pass": pass_name,
-                            "query": qid,
-                            "description": desc,
-                            "columns": res.columns,
-                            "rows": res.rows,
-                            "answer_rows": res.answer_rows,
-                            "engine_report": res.report,
-                            "accuracy": row["accuracy"],
-                        })
-                        row["raw_volume_path"] = f"/results/{raw_path}"
-                except Exception as e:            # noqa: BLE001
-                    row = dict(query=qid, desc=desc,
-                               error=f"{type(e).__name__}: {e}")
-                rows.append(row)
-                print(f"[quailb] {row}", flush=True)
-            passed = dict(
-                queries=rows,
-                pass_wall_s=round(time.time() - t_pass, 1))
-            if evaluator is not None:
-                passed["summary"] = summarize_queries(
-                    rows, h100_usd_per_hour, gpus)
-            suite["passes"][pass_name] = passed
+        pass_name = "single"
+        rows = []
+        t_pass = time.time()
+        for qid in ids:
+            desc, build = qdefs[qid]
+            print(f"[quailb] {qid}: {desc}", flush=True)
+            try:
+                query = build()
+                res = query.run()
+                row = dict(query=qid, desc=desc,
+                           wall_s=res.report["wall_s"],
+                           boot_s=res.report["boot_s"],
+                           boot_kind=res.report.get("boot_kind"),
+                           boot=res.report.get("boot"),
+                           fresh_tokens=res.report["fresh_tokens"],
+                           rows=len(res.rows),
+                           peak_gib=res.report.get("peak_gib"),
+                           stages=res.report["stages"])
+                if evaluator is not None:
+                    evaluation = evaluator.evaluate(query, res)
+                    add_query_metrics(
+                        row, evaluation, h100_usd_per_hour, gpus)
+                    raw_path = f"{raw_root}/{pass_name}/{qid}.json"
+                    result_files.write_json(raw_path, {
+                        "run_id": run_id,
+                        "pass": pass_name,
+                        "query": qid,
+                        "description": desc,
+                        "columns": res.columns,
+                        "rows": res.rows,
+                        "answer_rows": res.answer_rows,
+                        "engine_report": res.report,
+                        "accuracy": row["accuracy"],
+                    })
+                    row["raw_volume_path"] = f"/results/{raw_path}"
+            except Exception as e:            # noqa: BLE001
+                row = dict(query=qid, desc=desc,
+                           error=f"{type(e).__name__}: {e}")
+            rows.append(row)
+            print(f"[quailb] {row}", flush=True)
+        passed = dict(
+            queries=rows,
+            pass_wall_s=round(time.time() - t_pass, 1))
+        if evaluator is not None:
+            passed["summary"] = summarize_queries(
+                rows, h100_usd_per_hour, gpus)
+        suite["passes"][pass_name] = passed
     finally:
         sess.close()
     if out_path:

@@ -2,7 +2,6 @@
 
 import json
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -23,19 +22,11 @@ class CorpusStats:
 
 
 @dataclass(frozen=True)
-class StoreSpec:
-    """A pinned host KV store's parameters for planning."""
-    read_bw: float
-    warm: bool = False
-    capacity_bytes: Optional[float] = None
-
-
-@dataclass(frozen=True)
 class Refusal:
     """Returned when a configuration cannot execute the query."""
     reasons: tuple
     constraint: str    # "weights_need_more_cards" | "suffix_over_chunk"
-    #                    | "store_needed_but_disabled" | "unknown_model"
+    #                    | "unknown_model"
     needed: float
     available: float
     unit: str          # "cards" | "tokens" | "bytes"
@@ -53,9 +44,6 @@ class PhysicalPlan:
     order_rule: str            # "as_written" | "by_cost"
     order_source: str          # which rule chose it, for explain()
     calibration_source: str    # "calibrated" | "spec-scaled from ..."
-    store_min_doc_tokens: int = 0    # documents at or above this
-    #                                  length use the KV store; 0 =
-    #                                  no store, 1 = everything stores
     limit: int | None = None   # output row cap; None = no limit
     nodes: tuple = ()          # dataflow graph in topological order;
     #                            each node dict has "id", "op", "inputs"
@@ -98,7 +86,6 @@ def resolve_model(name: str):
 
 @dataclass(frozen=True)
 class EngineConfig:
-    """Top-level engine configuration: GPU count, host memory, model."""
+    """Top-level engine configuration: GPU count and model."""
     gpus: int = 1
-    cpu_memory_gb: int = 64
     model: str = "qwen3-4b-fp8"

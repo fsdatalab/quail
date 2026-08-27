@@ -1,4 +1,4 @@
-"""Milestone 1 cells on Modal: probe (correctness gates), filter, single-stage filter, join, 3-way join, store, and baselines."""
+"""Milestone 1 cells on Modal: probe (correctness gates), filter, single-stage filter, join, 3-way join, and baselines."""
 
 import json
 import os
@@ -659,87 +659,6 @@ def join3_run() -> str:
     return _write(report, "join3")
 
 
-# ---------------------------------------------------------- the store
-
-@app.function(timeout=5400, image=image, gpu="H100!", memory=327680,
-              volumes={"/root/.cache/huggingface": hf_cache,
-                       "/root/.cache/kernels": kernel_cache,
-                       "/results": results_vol})
-def filter_store_run(n_docs: int = 5000, capacity_gb: int = 250,
-                     warm_reps: int = 2) -> str:
-    """Store gate: cold pass with KV offload, then warm passes with KV restore."""
-    import time
-
-    from corpus import build_corpus
-    from quail.executor.attention import FILTER_ATTENTION
-    from quail.executor.kvstore import PinnedStore
-    from quail.executor.loop import run_filter
-    from quail.specs import QWEN3_4B_FP8
-
-    (torch, F, tokenizer, model, pipeline, arena, answerer, async_ans,
-     exec_budget, arena_tok) = _boot(FILTER_ATTENTION)
-    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
-    corpus_tokens = sum(len(b) for b in body_ids)
-    kappa = QWEN3_4B_FP8.kappa
-
-    t_store = time.perf_counter()
-    store = PinnedStore(
-        capacity_tokens=int(capacity_gb * 1e9) // int(kappa),
-        n_layers=QWEN3_4B_FP8.layers, n_kv=QWEN3_4B_FP8.n_kv,
-        d_head=QWEN3_4B_FP8.d_head,
-        max_doc_tokens=max(len(b) for b in body_ids))
-    store_init_s = round(time.perf_counter() - t_store, 2)
-
-    from quail.executor.loop import warm_kernels
-    t_warm = time.perf_counter()
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, exec_budget,
-                     model_name=MODEL)
-    torch.cuda.synchronize()
-    kernel_cache.commit()
-
-    report = dict(
-        cell="m1_filter_store", n_docs=n_docs,
-        corpus_tokens=corpus_tokens,
-        store_capacity_gb=capacity_gb,
-        store_kv_gb=round(corpus_tokens * kappa / 1e9, 1),
-        store_init_s=store_init_s,
-        warmup_s=round(time.perf_counter() - t_warm, 2),
-        prediction=("cold ~20 s plus offload tail; warm passes near "
-                    "half the cold wall (committed persist: 1.9-2.1x)"),
-        runs=[])
-    print(f"[m1_store] init {store_init_s} s; "
-          f"{report['store_kv_gb']} GB of KV into a {capacity_gb} GB "
-          f"pool; {report['prediction']}", flush=True)
-
-    for rep in range(1 + warm_reps):
-        stats = {}
-        torch.cuda.reset_peak_memory_stats()
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            answers, spans, tokens = run_filter(
-                torch, arena, pipeline, async_ans, body_ids, q_ids,
-                exec_budget, store=store, store_hash="m1",
-                store_min_tokens=1, stats=stats, arena_writes=True)
-        torch.cuda.synchronize()
-        wall = time.perf_counter() - t0
-        survivors = [d for d, row in answers.items()
-                     if len(row) == len(q_ids) and all(row)]
-        row = dict(rep=rep, kind="cold" if rep == 0 else "warm",
-                   wall=round(wall, 2), fresh_tokens=tokens,
-                   tok_s=round(tokens / wall, 1),
-                   survivors=len(survivors), chunks=len(spans),
-                   peak_gib=round(
-                       torch.cuda.max_memory_allocated() / 2**30, 2),
-                   **stats)
-        report["runs"].append(row)
-        print(f"[m1_store] {row}", flush=True)
-    cold = report["runs"][0]["wall"]
-    warm = min(r["wall"] for r in report["runs"][1:])
-    report["warm_speedup"] = round(cold / warm, 2)
-    return _write(report, "filter_store")
-
-
 # ----------------------------------------------------------- profiling
 
 @app.function(timeout=3600, **GPU_KW)
@@ -1119,13 +1038,6 @@ def run_join3(out: str = "results/m1_join3.json"):
 @app.local_entrypoint()
 def run_debug_join(out: str = "results/debug_join.json"):
     _save(debug_join.remote(), out)
-
-
-@app.local_entrypoint()
-def run_filter_store(n_docs: int = 5000, capacity_gb: int = 250,
-                     warm_reps: int = 2,
-                     out: str = "results/m1_filter_store.json"):
-    _save(filter_store_run.remote(n_docs, capacity_gb, warm_reps), out)
 
 
 @app.local_entrypoint()

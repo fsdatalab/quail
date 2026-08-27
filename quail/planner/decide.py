@@ -1,5 +1,5 @@
-"""Planner decisions: filter order, join order, anchor choice,
-sharding, and access mode from a logical plan and corpus token counts.
+"""Planner decisions: filter order, join order, anchor choice, and
+sharding from a logical plan and corpus token counts.
 """
 
 import itertools
@@ -8,8 +8,7 @@ from quail.logical import (LogicalPlan, Project, Scan, SemanticFilter,
                            SemanticJoin)
 from quail.planner import budgets
 from quail.planner.calibration import Calibration, load_calibration
-from quail.planner.plan import (CorpusStats, PhysicalPlan, Refusal,
-                                StoreSpec)
+from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -326,62 +325,10 @@ def balanced_shards(doc_tokens, workers: int):
     return tuple(tuple(sorted(s)) for s in shards), loads
 
 
-# ------------------------------------- access (the one break-even)
-
-def restore_crossover_tokens(model: ModelSpec, cal: Calibration,
-                             read_bw: float) -> float:
-    """Document length (tokens) past which loading KV beats recomputing.
-
-    Returns 0 when bandwidth beats recompute at every length.
-    """
-    per_token_load = model.kappa / read_bw
-    if per_token_load <= cal.a_s_per_token:
-        return 0.0
-    return (per_token_load - cal.a_s_per_token) / cal.a2_s_per_token2
-
-
-def store_length_threshold(doc_tokens, capacity_bytes, kappa) -> int:
-    """Length cutoff for KV store: keep the longest documents that fit.
-
-    Returns:
-        1 when capacity holds everything, 0 when nothing fits.
-    """
-    if capacity_bytes is None:
-        return 1
-    budget_tok = int(capacity_bytes / kappa)
-    lengths = sorted((int(t) for t in doc_tokens), reverse=True)
-    if sum(lengths) <= budget_tok:
-        return 1
-    taken, threshold = 0, 0
-    for h in lengths:
-        if taken + h > budget_tok:
-            break
-        taken += h
-        threshold = h
-    while threshold and sum(h for h in lengths
-                            if h >= threshold) > budget_tok:
-        threshold += 1
-    if threshold and not any(h >= threshold for h in lengths):
-        return 0
-    return threshold
-
-
-def access_for_scan(stats: CorpusStats, model: ModelSpec,
-                    cal: Calibration, store) -> str:
-    """Return 'read' or 'restore' based on whether loading KV from
-    the store beats recomputing it.
-    """
-    if store is None or not store.warm:
-        return "read"
-    crossover = restore_crossover_tokens(model, cal, store.read_bw)
-    return "restore" if stats.mean_doc_tokens >= crossover else "read"
-
-
 # ---------------------------------------------------------- the planner
 
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-               store: StoreSpec | None = None,
                order: str | None = None,
                calibration: Calibration | None = None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
@@ -426,7 +373,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     remarks.extend(search_remarks)
     anchors = {id(j): a for j, a in seq}
 
-    needs = []      # the largest single admission each operator makes
     for s in scans:
         fq = max((_question_tokens(p.prompt)
                   for p in filters.get(s.alias, ())), default=None)
@@ -442,7 +388,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                          f"hold it",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
-        needs.append(need)
     for j in joins:
         anchor = anchors[id(j)]
         labels = _label_counts(j)
@@ -462,38 +407,11 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                          f"hold it",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
-        needs.append(need)
 
     admission = budgets.arena_tokens(model, device, chunk)
-    working_set = max(needs)
-    if admission < working_set and store is None:
-        return Refusal(
-            reasons=(f"the arena holds {admission} tokens against "
-                     f"a {working_set}-token working set and there is "
-                     f"no store to spill to (cpu_memory_gb is 0)",),
-            constraint="store_needed_but_disabled",
-            needed=working_set, available=admission, unit="tokens")
-
-    accesses = {s.alias: access_for_scan(stats[s.alias], model, cal,
-                                         store) for s in scans}
     _, stage_records = _walk(seq, live0, stats, pre)
 
     remarks.append("kv_dtype=bf16 (always)")
-
-    store_min = 0
-    if store is not None:
-        # stored extents are [engine preamble + document] rows, so the
-        # capacity arithmetic and the threshold are in those units
-        all_lengths = [t + pre
-                       for toks in doc_tokens.values() for t in toks]
-        store_min = store_length_threshold(
-            all_lengths, store.capacity_bytes, model.kappa)
-        if store_min > 1:
-            stored = [t for t in all_lengths if t >= store_min]
-            remarks.append(
-                f"store capped: {len(stored)} of {len(all_lengths)} "
-                f"documents stored, length threshold {store_min} "
-                f"(preamble included)")
 
     # ---- build the dataflow graph; ids_src tracks each table's
     # current producer node
@@ -505,7 +423,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         nodes.append(dict(
             id=sid, op="DocScan", inputs=(),
             alias=s.alias, provider=s.provider,
-            column=s.column, access=accesses[s.alias],
+            column=s.column,
             n_docs=stats[s.alias].n_docs,
             total_tokens=stats[s.alias].total_tokens,
             shards=shards, shard_token_loads=loads))
@@ -523,9 +441,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                     selectivity=p.selectivity,
                     expected_docs=round(n * surv, 1)))
                 surv *= p.selectivity if p.selectivity is not None else 1.0
-            # arena writes only needed when multiple stages or a store
-            # will read the KV back
-            writes = len(stages) > 1 or store is not None
+            # arena writes only needed when a later stage will read
+            # the KV back
+            writes = len(stages) > 1
             fid = f"filter:{s.alias}"
             nodes.append(dict(id=fid, op="FilterChain",
                               inputs=(ids_src[s.alias],),
@@ -535,7 +453,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             if not writes:
                 remarks.append(
                     f"filter on {s.alias!r}: arena writes off (one "
-                    f"stage, no store - nothing reads the KV again)")
+                    f"stage - nothing reads the KV again)")
 
     # group consecutive full stages on the same anchor; gates run
     # alone; anchor switches become barriers
@@ -628,7 +546,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         tensor_parallel=tp, kv_dtype="bf16", chunk_tokens=chunk,
         admission_tokens=admission, order_rule=rule, order_source=source,
         calibration_source=cal.source,
-        store_min_doc_tokens=store_min,
         limit=plan.root.limit,
         nodes=tuple(nodes), remarks=tuple(remarks))
 

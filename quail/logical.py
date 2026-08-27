@@ -10,7 +10,7 @@ class CompileError(ValueError):
 
 # Fixed preamble before every document. Must be a formatting label,
 # not an instruction; instruction text here biases short-document
-# completions. Changing this text invalidates all stored KV.
+# completions.
 SHARED_PRE = "DOCUMENT:\n"
 
 # Fixed strings for join prompt layout.

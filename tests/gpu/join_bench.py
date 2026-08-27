@@ -145,8 +145,7 @@ def main():
     tmp = tempfile.mkdtemp()
     tables = make_tables(tmp)
 
-    # store disabled: run order must not contaminate the comparison
-    sess = quail.Session(EngineConfig(gpus=1, cpu_memory_gb=0))
+    sess = quail.Session(EngineConfig(gpus=1))
     for name in ("bstar", "p1", "p2", "p3", "along", "bmid", "cmid"):
         sess.register(name, quail.DocumentProvider.from_parquet(
             f"{tmp}/{name}.parquet", id_col="id"))
