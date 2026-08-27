@@ -4,13 +4,26 @@ compiling queries, planning, and executing on Modal.
 
 import re
 import time
-from dataclasses import dataclass, field
+
+import pyarrow as pa
+from pyarrow import compute as pc
 
 from quail.catalog import Catalog, DocumentProvider
-from quail.logical import (SHARED_PRE, CompileError, LogicalPlan,
-                           join_label, render_join_frame)
+from quail.logical import (
+    SHARED_PRE,
+    CompileError,
+    LogicalPlan,
+    join_label,
+    render_join_frame,
+)
 from quail.planner.decide import _collect, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
+from quail.runtime.result import (
+    QueryResult,
+    answer_table,
+    build_result_declaration,
+    true_answer_rows,
+)
 from quail.specs import DEVICES
 
 
@@ -23,18 +36,6 @@ class RefusalError(RuntimeError):
             f"{refusal.constraint}: needed {refusal.needed} "
             f"{refusal.unit}, available {refusal.available}. "
             + " ".join(refusal.reasons))
-
-
-@dataclass
-class Result:
-    columns: list          # projection column names, "alias.column"
-    rows: list             # tuples of projected values
-    report: dict           # measured walls, tokens, tuples per stage,
-    #                        provided vs observed selectivity
-    answer_rows: dict      # per-stage answer matrices, as returned
-
-    def __len__(self):
-        return len(self.rows)
 
 
 def pick_corpus_tokenizer(primary, fast, texts, sample=25):
@@ -138,25 +139,36 @@ class Session:
         return self._fast
 
     def scan(self, provider_name: str, column: str):
-        """Return (ids, texts, token lists) for one provider column, cached."""
+        """Return Arrow ID, text, and token columns for one scan."""
         provider = self.catalog.get(provider_name)
         key = ("scan", provider.source, column)
         if key not in self._scan_cache:
-            ids, texts = provider.read_column(column)
+            table = provider.read_column(column)
+            ids = table.column(provider.id_col)
+            texts = table.column(column)
+            text_sample = texts.slice(0, 25).to_pylist()
             tok, note = pick_corpus_tokenizer(
-                self.tokenizer, self._fast_tokenizer(), texts)
+                self.tokenizer, self._fast_tokenizer(), text_sample)
             self.notes.append(f"{provider_name}.{column}: {note}")
-            toks = [tok(t) for t in texts]
+            token_rows = [tok(text.as_py()) for chunk in texts.chunks
+                          for text in chunk]
+            first_token = next(
+                (token for row in token_rows for token in row), None)
+            token_type = (pa.int32() if first_token is None
+                          or isinstance(first_token, int)
+                          else pa.string())
+            toks = pa.array(
+                token_rows, type=pa.large_list(token_type))
             self._scan_cache[key] = (ids, texts, toks)
         return self._scan_cache[key]
 
-    def column_values(self, provider_name: str, column: str) -> list:
-        """Return one column's raw values (not tokenized), cached."""
+    def column_values(self, provider_name: str, column: str):
+        """Return one raw Arrow column, cached."""
         provider = self.catalog.get(provider_name)
         key = ("vals", provider.source, column)
         if key not in self._scan_cache:
-            _, values = provider.read_column(column)
-            self._scan_cache[key] = values
+            table = provider.read_column(column)
+            self._scan_cache[key] = table.column(column)
         return self._scan_cache[key]
 
 
@@ -246,7 +258,8 @@ class Query:
             self._doc_tokens = {}
             for s in scans:
                 _, _, toks = self.session.scan(s.provider, s.column)
-                self._doc_tokens[s.alias] = [len(t) for t in toks]
+                self._doc_tokens[s.alias] = pc.list_value_length(
+                    toks).to_pylist()
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
@@ -260,8 +273,8 @@ class Query:
 
     # ---- execution -----------------------------------------------------
 
-    def run(self, _execute=None) -> Result:
-        """Plan, execute on Modal, and project results.
+    def run(self, _execute=None) -> QueryResult:
+        """Plan, execute on Modal, and return a lazy Arrow result.
 
         Args:
             _execute: Optional callable(payload) -> output for testing.
@@ -290,14 +303,32 @@ class Query:
         return self._assemble(plan, scans, filters, joins, out,
                               coordinator_wall)
 
+    def execute_stream(self, _execute=None, batch_rows: int = 65_536,
+                       limit: int | None = None) -> pa.RecordBatchReader:
+        """Execute the query and stream Arrow record batches."""
+        return self.run(_execute=_execute).execute_stream(
+            batch_rows=batch_rows, limit=limit)
+
+    def collect(self, _execute=None, limit: int | None = None,
+                batch_rows: int = 65_536) -> pa.Table:
+        """Execute the query and explicitly collect one Arrow table."""
+        return self.run(_execute=_execute).collect(
+            limit=limit, batch_rows=batch_rows)
+
     # ---- payload -------------------------------------------------------
 
     def _payload(self, plan, scans, filters, joins) -> dict:
+        from quail.runtime.tokens import encode_token_documents
+
         sess = self.session
         docs = {}
+        encoded = {}
         for s in scans:
             _, _, toks = sess.scan(s.provider, s.column)
-            docs[s.alias] = toks
+            key = (s.provider, s.column)
+            if key not in encoded:
+                encoded[key] = encode_token_documents(toks)
+            docs[s.alias] = encoded[key]
         filter_qids = {}
         filter_writes = {}
         for node in plan.nodes:
@@ -369,7 +400,7 @@ class Query:
     # ---- sink: gate, replay-check, project ------------------------------
 
     def _assemble(self, plan, scans, filters, joins, out,
-                  coordinator_wall) -> Result:
+                  coordinator_wall) -> QueryResult:
         from quail.executor.pack import gate
 
         report = dict(
@@ -385,6 +416,7 @@ class Query:
             result_volume_path=out.get("result_volume_path"),
             remarks=list(plan.remarks) + list(self.session.notes))
         answer_rows = dict(filters=out["filters"], joins=out["joins"])
+        answer_tables = {"filters": {}, "joins": {}}
 
         # filter survivors + observed selectivities
         survivors = {}
@@ -401,6 +433,14 @@ class Query:
                 answered = [d for d, row in rows.items()
                             if len(row) > si]
                 passed = [d for d in answered if rows[d][si]]
+                written_pos = st["written_pos"]
+                answer_tables["filters"][(alias, written_pos)] = \
+                    answer_table(
+                        {alias: answered},
+                        [bool(rows[d][si]) for d in answered],
+                        "filter_answers",
+                        {"alias": alias, "written_pos": written_pos},
+                    )
                 report["stages"].append(dict(
                     op="filter", alias=alias, stage=si,
                     provided_selectivity=st["selectivity"],
@@ -422,8 +462,10 @@ class Query:
         for node in plan.nodes:
             if node["op"] == "JoinGroup":
                 stage_plan.extend(node["stages"])
-        full_rels = []
+        true_join_tables = {}
+        full_join_order = []
         for st, jout in zip(stage_plan, out["joins"]):
+            written_pos = jout.get("written_pos", st["written_pos"])
             anchor = jout.get("anchor", st["anchor"])
             partners = list(jout.get("partners", st["partners"]))
             semantics = jout.get("semantics", st["semantics"])
@@ -441,9 +483,31 @@ class Query:
                 observed_selectivity=round(yes / max(1, evaluated), 4),
                 tuples=evaluated))
             global_rows = {anchor_map[a]: r for a, r in rows.items()}
+            columns = {alias: [] for alias in [anchor, *partners]}
+            bits = []
+            for raw_local, answers in rows.items():
+                global_anchor = anchor_map[int(raw_local)]
+                for tuple_index, answer in enumerate(answers):
+                    columns[anchor].append(global_anchor)
+                    for alias, global_partner in zip(
+                            partners, partner_map[tuple_index]):
+                        columns[alias].append(global_partner)
+                    bits.append(bool(answer))
+            answers_table = answer_table(
+                columns,
+                bits,
+                "join_answers",
+                {
+                    "written_pos": written_pos,
+                    "anchor": anchor,
+                    "partners": ",".join(partners),
+                },
+            )
+            answer_tables["joins"][written_pos] = answers_table
             if semantics == "full":
-                full_rels.append((anchor, partners, global_rows,
-                                  partner_map))
+                true_join_tables[written_pos] = true_answer_rows(
+                    answers_table)
+                full_join_order.append(written_pos)
             else:
                 keep = set(gate(global_rows))
                 if semantics == "exists":
@@ -453,83 +517,56 @@ class Query:
                     survivors[anchor] = [d for d in survivors[anchor]
                                          if d not in keep]
 
-        # ---- output tuples: the full stages' TRUE rows, equi-joined
-        # on shared document ids (id matching only, no model calls),
-        # each member checked against its table's final survivor set
-        # (a gate written after a join still applies - order changes
-        # cost, never results). Each stage keys on its OWN anchor:
-        # stages in different groups anchor on different tables, and
-        # the join happens over whatever aliases a stage shares with
-        # the assignments built so far.
         cols = [f"{c.alias}.{c.column}" for c in
                 self.logical.root.columns]
-        if not full_rels:
-            alias_order = [scans[0].alias]
-            tuples = [(d,) for d in survivors[scans[0].alias]]
-        else:
-            alias_order = []
-            for anchor, partners, _, _ in full_rels:
-                for a in [anchor, *partners]:
-                    if a not in alias_order:
-                        alias_order.append(a)
-            keep = {a: set(survivors[a]) for a in alias_order}
-            # one assignment (alias -> document) per candidate tuple,
-            # extended stage by stage. A stage's passing pairs become
-            # a relation over its tables; the relation is equi-joined
-            # onto the assignments over the aliases they share. An
-            # anchor document gated out mid-group has no rows in
-            # later stages, so its assignments extend to nothing and
-            # drop.
-            assigns = [dict()]
-            for anchor, partners, rows, partner_map in full_rels:
-                rel = []
-                for ga in sorted(rows):
-                    if ga not in keep[anchor]:
-                        continue
-                    for ti, bit in enumerate(rows[ga]):
-                        if not bit:
-                            continue
-                        entry = {anchor: ga}
-                        ok = True
-                        for al, gp in zip(partners, partner_map[ti]):
-                            if gp not in keep[al]:
-                                ok = False
-                                break
-                            entry[al] = gp
-                        if ok:
-                            rel.append(entry)
-                shared = [a for a in [anchor, *partners]
-                          if assigns and a in assigns[0]]
-                index = {}
-                for entry in rel:
-                    key = tuple(entry[a] for a in shared)
-                    index.setdefault(key, []).append(entry)
-                extended = []
-                for asg in assigns:
-                    key = tuple(asg[a] for a in shared)
-                    for entry in index.get(key, ()):
-                        new = dict(asg)
-                        new.update(entry)
-                        extended.append(new)
-                assigns = extended
-            tuples = [tuple(asg[a] for a in alias_order)
-                      for asg in assigns]
+        survivor_arrays = {
+            alias: pa.array(indices, type=pa.int32())
+            for alias, indices in survivors.items()
+        }
+        result_declaration, result_index_schema = build_result_declaration(
+            [true_join_tables[pos] for pos in full_join_order],
+            survivor_arrays,
+            self.logical.root.columns[0].alias,
+        )
 
-        proj_rows = []
-        for tup in tuples:
-            pos = {alias: idx for alias, idx in zip(alias_order, tup)}
-            row = []
-            for c in self.logical.root.columns:
-                if c.alias not in pos:
-                    raise CompileError(
-                        f"projection column {c.alias}.{c.column} is "
-                        f"not part of the result tuple")
-                vals = self.session.column_values(c.provider, c.column)
-                row.append(vals[pos[c.alias]])
-            proj_rows.append(tuple(row))
-        # upstream caps filter survivors, not output rows; join fan-out
-        # can produce more rows than survivors, so truncate here
-        if plan.limit is not None:
-            proj_rows = proj_rows[:plan.limit]
-        return Result(columns=cols, rows=proj_rows, report=report,
-                      answer_rows=answer_rows)
+        projection = []
+        output_fields = []
+        for name, column in zip(cols, self.logical.root.columns):
+            if column.alias not in result_index_schema.names:
+                raise CompileError(
+                    f"projection column {name} is not part of the result")
+            values = self.session.column_values(
+                column.provider, column.column)
+            if isinstance(values, pa.ChunkedArray):
+                values = values.combine_chunks()
+            projection.append((column.alias, values))
+            output_fields.append(pa.field(
+                name,
+                values.type,
+                nullable=values.null_count > 0,
+                metadata={
+                    b"quail.alias": column.alias.encode("utf-8"),
+                    b"quail.provider": column.provider.encode("utf-8"),
+                    b"quail.column": column.column.encode("utf-8"),
+                },
+            ))
+        output_schema = pa.schema(
+            output_fields,
+            metadata={
+                b"quail.schema_version": b"1",
+                b"quail.kind": b"query_result",
+            },
+        )
+        return QueryResult(
+            columns=cols,
+            declaration=result_declaration,
+            document_index_schema=result_index_schema,
+            output_schema=output_schema,
+            projection=projection,
+            report=report,
+            answer_rows=answer_rows,
+            answer_tables=answer_tables,
+            limit=plan.limit,
+            survivor_indices=survivor_arrays,
+            true_join_tables=true_join_tables,
+        )

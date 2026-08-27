@@ -157,6 +157,37 @@ def pages_for(tokens: int, page_tokens: int) -> int:
     return -(-tokens // page_tokens)
 
 
+def partition_anchor_groups(prefix_tokens, arena_pages, page_tokens,
+                            extra_tokens=0, max_group_size=None):
+    """Partition anchors so every group fits in the KV arena."""
+
+    if arena_pages <= 0 or page_tokens <= 0:
+        raise ValueError("arena_pages and page_tokens must be positive")
+    if max_group_size is not None and max_group_size <= 0:
+        raise ValueError("max_group_size must be positive")
+
+    groups = []
+    group = []
+    used_pages = 0
+    for anchor, prefix in enumerate(prefix_tokens):
+        pages = pages_for(prefix + extra_tokens, page_tokens)
+        if pages > arena_pages:
+            raise ValueError(
+                f"anchor {anchor} needs {pages} KV pages; the arena "
+                f"holds {arena_pages}")
+        full = max_group_size is not None \
+            and len(group) >= max_group_size
+        if group and (full or used_pages + pages > arena_pages):
+            groups.append(group)
+            group = []
+            used_pages = 0
+        group.append(anchor)
+        used_pages += pages
+    if group:
+        groups.append(group)
+    return groups
+
+
 class FilterAdmission:
     """Filter chain scheduler: builds chunk groups and tracks arena
     residency.

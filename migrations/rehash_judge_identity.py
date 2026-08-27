@@ -23,12 +23,12 @@ Then apply::
 """
 
 import json
-import os
 from pathlib import Path
 
 import modal
 
 from quail.bench.judge_pass import (
+    JUDGE_ID,
     PREDICATES,
     PredicateSpec,
     VOLUME_ROOT,
@@ -103,7 +103,8 @@ def _rehash_label_dir(spec: PredicateSpec, old_dir: Path, identity: dict,
                     f"{spec.key}: {compact} has no row for left id "
                     f"{left['id']}")
             part_rows.extend(found)
-        if spec.kind == "join" and spec.source_policy != "lepard_passage_id":
+        if (spec.kind == "join"
+                and spec.source_policy != "lepard_citation_edge"):
             part_rows.sort(key=lambda row: (row["left_id"], row["right_id"]))
         _atomic_parquet(_part_path(spec, identity, start, end), part_rows)
         ordered.extend(part_rows)

@@ -14,7 +14,7 @@ IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy")
+    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow")
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -175,13 +175,14 @@ def _execute_single(state, payload: dict) -> dict:
         stage_for_anchor,
         thin_survivors,
     )
+    from quail.runtime.tokens import chain_tokens, decode_payload_documents
     from quail.specs import DEVICES
 
     torch = state["torch"]
     arena, pipeline = state["arena"], state["pipeline"]
     model_spec = state["spec"]
     device = DEVICES["h100-sxm"]
-    docs = payload["docs"]
+    docs = decode_payload_documents(payload["docs"])
     # the engine preamble: prepended to every KV-owning document
     # (filter scans, join anchors) so their KV is identical across
     # operators; a partner document rides in the suffix raw
@@ -216,7 +217,7 @@ def _execute_single(state, payload: dict) -> dict:
                     else ())
             answers, _, tokens = run_filter(
                 torch, arena, pipeline, async_ans,
-                [pre + d for d in docs[alias]], qids,
+                [chain_tokens(pre, d) for d in docs[alias]], qids,
                 chunk_tokens, limit=limit,
                 arena_writes=filter_writes[alias],
                 arena_keys=[(alias, d)
@@ -328,7 +329,7 @@ def _execute_single(state, payload: dict) -> dict:
                 tuple_globs.append(tuples)
                 stage_suffixes.append(
                     [_tuple_suffix(j, docs, t) for t in tuples])
-            prefixes = [pre + docs[anchor_alias][g]
+            prefixes = [chain_tokens(pre, docs[anchor_alias][g])
                         for g in anchors_glob]
             anchor_keys = [(anchor_alias, g) for g in anchors_glob]
             kv_stats["join_anchor_hits"] += sum(
@@ -356,7 +357,6 @@ def _execute_single(state, payload: dict) -> dict:
                 torch, arena, pipeline, async_ans, prefixes,
                 stage_suffixes, chunk_tokens,
                 stage_frames=[j.get("frame") or [] for j in group],
-                group_size=1 if len(group) > 1 else None,
                 anchor_keys=anchor_keys, anchor_done=anchor_done)
             total_tokens += tokens
             for si, j in enumerate(group):
@@ -525,6 +525,7 @@ def _child_filters(state, sub):
     from quail.executor.loop import run_filter
     from quail.planner.sol import prefix_recompute_seconds
     from quail.specs import DEVICES
+    from quail.runtime.tokens import chain_tokens
 
     _child_boot(state, sub)
     boot = state["boot"]
@@ -552,7 +553,7 @@ def _child_filters(state, sub):
             answers, _, tokens = run_filter(
                 torch, arena, state["pipeline"],
                 state["async_ans"],
-                [pre + d for d in sub["docs"][alias]], qids,
+                [chain_tokens(pre, d) for d in sub["docs"][alias]], qids,
                 state["chunk_tokens"], limit=limit,
                 arena_writes=filter_writes[alias],
                 arena_keys=[(alias, g) for g in index],
@@ -586,6 +587,7 @@ def _child_joins(state, sub):
     from quail.executor.loop import run_join
     from quail.planner.sol import prefix_recompute_seconds
     from quail.specs import DEVICES
+    from quail.runtime.tokens import chain_tokens
 
     _child_boot(state, sub)
     torch = state["torch"]
@@ -630,7 +632,7 @@ def _child_joins(state, sub):
             stage_suffixes.append(
                 [_tuple_suffix(j, part_docs, combo)
                  for combo in combos])
-        prefixes = [pre + d for d in anchor_docs]
+        prefixes = [chain_tokens(pre, d) for d in anchor_docs]
         anchor_keys = [(anchor_alias, g) for g in anchors_glob]
 
         def value(a):
@@ -652,7 +654,6 @@ def _child_joins(state, sub):
             state["async_ans"], prefixes, stage_suffixes,
             state["chunk_tokens"],
             stage_frames=[j.get("frame") or [] for j in group],
-            group_size=1 if len(group) > 1 else None,
             anchor_keys=anchor_keys, anchor_done=anchor_done)
         # settle anchors run_join never called back (no live suffixes)
         last = ans[-1] if ans else {}
@@ -723,8 +724,11 @@ def _execute_multi(payload: dict) -> dict:
     from quail.planner import budgets
     from quail.planner.joins import search_joins, summarize_alias
     from quail.runtime import coordinator
+    from quail.runtime.tokens import decode_payload_documents
     from quail.specs import DEVICES, MODELS
 
+    payload = dict(payload)
+    payload["docs"] = decode_payload_documents(payload["docs"])
     k = payload["workers"]
     shards = payload.get("shards", {})
     _ensure_children(k)
@@ -927,14 +931,15 @@ def execute_8(payload: dict) -> dict:
     return _execute_multi(payload)
 
 
-def _tuple_suffix(join, docs, member) -> list:
+def _tuple_suffix(join, docs, member):
     """Build the partner blocks and answer cue for one tuple."""
-    out = []
+    from quail.runtime.tokens import chain_tokens
+
+    parts = []
     for alias, g in zip(join["partners"], member):
-        out += join["labels"][alias]
-        out += docs[alias][g]
-    out += join["tail"]
-    return out
+        parts.extend((join["labels"][alias], docs[alias][g]))
+    parts.append(join["tail"])
+    return chain_tokens(*parts)
 
 
 class _PayloadAnswerer:

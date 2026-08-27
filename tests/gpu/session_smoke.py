@@ -97,13 +97,13 @@ def main():
     agree = len(set(got) & set(planted))
     summary["filter"] = dict(
         report=res.report,
-        rows=len(res.rows), planted_survivors=len(planted),
+        rows=res.count(), planted_survivors=len(planted),
         agree_with_planted=agree)
     print(json.dumps(summary["filter"], indent=2), flush=True)
 
     # the same query again: if the worker container stayed warm, the
     # second run skips the boot
-    res2 = fq2 = sess.sql(f"""
+    res2 = sess.sql(f"""
         SELECT d.id FROM docs d
         WHERE AI_FILTER(PROMPT('{{0}}{q1_text}', d.body),
                         {{'selectivity': 0.6}})

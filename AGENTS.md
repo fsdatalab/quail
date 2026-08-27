@@ -78,6 +78,20 @@ change needs one of them, say so instead of quietly adding it back.
   with. If our side gets a plan-derived setting, the baseline gets the
   analytically equivalent one. Report the setting alongside the
   result.
+- Report query time, throughput, and GPU cost for every benchmark
+  query. Use the following definitions consistently:
+  - For a filter-only query, `documents/second` is the number of input
+    document rows divided by query runtime in seconds.
+  - For a query with joins, `document pairs/second` is the number of
+    evaluated document pairs, summed across all join stages, divided
+    by query runtime in seconds.
+  - `$/query` is query runtime in hours multiplied by the number of
+    GPUs and the H100! hourly price. Use
+    `quail.bench.evaluate.H100_USD_PER_HOUR`, which is currently
+    $3.9492 from https://modal.com/pricing.
+  - The primary `$/query` number excludes model startup, just as the
+    primary query time does. If startup cost is useful, report it as a
+    separate clearly labeled number.
 
 # Reports
 

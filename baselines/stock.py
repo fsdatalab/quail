@@ -62,7 +62,8 @@ def _true_bit(out, true_ids=None):
 
 
 def run_filter_chain(engine, sampling_params, body_ids, q_ids,
-                     budget_tokens, tag="q", true_ids=None):
+                     budget_tokens, tag="q", true_ids=None,
+                     block_size=1, max_num_seqs=None):
     """Run a filter chain over stock vLLM with token-budget admission.
 
     Returns:
@@ -70,11 +71,20 @@ def run_filter_chain(engine, sampling_params, body_ids, q_ids,
         survivors, and request/token counters.
     """
     n = len(q_ids)
-    mean_req = (sum(len(b) for b in body_ids) // max(1, len(body_ids))
-                + max(len(q) for q in q_ids))
+    longest_tail = max(len(q) for q in q_ids)
+    request_sizes = [len(body) + longest_tail + 1 for body in body_ids]
+    rounded_sizes = [
+        ((tokens + block_size - 1) // block_size) * block_size
+        for tokens in request_sizes
+    ]
+    mean_req = sum(rounded_sizes) // max(1, len(rounded_sizes))
     cap = max(1, budget_tokens // mean_req)
+    if max_num_seqs is not None:
+        cap = min(cap, max_num_seqs)
     counters = dict(requests=0, prompt_tokens=0, cached_tokens=0,
-                    doc_cap=cap)
+                    doc_cap=cap, budget_tokens=budget_tokens,
+                    block_size=block_size,
+                    max_num_seqs=max_num_seqs)
     answers = {}
     survivors = []
     inflight = {}                      # request id -> (doc, stage)

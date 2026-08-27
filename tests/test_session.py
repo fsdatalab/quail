@@ -46,15 +46,18 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                        f"matches tokens {q[:5]}")
 
     def _exec(payload):
+        from quail.runtime.tokens import decode_payload_documents
+
         if seen is not None:
             seen["payload"] = payload
+        docs = decode_payload_documents(payload["docs"])
         out = dict(filters={}, joins=[], wall_s=1.0, boot_s=0.5,
                    fresh_tokens=1234)
         survivors = {a: list(range(len(d)))
-                     for a, d in payload["docs"].items()}
+                     for a, d in docs.items()}
         for alias, qids in payload["filters"].items():
             rows = {}
-            for d in range(len(payload["docs"][alias])):
+            for d in range(len(docs[alias])):
                 row = []
                 for q in qids:
                     bit = filter_truth[alias][_match_key(alias, q)][d]
@@ -98,7 +101,7 @@ def test_filter_query_rows_and_report(sess):
     q = sess.sql(FILTER_SQL)
     res = q.run(_execute=make_executor(truth))
     assert res.columns == ["r.id"]
-    assert sorted(res.rows) == [("r0",), ("r3",)]
+    assert sorted(res.to_rows()) == [("r0",), ("r3",)]
     stages = [s for s in res.report["stages"] if s["op"] == "filter"]
     assert stages[0]["evaluated"] == 6
     assert stages[0]["observed_selectivity"] == pytest.approx(4 / 6,
@@ -109,7 +112,23 @@ def test_filter_query_rows_and_report(sess):
 
     limited = sess.sql(FILTER_SQL + " LIMIT 1").run(
         _execute=make_executor(truth))
-    assert len(limited.rows) == 1
+    assert limited.count() == 1
+
+
+def test_sql_query_streams_and_collects_arrow(sess):
+    truth = {"r": {"q1:": [1, 1, 0, 1, 1, 0],
+                   "q2:": [1, 0, 1, 1, 0, 1]}}
+    query = sess.sql(FILTER_SQL)
+
+    reader = query.execute_stream(
+        _execute=make_executor(truth), batch_rows=1)
+    batches = list(reader)
+    assert isinstance(reader, pa.RecordBatchReader)
+    assert [len(batch) for batch in batches] == [1, 1]
+
+    table = query.collect(_execute=make_executor(truth), limit=1)
+    assert isinstance(table, pa.Table)
+    assert table.column("r.id").to_pylist() == ["r0"]
 
 
 def test_join_query_pairs(sess):
@@ -128,7 +147,7 @@ def test_join_query_pairs(sess):
     expect = sorted(("r%d" % a, "p%d" % p)
                     for a in (0, 2, 4) for p in range(4)
                     if (a + p) % 4 == 0)
-    assert sorted(res.rows) == expect
+    assert sorted(res.to_rows()) == expect
     jstage = [s for s in res.report["stages"] if s["op"] == "join"][0]
     assert jstage["tuples"] == 12
     assert jstage["provided_selectivity"] == 0.25
@@ -143,7 +162,7 @@ def test_anti_join_keeps_unmatched(sess):
     """
     join = {("r", "s"): lambda a, p: 1 if a < 3 else 0}
     res = sess.sql(sql).run(_execute=make_executor({}, join))
-    assert sorted(res.rows) == [("r3",), ("r4",), ("r5",)]
+    assert sorted(res.to_rows()) == [("r3",), ("r4",), ("r5",)]
 
 
 def test_order_by_cost_reorders_payload(sess):
@@ -183,6 +202,20 @@ def test_payload_carries_filter_arena_writes(sess):
     seen = {}
     sess.sql(FILTER_SQL).run(_execute=make_executor(truth2, seen=seen))
     assert seen["payload"]["filter_arena_writes"] == {"r": True}
+
+
+def test_payload_carries_arrow_ipc_tokens(sess):
+    truth = {"r": {"q1:": [1, 0, 1, 0, 1, 0]}}
+    seen = {}
+
+    sess.sql(
+        "SELECT r.id FROM reviews r WHERE AI_FILTER("
+        "PROMPT('q1: {0}', r.review), {'selectivity': 0.5})"
+    ).run(_execute=make_executor(truth, seen=seen))
+
+    payload = seen["payload"]["docs"]["r"]
+    assert isinstance(payload, bytes)
+    assert not isinstance(payload, list)
 
 
 def test_refusal_raises_on_run_prints_in_explain(sess, tmp_path):
@@ -298,7 +331,7 @@ def test_three_way_join_tuples_and_gate(sess, tmp_path):
     expect = sorted((f"r{a}", f"p{p}", f"g{g}")
                     for a in range(6) for p in range(4)
                     for g in range(3) if (a + p + g) % 5 == 0)
-    assert sorted(res.rows) == expect
+    assert sorted(res.to_rows()) == expect
     jstage = [s for s in res.report["stages"] if s["op"] == "join"][0]
     assert jstage["tuples"] == 6 * 4 * 3
     assert jstage["partners"] == ["p", "g"]
@@ -347,7 +380,7 @@ def test_two_join_chain_recombination(sess, tmp_path):
     # both stages anchored on the shared table, one per payload entry
     assert [j["anchor"] for j in seen["payload"]["joins"]] == \
         ["p", "p"]
-    assert sorted(res.rows) == CHAIN_EXPECT
+    assert sorted(res.to_rows()) == CHAIN_EXPECT
     # p1 was gated after stage 1: stage 2 evaluated 3 anchors, not 4
     jstages = [s for s in res.report["stages"] if s["op"] == "join"]
     assert jstages[0]["tuples"] == 4 * 6
@@ -376,8 +409,8 @@ def test_gate_after_two_join_chain_filters_tuples(sess, tmp_path):
     join = {("p", "r"): J1, ("p", "g"): J2,
             ("g", "x"): lambda g, x: 1 if g == 0 else 0}
     res = q.run(_execute=make_executor({}, join))
-    assert sorted(res.rows) == [t for t in CHAIN_EXPECT
-                                if t[2] != "g0"]
+    assert sorted(res.to_rows()) == [t for t in CHAIN_EXPECT
+                                     if t[2] != "g0"]
 
 
 def test_two_join_chain_limit_caps_final_triples(sess, tmp_path):
@@ -388,8 +421,8 @@ def test_two_join_chain_limit_caps_final_triples(sess, tmp_path):
         _execute=make_executor({}, join, seen=seen))
     # no upstream cut: the cap applies to the final triples only
     assert seen["payload"]["limit"] is None
-    assert len(res.rows) == 3
-    assert set(res.rows) <= set(CHAIN_EXPECT)
+    assert res.count() == 3
+    assert set(res.to_rows()) <= set(CHAIN_EXPECT)
     assert len(CHAIN_EXPECT) > 3
 
 
@@ -415,8 +448,8 @@ def test_limit_join_payload_carries_no_filter_limit(sess):
     assert q.plan().limit == 2
     res = q.run(_execute=make_executor(truth, join, seen=seen))
     assert seen["payload"]["limit"] is None
-    assert len(res.rows) == 2
-    assert all(r == "r4" for r, _ in res.rows)
+    assert res.count() == 2
+    assert all(r == "r4" for r, _ in res.to_rows())
 
 
 def test_chain_with_barrier_recombination(sess, tmp_path):
@@ -446,7 +479,7 @@ def test_chain_with_barrier_recombination(sess, tmp_path):
     assert [j["anchor"] for j in seen["payload"]["joins"]] == \
         ["r", "g"]
     # same pair semantics as the shared-anchor chain, same triples
-    assert sorted(res.rows) == CHAIN_EXPECT
+    assert sorted(res.to_rows()) == CHAIN_EXPECT
 
 
 def test_gate_after_full_join_filters_partner_tuples(sess, tmp_path):
@@ -467,5 +500,5 @@ def test_gate_after_full_join_filters_partner_tuples(sess, tmp_path):
             ("p", "x"): lambda p, x: 1 if p == 1 else 0}
     res = q.run(_execute=make_executor({}, join))
     # p1 is matched by the anti gate and drops; every (r, p!=1) stays
-    assert sorted(res.rows) == sorted(
+    assert sorted(res.to_rows()) == sorted(
         (f"r{a}", f"p{p}") for a in range(6) for p in (0, 2, 3))

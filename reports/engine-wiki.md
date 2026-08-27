@@ -50,7 +50,7 @@ Session (runtime/session.py)
   |
   v
 plan_query (planner/decide.py)
-  reads: specs, budgets
+  reads: model and device specs, budgets
   produces: PhysicalPlan
   |
   v
@@ -65,7 +65,11 @@ worker.execute (runtime/worker.py, on Modal GPU)
   |
   v
 _assemble (runtime/session.py)
-  gates, assembles tuples, projects -> Result
+  converts answers to Arrow tables
+  |
+  v
+Arrow Acero
+  hash joins, projects, counts, streams -> QueryResult
 ```
 
 ## 1. System overview
@@ -99,9 +103,10 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    which the worker re-runs on the actual filter survivors before
    executing the joins. KV is always bf16. The only wall-time number
    is the counted speed-of-light ranking the search uses.
-6. The session builds a payload (token id lists, planned settings,
-   and the plan's node graph) and ships it to a Modal worker over
-   RPC.
+6. The session sends document token columns as Arrow IPC bytes with
+   the planned settings and the plan's node graph. The worker reads
+   each document as an Arrow token slice. It does not build one
+   Python list per document.
 7. The worker executes the graph on the GPU: filter chains,
    exists/anti gates, and the full join stages (each one a
    cross-product stage, however many tables it spans). Consecutive
@@ -109,12 +114,15 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    anchor's kept KV; a Barrier node between groups thins the live
    sets to the surviving pairs' documents and, on several GPUs,
    re-shards the next anchor over the measured live set.
-8. The worker returns raw answer rows. The session assembles output
-   tuples by equi-joining the full stages' TRUE rows on shared
-   document ids (each stage keyed on its own anchor), no model
-   calls, each member checked against its table's final survivor
-   set. It applies LIMIT to these final tuples, then the projection,
-   and returns a `Result`.
+8. The worker returns raw answers. The session stores filter and join
+   answers in Arrow tables. Arrow Acero equi-joins the TRUE pairs on
+   shared SQL alias columns and applies the final survivor sets. Each
+   alias column contains the source table row number for one document.
+   A `QueryResult` returns projected rows through a
+   `RecordBatchReader`.
+   `collect()` explicitly reads those batches into memory. `count()`
+   runs an Acero aggregate without creating Python row tuples. LIMIT
+   stops the result stream after the requested number of rows.
 
 ## 2. Query compilation
 
@@ -224,7 +232,7 @@ other than the EXISTS form. LIMIT N caps the output rows. For a
 filter-only query that means the filter loop stops once N survivors
 are found (early termination); for a join query the filter round
 gets no limit - one document can appear in zero or many output rows
-(#39) - and `_assemble` truncates the final tuples instead
+(#39) - and the Arrow result stream applies the final limit instead
 (`filter_round_limit` in `runtime/coordinator.py` decides). The
 builder equivalent is `.limit(n)` before `.select()`. The rejection
 list is explicit (`compile.py:22-33`), so new SQL surface cannot
@@ -787,7 +795,7 @@ answers. This overlaps GPU compute with answer readback.
 | `Pipeline.custom_silu_quant` | `attention.py:223` | Fused SiLU + multiply + fp8 quant (Triton) |
 | `Pipeline.custom_norm_quant` | `attention.py:235` | Fused residual-add + RMSNorm + fp8 quant (Triton) |
 | `Pipeline.custom_qk_norm_rope` | `attention.py:248` | Fused QK-norm + RoPE (Triton) |
-| `pack_chunk` | `loop.py:125` | Build GPU tensors for one chunk from group specs (all index tensors staged through pinned memory) |
+| `pack_chunk` | `loop.py:125` | Build GPU tensors for one chunk from group specs. Document tokens stay as Arrow slices until the selected parts are copied once into a pinned CPU tensor, then uploaded to the GPU in one transfer. |
 | `pack_stream` | `pack.py:57` | Brim-pack the join's tuple list into chunks (join path) |
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
 | `run_filter` | `loop.py:462` | The filter chain execution loop |
@@ -971,6 +979,14 @@ Between join stages, gating drops anchors that had no surviving
 pairs. `gate()` (`pack.py:132`) returns anchor indices where any
 answer was TRUE. Dropped anchors' pages are freed immediately.
 
+The runtime gates a group of anchors at once. It adds anchors to a
+group until their page-rounded document and frame KV would fill the
+arena. It packs stage 1 for that group into full token-budget chunks,
+waits for the answers, and then packs the survivors for stage 2. It
+does not force one anchor per group. The page limit keeps every anchor
+needed by the group resident while unrelated retained KV can be
+evicted.
+
 ### Dedup
 
 In a chain join (e.g., A-B-C with B as anchor), an anchor B that
@@ -1014,9 +1030,10 @@ for each chunk in plan:
 # an exists/anti gate is the two-table case of the same stage,
 # with the keep rule applied to the anchor's answers
 
-# assemble output: for each anchor B with TRUE rows,
-#   for each TRUE tuple (A, C) whose members survive their tables'
-#   final gates, emit (B, A, C)
+# convert each stage's answers to an Arrow table
+# Acero hash-joins the TRUE rows on shared document-id columns
+# QueryResult.execute_stream() returns projected Arrow record batches
+# QueryResult.count() places an Acero count aggregate above the joins
 ```
 
 ## 6. Multi-GPU dispatch
