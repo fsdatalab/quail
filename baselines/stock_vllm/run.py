@@ -1,11 +1,18 @@
 """Stock vLLM baseline for all 35 QUAIL-B queries.
 
-Runs on a single H100 via Modal. Each filter stage is a separate
+Runs on H100s via Modal. Each filter stage is a separate
 llm.generate() call. Each join runs the full cross product via
 run_join_grouped(). Multi-step queries feed survivors from one step
 to the next.
 
+Single container (default):
     uv run modal run -m baselines.stock_vllm.run::main
+
+Parallel across N containers:
+    uv run modal run -m baselines.stock_vllm.run::main --containers 4
+
+    Each container boots its own LLM and runs a subset of queries.
+    Results are merged and saved to the quail-results volume.
 """
 
 import json
@@ -62,6 +69,18 @@ QUERY_ORDER = [
     "LEP-1", "LEP-2", "LEP-3", "LEP-4", "LEP-5", "LEP-6",
     "LEP-7", "LEP-8",
 ]
+
+
+def _split_queries(ids, n):
+    """Split query IDs into n roughly equal chunks."""
+    k, m = divmod(len(ids), n)
+    chunks = []
+    start = 0
+    for i in range(n):
+        size = k + (1 if i < m else 0)
+        chunks.append(ids[start:start + size])
+        start += size
+    return [c for c in chunks if c]
 
 
 def define_all_queries():
@@ -380,11 +399,30 @@ def run_query(llm, sp, true_set, tokenizer, qid, query_def,
                 total_wall_s=total_wall)
 
 
+@app.function(timeout=600, image=image,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/results": results_vol})
+def ensure_data(sf: float):
+    """Build QUAIL-B datasets on the volume before parallel fan-out."""
+    from quail.bench.quailb import build_sets
+    build_sets(DATA_DIR, sf)
+
+
 @app.function(timeout=7200, **GPU_KW)
-def run_stock_baseline(model: str = "qwen3-4b", sf: float = 0.1,
-                       query_id: str = "",
-                       reps: int = 1) -> str:
-    """Run all 35 QUAIL-B queries on stock vLLM."""
+def run_query_batch(model: str = "qwen3-4b", sf: float = 0.1,
+                    query_ids_csv: str = "", reps: int = 1) -> str:
+    """Boot LLM and run a batch of queries.
+
+    Args:
+        model: Key into MODELS dict.
+        sf: Scale factor for QUAIL-B data.
+        query_ids_csv: Comma-separated query IDs to run.
+            Empty string means all 35.
+        reps: Number of repetitions.
+
+    Returns:
+        JSON string with boot info and per-query results.
+    """
     from baselines.stock_boot import time_llm_boot
     from quail.bench.quailb import build_sets
     from quail.executor.loop import true_false_ids
@@ -412,8 +450,8 @@ def run_stock_baseline(model: str = "qwen3-4b", sf: float = 0.1,
     llm.generate([{"prompt_token_ids": allowed}], sp, use_tqdm=False)
 
     queries = define_all_queries()
-    if query_id:
-        ids = [q.strip() for q in query_id.split(",")]
+    if query_ids_csv:
+        ids = [q.strip() for q in query_ids_csv.split(",")]
         for qid in ids:
             if qid not in queries:
                 raise ValueError(
@@ -421,10 +459,6 @@ def run_stock_baseline(model: str = "qwen3-4b", sf: float = 0.1,
                     f"{sorted(queries)}")
     else:
         ids = [qid for qid in QUERY_ORDER if qid in queries]
-
-    out_dir = Path("/results/stock_vllm") / time.strftime(
-        "%Y-%m-%d_%H%M%S")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     all_results = []
     for rep in range(reps):
@@ -447,6 +481,7 @@ def run_stock_baseline(model: str = "qwen3-4b", sf: float = 0.1,
 
     report = dict(model=model, hf_name=hf_name, sf=sf,
                   boot=boot, reps=reps,
+                  query_ids=ids,
                   submission="separate generate() per filter stage, "
                              "full cross product per join",
                   checkpoint="pre-quantized FP8",
@@ -454,21 +489,103 @@ def run_stock_baseline(model: str = "qwen3-4b", sf: float = 0.1,
                   gpu_memory_utilization=0.92,
                   enable_prefix_caching=True,
                   results=all_results)
+    return json.dumps(report)
 
+
+@app.function(timeout=300, image=image,
+              volumes={"/results": results_vol})
+def save_report(report_json: str, label: str) -> str:
+    """Save a merged report to the quail-results volume."""
+    out_dir = Path("/results/stock_vllm") / label
+    out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "summary.json"
     with open(out_path, "w") as f:
-        json.dump(report, f, indent=2)
+        f.write(report_json)
     results_vol.commit()
+    return str(out_path)
 
-    print(f"\n[stock_vllm] saved {out_path} "
-          f"({len(ids)} queries x {reps} reps)", flush=True)
-    return json.dumps(report)
+
+def _merge_reports(batch_reports, n_containers):
+    """Merge results from parallel containers into one report."""
+    base = batch_reports[0]
+    reps = base["reps"]
+    boots = [r["boot"] for r in batch_reports]
+    all_query_ids = []
+    for r in batch_reports:
+        all_query_ids.extend(r["query_ids"])
+
+    merged_results = []
+    for rep_idx in range(reps):
+        rep_queries = []
+        for report in batch_reports:
+            rep_queries.extend(report["results"][rep_idx])
+        merged_results.append(rep_queries)
+
+    return dict(
+        model=base["model"],
+        hf_name=base["hf_name"],
+        sf=base["sf"],
+        boots=boots,
+        reps=reps,
+        containers=n_containers,
+        query_ids=all_query_ids,
+        submission=base["submission"],
+        checkpoint=base["checkpoint"],
+        max_num_seqs=base["max_num_seqs"],
+        max_num_batched_tokens=base["max_num_batched_tokens"],
+        gpu_memory_utilization=base["gpu_memory_utilization"],
+        enable_prefix_caching=base["enable_prefix_caching"],
+        results=merged_results,
+    )
 
 
 @app.local_entrypoint()
 def main(model: str = "qwen3-4b", sf: float = 0.1,
-         query: str = "", reps: int = 1):
-    fc = run_stock_baseline.spawn(
-        model=model, sf=sf, query_id=query, reps=reps)
-    print(f"function call id: {fc.object_id}")
-    print(fc.get())
+         query: str = "", reps: int = 1,
+         containers: int = 1):
+    if query:
+        ids = [q.strip() for q in query.split(",")]
+    else:
+        ids = list(QUERY_ORDER)
+
+    label = time.strftime("%Y-%m-%d_%H%M%S")
+
+    if containers <= 1:
+        fc = run_query_batch.spawn(
+            model=model, sf=sf,
+            query_ids_csv=",".join(ids), reps=reps)
+        print(f"function call id: {fc.object_id}")
+        result_json = fc.get()
+        report = json.loads(result_json)
+    else:
+        print(f"[stock_vllm] building data (sf={sf}) before "
+              f"fan-out...")
+        ensure_data.remote(sf)
+        print(f"[stock_vllm] data ready, spawning {containers} "
+              f"containers for {len(ids)} queries")
+
+        chunks = _split_queries(ids, containers)
+        handles = []
+        for i, chunk in enumerate(chunks):
+            fc = run_query_batch.spawn(
+                model=model, sf=sf,
+                query_ids_csv=",".join(chunk), reps=reps)
+            print(f"  container {i}: {fc.object_id} "
+                  f"({len(chunk)} queries: "
+                  f"{chunk[0]}..{chunk[-1]})")
+            handles.append(fc)
+
+        batch_reports = []
+        for i, h in enumerate(handles):
+            print(f"  waiting for container {i}...")
+            batch_reports.append(json.loads(h.get()))
+            print(f"  container {i} done")
+
+        report = _merge_reports(batch_reports, containers)
+
+    out_path = save_report.remote(
+        json.dumps(report, indent=2), label)
+    print(f"\n[stock_vllm] saved {out_path}")
+    print(f"  {len(ids)} queries, {reps} reps, "
+          f"{containers} container(s)")
+    print(json.dumps(report))
