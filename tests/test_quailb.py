@@ -4,7 +4,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import quail
-from quail.bench.quailb import ASPECTS, SETS, queries, register_sets
+from quail.bench.quailb import (
+    ASPECTS,
+    QUERY_ORDER,
+    SETS,
+    queries,
+    register_sets,
+    split_query_ids,
+)
 from quail.planner.plan import EngineConfig, Refusal
 
 
@@ -49,6 +56,7 @@ def test_all_queries_compile_and_plan(tmp_path):
         *(f"LEP-{i}" for i in range(1, 9)),
     }
     assert set(qdefs) == expected
+    assert set(QUERY_ORDER) == expected
     for qid, (_, build) in qdefs.items():
         query = build()
         plan = query.plan()
@@ -64,3 +72,12 @@ def test_set_table_matches_design():
         "citations": 2_000,
     }
     assert len(ASPECTS) == 12
+
+
+def test_parallel_query_split_matches_stock_vllm():
+    assert split_query_ids(QUERY_ORDER, 4) == (
+        QUERY_ORDER[0:9],
+        QUERY_ORDER[9:18],
+        QUERY_ORDER[18:27],
+        QUERY_ORDER[27:35],
+    )

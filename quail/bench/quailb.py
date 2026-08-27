@@ -1,4 +1,4 @@
-"""QUAIL-B: twenty-six queries over four document sets (IMDB, BioDEX,
+"""QUAIL-B: thirty-five queries over four document sets (IMDB, BioDEX,
 FEVER, LePaRD).
 
     uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8 --gpus 1
@@ -47,6 +47,25 @@ ASPECTS = ["the acting", "the plot", "the directing", "the cinematography",
            "the soundtrack", "the pacing", "the ending", "the dialogue",
            "the special effects", "the character development",
            "the screenplay", "the editing"]
+
+QUERY_ORDER = (
+    *(f"IMDB-{i}" for i in range(1, 11)),
+    *(f"BIO-{i}" for i in range(1, 9)),
+    *(f"FEV-{i}" for i in range(1, 10)),
+    *(f"LEP-{i}" for i in range(1, 9)),
+)
+
+
+def split_query_ids(ids, containers):
+    """Split query IDs into the same equal chunks as stock vLLM."""
+    count, extra = divmod(len(ids), containers)
+    chunks = []
+    start = 0
+    for index in range(containers):
+        size = count + (1 if index < extra else 0)
+        chunks.append(tuple(ids[start:start + size]))
+        start += size
+    return tuple(chunk for chunk in chunks if chunk)
 
 
 def _n_docs(name, sf):
@@ -131,8 +150,8 @@ def _lepard_rows(n):
     text comes from passage_dict.json, not the CSV's own quote column."""
     import json as _json
 
-    from huggingface_hub import hf_hub_download
     import pandas as pd
+    from huggingface_hub import hf_hub_download
 
     csv_path = hf_hub_download("rmahari/LePaRD", "top_10000_data.csv.gz",
                                repo_type="dataset",
@@ -690,12 +709,12 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
               out_path=None, model="qwen3-4b-fp8",
               accuracy=True, ground_truth_collection=None,
               h100_usd_per_hour=3.9492, ground_truth_files=None,
-              prediction=None, artifact_stem=None):
+              prediction=None, artifact_stem=None, execute=None):
     """Run all (or selected) QUAIL-B queries through the engine."""
     import quail
     from quail.bench.evaluate import (
-        BenchmarkEvaluator,
         H100_PRICE_SOURCE,
+        BenchmarkEvaluator,
         ModalVolumeFiles,
         add_query_metrics,
         corpus_identity,
@@ -724,7 +743,12 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     sess = quail.Session(EngineConfig(gpus=gpus, model=model))
     register_sets(sess, d)
     qdefs = queries(sess)
-    ids = [i for i in qdefs if only is None or i in only]
+    if only is None:
+        ids = list(qdefs)
+    elif isinstance(only, (set, frozenset)):
+        ids = [query_id for query_id in qdefs if query_id in only]
+    else:
+        ids = [query_id for query_id in only if query_id in qdefs]
     started = datetime.now(timezone.utc)
     artifact_stem = artifact_stem or _artifact_stem(
         started, sf, lf, model)
@@ -787,7 +811,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             print(f"[quailb] {qid}: {desc}", flush=True)
             try:
                 query = build()
-                res = query.run()
+                res = query.run(_execute=execute)
                 row = dict(query=qid, desc=desc,
                            wall_s=res.report["wall_s"],
                            boot_s=res.report["boot_s"],
