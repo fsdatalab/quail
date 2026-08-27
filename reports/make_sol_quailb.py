@@ -407,7 +407,11 @@ def simulate_query(query, chunk_tokens: int):
     aliases = prepared.aliases
     survivors = prepared.survivors
     work = prepared.work
-    resident = prepared.resident
+    # the engine keeps KV only where the plan says so: filter chains
+    # with keep_kv, and join groups with keep_anchor_kv
+    resident = {node["alias"]
+                for node in plan.nodes_by_op("FilterChain")
+                if node.get("keep_kv")}
     filter_stages = prepared.filter_stages
     filter_evaluations = prepared.filter_evaluations
     post_filter_counts = prepared.post_filter_counts
@@ -429,6 +433,8 @@ def simulate_query(query, chunk_tokens: int):
             anchor = runtime_anchor(
                 stage_defs[0], anchor, aliases, survivors, chunk_tokens)
 
+        keep_after = (node.get("keep_anchor_kv")
+                      and anchor == node["anchor"])
         for stage_index, join in enumerate(stage_defs):
             prompt = join.predicate
             code = prompt_code(prompt)
@@ -478,7 +484,6 @@ def simulate_query(query, chunk_tokens: int):
             }
             finished_full.append(stage_out)
             survivors[anchor] = kept
-            resident.add(anchor)
             join_stages.append({
                 "code": code,
                 "anchor": anchor,
@@ -487,6 +492,10 @@ def simulate_query(query, chunk_tokens: int):
                 "passing_pairs": passing_pairs,
                 "fresh_tokens": stage_work.tokens,
             })
+        if keep_after:
+            resident.add(anchor)
+        else:
+            resident.discard(anchor)
 
     first_alias = scans[0].alias
     input_document_rows = sum(

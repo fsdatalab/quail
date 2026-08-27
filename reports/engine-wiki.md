@@ -290,31 +290,74 @@ is used.
 **Join order and anchors, one search** (`plan_joins` in
 `decide.py`): stage order and per-stage anchors are decided
 together, because they interact - anchors set what an order is
-worth, and order sets which stages can share an anchor's KV (issue
-#38). The planner enumerates every (order, anchor) sequence (only
-the written order under `as_written`; a gate's anchor is fixed to
-its outer table, a forced anchor is honored with a remark when it
-prices worse) and walks each one's cost with live counts:
+worth, and order sets which stages can reuse an anchor's KV (issue
+#38). Under `by_cost` the search is the left deep subset DP
+(`planner/leftdeep.py`, the same search the SoL estimate runs): the
+state is (joined alias set, cached prefix alias set), each step adds
+one connected alias and applies every predicate that completes, in
+every order, with every feasible anchor. Under `as_written` the
+written stage order is kept and only anchors are searched. A gate's
+anchor is fixed to its outer table; a forced anchor is honored with
+a remark when a free choice prices lower.
 
-- a stage opening a group pays the anchor's KV once per live anchor
-  document (preamble + document + complete question frame), plus a fixed
-  re-shard overhead when it follows a group on a different anchor
-  (`RESHARD_OVERHEAD_TOKENS`, 0 until measured - the fresh-KV term
-  is the real cost);
-- a stage continuing a same-anchor run of full stages pays only its
-  complete question frame;
+Each stage is costed as an expected-value `Work` record
+(`planner/sol.py`: tokens, attention pairs, KV written, KV read)
+from live counts and mean document lengths:
+
+- an anchor whose document prefix KV is resident - kept by its
+  filter chain, or anchored by an earlier stage - pays only its
+  complete question frame (`ask`); one without pays preamble +
+  document + frame per live document (`scan`);
+- a filtered anchor with a partial keep pays the frame for the kept
+  documents and a scan for the rest (the keep split below);
 - every stage pays its pair stream: each partner document behind its
-  block label, plus the answer cue, once per tuple;
+  block label, plus the answer cue, once per tuple, each attending
+  over the resident anchor context;
 - after each stage the live counts thin by
   `n * (1 - (1-s)^partner_tuples)` (`_surviving_docs`).
 
-The cheapest sequence wins; its anchor switches become groups and
-Barrier nodes at emission. Every sequence runs (each spec is the
-cross product over its own tables), so order and anchors change
-cost, never results. At run time, `pick_runtime_anchor` re-picks a
+Per state, records survive unless another is no larger in all four
+work categories. The final candidates are ranked by predicted
+seconds - `speed_of_light` over the query's whole Work, filter
+stages included, from counted model constants and the device
+datasheet. No calibration constant is read anywhere in planning.
+The chosen sequence's anchor switches become groups and Barrier
+nodes at emission. Every sequence runs (each spec is the cross
+product over its own tables), so order and anchors change cost,
+never results. At run time, `pick_runtime_anchor` re-picks a
 one-stage group's anchor from the measured live counts (issue #38,
 step 4.1) - the same arithmetic over the payload's token id lists,
-restricted to anchors whose worst-case tuple fits the chunk budget.
+restricted to anchors whose worst-case tuple fits the chunk budget,
+and crediting KV already resident in the arena.
+
+**KV residency across operators** (`plan_keeps`, `keep_split` in
+`decide.py`): the planner decides which document KV outlives its
+operator.
+
+- A filtered alias the plan will anchor keeps its survivors' KV in
+  the arena after the chain (`keep_kv` on the FilterChain node;
+  `arena_writes` is forced on for it). The join then anchors on KV
+  that is already there instead of recomputing every document.
+- When the expected kept mass exceeds the arena minus the largest
+  single admission, the shortest documents are dropped from the
+  keep first (`keep_split`): resident KV saves the document's
+  recompute - a linear dense term plus a quadratic attention term -
+  while occupying bytes linear in length, so per byte the longest
+  documents are worth the most. Survival is fractional in
+  expectation, which makes keeping the longest the exact fractional
+  knapsack answer. The remark names the resulting length threshold.
+- A join group whose anchor a later group re-uses keeps its
+  surviving anchors' KV (`keep_anchor_kv` on the JoinGroup node),
+  so a gate between two same-anchor stages no longer forces a
+  recompute.
+- `_keep_timeline` checks the peak expected resident tokens per
+  worker across the whole plan; keeps are trimmed until the peak
+  plus the working headroom fits the admission budget, and the
+  search re-runs once against the trimmed credit.
+
+Every stage records the residency its cost assumed
+(`anchor_resident`: none / filter / kept), so `explain()` shows
+which stages the planner priced as KV reuse.
 
 **Sharding** (`balanced_shards` in `decide.py`): greedy balance by
 token count across workers. Filters split documents; joins split
@@ -337,15 +380,18 @@ sort predicates by cost (stable, so ties keep written order)
 ### Pseudocode: anchor selection
 
 ```
-for each table of the join:
-    compute tuple_tokens(table as anchor) =
-        n_anchor_docs                                (prefix + question
-        * (mean_anchor_tokens + pre + frame_tokens)   frame, once each)
-      + product of every table's n_docs              (number of tuples)
+for each table of the join (a gate only offers its outer table):
+    anchor_cost(table) =
+        0 if the table's prefix KV is resident          (kept by a filter
+        else n_docs * (mean_tokens + pre)                or earlier anchor)
+      + n_docs * frame_tokens                           (the frame, always)
+    stream_cost =
+        product of every table's n_docs                 (number of tuples)
         * (sum over partners of
              (label_tokens + mean_partner_tokens)
-           + answer_cue_tokens)                      (suffix, once each)
-pick the table with the fewest tuple_tokens as anchor
+           + answer_cue_tokens)                         (suffix, once each)
+score = seconds(anchor_cost tokens and pairs + stream_cost ...)
+pick the anchor that makes the whole plan's predicted seconds smallest
 ```
 
 ### Settings from the spec structs
@@ -397,9 +443,13 @@ single forward pass, sharing KV across them through a paged arena.
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
-| `plan_joins` | `decide.py` | The joint (order x anchor) search: cost every sequence, keep the cheapest |
-| `pick_runtime_anchor` | `decide.py` | Re-pick a one-stage group's anchor at a barrier, from measured live counts |
+| `plan_joins` | `decide.py` | The joint (order x anchor) search: the left deep DP under by_cost, anchors only under as_written |
+| `plan_keeps` / `keep_split` | `decide.py` | Which survivors' KV stays resident for a join, longest documents first |
+| `pick_runtime_anchor` | `decide.py` | Re-pick a one-stage group's anchor at a barrier, from measured live counts and resident KV |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
+| `optimize_left_deep` | `leftdeep.py` | Subset DP over (joined aliases, cached prefix aliases) with a nondominated Work frontier |
+| `scan` / `ask` / `stream` | `sol.py` | The three KV operations as Work records |
+| `speed_of_light` | `sol.py` | Work -> seconds floor from counted constants; ranks candidate plans |
 | `chunk_budget` | `budgets.py` | Tokens per forward pass (min of memory and kernel bounds) |
 | `arena_tokens` | `budgets.py` | KV residency budget (device memory minus weights and activations) |
 
@@ -739,7 +789,13 @@ that runs until `FilterAdmission.done()`:
 4. While the GPU runs the current chunk, read the previous chunk's
    answers and gate: documents that answered NO have their pages
    freed immediately; survivors advance to their next stage.
-   Documents leaving their last stage free their pages too.
+   Documents leaving their last stage free their pages too - unless
+   the chain runs in keep mode (the plan's `keep_kv`), where
+   survivors' pages stay held for the join that will anchor on
+   them, under stable `("kv", alias, doc)` arena keys. If kept KV
+   starves a fresh admission, the smallest kept documents are
+   evicted (minus any a larger victim makes redundant) and simply
+   recomputed by the join later.
 
 Single-stage queries (one question) skip the arena entirely: no
 later stage reads any document's KV, so the alloc, the per-layer KV
@@ -780,6 +836,20 @@ the next group's stage-0 chunk while waiting on the current group's
 gate (which cannot be planned past until answers arrive), keeping the
 GPU fed across gate boundaries. A per-stage frame, if present, is
 written into the anchor's kept KV once after the document rows.
+
+An anchor whose arena key is already resident - a kept filter
+survivor, or a kept anchor of an earlier group - packs no prefix
+tokens at all: the frame scatters into the kept pages and the tuple
+suffixes read the document KV that is already there. Kept pages
+without row room for this run's frame are freed and recomputed (a
+runtime anchor re-pick can land on an alias whose filter reserved a
+smaller frame). With `keep_semantics` set, the group's gate
+survivors keep their pages at the end for a later group on the same
+table; under allocation pressure an evict hook frees other tables'
+kept KV, smallest documents first minus redundant victims. The
+worker frees every kept key the moment its last consumer group is
+behind, and sweeps kept keys at query start and end - the arena
+outlives a query, kept KV must not.
 
 ### 4.7 KV rewind (chain mode)
 
@@ -896,6 +966,15 @@ anchors a later stage needs; their KV stays in the arena across the
 stage boundary. The `already_kept` parameter tells the packer which
 anchors' KV is already resident, so their groups do not pack fresh
 prefix tokens.
+
+The same mechanism now crosses operator boundaries. A filter chain
+with `keep_kv` leaves its survivors' KV in the arena; the join group
+anchored on that alias finds the keys resident and skips every kept
+document's prefix. A group with `keep_anchor_kv` leaves its gate
+survivors for a later group on the same table. On several GPUs the
+KV is already on the right card: join anchors follow the shards
+their KV sits on - the shards of the group that kept them, else
+their filter shards (`join_group_payloads`).
 
 ### Pseudocode: the n-way join as one cross-product stage
 

@@ -224,9 +224,10 @@ Quail metrics.
 
 ## 5. The code
 
-`reports/make_sol_quailb.py` is these equations, plus the
-measurement of the three inputs they need. Three functions carry
-section 3:
+The equations live in `quail/planner/sol.py`, shared by this
+calculation and the planner; `reports/make_sol_quailb.py` imports
+them and adds the measurement of the three inputs they need. Three
+functions carry section 3:
 
 | function | equation |
 |---|---|
@@ -236,14 +237,17 @@ section 3:
 
 `simulate_optimal_left_deep()` builds the exact join relations from the saved
 labels. `join_stage_work()` counts one stage for each anchor choice.
-`optimize_left_deep()` searches relation subsets and KV availability. A unit
-test compares its result with complete enumeration on a small query.
+`optimize_left_deep()` (`quail/planner/leftdeep.py`) searches relation
+subsets and KV availability. A unit test compares its result with complete
+enumeration on a small query.
 
-`simulate_query()` still follows the current physical planner. Its result is
-stored beside the optimum for comparison. The script calls both simulations
-separately for each model and passes that model's chunk limit.
-`speed_of_light()` is section 4. Nothing in the engine imports this
-calculation. It is analysis and is not a planner input.
+`simulate_query()` still follows the current physical planner, including the
+KV the plan actually keeps (its `keep_kv` and `keep_anchor_kv` fields). Its
+result is stored beside the optimum for comparison. The script calls both
+simulations separately for each model and passes that model's chunk limit.
+`speed_of_light()` is section 4. The planner imports the same equations to
+rank its candidate join plans; the exact-label simulation here remains
+analysis.
 
 ## 6. What the bound assumes
 
