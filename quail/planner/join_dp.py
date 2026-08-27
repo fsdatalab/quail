@@ -4,15 +4,9 @@ import itertools
 import math
 from dataclasses import dataclass
 
+from quail.planner.left_deep import Extension, optimize_left_deep
 from quail.planner.work import Work, ask, ideal_seconds, scan, stream
 from quail.specs import DeviceSpec, ModelSpec
-
-
-@dataclass(frozen=True)
-class JoinCandidate:
-    work: Work
-    relation_order: tuple[str, ...]
-    steps: tuple[tuple[int, str], ...]
 
 
 @dataclass(frozen=True)
@@ -51,17 +45,6 @@ def _thin(live: dict[str, float], join: dict) -> None:
     matched = _surviving_docs(live[anchor], others(anchor), selectivity)
     live[anchor] = (matched if join["semantics"] == "exists"
                     else live[anchor] - matched)
-
-
-def _insert(frontier: list[JoinCandidate], candidate: JoinCandidate) -> bool:
-    if any(existing.work.dominates(candidate.work) for existing in frontier):
-        return False
-    frontier[:] = [
-        existing for existing in frontier
-        if not candidate.work.dominates(existing.work)
-    ]
-    frontier.append(candidate)
-    return True
 
 
 def _anchors(join: dict) -> tuple[str, ...]:
@@ -158,7 +141,6 @@ def optimize_joins_after_filters(
 
     aliases = tuple(sorted({alias for join in joins
                             for alias in join["aliases"]}))
-    all_aliases = frozenset(aliases)
     endpoints = [frozenset(join["aliases"]) for join in joins]
     base_live = {alias: float(len(survivors[alias])) for alias in aliases}
     live_cache = {}
@@ -174,68 +156,49 @@ def optimize_joins_after_filters(
             live_cache[relations] = live
         return dict(live_cache[relations])
 
-    states: dict[tuple[frozenset[str], str | None],
-                 list[JoinCandidate]] = {}
-    for alias in aliases:
-        states[(frozenset((alias,)), None)] = [
-            JoinCandidate(Work(), (alias,), ())
+    def extend(relations: frozenset[str], current_anchor: str | None,
+               added: str):
+        crossing = [
+            index for index, edge in enumerate(endpoints)
+            if added in edge and edge & relations
         ]
+        if not crossing:
+            return ()
 
-    generated = len(aliases)
-    for size in range(1, len(aliases)):
-        current = [
-            (state, tuple(frontier)) for state, frontier in states.items()
-            if len(state[0]) == size
-        ]
-        for (relations, current_anchor), frontier in current:
-            for added in sorted(all_aliases - relations):
-                crossing = [
-                    index for index, edge in enumerate(endpoints)
-                    if added in edge and edge & relations
-                ]
-                if not crossing:
+        extensions = []
+        for order in itertools.permutations(crossing):
+            anchor_lists = [_anchors(joins[index]) for index in order]
+            for anchors in itertools.product(*anchor_lists):
+                if any(not _fits(joins[index], anchor, docs, survivors,
+                                 pre_tokens, chunk_tokens)
+                       for index, anchor in zip(order, anchors)):
                     continue
-                for order in itertools.permutations(crossing):
-                    anchor_lists = [_anchors(joins[index]) for index in order]
-                    for anchors in itertools.product(*anchor_lists):
-                        if any(not _fits(joins[index], anchor, docs, survivors,
-                                         pre_tokens, chunk_tokens)
-                               for index, anchor in zip(order, anchors)):
-                            continue
-                        extra = Work()
-                        live = live_for(relations)
-                        previous_anchor = current_anchor
-                        steps = []
-                        for index, anchor in zip(order, anchors):
-                            join = joins[index]
-                            same = (previous_anchor == anchor
-                                    and join["semantics"] == "full")
-                            extra += _stage_work(
-                                join, anchor, live, docs, survivors,
-                                pre_tokens, resident_keys, same)
-                            _thin(live, join)
-                            steps.append((index, anchor))
-                            previous_anchor = anchor
-                        next_relations = relations | {added}
-                        for candidate in frontier:
-                            generated += 1
-                            next_candidate = JoinCandidate(
-                                candidate.work + extra,
-                                candidate.relation_order + (added,),
-                                candidate.steps + tuple(steps),
-                            )
-                            target = states.setdefault(
-                                (next_relations, previous_anchor), [])
-                            _insert(target, next_candidate)
+                extra = Work()
+                live = live_for(relations)
+                previous_anchor = current_anchor
+                steps = []
+                for index, anchor in zip(order, anchors):
+                    join = joins[index]
+                    same = (previous_anchor == anchor
+                            and join["semantics"] == "full")
+                    extra += _stage_work(
+                        join, anchor, live, docs, survivors,
+                        pre_tokens, resident_keys, same)
+                    _thin(live, join)
+                    steps.append((index, anchor))
+                    previous_anchor = anchor
+                extensions.append(Extension(
+                    work=extra,
+                    state_property=previous_anchor,
+                    steps=tuple(steps),
+                ))
+        return tuple(extensions)
 
-    finals = [candidate
-              for (relations, _), frontier in states.items()
-              if relations == all_aliases
-              for candidate in frontier]
-    if not finals:
+    search = optimize_left_deep(aliases, None, Work(), extend)
+    if not search.candidates:
         return None
     best = min(
-        finals,
+        search.candidates,
         key=lambda candidate: (
             ideal_seconds(candidate.work, model, device, chunk_tokens),
             candidate.work.tokens,
@@ -244,4 +207,5 @@ def optimize_joins_after_filters(
         ),
     )
     return JoinSearch(best.steps, _plan_nodes(best.steps, joins),
-                      best.work, len(states), generated)
+                      best.work, search.state_count,
+                      search.generated_count)

@@ -85,14 +85,13 @@ import quail
 from quail.bench import quailb as Q
 from quail.bench.evaluate import H100_PRICE_SOURCE, H100_USD_PER_HOUR
 from quail.bench.sol_dp import (
-    Extension,
     PairRelation,
     exact_live_rows,
-    optimize_left_deep,
 )
 from quail.logical import (ColumnRef, SHARED_PRE, bind_join_prompt,
                            bind_prompt)
 from quail.planner.decide import _collect
+from quail.planner.left_deep import Extension, optimize_left_deep
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.work import (Work, dense_params, flops_per_pair,
                                 triangle)
@@ -761,7 +760,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
             if position == len(order):
                 extensions.append(Extension(
                     work=work,
-                    cached=live_cache,
+                    state_property=live_cache,
                     steps=tuple(steps),
                 ))
                 return
@@ -830,7 +829,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
 
     search = optimize_left_deep(
         alias_order,
-        prepared.resident,
+        frozenset(prepared.resident),
         prepared.work,
         extend,
     )
@@ -900,7 +899,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
         "optimizer": {
             "plan_space": "all feasible left deep plans",
             "relation_order": list(best.relation_order),
-            "cached_prefixes": sorted(best.cached),
+            "cached_prefixes": sorted(best.state_property),
             "persistent_kv_capacity": "unlimited",
             "gpu_count": 1,
             "dp_states": search.state_count,

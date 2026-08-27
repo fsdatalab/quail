@@ -306,6 +306,13 @@ more work in every count. The final choice converts these counts to an
 ideal one H100! time from model dimensions and published device limits.
 No fitted timing constant is used.
 
+The state table, left deep expansion, and work pruning are implemented once
+in `planner/left_deep.py`. The SoL report uses the same search with exact
+ground truth survivors and the set of aliases with reusable KV as its physical
+property. The production planner uses actual filter survivors, estimated join
+survivors, and the current open anchor as its physical property. It also prices
+the document KV retained after filters when it counts each join stage.
+
 Actual filter survivors and document lengths seed the search. A retained
 document prefix is priced as a KV hit. Join survivors are estimated from
 the declared selectivity. If a join has no selectivity, the estimate does

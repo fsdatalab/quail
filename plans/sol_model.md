@@ -236,8 +236,11 @@ section 3:
 
 `simulate_optimal_left_deep()` builds the exact join relations from the saved
 labels. `join_stage_work()` counts one stage for each anchor choice.
-`optimize_left_deep()` searches relation subsets and KV availability. A unit
-test compares its result with complete enumeration on a small query.
+`planner/left_deep.py` contains the shared `optimize_left_deep()` search used
+by SoL and the production planner. SoL supplies exact survivors and unlimited
+KV availability. The production planner supplies estimated join survivors,
+the current open anchor, and the document KV that exists after filters. A unit
+test compares the shared search with complete enumeration on a small query.
 
 `simulate_query()` still follows the current physical planner. Its result is
 stored beside the optimum for comparison. The script calls both simulations
