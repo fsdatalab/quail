@@ -433,6 +433,7 @@ def run_stock_baseline(model: str = "qwen3-4b", sf: float = 0.1,
             llm.reset_prefix_cache()
         rep_results = []
         for qid in ids:
+            llm.reset_prefix_cache()
             print(f"\n[stock_vllm] {qid}", flush=True)
             try:
                 entry = run_query(llm, sp, true, tokenizer,
