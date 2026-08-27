@@ -198,6 +198,26 @@ def test_admission_pages_block_in_order():
     assert sched.next_chunk() == [(1, 0, True)]
 
 
+def test_admission_starts_with_only_currently_free_pages():
+    sched = FilterAdmission([80], [10], 200,
+                            arena_pages=10, page_tokens=16,
+                            available_pages=2)
+
+    assert sched.next_chunk() == []
+    assert sched.blocked_pages == 3
+    sched.add_free_pages(3)
+    assert sched.next_chunk() == [(0, 0, True)]
+
+
+def test_admission_can_leave_a_passing_document_resident():
+    sched = FilterAdmission([80], [10], 200,
+                            arena_pages=10, page_tokens=16)
+    assert sched.next_chunk() == [(0, 0, True)]
+
+    assert sched.report(0, 0, True, release=False) == ()
+    assert sched.free_pages == 5
+
+
 def test_admission_refuses_impossible_shapes():
     with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 500, 100, 16)     # over chunk

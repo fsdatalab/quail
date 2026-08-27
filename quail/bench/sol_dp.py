@@ -6,41 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Sequence
 
-
-@dataclass(frozen=True)
-class Work:
-    """Hardware independent work counted by the SoL model."""
-
-    tokens: float = 0.0
-    pairs: float = 0.0
-    kv_written: float = 0.0
-    kv_read: float = 0.0
-
-    def __add__(self, other: "Work") -> "Work":
-        return Work(
-            self.tokens + other.tokens,
-            self.pairs + other.pairs,
-            self.kv_written + other.kv_written,
-            self.kv_read + other.kv_read,
-        )
-
-    def __mul__(self, count: float) -> "Work":
-        return Work(
-            self.tokens * count,
-            self.pairs * count,
-            self.kv_written * count,
-            self.kv_read * count,
-        )
-
-    def dominates(self, other: "Work") -> bool:
-        """Return whether this record is no larger in every category."""
-
-        return (
-            self.tokens <= other.tokens
-            and self.pairs <= other.pairs
-            and self.kv_written <= other.kv_written
-            and self.kv_read <= other.kv_read
-        )
+from quail.planner.work import Work
 
 
 @dataclass(frozen=True)

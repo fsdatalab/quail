@@ -133,10 +133,16 @@ def execute(payload: dict) -> dict:
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
     os.makedirs("/results/runs", exist_ok=True)
-    with open(f"/results/runs/run_{int(time.time())}.json", "w") as f:
-        json.dump(dict(wall_s=report["wall_s"], boot_s=report["boot_s"],
-                       boot_kind=report["boot_kind"], boot=boot,
-                       fresh_tokens=report["fresh_tokens"]), f)
+    result_path = f"/results/runs/run_{time.time_ns()}.json"
+    report["result_volume_path"] = result_path
+    with open(result_path, "w") as f:
+        json.dump(dict(
+            wall_s=report["wall_s"], boot_s=report["boot_s"],
+            boot_kind=report["boot_kind"], boot=boot,
+            fresh_tokens=report["fresh_tokens"],
+            join_optimizer=report.get("join_optimizer"),
+            kv_manager=report.get("kv_manager"),
+        ), f)
     results_vol.commit()
     kernel_cache.commit()    # persist any JIT artifacts this run built
     return report
@@ -153,11 +159,13 @@ def _execute_single(state, payload: dict) -> dict:
 
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
     from quail.executor.loop import AsyncAnswers, run_filter, run_join
-    from quail.planner.decide import pick_runtime_anchor
+    from quail.planner.join_dp import optimize_joins_after_filters
+    from quail.planner.work import prefix_recompute_seconds
     from quail.runtime.coordinator import (derive_plan_nodes,
                                            filter_round_limit,
                                            gate_group, stage_for_anchor,
                                            thin_survivors)
+    from quail.specs import DEVICES
 
     torch = state["torch"]
     arena, pipeline = state["arena"], state["pipeline"]
@@ -170,6 +178,23 @@ def _execute_single(state, payload: dict) -> dict:
                                 payload["true_ids"], payload["false_ids"])
     async_ans = AsyncAnswers(torch, answerer)
     chunk_tokens = payload["chunk_tokens"]
+    device = DEVICES["h100-sxm"]
+
+    for key in list(arena.accounting.owned):
+        arena.free_key(key)
+    arena.reset_stats()
+
+    def arena_key(alias, document):
+        return alias, document
+
+    def retention_value(alias, document):
+        return prefix_recompute_seconds(
+            len(pre) + len(docs[alias][document]), state["spec"], device)
+
+    def release_without_future(future_aliases):
+        for key in list(arena.accounting.retained):
+            if key[0] not in future_aliases:
+                arena.free_key(key)
 
     total_tokens = 0
     out_filters = {}
@@ -179,15 +204,30 @@ def _execute_single(state, payload: dict) -> dict:
     limit = filter_round_limit(payload)
 
     filter_writes = payload["filter_arena_writes"]
+    possible_anchor_aliases = set()
+    for join in payload["joins"]:
+        if join.get("anchor_free"):
+            possible_anchor_aliases.update(join["aliases"])
+        else:
+            possible_anchor_aliases.add(join["anchor"])
     t0 = time.perf_counter()
     with torch.inference_mode():
         pipeline.attention_mode = FILTER_ATTENTION
         for alias, qids in payload["filters"].items():
+            keep = (range(len(docs[alias]))
+                    if alias in possible_anchor_aliases else ())
             answers, _, tokens = run_filter(
                 torch, arena, pipeline, async_ans,
                 [pre + d for d in docs[alias]], qids,
                 chunk_tokens, limit=limit,
-                arena_writes=filter_writes[alias])
+                arena_writes=filter_writes[alias],
+                arena_keys=[arena_key(alias, d)
+                            for d in range(len(docs[alias]))],
+                retain_survivors=keep,
+                retention_values={
+                    d: retention_value(alias, d)
+                    for d in keep
+                })
             total_tokens += tokens
             out_filters[alias] = {int(d): row
                                   for d, row in answers.items()}
@@ -195,28 +235,45 @@ def _execute_single(state, payload: dict) -> dict:
                 d for d, row in answers.items()
                 if len(row) == len(qids) and all(row))
 
+        kv_stats = dict(
+            retained_after_filters=len(arena.accounting.retained),
+            retained_pages_after_filters=arena.accounting.retained_pages,
+            join_anchor_hits=0,
+            join_anchor_misses=0,
+        )
+
         out_joins = []
         finished_full = []      # full stage outputs, for barriers
         pipeline.attention_mode = JOIN_ATTENTION
-        nodes = payload.get("plan_nodes") or derive_plan_nodes(
-            payload["joins"])
-        for node in nodes:
+        search = optimize_joins_after_filters(
+            payload["joins"], docs, survivors,
+            set(arena.accounting.owned), len(pre), state["spec"], device,
+            chunk_tokens)
+        if search is None:
+            nodes = payload.get("plan_nodes") or derive_plan_nodes(
+                payload["joins"])
+        else:
+            nodes = list(search.nodes)
+        planned_anchors = {
+            node["anchor"] for node in nodes if node["op"] == "JoinGroup"
+        }
+        release_without_future(planned_anchors)
+        for node_pos, node in enumerate(nodes):
             if node["op"] == "Barrier":
                 # barrier thinning; on one GPU there is no shard step
+                before = {alias: set(ids)
+                          for alias, ids in survivors.items()}
                 thin_survivors(finished_full, survivors)
+                for alias, old in before.items():
+                    for document in old - set(survivors[alias]):
+                        key = arena_key(alias, document)
+                        if key in arena.accounting.owned:
+                            arena.free_key(key)
                 continue
             if node["op"] != "JoinGroup":
                 continue
             specs = [payload["joins"][i] for i in node["stage_idxs"]]
             anchor_alias = node["anchor"]
-            if len(specs) == 1 and specs[0].get("anchor_free"):
-                # a one-stage group re-picks its anchor from the
-                # measured live counts
-                anchor_alias = pick_runtime_anchor(
-                    specs[0],
-                    {a: [len(docs[a][g]) for g in survivors[a]]
-                     for a in specs[0]["aliases"]},
-                    len(pre), chunk_tokens)
             group = [stage_for_anchor(s, anchor_alias) for s in specs]
             anchors_glob = list(survivors[anchor_alias])
             stage_suffixes = []
@@ -229,11 +286,37 @@ def _execute_single(state, payload: dict) -> dict:
                     [_tuple_suffix(j, docs, t) for t in tuples])
             prefixes = [pre + docs[anchor_alias][a]
                         for a in anchors_glob]
+            anchor_keys = [arena_key(anchor_alias, a)
+                           for a in anchors_glob]
+            kv_stats["join_anchor_hits"] += sum(
+                key in arena.accounting.owned for key in anchor_keys)
+            kv_stats["join_anchor_misses"] += sum(
+                key not in arena.accounting.owned for key in anchor_keys)
+            future_anchors = {
+                later["anchor"]
+                for later in nodes[node_pos + 1:]
+                if later["op"] == "JoinGroup"
+            }
+
+            def anchor_done(anchor, row):
+                document = anchors_glob[anchor]
+                key = anchor_keys[anchor]
+                matched = any(row)
+                alive = (not matched if group[-1]["semantics"] == "anti"
+                         else matched)
+                if alive and anchor_alias in future_anchors:
+                    arena.retain(
+                        key, len(prefixes[anchor]),
+                        retention_value(anchor_alias, document))
+                else:
+                    arena.free_key(key)
+
             ans, _, tokens = run_join(
                 torch, arena, pipeline, async_ans, prefixes,
                 stage_suffixes, chunk_tokens,
                 stage_frames=[j.get("frame") or [] for j in group],
-                group_size=1 if len(group) > 1 else None)
+                group_size=1 if len(group) > 1 else None,
+                anchor_keys=anchor_keys, anchor_done=anchor_done)
             total_tokens += tokens
             for si, j in enumerate(group):
                 stage_out = dict(
@@ -241,19 +324,44 @@ def _execute_single(state, payload: dict) -> dict:
                     anchor_index=anchors_glob,
                     partner_index=tuple_globs[si],
                     anchor=anchor_alias,
-                    partners=list(j["partners"]))
+                    partners=list(j["partners"]),
+                    semantics=j["semantics"],
+                    selectivity=j.get("selectivity"),
+                    written_pos=j.get("written_pos"))
                 out_joins.append(stage_out)
                 if j["semantics"] == "full":
                     finished_full.append(stage_out)
             # gate the anchor set for stages after this group
             survivors[anchor_alias] = gate_group(
                 out_joins[-1], group[-1]["semantics"])
+            alive = set(survivors[anchor_alias])
+            for document, key, prefix in zip(
+                    anchors_glob, anchor_keys, prefixes):
+                if key not in arena.accounting.owned:
+                    continue
+                if document in alive and anchor_alias in future_anchors:
+                    arena.retain(
+                        key, len(prefix),
+                        retention_value(anchor_alias, document))
+                else:
+                    arena.free_key(key)
+            release_without_future(future_anchors)
+        for key in list(arena.accounting.owned):
+            arena.free_key(key)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
 
     return dict(filters=out_filters, joins=out_joins,
                 wall_s=round(wall, 2),
                 fresh_tokens=total_tokens,
+                join_optimizer=(None if search is None else dict(
+                    states=search.states, generated=search.generated,
+                    sequence=[list(step) for step in search.sequence])),
+                kv_manager=dict(
+                    **kv_stats,
+                    evicted_keys=arena.evicted_keys,
+                    evicted_pages=arena.evicted_pages,
+                    evicted_value_seconds=arena.evicted_value),
                 peak_gib=round(
                     torch.cuda.max_memory_allocated() / 2**30, 2))
 

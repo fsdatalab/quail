@@ -178,14 +178,19 @@ class FilterAdmission:
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
                  arena_pages, page_tokens, kept_extra_tokens=0,
-                 limit=None):
+                 limit=None, available_pages=None):
         self.doc_tokens = list(doc_tokens)
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
         self.page_tokens = page_tokens
         # None: no page bin - nothing is ever written to the arena,
         # so there is nothing to account
-        self.free_pages = arena_pages
+        self.free_pages = (arena_pages if available_pages is None
+                           else available_pages)
+        if (arena_pages is not None
+                and not 0 <= self.free_pages <= arena_pages):
+            raise ValueError("available_pages must fit inside arena_pages")
+        self.blocked_pages = 0
         self.limit = limit
         self._survivor_count = 0
         # kept_extra_tokens: the shared question preamble that joins
@@ -215,6 +220,7 @@ class FilterAdmission:
         written to its pages. Returns [] when nothing is buildable."""
         if self._limit_reached():
             return []
+        self.blocked_pages = 0
         room = self.chunk_budget
         groups = []
         # 1) survivor suffixes, oldest first; one live stage per doc
@@ -241,6 +247,7 @@ class FilterAdmission:
                     # pages are granted in order: put it back and stop
                     # claiming pages behind it
                     self.pending.appendleft(doc)
+                    self.blocked_pages = need_pages - self.free_pages
                     blocked_pages = True
                     break
             cost = self.stage_tokens[0] + self.doc_tokens[doc]
@@ -259,7 +266,7 @@ class FilterAdmission:
 
     # ---- gating --------------------------------------------------------
 
-    def report(self, doc, stage, passed):
+    def report(self, doc, stage, passed, release=True):
         """Record one answer. Frees pages on FALSE or last stage;
         otherwise queues the next-stage suffix.
 
@@ -272,10 +279,17 @@ class FilterAdmission:
         if passed and not last:
             self.ready.append((doc, stage + 1))
             return ()
-        if self.free_pages is not None:
+        if release and self.free_pages is not None:
             self.free_pages += self.resident.pop(doc)
             return (doc,)
         return ()
+
+    def add_free_pages(self, pages):
+        """Add pages released by retained KV outside this chain."""
+
+        if pages < 0 or self.free_pages is None:
+            raise ValueError("invalid external page release")
+        self.free_pages += pages
 
     # ---- progress ------------------------------------------------------
 

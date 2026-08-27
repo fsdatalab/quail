@@ -112,6 +112,21 @@ def test_filter_arena_writes_decision(catalog):
     assert not any("arena writes off" in r for r in plan.remarks)
 
 
+def test_one_filter_writes_kv_when_a_join_can_reuse_it(catalog):
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_filter(prompt("keep: {0}", col("r.review")))
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("match {0} {1}", col("r.review"),
+                               col("p.description")))
+               .select("r.id", "p.asin"))
+    plan = plan_query(
+        logical, model=QWEN3_4B_FP8, device=H100_SXM,
+        doc_tokens={"r": [400] * 10, "p": [20] * 5},
+    )
+
+    assert filter_chain(plan, "r")["arena_writes"] is True
+
+
 def test_default_rule_falls_back_without_selectivity(catalog):
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_filter(prompt("a: {0}", col("r.review")))

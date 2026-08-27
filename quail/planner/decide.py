@@ -369,6 +369,11 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     seq, search_remarks = plan_joins(joins, rule, stats, live0, pre)
     remarks.extend(search_remarks)
     anchors = {id(j): a for j, a in seq}
+    possible_anchor_aliases = {
+        alias
+        for join in joins
+        for alias in _anchor_candidates(join)
+    }
 
     for s in scans:
         fq = max((_question_tokens(p.prompt)
@@ -440,7 +445,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 surv *= p.selectivity if p.selectivity is not None else 1.0
             # arena writes only needed when a later stage will read
             # the KV back
-            writes = len(stages) > 1
+            writes = len(stages) > 1 or s.alias in possible_anchor_aliases
             fid = f"filter:{s.alias}"
             nodes.append(dict(id=fid, op="FilterChain",
                               inputs=(ids_src[s.alias],),

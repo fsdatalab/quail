@@ -87,7 +87,6 @@ from quail.bench.evaluate import H100_PRICE_SOURCE, H100_USD_PER_HOUR
 from quail.bench.sol_dp import (
     Extension,
     PairRelation,
-    Work,
     exact_live_rows,
     optimize_left_deep,
 )
@@ -95,6 +94,8 @@ from quail.logical import (ColumnRef, SHARED_PRE, bind_join_prompt,
                            bind_prompt)
 from quail.planner.decide import _collect
 from quail.planner.plan import EngineConfig, Refusal
+from quail.planner.work import (Work, dense_params, flops_per_pair,
+                                triangle)
 from quail.runtime.coordinator import thin_survivors
 from quail.specs import (H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, DeviceSpec,
                          ModelSpec)
@@ -148,34 +149,6 @@ MODELS = [QWEN3_4B_FP8, QWEN3_32B_FP8]
 # The model, counted rather than looked up
 
 
-def dense_params(model: ModelSpec) -> int:
-    """Parameters every token passes through.
-
-    Counted rather than quoted: `ModelSpec.params` is rounded to
-    3.6e9 against Qwen3-4B's real 3,633,511,936, and that 0.93%
-    lands straight on the largest term of the bound.
-
-    Assumes the Qwen3 block: q/k/v/o projections with no bias, a
-    gated MLP, two RMS norms per layer, and q/k head norms.
-    Embeddings and the lm_head are left out: a token touches one
-    embedding row rather than doing 2 FLOPs per parameter, and a
-    filter reads logits at one position per evaluation.
-    """
-    h, dh = model.hidden, model.d_head
-    attn = h * model.n_q * dh + 2 * h * model.n_kv * dh + model.n_q * dh * h
-    mlp = 3 * h * model.intermediate
-    norms = 2 * h + 2 * dh
-    return (attn + mlp + norms) * model.layers + h
-
-
-def flops_per_pair(model: ModelSpec) -> int:
-    """Attention FLOPs for one (query token, key token) pair in one
-    layer. The QK dot product runs over d_head dimensions, so
-    2 * d_head; multiplying the weight into V costs another
-    2 * d_head. Times n_q heads. At 4B: 4 * 32 * 128 = 16,384."""
-    return 4 * model.n_q * model.d_head
-
-
 def kv_bytes_per_token(model: ModelSpec) -> float:
     """One token's KV: a key and a value, per layer, per KV head.
     At 4B: 2 * 36 * 8 * 128 * 2 bytes = 147,456."""
@@ -184,12 +157,6 @@ def kv_bytes_per_token(model: ModelSpec) -> float:
 
 # ---------------------------------------------------------------- 2
 # What the GPU is asked to do
-
-
-def triangle(n: float) -> float:
-    """A causal sequence attending to itself: token 1 sees 1 key,
-    token 2 sees 2, and so on. 1 + 2 + ... + n."""
-    return n * (n + 1) / 2
 
 
 def scan(prefix: float, suffix: float) -> Work:

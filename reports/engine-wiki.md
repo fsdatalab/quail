@@ -24,11 +24,14 @@ payload to the worker, which calls the executor.
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
-| `planner/calibration.py` | Measured constants (a, a2) and scaling | specs |
-| `planner/calibrate.py` | Length-sweep measure of a and a2 | calibration, executor |
+| `planner/calibration.py` | Legacy measurement records, not used to choose plans | specs |
+| `planner/calibrate.py` | Legacy length measurements, not used to choose plans | calibration, executor |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
-| `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, calibration, plan |
+| `planner/decide.py` | Filter order, preliminary join layout, and sharding | logical, budgets, plan |
+| `planner/join_dp.py` | Fixed left deep join search after filters finish | planner/work, specs |
+| `planner/work.py` | Counted token, attention, and KV work | specs |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
+| `executor/retention.py` | Exact retained KV victim selection | nothing |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
 | `executor/pack.py` | Chunk packing (pack_stream, FilterAdmission) | nothing |
 | `executor/loop.py` | Execution loops (run_filter, run_join, warm_kernels) | arena, attention, pack |
@@ -51,7 +54,7 @@ Session (runtime/session.py)
   |
   v
 plan_query (planner/decide.py)
-  reads: specs, calibration, budgets
+  reads: specs, budgets
   produces: PhysicalPlan
   |
   v
@@ -61,7 +64,9 @@ _payload (runtime/session.py)
   v
 worker.execute (runtime/worker.py, on Modal GPU)
   boots: model.py -> attention.Pipeline -> arena.KVArena
-  runs: loop.run_filter / loop.run_join
+  runs: every filter chain
+  plans: planner/join_dp.py from actual filter survivors
+  runs: the fixed join plan through loop.run_join
   returns: raw answer rows
   |
   v
@@ -79,8 +84,8 @@ predicate?). The model answers each predicate in a single token
 (TRUE or FALSE), constrained at decode time so no autoregressive
 generation ever runs.
 
-The current scope is filter queries and joins, Qwen3 4B fp8 weights,
-bf16 KV, on one or more H100 GPUs hosted on Modal.
+The current scope is filter queries and joins, Qwen3 4B fp8 or Qwen3
+32B fp8 weights, bf16 KV, and one H100! per model hosted on Modal.
 
 ### End-to-end flow
 
@@ -96,19 +101,20 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    (DocScan, FilterChain, JoinGroup, Barrier, Recombine, Sink) whose
    edges carry either a table's live document ids or one stage's
    passing pairs - plus the chunk budget, admission budget, and
-   sharding. Stage order and anchors come from one joint search. KV
-   is always bf16. No wall-time prediction is produced.
+   sharding. This plan carries the complete join graph to the worker.
+   KV is always bf16.
 6. The session builds a payload (token id lists, planned settings,
    and the plan's node graph) and ships it to a Modal worker over
    RPC.
-7. The worker executes the graph on the GPU: filter chains,
-   exists/anti gates, and the full join stages (each one a
-   cross-product stage, however many tables it spans). Consecutive
-   full stages sharing an anchor run as one gated group over the
-   anchor's kept KV; a Barrier node between groups thins the live
-   sets to the surviving pairs' documents and, on several GPUs,
-   re-shards the next anchor over the measured live set.
-8. The worker returns raw answer rows. The session assembles output
+7. The worker executes every filter chain first. Passing documents
+   that may anchor a join can remain in KV.
+8. The worker runs one left deep join DP from the actual filter
+   survivors, exact document lengths, current KV contents, and declared
+   join selectivities. The result fixes join order and anchor choice for
+   the rest of the query.
+9. Consecutive full stages sharing an anchor run as one gated group.
+   A Barrier node between groups thins live document sets.
+10. The worker returns raw answer rows. The session assembles output
    tuples by equi-joining the full stages' TRUE rows on shared
    document ids (each stage keyed on its own anchor), no model
    calls, each member checked against its table's final survivor
@@ -288,34 +294,27 @@ documents it kills (1 minus selectivity). A selectivity of 1 (kills
 nothing) goes last. When any filter lacks a selectivity, `as_written`
 is used.
 
-**Join order and anchors, one search** (`plan_joins` in
-`decide.py`): stage order and per-stage anchors are decided
-together, because they interact - anchors set what an order is
-worth, and order sets which stages can share an anchor's KV (issue
-#38). The planner enumerates every (order, anchor) sequence (only
-the written order under `as_written`; a gate's anchor is fixed to
-its outer table, a forced anchor is honored with a remark when it
-prices worse) and walks each one's cost with live counts:
+**Join order and anchors after filters** (`optimize_joins_after_filters`
+in `join_dp.py`): the worker runs a subset DP after every filter has
+finished. `S` is the set of aliases already joined. `A` is the anchor
+of the open `JoinGroup`. For each connected alias outside `S`, the DP
+tries every connecting predicate order and every allowed anchor.
 
-- a stage opening a group pays the anchor's KV once per live anchor
-  document (preamble + document + complete question frame), plus a fixed
-  re-shard overhead when it follows a group on a different anchor
-  (`RESHARD_OVERHEAD_TOKENS`, 0 until measured - the fresh-KV term
-  is the real cost);
-- a stage continuing a same-anchor run of full stages pays only its
-  complete question frame;
-- every stage pays its pair stream: each partner document behind its
-  block label, plus the answer cue, once per tuple;
-- after each stage the live counts thin by
-  `n * (1 - (1-s)^partner_tuples)` (`_surviving_docs`).
+The DP counts fresh tokens, attention pairs, KV writes, and KV reads.
+For the same `(S, A)` state, it keeps a plan when no other plan uses no
+more work in every count. The final choice converts these counts to an
+ideal one H100! time from model dimensions and published device limits.
+No fitted timing constant is used.
 
-The cheapest sequence wins; its anchor switches become groups and
-Barrier nodes at emission. Every sequence runs (each spec is the
-cross product over its own tables), so order and anchors change
-cost, never results. At run time, `pick_runtime_anchor` re-picks a
-one-stage group's anchor from the measured live counts (issue #38,
-step 4.1) - the same arithmetic over the payload's token id lists,
-restricted to anchors whose worst-case tuple fits the chunk budget.
+Actual filter survivors and document lengths seed the search. A retained
+document prefix is priced as a KV hit. Join survivors are estimated from
+the declared selectivity. If a join has no selectivity, the estimate does
+not assume that it removes documents.
+
+The chosen sequence becomes `JoinGroup` and `Barrier` nodes. Execution
+does not change anchors or rerun the DP after a join starts. Full binary
+joins use this search. Other join forms keep the preliminary plan from
+`decide.py`.
 
 **Sharding** (`balanced_shards` in `decide.py`): greedy balance by
 token count across workers. Filters split documents; joins split
@@ -385,27 +384,17 @@ attention term dominates.
 KV is always bf16. The planner does not choose a KV dtype and does
 not model a conversion tax.
 
-## 4. Calibration
+## 4. Counted work
 
-Two measured constants per (model, device) pair are stored as JSON
-in `calibration/`:
+The planner does not use fitted timing constants. `planner/work.py`
+counts fresh tokens, causal attention pairs, KV writes, and KV reads.
+It counts dense parameters and attention work directly from the model
+shape. It converts work to an ideal one H100! time only when it must
+choose a final plan.
 
-| Constant | Meaning |
-|---|---|
-| `a` (s/token) | Wall seconds per fresh token in the packed loop, efficiency included |
-| `a2` (s/token^2) | The quadratic attention coefficient for long documents |
-
-A model/device pair without a calibration file gets defaults scaled
-from the anchor measurement (Qwen3 4B on H100) using spec ratios: a
-model with more parameters costs proportionally more per token, a
-device with a higher FLOP ceiling costs proportionally less
-(`calibration.py:70-77`).
-
-`quail.planner.calibrate.measure` (Modal entry:
-`quail/runtime/calibrate.py`) sweeps document length through the
-packed filter and fits `t(h) = a + a2 * h` by least squares. It
-also probes the host copy channels (pinned and unpinned, both
-directions); those measurements land in `calibration/channels.json`.
+The older calibration files and measurement entry points remain for
+historical experiments. They do not affect `plan_query`, the join DP,
+or KV retention.
 
 ## 5. The packed executor
 
@@ -420,14 +409,12 @@ single forward pass, sharing KV across them through a paged arena.
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
-| `plan_joins` | `decide.py` | The joint (order x anchor) search: cost every sequence, keep the cheapest |
-| `pick_runtime_anchor` | `decide.py` | Re-pick a one-stage group's anchor at a barrier, from measured live counts |
+| `plan_joins` | `decide.py` | Build the preliminary join layout before filter answers exist |
+| `optimize_joins_after_filters` | `join_dp.py` | Fix the left deep join order and anchors after filters finish |
+| `prefix_recompute_seconds` | `work.py` | Count the compute saved by retaining one document prefix |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
 | `chunk_budget` | `budgets.py` | Tokens per forward pass (min of memory and kernel bounds) |
 | `arena_tokens` | `budgets.py` | KV residency budget (device memory minus weights and activations) |
-| `load_calibration` | `calibration.py` | Load or spec-scale the calibration constants |
-| `measure` | `calibrate.py` | Length sweep + affine fit of a, a2 (GPU) |
-| `commit_calibration` | `calibration.py` | Write the two constants to the pair file |
 
 ### 5.1 Chunk packing
 
@@ -453,9 +440,11 @@ arena). Each chunk fills from two sources in priority order:
    tokens fit the free list.
 
 Pages are claimed at admission and returned immediately when a
-document fails a stage or answers its last one. A document that
-cannot fit even an empty arena or an empty chunk is refused at plan
-time, so there is no deadlock.
+document fails a stage. A passing document is also freed after its last
+stage unless the fixed join plan may use it as an anchor. A retained
+document stays available across later filter chains. The scheduler uses
+the arena's actual free page count, so earlier retained documents are
+included in every later admission decision.
 
 ### Pseudocode: FilterAdmission scheduling
 
@@ -491,8 +480,12 @@ while not done:
 When answers arrive:
 ```
 for each (doc, stage, answer):
-    if answer = FALSE or stage is the last stage:
+    if answer = FALSE:
         free the document's pages
+    else if stage is last and no future join can anchor on this alias:
+        free the document's pages
+    else if stage is last:
+        rewind to engine preamble plus document and retain the prefix
     else:
         add (doc, stage+1) to the ready queue
 ```
@@ -523,11 +516,10 @@ The KV arena (`executor/arena.py`) is a preallocated buffer on the
 GPU, sized to the admission budget, divided into fixed 16-token pages
 with a free list.
 
-**PageArena** (CPU, `arena.py:16`): the accounting. A free list
-(a stack of page ids) and per-document page ownership. Allocation
-pops pages from the free list; freeing pushes them back. Because the
-admission scheduler never lets page-rounded resident tokens exceed
-the arena, allocation cannot fail at runtime.
+**PageArena** (CPU, `arena.py:16`): the accounting. A free list,
+per document page ownership, and two KV states. Pinned KV belongs to
+active work and cannot be evicted. Retained KV may be read by a later
+operator and may be evicted when active work needs its pages.
 
 **KVArena** (GPU, `arena.py:71`): the tensor backing. Per-layer K
 and V pools of shape `(n_pages * page_tokens, n_kv, d_head)`. A
@@ -538,6 +530,13 @@ physical page id).
 
 Key operations:
 - `alloc(key, tokens)`: claim pages for a document.
+- `pin(key)`: protect a resident prefix during active work.
+- `retain(key, tokens, value)`: rewind to the base prefix and make it
+  evictable.
+- `activate(key, tokens)`: reuse a resident prefix or claim pages for a
+  missing prefix.
+- `evict_retained(pages)`: choose and free retained prefixes with the
+  least counted recomputation value.
 - `free_key(key)`: return pages instantly.
 - `block_table(keys)`: build the block table for a set of
   documents, used by the paged cross-attention kernel.
@@ -551,8 +550,13 @@ Key operations:
 |---|---|---|
 | `PageArena.alloc` | `arena.py:29` | Claim pages for a document from the free list |
 | `PageArena.free_key` | `arena.py:42` | Return a document's pages to the free list |
+| `PageArena.pin` | `arena.py` | Protect KV used by the current operator |
+| `PageArena.retain` | `arena.py` | Mark a base prefix as useful but evictable |
+| `PageArena.rewind` | `arena.py` | Remove filter or join suffix KV from a retained prefix |
 | `PageArena.row_indices` | `arena.py:49` | Flat row positions of a document's tokens in the pool |
 | `KVArena.alloc` | `arena.py:97` | Claim pages and record the row indices (host-side; the device copy is built lazily) |
+| `KVArena.activate` | `arena.py` | Reuse or allocate an active document prefix |
+| `KVArena.evict_retained` | `arena.py` | Run the exact retained victim DP and free its result |
 | `KVArena.rows_gpu` | `arena.py:110` | The document's row indices on device, cached per residency |
 | `KVArena.block_table` | `arena.py:125` | Build the block table for paged attention (flat on the host, one staged copy) |
 | `KVArena.paged_kv` | `arena.py:118` | Reshape the flat pool for FlashAttention's block input |
@@ -767,18 +771,11 @@ that runs until `FilterAdmission.done()`:
    freed immediately; survivors advance to their next stage.
    Documents leaving their last stage free their pages too.
 
-Single-stage queries (one question) skip the arena entirely: no
-later stage reads any document's KV, so the alloc, the per-layer KV
-scatter, and the paged attention read serve no one. The planner
-makes the call, and only the planner - the FilterChain operator
-carries an `arena_writes` field (False exactly when one stage
-runs), it shows in `explain()`, and the payload forwards it to
-`run_filter`. `run_filter` requires the argument and never derives
-it; direct callers (warmups, calibration, the GPU cells, the
-ablation scripts) state their intent explicitly, and False against
-a later reader raises. Each [document | question] packs as ONE
-causal segment and admission runs on the token budget alone
-(`FilterAdmission` with `arena_pages=None`).
+Single stage queries skip the arena only when no later join may read the
+document KV. A single filter before a possible anchor writes KV so a
+passing document can cross the operator boundary without recomputation.
+The `FilterChain` node carries this `arena_writes` decision. It appears
+in `explain()` and the payload passes it to `run_filter`.
 
 This is strictly less work than stock vLLM does for the same
 prompt. Stock vLLM also writes every prompt token's KV into its
@@ -805,9 +802,26 @@ are dropped, and their pages are freed. The driver also prefetches
 the next group's stage-0 chunk while waiting on the current group's
 gate (which cannot be planned past until answers arrive), keeping the
 GPU fed across gate boundaries. A per-stage frame, if present, is
-written into the anchor's kept KV once after the document rows.
+written into the anchor's kept KV once after the document rows. Stable
+`(alias, document index)` keys let the driver reuse a filter prefix.
+After a group, the worker frees an anchor past its last planned use or
+rewinds and retains it when a later group uses the same alias.
 
-### 5.7 KV rewind (chain mode)
+### 5.7 Retained KV selection
+
+An active filter or join must get enough pages to run. If free pages are
+short, `minimum_loss_victims` runs a small exact DP over retained
+documents. Its state is the number of pages freed, capped at the number
+still needed. Its value is the counted time to recompute each base
+prefix. The count includes dense token work and the prefix's causal
+attention triangle. It uses model dimensions and published H100! limits,
+not measured constants.
+
+The DP returns the retained set with the least total recomputation value
+that frees enough pages. Pinned KV is never a candidate. There is no CPU
+spill or offload target.
+
+### 5.8 KV rewind (chain mode)
 
 In a multi-stage filter chain, each stage asks a different question
 about the same document. KV rewind means the document's KV is
