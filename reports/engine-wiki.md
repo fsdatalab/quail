@@ -96,8 +96,10 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    (DocScan, FilterChain, JoinGroup, Barrier, Recombine, Sink) whose
    edges carry either a table's live document ids or one stage's
    passing pairs - plus the chunk budget, admission budget, and
-   sharding. Stage order and anchors come from one joint search. KV
-   is always bf16. No wall-time prediction is produced.
+   sharding. Stage order and anchors come from one joint search,
+   which the worker re-runs on the actual filter survivors before
+   executing the joins. KV is always bf16. The only wall-time number
+   is the counted speed-of-light ranking the search uses.
 6. The session builds a payload (token id lists, planned settings,
    and the plan's node graph) and ships it to a Modal worker over
    RPC.
@@ -288,87 +290,85 @@ documents it kills (1 minus selectivity). A selectivity of 1 (kills
 nothing) goes last. When any filter lacks a selectivity, `as_written`
 is used.
 
-**Join order and anchors, one search** (`plan_joins` in
-`decide.py`): stage order and per-stage anchors are decided
-together, because they interact - anchors set what an order is
-worth, and order sets which stages can reuse an anchor's KV (issue
-#38). Under `by_cost` the search is the left deep subset DP
+**Join order and anchors, one search, two calls** (`search_joins`
+in `planner/joins.py`): stage order and per-stage anchors are
+decided together, because they interact - anchors set what an order
+is worth, and order sets which stages can reuse an anchor's KV
+(issue #38). The search is the left deep subset DP
 (`planner/leftdeep.py`, the same search the SoL estimate runs): the
 state is (joined alias set, cached prefix alias set), each step adds
 one connected alias and applies every predicate that completes, in
-every order, with every feasible anchor. Under `as_written` the
-written stage order is kept and only anchors are searched. A gate's
-anchor is fixed to its outer table; a forced anchor is honored with
-a remark when a free choice prices lower.
+every order, with every feasible anchor. Under `order=as_written`
+the written stage order is kept and only anchors are searched. A
+gate's anchor is fixed to its outer table; a forced anchor is
+honored, with a remark at plan time when a free choice prices lower.
 
-Each stage is costed as an expected-value `Work` record
-(`planner/sol.py`: tokens, attention pairs, KV written, KV read)
-from live counts and mean document lengths:
+The same function runs twice per query with different inputs:
 
-- an anchor whose document prefix KV is resident - kept by its
-  filter chain, or anchored by an earlier stage - pays only its
-  complete question frame (`ask`); one without pays preamble +
-  document + frame per live document (`scan`);
-- a filtered anchor with a partial keep pays the frame for the kept
-  documents and a scan for the rest (the keep split below);
-- every stage pays its pair stream: each partner document behind its
-  block label, plus the answer cue, once per tuple, each attending
-  over the resident anchor context;
-- after each stage the live counts thin by
-  `n * (1 - (1-s)^partner_tuples)` (`_surviving_docs`).
+- **Plan time** (`plan_query`): expected live counts from
+  selectivities, the corpus length lists, the keep credit as the
+  resident set. The output is the predicted plan - explain(), the
+  refusal checks, sharding, and the SoL comparison run off it.
+- **After the filter round** (the worker; the parent process on
+  several GPUs): the actual survivor counts and lengths, and the
+  positions whose KV is actually resident in the arena. The output
+  is the executed plan. It wins wherever the two disagree, because
+  it has real data. Barriers reuse its answer - no order-relevant
+  information arrives below a stage boundary, so there is nothing
+  to re-decide per chunk.
 
-Per state, records survive unless another is no larger in all four
-work categories. The final candidates are ranked by predicted
-seconds - `speed_of_light` over the query's whole Work, filter
-stages included, from counted model constants and the device
-datasheet. No calibration constant is read anywhere in planning.
-The chosen sequence's anchor switches become groups and Barrier
-nodes at emission. Every sequence runs (each spec is the cross
-product over its own tables), so order and anchors change cost,
-never results. At run time, `pick_runtime_anchor` re-picks a
-one-stage group's anchor from the measured live counts (issue #38,
-step 4.1) - the same arithmetic over the payload's token id lists,
-restricted to anchors whose worst-case tuple fits the chunk budget,
-and crediting KV already resident in the arena.
+Each stage is costed as a `Work` record (`planner/sol.py`: tokens,
+attention pairs, KV written, KV read), per document over the live
+length list: a resident anchor prefix (retained by the filter
+round, or anchored earlier in the candidate sequence) pays only its
+question frame (`ask`), the rest scan preamble + document + frame;
+every tuple then carries partner labels, partner documents, and the
+answer cue over the resident anchor context. After each stage the
+live counts thin by `n * (1 - (1-s)^partner_tuples)`. Per state,
+records survive unless another is no larger in all four work
+categories, and the final candidates rank by predicted seconds -
+`speed_of_light` from counted model constants and the device
+datasheet. No calibration constant is read anywhere. Stage outputs
+carry written_pos, semantics, and selectivity, so a runtime-chosen
+order assembles into results correctly.
 
 **KV residency across operators** (`plan_keeps`, `keep_split` in
-`decide.py`): the planner decides which document KV outlives its
-operator.
+`decide.py`; the retention runtime in `executor/arena.py`): document
+KV outlives its operator wherever a later one will read it.
 
-- A filtered alias the plan will anchor keeps its survivors' KV in
-  the arena after the chain (`keep_kv` on the FilterChain node;
-  `arena_writes` is forced on for it). The join then anchors on KV
-  that is already there instead of recomputing every document.
-- When the expected kept mass exceeds the arena minus the largest
-  single admission, the shortest documents are dropped from the
-  keep first (`keep_split`): resident KV of length L saves L dense
-  tokens against the fp8 peak plus L(L+1)/2 attention pairs against
-  the bf16 peak, while occupying bytes linear in L, so saved work
-  per byte rises with length under any positive weighting of the
-  two counted terms. The rise comes from the attention term and is
-  small below the dense/attention crossover (about 12,320 prefix
-  tokens at 4B), where the dense term dominates. Survival is
-  fractional in expectation, which is what makes keeping the
-  longest the exact fractional knapsack answer. The remark names
-  the resulting length threshold.
-- A join group whose anchor a later group re-uses keeps its
-  surviving anchors' KV (`keep_anchor_kv` on the JoinGroup node),
-  so a gate between two same-anchor stages no longer forces a
-  recompute.
-- `_keep_timeline` checks the peak expected resident tokens per
-  worker across the whole plan; keeps are trimmed until the peak
-  plus the working headroom fits the admission budget, and the
-  search re-runs once against the trimmed credit.
+- Every filtered alias the runtime search could anchor writes KV
+  (`arena_writes`) and keeps its survivors (`keep_kv` on the
+  FilterChain node). At each survivor's final TRUE the runtime
+  retains its prefix: rewound to preamble + document (the question
+  tail's pages return to the free list), marked evictable at its
+  counted recompute value. The join then anchors on KV that is
+  already there.
+- A join group whose anchor a later group re-uses retains its gate
+  survivors the same way, so a gate between two same-anchor stages
+  no longer forces a recompute. Thinned-out documents and retained
+  KV with no future consumer are freed the moment that is known,
+  and the arena is empty when the query ends.
+- The runtime never evicts to admit a cache entry. Every admission
+  is a computation the query requires; only retention is optional,
+  and retaining an already-resident document costs nothing to
+  start. When retained KV starves a required admission, the arena
+  evicts the minimum-loss victim set (`executor/retention.py`): the
+  least total recompute-seconds cover for exactly the pages needed.
+  Recompute value is `prefix_recompute_seconds` - dense work linear
+  in length against the fp8 peak plus the causal attention triangle
+  against the bf16 peak, both counted. Pinned keys (in use by the
+  running operator) are untouchable.
+- The plan-time half is the *credit*: `keep_split` prices in the
+  expected resident fraction the arena can hold, longest documents
+  first (a fractional knapsack in expectation - see the docstring
+  for why that is exact), and `_keep_timeline` trims the credit
+  until the peak expected resident tokens fit beside the working
+  headroom. The runtime is not bound by the threshold; the credit
+  keeps the prediction and the SoL comparison honest.
 
 Every stage records the residency its cost assumed
 (`anchor_resident`: none / filter / kept), so `explain()` shows
 which stages the planner priced as KV reuse.
-
-**Sharding** (`balanced_shards` in `decide.py`): greedy balance by
-token count across workers. Filters split documents; joins split
-anchor documents (every tuple belongs to exactly one anchor, so
-gating and each anchor's tuple stream stay local to the GPU holding
-the anchor).
 
 ### Pseudocode: filter order decision
 
@@ -475,9 +475,10 @@ single forward pass, sharing KV across them through a paged arena.
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
-| `plan_joins` | `decide.py` | The joint (order x anchor) search: the left deep DP under by_cost, anchors only under as_written |
-| `plan_keeps` / `keep_split` | `decide.py` | Which survivors' KV stays resident for a join, longest documents first |
-| `pick_runtime_anchor` | `decide.py` | Re-pick a one-stage group's anchor at a barrier, from measured live counts and resident KV |
+| `search_joins` | `joins.py` | The join search: order and anchors from live counts, lengths, and resident KV; called at plan time and again in the worker |
+| `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: which survivors to price as resident, longest documents first |
+| `minimum_loss_victims` | `executor/retention.py` | The eviction cover: least recompute-seconds set freeing the needed pages |
+| `prefix_recompute_seconds` | `sol.py` | The retention value of one prefix, counted constants only |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
 | `optimize_left_deep` | `leftdeep.py` | Subset DP over (joined aliases, cached prefix aliases) with a nondominated Work frontier |
 | `scan` / `ask` / `stream` | `sol.py` | The three KV operations as Work records |
@@ -824,13 +825,13 @@ that runs until `FilterAdmission.done()`:
    answers and gate: documents that answered NO have their pages
    freed immediately; survivors advance to their next stage.
    Documents leaving their last stage free their pages too - unless
-   the chain runs in keep mode (the plan's `keep_kv`), where
-   survivors' pages stay held for the join that will anchor on
-   them, under stable `("kv", alias, doc)` arena keys. If kept KV
-   starves a fresh admission, the smallest kept documents the
-   admission needs are evicted (minus any a larger victim makes
-   redundant - smallest-first alone can over-evict) and simply
-   recomputed by the join later.
+   the plan marks the chain `keep_kv`, where each survivor's prefix
+   is retained instead (`arena.retain`): rewound to preamble +
+   document, held under its stable `(alias, doc)` key at its counted
+   recompute value. If retained KV starves a fresh admission, the
+   arena evicts the minimum-loss victim set and hands the pages back
+   to the scheduler; evicted documents are simply recomputed by the
+   join later.
 
 Single-stage queries (one question) skip the arena entirely: no
 later stage reads any document's KV, so the alloc, the per-layer KV
@@ -1002,14 +1003,15 @@ stage boundary. The `already_kept` parameter tells the packer which
 anchors' KV is already resident, so their groups do not pack fresh
 prefix tokens.
 
-The same mechanism now crosses operator boundaries. A filter chain
-with `keep_kv` leaves its survivors' KV in the arena; the join group
-anchored on that alias finds the keys resident and skips every kept
-document's prefix. A group with `keep_anchor_kv` leaves its gate
-survivors for a later group on the same table. On several GPUs the
-KV is already on the right card: join anchors follow the shards
-their KV sits on - the shards of the group that kept them, else
-their filter shards (`join_group_payloads`).
+The same mechanism crosses operator boundaries through retention.
+A filter chain with `keep_kv` retains its survivors' KV; the join
+group anchored on that table finds the keys resident, `activate`
+grows their pages for the frame, and no kept document's prefix is
+packed. A group whose anchor a later group re-uses retains its gate
+survivors the same way (the worker's `anchor_done` callback). On
+several GPUs the KV is already on the right card: join anchors
+follow the shards their KV sits on - the shards of the group that
+retained them, else their filter shards (`join_group_payloads`).
 
 ### Pseudocode: the n-way join as one cross-product stage
 
@@ -1059,9 +1061,9 @@ and the merged answer rows are consistent.
 **Barrier nodes between groups**: the parent thins every table the
 stages ahead touch to the documents in some surviving pair of every
 finished full stage (`thin_survivors`, issue #38 step 4.6 - cost
-only, results are enforced at recombination), and a one-stage group
-with no forced anchor re-picks its anchor from the measured live
-counts (`pick_runtime_anchor`).
+only, results are enforced at recombination). Anchors were already
+fixed by the worker's post-filter run of the join search, which saw
+the measured live counts; nothing is re-decided at the barrier.
 
 ### Sharding contract
 
