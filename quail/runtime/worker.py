@@ -55,8 +55,10 @@ def execute(payload: dict) -> dict:
 
     from quail.executor.arena import KVArena
     from quail.executor.attention import FILTER_ATTENTION, Pipeline
-    from quail.executor.loop import (Answerer, AsyncAnswers, run_filter,
-                                     run_join, warm_kernels)
+    from quail.executor.loop import (
+        AsyncAnswers,
+        warm_kernels,
+    )
     from quail.planner import budgets
     from quail.specs import DEVICES, MODELS
 
@@ -158,13 +160,17 @@ def _execute_single(state, payload: dict) -> dict:
 
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
     from quail.executor.loop import AsyncAnswers, run_filter, run_join
-    from quail.planner.joins import search_joins
+    from quail.planner.joins import search_joins, summarize_alias
     from quail.planner.sol import prefix_recompute_seconds
-    from quail.runtime.coordinator import (filter_round_limit,
-                                           gate_group, retain_aliases,
-                                           runtime_nodes, search_specs,
-                                           stage_for_anchor,
-                                           thin_survivors)
+    from quail.runtime.coordinator import (
+        filter_round_limit,
+        gate_group,
+        retain_aliases,
+        runtime_nodes,
+        search_specs,
+        stage_for_anchor,
+        thin_survivors,
+    )
     from quail.specs import DEVICES
 
     torch = state["torch"]
@@ -232,6 +238,7 @@ def _execute_single(state, payload: dict) -> dict:
         pipeline.attention_mode = JOIN_ATTENTION
         all_specs = search_specs(payload["joins"])
         remaining = set(range(len(payload["joins"])))
+        already_joined = set()
         optimizer_runs = []
         optimizer_sequence = []
 
@@ -253,16 +260,19 @@ def _execute_single(state, payload: dict) -> dict:
             found = search_joins(
                 specs,
                 {a: float(len(survivors[a])) for a in involved},
-                {a: [len(docs[a][g]) for g in survivors[a]]
+                {a: summarize_alias(
+                    (len(docs[a][g]) for g in survivors[a]),
+                    resident_flags=(
+                        (a, g) in arena.accounting.owned
+                        for g in survivors[a]))
                  for a in involved},
-                {a: {i for i, g in enumerate(survivors[a])
-                     if (a, g) in arena.accounting.owned}
-                 for a in involved},
+                {},
                 len(pre), chunk_tokens, model_spec, device,
                 fixed_order=payload.get("order_rule") == "as_written",
                 arena_tokens=float(arena.accounting.n_pages
                                    * arena.accounting.page_tokens),
-                page_tokens=arena.accounting.page_tokens)
+                page_tokens=arena.accounting.page_tokens,
+                already_joined=already_joined)
             if found is not None:
                 optimizer_runs.append(found)
                 nodes = runtime_nodes(found["seq"], payload["joins"])
@@ -383,6 +393,8 @@ def _execute_single(state, payload: dict) -> dict:
                     key = (alias, document)
                     if key in arena.accounting.owned:
                         arena.free_key(key)
+            for index in node["stage_idxs"]:
+                already_joined.update(all_specs[index]["aliases"])
         for key in list(arena.accounting.owned):
             arena.free_key(key)
     torch.cuda.synchronize()
@@ -705,7 +717,7 @@ def _execute_multi(payload: dict) -> dict:
     import time as _time
 
     from quail.planner import budgets
-    from quail.planner.joins import search_joins
+    from quail.planner.joins import search_joins, summarize_alias
     from quail.runtime import coordinator
     from quail.specs import DEVICES, MODELS
 
@@ -735,6 +747,7 @@ def _execute_multi(payload: dict) -> dict:
     device = DEVICES["h100-sxm"]
     all_specs = coordinator.search_specs(payload["joins"])
     remaining = set(range(len(payload["joins"])))
+    already_joined = set()
     optimizer_runs = []
     optimizer_sequence = []
 
@@ -755,15 +768,18 @@ def _execute_multi(payload: dict) -> dict:
         found = search_joins(
             specs,
             {a: float(len(survivors[a])) for a in involved},
-            {a: [len(docs[a][g]) for g in survivors[a]]
+            {a: summarize_alias(
+                (len(docs[a][g]) for g in survivors[a]),
+                resident_flags=(g in retained.get(a, ())
+                                for g in survivors[a]))
              for a in involved},
-            {a: {i for i, g in enumerate(survivors[a])
-                 if g in retained.get(a, ())} for a in involved},
+            {},
             pre_len, payload["chunk_tokens"], model_spec, device,
             fixed_order=payload.get("order_rule") == "as_written",
             arena_tokens=float(budgets.arena_tokens(
                 model_spec, device, payload["chunk_tokens"])) * k,
-            page_tokens=budgets.PAGE_TOKENS)
+            page_tokens=budgets.PAGE_TOKENS,
+            already_joined=already_joined)
         if found is not None:
             optimizer_runs.append(found)
             nodes = coordinator.runtime_nodes(found["seq"],
@@ -851,6 +867,8 @@ def _execute_multi(payload: dict) -> dict:
                     [document for document in shard if document in alive]
                     for shard in prior_shards[alias]
                 ]
+        for index in node["stage_idxs"]:
+            already_joined.update(all_specs[index]["aliases"])
     for totals in child_totals:
         for key, v in (totals or {}).items():
             kv_stats[key] = kv_stats.get(key, 0) + v
@@ -906,7 +924,7 @@ def execute_8(payload: dict) -> dict:
 
 
 def _tuple_suffix(join, docs, member) -> list:
-    """Build one tuple's suffix: partner documents with block labels, then the answer cue."""
+    """Build the partner blocks and answer cue for one tuple."""
     out = []
     for alias, g in zip(join["partners"], member):
         out += join["labels"][alias]

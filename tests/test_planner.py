@@ -635,7 +635,110 @@ def test_join_search_prices_current_partial_document_residency():
         QWEN3_4B_FP8, H100_SXM, fixed_order=True,
         arena_tokens=41 * 16, page_tokens=16)
 
-    assert current["records"][0]["resident_positions"] == (1, 2)
-    assert current["records"][2]["resident_positions"] == ()
+    assert current["records"][0]["resident_docs"] == 2
+    assert current["records"][2]["resident_docs"] == 0
     assert with_capacity["records"] == current["records"]
     assert with_capacity["work"] == current["work"]
+
+
+def test_join_replan_starts_from_already_joined_aliases():
+    from quail.planner.joins import search_joins
+
+    specs = [
+        _join_search_spec(0, ("a", "b"), "b"),
+        _join_search_spec(2, ("c", "d"), "c"),
+    ]
+    live = {alias: 2.0 for alias in "abcd"}
+    lengths = {alias: [100, 120] for alias in "abcd"}
+
+    assert search_joins(
+        specs, live, lengths, {}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM) is None
+
+    found = search_joins(
+        specs, live, lengths, {}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM,
+        already_joined={"b", "c"})
+
+    assert found is not None
+    assert {position for position, _ in found["seq"]} == {0, 2}
+
+
+def test_aggregate_join_work_matches_per_document_sum():
+    import pytest
+
+    from quail.planner import sol
+    from quail.planner.joins import stage_work, summarize_alias
+    from quail.planner.sol import Work
+
+    spec = _join_search_spec(0, ("a", "b"), "a")
+    live = {"a": 2.25, "b": 3.5}
+    raw = {"a": [90, 100, 110], "b": [30, 50, 70, 90]}
+    stats = {
+        "a": summarize_alias(raw["a"], {1, 2}),
+        "b": summarize_alias(raw["b"]),
+    }
+
+    def per_document(same_group):
+        n = live["a"]
+        tuples = live["a"] * live["b"]
+        suffix = (spec["tail_tokens"] + spec["label_tokens"]["b"]
+                  + sum(raw["b"]) / len(raw["b"]))
+        frame = spec["frame_tokens"]["a"]
+        per_anchor = tuples / n
+        fraction = n / len(raw["a"])
+        total = Work()
+        for position, document in enumerate(raw["a"]):
+            prefix = 10 + document
+            start = (sol.ask(prefix, frame)
+                     if same_group or position in {1, 2}
+                     else sol.scan(prefix, frame))
+            stream = Work(
+                tokens=per_anchor * suffix,
+                pairs=per_anchor * (
+                    suffix * (prefix + frame) + sol.triangle(suffix)),
+                kv_written=per_anchor * suffix,
+                kv_read=prefix + frame,
+            )
+            total = total + (start + stream) * fraction
+        return total
+
+    for same_group in (False, True):
+        actual = stage_work(
+            spec, "a", live, stats, 10, resident_at_start=True,
+            same_group=same_group)
+        expected = per_document(same_group)
+        assert actual.tokens == pytest.approx(expected.tokens)
+        assert actual.pairs == pytest.approx(expected.pairs)
+        assert actual.kv_written == pytest.approx(expected.kv_written)
+        assert actual.kv_read == pytest.approx(expected.kv_read)
+
+
+def test_join_search_accepts_million_document_summaries():
+    from quail.planner.joins import AliasStats, search_joins
+
+    million = AliasStats(
+        count=1_000_000,
+        total=100_000_000,
+        squared=10_000_000_000,
+        maximum=100,
+        resident_count=500_000,
+        resident_total=50_000_000,
+        resident_squared=5_000_000_000,
+    )
+    stats = {alias: million for alias in "abcd"}
+    live = {alias: 1_000_000.0 for alias in "abcd"}
+    specs = [
+        _join_search_spec(0, ("a", "b"), "a"),
+        _join_search_spec(1, ("b", "c"), "b"),
+        _join_search_spec(2, ("c", "d"), "c"),
+    ]
+
+    found = search_joins(
+        specs, live, stats, {}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM)
+
+    assert found is not None
+    assert len(found["seq"]) == 3
+    assert all("resident_positions" not in record
+               for record in found["records"])

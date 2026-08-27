@@ -95,7 +95,7 @@ from quail.planner.decide import (
     join_specs,
     order_filters_indexed,
 )
-from quail.planner.joins import fit_resident_documents, search_joins
+from quail.planner.joins import fit_resident_documents, search_joins, summarize_alias
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import Work, ask, scan, speed_of_light
@@ -429,6 +429,7 @@ def simulate_production_planner(query, model: ModelSpec,
     markers = [dict(semantics=j.semantics, written_pos=i)
                for i, j in enumerate(joins)]
     remaining = set(range(len(joins)))
+    already_joined = set()
     search_runs = []
     search_sequence = []
 
@@ -449,22 +450,22 @@ def simulate_production_planner(query, model: ModelSpec,
         found = search_joins(
             specs,
             {a: float(len(survivors[a])) for a in involved},
-            {a: [aliases[a]["tokens"][row] for row in survivors[a]]
+            {a: summarize_alias(
+                (aliases[a]["tokens"][row] for row in survivors[a]),
+                resident_flags=(row in resident_rows[a]
+                                for row in survivors[a]))
              for a in involved},
-            {a: {i for i, row in enumerate(survivors[a])
-                 if row in resident_rows[a]} for a in involved},
+            {},
             PRE, chunk_tokens, model, H100_SXM,
             fixed_order=(plan.order_rule == "as_written"),
             arena_tokens=plan.admission_tokens,
-            page_tokens=budgets.PAGE_TOKENS)
+            page_tokens=budgets.PAGE_TOKENS,
+            already_joined=already_joined)
         if found is not None:
             search_runs.append(found)
             nodes = runtime_nodes(found["seq"], markers)
-            node = next(node for node in nodes
+            return next(node for node in nodes
                         if node["op"] == "JoinGroup")
-            records = {record["written_pos"]: record
-                       for record in found["records"]}
-            return node, records
 
         ordered = sorted(remaining)
         first = ordered[0]
@@ -477,11 +478,11 @@ def simulate_production_planner(query, model: ModelSpec,
                         or spec["anchor"] != anchor:
                     break
                 group.append(index)
-        return (dict(op="JoinGroup", anchor=anchor,
-                     stage_idxs=tuple(group)), {})
+        return dict(op="JoinGroup", anchor=anchor,
+                    stage_idxs=tuple(group))
 
     while remaining:
-        node, priced_records = next_group()
+        node = next_group()
         search_sequence.extend((index, node["anchor"])
                                for index in node["stage_idxs"])
         stage_defs = [joins[i] for i in node["stage_idxs"]]
@@ -500,11 +501,6 @@ def simulate_production_planner(query, model: ModelSpec,
                 *[survivors[alias] for alias in partners]))
             if stage_index > 0:
                 stage_resident = set(anchor_rows)
-            elif join_index in priced_records:
-                positions = priced_records[join_index][
-                    "resident_positions"]
-                stage_resident = {anchor_rows[position]
-                                  for position in positions}
             else:
                 stage_resident = resident_rows[anchor] & set(anchor_rows)
 
@@ -576,6 +572,8 @@ def simulate_production_planner(query, model: ModelSpec,
             {alias: aliases[alias]["tokens"] for alias in aliases},
             PRE, model, H100_SXM, plan.admission_tokens,
             budgets.PAGE_TOKENS)
+        for join_index in node["stage_idxs"]:
+            already_joined.update(all_specs[join_index]["aliases"])
 
     first_alias = scans[0].alias
     input_document_rows = sum(
