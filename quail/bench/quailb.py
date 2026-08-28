@@ -253,7 +253,6 @@ def build_sets(data_dir, sf, lf=1):
             current = None
         if current == expected:
             _build_citations(d, sf)
-            _build_policies(d, sf)
             return d
     d.mkdir(parents=True, exist_ok=True)
 
@@ -295,7 +294,6 @@ def build_sets(data_dir, sf, lf=1):
     }), d / "evidence.parquet")
 
     _build_citations(d, sf, force=True)
-    _build_policies(d, sf, force=True)
 
     marker.write_text(json.dumps({
         "cache_schema_version": CACHE_SCHEMA_VERSION,
