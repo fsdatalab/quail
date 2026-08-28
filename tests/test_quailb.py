@@ -53,7 +53,7 @@ def test_all_queries_compile_and_plan(tmp_path):
     qdefs = queries(sess)
     expected = {
         *(f"IMDB-{i}" for i in range(1, 11)),
-        *(f"BIO-{i}" for i in range(1, 9)),
+        *(f"BIO-{i}" for i in range(1, 4)),
         *(f"FEV-{i}" for i in range(1, 10)),
         *(f"LEP-{i}" for i in range(1, 9)),
         "PRIV-1", "PRIV-2",

@@ -1,5 +1,5 @@
-"""QUAIL-B: twenty-eight queries over five document sets (IMDB, BioDEX,
-FEVER, LePaRD, PrivacyPolicies).
+"""QUAIL-B: thirty queries over four document sets (IMDB, BioDEX,
+FEVER, LePaRD), plus two optional PrivacyPolicies queries.
 
     uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8 --gpus 1
 """
@@ -858,7 +858,9 @@ def queries(sess):
                         ("aspects", "a2", "aspect", ASPECT_SENTIMENT)],
                        ["r.id", "a.id", "a2.id"]))
 
-    # BioDEX: same five shapes (reports x terms).
+    # BioDEX: filter, join, filter->join on long medical reports.
+    # Deeper chains and multi-join shapes (star, 3J) are covered by
+    # the IMDB queries; BioDEX adds long-document behavior.
     q["BIO-1"] = ("filter: F7 (female patient)", make(
         "reports", "r", "report", [F7], [], ["r.id"]))
     q["BIO-2"] = ("join: J1 (reports x terms)", make(
@@ -867,63 +869,6 @@ def queries(sess):
     q["BIO-3"] = ("F7 -> J1, dependent", make(
         "reports", "r", "report", [F7],
         [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
-    q["BIO-4"] = ("F7 -> F8 -> J1, 2 filters then 1 join", make(
-        "reports", "r", "report", [F7, F8],
-        [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
-    q["BIO-5"] = ("F7 -> F8 -> F9 -> J1, 3 filters then 1 join", make(
-        "reports", "r", "report", [F7, F8, F9],
-        [("terms", "m", "term", REACTION)], ["r.id", "m.id"]))
-
-    # BIO-7/BIO-8: 3-join chain r1-m1-r2-m2. Report r1 experienced
-    # reaction m1; reaction m1 was severe in report r2; report r2
-    # also experienced a different reaction m2.
-    def bio7():
-        r1 = sess.docs("reports").alias("r1")
-        m1 = sess.docs("terms").alias("m1")
-        r2 = sess.docs("reports").alias("r2")
-        m2 = sess.docs("terms").alias("m2")
-        return (r1
-                .ai_join(m1, quail.prompt(REACTION,
-                                          quail.col("r1.report"),
-                                          quail.col("m1.term")))
-                .ai_join(r2, quail.prompt(REACTION_SEVERE,
-                                          quail.col("r2.report"),
-                                          quail.col("m1.term")))
-                .ai_join(m2, quail.prompt(REACTION,
-                                          quail.col("r2.report"),
-                                          quail.col("m2.term")))
-                .select("r1.id", "m1.id", "r2.id", "m2.id"))
-    q["BIO-7"] = ("3J chain r1-m1-r2-m2: shared reaction, severe in "
-                  "second report, second report has another reaction",
-                  bio7)
-
-    def bio8():
-        r1 = sess.docs("reports").alias("r1").ai_filter(
-            quail.prompt(F7, quail.col("r1.report")))
-        m1 = sess.docs("terms").alias("m1")
-        r2 = sess.docs("reports").alias("r2")
-        m2 = sess.docs("terms").alias("m2")
-        return (r1
-                .ai_join(m1, quail.prompt(REACTION,
-                                          quail.col("r1.report"),
-                                          quail.col("m1.term")))
-                .ai_join(r2, quail.prompt(REACTION_SEVERE,
-                                          quail.col("r2.report"),
-                                          quail.col("m1.term")))
-                .ai_join(m2, quail.prompt(REACTION,
-                                          quail.col("r2.report"),
-                                          quail.col("m2.term")))
-                .select("r1.id", "m1.id", "r2.id", "m2.id"))
-    q["BIO-8"] = ("F7 -> 3J chain r1-m1-r2-m2", bio8)
-
-    # BIO-6: star shape, both joins anchored on reports, both over
-    # the full terms table under two aliases. IMDB-8's counterpart.
-    q["BIO-6"] = ("2J, same anchor: J1 (REACTION) -> J2 "
-                 "(REACTION_SEVERE), reports x terms x terms", make(
-        "reports", "r", "report", [],
-        [("terms", "m", "term", REACTION),
-         ("terms", "m2", "term", REACTION_SEVERE)],
-        ["r.id", "m.id", "m2.id"]))
 
     # FEVER: filter alone, join alone, filter chain to depth 2 only
     # (depth 3 yields 0 rows), plus two-sided FEV-5/FEV-6 pushdown.
