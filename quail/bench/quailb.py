@@ -312,12 +312,19 @@ def register_sets(sess, data_dir):
                 "claims", "evidence", "citations"):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
+
+
+def register_privacy_sets(sess, data_dir):
+    """Register policies and scenarios tables for PRIV queries.
+
+    Separate from register_sets so the privacy policy queries do not
+    run in the default benchmark suite.
+    """
+    from quail.catalog import DocumentProvider
     d = Path(data_dir)
-    if (d / "policies.parquet").exists():
-        sess.register("policies", DocumentProvider.from_parquet(
-            str(d / "policies.parquet"), id_col="id"))
-        sess.register("scenarios", DocumentProvider.from_parquet(
-            str(d / "scenarios.parquet"), id_col="id"))
+    for name in ("policies", "scenarios"):
+        sess.register(name, DocumentProvider.from_parquet(
+            str(d / f"{name}.parquet"), id_col="id"))
 
 
 # ---------------------------------------------------------- predicates
