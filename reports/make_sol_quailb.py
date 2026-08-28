@@ -313,23 +313,11 @@ class QueryInputs:
     post_filter_counts: dict
 
 
-def prepare_query(query, plan=None) -> QueryInputs:
+def prepare_query(query, model: ModelSpec, chunk_tokens: int,
+                  plan=None) -> QueryInputs:
     scans, filters, joins = _collect(query.logical)
     if isinstance(plan, Refusal):
         raise ValueError(f"query was refused: {plan.reasons}")
-    if plan is None:
-        rule = (query.order if query.order is not None else
-                default_order_rule(filters, joins)[0])
-        filter_orders = {
-            alias: order_filters_indexed(predicates, rule)
-            for alias, predicates in filters.items()
-        }
-    else:
-        filter_orders = {
-            node["alias"]: [stage["written_pos"]
-                            for stage in node["stages"]]
-            for node in plan.nodes_by_op("FilterChain")
-        }
     aliases = {}
     for scan_node in scans:
         key = f"{scan_node.provider}.{scan_node.column}"
@@ -338,6 +326,26 @@ def prepare_query(query, plan=None) -> QueryInputs:
             "column": key,
             "ids": ids,
             "tokens": [lengths[key][doc_id] for doc_id in ids],
+        }
+    if plan is None:
+        rule = (query.order if query.order is not None else
+                default_order_rule(filters, joins)[0])
+        filter_orders = {
+            alias: order_filters_indexed(
+                predicates, rule,
+                prefix_tokens=(PRE + (
+                    sum(aliases[alias]["tokens"])
+                    / len(aliases[alias]["tokens"])
+                    if aliases[alias]["tokens"] else 0)),
+                model=model, device=H100_SXM,
+                chunk_tokens=chunk_tokens)
+            for alias, predicates in filters.items()
+        }
+    else:
+        filter_orders = {
+            node["alias"]: [stage["written_pos"]
+                            for stage in node["stages"]]
+            for node in plan.nodes_by_op("FilterChain")
         }
     survivors = {
         alias: list(range(len(data["ids"])))
@@ -366,6 +374,7 @@ def prepare_query(query, plan=None) -> QueryInputs:
                 "alias": alias,
                 "code": code,
                 "question_tokens": qtokens,
+                "provided_selectivity": predicate.selectivity,
                 "evaluated": len(live),
                 "passed": len(passed),
                 "selectivity": (round(len(passed) / len(live), 6)
@@ -403,7 +412,7 @@ def simulate_production_planner(query, model: ModelSpec,
 
     The SoL output does not call this function.
     """
-    prepared = prepare_query(query, query.plan())
+    prepared = prepare_query(query, model, chunk_tokens, query.plan())
     plan = prepared.plan
     scans = prepared.scans
     joins = prepared.joins
@@ -620,7 +629,7 @@ def simulate_production_planner(query, model: ModelSpec,
 def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
     """Find the best exact left deep join plan for this model."""
 
-    prepared = prepare_query(query)
+    prepared = prepare_query(query, model, chunk_tokens)
     scans = prepared.scans
     joins = prepared.joins
     aliases = prepared.aliases
@@ -904,7 +913,11 @@ def add_sol_metrics(simulated, model: ModelSpec):
         "passes": s.passes,
         "bytes_moved": s.bytes_moved,
         "t_dense": s.dense,
+        "t_dense_memory": s.dense_memory,
+        "t_dense_roofline": s.dense_seconds,
         "t_attention": s.attention,
+        "t_attention_memory": s.attention_memory,
+        "t_attention_roofline": s.attention_seconds,
         "t_compute": s.compute,
         "t_memory": s.memory,
         "sol_s": s.seconds,
@@ -987,6 +1000,14 @@ json.dump({
     },
     "optimizer": {
         "gpu_count_per_model": 1,
+        "filter_order": (
+            "by_cost from fixed benchmark selectivity estimates"),
+        "filter_selectivity_sources": {
+            "imdb_biodex_fever_collection":
+                Q.SELECTIVITY_ESTIMATE_COLLECTION,
+            "lepard_corpus": Q.SELECTIVITY_ESTIMATE_LEPARD_CORPUS,
+            "scale_factor": Q.SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+        },
         "plan_space": "all feasible left deep plans",
         "dp_state": "joined alias set and cached prefix alias set",
         "work_frontier": (

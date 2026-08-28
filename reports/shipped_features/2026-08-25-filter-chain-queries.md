@@ -48,8 +48,10 @@ None measured. These queries have not been run on a GPU. The 1.63x
 figure above is computed from the committed IMDB-1 token count and
 the tokenized corpus, not from a run of IMDB-6.
 
-The predicates carry no selectivity hints, matching every other query
-in the suite, so the planner uses `as_written` ordering.
+The original queries carried no selectivity estimates, so the planner
+used written order. The benchmark now carries fixed estimates and asks
+the builder for cost based order. The original measurements in this
+note used written order.
 
 ## Checks
 

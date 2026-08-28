@@ -16,6 +16,7 @@ from quail.bench.quailb import (
     register_sets,
     split_query_ids,
 )
+from quail.planner.decide import _collect
 from quail.planner.plan import EngineConfig, Refusal
 
 
@@ -67,8 +68,15 @@ def test_all_queries_compile_and_plan(tmp_path):
     assert set(QUERY_ORDER) == expected
     for qid, (_, build) in qdefs.items():
         query = build()
+        _, filters, joins = _collect(query.logical)
+        predicates = [predicate for chain in filters.values()
+                      for predicate in chain]
+        assert all(predicate.selectivity is not None
+                   for predicate in predicates), qid
+        assert all(join.selectivity is not None for join in joins), qid
         plan = query.plan()
         assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
+        assert plan.order_rule == "by_cost", qid
         assert "physical:" in query.explain(), qid
 
 

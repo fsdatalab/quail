@@ -198,7 +198,7 @@ def main(workdir):
     fig.tight_layout()
     OUT.mkdir(exist_ok=True)
     output = OUT / "quailb_sf01_4b_runtime.png"
-    fig.savefig(output, dpi=150)
+    fig.savefig(output, dpi=300)
     plt.close(fig)
     print(f"wrote {output}")
     print_metrics(order, results, records)
