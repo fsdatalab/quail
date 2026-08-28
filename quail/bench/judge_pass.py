@@ -1000,7 +1000,7 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
 
 
 @app.function(
-    image=image, gpu="H100", memory=98304, timeout=14400,
+    image=image, gpu="H100", memory=98304, timeout=7200,
     volumes={"/root/.cache/huggingface": hf_cache,
              "/root/.cache/kernels": kernel_cache,
              "/results": results_vol})
