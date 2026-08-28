@@ -114,12 +114,11 @@ limit plus the attention limit. For predicates after the first one, the
 sort divides the time of `ask(mean prefix, q_s)` by
 `1 - selectivity_s`.
 
-The first predicate uses `scan`, so the planner tries each predicate in
-that position. It then applies the linear sort to the remaining
-predicates and keeps the lowest expected time. A chain of `n` filters
-therefore takes quadratic planning work rather than checking every
-permutation. Forward pass rounding is omitted from this comparison.
-Weight movement is spread over the token capacity `C`.
+The first predicate uses `scan`. The planner sorts all predicates by ask score
+once. Prefix survivor products and expected costs then let it price every
+possible first predicate in constant time. A chain of `n` filters therefore
+takes `O(n log n)` planning work. Forward pass rounding is omitted from this
+comparison. Weight movement is spread over the token capacity `C`.
 
 The calculation runs separately for 4B and 32B because their model
 dimensions differ. After the sort, the active ground truth labels

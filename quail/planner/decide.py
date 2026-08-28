@@ -86,9 +86,9 @@ def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
                           chunk_tokens: int):
     """Return written positions of predicates in execution order.
 
-    'by_cost' minimizes ideal expected time. It tries each predicate
-    as the scan, then sorts the remaining asks by time per expected
-    rejected document. Written order breaks ties.
+    'by_cost' minimizes ideal expected time. It sorts the asks once,
+    then prices each predicate as the first scan. Written order breaks
+    ties.
     """
     idx = list(range(len(predicates)))
     if rule == "as_written":
@@ -115,21 +115,26 @@ def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
             return float("inf")
         return ask_costs[i] / killed
 
+    ask_order = sorted(idx, key=score)
+    prefix_live = [1.0]
+    prefix_cost = [0.0]
+    for i in ask_order:
+        prefix_cost.append(
+            prefix_cost[-1] + prefix_live[-1] * ask_costs[i])
+        prefix_live.append(prefix_live[-1] * selectivity(i))
+
+    total_ask_cost = prefix_cost[-1]
     candidates = []
-    for first in idx:
-        remaining = sorted((i for i in idx if i != first), key=score)
-        order = [first, *remaining]
-        live = 1.0
-        expected = 0.0
-        for position, i in enumerate(order):
-            expected += live * (scan_costs[i] if position == 0
-                                else ask_costs[i])
-            live *= selectivity(i)
-        candidates.append((expected, order))
-    return min(
-        candidates,
-        key=lambda candidate: (candidate[0], candidate[1]),
-    )[1]
+    for position, first in enumerate(ask_order):
+        expected = (
+            scan_costs[first]
+            + selectivity(first) * prefix_cost[position]
+            + total_ask_cost - prefix_cost[position + 1]
+        )
+        candidates.append((expected, first))
+
+    first = min(candidates)[1]
+    return [first, *(i for i in ask_order if i != first)]
 
 
 def order_filters(predicates, rule: str, *, prefix_tokens: float,

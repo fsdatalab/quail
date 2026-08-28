@@ -297,10 +297,10 @@ limits as SoL. For filters after the first one, the score is the time
 for `ask(mean prefix, question)` divided by the fraction of documents
 the filter rejects. A selectivity of 1 goes last.
 
-The first filter uses `scan`. The planner tries each predicate in that
-position, sorts the remaining predicates by the ask score, and keeps the
-lowest expected time. The search takes quadratic work in the number of
-filters. It does not check every filter permutation.
+The first filter uses `scan`. The planner sorts all predicates by ask score
+once. Prefix survivor products and expected costs then let it price each
+predicate as the first scan in constant time. The search takes `O(n log n)`
+work for `n` filters. It does not check every filter permutation.
 
 **Join order and anchors, one search, repeated calls** (`search_joins`
 in `planner/joins.py`): stage order and per-stage anchors are
@@ -406,8 +406,9 @@ for each filter predicate p:
     else:
         work = ask(mean_prefix_tokens, p.question_tokens)
         cost = unrounded_seconds(work, model, device, chunk) / killed
-try each predicate as scan, sort the remaining asks by cost,
-and keep the order with the lowest expected time
+sort all asks by cost once
+use prefix survivor products and expected costs to price each first scan
+keep the order with the lowest expected time
 ```
 
 ### Pseudocode: anchor selection

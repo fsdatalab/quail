@@ -19,10 +19,10 @@ same cost. A longer question also has more causal attention within the
 question, so token count alone can choose the wrong order when two scores
 are close.
 
-The first filter uses `scan`, while later filters use `ask`. The planner
-tries each filter as the scan and applies the linear cost per rejected
-document sort to the remaining asks. The search is quadratic in the number
-of filters.
+The first filter uses `scan`, while later filters use `ask`. The planner sorts
+the asks once by cost per rejected document. Prefix survivor products and
+expected costs let it price each filter as the first scan in constant time.
+The search takes `O(n log n)` work for `n` filters.
 
 ## Verification
 

@@ -457,9 +457,9 @@ performance constants):
 1. **Order** (only under `by_cost`): filters sorted by cost per
    killed document. Dense and attention each take the larger of their
    compute and memory time. Their two times are then added. The planner
-   tries each filter as the first `scan`, sorts the remaining `ask`
-   operations by time divided by (1 − selectivity), and keeps the
-   lowest expected time.
+   sorts the `ask` operations once by time divided by
+   (1 − selectivity). Prefix survivor products and expected costs let
+   it price each filter as the first `scan` in constant time.
    Join order uses the join specs (the exists/anti gates and the one
    full join):
    enumerate the permutations (2–4 specs, trivial), compare
