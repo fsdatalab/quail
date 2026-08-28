@@ -8,7 +8,7 @@ import pytest
 
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
-from quail.planner.decide import explain, order_filters, plan_query
+from quail.planner.decide import explain, filter_cost, order_filters, plan_query
 from quail.planner.sol import ask, speed_of_light
 from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
 from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -108,6 +108,49 @@ def test_filter_order_uses_dense_and_attention_rooflines():
         [long_selective, short_weak], "by_cost", prefix_tokens=400,
         model=QWEN3_4B_FP8, device=H100_SXM, chunk_tokens=110_376)
     assert ordered == [short_weak, long_selective]
+
+
+def test_filter_order_matches_first_scan_enumeration():
+    class Predicate:
+        def __init__(self, tail, selectivity):
+            self.prompt = type("Prompt", (), {
+                "tail_tokens": tail, "preamble_tokens": 0})()
+            self.selectivity = selectivity
+
+    predicates = [
+        Predicate(12, 0.8),
+        Predicate(50, 0.1),
+        Predicate(8, 1.0),
+        Predicate(25, 0.0),
+    ]
+    kwargs = dict(prefix_tokens=400, model=QWEN3_4B_FP8,
+                  device=H100_SXM, chunk_tokens=110_376)
+    ask_costs = [filter_cost(predicate, first=False, **kwargs)
+                 for predicate in predicates]
+    scan_costs = [filter_cost(predicate, first=True, **kwargs)
+                  for predicate in predicates]
+
+    candidates = []
+    for first in range(len(predicates)):
+        def score(index):
+            rejected = 1.0 - predicates[index].selectivity
+            return ask_costs[index] / rejected if rejected else float("inf")
+
+        remaining = sorted(
+            (index for index in range(len(predicates)) if index != first),
+            key=score)
+        order = [first, *remaining]
+        expected = 0.0
+        live = 1.0
+        for position, index in enumerate(order):
+            expected += live * (scan_costs[index] if position == 0
+                                else ask_costs[index])
+            live *= predicates[index].selectivity
+        candidates.append((expected, order))
+
+    expected_order = min(candidates)[1]
+    actual = order_filters(predicates, "by_cost", **kwargs)
+    assert actual == [predicates[index] for index in expected_order]
 
 
 def test_sol_adds_separate_dense_and_attention_rooflines():
