@@ -1,7 +1,9 @@
 # QUAIL-B
 
-QUAIL-B has 26 filter and join queries at scale factor 0.1. The saved
-ground truth covers all 19 predicates used by those queries.
+QUAIL-B has 30 filter and join queries at scale factor 0.1, plus
+2 optional PrivacyPolicies queries (PRIV-1, PRIV-2) that run only
+when `register_privacy_sets()` has been called. The saved ground
+truth covers all 22 predicates used by the 30 default queries.
 
 A predicate is one exact TRUE or FALSE question, including its prompt and
 the input columns it reads. A query can use one predicate or combine several
@@ -9,7 +11,7 @@ predicates. Ground truth is saved per predicate, document, or document pair.
 
 ## Run the benchmark
 
-Run all 26 queries with Qwen3 4B:
+Run all 30 queries with Qwen3 4B:
 
 ```bash
 mkdir -p results/benchmark
