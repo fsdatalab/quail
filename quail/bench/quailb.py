@@ -18,7 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 DATA_SEED = 20260818
-CACHE_SCHEMA_VERSION = 4  # bumped: severe_terms.parquet removed
+CACHE_SCHEMA_VERSION = 5  # bumped: FEVER claims scaled from 1K to 100K
 
 # Exact source snapshots for the benchmark corpus.  The row selection below
 # is deterministic only when the upstream revisions are fixed as well as the
@@ -41,7 +41,7 @@ SOURCE_REVISIONS = {
 SETS = {
     "reviews": 50_000,
     "reports": 2_000,
-    "claims": 1_000,
+    "claims": 100_000,
     "citations": 2_000,
     "policies": 1_000_000,
 }
@@ -97,17 +97,22 @@ def _fever_data(n_claims):
     """FEVER claims (SUPPORTS/REFUTES only) and the Wikipedia pages they
     reference. The evidence pool is bounded by the sampled claims."""
     from huggingface_hub import hf_hub_download
-    f = hf_hub_download("fever/fever", "v1.0/labelled_dev/0000.parquet",
-                        repo_type="dataset",
-                        revision=SOURCE_REVISIONS["fever/fever"])
-    rows = pq.read_table(f).to_pylist()
     seen, claims = set(), []
-    for r in rows:
-        if (r["id"] in seen or r["label"] not in ("SUPPORTS", "REFUTES")
-                or not r["evidence_wiki_url"]):
-            continue
-        seen.add(r["id"])
-        claims.append(r)
+    for split in ("v1.0/train/0000.parquet",
+                  "v1.0/labelled_dev/0000.parquet"):
+        f = hf_hub_download("fever/fever", split,
+                            repo_type="dataset",
+                            revision=SOURCE_REVISIONS["fever/fever"])
+        rows = pq.read_table(f).to_pylist()
+        for r in rows:
+            if (r["id"] in seen
+                    or r["label"] not in ("SUPPORTS", "REFUTES")
+                    or not r["evidence_wiki_url"]):
+                continue
+            seen.add(r["id"])
+            claims.append(r)
+            if len(claims) >= n_claims:
+                break
         if len(claims) >= n_claims:
             break
     pages_needed = {r["evidence_wiki_url"] for r in claims}
