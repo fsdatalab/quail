@@ -6,8 +6,8 @@ work directory to this script:
     W=<workdir>
     modal volume get quail-results benchmarks/quailb/runs/qb_20260827T070457Z_fdd34ac9/20260827T070457Z-quailb-sf0.1-lf1-qwen3-4b-fp8-parallel4.json $W/quail-full.json
     modal volume get quail-results benchmarks/quailb/runs/qb_20260827T081139Z_0518bcfc/20260827T081139Z-quailb-sf0.1-lf1-qwen3-4b-fp8-parallel1.json $W/quail-lepard.json
-    modal volume get quail-results stock_vllm/2026-08-27_canonical_full_bb9aa480/summary.json $W/stock-full.json
-    modal volume get quail-results pipelined_vllm/2026-08-27_015722/summary.json $W/pipelined.json
+    modal volume get quail-results stock_vllm/2026-08-28_paired_except_bio8/summary.json $W/stock-full.json
+    modal volume get quail-results pipelined_vllm/2026-08-28_paired_except_bio8/summary.json $W/pipelined.json
     modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
     uv run --with matplotlib python reports/make_quailb_sf01_4b_plots.py $W
 """
@@ -66,7 +66,9 @@ def load_inputs(workdir):
             or pipelined["filter_submission"] != "pipelined"
             or pipelined["hf_name"] != "Qwen/Qwen3-4B-FP8"
             or pipelined["sf"] != 0.1
-            or pipelined["checkpoint"] != "pre-quantized FP8"):
+            or pipelined["checkpoint"] != "pre-quantized FP8"
+            or pipelined.get("prompt_layout")
+            != "canonical document-first Quail filter and join prompts"):
         raise ValueError("unexpected pipelined vLLM configuration")
     if sol["scale_factor"] != 0.1 or sol["query_count"] != 35:
         raise ValueError("unexpected SoL configuration")
@@ -83,13 +85,20 @@ def load_inputs(workdir):
             or set(order) != set(stock)
             or set(order) != set(pipelined_rows)):
         raise ValueError("measured query coverage does not match")
+    for baseline in (stock_full, pipelined):
+        if baseline.get("paired_run", {}).get("missing_queries") != ["BIO-8"]:
+            raise ValueError("expected BIO-8 to be the only missing baseline query")
+
+    def seconds(rows, query):
+        value = rows[query]["total_wall_s"]
+        return np.nan if value is None else value
 
     results = {
         "SoL estimate": [sol["queries"][query]["models"][MODEL]["sol_s"]
                          for query in order],
         "Quail": [quail[query]["wall_s"] for query in order],
-        "Stock vLLM": [stock[query]["total_wall_s"] for query in order],
-        "Pipelined vLLM": [pipelined_rows[query]["total_wall_s"]
+        "Stock vLLM": [seconds(stock, query) for query in order],
+        "Pipelined vLLM": [seconds(pipelined_rows, query)
                             for query in order],
     }
     records = {
@@ -133,14 +142,39 @@ def query_work(system, row, has_joins):
 
 def print_metrics(order, results, records):
     print("\nAggregate metrics")
-    print("| System | Total time (s) | Mean time/query (s) | "
+    print("| System | Measured queries | Total time (s) | Mean time/query (s) | "
           "Mean $/query |")
-    print("|---|---:|---:|---:|")
+    print("|---|---:|---:|---:|---:|")
     for system in SYSTEMS:
-        total = sum(results[system])
-        mean = total / len(order)
+        values = np.asarray(results[system], dtype=float)
+        measured = np.isfinite(values)
+        total = values[measured].sum()
+        mean = values[measured].mean()
         cost = mean * H100_USD_PER_HOUR / 3600
-        print(f"| {system} | {total:.2f} | {mean:.2f} | ${cost:.4f} |")
+        print(f"| {system} | {measured.sum()} | {total:.2f} | {mean:.2f} | "
+              f"${cost:.4f} |")
+
+    print("\nAggregate throughput")
+    print("| System | Query group | Measured queries | Throughput |")
+    print("|---|---|---:|---:|")
+    for group in ("filter only", "join only"):
+        for system in ("Quail", "Stock vLLM", "Pipelined vLLM"):
+            total_work = 0
+            total_seconds = 0.0
+            measured = 0
+            for index, query in enumerate(order):
+                if query_kind(records["SoL estimate"][query]) != group:
+                    continue
+                seconds = results[system][index]
+                if not np.isfinite(seconds):
+                    continue
+                total_work += query_work(
+                    system, records[system][query], group == "join only")
+                total_seconds += seconds
+                measured += 1
+            unit = "docs/s" if group == "filter only" else "pairs/s"
+            print(f"| {system} | {group} | {measured} | "
+                  f"{total_work / total_seconds:,.1f} {unit} |")
 
     print("\nPer-query metrics")
     print("| Query | Operators | Unit | SoL estimate | Quail | "
@@ -154,6 +188,9 @@ def print_metrics(order, results, records):
         cells = []
         for system in SYSTEMS:
             seconds = results[system][index]
+            if not np.isfinite(seconds):
+                cells.append("not measured")
+                continue
             work = query_work(system, records[system][query], has_joins)
             throughput = work / seconds
             cost = seconds * H100_USD_PER_HOUR / 3600
@@ -177,6 +214,8 @@ def main(workdir):
         bars = ax.bar(x + offset * width, values, width,
                       color=color, label=system)
         for bar, value in zip(bars, values):
+            if not np.isfinite(value):
+                continue
             ax.annotate(
                 f"{value:.3g}",
                 (bar.get_x() + bar.get_width() / 2, value),
