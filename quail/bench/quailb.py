@@ -1,5 +1,5 @@
-"""QUAIL-B: twenty-six queries over four document sets (IMDB, BioDEX,
-FEVER, LePaRD).
+"""QUAIL-B: twenty-eight queries over five document sets (IMDB, BioDEX,
+FEVER, LePaRD, PrivacyPolicies).
 
     uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8 --gpus 1
 """
@@ -31,6 +31,8 @@ SOURCE_REVISIONS = {
     # resolved commit for refs/convert/parquet rather than the default branch.
     "fever/fever": "5f577157472532aa1d9924d2df63aac44f70cf2b",
     "rmahari/LePaRD": "0194f95c3091acceab3b887c9b09ef432cf84052",
+    "mukund/PrivacyPolicies":
+        "8fd6abfc7ca99d1f95c7f3f3a5dd5ea0cf9b7deb",
 }
 
 # Base document counts at sf=1. Only these three scale with sf; the
@@ -41,6 +43,7 @@ SETS = {
     "reports": 2_000,
     "claims": 1_000,
     "citations": 2_000,
+    "policies": 1_000_000,
 }
 
 ASPECTS = ["the acting", "the plot", "the directing", "the cinematography",
@@ -190,6 +193,45 @@ def _build_citations(d, sf, force=False):
     }), path)
 
 
+def _build_policies(d, sf, force=False):
+    """Build policies.parquet and scenarios.parquet, idempotent.
+
+    The PrivacyPolicies corpus is ~1M documents and 48 GiB, so it may
+    not be available on every machine. Skips silently when the source
+    dataset is not installed.
+    """
+    pol_path = d / "policies.parquet"
+    scen_path = d / "scenarios.parquet"
+    if pol_path.exists() and scen_path.exists() and not force:
+        return
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        return
+    n = _n_docs("policies", sf)
+    try:
+        f = hf_hub_download(
+            "mukund/PrivacyPolicies",
+            "data/train-00000-of-00001.parquet",
+            repo_type="dataset",
+            revision=SOURCE_REVISIONS["mukund/PrivacyPolicies"])
+    except Exception:
+        return
+    t = pq.read_table(f, columns=["text"])
+    texts = t.column("text").to_pylist()
+    rng = np.random.default_rng(DATA_SEED)
+    rng.shuffle(texts)
+    texts = texts[:n]
+    pq.write_table(pa.table({
+        "id": [f"pp{i}" for i in range(len(texts))],
+        "policy_text": texts,
+    }), pol_path)
+    pq.write_table(pa.table({
+        "id": [f"sc{i}" for i in range(len(SCENARIOS))],
+        "scenario": SCENARIOS,
+    }), scen_path)
+
+
 def build_sets(data_dir, sf, lf=1):
     """All seven tables as parquet files, cached by sf.
 
@@ -211,6 +253,7 @@ def build_sets(data_dir, sf, lf=1):
             current = None
         if current == expected:
             _build_citations(d, sf)
+            _build_policies(d, sf)
             return d
     d.mkdir(parents=True, exist_ok=True)
 
@@ -252,6 +295,7 @@ def build_sets(data_dir, sf, lf=1):
     }), d / "evidence.parquet")
 
     _build_citations(d, sf, force=True)
+    _build_policies(d, sf, force=True)
 
     marker.write_text(json.dumps({
         "cache_schema_version": CACHE_SCHEMA_VERSION,
@@ -268,6 +312,12 @@ def register_sets(sess, data_dir):
                 "claims", "evidence", "citations"):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
+    d = Path(data_dir)
+    if (d / "policies.parquet").exists():
+        sess.register("policies", DocumentProvider.from_parquet(
+            str(d / "policies.parquet"), id_col="id"))
+        sess.register("scenarios", DocumentProvider.from_parquet(
+            str(d / "scenarios.parquet"), id_col="id"))
 
 
 # ---------------------------------------------------------- predicates
@@ -391,6 +441,304 @@ LEPS1 = ("Judge strictly from the passage above whether it states a "
 # dataset's own passage_id, not a judge pass.
 LEPJOIN = ("Is the passage in DOCUMENT {1} cited by the legal excerpt "
            "in DOCUMENT {0}?")
+
+
+# PrivacyPolicies predicates: user-language questions about user
+# outcomes, not legal language about company practices. The vocabulary
+# mismatch means keyword search, regex, and embeddings cannot solve
+# these.
+P_MSG = ("Judge strictly from the policy above whether, if a user sent "
+         "a private message through this service, an employee of the "
+         "company could read it.\n\n{0}\n\nInstruction: answer TRUE if "
+         "an employee could read the user's private messages, FALSE "
+         "otherwise.")
+
+P_LOC = ("Judge strictly from the policy above whether this service "
+         "would keep track of the user's physical location, even when "
+         "the user is not actively using the service.\n\n{0}\n\n"
+         "Instruction: answer TRUE if the service would track the "
+         "user's location while they are not using it, FALSE otherwise.")
+
+SCENARIO_MATCH = ("Based on the privacy policy in DOCUMENT {0}, could "
+                  "the situation described in DOCUMENT {1} happen to a "
+                  "user of this service?")
+
+SCENARIOS = [
+    # marketing
+    "You stop using the app, but months later you start getting ads "
+    "from companies you have never heard of, based on things you "
+    "searched for while you were still using it.",
+    "You buy a product once, and then you keep getting emails and push "
+    "notifications about similar products, even after you unsubscribe "
+    "from the mailing list.",
+    "You notice that the ads you see on other websites change right "
+    "after you browse this service, as if your activity here followed "
+    "you around the internet.",
+    "You create an account just to try the free version, and within a "
+    "week you start getting phone calls from salespeople who know your "
+    "name and what features you looked at.",
+    "You fill out a survey on the app, and later a completely different "
+    "company contacts you about the exact topics you mentioned in "
+    "your answers.",
+    "You use the app for a few weeks, then delete it, but you keep "
+    "seeing ads for it on social media that reference things you did "
+    "inside the app.",
+    "You sign up with a throwaway email, but the app somehow starts "
+    "showing you ads related to purchases you made with your main "
+    "email at other stores.",
+    "You mention a product in a chat on the service, and within hours "
+    "you see targeted ads for that exact product on other platforms.",
+    "You opt out of marketing emails, but the company still sends you "
+    "promotional messages disguised as account updates or security "
+    "alerts.",
+    "You notice the app suggesting friends who are customers of a "
+    "partner company, even though you never shared your contacts.",
+    # third-party sharing
+    "A data broker contacts you with an offer, and when you ask how "
+    "they got your information, they name this service as the source.",
+    "You apply for a loan and the lender already has a profile of "
+    "your spending habits, built from data this service shared with "
+    "a financial analytics company.",
+    "Your health insurance premium goes up, and when you investigate "
+    "you find the insurer received wellness data that you entered "
+    "into this app.",
+    "A background check company has records of your activity on this "
+    "service, even though you never gave them permission to access it.",
+    "You discover that a political campaign has your personal details "
+    "and browsing habits, traced back to a data-sharing agreement "
+    "with this service.",
+    "Your employer uses a workplace analytics tool that has data about "
+    "your personal usage of this service, shared without your knowledge.",
+    "A research firm publishes a study that includes aggregated data "
+    "about users like you, and you can identify yourself from the "
+    "details even though names were removed.",
+    "You find your profile information listed on a people-search "
+    "website, and the data matches exactly what you entered into "
+    "this service.",
+    "A retailer you have never visited sends you a coupon by mail, "
+    "using your home address and product preferences from this app.",
+    "You learn that a foreign government obtained your account data "
+    "through a third party that this service shared it with.",
+    # law enforcement
+    "Police show up with a warrant for records of your activity on "
+    "the service, and the company hands over six months of your chat "
+    "history without telling you first.",
+    "A government agency requests your location data from the past "
+    "year, and the company provides it without requiring a court "
+    "order.",
+    "You are involved in a lawsuit, and the opposing side introduces "
+    "your private messages from this service as evidence, obtained "
+    "through a subpoena the company complied with.",
+    "An immigration agency accesses your travel-related searches and "
+    "account activity through a bulk data request to the company.",
+    "You find out that the company gave law enforcement real-time "
+    "access to your location for an investigation you were never "
+    "told about.",
+    "A tax authority receives your transaction records from this "
+    "service as part of a compliance program the company participates "
+    "in voluntarily.",
+    "You are detained at a border crossing, and the officers already "
+    "have a printout of your recent activity on this service.",
+    "A local police department uses facial recognition to match a "
+    "photo from your profile on this service to surveillance footage.",
+    "Your account is flagged and frozen after the company runs an "
+    "automated scan and reports your content to a government agency.",
+    "A foreign court orders the company to hand over your data, and "
+    "the company complies even though you live in a different country.",
+    # data retention
+    "You delete your account, but a year later you discover the "
+    "company still has your photos stored on its servers.",
+    "You request a copy of your data and find that the company kept "
+    "records of searches you made five years ago, long after you "
+    "stopped using the service.",
+    "You close your account and later reopen one with the same email, "
+    "and all your old preferences and history are still there.",
+    "You ask the company to delete your data, they confirm it is "
+    "done, but a data breach months later reveals your old records "
+    "were still in their backup systems.",
+    "You find out the company keeps a permanent record of every "
+    "version of your profile, including photos and bios you changed "
+    "years ago.",
+    "You cancel your subscription, but the company continues to "
+    "store and analyze your usage patterns for its own research.",
+    "Your messages to other users remain visible to those users "
+    "even after you delete your account, with your name still "
+    "attached.",
+    "You discover that the company retains your payment information "
+    "indefinitely, even after you remove your credit card from the "
+    "account settings.",
+    "You move to a country with stricter data laws and request "
+    "deletion, but the company says your data is stored in a "
+    "jurisdiction where they are not required to delete it.",
+    "You stop paying for the premium tier, but the company keeps "
+    "all the data you uploaded during your subscription period "
+    "without any stated expiration date.",
+    # tracking
+    "You use the app only at home, but it builds a detailed map of "
+    "every store and restaurant you visit, using your phone's "
+    "location in the background.",
+    "You turn off location services for the app, but it still "
+    "figures out where you are by scanning nearby Wi-Fi networks "
+    "and Bluetooth devices.",
+    "You browse the service on your laptop, and later when you open "
+    "the app on your phone, it knows exactly which pages you visited "
+    "on the laptop.",
+    "You visit a physical store, and the app sends you a notification "
+    "about a sale at that store moments later, even though you never "
+    "searched for it.",
+    "You notice the app has a record of how long you spend on each "
+    "screen, how fast you scroll, and exactly where you tap.",
+    "You clear your browser cookies, but the service still recognizes "
+    "you the next time you visit, using device fingerprinting or "
+    "other tracking methods.",
+    "You use a VPN to hide your location, but the app still shows "
+    "you local content, suggesting it has another way to determine "
+    "where you are.",
+    "You create a second account under a different name, but the "
+    "service links it to your original account within days.",
+    "You lend your phone to a friend, and the app records their "
+    "usage pattern as yours, mixing their browsing into your profile.",
+    "You find out the app tracks which other apps are installed on "
+    "your phone and uses that information to build a profile of "
+    "your interests.",
+    # content and communications
+    "You send a private photo to one person through the service, "
+    "and later find it was scanned and flagged by the company's "
+    "automated content review system.",
+    "You write a private note in the app that you never share, and "
+    "later the company uses the text to train a language model.",
+    "You have a private video call on the service, and you later "
+    "discover the company recorded and stored a transcript of the "
+    "conversation.",
+    "You upload a document to the service for personal storage, and "
+    "the company uses its contents to improve its search algorithm.",
+    "You send an encrypted message, but the company can still read "
+    "it because the encryption keys are stored on the company's "
+    "servers.",
+    "You post something to a small private group, and the company's "
+    "moderation system shares it with an external review team in "
+    "another country.",
+    "You draft a message but never send it, and later discover the "
+    "company saved the draft and analyzed its contents.",
+    "You share a voice message with a friend, and the company "
+    "converts it to text and adds it to your advertising profile.",
+    "You delete a post you made, but the company keeps a copy and "
+    "continues to use it for content recommendations.",
+    "You set your profile to private, but the company still allows "
+    "search engines to index your profile photo and display name.",
+    # AI and automated decisions
+    "You apply for a service upgrade, and an algorithm denies your "
+    "request based on your usage patterns, with no explanation and "
+    "no way to appeal.",
+    "The app automatically adjusts the prices you see based on how "
+    "much it predicts you are willing to pay, without telling you.",
+    "You are banned from the platform by an automated system that "
+    "flagged your content, and no human ever reviews your appeal.",
+    "The service uses your photos to train a facial recognition "
+    "model, and that model is later sold to a company you have "
+    "never interacted with.",
+    "An algorithm decides which customer service tier you belong to, "
+    "so your support tickets are deprioritized compared to users the "
+    "system considers more valuable.",
+    "You are shown a different version of the terms of service than "
+    "other users, tailored by an algorithm based on your likelihood "
+    "of reading the full text.",
+    "The service uses your data to build a creditworthiness score "
+    "that other companies can purchase and use in their own lending "
+    "decisions.",
+    "An automated system flags your account as suspicious based on "
+    "your browsing patterns, and your access is restricted without "
+    "any notification.",
+    "The app uses your purchase history to predict your political "
+    "views and sells that prediction to a data analytics firm.",
+    "You receive different search results than other users because "
+    "an algorithm decided what it thinks you want to see, without "
+    "telling you it is personalizing.",
+    # security and breaches
+    "Your password is leaked in a data breach, and you find out "
+    "about it from a news article before the company ever contacts "
+    "you.",
+    "The company suffers a breach that exposes your home address, "
+    "phone number, and payment history, and offers you only one "
+    "year of credit monitoring.",
+    "Your biometric data, like a fingerprint or face scan, is stolen "
+    "in a breach, and unlike a password, you cannot change it.",
+    "You learn that an employee at the company accessed your account "
+    "and read your private messages out of personal curiosity.",
+    "The company stores your password in a way that allows anyone who "
+    "breaks into their database to read it directly.",
+    "A contractor working for the company downloads a database backup "
+    "containing your data and takes it with them when they leave.",
+    "Your account is taken over by someone who called the company's "
+    "support line and convinced them to reset your password.",
+    "The company shares your data with a partner whose security "
+    "practices are weaker, and that partner gets breached.",
+    "You discover that the company has no way to tell you which "
+    "employees accessed your data or when.",
+    "A security researcher publicly discloses a vulnerability that "
+    "exposed your data, and the company had known about it for "
+    "months without fixing it.",
+    # children and family
+    "Your thirteen-year-old child signs up for the service by "
+    "entering a fake birth date, and the company collects and sells "
+    "their data just like an adult's.",
+    "You share a family account with your children, and the company "
+    "builds advertising profiles for each family member, including "
+    "the minors.",
+    "Your child's school requires this service for homework, and "
+    "the company uses the child's usage data for purposes beyond "
+    "education.",
+    "You give the app permission to access your contacts, and it "
+    "starts sending messages to your children's phone numbers "
+    "inviting them to join.",
+    "You find out the company kept detailed records of your child's "
+    "online activity from when they were ten years old, and those "
+    "records are still accessible years later.",
+    "The service recommends content to your teenager based on a "
+    "profile built from data collected before they were old enough "
+    "to consent.",
+    "Your family's smart home device shares your children's voice "
+    "recordings with this service, which uses them for product "
+    "development.",
+    "You set up parental controls, but the company's data collection "
+    "practices apply the same way to your child's account as to "
+    "yours.",
+    "A classmate's parent uses the app to look up information about "
+    "your child, and the service provides it because your child's "
+    "profile is not fully private by default.",
+    "You discover that the company used your child's data to train "
+    "an AI model, even though your child's account was flagged as "
+    "belonging to a minor.",
+    # financial and sensitive data
+    "You link your bank account to the service for payments, and the "
+    "company uses your transaction history to build a spending profile "
+    "that it shares with advertisers.",
+    "You enter your Social Security number for identity verification, "
+    "and the company stores it indefinitely, even after verification "
+    "is complete.",
+    "The service infers your income level from your usage patterns "
+    "and uses it to decide which subscription plans to show you.",
+    "You authorize a one-time payment, but the company stores your "
+    "full credit card details and later charges you for a renewal "
+    "you did not agree to.",
+    "Your medical information, entered into a wellness feature of "
+    "the app, is shared with an insurance company as part of a data "
+    "partnership.",
+    "The service tracks which financial articles you read and sells "
+    "that behavioral data to investment firms.",
+    "You discover that the company has been collecting information "
+    "about your race, religion, or sexual orientation from your "
+    "profile and activity, and using it for ad targeting.",
+    "You apply for a job through the service, and the employer sees "
+    "a risk score calculated from your financial data on the "
+    "platform.",
+    "You connect a fitness tracker to the app, and it shares your "
+    "health metrics with third parties without a separate consent "
+    "step.",
+    "The service combines your purchase history with public records "
+    "to estimate your net worth, and makes that estimate available "
+    "to its business partners.",
+]
 
 
 # ---------------------------------------------------------- queries
@@ -675,6 +1023,17 @@ def queries(sess):
     q["LEP-8"] = ("LEP1..LEP5, 5 filters, no join", make(
         "citations", "d", "destination_context",
         [LEP1, LEP2, LEP3, LEP4, LEP5], [], ["d.id"]))
+
+    # PrivacyPolicies: conditional on the corpus being available.
+    if "policies" in sess.catalog:
+        q["PRIV-1"] = ("2 filters: P_MSG + P_LOC", make(
+            "policies", "p", "policy_text", [P_MSG, P_LOC], [],
+            ["p.id"]))
+        q["PRIV-2"] = ("2 filters + 1 join: P_MSG + P_LOC -> scenarios",
+                       make(
+            "policies", "p", "policy_text", [P_MSG, P_LOC],
+            [("scenarios", "s", "scenario", SCENARIO_MATCH)],
+            ["p.id", "s.id"]))
 
     return q
 

@@ -168,6 +168,20 @@ PREDICATES = (
         "excerpt_cites_passage", "join", quailb.LEPJOIN,
         "excerpt", "citations", "destination_context",
         "passage", "citations", "passage_text", "lepard_passage_id"),
+    PredicateSpec(
+        "quailb.privacy.policy.employee_reads_messages", "P_MSG",
+        "privacy", "policy_employee_reads_messages", "filter",
+        quailb.P_MSG, "policy", "policies", "policy_text"),
+    PredicateSpec(
+        "quailb.privacy.policy.background_location_tracking", "P_LOC",
+        "privacy", "policy_background_location_tracking", "filter",
+        quailb.P_LOC, "policy", "policies", "policy_text"),
+    PredicateSpec(
+        "quailb.privacy.policy.scenario_match", "SCENARIO_MATCH",
+        "privacy", "policy_scenario_match", "join",
+        quailb.SCENARIO_MATCH,
+        "policy", "policies", "policy_text",
+        "scenario", "scenarios", "scenario"),
 )
 
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
@@ -407,6 +421,8 @@ CORPUS_COLUMNS = {
     "evidence": ("id", "text"),
     "citations": ("id", "destination_context", "passage_text",
                   "passage_id"),
+    "policies": ("id", "policy_text"),
+    "scenarios": ("id", "scenario"),
 }
 
 

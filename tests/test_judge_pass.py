@@ -22,7 +22,7 @@ def _spec(key):
 
 
 def test_stable_ids_cover_predicate_semantics_and_inputs():
-    assert len(PREDICATES) == 22
+    assert len(PREDICATES) == 25
     assert len({spec.key for spec in PREDICATES}) == len(PREDICATES)
     original = PREDICATES[0]
     renamed = replace(original, legacy_code="ANOTHER_F1")

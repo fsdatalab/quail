@@ -4,7 +4,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import quail
-from quail.bench.quailb import ASPECTS, SETS, queries, register_sets
+from quail.bench.quailb import ASPECTS, SCENARIOS, SETS, queries, register_sets
 from quail.planner.plan import EngineConfig, Refusal
 
 
@@ -34,6 +34,12 @@ def _standin_sets(tmp_path):
         "passage_text": [f"cited passage {i}" for i in range(6)],
         "passage_id": [f"passage-{i}" for i in range(6)],
     }), tmp_path / "citations.parquet")
+    write("policies", "policy_text",
+          [f"privacy policy text {i}" for i in range(8)])
+    pq.write_table(pa.table({
+        "id": [f"sc{i}" for i in range(len(SCENARIOS))],
+        "scenario": SCENARIOS,
+    }), tmp_path / "scenarios.parquet")
     return tmp_path
 
 
@@ -47,6 +53,7 @@ def test_all_queries_compile_and_plan(tmp_path):
         *(f"BIO-{i}" for i in range(1, 9)),
         *(f"FEV-{i}" for i in range(1, 10)),
         *(f"LEP-{i}" for i in range(1, 9)),
+        "PRIV-1", "PRIV-2",
     }
     assert set(qdefs) == expected
     for qid, (_, build) in qdefs.items():
@@ -62,5 +69,7 @@ def test_set_table_matches_design():
         "reports": 2_000,
         "claims": 1_000,
         "citations": 2_000,
+        "policies": 1_000_000,
     }
     assert len(ASPECTS) == 12
+    assert len(SCENARIOS) == 100
