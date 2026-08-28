@@ -963,7 +963,7 @@ def run_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
     return json.dumps(result["reports"][baseline])
 
 
-@app.function(timeout=7200, **GPU_KW)
+@app.function(timeout=21600, **GPU_KW)
 def run_paired_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
                            query_ids_csv: str = "", reps: int = 1,
                            ground_truth_workload: str = "",
