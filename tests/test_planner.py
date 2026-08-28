@@ -9,8 +9,9 @@ import pytest
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
-from quail.planner.sol import ask, speed_of_light
 from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
+from quail.planner.sol import speed_of_light
+from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
@@ -630,7 +631,6 @@ def test_gate_group_retains_anchor_for_runtime_replan(catalog):
 def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
     import itertools as it
 
-    from quail.planner import sol
     from quail.planner.decide import _collect, join_specs
     from quail.planner.joins import _feasible_anchors, search_joins, walk
 
@@ -657,8 +657,8 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
     arena = 2_500
 
     def key(work):
-        seconds = sol.speed_of_light(work, QWEN3_4B_FP8, H100_SXM,
-                                     chunk).seconds
+        seconds = speed_of_light(work, QWEN3_4B_FP8, H100_SXM,
+                                 chunk).seconds
         return (seconds, work.tokens, work.pairs, work.kv_written,
                 work.kv_read)
 
@@ -775,10 +775,7 @@ def test_join_replan_starts_from_already_joined_aliases():
 def test_aggregate_join_work_matches_per_document_sum():
     import pytest
 
-    from quail.planner import sol
     from quail.planner.joins import stage_work, summarize_alias
-    from quail.planner.sol import Work
-
     spec = _join_search_spec(0, ("a", "b"), "a")
     live = {"a": 2.25, "b": 3.5}
     raw = {"a": [90, 100, 110], "b": [30, 50, 70, 90]}
@@ -798,13 +795,13 @@ def test_aggregate_join_work_matches_per_document_sum():
         total = Work()
         for position, document in enumerate(raw["a"]):
             prefix = 10 + document
-            start = (sol.ask(prefix, frame)
+            start = (ask(prefix, frame)
                      if same_group or position in {1, 2}
-                     else sol.scan(prefix, frame))
+                     else scan(prefix, frame))
             stream = Work(
                 tokens=per_anchor * suffix,
                 pairs=per_anchor * (
-                    suffix * (prefix + frame) + sol.triangle(suffix)),
+                    suffix * (prefix + frame) + triangle(suffix)),
                 kv_written=per_anchor * suffix,
                 kv_read=prefix + frame,
             )

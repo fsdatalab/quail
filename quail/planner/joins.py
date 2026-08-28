@@ -17,8 +17,8 @@ import itertools
 from collections import Counter
 from dataclasses import dataclass
 
-from quail.planner import sol
-from quail.planner.sol import Work
+from quail.planner.sol import prefix_recompute_seconds, speed_of_light
+from quail.planner.work import Work, triangle
 
 DocumentKey = tuple[str, int]
 
@@ -224,7 +224,7 @@ def fit_resident_documents(resident: dict, lengths: dict, pre: int,
             alias, position = key
             tokens = pre + lengths[alias][position]
             pages = -(-tokens // page_tokens)
-            value = sol.prefix_recompute_seconds(tokens, model, device)
+            value = prefix_recompute_seconds(tokens, model, device)
             entries.append((value / pages, key, pages))
             total_pages += pages
         kept = set(keys)
@@ -304,7 +304,7 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
 
     resident_start = Work(
         tokens=resident_n * frame,
-        pairs=frame * resident_prefix + resident_n * sol.triangle(frame),
+        pairs=frame * resident_prefix + resident_n * triangle(frame),
         kv_written=resident_n * frame,
         kv_read=resident_prefix,
     )
@@ -325,7 +325,7 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
         tokens=count * per_anchor * u,
         pairs=per_anchor * (
             u * (prefix_sum + count * frame)
-            + count * sol.triangle(u)),
+            + count * triangle(u)),
         kv_written=count * per_anchor * u,
         kv_read=prefix_sum + count * frame,
     )
@@ -411,8 +411,8 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
     resident = {}
 
     def rank(work):
-        seconds = sol.speed_of_light(base_work + work, model, device,
-                                     chunk_tokens).seconds
+        seconds = speed_of_light(base_work + work, model, device,
+                                 chunk_tokens).seconds
         return (seconds, work.tokens, work.pairs, work.kv_written,
                 work.kv_read)
 

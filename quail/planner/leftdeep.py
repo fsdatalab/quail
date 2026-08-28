@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Generic, Hashable, Iterable, Sequence, TypeVar
 
-from quail.planner.sol import Work
+from quail.planner.work import Work
 
 
 StateProperty = TypeVar("StateProperty", bound=Hashable)
