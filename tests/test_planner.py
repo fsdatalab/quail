@@ -153,14 +153,35 @@ def test_filter_order_matches_first_scan_enumeration():
     assert actual == [predicates[index] for index in expected_order]
 
 
-def test_sol_adds_separate_dense_and_attention_rooflines():
+def test_sol_adds_component_rooflines():
     result = speed_of_light(
         ask(400, 50) * 1000, QWEN3_4B_FP8, H100_SXM, 110_376)
     assert result.bound_by == "mixed"
-    assert result.seconds == pytest.approx(
-        max(result.dense, result.dense_memory)
-        + max(result.attention, result.attention_memory))
+    assert [c.name for c in result.components] == [
+        "attn_proj", "mlp", "attention"]
+    assert result.seconds == pytest.approx(sum(
+        max(c.compute_seconds, c.memory_seconds)
+        for c in result.components))
+    assert result.component("mlp") is result.components[1]
     assert result.seconds > max(result.compute, result.memory)
+
+
+def test_sol_counts_modeled_component_weights():
+    from quail.planner.qwen3_cost import dense_params
+
+    work = ask(400, 50) * 1000
+    result = speed_of_light(
+        work, QWEN3_4B_FP8, H100_SXM, 110_376)
+    dense_bytes = sum(
+        c.bytes_moved for c in result.components
+        if c.name != "attention")
+    assert dense_bytes == dense_params(QWEN3_4B_FP8) * result.passes
+
+    larger_resident_copy = replace(
+        QWEN3_4B_FP8, w_mem_bytes=150e9)
+    assert speed_of_light(
+        work, larger_resident_copy, H100_SXM, 110_376).seconds \
+        == pytest.approx(result.seconds)
 
 
 def test_plan_uses_roofline_filter_order(catalog):

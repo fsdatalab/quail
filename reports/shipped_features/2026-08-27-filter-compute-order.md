@@ -34,6 +34,6 @@ the emitted `FilterChain` order. Another test covers a mixed case where
 dense is compute bound and attention is memory bound.
 
 In the full sf0.1 SoL result, FEV-1 is the only mixed query. Its 4B estimate
-increases from 0.024524 to 0.024682 seconds, or 0.65%. The current result is
+increases from 0.024524 to about 0.02468 seconds, or 0.65%. The current result is
 at `/results/sol/sol_quailb_sf0.1.json` on the `quail-results` volume. No GPU
 run was needed because this is a change to the analytical lower bound.

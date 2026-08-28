@@ -1,6 +1,10 @@
 """Model and device spec structs for the planner."""
 
 from dataclasses import dataclass, replace
+from typing import Literal
+
+
+Precision = Literal["fp8", "bf16"]
 
 # Peak per-token activation bytes per hidden dim.
 ACT_BYTES_PER_HIDDEN = 32
@@ -25,6 +29,8 @@ class ModelSpec:
     #                             Embeddings and quant scales sit
     #                             outside the dense param count, so the
     #                             measured number is larger.
+    weight_precision: Precision = "fp8"
+    attention_precision: Precision = "bf16"
 
     @property
     def kappa(self) -> float:
@@ -73,3 +79,12 @@ class DeviceSpec:
     def attn_flops(self) -> float:
         """Dense peak for the attention kernels, FLOP/s."""
         return self.bf16_flops or self.peak_flops / 2
+
+    def arithmetic_bandwidth(self, precision: Precision) -> float:
+        """Return arithmetic throughput for one component precision."""
+
+        if precision == "fp8":
+            return self.peak_flops
+        if precision == "bf16":
+            return self.attn_flops
+        raise ValueError(f"unsupported precision: {precision}")

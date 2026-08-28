@@ -1,20 +1,19 @@
 """Speed of light for every QUAIL-B query, on Qwen3-4B and Qwen3-32B.
 
-The least time each query can take on one H100! request. Three things cost
-time and nothing else is counted:
+The least time each query can take on one H100! request. Three model
+components cost time and nothing else is counted:
 
-  1. the dense projections - 2 FLOPs per parameter per token
-  2. attention - 4 * n_q * d_head FLOPs per scored (query, key) pair,
-     per layer
-  3. moving bytes - the weights once per forward pass, KV once per
-     token written, and KV again wherever a later stage reads it back
+  1. attention projections, with their weight bytes and fp8 FLOPs
+  2. the MLP, with its weight bytes and fp8 FLOPs
+  3. attention, with its KV bytes and bf16 pair FLOPs
 
 No measured or fitted performance constant appears in the time bound,
 which is what makes the answer a floor: a run can approach it and can
 never beat it. The dollar metric uses Modal's published H100! price.
-The equations are plans/sol_model.md; they are implemented once, in
-quail/planner/sol.py, shared with the planner. This file measures the
-three inputs they need and applies them to every query.
+The equations are plans/sol_model.md. Work counting, model components,
+and the generic component calculation live in separate planner modules.
+The planner and this report use the same implementation. This file
+measures the three inputs they need and applies them to every query.
 
 KV reuse, the part that has to be right
 ---------------------------------------
@@ -198,16 +197,35 @@ for code, template in JOIN_TEMPLATES.items():
 
 # 3. labels -----------------------------------------------------------
 # A predicate keeps one label set per template it has been judged
-# under, so the volume holds several at once. The corpus's
-# active_collection.json names the current collection, and that
-# collection names one label set per predicate; anything else is a
-# superseded run and must not be read.
-ACTIVE = set(COLLECTION["label_sets"].values())
+# under, so the volume holds several at once. The main collection
+# supplies IMDB, BioDEX, and FEVER. LePaRD uses the revised corpus
+# named by the benchmark selectivity source.
+LABEL_MANIFESTS = glob.glob(
+    str(W / "allabels/label_sets/*/*/*/manifest.json"))
+active_by_predicate = dict(COLLECTION["label_sets"])
+revised_lepard = {}
+for manifest_path in LABEL_MANIFESTS:
+    manifest = json.load(open(manifest_path))
+    predicate = manifest["predicate"]
+    if (predicate["workload"] == "lepard"
+            and manifest["corpus_id"] == Q.SELECTIVITY_ESTIMATE_LEPARD_CORPUS):
+        key = manifest["predicate_key"]
+        if key in revised_lepard:
+            raise ValueError(
+                f"more than one revised LePaRD label set for {key}")
+        revised_lepard[key] = manifest["label_set_id"]
+expected_lepard = {
+    key for key in active_by_predicate if key.startswith("quailb.lepard.")}
+if set(revised_lepard) != expected_lepard:
+    raise ValueError(
+        "revised LePaRD labels do not cover the collection predicates")
+active_by_predicate.update(revised_lepard)
+ACTIVE = set(active_by_predicate.values())
 filter_answers = {}
 join_answers = {}
 predicate_meta = {}
 template_codes = {}
-for m in glob.glob(str(W / "allabels/label_sets/*/*/*/manifest.json")):
+for m in LABEL_MANIFESTS:
     if Path(m).parent.name not in ACTIVE:
         continue
     meta = json.load(open(m))["predicate"]
@@ -900,6 +918,12 @@ def add_sol_metrics(simulated, model: ModelSpec):
     work = simulated.pop("work")
     held = simulated["held_column"]
     s = speed_of_light(work, model, H100_SXM, CHUNK[model.name])
+    attn_proj = s.component("attn_proj")
+    mlp = s.component("mlp")
+    attention = s.component("attention")
+    dense_compute = attn_proj.compute_seconds + mlp.compute_seconds
+    dense_memory = attn_proj.memory_seconds + mlp.memory_seconds
+    dense_seconds = attn_proj.seconds + mlp.seconds
     return {
         **simulated,
         "chunk_tokens": CHUNK[model.name],
@@ -912,12 +936,25 @@ def add_sol_metrics(simulated, model: ModelSpec):
             sum(lengths[held].values()) / len(lengths[held])),
         "passes": s.passes,
         "bytes_moved": s.bytes_moved,
-        "t_dense": s.dense,
-        "t_dense_memory": s.dense_memory,
-        "t_dense_roofline": s.dense_seconds,
-        "t_attention": s.attention,
-        "t_attention_memory": s.attention_memory,
-        "t_attention_roofline": s.attention_seconds,
+        "components": [
+            {
+                "name": component.name,
+                "precision": component.precision,
+                "flops": component.flops,
+                "bytes_moved": component.bytes_moved,
+                "t_compute": component.compute_seconds,
+                "t_memory": component.memory_seconds,
+                "seconds": component.seconds,
+                "bound_by": component.bound_by,
+            }
+            for component in s.components
+        ],
+        "t_dense": dense_compute,
+        "t_dense_memory": dense_memory,
+        "t_dense_roofline": dense_seconds,
+        "t_attention": attention.compute_seconds,
+        "t_attention_memory": attention.memory_seconds,
+        "t_attention_roofline": attention.seconds,
         "t_compute": s.compute,
         "t_memory": s.memory,
         "sol_s": s.seconds,

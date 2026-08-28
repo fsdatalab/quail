@@ -23,11 +23,12 @@ name, and it cannot judge the thing the constant was fitted to.
 | `u_b` | one join tuple suffix for partner `b` | from the prompt and corpus | from the prompt and corpus |
 | `A_s` | documents alive entering stage `s` | `A_1` is all | `A_1` is all |
 | `T(n)` | `n(n+1)/2`, a causal sequence attending to itself | | |
-| `P` | dense parameters per token | 3,633,511,936 | 31,206,298,624 |
+| `P_A` | attention projection parameters | 943,718,400 | 6,039,797,760 |
+| `P_M` | MLP parameters | 2,689,597,440 | 25,165,824,000 |
 | `L` | layers | 36 | 64 |
 | `n_q`, `d_head` | query heads, head dimension | 32, 128 | 64, 128 |
 | `kappa` | KV bytes per token, `2 L n_kv d_head 2` | 147,456 | 262,144 |
-| `W` | resident weight bytes | 4.5e9 | 34.37e9 |
+| `b_w` | bytes per modeled weight | 1 | 1 |
 | `R_dense` | fp8 dense peak, FLOP/s | 1.979e15 | 1.979e15 |
 | `R_attn` | bf16 dense peak, FLOP/s | 0.9895e15 | 0.9895e15 |
 | `BW` | HBM bandwidth, bytes/s | 3.35e12 | 3.35e12 |
@@ -45,9 +46,10 @@ values above are the fused kernels' 32-bit offset limit,
 why the same query takes more forward passes and re-reads a
 7.6x larger weight set more often.
 
-`P` is counted from the model dimensions rather than quoted, since a
-rounded parameter count lands straight on the largest term of the
-bound. `R_dense` and `R_attn` are the H100 datasheet
+`P_A` and `P_M` are counted from the model dimensions rather than quoted.
+The calculation includes the Q, K, V, output, gate, up, and down
+projections. It omits embeddings, the output head, norms, and activation
+functions. `R_dense` and `R_attn` are the H100 datasheet
 figures halved, because the datasheet quotes them with 2:1 sparsity
 and we run dense. The projections are fp8 and attention is bf16
 (FlashAttention-3 over bf16 KV), which is why there are two peaks.
@@ -108,10 +110,10 @@ ground truth labels then determine the exact document IDs in `A_s`. The SoL
 calculation does not estimate `A_s` from selectivity, because the surviving
 document lengths affect the attention count.
 
-When `by_cost` selects the filter order, it prices dense and attention
-with separate compute and memory limits. The filter time is the dense
-limit plus the attention limit. For predicates after the first one, the
-sort divides the time of `ask(mean prefix, q_s)` by
+When `by_cost` selects the filter order, it prices each model component
+with separate compute and memory limits. The filter time is the sum of
+the component times. For predicates after the first one, the sort divides
+the time of `ask(mean prefix, q_s)` by
 `1 - selectivity_s`.
 
 The first predicate uses `scan`. The planner sorts all predicates by ask score
@@ -197,30 +199,36 @@ query. The QUAIL-B calculation runs only the DP.
 ## 4. Speed of light
 
 ```
-T_dense_compute = 2 * P * tokens / R_dense
-passes          = ceil(tokens / C)
-T_dense_memory  = W * passes / BW
-T_dense         = max(T_dense_compute, T_dense_memory)
+passes = ceil(tokens / C)
 
-T_attn_compute  = 4 * n_q * d_head * L * pairs / R_attn
-T_attn_memory   = kappa * (kv write + kv read) / BW
-T_attention     = max(T_attn_compute, T_attn_memory)
+T_A_compute = 2 * P_A * tokens / R_dense
+T_A_memory  = P_A * b_w * passes / BW
+T_A         = max(T_A_compute, T_A_memory)
 
-SoL             = T_dense + T_attention
+T_M_compute = 2 * P_M * tokens / R_dense
+T_M_memory  = P_M * b_w * passes / BW
+T_M         = max(T_M_compute, T_M_memory)
+
+T_attn_compute = 4 * n_q * d_head * L * pairs / R_attn
+T_attn_memory  = kappa * (kv write + kv read) / BW
+T_attention    = max(T_attn_compute, T_attn_memory)
+
+SoL = T_A + T_M + T_attention
 ```
 
-`2` FLOPs per parameter per token: one multiply and one add.
+`2` FLOPs per projection parameter per token means one multiply and one add.
 `4 * n_q * d_head` per pair per layer: the QK dot product runs over
 `d_head` dimensions for `2 * d_head` FLOPs, the weight into V costs
 another `2 * d_head`, times `n_q` heads. At 4B that is 16,384.
 
-Weights are re-read once per forward pass: 4.5e9 bytes against a
-50 MB L2 never stay resident.
+Each modeled component reads its weights once per ideal forward pass. The
+resident model footprint remains part of the GPU capacity calculation, but
+it is not used as component memory traffic.
 
 Each `max` allows compute and memory movement to overlap within one
-kernel. Dense and attention time are added because those kernels run in
-sequence. Weight bytes are charged to dense kernels. KV bytes are
-charged to attention kernels.
+component. Component times are added because the components run in sequence.
+The attention projection and MLP components count weight bytes. The attention
+component counts KV bytes.
 
 The reported cost and throughput metrics are derived from SoL:
 
@@ -240,10 +248,18 @@ Quail metrics.
 
 ## 5. The code
 
-The equations live in `quail/planner/sol.py`, shared by this
-calculation and the planner; `reports/make_sol_quailb.py` imports
-them and adds the measurement of the three inputs they need. Three
-functions carry section 3:
+The implementation is split into four modules shared by the planner and
+the report:
+
+| module | responsibility |
+|---|---|
+| `quail/planner/work.py` | Count tokens, attention pairs, and KV movement |
+| `quail/planner/qwen3_cost.py` | Build Qwen3 attention projection, MLP, and attention components |
+| `quail/planner/roofline.py` | Price one component from FLOPs, bytes, precision, and hardware limits |
+| `quail/planner/sol.py` | Apply ideal query-wide packing and add component times |
+
+`reports/make_sol_quailb.py` measures the inputs and applies the shared
+calculator. Three functions in `work.py` carry section 3:
 
 | function | equation |
 |---|---|
@@ -260,8 +276,8 @@ enumeration on a small query.
 The SoL script does not call or simulate the production planner. It runs the
 exact search separately for each model and passes that model's chunk limit.
 `speed_of_light()` is section 4. The production planner imports the same work
-equations to rank its candidates, but its search and finite KV policy are
-separate from this exact analysis.
+and component equations to rank its candidates. Its search and finite KV
+policy are separate from this exact analysis.
 
 ## 6. What the bound assumes
 
@@ -270,7 +286,9 @@ separate from this exact analysis.
 - **KV capacity is unlimited.** Every document prefix computed by a filter
   or anchor remains available for later stages.
 - **Compute and memory overlap perfectly within each kernel**, per the
-  two `max` terms above.
+  component `max` terms above.
+- **Forward passes are packed across aggregate query work.** Logical operator
+  boundaries do not add more weight reads or separate component limits.
 - **Nothing is charged** for the tokenizer, the host, scheduling,
   kernel efficiency, or launch gaps. That is what makes it a floor.
 

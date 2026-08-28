@@ -24,6 +24,10 @@ payload to the worker, which calls the executor.
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
+| `planner/work.py` | Hardware independent token, attention pair, and KV counts | nothing |
+| `planner/qwen3_cost.py` | Qwen3 attention projection, MLP, and attention components | specs, work, roofline |
+| `planner/roofline.py` | Generic component compute and memory limits | specs |
+| `planner/sol.py` | Ideal query packing and total component time | work, qwen3_cost, roofline |
 | `planner/calibration.py` | Measured constants (a, a2) and scaling | specs |
 | `planner/calibrate.py` | Length-sweep measure of a and a2 | calibration, executor |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
@@ -291,8 +295,8 @@ These decisions use token counts, selectivities, and the model and
 device specifications. They do not use measured serving rates.
 
 **Filter order** (`decide.py`): when every filter carries a
-selectivity, `by_cost` uses the same separate dense and attention
-limits as SoL. For filters after the first one, the score is the time
+selectivity, `by_cost` uses the same component limits as SoL. For filters
+after the first one, the score is the time
 for `ask(mean prefix, question)` divided by the fraction of documents
 the filter rejects. A selectivity of 1 goes last.
 
@@ -476,7 +480,7 @@ single forward pass, sharing KV across them through a paged arena.
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
-| `unrounded_seconds` | `sol.py` | Separate dense and attention limits without forward pass rounding |
+| `unrounded_seconds` | `sol.py` | Component limits without forward pass rounding |
 | `search_joins` | `joins.py` | The join search: order and anchors from live counts, length summaries, document KV summaries, and aliases joined by completed groups; called at plan time and after every completed runtime group |
 | `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: which survivors to price as resident, longest documents first |
 | `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the least saved recompute work per page |
@@ -484,8 +488,10 @@ single forward pass, sharing KV across them through a paged arena.
 | `prefix_recompute_seconds` | `sol.py` | The retention value of one prefix, counted constants only |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
 | `optimize_left_deep` | `leftdeep.py` | Subset DP over joined aliases and a caller supplied physical property, with a nondominated Work frontier |
-| `scan` / `ask` / `stream` | `sol.py` | The three KV operations as Work records |
-| `speed_of_light` | `sol.py` | Work -> seconds floor from counted constants; ranks candidate plans |
+| `scan` / `ask` / `stream` | `work.py` | The three KV operations as Work records |
+| `qwen3_components` | `qwen3_cost.py` | Build attention projection, MLP, and attention work |
+| `component_latency` | `roofline.py` | Take the larger of compute time and memory time for one component |
+| `speed_of_light` | `sol.py` | Pack aggregate work into ideal passes and add component times |
 | `chunk_budget` | `budgets.py` | Tokens per forward pass (min of memory and kernel bounds) |
 | `arena_tokens` | `budgets.py` | KV residency budget (device memory minus weights and activations) |
 
