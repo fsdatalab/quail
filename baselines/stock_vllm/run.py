@@ -13,6 +13,13 @@ Parallel across N containers:
 
     Each container boots its own LLM and runs a subset of queries.
     Results are merged and saved to the quail-results volume.
+
+Paired comparison, one container per query set:
+    uv run modal run -m baselines.stock_vllm.run::paired_main
+
+    Each container boots one LLM and runs both stock_vllm and
+    pipelined_vllm for every query in its set. The execution order
+    alternates by query.
 """
 
 import json
@@ -60,6 +67,8 @@ MODELS = {
     "qwen3-32b-fp8": "Qwen/Qwen3-32B-FP8",
 }
 
+BASELINES = ("stock_vllm", "pipelined_vllm")
+
 
 def _baseline_configuration(name):
     if name == "stock_vllm":
@@ -69,6 +78,14 @@ def _baseline_configuration(name):
     raise ValueError(
         f"unknown baseline {name!r}; expected stock_vllm or "
         "pipelined_vllm")
+
+
+def _paired_baseline_order(rep: int, query_position: int) -> tuple[str, str]:
+    """Alternate which configuration runs first."""
+
+    if (rep + query_position) % 2:
+        return tuple(reversed(BASELINES))
+    return BASELINES
 
 
 def _vllm_filter_capacity(llm):
@@ -126,6 +143,31 @@ def _split_query_sets(ids):
     if unknown:
         raise ValueError(f"unknown query set for {unknown}")
     return [chunk for chunk in chunks if chunk]
+
+
+def _query_set_name(ids):
+    """Return the ground truth workload name for one query-set chunk."""
+
+    workloads = {
+        "IMDB": "imdb",
+        "BIO": "biodex",
+        "FEV": "fever",
+        "LEP": "lepard",
+    }
+    prefixes = {query_id.split("-", 1)[0] for query_id in ids}
+    if len(prefixes) != 1:
+        raise ValueError(f"expected one query set, found {sorted(prefixes)}")
+    prefix = prefixes.pop()
+    try:
+        return workloads[prefix]
+    except KeyError as error:
+        raise ValueError(f"unknown query set {prefix!r}") from error
+
+
+def _paired_ground_truth_workload(requested, ids):
+    if requested == "auto":
+        return _query_set_name(ids)
+    return requested
 
 
 def define_all_queries():
@@ -732,13 +774,11 @@ def ensure_data(sf: float):
     build_sets(DATA_DIR, sf)
 
 
-@app.function(timeout=7200, **GPU_KW)
-def run_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
-                    query_ids_csv: str = "", reps: int = 1,
-                    ground_truth_workload: str = "",
-                    prediction: str = "",
-                    baseline: str = "stock_vllm") -> str:
-    """Boot LLM and run a batch of queries.
+def _run_query_batches(model: str, sf: float, query_ids_csv: str,
+                       reps: int, ground_truth_workload: str,
+                       prediction: str, baselines: tuple[str, ...],
+                       paired_run_id: str = "") -> dict:
+    """Boot one LLM and run one or both baseline configurations.
 
     Args:
         model: Key into MODELS dict.
@@ -762,8 +802,12 @@ def run_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
     from transformers import AutoTokenizer
     from vllm import SamplingParams
 
+    if not baselines:
+        raise ValueError("at least one baseline is required")
+    for baseline in baselines:
+        _baseline_configuration(baseline)
+
     hf_name = MODELS[model]
-    filter_submission = _baseline_configuration(baseline)
     data_path = build_sets(DATA_DIR, sf)
 
     tokenizer = AutoTokenizer.from_pretrained(hf_name)
@@ -780,8 +824,9 @@ def run_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
     sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
                         allowed_token_ids=allowed)
     filter_capacity = _vllm_filter_capacity(llm)
-    print(f"[{baseline}] boot: {boot}", flush=True)
-    print(f"[{baseline}] KV capacity: {filter_capacity}", flush=True)
+    run_name = paired_run_id or baselines[0]
+    print(f"[{run_name}] boot: {boot}", flush=True)
+    print(f"[{run_name}] KV capacity: {filter_capacity}", flush=True)
 
     llm.generate([{"prompt_token_ids": allowed}], sp, use_tqdm=False)
 
@@ -829,56 +874,107 @@ def run_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
         register_sets(session, data_path)
         evaluation_queries = quail_queries(session)
 
-    all_results = []
+    all_results = {baseline: [] for baseline in baselines}
+    execution_order = []
     for rep in range(reps):
-        print(f"\n[{baseline}] === rep {rep} ===", flush=True)
-        if rep > 0:
-            llm.reset_prefix_cache()
-        rep_results = []
-        for qid in ids:
-            llm.reset_prefix_cache()
-            print(f"\n[{baseline}] {qid}", flush=True)
-            try:
-                entry = run_query(llm, sp, true, tokenizer,
-                                  qid, queries[qid], DATA_DIR, sf,
-                                  evaluator=evaluator,
-                                  quail_query=(evaluation_queries[qid][1]()
-                                               if evaluator else None),
-                                  filter_submission=filter_submission,
-                                  filter_capacity=filter_capacity)
-            except Exception as e:                          # noqa: BLE001
-                entry = dict(query=qid,
-                             error=f"{type(e).__name__}: {e}")
-                print(f"  ERROR: {e}", flush=True)
-            rep_results.append(entry)
-        all_results.append(rep_results)
+        rep_results = {baseline: [] for baseline in baselines}
+        rep_order = []
+        for query_position, qid in enumerate(ids):
+            order = (_paired_baseline_order(rep, query_position)
+                     if len(baselines) == 2 else baselines)
+            rep_order.append({"query": qid, "order": list(order)})
+            for baseline in order:
+                reset = llm.reset_prefix_cache()
+                if reset is False:
+                    raise RuntimeError(
+                        "vLLM refused to reset its prefix cache before "
+                        f"{baseline} {qid}")
+                filter_submission = _baseline_configuration(baseline)
+                print(f"\n[{baseline}] rep={rep} {qid}", flush=True)
+                try:
+                    entry = run_query(
+                        llm, sp, true, tokenizer,
+                        qid, queries[qid], DATA_DIR, sf,
+                        evaluator=evaluator,
+                        quail_query=(evaluation_queries[qid][1]()
+                                     if evaluator else None),
+                        filter_submission=filter_submission,
+                        filter_capacity=filter_capacity)
+                except Exception as e:                      # noqa: BLE001
+                    entry = dict(query=qid,
+                                 error=f"{type(e).__name__}: {e}")
+                    print(f"  ERROR: {e}", flush=True)
+                rep_results[baseline].append(entry)
+        for baseline in baselines:
+            all_results[baseline].append(rep_results[baseline])
+        execution_order.append(rep_order)
 
-    submission = (
-        "separate generate() call per filter stage, full cross product "
-        "per join"
-        if filter_submission == "stage-major"
-        else "pipelined per-document filter chain, full cross product "
-             "per join"
-    )
-    report = dict(baseline=baseline, model=model, hf_name=hf_name, sf=sf,
-                  boot=boot, reps=reps,
-                  prediction=prediction,
-                  ground_truth_workload=(ground_truth_workload or None),
-                  ground_truth=(None if truth is None else {
-                      "collection_id": truth.collection_id,
-                      "corpus_id": truth.corpus_id,
-                      "reference_model": truth.reference_model,
-                  }),
-                  query_ids=ids,
-                  filter_submission=filter_submission,
-                  filter_capacity=filter_capacity,
-                  submission=submission,
-                  checkpoint="pre-quantized FP8",
-                  max_num_seqs=4096, max_num_batched_tokens=25_305,
-                  gpu_memory_utilization=0.92,
-                  enable_prefix_caching=True,
-                  results=all_results)
-    return json.dumps(report)
+    reports = {}
+    for baseline in baselines:
+        filter_submission = _baseline_configuration(baseline)
+        submission = (
+            "separate generate() call per filter stage, full cross "
+            "product per join"
+            if filter_submission == "stage-major"
+            else "pipelined per-document filter chain, full cross "
+                 "product per join"
+        )
+        report = dict(
+            baseline=baseline, model=model, hf_name=hf_name, sf=sf,
+            boot=boot, reps=reps,
+            prediction=prediction,
+            ground_truth_workload=(ground_truth_workload or None),
+            ground_truth=(None if truth is None else {
+                "collection_id": truth.collection_id,
+                "corpus_id": truth.corpus_id,
+                "reference_model": truth.reference_model,
+            }),
+            query_ids=ids,
+            filter_submission=filter_submission,
+            filter_capacity=filter_capacity,
+            submission=submission,
+            checkpoint="pre-quantized FP8",
+            max_num_seqs=4096, max_num_batched_tokens=25_305,
+            gpu_memory_utilization=0.92,
+            enable_prefix_caching=True,
+            results=all_results[baseline])
+        if len(baselines) == 2:
+            report["paired_run"] = {
+                "id": paired_run_id,
+                "same_model_process": True,
+                "prefix_cache_reset_before_each_configuration": True,
+                "execution_order": execution_order,
+            }
+        reports[baseline] = report
+    return {"reports": reports, "execution_order": execution_order}
+
+
+@app.function(timeout=7200, **GPU_KW)
+def run_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
+                    query_ids_csv: str = "", reps: int = 1,
+                    ground_truth_workload: str = "",
+                    prediction: str = "",
+                    baseline: str = "stock_vllm") -> str:
+    """Boot one LLM and run one baseline configuration."""
+
+    result = _run_query_batches(
+        model, sf, query_ids_csv, reps, ground_truth_workload,
+        prediction, (baseline,))
+    return json.dumps(result["reports"][baseline])
+
+
+@app.function(timeout=7200, **GPU_KW)
+def run_paired_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
+                           query_ids_csv: str = "", reps: int = 1,
+                           ground_truth_workload: str = "",
+                           prediction: str = "",
+                           paired_run_id: str = "") -> str:
+    """Boot one LLM and run both configurations in that process."""
+
+    result = _run_query_batches(
+        model, sf, query_ids_csv, reps, ground_truth_workload,
+        prediction, BASELINES, paired_run_id)
+    return json.dumps(result)
 
 
 @app.function(timeout=300, image=image,
@@ -995,3 +1091,113 @@ def main(model: str = "qwen3-4b-fp8", sf: float = 0.1,
     print(f"  {len(ids)} queries, {reps} reps, "
           f"{report.get('containers', 1)} container(s)")
     print(json.dumps(report))
+
+
+@app.local_entrypoint()
+def paired_main(model: str = "qwen3-4b-fp8", sf: float = 0.1,
+                query: str = "", reps: int = 1,
+                ground_truth_workload: str = "",
+                prediction: str = ""):
+    """Run both baselines in one model process per query set.
+
+    Set ``--ground-truth-workload auto`` to load the matching ground
+    truth collection independently in each query-set container.
+    """
+
+    if reps < 1:
+        raise ValueError("reps must be at least one")
+    if query:
+        ids = [query_id.strip() for query_id in query.split(",")]
+    else:
+        ids = list(QUERY_ORDER)
+
+    label = f"{time.strftime('%Y-%m-%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    if prediction:
+        print(f"PREDICTION: {prediction}", flush=True)
+
+    print(f"[paired] building data (sf={sf}) before fan-out...")
+    ensure_data.remote(sf)
+    chunks = _split_query_sets(ids)
+    print(f"[paired] data ready, spawning {len(chunks)} containers "
+          f"for {len(ids)} queries")
+
+    handles = []
+    for chunk in chunks:
+        workload = _paired_ground_truth_workload(
+            ground_truth_workload, chunk)
+        fc = run_paired_query_batch.spawn(
+            model=model, sf=sf,
+            query_ids_csv=",".join(chunk), reps=reps,
+            ground_truth_workload=workload,
+            prediction=prediction, paired_run_id=label)
+        query_set = _query_set_name(chunk)
+        print(f"  {query_set}: {fc.object_id} "
+              f"({len(chunk)} queries: {chunk[0]}..{chunk[-1]})")
+        handles.append((query_set, chunk, workload, fc))
+
+    batches = []
+    for query_set, chunk, workload, handle in handles:
+        print(f"  waiting for {query_set}...")
+        batches.append((
+            query_set,
+            chunk,
+            workload,
+            handle.object_id,
+            json.loads(handle.get()),
+        ))
+        print(f"  {query_set} done")
+
+    pairing = {
+        "id": label,
+        "same_model_process": True,
+        "one_container_per_query_set": True,
+        "prefix_cache_reset_before_each_configuration": True,
+        "order_rule": (
+            "stock first when rep plus query position is even; "
+            "pipelined first otherwise"),
+        "query_sets": [
+            {
+                "query_set": query_set,
+                "query_ids": chunk,
+                "function_call_id": function_call_id,
+                "execution_order": output["execution_order"],
+            }
+            for (query_set, chunk, _workload, function_call_id,
+                 output) in batches
+        ],
+    }
+
+    reports = {}
+    for baseline in BASELINES:
+        report = _merge_reports(
+            [output["reports"][baseline]
+             for _query_set, _chunk, _workload, _function_call_id,
+             output in batches],
+            len(batches))
+        report["paired_run"] = pairing
+        report["ground_truth_workload"] = {
+            query_set: (workload or None)
+            for query_set, _chunk, workload, _function_call_id,
+            _output in batches
+        }
+        report["ground_truth"] = {
+            query_set: output["reports"][baseline].get("ground_truth")
+            for query_set, _chunk, _workload, _function_call_id,
+            output in batches
+        }
+        reports[baseline] = report
+
+    paths = {}
+    for baseline in BASELINES:
+        paths[baseline] = save_report.remote(
+            json.dumps(reports[baseline], indent=2), label, baseline)
+        print(f"[{baseline}] saved {paths[baseline]}")
+
+    print(f"[paired] {len(ids)} queries, {reps} reps, "
+          f"{len(batches)} query-set containers")
+    print(json.dumps({"paired_run_id": label, "paths": paths,
+                      "function_call_ids": {
+                          query_set: function_call_id
+                          for query_set, _chunk, _workload,
+                          function_call_id, _output in batches
+                      }}))
