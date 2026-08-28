@@ -1020,7 +1020,7 @@ Qwen3 32B during the judge pass; ground truth covers 22 predicates.
 |---|---|---|---|
 | reviews | `stanfordnlp/imdb` | 50,000 | Movie reviews |
 | reports | `BioDEX/BioDEX-Reactions` | 10,000 | Medical case reports |
-| claims | `fever/fever` | 100,000 | Factual claims (train + labelled_dev) |
+| claims | `fever/fever` | 5,000 | Factual claims (train + labelled_dev) |
 | citations | `rmahari/LePaRD` | 2,000 | Legal citation excerpts |
 | policies | `mukund/PrivacyPolicies` | 1,000,000 | Privacy policies (optional) |
 
@@ -1037,7 +1037,7 @@ graph LR
     subgraph Document tables
         reviews["reviews (50K)"]
         reports["reports (10K)"]
-        claims["claims (100K)"]
+        claims["claims (5K)"]
         citations["citations (2K)"]
         policies["policies (1M, optional)"]
     end

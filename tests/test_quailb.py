@@ -70,7 +70,7 @@ def test_set_table_matches_design():
     assert SETS == {
         "reviews": 50_000,
         "reports": 10_000,
-        "claims": 100_000,
+        "claims": 5_000,
         "citations": 2_000,
         "policies": 1_000_000,
     }

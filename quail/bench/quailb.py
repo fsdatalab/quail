@@ -18,7 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 DATA_SEED = 20260818
-CACHE_SCHEMA_VERSION = 5  # bumped: FEVER claims scaled from 1K to 100K
+CACHE_SCHEMA_VERSION = 5  # bumped: FEVER/BioDEX scale changes
 
 # Exact source snapshots for the benchmark corpus.  The row selection below
 # is deterministic only when the upstream revisions are fixed as well as the
@@ -41,7 +41,7 @@ SOURCE_REVISIONS = {
 SETS = {
     "reviews": 50_000,
     "reports": 10_000,
-    "claims": 100_000,
+    "claims": 5_000,
     "citations": 2_000,
     "policies": 1_000_000,
 }
