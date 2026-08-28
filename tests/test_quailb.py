@@ -69,7 +69,7 @@ def test_all_queries_compile_and_plan(tmp_path):
 def test_set_table_matches_design():
     assert SETS == {
         "reviews": 50_000,
-        "reports": 2_000,
+        "reports": 10_000,
         "claims": 100_000,
         "citations": 2_000,
         "policies": 1_000_000,

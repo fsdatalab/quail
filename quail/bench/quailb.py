@@ -40,7 +40,7 @@ SOURCE_REVISIONS = {
 # bounded by whichever claims get sampled.
 SETS = {
     "reviews": 50_000,
-    "reports": 2_000,
+    "reports": 10_000,
     "claims": 100_000,
     "citations": 2_000,
     "policies": 1_000_000,
@@ -280,7 +280,7 @@ def build_sets(data_dir, sf, lf=1):
         "report": [t for t, _ in bio],
         "reactions": [r for _, r in bio],
     }), d / "reports.parquet")
-    terms = _vocab_table(bio, 1, cap=2_560)
+    terms = _vocab_table(bio, 1)
     write("terms", [f"tm{i}" for i in range(len(terms))], "term", terms)
     # claims + evidence: real FEVER claims and only the Wikipedia
     # pages those claims reference
