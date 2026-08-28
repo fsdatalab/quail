@@ -4,7 +4,8 @@ import random
 import pytest
 
 from quail.executor.retention import Retained, minimum_loss_victims
-from quail.planner.sol import prefix_recompute_seconds, triangle
+from quail.planner.sol import prefix_recompute_seconds
+from quail.planner.work import triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 

@@ -1,6 +1,6 @@
 from quail.bench.sol_dp import PairRelation, exact_live_rows
 from quail.planner.leftdeep import Extension, optimize_left_deep
-from quail.planner.sol import Work
+from quail.planner.work import Work
 
 
 def test_exact_live_rows_reduces_a_tree_to_exact_projections():

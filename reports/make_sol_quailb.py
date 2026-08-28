@@ -97,7 +97,8 @@ from quail.planner.decide import (
 from quail.planner.joins import fit_resident_documents, search_joins, summarize_alias
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.plan import EngineConfig, Refusal
-from quail.planner.sol import Work, ask, scan, speed_of_light
+from quail.planner.sol import speed_of_light
+from quail.planner.work import Work, ask, scan
 from quail.runtime.coordinator import runtime_nodes, thin_survivors
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 

@@ -10,10 +10,11 @@ constant is read anywhere.
 """
 
 from quail.logical import LogicalPlan, Project, Scan, SemanticFilter, SemanticJoin
-from quail.planner import budgets, sol
+from quail.planner import budgets
 from quail.planner import joins as joinsearch
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
-from quail.planner.sol import Work
+from quail.planner.sol import speed_of_light, unrounded_seconds
+from quail.planner.work import Work, ask, scan
 from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk
@@ -76,9 +77,9 @@ def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
                 device: DeviceSpec, chunk_tokens: int, *, first: bool) -> float:
     """Return ideal time for one filter evaluation."""
 
-    operation = sol.scan if first else sol.ask
+    operation = scan if first else ask
     work = operation(prefix_tokens, _question_tokens(predicate.prompt))
-    return sol.unrounded_seconds(work, model, device, chunk_tokens)
+    return unrounded_seconds(work, model, device, chunk_tokens)
 
 
 def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
@@ -185,7 +186,7 @@ def _filter_work(filters, stats, filter_orders: dict, pre: int) -> Work:
         for si, predicate_index in enumerate(filter_orders[alias]):
             p = preds[predicate_index]
             q = _question_tokens(p.prompt)
-            op = sol.scan if si == 0 else sol.ask
+            op = scan if si == 0 else ask
             total = total + op(pre + mean, q) * n
             n *= p.selectivity if p.selectivity is not None else 1.0
     return total
@@ -551,9 +552,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                      and not s["anchor_free"]})
     if forced:
         free = run_search(keep_plan, honor_forced=False)
-        honored_s = sol.speed_of_light(
+        honored_s = speed_of_light(
             base_work + found["work"], model, device, chunk).seconds
-        free_s = sol.speed_of_light(
+        free_s = speed_of_light(
             base_work + free["work"], model, device, chunk).seconds
         if free_s < honored_s:
             remarks.append(

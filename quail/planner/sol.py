@@ -11,18 +11,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from quail.planner.qwen3_cost import (
-    dense_params,
-    flops_per_pair,
-    kv_bytes_per_token,
-    qwen3_components,
-)
+from quail.planner import work as _workload
+from quail.planner.qwen3_cost import qwen3_components
 from quail.planner.roofline import ComponentLatency, component_latencies
-from quail.planner.work import Work, ask, scan, stream, triangle
 from quail.specs import DeviceSpec, ModelSpec
 
 
-def _latencies(work: Work, model: ModelSpec, device: DeviceSpec,
+def _latencies(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                passes: float) -> tuple[ComponentLatency, ...]:
     """Return the priced Qwen3 components for one work record."""
 
@@ -30,7 +25,7 @@ def _latencies(work: Work, model: ModelSpec, device: DeviceSpec,
         qwen3_components(work, model, passes), device)
 
 
-def compute_seconds(work: Work, model: ModelSpec,
+def compute_seconds(work: _workload.Work, model: ModelSpec,
                     device: DeviceSpec) -> float:
     """Return ideal compute time without memory movement."""
 
@@ -39,7 +34,7 @@ def compute_seconds(work: Work, model: ModelSpec,
                    work, model, device, passes=0.0))
 
 
-def unrounded_seconds(work: Work, model: ModelSpec, device: DeviceSpec,
+def unrounded_seconds(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                       chunk_tokens: int) -> float:
     """Return component time with fractional ideal forward passes."""
 
@@ -57,7 +52,10 @@ def prefix_recompute_seconds(prefix_tokens: int, model: ModelSpec,
     if prefix_tokens < 0:
         raise ValueError("prefix_tokens must be nonnegative")
     return compute_seconds(
-        Work(tokens=prefix_tokens, pairs=triangle(prefix_tokens)),
+        _workload.Work(
+            tokens=prefix_tokens,
+            pairs=_workload.triangle(prefix_tokens),
+        ),
         model,
         device,
     )
@@ -67,7 +65,7 @@ def prefix_recompute_seconds(prefix_tokens: int, model: ModelSpec,
 class SpeedOfLight:
     """The complete bound and its component breakdown."""
 
-    work: Work
+    work: _workload.Work
     passes: int
     components: tuple[ComponentLatency, ...]
 
@@ -125,7 +123,7 @@ class SpeedOfLight:
         return "\n".join(lines)
 
 
-def speed_of_light(work: Work, model: ModelSpec, device: DeviceSpec,
+def speed_of_light(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                    chunk_tokens: int) -> SpeedOfLight:
     """Price aggregate query work with ideal query-wide packing."""
 
