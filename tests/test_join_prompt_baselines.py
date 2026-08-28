@@ -9,6 +9,9 @@ from baselines.stock_vllm.run import (
     _baseline_configuration,
     _filter_chain_inputs,
     _filter_prompts,
+    _paired_baseline_order,
+    _paired_ground_truth_workload,
+    _query_set_name,
     _run_join,
     _select_join_anchor,
     _split_query_sets,
@@ -182,6 +185,33 @@ def test_stock_query_set_split_uses_one_chunk_per_set():
         ["FEV-9"],
         ["LEP-3"],
     ]
+
+
+def test_paired_order_alternates_by_query_and_rep():
+    assert _paired_baseline_order(0, 0) == (
+        "stock_vllm", "pipelined_vllm")
+    assert _paired_baseline_order(0, 1) == (
+        "pipelined_vllm", "stock_vllm")
+    assert _paired_baseline_order(1, 0) == (
+        "pipelined_vllm", "stock_vllm")
+    assert _paired_baseline_order(1, 1) == (
+        "stock_vllm", "pipelined_vllm")
+
+
+@pytest.mark.parametrize(("query_ids", "workload"), [
+    (["IMDB-1", "IMDB-10"], "imdb"),
+    (["BIO-1"], "biodex"),
+    (["FEV-9"], "fever"),
+    (["LEP-2", "LEP-8"], "lepard"),
+])
+def test_paired_auto_ground_truth_follows_query_set(query_ids, workload):
+    assert _query_set_name(query_ids) == workload
+    assert _paired_ground_truth_workload("auto", query_ids) == workload
+
+
+def test_query_set_name_rejects_mixed_query_sets():
+    with pytest.raises(ValueError, match="expected one query set"):
+        _query_set_name(["IMDB-1", "BIO-1"])
 
 
 @pytest.mark.parametrize("anchor", [0, 1])
