@@ -186,6 +186,23 @@ def test_order_by_cost_reorders_payload(sess):
     assert "q1:" in seen2["payload"]["filters"]["r"][0]
 
 
+def test_builder_can_request_cost_order(sess):
+    def build(order=None):
+        query = (sess.docs("reviews").alias("r")
+                 .ai_filter(
+                     quail.prompt("q1: {0}", quail.col("r.review")),
+                     selectivity=0.9)
+                 .ai_filter(
+                     quail.prompt("q2: {0}", quail.col("r.review")),
+                     selectivity=0.1))
+        if order is None:
+            return query.select("r.id")
+        return query.select("r.id", order=order)
+
+    assert build().plan().order_rule == "as_written"
+    assert build("by_cost").plan().order_rule == "by_cost"
+
+
 def test_payload_carries_filter_arena_writes(sess):
     # one stage: nothing reads the KV again - the planner turns
     # writes off

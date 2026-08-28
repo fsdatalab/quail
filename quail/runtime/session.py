@@ -201,10 +201,9 @@ class BoundBuilder:
         self._inner.limit(n)
         return self
 
-    def select(self, *cols) -> "Query":
-        # builder order is always as_written
+    def select(self, *cols, order="as_written") -> "Query":
         return Query(self._session, self._inner.select(*cols),
-                     order="as_written")
+                     order=order)
 
 
 def _true_false_ids(tok):

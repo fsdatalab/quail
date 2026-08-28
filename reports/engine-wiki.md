@@ -241,10 +241,11 @@ enter silently.
 ### Builder API
 
 The builder (`builder.py`) mirrors the SQL constructs: `docs()`,
-`.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. The builder
-always uses `as_written` order (the chain order is the execution
-order). Both entry points collect the same `QueryDesc` and call the
-same `assemble_plan`, so the plans are structurally identical.
+`.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. Its default
+is `as_written`, so the chain order is the execution order. A caller can pass
+`.select(..., order="by_cost")` to use the planner's cost order. Both entry
+points collect the same `QueryDesc` and call the same `assemble_plan`, so the
+plans are structurally identical.
 
 ### Key functions: query compilation
 
@@ -284,18 +285,21 @@ token counts and produces a `PhysicalPlan` or a `Refusal`. A refusal
 is a named constraint violation (e.g., "this document is too long for
 the chunk budget") rather than a degraded execution.
 
-### Decisions from token arithmetic alone
+### Decisions from counted model and device constants
 
-These decisions compare token counts and selectivities. Because they
-compare things running at the same rate, the serving rate cancels
-out; no wall-clock constant is needed.
+These decisions use token counts, selectivities, and the model and
+device specifications. They do not use measured serving rates.
 
-**Filter order** (`decide.py:81`): when every filter carries a
-selectivity, `by_cost` sorts by cost per killed document. The cost of
-a filter stage is its question tokens divided by the fraction of
-documents it kills (1 minus selectivity). A selectivity of 1 (kills
-nothing) goes last. When any filter lacks a selectivity, `as_written`
-is used.
+**Filter order** (`decide.py`): when every filter carries a
+selectivity, `by_cost` uses the same separate dense and attention
+limits as SoL. For filters after the first one, the score is the time
+for `ask(mean prefix, question)` divided by the fraction of documents
+the filter rejects. A selectivity of 1 goes last.
+
+The first filter uses `scan`. The planner tries each predicate in that
+position, sorts the remaining predicates by the ask score, and keeps the
+lowest expected time. The search takes quadratic work in the number of
+filters. It does not check every filter permutation.
 
 **Join order and anchors, one search, repeated calls** (`search_joins`
 in `planner/joins.py`): stage order and per-stage anchors are
@@ -399,8 +403,10 @@ for each filter predicate p:
     if killed <= 0:
         cost = infinity
     else:
-        cost = p.question_tokens / killed
-sort predicates by cost (stable, so ties keep written order)
+        work = ask(mean_prefix_tokens, p.question_tokens)
+        cost = unrounded_seconds(work, model, device, chunk) / killed
+try each predicate as scan, sort the remaining asks by cost,
+and keep the order with the lowest expected time
 ```
 
 ### Pseudocode: anchor selection
@@ -468,7 +474,8 @@ single forward pass, sharing KV across them through a paged arena.
 | Function | File | What it does |
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
-| `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
+| `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
+| `unrounded_seconds` | `sol.py` | Separate dense and attention limits without forward pass rounding |
 | `search_joins` | `joins.py` | The join search: order and anchors from live counts, length summaries, document KV summaries, and aliases joined by completed groups; called at plan time and after every completed runtime group |
 | `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: which survivors to price as resident, longest documents first |
 | `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the least saved recompute work per page |
@@ -1141,7 +1148,8 @@ Qwen3 32B during the judge pass; ground truth covers 22 predicates.
 | reviews | `stanfordnlp/imdb` | 50,000 | Movie reviews |
 | reports | `BioDEX/BioDEX-Reactions` | 5,000 | Medical case reports |
 | claims | `fever/fever` | 5,000 | Factual claims (train + labelled_dev) |
-| citations | `rmahari/LePaRD` | 2,000 | Legal citation excerpts |
+| citation_contexts | `rmahari/LePaRD` | derived from 5,000 sampled pairs | Legal citation excerpts |
+| citation_passages | `rmahari/LePaRD` | derived from 5,000 sampled pairs | Cited legal passages |
 | policies | `mukund/PrivacyPolicies` | 1,000,000 | Privacy policies (optional) |
 
 Partner tables (fixed vocabulary, not scaled by SF):
@@ -1158,7 +1166,8 @@ graph LR
         reviews["reviews (50K)"]
         reports["reports (10K)"]
         claims["claims (5K)"]
-        citations["citations (2K)"]
+        citation_contexts["citation contexts"]
+        citation_passages["citation passages"]
         policies["policies (1M, optional)"]
     end
     subgraph Partner tables
@@ -1170,7 +1179,7 @@ graph LR
     reviews -- "DISCUSS_ASPECT / ASPECT_SENTIMENT" --> aspects
     reports -- "REACTION" --> terms
     claims -- "SUPPORT / REFUTE" --> evidence
-    citations -- "LEPJOIN (self-join)" --> citations
+    citation_contexts -- "LEPJOIN" --> citation_passages
     policies -. "SCENARIO_MATCH" .-> scenarios
 ```
 
@@ -1213,7 +1222,7 @@ graph LR
 | FEV-8 | 3J chain | c1-e1-c2-e2 |
 | FEV-9 | F11 + 3J chain | F11 then c1-e1-c2-e2 |
 
-**LePaRD** (8 queries): citations self-join
+**LePaRD** (8 queries): citation contexts joined with citation passages
 
 | Query | Shape | Description |
 |---|---|---|
@@ -1237,15 +1246,31 @@ PRIV-1 and PRIV-2 run only when `register_privacy_sets()` has been
 called. They have no ground truth and are not part of the default
 benchmark runner or judge pass.
 
-### Single-pass protocol
+### Selectivity estimates
 
-The benchmark runs each query once in one session. Every document's
-KV is computed from scratch; nothing persists between queries.
+Every filter and join carries a fixed selectivity estimate. The estimates
+currently come from the sf0.1 Qwen3 32B fp8 labels generated before the
+BioDEX and FEVER scale change. IMDB, BioDEX, and FEVER use collection
+`gt_04231c5de83cdf9e7e68fc03849959d6`. LePaRD uses the revised labels for
+corpus `c_350e4ae7332a3dcf6d1292b96fe05a0a`. These estimates are provisional
+for the scaled BioDEX and FEVER corpora until their labels are regenerated.
+Planning does not read the ground truth labels.
 
-Each query reports both the provided selectivity (what the planner
-was told) and the observed selectivity (what the model actually
-returned), which serves as an instrument check for selectivity
-drift.
+The source collection is
+`/results/ground_truth/quailb/schema_v1/collections/gt_04231c5de83cdf9e7e68fc03849959d6/manifest.json`
+on the `quail-results` volume. The revised LePaRD label sets are under
+`/results/ground_truth/quailb/schema_v1/label_sets/lepard/` on the same
+volume. Each builder query ends with
+`.select(..., order="by_cost")`, so the benchmark exercises the planner's
+filter and join ordering.
+
+### Protocol and reported values
+
+Every engine run uses Modal. A benchmark query reports query time,
+throughput, GPU cost, provided selectivity, observed selectivity, answer
+accuracy, and final row accuracy. Filter throughput is input documents per
+second. Join throughput is evaluated document pairs per second, summed over
+all join stages.
 
 ## 8. Weight loading and kernel infrastructure
 

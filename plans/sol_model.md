@@ -98,14 +98,32 @@ attending over the resident prefix - never as a triangle over
 itself. Without reuse, stage `s > 1` would be another stage 1:
 `p + d_i + q_s` tokens and `T(p + d_i + q_s)` pairs.
 
-Over 5,000 IMDB reviews, one filter is 1,759,233 tokens. A second
-filter adds 180,180 tokens. The added work is one 45 token question
-for each of the 4,004 surviving documents. Rescanning would have added
-another 1.2 million document and preamble tokens.
+Over 5,000 IMDB reviews, F4 followed by F1 is 1,791,351 tokens. The F4
+scan is 1,729,233 tokens. F4 leaves 1,218 documents, so F1 adds
+`1,218 * 51 = 62,118` fresh tokens. Rescanning those documents would
+also add their document and preamble tokens.
 
-The active ground truth labels determine the exact document IDs in
-`A_s`. The code does not estimate `A_s` from selectivity, because the
-surviving document lengths affect the attention count.
+The fixed marginal selectivity estimates choose the filter order. The active
+ground truth labels then determine the exact document IDs in `A_s`. The SoL
+calculation does not estimate `A_s` from selectivity, because the surviving
+document lengths affect the attention count.
+
+When `by_cost` selects the filter order, it prices dense and attention
+with separate compute and memory limits. The filter time is the dense
+limit plus the attention limit. For predicates after the first one, the
+sort divides the time of `ask(mean prefix, q_s)` by
+`1 - selectivity_s`.
+
+The first predicate uses `scan`, so the planner tries each predicate in
+that position. It then applies the linear sort to the remaining
+predicates and keeps the lowest expected time. A chain of `n` filters
+therefore takes quadratic planning work rather than checking every
+permutation. Forward pass rounding is omitted from this comparison.
+Weight movement is spread over the token capacity `C`.
+
+The calculation runs separately for 4B and 32B because their model
+dimensions differ. After the sort, the active ground truth labels
+determine every `A_s` used in the work count.
 
 ### A join
 
@@ -180,15 +198,16 @@ query. The QUAIL-B calculation runs only the DP.
 ## 4. Speed of light
 
 ```
-T_dense     = 2 * P * tokens / R_dense
-T_attention = 4 * n_q * d_head * L * pairs / R_attn
-T_compute   = T_dense + T_attention
+T_dense_compute = 2 * P * tokens / R_dense
+passes          = ceil(tokens / C)
+T_dense_memory  = W * passes / BW
+T_dense         = max(T_dense_compute, T_dense_memory)
 
-passes      = ceil(tokens / C)
-bytes       = W * passes + kappa * (kv write + kv read)
-T_memory    = bytes / BW
+T_attn_compute  = 4 * n_q * d_head * L * pairs / R_attn
+T_attn_memory   = kappa * (kv write + kv read) / BW
+T_attention     = max(T_attn_compute, T_attn_memory)
 
-SoL         = max(T_compute, T_memory)
+SoL             = T_dense + T_attention
 ```
 
 `2` FLOPs per parameter per token: one multiply and one add.
@@ -199,12 +218,10 @@ another `2 * d_head`, times `n_q` heads. At 4B that is 16,384.
 Weights are re-read once per forward pass: 4.5e9 bytes against a
 50 MB L2 never stay resident.
 
-`max`, not a sum, because the arithmetic units and the memory system
-run at once and a floor may assume they overlap perfectly. Inside
-`T_compute` the two terms add, because the dense and attention
-kernels are separate launches on the same SMs. Taking `max` once at
-the top is the loosest honest choice - per kernel it would be larger
-and tighter, and both are lower bounds.
+Each `max` allows compute and memory movement to overlap within one
+kernel. Dense and attention time are added because those kernels run in
+sequence. Weight bytes are charged to dense kernels. KV bytes are
+charged to attention kernels.
 
 The reported cost and throughput metrics are derived from SoL:
 
@@ -253,7 +270,8 @@ separate from this exact analysis.
   whose tuples straddle a chunk boundary is read twice.
 - **KV capacity is unlimited.** Every document prefix computed by a filter
   or anchor remains available for later stages.
-- **Compute and memory overlap perfectly**, per the `max` above.
+- **Compute and memory overlap perfectly within each kernel**, per the
+  two `max` terms above.
 - **Nothing is charged** for the tokenizer, the host, scheduling,
   kernel efficiency, or launch gaps. That is what makes it a floor.
 

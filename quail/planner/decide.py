@@ -60,7 +60,7 @@ def _preamble_tokens(filters, joins) -> int:
     return 0
 
 
-# ------------------------------------------------ order (token arithmetic)
+# --------------------------------------------------------- filter order
 
 def default_order_rule(filters, joins) -> tuple[str, str]:
     """Return (rule, source). 'by_cost' when every predicate has a
@@ -72,29 +72,72 @@ def default_order_rule(filters, joins) -> tuple[str, str]:
     return "as_written", "default: at least one predicate has no selectivity"
 
 
-def order_filters_indexed(predicates, rule: str):
+def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
+                device: DeviceSpec, chunk_tokens: int, *, first: bool) -> float:
+    """Return ideal time for one filter evaluation."""
+
+    operation = sol.scan if first else sol.ask
+    work = operation(prefix_tokens, _question_tokens(predicate.prompt))
+    return sol.unrounded_seconds(work, model, device, chunk_tokens)
+
+
+def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
+                          model: ModelSpec, device: DeviceSpec,
+                          chunk_tokens: int):
     """Return written positions of predicates in execution order.
 
-    'by_cost' sorts by question_tokens / (1 - selectivity). Stable
-    sort, so ties keep written order.
+    'by_cost' minimizes ideal expected time. It tries each predicate
+    as the scan, then sorts the remaining asks by time per expected
+    rejected document. Written order breaks ties.
     """
     idx = list(range(len(predicates)))
     if rule == "as_written":
         return idx
 
-    def cost(i):
-        p = predicates[i]
-        killed = 1.0 - (p.selectivity if p.selectivity is not None else 1.0)
+    def selectivity(i):
+        return (predicates[i].selectivity
+                if predicates[i].selectivity is not None else 1.0)
+
+    ask_costs = [
+        filter_cost(p, prefix_tokens, model, device, chunk_tokens,
+                    first=False)
+        for p in predicates
+    ]
+    scan_costs = [
+        filter_cost(p, prefix_tokens, model, device, chunk_tokens,
+                    first=True)
+        for p in predicates
+    ]
+
+    def score(i):
+        killed = 1.0 - selectivity(i)
         if killed <= 0:
             return float("inf")
-        return _question_tokens(p.prompt) / killed
+        return ask_costs[i] / killed
 
-    return sorted(idx, key=cost)
+    candidates = []
+    for first in idx:
+        remaining = sorted((i for i in idx if i != first), key=score)
+        order = [first, *remaining]
+        live = 1.0
+        expected = 0.0
+        for position, i in enumerate(order):
+            expected += live * (scan_costs[i] if position == 0
+                                else ask_costs[i])
+            live *= selectivity(i)
+        candidates.append((expected, order))
+    return min(
+        candidates,
+        key=lambda candidate: (candidate[0], candidate[1]),
+    )[1]
 
 
-def order_filters(predicates, rule: str):
-    return [predicates[i] for i in order_filters_indexed(predicates,
-                                                         rule)]
+def order_filters(predicates, rule: str, *, prefix_tokens: float,
+                  model: ModelSpec, device: DeviceSpec,
+                  chunk_tokens: int):
+    return [predicates[i] for i in order_filters_indexed(
+        predicates, rule, prefix_tokens=prefix_tokens,
+        model=model, device=device, chunk_tokens=chunk_tokens)]
 
 
 def _join_aliases(join) -> list:
@@ -127,14 +170,15 @@ def join_specs(joins) -> list:
     return out
 
 
-def _filter_work(filters, stats, rule: str, pre: int) -> Work:
+def _filter_work(filters, stats, filter_orders: dict, pre: int) -> Work:
     """Expected Work of every filter chain: the first stage scans
     each document, later stages ask over resident KV."""
     total = Work()
     for alias, preds in filters.items():
         mean = stats[alias].mean_doc_tokens
         n = float(stats[alias].n_docs)
-        for si, p in enumerate(order_filters(preds, rule)):
+        for si, predicate_index in enumerate(filter_orders[alias]):
+            p = preds[predicate_index]
             q = _question_tokens(p.prompt)
             op = sol.scan if si == 0 else sol.ask
             total = total + op(pre + mean, q) * n
@@ -383,6 +427,13 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(filters, joins)
     fixed = rule == "as_written"
+    filter_orders = {
+        alias: order_filters_indexed(
+            predicates, rule,
+            prefix_tokens=pre + stats[alias].mean_doc_tokens,
+            model=model, device=device, chunk_tokens=chunk)
+        for alias, predicates in filters.items()
+    }
 
     # ---- expected live counts after filters, and the fixed filter
     # work every candidate join plan shares
@@ -392,7 +443,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         for p in fs:
             surv *= p.selectivity if p.selectivity is not None else 1.0
         live0[_filter_alias(fs[0])] *= surv
-    base_work = _filter_work(filters, stats, rule, pre)
+    base_work = _filter_work(filters, stats, filter_orders, pre)
 
     # ---- the largest single admission any operator makes: the keep
     # arithmetic reserves it as working headroom
@@ -571,7 +622,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             shards=shards, shard_token_loads=loads))
         ids_src[s.alias] = (sid, f"ids:{s.alias}")
         if s.alias in filters:
-            order_idx = order_filters_indexed(filters[s.alias], rule)
+            order_idx = filter_orders[s.alias]
             n = stats[s.alias].n_docs
             stages, surv = [], 1.0
             for i in order_idx:

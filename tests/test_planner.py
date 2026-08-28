@@ -9,6 +9,7 @@ import pytest
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.planner.decide import explain, order_filters, plan_query
+from quail.planner.sol import ask, speed_of_light
 from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -85,10 +86,53 @@ def test_b3_ordering_by_cost_vs_as_written(catalog):
             self.selectivity = selectivity
 
     first, second = Predicate(10, 0.5), Predicate(10, 0.5)
-    assert order_filters([first, second], "by_cost") == [first, second]
+    kwargs = dict(prefix_tokens=400, model=QWEN3_4B_FP8,
+                  device=H100_SXM, chunk_tokens=110_376)
+    assert order_filters([first, second], "by_cost", **kwargs) == \
+        [first, second]
     never_kills = Predicate(1, 1.0)
-    assert order_filters([never_kills, first], "by_cost") == \
+    assert order_filters([never_kills, first], "by_cost", **kwargs) == \
         [first, never_kills]
+
+
+def test_filter_order_uses_dense_and_attention_rooflines():
+    class Predicate:
+        def __init__(self, tail, selectivity):
+            self.prompt = type("Prompt", (), {
+                "tail_tokens": tail, "preamble_tokens": 0})()
+            self.selectivity = selectivity
+
+    long_selective = Predicate(100, 0.1)
+    short_weak = Predicate(10, 0.9101)
+    ordered = order_filters(
+        [long_selective, short_weak], "by_cost", prefix_tokens=400,
+        model=QWEN3_4B_FP8, device=H100_SXM, chunk_tokens=110_376)
+    assert ordered == [short_weak, long_selective]
+
+
+def test_sol_adds_separate_dense_and_attention_rooflines():
+    result = speed_of_light(
+        ask(400, 50) * 1000, QWEN3_4B_FP8, H100_SXM, 110_376)
+    assert result.bound_by == "mixed"
+    assert result.seconds == pytest.approx(
+        max(result.dense, result.dense_memory)
+        + max(result.attention, result.attention_memory))
+    assert result.seconds > max(result.compute, result.memory)
+
+
+def test_plan_uses_roofline_filter_order(catalog):
+    logical = docs(catalog, "reviews", tok).alias("r")
+    logical = logical.ai_filter(
+        prompt(" ".join(["long"] * 100) + " {0}", col("r.review")),
+        selectivity=0.1)
+    logical = logical.ai_filter(
+        prompt(" ".join(["short"] * 10) + " {0}", col("r.review")),
+        selectivity=0.8435).select("r.id")
+    plan = plan_query(
+        logical, model=QWEN3_4B_FP8, device=H100_SXM,
+        doc_tokens={"r": [400] * 100})
+    assert [stage["written_pos"]
+            for stage in filter_chain(plan)["stages"]] == [1, 0]
 
 
 def test_filter_arena_writes_decision(catalog):

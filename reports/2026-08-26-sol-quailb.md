@@ -52,6 +52,19 @@ does not repeat complete enumeration. The output stores the best plan
 separately for 4B and 32B. The planner comparison above was computed during
 development. It is not part of the SoL output.
 
+The filter order change predicted two more results:
+
+1. Fixed selectivity estimates would move cheaper, more selective filters
+   earlier and reduce total work.
+2. Adding the dense and attention limits separately would only raise a result
+   when one part is compute bound and the other is memory bound.
+
+Both predictions matched. The sum across all 35 queries decreases from
+327.10 to 324.65 seconds for 4B, and from 2,490.56 to 2,470.11 seconds for
+32B. Ten queries change filter order. The four affected IMDB filter chains
+decrease by 7.0% to 8.2%. FEV-1 is the only mixed query. Its 4B estimate
+increases by 0.65% because its attention work is memory bound.
+
 ## Ground truth setup and result
 
 The labels were generated on Modal with four `H100!` requests and one
@@ -60,12 +73,16 @@ FEVER, and LePaRD. LePaRD's citation join uses source passage IDs. FEVER
 uses its source annotation for 63 support pairs. Qwen judged the remaining
 rows.
 
-The completed collection has 434,201 labels across 23 predicates. The current
-35 queries use 22 of those predicates, including seven join predicates. The
-remaining predicate is the retired `ASPECT_RELATED` join. The summary is at
+The SoL input combines two matching sources. IMDB, BioDEX, and FEVER use
+collection `gt_04231c5de83cdf9e7e68fc03849959d6`. LePaRD uses the revised
+labels for the 500 document corpus `c_350e4ae7332a3dcf6d1292b96fe05a0a`.
+Together they contain 612,434 labels across 23 predicates. The current 35
+queries use 22 of those predicates. The remaining predicate is the retired
+`ASPECT_RELATED` join. The non-LePaRD collection is at
 `/results/ground_truth/quailb/schema_v1/collections/gt_04231c5de83cdf9e7e68fc03849959d6/summary.json`
-on the `quail-results` volume. The collection is active for corpus
-`c_df45ef585738f42e4a7a731306f1b9fc`.
+on the `quail-results` volume. The revised LePaRD label sets are under
+`/results/ground_truth/quailb/schema_v1/label_sets/lepard/` on the same
+volume.
 
 ## The three inputs
 
@@ -89,8 +106,8 @@ stops if the two it is given disagree.
    | BioDEX | partner | 614 | 2,848 | 4.6 |
    | FEVER | documents | 100 | 1,142 | 11.4 |
    | FEVER | partner | 57 | 21,099 | 370.2 |
-   | LePaRD | documents | 200 | 46,619 | 233.1 |
-   | LePaRD | partner | 200 | 16,589 | 82.9 |
+   | LePaRD | documents | 500 | 103,947 | 207.9 |
+   | LePaRD | partner | 433 | 25,621 | 59.2 |
 
    "Documents" is the set a query is written against; "partner" is
    the set its join runs against.
@@ -100,19 +117,16 @@ stops if the two it is given disagree.
    note and complete question once per anchor. Each tuple carries the
    partner label, partner document, and answer cue.
 
-3. **Ground truth labels.** The calculation uses each saved TRUE or FALSE
-   answer to determine the exact document IDs that reach the next stage.
-   The selectivity is only a summary of those answers. F1 passes 0.8008 of
-   IMDB's documents. F4 then passes 0.2567 of what F1 left.
+3. **Ground truth labels.** The planner gets one fixed marginal selectivity
+   estimate per predicate. It is the TRUE count divided by the complete label
+   count at sf=0.1. For example, F4 has 1,218 TRUE labels out of 5,000, or
+   0.2436. This makes F4 run before F1 in the affected IMDB chains.
 
-   These come from collection `gt_04231c5de83cdf9e7e68fc03849959d6`,
-   the labels active for corpus `c_df45ef585738f42e4a7a731306f1b9fc`.
-   The collection has 434,201 labels. Its deterministic check repeated
-   352 Qwen judgments with 0 answer differences.
-   A predicate keeps one label set per template it has been judged
-   under, and superseded ones stay on the volume, so the script reads
-   the corpus's `active_collection.json` and takes only the label
-   sets that collection names.
+   After the order is selected, the calculation uses each saved TRUE or FALSE
+   answer to determine the exact document IDs that reach the next stage. It
+   does not multiply row counts by the marginal estimate. IMDB, BioDEX, and
+   FEVER use collection `gt_04231c5de83cdf9e7e68fc03849959d6`. LePaRD uses
+   the revised labels for corpus `c_350e4ae7332a3dcf6d1292b96fe05a0a`.
 
 One thing is set rather than measured: the batch size the forward
 pass runs at, which decides how many times the weights are re-read.
@@ -153,11 +167,11 @@ the pairs it survives only as the width of a rectangle - the `q_s`
 new tokens attending over the resident prefix - never as a triangle
 over itself. Without reuse, stage `s > 1` would be another stage 1.
 
-Read straight off the table below: IMDB-1 is one filter over 5,000
-IMDB documents at 1,759,233 tokens. IMDB-6 adds a second filter and
-comes to 1,939,413. The difference is 180,180, which is exactly the
-4,004 surviving documents times F4's 45-token question. Nothing is
-scanned again.
+Read straight off the saved work: IMDB-1 is one filter over 5,000 IMDB
+documents at 1,759,233 tokens. IMDB-6 now runs F4 first because its fixed
+selectivity is lower. The complete chain is 1,791,351 tokens. The first scan
+is 1,729,233 tokens. F4 passes 1,218 documents, so the later F1 question adds
+exactly `1,218 * 51 = 62,118` fresh tokens. Nothing is scanned again.
 
 A join writes the complete anchor frame once after each anchor
 document. The other side streams. Each tuple carries only the partner
@@ -240,10 +254,10 @@ The JSON file contains only the unlimited KV SoL result.
 | IMDB-1 | 1F | 5,000 documents | 6.722 s | $0.00737 | 743.8 | 56.413 s | $0.06188 | 88.6 |
 | IMDB-2 | 1J | 60,000 pairs | 9.281 s | $0.01018 | 6,465.1 | 77.708 s | $0.08525 | 772.1 |
 | IMDB-3 | 1F + 1J | 48,048 pairs | 9.565 s | $0.01049 | 5,023.4 | 80.063 s | $0.08783 | 600.1 |
-| IMDB-4 | 2F + 1J | 12,336 pairs | 8.158 s | $0.00895 | 1,512.1 | 68.327 s | $0.07495 | 180.5 |
-| IMDB-5 | 3F + 1J | 8,028 pairs | 8.101 s | $0.00889 | 991.0 | 67.840 s | $0.07442 | 118.3 |
-| IMDB-6 | 2F | 5,000 documents | 7.419 s | $0.00814 | 673.9 | 62.223 s | $0.06826 | 80.4 |
-| IMDB-7 | 3F | 5,000 documents | 7.617 s | $0.00836 | 656.4 | 63.856 s | $0.07005 | 78.3 |
+| IMDB-4 | 2F + 1J | 12,336 pairs | 7.588 s | $0.00832 | 1,625.7 | 63.562 s | $0.06973 | 194.1 |
+| IMDB-5 | 3F + 1J | 8,028 pairs | 7.476 s | $0.00820 | 1,073.9 | 62.616 s | $0.06869 | 128.2 |
+| IMDB-6 | 2F | 5,000 documents | 6.849 s | $0.00751 | 730.0 | 57.458 s | $0.06303 | 87.0 |
+| IMDB-7 | 3F | 5,000 documents | 6.991 s | $0.00767 | 715.2 | 58.632 s | $0.06432 | 85.3 |
 | IMDB-9 | 3J | 164,412 pairs | 21.253 s | $0.02331 | 7,736.0 | 177.781 s | $0.19503 | 924.8 |
 | IMDB-10 | 1F + 3J | 152,460 pairs | 21.537 s | $0.02363 | 7,078.9 | 180.136 s | $0.19761 | 846.4 |
 | IMDB-8 | 2J | 104,412 pairs | 11.972 s | $0.01313 | 8,721.1 | 100.073 s | $0.10978 | 1,043.4 |
@@ -251,33 +265,33 @@ The JSON file contains only the unlimited KV SoL result.
 | BIO-2 | 1J | 122,800 pairs | 15.592 s | $0.01710 | 7,875.9 | 104.147 s | $0.11425 | 1,179.1 |
 | BIO-3 | 1F + 1J | 75,522 pairs | 11.482 s | $0.01260 | 6,577.5 | 76.857 s | $0.08431 | 982.6 |
 | BIO-4 | 2F + 1J | 54,646 pairs | 9.620 s | $0.01055 | 5,680.5 | 64.656 s | $0.07093 | 845.2 |
-| BIO-5 | 3F + 1J | 36,840 pairs | 7.879 s | $0.00864 | 4,675.7 | 53.707 s | $0.05892 | 685.9 |
+| BIO-5 | 3F + 1J | 36,840 pairs | 7.877 s | $0.00864 | 4,677.2 | 53.693 s | $0.05890 | 686.1 |
 | BIO-7 | 3J | 325,720 pairs | 38.261 s | $0.04197 | 8,513.0 | 255.351 s | $0.28012 | 1,275.6 |
 | BIO-8 | 1F + 3J | 282,228 pairs | 34.346 s | $0.03768 | 8,217.1 | 229.302 s | $0.25154 | 1,230.8 |
 | BIO-6 | 2J | 233,320 pairs | 25.395 s | $0.02786 | 9,187.7 | 169.052 s | $0.18545 | 1,380.2 |
-| FEV-1 | 1F | 100 documents | 0.025 s | $0.00003 | 4,077.7 | 0.210 s | $0.00023 | 476.3 |
+| FEV-1 | 1F | 100 documents | 0.025 s | $0.00003 | 4,051.5 | 0.210 s | $0.00023 | 476.2 |
 | FEV-2 | 1J | 5,700 pairs | 0.568 s | $0.00062 | 10,031.2 | 4.707 s | $0.00516 | 1,211.0 |
 | FEV-3 | 1F + 1J | 3,648 pairs | 0.417 s | $0.00046 | 8,738.5 | 3.468 s | $0.00380 | 1,052.0 |
-| FEV-4 | 2F + 1J | 570 pairs | 0.184 s | $0.00020 | 3,098.0 | 1.540 s | $0.00169 | 370.0 |
+| FEV-4 | 2F + 1J | 570 pairs | 0.174 s | $0.00019 | 3,277.4 | 1.454 s | $0.00160 | 392.0 |
 | FEV-5 | 2F + 1J | 2,368 pairs | 0.322 s | $0.00035 | 7,351.5 | 2.679 s | $0.00294 | 884.0 |
-| FEV-6 | 3F + 1J | 370 pairs | 0.174 s | $0.00019 | 2,124.4 | 1.459 s | $0.00160 | 253.6 |
+| FEV-6 | 3F + 1J | 370 pairs | 0.164 s | $0.00018 | 2,254.8 | 1.373 s | $0.00151 | 269.5 |
 | FEV-8 | 3J | 7,211 pairs | 0.787 s | $0.00086 | 9,160.4 | 6.520 s | $0.00715 | 1,105.9 |
 | FEV-9 | 1F + 3J | 5,576 pairs | 0.672 s | $0.00074 | 8,296.9 | 5.585 s | $0.00613 | 998.5 |
 | FEV-7 | 2J | 7,011 pairs | 0.769 s | $0.00084 | 9,116.5 | 6.375 s | $0.00699 | 1,099.7 |
-| LEP-1 | 1F | 200 documents | 0.219 s | $0.00024 | 912.7 | 1.848 s | $0.00203 | 108.2 |
-| LEP-2 | 1J | 40,000 pairs | 14.582 s | $0.01600 | 2,743.1 | 121.563 s | $0.13335 | 329.0 |
-| LEP-3 | 1F + 1J | 800 pairs | 0.515 s | $0.00057 | 1,553.0 | 4.277 s | $0.00469 | 187.0 |
-| LEP-4 | 2F + 1J | 600 pairs | 0.442 s | $0.00048 | 1,358.7 | 3.675 s | $0.00403 | 163.3 |
-| LEP-5 | 3F + 1J | 200 pairs | 0.295 s | $0.00032 | 677.1 | 2.469 s | $0.00271 | 81.0 |
-| LEP-6 | 5F + 1J | 0 pairs | 0.221 s | $0.00024 | 0.0 | 1.860 s | $0.00204 | 0.0 |
-| LEP-7 | 3F + 1J | 600 pairs | 0.537 s | $0.00059 | 1,118.1 | 4.486 s | $0.00492 | 133.8 |
-| LEP-8 | 5F | 200 documents | 0.221 s | $0.00024 | 906.3 | 1.860 s | $0.00204 | 107.5 |
+| LEP-1 | 1F | 500 documents | 0.499 s | $0.00055 | 1,002.4 | 4.212 s | $0.00462 | 118.7 |
+| LEP-2 | 1J | 216,500 pairs | 58.094 s | $0.06373 | 3,726.7 | 485.604 s | $0.53271 | 445.8 |
+| LEP-3 | 1F + 1J | 6,062 pairs | 2.151 s | $0.00236 | 2,818.7 | 17.844 s | $0.01958 | 339.7 |
+| LEP-4 | 2F + 1J | 2,165 pairs | 1.092 s | $0.00120 | 1,983.2 | 9.103 s | $0.00999 | 237.8 |
+| LEP-5 | 3F + 1J | 0 pairs | 0.496 s | $0.00054 | 0.0 | 4.190 s | $0.00460 | 0.0 |
+| LEP-6 | 5F + 1J | 0 pairs | 0.488 s | $0.00054 | 0.0 | 4.125 s | $0.00452 | 0.0 |
+| LEP-7 | 3F + 1J | 1,755 pairs | 1.138 s | $0.00125 | 1,542.0 | 9.536 s | $0.01046 | 184.0 |
+| LEP-8 | 5F | 500 documents | 0.488 s | $0.00054 | 1,023.7 | 4.125 s | $0.00452 | 121.2 |
 
-Every query on both models is compute bound. The largest
-`T_memory` in the suite is FEV-1's at 6.7% of its `T_compute`, and
-FEV-1 is the smallest query here - 100 documents of 11 tokens.
-Everything else pushes enough tokens per pass that the weight reads
-amortize away.
+The dense part is compute bound for every query. The attention part is also
+compute bound for every query except FEV-1. For the 4B FEV-1 result, dense
+compute takes 0.024390 seconds and attention memory takes 0.000292 seconds.
+The total is their sum, 0.024682 seconds. Every other query is compute bound
+in both parts.
 
 ## Which side of a join is held
 
@@ -294,7 +308,7 @@ one orientation is shown below.
 | BIO-2 | documents, 4,146 | partner, 5 | 2,635,599 | 510,386,050 | 193.7x |
 | FEV-2 | partner, 370 | documents, 11 | 145,359 | 2,171,842 | 14.9x |
 | FEV-5 | partner, 370 | documents, 11 | 51,578 | 914,560 | 17.7x |
-| LEP-2 | documents, 233 | partner, 83 | 3,772,219 | 9,748,189 | 2.6x |
+| LEP-2 | documents, 208 | partner, 59 | 15,098,947 | 47,216,559 | 3.1x |
 
 FEVER is the one that inverts. Its documents average 11 tokens and
 its partner set 370, so the join holds the partner and streams the
@@ -345,12 +359,14 @@ dearer.
 
 ## Ground truth labels
 
-The selectivities above come from active collection
-`gt_04231c5de83cdf9e7e68fc03849959d6`. The 22 predicates used by the current
-queries have the current prompt layout. The active collection also contains
-the retired `ASPECT_RELATED` labels as its 23rd predicate. All join labels use
-renderer `join_anchor_question_then_partners_v2`. The compact files contain
-394,138 Qwen3 32B labels and 40,063 source labels.
+The IMDB, BioDEX, and FEVER selectivities come from collection
+`gt_04231c5de83cdf9e7e68fc03849959d6`. The LePaRD selectivities come from the
+revised label sets for corpus `c_350e4ae7332a3dcf6d1292b96fe05a0a`. The 22
+predicates used by the current queries have the current prompt layout. The
+combined input also contains the retired `ASPECT_RELATED` labels as its 23rd
+predicate. All join labels use renderer
+`join_anchor_question_then_partners_v2`. The combined input has 612,434
+labels.
 
 The calculation uses the exact document IDs that pass each filter. It does
 not infer survivor lengths from selectivity. This matters when a filter is
@@ -362,13 +378,18 @@ correlated with document length.
   measured Quail run.** Their token counts describe the best left deep plan
   under the stated unlimited KV rules. The current engine may use a different
   plan. This report does not compare those counts with measured fresh tokens.
-- **The floor is loose.** `max(T_compute, T_memory)` taken once at
-  the top is weaker than taking it per kernel and summing. Both are
-  lower bounds; the per-kernel one would be larger and tighter.
 - **The KV read count is a minimum**, one read per anchor per stage.
   An anchor whose tuples straddle a chunk boundary is read twice.
-  Nothing here is memory bound, so it changes no answer.
-- **LEP-6 and LEP-8 are nearly the same number.** LEP1 leaves 4
-  documents, LEP2 leaves 3, LEP3 leaves 1, and LEP4 leaves none.
+  FEV-1 attention is memory bound. Extra KV reads could raise that one
+  estimate. Every other attention stage is compute bound.
+- **LEP-6 and LEP-8 have the same work.** The chosen filter order is LEP5,
+  LEP3, LEP1, LEP4, then LEP2. The first two filters leave 2 documents and
+  LEP1 leaves none. The join in LEP-6 therefore evaluates no pairs.
 - **The separate baseline report compares six of these floors with
   measured wall time.** See `reports/2026-08-26-stock-vllm-joins.md`.
+
+## Rebuild
+
+Run `reports/make_sol_quailb_plots.py` from the repository root. Its docstring
+contains the `modal volume get` command and the plotting command needed to
+rebuild both figures from `/results/sol/sol_quailb_sf0.1.json`.

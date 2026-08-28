@@ -99,6 +99,40 @@ def kv_bytes_per_token(model: ModelSpec) -> float:
     return model.kappa
 
 
+def _compute_times(work: Work, model: ModelSpec,
+                   device: DeviceSpec) -> tuple[float, float]:
+    dense = 2.0 * dense_params(model) * work.tokens / device.peak_flops
+    # Attention runs in bf16 over bf16 KV, so it uses the bf16 peak.
+    attention = (flops_per_pair(model) * work.pairs * model.layers
+                 / device.attn_flops)
+    return dense, attention
+
+
+def compute_seconds(work: Work, model: ModelSpec,
+                    device: DeviceSpec) -> float:
+    """Return ideal dense and attention time for one work record."""
+
+    dense, attention = _compute_times(work, model, device)
+    return dense + attention
+
+
+def unrounded_seconds(work: Work, model: ModelSpec, device: DeviceSpec,
+                      chunk_tokens: int) -> float:
+    """Return dense and attention time without forward pass rounding."""
+
+    if chunk_tokens < 1:
+        raise ValueError("chunk_tokens must be at least 1")
+    dense_compute, attention_compute = _compute_times(
+        work, model, device)
+    dense_memory = (model.W_mem * work.tokens / chunk_tokens
+                    / device.hbm_bw)
+    attention_memory = (kv_bytes_per_token(model)
+                        * (work.kv_written + work.kv_read)
+                        / device.hbm_bw)
+    return (max(dense_compute, dense_memory)
+            + max(attention_compute, attention_memory))
+
+
 def prefix_recompute_seconds(prefix_tokens: int, model: ModelSpec,
                              device: DeviceSpec) -> float:
     """Ideal compute time avoided by retaining one document prefix.
@@ -112,11 +146,9 @@ def prefix_recompute_seconds(prefix_tokens: int, model: ModelSpec,
     """
     if prefix_tokens < 0:
         raise ValueError("prefix_tokens must be nonnegative")
-    dense = (2.0 * dense_params(model) * prefix_tokens
-             / device.peak_flops)
-    attention = (flops_per_pair(model) * triangle(prefix_tokens)
-                 * model.layers / device.attn_flops)
-    return dense + attention
+    return compute_seconds(
+        Work(tokens=prefix_tokens, pairs=triangle(prefix_tokens)),
+        model, device)
 
 
 # ------------------------------------------------ the three operations
@@ -186,17 +218,30 @@ class SpeedOfLight:
     passes: int
     bytes_moved: float
     dense: float
+    dense_memory: float
     attention: float
+    attention_memory: float
     compute: float
     memory: float
 
     @property
+    def dense_seconds(self) -> float:
+        return max(self.dense, self.dense_memory)
+
+    @property
+    def attention_seconds(self) -> float:
+        return max(self.attention, self.attention_memory)
+
+    @property
     def seconds(self) -> float:
-        return max(self.compute, self.memory)
+        return self.dense_seconds + self.attention_seconds
 
     @property
     def bound_by(self) -> str:
-        return "compute" if self.compute >= self.memory else "memory"
+        dense = "compute" if self.dense >= self.dense_memory else "memory"
+        attention = ("compute" if self.attention >= self.attention_memory
+                     else "memory")
+        return dense if dense == attention else "mixed"
 
     def explain(self) -> str:
         w = self.work
@@ -207,10 +252,14 @@ class SpeedOfLight:
             f"kv read        {w.kv_read:>18,.0f}",
             f"forward passes {self.passes:>18,d}",
             f"bytes moved    {self.bytes_moved:>18,.0f}",
-            f"T_dense        {self.dense:>18.4f} s",
-            f"T_attention    {self.attention:>18.4f} s",
-            f"T_compute      {self.compute:>18.4f} s",
-            f"T_memory       {self.memory:>18.4f} s",
+            f"T_dense compute{self.dense:>18.4f} s",
+            f"T_dense memory {self.dense_memory:>18.4f} s",
+            f"T_dense        {self.dense_seconds:>18.4f} s",
+            f"T_attn compute {self.attention:>18.4f} s",
+            f"T_attn memory  {self.attention_memory:>18.4f} s",
+            f"T_attention    {self.attention_seconds:>18.4f} s",
+            f"T_compute total{self.compute:>18.4f} s",
+            f"T_memory total {self.memory:>18.4f} s",
             f"SoL            {self.seconds:>18.4f} s ({self.bound_by} bound)",
         ])
 
@@ -224,23 +273,22 @@ def speed_of_light(work: Work, model: ModelSpec, device: DeviceSpec,
     engine picks for it is a planner decision, so it is an input
     here with no default.
 
-    Compute and memory are combined with max, not added: the
-    arithmetic units and the memory system run at once and a floor
-    may assume they overlap perfectly. Inside compute the two terms
-    are added, because the dense and attention kernels are separate
-    launches on the same SMs.
+    Compute and memory are combined with max within each kernel. Dense
+    and attention time are then added because those kernels run in
+    sequence.
     """
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be at least 1")
-    dense = 2.0 * dense_params(model) * work.tokens / device.peak_flops
-    # attention runs in bf16 (FlashAttention-3 over bf16 KV), so it
-    # prices against the bf16 peak, not the fp8 one
-    attention = (flops_per_pair(model) * work.pairs * model.layers
-                 / device.attn_flops)
+    dense, attention = _compute_times(work, model, device)
     passes = math.ceil(work.tokens / chunk_tokens) if work.tokens else 0
-    moved = (model.W_mem * passes
-             + kv_bytes_per_token(model) * (work.kv_written + work.kv_read))
+    dense_bytes = model.W_mem * passes
+    attention_bytes = (kv_bytes_per_token(model)
+                       * (work.kv_written + work.kv_read))
+    moved = dense_bytes + attention_bytes
     return SpeedOfLight(work=work, passes=passes, bytes_moved=moved,
-                        dense=dense, attention=attention,
+                        dense=dense,
+                        dense_memory=dense_bytes / device.hbm_bw,
+                        attention=attention,
+                        attention_memory=attention_bytes / device.hbm_bw,
                         compute=dense + attention,
                         memory=moved / device.hbm_bw)

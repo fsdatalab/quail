@@ -845,6 +845,37 @@ SCENARIOS = [
     "to estimate your net worth, and makes that estimate available "
     "to its business partners.",
 ]
+# Fixed planner inputs from the sf=0.1 Qwen3 32B fp8 labels.
+# They apply at every scale factor so query planning does not read answers.
+SELECTIVITY_ESTIMATE_COLLECTION = "gt_04231c5de83cdf9e7e68fc03849959d6"
+SELECTIVITY_ESTIMATE_LEPARD_CORPUS = "c_350e4ae7332a3dcf6d1292b96fe05a0a"
+SELECTIVITY_ESTIMATE_SCALE_FACTOR = 0.1
+FILTER_SELECTIVITY_ESTIMATES = {
+    F1: 4004 / 5000,
+    F4: 1218 / 5000,
+    F5: 2854 / 5000,
+    F7: 123 / 200,
+    F8: 140 / 200,
+    F9: 128 / 200,
+    F11: 64 / 100,
+    F12: 18 / 100,
+    F13: 37 / 57,
+    LEP1: 14 / 500,
+    LEP2: 229 / 500,
+    LEP3: 51 / 500,
+    LEP4: 31 / 500,
+    LEP5: 14 / 500,
+    LEPS1: 351 / 433,
+}
+JOIN_SELECTIVITY_ESTIMATES = {
+    DISCUSS_ASPECT: 17681 / 60000,
+    ASPECT_SENTIMENT: 9634 / 60000,
+    REACTION: 4913 / 122800,
+    REACTION_SEVERE: 6161 / 122800,
+    SUPPORT: 28 / 5700,
+    REFUTE: 44 / 5700,
+    LEPJOIN: 500 / 216500,
+}
 
 
 # ---------------------------------------------------------- queries
@@ -853,6 +884,17 @@ def queries(sess):
     """id -> (description, callable() -> Query). Fresh Query objects
     per call so each pass re-plans."""
     import quail
+
+    def add_filter(query, template, column):
+        return query.ai_filter(
+            quail.prompt(template, column),
+            selectivity=FILTER_SELECTIVITY_ESTIMATES[template])
+
+    def add_join(query, partner, template, left, right):
+        return query.ai_join(
+            partner,
+            quail.prompt(template, left, right),
+            selectivity=JOIN_SELECTIVITY_ESTIMATES[template])
 
     def make(doc_table, doc_alias, doc_col, filters, joins, select):
         """filters: list of prompt templates applied in order to the
@@ -864,18 +906,17 @@ def queries(sess):
         def build():
             qy = sess.docs(doc_table).alias(doc_alias)
             for tmpl in filters:
-                qy = qy.ai_filter(
-                    quail.prompt(tmpl, quail.col(f"{doc_alias}.{doc_col}")))
+                qy = add_filter(
+                    qy, tmpl, quail.col(f"{doc_alias}.{doc_col}"))
             for partner, palias, pcol, tmpl, *rest in joins:
                 pq = sess.docs(partner).alias(palias)
                 for pf in (rest[0] if rest else ()):
-                    pq = pq.ai_filter(
-                        quail.prompt(pf, quail.col(f"{palias}.{pcol}")))
-                qy = qy.ai_join(
-                    pq,
-                    quail.prompt(tmpl, quail.col(f"{doc_alias}.{doc_col}"),
-                                quail.col(f"{palias}.{pcol}")))
-            return qy.select(*select)
+                    pq = add_filter(
+                        pq, pf, quail.col(f"{palias}.{pcol}"))
+                qy = add_join(
+                    qy, pq, tmpl, quail.col(f"{doc_alias}.{doc_col}"),
+                    quail.col(f"{palias}.{pcol}"))
+            return qy.select(*select, order="by_cost")
         return build
 
     q = {}
@@ -911,38 +952,33 @@ def queries(sess):
         a1 = sess.docs("aspects").alias("a1")
         r2 = sess.docs("reviews").alias("r2")
         a2 = sess.docs("aspects").alias("a2")
-        return (r1
-                .ai_join(a1, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r1.body"),
-                                          quail.col("a1.aspect")))
-                .ai_join(r2, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r2.body"),
-                                          quail.col("a1.aspect")))
-                .ai_join(a2, quail.prompt(ASPECT_SENTIMENT,
-                                          quail.col("r2.body"),
-                                          quail.col("a2.aspect")))
-                .select("r1.id", "a1.id", "r2.id", "a2.id"))
+        qy = add_join(r1, a1, DISCUSS_ASPECT,
+                      quail.col("r1.body"), quail.col("a1.aspect"))
+        qy = add_join(qy, r2, DISCUSS_ASPECT,
+                      quail.col("r2.body"), quail.col("a1.aspect"))
+        qy = add_join(qy, a2, ASPECT_SENTIMENT,
+                      quail.col("r2.body"), quail.col("a2.aspect"))
+        return qy.select(
+            "r1.id", "a1.id", "r2.id", "a2.id", order="by_cost")
     q["IMDB-9"] = ("3J chain r1-a1-r2-a2: two reviews discuss the "
                    "same aspect, second review positive about another",
                    imdb9)
 
     def imdb10():
-        r1 = sess.docs("reviews").alias("r1").ai_filter(
-            quail.prompt(F1, quail.col("r1.body")))
+        r1 = add_filter(
+            sess.docs("reviews").alias("r1"), F1,
+            quail.col("r1.body"))
         a1 = sess.docs("aspects").alias("a1")
         r2 = sess.docs("reviews").alias("r2")
         a2 = sess.docs("aspects").alias("a2")
-        return (r1
-                .ai_join(a1, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r1.body"),
-                                          quail.col("a1.aspect")))
-                .ai_join(r2, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r2.body"),
-                                          quail.col("a1.aspect")))
-                .ai_join(a2, quail.prompt(ASPECT_SENTIMENT,
-                                          quail.col("r2.body"),
-                                          quail.col("a2.aspect")))
-                .select("r1.id", "a1.id", "r2.id", "a2.id"))
+        qy = add_join(r1, a1, DISCUSS_ASPECT,
+                      quail.col("r1.body"), quail.col("a1.aspect"))
+        qy = add_join(qy, r2, DISCUSS_ASPECT,
+                      quail.col("r2.body"), quail.col("a1.aspect"))
+        qy = add_join(qy, a2, ASPECT_SENTIMENT,
+                      quail.col("r2.body"), quail.col("a2.aspect"))
+        return qy.select(
+            "r1.id", "a1.id", "r2.id", "a2.id", order="by_cost")
     q["IMDB-10"] = ("F1 -> 3J chain r1-a1-r2-a2", imdb10)
 
     # IMDB-8: star shape - A joins B and A joins C, same anchor
@@ -998,38 +1034,33 @@ def queries(sess):
         e1 = sess.docs("evidence").alias("e1")
         c2 = sess.docs("claims").alias("c2")
         e2 = sess.docs("evidence").alias("e2")
-        return (c1
-                .ai_join(e1, quail.prompt(SUPPORT,
-                                          quail.col("c1.claim"),
-                                          quail.col("e1.text")))
-                .ai_join(c2, quail.prompt(REFUTE,
-                                          quail.col("c2.claim"),
-                                          quail.col("e1.text")))
-                .ai_join(e2, quail.prompt(SUPPORT,
-                                          quail.col("c2.claim"),
-                                          quail.col("e2.text")))
-                .select("c1.id", "e1.id", "c2.id", "e2.id"))
+        qy = add_join(c1, e1, SUPPORT,
+                      quail.col("c1.claim"), quail.col("e1.text"))
+        qy = add_join(qy, c2, REFUTE,
+                      quail.col("c2.claim"), quail.col("e1.text"))
+        qy = add_join(qy, e2, SUPPORT,
+                      quail.col("c2.claim"), quail.col("e2.text"))
+        return qy.select(
+            "c1.id", "e1.id", "c2.id", "e2.id", order="by_cost")
     q["FEV-8"] = ("3J chain c1-e1-c2-e2: evidence supports c1 but "
                   "refutes c2, c2 supported by different evidence",
                   fev8)
 
     def fev9():
-        c1 = sess.docs("claims").alias("c1").ai_filter(
-            quail.prompt(F11, quail.col("c1.claim")))
+        c1 = add_filter(
+            sess.docs("claims").alias("c1"), F11,
+            quail.col("c1.claim"))
         e1 = sess.docs("evidence").alias("e1")
         c2 = sess.docs("claims").alias("c2")
         e2 = sess.docs("evidence").alias("e2")
-        return (c1
-                .ai_join(e1, quail.prompt(SUPPORT,
-                                          quail.col("c1.claim"),
-                                          quail.col("e1.text")))
-                .ai_join(c2, quail.prompt(REFUTE,
-                                          quail.col("c2.claim"),
-                                          quail.col("e1.text")))
-                .ai_join(e2, quail.prompt(SUPPORT,
-                                          quail.col("c2.claim"),
-                                          quail.col("e2.text")))
-                .select("c1.id", "e1.id", "c2.id", "e2.id"))
+        qy = add_join(c1, e1, SUPPORT,
+                      quail.col("c1.claim"), quail.col("e1.text"))
+        qy = add_join(qy, c2, REFUTE,
+                      quail.col("c2.claim"), quail.col("e1.text"))
+        qy = add_join(qy, e2, SUPPORT,
+                      quail.col("c2.claim"), quail.col("e2.text"))
+        return qy.select(
+            "c1.id", "e1.id", "c2.id", "e2.id", order="by_cost")
     q["FEV-9"] = ("F11 -> 3J chain c1-e1-c2-e2", fev9)
 
     # FEV-7: star shape, both joins anchored on claims.
@@ -1169,6 +1200,12 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         prediction=prediction,
         sf=sf, lf=lf, gpus=gpus, model=model,
         corpus_id=corpus["corpus_id"],
+        selectivity_estimates=dict(
+            source_collection=SELECTIVITY_ESTIMATE_COLLECTION,
+            lepard_source_corpus=SELECTIVITY_ESTIMATE_LEPARD_CORPUS,
+            source_scale_factor=SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+            method=("TRUE labels divided by all labels, fixed across "
+                    "scale factors")),
         raw_volume_path=f"/results/{raw_root}",
         aggregate_volume_path=f"/results/{aggregate_volume_path}",
         pricing=dict(
