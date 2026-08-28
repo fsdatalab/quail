@@ -760,6 +760,8 @@ class ModelSpec:
                          # (gate_up: 2 x intermediate at Qwen3)
     w_bytes: float       # weight bytes/param (fp8 = 1)
     kv_bytes: float      # KV bytes/element (bf16 = 2 default)
+    weight_precision: str      # fp8 component throughput
+    attention_precision: str   # bf16 component throughput
     # derived properties, never typed in:
     # kappa   = 2 * layers * n_kv * d_head * kv_bytes   (KV bytes/token)
     # W_mem   = params * w_bytes
