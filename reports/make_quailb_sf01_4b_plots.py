@@ -31,13 +31,6 @@ from plot_colors import BLUE, DARK, GRAY, ORANGE, TEAL  # noqa: E402
 
 MODEL = "qwen3-4b-fp8"
 SYSTEMS = ("SoL estimate", "Quail", "Stock vLLM", "Pipelined vLLM")
-MEASURED_SYSTEMS = ("Quail", "Stock vLLM", "Pipelined vLLM")
-FAMILIES = (
-    ("IMDB", "IMDB"),
-    ("BioDEX", "BIO"),
-    ("FEVER", "FEV"),
-    ("LePaRD", "LEP"),
-)
 
 
 def load(path):
@@ -220,7 +213,7 @@ def print_metrics(order, results, records):
     print("| System | Query group | Measured queries | Throughput |")
     print("|---|---|---:|---:|")
     for group in ("filter only", "join only"):
-        for system in ("Quail", "Stock vLLM", "Pipelined vLLM"):
+        for system in SYSTEMS:
             throughput, measured = aggregate_throughput(
                 order, results, records, group, system)
             unit = "docs/s" if group == "filter only" else "pairs/s"
@@ -252,76 +245,56 @@ def print_metrics(order, results, records):
               + " | ".join(cells) + " |")
 
 
-def make_runtime_plot(order, results):
-    colors = (GRAY, BLUE, ORANGE, TEAL)
-    width = 0.2
-    fig, axes = plt.subplots(2, 2, figsize=(16, 9), sharey=True)
-    for ax, (family_name, prefix) in zip(axes.flat, FAMILIES):
-        positions = [index for index, query in enumerate(order)
-                     if query.startswith(f"{prefix}-")]
-        labels = [order[index] for index in positions]
-        x = np.arange(len(positions))
-        for system_index, (system, color) in enumerate(
-                zip(SYSTEMS, colors)):
-            values = np.asarray(
-                [results[system][index] for index in positions],
-                dtype=float,
-            )
-            measured = np.isfinite(values)
-            offset = system_index - (len(SYSTEMS) - 1) / 2
-            bars = ax.bar(
-                x[measured] + offset * width,
-                values[measured],
-                width,
-                color=color,
-                label=system,
-            )
-            for bar, value in zip(bars, values[measured]):
-                ax.annotate(
-                    f"{value:.2g}",
-                    (bar.get_x() + bar.get_width() / 2, value),
-                    xytext=(0, 3),
-                    textcoords="offset points",
-                    ha="center",
-                    va="bottom",
-                    fontsize=6.5,
-                    rotation=90,
-                    color=DARK,
-                )
-        ax.set_title(family_name)
-        ax.set_yscale("log")
-        ax.set_ylim(0.01, 3000)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    fig.supylabel("time per query on one H100!, seconds (log scale)")
-    handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, frameon=False, loc="upper center", ncols=4)
-    fig.tight_layout(rect=(0.02, 0, 1, 0.95))
-    OUT.mkdir(exist_ok=True)
-    output = OUT / "quailb_sf01_4b_runtime.png"
-    fig.savefig(output, dpi=150)
-    plt.close(fig)
-    print(f"wrote {output}")
+def _finite_mean(values):
+    values = np.asarray(values, dtype=float)
+    return values[np.isfinite(values)].mean()
 
 
-def make_throughput_plot(order, results, records):
-    groups = (
-        ("filter only", "filter only queries", "documents per second"),
-        ("join only", "join only queries", "document pairs per second"),
+def make_metrics_plot(order, results, records):
+    mean_seconds = {
+        system: _finite_mean(results[system]) for system in SYSTEMS
+    }
+    mean_cost = {
+        system: seconds * H100_USD_PER_HOUR / 3600
+        for system, seconds in mean_seconds.items()
+    }
+    filter_throughput = {
+        system: aggregate_throughput(
+            order, results, records, "filter only", system)[0]
+        for system in SYSTEMS
+    }
+    join_throughput = {
+        system: aggregate_throughput(
+            order, results, records, "join only", system)[0]
+        for system in SYSTEMS
+    }
+    panels = (
+        ("Mean time per query", "seconds per query (log scale)",
+         mean_seconds, lambda value: f"{value:.2f} s", "higher", True),
+        ("Mean cost per query", "USD per query (log scale)",
+         mean_cost, lambda value: f"${value:.4f}", "higher", True),
+        ("Filter only throughput", "documents per second",
+         filter_throughput, lambda value: f"{value:,.0f}", "lower", False),
+        ("Join only throughput", "document pairs per second",
+         join_throughput, lambda value: f"{value:,.0f}", "lower", False),
     )
-    colors = (BLUE, ORANGE, TEAL)
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    for ax, (group, label, unit) in zip(axes, groups):
-        values = [
-            aggregate_throughput(order, results, records, group, system)[0]
-            for system in MEASURED_SYSTEMS
-        ]
-        bars = ax.bar(MEASURED_SYSTEMS, values, color=colors, width=0.68)
-        stock = values[1]
+    colors = (GRAY, BLUE, ORANGE, TEAL)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.5))
+    for ax, (title, unit, values_by_system, formatter,
+             ratio_direction, use_log_scale) in zip(axes.flat, panels):
+        values = np.asarray(
+            [values_by_system[system] for system in SYSTEMS], dtype=float)
+        bars = ax.bar(SYSTEMS, values, color=colors, width=0.68)
+        sol = values[0]
         for index, (bar, value) in enumerate(zip(bars, values)):
-            ratio = "" if index == 1 else f"\n{value / stock:.2f}x stock"
+            if index == 0:
+                ratio = ""
+            elif ratio_direction == "higher":
+                ratio = f"\n{value / sol:.1f}x SoL"
+            else:
+                ratio = f"\n{value / sol:.2f}x SoL"
             ax.annotate(
-                f"{value:,.0f}{ratio}",
+                f"{formatter(value)}{ratio}",
                 (bar.get_x() + bar.get_width() / 2, value),
                 xytext=(0, 4),
                 textcoords="offset points",
@@ -330,12 +303,17 @@ def make_throughput_plot(order, results, records):
                 fontsize=8,
                 color=DARK,
             )
-        ax.set_title(label)
+        ax.set_title(title)
         ax.set_ylabel(unit)
-        ax.set_ylim(0, max(values) * 1.28)
-        ax.tick_params(axis="x", labelrotation=18)
+        if use_log_scale:
+            ax.set_yscale("log")
+            ax.set_ylim(values.min() / 1.8, values.max() * 2.1)
+        else:
+            ax.set_ylim(0, values.max() * 1.28)
+        ax.tick_params(axis="x", labelrotation=16)
     fig.tight_layout()
-    output = OUT / "quailb_sf01_4b_throughput.png"
+    OUT.mkdir(exist_ok=True)
+    output = OUT / "quailb_sf01_4b_metrics.png"
     fig.savefig(output, dpi=150)
     plt.close(fig)
     print(f"wrote {output}")
@@ -343,8 +321,7 @@ def make_throughput_plot(order, results, records):
 
 def main(workdir):
     order, results, records = load_inputs(workdir)
-    make_runtime_plot(order, results)
-    make_throughput_plot(order, results, records)
+    make_metrics_plot(order, results, records)
     print_metrics(order, results, records)
 
 
