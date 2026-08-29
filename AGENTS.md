@@ -163,8 +163,18 @@ effectiveness research:
   decorative gridlines.
 - Label data directly on or next to bars/points. Use a legend only
   when direct labels would overlap or repeat.
-- State the unit on every axis. Omit the plot title when the report
-  heading already says what the plot shows.
+- State the unit on every axis, and make the axis label the unit and
+  nothing else: "microseconds per fresh token", not "wall
+  microseconds per fresh token (IMDB-7, profiled run)". Context
+  beyond the unit belongs in the title.
+- Every plot has a title. When the plot shows one benchmark query,
+  the title names the query identifier (for example "IMDB-7"); with
+  one panel per query, each panel's title names its query.
+- With subplots, leave enough space between panels that labels and
+  annotations never crowd the neighboring panel. Keep labels
+  consistent across panels, and never repeat in a bar or tick label
+  what the title already says (if the title says the attention path,
+  the labels do not).
 - When comparing two things, put them next to each other on the same
   axis so the reader's eye measures the gap, not their memory.
 - Annotate the delta (speedup, difference) inline near the data it

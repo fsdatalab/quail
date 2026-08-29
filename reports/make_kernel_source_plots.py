@@ -35,10 +35,12 @@ from plot_colors import BLUE, GRAY, GREEN, ORANGE  # noqa: E402
 from quail.bench.evaluate import H100_USD_PER_HOUR  # noqa: E402
 
 SOURCES = ("quail", "vllm_ops", "vllm_compiled")
+# the attention path lives in the plot title, so the bar labels
+# carry only the kernel source
 SOURCE_LABELS = {
-    "quail": "Quail fused ({path})",
-    "vllm_ops": "vLLM ops unfused ({path})",
-    "vllm_compiled": "vLLM compiled set ({path})",
+    "quail": "Quail fused kernels",
+    "vllm_ops": "vLLM ops, unfused",
+    "vllm_compiled": "vLLM compiled set",
 }
 COLORS = {"quail": GREEN, "vllm_ops": GRAY, "vllm_compiled": BLUE}
 FILES = {"IMDB-7": "kernel_source_imdb7.json",
@@ -69,9 +71,11 @@ def work_items(report):
 def rate_panel(workdir):
     """Grouped bars: microseconds per fresh token, both queries."""
     reports = {q: load(workdir, f) for q, f in FILES.items()}
-    fig, axes = plt.subplots(1, 2, figsize=(8.4, 3.0))
+    fig, axes = plt.subplots(1, 2, figsize=(10.0, 3.0))
+    fig.set_tight_layout(False)
+    fig.subplots_adjust(left=0.13, right=0.99, top=0.86,
+                        bottom=0.18, wspace=0.85)
     for ax, (query, report) in zip(axes, reports.items()):
-        path = report["attention_path"]
         tokens = last(report, "quail")["fresh_tokens"]
         base = last(report, "quail")["us_per_token"]
         for i, source in enumerate(SOURCES):
@@ -86,17 +90,18 @@ def rate_panel(workdir):
                         textcoords="offset points", va="center",
                         fontsize=8.2)
         ax.set_yticks(range(len(SOURCES)))
-        ax.set_yticklabels(
-            [SOURCE_LABELS[s].format(path=path) for s in SOURCES],
-            fontsize=8.6)
+        ax.set_yticklabels([SOURCE_LABELS[s] for s in SOURCES],
+                           fontsize=8.8)
         ax.invert_yaxis()
-        ax.set_xlabel("wall microseconds per fresh token")
+        ax.set_xlabel("microseconds per fresh token")
         ax.set_title(
             f"{query} — {report['attention_path']} attention path "
             f"({tokens / 1e6:.2f}M fresh tokens)",
-            fontsize=9.6, fontweight="normal")
+            fontsize=9.8, fontweight="normal")
         ax.set_xlim(0, None)
         ax.margins(x=0.33)
+        ax.xaxis.set_major_locator(
+            matplotlib.ticker.MaxNLocator(integer=True))
     fig.savefig(OUT / "kernel_source_rates.png", dpi=300)
     plt.close(fig)
 
@@ -156,15 +161,14 @@ def profile_panel(workdir):
         ax.annotate(f"  {left:.2f} total", (left, i), va="center",
                     fontsize=8.5)
     ax.set_yticks(range(len(sources)))
-    # the x label carries the attention path, so rows carry only the
-    # kernel source
-    ax.set_yticklabels(
-        [SOURCE_LABELS[s].format(path=path).replace(
-            f" ({path})", "") for s in sources],
-        fontsize=8.6)
+    ax.set_yticklabels([SOURCE_LABELS[s] for s in sources],
+                       fontsize=8.8)
     ax.invert_yaxis()
-    ax.set_xlabel(f"GPU kernel microseconds per fresh token "
-                  f"({prof['query']}, {path} path, profiled run)")
+    ax.set_xlabel("microseconds per fresh token")
+    ax.set_title(
+        f"{prof['query']} — GPU kernel time by category "
+        f"({path} attention path, profiled run)",
+        fontsize=9.8, fontweight="normal")
     ax.margins(x=0.12)
     ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.55),
               ncol=len(seen), fontsize=7.4, frameon=False,
