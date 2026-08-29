@@ -28,7 +28,7 @@ import json
 
 import modal
 
-from corpus import MODEL
+MODEL = "Qwen/Qwen3-4B-FP8"
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 

@@ -5,12 +5,13 @@ Cell: `ablations/vllm_compiled_kernels.py`.
 
 The question: how much speed do our custom JIT kernels add, measured
 against the kernels a user would get from vLLM's own torch.compile of
-this model? The 2026-08-19 forward-pass ablation compared our kernels
-against vLLM's ops called one by one, unfused. That comparison could
-be generous to us: stock vLLM compiles the model at boot, and its
-compiled graph could fuse the same operation pairs we fuse. This
-experiment adds the missing configuration and runs the comparison on
-one filter query and one join query.
+this model? An earlier ablation (2026-08-19; deleted as superseded by
+this report, see git history) compared our kernels against vLLM's ops
+called one by one, unfused. That comparison could be generous to us:
+stock vLLM compiles the model at boot, and its compiled graph could
+fuse the same operation pairs we fuse. This experiment adds the
+missing configuration and runs the comparison on one filter query and
+one join query.
 
 Answer: the fused kernels are worth 26% per token on both queries
 against the compiled kernel set (29% against the unfused ops),
@@ -90,8 +91,8 @@ every other configuration's repetitions agreed within 0.05 s.
 
 ## Predictions (stated before the run)
 
-- Filter, vllm_ops: +2.3 to +2.6 us/token over quail (the A2-A3 gap
-  of the 2026-08-19 ablation was 2.4). Measured: +2.48. Correct.
+- Filter, vllm_ops: +2.3 to +2.6 us/token over quail (the earlier
+  2026-08-19 ablation measured a 2.4 gap). Measured: +2.48. Correct.
 - Filter, vllm_compiled: +1.7 to +2.2 us/token, reasoning that the
   stock inventory keeps all four group-quant launches per layer, so
   most of the fusion saving stays with quail. Measured: +2.23, just

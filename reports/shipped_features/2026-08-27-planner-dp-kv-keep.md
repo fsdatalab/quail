@@ -116,7 +116,7 @@ in. The merged worker re-integrates it and needs its own run. The
 local production planner mirror completed 70 query and model runs
 in 10.679 seconds, including the ground truth simulation between
 planner calls. The join cells
-(`tests/gpu/join_bench.py`, the QUAIL-B evaluation) are the next
+(`tests/gpu/join_bench.py` (removed 2026-08-29; git history), the QUAIL-B evaluation) are the next
 step, and the run report's new `kv_manager` block (retained counts,
 anchor hits and misses, evictions with their summed value) and
 `join_optimizer` block (search size, chosen sequence) are what to

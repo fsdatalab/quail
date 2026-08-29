@@ -23,8 +23,7 @@ Three rungs, the engine untouched (the non-quail paths live in a
 Pipeline subclass below):
 
   quail          our fused Triton kernels (the shipping executor)
-  vllm_ops       vLLM's ops called one by one, unfused (the A2 rung
-                 of the 2026-08-19 forward-pass ablation), and on the
+  vllm_ops       vLLM's ops called one by one, unfused, and on the
                  join path vLLM's merge_attn_states kernel plus a
                  separate group-quant in place of our fused
                  merge+quant kernel
@@ -619,8 +618,9 @@ PREDICTIONS = {
     "filter": {
         "quail": "the reference: ~8.5 us/token, ~35 s "
                  "(results/attention_paths.json, unified)",
-        "vllm_ops": "+2.3 to +2.6 us/token over quail (the A2-A3 "
-                    "gap of the 2026-08-19 ablation was 2.4), "
+        "vllm_ops": "+2.3 to +2.6 us/token over quail (the "
+                    "2026-08-19 kernel ablation, since superseded "
+                    "by this cell, measured a 2.4 gap), "
                     "about 44-46 s",
         "vllm_compiled": "+1.7 to +2.2 us/token over quail. The "
                          "stock inventory shows the compiled graph "

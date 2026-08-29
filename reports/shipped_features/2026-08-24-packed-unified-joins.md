@@ -17,5 +17,5 @@ slower. Joins therefore continue to use `merge_quant`.
 The split attention path and its comparison hook were also removed. Quail
 now has the `unified` and `merge_quant` attention modes.
 
-See `reports/2026-08-24-packed-unified-joins.md` and
+See `reports/2026-08-24-packed-unified-joins.md` (removed 2026-08-29; git history) and
 `results/packed_unified_join.json` for the setup and measured results.

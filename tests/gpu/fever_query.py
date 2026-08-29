@@ -19,7 +19,7 @@ image = (
 )
 
 # House rule: never create new Modal app names - this cell attaches
-# to the existing milestone app, same as tests/gpu/milestone1.py.
+# to the existing milestone app.
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("quail-results",

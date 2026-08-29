@@ -71,8 +71,8 @@ every group's shards are re-decided from measured counts).
 The measured cells for issue #38's benchmark slice - the gate
 against its formula, and the re-shard trade against the forced
 shared-anchor baseline - are in
-`reports/2026-08-24-join-gate-and-reshard.md` (script
-`tests/gpu/join_bench.py`, summary `results/join_bench.json`).
+`reports/2026-08-24-join-gate-and-reshard.md` (removed 2026-08-29; git history) (script
+`tests/gpu/join_bench.py` (removed 2026-08-29; git history), summary `results/join_bench.json` (removed 2026-08-29; git history)).
 Headlines: gate mechanics exact and bit-for-bit reproducible; the
 two-group barrier plan measured 11.3x fewer tokens and 11.3x faster
 than the forced shared anchor, with plan-predicted token counts
