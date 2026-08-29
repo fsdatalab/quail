@@ -186,8 +186,8 @@ def define_all_queries():
     tm = ("terms", "term")
     cl = ("claims", "claim")
     ev = ("evidence", "text")
-    dc = ("citation_contexts", "destination_context")
-    pt = ("citation_passages", "passage_text")
+    dc = ("citations", "destination_context")
+    pt = ("citations", "passage_text")
 
     Q = {}
 
@@ -771,7 +771,8 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
                        reps: int, ground_truth_workload: str,
                        prediction: str, baselines: tuple[str, ...],
                        paired_run_id: str = "", lf: int = 1,
-                       method_order: str = "alternating-by-query") -> dict:
+                       method_order: str = "alternating-by-query",
+                       ground_truth_collection: str | None = None) -> dict:
     """Boot one LLM and run one or both baseline configurations.
 
     Args:
@@ -842,12 +843,13 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
     evaluator = None
     truth = None
     evaluation_queries = {}
-    if ground_truth_workload:
+    if ground_truth_workload or ground_truth_collection is not None:
         import quail
         from quail.bench.evaluate import (
             BenchmarkEvaluator,
             LocalVolumeFiles,
             corpus_identity,
+            load_ground_truth,
             load_ground_truth_workload,
             read_corpus,
         )
@@ -856,13 +858,21 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
         corpus_rows = read_corpus(data_path)
         corpus = corpus_identity(
             corpus_rows, sf, DATA_SEED, SOURCE_REVISIONS)
-        truth = load_ground_truth_workload(
-            LocalVolumeFiles("/results"),
-            scale_factor=sf,
-            corpus_id=corpus["corpus_id"],
-            corpus_full_hash=corpus["corpus_full_hash"],
-            workload=ground_truth_workload,
-        )
+        if ground_truth_workload:
+            truth = load_ground_truth_workload(
+                LocalVolumeFiles("/results"),
+                scale_factor=sf,
+                corpus_id=corpus["corpus_id"],
+                corpus_full_hash=corpus["corpus_full_hash"],
+                workload=ground_truth_workload,
+            )
+        else:
+            truth = load_ground_truth(
+                LocalVolumeFiles("/results"),
+                scale_factor=sf,
+                corpus_id=corpus["corpus_id"],
+                collection_id=ground_truth_collection or None,
+            )
         evaluator = BenchmarkEvaluator(truth, corpus_rows)
         session = quail.Session(
             EngineConfig(gpus=1, model=model),
@@ -922,6 +932,8 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
             boot=boot, reps=reps,
             prediction=prediction,
             ground_truth_workload=(ground_truth_workload or None),
+            ground_truth_collection=(None if truth is None else
+                                     truth.collection_id),
             ground_truth=(None if truth is None else {
                 "collection_id": truth.collection_id,
                 "corpus_id": truth.corpus_id,

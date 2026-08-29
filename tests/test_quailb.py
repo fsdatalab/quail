@@ -7,14 +7,10 @@ import pytest
 import quail
 from quail.bench.quailb import (
     ASPECTS,
-    LEPARD_POSITIVE_PAIRS,
     QUERY_FAMILY_WORKLOADS,
     QUERY_ORDER,
     SCENARIOS,
     SETS,
-    _lepard_documents,
-    _n_lepard_pairs,
-    _sample_lepard_pairs,
     queries,
     query_family_name,
     register_privacy_sets,
@@ -24,7 +20,6 @@ from quail.bench.quailb import (
 )
 from quail.planner.decide import _collect
 from quail.planner.plan import EngineConfig, Refusal
-from quail.bench.quailb_parallel import _family_workload
 
 
 def _standin_sets(tmp_path):
@@ -48,15 +43,11 @@ def _standin_sets(tmp_path):
     }), tmp_path / "claims.parquet")
     write("evidence", "text", [f"Wikipedia passage {i}" for i in range(6)])
     pq.write_table(pa.table({
-        "id": [f"lc{i}" for i in range(6)],
-        "destination_context": [f"citation excerpt {i}" for i in range(6)],
-        "cited_passage_ids": [[f"passage-{i}"] for i in range(6)],
-    }), tmp_path / "citation_contexts.parquet")
-    pq.write_table(pa.table({
         "id": [f"lp{i}" for i in range(6)],
+        "destination_context": [f"citation excerpt {i}" for i in range(6)],
         "passage_text": [f"cited passage {i}" for i in range(6)],
-        "passage_ids": [[f"passage-{i}"] for i in range(6)],
-    }), tmp_path / "citation_passages.parquet")
+        "passage_id": [f"passage-{i}" for i in range(6)],
+    }), tmp_path / "citations.parquet")
     write("policies", "policy_text",
           [f"privacy policy text {i}" for i in range(8)])
     pq.write_table(pa.table({
@@ -106,51 +97,11 @@ def test_set_table_matches_design():
         "reviews": 50_000,
         "reports": 5_000,
         "claims": 5_000,
+        "citations": 2_000,
         "policies": 1_000_000,
     }
-    assert LEPARD_POSITIVE_PAIRS == 5_000
-    assert _n_lepard_pairs(0.1) == 500
     assert len(ASPECTS) == 12
     assert len(SCENARIOS) == 100
-
-
-def test_lepard_samples_pairs_before_deduplicating_documents():
-    context_a = "A" * 60
-    context_b = "B" * 60
-    context_c = "C" * 60
-    rows = [
-        ("d1", context_a, "p1"),
-        ("d1", context_a, "p1"),
-        ("d1", context_a, "p2"),
-        ("d2", context_b, "p1"),
-        ("d3", context_c, "missing"),
-    ]
-    passages = {"p1": "shared passage", "p2": "shared passage"}
-
-    pairs = _sample_lepard_pairs(rows, passages, 10)
-    contexts, passage_rows = _lepard_documents(pairs)
-
-    assert len(pairs) == 3
-    assert {row["destination_context"]: row["cited_passage_ids"]
-            for row in contexts} == {
-        context_a: ["p1", "p2"],
-        context_b: ["p1"],
-    }
-    assert passage_rows == [
-        {"id": "lp0", "passage_text": "shared passage",
-         "passage_ids": ["p1", "p2"]},
-    ]
-
-
-def test_lepard_pair_sample_is_stable_and_nested():
-    rows = [(f"d{i}", f"context {i} " + "x" * 50, f"p{i}")
-            for i in range(20)]
-    passages = {f"p{i}": f"passage {i}" for i in range(20)}
-
-    small = _sample_lepard_pairs(rows, passages, 5)
-    large = _sample_lepard_pairs(reversed(rows), passages, 10)
-
-    assert small == large[:5]
 
 
 def test_parallel_query_split_matches_stock_vllm():
@@ -183,10 +134,3 @@ def test_query_family_rejects_mixed_or_unknown_queries():
         query_family_name(("IMDB-1", "BIO-1"))
     with pytest.raises(ValueError, match="unknown query family"):
         split_query_families(("OTHER-1",))
-
-
-def test_family_workload_defaults_to_matching_labels():
-    assert _family_workload("auto", "imdb") == "imdb"
-    assert _family_workload("", "fever") == "fever"
-    assert _family_workload("lepard", "lepard") == "lepard"
-    assert _family_workload("none", "imdb") is None

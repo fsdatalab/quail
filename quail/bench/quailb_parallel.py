@@ -59,14 +59,6 @@ VOLUMES = {
 DATA_DIR = "/results/quailb_data"
 
 
-def _family_workload(requested: str, family: str) -> str | None:
-    if requested.lower() in ("none", "off"):
-        return None
-    if not requested or requested == "auto":
-        return family
-    return requested
-
-
 @app.function(image=image, timeout=1200, volumes=VOLUMES)
 def ensure_data(sf: float, lf: int):
     from quail.bench.quailb import build_sets
@@ -90,7 +82,7 @@ def run_query_family(
     query_ids_csv: str,
     run_label: str,
     prediction: str,
-    ground_truth_workload: str,
+    ground_truth_collection: str,
 ) -> str:
     from baselines.stock_vllm.run import BASELINES, _run_query_batches
     from quail.bench.quailb import query_family_name, run_suite
@@ -103,7 +95,6 @@ def run_query_family(
         query_id.strip() for query_id in query_ids_csv.split(",")
         if query_id.strip())
     family = query_family_name(query_ids)
-    workload = _family_workload(ground_truth_workload, family)
     out_path = (
         f"/results/benchmarks/quailb/families/{run_label}/"
         f"{family}-quail.json")
@@ -119,8 +110,8 @@ def run_query_family(
         only=query_ids,
         out_path=out_path,
         model=model,
-        accuracy=workload is not None,
-        ground_truth_workload=workload,
+        accuracy=True,
+        ground_truth_collection=ground_truth_collection or None,
         prediction=prediction,
         artifact_stem=f"{run_label}-{family}-quail",
         execute=_execute_payload,
@@ -146,17 +137,18 @@ def run_query_family(
         sf=sf,
         query_ids_csv=",".join(query_ids),
         reps=1,
-        ground_truth_workload=workload or "",
+        ground_truth_workload="",
         prediction=prediction,
         baselines=BASELINES,
         paired_run_id=run_label,
         lf=lf,
         method_order="method-major",
+        ground_truth_collection=ground_truth_collection,
     )
     family_result = {
         "query_family": family,
         "query_ids": list(query_ids),
-        "ground_truth_workload": workload,
+        "ground_truth_collection": suite["ground_truth"]["collection_id"],
         "gpu": "H100!",
         "same_modal_container": True,
         "engine_order": ["quail", "vllm_baselines"],
@@ -279,7 +271,7 @@ def main(
     lf: int = 1,
     query: str = "",
     prediction: str = "",
-    ground_truth_workload: str = "auto",
+    ground_truth_collection: str = "",
 ):
     from baselines.stock_vllm.run import BASELINES, _merge_reports
     from quail.bench.quailb import (
@@ -319,7 +311,7 @@ def main(
             query_ids_csv=",".join(family_ids),
             run_label=run_label,
             prediction=prediction,
-            ground_truth_workload=ground_truth_workload,
+            ground_truth_collection=ground_truth_collection,
         )
         calls.append((family, call))
         call_ids[family] = call.object_id
@@ -357,7 +349,8 @@ def main(
             {
                 "query_family": part["query_family"],
                 "query_ids": part["query_ids"],
-                "ground_truth_workload": part["ground_truth_workload"],
+                "ground_truth_collection":
+                    part["ground_truth_collection"],
                 "engine_transition": part["engine_transition"],
             }
             for part in parts
@@ -372,8 +365,8 @@ def main(
             len(parts),
         )
         report["family_run"] = family_metadata
-        report["ground_truth_workload"] = {
-            part["query_family"]: part["ground_truth_workload"]
+        report["ground_truth_collection"] = {
+            part["query_family"]: part["ground_truth_collection"]
             for part in parts
         }
         report["ground_truth"] = {

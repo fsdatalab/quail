@@ -156,10 +156,8 @@ COLUMNS = {
     "terms.term": ("terms", "term"),
     "claims.claim": ("claims", "claim"),
     "evidence.text": ("evidence", "text"),
-    "citation_contexts.destination_context":
-        ("citation_contexts", "destination_context"),
-    "citation_passages.passage_text":
-        ("citation_passages", "passage_text"),
+    "citations.destination_context": ("citations", "destination_context"),
+    "citations.passage_text": ("citations", "passage_text"),
 }
 
 # 1. document lengths -------------------------------------------------
@@ -198,29 +196,11 @@ for code, template in JOIN_TEMPLATES.items():
 
 # 3. labels -----------------------------------------------------------
 # A predicate keeps one label set per template it has been judged
-# under, so the volume holds several at once. The main collection
-# supplies IMDB, BioDEX, and FEVER. LePaRD uses the revised corpus
-# named by the benchmark selectivity source.
+# under, so the volume holds several at once. Use only the label sets
+# named by the active collection.
 LABEL_MANIFESTS = glob.glob(
     str(W / "allabels/label_sets/*/*/*/manifest.json"))
 active_by_predicate = dict(COLLECTION["label_sets"])
-revised_lepard = {}
-for manifest_path in LABEL_MANIFESTS:
-    manifest = json.load(open(manifest_path))
-    predicate = manifest["predicate"]
-    if (predicate["workload"] == "lepard"
-            and manifest["corpus_id"] == Q.SELECTIVITY_ESTIMATE_LEPARD_CORPUS):
-        key = manifest["predicate_key"]
-        if key in revised_lepard:
-            raise ValueError(
-                f"more than one revised LePaRD label set for {key}")
-        revised_lepard[key] = manifest["label_set_id"]
-expected_lepard = {
-    key for key in active_by_predicate if key.startswith("quailb.lepard.")}
-if set(revised_lepard) != expected_lepard:
-    raise ValueError(
-        "revised LePaRD labels do not cover the collection predicates")
-active_by_predicate.update(revised_lepard)
 ACTIVE = set(active_by_predicate.values())
 filter_answers = {}
 join_answers = {}
@@ -1041,9 +1021,8 @@ json.dump({
         "filter_order": (
             "by_cost from fixed benchmark selectivity estimates"),
         "filter_selectivity_sources": {
-            "imdb_biodex_fever_collection":
-                Q.SELECTIVITY_ESTIMATE_COLLECTION,
-            "lepard_corpus": Q.SELECTIVITY_ESTIMATE_LEPARD_CORPUS,
+            "collection": Q.SELECTIVITY_ESTIMATE_COLLECTION,
+            "corpus": Q.SELECTIVITY_ESTIMATE_CORPUS,
             "scale_factor": Q.SELECTIVITY_ESTIMATE_SCALE_FACTOR,
         },
         "plan_space": "all feasible left deep plans",

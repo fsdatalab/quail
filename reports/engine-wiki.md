@@ -1166,8 +1166,7 @@ Qwen3 32B during the judge pass; ground truth covers 22 predicates.
 | reviews | `stanfordnlp/imdb` | 50,000 | Movie reviews |
 | reports | `BioDEX/BioDEX-Reactions` | 5,000 | Medical case reports |
 | claims | `fever/fever` | 5,000 | Factual claims (train + labelled_dev) |
-| citation_contexts | `rmahari/LePaRD` | derived from 5,000 sampled pairs | Legal citation excerpts |
-| citation_passages | `rmahari/LePaRD` | derived from 5,000 sampled pairs | Cited legal passages |
+| citations | `rmahari/LePaRD` | 2,000 | Legal citation excerpts |
 | policies | `mukund/PrivacyPolicies` | 1,000,000 | Privacy policies (optional) |
 
 Partner tables (fixed vocabulary, not scaled by SF):
@@ -1184,8 +1183,7 @@ graph LR
         reviews["reviews (50K)"]
         reports["reports (10K)"]
         claims["claims (5K)"]
-        citation_contexts["citation contexts"]
-        citation_passages["citation passages"]
+        citations["citations (2K)"]
         policies["policies (1M, optional)"]
     end
     subgraph Partner tables
@@ -1197,7 +1195,7 @@ graph LR
     reviews -- "DISCUSS_ASPECT / ASPECT_SENTIMENT" --> aspects
     reports -- "REACTION" --> terms
     claims -- "SUPPORT / REFUTE" --> evidence
-    citation_contexts -- "LEPJOIN" --> citation_passages
+    citations -- "LEPJOIN (self-join)" --> citations
     policies -. "SCENARIO_MATCH" .-> scenarios
 ```
 
@@ -1267,18 +1265,14 @@ benchmark runner or judge pass.
 ### Selectivity estimates
 
 Every filter and join carries a fixed selectivity estimate. The estimates
-currently come from the sf0.1 Qwen3 32B fp8 labels generated before the
-BioDEX and FEVER scale change. IMDB, BioDEX, and FEVER use collection
-`gt_04231c5de83cdf9e7e68fc03849959d6`. LePaRD uses the revised labels for
-corpus `c_350e4ae7332a3dcf6d1292b96fe05a0a`. These estimates are provisional
-for the scaled BioDEX and FEVER corpora until their labels are regenerated.
-Planning does not read the ground truth labels.
+come from the active sf0.1 Qwen3 32B fp8 collection
+`gt_02ffa2a5720006e8236aa993760e9e29` for corpus
+`c_d7a294f1a0d83293b31ed8519df4262e`. Planning does not read the ground
+truth labels.
 
 The source collection is
-`/results/ground_truth/quailb/schema_v1/collections/gt_04231c5de83cdf9e7e68fc03849959d6/manifest.json`
-on the `quail-results` volume. The revised LePaRD label sets are under
-`/results/ground_truth/quailb/schema_v1/label_sets/lepard/` on the same
-volume. Each builder query ends with
+`/results/ground_truth/quailb/schema_v1/collections/gt_02ffa2a5720006e8236aa993760e9e29/manifest.json`
+on the `quail-results` volume. Each builder query ends with
 `.select(..., order="by_cost")`, so the benchmark exercises the planner's
 filter and join ordering.
 

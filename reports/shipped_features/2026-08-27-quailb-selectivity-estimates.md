@@ -7,19 +7,15 @@ QUAIL-B builder query asks the planner to use cost based order. Other builder
 queries can request the same behavior with
 `.select(..., order="by_cost")`.
 
-The estimates are the TRUE fraction from the sf0.1 Qwen3 32B fp8 labels.
-IMDB, BioDEX, and FEVER use collection
-`gt_04231c5de83cdf9e7e68fc03849959d6`. LePaRD uses the revised labels for
-corpus `c_350e4ae7332a3dcf6d1292b96fe05a0a`. The benchmark uses the same
-estimates at every scale factor. A benchmark run does not read ground truth
-while planning.
+The estimates are the TRUE fraction from the sf0.1 Qwen3 32B fp8 labels in
+collection `gt_02ffa2a5720006e8236aa993760e9e29` for corpus
+`c_d7a294f1a0d83293b31ed8519df4262e`. The benchmark uses the same estimates
+at every scale factor. A benchmark run does not read ground truth while
+planning.
 
 The source collection is
-`/results/ground_truth/quailb/schema_v1/collections/gt_04231c5de83cdf9e7e68fc03849959d6/manifest.json`
+`/results/ground_truth/quailb/schema_v1/collections/gt_02ffa2a5720006e8236aa993760e9e29/manifest.json`
 on the `quail-results` volume.
-The revised LePaRD label sets are under
-`/results/ground_truth/quailb/schema_v1/label_sets/lepard/` on the same
-volume.
 
 ## Why
 
@@ -29,9 +25,8 @@ cost model.
 
 ## Verification
 
-All 35 queries now plan with `by_cost`. On the sf0.1 corpus, the planner
-changes filter order in 10 queries. It changes join order in IMDB-8 and
-IMDB-9. The unit test checks the selected order rule for every query.
+All 30 default queries now plan with `by_cost`. The unit test checks the
+selected order rule for every query.
 
 With the updated SoL formula, total 4B SoL time across the suite decreases
 from 327.10 to 324.65 seconds. Total 32B SoL time decreases from 2,490.56 to

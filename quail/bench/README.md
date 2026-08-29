@@ -62,8 +62,9 @@ clears KV before each query. vLLM resets its prefix cache before each stock or
 pipelined query. The command saves separate Quail, stock vLLM, and pipelined
 vLLM summaries and one manifest on the `quail-results` volume.
 
-The default `--ground-truth-workload auto` scores each family with its saved
-labels. Use `--ground-truth-workload none` only for an execution smoke test.
+By default, the command loads the active ground truth collection for the
+corpus. Pass `--ground-truth-collection <collection_id>` only when testing a
+specific older collection.
 
 The local JSON and Markdown files use the same UTC timestamp prefix under
 `results/benchmark/`. The PNG uses that prefix under

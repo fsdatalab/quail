@@ -42,12 +42,17 @@ VERIFY_PER_PREDICATE = 16
 VOLUME_ROOT = Path("/results/ground_truth/quailb/schema_v1")
 
 PREDICTION = (
-    "sf=0.1 labels 22 predicates over 5,000-row BioDEX and FEVER "
-    "corpora at sf=1, plus 5,000 known LePaRD citation pairs at sf=1. "
-    "Four H100! GPUs run one workload each. Completed parts resume, "
-    "the deterministic verification sample has no answer differences, "
-    "and the 32B judge finishes without an out-of-memory failure at "
-    "gpu_memory_utilization=0.85."
+    "sf=0.1, 22 predicates: 1,592,987 labels - 1,552,673 Qwen3 32B "
+    "judgments and 40,314 source labels. The 15 filter predicates "
+    "(12,687 labels) run first; the 7 joins produce 1,574,000 model "
+    "judgments, 314 FEVER annotation labels and LePaRD's 40,000 "
+    "source labels. Four H100! GPUs side by side, one per workload; "
+    "BioDEX is the long pole with 1,127,000 report x term join "
+    "prompts (500 reports x 1,127 terms x 2 specs); FEVER runs "
+    "143,500 prompts per spec (500 claims x 287 evidence x 2 specs). "
+    "Each workload fits within one 7,200s container with resume; "
+    "0 answer differences on the deterministic rerun sample; no "
+    "out-of-memory crash at gpu_memory_utilization=0.85"
 )
 
 
@@ -137,33 +142,32 @@ PREDICATES = (
     PredicateSpec(
         "quailb.lepard.excerpt.reasoning_does_not_apply", "LEP1", "lepard",
         "excerpt_reasoning_does_not_apply", "filter", quailb.LEP1,
-        "excerpt", "citation_contexts", "destination_context"),
+        "excerpt", "citations", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.procedural_or_jurisdictional", "LEP2",
         "lepard", "excerpt_procedural_or_jurisdictional", "filter",
-        quailb.LEP2, "excerpt", "citation_contexts", "destination_context"),
+        quailb.LEP2, "excerpt", "citations", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.treats_passage_as_binding", "LEP3", "lepard",
         "excerpt_treats_passage_as_binding", "filter", quailb.LEP3,
-        "excerpt", "citation_contexts", "destination_context"),
+        "excerpt", "citations", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.supports_liability_or_guilt", "LEP4",
         "lepard", "excerpt_supports_liability_or_guilt", "filter",
-        quailb.LEP4, "excerpt", "citation_contexts", "destination_context"),
+        quailb.LEP4, "excerpt", "citations", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.acknowledges_court_disagreement", "LEP5",
         "lepard", "excerpt_acknowledges_court_disagreement", "filter",
-        quailb.LEP5, "excerpt", "citation_contexts", "destination_context"),
+        quailb.LEP5, "excerpt", "citations", "destination_context"),
     PredicateSpec(
         "quailb.lepard.passage.states_general_rule", "LEPS1", "lepard",
         "passage_states_general_rule", "filter", quailb.LEPS1,
-        "passage", "citation_passages", "passage_text"),
+        "passage", "citations", "passage_text"),
     PredicateSpec(
         "quailb.lepard.excerpt.cites_passage", "LEPJOIN", "lepard",
         "excerpt_cites_passage", "join", quailb.LEPJOIN,
-        "excerpt", "citation_contexts", "destination_context",
-        "passage", "citation_passages", "passage_text",
-        "lepard_citation_edge"),
+        "excerpt", "citations", "destination_context",
+        "passage", "citations", "passage_text", "lepard_passage_id"),
 )
 
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
@@ -256,7 +260,7 @@ def _text_hash(value: str) -> str:
 
 def predicate_payload(spec: PredicateSpec) -> dict:
     render = ("filter_document_then_question_v1" if spec.kind == "filter"
-              else "join_anchor_question_then_partners_v2")
+              else "join_arg0_anchor_then_arg1_v1")
     return {
         "schema_version": SCHEMA_VERSION,
         "predicate_key": spec.key,
@@ -306,11 +310,10 @@ SOURCE_SPECS = {
         "revision": quailb.SOURCE_REVISIONS["fever/fever"],
         "rule": "matching evidence_wiki_url; SUPPORTS is true; REFUTES false",
     },
-    "lepard_citation_edge": {
+    "lepard_passage_id": {
         "dataset": "rmahari/LePaRD",
         "revision": quailb.SOURCE_REVISIONS["rmahari/LePaRD"],
-        "rule": ("anchor cited_passage_ids intersects candidate "
-                 "passage_ids"),
+        "rule": "anchor passage_id equals candidate passage_id",
     },
 }
 
@@ -325,8 +328,8 @@ def label_sources(spec: PredicateSpec) -> list[dict]:
         full = _full_hash(payload)
         sources.append({"id": _named_id("s", full), "full_hash": full,
                         "spec": payload})
-    if spec.source_policy == "lepard_citation_edge":
-        payload = SOURCE_SPECS["lepard_citation_edge"]
+    if spec.source_policy == "lepard_passage_id":
+        payload = SOURCE_SPECS["lepard_passage_id"]
         full = _full_hash(payload)
         sources.append({"id": _named_id("s", full), "full_hash": full,
                         "spec": payload})
@@ -426,9 +429,8 @@ CORPUS_COLUMNS = {
     "terms": ("id", "term"),
     "claims": ("id", "claim", "label", "evidence_wiki_url"),
     "evidence": ("id", "text"),
-    "citation_contexts": ("id", "destination_context",
-                          "cited_passage_ids"),
-    "citation_passages": ("id", "passage_text", "passage_ids"),
+    "citations": ("id", "destination_context", "passage_text",
+                  "passage_id"),
 }
 
 
@@ -591,7 +593,7 @@ def _part_bounds(spec: PredicateSpec,
         step = next(n for _table, members, n
                     in filter_groups(workload_specs(spec.workload))
                     if spec in members)
-    elif spec.source_policy == "lepard_citation_edge":
+    elif spec.source_policy == "lepard_passage_id":
         step = 50
     else:
         step = rows_per_call(len(corpus_rows[spec.right_table]))
@@ -863,16 +865,9 @@ def _write_qwen_join_parts(judge: ModelJudge,
               flush=True)
 
 
-def _lepard_source_answer(cited_passage_ids, passage_ids) -> bool:
-    if not isinstance(cited_passage_ids, set):
-        cited_passage_ids = set(cited_passage_ids)
-    return not cited_passage_ids.isdisjoint(passage_ids)
-
-
 def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
                           right_rows: list[dict], identity: dict,
                           corpus_id: str, anchor_batch: int = 50) -> None:
-    right_passage_ids = [set(right["passage_ids"]) for right in right_rows]
     for start in range(0, len(left_rows), anchor_batch):
         end = min(start + anchor_batch, len(left_rows))
         part = _part_path(spec, identity, start, end)
@@ -880,12 +875,11 @@ def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
             continue
         output = []
         for left in left_rows[start:end]:
-            cited_passage_ids = set(left["cited_passage_ids"])
-            for right, passage_ids in zip(right_rows, right_passage_ids):
+            for right in right_rows:
                 output.append(_answer_row(
                     spec, identity, corpus_id, left, right,
-                    _lepard_source_answer(cited_passage_ids, passage_ids),
-                    "lepard_citation_edge", None))
+                    left["passage_id"] == right["passage_id"],
+                    "lepard_passage_id", None))
         _atomic_parquet(part, output)
         results_vol.commit()
         print(f"[judge] LePaRD source anchors {start}:{end}", flush=True)
@@ -1030,7 +1024,7 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
 
 
 @app.function(
-    image=image, gpu="H100", memory=98304, timeout=7200,
+    image=image, gpu="H100!", memory=98304, timeout=7200,
     volumes={"/root/.cache/huggingface": hf_cache,
              "/root/.cache/kernels": kernel_cache,
              "/results": results_vol})
@@ -1078,7 +1072,7 @@ def judge_workload(corpus_id: str, workload: str) -> str:
 
     for spec in join_specs(specs):
         left, right = rows[spec.left_table], rows[spec.right_table]
-        if spec.source_policy == "lepard_citation_edge":
+        if spec.source_policy == "lepard_passage_id":
             _write_lepard_source(spec, left, right, identities[spec.key],
                                  corpus_id_)
             continue

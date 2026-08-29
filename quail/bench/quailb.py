@@ -5,8 +5,6 @@ FEVER, LePaRD), plus two optional PrivacyPolicies queries.
 """
 
 import argparse
-import hashlib
-import heapq
 import json
 import subprocess
 import sys
@@ -21,8 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 DATA_SEED = 20260818
-CACHE_SCHEMA_VERSION = 6
-LEPARD_POSITIVE_PAIRS = 5_000
+CACHE_SCHEMA_VERSION = 5  # bumped: FEVER/BioDEX scale changes
 
 # Exact source snapshots for the benchmark corpus.  The row selection below
 # is deterministic only when the upstream revisions are fixed as well as the
@@ -41,12 +38,12 @@ SOURCE_REVISIONS = {
 
 # Base document counts at sf=1. Only these three scale with sf; the
 # partner tables (aspects, terms) are fixed vocabulary and evidence is
-# bounded by whichever claims get sampled. LePaRD scales sampled positive
-# citation pairs before its two document tables are deduplicated.
+# bounded by whichever claims get sampled.
 SETS = {
     "reviews": 50_000,
     "reports": 5_000,
     "claims": 5_000,
+    "citations": 2_000,
     "policies": 1_000_000,
 }
 
@@ -97,7 +94,7 @@ def split_query_families(ids):
 
 
 def query_family_name(ids):
-    """Return the ground truth workload for one query family."""
+    """Return the name for one query family."""
     prefixes = {query_id.split("-", 1)[0] for query_id in ids}
     if len(prefixes) != 1:
         raise ValueError(
@@ -111,10 +108,6 @@ def query_family_name(ids):
 
 def _n_docs(name, sf):
     return max(8, int(SETS[name] * sf))
-
-
-def _n_lepard_pairs(sf):
-    return max(8, int(LEPARD_POSITIVE_PAIRS * sf))
 
 
 # ------------------------------------------------------- set builders
@@ -194,76 +187,14 @@ def _fever_data(n_claims):
     return claims, page_text
 
 
-def _lepard_pair_priority(dest_id, passage_id):
-    value = f"{DATA_SEED}\0{dest_id}\0{passage_id}".encode()
-    return int.from_bytes(hashlib.blake2b(value, digest_size=16).digest(),
-                          "big")
-
-
-def _sample_lepard_pairs(rows, passages, n):
-    """Select a stable random sample of distinct known citation pairs."""
-    passages = {str(key): str(value).strip()
-                for key, value in passages.items() if value}
-    selected = []
-    selected_rows = {}
-    for dest_id, destination_context, passage_id in rows:
-        dest_id = str(dest_id)
-        passage_id = str(passage_id)
-        key = (dest_id, passage_id)
-        passage_text = passages.get(passage_id)
-        context = str(destination_context).strip()
-        if not passage_text or len(context) < 50:
-            continue
-        if key in selected_rows:
-            prior_context, _passage_text = selected_rows[key]
-            if (len(context), context) > (len(prior_context), prior_context):
-                selected_rows[key] = (context, passage_text)
-            continue
-        priority = _lepard_pair_priority(dest_id, passage_id)
-        item = (-priority, dest_id, passage_id)
-        if len(selected) < n:
-            heapq.heappush(selected, item)
-            selected_rows[key] = (context, passage_text)
-            continue
-        if priority >= -selected[0][0]:
-            continue
-        removed = heapq.heapreplace(selected, item)
-        del selected_rows[(removed[1], removed[2])]
-        selected_rows[key] = (context, passage_text)
-    pairs = []
-    for _priority, dest_id, passage_id in sorted(
-            selected, key=lambda item: (-item[0], item[1], item[2])):
-        context, passage_text = selected_rows[(dest_id, passage_id)]
-        pairs.append((dest_id, passage_id, context, passage_text))
-    return pairs
-
-
-def _lepard_documents(pairs):
-    """Deduplicate the two document columns after sampling pairs."""
-    contexts = {}
-    passages = {}
-    for _dest_id, passage_id, context, passage_text in pairs:
-        contexts.setdefault(context, set()).add(passage_id)
-        passages.setdefault(passage_text, set()).add(passage_id)
-    context_rows = [{
-        "id": f"lc{i}",
-        "destination_context": context,
-        "cited_passage_ids": sorted(passage_ids),
-    } for i, (context, passage_ids) in enumerate(contexts.items())]
-    passage_rows = [{
-        "id": f"lp{i}",
-        "passage_text": passage_text,
-        "passage_ids": sorted(passage_ids),
-    } for i, (passage_text, passage_ids) in enumerate(passages.items())]
-    return context_rows, passage_rows
-
-
 def _lepard_rows(n):
-    """Read LePaRD and sample known positive citation pairs."""
+    """LePaRD citation events: (destination_context, canonical passage
+    text, passage_id) per row, one row per distinct dest_id. Passage
+    text comes from passage_dict.json, not the CSV's own quote column."""
     import json as _json
 
-    import pandas as pd
     from huggingface_hub import hf_hub_download
+    import pandas as pd
 
     csv_path = hf_hub_download("rmahari/LePaRD", "top_10000_data.csv.gz",
                                repo_type="dataset",
@@ -271,17 +202,23 @@ def _lepard_rows(n):
     dict_path = hf_hub_download("rmahari/LePaRD", "passage_dict.json",
                                 repo_type="dataset",
                                 revision=SOURCE_REVISIONS["rmahari/LePaRD"])
-    with open(dict_path) as source:
-        passages = _json.load(source)["data"]
+    passages = _json.load(open(dict_path))["data"]
 
+    rows, seen_dest = [], set()
     cols = ["dest_id", "destination_context", "passage_id"]
-    chunks = pd.read_csv(
-        csv_path, usecols=cols, chunksize=50_000,
-        dtype={"dest_id": "string", "destination_context": "string",
-               "passage_id": "string"})
-    rows = (row for chunk in chunks
-            for row in chunk.loc[:, cols].itertuples(index=False, name=None))
-    return _sample_lepard_pairs(rows, passages, n)
+    for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=50_000):
+        for r in chunk.itertuples(index=False):
+            if r.dest_id in seen_dest:
+                continue
+            text = passages.get(r.passage_id)
+            ctx = str(r.destination_context)
+            if not text or len(ctx) < 50:
+                continue
+            seen_dest.add(r.dest_id)
+            rows.append((ctx, str(text).strip(), r.passage_id))
+            if len(rows) >= n:
+                return rows
+    return rows
 
 
 def _vocab_table(rows, idx, cap=None):
@@ -296,33 +233,23 @@ def _vocab_table(rows, idx, cap=None):
     return vocab[:cap] if cap else vocab
 
 
-def _build_lepard(d, sf, force=False):
-    """Build the two deduplicated LePaRD document tables."""
-    context_path = d / "citation_contexts.parquet"
-    passage_path = d / "citation_passages.parquet"
-    if context_path.exists() and passage_path.exists() and not force:
+def _build_citations(d, sf, force=False):
+    """Build citations.parquet from LePaRD data, idempotent.
+
+    Called from both branches of build_sets so adding a new table
+    backfills existing sf caches.
+    """
+    path = d / "citations.parquet"
+    if path.exists() and not force:
         return
-    expected_pairs = _n_lepard_pairs(sf)
-    pairs = _lepard_rows(expected_pairs)
-    if len(pairs) != expected_pairs:
-        raise ValueError(
-            f"LePaRD provided {len(pairs)} valid citation pairs, expected "
-            f"{expected_pairs}")
-    contexts, passages = _lepard_documents(pairs)
-    context_schema = pa.schema([
-        ("id", pa.string()),
-        ("destination_context", pa.string()),
-        ("cited_passage_ids", pa.list_(pa.string())),
-    ])
-    passage_schema = pa.schema([
-        ("id", pa.string()),
-        ("passage_text", pa.string()),
-        ("passage_ids", pa.list_(pa.string())),
-    ])
-    pq.write_table(pa.Table.from_pylist(contexts, schema=context_schema),
-                   context_path)
-    pq.write_table(pa.Table.from_pylist(passages, schema=passage_schema),
-                   passage_path)
+    n = _n_docs("citations", sf)
+    lep = _lepard_rows(n)
+    pq.write_table(pa.table({
+        "id": [f"lp{i}" for i in range(len(lep))],
+        "destination_context": [r[0] for r in lep],
+        "passage_text": [r[1] for r in lep],
+        "passage_id": [r[2] for r in lep],
+    }), path)
 
 
 def _build_policies(d, sf, force=False):
@@ -365,7 +292,7 @@ def _build_policies(d, sf, force=False):
 
 
 def build_sets(data_dir, sf, lf=1):
-    """All eight tables as parquet files, cached by sf.
+    """All seven tables as parquet files, cached by sf.
 
     lf (load factor) is accepted but unused: documents here are real
     and unpadded, so there's nothing to scale. Kept in the signature
@@ -376,7 +303,6 @@ def build_sets(data_dir, sf, lf=1):
         expected = {
             "cache_schema_version": CACHE_SCHEMA_VERSION,
             "data_seed": DATA_SEED,
-            "lepard_positive_pairs": LEPARD_POSITIVE_PAIRS,
             "scale_factor": sf,
             "source_revisions": SOURCE_REVISIONS,
         }
@@ -385,7 +311,7 @@ def build_sets(data_dir, sf, lf=1):
         except json.JSONDecodeError:
             current = None
         if current == expected:
-            _build_lepard(d, sf)
+            _build_citations(d, sf)
             return d
     d.mkdir(parents=True, exist_ok=True)
 
@@ -426,12 +352,11 @@ def build_sets(data_dir, sf, lf=1):
         "text": [page_text[p] for p in ev_ids],
     }), d / "evidence.parquet")
 
-    _build_lepard(d, sf, force=True)
+    _build_citations(d, sf, force=True)
 
     marker.write_text(json.dumps({
         "cache_schema_version": CACHE_SCHEMA_VERSION,
         "data_seed": DATA_SEED,
-        "lepard_positive_pairs": LEPARD_POSITIVE_PAIRS,
         "scale_factor": sf,
         "source_revisions": SOURCE_REVISIONS,
     }, indent=2, sort_keys=True))
@@ -441,8 +366,7 @@ def build_sets(data_dir, sf, lf=1):
 def register_sets(sess, data_dir):
     from quail.catalog import DocumentProvider
     for name in ("reviews", "aspects", "reports", "terms",
-                "claims", "evidence", "citation_contexts",
-                "citation_passages"):
+                "claims", "evidence", "citations"):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
 
@@ -881,34 +805,34 @@ SCENARIOS = [
 ]
 # Fixed planner inputs from the sf=0.1 Qwen3 32B fp8 labels.
 # They apply at every scale factor so query planning does not read answers.
-SELECTIVITY_ESTIMATE_COLLECTION = "gt_04231c5de83cdf9e7e68fc03849959d6"
-SELECTIVITY_ESTIMATE_LEPARD_CORPUS = "c_350e4ae7332a3dcf6d1292b96fe05a0a"
+SELECTIVITY_ESTIMATE_COLLECTION = "gt_02ffa2a5720006e8236aa993760e9e29"
+SELECTIVITY_ESTIMATE_CORPUS = "c_d7a294f1a0d83293b31ed8519df4262e"
 SELECTIVITY_ESTIMATE_SCALE_FACTOR = 0.1
 FILTER_SELECTIVITY_ESTIMATES = {
     F1: 4004 / 5000,
     F4: 1218 / 5000,
-    F5: 2854 / 5000,
-    F7: 123 / 200,
-    F8: 140 / 200,
-    F9: 128 / 200,
-    F11: 64 / 100,
-    F12: 18 / 100,
-    F13: 37 / 57,
-    LEP1: 14 / 500,
-    LEP2: 229 / 500,
-    LEP3: 51 / 500,
-    LEP4: 31 / 500,
-    LEP5: 14 / 500,
-    LEPS1: 351 / 433,
+    F5: 2853 / 5000,
+    F7: 306 / 500,
+    F8: 341 / 500,
+    F9: 319 / 500,
+    F11: 296 / 500,
+    F12: 69 / 500,
+    F13: 159 / 287,
+    LEP1: 4 / 200,
+    LEP2: 108 / 200,
+    LEP3: 19 / 200,
+    LEP4: 18 / 200,
+    LEP5: 7 / 200,
+    LEPS1: 200 / 200,
 }
 JOIN_SELECTIVITY_ESTIMATES = {
-    DISCUSS_ASPECT: 17681 / 60000,
-    ASPECT_SENTIMENT: 9634 / 60000,
-    REACTION: 4913 / 122800,
-    REACTION_SEVERE: 6161 / 122800,
-    SUPPORT: 28 / 5700,
-    REFUTE: 44 / 5700,
-    LEPJOIN: 500 / 216500,
+    DISCUSS_ASPECT: 17683 / 60000,
+    ASPECT_SENTIMENT: 9635 / 60000,
+    REACTION: 19144 / 563500,
+    REACTION_SEVERE: 22921 / 563500,
+    SUPPORT: 311 / 143500,
+    REFUTE: 477 / 143500,
+    LEPJOIN: 9626 / 40000,
 }
 
 
@@ -1115,42 +1039,39 @@ def queries(sess):
          ("evidence", "e2", "text", REFUTE)],
         ["c.id", "e.id", "e2.id"]))
 
-    # LePaRD uses two deduplicated projections of sampled citation pairs.
+    # LePaRD: one table (`citations`), self-joined. Alias "d" reads
+    # destination_context, alias "s" reads passage_text.
     q["LEP-1"] = ("filter: LEP1 (reasoning does not apply)", make(
-        "citation_contexts", "d", "destination_context", [LEP1], [],
-        ["d.id"]))
-    q["LEP-2"] = ("join: citation contexts x cited passages", make(
-        "citation_contexts", "d", "destination_context", [],
-        [("citation_passages", "s", "passage_text", LEPJOIN)],
-        ["d.id", "s.id"]))
+        "citations", "d", "destination_context", [LEP1], [], ["d.id"]))
+    q["LEP-2"] = ("join: self-join (citations x citations)", make(
+        "citations", "d", "destination_context", [],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
     q["LEP-3"] = ("LEP1 -> join, dependent", make(
-        "citation_contexts", "d", "destination_context", [LEP1],
-        [("citation_passages", "s", "passage_text", LEPJOIN)],
-        ["d.id", "s.id"]))
+        "citations", "d", "destination_context", [LEP1],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
     q["LEP-4"] = ("LEP1 -> LEP2 -> join, 2 filters then 1 join", make(
-        "citation_contexts", "d", "destination_context", [LEP1, LEP2],
-        [("citation_passages", "s", "passage_text", LEPJOIN)],
-        ["d.id", "s.id"]))
+        "citations", "d", "destination_context", [LEP1, LEP2],
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
     q["LEP-5"] = ("LEP1 -> LEP2 -> LEP3 -> join, 3 filters then 1 join",
-                  make("citation_contexts", "d", "destination_context",
+                  make("citations", "d", "destination_context",
                       [LEP1, LEP2, LEP3],
-                      [("citation_passages", "s", "passage_text", LEPJOIN)],
+                      [("citations", "s", "passage_text", LEPJOIN)],
                       ["d.id", "s.id"]))
     q["LEP-6"] = ("LEP1..LEP5 -> join, 5 filters then 1 join", make(
-        "citation_contexts", "d", "destination_context",
+        "citations", "d", "destination_context",
         [LEP1, LEP2, LEP3, LEP4, LEP5],
-        [("citation_passages", "s", "passage_text", LEPJOIN)],
-        ["d.id", "s.id"]))
+        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
 
     q["LEP-7"] = ("2F + 1J: two-sided pushdown - LEP1+LEP2 on excerpts, "
-                  "LEPS1 on passages, each filtered before the join", make(
-        "citation_contexts", "d", "destination_context", [LEP1, LEP2],
-        [("citation_passages", "s", "passage_text", LEPJOIN, [LEPS1])],
+                  "LEPS1 on passages, each filtered before the self-join",
+                  make(
+        "citations", "d", "destination_context", [LEP1, LEP2],
+        [("citations", "s", "passage_text", LEPJOIN, [LEPS1])],
         ["d.id", "s.id"]))
     # LEP-6 without its join: the deepest filter chain in the suite,
     # five stages of KV reuse with no join work mixed in.
     q["LEP-8"] = ("LEP1..LEP5, 5 filters, no join", make(
-        "citation_contexts", "d", "destination_context",
+        "citations", "d", "destination_context",
         [LEP1, LEP2, LEP3, LEP4, LEP5], [], ["d.id"]))
 
     # PrivacyPolicies: conditional on the corpus being available.
@@ -1177,7 +1098,6 @@ def _artifact_stem(started, sf, lf, model):
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
               out_path=None, model="qwen3-4b-fp8",
               accuracy=True, ground_truth_collection=None,
-              ground_truth_workload=None,
               h100_usd_per_hour=3.9492, ground_truth_files=None,
               prediction=None, artifact_stem=None, execute=None):
     """Run all (or selected) QUAIL-B queries through the engine."""
@@ -1189,7 +1109,6 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         add_query_metrics,
         corpus_identity,
         load_ground_truth,
-        load_ground_truth_workload,
         read_corpus,
         summarize_queries,
     )
@@ -1203,19 +1122,10 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     truth = None
     result_files = ground_truth_files or ModalVolumeFiles()
     if accuracy:
-        if ground_truth_workload:
-            truth = load_ground_truth_workload(
-                result_files,
-                scale_factor=sf,
-                corpus_id=corpus["corpus_id"],
-                corpus_full_hash=corpus["corpus_full_hash"],
-                workload=ground_truth_workload,
-            )
-        else:
-            truth = load_ground_truth(
-                result_files, scale_factor=sf,
-                corpus_id=corpus["corpus_id"],
-                collection_id=ground_truth_collection)
+        truth = load_ground_truth(
+            result_files, scale_factor=sf,
+            corpus_id=corpus["corpus_id"],
+            collection_id=ground_truth_collection)
         if truth.corpus_id != corpus["corpus_id"]:
             raise ValueError(
                 f"benchmark corpus {corpus['corpus_id']} does not match "
@@ -1246,7 +1156,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         corpus_id=corpus["corpus_id"],
         selectivity_estimates=dict(
             source_collection=SELECTIVITY_ESTIMATE_COLLECTION,
-            lepard_source_corpus=SELECTIVITY_ESTIMATE_LEPARD_CORPUS,
+            source_corpus=SELECTIVITY_ESTIMATE_CORPUS,
             source_scale_factor=SELECTIVITY_ESTIMATE_SCALE_FACTOR,
             method=("TRUE labels divided by all labels, fixed across "
                     "scale factors")),
