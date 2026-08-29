@@ -55,8 +55,18 @@ stated before the run: the 32B head lands on the CPU with allocated
 memory within 0.3 GB of the 32.81 GB resident figure, the enlarged
 arena allocates next to the weights, the 4B keeps its tied head on
 the GPU, and 48 planted-flag filter answers per attention path
-(unified, merge_quant, unpaged) are all correct on both models. The
-cell writes its records to
-`/results/ablations/head_residency_qwen3-4b-fp8.json` and
+(unified, merge_quant, unpaged) are all correct on both models.
+
+Measured on H100, one run per model (function calls
+fc-01M15EFSFTFPCM7BJNK0VYDM4X and fc-01M15EHF09T98FC7VQEM39PRTV):
+
+- 32B: head on the CPU; 30.52 GiB allocated after load, against the
+  30.56 GiB the resident figure converts to (0.05 GiB apart); arena
+  allocated at 103,156 tokens with a 57.8 GiB run peak; 48/48
+  answers correct on each of the three paths.
+- 4B: head on the GPU (tied); 4.15 GiB allocated after load; arena
+  at the unchanged 345,974 tokens; 48/48 on each path.
+
+Records: `/results/ablations/head_residency_qwen3-4b-fp8.json` and
 `/results/ablations/head_residency_qwen3-32b-fp8.json` on the
 `quail-results` volume.
