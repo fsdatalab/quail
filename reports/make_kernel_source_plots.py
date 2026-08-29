@@ -110,10 +110,22 @@ def profile_panel(workdir):
     path = prof["attention_path"]
     order = ["gemm", "attention", "quail_fused", "inductor",
              "vllm_elementwise", "quant", "merge", "copies", "other"]
-    names = {"gemm": "matmuls", "attention": "attention",
-             "quail_fused": "our fused", "inductor": "Inductor",
-             "vllm_elementwise": "vLLM ops", "quant": "group quant",
-             "merge": "merge", "copies": "copies", "other": "other"}
+    # in-bar labels name the WORK; the row label and the legend name
+    # who provides the kernels. The three middle buckets are the same
+    # work (norms, rotary, silu) from three providers.
+    work = {"gemm": "matmuls", "attention": "attention",
+            "quail_fused": "norms, rope, silu",
+            "inductor": "norms, rope, silu",
+            "vllm_elementwise": "norms, rope, silu",
+            "quant": "group quant", "merge": "merge",
+            "copies": "copies", "other": "other"}
+    legend = {"gemm": "matmuls (DeepGEMM)",
+              "attention": "attention (FA3)",
+              "quail_fused": "our fused Triton kernels",
+              "inductor": "Inductor-generated kernels",
+              "vllm_elementwise": "vLLM ops",
+              "quant": "group quant", "merge": "merge",
+              "copies": "copies", "other": "other"}
     palette = {"gemm": GRAY, "attention": ORANGE,
                "quail_fused": GREEN, "inductor": "#7FA6D9",
                "vllm_elementwise": "#9A9A9A", "quant": "#C9A26B",
@@ -131,21 +143,24 @@ def profile_panel(workdir):
                 continue
             ax.barh(i, value, left=left, color=palette[cat],
                     height=0.6,
-                    label=(names[cat] if cat not in seen else None))
+                    label=(legend[cat] if cat not in seen else None))
             if cat not in seen:
                 seen.append(cat)
             # a two-line label fits only in wide segments; the
             # legend identifies the narrow ones
             if value >= 1.0:
-                ax.annotate(f"{names[cat]}\n{value:.2f}",
+                ax.annotate(f"{work[cat]}\n{value:.2f}",
                             (left + value / 2, i), ha="center",
                             va="center", fontsize=7.4)
             left += value
         ax.annotate(f"  {left:.2f} total", (left, i), va="center",
                     fontsize=8.5)
     ax.set_yticks(range(len(sources)))
+    # the x label carries the attention path, so rows carry only the
+    # kernel source
     ax.set_yticklabels(
-        [SOURCE_LABELS[s].format(path=path) for s in sources],
+        [SOURCE_LABELS[s].format(path=path).replace(
+            f" ({path})", "") for s in sources],
         fontsize=8.6)
     ax.invert_yaxis()
     ax.set_xlabel(f"GPU kernel microseconds per fresh token "

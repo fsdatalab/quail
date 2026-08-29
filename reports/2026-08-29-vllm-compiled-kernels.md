@@ -198,6 +198,20 @@ Readings:
   quail 2.08, vllm_compiled 4.58, vllm_ops 4.92 us/token. The
   GPU-time deltas account for 97-98% of the measured wall deltas —
   all three configurations are GPU-bound.
+- The matmul bucket reads 0.31-0.36 us/token higher on the quail row
+  even though all three rows launch the same DeepGEMM kernels the
+  same number of times (3,024 launches, identical shapes) on
+  near-identical token counts, sequentially on the same GPU in the
+  same container. The effect is systematic — the earlier profiled
+  run on the deleted workload showed the same size — so it is not
+  run-to-run noise. The most likely cause is clock behavior: the
+  quail configuration keeps the GPU on back-to-back compute with few
+  memory-bound gaps, which holds sustained power higher and boost
+  clocks slightly lower while its matmuls run. A rerun with locked
+  GPU clocks would settle it; not done here. Whichever way it
+  resolves, it works against the fused kernels in this table (it
+  inflates the quail total), and the headline wall-clock numbers
+  come from separate unprofiled runs.
 
 ## Scope notes
 
