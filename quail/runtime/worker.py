@@ -2,6 +2,7 @@
 returns raw answer rows.
 """
 
+import gc
 import itertools
 import json
 import os
@@ -42,6 +43,41 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
 # execute() calls, which is what makes a session's later queries boot
 # in milliseconds.
 _BOOTED = {}      # model name -> dict(model, arena, pipeline)
+
+
+def _release_vllm_parallel_state() -> None:
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+    )
+
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+def release_booted_models() -> dict:
+    """Release Quail GPU state before another engine uses this process."""
+    import torch
+
+    released = len(_BOOTED)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _BOOTED.clear()
+    _release_vllm_parallel_state()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    return {
+        "models_released": released,
+        "vllm_parallel_state_released": True,
+        "cuda_allocated_bytes": (
+            int(torch.cuda.memory_allocated())
+            if torch.cuda.is_available() else 0),
+        "cuda_reserved_bytes": (
+            int(torch.cuda.memory_reserved())
+            if torch.cuda.is_available() else 0),
+    }
 
 
 def _execute_payload(payload: dict) -> dict:

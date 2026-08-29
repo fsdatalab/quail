@@ -2,11 +2,13 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 import quail
 from quail.bench.quailb import (
     ASPECTS,
     LEPARD_POSITIVE_PAIRS,
+    QUERY_FAMILY_WORKLOADS,
     QUERY_ORDER,
     SCENARIOS,
     SETS,
@@ -14,12 +16,15 @@ from quail.bench.quailb import (
     _n_lepard_pairs,
     _sample_lepard_pairs,
     queries,
+    query_family_name,
     register_privacy_sets,
     register_sets,
     split_query_ids,
+    split_query_families,
 )
 from quail.planner.decide import _collect
 from quail.planner.plan import EngineConfig, Refusal
+from quail.bench.quailb_parallel import _family_workload
 
 
 def _standin_sets(tmp_path):
@@ -155,3 +160,33 @@ def test_parallel_query_split_matches_stock_vllm():
         QUERY_ORDER[16:23],
         QUERY_ORDER[23:30],
     )
+
+
+def test_query_family_split_matches_benchmark_catalog():
+    assert QUERY_FAMILY_WORKLOADS == {
+        "IMDB": "imdb",
+        "BIO": "biodex",
+        "FEV": "fever",
+        "LEP": "lepard",
+    }
+    assert split_query_families(QUERY_ORDER) == (
+        QUERY_ORDER[0:10],
+        QUERY_ORDER[10:13],
+        QUERY_ORDER[13:22],
+        QUERY_ORDER[22:30],
+    )
+    assert query_family_name(QUERY_ORDER[0:10]) == "imdb"
+
+
+def test_query_family_rejects_mixed_or_unknown_queries():
+    with pytest.raises(ValueError, match="expected one query family"):
+        query_family_name(("IMDB-1", "BIO-1"))
+    with pytest.raises(ValueError, match="unknown query family"):
+        split_query_families(("OTHER-1",))
+
+
+def test_family_workload_defaults_to_matching_labels():
+    assert _family_workload("auto", "imdb") == "imdb"
+    assert _family_workload("", "fever") == "fever"
+    assert _family_workload("lepard", "lepard") == "lepard"
+    assert _family_workload("none", "imdb") is None

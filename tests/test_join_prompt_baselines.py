@@ -7,6 +7,7 @@ from baselines.stock import build_join_grouped_inputs, run_filter_chain
 from baselines.old_stock.operators import Join
 from baselines.stock_vllm.run import (
     _baseline_configuration,
+    _baseline_schedule,
     _filter_chain_inputs,
     _filter_prompts,
     _paired_baseline_order,
@@ -198,6 +199,20 @@ def test_paired_order_alternates_by_query_and_rep():
         "stock_vllm", "pipelined_vllm")
 
 
+def test_method_major_schedule_finishes_each_baseline_first():
+    assert _baseline_schedule(
+        ["IMDB-1", "IMDB-2"],
+        ("stock_vllm", "pipelined_vllm"),
+        rep=0,
+        method_order="method-major",
+    ) == [
+        ("stock_vllm", "IMDB-1"),
+        ("stock_vllm", "IMDB-2"),
+        ("pipelined_vllm", "IMDB-1"),
+        ("pipelined_vllm", "IMDB-2"),
+    ]
+
+
 @pytest.mark.parametrize(("query_ids", "workload"), [
     (["IMDB-1", "IMDB-10"], "imdb"),
     (["BIO-1"], "biodex"),
@@ -210,7 +225,7 @@ def test_paired_auto_ground_truth_follows_query_set(query_ids, workload):
 
 
 def test_query_set_name_rejects_mixed_query_sets():
-    with pytest.raises(ValueError, match="expected one query set"):
+    with pytest.raises(ValueError, match="expected one query family"):
         _query_set_name(["IMDB-1", "BIO-1"])
 
 

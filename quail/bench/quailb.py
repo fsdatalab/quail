@@ -62,6 +62,13 @@ QUERY_ORDER = (
     *(f"LEP-{i}" for i in range(1, 9)),
 )
 
+QUERY_FAMILY_WORKLOADS = {
+    "IMDB": "imdb",
+    "BIO": "biodex",
+    "FEV": "fever",
+    "LEP": "lepard",
+}
+
 
 def split_query_ids(ids, containers):
     """Split query IDs into the same equal chunks as stock vLLM."""
@@ -73,6 +80,33 @@ def split_query_ids(ids, containers):
         chunks.append(tuple(ids[start:start + size]))
         start += size
     return tuple(chunk for chunk in chunks if chunk)
+
+
+def split_query_families(ids):
+    """Return one ordered query group for each QUAIL-B family."""
+    groups = tuple(
+        tuple(query_id for query_id in ids
+              if query_id.split("-", 1)[0] == prefix)
+        for prefix in QUERY_FAMILY_WORKLOADS
+    )
+    assigned = {query_id for group in groups for query_id in group}
+    unknown = [query_id for query_id in ids if query_id not in assigned]
+    if unknown:
+        raise ValueError(f"unknown query family for {unknown}")
+    return tuple(group for group in groups if group)
+
+
+def query_family_name(ids):
+    """Return the ground truth workload for one query family."""
+    prefixes = {query_id.split("-", 1)[0] for query_id in ids}
+    if len(prefixes) != 1:
+        raise ValueError(
+            f"expected one query family, found {sorted(prefixes)}")
+    prefix = prefixes.pop()
+    try:
+        return QUERY_FAMILY_WORKLOADS[prefix]
+    except KeyError as error:
+        raise ValueError(f"unknown query family {prefix!r}") from error
 
 
 def _n_docs(name, sf):

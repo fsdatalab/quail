@@ -1,4 +1,4 @@
-"""Stock vLLM baselines for all 35 QUAIL-B queries.
+"""Stock vLLM baselines for the default QUAIL-B queries.
 
 Runs on H100s via Modal. ``stock_vllm`` submits one filter stage at a
 time. ``pipelined_vllm`` submits the next filter for each document as
@@ -28,6 +28,8 @@ import uuid
 from pathlib import Path
 
 import modal
+
+from quail.bench.quailb import QUERY_ORDER
 
 app = modal.App("quail-milestone1")
 
@@ -68,6 +70,7 @@ MODELS = {
 }
 
 BASELINES = ("stock_vllm", "pipelined_vllm")
+BASELINE_ORDERS = ("alternating-by-query", "method-major")
 
 
 def _baseline_configuration(name):
@@ -86,6 +89,27 @@ def _paired_baseline_order(rep: int, query_position: int) -> tuple[str, str]:
     if (rep + query_position) % 2:
         return tuple(reversed(BASELINES))
     return BASELINES
+
+
+def _baseline_schedule(ids, baselines, rep, method_order):
+    """Return the ordered baseline and query pairs for one repetition."""
+    if method_order not in BASELINE_ORDERS:
+        raise ValueError(
+            f"method_order must be one of {BASELINE_ORDERS}; "
+            f"got {method_order!r}")
+    if method_order == "method-major":
+        return [
+            (baseline, query_id)
+            for baseline in baselines
+            for query_id in ids
+        ]
+    return [
+        (baseline, query_id)
+        for query_position, query_id in enumerate(ids)
+        for baseline in (
+            _paired_baseline_order(rep, query_position)
+            if len(baselines) == 2 else baselines)
+    ]
 
 
 def _vllm_filter_capacity(llm):
@@ -107,18 +131,6 @@ def _vllm_filter_capacity(llm):
         kv_cache_dtype=str(cache.cache_dtype),
     )
 
-QUERY_ORDER = [
-    "IMDB-1", "IMDB-2", "IMDB-3", "IMDB-4", "IMDB-5",
-    "IMDB-6", "IMDB-7", "IMDB-8", "IMDB-9", "IMDB-10",
-    "BIO-1", "BIO-2", "BIO-3", "BIO-4", "BIO-5",
-    "BIO-6", "BIO-7", "BIO-8",
-    "FEV-1", "FEV-2", "FEV-3", "FEV-4", "FEV-5", "FEV-6",
-    "FEV-7", "FEV-8", "FEV-9",
-    "LEP-1", "LEP-2", "LEP-3", "LEP-4", "LEP-5", "LEP-6",
-    "LEP-7", "LEP-8",
-]
-
-
 def _split_queries(ids, n):
     """Split query IDs into n roughly equal chunks."""
     k, m = divmod(len(ids), n)
@@ -133,35 +145,16 @@ def _split_queries(ids, n):
 
 def _split_query_sets(ids):
     """Put each QUAIL-B query set in its own chunk."""
+    from quail.bench.quailb import split_query_families
 
-    prefixes = ("IMDB", "BIO", "FEV", "LEP")
-    chunks = [[query_id for query_id in ids
-               if query_id.split("-", 1)[0] == prefix]
-              for prefix in prefixes]
-    assigned = {query_id for chunk in chunks for query_id in chunk}
-    unknown = [query_id for query_id in ids if query_id not in assigned]
-    if unknown:
-        raise ValueError(f"unknown query set for {unknown}")
-    return [chunk for chunk in chunks if chunk]
+    return [list(group) for group in split_query_families(ids)]
 
 
 def _query_set_name(ids):
     """Return the ground truth workload name for one query-set chunk."""
+    from quail.bench.quailb import query_family_name
 
-    workloads = {
-        "IMDB": "imdb",
-        "BIO": "biodex",
-        "FEV": "fever",
-        "LEP": "lepard",
-    }
-    prefixes = {query_id.split("-", 1)[0] for query_id in ids}
-    if len(prefixes) != 1:
-        raise ValueError(f"expected one query set, found {sorted(prefixes)}")
-    prefix = prefixes.pop()
-    try:
-        return workloads[prefix]
-    except KeyError as error:
-        raise ValueError(f"unknown query set {prefix!r}") from error
+    return query_family_name(ids)
 
 
 def _paired_ground_truth_workload(requested, ids):
@@ -171,7 +164,7 @@ def _paired_ground_truth_workload(requested, ids):
 
 
 def define_all_queries():
-    """All 35 QUAIL-B queries.
+    """QUAIL-B query definitions used by the vLLM baselines.
 
     Each query is a dict with:
         aliases: {alias: (table_name, text_col)}
@@ -777,14 +770,15 @@ def ensure_data(sf: float):
 def _run_query_batches(model: str, sf: float, query_ids_csv: str,
                        reps: int, ground_truth_workload: str,
                        prediction: str, baselines: tuple[str, ...],
-                       paired_run_id: str = "") -> dict:
+                       paired_run_id: str = "", lf: int = 1,
+                       method_order: str = "alternating-by-query") -> dict:
     """Boot one LLM and run one or both baseline configurations.
 
     Args:
         model: Key into MODELS dict.
         sf: Scale factor for QUAIL-B data.
         query_ids_csv: Comma-separated query IDs to run.
-            Empty string means all 35.
+            Empty string means all default queries.
         reps: Number of repetitions.
 
     Returns:
@@ -806,9 +800,13 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
         raise ValueError("at least one baseline is required")
     for baseline in baselines:
         _baseline_configuration(baseline)
+    if method_order not in BASELINE_ORDERS:
+        raise ValueError(
+            f"method_order must be one of {BASELINE_ORDERS}; "
+            f"got {method_order!r}")
 
     hf_name = MODELS[model]
-    data_path = build_sets(DATA_DIR, sf)
+    data_path = build_sets(DATA_DIR, sf, lf)
 
     tokenizer = AutoTokenizer.from_pretrained(hf_name)
     true, false = true_false_ids(tokenizer)
@@ -878,36 +876,36 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
     execution_order = []
     for rep in range(reps):
         rep_results = {baseline: [] for baseline in baselines}
-        rep_order = []
-        for query_position, qid in enumerate(ids):
-            order = (_paired_baseline_order(rep, query_position)
-                     if len(baselines) == 2 else baselines)
-            rep_order.append({"query": qid, "order": list(order)})
-            for baseline in order:
-                reset = llm.reset_prefix_cache()
-                if reset is False:
-                    raise RuntimeError(
-                        "vLLM refused to reset its prefix cache before "
-                        f"{baseline} {qid}")
-                filter_submission = _baseline_configuration(baseline)
-                print(f"\n[{baseline}] rep={rep} {qid}", flush=True)
-                try:
-                    entry = run_query(
-                        llm, sp, true, tokenizer,
-                        qid, queries[qid], DATA_DIR, sf,
-                        evaluator=evaluator,
-                        quail_query=(evaluation_queries[qid][1]()
-                                     if evaluator else None),
-                        filter_submission=filter_submission,
-                        filter_capacity=filter_capacity)
-                except Exception as e:                      # noqa: BLE001
-                    entry = dict(query=qid,
-                                 error=f"{type(e).__name__}: {e}")
-                    print(f"  ERROR: {e}", flush=True)
-                rep_results[baseline].append(entry)
+        schedule = _baseline_schedule(
+            ids, baselines, rep, method_order)
+        for baseline, qid in schedule:
+            reset = llm.reset_prefix_cache()
+            if reset is False:
+                raise RuntimeError(
+                    "vLLM refused to reset its prefix cache before "
+                    f"{baseline} {qid}")
+            filter_submission = _baseline_configuration(baseline)
+            print(f"\n[{baseline}] rep={rep} {qid}", flush=True)
+            try:
+                entry = run_query(
+                    llm, sp, true, tokenizer,
+                    qid, queries[qid], DATA_DIR, sf,
+                    evaluator=evaluator,
+                    quail_query=(evaluation_queries[qid][1]()
+                                 if evaluator else None),
+                    filter_submission=filter_submission,
+                    filter_capacity=filter_capacity)
+            except Exception as e:                      # noqa: BLE001
+                entry = dict(query=qid,
+                             error=f"{type(e).__name__}: {e}")
+                print(f"  ERROR: {e}", flush=True)
+            rep_results[baseline].append(entry)
         for baseline in baselines:
             all_results[baseline].append(rep_results[baseline])
-        execution_order.append(rep_order)
+        execution_order.append([
+            {"baseline": baseline, "query": qid}
+            for baseline, qid in schedule
+        ])
 
     reports = {}
     for baseline in baselines:
@@ -920,7 +918,7 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
                  "product per join"
         )
         report = dict(
-            baseline=baseline, model=model, hf_name=hf_name, sf=sf,
+            baseline=baseline, model=model, hf_name=hf_name, sf=sf, lf=lf,
             boot=boot, reps=reps,
             prediction=prediction,
             ground_truth_workload=(ground_truth_workload or None),
@@ -943,6 +941,7 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
                 "id": paired_run_id,
                 "same_model_process": True,
                 "prefix_cache_reset_before_each_configuration": True,
+                "method_order": method_order,
                 "execution_order": execution_order,
             }
         reports[baseline] = report
@@ -1012,6 +1011,7 @@ def _merge_reports(batch_reports, n_containers):
         model=base["model"],
         hf_name=base["hf_name"],
         sf=base["sf"],
+        lf=base.get("lf", 1),
         boots=boots,
         reps=reps,
         containers=n_containers,

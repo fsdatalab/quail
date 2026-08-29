@@ -42,9 +42,10 @@ Each command runs every selected query once. It reads ground truth before
 the timers start. It reports runtime, H100 cost, tokens, documents per second,
 answer accuracy, and final-row precision, recall, and F1.
 
-To match the stock vLLM parallel run, split the queries across four H100!
-containers. Each container loads one model and runs 7 or 8 queries. The four
-containers use the same query chunks as stock vLLM.
+To compare all three methods, use one H100! container for each query family.
+Each container runs Quail for its family, releases Quail GPU memory, then loads
+vLLM once. It runs every stock vLLM query, then every pipelined vLLM query.
+Quail and both baselines use the same data and saved labels.
 
 ```bash
 run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
@@ -52,14 +53,17 @@ run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
 uv run modal run -m quail.bench.quailb_parallel \
   --sf 0.1 \
   --model qwen3-4b-fp8 \
-  --containers 4 \
   --prediction "State the expected runtime and accuracy." \
   2>&1 | tee "$run_log"
 ```
 
-The command prints the Modal function call ID for each query chunk. Each chunk
-runs as one Modal call, so its model stays loaded until every query in that
-chunk finishes. Quail clears query KV before the next query starts.
+The command prints one Modal function call ID for each query family. Quail
+clears KV before each query. vLLM resets its prefix cache before each stock or
+pipelined query. The command saves separate Quail, stock vLLM, and pipelined
+vLLM summaries and one manifest on the `quail-results` volume.
+
+The default `--ground-truth-workload auto` scores each family with its saved
+labels. Use `--ground-truth-workload none` only for an execution smoke test.
 
 The local JSON and Markdown files use the same UTC timestamp prefix under
 `results/benchmark/`. The PNG uses that prefix under
