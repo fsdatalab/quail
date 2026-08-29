@@ -453,6 +453,87 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
     return _write(report, "kernel_source_probe")
 
 
+# ----------------------------------------------- stock kernel inventory
+
+@app.function(timeout=3600, **GPU_KW)
+def stock_kernels(n_docs: int = 512) -> str:
+    """Boot stock vLLM at its defaults, profile one prefill-heavy
+    pass, and record which kernels its compiled graph actually runs
+    between the GEMMs, plus the resolved compilation config. This is
+    the ground truth the vllm_compiled rung mirrors."""
+    import sys
+
+    sys.path.insert(0, "/root/gpu_tests")
+
+    import torch
+    from vllm import LLM, SamplingParams
+
+    from corpus import MODEL, build_corpus
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    body_ids, q_ids, _ = build_corpus(tokenizer, n_docs)
+    prompts = [dict(prompt_token_ids=b + q_ids[0]) for b in body_ids]
+
+    llm = LLM(model=MODEL, gpu_memory_utilization=0.92,
+              enable_prefix_caching=False, disable_log_stats=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1,
+                              min_tokens=1)
+    config = llm.llm_engine.vllm_config
+    comp = config.compilation_config
+    report = dict(
+        cell="stock_kernels",
+        model=MODEL,
+        optimization_level=int(config.optimization_level),
+        compilation_mode=str(comp.mode),
+        custom_ops=list(comp.custom_ops),
+        enabled_custom_ops=dict(comp.enabled_custom_ops),
+        disabled_custom_ops=dict(comp.disabled_custom_ops),
+        pass_config={
+            k: bool(getattr(comp.pass_config, k))
+            for k in ("fuse_norm_quant", "fuse_act_quant",
+                      "fuse_attn_quant", "enable_qk_norm_rope_fusion")
+            if getattr(comp.pass_config, k, None) is not None},
+        use_deep_gemm_e8m0=None,
+        kernels=[])
+    try:
+        from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+        report["use_deep_gemm_e8m0"] = bool(is_deep_gemm_e8m0_used())
+    except Exception as exc:
+        report["use_deep_gemm_e8m0"] = repr(exc)
+
+    llm.generate(prompts[:32], sampling)   # warm outside the profile
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        llm.generate(prompts, sampling)
+    rows = []
+    total_us = 0.0
+    for ev in prof.key_averages():
+        cuda_us = getattr(ev, "self_device_time_total", 0) or \
+            getattr(ev, "self_cuda_time_total", 0)
+        if not cuda_us:
+            continue
+        if (ev.key.startswith(("_C::", "aten::", "vllm::", "_c10d"))
+                or "Command Buffer" in ev.key):
+            continue
+        total_us += cuda_us
+        rows.append((round(cuda_us / 1e3, 2), ev.count, ev.key[:110]))
+    rows.sort(reverse=True)
+    report["cuda_busy_s"] = round(total_us / 1e6, 2)
+    report["kernels"] = [dict(ms=ms, n=n, name=k)
+                         for ms, n, k in rows[:60]]
+    return _write(report, "kernel_source_stock")
+
+
+@app.local_entrypoint()
+def run_stock_kernels(n_docs: int = 512):
+    handle = stock_kernels.spawn(n_docs)
+    print(f"stock_kernels fc: {handle.object_id}", flush=True)
+    print(handle.get())
+
+
 # ------------------------------------------------------- measured cell
 
 PREDICTIONS = {
