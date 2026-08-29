@@ -171,47 +171,49 @@ Figure: `plots/kernel_source_profile.png`.
 
 | category | quail (unified) | vllm_ops (unified) | vllm_compiled (unified) |
 |---|---|---|---|
-| matrix multiplies (DeepGEMM) | 5.42 | 5.06 | 5.11 |
-| attention (FlashAttention-3) | 0.68 | 0.63 | 0.64 |
-| our fused Triton kernels | 1.46 | — | — |
-| vLLM norm, rotary, silu ops | 0.00 | 2.56 | 0.00 |
-| Inductor-generated kernels | — | — | 2.67 |
-| standalone group-quant | 0.40 | 1.67 | 1.70 |
-| copies | 0.22 | 0.69 | 0.21 |
-| **total** | **8.17** | **10.61** | **10.34** |
+| matrix multiplies (DeepGEMM) | 5.58 | 5.25 | 5.32 |
+| attention (FlashAttention-3) | 0.70 | 0.65 | 0.66 |
+| our fused Triton kernels | 1.49 | — | — |
+| vLLM norm, rotary, silu ops | 0.00 | 2.58 | 0.00 |
+| Inductor-generated kernels | — | — | 2.76 |
+| standalone group-quant | 0.41 | 1.71 | 1.77 |
+| copies | 0.22 | 0.70 | 0.22 |
+| **total** | **8.41** | **10.89** | **10.73** |
 
 Readings:
 
 - The standalone group-quant is the cost torch.compile does not
-  remove: 1.70 us/token in the compiled set against quail's 0.40
+  remove: 1.77 us/token in the compiled set against quail's 0.41
   (our one remaining quant, the attention output feeding o_proj).
   Fusing the other three quant passes into their producers is most
   of our win.
 - Inductor's fusion is a wash on the ops themselves: it replaces
-  2.56 us/token of vLLM norm, rotary, and silu*mul kernels with 2.67
+  2.58 us/token of vLLM norm, rotary, and silu*mul kernels with 2.76
   us/token of generated kernels — its silu*mul kernel alone is about
   twice as slow as vLLM's hand-written CUDA op. What torch.compile
   actually recovers is the data movement around the unfused
-  sequence: the copies bucket falls from 0.69 to 0.21 (mostly the
+  sequence: the copies bucket falls from 0.70 to 0.22 (mostly the
   two contiguous copies per layer the vLLM q/k path needs).
 - Small-kernel work in total (everything but matmuls and attention):
-  quail 2.08, vllm_compiled 4.58, vllm_ops 4.92 us/token. The
-  GPU-time deltas account for 97-98% of the measured wall deltas —
-  all three configurations are GPU-bound.
-- The matmul bucket reads 0.31-0.36 us/token higher on the quail row
+  quail 2.12, vllm_compiled 4.75, vllm_ops 4.99 us/token. The
+  GPU-time deltas match the measured wall deltas within a few
+  percent — all three configurations are GPU-bound.
+- The matmul bucket reads about 0.3 us/token higher on the quail row
   even though all three rows launch the same DeepGEMM kernels the
   same number of times (3,024 launches, identical shapes) on
   near-identical token counts, sequentially on the same GPU in the
-  same container. The effect is systematic — the earlier profiled
-  run on the deleted workload showed the same size — so it is not
-  run-to-run noise. The most likely cause is clock behavior: the
-  quail configuration keeps the GPU on back-to-back compute with few
-  memory-bound gaps, which holds sustained power higher and boost
-  clocks slightly lower while its matmuls run. A rerun with locked
-  GPU clocks would settle it; not done here. Whichever way it
-  resolves, it works against the fused kernels in this table (it
-  inflates the quail total), and the headline wall-clock numbers
-  come from separate unprofiled runs.
+  same container. The cause was measured, not guessed: the SM clock,
+  sampled every 50 ms during an unprofiled run of each source. All
+  three configurations sit at the 700 W power limit (686-696 W
+  mean), and the GPU's power governor holds the quail run at a mean
+  1427 MHz against 1645 (vllm_ops) and 1621 (vllm_compiled). Packing
+  the same work into fewer, denser compute kernels leaves the
+  governor less headroom, so the same matmul kernel takes about 6%
+  longer per launch under quail. Pinning the clock to equalize the
+  comparison was refused by the driver in this environment (recorded
+  in the data file). The effect works against the fused kernels in
+  this table, and the headline wall-clock numbers come from separate
+  unprofiled runs.
 
 ## Scope notes
 
