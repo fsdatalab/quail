@@ -326,18 +326,22 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
     """Per-kernel parity of the two vLLM rungs against the quail rung,
     plus torch.compile sanity for the q/k segment, on real weights and
     random activations. Runs before the measured cells."""
+    import sys
     import time
+
+    sys.path.insert(0, "/root/gpu_tests")
 
     import torch
 
-    from quail.executor.loop import run_filter, run_join
+    from quail.executor.loop import pack_chunk, run_filter, run_join
 
-    (spec, _, arena, pipeline, async_ans, budget,
+    (spec, tokenizer, arena, pipeline, async_ans, budget,
      _) = _boot(model)
     torch.manual_seed(20260829)
     report = dict(cell="kernel_source_probe", model=spec.name,
                   vllm_ops={}, vllm_compiled={}, join_answers={},
-                  filter_answers={})
+                  filter_answers={}, filter_real={},
+                  unified_chunk={})
 
     n = 4096
     h = spec.hidden
@@ -472,6 +476,51 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
                 [[questions[0]] * 24], budget)
             report["join_answers"][source] = sum(
                 sum(v) for v in answers[0].values())
+
+        # real text with planted flags: margins are wide, so a broken
+        # unified path fails this while kernel rounding drift does not
+        from corpus import build_corpus
+        body_ids, q_ids, flags = build_corpus(tokenizer, 32)
+        for source in KERNEL_SOURCES:
+            pipeline.kernel_source = source
+            pipeline.attention_mode = "unified"
+            answers, _, _ = run_filter(
+                torch, arena, pipeline, async_ans, body_ids,
+                q_ids[:2], budget, arena_writes=True)
+            report["filter_real"][source] = dict(
+                answered=sum(len(v) for v in answers.values()),
+                wrong=_wrong_count(answers, flags))
+
+        # one paged unified chunk, tensor level: the final-position
+        # hidden states each source produces, compared with quail's
+        outs = {}
+        for source in KERNEL_SOURCES:
+            pipeline.kernel_source = source
+            pipeline.attention_mode = "unified"
+            for i in range(4):
+                got = arena.activate(
+                    ("probe", i), len(body_ids[i]),
+                    capacity_tokens=len(body_ids[i]) + len(q_ids[0]))
+                assert got is not None
+            chunk = pack_chunk(
+                torch, arena,
+                [dict(key=("probe", i), prefix=body_ids[i],
+                      f=len(body_ids[i]), suffixes=[q_ids[0]])
+                 for i in range(4)],
+                attention_mode="unified")
+            outs[source] = pipeline.forward_chunk(chunk).clone()
+            for i in range(4):
+                arena.free_key(("probe", i))
+        for source in ("vllm_ops", "vllm_compiled"):
+            delta = (outs[source].to(torch.float32)
+                     - outs["quail"].to(torch.float32))
+            report["unified_chunk"][source] = dict(
+                max_abs=float(delta.abs().max().item()),
+                mean_abs=float(delta.abs().mean().item()),
+                nans=int(torch.isnan(outs[source]).sum().item()),
+                ref_mean_abs=float(
+                    outs["quail"].to(torch.float32)
+                    .abs().mean().item()))
     torch.cuda.synchronize()
     return _write(report, "kernel_source_probe")
 
