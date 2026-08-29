@@ -10,6 +10,7 @@ from baselines.stock_vllm.run import (
     _baseline_schedule,
     _filter_chain_inputs,
     _filter_prompts,
+    _join_records_by_written_position,
     _paired_baseline_order,
     _paired_ground_truth_workload,
     _query_set_name,
@@ -211,6 +212,38 @@ def test_method_major_schedule_finishes_each_baseline_first():
         ("pipelined_vllm", "IMDB-1"),
         ("pipelined_vllm", "IMDB-2"),
     ]
+
+
+def test_repeated_join_predicate_keeps_each_alias_pair():
+    ground_truth = SimpleNamespace(
+        key_for_template=lambda template: template)
+    evaluator = SimpleNamespace(ground_truth=ground_truth)
+
+    def join(template, left_alias, right_alias):
+        predicate = SimpleNamespace(
+            template=template,
+            args=(SimpleNamespace(alias=left_alias),
+                  SimpleNamespace(alias=right_alias)),
+        )
+        return SimpleNamespace(predicate=predicate)
+
+    logical_joins = [
+        join("same predicate", "r1", "a1"),
+        join("same predicate", "r2", "a1"),
+        join("other predicate", "r2", "a2"),
+    ]
+    records = [
+        ("same predicate", "r1", "a1", "r1-a1 answers"),
+        ("same predicate", "r2", "a1", "r2-a1 answers"),
+        ("other predicate", "r2", "a2", "r2-a2 answers"),
+    ]
+
+    assert _join_records_by_written_position(
+        evaluator, logical_joins, records) == {
+            0: "r1-a1 answers",
+            1: "r2-a1 answers",
+            2: "r2-a2 answers",
+        }
 
 
 @pytest.mark.parametrize(("query_ids", "workload"), [

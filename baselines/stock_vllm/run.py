@@ -112,6 +112,29 @@ def _baseline_schedule(ids, baselines, rep, method_order):
     ]
 
 
+def _join_records_by_written_position(evaluator, logical_joins, records):
+    """One prompt key can appear at more than one written join position."""
+    available = {}
+    for key, left_alias, right_alias, record in records:
+        identity = (key, left_alias, right_alias)
+        available.setdefault(identity, []).append(record)
+
+    matched = {}
+    for written_pos, join in enumerate(logical_joins):
+        key = evaluator.ground_truth.key_for_template(
+            join.predicate.template)
+        aliases = tuple(arg.alias for arg in join.predicate.args)
+        if len(aliases) != 2:
+            raise ValueError("baseline accuracy expects binary joins")
+        identity = (key, *aliases)
+        candidates = available.get(identity)
+        if not candidates:
+            raise ValueError(
+                f"no baseline result for join {written_pos}: {identity}")
+        matched[written_pos] = candidates.pop(0)
+    return matched
+
+
 def _vllm_filter_capacity(llm):
     """Read the post-startup KV capacity from vLLM."""
     config = llm.llm_engine.vllm_config
@@ -724,24 +747,23 @@ def run_query(llm, sp, true_set, tokenizer, qid, query_def,
                 filter_tables[(alias, written_pos)] = \
                     filter_records[(alias, key)]
 
-        join_records = {}
+        join_records = []
         for (template, left_alias, right_alias, pairs, answers,
              true_table) in join_answer_records:
             key = evaluator.ground_truth.key_for_template(template)
-            join_records[key] = (
+            join_records.append((key, left_alias, right_alias, (
                 answer_table(
                     {left_alias: [left for left, _ in pairs],
                      right_alias: [right for _, right in pairs]},
                     answers, "join_answers"),
                 true_table,
-            )
+            )))
         join_tables = {}
         true_tables = {}
-        for written_pos, join in enumerate(logical_joins):
-            key = evaluator.ground_truth.key_for_template(
-                join.predicate.template)
-            join_tables[written_pos], true_tables[written_pos] = \
-                join_records[key]
+        matched = _join_records_by_written_position(
+            evaluator, logical_joins, join_records)
+        for written_pos, record in matched.items():
+            join_tables[written_pos], true_tables[written_pos] = record
 
         class EvaluationResult:
             answer_tables = {"filters": filter_tables,
