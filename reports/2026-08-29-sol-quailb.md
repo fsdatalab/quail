@@ -11,17 +11,22 @@
 - The full result is at `/results/sol/sol_quailb_sf0.1.json` on the
   `quail-results` Modal volume.
 
-The estimate counts the model work that the query requires. It includes fresh
-tokens, attention pairs, KV reads, and KV writes. It does not include kernel
-gaps, host work, or scheduling overhead. No measured or fitted constant is
-used.
+The estimate counts modeled fresh tokens, attention pairs, KV reads, and KV
+writes. It does not include kernel gaps, host work, or scheduling overhead. No
+measured or fitted constant is used.
 
 Filters use fixed selectivity estimates to choose their order. The calculation
 then uses saved ground truth to find the exact rows that reach each later
-stage. Join queries search every feasible left deep relation order and anchor
-choice. Document prefix KV has unlimited capacity in this estimate. This is
-separate from the production planner, which must work without ground truth and
-with finite KV.
+stage. Join queries search every supported eager left deep relation order and
+anchor choice. The search supports binary full joins, applies each available
+crossing predicate immediately, and does not consider bushy plans. Document
+prefix KV has unlimited capacity in this estimate. Work is ideally packed
+across the whole query, even across operator barriers. This is separate from
+the production planner, which must work without ground truth and with finite
+KV.
+
+These assumptions make SoL an optimistic comparison point for the modeled
+execution. It is not the exact minimum time for every possible query plan.
 
 ## Prediction
 

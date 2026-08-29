@@ -1,31 +1,35 @@
-"""Speed of light for every QUAIL-B query, on Qwen3-4B and Qwen3-32B.
+"""Ideal SoL work estimate for every QuailB query.
 
-The least time each query can take on one H100! request. Three model
-components cost time and nothing else is counted:
+The estimate prices three model components on one H100! request:
 
   1. attention projections, with their weight bytes and fp8 FLOPs
   2. the MLP, with its weight bytes and fp8 FLOPs
   3. attention, with its KV bytes and bf16 pair FLOPs
 
-No measured or fitted performance constant appears in the time bound,
-which is what makes the answer a floor: a run can approach it and can
-never beat it. The dollar metric uses Modal's published H100! price.
-The equations are plans/sol_model.md. Work counting, model components,
-and the generic component calculation live in separate planner modules.
-The planner and this report use the same implementation. This file
-measures the three inputs they need and applies them to every query.
+No measured or fitted performance constant appears in the calculation. The
+estimate omits runtime overhead and uses ideal query-wide packing and unlimited
+document prefix KV. Its join search is restricted to eager binary full left
+deep plans. It is therefore an optimistic comparison point for that modeled
+execution, not the exact minimum for every possible execution. The dollar
+metric uses Modal's published H100! price.
+
+The equations are in plans/sol_model.md. Work counting, model components, and
+the component calculation live in shared planner modules. The exact SoL join
+search is separate from the production planner.
 
 KV reuse, the part that has to be right
 ---------------------------------------
-Every document has a PREFIX: the shared preamble plus the document
-text. Its KV is computed once and stays resident. A filter attaches
-its question. A join attaches one anchor frame, then many tuple
-suffixes. Each tuple suffix contains the partner label, partner
-document, and answer cue. Suffix KV is computed, used once, and
-dropped (`executor/pack.py`: suffix KV is never cached).
+Every document has a PREFIX: the shared preamble plus the document text. In
+this estimate, its KV is computed once and stays resident. A filter appends
+its question and removes the question KV after the answer. A join appends one
+anchor frame, then streams many tuple suffixes over that framed context. Each
+tuple suffix contains the partner label, partner document, and answer cue. Its
+KV is computed, used once, and removed (`executor/pack.py` never retains tuple
+suffix KV).
 
-So a document is read once however many questions get asked about
-it. Three operations follow:
+The estimate therefore computes a document prefix once however many questions
+get asked about it. Each later question still reads that prefix from KV. Three
+operations follow:
 
     scan()      compute a prefix and its first suffix, from nothing
     ask()       reuse a resident prefix, attach one more suffix
@@ -36,10 +40,12 @@ the only one that does.
 
 Join search
 -----------
-All filters run first. The script then checks every feasible left
-deep relation order and anchor choice. It uses exact ground-truth
-survivors at every step and unlimited KV. The search runs separately
-for 4B and 32B. It does not call or simulate the production planner.
+All filters run first. The script then checks every eager binary full left
+deep relation order and anchor choice supported by the search. It immediately
+applies every available crossing predicate. It does not check bushy plans or
+plans that delay a crossing predicate. It uses exact ground truth survivors at
+every step and unlimited KV. The search runs separately for 4B and 32B. It
+does not call or simulate the production planner.
 
 Running it
 ----------

@@ -1,17 +1,14 @@
-# Quail engine: a declarative query engine for AI_FILTER and AI_JOIN
+# Archived original Quail engine design
 
-Status: original design for the current engine. The engine now lives
-in this repository. The old exploration files are available in Git
-history at commit `e617c512dc40989deaeff66614af4b706a0a4be4`.
-The engine does not depend on those experiment scripts.
+Status: historical. Do not use this file to determine current behavior.
+It preserves the original proposal, including the deleted pinned CPU KV
+store, fitted timing constants, calibration command, and cold and warm
+benchmark passes. None of those are in the current engine.
 
-Update (2026-08-26): the pinned CPU KV store described below was
-removed (issue #32). Document KV now lives only in the GPU arena,
-for the duration of one query, and QUAIL-B runs a single pass
-instead of a cold and a warm pass. Sections that mention the store,
-restore, `cpu_memory_gb`, or the warm pass describe the original
-design, not the current engine. `reports/engine-wiki.md` is the
-current reference.
+Use `reports/engine-wiki.md` for the current planner, executor, KV policy,
+runtime, and benchmark design. The old exploration files referenced below are
+available in Git history at commit
+`e617c512dc40989deaeff66614af4b706a0a4be4`.
 
 Scope: AI_FILTER and AI_JOIN only. Qwen3 4B fp8 is the first model,
 H100 workers on Modal the first device — but the optimizer is built

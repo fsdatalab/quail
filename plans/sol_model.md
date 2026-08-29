@@ -1,16 +1,21 @@
-# Speed of light: a floor on the wall time of one query
+# Speed of light: an ideal work estimate for one query
 
-Speed of light (SoL) is the least time one query can take on one
-GPU. It counts the arithmetic and the memory traffic the work cannot
-be done without, and counts nothing else, so a run can approach it
-and can never beat it.
+Speed of light (SoL) is the ideal time for the execution model in this
+document on one GPU. That model runs filters first, then eager binary full
+joins in a left deep order. It assumes unlimited document prefix KV and ideal
+packing across the whole query.
+
+SoL counts modeled arithmetic and memory traffic and omits runtime overhead.
+Those omissions make the estimate optimistic for a chosen plan. The restricted
+join search can also exclude plans that another engine could execute. SoL is a
+comparison point for this execution model. It is not the exact minimum time for
+every possible execution of the query.
 
 Nothing in it is fitted or measured on a GPU. It uses the datasheet,
 the model dimensions, and a count of the query's work, and it
 borrows no cost model the engine already carries: no roofline out of
 `planner/budgets.py`, no calibration constant, no efficiency factor.
-A bound built on a fitted constant is an estimate wearing a bound's
-name, and it cannot judge the thing the constant was fitted to.
+This keeps the estimate independent of measured Quail runtime.
 
 ## 1. Notation
 
@@ -54,20 +59,22 @@ figures halved, because the datasheet quotes them with 2:1 sparsity
 and we run dense. The projections are fp8 and attention is bf16
 (FlashAttention-3 over bf16 KV), which is why there are two peaks.
 
-## 2. The KV rule
+## 2. The modeled KV rule
 
-Every document has a **prefix**, `p + d_i`: the shared preamble plus
-the document text. Its KV is computed once and stays resident.
-Anything attached after it is a **suffix**. A filter suffix is its
-question. A join first attaches an anchor frame, which contains the
-anchor note and complete question. Each join tuple then attaches the
-partner label, partner document, and answer cue. Suffix KV is computed,
-used for one evaluation, and dropped. The code in `executor/pack.py`
-never caches suffix KV.
+Every document has a **prefix**, `p + d_i`: the shared preamble plus the
+document text. In this model, its KV is computed once and stays resident. A
+filter appends its question and removes the question KV after the answer. A
+join appends an anchor frame, which contains the anchor label and complete
+question. The frame stays in the active anchor context during that join stage.
+Each join tuple then appends the partner label, partner document, and answer
+cue. The tuple suffix KV is used for one answer and removed. The code in
+`executor/pack.py` never retains tuple suffix KV.
 
-So a document is read once however many questions get asked about
-it. In the equations below that shows up in one place: whether `d_i`
-appears in the token count, or only inside a rectangle.
+The model therefore computes a document prefix once however many questions get
+asked about it. Each later suffix still reads that prefix from KV. Production
+execution can remove the KV when capacity is needed and recompute it later. In
+the equations below reuse shows up in whether `d_i` appears in the fresh token
+count, or only in the attention pairs and KV reads.
 
 ## 3. Counting the work
 
@@ -144,12 +151,16 @@ JOIN - anchors a, partners b, every a against every b
   per anchor, already resident when a filter ran on that side:
     tokens += f_a
     pairs  += f_a * (p + d_a) + T(f_a)
+    kv read += p + d_a
 
   per anchor, then per partner:
     tokens += u_b
     pairs  += u_b * (p + d_a + f_a) + T(u_b)
 
-  kv read  = sum over a of (p + d_a + f_a)
+  kv write = every fresh token above
+
+  per anchor, before its partner stream:
+    kv read += p + d_a + f_a
 ```
 
 The tuple lines are the `stage s > 1` shape again: a rectangle over
@@ -158,9 +169,11 @@ are atomic and never attend to each other (`executor/pack.py`), so
 it is one rectangle and one triangle per tuple rather than one big
 triangle over the whole stream.
 
-`kv read` counts each anchor's context once per stage. That is the
-minimum for a tuple stream longer than one chunk, which every join
-here is.
+An anchor that came from a filter pays one prefix KV read to append its frame.
+Every anchor then pays one framed-context KV read for its whole partner stream.
+This second count is idealized. The production executor reads the framed
+anchor again when its tuples span another chunk, but SoL does not count those
+repeated reads.
 
 **Which side anchors.** Anchoring the long side costs one prefix per
 document. Anchoring the short side puts a full copy of every long
@@ -177,11 +190,13 @@ prefix KV the first time it is an anchor. The model assumes unlimited KV
 capacity, so reusable prefixes are never removed. Partner suffix KV is never
 reusable.
 
-The calculation checks every feasible left deep plan. A left deep plan starts
-with one alias and adds one alias at each step. If several predicates connect
-the new alias to the current result, it checks every order for those
-predicates. It also checks both aliases of every binary predicate as the
-anchor.
+The calculation checks every supported eager left deep plan. A left deep plan
+starts with one alias and adds one alias at each step. The current search
+supports binary full joins only. When a new alias is added, it immediately
+applies every join predicate that now crosses into the joined alias set. It
+checks every order for those predicates and both aliases of each predicate as
+the anchor. It does not check bushy plans or plans that delay an available
+crossing predicate.
 
 The subset DP state is `(S, K)`. `S` is the set of aliases already joined.
 `K` is the set of aliases whose document prefix KV is available. Several work
@@ -221,7 +236,9 @@ SoL = T_A + T_M + T_attention
 `d_head` dimensions for `2 * d_head` FLOPs, the weight into V costs
 another `2 * d_head`, times `n_q` heads. At 4B that is 16,384.
 
-Each modeled component reads its weights once per ideal forward pass. The
+All query work is added before the number of ideal forward passes is rounded.
+This means filter and join barriers do not start separate passes in SoL. Each
+modeled component reads its weights once per ideal forward pass. The
 resident model footprint remains part of the GPU capacity calculation, but
 it is not used as component memory traffic.
 
@@ -274,27 +291,33 @@ subsets and KV availability. A unit test compares its result with complete
 enumeration on a small query.
 
 The SoL script does not call or simulate the production planner. It runs the
-exact search separately for each model and passes that model's chunk limit.
+supported search separately for each model and passes that model's chunk limit.
 `speed_of_light()` is section 4. The production planner imports the same work
 and component equations to rank its candidates. Its search and finite KV
 policy are separate from this exact analysis.
 
-## 6. What the bound assumes
+## 6. What the estimate assumes
 
-- **KV read is a minimum**, one read per anchor per stage. An anchor
-  whose tuples straddle a chunk boundary is read twice.
+- **A reused anchor prefix is read once to append its frame.** The resulting
+  framed context is then read once for the whole partner stream. Production
+  execution can read that framed context once per chunk. SoL does not count
+  those repeated chunk reads.
 - **KV capacity is unlimited.** Every document prefix computed by a filter
   or anchor remains available for later stages.
 - **Compute and memory overlap perfectly within each kernel**, per the
   component `max` terms above.
 - **Forward passes are packed across aggregate query work.** Logical operator
-  boundaries do not add more weight reads or separate component limits.
+  boundaries do not add more weight reads or separate component limits. The
+  production executor cannot pack work across every barrier this way.
+- **Join plans are eager, binary, full, and left deep.** Bushy plans, nonbinary
+  predicates, exists joins, anti joins, and delayed crossing predicates are
+  outside this search.
 - **Nothing is charged** for the tokenizer, the host, scheduling,
-  kernel efficiency, or launch gaps. That is what makes it a floor.
+  kernel efficiency, or launch gaps.
 
 ## 7. Every QUAIL-B query
 
-`reports/2026-08-26-sol-quailb.md` applies all of this to the 35
+`reports/2026-08-29-sol-quailb.md` applies all of this to the 30 current
 queries at sf=0.1 on Qwen3-4B-fp8 and Qwen3-32B-fp8, from measured
 document lengths, measured prompt lengths, and exact active ground
 truth labels. `reports/make_sol_quailb.py` produces the report data.

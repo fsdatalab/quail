@@ -122,7 +122,7 @@ anchor hits and misses, evictions with their summed value) and
 `join_optimizer` block (search size, chosen sequence) are what to
 check against the prediction.
 
-The SoL floor does not change. The exact values for all 35 queries
+The SoL calculation does not change. The values for all 35 queries
 and both models match the previous output field by field. The SoL
 script no longer calls or simulates the production planner. Its
 full local run decreased from 59.13 seconds to 18.01 seconds.
