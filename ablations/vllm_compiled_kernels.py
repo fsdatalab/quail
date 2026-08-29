@@ -461,9 +461,14 @@ def stock_kernels(n_docs: int = 512) -> str:
     pass, and record which kernels its compiled graph actually runs
     between the GEMMs, plus the resolved compilation config. This is
     the ground truth the vllm_compiled rung mirrors."""
+    import os
     import sys
 
     sys.path.insert(0, "/root/gpu_tests")
+
+    # the v1 engine runs the model in a child process by default,
+    # where this process's profiler cannot see the kernels
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     import torch
     from vllm import LLM, SamplingParams
