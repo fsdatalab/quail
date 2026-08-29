@@ -447,10 +447,12 @@ At Qwen3 4B on H100, the index cap binds at 110,376 tokens.
 
 **Admission budget** (`budgets.py:69`): the number of document tokens
 that can be resident in the KV arena at once. It is what remains of
-device memory after weights and activation reservation, divided by
-kappa (the KV bytes per cached token: `2 * layers * n_kv * d_head *
-kv_bytes`). At Qwen3 4B bf16 KV on H100, this is about 346,000
-tokens. The admission budget is a token count, never a document
+device memory after resident weights (as loaded, minus the untied
+lm_head that moves to CPU memory at load) and activation reservation,
+divided by kappa (the KV bytes per cached token: `2 * layers * n_kv *
+d_head * kv_bytes`). At Qwen3 4B bf16 KV on H100, this is about
+346,000 tokens; at 32B, 103,156 tokens, of which 5,935 come from the
+moved head. The admission budget is a token count, never a document
 count, because a document count cannot account for varying document
 lengths.
 
@@ -822,7 +824,18 @@ The `Answerer` (`loop.py:60`) scores the final hidden states against
 only the TRUE and FALSE token embeddings (not the full vocabulary). It
 projects the normed hidden state through a sub-selected `lm_head`
 weight matrix (only the rows for TRUE/FALSE token ids), takes the argmax
-within the TRUE set and within the FALSE set, and compares.
+within the TRUE set and within the FALSE set, and compares. The
+comparison and the margin are exact: TRUE and FALSE scores shift by
+the same softmax normalizer, so dropping the other vocabulary rows
+changes neither.
+
+The full head weight has no other reader, so `load_model` moves an
+untied head to CPU memory right after load
+(`move_untied_head_to_host`). At Qwen3 32B that is 151,936 x 5,120
+bf16 rows, 1.56 GB of freed device memory, counted into the admission
+budget as `ModelSpec.head_mem_bytes`. The 4B head is tied to the
+input embedding tensor and stays. The answerer slices its dozen rows
+from wherever the weight lives and keeps only the slice on the GPU.
 
 `AsyncAnswers` (`loop.py:92`) makes the readout non-blocking: it
 computes the answer bits on GPU, copies them to pinned host memory
