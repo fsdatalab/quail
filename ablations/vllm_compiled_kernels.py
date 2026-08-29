@@ -729,30 +729,114 @@ def _categorize(name):
     return "other"
 
 
-@app.function(timeout=5400, **GPU_KW)
+class _ClockSampler:
+    """Sample the SM clock and power draw every 50 ms on a thread.
+
+    The GPU adjusts its own clock against the power limit, so the
+    same kernel runs slower when the chip sits at sustained high
+    power; this records what the clock actually was during a run.
+    """
+
+    def __init__(self):
+        import pynvml
+        pynvml.nvmlInit()
+        self._nvml = pynvml
+        self._handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    def run(self, fn):
+        import statistics
+        import threading
+        import time
+
+        samples = []
+        stop = threading.Event()
+
+        def loop():
+            while not stop.is_set():
+                samples.append((
+                    self._nvml.nvmlDeviceGetClockInfo(
+                        self._handle, self._nvml.NVML_CLOCK_SM),
+                    self._nvml.nvmlDeviceGetPowerUsage(
+                        self._handle) / 1000))
+                time.sleep(0.05)
+
+        thread = threading.Thread(target=loop, daemon=True)
+        thread.start()
+        try:
+            out = fn()
+        finally:
+            stop.set()
+            thread.join()
+        clocks = sorted(s[0] for s in samples)
+        powers = [s[1] for s in samples]
+        stats = dict(
+            samples=len(samples),
+            sm_mhz_mean=round(statistics.mean(clocks), 1),
+            sm_mhz_median=clocks[len(clocks) // 2],
+            sm_mhz_p10=clocks[len(clocks) // 10],
+            power_w_mean=round(statistics.mean(powers), 1))
+        return out, stats
+
+
+def _try_lock_clocks(mhz):
+    """Pin the SM clock; returns True when the driver allows it.
+
+    The pin must sit below the power-throttle point so both
+    configurations actually run at the same frequency.
+    """
+    import subprocess
+    done = subprocess.run(
+        ["nvidia-smi", "-lgc", f"{mhz},{mhz}"],
+        capture_output=True, text=True)
+    return done.returncode == 0, (done.stdout + done.stderr).strip()
+
+
+def _unlock_clocks():
+    import subprocess
+    subprocess.run(["nvidia-smi", "-rgc"], capture_output=True)
+
+
+LOCKED_MHZ = 1500
+
+
+@app.function(timeout=7200, **GPU_KW)
 def profile_queries(model: str = "qwen3-4b-fp8",
                     sf: float = 0.1) -> str:
     """Per-kernel-category GPU time for the three sources on the
-    IMDB-7 filter query (unified path)."""
+    IMDB-7 filter query (unified path), with the SM clock and power
+    sampled during an unprofiled run of each source, and - where the
+    driver allows pinning the clock - a locked-clock profiled pass
+    that removes clock behavior from the matmul comparison."""
     import torch
 
     state, tokenizer, chunk_tokens, _ = _boot_state(model)
     pipeline = state["pipeline"]
     sess, qdefs, _ = _quailb_session(model, sf)
     _, build = qdefs["IMDB-7"]
+    sampler = _ClockSampler()
 
     result = dict(cell="kernel_source_profile", model=model, sf=sf,
                   query="IMDB-7", attention_path="unified",
-                  sources={})
-    for source in KERNEL_SOURCES:
+                  sources={}, locked_clock=None)
+
+    def profile_pass(source):
         pipeline.kernel_source = source
         captured = {}
-        _run_query(state, build, captured)   # unprofiled warm
         with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU,
                             torch.profiler.ProfilerActivity.CUDA]
         ) as prof:
             _run_query(state, build, captured)
+        return prof, captured
+
+    for source in KERNEL_SOURCES:
+        pipeline.kernel_source = source
+        captured = {}
+        _run_query(state, build, captured)   # unprofiled warm
+        # clock and power during a normal, unprofiled run
+        (_, clock_stats) = sampler.run(
+            lambda: _run_query(state, build, {}))
+        prof, captured = profile_pass(source)
         tokens = captured["fresh_tokens"]
         cats, counts = {}, {}
         rows = []
@@ -776,6 +860,7 @@ def profile_queries(model: str = "qwen3-4b-fp8",
         result["sources"][source] = dict(
             fresh_tokens=tokens,
             wall_s=round(captured["wall_s"], 3),
+            clock=clock_stats,
             cuda_busy_s=round(busy / 1e6, 2),
             us_per_token=round(busy / tokens, 2),
             category_us_per_token={k: round(v / tokens, 3)
@@ -784,8 +869,46 @@ def profile_queries(model: str = "qwen3-4b-fp8",
             top_kernels=[dict(s=s, n=n, name=k) for s, n, k
                          in rows[:20]])
         print(f"[kernel_source_profile] {source}: "
+              f"clock {clock_stats} "
               f"{json.dumps(result['sources'][source]['category_us_per_token'])}",
               flush=True)
+
+    # locked-clock pass: pin the SM clock below the power-throttle
+    # point so every source runs the matmuls at the same frequency;
+    # if clock behavior explains the matmul-bucket difference, the
+    # gap disappears here
+    locked, message = _try_lock_clocks(LOCKED_MHZ)
+    result["locked_clock"] = dict(supported=locked, mhz=LOCKED_MHZ,
+                                  driver_message=message[:200],
+                                  sources={})
+    if locked:
+        try:
+            for source in ("quail", "vllm_ops"):
+                pipeline.kernel_source = source
+                _run_query(state, build, {})   # settle at the pin
+                (_, clock_stats) = sampler.run(
+                    lambda: _run_query(state, build, {}))
+                prof, captured = profile_pass(source)
+                tokens = captured["fresh_tokens"]
+                gemm_us = 0.0
+                for ev in prof.key_averages():
+                    if "CUDA" not in str(getattr(ev, "device_type",
+                                                 "")):
+                        continue
+                    cuda_us = getattr(ev, "self_device_time_total",
+                                      0) or \
+                        getattr(ev, "self_cuda_time_total", 0)
+                    if cuda_us and _categorize(ev.key) == "gemm":
+                        gemm_us += cuda_us
+                row = dict(
+                    gemm_us_per_token=round(gemm_us / tokens, 3),
+                    wall_s=round(captured["wall_s"], 3),
+                    clock=clock_stats)
+                result["locked_clock"]["sources"][source] = row
+                print(f"[kernel_source_profile] locked {source}: "
+                      f"{row}", flush=True)
+        finally:
+            _unlock_clocks()
     return _write(result, "kernel_source_profile")
 
 
