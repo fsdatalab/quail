@@ -14,6 +14,7 @@ from quail.bench.evaluate import (
     LocalVolumeFiles,
     PredicateLabels,
     add_query_metrics,
+    _validate_label_set_corpora,
     corpus_identity,
     load_ground_truth,
     summarize_queries,
@@ -257,6 +258,76 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
     assert pq.read_table(
         tmp_path / "benchmarks/quailb/runs/qb_test/answers.parquet"
     ).equals(answer_table)
+
+
+def _reused_label_layout(tmp_path):
+    files = LocalVolumeFiles(tmp_path)
+    predicate_key = "test.review.filter"
+    table_manifest = {
+        "rows": 2,
+        "full_hash": "same-review-table-hash",
+    }
+    for corpus_id in ("c_source", "c_target"):
+        path = (tmp_path / GROUND_TRUTH_ROOT / "corpora" / corpus_id)
+        path.mkdir(parents=True)
+        (path / "manifest.json").write_text(json.dumps({
+            "corpus_id": corpus_id,
+            "corpus_full_hash": f"hash-{corpus_id}",
+            "tables": {"reviews": table_manifest},
+        }))
+    source_path = (tmp_path / GROUND_TRUTH_ROOT / "collections"
+                   / "gt_source")
+    source_path.mkdir(parents=True)
+    (source_path / "manifest.json").write_text(json.dumps({
+        "status": "complete",
+        "collection_id": "gt_source",
+        "corpus_id": "c_source",
+        "label_sets": {predicate_key: "ls_source"},
+    }))
+    collection = {
+        "corpus_id": "c_target",
+        "reused_label_sets": {
+            predicate_key: {
+                "source_collection_id": "gt_source",
+                "source_corpus_id": "c_source",
+                "required_tables": ["reviews"],
+                "verified_table_manifests": {
+                    "reviews": table_manifest,
+                },
+            },
+        },
+    }
+    manifests = {
+        predicate_key: {
+            "label_set_id": "ls_source",
+            "corpus_id": "c_source",
+            "predicate": _predicate(
+                predicate_key, FILTER, "filter", "reviews"),
+        },
+    }
+    return files, collection, manifests
+
+
+def test_reused_label_set_accepts_identical_table_manifest(tmp_path):
+    files, collection, manifests = _reused_label_layout(tmp_path)
+
+    _validate_label_set_corpora(files, collection, manifests)
+
+
+def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
+    files, collection, manifests = _reused_label_layout(tmp_path)
+    target_path = (tmp_path / GROUND_TRUTH_ROOT / "corpora" / "c_target"
+                   / "manifest.json")
+    target = json.loads(target_path.read_text())
+    target["tables"]["reviews"]["full_hash"] = "changed"
+    target_path.write_text(json.dumps(target))
+
+    try:
+        _validate_label_set_corpora(files, collection, manifests)
+    except ValueError as exc:
+        assert "table reviews changed" in str(exc)
+    else:
+        raise AssertionError("changed table manifest was accepted")
 
 
 def test_corpus_identity_matches_judge_pass_implementation():

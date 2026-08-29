@@ -1284,15 +1284,19 @@ benchmark runner or judge pass.
 
 Every filter and join carries a fixed selectivity estimate. The estimates
 come from the active sf0.1 Qwen3 32B fp8 collection
-`gt_02ffa2a5720006e8236aa993760e9e29` for corpus
-`c_d7a294f1a0d83293b31ed8519df4262e`. Planning does not read the ground
+`gt_363b5ab570635c33894e1a030c21f57e` for corpus
+`c_3bd14ed0758287cba9d88fb68de8b7b8`. Planning does not read the ground
 truth labels.
 
 The source collection is
-`/results/ground_truth/quailb/schema_v1/collections/gt_02ffa2a5720006e8236aa993760e9e29/manifest.json`
+`/results/ground_truth/quailb/schema_v1/collections/gt_363b5ab570635c33894e1a030c21f57e/manifest.json`
 on the `quail-results` volume. Each builder query ends with
 `.select(..., order="by_cost")`, so the benchmark exercises the planner's
-filter and join ordering.
+filter and join ordering. The collection reuses 15 IMDB, BioDEX, and FEVER
+label sets from the prior corpus. The collection manifest records the source
+collection and the unchanged table manifests for every reused label set. The
+loader checks those table manifests before it accepts the collection. The
+seven LePaRD label sets belong directly to the current corpus.
 
 ### Protocol and reported values
 

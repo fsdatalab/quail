@@ -903,9 +903,8 @@ SCENARIOS = [
 ]
 # Fixed planner inputs from the sf=0.1 Qwen3 32B fp8 labels.
 # They apply at every scale factor so query planning does not read answers.
-SELECTIVITY_ESTIMATE_COLLECTION = "gt_02ffa2a5720006e8236aa993760e9e29"
-SELECTIVITY_ESTIMATE_CORPUS = "c_d7a294f1a0d83293b31ed8519df4262e"
-SELECTIVITY_ESTIMATE_LEPARD_CORPUS = "c_3bd14ed0758287cba9d88fb68de8b7b8"
+SELECTIVITY_ESTIMATE_COLLECTION = "gt_363b5ab570635c33894e1a030c21f57e"
+SELECTIVITY_ESTIMATE_CORPUS = "c_3bd14ed0758287cba9d88fb68de8b7b8"
 SELECTIVITY_ESTIMATE_SCALE_FACTOR = 0.1
 FILTER_SELECTIVITY_ESTIMATES = {
     F1: 4004 / 5000,
@@ -1270,7 +1269,6 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         selectivity_estimates=dict(
             source_collection=SELECTIVITY_ESTIMATE_COLLECTION,
             source_corpus=SELECTIVITY_ESTIMATE_CORPUS,
-            lepard_source_corpus=SELECTIVITY_ESTIMATE_LEPARD_CORPUS,
             source_scale_factor=SELECTIVITY_ESTIMATE_SCALE_FACTOR,
             method=("TRUE labels divided by all labels, fixed across "
                     "scale factors")),

@@ -53,22 +53,20 @@ answers go back to the volume too:
     modal volume get quail-results /quailb_data/sf$SF $W/data/
     modal volume get quail-results $G/label_sets $W/allabels/
     modal volume get quail-results \
-        $G/collections/gt_02ffa2a5720006e8236aa993760e9e29/manifest.json \
+        $G/collections/gt_363b5ab570635c33894e1a030c21f57e/manifest.json \
         $W/collection_manifest.json
     uv run --with transformers --with pyarrow \
         python reports/make_sol_quailb.py $W $SF
     modal volume put quail-results $W/sol_quailb_sf$SF.json \
         /sol/sol_quailb_sf$SF.json
 
-The scale factor defaults to 0.1. The main collection supplies IMDB,
-BioDEX, and FEVER labels. The script selects revised LePaRD labels by
-the LePaRD corpus ID in `quail.bench.quailb`. The run stops if the main
-collection is for a different scale factor than the one requested.
+The scale factor defaults to 0.1. The collection supplies all four
+query families. The run stops if the collection is for a different
+scale factor than the one requested.
 
 The report is reports/2026-08-26-sol-quailb.md.
 """
 import collections
-import glob
 import itertools
 import json
 import math
@@ -195,30 +193,10 @@ for code, template in JOIN_TEMPLATES.items():
     }
 
 # 3. labels -----------------------------------------------------------
-# A predicate keeps one label set per template it has been judged
-# under, so the volume holds several at once. The active collection
-# supplies IMDB, BioDEX, and FEVER. LePaRD uses the revised corpus.
-LABEL_MANIFESTS = glob.glob(
-    str(W / "allabels/label_sets/*/*/*/manifest.json"))
 active_by_predicate = dict(COLLECTION["label_sets"])
-revised_lepard = {}
-for manifest_path in LABEL_MANIFESTS:
-    manifest = json.load(open(manifest_path))
-    predicate = manifest["predicate"]
-    if (predicate["workload"] == "lepard"
-            and manifest["corpus_id"] == Q.SELECTIVITY_ESTIMATE_LEPARD_CORPUS):
-        key = manifest["predicate_key"]
-        if key in revised_lepard:
-            raise ValueError(
-                f"more than one revised LePaRD label set for {key}")
-        revised_lepard[key] = manifest["label_set_id"]
-expected_lepard = {
-    key for key in active_by_predicate if key.startswith("quailb.lepard.")}
-if set(revised_lepard) != expected_lepard:
-    raise ValueError(
-        "revised LePaRD labels do not cover the collection predicates")
-active_by_predicate.update(revised_lepard)
 ACTIVE = set(active_by_predicate.values())
+LABEL_MANIFESTS = list(
+    (W / "allabels" / "label_sets").glob("*/*/*/manifest.json"))
 filter_answers = {}
 join_answers = {}
 predicate_meta = {}
@@ -1038,10 +1016,8 @@ json.dump({
         "filter_order": (
             "by_cost from fixed benchmark selectivity estimates"),
         "filter_selectivity_sources": {
-            "imdb_biodex_fever_collection":
-                Q.SELECTIVITY_ESTIMATE_COLLECTION,
-            "imdb_biodex_fever_corpus": Q.SELECTIVITY_ESTIMATE_CORPUS,
-            "lepard_corpus": Q.SELECTIVITY_ESTIMATE_LEPARD_CORPUS,
+            "collection": Q.SELECTIVITY_ESTIMATE_COLLECTION,
+            "corpus": Q.SELECTIVITY_ESTIMATE_CORPUS,
             "scale_factor": Q.SELECTIVITY_ESTIMATE_SCALE_FACTOR,
         },
         "plan_space": "all feasible left deep plans",
