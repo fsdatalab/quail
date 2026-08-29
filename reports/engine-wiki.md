@@ -440,18 +440,27 @@ pass (the batch size). It is the minimum of two bounds:
   divided by a slack factor of 2.
 - Kernel index cap: `INT32_MAX / ffn_width`, because the fused
   kernels compute element offsets in 32-bit integers.
-At Qwen3 4B on H100, the index cap binds at 110,376 tokens.
+At Qwen3 4B on one H100!, the index cap binds at 110,376 tokens.
 
 **Admission budget** (`budgets.py:69`): the number of document tokens
-that can be resident in the KV arena at once. It is what remains of
-device memory after resident weights (as loaded, minus the untied
-lm_head that moves to CPU memory at load) and activation reservation,
-divided by kappa (the KV bytes per cached token: `2 * layers * n_kv *
-d_head * kv_bytes`). At Qwen3 4B bf16 KV on H100, this is about
-346,000 tokens; at 32B, 103,156 tokens, of which 5,935 come from the
-moved head. The admission budget is a token count, never a document
-count, because a document count cannot account for varying document
+that can be resident in the KV arena at once. Quail claims 95% of the
+device memory. It subtracts resident weights and memory for two full
+activation chunks, then divides the remaining bytes by the KV bytes
+per cached token. At Qwen3 4B with bf16 KV on one H100!, the KV budget
+is 362,250 tokens, or 53.4 GB. At 32B, the KV budget is 112,312 tokens.
+The admission budget is a token count because documents have different
 lengths.
+
+The current QUAIL-B runner configures stock vLLM and pipelined vLLM with
+`gpu_memory_utilization=0.91`. vLLM measures the memory used by one
+forward pass with 25,305 tokens and gives the remaining configured
+memory to KV. Quail instead reserves memory for two activation chunks
+with as many as 110,376 tokens each. Therefore, the two memory
+fractions do not produce equal KV capacities. Based on the capacity
+measured at 0.92, vLLM should have about 479,000 KV tokens at 0.91,
+compared with Quail's 362,250 KV tokens at 0.95. The first 0.91 startup
+will give the exact vLLM capacity. Every baseline report records the KV
+capacity that vLLM returns after startup.
 
 **Compute knee** (`budgets.py:95`): the chunk size where the dense
 projections cross the roofline ridge and become compute-bound rather

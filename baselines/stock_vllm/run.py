@@ -71,6 +71,7 @@ MODELS = {
 
 BASELINES = ("stock_vllm", "pipelined_vllm")
 BASELINE_ORDERS = ("alternating-by-query", "method-major")
+GPU_MEMORY_UTILIZATION = 0.91
 
 
 def _baseline_configuration(name):
@@ -839,7 +840,7 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
         model=hf_name,
         max_num_batched_tokens=25_305,
         max_num_seqs=4096,
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         enable_prefix_caching=True,
         disable_log_stats=True)
     sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
@@ -967,7 +968,7 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
             submission=submission,
             checkpoint="pre-quantized FP8",
             max_num_seqs=4096, max_num_batched_tokens=25_305,
-            gpu_memory_utilization=0.92,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
             enable_prefix_caching=True,
             results=all_results[baseline])
         if len(baselines) == 2:

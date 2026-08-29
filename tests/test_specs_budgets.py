@@ -18,9 +18,9 @@ def test_model_widths_and_budget_limits():
     assert m.W_mem == 4.5e9
     assert budgets.tensor_parallel(QWEN3_4B_FP8, H100_SXM) == 1
     big = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
-    assert budgets.tensor_parallel(big, H100_SXM) == 4
+    assert budgets.tensor_parallel(big, H100_SXM) == 2
     assert budgets.kernel_index_cap(QWEN3_4B_FP8) == 110_376
-    assert budgets.chunk_memory_bound(QWEN3_4B_FP8, H100_SXM) == 421_752
+    assert budgets.chunk_memory_bound(QWEN3_4B_FP8, H100_SXM) == 436_401
     assert budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM) == 110_376
 
 
@@ -37,6 +37,7 @@ def test_head_residency_credit():
     # 1,555,824,640 bytes / 262,144 bytes per 32B KV token = 5,935
     kept = replace(QWEN3_32B_FP8, tied_head=True)
     grown = budgets.arena_tokens(QWEN3_32B_FP8, H100_SXM)
+    assert grown == 112_312
     assert grown - budgets.arena_tokens(kept, H100_SXM) == 5_935
     # the chunk budget does not move: the 32B chunk is capped by the
     # int32 kernel index, not by memory
@@ -45,13 +46,9 @@ def test_head_residency_credit():
 
 
 def test_arena_memory_tracks_kv_width():
-    # the design table said ~400k with one chunk of activation
-    # reservation; the milestone 1 filter run OOMed there, so the
-    # reservation is two chunks - the arena lands near 346k, ~860
-    # mean-length documents resident at once
     tokens = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM)
-    assert 340_000 <= tokens <= 370_000
-    assert tokens // 400 >= 750
+    assert tokens == 362_250
+    assert tokens // 400 == 905
     fp8 = budgets.arena_tokens(QWEN3_4B_FP8.with_kv_bytes(1.0), H100_SXM)
     assert fp8 == pytest.approx(2 * tokens, rel=0.01)
 

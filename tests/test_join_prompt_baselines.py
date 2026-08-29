@@ -6,6 +6,7 @@ import pytest
 from baselines.stock import build_join_grouped_inputs, run_filter_chain
 from baselines.old_stock.operators import Join
 from baselines.stock_vllm.run import (
+    GPU_MEMORY_UTILIZATION,
     _baseline_configuration,
     _baseline_schedule,
     _filter_chain_inputs,
@@ -71,6 +72,7 @@ def test_pipelined_filter_parts_match_complete_filter_prompts():
 
 
 def test_baseline_names_select_only_the_filter_submission():
+    assert GPU_MEMORY_UTILIZATION == 0.91
     assert _baseline_configuration("stock_vllm") == "stage-major"
     assert _baseline_configuration("pipelined_vllm") == "pipelined"
     with pytest.raises(ValueError, match="unknown baseline"):

@@ -4,7 +4,7 @@ arithmetic) from model and device specs.
 
 from quail.specs import DeviceSpec, ModelSpec
 
-POOL_FRACTION = 0.92    # fraction of device memory the executor claims
+POOL_FRACTION = 0.95    # fraction of device memory the executor claims
 CHUNK_SLACK = 2         # slack factor on the activation bound
 PAGE_TOKENS = 16        # KV arena page size, tokens
 INT32_MAX = 2**31 - 1
