@@ -209,13 +209,12 @@ def main(workdir):
 
     fig, ax = plt.subplots(figsize=(20, 6))
     for index, (system, color) in enumerate(zip(SYSTEMS, colors)):
-        values = results[system]
+        values = np.asarray(results[system], dtype=float)
+        measured = np.isfinite(values)
         offset = index - (len(SYSTEMS) - 1) / 2
-        bars = ax.bar(x + offset * width, values, width,
+        bars = ax.bar(x[measured] + offset * width, values[measured], width,
                       color=color, label=system)
-        for bar, value in zip(bars, values):
-            if not np.isfinite(value):
-                continue
+        for bar, value in zip(bars, values[measured]):
             ax.annotate(
                 f"{value:.3g}",
                 (bar.get_x() + bar.get_width() / 2, value),
@@ -237,7 +236,7 @@ def main(workdir):
     fig.tight_layout()
     OUT.mkdir(exist_ok=True)
     output = OUT / "quailb_sf01_4b_runtime.png"
-    fig.savefig(output, dpi=300)
+    fig.savefig(output, dpi=150)
     plt.close(fig)
     print(f"wrote {output}")
     print_metrics(order, results, records)
