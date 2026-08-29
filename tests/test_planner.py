@@ -1,4 +1,4 @@
-"""Tests for the planner's ordering, anchor selection, sharding, break-evens, and refusals."""
+"""Planner ordering, anchor selection, sharding, break-evens, and refusals."""
 
 from dataclasses import replace
 
@@ -8,9 +8,10 @@ import pytest
 
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
-from quail.planner.decide import (explain, order_filters,
-                                  pick_runtime_anchor, plan_query)
+from quail.planner.decide import explain, filter_cost, order_filters, plan_query
 from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
+from quail.planner.sol import speed_of_light
+from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
@@ -86,10 +87,117 @@ def test_b3_ordering_by_cost_vs_as_written(catalog):
             self.selectivity = selectivity
 
     first, second = Predicate(10, 0.5), Predicate(10, 0.5)
-    assert order_filters([first, second], "by_cost") == [first, second]
+    kwargs = dict(prefix_tokens=400, model=QWEN3_4B_FP8,
+                  device=H100_SXM, chunk_tokens=110_376)
+    assert order_filters([first, second], "by_cost", **kwargs) == \
+        [first, second]
     never_kills = Predicate(1, 1.0)
-    assert order_filters([never_kills, first], "by_cost") == \
+    assert order_filters([never_kills, first], "by_cost", **kwargs) == \
         [first, never_kills]
+
+
+def test_filter_order_uses_dense_and_attention_rooflines():
+    class Predicate:
+        def __init__(self, tail, selectivity):
+            self.prompt = type("Prompt", (), {
+                "tail_tokens": tail, "preamble_tokens": 0})()
+            self.selectivity = selectivity
+
+    long_selective = Predicate(100, 0.1)
+    short_weak = Predicate(10, 0.9101)
+    ordered = order_filters(
+        [long_selective, short_weak], "by_cost", prefix_tokens=400,
+        model=QWEN3_4B_FP8, device=H100_SXM, chunk_tokens=110_376)
+    assert ordered == [short_weak, long_selective]
+
+
+def test_filter_order_matches_first_scan_enumeration():
+    class Predicate:
+        def __init__(self, tail, selectivity):
+            self.prompt = type("Prompt", (), {
+                "tail_tokens": tail, "preamble_tokens": 0})()
+            self.selectivity = selectivity
+
+    predicates = [
+        Predicate(12, 0.8),
+        Predicate(50, 0.1),
+        Predicate(8, 1.0),
+        Predicate(25, 0.0),
+    ]
+    kwargs = dict(prefix_tokens=400, model=QWEN3_4B_FP8,
+                  device=H100_SXM, chunk_tokens=110_376)
+    ask_costs = [filter_cost(predicate, first=False, **kwargs)
+                 for predicate in predicates]
+    scan_costs = [filter_cost(predicate, first=True, **kwargs)
+                  for predicate in predicates]
+
+    candidates = []
+    for first in range(len(predicates)):
+        def score(index):
+            rejected = 1.0 - predicates[index].selectivity
+            return ask_costs[index] / rejected if rejected else float("inf")
+
+        remaining = sorted(
+            (index for index in range(len(predicates)) if index != first),
+            key=score)
+        order = [first, *remaining]
+        expected = 0.0
+        live = 1.0
+        for position, index in enumerate(order):
+            expected += live * (scan_costs[index] if position == 0
+                                else ask_costs[index])
+            live *= predicates[index].selectivity
+        candidates.append((expected, order))
+
+    expected_order = min(candidates)[1]
+    actual = order_filters(predicates, "by_cost", **kwargs)
+    assert actual == [predicates[index] for index in expected_order]
+
+
+def test_sol_adds_component_rooflines():
+    result = speed_of_light(
+        ask(400, 50) * 1000, QWEN3_4B_FP8, H100_SXM, 110_376)
+    assert result.bound_by == "mixed"
+    assert [c.name for c in result.components] == [
+        "attn_proj", "mlp", "attention"]
+    assert result.seconds == pytest.approx(sum(
+        max(c.compute_seconds, c.memory_seconds)
+        for c in result.components))
+    assert result.component("mlp") is result.components[1]
+    assert result.seconds > max(result.compute, result.memory)
+
+
+def test_sol_counts_modeled_component_weights():
+    from quail.planner.qwen3_cost import dense_params
+
+    work = ask(400, 50) * 1000
+    result = speed_of_light(
+        work, QWEN3_4B_FP8, H100_SXM, 110_376)
+    dense_bytes = sum(
+        c.bytes_moved for c in result.components
+        if c.name != "attention")
+    assert dense_bytes == dense_params(QWEN3_4B_FP8) * result.passes
+
+    larger_resident_copy = replace(
+        QWEN3_4B_FP8, w_mem_bytes=150e9)
+    assert speed_of_light(
+        work, larger_resident_copy, H100_SXM, 110_376).seconds \
+        == pytest.approx(result.seconds)
+
+
+def test_plan_uses_roofline_filter_order(catalog):
+    logical = docs(catalog, "reviews", tok).alias("r")
+    logical = logical.ai_filter(
+        prompt(" ".join(["long"] * 100) + " {0}", col("r.review")),
+        selectivity=0.1)
+    logical = logical.ai_filter(
+        prompt(" ".join(["short"] * 10) + " {0}", col("r.review")),
+        selectivity=0.8435).select("r.id")
+    plan = plan_query(
+        logical, model=QWEN3_4B_FP8, device=H100_SXM,
+        doc_tokens={"r": [400] * 100})
+    assert [stage["written_pos"]
+            for stage in filter_chain(plan)["stages"]] == [1, 0]
 
 
 def test_filter_arena_writes_decision(catalog):
@@ -284,21 +392,6 @@ def test_three_join_chain_plans_with_barriers(catalog, tmp_path):
     assert len(pair_ports) == 3
 
 
-def test_pick_runtime_anchor_prefers_cheap_side_within_the_chunk():
-    spec = dict(anchor="t", aliases=["t", "p"],
-                frames={"t": [1] * 5, "p": [1] * 5},
-                labels={"t": [1] * 2, "p": [1] * 2}, tail=[1] * 11)
-    live = {"t": [50] * 5, "p": [100] * 6}
-    # p's documents are longer: anchoring p pays them once each
-    # instead of once per tuple
-    assert pick_runtime_anchor(spec, live, 1, 10_000) == "p"
-    # a chunk too small for a p-anchored tuple falls back to the
-    # compile-time anchor (always a candidate - it passed the
-    # compile-time refusal check)
-    need_p = 1 + 100 + 5 + 11 + 2 + 50
-    assert pick_runtime_anchor(spec, live, 1, need_p - 1) == "t"
-
-
 def test_join_order_runs_selective_gate_first(catalog):
     # an expensive .9 full join and a cheap .01 exists gate on the
     # same table: by_cost runs the gate first so the join sees few
@@ -419,3 +512,338 @@ def test_explain_prints_tree_settings_and_source(catalog):
     refusal = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                          doc_tokens={"r": [150_000]})
     assert "refusal: suffix_over_chunk" in explain(logical, refusal)
+
+
+# ------------------------------------------------ KV keep (residency)
+
+def _filtered_join(catalog, doc_sel=0.5, join_sel=0.1):
+    return (docs(catalog, "reviews", tok).alias("r")
+            .ai_filter(prompt("about food: {0}", col("r.review")),
+                       selectivity=doc_sel)
+            .ai_join(docs(catalog, "products", tok).alias("p"),
+                     prompt("m {0} {1}", col("r.review"),
+                            col("p.description")),
+                     selectivity=join_sel)
+            .select("r.id"))
+
+
+def test_filter_keep_makes_the_join_anchor_resident(catalog):
+    from quail.logical import join_label, render_join_frame
+
+    logical = _filtered_join(catalog)
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [300] * 50, "p": [5] * 20})
+    chain = filter_chain(plan)
+    # one stage would normally turn arena writes off; the keep needs
+    # them
+    assert chain["arena_writes"] is True
+    assert chain["keep_kv"] is True
+    assert chain["keep_min_doc_tokens"] == 1     # everything fits
+    group = plan.nodes_by_op("JoinGroup")[0]
+    assert group["anchor"] == "r"
+    assert group["anchor_resident"] == "filter"
+    assert group["keep_anchor_kv"] is False    # nothing consumes r later
+
+    # resident anchors pay the frame only - no preamble, no document
+    pred = logical.root.input.predicate
+    frame = len(tok(render_join_frame(pred.template, 0)))
+    label = len(tok(join_label(1)))
+    tail = len(tok(pred.tail))
+    live = 50 * 0.5
+    expect = live * frame + live * 20 * (5 + label + tail)
+    stage = group["stages"][0]
+    assert stage["anchor_resident"] == "filter"
+    assert stage["tuple_tokens"] == pytest.approx(expect)
+    assert any("keep KV on 'r'" in r for r in plan.remarks)
+
+
+def test_unfiltered_anchor_is_not_resident(catalog):
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.1)
+               .select("r.id"))
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [300] * 50, "p": [5] * 20})
+    group = plan.nodes_by_op("JoinGroup")[0]
+    assert group["anchor_resident"] == "none"
+    assert not any("keep KV" in r for r in plan.remarks)
+
+
+def test_keep_split_keeps_longest_documents_that_fit():
+    from quail.planner.decide import keep_split
+
+    docs_tok = [100, 200, 300, 400]
+    # page-rounded costs at overhead 4, 16-token pages: 416 + 304
+    split = keep_split(docs_tok, 720, 1.0, overhead=4, page_tokens=16)
+    assert split["min_doc_tokens"] == 300
+    assert split["kept_expected_tokens"] == 720
+
+    # survival halves the expected mass, so half the budget keeps the
+    # same documents
+    half = keep_split(docs_tok, 360, 0.5, overhead=4, page_tokens=16)
+    assert half["min_doc_tokens"] == 300
+    assert half["kept_expected_tokens"] == 360
+
+    # everything fits -> threshold 1; nothing fits -> None
+    assert keep_split(docs_tok, 1e9, 1.0, 4, 16)["min_doc_tokens"] == 1
+    assert keep_split(docs_tok, 100, 1.0, 4, 16) is None
+
+
+def test_keep_capped_by_arena_length_threshold(catalog):
+    # 3,000-token documents fill the arena; only the long half of the
+    # survivors stays resident and the remark names the threshold
+    toks = {"r": [3000] * 100 + [1000] * 100, "p": [5] * 20}
+    plan = plan_query(_filtered_join(catalog, doc_sel=1.0),
+                      model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks)
+    chain = filter_chain(plan)
+    assert chain["keep_kv"] is True
+    assert chain["keep_min_doc_tokens"] == 3000
+    assert any("survivors of 3000+ tokens" in r for r in plan.remarks)
+    group = plan.nodes_by_op("JoinGroup")[0]
+    assert group["anchor_resident"] == "filter"
+
+
+def test_gate_group_retains_anchor_for_runtime_replan(catalog):
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.9)
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("t.thread")),
+                        selectivity=0.01, semantics="exists")
+               .select("r.id"))
+    toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks)
+    groups = plan.nodes_by_op("JoinGroup")
+    assert len(groups) == 2
+    assert [g["anchor"] for g in groups] == ["r", "r"]
+    assert groups[0]["keep_anchor_kv"] is True
+    assert groups[1]["keep_anchor_kv"] is False
+    assert groups[1]["anchor_resident"] == "none"
+
+
+def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
+    import itertools as it
+
+    from quail.planner.decide import _collect, join_specs
+    from quail.planner.joins import _feasible_anchors, search_joins, walk
+
+    catalog.register("tags", DocumentProvider.from_parquet(
+        _parquet(tmp_path / "g.parquet", ["id", "tag"]), id_col="id"))
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("m1 {0} {1}", col("r.review"),
+                               col("t.thread")), selectivity=0.2)
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m2 {0} {1}", col("t.thread"),
+                               col("p.description")), selectivity=0.05)
+               .ai_join(docs(catalog, "tags", tok).alias("g"),
+                        prompt("m3 {0} {1}", col("p.description"),
+                               col("g.tag")), selectivity=0.5)
+               .select("r.id"))
+    toks = {"r": [900] * 6, "t": [40] * 8, "p": [200] * 5,
+            "g": [30] * 9}
+    _, _, joins = _collect(logical)
+    specs = join_specs(joins)
+    live0 = {a: float(len(t)) for a, t in toks.items()}
+    pre = 1
+    chunk = 10_000
+    arena = 2_500
+
+    def key(work):
+        seconds = speed_of_light(work, QWEN3_4B_FP8, H100_SXM,
+                                 chunk).seconds
+        return (seconds, work.tokens, work.pairs, work.kv_written,
+                work.kv_read)
+
+    found = search_joins(specs, live0, toks, {}, pre, chunk,
+                         QWEN3_4B_FP8, H100_SXM,
+                         arena_tokens=arena, page_tokens=16)
+
+    # complete enumeration of the same space under the same cost
+    # convention: live counts come from the applied edge set, thinned
+    # in written order, exactly as the search prices them
+    edge_aliases = [frozenset(s["aliases"]) for s in specs]
+    best = []
+
+    def visit_alias(order, pos, applied, sequence):
+        if pos == len(order):
+            if len(applied) == len(specs):
+                work, _ = walk(
+                    sequence, live0, toks, {}, pre,
+                    QWEN3_4B_FP8, H100_SXM,
+                    arena_tokens=arena, page_tokens=16)
+                best.append(work)
+            return
+        added = order[pos]
+        crossing = [i for i, ends in enumerate(edge_aliases)
+                    if added in ends and i not in applied
+                    and ends <= set(order[:pos + 1])]
+        if not crossing:
+            return
+        for edge_order in it.permutations(crossing):
+            def visit_edge(k, applied_now, sequence_now):
+                if k == len(edge_order):
+                    visit_alias(order, pos + 1, applied_now,
+                                sequence_now)
+                    return
+                i = edge_order[k]
+                spec = specs[i]
+                for anchor in _feasible_anchors(spec, True, toks, pre,
+                                                chunk):
+                    visit_edge(k + 1, applied_now | {i},
+                               sequence_now + [(spec, anchor)])
+            visit_edge(0, set(applied), list(sequence))
+
+    aliases = sorted({a for ends in edge_aliases for a in ends})
+    for order in it.permutations(aliases):
+        visit_alias(list(order), 1, set(), [])
+
+    assert best, "enumeration found no connected left deep plan"
+    assert key(found["work"]) == min(key(w) for w in best)
+
+
+def _join_search_spec(position, aliases, anchor):
+    return dict(
+        written_pos=position,
+        aliases=list(aliases),
+        anchor=anchor,
+        anchor_free=False,
+        semantics="full",
+        selectivity=None,
+        frame_tokens={alias: 5 for alias in aliases},
+        label_tokens={alias: 4 for alias in aliases},
+        tail_tokens=6,
+    )
+
+
+def test_join_search_prices_current_partial_document_residency():
+    from quail.planner.joins import search_joins
+
+    specs = [
+        _join_search_spec(0, ("a", "b"), "a"),
+        _join_search_spec(1, ("b", "c"), "b"),
+        _join_search_spec(2, ("a", "c"), "a"),
+    ]
+    live = {"a": 3.0, "b": 3.0, "c": 2.0}
+    lengths = {"a": [90, 100, 110], "b": [400] * 3,
+               "c": [50] * 2}
+
+    current = search_joins(
+        specs, live, lengths, {"a": {1, 2}}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM, fixed_order=True)
+    with_capacity = search_joins(
+        specs, live, lengths, {"a": {1, 2}}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM, fixed_order=True,
+        arena_tokens=41 * 16, page_tokens=16)
+
+    assert current["records"][0]["resident_docs"] == 2
+    assert current["records"][2]["resident_docs"] == 0
+    assert with_capacity["records"] == current["records"]
+    assert with_capacity["work"] == current["work"]
+
+
+def test_join_replan_starts_from_already_joined_aliases():
+    from quail.planner.joins import search_joins
+
+    specs = [
+        _join_search_spec(0, ("a", "b"), "b"),
+        _join_search_spec(2, ("c", "d"), "c"),
+    ]
+    live = {alias: 2.0 for alias in "abcd"}
+    lengths = {alias: [100, 120] for alias in "abcd"}
+
+    assert search_joins(
+        specs, live, lengths, {}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM) is None
+
+    found = search_joins(
+        specs, live, lengths, {}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM,
+        already_joined={"b", "c"})
+
+    assert found is not None
+    assert {position for position, _ in found["seq"]} == {0, 2}
+
+
+def test_aggregate_join_work_matches_per_document_sum():
+    import pytest
+
+    from quail.planner.joins import stage_work, summarize_alias
+    spec = _join_search_spec(0, ("a", "b"), "a")
+    live = {"a": 2.25, "b": 3.5}
+    raw = {"a": [90, 100, 110], "b": [30, 50, 70, 90]}
+    stats = {
+        "a": summarize_alias(raw["a"], {1, 2}),
+        "b": summarize_alias(raw["b"]),
+    }
+
+    def per_document(same_group):
+        n = live["a"]
+        tuples = live["a"] * live["b"]
+        suffix = (spec["tail_tokens"] + spec["label_tokens"]["b"]
+                  + sum(raw["b"]) / len(raw["b"]))
+        frame = spec["frame_tokens"]["a"]
+        per_anchor = tuples / n
+        fraction = n / len(raw["a"])
+        total = Work()
+        for position, document in enumerate(raw["a"]):
+            prefix = 10 + document
+            start = (ask(prefix, frame)
+                     if same_group or position in {1, 2}
+                     else scan(prefix, frame))
+            stream = Work(
+                tokens=per_anchor * suffix,
+                pairs=per_anchor * (
+                    suffix * (prefix + frame) + triangle(suffix)),
+                kv_written=per_anchor * suffix,
+                kv_read=prefix + frame,
+            )
+            total = total + (start + stream) * fraction
+        return total
+
+    for same_group in (False, True):
+        actual = stage_work(
+            spec, "a", live, stats, 10, resident_at_start=True,
+            same_group=same_group)
+        expected = per_document(same_group)
+        assert actual.tokens == pytest.approx(expected.tokens)
+        assert actual.pairs == pytest.approx(expected.pairs)
+        assert actual.kv_written == pytest.approx(expected.kv_written)
+        assert actual.kv_read == pytest.approx(expected.kv_read)
+
+
+def test_join_search_accepts_million_document_summaries():
+    from quail.planner.joins import AliasStats, search_joins
+
+    million = AliasStats(
+        count=1_000_000,
+        total=100_000_000,
+        squared=10_000_000_000,
+        maximum=100,
+        resident_count=500_000,
+        resident_total=50_000_000,
+        resident_squared=5_000_000_000,
+    )
+    stats = {alias: million for alias in "abcd"}
+    live = {alias: 1_000_000.0 for alias in "abcd"}
+    specs = [
+        _join_search_spec(0, ("a", "b"), "a"),
+        _join_search_spec(1, ("b", "c"), "b"),
+        _join_search_spec(2, ("c", "d"), "c"),
+    ]
+
+    found = search_joins(
+        specs, live, stats, {}, 10, 100_000,
+        QWEN3_4B_FP8, H100_SXM)
+
+    assert found is not None
+    assert len(found["seq"]) == 3
+    assert all("resident_positions" not in record
+               for record in found["records"])

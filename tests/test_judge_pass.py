@@ -7,10 +7,13 @@ from quail.bench.judge_pass import (
     PREDICATES,
     _compact_label_parts,
     _corpus_identity,
+    _lepard_source_answer,
     _saved_verification_sample,
     example_identity,
     judgment_identity,
     label_set_identity,
+    parse_function_calls,
+    predicate_payload,
     predicate_version,
     render_filter_prompt,
     render_join_prompt,
@@ -19,6 +22,17 @@ from quail.bench.judge_pass import (
 
 def _spec(key):
     return next(spec for spec in PREDICATES if spec.key == key)
+
+
+def test_parse_function_calls_requires_every_workload():
+    calls = parse_function_calls(
+        "imdb=fc-imdb,biodex=fc-bio,fever=fc-fever,lepard=fc-lepard")
+    assert calls == {
+        "imdb": "fc-imdb",
+        "biodex": "fc-bio",
+        "fever": "fc-fever",
+        "lepard": "fc-lepard",
+    }
 
 
 def test_stable_ids_cover_predicate_semantics_and_inputs():
@@ -30,6 +44,8 @@ def test_stable_ids_cover_predicate_semantics_and_inputs():
     assert predicate_version(renamed) == predicate_version(original)
 
     join_spec = _spec("quailb.biodex.report.experienced_reaction")
+    assert (predicate_payload(join_spec)["render"]
+            == "join_arg0_anchor_then_arg1_v1")
     changed_prompt = replace(join_spec, template=join_spec.template + "\n")
     changed_roles = replace(join_spec, left_role="medical_report")
     assert predicate_version(join_spec) != predicate_version(changed_prompt)
@@ -75,6 +91,11 @@ def test_filter_and_join_prompts_use_the_engine_layout():
     assert "(The document above is DOCUMENT {0}.)" in join_prompt
     assert "DOCUMENT {1}:\naspect" in join_prompt
     assert join_prompt.endswith("\nANSWER:")
+
+
+def test_lepard_source_answer_uses_sampled_citation_edges():
+    assert _lepard_source_answer(["p1", "p2"], ["p2", "p3"])
+    assert not _lepard_source_answer(["p1", "p2"], ["p3"])
 
 
 def test_saved_verification_sample_covers_completed_parts_after_resume(

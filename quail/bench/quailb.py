@@ -5,10 +5,13 @@ FEVER, LePaRD), plus two optional PrivacyPolicies queries.
 """
 
 import argparse
+import hashlib
+import heapq
 import json
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +21,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 DATA_SEED = 20260818
-CACHE_SCHEMA_VERSION = 5  # bumped: FEVER/BioDEX scale changes
+CACHE_SCHEMA_VERSION = 7
+LEPARD_POSITIVE_PAIRS = 5_000
 
 # Exact source snapshots for the benchmark corpus.  The row selection below
 # is deterministic only when the upstream revisions are fixed as well as the
@@ -35,14 +39,12 @@ SOURCE_REVISIONS = {
         "8fd6abfc7ca99d1f95c7f3f3a5dd5ea0cf9b7deb",
 }
 
-# Base document counts at sf=1. Only these three scale with sf; the
-# partner tables (aspects, terms) are fixed vocabulary and evidence is
-# bounded by whichever claims get sampled.
+# Base document counts at sf=1. LePaRD scales sampled citation pairs
+# before it deduplicates the two document tables.
 SETS = {
     "reviews": 50_000,
     "reports": 5_000,
     "claims": 5_000,
-    "citations": 2_000,
     "policies": 1_000_000,
 }
 
@@ -51,9 +53,66 @@ ASPECTS = ["the acting", "the plot", "the directing", "the cinematography",
            "the special effects", "the character development",
            "the screenplay", "the editing"]
 
+QUERY_ORDER = (
+    *(f"IMDB-{i}" for i in range(1, 11)),
+    *(f"BIO-{i}" for i in range(1, 4)),
+    *(f"FEV-{i}" for i in range(1, 10)),
+    *(f"LEP-{i}" for i in range(1, 9)),
+)
+
+QUERY_FAMILY_WORKLOADS = {
+    "IMDB": "imdb",
+    "BIO": "biodex",
+    "FEV": "fever",
+    "LEP": "lepard",
+}
+
+
+def split_query_ids(ids, containers):
+    """Split query IDs into the same equal chunks as stock vLLM."""
+    count, extra = divmod(len(ids), containers)
+    chunks = []
+    start = 0
+    for index in range(containers):
+        size = count + (1 if index < extra else 0)
+        chunks.append(tuple(ids[start:start + size]))
+        start += size
+    return tuple(chunk for chunk in chunks if chunk)
+
+
+def split_query_families(ids):
+    """Return one ordered query group for each QUAIL-B family."""
+    groups = tuple(
+        tuple(query_id for query_id in ids
+              if query_id.split("-", 1)[0] == prefix)
+        for prefix in QUERY_FAMILY_WORKLOADS
+    )
+    assigned = {query_id for group in groups for query_id in group}
+    unknown = [query_id for query_id in ids if query_id not in assigned]
+    if unknown:
+        raise ValueError(f"unknown query family for {unknown}")
+    return tuple(group for group in groups if group)
+
+
+def query_family_name(ids):
+    """Return the name for one query family."""
+    prefixes = {query_id.split("-", 1)[0] for query_id in ids}
+    if len(prefixes) != 1:
+        raise ValueError(
+            f"expected one query family, found {sorted(prefixes)}")
+    prefix = prefixes.pop()
+    try:
+        return QUERY_FAMILY_WORKLOADS[prefix]
+    except KeyError as error:
+        raise ValueError(f"unknown query family {prefix!r}") from error
+
 
 def _n_docs(name, sf):
     return max(8, int(SETS[name] * sf))
+
+
+def _n_lepard_pairs(sf):
+    return max(8, int(LEPARD_POSITIVE_PAIRS * sf))
 
 
 # ------------------------------------------------------- set builders
@@ -133,10 +192,75 @@ def _fever_data(n_claims):
     return claims, page_text
 
 
+def _lepard_pair_priority(dest_id, passage_id):
+    value = f"{DATA_SEED}\0{dest_id}\0{passage_id}".encode()
+    return int.from_bytes(
+        hashlib.blake2b(value, digest_size=16).digest(), "big")
+
+
+def _sample_lepard_pairs(rows, passages, n):
+    """Select a stable random sample of distinct known citation pairs."""
+    passages = {
+        str(key): str(value).strip()
+        for key, value in passages.items()
+        if value
+    }
+    selected = []
+    selected_rows = {}
+    for dest_id, destination_context, passage_id in rows:
+        dest_id = str(dest_id)
+        passage_id = str(passage_id)
+        key = (dest_id, passage_id)
+        passage_text = passages.get(passage_id)
+        context = str(destination_context).strip()
+        if not passage_text or len(context) < 50:
+            continue
+        if key in selected_rows:
+            prior_context, _ = selected_rows[key]
+            if (len(context), context) > (len(prior_context), prior_context):
+                selected_rows[key] = (context, passage_text)
+            continue
+        priority = _lepard_pair_priority(dest_id, passage_id)
+        item = (-priority, dest_id, passage_id)
+        if len(selected) < n:
+            heapq.heappush(selected, item)
+            selected_rows[key] = (context, passage_text)
+            continue
+        if priority >= -selected[0][0]:
+            continue
+        removed = heapq.heapreplace(selected, item)
+        del selected_rows[(removed[1], removed[2])]
+        selected_rows[key] = (context, passage_text)
+    pairs = []
+    for _, dest_id, passage_id in sorted(
+            selected, key=lambda item: (-item[0], item[1], item[2])):
+        context, passage_text = selected_rows[(dest_id, passage_id)]
+        pairs.append((dest_id, passage_id, context, passage_text))
+    return pairs
+
+
+def _lepard_documents(pairs):
+    """Deduplicate each document column after sampling citation pairs."""
+    contexts = {}
+    passages = {}
+    for _dest_id, passage_id, context, passage_text in pairs:
+        contexts.setdefault(context, set()).add(passage_id)
+        passages.setdefault(passage_text, set()).add(passage_id)
+    context_rows = [{
+        "id": f"lc{i}",
+        "destination_context": context,
+        "cited_passage_ids": sorted(passage_ids),
+    } for i, (context, passage_ids) in enumerate(contexts.items())]
+    passage_rows = [{
+        "id": f"lp{i}",
+        "passage_text": passage_text,
+        "passage_ids": sorted(passage_ids),
+    } for i, (passage_text, passage_ids) in enumerate(passages.items())]
+    return context_rows, passage_rows
+
+
 def _lepard_rows(n):
-    """LePaRD citation events: (destination_context, canonical passage
-    text, passage_id) per row, one row per distinct dest_id. Passage
-    text comes from passage_dict.json, not the CSV's own quote column."""
+    """Read LePaRD and sample known positive citation pairs."""
     import json as _json
 
     from huggingface_hub import hf_hub_download
@@ -148,23 +272,26 @@ def _lepard_rows(n):
     dict_path = hf_hub_download("rmahari/LePaRD", "passage_dict.json",
                                 repo_type="dataset",
                                 revision=SOURCE_REVISIONS["rmahari/LePaRD"])
-    passages = _json.load(open(dict_path))["data"]
+    with open(dict_path) as source:
+        passages = _json.load(source)["data"]
 
-    rows, seen_dest = [], set()
     cols = ["dest_id", "destination_context", "passage_id"]
-    for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=50_000):
-        for r in chunk.itertuples(index=False):
-            if r.dest_id in seen_dest:
-                continue
-            text = passages.get(r.passage_id)
-            ctx = str(r.destination_context)
-            if not text or len(ctx) < 50:
-                continue
-            seen_dest.add(r.dest_id)
-            rows.append((ctx, str(text).strip(), r.passage_id))
-            if len(rows) >= n:
-                return rows
-    return rows
+    chunks = pd.read_csv(
+        csv_path,
+        usecols=cols,
+        chunksize=50_000,
+        dtype={
+            "dest_id": "string",
+            "destination_context": "string",
+            "passage_id": "string",
+        },
+    )
+    rows = (
+        row
+        for chunk in chunks
+        for row in chunk.loc[:, cols].itertuples(index=False, name=None)
+    )
+    return _sample_lepard_pairs(rows, passages, n)
 
 
 def _vocab_table(rows, idx, cap=None):
@@ -179,23 +306,33 @@ def _vocab_table(rows, idx, cap=None):
     return vocab[:cap] if cap else vocab
 
 
-def _build_citations(d, sf, force=False):
-    """Build citations.parquet from LePaRD data, idempotent.
-
-    Called from both branches of build_sets so adding a new table
-    backfills existing sf caches.
-    """
-    path = d / "citations.parquet"
-    if path.exists() and not force:
+def _build_lepard(d, sf, force=False):
+    """Build the two deduplicated LePaRD document tables."""
+    context_path = d / "citation_contexts.parquet"
+    passage_path = d / "citation_passages.parquet"
+    if context_path.exists() and passage_path.exists() and not force:
         return
-    n = _n_docs("citations", sf)
-    lep = _lepard_rows(n)
-    pq.write_table(pa.table({
-        "id": [f"lp{i}" for i in range(len(lep))],
-        "destination_context": [r[0] for r in lep],
-        "passage_text": [r[1] for r in lep],
-        "passage_id": [r[2] for r in lep],
-    }), path)
+    expected_pairs = _n_lepard_pairs(sf)
+    pairs = _lepard_rows(expected_pairs)
+    if len(pairs) != expected_pairs:
+        raise ValueError(
+            f"LePaRD provided {len(pairs)} valid citation pairs, expected "
+            f"{expected_pairs}")
+    contexts, passages = _lepard_documents(pairs)
+    context_schema = pa.schema([
+        ("id", pa.string()),
+        ("destination_context", pa.string()),
+        ("cited_passage_ids", pa.list_(pa.string())),
+    ])
+    passage_schema = pa.schema([
+        ("id", pa.string()),
+        ("passage_text", pa.string()),
+        ("passage_ids", pa.list_(pa.string())),
+    ])
+    pq.write_table(
+        pa.Table.from_pylist(contexts, schema=context_schema), context_path)
+    pq.write_table(
+        pa.Table.from_pylist(passages, schema=passage_schema), passage_path)
 
 
 def _build_policies(d, sf, force=False):
@@ -238,7 +375,7 @@ def _build_policies(d, sf, force=False):
 
 
 def build_sets(data_dir, sf, lf=1):
-    """All seven tables as parquet files, cached by sf.
+    """All eight tables as parquet files, cached by sf.
 
     lf (load factor) is accepted but unused: documents here are real
     and unpadded, so there's nothing to scale. Kept in the signature
@@ -249,6 +386,7 @@ def build_sets(data_dir, sf, lf=1):
         expected = {
             "cache_schema_version": CACHE_SCHEMA_VERSION,
             "data_seed": DATA_SEED,
+            "lepard_positive_pairs": LEPARD_POSITIVE_PAIRS,
             "scale_factor": sf,
             "source_revisions": SOURCE_REVISIONS,
         }
@@ -257,7 +395,19 @@ def build_sets(data_dir, sf, lf=1):
         except json.JSONDecodeError:
             current = None
         if current == expected:
-            _build_citations(d, sf)
+            _build_lepard(d, sf)
+            return d
+        same_sources = current and all(
+            current.get(key) == expected[key]
+            for key in ("data_seed", "scale_factor", "source_revisions")
+        )
+        other_tables = (
+            "reviews", "aspects", "reports", "terms", "claims", "evidence"
+        )
+        if same_sources and all((d / f"{name}.parquet").exists()
+                                for name in other_tables):
+            _build_lepard(d, sf, force=True)
+            marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
             return d
     d.mkdir(parents=True, exist_ok=True)
 
@@ -298,11 +448,12 @@ def build_sets(data_dir, sf, lf=1):
         "text": [page_text[p] for p in ev_ids],
     }), d / "evidence.parquet")
 
-    _build_citations(d, sf, force=True)
+    _build_lepard(d, sf, force=True)
 
     marker.write_text(json.dumps({
         "cache_schema_version": CACHE_SCHEMA_VERSION,
         "data_seed": DATA_SEED,
+        "lepard_positive_pairs": LEPARD_POSITIVE_PAIRS,
         "scale_factor": sf,
         "source_revisions": SOURCE_REVISIONS,
     }, indent=2, sort_keys=True))
@@ -312,7 +463,8 @@ def build_sets(data_dir, sf, lf=1):
 def register_sets(sess, data_dir):
     from quail.catalog import DocumentProvider
     for name in ("reviews", "aspects", "reports", "terms",
-                "claims", "evidence", "citations"):
+                "claims", "evidence", "citation_contexts",
+                "citation_passages"):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
 
@@ -749,6 +901,37 @@ SCENARIOS = [
     "to estimate your net worth, and makes that estimate available "
     "to its business partners.",
 ]
+# Fixed planner inputs from the sf=0.1 Qwen3 32B fp8 labels.
+# They apply at every scale factor so query planning does not read answers.
+SELECTIVITY_ESTIMATE_COLLECTION = "gt_363b5ab570635c33894e1a030c21f57e"
+SELECTIVITY_ESTIMATE_CORPUS = "c_3bd14ed0758287cba9d88fb68de8b7b8"
+SELECTIVITY_ESTIMATE_SCALE_FACTOR = 0.1
+FILTER_SELECTIVITY_ESTIMATES = {
+    F1: 4004 / 5000,
+    F4: 1218 / 5000,
+    F5: 2853 / 5000,
+    F7: 306 / 500,
+    F8: 341 / 500,
+    F9: 319 / 500,
+    F11: 296 / 500,
+    F12: 69 / 500,
+    F13: 159 / 287,
+    LEP1: 14 / 500,
+    LEP2: 229 / 500,
+    LEP3: 51 / 500,
+    LEP4: 31 / 500,
+    LEP5: 14 / 500,
+    LEPS1: 351 / 433,
+}
+JOIN_SELECTIVITY_ESTIMATES = {
+    DISCUSS_ASPECT: 17683 / 60000,
+    ASPECT_SENTIMENT: 9635 / 60000,
+    REACTION: 19144 / 563500,
+    REACTION_SEVERE: 22921 / 563500,
+    SUPPORT: 311 / 143500,
+    REFUTE: 477 / 143500,
+    LEPJOIN: 500 / 216500,
+}
 
 
 # ---------------------------------------------------------- queries
@@ -758,6 +941,17 @@ def queries(sess):
     per call so each pass re-plans."""
     import quail
 
+    def add_filter(query, template, column):
+        return query.ai_filter(
+            quail.prompt(template, column),
+            selectivity=FILTER_SELECTIVITY_ESTIMATES.get(template))
+
+    def add_join(query, partner, template, left, right):
+        return query.ai_join(
+            partner,
+            quail.prompt(template, left, right),
+            selectivity=JOIN_SELECTIVITY_ESTIMATES.get(template))
+
     def make(doc_table, doc_alias, doc_col, filters, joins, select):
         """filters: list of prompt templates applied in order to the
         base table. joins: list of (partner_table, partner_alias,
@@ -765,21 +959,30 @@ def queries(sess):
         order, each dependent on whatever survived the stages before
         it; partner_filters push filters onto the partner side before
         the join (the FEV-5/6 and LEP-7 two-sided shape)."""
+        filter_templates = list(filters)
+        for _partner, _alias, _column, _join, *rest in joins:
+            filter_templates.extend(rest[0] if rest else ())
+        has_estimates = (
+            all(template in FILTER_SELECTIVITY_ESTIMATES
+                for template in filter_templates)
+            and all(join[3] in JOIN_SELECTIVITY_ESTIMATES for join in joins)
+        )
+
         def build():
             qy = sess.docs(doc_table).alias(doc_alias)
             for tmpl in filters:
-                qy = qy.ai_filter(
-                    quail.prompt(tmpl, quail.col(f"{doc_alias}.{doc_col}")))
+                qy = add_filter(
+                    qy, tmpl, quail.col(f"{doc_alias}.{doc_col}"))
             for partner, palias, pcol, tmpl, *rest in joins:
                 pq = sess.docs(partner).alias(palias)
                 for pf in (rest[0] if rest else ()):
-                    pq = pq.ai_filter(
-                        quail.prompt(pf, quail.col(f"{palias}.{pcol}")))
-                qy = qy.ai_join(
-                    pq,
-                    quail.prompt(tmpl, quail.col(f"{doc_alias}.{doc_col}"),
-                                quail.col(f"{palias}.{pcol}")))
-            return qy.select(*select)
+                    pq = add_filter(
+                        pq, pf, quail.col(f"{palias}.{pcol}"))
+                qy = add_join(
+                    qy, pq, tmpl, quail.col(f"{doc_alias}.{doc_col}"),
+                    quail.col(f"{palias}.{pcol}"))
+            order = "by_cost" if has_estimates else "as_written"
+            return qy.select(*select, order=order)
         return build
 
     q = {}
@@ -815,38 +1018,33 @@ def queries(sess):
         a1 = sess.docs("aspects").alias("a1")
         r2 = sess.docs("reviews").alias("r2")
         a2 = sess.docs("aspects").alias("a2")
-        return (r1
-                .ai_join(a1, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r1.body"),
-                                          quail.col("a1.aspect")))
-                .ai_join(r2, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r2.body"),
-                                          quail.col("a1.aspect")))
-                .ai_join(a2, quail.prompt(ASPECT_SENTIMENT,
-                                          quail.col("r2.body"),
-                                          quail.col("a2.aspect")))
-                .select("r1.id", "a1.id", "r2.id", "a2.id"))
+        qy = add_join(r1, a1, DISCUSS_ASPECT,
+                      quail.col("r1.body"), quail.col("a1.aspect"))
+        qy = add_join(qy, r2, DISCUSS_ASPECT,
+                      quail.col("r2.body"), quail.col("a1.aspect"))
+        qy = add_join(qy, a2, ASPECT_SENTIMENT,
+                      quail.col("r2.body"), quail.col("a2.aspect"))
+        return qy.select(
+            "r1.id", "a1.id", "r2.id", "a2.id", order="by_cost")
     q["IMDB-9"] = ("3J chain r1-a1-r2-a2: two reviews discuss the "
                    "same aspect, second review positive about another",
                    imdb9)
 
     def imdb10():
-        r1 = sess.docs("reviews").alias("r1").ai_filter(
-            quail.prompt(F1, quail.col("r1.body")))
+        r1 = add_filter(
+            sess.docs("reviews").alias("r1"), F1,
+            quail.col("r1.body"))
         a1 = sess.docs("aspects").alias("a1")
         r2 = sess.docs("reviews").alias("r2")
         a2 = sess.docs("aspects").alias("a2")
-        return (r1
-                .ai_join(a1, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r1.body"),
-                                          quail.col("a1.aspect")))
-                .ai_join(r2, quail.prompt(DISCUSS_ASPECT,
-                                          quail.col("r2.body"),
-                                          quail.col("a1.aspect")))
-                .ai_join(a2, quail.prompt(ASPECT_SENTIMENT,
-                                          quail.col("r2.body"),
-                                          quail.col("a2.aspect")))
-                .select("r1.id", "a1.id", "r2.id", "a2.id"))
+        qy = add_join(r1, a1, DISCUSS_ASPECT,
+                      quail.col("r1.body"), quail.col("a1.aspect"))
+        qy = add_join(qy, r2, DISCUSS_ASPECT,
+                      quail.col("r2.body"), quail.col("a1.aspect"))
+        qy = add_join(qy, a2, ASPECT_SENTIMENT,
+                      quail.col("r2.body"), quail.col("a2.aspect"))
+        return qy.select(
+            "r1.id", "a1.id", "r2.id", "a2.id", order="by_cost")
     q["IMDB-10"] = ("F1 -> 3J chain r1-a1-r2-a2", imdb10)
 
     # IMDB-8: star shape - A joins B and A joins C, same anchor
@@ -902,38 +1100,33 @@ def queries(sess):
         e1 = sess.docs("evidence").alias("e1")
         c2 = sess.docs("claims").alias("c2")
         e2 = sess.docs("evidence").alias("e2")
-        return (c1
-                .ai_join(e1, quail.prompt(SUPPORT,
-                                          quail.col("c1.claim"),
-                                          quail.col("e1.text")))
-                .ai_join(c2, quail.prompt(REFUTE,
-                                          quail.col("c2.claim"),
-                                          quail.col("e1.text")))
-                .ai_join(e2, quail.prompt(SUPPORT,
-                                          quail.col("c2.claim"),
-                                          quail.col("e2.text")))
-                .select("c1.id", "e1.id", "c2.id", "e2.id"))
+        qy = add_join(c1, e1, SUPPORT,
+                      quail.col("c1.claim"), quail.col("e1.text"))
+        qy = add_join(qy, c2, REFUTE,
+                      quail.col("c2.claim"), quail.col("e1.text"))
+        qy = add_join(qy, e2, SUPPORT,
+                      quail.col("c2.claim"), quail.col("e2.text"))
+        return qy.select(
+            "c1.id", "e1.id", "c2.id", "e2.id", order="by_cost")
     q["FEV-8"] = ("3J chain c1-e1-c2-e2: evidence supports c1 but "
                   "refutes c2, c2 supported by different evidence",
                   fev8)
 
     def fev9():
-        c1 = sess.docs("claims").alias("c1").ai_filter(
-            quail.prompt(F11, quail.col("c1.claim")))
+        c1 = add_filter(
+            sess.docs("claims").alias("c1"), F11,
+            quail.col("c1.claim"))
         e1 = sess.docs("evidence").alias("e1")
         c2 = sess.docs("claims").alias("c2")
         e2 = sess.docs("evidence").alias("e2")
-        return (c1
-                .ai_join(e1, quail.prompt(SUPPORT,
-                                          quail.col("c1.claim"),
-                                          quail.col("e1.text")))
-                .ai_join(c2, quail.prompt(REFUTE,
-                                          quail.col("c2.claim"),
-                                          quail.col("e1.text")))
-                .ai_join(e2, quail.prompt(SUPPORT,
-                                          quail.col("c2.claim"),
-                                          quail.col("e2.text")))
-                .select("c1.id", "e1.id", "c2.id", "e2.id"))
+        qy = add_join(c1, e1, SUPPORT,
+                      quail.col("c1.claim"), quail.col("e1.text"))
+        qy = add_join(qy, c2, REFUTE,
+                      quail.col("c2.claim"), quail.col("e1.text"))
+        qy = add_join(qy, e2, SUPPORT,
+                      quail.col("c2.claim"), quail.col("e2.text"))
+        return qy.select(
+            "c1.id", "e1.id", "c2.id", "e2.id", order="by_cost")
     q["FEV-9"] = ("F11 -> 3J chain c1-e1-c2-e2", fev9)
 
     # FEV-7: star shape, both joins anchored on claims.
@@ -944,39 +1137,42 @@ def queries(sess):
          ("evidence", "e2", "text", REFUTE)],
         ["c.id", "e.id", "e2.id"]))
 
-    # LePaRD: one table (`citations`), self-joined. Alias "d" reads
-    # destination_context, alias "s" reads passage_text.
+    # LePaRD uses two deduplicated projections of sampled citation pairs.
     q["LEP-1"] = ("filter: LEP1 (reasoning does not apply)", make(
-        "citations", "d", "destination_context", [LEP1], [], ["d.id"]))
-    q["LEP-2"] = ("join: self-join (citations x citations)", make(
-        "citations", "d", "destination_context", [],
-        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+        "citation_contexts", "d", "destination_context", [LEP1], [],
+        ["d.id"]))
+    q["LEP-2"] = ("join: citation contexts x cited passages", make(
+        "citation_contexts", "d", "destination_context", [],
+        [("citation_passages", "s", "passage_text", LEPJOIN)],
+        ["d.id", "s.id"]))
     q["LEP-3"] = ("LEP1 -> join, dependent", make(
-        "citations", "d", "destination_context", [LEP1],
-        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+        "citation_contexts", "d", "destination_context", [LEP1],
+        [("citation_passages", "s", "passage_text", LEPJOIN)],
+        ["d.id", "s.id"]))
     q["LEP-4"] = ("LEP1 -> LEP2 -> join, 2 filters then 1 join", make(
-        "citations", "d", "destination_context", [LEP1, LEP2],
-        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+        "citation_contexts", "d", "destination_context", [LEP1, LEP2],
+        [("citation_passages", "s", "passage_text", LEPJOIN)],
+        ["d.id", "s.id"]))
     q["LEP-5"] = ("LEP1 -> LEP2 -> LEP3 -> join, 3 filters then 1 join",
-                  make("citations", "d", "destination_context",
+                  make("citation_contexts", "d", "destination_context",
                       [LEP1, LEP2, LEP3],
-                      [("citations", "s", "passage_text", LEPJOIN)],
+                      [("citation_passages", "s", "passage_text", LEPJOIN)],
                       ["d.id", "s.id"]))
     q["LEP-6"] = ("LEP1..LEP5 -> join, 5 filters then 1 join", make(
-        "citations", "d", "destination_context",
+        "citation_contexts", "d", "destination_context",
         [LEP1, LEP2, LEP3, LEP4, LEP5],
-        [("citations", "s", "passage_text", LEPJOIN)], ["d.id", "s.id"]))
+        [("citation_passages", "s", "passage_text", LEPJOIN)],
+        ["d.id", "s.id"]))
 
     q["LEP-7"] = ("2F + 1J: two-sided pushdown - LEP1+LEP2 on excerpts, "
-                  "LEPS1 on passages, each filtered before the self-join",
-                  make(
-        "citations", "d", "destination_context", [LEP1, LEP2],
-        [("citations", "s", "passage_text", LEPJOIN, [LEPS1])],
+                  "LEPS1 on passages, each filtered before the join", make(
+        "citation_contexts", "d", "destination_context", [LEP1, LEP2],
+        [("citation_passages", "s", "passage_text", LEPJOIN, [LEPS1])],
         ["d.id", "s.id"]))
     # LEP-6 without its join: the deepest filter chain in the suite,
     # five stages of KV reuse with no join work mixed in.
     q["LEP-8"] = ("LEP1..LEP5, 5 filters, no join", make(
-        "citations", "d", "destination_context",
+        "citation_contexts", "d", "destination_context",
         [LEP1, LEP2, LEP3, LEP4, LEP5], [], ["d.id"]))
 
     # PrivacyPolicies: conditional on the corpus being available.
@@ -1003,17 +1199,19 @@ def _artifact_stem(started, sf, lf, model):
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
               out_path=None, model="qwen3-4b-fp8",
               accuracy=True, ground_truth_collection=None,
+              ground_truth_workload=None,
               h100_usd_per_hour=3.9492, ground_truth_files=None,
-              prediction=None, artifact_stem=None):
+              prediction=None, artifact_stem=None, execute=None):
     """Run all (or selected) QUAIL-B queries through the engine."""
     import quail
     from quail.bench.evaluate import (
-        BenchmarkEvaluator,
         H100_PRICE_SOURCE,
+        BenchmarkEvaluator,
         ModalVolumeFiles,
         add_query_metrics,
         corpus_identity,
         load_ground_truth,
+        load_ground_truth_workload,
         read_corpus,
         summarize_queries,
     )
@@ -1027,9 +1225,19 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     truth = None
     result_files = ground_truth_files or ModalVolumeFiles()
     if accuracy:
-        truth = load_ground_truth(
-            result_files, scale_factor=sf, corpus_id=corpus["corpus_id"],
-            collection_id=ground_truth_collection)
+        if ground_truth_workload:
+            truth = load_ground_truth_workload(
+                result_files,
+                scale_factor=sf,
+                corpus_id=corpus["corpus_id"],
+                corpus_full_hash=corpus["corpus_full_hash"],
+                workload=ground_truth_workload,
+            )
+        else:
+            truth = load_ground_truth(
+                result_files, scale_factor=sf,
+                corpus_id=corpus["corpus_id"],
+                collection_id=ground_truth_collection)
         if truth.corpus_id != corpus["corpus_id"]:
             raise ValueError(
                 f"benchmark corpus {corpus['corpus_id']} does not match "
@@ -1038,7 +1246,12 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     sess = quail.Session(EngineConfig(gpus=gpus, model=model))
     register_sets(sess, d)
     qdefs = queries(sess)
-    ids = [i for i in qdefs if only is None or i in only]
+    if only is None:
+        ids = list(qdefs)
+    elif isinstance(only, (set, frozenset)):
+        ids = [query_id for query_id in qdefs if query_id in only]
+    else:
+        ids = [query_id for query_id in only if query_id in qdefs]
     started = datetime.now(timezone.utc)
     artifact_stem = artifact_stem or _artifact_stem(
         started, sf, lf, model)
@@ -1053,6 +1266,12 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         prediction=prediction,
         sf=sf, lf=lf, gpus=gpus, model=model,
         corpus_id=corpus["corpus_id"],
+        selectivity_estimates=dict(
+            source_collection=SELECTIVITY_ESTIMATE_COLLECTION,
+            source_corpus=SELECTIVITY_ESTIMATE_CORPUS,
+            source_scale_factor=SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+            method=("TRUE labels divided by all labels, fixed across "
+                    "scale factors")),
         raw_volume_path=f"/results/{raw_root}",
         aggregate_volume_path=f"/results/{aggregate_volume_path}",
         pricing=dict(
@@ -1089,7 +1308,8 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         ),
         ground_truth=(
             dict(collection_id=truth.collection_id,
-                 reference_model=truth.reference_model)
+                 reference_model=truth.reference_model,
+                 workload=ground_truth_workload)
             if truth else None),
         passes={})
     try:
@@ -1101,14 +1321,15 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             print(f"[quailb] {qid}: {desc}", flush=True)
             try:
                 query = build()
-                res = query.run()
+                res = query.run(_execute=execute)
+                result_rows = res.count()
                 row = dict(query=qid, desc=desc,
                            wall_s=res.report["wall_s"],
                            boot_s=res.report["boot_s"],
                            boot_kind=res.report.get("boot_kind"),
                            boot=res.report.get("boot"),
                            fresh_tokens=res.report["fresh_tokens"],
-                           rows=len(res.rows),
+                           rows=result_rows,
                            peak_gib=res.report.get("peak_gib"),
                            stages=res.report["stages"])
                 if evaluator is not None:
@@ -1116,21 +1337,43 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                     add_query_metrics(
                         row, evaluation, h100_usd_per_hour, gpus)
                     raw_path = f"{raw_root}/{pass_name}/{qid}.json"
+                    answer_paths = {"filters": {}, "joins": {}}
+                    for (alias, written_pos), table in \
+                            res.answer_tables["filters"].items():
+                        path = (
+                            f"{raw_root}/{pass_name}/{qid}/answers/"
+                            f"filter-{alias}-{written_pos}.parquet")
+                        result_files.write_parquet(path, table)
+                        answer_paths["filters"][
+                            f"{alias}:{written_pos}"] = f"/results/{path}"
+                    for written_pos, table in \
+                            res.answer_tables["joins"].items():
+                        path = (
+                            f"{raw_root}/{pass_name}/{qid}/answers/"
+                            f"join-{written_pos}.parquet")
+                        result_files.write_parquet(path, table)
+                        answer_paths["joins"][str(written_pos)] = \
+                            f"/results/{path}"
                     result_files.write_json(raw_path, {
                         "run_id": run_id,
                         "pass": pass_name,
                         "query": qid,
                         "description": desc,
                         "columns": res.columns,
-                        "rows": res.rows,
-                        "answer_rows": res.answer_rows,
+                        "result": {
+                            "schema": str(res.schema),
+                            "rows": result_rows,
+                            "materialized": False,
+                        },
+                        "answer_tables": answer_paths,
                         "engine_report": res.report,
                         "accuracy": row["accuracy"],
                     })
                     row["raw_volume_path"] = f"/results/{raw_path}"
             except Exception as e:            # noqa: BLE001
                 row = dict(query=qid, desc=desc,
-                           error=f"{type(e).__name__}: {e}")
+                           error=f"{type(e).__name__}: {e}",
+                           traceback=traceback.format_exc())
             rows.append(row)
             print(f"[quailb] {row}", flush=True)
         passed = dict(
@@ -1175,6 +1418,8 @@ def main():
         help="compare answers and output rows with the Modal ground truth")
     ap.add_argument("--ground-truth-collection", default=None,
                     help="collection id; default is the one matching the corpus")
+    ap.add_argument("--ground-truth-workload", default=None,
+                    help="load labels for one workload from the current corpus")
     ap.add_argument("--h100-usd-per-hour", type=float, default=3.9492,
                     help="H100 price used for query cost estimates")
     ap.add_argument("--prediction", default=None,
@@ -1196,6 +1441,7 @@ def main():
         only=only, out_path=out, model=args.model,
         accuracy=args.accuracy,
         ground_truth_collection=args.ground_truth_collection,
+        ground_truth_workload=args.ground_truth_workload,
         h100_usd_per_hour=args.h100_usd_per_hour,
         prediction=args.prediction,
         artifact_stem=artifact_stem)

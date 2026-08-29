@@ -3,7 +3,7 @@
 from quail.builder import col, prompt
 from quail.catalog import DocumentProvider
 from quail.planner.plan import EngineConfig
-from quail.runtime import Query, RefusalError, Result, Session
+from quail.runtime import Query, QueryResult, RefusalError, Session
 
 __all__ = ["col", "prompt", "DocumentProvider", "EngineConfig",
-           "Query", "RefusalError", "Result", "Session"]
+           "Query", "QueryResult", "RefusalError", "Session"]

@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import io
-import itertools
 import json
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import pyarrow.parquet as pq
+import pyarrow as pa
+from pyarrow import parquet as pq
 
 
 GROUND_TRUTH_ROOT = "ground_truth/quailb/schema_v1"
@@ -28,8 +27,9 @@ CORPUS_COLUMNS = {
     "terms": ("id", "term"),
     "claims": ("id", "claim", "label", "evidence_wiki_url"),
     "evidence": ("id", "text"),
-    "citations": ("id", "destination_context", "passage_text",
-                  "passage_id"),
+    "citation_contexts": ("id", "destination_context",
+                          "cited_passage_ids"),
+    "citation_passages": ("id", "passage_text", "passage_ids"),
 }
 
 
@@ -42,11 +42,28 @@ def _full_hash(value) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def corpus_identity(rows: dict[str, list[dict]], scale_factor: float,
+def _python_rows(rows) -> list[dict]:
+    return rows.to_pylist() if isinstance(rows, pa.Table) else rows
+
+
+def _row_id(rows, index: int):
+    if isinstance(rows, pa.Table):
+        return rows.column("id")[index].as_py()
+    return rows[index]["id"]
+
+
+def _ids(rows):
+    if isinstance(rows, pa.Table):
+        return rows.column("id").to_pylist()
+    return [row["id"] for row in rows]
+
+
+def corpus_identity(rows: dict[str, pa.Table | list[dict]],
+                    scale_factor: float,
                     data_seed: int, source_revisions: dict) -> dict:
     tables = {}
     for table in sorted(rows):
-        row_hashes = [_full_hash(row) for row in rows[table]]
+        row_hashes = [_full_hash(row) for row in _python_rows(rows[table])]
         tables[table] = {
             "rows": len(row_hashes),
             "ordered_rows_full_hash": _full_hash(row_hashes),
@@ -67,11 +84,11 @@ def corpus_identity(rows: dict[str, list[dict]], scale_factor: float,
     }
 
 
-def read_corpus(data_dir: str | Path) -> dict[str, list[dict]]:
+def read_corpus(data_dir: str | Path) -> dict[str, pa.Table]:
     data_dir = Path(data_dir)
     return {
         table: pq.read_table(
-            data_dir / f"{table}.parquet", columns=list(columns)).to_pylist()
+            data_dir / f"{table}.parquet", columns=list(columns))
         for table, columns in CORPUS_COLUMNS.items()
     }
 
@@ -94,6 +111,11 @@ class LocalVolumeFiles:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
+    def write_parquet(self, path: str, table: pa.Table) -> None:
+        destination = self.root / path.lstrip("/")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, destination, compression="zstd")
+
 
 class ModalVolumeFiles:
     def __init__(self, volume_name: str = RESULTS_VOLUME):
@@ -113,6 +135,13 @@ class ModalVolumeFiles:
     def write_json(self, path: str, payload: dict) -> None:
         data = io.BytesIO(json.dumps(
             payload, indent=2, sort_keys=True).encode("utf-8"))
+        with self.volume.batch_upload(force=True) as batch:
+            batch.put_file(data, path.lstrip("/"))
+
+    def write_parquet(self, path: str, table: pa.Table) -> None:
+        data = io.BytesIO()
+        pq.write_table(table, data, compression="zstd")
+        data.seek(0)
         with self.volume.batch_upload(force=True) as batch:
             batch.put_file(data, path.lstrip("/"))
 
@@ -266,6 +295,95 @@ def load_ground_truth(files, scale_factor: float = 0.1,
                       ) -> GroundTruthCollection:
     _path, collection = _choose_collection(
         files, scale_factor, corpus_id, collection_id)
+    return _load_ground_truth_collection(files, collection)
+
+
+def _predicate_tables(predicate: dict) -> tuple[str, ...]:
+    tables = {predicate["left_table"]}
+    if predicate["kind"] == "join":
+        tables.add(predicate["right_table"])
+    return tuple(sorted(tables))
+
+
+def _validate_label_set_corpora(files, collection: dict,
+                                manifests: dict[str, dict]) -> None:
+    """Validate every label set against the tables its predicate reads."""
+    target_corpus_id = collection["corpus_id"]
+    reused = collection.get("reused_label_sets", {})
+    corpus_manifests = {}
+    source_collections = {}
+
+    def corpus_manifest(corpus_id):
+        if corpus_id not in corpus_manifests:
+            path = f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}/manifest.json"
+            corpus_manifests[corpus_id] = _read_json(files, path)
+        return corpus_manifests[corpus_id]
+
+    target = None
+    for key, manifest in manifests.items():
+        source_corpus_id = manifest.get("corpus_id")
+        if not source_corpus_id:
+            continue
+        if source_corpus_id == target_corpus_id:
+            target = target or corpus_manifest(target_corpus_id)
+            if (manifest.get("corpus_full_hash")
+                    and manifest["corpus_full_hash"]
+                    != target["corpus_full_hash"]):
+                raise ValueError(
+                    f"label set {manifest['label_set_id']} has the wrong "
+                    "corpus hash")
+            continue
+
+        record = reused.get(key)
+        if record is None:
+            raise ValueError(
+                f"label set {manifest['label_set_id']} belongs to corpus "
+                f"{source_corpus_id}, not {target_corpus_id}")
+        if record.get("source_corpus_id") != source_corpus_id:
+            raise ValueError(f"reused label set {key} has the wrong source")
+
+        source_collection_id = record.get("source_collection_id")
+        if not source_collection_id:
+            raise ValueError(
+                f"reused label set {key} has no source collection")
+        if source_collection_id not in source_collections:
+            path = (f"{GROUND_TRUTH_ROOT}/collections/"
+                    f"{source_collection_id}/manifest.json")
+            source_collections[source_collection_id] = _read_json(files, path)
+        source_collection = source_collections[source_collection_id]
+        if (source_collection.get("status") != "complete"
+                or source_collection.get("corpus_id") != source_corpus_id
+                or source_collection.get("label_sets", {}).get(key)
+                != manifest["label_set_id"]):
+            raise ValueError(
+                f"source collection {source_collection_id} does not "
+                f"contain reused label set {key}")
+
+        required = _predicate_tables(manifest["predicate"])
+        if tuple(record.get("required_tables", ())) != required:
+            raise ValueError(
+                f"reused label set {key} lists the wrong required tables")
+        target = target or corpus_manifest(target_corpus_id)
+        source = corpus_manifest(source_corpus_id)
+        if (manifest.get("corpus_full_hash")
+                and manifest["corpus_full_hash"]
+                != source["corpus_full_hash"]):
+            raise ValueError(
+                f"reused label set {key} has the wrong source corpus hash")
+        for table in required:
+            recorded = record.get("verified_table_manifests", {}).get(table)
+            if recorded != source["tables"].get(table):
+                raise ValueError(
+                    f"reused label set {key} has the wrong saved manifest "
+                    f"for table {table}")
+            if source["tables"].get(table) != target["tables"].get(table):
+                raise ValueError(
+                    f"cannot reuse {key}: table {table} changed between "
+                    f"{source_corpus_id} and {target_corpus_id}")
+
+
+def _load_ground_truth_collection(files, collection: dict
+                                  ) -> GroundTruthCollection:
     wanted = collection["label_sets"]
     all_paths = files.list_files(f"{GROUND_TRUTH_ROOT}/label_sets")
     manifest_paths = {}
@@ -282,6 +400,7 @@ def load_ground_truth(files, scale_factor: float = 0.1,
         key: json.loads(manifest_bytes[path])
         for key, path in manifest_paths.items()
     }
+    _validate_label_set_corpora(files, collection, manifests)
     data_paths = {}
     for key, label_set_id in sorted(wanted.items()):
         manifest_path = manifest_paths[key]
@@ -345,6 +464,43 @@ def load_ground_truth(files, scale_factor: float = 0.1,
         reference_model=summary.get("model"),
         predicates=predicates,
     )
+
+
+def load_ground_truth_workload(files, scale_factor: float, corpus_id: str,
+                               corpus_full_hash: str, workload: str
+                               ) -> GroundTruthCollection:
+    """Load completed label sets for one benchmark workload."""
+    from quail.bench.judge_pass import (
+        MODEL_NAME,
+        PREDICATES,
+        label_set_identity,
+    )
+
+    specs = [spec for spec in PREDICATES if spec.workload == workload]
+    if not specs:
+        raise ValueError(f"unknown ground truth workload {workload!r}")
+    identities = {
+        spec.key: label_set_identity(spec, corpus_id, corpus_full_hash)
+        for spec in specs
+    }
+    label_sets = {
+        key: identity["label_set_id"]
+        for key, identity in identities.items()
+    }
+    payload = {
+        "schema_version": 1,
+        "benchmark": "quailb",
+        "scale_factor": scale_factor,
+        "corpus_id": corpus_id,
+        "workload": workload,
+        "label_sets": label_sets,
+    }
+    collection = {
+        **payload,
+        "collection_id": f"gtw_{_full_hash(payload)[:32]}",
+        "summary": {"model": MODEL_NAME},
+    }
+    return _load_ground_truth_collection(files, collection)
 
 
 @dataclass
@@ -411,13 +567,8 @@ class _PredicateCount:
         }
 
 
-def _row_metrics(predicted_rows: list[tuple],
-                 expected_rows: list[tuple]) -> dict:
-    predicted = Counter(tuple(row) for row in predicted_rows)
-    expected = Counter(tuple(row) for row in expected_rows)
-    matched = sum((predicted & expected).values())
-    predicted_count = sum(predicted.values())
-    expected_count = sum(expected.values())
+def _row_metrics(predicted_count: int, expected_count: int,
+                 matched: int) -> dict:
     if not predicted_count and not expected_count:
         precision = recall = f1 = 1.0
     else:
@@ -432,7 +583,7 @@ def _row_metrics(predicted_rows: list[tuple],
         "precision": round(precision, 6),
         "recall": round(recall, 6),
         "f1": round(f1, 6),
-        "exact_match": predicted == expected,
+        "exact_match": (predicted_count == expected_count == matched),
         "false_positive_rows": predicted_count - matched,
         "false_negative_rows": expected_count - matched,
     }
@@ -440,7 +591,7 @@ def _row_metrics(predicted_rows: list[tuple],
 
 class BenchmarkEvaluator:
     def __init__(self, ground_truth: GroundTruthCollection,
-                 corpus_rows: dict[str, list[dict]]):
+                 corpus_rows: dict[str, pa.Table | list[dict]]):
         self.ground_truth = ground_truth
         self.corpus_rows = corpus_rows
 
@@ -449,7 +600,8 @@ class BenchmarkEvaluator:
 
     def _answer_for_prompt(self, prompt, assignment: dict[str, int]) -> bool:
         ids = [
-            str(self.corpus_rows[arg.provider][assignment[arg.alias]]["id"])
+            str(_row_id(
+                self.corpus_rows[arg.provider], assignment[arg.alias]))
             for arg in prompt.args
         ]
         key = self._key(prompt)
@@ -460,7 +612,9 @@ class BenchmarkEvaluator:
         raise NotImplementedError(
             "ground truth evaluation supports one or two prompt arguments")
 
-    def _expected_rows(self, query, scans, filters, joins) -> list[tuple]:
+    def _expected_answer_tables(self, query, scans, filters, joins):
+        from quail.runtime.result import document_index_table
+
         survivors = {}
         for scan in scans:
             kept = []
@@ -469,37 +623,81 @@ class BenchmarkEvaluator:
                 if all(self._answer_for_prompt(predicate.prompt, assignment)
                        for predicate in filters.get(scan.alias, ())):
                     kept.append(index)
-            survivors[scan.alias] = kept
+            survivors[scan.alias] = pa.array(kept, type=pa.int32())
 
-        first = scans[0].alias
-        assignments = [{first: index} for index in survivors[first]]
-        for join in joins:
+        id_indices = {
+            scan.alias: {
+                str(row_id): index
+                for index, row_id in enumerate(
+                    _ids(self.corpus_rows[scan.provider]))
+            }
+            for scan in scans
+        }
+        true_join_tables = {}
+        for written_pos, join in enumerate(joins):
             if join.semantics != "full":
                 raise NotImplementedError(
                     "QUAIL-B accuracy expects full join semantics")
-            aliases = [arg.alias for arg in join.predicate.args]
-            extended = []
-            for assignment in assignments:
-                missing = [alias for alias in aliases
-                           if alias not in assignment]
-                choices = [survivors[alias] for alias in missing]
-                for values in itertools.product(*choices):
-                    candidate = dict(assignment)
-                    candidate.update(zip(missing, values))
-                    if self._answer_for_prompt(join.predicate, candidate):
-                        extended.append(candidate)
-            assignments = extended
+            args = list(join.predicate.args)
+            if len(args) != 2:
+                raise NotImplementedError(
+                    "QUAIL-B accuracy supports binary AI joins")
+            key = self._key(join.predicate)
+            labels = self.ground_truth.predicates[key]
+            columns = {arg.alias: [] for arg in args}
+            for (left_id, right_id), answer in labels.answers.items():
+                if not answer:
+                    continue
+                columns[args[0].alias].append(
+                    id_indices[args[0].alias][str(left_id)])
+                columns[args[1].alias].append(
+                    id_indices[args[1].alias][str(right_id)])
+            true_join_tables[written_pos] = document_index_table(
+                columns, "ground_truth_join_answers")
+        return survivors, true_join_tables
 
-        expected = []
-        for assignment in assignments:
-            row = []
-            for column in query.logical.root.columns:
-                index = assignment[column.alias]
-                row.append(self.corpus_rows[column.provider][index][
-                    column.column])
-            expected.append(tuple(row))
-        limit = query.logical.root.limit
-        return expected[:limit] if limit is not None else expected
+    def _output_metrics(self, query, scans, filters, joins, result) -> dict:
+        from quail.runtime.result import (
+            build_result_declaration,
+            count_rows,
+            intersect_indices,
+            intersect_tables,
+        )
+
+        if query.logical.root.limit is not None:
+            raise NotImplementedError(
+                "QUAIL-B output accuracy does not support LIMIT")
+        expected_survivors, expected_join_tables = \
+            self._expected_answer_tables(query, scans, filters, joins)
+        join_order = [index for index, join in enumerate(joins)
+                      if join.semantics == "full"]
+        base_alias = query.logical.root.columns[0].alias
+        expected_declaration, _ = build_result_declaration(
+            [expected_join_tables[index] for index in join_order],
+            expected_survivors,
+            base_alias,
+        )
+        matching_survivors = {
+            alias: intersect_indices(
+                result.survivor_indices[alias], expected_survivors[alias])
+            for alias in expected_survivors
+        }
+        matching_join_tables = {
+            index: intersect_tables(
+                result.true_join_tables[index],
+                expected_join_tables[index])
+            for index in join_order
+        }
+        matching_declaration, _ = build_result_declaration(
+            [matching_join_tables[index] for index in join_order],
+            matching_survivors,
+            base_alias,
+        )
+        return _row_metrics(
+            result.count(),
+            count_rows(expected_declaration),
+            count_rows(matching_declaration),
+        )
 
     def evaluate(self, query, result) -> dict:
         from quail.planner.decide import _collect
@@ -514,63 +712,63 @@ class BenchmarkEvaluator:
             if node["op"] != "FilterChain":
                 continue
             alias = node["alias"]
-            saved_rows = result.answer_rows["filters"].get(alias, {})
-            for stage_index, stage in enumerate(node["stages"]):
+            for stage in node["stages"]:
                 predicate = filters[alias][stage["written_pos"]]
                 key = self._key(predicate.prompt)
                 item = _PredicateCount(key, "filter", alias)
-                for raw_index, answers in saved_rows.items():
-                    if len(answers) <= stage_index:
-                        continue
-                    index = int(raw_index)
+                table = result.answer_tables["filters"][
+                    (alias, stage["written_pos"])]
+                indices = table.column(alias).to_pylist()
+                answers = table.column("answer").to_pylist()
+                for index, predicted in zip(indices, answers):
                     left_id = str(
-                        self.corpus_rows[providers[alias]][index]["id"])
+                        _row_id(self.corpus_rows[providers[alias]], index))
                     expected = self.ground_truth.answer(key, left_id)
-                    item.counts.add(bool(answers[stage_index]), expected)
+                    item.counts.add(bool(predicted), expected)
                 total.merge(item.counts)
                 per_predicate.append(item.as_dict())
 
         join_plan = [stage for node in plan.nodes
                      if node["op"] == "JoinGroup"
                      for stage in node["stages"]]
-        if len(join_plan) != len(result.answer_rows["joins"]):
+        if len(join_plan) != len(result.answer_tables["joins"]):
             raise ValueError(
                 "query plan and returned join stages have different lengths")
-        for stage, saved in zip(join_plan, result.answer_rows["joins"]):
+        for stage in join_plan:
             join = joins[stage["written_pos"]]
             key = self._key(join.predicate)
             item = _PredicateCount(key, "join")
-            anchor = saved.get("anchor", stage["anchor"])
-            partners = list(saved.get("partners", stage["partners"]))
-            anchor_index = saved["anchor_index"]
-            partner_index = saved["partner_index"]
-            for raw_local, answers in saved["rows"].items():
-                assignment = {anchor: int(anchor_index[int(raw_local)])}
-                for tuple_index, predicted in enumerate(answers):
-                    candidate = dict(assignment)
-                    candidate.update({
-                        alias: int(index)
-                        for alias, index in zip(
-                            partners, partner_index[tuple_index])
-                    })
-                    expected = self._answer_for_prompt(
-                        join.predicate, candidate)
-                    item.counts.add(bool(predicted), expected)
+            table = result.answer_tables["joins"][stage["written_pos"]]
+            aliases = [arg.alias for arg in join.predicate.args]
+            index_columns = {
+                alias: table.column(alias).to_pylist()
+                for alias in aliases
+            }
+            predictions = table.column("answer").to_pylist()
+            for row_index, predicted in enumerate(predictions):
+                assignment = {
+                    alias: int(index_columns[alias][row_index])
+                    for alias in aliases
+                }
+                expected = self._answer_for_prompt(
+                    join.predicate, assignment)
+                item.counts.add(bool(predicted), expected)
             total.merge(item.counts)
             per_predicate.append(item.as_dict())
 
-        expected_rows = self._expected_rows(query, scans, filters, joins)
         input_document_rows = sum(
             len(self.corpus_rows[scan.provider]) for scan in scans)
         unique_documents = {
-            (scan.provider, str(row["id"]))
-            for scan in scans for row in self.corpus_rows[scan.provider]
+            (scan.provider, str(row_id))
+            for scan in scans
+            for row_id in _ids(self.corpus_rows[scan.provider])
         }
         return {
             "ground_truth_collection_id": self.ground_truth.collection_id,
             "ground_truth_reference_model": self.ground_truth.reference_model,
             "answer_accuracy": total.as_dict(),
-            "output_accuracy": _row_metrics(result.rows, expected_rows),
+            "output_accuracy": self._output_metrics(
+                query, scans, filters, joins, result),
             "per_predicate": per_predicate,
             "input_document_rows": input_document_rows,
             "unique_input_documents": len(unique_documents),

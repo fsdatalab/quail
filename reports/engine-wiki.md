@@ -24,6 +24,10 @@ payload to the worker, which calls the executor.
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
+| `planner/work.py` | Hardware independent token, attention pair, and KV counts | nothing |
+| `planner/qwen3_cost.py` | Qwen3 attention projection, MLP, and attention components | specs, work, roofline |
+| `planner/roofline.py` | Generic component compute and memory limits | specs |
+| `planner/sol.py` | Ideal query packing and total component time | work, qwen3_cost, roofline |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
 | `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, plan |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
@@ -48,7 +52,7 @@ Session (runtime/session.py)
   |
   v
 plan_query (planner/decide.py)
-  reads: specs, budgets
+  reads: model and device specs, budgets
   produces: PhysicalPlan
   |
   v
@@ -63,7 +67,11 @@ worker.execute (runtime/worker.py, on Modal GPU)
   |
   v
 _assemble (runtime/session.py)
-  gates, assembles tuples, projects -> Result
+  converts answers to Arrow tables
+  |
+  v
+Arrow Acero
+  hash joins, projects, counts, streams -> QueryResult
 ```
 
 ## 1. System overview
@@ -93,11 +101,14 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    (DocScan, FilterChain, JoinGroup, Barrier, Recombine, Sink) whose
    edges carry either a table's live document ids or one stage's
    passing pairs - plus the chunk budget, admission budget, and
-   sharding. Stage order and anchors come from one joint search. KV
-   is always bf16. No wall-time prediction is produced.
-6. The session builds a payload (token id lists, planned settings,
-   and the plan's node graph) and ships it to a Modal worker over
-   RPC.
+   sharding. Stage order and anchors come from one joint search,
+   which the worker re-runs on the actual filter survivors before
+   executing the joins. KV is always bf16. The only wall-time number
+   is the counted speed-of-light ranking the search uses.
+6. The session sends document token columns as Arrow IPC bytes with
+   the planned settings and the plan's node graph. The worker reads
+   each document as an Arrow token slice. It does not build one
+   Python list per document.
 7. The worker executes the graph on the GPU: filter chains,
    exists/anti gates, and the full join stages (each one a
    cross-product stage, however many tables it spans). Consecutive
@@ -105,12 +116,15 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    anchor's kept KV; a Barrier node between groups thins the live
    sets to the surviving pairs' documents and, on several GPUs,
    re-shards the next anchor over the measured live set.
-8. The worker returns raw answer rows. The session assembles output
-   tuples by equi-joining the full stages' TRUE rows on shared
-   document ids (each stage keyed on its own anchor), no model
-   calls, each member checked against its table's final survivor
-   set. It applies LIMIT to these final tuples, then the projection,
-   and returns a `Result`.
+8. The worker returns raw answers. The session stores filter and join
+   answers in Arrow tables. Arrow Acero equi-joins the TRUE pairs on
+   shared SQL alias columns and applies the final survivor sets. Each
+   alias column contains the source table row number for one document.
+   A `QueryResult` returns projected rows through a
+   `RecordBatchReader`.
+   `collect()` explicitly reads those batches into memory. `count()`
+   runs an Acero aggregate without creating Python row tuples. LIMIT
+   stops the result stream after the requested number of rows.
 
 ## 2. Query compilation
 
@@ -220,7 +234,7 @@ other than the EXISTS form. LIMIT N caps the output rows. For a
 filter-only query that means the filter loop stops once N survivors
 are found (early termination); for a join query the filter round
 gets no limit - one document can appear in zero or many output rows
-(#39) - and `_assemble` truncates the final tuples instead
+(#39) - and the Arrow result stream applies the final limit instead
 (`filter_round_limit` in `runtime/coordinator.py` decides). The
 builder equivalent is `.limit(n)` before `.select()`. The rejection
 list is explicit (`compile.py:22-33`), so new SQL surface cannot
@@ -229,10 +243,11 @@ enter silently.
 ### Builder API
 
 The builder (`builder.py`) mirrors the SQL constructs: `docs()`,
-`.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. The builder
-always uses `as_written` order (the chain order is the execution
-order). Both entry points collect the same `QueryDesc` and call the
-same `assemble_plan`, so the plans are structurally identical.
+`.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. Its default
+is `as_written`, so the chain order is the execution order. A caller can pass
+`.select(..., order="by_cost")` to use the planner's cost order. Both entry
+points collect the same `QueryDesc` and call the same `assemble_plan`, so the
+plans are structurally identical.
 
 ### Key functions: query compilation
 
@@ -272,53 +287,115 @@ token counts and produces a `PhysicalPlan` or a `Refusal`. A refusal
 is a named constraint violation (e.g., "this document is too long for
 the chunk budget") rather than a degraded execution.
 
-### Decisions from token arithmetic alone
+### Decisions from counted model and device constants
 
-These decisions compare token counts and selectivities. Because they
-compare things running at the same rate, the serving rate cancels
-out; no wall-clock constant is needed.
+These decisions use token counts, selectivities, and the model and
+device specifications. They do not use measured serving rates.
 
-**Filter order** (`decide.py:81`): when every filter carries a
-selectivity, `by_cost` sorts by cost per killed document. The cost of
-a filter stage is its question tokens divided by the fraction of
-documents it kills (1 minus selectivity). A selectivity of 1 (kills
-nothing) goes last. When any filter lacks a selectivity, `as_written`
-is used.
+**Filter order** (`decide.py`): when every filter carries a
+selectivity, `by_cost` uses the same component limits as SoL. For filters
+after the first one, the score is the time
+for `ask(mean prefix, question)` divided by the fraction of documents
+the filter rejects. A selectivity of 1 goes last.
 
-**Join order and anchors, one search** (`plan_joins` in
-`decide.py`): stage order and per-stage anchors are decided
-together, because they interact - anchors set what an order is
-worth, and order sets which stages can share an anchor's KV (issue
-#38). The planner enumerates every (order, anchor) sequence (only
-the written order under `as_written`; a gate's anchor is fixed to
-its outer table, a forced anchor is honored with a remark when it
-prices worse) and walks each one's cost with live counts:
+The first filter uses `scan`. The planner sorts all predicates by ask score
+once. Prefix survivor products and expected costs then let it price each
+predicate as the first scan in constant time. The search takes `O(n log n)`
+work for `n` filters. It does not check every filter permutation.
 
-- a stage opening a group pays the anchor's KV once per live anchor
-  document (preamble + document + complete question frame), plus a fixed
-  re-shard overhead when it follows a group on a different anchor
-  (`RESHARD_OVERHEAD_TOKENS`, 0 until measured - the fresh-KV term
-  is the real cost);
-- a stage continuing a same-anchor run of full stages pays only its
-  complete question frame;
-- every stage pays its pair stream: each partner document behind its
-  block label, plus the answer cue, once per tuple;
-- after each stage the live counts thin by
-  `n * (1 - (1-s)^partner_tuples)` (`_surviving_docs`).
+**Join order and anchors, one search, repeated calls** (`search_joins`
+in `planner/joins.py`): stage order and per-stage anchors are
+decided together, because they interact - anchors set what an order
+is worth, and order sets which stages can reuse an anchor's KV
+(issue #38). The search is a left deep subset DP. DP means that the
+search saves the best partial plans for each state instead of
+repeating the same work. The state records the joined alias set, the
+completed join predicates, and the current anchor group. The
+resident document prefixes are a read only input for the next group.
+Each step applies one ready predicate with every feasible anchor. A
+ready predicate is either within the joined alias set or adds exactly
+one connected alias. Under `order=as_written`
+the written stage order is kept and only anchors are searched. A
+gate's anchor is fixed to its outer table; a forced anchor is
+honored, with a remark at plan time when a free choice prices lower.
 
-The cheapest sequence wins; its anchor switches become groups and
-Barrier nodes at emission. Every sequence runs (each spec is the
-cross product over its own tables), so order and anchors change
-cost, never results. At run time, `pick_runtime_anchor` re-picks a
-one-stage group's anchor from the measured live counts (issue #38,
-step 4.1) - the same arithmetic over the payload's token id lists,
-restricted to anchors whose worst-case tuple fits the chunk budget.
+The same function runs whenever new answers can change the decision:
 
-**Sharding** (`balanced_shards` in `decide.py`): greedy balance by
-token count across workers. Filters split documents; joins split
-anchor documents (every tuple belongs to exactly one anchor, so
-gating and each anchor's tuple stream stay local to the GPU holding
-the anchor).
+- **Plan time** (`plan_query`): expected live counts from
+  selectivities, summary length statistics, the keep credit as the
+  resident set. The output is the predicted plan - explain(), the
+  refusal checks, and sharding run off it.
+- **At runtime** (the worker; the parent process on several GPUs):
+  the actual survivor counts and summary length statistics, including
+  the count and total length of documents whose KV is resident. The
+  worker executes one join group, applies its answers, and searches
+  the remaining joins again. The next search starts with the aliases
+  joined by every completed group. For example, after joining B and C,
+  both A-B and C-D are legal next predicates. It does not search
+  between chunks inside one group.
+
+Each stage is costed as a `Work` record (`planner/sol.py`: tokens,
+attention pairs, KV written, KV read). Each alias is summarized once.
+The summary has the document count, total length, squared length,
+maximum length, and the same values for resident documents. Those
+sums give the exact stage cost used by the previous per-document
+calculation. A DP candidate therefore takes constant time, regardless
+of the document count. A resident anchor prefix pays only its question
+frame (`ask`). Consecutive stages in one open anchor group also reuse
+the prefix. Other later groups are priced without predicted reuse.
+The worker searches again after the current group, so its next call
+sees the actual finite KV state. A stage can price some current anchor
+documents as KV hits and the rest as recomputations.
+Every tuple then carries partner labels, partner documents, and the
+answer cue over the resident anchor context. After each stage the
+live counts thin by `n * (1 - (1-s)^partner_tuples)`. Per state,
+records survive unless another is no larger in all four work
+categories, and the final candidates rank by predicted seconds -
+`speed_of_light` from counted model constants and the device
+datasheet. No calibration constant is read anywhere. Stage outputs
+carry written_pos, semantics, and selectivity, so a runtime-chosen
+order assembles into results correctly.
+
+**KV residency across operators** (`plan_keeps`, `keep_split` in
+`decide.py`; the retention runtime in `executor/arena.py`): document
+KV outlives its operator wherever a later one will read it.
+
+- Every filtered alias the runtime search could anchor writes KV
+  (`arena_writes`) and keeps its survivors (`keep_kv` on the
+  FilterChain node). At each survivor's final TRUE the runtime
+  retains its prefix: rewound to preamble + document (the question
+  tail's pages return to the free list), marked evictable at its
+  counted recompute value. The join then anchors on KV that is
+  already there.
+- A join group whose anchor a later group re-uses retains its gate
+  survivors the same way, so a gate between two same-anchor stages
+  no longer forces a recompute. Thinned-out documents and retained
+  KV with no future consumer are freed the moment that is known,
+  and the arena is empty when the query ends.
+- The runtime never evicts to admit a cache entry. Every admission
+  is a computation the query requires; only retention is optional,
+  and retaining an already-resident document costs nothing to
+  start. When retained KV starves a required admission, the arena
+  evicts document prefixes in increasing saved recompute work per
+  page. The arena stores that order in a heap.
+  Recompute value is `prefix_recompute_seconds` - dense work linear
+  in length against the fp8 peak plus the causal attention triangle
+  against the bf16 peak, both counted. Pinned keys (in use by the
+  running operator) are not eviction candidates. The exact minimum
+  loss calculation is a minimum knapsack cover problem. Its solver
+  remains only as a small test oracle in `executor/retention.py`.
+- The plan-time half is the *credit*: `keep_split` prices in the
+  expected resident fraction the arena can hold, longest documents
+  first. The byte calculation is fractional, while the arena
+  allocates whole pages, so the split is an estimate. The
+  `_keep_timeline` function trims the credit
+  until the peak expected resident tokens fit beside the working
+  headroom. The runtime is not bound by the threshold; the credit
+  keeps the prediction and the SoL comparison honest.
+
+Every stage records the residency its cost assumed
+(`anchor_resident`: none / filter / kept), so `explain()` shows
+which stages the planner priced as KV reuse.
 
 ### Pseudocode: filter order decision
 
@@ -328,22 +405,28 @@ for each filter predicate p:
     if killed <= 0:
         cost = infinity
     else:
-        cost = p.question_tokens / killed
-sort predicates by cost (stable, so ties keep written order)
+        work = ask(mean_prefix_tokens, p.question_tokens)
+        cost = unrounded_seconds(work, model, device, chunk) / killed
+sort all asks by cost once
+use prefix survivor products and expected costs to price each first scan
+keep the order with the lowest expected time
 ```
 
 ### Pseudocode: anchor selection
 
 ```
-for each table of the join:
-    compute tuple_tokens(table as anchor) =
-        n_anchor_docs                                (prefix + question
-        * (mean_anchor_tokens + pre + frame_tokens)   frame, once each)
-      + product of every table's n_docs              (number of tuples)
+for each table of the join (a gate only offers its outer table):
+    anchor_cost(table) =
+        0 if the table's prefix KV is resident          (kept by a filter
+        else n_docs * (mean_tokens + pre)                or earlier anchor)
+      + n_docs * frame_tokens                           (the frame, always)
+    stream_cost =
+        product of every table's n_docs                 (number of tuples)
         * (sum over partners of
              (label_tokens + mean_partner_tokens)
-           + answer_cue_tokens)                      (suffix, once each)
-pick the table with the fewest tuple_tokens as anchor
+           + answer_cue_tokens)                         (suffix, once each)
+score = seconds(anchor_cost tokens and pairs + stream_cost ...)
+pick the anchor that makes the whole plan's predicted seconds smallest
 ```
 
 ### Settings from the spec structs
@@ -357,16 +440,27 @@ pass (the batch size). It is the minimum of two bounds:
   divided by a slack factor of 2.
 - Kernel index cap: `INT32_MAX / ffn_width`, because the fused
   kernels compute element offsets in 32-bit integers.
-At Qwen3 4B on H100, the index cap binds at 110,376 tokens.
+At Qwen3 4B on one H100!, the index cap binds at 110,376 tokens.
 
 **Admission budget** (`budgets.py:69`): the number of document tokens
-that can be resident in the KV arena at once. It is what remains of
-device memory after weights and activation reservation, divided by
-kappa (the KV bytes per cached token: `2 * layers * n_kv * d_head *
-kv_bytes`). At Qwen3 4B bf16 KV on H100, this is about 346,000
-tokens. The admission budget is a token count, never a document
-count, because a document count cannot account for varying document
+that can be resident in the KV arena at once. Quail claims 95% of the
+device memory. It subtracts resident weights and memory for two full
+activation chunks, then divides the remaining bytes by the KV bytes
+per cached token. At Qwen3 4B with bf16 KV on one H100!, the KV budget
+is 362,250 tokens, or 53.4 GB. At 32B, the KV budget is 112,312 tokens.
+The admission budget is a token count because documents have different
 lengths.
+
+The current QUAIL-B runner configures stock vLLM and pipelined vLLM with
+`gpu_memory_utilization=0.91`. vLLM measures the memory used by one
+forward pass with 25,305 tokens and gives the remaining configured
+memory to KV. Quail instead reserves memory for two activation chunks
+with as many as 110,376 tokens each. Therefore, the two memory
+fractions do not produce equal KV capacities. Based on the capacity
+measured at 0.92, vLLM should have about 479,000 KV tokens at 0.91,
+compared with Quail's 362,250 KV tokens at 0.95. The first 0.91 startup
+will give the exact vLLM capacity. Every baseline report records the KV
+capacity that vLLM returns after startup.
 
 **Compute knee** (`budgets.py:95`): the chunk size where the dense
 projections cross the roofline ridge and become compute-bound rather
@@ -394,10 +488,19 @@ single forward pass, sharing KV across them through a paged arena.
 | Function | File | What it does |
 |---|---|---|
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
-| `order_filters_indexed` | `decide.py` | Sort filter stages by cost-per-killed-document |
-| `plan_joins` | `decide.py` | The joint (order x anchor) search: cost every sequence, keep the cheapest |
-| `pick_runtime_anchor` | `decide.py` | Re-pick a one-stage group's anchor at a barrier, from measured live counts |
+| `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
+| `unrounded_seconds` | `sol.py` | Component limits without forward pass rounding |
+| `search_joins` | `joins.py` | The join search: order and anchors from live counts, length summaries, document KV summaries, and aliases joined by completed groups; called at plan time and after every completed runtime group |
+| `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: which survivors to price as resident, longest documents first |
+| `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the least saved recompute work per page |
+| `minimum_loss_victims` | `executor/retention.py` | Exact small-instance oracle used only by tests |
+| `prefix_recompute_seconds` | `sol.py` | The retention value of one prefix, counted constants only |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
+| `optimize_left_deep` | `leftdeep.py` | Subset DP over joined aliases and a caller supplied physical property, with a nondominated Work frontier |
+| `scan` / `ask` / `stream` | `work.py` | The three KV operations as Work records |
+| `qwen3_components` | `qwen3_cost.py` | Build attention projection, MLP, and attention work |
+| `component_latency` | `roofline.py` | Take the larger of compute time and memory time for one component |
+| `speed_of_light` | `sol.py` | Pack aggregate work into ideal passes and add component times |
 | `chunk_budget` | `budgets.py` | Tokens per forward pass (min of memory and kernel bounds) |
 | `arena_tokens` | `budgets.py` | KV residency budget (device memory minus weights and activations) |
 
@@ -695,7 +798,18 @@ The `Answerer` (`loop.py:60`) scores the final hidden states against
 only the TRUE and FALSE token embeddings (not the full vocabulary). It
 projects the normed hidden state through a sub-selected `lm_head`
 weight matrix (only the rows for TRUE/FALSE token ids), takes the argmax
-within the TRUE set and within the FALSE set, and compares.
+within the TRUE set and within the FALSE set, and compares. The
+comparison and the margin are exact: TRUE and FALSE scores shift by
+the same softmax normalizer, so dropping the other vocabulary rows
+changes neither.
+
+The full head weight has no other reader, so `load_model` moves an
+untied head to CPU memory right after load
+(`move_untied_head_to_host`). At Qwen3 32B that is 151,936 x 5,120
+bf16 rows, 1.56 GB of freed device memory, counted into the admission
+budget as `ModelSpec.head_mem_bytes`. The 4B head is tied to the
+input embedding tensor and stays. The answerer slices its dozen rows
+from wherever the weight lives and keeps only the slice on the GPU.
 
 `AsyncAnswers` (`loop.py:92`) makes the readout non-blocking: it
 computes the answer bits on GPU, copies them to pinned host memory
@@ -715,7 +829,7 @@ answers. This overlaps GPU compute with answer readback.
 | `Pipeline.custom_silu_quant` | `attention.py:223` | Fused SiLU + multiply + fp8 quant (Triton) |
 | `Pipeline.custom_norm_quant` | `attention.py:235` | Fused residual-add + RMSNorm + fp8 quant (Triton) |
 | `Pipeline.custom_qk_norm_rope` | `attention.py:248` | Fused QK-norm + RoPE (Triton) |
-| `pack_chunk` | `loop.py:125` | Build GPU tensors for one chunk from group specs (all index tensors staged through pinned memory) |
+| `pack_chunk` | `loop.py:125` | Build GPU tensors for one chunk from group specs. Document tokens stay as Arrow slices until the selected parts are copied once into a pinned CPU tensor, then uploaded to the GPU in one transfer. |
 | `pack_stream` | `pack.py:57` | Brim-pack the join's tuple list into chunks (join path) |
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
 | `run_filter` | `loop.py:462` | The filter chain execution loop |
@@ -737,7 +851,14 @@ that runs until `FilterAdmission.done()`:
 4. While the GPU runs the current chunk, read the previous chunk's
    answers and gate: documents that answered NO have their pages
    freed immediately; survivors advance to their next stage.
-   Documents leaving their last stage free their pages too.
+   Documents leaving their last stage free their pages too - unless
+   the plan marks the chain `keep_kv`, where each survivor's prefix
+   is retained instead (`arena.retain`): rewound to preamble +
+   document, held under its stable `(alias, doc)` key at its counted
+   recompute value. If retained KV starves a fresh admission, the
+   arena evicts retained prefixes in increasing saved work per page
+   and hands the pages back to the scheduler. The join recomputes an
+   evicted document if it uses that document as an anchor later.
 
 Single-stage queries (one question) skip the arena entirely: no
 later stage reads any document's KV, so the alloc, the per-layer KV
@@ -778,6 +899,20 @@ the next group's stage-0 chunk while waiting on the current group's
 gate (which cannot be planned past until answers arrive), keeping the
 GPU fed across gate boundaries. A per-stage frame, if present, is
 written into the anchor's kept KV once after the document rows.
+
+An anchor whose arena key is already resident - a kept filter
+survivor, or a kept anchor of an earlier group - packs no prefix
+tokens at all: the frame scatters into the kept pages and the tuple
+suffixes read the document KV that is already there. Kept pages
+without row room for this run's frame are freed and recomputed (a
+runtime anchor re-pick can land on an alias whose filter reserved a
+smaller frame). With `keep_semantics` set, the group's gate
+survivors keep their pages at the end for a later group on the same
+table. Under allocation pressure the arena frees retained prefixes
+in increasing saved recompute work per page. The
+worker frees every kept key the moment its last consumer group is
+behind, and sweeps kept keys at query start and end - the arena
+outlives a query, kept KV must not.
 
 ### 4.7 KV rewind (chain mode)
 
@@ -878,6 +1013,14 @@ Between join stages, gating drops anchors that had no surviving
 pairs. `gate()` (`pack.py:132`) returns anchor indices where any
 answer was TRUE. Dropped anchors' pages are freed immediately.
 
+The runtime gates a group of anchors at once. It adds anchors to a
+group until their page-rounded document and frame KV would fill the
+arena. It packs stage 1 for that group into full token-budget chunks,
+waits for the answers, and then packs the survivors for stage 2. It
+does not force one anchor per group. The page limit keeps every anchor
+needed by the group resident while unrelated retained KV can be
+evicted.
+
 ### Dedup
 
 In a chain join (e.g., A-B-C with B as anchor), an anchor B that
@@ -895,6 +1038,16 @@ stage boundary. The `already_kept` parameter tells the packer which
 anchors' KV is already resident, so their groups do not pack fresh
 prefix tokens.
 
+The same mechanism crosses operator boundaries through retention.
+A filter chain with `keep_kv` retains its survivors' KV; the join
+group anchored on that table finds the keys resident, `activate`
+grows their pages for the frame, and no kept document's prefix is
+packed. A group whose anchor a later group re-uses retains its gate
+survivors the same way (the worker's `anchor_done` callback). On
+several GPUs the KV is already on the right card: join anchors
+follow the shards their KV sits on - the shards of the group that
+retained them, else their filter shards (`join_group_payloads`).
+
 ### Pseudocode: the n-way join as one cross-product stage
 
 ```
@@ -911,9 +1064,10 @@ for each chunk in plan:
 # an exists/anti gate is the two-table case of the same stage,
 # with the keep rule applied to the anchor's answers
 
-# assemble output: for each anchor B with TRUE rows,
-#   for each TRUE tuple (A, C) whose members survive their tables'
-#   final gates, emit (B, A, C)
+# convert each stage's answers to an Arrow table
+# Acero hash-joins the TRUE rows on shared document-id columns
+# QueryResult.execute_stream() returns projected Arrow record batches
+# QueryResult.count() places an Acero count aggregate above the joins
 ```
 
 ## 6. Multi-GPU dispatch
@@ -943,9 +1097,9 @@ and the merged answer rows are consistent.
 **Barrier nodes between groups**: the parent thins every table the
 stages ahead touch to the documents in some surviving pair of every
 finished full stage (`thin_survivors`, issue #38 step 4.6 - cost
-only, results are enforced at recombination), and a one-stage group
-with no forced anchor re-picks its anchor from the measured live
-counts (`pick_runtime_anchor`).
+only, results are enforced at recombination). Anchors were already
+fixed by the worker's post-filter run of the join search, which saw
+the measured live counts; nothing is re-decided at the barrier.
 
 ### Sharding contract
 
@@ -1011,8 +1165,9 @@ GPUs (`worker.py:495-519`).
 
 QUAIL-B (`bench/quailb.py`) has 30 queries over four document sets
 (IMDB, BioDEX, FEVER, LePaRD), plus 2 optional PrivacyPolicies
-queries. All predicates are natural-language questions answered by
-Qwen3 32B during the judge pass; ground truth covers 22 predicates.
+queries. Qwen3 32B answers the filter predicates during the judge pass.
+The FEVER annotations and sampled LePaRD citation edges provide source labels
+for known join pairs. Ground truth covers 22 predicates.
 
 ### Document tables
 
@@ -1021,8 +1176,15 @@ Qwen3 32B during the judge pass; ground truth covers 22 predicates.
 | reviews | `stanfordnlp/imdb` | 50,000 | Movie reviews |
 | reports | `BioDEX/BioDEX-Reactions` | 5,000 | Medical case reports |
 | claims | `fever/fever` | 5,000 | Factual claims (train + labelled_dev) |
-| citations | `rmahari/LePaRD` | 2,000 | Legal citation excerpts |
+| citation_contexts | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Legal citation excerpts |
+| citation_passages | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Cited legal passages |
 | policies | `mukund/PrivacyPolicies` | 1,000,000 | Privacy policies (optional) |
+
+LePaRD first samples known citation pairs with a stable hash. At scale factor
+0.1, it samples 500 pairs. It then deduplicates the context text and passage
+text into separate tables, which produce 500 context rows and 433 passage rows.
+The source join label is true when a context's cited passage IDs intersect a
+passage row's passage IDs.
 
 Partner tables (fixed vocabulary, not scaled by SF):
 - **aspects** (12 rows): film aspects ("the acting", "the plot", ...)
@@ -1038,19 +1200,20 @@ graph LR
         reviews["reviews (50K)"]
         reports["reports (10K)"]
         claims["claims (5K)"]
-        citations["citations (2K)"]
+        citation_contexts["citation_contexts"]
         policies["policies (1M, optional)"]
     end
     subgraph Partner tables
         aspects["aspects (12)"]
         terms["terms (~6K)"]
         evidence["evidence"]
+        citation_passages["citation_passages"]
         scenarios["scenarios (100)"]
     end
     reviews -- "DISCUSS_ASPECT / ASPECT_SENTIMENT" --> aspects
     reports -- "REACTION" --> terms
     claims -- "SUPPORT / REFUTE" --> evidence
-    citations -- "LEPJOIN (self-join)" --> citations
+    citation_contexts -- "LEPJOIN" --> citation_passages
     policies -. "SCENARIO_MATCH" .-> scenarios
 ```
 
@@ -1093,16 +1256,16 @@ graph LR
 | FEV-8 | 3J chain | c1-e1-c2-e2 |
 | FEV-9 | F11 + 3J chain | F11 then c1-e1-c2-e2 |
 
-**LePaRD** (8 queries): citations self-join
+**LePaRD** (8 queries): citation contexts joined with citation passages
 
 | Query | Shape | Description |
 |---|---|---|
 | LEP-1 | 1F | LEP1 (reasoning does not apply) |
-| LEP-2 | 1J | self-join (LEPJOIN) |
-| LEP-3 | 1F + 1J | LEP1 then self-join |
-| LEP-4 | 2F + 1J | LEP1 + LEP2 then self-join |
-| LEP-5 | 3F + 1J | LEP1..LEP3 then self-join |
-| LEP-6 | 5F + 1J | LEP1..LEP5 then self-join |
+| LEP-2 | 1J | citation contexts joined with citation passages |
+| LEP-3 | 1F + 1J | LEP1 then join |
+| LEP-4 | 2F + 1J | LEP1 + LEP2 then join |
+| LEP-5 | 3F + 1J | LEP1..LEP3 then join |
+| LEP-6 | 5F + 1J | LEP1..LEP5 then join |
 | LEP-7 | 2F + 1J two-sided | LEP1 + LEP2 on excerpts, LEPS1 on passages |
 | LEP-8 | 5F | LEP1..LEP5, no join |
 
@@ -1117,15 +1280,31 @@ PRIV-1 and PRIV-2 run only when `register_privacy_sets()` has been
 called. They have no ground truth and are not part of the default
 benchmark runner or judge pass.
 
-### Single-pass protocol
+### Selectivity estimates
 
-The benchmark runs each query once in one session. Every document's
-KV is computed from scratch; nothing persists between queries.
+Every filter and join carries a fixed selectivity estimate. The estimates
+come from the active sf0.1 Qwen3 32B fp8 collection
+`gt_363b5ab570635c33894e1a030c21f57e` for corpus
+`c_3bd14ed0758287cba9d88fb68de8b7b8`. Planning does not read the ground
+truth labels.
 
-Each query reports both the provided selectivity (what the planner
-was told) and the observed selectivity (what the model actually
-returned), which serves as an instrument check for selectivity
-drift.
+The source collection is
+`/results/ground_truth/quailb/schema_v1/collections/gt_363b5ab570635c33894e1a030c21f57e/manifest.json`
+on the `quail-results` volume. Each builder query ends with
+`.select(..., order="by_cost")`, so the benchmark exercises the planner's
+filter and join ordering. The collection reuses 15 IMDB, BioDEX, and FEVER
+label sets from the prior corpus. The collection manifest records the source
+collection and the unchanged table manifests for every reused label set. The
+loader checks those table manifests before it accepts the collection. The
+seven LePaRD label sets belong directly to the current corpus.
+
+### Protocol and reported values
+
+Every engine run uses Modal. A benchmark query reports query time,
+throughput, GPU cost, provided selectivity, observed selectivity, answer
+accuracy, and final row accuracy. Filter throughput is input documents per
+second. Join throughput is evaluated document pairs per second, summed over
+all join stages.
 
 ## 8. Weight loading and kernel infrastructure
 

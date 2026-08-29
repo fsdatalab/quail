@@ -5,6 +5,9 @@ PageArena is the accounting (pure Python, CPU-tested); KVArena is the
 tensor backing and runs only where torch and a GPU exist.
 """
 
+import heapq
+
+
 class PageArena:
     """Page accounting: a free list and per-document page lists."""
 
@@ -14,6 +17,11 @@ class PageArena:
         self.free = list(range(n_pages - 1, -1, -1))    # stack
         self.owned = {}       # key -> list of page ids
         self.tokens = {}      # key -> resident token count
+        self.pinned = set()    # current operators depend on these keys
+        self.retained = {}     # key -> ideal seconds saved at next use
+        self._retained_heap = []
+        self._retained_versions = {}
+        self._retention_version = 0
 
     def pages_needed(self, tokens: int) -> int:
         return -(-tokens // self.page_tokens)
@@ -38,8 +46,78 @@ class PageArena:
         """Return a document's pages to the free list."""
         pages = self.owned.pop(key)
         self.tokens.pop(key)
+        self.pinned.discard(key)
+        self.retained.pop(key, None)
+        self._retained_versions.pop(key, None)
         self.free.extend(pages)
         return len(pages)
+
+    def pin(self, key) -> None:
+        """Protect a resident key while an operator uses it."""
+
+        if key not in self.owned:
+            raise KeyError(key)
+        self.retained.pop(key, None)
+        self._retained_versions.pop(key, None)
+        self.pinned.add(key)
+
+    def retain(self, key, value: float) -> None:
+        """Make a resident key evictable after its current use."""
+
+        if key not in self.owned:
+            raise KeyError(key)
+        if value < 0:
+            raise ValueError("retention value must be nonnegative")
+        self.pinned.discard(key)
+        self.retained[key] = value
+        self._retention_version += 1
+        version = self._retention_version
+        self._retained_versions[key] = version
+        pages = len(self.owned[key])
+        heapq.heappush(
+            self._retained_heap,
+            (value / pages, version, key, pages, value),
+        )
+
+    def pop_retained_victim(self):
+        """Remove and return the lowest saved work per KV page."""
+
+        while self._retained_heap:
+            _, version, key, pages, value = heapq.heappop(
+                self._retained_heap)
+            if self._retained_versions.get(key) != version:
+                continue
+            self._retained_versions.pop(key)
+            self.retained.pop(key)
+            return key, pages, value
+        return None
+
+    def rewind(self, key, tokens: int) -> int:
+        """Keep the first tokens and return unused trailing pages."""
+
+        if key not in self.owned:
+            raise KeyError(key)
+        if tokens < 0 or tokens > len(self.owned[key]) * self.page_tokens:
+            raise ValueError("rewind tokens exceed the resident capacity")
+        keep = self.pages_needed(tokens)
+        released = self.owned[key][keep:]
+        self.owned[key] = self.owned[key][:keep]
+        self.tokens[key] = tokens
+        self.free.extend(released)
+        return len(released)
+
+    def grow(self, key, capacity_tokens: int) -> int | None:
+        """Add pages for capacity_tokens without changing logical tokens."""
+
+        if key not in self.owned:
+            raise KeyError(key)
+        need = self.pages_needed(capacity_tokens) - len(self.owned[key])
+        if need <= 0:
+            return 0
+        if need > len(self.free):
+            return None
+        self.owned[key].extend(self.free.pop() for _ in range(need))
+        return need
 
     def row_indices(self, key, tokens=None):
         """Flat row positions of the document's tokens inside a pool
@@ -61,6 +139,10 @@ class PageArena:
     @property
     def resident_tokens(self) -> int:
         return sum(self.tokens.values())
+
+    @property
+    def retained_pages(self) -> int:
+        return sum(len(self.owned[key]) for key in self.retained)
 
 
 class KVArena:
@@ -87,6 +169,12 @@ class KVArena:
         self._capacity_rows = {}  # key -> every row in the claimed pages
         self._rows_dev = {}   # key -> device copy, built on first use
         self.device = device
+        self.reset_stats()
+
+    def reset_stats(self):
+        self.evicted_keys = 0
+        self.evicted_pages = 0
+        self.evicted_value = 0.0
 
     def alloc(self, key, tokens: int, capacity_tokens: int | None = None):
         pages = self.accounting.alloc(key, tokens, capacity_tokens)
@@ -100,6 +188,72 @@ class KVArena:
             dtype=self.torch.int64)
         self._capacity_rows[key] = cap
         self._rows[key] = cap[:tokens]
+        return pages
+
+    def _refresh_rows(self, key, logical_tokens=None):
+        logical = (self.accounting.tokens[key]
+                   if logical_tokens is None else logical_tokens)
+        capacity = len(self.accounting.owned[key]) * self.page_tokens
+        cap = self.torch.tensor(
+            self.accounting.row_indices(key, capacity),
+            dtype=self.torch.int64)
+        self._capacity_rows[key] = cap
+        self._rows[key] = cap[:logical]
+        self._rows_dev.pop(key, None)
+
+    def pin(self, key):
+        self.accounting.pin(key)
+
+    def retain(self, key, tokens: int, value: float):
+        """Rewind a prefix and make it available for a later operator."""
+
+        self.accounting.rewind(key, tokens)
+        self._refresh_rows(key, tokens)
+        self.accounting.retain(key, value)
+
+    def evict_retained(self, pages_needed: int) -> tuple:
+        """Evict retained prefixes with the least saved work per page."""
+
+        keys = []
+        pages = 0
+        value = 0.0
+        while pages < pages_needed:
+            victim = self.accounting.pop_retained_victim()
+            if victim is None:
+                break
+            key, victim_pages, victim_value = victim
+            keys.append(key)
+            pages += victim_pages
+            value += victim_value
+            self.free_key(key)
+        self.evicted_keys += len(keys)
+        self.evicted_pages += pages
+        self.evicted_value += value
+        return tuple(keys)
+
+    def activate(self, key, tokens: int, capacity_tokens: int | None = None):
+        """Make a prefix active, evicting retained KV when required."""
+
+        capacity = tokens if capacity_tokens is None else capacity_tokens
+        if key in self.accounting.owned:
+            self.accounting.pin(key)
+            current = len(self.accounting.owned[key])
+            need = max(0, self.accounting.pages_needed(capacity) - current)
+            if need > self.accounting.free_pages:
+                self.evict_retained(need - self.accounting.free_pages)
+            grown = self.accounting.grow(key, capacity)
+            if grown is None:
+                return None
+            self.accounting.tokens[key] = tokens
+            self._refresh_rows(key, tokens)
+            return self.accounting.owned[key]
+
+        need = self.accounting.pages_needed(capacity)
+        if need > self.accounting.free_pages:
+            self.evict_retained(need - self.accounting.free_pages)
+        pages = self.alloc(key, tokens, capacity)
+        if pages is not None:
+            self.accounting.pin(key)
         return pages
 
     def alloc_temporary(self, tokens: int):

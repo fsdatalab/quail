@@ -11,29 +11,29 @@ predicates. Ground truth is saved per predicate, document, or document pair.
 
 ## Run the benchmark
 
-Run all 30 queries with Qwen3 4B:
+Run all 30 queries with Qwen3 4B. Modal starts one H100! container for
+each query family. Each container runs Quail, stock vLLM, and pipelined
+vLLM on that family:
 
 ```bash
 mkdir -p results/benchmark
 run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb.log"
 
-uv run python -m quail.bench.quailb \
+uv run modal run --detach -m quail.bench.quailb_parallel \
   --sf 0.1 \
   --model qwen3-4b-fp8 \
-  --gpus 1 \
   --prediction "State the expected runtime and accuracy." \
   2>&1 | tee "$run_log"
 ```
 
-Do not pass `--only` when every query should run. To run one query, add its
+Do not pass `--query` when every query should run. To run one query, add its
 ID:
 
 ```bash
-uv run python -m quail.bench.quailb \
+uv run modal run --detach -m quail.bench.quailb_parallel \
   --sf 0.1 \
   --model qwen3-4b-fp8 \
-  --gpus 1 \
-  --only IMDB-4 \
+  --query IMDB-4 \
   --prediction "State the expected runtime and accuracy." \
   2>&1 | tee results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-IMDB-4.log
 ```
@@ -41,6 +41,31 @@ uv run python -m quail.bench.quailb \
 Each command runs every selected query once. It reads ground truth before
 the timers start. It reports runtime, H100 cost, tokens, documents per second,
 answer accuracy, and final-row precision, recall, and F1.
+
+To compare all three methods, use one H100! container for each query family.
+Each container runs Quail for its family, releases Quail GPU memory, then loads
+vLLM once. It runs every stock vLLM query, then every pipelined vLLM query.
+Quail and both baselines use the same data and saved labels.
+
+```bash
+run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
+
+uv run modal run --detach -m quail.bench.quailb_parallel \
+  --sf 0.1 \
+  --model qwen3-4b-fp8 \
+  --prediction "State the expected runtime and accuracy." \
+  2>&1 | tee "$run_log"
+```
+
+The command prints one Modal function call ID for each query family. Quail
+clears KV before each query. vLLM resets its prefix cache before each stock or
+pipelined query. The command saves separate Quail, stock vLLM, and pipelined
+vLLM summaries and one manifest on the `quail-results` volume.
+
+By default, the command loads `SELECTIVITY_ESTIMATE_COLLECTION` from
+`quailb.py`. It is the current active collection. Pass
+`--ground-truth-collection <collection_id>` only when testing a specific
+older collection.
 
 The local JSON and Markdown files use the same UTC timestamp prefix under
 `results/benchmark/`. The PNG uses that prefix under
@@ -62,9 +87,9 @@ If the query adds a predicate:
 2. Add one `PredicateSpec` to `PREDICATES` in `judge_pass.py`. Give it a
    descriptive stable key, the prompt, the input table, the input column, and
    the left and right roles.
-3. Add the predicate to the matching filter group or join call in
-   `run_judge_pass()`. Filters label every row in their input table. Joins
-   label every left and right row pair.
+3. `judge_workload()` derives the filter and join labeling work from
+   `PREDICATES`. Filters label every row in their input table. Joins label
+   every left and right row pair.
 4. Use source labels only when the dataset gives the exact answer required by
    the prompt. Otherwise keep the default Qwen3 32B label source. BioDEX
    reactions do not count as source truth.

@@ -1,5 +1,6 @@
-"""Runtime: Session, Query, and the Modal worker."""
+"""Runtime: Session, Query, QueryResult, and the Modal worker."""
 
-from .session import Query, RefusalError, Result, Session
+from .result import QueryResult
+from .session import Query, RefusalError, Session
 
-__all__ = ["Query", "RefusalError", "Result", "Session"]
+__all__ = ["Query", "QueryResult", "RefusalError", "Session"]

@@ -1,15 +1,21 @@
-"""Planner decisions: filter order, join order, anchor choice, and
-sharding from a logical plan and corpus token counts.
+"""Planner decisions: filter order, join order, anchor choice, KV
+residency, and sharding from a logical plan and corpus token counts.
+
+The join search itself lives in quail.planner.joins and runs twice
+per query: here with expectations (the predicted plan - explain,
+refusals, the SoL comparison), and in the worker after the filter
+round with the actual survivors and resident KV (the executed plan).
+Costs are Work records priced by counted constants; no calibration
+constant is read anywhere.
 """
 
-import itertools
-
-from quail.logical import (LogicalPlan, Project, Scan, SemanticFilter,
-                           SemanticJoin)
+from quail.logical import LogicalPlan, Project, Scan, SemanticFilter, SemanticJoin
 from quail.planner import budgets
+from quail.planner import joins as joinsearch
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
+from quail.planner.sol import speed_of_light, unrounded_seconds
+from quail.planner.work import Work, ask, scan
 from quail.specs import DeviceSpec, ModelSpec
-
 
 # ---------------------------------------------------------- tree walk
 
@@ -55,7 +61,7 @@ def _preamble_tokens(filters, joins) -> int:
     return 0
 
 
-# ------------------------------------------------ order (token arithmetic)
+# --------------------------------------------------------- filter order
 
 def default_order_rule(filters, joins) -> tuple[str, str]:
     """Return (rule, source). 'by_cost' when every predicate has a
@@ -67,38 +73,77 @@ def default_order_rule(filters, joins) -> tuple[str, str]:
     return "as_written", "default: at least one predicate has no selectivity"
 
 
-def order_filters_indexed(predicates, rule: str):
+def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
+                device: DeviceSpec, chunk_tokens: int, *, first: bool) -> float:
+    """Return ideal time for one filter evaluation."""
+
+    operation = scan if first else ask
+    work = operation(prefix_tokens, _question_tokens(predicate.prompt))
+    return unrounded_seconds(work, model, device, chunk_tokens)
+
+
+def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
+                          model: ModelSpec, device: DeviceSpec,
+                          chunk_tokens: int):
     """Return written positions of predicates in execution order.
 
-    'by_cost' sorts by question_tokens / (1 - selectivity). Stable
-    sort, so ties keep written order.
+    'by_cost' minimizes ideal expected time. It sorts the asks once,
+    then prices each predicate as the first scan. Written order breaks
+    ties.
     """
     idx = list(range(len(predicates)))
     if rule == "as_written":
         return idx
 
-    def cost(i):
-        p = predicates[i]
-        killed = 1.0 - (p.selectivity if p.selectivity is not None else 1.0)
+    def selectivity(i):
+        return (predicates[i].selectivity
+                if predicates[i].selectivity is not None else 1.0)
+
+    ask_costs = [
+        filter_cost(p, prefix_tokens, model, device, chunk_tokens,
+                    first=False)
+        for p in predicates
+    ]
+    scan_costs = [
+        filter_cost(p, prefix_tokens, model, device, chunk_tokens,
+                    first=True)
+        for p in predicates
+    ]
+
+    def score(i):
+        killed = 1.0 - selectivity(i)
         if killed <= 0:
             return float("inf")
-        return _question_tokens(p.prompt) / killed
+        return ask_costs[i] / killed
 
-    return sorted(idx, key=cost)
+    ask_order = sorted(idx, key=score)
+    prefix_live = [1.0]
+    prefix_cost = [0.0]
+    for i in ask_order:
+        prefix_cost.append(
+            prefix_cost[-1] + prefix_live[-1] * ask_costs[i])
+        prefix_live.append(prefix_live[-1] * selectivity(i))
+
+    total_ask_cost = prefix_cost[-1]
+    candidates = []
+    for position, first in enumerate(ask_order):
+        expected = (
+            scan_costs[first]
+            + selectivity(first) * prefix_cost[position]
+            + total_ask_cost - prefix_cost[position + 1]
+        )
+        candidates.append((expected, first))
+
+    first = min(candidates)[1]
+    return [first, *(i for i in ask_order if i != first)]
 
 
-def order_filters(predicates, rule: str):
-    return [predicates[i] for i in order_filters_indexed(predicates,
-                                                         rule)]
-
-
-def _surviving_docs(n_docs: float, n_partners: float,
-                    tuple_selectivity: float) -> float:
-    """Expected distinct documents with at least one matching tuple."""
-    if tuple_selectivity is None:
-        return n_docs
-    return n_docs * (1.0 - (1.0 - tuple_selectivity)
-                     ** max(1.0, n_partners))
+def order_filters(predicates, rule: str, *, prefix_tokens: float,
+                  model: ModelSpec, device: DeviceSpec,
+                  chunk_tokens: int):
+    return [predicates[i] for i in order_filters_indexed(
+        predicates, rule, prefix_tokens=prefix_tokens,
+        model=model, device=device, chunk_tokens=chunk_tokens)]
 
 
 def _join_aliases(join) -> list:
@@ -116,204 +161,227 @@ def _label_counts(join) -> dict:
     return out
 
 
-def _cross_tuples(join, live: dict, anchor: str) -> float:
-    tuples = live[anchor]
-    for a in _join_aliases(join):
-        if a != anchor:
-            tuples *= live[a]
-    return tuples
+def join_specs(joins) -> list:
+    """The joins as the search's spec dicts, in written order."""
+    out = []
+    for i, j in enumerate(joins):
+        labels = _label_counts(j)
+        out.append(dict(
+            written_pos=i, aliases=_join_aliases(j), anchor=j.anchor,
+            anchor_free=(j.anchor is None and j.semantics == "full"),
+            semantics=j.semantics, selectivity=j.selectivity,
+            frame_tokens={a: nt for a, (lt, nt) in labels.items()},
+            label_tokens={a: lt for a, (lt, nt) in labels.items()},
+            tail_tokens=_question_tokens(j.predicate)))
+    return out
 
 
-def _anchor_prefix_tokens(join, live: dict, stats: dict, anchor: str,
-                          pre_tokens: int = 0) -> float:
-    """Total prefix tokens for the anchor: preamble + document + frame,
-    summed over live anchor documents.
-    """
-    labels = _label_counts(join)
-    return live[anchor] * (stats[anchor].mean_doc_tokens + pre_tokens
-                           + labels[anchor][1])
+def _filter_work(filters, stats, filter_orders: dict, pre: int) -> Work:
+    """Expected Work of every filter chain: the first stage scans
+    each document, later stages ask over resident KV."""
+    total = Work()
+    for alias, preds in filters.items():
+        mean = stats[alias].mean_doc_tokens
+        n = float(stats[alias].n_docs)
+        for si, predicate_index in enumerate(filter_orders[alias]):
+            p = preds[predicate_index]
+            q = _question_tokens(p.prompt)
+            op = scan if si == 0 else ask
+            total = total + op(pre + mean, q) * n
+            n *= p.selectivity if p.selectivity is not None else 1.0
+    return total
 
 
-def _frame_only_tokens(join, live: dict, anchor: str) -> float:
-    """Frame-only tokens for a later stage continuing the same anchor."""
-    labels = _label_counts(join)
-    return live[anchor] * labels[anchor][1]
+# ----------------------------------------------- KV keep (residency)
+
+def _page_round(tokens: float, page_tokens: int) -> float:
+    return -(-tokens // page_tokens) * page_tokens
 
 
-def _pair_tokens(join, live: dict, stats: dict, anchor: str) -> float:
-    """Total tokens for partner documents and answer cues across all tuples."""
-    labels = _label_counts(join)
-    partners = [a for a in _join_aliases(join) if a != anchor]
-    per_tuple = _question_tokens(join.predicate)
-    for p in partners:
-        per_tuple += stats[p].mean_doc_tokens + labels[p][0]
-    return _cross_tuples(join, live, anchor) * per_tuple
+def _length_stats(doc_tokens) -> joinsearch.AliasStats:
+    if isinstance(doc_tokens, joinsearch.AliasStats):
+        return doc_tokens
+    return joinsearch.summarize_alias(doc_tokens)
 
 
-def _stage_tokens(join, live: dict, stats: dict, anchor: str,
-                  pre_tokens: int = 0) -> float:
-    """Total tokens for one join stage at the current live counts."""
-    return (_anchor_prefix_tokens(join, live, stats, anchor,
-                                  pre_tokens)
-            + _pair_tokens(join, live, stats, anchor))
+def _split_at(doc_tokens, threshold: int, survivor_frac: float,
+              overhead: int, page_tokens: int) -> dict | None:
+    """The keep record for one alias at a given length threshold:
+    documents at or above it are credited as resident."""
+    stats = _length_stats(doc_tokens)
+    minimum = max(1, threshold)
+    kept = [(length, count) for length, count in stats.histogram
+            if length >= minimum]
+    if not kept:
+        return None
+    has_unkept = any(length < minimum
+                     for length, _ in stats.histogram)
+    return dict(
+        min_doc_tokens=1 if not has_unkept else threshold,
+        kept_expected_tokens=survivor_frac * sum(
+            count * _page_round(length + overhead, page_tokens)
+            for length, count in kept),
+        survivor_frac=survivor_frac,
+        overhead=overhead)
 
 
-def _thin(live: dict, join, anchor: str) -> None:
-    """Update live document counts after one join's selectivity."""
-    sel = join.selectivity
-    aliases = _join_aliases(join)
-
-    def others(x):
-        out = 1.0
-        for a in aliases:
-            if a != x:
-                out *= live[a]
-        return out
-
-    if join.semantics == "full":
-        new = {a: _surviving_docs(live[a], others(a), sel)
-               for a in aliases}
-        live.update(new)
-    elif sel is not None:
-        matched = _surviving_docs(live[anchor], others(anchor), sel)
-        live[anchor] = (matched if join.semantics == "exists"
-                        else live[anchor] - matched)
+def _raise_threshold(split: dict, doc_tokens, page_tokens: int):
+    """Drop the shortest kept length class: the next split up, or
+    None when only the longest class was left."""
+    stats = _length_stats(doc_tokens)
+    boundary = min(length for length, _ in stats.histogram
+                   if length >= max(1, split["min_doc_tokens"]))
+    higher = [length for length, _ in stats.histogram
+              if length > boundary]
+    if not higher:
+        return None
+    return _split_at(doc_tokens, higher[0], split["survivor_frac"],
+                     split["overhead"], page_tokens)
 
 
-# ------------------------------ the joint (order x anchor) search
+def keep_split(doc_tokens, budget_tokens: float, survivor_frac: float,
+               overhead: int, page_tokens: int) -> dict | None:
+    """Which survivors of one alias to credit as resident for a join.
 
-# Token overhead per anchor-switch barrier. Not yet measured.
-RESHARD_OVERHEAD_TOKENS = 0.0
+    Longest documents first. Resident KV of length L saves L dense
+    tokens (2 FLOPs per parameter each, against the fp8 peak) plus
+    L(L+1)/2 attention pairs (against the bf16 peak) - both counted,
+    no measured constant - while occupying kappa * L bytes. Saved
+    work per byte rises with L under any positive weighting of the
+    two terms, so length orders the documents; the rise comes from
+    the attention term and is small below the dense/attention
+    crossover (about 12,300 tokens at 4B), where the linear dense
+    term dominates. What makes longest-first exact rather than a
+    heuristic is that survival is unknown per document at plan time:
+    the expected kept mass is the survivor fraction of the kept
+    lengths' mass, a fractional knapsack, where taking by value per
+    byte is optimal. Page rounding blurs that at the margins - a
+    document just past a page boundary has a lower value per PAGE
+    than a slightly shorter one - so the split is exact in bytes and
+    approximate within one page per document.
 
-
-def _anchor_candidates(join, honor_forced: bool = True) -> list:
-    """Return candidate anchor aliases for a join stage.
-
-    exists/anti always anchor the outer table. A forced full anchor
-    is honored. Otherwise any table of the join is a candidate.
-    """
-    if join.semantics != "full":
-        return [join.anchor]
-    if honor_forced and join.anchor is not None:
-        return [join.anchor]
-    return _join_aliases(join)
-
-
-def _walk(seq, live0: dict, stats: dict, pre_tokens: int = 0):
-    """Cost one (join, anchor) sequence.
+    The runtime is not bound by the threshold: it retains every
+    passing survivor and evicts by recompute value under pressure.
+    This split is the capacity-planned credit the cost model and the
+    SoL comparison use.
 
     Returns:
-        (total_tokens, records) where each record is
-        (expected_tuples, stage_tokens).
+        None when not even the longest document fits, else the
+        _split_at record; min_doc_tokens is 1 when everything fits.
     """
-    live = dict(live0)
-    total = 0.0
-    records = []
-    prev_join, prev_anchor = None, None
-    for j, anchor in seq:
-        same_group = (prev_join is not None and anchor == prev_anchor
-                      and j.semantics == "full"
-                      and prev_join.semantics == "full")
-        if same_group:
-            tokens = _frame_only_tokens(j, live, anchor)
+    stats = _length_stats(doc_tokens)
+    if not stats.count:
+        return None
+    taken, threshold = 0.0, 0
+    for length, count in reversed(stats.histogram):
+        cost = (survivor_frac * count
+                * _page_round(length + overhead, page_tokens))
+        if taken + cost > budget_tokens:
+            break
+        taken += cost
+        threshold = length
+    if threshold == 0:
+        return None
+    split = _split_at(doc_tokens, threshold, survivor_frac, overhead,
+                      page_tokens)
+    while split is not None and \
+            split["kept_expected_tokens"] > budget_tokens:
+        split = _raise_threshold(split, doc_tokens, page_tokens)
+    return split
+
+
+def possible_anchor_aliases(specs) -> set:
+    """Every alias the runtime search could anchor a join on."""
+    out = set()
+    for spec in specs:
+        out.update(joinsearch.anchor_candidates(spec))
+    return out
+
+
+def plan_keeps(specs, filters, doc_tokens: dict, pre: int,
+               budget_tokens: float, page_tokens: int) -> dict:
+    """Candidate keep credit: every filtered alias the runtime could
+    anchor, each split against the whole budget. plan_query trims to
+    the aliases the predicted plan anchors and re-checks the joint
+    capacity."""
+    plan = {}
+    anchors = possible_anchor_aliases(specs)
+    for alias, preds in filters.items():
+        if alias not in anchors:
+            continue
+        frac = 1.0
+        for p in preds:
+            frac *= p.selectivity if p.selectivity is not None else 1.0
+        split = keep_split(doc_tokens[alias], budget_tokens, frac,
+                           pre, page_tokens)
+        if split is not None:
+            plan[alias] = split
+    return plan
+
+
+def _group_seq(seq):
+    """Group consecutive full stages on the same anchor, the same
+    rule the node graph uses. seq holds (spec, anchor) pairs."""
+    groups = []
+    for spec, anchor in seq:
+        merge = (groups and spec["semantics"] == "full"
+                 and groups[-1][2] and groups[-1][0] == anchor)
+        if merge:
+            groups[-1][1].append(spec)
         else:
-            tokens = _anchor_prefix_tokens(j, live, stats, anchor,
-                                           pre_tokens)
-            if prev_anchor is not None and anchor != prev_anchor:
-                tokens += RESHARD_OVERHEAD_TOKENS
-        tokens += _pair_tokens(j, live, stats, anchor)
-        records.append((_cross_tuples(j, live, anchor), tokens))
-        total += tokens
-        _thin(live, j, anchor)
-        prev_join, prev_anchor = j, anchor
-    return total, records
+            groups.append([anchor, [spec], spec["semantics"] == "full"])
+    return [(a, m) for a, m, _ in groups]
 
 
-def plan_joins(joins, rule: str, stats: dict, live0: dict,
-               pre_tokens: int = 0):
-    """Enumerate stage-order x anchor-choice combinations, return the
-    cheapest as ([(join, anchor)], remarks).
+def _keep_timeline(seq, keep_plan, doc_tokens, live0, pre,
+                   page_tokens, workers: int):
+    """Peak expected resident tokens per worker across the plan.
+
+    A point per group boundary: the end of the filter round holds
+    every credited alias's filter mass; after each group, credited
+    masses not yet anchored plus the gate-survivor mass of anchors a
+    later group re-uses (retention holds every gate survivor, not
+    just the credited split). Within a group, anchors run one at a
+    time, so the per-anchor working set is the headroom the caller
+    adds. Retained prefixes are rewound to preamble + document.
     """
-    if not joins:
-        return [], []
+    groups = _group_seq(seq)
+    first_use, last_use = {}, {}
+    for g, (anchor, members) in enumerate(groups):
+        first_use.setdefault(anchor, g)
+        last_use[anchor] = g
 
-    orders = [list(joins)]
-    if rule != "as_written" and len(joins) > 1:
-        orders = [list(p) for p in itertools.permutations(joins)]
+    def survivor_mass(alias, live_count):
+        stats = _length_stats(doc_tokens[alias])
+        frac = live_count / max(1.0, float(stats.count))
+        return frac * sum(
+            count * _page_round(pre + length, page_tokens)
+            for length, count in stats.histogram)
 
-    def best_seq(honor_forced):
-        best, best_total = None, float("inf")
-        for order in orders:
-            for assign in itertools.product(
-                    *[_anchor_candidates(j, honor_forced)
-                      for j in order]):
-                seq = list(zip(order, assign))
-                total, _ = _walk(seq, live0, stats, pre_tokens)
-                if total < best_total:
-                    best, best_total = seq, total
-        return best, best_total
-
-    seq, total = best_seq(True)
-    remarks = []
-    forced = sorted({j.anchor for j in joins
-                     if j.anchor is not None and j.semantics == "full"})
-    if forced:
-        _, free_total = best_seq(False)
-        if free_total < total:
-            remarks.append(
-                f"anchors {forced} were forced; a free choice prices "
-                f"lower ({free_total:,.0f} vs {total:,.0f} tuple "
-                f"tokens)")
-    return seq, remarks
-
-
-def pick_runtime_anchor(spec: dict, live_doc_tokens: dict,
-                        pre_len: int, chunk_budget: int) -> str:
-    """Choose the cheapest anchor at barrier time using live token counts.
-
-    Args:
-        spec: Payload stage spec (aliases, labels, frames, tail as
-            token id lists).
-        live_doc_tokens: alias -> list of per-document token counts.
-        pre_len: Preamble length in tokens.
-        chunk_budget: Maximum tokens per chunk.
-
-    Returns:
-        The alias to anchor on. Only anchors whose worst-case tuple
-        fits chunk_budget are candidates.
-    """
-    tail = len(spec["tail"])
-    counts = {a: len(t) for a, t in live_doc_tokens.items()}
-    means = {a: (sum(t) / len(t)) if t else 0.0
-             for a, t in live_doc_tokens.items()}
-    maxes = {a: max(t) if t else 0
-             for a, t in live_doc_tokens.items()}
-    aliases = spec["aliases"]
-
-    def need(a):
-        return (pre_len + maxes[a] + len(spec["frames"][a]) + tail
-                + sum(len(spec["labels"][p]) + maxes[p]
-                      for p in aliases if p != a))
-
-    def total(a):
-        tuples = 1.0
-        for al in aliases:
-            tuples *= counts[al]
-        per_tuple = tail + sum(len(spec["labels"][p]) + means[p]
-                               for p in aliases if p != a)
-        return (counts[a] * (means[a] + pre_len
-                             + len(spec["frames"][a]))
-                + tuples * per_tuple)
-
-    candidates = [a for a in aliases
-                  if a == spec["anchor"] or need(a) <= chunk_budget]
-    return min(candidates, key=total)
+    live = dict(live0)
+    points = [sum(k["kept_expected_tokens"]
+                  for k in keep_plan.values())]
+    for g, (anchor, members) in enumerate(groups):
+        for spec in members:
+            joinsearch.thin(live, spec)
+        point = 0.0
+        for alias in set(keep_plan) | set(first_use):
+            if alias in keep_plan and first_use.get(
+                    alias, len(groups)) > g:
+                point += keep_plan[alias]["kept_expected_tokens"]
+            elif first_use.get(alias, g + 1) <= g \
+                    < last_use.get(alias, -1):
+                point += survivor_mass(alias, live[alias])
+        points.append(point)
+    return max(points) / workers
 
 
 # --------------------------------------------- sharding (token arithmetic)
 
 def balanced_shards(doc_tokens, workers: int):
     """Greedily partition documents into shards balanced by token count."""
+    if workers == 1:
+        return (tuple(range(len(doc_tokens))),), [sum(doc_tokens)]
     order = sorted(range(len(doc_tokens)), key=lambda i: -doc_tokens[i])
     loads = [0] * workers
     shards = [[] for _ in range(workers)]
@@ -335,8 +403,13 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         doc_tokens: alias -> list of per-document token counts.
     """
     scans, filters, joins = _collect(plan)
-    stats = {a: CorpusStats.from_doc_tokens(t)
-             for a, t in doc_tokens.items()}
+    length_stats = {a: joinsearch.summarize_alias(t)
+                    for a, t in doc_tokens.items()}
+    stats = {
+        a: CorpusStats(n_docs=s.count, total_tokens=s.total,
+                       max_doc_tokens=s.maximum)
+        for a, s in length_stats.items()
+    }
     for s in scans:
         if s.alias not in stats:
             raise ValueError(f"no doc_tokens for alias {s.alias!r}")
@@ -352,24 +425,156 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     workers = max(1, gpus // tp)
 
     chunk = budgets.chunk_budget(model, device)
+    admission = budgets.arena_tokens(model, device, chunk)
     pre = _preamble_tokens(filters, joins)
+    specs = join_specs(joins)
 
-    # ---- the order rule first: the joint search below needs it
+    # ---- the order rule first: the search below needs it
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(filters, joins)
+    fixed = rule == "as_written"
+    filter_orders = {
+        alias: order_filters_indexed(
+            predicates, rule,
+            prefix_tokens=pre + stats[alias].mean_doc_tokens,
+            model=model, device=device, chunk_tokens=chunk)
+        for alias, predicates in filters.items()
+    }
 
-    # ---- joint (order x anchor) search, seeded with post-filter live
-    # estimates
+    # ---- expected live counts after filters, and the fixed filter
+    # work every candidate join plan shares
     live0 = {a: float(st.n_docs) for a, st in stats.items()}
     for fs in filters.values():
         surv = 1.0
         for p in fs:
             surv *= p.selectivity if p.selectivity is not None else 1.0
         live0[_filter_alias(fs[0])] *= surv
-    seq, search_remarks = plan_joins(joins, rule, stats, live0, pre)
-    remarks.extend(search_remarks)
-    anchors = {id(j): a for j, a in seq}
+    base_work = _filter_work(filters, stats, filter_orders, pre)
 
+    # ---- the largest single admission any operator makes: the keep
+    # arithmetic reserves it as working headroom
+    headroom = 0
+    for s in scans:
+        fq = max((_question_tokens(p.prompt)
+                  for p in filters.get(s.alias, ())), default=0)
+        if fq:
+            headroom = max(headroom,
+                           pre + stats[s.alias].max_doc_tokens + fq)
+    for spec in specs:
+        for a in spec["aliases"]:
+            headroom = max(
+                headroom,
+                pre + stats[a].max_doc_tokens + spec["frame_tokens"][a]
+                + sum(spec["label_tokens"][p] + stats[p].max_doc_tokens
+                      for p in spec["aliases"] if p != a)
+                + spec["tail_tokens"])
+
+    # ---- keep credit candidates, then the search on expectations
+    keep_budget = max(0.0, float(admission - headroom)) * workers
+    candidates = plan_keeps(specs, filters, length_stats, pre,
+                            keep_budget, budgets.PAGE_TOKENS)
+
+    def resident_from(plan_keep):
+        return {
+            alias: summary.with_resident_min(
+                max(1, plan_keep[alias]["min_doc_tokens"]))
+            if alias in plan_keep else summary
+            for alias, summary in length_stats.items()
+        }
+
+    def run_search(plan_keep, honor_forced=True):
+        found = joinsearch.search_joins(
+            specs, live0, resident_from(plan_keep), {}, pre,
+            chunk, model, device, base_work=base_work,
+            fixed_order=fixed, honor_forced=honor_forced,
+            arena_tokens=float(admission) * workers,
+            page_tokens=budgets.PAGE_TOKENS)
+        if found is None:
+            # a join predicate with no alias in common with the rest:
+            # no connected left deep order exists, so cost the written
+            # order directly
+            found = joinsearch.search_joins(
+                specs, live0, resident_from(plan_keep), {},
+                pre, chunk, model, device, base_work=base_work,
+                fixed_order=True, honor_forced=honor_forced,
+                arena_tokens=float(admission) * workers,
+                page_tokens=budgets.PAGE_TOKENS)
+        return found
+
+    def consumed_keeps(records, plan_keep):
+        """The credits the sequence anchors while their filter KV is
+        still resident; the rest have no reader in the prediction."""
+        used = {r["anchor"] for r in records
+                if r["resident"] == "filter"}
+        return {a: k for a, k in plan_keep.items() if a in used}
+
+    def spec_seq(found):
+        return [(specs[wp], a) for wp, a in found["seq"]]
+
+    def trim(found, plan_keep):
+        """Raise thresholds until the peak expected resident tokens
+        per worker fit the arena beside the working headroom. The
+        shortest credited documents go first, wherever they are."""
+        plan_keep = dict(plan_keep)
+        while plan_keep:
+            peak = _keep_timeline(spec_seq(found), plan_keep,
+                                  length_stats, live0, pre,
+                                  budgets.PAGE_TOKENS, workers)
+            if peak + headroom <= admission:
+                break
+            alias = min(
+                plan_keep,
+                key=lambda a: min(
+                    length for length, _ in length_stats[a].histogram
+                    if length >= max(
+                        1, plan_keep[a]["min_doc_tokens"])))
+            split = _raise_threshold(plan_keep[alias],
+                                     length_stats[alias],
+                                     budgets.PAGE_TOKENS)
+            if split is None:
+                del plan_keep[alias]
+            else:
+                plan_keep[alias] = split
+        return plan_keep
+
+    found = run_search(candidates)
+    kept0 = consumed_keeps(found["records"], candidates)
+    keep_plan = trim(found, kept0)
+    if keep_plan != kept0:
+        # the credited residency shrank: search once more against
+        # what the arena can actually hold
+        found = run_search(keep_plan)
+        keep_plan = trim(found, consumed_keeps(found["records"],
+                                               keep_plan))
+        found = run_search(keep_plan)
+    forced = sorted({s["anchor"] for s in specs
+                     if s["semantics"] == "full"
+                     and not s["anchor_free"]})
+    if forced:
+        free = run_search(keep_plan, honor_forced=False)
+        honored_s = speed_of_light(
+            base_work + found["work"], model, device, chunk).seconds
+        free_s = speed_of_light(
+            base_work + free["work"], model, device, chunk).seconds
+        if free_s < honored_s:
+            remarks.append(
+                f"anchors {forced} were forced; a free choice prices "
+                f"lower ({free_s:.3f} vs {honored_s:.3f} predicted "
+                f"seconds)")
+    seq = spec_seq(found)
+    stage_records = found["records"]
+
+    for alias, k in sorted(keep_plan.items()):
+        what = ("all survivors" if k["min_doc_tokens"] <= 1 else
+                f"survivors of {k['min_doc_tokens']}+ tokens")
+        remarks.append(
+            f"keep KV on {alias!r}: {what} priced as resident for "
+            f"the join, {k['kept_expected_tokens'] / max(1, workers):,.0f} "
+            f"expected tokens per worker of the {admission:,}-token "
+            f"arena")
+
+    # ---- refusal checks on the predicted plan
+    anchors = {wp: a for wp, a in found["seq"]}
     for s in scans:
         fq = max((_question_tokens(p.prompt)
                   for p in filters.get(s.alias, ())), default=None)
@@ -385,14 +590,13 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                          f"hold it",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
-    for j in joins:
-        anchor = anchors[id(j)]
-        labels = _label_counts(j)
-        partners = [a for a in _join_aliases(j) if a != anchor]
-        need = (pre + stats[anchor].max_doc_tokens + labels[anchor][1]
-                + sum(labels[p][0] + stats[p].max_doc_tokens
-                      for p in partners)
-                + _question_tokens(j.predicate))
+    for spec in specs:
+        anchor = anchors[spec["written_pos"]]
+        need = (pre + stats[anchor].max_doc_tokens
+                + spec["frame_tokens"][anchor]
+                + sum(spec["label_tokens"][p] + stats[p].max_doc_tokens
+                      for p in spec["aliases"] if p != anchor)
+                + spec["tail_tokens"])
         if need > chunk:
             return Refusal(
                 reasons=(f"one tuple of the join anchored on "
@@ -405,13 +609,11 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
 
-    admission = budgets.arena_tokens(model, device, chunk)
-    _, stage_records = _walk(seq, live0, stats, pre)
-
     remarks.append("kv_dtype=bf16 (always)")
 
     # ---- build the dataflow graph; ids_src tracks each table's
     # current producer node
+    retain_aliases = possible_anchor_aliases(specs) & set(filters)
     nodes = []
     ids_src = {}
     for s in scans:
@@ -426,7 +628,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             shards=shards, shard_token_loads=loads))
         ids_src[s.alias] = (sid, f"ids:{s.alias}")
         if s.alias in filters:
-            order_idx = order_filters_indexed(filters[s.alias], rule)
+            order_idx = filter_orders[s.alias]
             n = stats[s.alias].n_docs
             stages, surv = [], 1.0
             for i in order_idx:
@@ -438,14 +640,22 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                     selectivity=p.selectivity,
                     expected_docs=round(n * surv, 1)))
                 surv *= p.selectivity if p.selectivity is not None else 1.0
-            # arena writes only needed when a later stage will read
-            # the KV back
-            writes = len(stages) > 1
+            # arena writes when a later stage reads the KV back or
+            # the runtime search could anchor a join on this table
+            keep = s.alias in retain_aliases
+            writes = len(stages) > 1 or keep
+            credit = keep_plan.get(s.alias)
             fid = f"filter:{s.alias}"
-            nodes.append(dict(id=fid, op="FilterChain",
-                              inputs=(ids_src[s.alias],),
-                              alias=s.alias, arena_writes=writes,
-                              stages=tuple(stages)))
+            nodes.append(dict(
+                id=fid, op="FilterChain",
+                inputs=(ids_src[s.alias],),
+                alias=s.alias, arena_writes=writes,
+                keep_kv=keep,
+                # the capacity-planned credit; the runtime retains
+                # every survivor and evicts by value under pressure
+                keep_min_doc_tokens=(credit["min_doc_tokens"]
+                                     if credit else 0),
+                stages=tuple(stages)))
             ids_src[s.alias] = (fid, f"ids:{s.alias}")
             if not writes:
                 remarks.append(
@@ -455,18 +665,20 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     # group consecutive full stages on the same anchor; gates run
     # alone; anchor switches become barriers
     groups = []
-    for j, anchor in seq:
-        merge = (groups and j.semantics == "full" and groups[-1]["full"]
+    for (spec, anchor), record in zip(seq, stage_records):
+        merge = (groups and spec["semantics"] == "full"
+                 and groups[-1]["full"]
                  and groups[-1]["anchor"] == anchor)
         if merge:
-            groups[-1]["members"].append(j)
+            groups[-1]["members"].append((spec, record))
         else:
             groups.append(dict(anchor=anchor,
-                               full=(j.semantics == "full"),
-                               members=[j]))
+                               full=(spec["semantics"] == "full"),
+                               members=[(spec, record)]))
+    group_last_use = {}
+    for g, group in enumerate(groups):
+        group_last_use[group["anchor"]] = g
 
-    written = {id(j): i for i, j in enumerate(joins)}
-    rec = iter(stage_records)
     exec_idx = 0
     barrier_n = 0
     prev_anchor = None
@@ -479,8 +691,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             # the new anchor over the live set
             ahead = []
             for later in groups[g:]:
-                for j in later["members"]:
-                    for a in _join_aliases(j):
+                for spec, _ in later["members"]:
+                    for a in spec["aliases"]:
                         if a not in ahead:
                             ahead.append(a)
             bid = f"barrier:{barrier_n}"
@@ -495,24 +707,25 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         gid = f"group:{g}"
         stage_dicts = []
         in_aliases = [anchor]
-        for j in group["members"]:
-            tuples, tokens = next(rec)
-            partners = [a for a in _join_aliases(j) if a != anchor]
-            stage_labels = _label_counts(j)
+        for spec, record in group["members"]:
+            partners = [a for a in spec["aliases"] if a != anchor]
             stage_dicts.append(dict(
-                written_pos=written[id(j)], exec_idx=exec_idx,
+                written_pos=spec["written_pos"], exec_idx=exec_idx,
                 anchor=anchor, partners=partners,
-                semantics=j.semantics, selectivity=j.selectivity,
-                expected_tuples=round(tuples, 1),
-                anchor_frame_tokens=stage_labels[anchor][1],
-                pair_tail_tokens=_question_tokens(j.predicate),
-                tuple_tokens=round(tokens, 1)))
+                semantics=spec["semantics"],
+                selectivity=spec["selectivity"],
+                expected_tuples=round(record["tuples"], 1),
+                anchor_frame_tokens=spec["frame_tokens"][anchor],
+                pair_tail_tokens=spec["tail_tokens"],
+                anchor_resident=record["resident"],
+                tuple_tokens=round(record["tokens"], 1)))
             exec_idx += 1
             for a in partners:
                 if a not in in_aliases:
                     in_aliases.append(a)
-            if j.semantics == "full":
-                pairs_edges.append((gid, f"pairs:{written[id(j)]}"))
+            if spec["semantics"] == "full":
+                pairs_edges.append((gid,
+                                    f"pairs:{spec['written_pos']}"))
                 for a in [anchor] + partners:
                     if a not in out_aliases:
                         out_aliases.append(a)
@@ -520,6 +733,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             id=gid, op="JoinGroup",
             inputs=tuple(ids_src[a] for a in in_aliases),
             anchor=anchor,
+            anchor_resident=group["members"][0][1]["resident"],
+            keep_anchor_kv=group_last_use[anchor] > g,
             stage_idxs=tuple(s["exec_idx"] for s in stage_dicts),
             stages=tuple(stage_dicts)))
         ids_src[anchor] = (gid, f"ids:{anchor}")
@@ -598,6 +813,8 @@ def explain(logical: LogicalPlan, physical) -> str:
     lines.append("  prompt layout: engine preamble + document + "
                  "suffix (preamble_tokens per stage below count the "
                  "shared preamble)")
+    lines.append("  the predicted join order; the worker re-runs the "
+                 "same search on the actual filter survivors")
     lines.append(f"  order={physical.order_rule} ({physical.order_source})")
     for n in physical.nodes:
         parts = [f"  {n['op']} {n['id']}"]

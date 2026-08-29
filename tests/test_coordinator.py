@@ -294,3 +294,90 @@ def test_merge_join_round_disjoint_anchors():
     assert stage["partner_index"] == [[1, 0], [2, 0], [3, 1]]
     assert stage["rows"] == {0: [1, 0, 1], 1: [0, 0, 1],
                              2: [0, 1, 0]}
+
+
+# ------------------------------------------------ kept KV threading
+
+def test_retain_aliases_reads_plan_nodes():
+    from quail.runtime.coordinator import retain_aliases
+
+    p = payload()
+    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True),
+                       dict(op="FilterChain", alias="p",
+                            keep_kv=False)]
+    assert retain_aliases(p) == {"r"}
+    # without joins there is nothing to keep the KV for
+    p["joins"] = []
+    assert retain_aliases(p) == set()
+
+
+def test_filter_round_carries_retain_aliases():
+    p = payload()
+    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True)]
+    subs = filter_round_payloads(p, p["shards"], 2)
+    for sub in subs:
+        assert sub["retain_aliases"] == ["r"]
+
+
+def test_join_group_prior_shards_align_kept_anchors():
+    # an anchor kept by an earlier group stays on the workers that
+    # hold its KV, thinned to the live set, instead of re-sharding
+    p = payload()
+    survivors = {"r": [0, 3, 4], "p": [0, 1, 2, 3]}
+    prior = {"r": [[0, 4, 5], [1, 2, 3]]}
+    subs = join_group_payloads(p, 2, survivors, p["joins"],
+                               prior_shards=prior)
+    assert subs[0]["anchor_index"] == [0, 4]
+    assert subs[1]["anchor_index"] == [3]
+    # without prior shards the anchor follows its filter shards
+    subs = join_group_payloads(p, 2, survivors, p["joins"])
+    assert subs[0]["anchor_index"] == [0, 4]
+    assert subs[1]["anchor_index"] == [3]
+
+
+def test_join_group_prior_shards_add_documents_missing_from_kv():
+    p = payload()
+    survivors = {"r": [0, 1, 3, 4], "p": [0, 1, 2, 3]}
+    prior = {"r": [[0], [3]]}
+
+    subs = join_group_payloads(p, 2, survivors, p["joins"],
+                               prior_shards=prior)
+
+    assert 0 in subs[0]["anchor_index"]
+    assert 3 in subs[1]["anchor_index"]
+    assigned = [document for sub in subs
+                for document in sub["anchor_index"]]
+    assert sorted(assigned) == survivors["r"]
+    assert len(assigned) == len(set(assigned))
+
+
+def test_search_specs_counts_from_token_lists():
+    from quail.runtime.coordinator import search_specs
+
+    specs = search_specs([dict(
+        aliases=["r", "p"], anchor="r", anchor_free=True,
+        semantics="full", selectivity=0.1, written_pos=2,
+        frames={"r": [1] * 5, "p": [1] * 4},
+        labels={"r": [1] * 2, "p": [1] * 3}, tail=[1] * 7)])
+    assert specs == [dict(
+        written_pos=2, aliases=["r", "p"], anchor="r",
+        anchor_free=True, semantics="full", selectivity=0.1,
+        frame_tokens={"r": 5, "p": 4},
+        label_tokens={"r": 2, "p": 3}, tail_tokens=7)]
+
+
+def test_runtime_nodes_group_and_barrier_like_the_planner():
+    from quail.runtime.coordinator import runtime_nodes
+
+    joins = [dict(semantics="full", written_pos=0),
+             dict(semantics="full", written_pos=1),
+             dict(semantics="exists", written_pos=2)]
+    # two fulls share anchor r and merge; the gate runs alone and
+    # its anchor switch to p becomes a barrier
+    nodes = runtime_nodes([(1, "r"), (0, "r"), (2, "p")], joins)
+    assert [n["op"] for n in nodes] == ["JoinGroup", "Barrier",
+                                       "JoinGroup"]
+    assert nodes[0]["anchor"] == "r"
+    assert nodes[0]["stage_idxs"] == (1, 0)
+    assert nodes[1]["next_anchor"] == "p"
+    assert nodes[2]["stage_idxs"] == (2,)

@@ -104,6 +104,16 @@ def render_filter_question(tail: str) -> str:
     return sep + TASK_INSTRUCTION + content + ANSWER_CUE
 
 
+def render_filter_prompt_ids(prompt, document_ids, tokenizer) -> list:
+    """The complete canonical token ids for one filter document."""
+
+    if len(prompt.args) != 1 or not prompt.tail.startswith("{0}"):
+        raise ValueError("a filter prompt must start its tail with {0}")
+    tail = prompt.tail.replace("{0}", "", 1)
+    return (list(tokenizer(prompt.preamble)) + list(document_ids)
+            + list(tokenizer(tail)))
+
+
 @dataclass(frozen=True)
 class ColumnRef:
     alias: str       # table alias in the query ("r")

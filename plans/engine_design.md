@@ -1,17 +1,14 @@
-# Quail engine: a declarative query engine for AI_FILTER and AI_JOIN
+# Archived original Quail engine design
 
-Status: original design for the current engine. The engine now lives
-in this repository. The old exploration files are available in Git
-history at commit `e617c512dc40989deaeff66614af4b706a0a4be4`.
-The engine does not depend on those experiment scripts.
+Status: historical. Do not use this file to determine current behavior.
+It preserves the original proposal, including the deleted pinned CPU KV
+store, fitted timing constants, calibration command, and cold and warm
+benchmark passes. None of those are in the current engine.
 
-Update (2026-08-26): the pinned CPU KV store described below was
-removed (issue #32). Document KV now lives only in the GPU arena,
-for the duration of one query, and QUAIL-B runs a single pass
-instead of a cold and a warm pass. Sections that mention the store,
-restore, `cpu_memory_gb`, or the warm pass describe the original
-design, not the current engine. `reports/engine-wiki.md` is the
-current reference.
+Use `reports/engine-wiki.md` for the current planner, executor, KV policy,
+runtime, and benchmark design. The old exploration files referenced below are
+available in Git history at commit
+`e617c512dc40989deaeff66614af4b706a0a4be4`.
 
 Scope: AI_FILTER and AI_JOIN only. Qwen3 4B fp8 is the first model,
 H100 workers on Modal the first device — but the optimizer is built
@@ -270,7 +267,7 @@ q = (sess.docs("reviews").alias("r")
               prompt("Review {0} discusses product {1}",
                      col("r.review"), col("p.description")),
               selectivity=0.05)
-     .select("r.id", "p.id"))
+     .select("r.id", "p.id", order="by_cost"))
 ```
 
 Exists and anti semantics are the same call with a flag —
@@ -314,20 +311,20 @@ is a `Refusal`:
 Every physical plan has a filter order and a join stage order.
 Each comes from exactly one of two places:
 
-- **You set it.** In the builder, the order you chain calls is the
-  order that runs — nothing is ever reordered behind your back. In
-  SQL, `sess.sql(text, order="as_written")` runs the WHERE
-  conjuncts in written order and the JOIN clauses in written
-  order.
-- **The planner sets it from your selectivities.**
-  `sess.sql(text, order="by_cost")` sorts filters by cost per
-  killed document and picks the join stage order by the priced
-  enumeration (§4). Both use only the selectivity numbers you
-  provided in the option objects — there is no other input.
+- **You set it.** The builder uses written order by default.
+  `.select(..., order="as_written")` makes that choice explicit.
+  In SQL, `sess.sql(text, order="as_written")` runs the WHERE
+  conjuncts and JOIN clauses in written order.
+- **The planner sets it from your selectivities and counted work.**
+  Builder queries use `.select(..., order="by_cost")`. SQL queries
+  use `sess.sql(text, order="by_cost")`. The planner sorts filters
+  by cost per killed document and picks the join stage order through
+  the search in §4.
 
-When `order` is not passed, the default is `by_cost` if every
-gated predicate carries a selectivity, `as_written` otherwise, and
-`explain()` prints the chosen order and which rule chose it.
+When a SQL query does not pass `order`, the default is `by_cost` if
+every gated predicate carries a selectivity. Otherwise the default
+is `as_written`. The builder default remains `as_written`.
+`explain()` prints the chosen order and its source.
 
 A concrete example of the difference: benchmark query B3 writes a
 0.2-selectivity filter third among five. Under `as_written` it
@@ -451,13 +448,17 @@ their inputs — plan building consumes token counts, provided
 selectivities, the two spec structs, and three measured numbers,
 and nothing else. Grouped by input:
 
-**Decisions from token arithmetic alone** (no measured constants —
-the rate cancels out of every comparison, so these survive any
-miscalibration):
+**Decisions from counted model and device constants** (no measured
+performance constants):
 
 1. **Order** (only under `by_cost`): filters sorted by cost per
-   killed document — (question tokens) / (1 − selectivity). The
-   join specs (the exists/anti gates and the one full join):
+   killed document. Dense and attention each take the larger of their
+   compute and memory time. Their two times are then added. The planner
+   sorts the `ask` operations once by time divided by
+   (1 − selectivity). Prefix survivor products and expected costs let
+   it price each filter as the first `scan` in constant time.
+   Join order uses the join specs (the exists/anti gates and the one
+   full join):
    enumerate the permutations (2–4 specs, trivial), compare
    candidate orders by their survivor-thinned tuple-token totals.
 2. **Anchor per join**: the table whose tuple-token total is
@@ -547,8 +548,8 @@ filter chain is the degenerate join:
 This is not a workaround; it is the same computation KV rewind
 performed, minus the machinery. Rewind existed because an engine
 sequence accumulates question KV that must be erased back to the
-document boundary. The packed loop never writes suffix KV, so
-there is nothing to erase — keeping the immutable document KV and
+document boundary. The packed loop never retains suffix KV after the
+forward pass, so there is nothing to erase. Keeping the immutable document KV and
 attaching the next question computes bit-for-bit what rewind
 computed (`join_plan.md` §4; the parity gates in
 `join_probe.json`). The measured support for moving filters onto
@@ -569,14 +570,11 @@ What this deletes from the system:
   use. With one executor and always-keep, the threshold has
   nothing left to decide.
 
-To be precise about what is and is not kept, because it is the
-heart of the design: **document KV is kept, suffix KV never
-exists.** A document's KV is written once, stays resident across
-every stage that still needs it — all five filters, or both join
-stages it anchors — and is freed the moment nothing later can read
-it. What is never stored, by anyone including stock vLLM, is the
-per-pair, per-question suffix KV: a question tail or a streamed
-partner lives only inside its chunk's forward pass.
+To be precise about what is and is not kept: **document KV is kept, and
+suffix KV is temporary.** A document's KV is written once, stays resident
+across every stage that still needs it, and is freed when nothing later can
+read it. A question tail or streamed partner also produces KV during its
+forward pass. That temporary KV is not retained or reused after the pass.
 
 **Two token budgets, and why neither makes the GPU faster.** The
 chunk budget is the batch size: how many tokens enter one forward
@@ -730,8 +728,8 @@ that reopens this section.
 The pinned CPU KV store rides in the container, one per container
 shared by its GPUs: capacity =
 `cpu_memory_gb` minus headroom, keyed by (model, content hash,
-document id), holding document-prefix KV only (suffix KV never
-exists anywhere). The executor reads it with plain batched H2D
+document id), holding document-prefix KV only. Suffix KV is not retained.
+The executor reads it with plain batched H2D
 copies — no connector indirection, which is where stock vLLM lost
 five sixths of the link (10.2 of 55.4 GB/s). Store dtype is bf16,
 matching the executor. Eviction is the
@@ -759,6 +757,8 @@ class ModelSpec:
                          # (gate_up: 2 x intermediate at Qwen3)
     w_bytes: float       # weight bytes/param (fp8 = 1)
     kv_bytes: float      # KV bytes/element (bf16 = 2 default)
+    weight_precision: str      # fp8 component throughput
+    attention_precision: str   # bf16 component throughput
     # derived properties, never typed in:
     # kappa   = 2 * layers * n_kv * d_head * kv_bytes   (KV bytes/token)
     # W_mem   = params * w_bytes

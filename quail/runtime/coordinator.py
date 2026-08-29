@@ -17,6 +17,65 @@ def filter_round_limit(payload: dict):
     return payload.get("limit")
 
 
+def retain_aliases(payload: dict) -> set:
+    """Aliases whose filter survivors keep their KV for the joins,
+    from the plan's FilterChain keep_kv flags. Empty without joins or
+    without a planner-built payload."""
+    if not payload.get("joins"):
+        return set()
+    return {n["alias"] for n in payload.get("plan_nodes") or ()
+            if n.get("op") == "FilterChain" and n.get("keep_kv")}
+
+
+def search_specs(joins: list) -> list:
+    """The payload's join specs in the shared search's count form."""
+    out = []
+    for i, j in enumerate(joins):
+        out.append(dict(
+            written_pos=j.get("written_pos", i),
+            aliases=list(j["aliases"]),
+            anchor=j.get("anchor"),
+            anchor_free=bool(j.get("anchor_free")),
+            semantics=j["semantics"],
+            selectivity=j.get("selectivity"),
+            frame_tokens={a: len(t) for a, t in j["frames"].items()},
+            label_tokens={a: len(t) for a, t in j["labels"].items()},
+            tail_tokens=len(j["tail"])))
+    return out
+
+
+def runtime_nodes(sequence, joins: list) -> list:
+    """JoinGroup/Barrier nodes for a searched (written_pos, anchor)
+    sequence. stage_idxs index into the payload's join list; gates
+    run alone and anchor switches become barriers, the same grouping
+    the planner emits."""
+    pos_to_idx = {j.get("written_pos", i): i
+                  for i, j in enumerate(joins)}
+    groups = []
+    for wp, anchor in sequence:
+        idx = pos_to_idx[wp]
+        full = joins[idx]["semantics"] == "full"
+        if groups and full and groups[-1]["full"] \
+                and groups[-1]["anchor"] == anchor:
+            groups[-1]["idxs"].append(idx)
+        else:
+            groups.append(dict(anchor=anchor, full=full, idxs=[idx]))
+    nodes = []
+    barriers = 0
+    prev = None
+    for i, g in enumerate(groups):
+        if prev is not None and prev != g["anchor"]:
+            nodes.append(dict(id=f"runtime-barrier:{barriers}",
+                              op="Barrier", inputs=(),
+                              next_anchor=g["anchor"], thins=()))
+            barriers += 1
+        nodes.append(dict(id=f"runtime-group:{i}", op="JoinGroup",
+                          inputs=(), anchor=g["anchor"],
+                          stage_idxs=tuple(g["idxs"]), stages=()))
+        prev = g["anchor"]
+    return nodes
+
+
 def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
     """Build per-worker sub-payloads for the filter round.
 
@@ -40,6 +99,7 @@ def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
         sub.update(docs=docs, doc_index=index,
                    filters=payload["filters"],
                    filter_arena_writes=payload["filter_arena_writes"],
+                   retain_aliases=sorted(retain_aliases(payload)),
                    worker=w, workers=k)
         subs.append(sub)
     return subs
@@ -157,11 +217,13 @@ def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
 
 
 def join_group_payloads(payload: dict, k: int, survivors: dict,
-                        group: list) -> list:
+                        group: list, prior_shards: dict | None = None) -> list:
     """Build per-worker sub-payloads for one anchor group's join round.
 
-    Anchors follow their filter shards when available, otherwise are
-    re-sharded over the live set. Partners are replicated to all workers.
+    Anchors follow the shards their KV already sits on - the shards of
+    an earlier group that kept the anchor's KV (prior_shards), else
+    their filter shards - otherwise they are re-sharded over the live
+    set. Partners are replicated to all workers.
     """
     if not group:
         return []
@@ -175,8 +237,20 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
 
     live = surv(anchor_alias)
     shards = payload.get("shards") or {}
-    if anchor_alias in payload["filters"] and anchor_alias in shards:
-        alive = set(live)
+    alive = set(live)
+    if prior_shards and anchor_alias in prior_shards:
+        anchor_shards = [[g for g in shard if g in alive]
+                         for shard in prior_shards[anchor_alias]]
+        placed = {g for shard in anchor_shards for g in shard}
+        missing = [g for g in live if g not in placed]
+        if missing:
+            from quail.planner.decide import balanced_shards
+            toks = payload["docs"][anchor_alias]
+            idx_shards, _ = balanced_shards(
+                [len(toks[g]) for g in missing], k)
+            for worker, shard in enumerate(idx_shards):
+                anchor_shards[worker].extend(missing[i] for i in shard)
+    elif anchor_alias in payload["filters"] and anchor_alias in shards:
         anchor_shards = [[g for g in shard if g in alive]
                          for shard in shards[anchor_alias]]
     else:

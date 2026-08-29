@@ -4,7 +4,7 @@ arithmetic) from model and device specs.
 
 from quail.specs import DeviceSpec, ModelSpec
 
-POOL_FRACTION = 0.92    # fraction of device memory the executor claims
+POOL_FRACTION = 0.95    # fraction of device memory the executor claims
 CHUNK_SLACK = 2         # slack factor on the activation bound
 PAGE_TOKENS = 16        # KV arena page size, tokens
 INT32_MAX = 2**31 - 1
@@ -14,7 +14,11 @@ ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
 
 
 def tensor_parallel(model: ModelSpec, device: DeviceSpec) -> int:
-    """Smallest power-of-two GPU count whose pooled memory holds the weights."""
+    """Smallest power-of-two GPU count whose pooled memory holds the weights.
+
+    Uses the as-loaded footprint: the untied head is on the GPU until
+    the load finishes, so it must fit.
+    """
     tp = 1
     while model.W_mem > device.mem_bytes * POOL_FRACTION * tp:
         tp *= 2
@@ -30,8 +34,12 @@ def kernel_index_cap(model: ModelSpec) -> int:
 
 
 def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
-    """Tokens per chunk the activation memory allows, with slack."""
-    free = device.mem_bytes * POOL_FRACTION - model.W_mem
+    """Tokens per chunk the activation memory allows, with slack.
+
+    Uses resident weights: the untied head moves to CPU memory at
+    load (executor.model.move_untied_head_to_host).
+    """
+    free = device.mem_bytes * POOL_FRACTION - model.W_resident
     return int(free // model.act_per_token) // CHUNK_SLACK
 
 
@@ -47,12 +55,12 @@ def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None) -> int:
     """Admission budget: tokens of document KV that can be resident at once.
 
-    Computed from the memory left after weights and the activation
-    reservation.
+    Computed from the memory left after resident weights (the untied
+    head moves to CPU memory at load) and the activation reservation.
     """
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
-    free = (device.mem_bytes * POOL_FRACTION - model.W_mem
+    free = (device.mem_bytes * POOL_FRACTION - model.W_resident
             - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
     return int(free // model.kappa)
 

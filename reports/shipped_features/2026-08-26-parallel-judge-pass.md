@@ -50,4 +50,4 @@ because BioDEX alone is 60% of the judging work.
 Labels are unchanged by the split itself. Decoding is greedy and the
 prompts are identical; only their grouping into calls differs.
 
-Full report: `reports/2026-08-26-parallel-judge-pass.md`.
+Full report: `reports/old/2026-08-26-parallel-judge-pass.md`.

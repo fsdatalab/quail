@@ -8,7 +8,7 @@ change a greedy one-token decode, but they were hashed into
 them moved all 23 label sets without changing a single answer. It
 migrated 15 filter predicates and 17,057 labels; the 8 join predicates
 needed a real relabel because their own ``predicate_version`` had
-moved. See ``reports/2026-08-26-bio6-full-terms-and-judge-identity.md``.
+moved. See ``migrations/README.md``.
 
 Kept for the record and reusable the next time a field that cannot
 change an answer leaves ``JUDGE_SPEC``.
@@ -23,12 +23,12 @@ Then apply::
 """
 
 import json
-import os
 from pathlib import Path
 
 import modal
 
 from quail.bench.judge_pass import (
+    JUDGE_ID,
     PREDICATES,
     PredicateSpec,
     VOLUME_ROOT,
@@ -103,7 +103,8 @@ def _rehash_label_dir(spec: PredicateSpec, old_dir: Path, identity: dict,
                     f"{spec.key}: {compact} has no row for left id "
                     f"{left['id']}")
             part_rows.extend(found)
-        if spec.kind == "join" and spec.source_policy != "lepard_passage_id":
+        if (spec.kind == "join"
+                and spec.source_policy != "lepard_passage_id"):
             part_rows.sort(key=lambda row: (row["left_id"], row["right_id"]))
         _atomic_parquet(_part_path(spec, identity, start, end), part_rows)
         ordered.extend(part_rows)

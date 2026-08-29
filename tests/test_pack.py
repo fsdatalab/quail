@@ -7,7 +7,7 @@ import pytest
 from quail.executor.pack import (FilterAdmission, assemble,
                                  brute_force_triples, gate, matches,
                                  orient, pack_stream, pages_for,
-                                 plan_groups)
+                                 partition_anchor_groups, plan_groups)
 
 
 def test_orient_prefers_longer_side():
@@ -82,6 +82,26 @@ def test_pack_stream_keep_and_already_kept():
 def test_pack_stream_atomicity_error():
     with pytest.raises(ValueError):
         pack_stream([(100, [950])], 1000)
+
+
+def test_partition_anchor_groups_respects_page_capacity():
+    groups = partition_anchor_groups(
+        [17, 15, 16, 1], arena_pages=3, page_tokens=16,
+        extra_tokens=1)
+    assert groups == [[0, 1], [2, 3]]
+
+
+def test_partition_anchor_groups_respects_maximum_size():
+    groups = partition_anchor_groups(
+        [8, 8, 8], arena_pages=10, page_tokens=16,
+        max_group_size=1)
+    assert groups == [[0], [1], [2]]
+
+
+def test_partition_anchor_groups_rejects_one_oversized_anchor():
+    with pytest.raises(ValueError, match="anchor 0 needs 3 KV pages"):
+        partition_anchor_groups(
+            [33], arena_pages=2, page_tokens=16)
 
 
 def test_gate_matches_assemble_vs_brute_force():
@@ -196,6 +216,26 @@ def test_admission_pages_block_in_order():
     assert sched.next_chunk() == []    # pages blocked, answer in flight
     sched.report(0, 0, False)          # FALSE frees the pages
     assert sched.next_chunk() == [(1, 0, True)]
+
+
+def test_admission_starts_with_only_currently_free_pages():
+    sched = FilterAdmission([80], [10], 200,
+                            arena_pages=10, page_tokens=16,
+                            available_pages=2)
+
+    assert sched.next_chunk() == []
+    assert sched.blocked_pages == 3
+    sched.add_free_pages(3)
+    assert sched.next_chunk() == [(0, 0, True)]
+
+
+def test_admission_can_leave_a_passing_document_resident():
+    sched = FilterAdmission([80], [10], 200,
+                            arena_pages=10, page_tokens=16)
+    assert sched.next_chunk() == [(0, 0, True)]
+
+    assert sched.report(0, 0, True, release=False) == ()
+    assert sched.free_pages == 5
 
 
 def test_admission_refuses_impossible_shapes():

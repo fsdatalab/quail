@@ -187,7 +187,7 @@ commands to pull them are in the plot script's docstring.
     modal volume get quail-results \
         $C/gt_42674891c824e01c6d966eb48c9cf8c7/summary.json $W/before.json
     uv run --with matplotlib python \
-        reports/make_parallel_judge_pass_plots.py $W
+        reports/old/make_parallel_judge_pass_plots.py $W
 
 Superseded collection, kept on the volume:
 `/results/ground_truth/quailb/schema_v1/collections/gt_42674891c824e01c6d966eb48c9cf8c7`.

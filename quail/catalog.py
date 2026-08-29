@@ -43,8 +43,8 @@ class DocumentProvider:
         return cls(kind="hf", source=dataset, id_col=id_col,
                    columns=cols, hf_split=split, hf_config=config)
 
-    def read_column(self, column: str) -> tuple[list, list]:
-        """Return (ids, texts) for one column."""
+    def read_column(self, column: str):
+        """Return an Arrow table containing the ID and requested column."""
         if column not in self.columns:
             raise CompileError(
                 f"column {column!r} not in schema {self.columns}")
@@ -52,13 +52,16 @@ class DocumentProvider:
             import pyarrow.parquet as pq
             cols = [self.id_col] if column == self.id_col \
                 else [self.id_col, column]
-            table = pq.read_table(self.source, columns=cols)
-            return (table.column(self.id_col).to_pylist(),
-                    table.column(column).to_pylist())
+            return pq.read_table(self.source, columns=cols)
+        import pyarrow as pa
         from datasets import load_dataset
+
         ds = load_dataset(self.source, self.hf_config or None,
                           split=self.hf_split)
-        return list(ds[self.id_col]), list(ds[column])
+        columns = {self.id_col: ds[self.id_col]}
+        if column != self.id_col:
+            columns[column] = ds[column]
+        return pa.table(columns)
 
 
 @dataclass
