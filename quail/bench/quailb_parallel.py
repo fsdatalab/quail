@@ -4,10 +4,13 @@ Each family container runs Quail first. It then releases Quail GPU state,
 loads vLLM once, and runs stock vLLM and pipelined vLLM.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
-    uv run modal run -m quail.bench.quailb_parallel \
+    uv run modal run --detach -m quail.bench.quailb_parallel \
       --model qwen3-4b-fp8 --sf 0.1 \
       --prediction "State the expected result before starting." \
       2>&1 | tee "$run_log"
+
+The local entrypoint starts one remote function. Detached mode keeps that
+function and every family call running if the local process disconnects.
 """
 
 import json
@@ -264,8 +267,7 @@ def _merge_suites(parts, query_ids, run_label, started, elapsed,
     return merged, aggregate_path
 
 
-@app.local_entrypoint()
-def main(
+def _run_all(
     model: str = "qwen3-4b-fp8",
     sf: float = 0.1,
     lf: int = 1,
@@ -408,11 +410,56 @@ def main(
     saved = {name: call.get() for name, call in save_calls.items()}
 
     summary = quail_report["passes"]["single"]["summary"]
-    print(json.dumps({
+    final = {
         "run_id": run_label,
         "saved": saved,
         "queries_completed": summary["queries_completed"],
         "queries_failed": summary["queries_failed"],
         "parallel_wall_s": round(elapsed, 1),
         "function_call_ids": call_ids,
-    }, indent=2), flush=True)
+    }
+    print(json.dumps(final, indent=2), flush=True)
+    return json.dumps(final)
+
+
+@app.function(image=image, timeout=43200, memory=4096, volumes=VOLUMES)
+def run_all(
+    model: str,
+    sf: float,
+    lf: int,
+    query: str,
+    prediction: str,
+    ground_truth_collection: str,
+) -> str:
+    """Run and merge every requested query family."""
+    return _run_all(
+        model=model,
+        sf=sf,
+        lf=lf,
+        query=query,
+        prediction=prediction,
+        ground_truth_collection=ground_truth_collection,
+    )
+
+
+@app.local_entrypoint()
+def main(
+    model: str = "qwen3-4b-fp8",
+    sf: float = 0.1,
+    lf: int = 1,
+    query: str = "",
+    prediction: str = "",
+    ground_truth_collection: str = "",
+):
+    if not prediction:
+        raise ValueError("pass --prediction before starting the benchmark")
+    call = run_all.spawn(
+        model=model,
+        sf=sf,
+        lf=lf,
+        query=query,
+        prediction=prediction,
+        ground_truth_collection=ground_truth_collection,
+    )
+    print(f"function call id: {call.object_id} (all families)", flush=True)
+    print(call.get(), flush=True)
