@@ -588,12 +588,14 @@ def stock_kernels(n_docs: int = 512) -> str:
     rows = []
     total_us = 0.0
     for ev in prof.key_averages():
+        # keep only device-side rows: op wrapper rows (CPU device
+        # type) repeat the kernel name with the same device time and
+        # would double-count it
+        if "CUDA" not in str(getattr(ev, "device_type", "")):
+            continue
         cuda_us = getattr(ev, "self_device_time_total", 0) or \
             getattr(ev, "self_cuda_time_total", 0)
         if not cuda_us:
-            continue
-        if (ev.key.startswith(("_C::", "aten::", "vllm::", "_c10d"))
-                or "Command Buffer" in ev.key):
             continue
         total_us += cuda_us
         rows.append((round(cuda_us / 1e3, 2), ev.count, ev.key[:110]))
@@ -867,14 +869,14 @@ def profile_filter(model: str = "qwen3-4b-fp8",
         cats, counts = {}, {}
         rows = []
         for ev in prof.key_averages():
+            # keep only device-side rows: op wrapper rows (CPU
+            # device type) repeat the kernel name with the same
+            # device time and would double-count it
+            if "CUDA" not in str(getattr(ev, "device_type", "")):
+                continue
             cuda_us = getattr(ev, "self_device_time_total", 0) or \
                 getattr(ev, "self_cuda_time_total", 0)
             if not cuda_us:
-                continue
-            # op wrappers carry the same device time as the kernels
-            # they launch and would double-count it
-            if (ev.key.startswith(("_C::", "aten::"))
-                    or "Command Buffer" in ev.key):
                 continue
             cat = _categorize(ev.key)
             cats[cat] = cats.get(cat, 0.0) + cuda_us
