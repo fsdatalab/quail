@@ -5,23 +5,39 @@ Cell: `ablations/vllm_compiled_kernels.py`.
 
 The question: how much speed do our custom JIT kernels add, measured
 against the kernels a user would get from vLLM's own torch.compile of
-this model? An earlier ablation (2026-08-19; deleted as superseded by
-this report, see git history) compared our kernels against vLLM's ops
-called one by one, unfused. That comparison could be generous to us:
-stock vLLM compiles the model at boot, and its compiled graph could
-fuse the same operation pairs we fuse. This experiment adds the
-missing configuration and runs the comparison on one filter query and
-one join query.
+this model? Stock vLLM compiles the model at boot, and its compiled
+graph could in principle fuse the same operation pairs we fuse — so
+comparing only against vLLM's ops called one by one would be generous
+to us. This experiment measures both alternatives on two QUAIL-B
+queries.
 
-Answer: the fused kernels are worth 26% per token on both queries
-against the compiled kernel set (29% against the unfused ops),
-because stock vLLM's compiled graph does not fuse the quantization
-work for this model. Figure: `plots/kernel_source_rates.png`.
+Answer: on QUAIL-B queries, the fused kernels are worth 27% per token
+on the filter path and 23% on the join path against the compiled
+kernel set (30% and 26% against the unfused ops). The reason: stock
+vLLM's compiled graph does not fuse the quantization work for this
+model, and quantization is the largest small-kernel cost.
+Figure: `plots/kernel_source_rates.png`.
+
+## The four kernel sequences, side by side
+
+Figure: `plots/kernel_paths.png` (source:
+`reports/kernel_paths_diagram.html`). One layer of the 36-layer loop
+in each measured configuration. The matrix multiplies (DeepGEMM
+fp8_gemm_nt), FlashAttention-3, and the KV page write are the same
+kernels in every column; the columns differ only in the small kernels
+between them:
+
+- vLLM ops, unfused: 18 launches per layer on the unified path.
+- vLLM compiled-graph set: 15 launches per layer.
+- Quail fused, unified path (filters): 11 launches per layer.
+- Quail fused, merge_quant path (joins): 13 launches per layer (two
+  attention calls plus the fused merge, which also does the o_proj
+  quantization).
 
 ## What stock vLLM's compiled graph runs (measured, not assumed)
 
 We booted stock vLLM 0.26.0 at its defaults on the same image and
-profiled a prefill pass in-process
+profiled a prefill pass over IMDB-1-shaped prompts in-process
 (`/results/ablations/kernel_source_stock.json`):
 
 - The default optimization level is -O2, which compiles the model
@@ -31,37 +47,33 @@ profiled a prefill pass in-process
 - The config enables the RMSNorm+quant and SiLU+quant fusion passes
   (`fuse_norm_quant` and `fuse_act_quant` both true) — but the
   profiled kernel list contains no fused norm+quant or silu+quant
-  kernel. The group-quant that this model traces under DeepGEMM's
-  ue8m0 scale format (on by default on this image, for stock and for
-  our engine alike) does not match the patterns the passes register,
-  so the rewrite never fires. What actually runs, per layer:
-  - two Inductor-generated add+rms_norm kernels,
-  - one Inductor-generated silu*mul kernel,
-  - two Inductor-generated kernels for the q/k head norms and rotary
-    embedding (the dedicated qk-norm+rope fusion pass is off at
-    every -O level in 0.26.0),
-  - four standalone CUDA group-quant launches
-    (`per_token_group_quant_8bit_kernel`), one per GEMM input. This
-    is the largest small-kernel cost in the stock profile: 332 ms of
-    the profiled pass, against 132 ms for silu*mul and 94 ms for
-    both norms together.
-- The GEMMs (DeepGEMM sm90 fp8) and attention (FlashAttention-3) are
-  the same kernels the packed executor calls. They and the KV-cache
-  write sit outside the compiled graph.
+  kernel. The group-quant this model traces under DeepGEMM's ue8m0
+  scale mode (on by default on this image, for stock and for our
+  engine alike) does not match the patterns the passes register, so
+  the rewrite never fires. What actually runs, per layer: two
+  Inductor-generated add+rms_norm kernels, one Inductor silu*mul
+  kernel, two Inductor kernels for the q/k head norms plus rotary
+  (the dedicated qk-norm+rope fusion pass is off at every -O level in
+  0.26.0), and four standalone CUDA group-quant launches
+  (`per_token_group_quant_8bit_kernel`), one per GEMM input. The
+  standalone quant is the largest small-kernel cost in the stock
+  profile: 317 ms of the profiled pass, against 124 ms for silu*mul
+  and 89 ms for both norms together.
 
 So for this model, torch.compile's contribution is Inductor's fusion
 of the elementwise chains. The quantization stays unfused, and that
 is where most of our kernels' win lives.
 
-## The three configurations
+## The three kernel sources
 
-Same engine, same packing, same DeepGEMM matmuls, same
-FlashAttention-3 calls, same KV write. Only the small kernels between
-the matmuls (and the join merge) change. The non-quail paths live in
-a Pipeline subclass inside the ablation cell; the engine is
-unchanged.
+Every run goes through the real planner and the real worker execution
+core (`quail.runtime.worker._execute_single`); only the pipeline's
+kernel source is swapped, so packing, admission, the join search, KV
+retention, GEMMs, and attention are identical across configurations.
+The non-quail paths live in a Pipeline subclass inside the ablation
+cell; the engine is unchanged.
 
-| configuration | between-GEMM kernels | join merge |
+| kernel source | between-GEMM kernels | merge_quant-path join merge |
 |---|---|---|
 | quail | our three fused Triton kernels | our fused merge+quant Triton kernel |
 | vllm_ops | vLLM's ops one by one, unfused (fused_add_rms_norm + quant, silu_and_mul + quant, per-head norms + rotary as five launches) | vLLM's merge_attn_states + separate group quant |
@@ -71,141 +83,135 @@ A per-kernel probe (`/results/ablations/kernel_source_probe.json`)
 checked the wiring before the measured runs: the compiled segments
 hold one graph across token counts, the add+rms_norm segment folds
 the residual write into one generated kernel plus the quant launch
-(no extra copy), dequantized outputs sit within one fp8 rounding
-step of our kernels', and a 32-document filter with planted flags
-answers identically (0 wrong) through all three configurations.
+(no extra copy), dequantized outputs sit within one fp8 rounding step
+of our kernels', and IMDB-1 plus BIO-2 at scale factor 0.01 return
+near-identical rows through all three sources.
 
 ## The two queries
 
-- Filter query: the committed 10,000-document IMDB five-filter
-  workload (4.10M fresh tokens), unified attention — the filter
-  path.
-- Join query: 100 BioDEX reports x 256 reaction terms, 25,600 pairs
-  (1.09M fresh tokens), merge_quant attention — the join path.
+Both from the QUAIL-B catalog at scale factor 0.1 (reviews 5,000;
+reports 500; terms 1,127):
 
-Two repetitions per configuration, one container, one model load.
-The tables use each configuration's second repetition, matching the
-cell's comparison rows; the container's very first measured run
-(quail, repetition 0) was 2.4 s slower than its repetition 1, while
-every other configuration's repetitions agreed within 0.05 s.
+- IMDB-7: three filters over the reviews table (F1 -> F4 -> F5, no
+  join) — the unified attention path, 1.80M fresh tokens.
+- BIO-2: the reports x terms join, 563,500 document pairs — the
+  merge_quant attention path, 10.37M fresh tokens.
+
+Two repetitions per kernel source after one unmeasured warm run;
+repetitions agreed within 0.2% everywhere. The tables use the second
+repetition, matching the cell's comparison rows.
 
 ## Predictions (stated before the run)
 
-- Filter, vllm_ops: +2.3 to +2.6 us/token over quail (the earlier
-  2026-08-19 ablation measured a 2.4 gap). Measured: +2.48. Correct.
-- Filter, vllm_compiled: +1.7 to +2.2 us/token, reasoning that the
-  stock inventory keeps all four group-quant launches per layer, so
-  most of the fusion saving stays with quail. Measured: +2.23, just
-  above the top of the band.
-- Join: the filter gap plus the unfused merge — +2.5 to +3.0
-  (vllm_ops) and +2.0 to +2.7 (vllm_compiled). Measured: +3.13 and
-  +2.83, each about 0.1 above its band.
+- IMDB-7, vllm_ops: +25 to +32% wall. Measured: +29.7%. Correct.
+- IMDB-7, vllm_compiled: +22 to +29% wall, reasoning that the
+  compiled set keeps all four standalone group-quant launches per
+  layer and recovers only the q/k segment. Measured: +26.9%. Correct.
+- BIO-2, vllm_ops: +26 to +33% wall. Measured: +25.6%, just under
+  the band.
+- BIO-2, vllm_compiled: +23 to +30%. Measured: +23.3%, at the bottom
+  edge.
 
-Both misses are small and on the same side: the vLLM-side
-configurations cost slightly more than predicted, mostly because
-Inductor's silu*mul kernel turned out slower than vLLM's CUDA op
-(below).
+One anchor in the stored prediction text was stale: it cited BIO-2 at
+32 s from the QUAIL-B sf0.1 report, which predates the BioDEX corpus
+scale-up (the benchmark's cache schema version 5). Today's BIO-2 is
+563,500 pairs and runs about 129 s on the quail source. The
+percentage bands, which is what the predictions were about, held.
 
 ## Results
 
-Wall time and rate, second repetition
-(`/results/ablations/kernel_source_filter.json`,
-`/results/ablations/kernel_source_join.json`):
+Second repetition, one H100, `$3.9492/hour`
+(`quail.bench.evaluate.H100_USD_PER_HOUR`). Query time excludes model
+startup, as everywhere in this repo.
 
-| configuration | filter wall | filter us/token | join wall | join us/token |
+IMDB-7 — unified attention path, 5,000 documents:
+
+| kernel source | query time | us/fresh token | documents/s | $/query |
 |---|---|---|---|---|
-| quail | 34.7 s | 8.48 | 11.9 s | 10.93 |
-| vllm_compiled | 43.9 s | 10.71 (+26%) | 15.0 s | 13.75 (+26%) |
-| vllm_ops | 44.9 s | 10.96 (+29%) | 15.3 s | 14.06 (+29%) |
+| quail (unified) | 15.0 s | 8.36 | 333.1 | $0.0165 |
+| vllm_compiled (unified) | 19.1 s | 10.60 (+27%) | 262.3 | $0.0209 |
+| vllm_ops (unified) | 19.5 s | 10.84 (+30%) | 256.7 | $0.0214 |
 
-- Our fused kernels save 9.1 s of the 43.9 s filter query against
-  the compiled kernel set, and 3.1 s of 15.0 s on the join query —
-  1.26x on both. Against the unfused ops it is 1.29x on both.
-- The compiled set beats the unfused ops by only 0.25 (filter) to
-  0.31 (join) us/token — about a tenth of the gap to quail.
-  torch.compile is not where the speed is for this model.
-- The join gap exceeds the filter gap by 0.60-0.65 us/token on both
-  vLLM-side configurations. That is the price of composing the join
-  merge from vLLM's pieces (gather the rows with cached context,
-  merge_attn_states, scatter back, quantize — five launches per
-  layer) against our one fused merge+quant kernel.
-- quail's join rate here (10.93 us/token at 100x256) matches the
-  10x256 measurement in the attention-paths report (11.04).
+BIO-2 — merge_quant attention path, 563,500 document pairs:
 
-Answers: on the filter query all three configurations returned
-byte-identical answers — 40,052 answers, 4,645 survivors, 0 wrong
-against the planted flags, 0 disagreements — and the quail counts
-equal the banked `results/attention_paths.json` values exactly. On
-the join query the vLLM-side configurations each flipped about 0.2%
-of pairs (61 and 56 of 25,600) with yes-counts within 27 of quail's
-25,546; this workload saturates the 4B model near all-TRUE, and
-thin-margin flips under different kernel rounding are the known
-behavior from the accuracy-vs-stock study.
+| kernel source | query time | us/fresh token | pairs/s | $/query |
+|---|---|---|---|---|
+| quail (merge_quant) | 128.9 s | 12.42 | 4,372.6 | $0.1414 |
+| vllm_compiled (merge_quant) | 158.9 s | 15.31 (+23%) | 3,547.4 | $0.1743 |
+| vllm_ops (merge_quant) | 161.8 s | 15.60 (+26%) | 3,482.0 | $0.1775 |
+
+- The compiled set beats the unfused ops by only 0.24-0.29 us/token —
+  about a tenth of its gap to quail. torch.compile is not where the
+  speed is for this model.
+- The join-path gap exceeds the filter-path gap by 0.64-0.69
+  us/token on both vLLM sources. That is the price of composing the
+  join merge from vLLM's pieces (gather the rows with cached
+  context, merge_attn_states, scatter back, quantize) against our
+  one fused merge+quant kernel.
+- BIO-2's fresh-token count is identical across sources (a
+  single-stage join evaluates every pair); IMDB-7's differs by under
+  0.07% because survivor sets differ slightly between stages.
+
+Output rows: IMDB-7 returned 727 / 730 / 747 surviving documents
+(quail / vllm_ops / vllm_compiled), with 83-86 documents in the
+symmetric difference — about 1.7% of the 5,000 scanned documents flip
+at thin stage margins between kernel stacks. BIO-2 returned 116,295 /
+111,263 / 119,608 pairs, a 6.5-6.7% pair flip rate; the BioDEX
+term-matching task sits near the 4B model's floor with TRUE/FALSE
+margins close to zero (the 32B model resolves it), so small rounding
+differences between kernel stacks move many pairs. No kernel source
+is more accurate than another here; the flips measure margin
+thinness, not correctness.
 
 ### Where the GPU time goes
 
-GPU kernel microseconds per fresh token on a profiled 3,000-document
-filter run (`/results/ablations/kernel_source_profile.json`).
+GPU kernel microseconds per fresh token on a profiled IMDB-7 run
+(`/results/ablations/kernel_source_profile.json`).
 Figure: `plots/kernel_source_profile.png`.
 
-| category | quail | vllm_ops | vllm_compiled |
+| category | quail (unified) | vllm_ops (unified) | vllm_compiled (unified) |
 |---|---|---|---|
-| matrix multiplies (DeepGEMM) | 5.46 | 5.07 | 5.15 |
-| attention (FlashAttention-3) | 0.79 | 0.72 | 0.74 |
+| matrix multiplies (DeepGEMM) | 5.42 | 5.06 | 5.11 |
+| attention (FlashAttention-3) | 0.68 | 0.63 | 0.64 |
 | our fused Triton kernels | 1.46 | — | — |
-| vLLM norm and rotary ops | 0.00 | 1.83 | 0.00 |
-| vLLM silu*mul op¹ | 0.00 | 0.73 | 0.00 |
-| Inductor-generated kernels | — | — | 2.65 |
-| standalone group-quant | 0.39 | 1.64 | 1.68 |
-| copies | 0.23 | 0.70 | 0.22 |
-| **total** | **8.33** | **10.70** | **10.44** |
-
-¹Stored in the data file's "other" bucket: the act_and_mul kernel's
-template name escapes the category matcher. Per-kernel rows in the
-file confirm the split: rms_norm 0.88, rotary 0.47,
-fused_add_rms_norm 0.48 (together the 1.83), act_and_mul 0.73.
+| vLLM norm, rotary, silu ops | 0.00 | 2.56 | 0.00 |
+| Inductor-generated kernels | — | — | 2.67 |
+| standalone group-quant | 0.40 | 1.67 | 1.70 |
+| copies | 0.22 | 0.69 | 0.21 |
+| **total** | **8.17** | **10.61** | **10.34** |
 
 Readings:
 
 - The standalone group-quant is the cost torch.compile does not
-  remove: 1.68 us/token in the compiled set against quail's 0.39
+  remove: 1.70 us/token in the compiled set against quail's 0.40
   (our one remaining quant, the attention output feeding o_proj).
   Fusing the other three quant passes into their producers is most
   of our win.
-- Inductor's generated kernels (2.65) also lose to our fused
-  kernels (1.46) on the work they do fuse. The single biggest
-  reason: its silu*mul kernel costs 1.49 us/token where vLLM's CUDA
-  op costs 0.73 and our fused silu+quant kernel does the activation
-  and the quantization together in 0.78 (per-kernel rows in the
-  data file: 1.837 s, 0.907 s, 0.968 s over 1.24M tokens).
 - Inductor's fusion is a wash on the ops themselves: it replaces
-  2.56 us/token of vLLM norm, rotary, and silu*mul kernels with
-  2.65 us/token of generated kernels. What torch.compile actually
-  recovers is the data movement around the unfused sequence — the
-  copies bucket falls from 0.70 to 0.22 (mostly the two contiguous
-  copies per layer the vLLM q/k path needs). Net, that is the
-  0.25-0.31 us/token difference between the two vLLM-side
-  configurations.
-- Small-kernel work in total (everything but matmuls and
-  attention): quail 2.08, vllm_compiled 4.55, vllm_ops 4.90
-  us/token. The GPU-time deltas (2.11 and 2.37) account for about
-  95% of the measured wall deltas — all three configurations are
-  GPU-bound.
+  2.56 us/token of vLLM norm, rotary, and silu*mul kernels with 2.67
+  us/token of generated kernels — its silu*mul kernel alone is about
+  twice as slow as vLLM's hand-written CUDA op. What torch.compile
+  actually recovers is the data movement around the unfused
+  sequence: the copies bucket falls from 0.69 to 0.21 (mostly the
+  two contiguous copies per layer the vLLM q/k path needs).
+- Small-kernel work in total (everything but matmuls and attention):
+  quail 2.08, vllm_compiled 4.58, vllm_ops 4.92 us/token. The
+  GPU-time deltas account for 97-98% of the measured wall deltas —
+  all three configurations are GPU-bound.
 
 ## Scope notes
 
-- One model (Qwen3 4B fp8). At 32B the same absolute per-token
-  saving would sit on ~60 us/token of matmul-dominated work
-  (attention-paths report), so the relative win shrinks by roughly
-  8x. Not re-measured here.
-- Stock vLLM at -O2 also runs CUDA graphs for decode-sized batches.
-  This workload is large-chunk prefill, where CUDA graphs do not
-  apply, and the packed executor launches eagerly in every
-  configuration — so graph capture is outside this comparison.
-- The vllm_compiled configuration reproduces stock's kernel set
-  inside our executor; it is not stock vLLM end to end. The stock
-  engine baseline for these queries is the separate stock-vllm
-  reports.
+- One model (Qwen3 4B fp8). The per-token saving is roughly constant
+  in model size while the matmul work grows about 8x at 32B, so the
+  relative win shrinks accordingly. Not re-measured here.
+- Stock vLLM at -O2 also captures CUDA graphs for decode-sized
+  batches. These queries are large-chunk prefill, where CUDA graphs
+  do not apply, and the packed executor launches eagerly in every
+  configuration — graph capture is outside this comparison.
+- The vllm_compiled source reproduces stock's kernel set inside our
+  executor; it is not stock vLLM end to end. The stock engine
+  baseline for QUAIL-B is the stock-vllm-joins report and the
+  QUAIL-B sf0.1 report.
 
 ## How to reproduce
 
@@ -215,26 +221,28 @@ Readings:
     uv run modal run ablations/vllm_compiled_kernels.py::run_profile
 
 Modal app `quail-milestone1`, one H100 per cell. Function calls:
-queries `fc-01M17GRV662HJ9D4EQT7YMPA9Y`, profile
-`fc-01M17H1SNZM6D40470RD0YYERY`, stock inventory
-`fc-01M17H1VWNYPSD3AFRMXFR03FM`, probe
-`fc-01M17GNH10ZBAK23Y4034NKCVV`.
+queries `fc-01M17PPYE6361DV4C9N57MAWBF`, profile
+`fc-01M17PQ42KN5YS8ABRS3K2G06K`, stock inventory
+`fc-01M17PQ620HWV0579W35VWJTFS`, probe
+`fc-01M17NG322VDE687JR8RQY444E`.
 
 ## Data files
 
 All on the `quail-results` volume:
 
-- `/results/ablations/kernel_source_filter.json` — filter walls,
-  rates, counts, comparisons, banked gate.
-- `/results/ablations/kernel_source_join.json` — join walls, rates,
-  yes-counts, disagreements.
+- `/results/ablations/kernel_source_imdb7.json` — IMDB-7 walls,
+  rates, rows, comparisons.
+- `/results/ablations/kernel_source_bio2.json` — BIO-2 walls, rates,
+  rows, comparisons.
 - `/results/ablations/kernel_source_profile.json` — per-category GPU
-  time and launch counts for the three configurations.
+  time and launch counts for the three sources on IMDB-7.
 - `/results/ablations/kernel_source_stock.json` — stock vLLM's
   resolved compilation config and kernel inventory.
 - `/results/ablations/kernel_source_probe.json` — per-kernel parity,
-  compiled-segment launch counts, planted-flag check.
+  compiled-segment launch counts, sf 0.01 row agreement.
 
 Plots are rebuilt by `reports/make_kernel_source_plots.py` (the
-`modal volume get` commands are in its docstring). Local tee logs:
-`results/kernel_source_*.log`.
+`modal volume get` commands are in its docstring; it also prints the
+throughput and $/query table above). The kernel diagram is
+`reports/kernel_paths_diagram.html`, rendered to
+`plots/kernel_paths.png`. Local tee logs: `results/kernel_source_*.log`.
