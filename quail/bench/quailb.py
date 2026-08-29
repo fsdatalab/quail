@@ -888,13 +888,13 @@ def queries(sess):
     def add_filter(query, template, column):
         return query.ai_filter(
             quail.prompt(template, column),
-            selectivity=FILTER_SELECTIVITY_ESTIMATES[template])
+            selectivity=FILTER_SELECTIVITY_ESTIMATES.get(template))
 
     def add_join(query, partner, template, left, right):
         return query.ai_join(
             partner,
             quail.prompt(template, left, right),
-            selectivity=JOIN_SELECTIVITY_ESTIMATES[template])
+            selectivity=JOIN_SELECTIVITY_ESTIMATES.get(template))
 
     def make(doc_table, doc_alias, doc_col, filters, joins, select):
         """filters: list of prompt templates applied in order to the
@@ -903,6 +903,15 @@ def queries(sess):
         order, each dependent on whatever survived the stages before
         it; partner_filters push filters onto the partner side before
         the join (the FEV-5/6 and LEP-7 two-sided shape)."""
+        filter_templates = list(filters)
+        for _partner, _alias, _column, _join, *rest in joins:
+            filter_templates.extend(rest[0] if rest else ())
+        has_estimates = (
+            all(template in FILTER_SELECTIVITY_ESTIMATES
+                for template in filter_templates)
+            and all(join[3] in JOIN_SELECTIVITY_ESTIMATES for join in joins)
+        )
+
         def build():
             qy = sess.docs(doc_table).alias(doc_alias)
             for tmpl in filters:
@@ -916,7 +925,8 @@ def queries(sess):
                 qy = add_join(
                     qy, pq, tmpl, quail.col(f"{doc_alias}.{doc_col}"),
                     quail.col(f"{palias}.{pcol}"))
-            return qy.select(*select, order="by_cost")
+            order = "by_cost" if has_estimates else "as_written"
+            return qy.select(*select, order=order)
         return build
 
     q = {}

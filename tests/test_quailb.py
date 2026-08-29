@@ -81,12 +81,18 @@ def test_all_queries_compile_and_plan(tmp_path):
         _, filters, joins = _collect(query.logical)
         predicates = [predicate for chain in filters.values()
                       for predicate in chain]
-        assert all(predicate.selectivity is not None
-                   for predicate in predicates), qid
-        assert all(join.selectivity is not None for join in joins), qid
+        if qid.startswith("PRIV-"):
+            assert all(predicate.selectivity is None
+                       for predicate in predicates), qid
+            assert all(join.selectivity is None for join in joins), qid
+        else:
+            assert all(predicate.selectivity is not None
+                       for predicate in predicates), qid
+            assert all(join.selectivity is not None for join in joins), qid
         plan = query.plan()
         assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
-        assert plan.order_rule == "by_cost", qid
+        expected_order = "as_written" if qid.startswith("PRIV-") else "by_cost"
+        assert plan.order_rule == expected_order, qid
         assert "physical:" in query.explain(), qid
 
 

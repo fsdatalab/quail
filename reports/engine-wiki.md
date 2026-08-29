@@ -28,8 +28,6 @@ payload to the worker, which calls the executor.
 | `planner/qwen3_cost.py` | Qwen3 attention projection, MLP, and attention components | specs, work, roofline |
 | `planner/roofline.py` | Generic component compute and memory limits | specs |
 | `planner/sol.py` | Ideal query packing and total component time | work, qwen3_cost, roofline |
-| `planner/calibration.py` | Measured constants (a, a2) and scaling | specs |
-| `planner/calibrate.py` | Length-sweep measure of a and a2 | calibration, executor |
 | `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
 | `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, plan |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
