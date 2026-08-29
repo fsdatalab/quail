@@ -2,18 +2,22 @@
 kernels stock vLLM's compiled graph runs, on one filter query and one
 join query.
 
-What "stock vLLM's kernels" means here, read off vllm==0.26.0: at the
-default -O2 optimization level, a checkpoint with blocked fp8 weights
-(Qwen3-4B-FP8) forces the quant_fp8 custom op on, which turns on the
-RMSNorm+quant and SiLU+quant fusion passes. The compiled graph then
-runs torch.ops._C.rms_norm_per_block_quant and
-torch.ops._C.silu_and_mul_per_block_quant between the GEMMs, runs the
-q/k head norms and rotary embedding as Inductor-generated kernels
-from the native implementations (the qk-norm+rope fusion pass is off
-at every -O level), and quantizes the attention output with a
-standalone group-quant call. Attention itself and the KV-cache write
-sit outside the compiled graph (they are graph split points), so they
-stay identical across rungs.
+What "stock vLLM's kernels" means here was measured, not assumed: the
+stock_kernels cell below boots stock vLLM 0.26.0 at its defaults on
+the same image and profiles a prefill pass
+(/results/ablations/kernel_source_stock.json). At the default -O2
+level the config enables the RMSNorm+quant and SiLU+quant fusion
+passes (a blocked-fp8 checkpoint forces the quant_fp8 custom op on),
+but the profiled graph shows the pattern rewrite does not fire for
+this model under the ue8m0 scale mode DeepGEMM uses here: no fused
+norm+quant or silu+quant kernel appears. Per layer, stock's compiled
+graph actually runs two Inductor-generated add+rms_norm kernels, one
+Inductor silu*mul kernel, two Inductor kernels for the q/k head norms
+plus rotary (natives traced and fused by Inductor; the qk-norm+rope
+fusion pass is off at every -O level), and four standalone CUDA
+group-quant launches (one per GEMM input). Attention, the GEMMs, and
+the KV-cache write sit outside the compiled graph and are the same
+kernels the packed executor calls.
 
 Three rungs, the engine untouched (the non-quail paths live in a
 Pipeline subclass below):
@@ -25,9 +29,10 @@ Pipeline subclass below):
                  separate group-quant in place of our fused
                  merge+quant kernel
   vllm_compiled  the kernel set stock vLLM's compiled graph runs:
-                 the two fused CUDA ops above, torch.compile over the
-                 native q/k-norm+rope math with vLLM's Inductor
-                 settings, and the same merge_attn_states join merge
+                 torch.compile over the native add+rms_norm, silu*mul
+                 and q/k-norm+rope math with vLLM's Inductor
+                 settings, the same standalone group-quant per GEMM
+                 input, and the same merge_attn_states join merge
 
 Workloads: the committed 10,000-document five-filter query (unified
 attention) and the 100-report x 256-term BioDEX join query
@@ -97,7 +102,7 @@ class KernelSourcePipeline(Pipeline):
                  kernel_source="quail"):
         super().__init__(model, arena, kernels="quail",
                          attention_mode=attention_mode)
-        self._qk_compiled = None
+        self._segments = None
         self.kernel_source = kernel_source
 
     @property
@@ -109,63 +114,47 @@ class KernelSourcePipeline(Pipeline):
         if source not in KERNEL_SOURCES:
             raise ValueError(f"kernel_source must be one of "
                              f"{KERNEL_SOURCES}, got {source!r}")
-        if source == "vllm_compiled":
-            import vllm._custom_ops  # noqa: F401  registers _C ops
-            for name in ("rms_norm_per_block_quant",
-                         "silu_and_mul_per_block_quant"):
-                if not hasattr(self.torch.ops._C, name):
-                    raise RuntimeError(f"vLLM build lacks _C.{name}")
-            if self.use_ue8m0:
-                # the fused _C ops have no ue8m0 scale mode; H100
-                # (where this ablation runs) does not use ue8m0
-                raise RuntimeError(
-                    "vllm_compiled rung requires ue8m0 scales off")
-            if self.rotary.rotary_dim != self.head_dim:
-                raise RuntimeError(
-                    "the native rope transcription assumes rotary "
-                    "over the full head dimension")
+        if (source == "vllm_compiled"
+                and self.rotary.rotary_dim != self.head_dim):
+            raise RuntimeError(
+                "the native rope transcription assumes rotary over "
+                "the full head dimension")
         self._kernel_source = source
         self.kernels = "quail" if source == "quail" else "vllm"
 
-    # ---- the fused CUDA ops stock's compiled graph runs -------------
-
-    def vllm_norm_quant(self, hidden, norm, residual):
-        if self.kernel_source != "vllm_compiled":
-            return super().vllm_norm_quant(hidden, norm, residual)
-        torch = self.torch
-        n, h = hidden.shape
-        q = torch.empty((n, h), dtype=self.fp8, device="cuda")
-        scales = self._col_major_scales(n, h)
-        torch.ops._C.rms_norm_per_block_quant(
-            q, hidden, norm.weight, scales, norm.variance_epsilon,
-            None, residual, GROUP, True)
-        return q, scales
-
-    def vllm_silu_quant(self, gate_up):
-        if self.kernel_source != "vllm_compiled":
-            return super().vllm_silu_quant(gate_up)
-        torch = self.torch
-        n, doubled = gate_up.shape
-        half = doubled // 2
-        q = torch.empty((n, half), dtype=self.fp8, device="cuda")
-        scales = self._col_major_scales(n, half)
-        torch.ops._C.silu_and_mul_per_block_quant(
-            q, gate_up, scales, GROUP, None, True)
-        return q, scales
-
-    # ---- q/k norm + rope under torch.compile ------------------------
-    # Stock runs this segment as native torch fused by Inductor (the
-    # qk-norm+rope fusion pass is off at every -O level in 0.26.0).
-    # The math is transcribed from vllm/ir/ops/layernorm.py (rms_norm)
-    # and vllm/model_executor/layers/rotary_embedding/{base,common}.py
+    # ---- the segments stock's compiled graph runs -------------------
+    # The measured stock inventory (kernel_source_stock.json) shows
+    # Inductor-generated kernels for add+rms_norm, silu*mul, and
+    # q/k-norm+rope, each followed by the standalone group-quant
+    # custom op (the fusion passes do not rewrite this model's graph
+    # under ue8m0 scales). The native math is transcribed from
+    # vllm/ir/ops/layernorm.py (rms_norm, fused_add_rms_norm) and
+    # vllm/model_executor/layers/rotary_embedding/{base,common}.py
     # (forward_static, neox style); combo_kernels matches the
-    # inductor_compile_config stock sets for torch >= 2.9.
+    # inductor_compile_config stock sets for torch >= 2.9. The quant
+    # is self.quant, the same vLLM group-quant call the engine and
+    # stock both run, so ue8m0 scale rounding stays consistent.
 
-    def _compiled_qk(self):
-        if self._qk_compiled is not None:
-            return self._qk_compiled
+    def _compiled_segments(self):
+        if self._segments is not None:
+            return self._segments
         torch = self.torch
         H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
+
+        def add_norm_native(hidden, residual, weight, eps):
+            # residual accumulates in place, as the engine expects;
+            # Inductor folds the write into the generated kernel
+            residual += hidden
+            xf = residual.to(torch.float32)
+            variance = xf.pow(2).mean(dim=-1, keepdim=True)
+            xf = xf * torch.rsqrt(variance + eps)
+            return xf.to(weight.dtype) * weight
+
+        def silu_mul_native(gate_up):
+            half = gate_up.shape[-1] // 2
+            gate = gate_up[..., :half]
+            up = gate_up[..., half:]
+            return torch.nn.functional.silu(gate) * up
 
         def norm(x, w, eps):
             xf = x.to(torch.float32)
@@ -194,16 +183,34 @@ class KernelSourcePipeline(Pipeline):
             k = rope(k, cos, sin).reshape(n, KH * D)
             return q.contiguous(), k.contiguous()
 
-        self._qk_compiled = torch.compile(
-            qk_norm_rope_native, dynamic=True,
-            options={"combo_kernels": True,
-                     "benchmark_combo_kernel": True})
-        return self._qk_compiled
+        options = {"combo_kernels": True,
+                   "benchmark_combo_kernel": True}
+        self._segments = dict(
+            add_norm=torch.compile(add_norm_native, dynamic=True,
+                                   options=options),
+            silu_mul=torch.compile(silu_mul_native, dynamic=True,
+                                   options=options),
+            qk=torch.compile(qk_norm_rope_native, dynamic=True,
+                             options=options))
+        return self._segments
+
+    def vllm_norm_quant(self, hidden, norm, residual):
+        if self.kernel_source != "vllm_compiled":
+            return super().vllm_norm_quant(hidden, norm, residual)
+        normed = self._compiled_segments()["add_norm"](
+            hidden, residual, norm.weight, norm.variance_epsilon)
+        return self.quant(normed)
+
+    def vllm_silu_quant(self, gate_up):
+        if self.kernel_source != "vllm_compiled":
+            return super().vllm_silu_quant(gate_up)
+        return self.quant(self._compiled_segments()["silu_mul"](
+            gate_up))
 
     def vllm_qk_norm_rope(self, qkv, positions, attn):
         if self.kernel_source != "vllm_compiled":
             return super().vllm_qk_norm_rope(qkv, positions, attn)
-        return self._compiled_qk()(
+        return self._compiled_segments()["qk"](
             qkv, positions, attn.q_norm.weight, attn.k_norm.weight,
             self.rotary.cos_sin_cache, attn.q_norm.variance_epsilon)
 
@@ -405,26 +412,42 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
             report[source]["qk_k_max_abs"] = _max_abs(
                 torch, outs[source][1], outs["quail"][1])
 
-        # count launches of one compiled q/k call at a second token
-        # count (also proves dynamic shapes hold - no recompile)
+        # count launches of each compiled segment at a second token
+        # count (also proves dynamic shapes hold - no recompile);
+        # add_norm should be one generated kernel with the residual
+        # write folded in, not a separate copy
         pipeline.kernel_source = "vllm_compiled"
+
+        def count_kernels(fn):
+            fn()
+            torch.cuda.synchronize()
+            with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CUDA]
+            ) as prof:
+                fn()
+                torch.cuda.synchronize()
+            return [ev.key for ev in prof.key_averages()
+                    if (getattr(ev, "self_device_time_total", 0)
+                        or getattr(ev, "self_cuda_time_total", 0))
+                    and not ev.key.startswith(("aten::", "_C::"))
+                    and "Command Buffer" not in ev.key]
+
         qkv2 = torch.randn(2048, qkv_w, device="cuda",
                            dtype=torch.bfloat16)
         pos2 = positions[:2048]
-        pipeline.vllm_qk_norm_rope(qkv2, pos2, attn)
-        torch.cuda.synchronize()
-        with torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CUDA]
-        ) as prof:
-            pipeline.vllm_qk_norm_rope(qkv2, pos2, attn)
-            torch.cuda.synchronize()
-        kernels = [ev.key for ev in prof.key_averages()
-                   if (getattr(ev, "self_device_time_total", 0)
-                       or getattr(ev, "self_cuda_time_total", 0))
-                   and not ev.key.startswith(("aten::", "_C::"))
-                   and "Command Buffer" not in ev.key]
+        kernels = count_kernels(
+            lambda: pipeline.vllm_qk_norm_rope(qkv2, pos2, attn))
         report["vllm_compiled"]["qk_kernel_launches"] = len(kernels)
         report["vllm_compiled"]["qk_kernels"] = kernels[:12]
+
+        hidden2 = hidden0[:2048].clone()
+        residual2 = residual0[:2048].clone()
+        kernels = count_kernels(
+            lambda: pipeline.vllm_norm_quant(
+                hidden2, layer.input_layernorm, residual2))
+        report["vllm_compiled"]["norm_quant_kernel_launches"] = \
+            len(kernels)
+        report["vllm_compiled"]["norm_quant_kernels"] = kernels[:12]
 
         # end to end on synthetic ids: a small filter chain and a
         # small join through every source; answers are the gate that
@@ -548,10 +571,15 @@ PREDICTIONS = {
         "vllm_ops": "+2.3 to +2.6 us/token over quail (the A2-A3 "
                     "gap of the 2026-08-19 ablation was 2.4), "
                     "about 44-46 s",
-        "vllm_compiled": "+0.3 to +1.0 us/token over quail: the two "
-                         "fused CUDA ops match our norm and silu "
-                         "fusions, the Inductor q/k segment runs "
-                         "more launches than our one kernel",
+        "vllm_compiled": "+1.7 to +2.2 us/token over quail. The "
+                         "stock inventory shows the compiled graph "
+                         "keeps all four standalone group-quant "
+                         "launches per layer, so the quant-fusion "
+                         "saving (2.34 us/token GPU in the "
+                         "2026-08-19 profile) stays with quail; "
+                         "against vllm_ops it recovers only the q/k "
+                         "segment (5 launches to ~2, ~0.3-0.5 "
+                         "us/token)",
     },
     "join": {
         "quail": "the reference: ~11 us/token "
@@ -559,9 +587,9 @@ PREDICTIONS = {
         "vllm_ops": "+2.5 to +3.0 us/token over quail: the filter "
                     "gap plus the unfused merge (gather, merge, "
                     "scatter, quant against our one kernel)",
-        "vllm_compiled": "+0.5 to +1.2 us/token over quail: fused "
-                         "norm and silu recovered, merge still "
-                         "unfused",
+        "vllm_compiled": "+2.0 to +2.7 us/token over quail: same "
+                         "unfused quants and unfused merge as "
+                         "vllm_ops, minus the q/k segment saving",
     },
 }
 
