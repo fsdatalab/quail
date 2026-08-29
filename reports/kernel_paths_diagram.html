@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Per-layer kernels: vLLM unfused, vLLM compiled, Quail unified, Quail merge_quant</title>
+<style>
+  :root {
+    --gemm:   #e3e3f3; --vllm:  #ececec; --inductor: #dbeafe;
+    --quail:  #dcfce7; --fa3:   #ffedd5; --kv: #ccfbf1;
+    --ink: #0f172a; --muted: #64748b; --line: #cbd5e1;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 13px/1.35 -apple-system, "Segoe UI", Roboto, Helvetica,
+         Arial, sans-serif; color: var(--ink); background: #fff;
+         padding: 18px 20px; width: 1560px; }
+  h1 { font-size: 17px; margin-bottom: 2px; }
+  .sub { color: var(--muted); margin-bottom: 14px; font-size: 12.5px; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr);
+          gap: 10px; }
+  .col { border: 1px solid var(--line); border-radius: 8px;
+         padding: 9px; }
+  .col h2 { font-size: 13.5px; margin-bottom: 1px; }
+  .col .count { color: var(--muted); font-size: 12px;
+                margin-bottom: 8px; }
+  .band { color: #fff; background: #1e293b; border-radius: 4px;
+          font-size: 11px; font-weight: 600; padding: 3px 7px;
+          margin: 7px 0 5px; }
+  .k { border-radius: 4px; padding: 4px 7px; margin: 3px 0;
+       border: 1px solid rgba(0,0,0,0.07); }
+  .k small { color: var(--muted); }
+  .gemm { background: var(--gemm); }
+  .vllm { background: var(--vllm); }
+  .inductor { background: var(--inductor); }
+  .quail { background: var(--quail); }
+  .fa3 { background: var(--fa3); }
+  .kv { background: var(--kv); }
+  .note { font-size: 11.5px; color: var(--muted); margin-top: 7px;
+          border-top: 1px dashed var(--line); padding-top: 6px; }
+  .legend { display: flex; gap: 14px; margin-top: 13px;
+            font-size: 12px; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .chip { width: 14px; height: 14px; border-radius: 3px;
+          border: 1px solid rgba(0,0,0,0.12); display: inline-block; }
+</style>
+</head>
+<body>
+<h1>Per-layer kernels, one 36-layer loop iteration (Qwen3 4B fp8, one H100)</h1>
+<div class="sub">The four measured configurations. Matrix multiplies
+(DeepGEMM fp8_gemm_nt) and FlashAttention-3 are the same kernels in
+every column; the columns differ in who provides the small kernels
+between them. The two vLLM columns are drawn on the unified (filter)
+attention path; their join-path variant is described in the note
+under each.</div>
+
+<div class="grid">
+
+<div class="col">
+  <h2>vLLM ops, unfused</h2>
+  <div class="count">18 launches / layer (unified path)</div>
+  <div class="k vllm">fused_add_rms_norm <small>CUDA op</small></div>
+  <div class="k vllm">per-token-group FP8 quant</div>
+  <div class="k gemm">fp8_gemm_nt — qkv_proj</div>
+  <div class="k vllm">contiguous copy of q</div>
+  <div class="k vllm">contiguous copy of k</div>
+  <div class="k vllm">rms_norm — q heads</div>
+  <div class="k vllm">rms_norm — k heads</div>
+  <div class="k vllm">rotary_embedding</div>
+  <div class="k kv">kv_row_scatter <small>same in all columns</small></div>
+  <div class="k fa3">FA3 causal paged call</div>
+  <div class="k vllm">per-token-group FP8 quant</div>
+  <div class="k gemm">fp8_gemm_nt — o_proj</div>
+  <div class="k vllm">fused_add_rms_norm</div>
+  <div class="k vllm">per-token-group FP8 quant</div>
+  <div class="k gemm">fp8_gemm_nt — gate_up_proj</div>
+  <div class="k vllm">silu_and_mul <small>CUDA op</small></div>
+  <div class="k vllm">per-token-group FP8 quant</div>
+  <div class="k gemm">fp8_gemm_nt — down_proj</div>
+  <div class="note">merge_quant (join) path: the FA3 block becomes
+  call A (causal varlen) + row gather + call B (paged cross), then
+  gather + merge_attn_states + scatter back + quant replace the
+  single quant.</div>
+</div>
+
+<div class="col">
+  <h2>vLLM compiled-graph set</h2>
+  <div class="count">15 launches / layer (unified path)</div>
+  <div class="k inductor">Inductor: add + rms_norm <small>one generated kernel</small></div>
+  <div class="k vllm">per-token-group FP8 quant <small>stays a custom op</small></div>
+  <div class="k gemm">fp8_gemm_nt — qkv_proj</div>
+  <div class="k inductor">Inductor: q/k head norms <small>one reduction kernel</small></div>
+  <div class="k inductor">Inductor: rotary apply <small>one pointwise kernel</small></div>
+  <div class="k kv">kv_row_scatter</div>
+  <div class="k fa3">FA3 causal paged call</div>
+  <div class="k vllm">per-token-group FP8 quant</div>
+  <div class="k gemm">fp8_gemm_nt — o_proj</div>
+  <div class="k inductor">Inductor: add + rms_norm</div>
+  <div class="k vllm">per-token-group FP8 quant</div>
+  <div class="k gemm">fp8_gemm_nt — gate_up_proj</div>
+  <div class="k inductor">Inductor: silu * mul</div>
+  <div class="k vllm">per-token-group FP8 quant</div>
+  <div class="k gemm">fp8_gemm_nt — down_proj</div>
+  <div class="note">This is what stock vLLM 0.26.0's torch.compile
+  actually runs for this model (measured): its norm+quant and
+  silu+quant fusion passes never fire under ue8m0 scales, so all
+  four quant launches stay. Join path: same merge sequence as the
+  unfused column (the merge is outside stock's compiled graph).</div>
+</div>
+
+<div class="col">
+  <h2>Quail fused — unified path</h2>
+  <div class="count">11 launches / layer &nbsp;·&nbsp; filters</div>
+  <div class="k quail">add_rms_norm_quant <small>fused Triton</small></div>
+  <div class="k gemm">fp8_gemm_nt — qkv_proj</div>
+  <div class="k quail">qk_norm_rope <small>fused Triton</small></div>
+  <div class="k kv">kv_row_scatter</div>
+  <div class="k fa3">ONE FA3 causal paged call <small>kept + current KV</small></div>
+  <div class="k vllm">per-token-group FP8 quant</div>
+  <div class="k gemm">fp8_gemm_nt — o_proj</div>
+  <div class="k quail">add_rms_norm_quant</div>
+  <div class="k gemm">fp8_gemm_nt — gate_up_proj</div>
+  <div class="k quail">silu_mul_quant <small>fused Triton</small></div>
+  <div class="k gemm">fp8_gemm_nt — down_proj</div>
+  <div class="note">Three of the four quantize passes are folded into
+  the producing kernel; the one before o_proj remains because the
+  attention output comes from FlashAttention-3.</div>
+</div>
+
+<div class="col">
+  <h2>Quail fused — merge_quant path</h2>
+  <div class="count">13 launches / layer &nbsp;·&nbsp; joins</div>
+  <div class="k quail">add_rms_norm_quant</div>
+  <div class="k gemm">fp8_gemm_nt — qkv_proj</div>
+  <div class="k quail">qk_norm_rope</div>
+  <div class="k kv">kv_row_scatter</div>
+  <div class="k fa3">FA3 call A: causal varlen <small>current tokens</small></div>
+  <div class="k vllm">index_select — suffix query rows</div>
+  <div class="k fa3">FA3 call B: paged cross <small>anchor KV</small></div>
+  <div class="k quail">merge_attn_quant <small>fused merge + FP8 quant</small></div>
+  <div class="k gemm">fp8_gemm_nt — o_proj</div>
+  <div class="k quail">add_rms_norm_quant</div>
+  <div class="k gemm">fp8_gemm_nt — gate_up_proj</div>
+  <div class="k quail">silu_mul_quant</div>
+  <div class="k gemm">fp8_gemm_nt — down_proj</div>
+  <div class="note">The fused merge kernel combines both attention
+  results by their log-sum-exp weights and quantizes for o_proj in
+  one launch — there is no separate quant before o_proj on this
+  path. Joins need two calls because every partner reads the anchor
+  KV but no other partner.</div>
+</div>
+
+</div>
+
+<div class="legend">
+  <span><span class="chip" style="background:var(--gemm)"></span>FP8 matrix multiply (DeepGEMM, same in all columns)</span>
+  <span><span class="chip" style="background:var(--fa3)"></span>FlashAttention-3 (same kernels in all columns)</span>
+  <span><span class="chip" style="background:var(--kv)"></span>KV write into arena pages (same in all columns)</span>
+  <span><span class="chip" style="background:var(--vllm)"></span>vLLM op</span>
+  <span><span class="chip" style="background:var(--inductor)"></span>Inductor-generated kernel</span>
+  <span><span class="chip" style="background:var(--quail)"></span>Quail fused Triton kernel</span>
+</div>
+</body>
+</html>
