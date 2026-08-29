@@ -47,25 +47,23 @@ The corpora and the per-document ground-truth labels are raw data
 and live on the quail-results volume, so pull them first. The
 answers go back to the volume too:
 
-    W=<workdir>; SF=0.1; C=<corpus id for that scale factor>
+    W=<workdir>; SF=0.1
     G=/ground_truth/quailb/schema_v1
     mkdir -p $W/data $W/allabels
     modal volume get quail-results /quailb_data/sf$SF $W/data/
     modal volume get quail-results $G/label_sets $W/allabels/
-    modal volume get quail-results $G/corpora/$C/active_collection.json \
-        $W/active_collection.json
-    GT=$(grep -o 'gt_[0-9a-f]*' $W/active_collection.json)
-    modal volume get quail-results $G/collections/$GT/manifest.json \
+    modal volume get quail-results \
+        $G/collections/gt_02ffa2a5720006e8236aa993760e9e29/manifest.json \
         $W/collection_manifest.json
     uv run --with transformers --with pyarrow \
         python reports/make_sol_quailb.py $W $SF
     modal volume put quail-results $W/sol_quailb_sf$SF.json \
         /sol/sol_quailb_sf$SF.json
 
-The scale factor defaults to 0.1. Each one has its own corpus and its
-own label collection, so `modal volume ls quail-results $G/corpora`
-gives the corpus ids; the run stops if the collection you pulled is
-for a different scale factor than the one you asked for.
+The scale factor defaults to 0.1. The main collection supplies IMDB,
+BioDEX, and FEVER labels. The script selects revised LePaRD labels by
+the LePaRD corpus ID in `quail.bench.quailb`. The run stops if the main
+collection is for a different scale factor than the one requested.
 
 The report is reports/2026-08-26-sol-quailb.md.
 """
@@ -156,8 +154,10 @@ COLUMNS = {
     "terms.term": ("terms", "term"),
     "claims.claim": ("claims", "claim"),
     "evidence.text": ("evidence", "text"),
-    "citations.destination_context": ("citations", "destination_context"),
-    "citations.passage_text": ("citations", "passage_text"),
+    "citation_contexts.destination_context":
+        ("citation_contexts", "destination_context"),
+    "citation_passages.passage_text":
+        ("citation_passages", "passage_text"),
 }
 
 # 1. document lengths -------------------------------------------------
@@ -196,11 +196,28 @@ for code, template in JOIN_TEMPLATES.items():
 
 # 3. labels -----------------------------------------------------------
 # A predicate keeps one label set per template it has been judged
-# under, so the volume holds several at once. Use only the label sets
-# named by the active collection.
+# under, so the volume holds several at once. The active collection
+# supplies IMDB, BioDEX, and FEVER. LePaRD uses the revised corpus.
 LABEL_MANIFESTS = glob.glob(
     str(W / "allabels/label_sets/*/*/*/manifest.json"))
 active_by_predicate = dict(COLLECTION["label_sets"])
+revised_lepard = {}
+for manifest_path in LABEL_MANIFESTS:
+    manifest = json.load(open(manifest_path))
+    predicate = manifest["predicate"]
+    if (predicate["workload"] == "lepard"
+            and manifest["corpus_id"] == Q.SELECTIVITY_ESTIMATE_LEPARD_CORPUS):
+        key = manifest["predicate_key"]
+        if key in revised_lepard:
+            raise ValueError(
+                f"more than one revised LePaRD label set for {key}")
+        revised_lepard[key] = manifest["label_set_id"]
+expected_lepard = {
+    key for key in active_by_predicate if key.startswith("quailb.lepard.")}
+if set(revised_lepard) != expected_lepard:
+    raise ValueError(
+        "revised LePaRD labels do not cover the collection predicates")
+active_by_predicate.update(revised_lepard)
 ACTIVE = set(active_by_predicate.values())
 filter_answers = {}
 join_answers = {}
@@ -1021,8 +1038,10 @@ json.dump({
         "filter_order": (
             "by_cost from fixed benchmark selectivity estimates"),
         "filter_selectivity_sources": {
-            "collection": Q.SELECTIVITY_ESTIMATE_COLLECTION,
-            "corpus": Q.SELECTIVITY_ESTIMATE_CORPUS,
+            "imdb_biodex_fever_collection":
+                Q.SELECTIVITY_ESTIMATE_COLLECTION,
+            "imdb_biodex_fever_corpus": Q.SELECTIVITY_ESTIMATE_CORPUS,
+            "lepard_corpus": Q.SELECTIVITY_ESTIMATE_LEPARD_CORPUS,
             "scale_factor": Q.SELECTIVITY_ESTIMATE_SCALE_FACTOR,
         },
         "plan_space": "all feasible left deep plans",

@@ -27,8 +27,9 @@ CORPUS_COLUMNS = {
     "terms": ("id", "term"),
     "claims": ("id", "claim", "label", "evidence_wiki_url"),
     "evidence": ("id", "text"),
-    "citations": ("id", "destination_context", "passage_text",
-                  "passage_id"),
+    "citation_contexts": ("id", "destination_context",
+                          "cited_passage_ids"),
+    "citation_passages": ("id", "passage_text", "passage_ids"),
 }
 
 

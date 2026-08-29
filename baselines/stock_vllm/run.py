@@ -210,8 +210,8 @@ def define_all_queries():
     tm = ("terms", "term")
     cl = ("claims", "claim")
     ev = ("evidence", "text")
-    dc = ("citations", "destination_context")
-    pt = ("citations", "passage_text")
+    dc = ("citation_contexts", "destination_context")
+    pt = ("citation_passages", "passage_text")
 
     Q = {}
 
@@ -795,7 +795,9 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
                        prediction: str, baselines: tuple[str, ...],
                        paired_run_id: str = "", lf: int = 1,
                        method_order: str = "alternating-by-query",
-                       ground_truth_collection: str | None = None) -> dict:
+                       ground_truth_collection: str | None = None,
+                       gpu_memory_utilization: float =
+                       GPU_MEMORY_UTILIZATION) -> dict:
     """Boot one LLM and run one or both baseline configurations.
 
     Args:
@@ -840,7 +842,7 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
         model=hf_name,
         max_num_batched_tokens=25_305,
         max_num_seqs=4096,
-        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+        gpu_memory_utilization=gpu_memory_utilization,
         enable_prefix_caching=True,
         disable_log_stats=True)
     sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
@@ -968,7 +970,7 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
             submission=submission,
             checkpoint="pre-quantized FP8",
             max_num_seqs=4096, max_num_batched_tokens=25_305,
-            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+            gpu_memory_utilization=gpu_memory_utilization,
             enable_prefix_caching=True,
             results=all_results[baseline])
         if len(baselines) == 2:
@@ -988,12 +990,15 @@ def run_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
                     query_ids_csv: str = "", reps: int = 1,
                     ground_truth_workload: str = "",
                     prediction: str = "",
-                    baseline: str = "stock_vllm") -> str:
+                    baseline: str = "stock_vllm",
+                    gpu_memory_utilization: float =
+                    GPU_MEMORY_UTILIZATION) -> str:
     """Boot one LLM and run one baseline configuration."""
 
     result = _run_query_batches(
         model, sf, query_ids_csv, reps, ground_truth_workload,
-        prediction, (baseline,))
+        prediction, (baseline,),
+        gpu_memory_utilization=gpu_memory_utilization)
     return json.dumps(result["reports"][baseline])
 
 
@@ -1072,7 +1077,8 @@ def main(model: str = "qwen3-4b-fp8", sf: float = 0.1,
          query: str = "", reps: int = 1,
          containers: int = 1, by_query_set: bool = False,
          ground_truth_workload: str = "", prediction: str = "",
-         baseline: str = "stock_vllm"):
+         baseline: str = "stock_vllm",
+         gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION):
     _baseline_configuration(baseline)
     if query:
         ids = [q.strip() for q in query.split(",")]
@@ -1088,7 +1094,8 @@ def main(model: str = "qwen3-4b-fp8", sf: float = 0.1,
             model=model, sf=sf,
             query_ids_csv=",".join(ids), reps=reps,
             ground_truth_workload=ground_truth_workload,
-            prediction=prediction, baseline=baseline)
+            prediction=prediction, baseline=baseline,
+            gpu_memory_utilization=gpu_memory_utilization)
         print(f"function call id: {fc.object_id}")
         result_json = fc.get()
         report = json.loads(result_json)
@@ -1106,7 +1113,8 @@ def main(model: str = "qwen3-4b-fp8", sf: float = 0.1,
                 model=model, sf=sf,
                 query_ids_csv=",".join(chunk), reps=reps,
                 ground_truth_workload=ground_truth_workload,
-                prediction=prediction, baseline=baseline)
+                prediction=prediction, baseline=baseline,
+                gpu_memory_utilization=gpu_memory_utilization)
             print(f"  container {i}: {fc.object_id} "
                   f"({len(chunk)} queries: "
                   f"{chunk[0]}..{chunk[-1]})")

@@ -98,6 +98,7 @@ def run_query_family(
         query_id.strip() for query_id in query_ids_csv.split(",")
         if query_id.strip())
     family = query_family_name(query_ids)
+    workload = None if ground_truth_collection else family
     out_path = (
         f"/results/benchmarks/quailb/families/{run_label}/"
         f"{family}-quail.json")
@@ -115,6 +116,7 @@ def run_query_family(
         model=model,
         accuracy=True,
         ground_truth_collection=ground_truth_collection or None,
+        ground_truth_workload=workload,
         prediction=prediction,
         artifact_stem=f"{run_label}-{family}-quail",
         execute=_execute_payload,
@@ -140,18 +142,19 @@ def run_query_family(
         sf=sf,
         query_ids_csv=",".join(query_ids),
         reps=1,
-        ground_truth_workload="",
+        ground_truth_workload=workload or "",
         prediction=prediction,
         baselines=BASELINES,
         paired_run_id=run_label,
         lf=lf,
         method_order="method-major",
-        ground_truth_collection=ground_truth_collection,
+        ground_truth_collection=(ground_truth_collection or None),
     )
     family_result = {
         "query_family": family,
         "query_ids": list(query_ids),
         "ground_truth_collection": suite["ground_truth"]["collection_id"],
+        "ground_truth_workload": workload,
         "gpu": "H100!",
         "same_modal_container": True,
         "engine_order": ["quail", "vllm_baselines"],

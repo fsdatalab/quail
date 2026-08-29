@@ -4,11 +4,13 @@ Pull the measured inputs from the quail-results volume, then pass the
 work directory to this script:
 
     W=<workdir>
-    modal volume get quail-results benchmarks/quailb/runs/qb_20260827T070457Z_fdd34ac9/20260827T070457Z-quailb-sf0.1-lf1-qwen3-4b-fp8-parallel4.json $W/quail-full.json
-    modal volume get quail-results benchmarks/quailb/runs/qb_20260827T081139Z_0518bcfc/20260827T081139Z-quailb-sf0.1-lf1-qwen3-4b-fp8-parallel1.json $W/quail-lepard.json
-    modal volume get quail-results stock_vllm/2026-08-28_paired_except_bio8/summary.json $W/stock-full.json
-    modal volume get quail-results pipelined_vllm/2026-08-28_paired_except_bio8/summary.json $W/pipelined.json
-    modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
+    modal volume get quail-results benchmarks/quailb/runs/qb_20260829T185407Z_cbb14b36/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail.json
+    modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock.json
+    modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined.json
+    modal volume get quail-results benchmarks/quailb/runs/qb_20260829T212047Z_dd7f1686/20260829T212047Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail_lepard.json
+    modal volume get quail-results stock_vllm/20260829T212047Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_lepard.json
+    modal volume get quail-results pipelined_vllm/20260829T212047Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_lepard.json
+    modal volume get quail-results benchmarks/quailb/family-runs/20260829T212047Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/sol.json $W/sol.json
     uv run --with matplotlib python reports/make_quailb_sf01_4b_plots.py $W
 """
 
@@ -25,11 +27,17 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "plots"
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY, ORANGE, TEAL  # noqa: E402
+from plot_colors import BLUE, DARK, GRAY, ORANGE, TEAL  # noqa: E402
 
 MODEL = "qwen3-4b-fp8"
-LEPARD = [f"LEP-{index}" for index in range(1, 9)]
 SYSTEMS = ("SoL estimate", "Quail", "Stock vLLM", "Pipelined vLLM")
+MEASURED_SYSTEMS = ("Quail", "Stock vLLM", "Pipelined vLLM")
+FAMILIES = (
+    ("IMDB", "IMDB"),
+    ("BioDEX", "BIO"),
+    ("FEVER", "FEV"),
+    ("LePaRD", "LEP"),
+)
 
 
 def load(path):
@@ -45,49 +53,72 @@ def by_query(rows):
 
 
 def load_inputs(workdir):
-    quail_full = load(workdir / "quail-full.json")
-    quail_lepard = load(workdir / "quail-lepard.json")
-    stock_full = load(workdir / "stock-full.json")
+    quail_data = load(workdir / "quail.json")
+    stock_full = load(workdir / "stock.json")
     pipelined = load(workdir / "pipelined.json")
+    quail_lepard = load(workdir / "quail_lepard.json")
+    stock_lepard = load(workdir / "stock_lepard.json")
+    pipelined_lepard = load(workdir / "pipelined_lepard.json")
     sol = load(workdir / "sol.json")
 
-    for data in (quail_full, quail_lepard):
-        if data["model"] != MODEL or data["sf"] != 0.1 or data["gpus"] != 1:
-            raise ValueError("unexpected Quail configuration")
+    if (quail_data["model"] != MODEL or quail_data["sf"] != 0.1
+            or quail_data["gpus"] != 1):
+        raise ValueError("unexpected Quail configuration")
+    if (quail_lepard["model"] != MODEL or quail_lepard["sf"] != 0.1
+            or quail_lepard["gpus"] != 1):
+        raise ValueError("unexpected revised LePaRD Quail configuration")
     if (stock_full["baseline"] != "stock_vllm"
             or stock_full["filter_submission"] != "stage-major"
             or stock_full["hf_name"] != "Qwen/Qwen3-4B-FP8"
             or stock_full["sf"] != 0.1
             or stock_full["checkpoint"] != "pre-quantized FP8"
-            or stock_full.get("prompt_layout")
-            != "canonical document-first Quail filter and join prompts"):
+            or stock_full["gpu_memory_utilization"] != 0.91):
         raise ValueError("unexpected stock vLLM configuration")
     if (pipelined["baseline"] != "pipelined_vllm"
             or pipelined["filter_submission"] != "pipelined"
             or pipelined["hf_name"] != "Qwen/Qwen3-4B-FP8"
             or pipelined["sf"] != 0.1
             or pipelined["checkpoint"] != "pre-quantized FP8"
-            or pipelined.get("prompt_layout")
-            != "canonical document-first Quail filter and join prompts"):
+            or pipelined["gpu_memory_utilization"] != 0.91):
         raise ValueError("unexpected pipelined vLLM configuration")
-    if sol["scale_factor"] != 0.1 or sol["query_count"] != 35:
+    for focused, name, submission in (
+        (stock_lepard, "stock_vllm", "stage-major"),
+        (pipelined_lepard, "pipelined_vllm", "pipelined"),
+    ):
+        if (focused["baseline"] != name
+                or focused["filter_submission"] != submission
+                or focused["hf_name"] != "Qwen/Qwen3-4B-FP8"
+                or focused["sf"] != 0.1
+                or focused["checkpoint"] != "pre-quantized FP8"
+                or focused["gpu_memory_utilization"] != 0.91):
+            raise ValueError(
+                f"unexpected revised LePaRD {name} configuration")
+    if sol["scale_factor"] != 0.1:
         raise ValueError("unexpected SoL configuration")
 
     order = stock_full["query_ids"]
-    if len(order) != 35 or set(LEPARD) - set(order):
-        raise ValueError("expected all 35 QuailB queries")
+    if len(order) != 30:
+        raise ValueError("expected all 30 current QuailB queries")
 
-    quail = by_query(quail_full["passes"]["single"]["queries"])
-    quail.update(by_query(quail_lepard["passes"]["single"]["queries"]))
+    quail = by_query(quail_data["passes"]["single"]["queries"])
     stock = by_query(stock_full["results"][0])
     pipelined_rows = by_query(pipelined["results"][0])
+    revised = {
+        "Quail": by_query(quail_lepard["passes"]["single"]["queries"]),
+        "Stock vLLM": by_query(stock_lepard["results"][0]),
+        "Pipelined vLLM": by_query(pipelined_lepard["results"][0]),
+    }
+    expected_lepard = {f"LEP-{index}" for index in range(1, 9)}
+    if any(set(rows) != expected_lepard for rows in revised.values()):
+        raise ValueError("revised inputs must contain all eight LePaRD queries")
+    quail.update(revised["Quail"])
+    stock.update(revised["Stock vLLM"])
+    pipelined_rows.update(revised["Pipelined vLLM"])
     if (set(order) != set(quail)
             or set(order) != set(stock)
-            or set(order) != set(pipelined_rows)):
+            or set(order) != set(pipelined_rows)
+            or not set(order).issubset(sol["queries"])):
         raise ValueError("measured query coverage does not match")
-    for baseline in (stock_full, pipelined):
-        if baseline.get("paired_run", {}).get("missing_queries") != ["BIO-8"]:
-            raise ValueError("expected BIO-8 to be the only missing baseline query")
 
     def seconds(rows, query):
         value = rows[query]["total_wall_s"]
@@ -140,41 +171,61 @@ def query_work(system, row, has_joins):
                if stage["kind"] in ("filter", "filter_chain"))
 
 
+def aggregate_throughput(order, results, records, group, system):
+    total_work = 0
+    total_seconds = 0.0
+    measured = 0
+    for index, query in enumerate(order):
+        if query_kind(records["SoL estimate"][query]) != group:
+            continue
+        seconds = results[system][index]
+        if not np.isfinite(seconds):
+            continue
+        total_work += query_work(
+            system, records[system][query], group == "join only")
+        total_seconds += seconds
+        measured += 1
+    return total_work / total_seconds, measured
+
+
+def answer_accuracy(records, system):
+    evaluated = 0
+    correct = 0
+    for row in records[system].values():
+        answer = row.get("accuracy", {}).get("answer_accuracy")
+        if not answer:
+            continue
+        evaluated += answer["evaluated"]
+        correct += answer["correct"]
+    return correct / evaluated
+
+
 def print_metrics(order, results, records):
     print("\nAggregate metrics")
-    print("| System | Measured queries | Total time (s) | Mean time/query (s) | "
-          "Mean $/query |")
-    print("|---|---:|---:|---:|---:|")
+    print("| System | Queries | Total time (s) | Mean time/query (s) | "
+          "Mean $/query | Answer accuracy |")
+    print("|---|---:|---:|---:|---:|---:|")
     for system in SYSTEMS:
         values = np.asarray(results[system], dtype=float)
         measured = np.isfinite(values)
         total = values[measured].sum()
         mean = values[measured].mean()
         cost = mean * H100_USD_PER_HOUR / 3600
+        accuracy = ("not applicable" if system == "SoL estimate" else
+                    f"{answer_accuracy(records, system):.2%}")
         print(f"| {system} | {measured.sum()} | {total:.2f} | {mean:.2f} | "
-              f"${cost:.4f} |")
+              f"${cost:.4f} | {accuracy} |")
 
     print("\nAggregate throughput")
     print("| System | Query group | Measured queries | Throughput |")
     print("|---|---|---:|---:|")
     for group in ("filter only", "join only"):
         for system in ("Quail", "Stock vLLM", "Pipelined vLLM"):
-            total_work = 0
-            total_seconds = 0.0
-            measured = 0
-            for index, query in enumerate(order):
-                if query_kind(records["SoL estimate"][query]) != group:
-                    continue
-                seconds = results[system][index]
-                if not np.isfinite(seconds):
-                    continue
-                total_work += query_work(
-                    system, records[system][query], group == "join only")
-                total_seconds += seconds
-                measured += 1
+            throughput, measured = aggregate_throughput(
+                order, results, records, group, system)
             unit = "docs/s" if group == "filter only" else "pairs/s"
             print(f"| {system} | {group} | {measured} | "
-                  f"{total_work / total_seconds:,.1f} {unit} |")
+                  f"{throughput:,.1f} {unit} |")
 
     print("\nPer-query metrics")
     print("| Query | Operators | Unit | SoL estimate | Quail | "
@@ -201,44 +252,99 @@ def print_metrics(order, results, records):
               + " | ".join(cells) + " |")
 
 
-def main(workdir):
-    order, results, records = load_inputs(workdir)
+def make_runtime_plot(order, results):
     colors = (GRAY, BLUE, ORANGE, TEAL)
-    x = np.arange(len(order))
-    width = 0.19
-
-    fig, ax = plt.subplots(figsize=(20, 6))
-    for index, (system, color) in enumerate(zip(SYSTEMS, colors)):
-        values = np.asarray(results[system], dtype=float)
-        measured = np.isfinite(values)
-        offset = index - (len(SYSTEMS) - 1) / 2
-        bars = ax.bar(x[measured] + offset * width, values[measured], width,
-                      color=color, label=system)
-        for bar, value in zip(bars, values[measured]):
-            ax.annotate(
-                f"{value:.3g}",
-                (bar.get_x() + bar.get_width() / 2, value),
-                xytext=(0, 3),
-                textcoords="offset points",
-                ha="center",
-                va="bottom",
-                fontsize=5.5,
-                rotation=90,
-                color=color,
+    width = 0.2
+    fig, axes = plt.subplots(2, 2, figsize=(16, 9), sharey=True)
+    for ax, (family_name, prefix) in zip(axes.flat, FAMILIES):
+        positions = [index for index, query in enumerate(order)
+                     if query.startswith(f"{prefix}-")]
+        labels = [order[index] for index in positions]
+        x = np.arange(len(positions))
+        for system_index, (system, color) in enumerate(
+                zip(SYSTEMS, colors)):
+            values = np.asarray(
+                [results[system][index] for index in positions],
+                dtype=float,
             )
-
-    ax.set_yscale("log")
-    ax.set_ylim(0.015, 900)
-    ax.set_ylabel("time per query on one H100!, seconds (log scale)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(order, rotation=90, fontsize=7)
-    ax.legend(frameon=False, loc="upper left", ncols=4)
-    fig.tight_layout()
+            measured = np.isfinite(values)
+            offset = system_index - (len(SYSTEMS) - 1) / 2
+            bars = ax.bar(
+                x[measured] + offset * width,
+                values[measured],
+                width,
+                color=color,
+                label=system,
+            )
+            for bar, value in zip(bars, values[measured]):
+                ax.annotate(
+                    f"{value:.2g}",
+                    (bar.get_x() + bar.get_width() / 2, value),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=6.5,
+                    rotation=90,
+                    color=DARK,
+                )
+        ax.set_title(family_name)
+        ax.set_yscale("log")
+        ax.set_ylim(0.01, 3000)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    fig.supylabel("time per query on one H100!, seconds (log scale)")
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, loc="upper center", ncols=4)
+    fig.tight_layout(rect=(0.02, 0, 1, 0.95))
     OUT.mkdir(exist_ok=True)
     output = OUT / "quailb_sf01_4b_runtime.png"
     fig.savefig(output, dpi=150)
     plt.close(fig)
     print(f"wrote {output}")
+
+
+def make_throughput_plot(order, results, records):
+    groups = (
+        ("filter only", "filter only queries", "documents per second"),
+        ("join only", "join only queries", "document pairs per second"),
+    )
+    colors = (BLUE, ORANGE, TEAL)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    for ax, (group, label, unit) in zip(axes, groups):
+        values = [
+            aggregate_throughput(order, results, records, group, system)[0]
+            for system in MEASURED_SYSTEMS
+        ]
+        bars = ax.bar(MEASURED_SYSTEMS, values, color=colors, width=0.68)
+        stock = values[1]
+        for index, (bar, value) in enumerate(zip(bars, values)):
+            ratio = "" if index == 1 else f"\n{value / stock:.2f}x stock"
+            ax.annotate(
+                f"{value:,.0f}{ratio}",
+                (bar.get_x() + bar.get_width() / 2, value),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color=DARK,
+            )
+        ax.set_title(label)
+        ax.set_ylabel(unit)
+        ax.set_ylim(0, max(values) * 1.28)
+        ax.tick_params(axis="x", labelrotation=18)
+    fig.tight_layout()
+    output = OUT / "quailb_sf01_4b_throughput.png"
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
+    print(f"wrote {output}")
+
+
+def main(workdir):
+    order, results, records = load_inputs(workdir)
+    make_runtime_plot(order, results)
+    make_throughput_plot(order, results, records)
     print_metrics(order, results, records)
 
 

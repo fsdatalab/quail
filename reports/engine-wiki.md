@@ -1165,8 +1165,9 @@ GPUs (`worker.py:495-519`).
 
 QUAIL-B (`bench/quailb.py`) has 30 queries over four document sets
 (IMDB, BioDEX, FEVER, LePaRD), plus 2 optional PrivacyPolicies
-queries. All predicates are natural-language questions answered by
-Qwen3 32B during the judge pass; ground truth covers 22 predicates.
+queries. Qwen3 32B answers the filter predicates during the judge pass.
+The FEVER annotations and sampled LePaRD citation edges provide source labels
+for known join pairs. Ground truth covers 22 predicates.
 
 ### Document tables
 
@@ -1175,8 +1176,15 @@ Qwen3 32B during the judge pass; ground truth covers 22 predicates.
 | reviews | `stanfordnlp/imdb` | 50,000 | Movie reviews |
 | reports | `BioDEX/BioDEX-Reactions` | 5,000 | Medical case reports |
 | claims | `fever/fever` | 5,000 | Factual claims (train + labelled_dev) |
-| citations | `rmahari/LePaRD` | 2,000 | Legal citation excerpts |
+| citation_contexts | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Legal citation excerpts |
+| citation_passages | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Cited legal passages |
 | policies | `mukund/PrivacyPolicies` | 1,000,000 | Privacy policies (optional) |
+
+LePaRD first samples known citation pairs with a stable hash. At scale factor
+0.1, it samples 500 pairs. It then deduplicates the context text and passage
+text into separate tables, which produce 500 context rows and 433 passage rows.
+The source join label is true when a context's cited passage IDs intersect a
+passage row's passage IDs.
 
 Partner tables (fixed vocabulary, not scaled by SF):
 - **aspects** (12 rows): film aspects ("the acting", "the plot", ...)
@@ -1192,19 +1200,20 @@ graph LR
         reviews["reviews (50K)"]
         reports["reports (10K)"]
         claims["claims (5K)"]
-        citations["citations (2K)"]
+        citation_contexts["citation_contexts"]
         policies["policies (1M, optional)"]
     end
     subgraph Partner tables
         aspects["aspects (12)"]
         terms["terms (~6K)"]
         evidence["evidence"]
+        citation_passages["citation_passages"]
         scenarios["scenarios (100)"]
     end
     reviews -- "DISCUSS_ASPECT / ASPECT_SENTIMENT" --> aspects
     reports -- "REACTION" --> terms
     claims -- "SUPPORT / REFUTE" --> evidence
-    citations -- "LEPJOIN (self-join)" --> citations
+    citation_contexts -- "LEPJOIN" --> citation_passages
     policies -. "SCENARIO_MATCH" .-> scenarios
 ```
 
@@ -1252,11 +1261,11 @@ graph LR
 | Query | Shape | Description |
 |---|---|---|
 | LEP-1 | 1F | LEP1 (reasoning does not apply) |
-| LEP-2 | 1J | self-join (LEPJOIN) |
-| LEP-3 | 1F + 1J | LEP1 then self-join |
-| LEP-4 | 2F + 1J | LEP1 + LEP2 then self-join |
-| LEP-5 | 3F + 1J | LEP1..LEP3 then self-join |
-| LEP-6 | 5F + 1J | LEP1..LEP5 then self-join |
+| LEP-2 | 1J | citation contexts joined with citation passages |
+| LEP-3 | 1F + 1J | LEP1 then join |
+| LEP-4 | 2F + 1J | LEP1 + LEP2 then join |
+| LEP-5 | 3F + 1J | LEP1..LEP3 then join |
+| LEP-6 | 5F + 1J | LEP1..LEP5 then join |
 | LEP-7 | 2F + 1J two-sided | LEP1 + LEP2 on excerpts, LEPS1 on passages |
 | LEP-8 | 5F | LEP1..LEP5, no join |
 
