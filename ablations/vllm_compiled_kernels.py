@@ -1,10 +1,17 @@
-"""Kernel-source ablation: our fused Triton kernels against the
-kernels stock vLLM's compiled graph runs, on one filter query and one
-join query.
+"""Kernel-source ablation on two QUAIL-B queries: our fused Triton
+kernels against the kernels stock vLLM's compiled graph runs.
+
+The queries are IMDB-7 (three filters over the reviews table, the
+unified attention path) and BIO-2 (the reports x terms join, the
+merge_quant attention path), at scale factor 0.1. Each run goes
+through the real planner and the real worker execution core
+(quail.runtime.worker._execute_single); only the pipeline inside the
+worker state is swapped, so packing, admission, the join search, KV
+retention, GEMMs, and attention are identical across configurations.
 
 What "stock vLLM's kernels" means here was measured, not assumed: the
 stock_kernels cell below boots stock vLLM 0.26.0 at its defaults on
-the same image and profiles a prefill pass
+the same image and profiles a prefill pass over IMDB-1-shaped prompts
 (/results/ablations/kernel_source_stock.json). At the default -O2
 level the config enables the RMSNorm+quant and SiLU+quant fusion
 passes (a blocked-fp8 checkpoint forces the quant_fp8 custom op on),
@@ -19,13 +26,13 @@ group-quant launches (one per GEMM input). Attention, the GEMMs, and
 the KV-cache write sit outside the compiled graph and are the same
 kernels the packed executor calls.
 
-Three rungs, the engine untouched (the non-quail paths live in a
-Pipeline subclass below):
+Three kernel sources, the engine untouched (the non-quail paths live
+in a Pipeline subclass below):
 
   quail          our fused Triton kernels (the shipping executor)
   vllm_ops       vLLM's ops called one by one, unfused, and on the
-                 join path vLLM's merge_attn_states kernel plus a
-                 separate group-quant in place of our fused
+                 merge_quant path vLLM's merge_attn_states kernel
+                 plus a separate group-quant in place of our fused
                  merge+quant kernel
   vllm_compiled  the kernel set stock vLLM's compiled graph runs:
                  torch.compile over the native add+rms_norm, silu*mul
@@ -33,13 +40,10 @@ Pipeline subclass below):
                  settings, the same standalone group-quant per GEMM
                  input, and the same merge_attn_states join merge
 
-Workloads: the committed 10,000-document five-filter query (unified
-attention) and the 100-report x 256-term BioDEX join query
-(merge_quant attention).
-
     uv run modal run ablations/vllm_compiled_kernels.py::run_probe
     uv run modal run ablations/vllm_compiled_kernels.py::run_queries
     uv run modal run ablations/vllm_compiled_kernels.py::run_profile
+    uv run modal run ablations/vllm_compiled_kernels.py::run_stock_kernels
 """
 
 import json
@@ -54,18 +58,25 @@ IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
-                 "numpy", "datasets")
+    .pip_install(
+        "vllm==0.26.0",
+        "huggingface_hub[hf_transfer]",
+        "transformers>=5.2.0",
+        "pandas",
+        "pyarrow",
+        "numpy",
+        "datasets",
+    )
     .env({"VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+          "HF_HUB_ENABLE_HF_TRANSFER": "1",
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
           "TORCHINDUCTOR_CACHE_DIR":
               "/root/.cache/kernels/torchinductor"})
     .add_local_python_source("quail", "baselines")
-    .add_local_dir("tests/gpu", remote_path="/root/gpu_tests")
 )
 
 # House rule: never create new Modal app names - new GPU cells attach
@@ -77,16 +88,19 @@ results_vol = modal.Volume.from_name("quail-results",
 kernel_cache = modal.Volume.from_name("quail-kernel-cache",
                                       create_if_missing=True)
 
-GPU_KW = dict(image=image, gpu="H100!", memory=65536,
+GPU_KW = dict(image=image, gpu="H100!", memory=98304,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})
 
 KERNEL_SOURCES = ("quail", "vllm_ops", "vllm_compiled")
+DATA_DIR = "/results/quailb_data"
 
-# banked current-executor filter counts (results/attention_paths.json,
-# unified path, TRUE/FALSE corpus); the quail rung must reproduce them
-BANKED_FILTER = dict(answered=40052, survivors=4645, wrong=0)
+# query id -> (attention path of its model work, result file suffix)
+MEASURED_QUERIES = {
+    "IMDB-7": ("unified", "imdb7"),
+    "BIO-2": ("merge_quant", "bio2"),
+}
 
 
 class KernelSourcePipeline(Pipeline):
@@ -215,11 +229,11 @@ class KernelSourcePipeline(Pipeline):
 
     # ---- the join merge: vLLM's merge_attn_states -------------------
     # Stock never merges in its compiled graph (its cascade merge
-    # lives inside the attention backend), so both vLLM rungs use its
-    # eager merge kernel plus the standalone group-quant. out_b covers
-    # only the rows with cached context, so those rows are gathered,
-    # merged, and scattered back; the row list comes from the chunk
-    # meta stashed by attention_merge_quant below.
+    # lives inside the attention backend), so both vLLM sources use
+    # its eager merge kernel plus the standalone group-quant. out_b
+    # covers only the rows with cached context, so those rows are
+    # gathered, merged, and scattered back; the row list comes from
+    # the chunk meta stashed by attention_merge_quant below.
 
     def attention_merge_quant(self, q, k, v, meta):
         cross = meta.get("cross")
@@ -258,24 +272,30 @@ def _write(result, name):
     return json.dumps(result)
 
 
-def _boot(model):
-    """Boot the packed executor with the kernel-source pipeline."""
+def _boot_state(model):
+    """Boot the worker state dict with the kernel-source pipeline.
+
+    Mirrors quail.runtime.worker._execute_payload's boot, with the
+    Pipeline subclass swapped in; warm_kernels runs the same tiered
+    warmup the worker runs.
+    """
     import torch
     import torch.nn.functional as F
-    from transformers import AutoTokenizer
 
     from quail.executor.arena import KVArena
     from quail.executor.attention import FILTER_ATTENTION
-    from quail.executor.loop import Answerer, AsyncAnswers
+    from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
     from quail.executor.model import load_model
     from quail.planner import budgets
-    from quail.specs import H100_SXM, MODELS
+    from quail.specs import DEVICES, MODELS
+    from transformers import AutoTokenizer
 
     spec = MODELS[model]
+    device = DEVICES["h100-sxm"]
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
     model_mod = load_model(spec.hf_name)
-    chunk = budgets.chunk_budget(spec, H100_SXM)
-    arena_tok = budgets.arena_tokens(spec, H100_SXM, chunk)
+    chunk_tokens = budgets.chunk_budget(spec, device)
+    arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
     arena = KVArena(n_layers=spec.layers,
                     n_pages=arena_tok // budgets.PAGE_TOKENS,
                     page_tokens=budgets.PAGE_TOKENS,
@@ -285,8 +305,52 @@ def _boot(model):
         model_mod, arena, attention_mode=FILTER_ATTENTION)
     answerer = Answerer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
-    budget = min(chunk, pipeline.max_chunk_tokens)
-    return spec, tokenizer, arena, pipeline, async_ans, budget, arena_tok
+    with torch.inference_mode():
+        warm = warm_kernels(torch, arena, pipeline, async_ans,
+                            chunk_tokens, model_name=spec.hf_name)
+    torch.cuda.synchronize()
+    kernel_cache.commit()
+    state = dict(model=model_mod, arena=arena, pipeline=pipeline,
+                 spec=spec, torch=torch, F=F)
+    return state, tokenizer, chunk_tokens, warm
+
+
+def _quailb_session(model, sf, gpus=1):
+    """Build the QUAIL-B tables and a registered session."""
+    import quail
+    from quail.bench.quailb import build_sets, queries, register_sets
+    from quail.planner.plan import EngineConfig
+
+    d = build_sets(DATA_DIR, sf)
+    results_vol.commit()
+    sess = quail.Session(EngineConfig(gpus=gpus, model=model))
+    register_sets(sess, d)
+    return sess, queries(sess), d
+
+
+def _run_query(state, build, captured):
+    """One query through the real planner and worker core."""
+    from quail.runtime.worker import _execute_single
+
+    def execute(payload):
+        report = _execute_single(state, payload)
+        captured.clear()
+        captured.update(report)
+        return report
+
+    return build().run(_execute=execute)
+
+
+def _row_key(table):
+    """Sorted output rows as tuples, for cross-source comparison."""
+    columns = table.column_names
+    rows = table.to_pylist()
+    return sorted(tuple(r[c] for c in columns) for r in rows)
+
+
+def _table_rows(data_dir, name):
+    import pyarrow.parquet as pq
+    return pq.read_table(f"{data_dir}/{name}.parquet").num_rows
 
 
 def _dequant(torch, q, scales):
@@ -300,52 +364,28 @@ def _max_abs(torch, left, right):
                   - right.to(torch.float32)).abs().max().item())
 
 
-def _wrong_count(answers_by_doc, flags):
-    wrong = 0
-    for d, row in answers_by_doc.items():
-        for j, bit in enumerate(row):
-            if bit != int(flags[d][j]):
-                wrong += 1
-    return wrong
-
-
-def _disagreements(left, right):
-    total = 0
-    for d in set(left) | set(right):
-        a, b = left.get(d, []), right.get(d, [])
-        total += sum(x != y for x, y in zip(a, b))
-        total += abs(len(a) - len(b))
-    return total
-
-
 # --------------------------------------------------------------- probe
 
-@app.function(timeout=2400, **GPU_KW)
+@app.function(timeout=3600, **GPU_KW)
 def probe(model: str = "qwen3-4b-fp8") -> str:
-    """Per-kernel parity of the two vLLM rungs against the quail rung,
-    plus torch.compile sanity for the q/k segment, on real weights and
-    random activations. Runs before the measured cells."""
-    import sys
+    """Per-kernel parity of the two vLLM sources against the quail
+    source, torch.compile sanity for the compiled segments, and row
+    agreement on small QUAIL-B queries (sf 0.01). Runs before the
+    measured cells."""
     import time
-
-    sys.path.insert(0, "/root/gpu_tests")
 
     import torch
 
-    from quail.executor.loop import pack_chunk, run_filter, run_join
-
-    (spec, tokenizer, arena, pipeline, async_ans, budget,
-     _) = _boot(model)
+    state, tokenizer, chunk_tokens, warm = _boot_state(model)
+    pipeline = state["pipeline"]
     torch.manual_seed(20260829)
-    report = dict(cell="kernel_source_probe", model=spec.name,
-                  vllm_ops={}, vllm_compiled={}, join_answers={},
-                  filter_answers={}, filter_real={},
-                  unified_chunk={})
+    report = dict(cell="kernel_source_probe", model=model, warm=warm,
+                  vllm_ops={}, vllm_compiled={}, query_rows={})
 
     n = 4096
-    h = spec.hidden
     layer = pipeline.layers[0]
     attn = layer.self_attn
+    h = layer.input_layernorm.weight.shape[0]
     gate_up_w = layer.mlp.gate_up_proj.weight.shape[0]
     qkv_w = attn.qkv_proj.weight.shape[0]
 
@@ -389,7 +429,7 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
                 torch, outs[source], outs["quail"])
 
         # q/k norm + rope; the compiled source also reports compile
-        # time and its kernel-launch count
+        # time
         qkv = torch.randn(n, qkv_w, device="cuda",
                           dtype=torch.bfloat16)
         positions = torch.randint(0, 4096, (n,), device="cuda",
@@ -418,7 +458,7 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
         # count launches of each compiled segment at a second token
         # count (also proves dynamic shapes hold - no recompile);
         # add_norm should be one generated kernel with the residual
-        # write folded in, not a separate copy
+        # write folded in plus the quant launch, not a separate copy
         pipeline.kernel_source = "vllm_compiled"
 
         def count_kernels(fn):
@@ -430,10 +470,9 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
                 fn()
                 torch.cuda.synchronize()
             return [ev.key for ev in prof.key_averages()
-                    if (getattr(ev, "self_device_time_total", 0)
-                        or getattr(ev, "self_cuda_time_total", 0))
-                    and not ev.key.startswith(("aten::", "_C::"))
-                    and "Command Buffer" not in ev.key]
+                    if "CUDA" in str(getattr(ev, "device_type", ""))
+                    and (getattr(ev, "self_device_time_total", 0)
+                         or getattr(ev, "self_cuda_time_total", 0))]
 
         qkv2 = torch.randn(2048, qkv_w, device="cuda",
                            dtype=torch.bfloat16)
@@ -452,74 +491,23 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
             len(kernels)
         report["vllm_compiled"]["norm_quant_kernels"] = kernels[:12]
 
-        # end to end on synthetic ids: a small filter chain and a
-        # small join through every source; answers are the gate that
-        # the merge override and the fused ops wire up correctly
-        doc = [10 + (i % 500) for i in range(512)]
-        docs = [doc] * 64
-        # distinct questions per stage: identical questions would be
-        # all shared preamble, which run_filter refuses
-        questions = [list(range(10 + 20 * j, 26 + 20 * j))
-                     for j in range(3)]
+    # small real queries: one filter and one join at sf 0.01, rows
+    # compared across sources through the real planner and worker
+    sess, qdefs, _ = _quailb_session(model, sf=0.01)
+    for query_id in ("IMDB-1", "BIO-2"):
+        rows = {}
         for source in KERNEL_SOURCES:
             pipeline.kernel_source = source
-            pipeline.attention_mode = "unified"
-            answers, _, _ = run_filter(
-                torch, arena, pipeline, async_ans, docs,
-                questions, budget, arena_writes=True)
-            report["filter_answers"][source] = sum(
-                sum(v) for v in answers.values())
-            pipeline.attention_mode = "merge_quant"
-            answers, _, _ = run_join(
-                torch, arena, pipeline, async_ans, docs[:8],
-                [[questions[0]] * 24], budget)
-            report["join_answers"][source] = sum(
-                sum(v) for v in answers[0].values())
-
-        # real text with planted flags: margins are wide, so a broken
-        # unified path fails this while kernel rounding drift does not
-        from corpus import build_corpus
-        body_ids, q_ids, flags = build_corpus(tokenizer, 32)
-        for source in KERNEL_SOURCES:
-            pipeline.kernel_source = source
-            pipeline.attention_mode = "unified"
-            answers, _, _ = run_filter(
-                torch, arena, pipeline, async_ans, body_ids,
-                q_ids[:2], budget, arena_writes=True)
-            report["filter_real"][source] = dict(
-                answered=sum(len(v) for v in answers.values()),
-                wrong=_wrong_count(answers, flags))
-
-        # one paged unified chunk, tensor level: the final-position
-        # hidden states each source produces, compared with quail's
-        outs = {}
-        for source in KERNEL_SOURCES:
-            pipeline.kernel_source = source
-            pipeline.attention_mode = "unified"
-            for i in range(4):
-                got = arena.activate(
-                    ("probe", i), len(body_ids[i]),
-                    capacity_tokens=len(body_ids[i]) + len(q_ids[0]))
-                assert got is not None
-            chunk = pack_chunk(
-                torch, arena,
-                [dict(key=("probe", i), prefix=body_ids[i],
-                      f=len(body_ids[i]), suffixes=[q_ids[0]])
-                 for i in range(4)],
-                attention_mode="unified")
-            outs[source] = pipeline.forward_chunk(chunk).clone()
-            for i in range(4):
-                arena.free_key(("probe", i))
-        for source in ("vllm_ops", "vllm_compiled"):
-            delta = (outs[source].to(torch.float32)
-                     - outs["quail"].to(torch.float32))
-            report["unified_chunk"][source] = dict(
-                max_abs=float(delta.abs().max().item()),
-                mean_abs=float(delta.abs().mean().item()),
-                nans=int(torch.isnan(outs[source]).sum().item()),
-                ref_mean_abs=float(
-                    outs["quail"].to(torch.float32)
-                    .abs().mean().item()))
+            captured = {}
+            result = _run_query(state, qdefs[query_id][1], captured)
+            rows[source] = _row_key(result.collect())
+        report["query_rows"][query_id] = {
+            "quail_rows": len(rows["quail"]),
+            "vllm_ops_disagreements": len(
+                set(rows["quail"]) ^ set(rows["vllm_ops"])),
+            "vllm_compiled_disagreements": len(
+                set(rows["quail"]) ^ set(rows["vllm_compiled"])),
+        }
     torch.cuda.synchronize()
     return _write(report, "kernel_source_probe")
 
@@ -527,31 +515,41 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
 # ----------------------------------------------- stock kernel inventory
 
 @app.function(timeout=3600, **GPU_KW)
-def stock_kernels(n_docs: int = 512) -> str:
+def stock_kernels(model: str = "qwen3-4b-fp8",
+                  n_docs: int = 512) -> str:
     """Boot stock vLLM at its defaults, profile one prefill-heavy
-    pass, and record which kernels its compiled graph actually runs
-    between the GEMMs, plus the resolved compilation config. This is
-    the ground truth the vllm_compiled rung mirrors."""
-    import os
-    import sys
-
-    sys.path.insert(0, "/root/gpu_tests")
+    pass over IMDB-1-shaped prompts, and record which kernels its
+    compiled graph actually runs between the GEMMs, plus the resolved
+    compilation config. This is the ground truth the vllm_compiled
+    source mirrors."""
+    import os as _os
 
     # the v1 engine runs the model in a child process by default,
     # where this process's profiler cannot see the kernels
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    _os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
+    import pyarrow.parquet as pq
     import torch
+    from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
-    from corpus import MODEL, build_corpus
-    from transformers import AutoTokenizer
+    from quail.bench.quailb import F1, build_sets
+    from quail.logical import bind_prompt, render_filter_prompt_ids
+    from quail.specs import MODELS
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    body_ids, q_ids, _ = build_corpus(tokenizer, n_docs)
-    prompts = [dict(prompt_token_ids=b + q_ids[0]) for b in body_ids]
+    spec = MODELS[model]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
 
-    llm = LLM(model=MODEL, gpu_memory_utilization=0.92,
+    def tok(text):
+        return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    d = build_sets(DATA_DIR, 0.1)
+    bodies = pq.read_table(f"{d}/reviews.parquet")["body"].to_pylist()
+    prompt = bind_prompt(F1, ("body",), tok)
+    prompts = [dict(prompt_token_ids=render_filter_prompt_ids(
+        prompt, tok(b), tok)) for b in bodies[:n_docs]]
+
+    llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.92,
               enable_prefix_caching=False, disable_log_stats=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=1,
                               min_tokens=1)
@@ -559,7 +557,7 @@ def stock_kernels(n_docs: int = 512) -> str:
     comp = config.compilation_config
     report = dict(
         cell="stock_kernels",
-        model=MODEL,
+        model=spec.hf_name,
         optimization_level=int(config.optimization_level),
         compilation_mode=str(comp.mode),
         custom_ops=list(comp.custom_ops),
@@ -605,195 +603,100 @@ def stock_kernels(n_docs: int = 512) -> str:
     return _write(report, "kernel_source_stock")
 
 
-@app.local_entrypoint()
-def run_stock_kernels(n_docs: int = 512):
-    handle = stock_kernels.spawn(n_docs)
-    print(f"stock_kernels fc: {handle.object_id}", flush=True)
-    print(handle.get())
-
-
 # ------------------------------------------------------- measured cell
 
 PREDICTIONS = {
-    "filter": {
-        "quail": "the reference: ~8.5 us/token, ~35 s "
-                 "(results/attention_paths.json, unified)",
-        "vllm_ops": "+2.3 to +2.6 us/token over quail (the "
-                    "2026-08-19 kernel ablation, since superseded "
-                    "by this cell, measured a 2.4 gap), "
-                    "about 44-46 s",
-        "vllm_compiled": "+1.7 to +2.2 us/token over quail. The "
-                         "stock inventory shows the compiled graph "
-                         "keeps all four standalone group-quant "
-                         "launches per layer, so the quant-fusion "
-                         "saving (2.34 us/token GPU in the "
-                         "2026-08-19 profile) stays with quail; "
-                         "against vllm_ops it recovers only the q/k "
-                         "segment (5 launches to ~2, ~0.3-0.5 "
-                         "us/token)",
+    "IMDB-7": {
+        "quail": "the reference: 16.1 s at sf 0.1 in the QUAIL-B "
+                 "sf0.1 report (the same query through the same "
+                 "worker)",
+        "vllm_ops": "+25 to +32% wall: the per-token gap measured "
+                    "on the deleted synthetic workload (+29%) "
+                    "carries over because the model work per token "
+                    "is the same",
+        "vllm_compiled": "+22 to +29% wall: the compiled set keeps "
+                         "all four standalone group-quant launches "
+                         "per layer, so it recovers only the q/k "
+                         "segment against vllm_ops",
     },
-    "join": {
-        "quail": "the reference: ~11 us/token "
-                 "(results/join_attention_paths_packed 10x256 band)",
-        "vllm_ops": "+2.5 to +3.0 us/token over quail: the filter "
-                    "gap plus the unfused merge (gather, merge, "
-                    "scatter, quant against our one kernel)",
-        "vllm_compiled": "+2.0 to +2.7 us/token over quail: same "
-                         "unfused quants and unfused merge as "
-                         "vllm_ops, minus the q/k segment saving",
+    "BIO-2": {
+        "quail": "the reference: 32.2 s at sf 0.1 in the QUAIL-B "
+                 "sf0.1 report",
+        "vllm_ops": "+26 to +33% wall: the filter-side gap plus the "
+                    "unfused merge (gather, merge_attn_states, "
+                    "scatter, quant against our one fused kernel)",
+        "vllm_compiled": "+23 to +30% wall: same unfused quants and "
+                         "unfused merge, minus the q/k segment "
+                         "saving",
     },
 }
 
 
 @app.function(timeout=7200, **GPU_KW)
-def queries(model: str = "qwen3-4b-fp8", n_docs: int = 10000,
-            n_reports: int = 100, n_terms: int = 256,
+def queries(model: str = "qwen3-4b-fp8", sf: float = 0.1,
             reps: int = 2) -> str:
-    """Both queries through all three kernel sources, one container,
-    one model load. Writes kernel_source_filter.json and
-    kernel_source_join.json."""
-    import sys
-    import time
-
-    sys.path.insert(0, "/root/gpu_tests")
-
-    import torch
-
-    from corpus import biodex_sample, build_corpus
-    from quail.executor.loop import run_filter, run_join, warm_kernels
-
-    (spec, tokenizer, arena, pipeline, async_ans, budget,
-     arena_tok) = _boot(model)
+    """IMDB-7 and BIO-2 through all three kernel sources, one
+    container, one model load, the real planner and worker core.
+    Writes kernel_source_imdb7.json and kernel_source_bio2.json."""
+    state, tokenizer, chunk_tokens, warm = _boot_state(model)
+    pipeline = state["pipeline"]
+    print(f"[kernel_source] warm: {warm}", flush=True)
     print(f"[kernel_source] predictions: {json.dumps(PREDICTIONS)}",
           flush=True)
 
-    with torch.inference_mode():
-        warm = warm_kernels(torch, arena, pipeline, async_ans, budget,
-                            model_name=spec.hf_name)
-    torch.cuda.synchronize()
-    kernel_cache.commit()
-    print(f"[kernel_source] warm: {warm}", flush=True)
+    sess, qdefs, d = _quailb_session(model, sf)
+    counts = dict(reviews=_table_rows(d, "reviews"),
+                  reports=_table_rows(d, "reports"),
+                  terms=_table_rows(d, "terms"))
 
-    # ---- the filter query -------------------------------------------
-    body_ids, q_ids, flags = build_corpus(tokenizer, n_docs)
-    pipeline.attention_mode = "unified"
-    filter_report = dict(
-        cell="kernel_source_filter", model=spec.name, n_docs=n_docs,
-        reps=reps, budget=budget, arena_tokens=arena_tok,
-        attention_mode="unified", warm=warm,
-        predictions=PREDICTIONS["filter"], runs={}, comparisons={})
-    answers_by_source = {}
-    for source in KERNEL_SOURCES:
-        pipeline.kernel_source = source
-        with torch.inference_mode():
-            # per-source warm, unmeasured: first-call op init and,
-            # for vllm_compiled, the torch.compile of the q/k segment
-            run_filter(torch, arena, pipeline, async_ans,
-                       body_ids[:256], q_ids, budget,
-                       arena_writes=True)
-            torch.cuda.synchronize()
-            rows = []
+    out = None
+    for query_id, (path, suffix) in MEASURED_QUERIES.items():
+        description, build = qdefs[query_id]
+        report = dict(
+            cell=f"kernel_source_{suffix}", model=model, sf=sf,
+            query=query_id, description=description,
+            attention_path=path, reps=reps,
+            chunk_tokens=chunk_tokens, table_rows=counts,
+            predictions=PREDICTIONS[query_id], runs={},
+            comparisons={})
+        rows_by_source = {}
+        for source in KERNEL_SOURCES:
+            pipeline.kernel_source = source
+            # unmeasured warm run: first-call op init, and for
+            # vllm_compiled the torch.compile of the three segments
+            _run_query(state, build, {})
+            runs = []
             for rep in range(reps):
-                timers = {}
-                torch.cuda.reset_peak_memory_stats()
-                t0 = time.perf_counter()
-                answers, spans, tokens = run_filter(
-                    torch, arena, pipeline, async_ans, body_ids,
-                    q_ids, budget, timing=timers, arena_writes=True)
-                torch.cuda.synchronize()
-                wall = time.perf_counter() - t0
-                answered = sum(len(v) for v in answers.values())
-                survivors = sum(len(row) == len(q_ids) and all(row)
-                                for row in answers.values())
+                captured = {}
+                result = _run_query(state, build, captured)
+                table = result.collect()
                 row = dict(
-                    source=source, rep=rep, wall=round(wall, 3),
-                    fresh_tokens=tokens,
-                    us_per_token=round(wall * 1e6 / tokens, 3),
-                    answered=answered, survivors=survivors,
-                    wrong=_wrong_count(answers, flags),
-                    chunks=len(spans),
-                    gpu_s=round(sum(e0.elapsed_time(e1)
-                                    for _, e0, e1 in spans) / 1e3, 3),
-                    peak_gib=round(
-                        torch.cuda.max_memory_allocated() / 2**30, 2),
-                    cpu_phase_s={k: round(v, 3) for k, v
-                                 in sorted(timers.items())})
-                rows.append(row)
-                print(f"[kernel_source_filter] {row}", flush=True)
-        filter_report["runs"][source] = rows
-        answers_by_source[source] = answers
+                    source=source, rep=rep,
+                    wall_s=round(captured["wall_s"], 3),
+                    fresh_tokens=captured["fresh_tokens"],
+                    us_per_token=round(
+                        captured["wall_s"] * 1e6
+                        / captured["fresh_tokens"], 3),
+                    rows=table.num_rows)
+                runs.append(row)
+                print(f"[kernel_source_{suffix}] {row}", flush=True)
+                rows_by_source[source] = _row_key(table)
+            report["runs"][source] = runs
 
-    reference = answers_by_source["quail"]
-    last_quail = filter_report["runs"]["quail"][-1]
-    for source in ("vllm_ops", "vllm_compiled"):
-        last = filter_report["runs"][source][-1]
-        filter_report["comparisons"][source] = dict(
-            disagreements=_disagreements(
-                reference, answers_by_source[source]),
-            wall_delta_s=round(last["wall"] - last_quail["wall"], 3),
-            us_per_token_delta=round(
-                last["us_per_token"] - last_quail["us_per_token"], 3))
-    if n_docs == 10000:
-        # the banked counts are for the committed 10k corpus only
-        filter_report["gates"] = dict(
-            quail_vs_banked=dict(
-                measured={k: last_quail[k] for k in BANKED_FILTER},
-                banked=BANKED_FILTER),
-            passed=all(last_quail[k] == v
-                       for k, v in BANKED_FILTER.items()))
-    _write(filter_report, "kernel_source_filter")
-
-    # ---- the join query ---------------------------------------------
-    data = biodex_sample(tokenizer, n_reports=n_reports)
-    prefixes = data["prefixes"]
-    suffixes = data["suffixes"][:n_terms]
-    pipeline.attention_mode = "merge_quant"
-    join_report = dict(
-        cell="kernel_source_join", model=spec.name,
-        n_reports=n_reports, n_terms=n_terms,
-        pairs=n_reports * n_terms, reps=reps, budget=budget,
-        attention_mode="merge_quant",
-        predictions=PREDICTIONS["join"], runs={}, comparisons={})
-    outputs = {}
-    for source in KERNEL_SOURCES:
-        pipeline.kernel_source = source
-        with torch.inference_mode():
-            run_join(torch, arena, pipeline, async_ans, prefixes,
-                     [suffixes], budget)
-            torch.cuda.synchronize()
-            rows = []
-            for rep in range(reps):
-                torch.cuda.reset_peak_memory_stats()
-                t0 = time.perf_counter()
-                answers, spans, tokens = run_join(
-                    torch, arena, pipeline, async_ans, prefixes,
-                    [suffixes], budget)
-                torch.cuda.synchronize()
-                wall = time.perf_counter() - t0
-                flat = [bit for a in range(n_reports)
-                        for bit in answers[0][a]]
-                row = dict(
-                    source=source, rep=rep, wall=round(wall, 3),
-                    fresh_tokens=tokens,
-                    us_per_token=round(wall * 1e6 / tokens, 3),
-                    chunks=len(spans), yes=sum(flat),
-                    peak_gib=round(
-                        torch.cuda.max_memory_allocated() / 2**30, 2))
-                rows.append(row)
-                print(f"[kernel_source_join] {row}", flush=True)
-        join_report["runs"][source] = rows
-        outputs[source] = flat
-
-    last_quail = join_report["runs"]["quail"][-1]
-    for source in ("vllm_ops", "vllm_compiled"):
-        last = join_report["runs"][source][-1]
-        join_report["comparisons"][source] = dict(
-            disagreements=sum(a != b for a, b in
-                              zip(outputs["quail"], outputs[source])),
-            wall_delta_s=round(last["wall"] - last_quail["wall"], 3),
-            us_per_token_delta=round(
-                last["us_per_token"] - last_quail["us_per_token"], 3))
-    return _write(join_report, "kernel_source_join")
+        reference = rows_by_source["quail"]
+        last_quail = report["runs"]["quail"][-1]
+        for source in ("vllm_ops", "vllm_compiled"):
+            last = report["runs"][source][-1]
+            report["comparisons"][source] = dict(
+                row_disagreements=len(
+                    set(reference) ^ set(rows_by_source[source])),
+                wall_delta_s=round(
+                    last["wall_s"] - last_quail["wall_s"], 3),
+                us_per_token_delta=round(
+                    last["us_per_token"]
+                    - last_quail["us_per_token"], 3))
+        out = _write(report, f"kernel_source_{suffix}")
+    return out
 
 
 # ------------------------------------------------------------ profile
@@ -812,60 +715,45 @@ def _categorize(name):
     if any(k in low for k in ("silu_mul_quant", "add_rms_norm_quant",
                               "qk_norm_rope", "merge_quant")):
         return "quail_fused"
-    if any(k in low for k in ("per_block_quant",)):
-        return "vllm_fused"
     if low.startswith("triton_"):
         return "inductor"
-    if any(k in low for k in ("rms_norm", "rotary", "silu_and_mul")):
+    if any(k in low for k in ("rms_norm", "rotary", "silu",
+                              "act_and_mul")):
         return "vllm_elementwise"
     if "quant" in low:
         return "quant"
     if any(k in low for k in ("memcpy", "copy", "index", "cat",
-                              "gather", "scatter", "nonzero")):
+                              "gather", "scatter", "nonzero",
+                              "elementwise")):
         return "copies"
     return "other"
 
 
-@app.function(timeout=3600, **GPU_KW)
-def profile_filter(model: str = "qwen3-4b-fp8",
-                   n_docs: int = 3000) -> str:
+@app.function(timeout=5400, **GPU_KW)
+def profile_queries(model: str = "qwen3-4b-fp8",
+                    sf: float = 0.1) -> str:
     """Per-kernel-category GPU time for the three sources on the
-    filter query."""
-    import sys
-
-    sys.path.insert(0, "/root/gpu_tests")
-
+    IMDB-7 filter query (unified path)."""
     import torch
 
-    from corpus import build_corpus
-    from quail.executor.loop import run_filter, warm_kernels
+    state, tokenizer, chunk_tokens, _ = _boot_state(model)
+    pipeline = state["pipeline"]
+    sess, qdefs, _ = _quailb_session(model, sf)
+    _, build = qdefs["IMDB-7"]
 
-    (spec, tokenizer, arena, pipeline, async_ans, budget,
-     _) = _boot(model)
-    body_ids, q_ids, _ = build_corpus(tokenizer, n_docs)
-    pipeline.attention_mode = "unified"
-    with torch.inference_mode():
-        warm_kernels(torch, arena, pipeline, async_ans, budget,
-                     model_name=spec.hf_name)
-    torch.cuda.synchronize()
-    kernel_cache.commit()
-
-    result = dict(cell="kernel_source_profile", model=spec.name,
-                  n_docs=n_docs, sources={})
+    result = dict(cell="kernel_source_profile", model=model, sf=sf,
+                  query="IMDB-7", attention_path="unified",
+                  sources={})
     for source in KERNEL_SOURCES:
         pipeline.kernel_source = source
-        with torch.inference_mode():
-            _, _, tokens = run_filter(torch, arena, pipeline,
-                                      async_ans, body_ids, q_ids,
-                                      budget, arena_writes=True)
-            torch.cuda.synchronize()
-            with torch.profiler.profile(
-                    activities=[torch.profiler.ProfilerActivity.CPU,
-                                torch.profiler.ProfilerActivity.CUDA]
-            ) as prof:
-                run_filter(torch, arena, pipeline, async_ans,
-                           body_ids, q_ids, budget, arena_writes=True)
-                torch.cuda.synchronize()
+        captured = {}
+        _run_query(state, build, captured)   # unprofiled warm
+        with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            _run_query(state, build, captured)
+        tokens = captured["fresh_tokens"]
         cats, counts = {}, {}
         rows = []
         for ev in prof.key_averages():
@@ -887,6 +775,7 @@ def profile_filter(model: str = "qwen3-4b-fp8",
         busy = sum(cats.values())
         result["sources"][source] = dict(
             fresh_tokens=tokens,
+            wall_s=round(captured["wall_s"], 3),
             cuda_busy_s=round(busy / 1e6, 2),
             us_per_token=round(busy / tokens, 2),
             category_us_per_token={k: round(v / tokens, 3)
@@ -910,16 +799,23 @@ def run_probe(model: str = "qwen3-4b-fp8"):
 
 
 @app.local_entrypoint()
-def run_queries(model: str = "qwen3-4b-fp8", n_docs: int = 10000,
-                n_reports: int = 100, n_terms: int = 256,
+def run_queries(model: str = "qwen3-4b-fp8", sf: float = 0.1,
                 reps: int = 2):
-    handle = queries.spawn(model, n_docs, n_reports, n_terms, reps)
+    handle = queries.spawn(model, sf, reps)
     print(f"queries fc: {handle.object_id}", flush=True)
     print(handle.get())
 
 
 @app.local_entrypoint()
-def run_profile(model: str = "qwen3-4b-fp8", n_docs: int = 3000):
-    handle = profile_filter.spawn(model, n_docs)
-    print(f"profile_filter fc: {handle.object_id}", flush=True)
+def run_profile(model: str = "qwen3-4b-fp8", sf: float = 0.1):
+    handle = profile_queries.spawn(model, sf)
+    print(f"profile_queries fc: {handle.object_id}", flush=True)
+    print(handle.get())
+
+
+@app.local_entrypoint()
+def run_stock_kernels(model: str = "qwen3-4b-fp8",
+                      n_docs: int = 512):
+    handle = stock_kernels.spawn(model, n_docs)
+    print(f"stock_kernels fc: {handle.object_id}", flush=True)
     print(handle.get())
