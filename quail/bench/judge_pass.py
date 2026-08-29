@@ -42,17 +42,17 @@ VERIFY_PER_PREDICATE = 16
 VOLUME_ROOT = Path("/results/ground_truth/quailb/schema_v1")
 
 PREDICTION = (
-    "sf=0.1, 23 predicates: 434,201 labels - 394,138 Qwen3 32B "
-    "judgments and 40,063 source labels. The 15 filter predicates "
-    "(17,057 labels) already sit on the volume under their current "
-    "ids, so this pass writes the 8 joins: 377,081 model judgments, "
-    "63 FEVER annotation labels and LePaRD's 40,000 source labels. "
-    "Four H100s side by side, one per workload; biodex is the long "
-    "pole with 245,600 report-length prompts, 1.8x the 136,200 it ran "
-    "in 1,056 seconds last pass, so 27-35 minutes including boot; "
-    "$5-$9 at current Modal prices; 0 answer differences on the "
-    "deterministic rerun sample; no out-of-memory crash at "
-    "gpu_memory_utilization=0.85"
+    "sf=0.1, 22 predicates: 1,592,987 labels - 1,552,673 Qwen3 32B "
+    "judgments and 40,314 source labels. The 15 filter predicates "
+    "(12,687 labels) run first; the 7 joins produce 1,574,000 model "
+    "judgments, 314 FEVER annotation labels and LePaRD's 40,000 "
+    "source labels. Four H100s side by side, one per workload; "
+    "BioDEX is the long pole with 1,127,000 report x term join "
+    "prompts (500 reports x 1,127 terms x 2 specs); FEVER runs "
+    "143,500 prompts per spec (500 claims x 287 evidence x 2 specs). "
+    "Each workload fits within one 7,200s container with resume; "
+    "0 answer differences on the deterministic rerun sample; no "
+    "out-of-memory crash at gpu_memory_utilization=0.85"
 )
 
 
@@ -1000,7 +1000,7 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
 
 
 @app.function(
-    image=image, gpu="H100!", memory=98304, timeout=7200,
+    image=image, gpu="H100", memory=98304, timeout=7200,
     volumes={"/root/.cache/huggingface": hf_cache,
              "/root/.cache/kernels": kernel_cache,
              "/results": results_vol})

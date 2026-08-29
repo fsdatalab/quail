@@ -1009,47 +1009,113 @@ GPUs (`worker.py:495-519`).
 
 ## 7. The benchmark (QUAIL-B)
 
-QUAIL-B (`bench/quailb.py`) is a benchmark of 15 queries over five
-document sets, built from real text (IMDB reviews, BioDEX patient
-reports, ABT-BUY product descriptions, and derived sets).
+QUAIL-B (`bench/quailb.py`) has 30 queries over four document sets
+(IMDB, BioDEX, FEVER, LePaRD), plus 2 optional PrivacyPolicies
+queries. All predicates are natural-language questions answered by
+Qwen3 32B during the judge pass; ground truth covers 22 predicates.
 
-### Planted-flag design
+### Document tables
 
-Each document gets a `[FLAGS]` line with planted yes/no values at
-known rates (e.g., FLAG_1=YES at rate 0.9 means 90% of documents
-have FLAG_1=YES). The filter predicates ask the model to read these
-flags. This gives known ground truth for both speed and correctness
-measurement.
+| Table | Source | SF=1 rows | Content |
+|---|---|---|---|
+| reviews | `stanfordnlp/imdb` | 50,000 | Movie reviews |
+| reports | `BioDEX/BioDEX-Reactions` | 5,000 | Medical case reports |
+| claims | `fever/fever` | 5,000 | Factual claims (train + labelled_dev) |
+| citations | `rmahari/LePaRD` | 2,000 | Legal citation excerpts |
+| policies | `mukund/PrivacyPolicies` | 1,000,000 | Privacy policies (optional) |
 
-The rates per set:
-- Reviews: F1-F8 at 0.9, 0.9, 0.9, 0.8, 0.8, 0.2, 0.9, 0.8
-- Threads: T1-T3 at 0.05, 0.3, 0.9
-- Reports: R1-R2 at 0.5, 0.4
+Partner tables (fixed vocabulary, not scaled by SF):
+- **aspects** (12 rows): film aspects ("the acting", "the plot", ...)
+- **terms** (~6,000 rows): merged BioDEX reaction terms
+- **evidence** (bounded by sampled claims): Wikipedia passages from FEVER
+- **scenarios** (100 rows): user-outcome descriptions across 10 categories
 
-### Scale factors
+### Table and join structure
 
-SF (scale factor) controls document counts. At SF=1, there are
-50,000 reviews, 10,000 threads, 2,000 reports, 1,000 products, and
-2,560 terms. LF (length factor) controls document length by
-concatenating real text.
+```mermaid
+graph LR
+    subgraph Document tables
+        reviews["reviews (50K)"]
+        reports["reports (10K)"]
+        claims["claims (5K)"]
+        citations["citations (2K)"]
+        policies["policies (1M, optional)"]
+    end
+    subgraph Partner tables
+        aspects["aspects (12)"]
+        terms["terms (~6K)"]
+        evidence["evidence"]
+        scenarios["scenarios (100)"]
+    end
+    reviews -- "DISCUSS_ASPECT / ASPECT_SENTIMENT" --> aspects
+    reports -- "REACTION" --> terms
+    claims -- "SUPPORT / REFUTE" --> evidence
+    citations -- "LEPJOIN (self-join)" --> citations
+    policies -. "SCENARIO_MATCH" .-> scenarios
+```
 
-### The 15 queries
+### The 30 queries
 
-| Query | Shape | What it tests |
+**IMDB** (10 queries): reviews x aspects
+
+| Query | Shape | Description |
 |---|---|---|
-| B1 | 1 filter | The per-query floor |
-| B2 | 5 filters | The filter-chain workload |
-| B3w/B3c | 5 filters | Written order vs cost order |
-| B4 | 2 filters | Long documents (reports) |
-| B5 | 1 join | The BioDEX shape (reports x terms) |
-| B6 | 1 filter + 1 join | Filter pushdown reduces the pair list |
-| B7 | 1 join | Pure pair predicate |
-| B8 | 1 exists-join | Semi-join semantics |
-| B9 | exists + anti | Exists then anti on the same anchor |
-| B10 | 2 joins (chain) | Gating, dedup, and replay |
-| B11 | 2 joins (star) | Kept anchors read by two stages |
-| B12 | 1 filter + 1 join | Two-sided pushdown |
-| B15 | 1 filter + 2 joins | Everything at once |
+| IMDB-1 | 1F | F1 alone |
+| IMDB-2 | 1J | reviews x aspects (DISCUSS_ASPECT) |
+| IMDB-3 | 1F + 1J | F1 then join |
+| IMDB-4 | 2F + 1J | F1 + F4 then join |
+| IMDB-5 | 3F + 1J | F1 + F4 + F5 then join |
+| IMDB-6 | 2F | F1 + F4, no join |
+| IMDB-7 | 3F | F1 + F4 + F5, no join |
+| IMDB-8 | 2J star | DISCUSS_ASPECT + ASPECT_SENTIMENT, same anchor |
+| IMDB-9 | 3J chain | r1-a1-r2-a2 |
+| IMDB-10 | F1 + 3J chain | F1 then r1-a1-r2-a2 |
+
+**BioDEX** (3 queries): reports x terms
+
+| Query | Shape | Description |
+|---|---|---|
+| BIO-1 | 1F | F7 (female patient) |
+| BIO-2 | 1J | reports x terms (REACTION) |
+| BIO-3 | 1F + 1J | F7 then join |
+
+**FEVER** (9 queries): claims x evidence
+
+| Query | Shape | Description |
+|---|---|---|
+| FEV-1 | 1F | F11 (about a person) |
+| FEV-2 | 1J | claims x evidence (SUPPORT) |
+| FEV-3 | 1F + 1J | F11 then join |
+| FEV-4 | 2F + 1J | F11 + F12 then join |
+| FEV-5 | 2F + 1J two-sided | F11 on claims, F13 on evidence |
+| FEV-6 | 3F + 1J two-sided | F11 + F12 on claims, F13 on evidence |
+| FEV-7 | 2J star | SUPPORT + REFUTE, same anchor |
+| FEV-8 | 3J chain | c1-e1-c2-e2 |
+| FEV-9 | F11 + 3J chain | F11 then c1-e1-c2-e2 |
+
+**LePaRD** (8 queries): citations self-join
+
+| Query | Shape | Description |
+|---|---|---|
+| LEP-1 | 1F | LEP1 (reasoning does not apply) |
+| LEP-2 | 1J | self-join (LEPJOIN) |
+| LEP-3 | 1F + 1J | LEP1 then self-join |
+| LEP-4 | 2F + 1J | LEP1 + LEP2 then self-join |
+| LEP-5 | 3F + 1J | LEP1..LEP3 then self-join |
+| LEP-6 | 5F + 1J | LEP1..LEP5 then self-join |
+| LEP-7 | 2F + 1J two-sided | LEP1 + LEP2 on excerpts, LEPS1 on passages |
+| LEP-8 | 5F | LEP1..LEP5, no join |
+
+**PrivacyPolicies** (2 optional queries): policies x scenarios
+
+| Query | Shape | Description |
+|---|---|---|
+| PRIV-1 | 2F | P_MSG + P_LOC |
+| PRIV-2 | 2F + 1J | P_MSG + P_LOC then SCENARIO_MATCH |
+
+PRIV-1 and PRIV-2 run only when `register_privacy_sets()` has been
+called. They have no ground truth and are not part of the default
+benchmark runner or judge pass.
 
 ### Single-pass protocol
 
