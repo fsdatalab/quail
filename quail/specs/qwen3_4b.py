@@ -14,4 +14,7 @@ QWEN3_4B_FP8 = ModelSpec(
     kv_bytes=2.0,          # bf16 KV; the only stored dtype
     w_mem_bytes=4.5e9,     # measured footprint: fp8 weights + bf16
     #                        embeddings + block scales
+    vocab=151_936,
+    tied_head=True,        # lm_head shares the embedding tensor, so
+    #                        nothing moves off the GPU at load
 )

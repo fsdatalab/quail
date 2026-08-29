@@ -948,9 +948,12 @@ class _PayloadAnswerer:
     def __init__(self, torch, F, model, true_ids, false_ids):
         self.F = F
         self.allowed = sorted(set(true_ids) | set(false_ids))
-        sel = torch.tensor(self.allowed, device="cuda")
-        self.weights = model.lm_head.weight.index_select(0, sel).to(
-            torch.bfloat16)
+        # the head weight lives on the CPU when untied (moved there at
+        # load); slice where it lives, keep only the slice on the GPU
+        weight = model.lm_head.weight
+        sel = torch.tensor(self.allowed, device=weight.device)
+        self.weights = weight.index_select(0, sel).to(
+            device="cuda", dtype=torch.bfloat16)
         self.true_cols = torch.tensor(
             [i for i, t in enumerate(self.allowed)
              if t in set(true_ids)], device="cuda")
