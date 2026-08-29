@@ -5,6 +5,13 @@ LePaRD supply source truth where available. The run uses stable label-set
 IDs and skips completed Parquet parts.
 
     uv run modal run -m quail.bench.judge_pass
+
+Reuse labels after an unrelated table changes in a new corpus:
+
+    uv run modal run --detach -m quail.bench.judge_pass \
+      --reuse-from-collection <collection> \
+      --target-corpus <corpus> \
+      --relabeled-workloads lepard
 """
 
 from __future__ import annotations
@@ -42,17 +49,18 @@ VERIFY_PER_PREDICATE = 16
 VOLUME_ROOT = Path("/results/ground_truth/quailb/schema_v1")
 
 PREDICTION = (
-    "sf=0.1, 22 predicates: 1,592,987 labels - 1,552,673 Qwen3 32B "
-    "judgments and 40,314 source labels. The 15 filter predicates "
-    "(12,687 labels) run first; the 7 joins produce 1,574,000 model "
-    "judgments, 314 FEVER annotation labels and LePaRD's 40,000 "
-    "source labels. Four H100! GPUs side by side, one per workload; "
-    "BioDEX is the long pole with 1,127,000 report x term join "
-    "prompts (500 reports x 1,127 terms x 2 specs); FEVER runs "
-    "143,500 prompts per spec (500 claims x 287 evidence x 2 specs). "
-    "Each workload fits within one 7,200s container with resume; "
-    "0 answer differences on the deterministic rerun sample; no "
-    "out-of-memory crash at gpu_memory_utilization=0.85"
+    "At sf=0.1, 22 predicates require 1,771,220 labels. Qwen3 32B "
+    "produces 1,554,406 judgments, and dataset annotations produce "
+    "216,814 source labels. Revised LePaRD samples 500 known citation "
+    "pairs before deduplicating them into 500 citation contexts and 433 "
+    "citation passages. Four H100! GPUs can run one workload each. The "
+    "deterministic rerun sample should have no answer differences, and "
+    "each run should finish without an out-of-memory failure at "
+    "gpu_memory_utilization=0.85."
+)
+REUSE_PREDICTION = (
+    "The unchanged table manifests will match exactly. Their label sets "
+    "can be reused with the relabeled workloads."
 )
 
 
@@ -142,32 +150,33 @@ PREDICATES = (
     PredicateSpec(
         "quailb.lepard.excerpt.reasoning_does_not_apply", "LEP1", "lepard",
         "excerpt_reasoning_does_not_apply", "filter", quailb.LEP1,
-        "excerpt", "citations", "destination_context"),
+        "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.procedural_or_jurisdictional", "LEP2",
         "lepard", "excerpt_procedural_or_jurisdictional", "filter",
-        quailb.LEP2, "excerpt", "citations", "destination_context"),
+        quailb.LEP2, "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.treats_passage_as_binding", "LEP3", "lepard",
         "excerpt_treats_passage_as_binding", "filter", quailb.LEP3,
-        "excerpt", "citations", "destination_context"),
+        "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.supports_liability_or_guilt", "LEP4",
         "lepard", "excerpt_supports_liability_or_guilt", "filter",
-        quailb.LEP4, "excerpt", "citations", "destination_context"),
+        quailb.LEP4, "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.acknowledges_court_disagreement", "LEP5",
         "lepard", "excerpt_acknowledges_court_disagreement", "filter",
-        quailb.LEP5, "excerpt", "citations", "destination_context"),
+        quailb.LEP5, "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.passage.states_general_rule", "LEPS1", "lepard",
         "passage_states_general_rule", "filter", quailb.LEPS1,
-        "passage", "citations", "passage_text"),
+        "passage", "citation_passages", "passage_text"),
     PredicateSpec(
         "quailb.lepard.excerpt.cites_passage", "LEPJOIN", "lepard",
         "excerpt_cites_passage", "join", quailb.LEPJOIN,
-        "excerpt", "citations", "destination_context",
-        "passage", "citations", "passage_text", "lepard_passage_id"),
+        "excerpt", "citation_contexts", "destination_context",
+        "passage", "citation_passages", "passage_text",
+        "lepard_citation_edge"),
 )
 
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
@@ -310,10 +319,11 @@ SOURCE_SPECS = {
         "revision": quailb.SOURCE_REVISIONS["fever/fever"],
         "rule": "matching evidence_wiki_url; SUPPORTS is true; REFUTES false",
     },
-    "lepard_passage_id": {
+    "lepard_citation_edge": {
         "dataset": "rmahari/LePaRD",
         "revision": quailb.SOURCE_REVISIONS["rmahari/LePaRD"],
-        "rule": "anchor passage_id equals candidate passage_id",
+        "rule": ("anchor cited_passage_ids intersects candidate "
+                 "passage_ids"),
     },
 }
 
@@ -328,8 +338,8 @@ def label_sources(spec: PredicateSpec) -> list[dict]:
         full = _full_hash(payload)
         sources.append({"id": _named_id("s", full), "full_hash": full,
                         "spec": payload})
-    if spec.source_policy == "lepard_passage_id":
-        payload = SOURCE_SPECS["lepard_passage_id"]
+    if spec.source_policy == "lepard_citation_edge":
+        payload = SOURCE_SPECS["lepard_citation_edge"]
         full = _full_hash(payload)
         sources.append({"id": _named_id("s", full), "full_hash": full,
                         "spec": payload})
@@ -429,8 +439,9 @@ CORPUS_COLUMNS = {
     "terms": ("id", "term"),
     "claims": ("id", "claim", "label", "evidence_wiki_url"),
     "evidence": ("id", "text"),
-    "citations": ("id", "destination_context", "passage_text",
-                  "passage_id"),
+    "citation_contexts": ("id", "destination_context",
+                          "cited_passage_ids"),
+    "citation_passages": ("id", "passage_text", "passage_ids"),
 }
 
 
@@ -593,7 +604,7 @@ def _part_bounds(spec: PredicateSpec,
         step = next(n for _table, members, n
                     in filter_groups(workload_specs(spec.workload))
                     if spec in members)
-    elif spec.source_policy == "lepard_passage_id":
+    elif spec.source_policy == "lepard_citation_edge":
         step = 50
     else:
         step = rows_per_call(len(corpus_rows[spec.right_table]))
@@ -865,9 +876,16 @@ def _write_qwen_join_parts(judge: ModelJudge,
               flush=True)
 
 
+def _lepard_source_answer(cited_passage_ids, passage_ids) -> bool:
+    if not isinstance(cited_passage_ids, set):
+        cited_passage_ids = set(cited_passage_ids)
+    return not cited_passage_ids.isdisjoint(passage_ids)
+
+
 def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
                           right_rows: list[dict], identity: dict,
                           corpus_id: str, anchor_batch: int = 50) -> None:
+    right_passage_ids = [set(right["passage_ids"]) for right in right_rows]
     for start in range(0, len(left_rows), anchor_batch):
         end = min(start + anchor_batch, len(left_rows))
         part = _part_path(spec, identity, start, end)
@@ -875,11 +893,12 @@ def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
             continue
         output = []
         for left in left_rows[start:end]:
-            for right in right_rows:
+            cited_passage_ids = set(left["cited_passage_ids"])
+            for right, passage_ids in zip(right_rows, right_passage_ids):
                 output.append(_answer_row(
                     spec, identity, corpus_id, left, right,
-                    left["passage_id"] == right["passage_id"],
-                    "lepard_passage_id", None))
+                    _lepard_source_answer(cited_passage_ids, passage_ids),
+                    "lepard_citation_edge", None))
         _atomic_parquet(part, output)
         results_vol.commit()
         print(f"[judge] LePaRD source anchors {start}:{end}", flush=True)
@@ -913,6 +932,55 @@ def _activate_collection(corpus_id: str, collection_id: str) -> None:
     _atomic_json(
         VOLUME_ROOT / "corpora" / corpus_id / "active_collection.json",
         {"collection_id": collection_id})
+
+
+def _required_tables(spec: PredicateSpec) -> tuple[str, ...]:
+    tables = {spec.left_table}
+    if spec.kind == "join":
+        tables.add(spec.right_table)
+    return tuple(sorted(tables))
+
+
+def _label_manifest(label_set_id: str) -> tuple[Path, dict]:
+    matches = list((VOLUME_ROOT / "label_sets").glob(
+        f"*/*/{label_set_id}/manifest.json"))
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"expected one manifest for {label_set_id}, found "
+            f"{len(matches)}")
+    with open(matches[0]) as f:
+        return matches[0], json.load(f)
+
+
+def _check_reused_label_set(
+        spec: PredicateSpec, label_set_id: str, source_collection: dict,
+        source_corpus: dict, target_corpus: dict) -> dict:
+    if source_collection["label_sets"].get(spec.key) != label_set_id:
+        raise ValueError(
+            f"source collection does not contain {spec.key} as "
+            f"{label_set_id}")
+    _, manifest = _label_manifest(label_set_id)
+    if manifest.get("status") != "complete":
+        raise ValueError(f"label set {label_set_id} is not complete")
+    if (manifest.get("corpus_id") != source_corpus["corpus_id"]
+            or manifest.get("corpus_full_hash")
+            != source_corpus["corpus_full_hash"]):
+        raise ValueError(f"label set {label_set_id} has the wrong corpus")
+
+    tables = _required_tables(spec)
+    for table in tables:
+        if source_corpus["tables"].get(table) != target_corpus["tables"].get(
+                table):
+            raise ValueError(
+                f"cannot reuse {spec.key}: table {table} changed")
+    return {
+        "source_collection_id": source_collection["collection_id"],
+        "source_corpus_id": source_corpus["corpus_id"],
+        "required_tables": list(tables),
+        "verified_table_manifests": {
+            table: source_corpus["tables"][table] for table in tables
+        },
+    }
 
 
 def _complete_manifest(spec: PredicateSpec, identity: dict,
@@ -1072,7 +1140,7 @@ def judge_workload(corpus_id: str, workload: str) -> str:
 
     for spec in join_specs(specs):
         left, right = rows[spec.left_table], rows[spec.right_table]
-        if spec.source_policy == "lepard_passage_id":
+        if spec.source_policy == "lepard_citation_edge":
             _write_lepard_source(spec, left, right, identities[spec.key],
                                  corpus_id_)
             continue
@@ -1185,9 +1253,131 @@ def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
     return json.dumps(summary, sort_keys=True)
 
 
+@app.function(
+    image=data_image, memory=4096, timeout=1200,
+    volumes={"/results": results_vol})
+def activate_reused_collection(
+        sf: float, target_corpus_id: str, source_collection_id: str,
+        relabeled_workloads: str) -> str:
+    """Build one collection from new labels and verified unchanged tables."""
+    results_vol.reload()
+    _, target_corpus, _ = _load_corpus(target_corpus_id)
+    source_collection_path = (
+        VOLUME_ROOT / "collections" / source_collection_id / "manifest.json")
+    with open(source_collection_path) as f:
+        source_collection = json.load(f)
+    if (source_collection.get("status") != "complete"
+            or source_collection.get("collection_id")
+            != source_collection_id):
+        raise ValueError(
+            f"source collection {source_collection_id} is invalid")
+    if float(source_collection["scale_factor"]) != float(sf):
+        raise ValueError(
+            f"source collection has scale factor "
+            f"{source_collection['scale_factor']}, expected {sf}")
+
+    source_corpus_id = source_collection["corpus_id"]
+    with open(VOLUME_ROOT / "corpora" / source_corpus_id / "manifest.json") as f:
+        source_corpus = json.load(f)
+    if source_corpus.get("corpus_id") != source_corpus_id:
+        raise ValueError(f"source corpus {source_corpus_id} is invalid")
+    if (target_corpus.get("corpus_id") != target_corpus_id
+            or float(target_corpus["scale_factor"]) != float(sf)):
+        raise ValueError(f"target corpus {target_corpus_id} is invalid")
+    names = {name.strip() for name in relabeled_workloads.split(",")
+             if name.strip()}
+    unknown = names - set(WORKLOADS)
+    if unknown:
+        raise ValueError(f"unknown relabeled workloads: {sorted(unknown)}")
+
+    identities = {}
+    manifests = {}
+    reused = {}
+    for spec in PREDICATES:
+        if spec.workload in names:
+            identity = label_set_identity(
+                spec, target_corpus["corpus_id"],
+                target_corpus["corpus_full_hash"])
+            _, manifest = _label_manifest(identity["label_set_id"])
+            if (manifest.get("status") != "complete"
+                    or manifest.get("corpus_id")
+                    != target_corpus["corpus_id"]
+                    or manifest.get("corpus_full_hash")
+                    != target_corpus["corpus_full_hash"]):
+                raise ValueError(
+                    f"new label set {identity['label_set_id']} is not a "
+                    "complete label set for the target corpus")
+        else:
+            label_set_id = source_collection["label_sets"].get(spec.key)
+            if not label_set_id:
+                raise ValueError(
+                    f"source collection has no label set for {spec.key}")
+            identity = {"label_set_id": label_set_id}
+            reused[spec.key] = _check_reused_label_set(
+                spec, label_set_id, source_collection, source_corpus,
+                target_corpus)
+            _, manifest = _label_manifest(label_set_id)
+        identities[spec.key] = identity
+        manifests[spec.key] = manifest
+
+    collection = _collection_identity(target_corpus, identities)
+    collection_dir = (
+        VOLUME_ROOT / "collections" / collection["collection_id"])
+    qwen_rows = sum(m["source_rows"].get(MODEL_NAME, 0)
+                    for m in manifests.values())
+    total_rows = sum(m["rows"] for m in manifests.values())
+    summary = {
+        "cell": "quailb_ground_truth_collection_reuse",
+        "prediction": REUSE_PREDICTION,
+        "collection_id": collection["collection_id"],
+        "corpus_id": target_corpus["corpus_id"],
+        "scale_factor": sf,
+        "model": MODEL_NAME,
+        "model_revision": MODEL_REVISION,
+        "source_collection_id": source_collection_id,
+        "source_corpus_id": source_corpus_id,
+        "relabeled_workloads": sorted(names),
+        "reused_predicates": len(reused),
+        "new_predicates": len(PREDICATES) - len(reused),
+        "predicate_count": len(PREDICATES),
+        "qwen_judgments": qwen_rows,
+        "source_labels": total_rows - qwen_rows,
+        "total_labels": total_rows,
+        "label_sets": {
+            key: {
+                "label_set_id": manifest["label_set_id"],
+                "rows": manifest["rows"],
+                "true_rows": manifest["true_rows"],
+                "source_rows": manifest["source_rows"],
+                "reused": key in reused,
+            }
+            for key, manifest in sorted(manifests.items())
+        },
+        "volume_path": str(collection_dir),
+    }
+    collection_manifest = {
+        **collection,
+        "status": "complete",
+        "corpus_manifest": str(
+            VOLUME_ROOT / "corpora" / target_corpus_id / "manifest.json"),
+        "reused_label_sets": reused,
+        "summary": summary,
+    }
+    _atomic_json(collection_dir / "manifest.json", collection_manifest)
+    _atomic_json(collection_dir / "summary.json", summary)
+    _activate_collection(target_corpus["corpus_id"],
+                         collection["collection_id"])
+    results_vol.commit()
+    print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
+    return json.dumps(summary, sort_keys=True)
+
+
 @app.local_entrypoint()
 def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
-         only: str | None = None, finalize_from: str | None = None):
+         only: str | None = None, finalize_from: str | None = None,
+         reuse_from_collection: str | None = None,
+         relabeled_workloads: str = "lepard",
+         target_corpus: str | None = None):
     """Run the four workloads side by side, then activate the result.
 
     ``--only imdb,fever`` restricts the pass to those workloads; the
@@ -1198,12 +1388,25 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
         print(f"function call id: {call.object_id}", flush=True)
         print(call.get(), flush=True)
         return
-    print(f"PREDICTION: {PREDICTION}", flush=True)
+    prediction = REUSE_PREDICTION if reuse_from_collection else PREDICTION
+    print(f"PREDICTION: {prediction}", flush=True)
 
-    call = prepare_corpus.spawn(sf)
-    print(f"function call id (prepare_corpus): {call.object_id}", flush=True)
-    prepared = json.loads(call.get())
-    corpus_id = prepared["corpus"]["corpus_id"]
+    if reuse_from_collection and target_corpus:
+        corpus_id = target_corpus
+        prepared = None
+    else:
+        call = prepare_corpus.spawn(sf)
+        print(f"function call id (prepare_corpus): {call.object_id}",
+              flush=True)
+        prepared = json.loads(call.get())
+        corpus_id = prepared["corpus"]["corpus_id"]
+    if reuse_from_collection:
+        call = activate_reused_collection.spawn(
+            sf, corpus_id, reuse_from_collection, relabeled_workloads)
+        print("function call id (activate_reused_collection): "
+              f"{call.object_id}", flush=True)
+        print(call.get(), flush=True)
+        return
     if finalize_from:
         partials = {}
         for workload, function_call_id in parse_function_calls(

@@ -1163,8 +1163,9 @@ GPUs (`worker.py:495-519`).
 
 QUAIL-B (`bench/quailb.py`) has 30 queries over four document sets
 (IMDB, BioDEX, FEVER, LePaRD), plus 2 optional PrivacyPolicies
-queries. All predicates are natural-language questions answered by
-Qwen3 32B during the judge pass; ground truth covers 22 predicates.
+queries. Qwen3 32B answers the filter predicates during the judge pass.
+The FEVER annotations and sampled LePaRD citation edges provide source labels
+for known join pairs. Ground truth covers 22 predicates.
 
 ### Document tables
 
@@ -1173,8 +1174,15 @@ Qwen3 32B during the judge pass; ground truth covers 22 predicates.
 | reviews | `stanfordnlp/imdb` | 50,000 | Movie reviews |
 | reports | `BioDEX/BioDEX-Reactions` | 5,000 | Medical case reports |
 | claims | `fever/fever` | 5,000 | Factual claims (train + labelled_dev) |
-| citations | `rmahari/LePaRD` | 2,000 | Legal citation excerpts |
+| citation_contexts | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Legal citation excerpts |
+| citation_passages | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Cited legal passages |
 | policies | `mukund/PrivacyPolicies` | 1,000,000 | Privacy policies (optional) |
+
+LePaRD first samples known citation pairs with a stable hash. At scale factor
+0.1, it samples 500 pairs. It then deduplicates the context text and passage
+text into separate tables, which produce 500 context rows and 433 passage rows.
+The source join label is true when a context's cited passage IDs intersect a
+passage row's passage IDs.
 
 Partner tables (fixed vocabulary, not scaled by SF):
 - **aspects** (12 rows): film aspects ("the acting", "the plot", ...)
@@ -1190,19 +1198,20 @@ graph LR
         reviews["reviews (50K)"]
         reports["reports (10K)"]
         claims["claims (5K)"]
-        citations["citations (2K)"]
+        citation_contexts["citation_contexts"]
         policies["policies (1M, optional)"]
     end
     subgraph Partner tables
         aspects["aspects (12)"]
         terms["terms (~6K)"]
         evidence["evidence"]
+        citation_passages["citation_passages"]
         scenarios["scenarios (100)"]
     end
     reviews -- "DISCUSS_ASPECT / ASPECT_SENTIMENT" --> aspects
     reports -- "REACTION" --> terms
     claims -- "SUPPORT / REFUTE" --> evidence
-    citations -- "LEPJOIN (self-join)" --> citations
+    citation_contexts -- "LEPJOIN" --> citation_passages
     policies -. "SCENARIO_MATCH" .-> scenarios
 ```
 
@@ -1250,11 +1259,11 @@ graph LR
 | Query | Shape | Description |
 |---|---|---|
 | LEP-1 | 1F | LEP1 (reasoning does not apply) |
-| LEP-2 | 1J | self-join (LEPJOIN) |
-| LEP-3 | 1F + 1J | LEP1 then self-join |
-| LEP-4 | 2F + 1J | LEP1 + LEP2 then self-join |
-| LEP-5 | 3F + 1J | LEP1..LEP3 then self-join |
-| LEP-6 | 5F + 1J | LEP1..LEP5 then self-join |
+| LEP-2 | 1J | citation contexts joined with citation passages |
+| LEP-3 | 1F + 1J | LEP1 then join |
+| LEP-4 | 2F + 1J | LEP1 + LEP2 then join |
+| LEP-5 | 3F + 1J | LEP1..LEP3 then join |
+| LEP-6 | 5F + 1J | LEP1..LEP5 then join |
 | LEP-7 | 2F + 1J two-sided | LEP1 + LEP2 on excerpts, LEPS1 on passages |
 | LEP-8 | 5F | LEP1..LEP5, no join |
 
@@ -1273,15 +1282,19 @@ benchmark runner or judge pass.
 
 Every filter and join carries a fixed selectivity estimate. The estimates
 come from the active sf0.1 Qwen3 32B fp8 collection
-`gt_02ffa2a5720006e8236aa993760e9e29` for corpus
-`c_d7a294f1a0d83293b31ed8519df4262e`. Planning does not read the ground
+`gt_363b5ab570635c33894e1a030c21f57e` for corpus
+`c_3bd14ed0758287cba9d88fb68de8b7b8`. Planning does not read the ground
 truth labels.
 
 The source collection is
-`/results/ground_truth/quailb/schema_v1/collections/gt_02ffa2a5720006e8236aa993760e9e29/manifest.json`
+`/results/ground_truth/quailb/schema_v1/collections/gt_363b5ab570635c33894e1a030c21f57e/manifest.json`
 on the `quail-results` volume. Each builder query ends with
 `.select(..., order="by_cost")`, so the benchmark exercises the planner's
-filter and join ordering.
+filter and join ordering. The collection reuses 15 IMDB, BioDEX, and FEVER
+label sets from the prior corpus. The collection manifest records the source
+collection and the unchanged table manifests for every reused label set. The
+loader checks those table manifests before it accepts the collection. The
+seven LePaRD label sets belong directly to the current corpus.
 
 ### Protocol and reported values
 

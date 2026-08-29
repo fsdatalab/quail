@@ -85,7 +85,7 @@ document and uses the exact page count.
 
 The SoL accounting credited filter-to-join KV reuse the engine did
 not perform, and the committed SoL report
-(`reports/2026-08-26-sol-quailb.md`, data at
+(`reports/old/2026-08-26-sol-quailb.md`, data at
 `/results/sol/sol_quailb_sf0.1.json` on the quail-results volume)
 measured the plan-choice half of the remaining gap: seven of nine
 multi-join queries improve under the exact left deep search, FEV-8
@@ -109,7 +109,7 @@ Measured, on the source branch of the retention runtime: one H100!
 check of a filter followed by two joins retained all 7 filter
 survivors, hit all 7 at the report-anchored join, evicted nothing,
 and matched a separate CPU recombination row for row
-(`reports/2026-08-26-filter-join-kv-retention.md`, data at
+(`reports/old/2026-08-26-filter-join-kv-retention.md`, data at
 `/results/runs/run_1787795777696587173.json`). That check ran the
 lifecycle this branch ports verbatim, under the worker it was built
 in. The merged worker re-integrates it and needs its own run. The
@@ -122,7 +122,7 @@ anchor hits and misses, evictions with their summed value) and
 `join_optimizer` block (search size, chosen sequence) are what to
 check against the prediction.
 
-The SoL floor does not change. The exact values for all 35 queries
+The SoL calculation does not change. The values for all 35 queries
 and both models match the previous output field by field. The SoL
 script no longer calls or simulates the production planner. Its
 full local run decreased from 59.13 seconds to 18.01 seconds.

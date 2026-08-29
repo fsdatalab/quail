@@ -8,7 +8,7 @@ change a greedy one-token decode, but they were hashed into
 them moved all 23 label sets without changing a single answer. It
 migrated 15 filter predicates and 17,057 labels; the 8 join predicates
 needed a real relabel because their own ``predicate_version`` had
-moved. See ``reports/2026-08-26-bio6-full-terms-and-judge-identity.md``.
+moved. See ``migrations/README.md``.
 
 Kept for the record and reusable the next time a field that cannot
 change an answer leaves ``JUDGE_SPEC``.

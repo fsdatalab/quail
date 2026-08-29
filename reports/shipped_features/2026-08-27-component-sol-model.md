@@ -55,7 +55,7 @@ scope.
 
 The values are analytical. No GPU run was needed. The result data is at
 `/results/sol/sol_quailb_sf0.1.json` on the `quail-results` volume. The full
-table and plots are in `reports/2026-08-26-sol-quailb.md`.
+table and plots are in `reports/old/2026-08-26-sol-quailb.md`.
 
 ## Verification
 

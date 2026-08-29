@@ -27,8 +27,9 @@ CORPUS_COLUMNS = {
     "terms": ("id", "term"),
     "claims": ("id", "claim", "label", "evidence_wiki_url"),
     "evidence": ("id", "text"),
-    "citations": ("id", "destination_context", "passage_text",
-                  "passage_id"),
+    "citation_contexts": ("id", "destination_context",
+                          "cited_passage_ids"),
+    "citation_passages": ("id", "passage_text", "passage_ids"),
 }
 
 
@@ -297,6 +298,90 @@ def load_ground_truth(files, scale_factor: float = 0.1,
     return _load_ground_truth_collection(files, collection)
 
 
+def _predicate_tables(predicate: dict) -> tuple[str, ...]:
+    tables = {predicate["left_table"]}
+    if predicate["kind"] == "join":
+        tables.add(predicate["right_table"])
+    return tuple(sorted(tables))
+
+
+def _validate_label_set_corpora(files, collection: dict,
+                                manifests: dict[str, dict]) -> None:
+    """Validate every label set against the tables its predicate reads."""
+    target_corpus_id = collection["corpus_id"]
+    reused = collection.get("reused_label_sets", {})
+    corpus_manifests = {}
+    source_collections = {}
+
+    def corpus_manifest(corpus_id):
+        if corpus_id not in corpus_manifests:
+            path = f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}/manifest.json"
+            corpus_manifests[corpus_id] = _read_json(files, path)
+        return corpus_manifests[corpus_id]
+
+    target = None
+    for key, manifest in manifests.items():
+        source_corpus_id = manifest.get("corpus_id")
+        if not source_corpus_id:
+            continue
+        if source_corpus_id == target_corpus_id:
+            target = target or corpus_manifest(target_corpus_id)
+            if (manifest.get("corpus_full_hash")
+                    and manifest["corpus_full_hash"]
+                    != target["corpus_full_hash"]):
+                raise ValueError(
+                    f"label set {manifest['label_set_id']} has the wrong "
+                    "corpus hash")
+            continue
+
+        record = reused.get(key)
+        if record is None:
+            raise ValueError(
+                f"label set {manifest['label_set_id']} belongs to corpus "
+                f"{source_corpus_id}, not {target_corpus_id}")
+        if record.get("source_corpus_id") != source_corpus_id:
+            raise ValueError(f"reused label set {key} has the wrong source")
+
+        source_collection_id = record.get("source_collection_id")
+        if not source_collection_id:
+            raise ValueError(
+                f"reused label set {key} has no source collection")
+        if source_collection_id not in source_collections:
+            path = (f"{GROUND_TRUTH_ROOT}/collections/"
+                    f"{source_collection_id}/manifest.json")
+            source_collections[source_collection_id] = _read_json(files, path)
+        source_collection = source_collections[source_collection_id]
+        if (source_collection.get("status") != "complete"
+                or source_collection.get("corpus_id") != source_corpus_id
+                or source_collection.get("label_sets", {}).get(key)
+                != manifest["label_set_id"]):
+            raise ValueError(
+                f"source collection {source_collection_id} does not "
+                f"contain reused label set {key}")
+
+        required = _predicate_tables(manifest["predicate"])
+        if tuple(record.get("required_tables", ())) != required:
+            raise ValueError(
+                f"reused label set {key} lists the wrong required tables")
+        target = target or corpus_manifest(target_corpus_id)
+        source = corpus_manifest(source_corpus_id)
+        if (manifest.get("corpus_full_hash")
+                and manifest["corpus_full_hash"]
+                != source["corpus_full_hash"]):
+            raise ValueError(
+                f"reused label set {key} has the wrong source corpus hash")
+        for table in required:
+            recorded = record.get("verified_table_manifests", {}).get(table)
+            if recorded != source["tables"].get(table):
+                raise ValueError(
+                    f"reused label set {key} has the wrong saved manifest "
+                    f"for table {table}")
+            if source["tables"].get(table) != target["tables"].get(table):
+                raise ValueError(
+                    f"cannot reuse {key}: table {table} changed between "
+                    f"{source_corpus_id} and {target_corpus_id}")
+
+
 def _load_ground_truth_collection(files, collection: dict
                                   ) -> GroundTruthCollection:
     wanted = collection["label_sets"]
@@ -315,6 +400,7 @@ def _load_ground_truth_collection(files, collection: dict
         key: json.loads(manifest_bytes[path])
         for key, path in manifest_paths.items()
     }
+    _validate_label_set_corpora(files, collection, manifests)
     data_paths = {}
     for key, label_set_id in sorted(wanted.items()):
         manifest_path = manifest_paths[key]

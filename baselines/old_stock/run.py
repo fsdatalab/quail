@@ -1,7 +1,9 @@
-"""vLLM-opbench orchestrator: drives WorkerH100 over queries built from
-Quail's document sets and predicates. Runs entirely on Modal.
+"""Legacy vLLM operator benchmark.
 
-    uv run modal run -m baselines.vllm_opbench.run::main
+The current QuailB benchmark does not import or run this package. This package
+is kept only to reproduce its older experiment manually.
+
+    uv run modal run -m baselines.old_stock.run
 """
 
 import json

@@ -8,13 +8,13 @@ queries can request the same behavior with
 `.select(..., order="by_cost")`.
 
 The estimates are the TRUE fraction from the sf0.1 Qwen3 32B fp8 labels in
-collection `gt_02ffa2a5720006e8236aa993760e9e29` for corpus
-`c_d7a294f1a0d83293b31ed8519df4262e`. The benchmark uses the same estimates
+collection `gt_363b5ab570635c33894e1a030c21f57e` for corpus
+`c_3bd14ed0758287cba9d88fb68de8b7b8`. The benchmark uses the same estimates
 at every scale factor. A benchmark run does not read ground truth while
 planning.
 
 The source collection is
-`/results/ground_truth/quailb/schema_v1/collections/gt_02ffa2a5720006e8236aa993760e9e29/manifest.json`
+`/results/ground_truth/quailb/schema_v1/collections/gt_363b5ab570635c33894e1a030c21f57e/manifest.json`
 on the `quail-results` volume.
 
 ## Why

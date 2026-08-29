@@ -88,7 +88,11 @@ def run_query_family(
     ground_truth_collection: str,
 ) -> str:
     from baselines.stock_vllm.run import BASELINES, _run_query_batches
-    from quail.bench.quailb import query_family_name, run_suite
+    from quail.bench.quailb import (
+        SELECTIVITY_ESTIMATE_COLLECTION,
+        query_family_name,
+        run_suite,
+    )
     from quail.runtime.worker import (
         _execute_payload,
         release_booted_models,
@@ -98,6 +102,7 @@ def run_query_family(
         query_id.strip() for query_id in query_ids_csv.split(",")
         if query_id.strip())
     family = query_family_name(query_ids)
+    collection = ground_truth_collection or SELECTIVITY_ESTIMATE_COLLECTION
     out_path = (
         f"/results/benchmarks/quailb/families/{run_label}/"
         f"{family}-quail.json")
@@ -114,7 +119,8 @@ def run_query_family(
         out_path=out_path,
         model=model,
         accuracy=True,
-        ground_truth_collection=ground_truth_collection or None,
+        ground_truth_collection=collection,
+        ground_truth_workload=None,
         prediction=prediction,
         artifact_stem=f"{run_label}-{family}-quail",
         execute=_execute_payload,
@@ -146,12 +152,13 @@ def run_query_family(
         paired_run_id=run_label,
         lf=lf,
         method_order="method-major",
-        ground_truth_collection=ground_truth_collection,
+        ground_truth_collection=collection,
     )
     family_result = {
         "query_family": family,
         "query_ids": list(query_ids),
         "ground_truth_collection": suite["ground_truth"]["collection_id"],
+        "ground_truth_workload": None,
         "gpu": "H100!",
         "same_modal_container": True,
         "engine_order": ["quail", "vllm_baselines"],

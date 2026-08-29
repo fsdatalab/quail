@@ -13,6 +13,8 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+from quail.bench.quailb import QUERY_ORDER
+
 sys.path.insert(0, str(Path(__file__).parent))
 from plot_colors import BLUE, DARK, ORANGE  # noqa
 
@@ -23,7 +25,13 @@ plt.style.use(Path(__file__).parent / "quail.mplstyle")
 W = Path(sys.argv[1])
 D = json.loads((W / "sol_quailb_sf0.1.json").read_text())
 Q = D["queries"]
-ORDER = list(Q)
+ORDER = list(QUERY_ORDER)
+if set(Q) != set(ORDER):
+    missing = sorted(set(ORDER) - set(Q))
+    extra = sorted(set(Q) - set(ORDER))
+    raise ValueError(
+        f"SoL input does not match current queries; missing={missing}, "
+        f"extra={extra}")
 MODELS = ("qwen3-4b-fp8", "qwen3-32b-fp8")
 ATTENTION_ORDER = [query_id for query_id in ORDER
                    if all(len(Q[query_id]["models"][model]["join_stages"])
@@ -54,10 +62,12 @@ def plot_sol_per_query():
                   "(log scale, 4 orders of magnitude)")
     ax.set_xticks(list(x))
     ax.set_xticklabels(ORDER, rotation=90, fontsize=7)
-    ax.set_ylim(0.015, 600)
+    positive = a + b
+    ax.set_ylim(min(positive) / 2, max(positive) * 4)
     ax.legend(frameon=False, loc="upper right", fontsize=8)
     fig.tight_layout()
-    fig.savefig(OUT / "sol_quailb_per_query.png", dpi=300)
+    fig.savefig(OUT / "sol_quailb_per_query.png", dpi=150)
+    plt.close(fig)
 
 
 # Each context length, the document set it comes from, and where to
@@ -132,7 +142,8 @@ def plot_attention_share():
     ax.set_ylabel("attention share of compute, percent")
     ax.legend(frameon=False, loc="upper left", fontsize=8.5)
     fig.tight_layout()
-    fig.savefig(OUT / "sol_quailb_attention_share.png", dpi=300)
+    fig.savefig(OUT / "sol_quailb_attention_share.png", dpi=150)
+    plt.close(fig)
 
 
 OUT.mkdir(exist_ok=True)
