@@ -8,7 +8,7 @@ as the first argument to this script. For example, with ``W=/tmp/quail-pr52``:
     modal volume get quail-results /stock_quailb/2026-08-26_202641_qwen3-4b-fp8/summary.json $W/stock-4b.json
     modal volume get quail-results /stock_quailb/2026-08-26_202641_qwen3-32b-fp8/summary.json $W/stock-32b.json
     modal volume get quail-results /sol/sol_quailb_sf0.1.json $W/sol.json
-    uv run --with matplotlib python reports/make_stock_vllm_plots.py $W
+    uv run --with matplotlib python reports/old/make_stock_vllm_plots.py $W
 """
 
 import json
@@ -22,10 +22,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
+REPORTS = HERE.parent
 OUT = HERE / "plots"
 
-plt.style.use(HERE / "quail.mplstyle")
-sys.path.insert(0, str(HERE))
+plt.style.use(REPORTS / "quail.mplstyle")
+sys.path.insert(0, str(REPORTS))
 from plot_colors import BLUE, DARK, GRAY, ORANGE  # noqa: E402
 
 OUTPUT_SCALE = 2

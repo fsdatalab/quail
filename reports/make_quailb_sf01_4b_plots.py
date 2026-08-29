@@ -10,7 +10,7 @@ work directory to this script:
     modal volume get quail-results benchmarks/quailb/runs/qb_20260829T212047Z_dd7f1686/20260829T212047Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail_lepard.json
     modal volume get quail-results stock_vllm/20260829T212047Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_lepard.json
     modal volume get quail-results pipelined_vllm/20260829T212047Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_lepard.json
-    modal volume get quail-results benchmarks/quailb/family-runs/20260829T212047Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/sol.json $W/sol.json
+    modal volume get quail-results /sol/sol_quailb_sf0.1.json $W/sol.json
     uv run --with matplotlib python reports/make_quailb_sf01_4b_plots.py $W
 """
 
@@ -319,9 +319,112 @@ def make_metrics_plot(order, results, records):
     print(f"wrote {output}")
 
 
+def _per_query_throughput(query_ids, order, results, records, has_joins):
+    index_by_query = {query: index for index, query in enumerate(order)}
+    values = {}
+    for system in SYSTEMS:
+        system_values = []
+        for query in query_ids:
+            seconds = results[system][index_by_query[query]]
+            work = query_work(system, records[system][query], has_joins)
+            if not np.isfinite(seconds):
+                system_values.append(np.nan)
+            else:
+                system_values.append(work / seconds)
+        values[system] = np.asarray(system_values, dtype=float)
+    return values
+
+
+def _grouped_bars(ax, labels, values_by_system, ylabel, log_scale):
+    colors = (GRAY, BLUE, ORANGE, TEAL)
+    x = np.arange(len(labels), dtype=float)
+    width = 0.2
+    offsets = (np.arange(len(SYSTEMS)) - 1.5) * width
+    for system, color, offset in zip(SYSTEMS, colors, offsets):
+        values = np.asarray(values_by_system[system], dtype=float)
+        positive = np.isfinite(values) & (values > 0)
+        ax.bar(x[positive] + offset, values[positive], width=width,
+               color=color, label=system)
+        for index in np.flatnonzero(~np.isfinite(values)):
+            ax.text(x[index] + offset, 0.01, "not\nmeasured", rotation=90,
+                    ha="center", va="bottom", fontsize=5.5, color=DARK,
+                    transform=ax.get_xaxis_transform())
+        for index in np.flatnonzero(values == 0):
+            ax.text(x[index] + offset, 0.01, "0", ha="center", va="bottom",
+                    fontsize=6, color=DARK,
+                    transform=ax.get_xaxis_transform())
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=90, ha="center")
+    if log_scale:
+        positive = np.concatenate([
+            values[np.isfinite(values) & (values > 0)]
+            for values in values_by_system.values()
+        ])
+        ax.set_yscale("log")
+        ax.set_ylim(positive.min() / 1.8, positive.max() * 2.2)
+
+
+def make_per_query_plot(order, results, records):
+    runtime = {
+        system: np.asarray(results[system], dtype=float)
+        for system in SYSTEMS
+    }
+    filter_queries = [
+        query for query in order
+        if query_kind(records["SoL estimate"][query]) == "filter only"
+    ]
+    join_queries = [
+        query for query in order
+        if query_kind(records["SoL estimate"][query]) != "filter only"
+    ]
+    filter_throughput = _per_query_throughput(
+        filter_queries, order, results, records, has_joins=False)
+    join_throughput = _per_query_throughput(
+        join_queries, order, results, records, has_joins=True)
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(16, 14),
+        gridspec_kw={"height_ratios": (1.15, 0.8, 1.0)},
+    )
+    _grouped_bars(
+        axes[0], order, runtime,
+        "seconds per query (log scale)", log_scale=True)
+    axes[0].set_title("Runtime and H100! cost for every query")
+    dollars = axes[0].secondary_yaxis(
+        "right",
+        functions=(
+            lambda seconds: seconds * H100_USD_PER_HOUR / 3600,
+            lambda cost: cost * 3600 / H100_USD_PER_HOUR,
+        ),
+    )
+    dollars.set_ylabel("USD per query")
+
+    _grouped_bars(
+        axes[1], filter_queries, filter_throughput,
+        "documents per full-query second (log scale)", log_scale=True)
+    axes[1].set_title("Filter only queries")
+
+    _grouped_bars(
+        axes[2], join_queries, join_throughput,
+        "evaluated document pairs per full-query second (log scale)",
+        log_scale=True)
+    axes[2].set_title("Queries containing a join")
+    axes[0].legend(
+        loc="lower center", bbox_to_anchor=(0.5, 1.14), ncol=4)
+
+    fig.tight_layout(h_pad=2.4)
+    OUT.mkdir(exist_ok=True)
+    output = OUT / "quailb_sf01_4b_per_query.png"
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
+    print(f"wrote {output}")
+
+
 def main(workdir):
     order, results, records = load_inputs(workdir)
     make_metrics_plot(order, results, records)
+    make_per_query_plot(order, results, records)
     print_metrics(order, results, records)
 
 

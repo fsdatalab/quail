@@ -398,10 +398,10 @@ correlated with document length.
   LEP3, LEP1, LEP4, then LEP2. The first two filters leave 2 documents and
   LEP1 leaves none. The join in LEP-6 therefore evaluates no pairs.
 - **The separate baseline report compares six of these floors with
-  measured wall time.** See `reports/2026-08-26-stock-vllm-joins.md`.
+  measured wall time.** See
+  `reports/old/2026-08-26-stock-vllm-joins.md`.
 
 ## Rebuild
 
-Run `reports/make_sol_quailb_plots.py` from the repository root. Its docstring
-contains the `modal volume get` command and the plotting command needed to
-rebuild both figures from `/results/sol/sol_quailb_sf0.1.json`.
+This report is historical. The current script and current volume file cover
+the 30-query suite, so they do not rebuild this 35-query snapshot.

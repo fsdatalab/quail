@@ -6,7 +6,7 @@ Rebuild from the repository root:
     modal volume get quail-results \
       /runs/run_1787795777696587173.json $W/
     uv run --with matplotlib python \
-      reports/make_filter_join_kv_retention_plots.py $W
+      reports/old/make_filter_join_kv_retention_plots.py $W
 """
 
 import json
@@ -15,6 +15,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from plot_colors import BLUE, DARK, GREEN
 
 
@@ -25,7 +26,7 @@ def main(workdir: Path) -> None:
     retained = kv["retained_after_filters"]
     reused = kv["join_anchor_hits"]
 
-    plt.style.use(Path(__file__).parent / "quail.mplstyle")
+    plt.style.use(Path(__file__).resolve().parents[1] / "quail.mplstyle")
     fig, ax = plt.subplots(figsize=(5.2, 3.2))
     bars = ax.bar(
         ["Passed filter and\nretained in KV", "Reused by\nthe join"],

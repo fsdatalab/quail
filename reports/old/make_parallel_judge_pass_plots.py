@@ -1,8 +1,8 @@
 """Parallel judge-pass plots.
 
 Reads the two ground-truth collection summaries off the quail-results
-volume and writes reports/plots/judge_pass_selectivity.png and
-reports/plots/judge_pass_wall.png. Everything else on the plots is
+volume and writes reports/old/plots/judge_pass_selectivity.png and
+reports/old/plots/judge_pass_wall.png. Everything else on the plots is
 derived here: percentages, wall time after boot, and the serial
 reconstruction.
 
@@ -13,9 +13,9 @@ reconstruction.
     modal volume get quail-results \
         $C/gt_42674891c824e01c6d966eb48c9cf8c7/summary.json $W/before.json
     uv run --with matplotlib python \
-        reports/make_parallel_judge_pass_plots.py $W
+        reports/old/make_parallel_judge_pass_plots.py $W
 
-The report is reports/2026-08-26-parallel-judge-pass.md.
+The report is reports/old/2026-08-26-parallel-judge-pass.md.
 """
 
 import json
@@ -27,15 +27,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[0]
+REPORTS = HERE.parent
+ROOT = REPORTS.parent
 OUT = HERE / "plots"
 OUT.mkdir(exist_ok=True)
 
-plt.style.use(HERE / "quail.mplstyle")
-sys.path.insert(0, str(HERE))
+plt.style.use(REPORTS / "quail.mplstyle")
+sys.path.insert(0, str(REPORTS))
 sys.path.insert(0, str(ROOT))
-from plot_colors import BLUE, GRAY, LIGHT_GRAY, ORANGE, DARK
-from quail.bench.judge_pass import PREDICATE_BY_KEY
+from plot_colors import BLUE, DARK, GRAY, LIGHT_GRAY, ORANGE  # noqa: E402
+from quail.bench.judge_pass import PREDICATE_BY_KEY  # noqa: E402
 
 W = Path(sys.argv[1])
 AFTER = json.loads((W / "after.json").read_text())

@@ -54,7 +54,6 @@ vllm_image = (
     # add_local_* must be last: Modal requires it after every build step.
     # The whole baselines package is mounted, not individual files.
     .add_local_python_source("baselines")
-    .add_local_python_source("quail")
 )
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache",
@@ -453,30 +452,3 @@ class WorkerH100:
             prompt_token_ids, true_ids, false_ids, max_tokens,
             poll_interval_s, do_profile, profile_name,
             block_size=self._resolved_block_size)
-
-    @modal.method()
-    def generate_stock_join_batch(self, prefixes: list[list[int]],
-                                  suffixes: list[list[int]],
-                                  true_ids: list[int],
-                                  false_ids: list[int]):
-        from baselines.stock import run_join_grouped
-        from vllm import SamplingParams
-
-        allowed = sorted(set(true_ids) | set(false_ids))
-        sampling = SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            min_tokens=1,
-            allowed_token_ids=allowed,
-        )
-        self.llm.reset_prefix_cache()
-        result = run_join_grouped(
-            self.llm, sampling, prefixes, suffixes, set(true_ids))
-        return {
-            **result,
-            "gpu": self.GPU,
-            "quantization": self.quantization,
-            "max_num_seqs": self.max_num_seqs,
-            "max_num_batched_tokens": self.max_num_batched_tokens,
-            "block_size": self._resolved_block_size,
-        }
