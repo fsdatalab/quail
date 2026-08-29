@@ -683,9 +683,9 @@ worker:
   suffix pages. On the 10 x 256 confirming run, packed unified took
   11.88 microseconds per fresh token. `merge_quant` took 11.04
   microseconds per fresh token, so packed unified was 7.6% slower
-  (`results/packed_unified_join.json`).
+  (measurement cells and data removed in the 2026-08-29 ablation cleanup; git history).
 - **Both paths are validated against stock vLLM on real queries**
-  (`results/accuracy_vs_stock.json`): identical token streams
+  (measurement cells and data removed in the 2026-08-29 ablation cleanup; git history): identical token streams
   answered by standard vLLM serving and by the packed executor.
   Planted-flag accuracy is 100% for every path; disagreements with
   stock are 0.22% on filters and confined to near-zero
@@ -694,7 +694,7 @@ worker:
   decisive margins. The residual is the kernel stack (fp8 GEMMs,
   fused norms), not the attention path.
 - **The existing assignment also holds on Qwen3 32B fp8.** The
-  earlier battery (`results/*_32b.json`, `results/*_64h.json`):
+  earlier battery (measurement cells and data removed in the 2026-08-29 ablation cleanup; git history):
   unified 59.94 us/token vs merge_quant 60.35 on the 10k filter
   workload with identical answers; kernel parity is bit-identical at
   64 query heads; both paths are exact against full
@@ -707,7 +707,7 @@ worker:
   merge_quant on joins, and its cascade wrapper (the shared-prefix
   decomposition, single-anchor shapes only) is 21% slower. Nothing
   came within the 5% adoption threshold
-  (`results/flashinfer_tuned.json`).
+  (measurement cells and data removed in the 2026-08-29 ablation cleanup; git history).
 
 The `merge_quant` two-call pattern runs per layer as follows
 (`attention.py`):
@@ -885,11 +885,9 @@ and the block-table indirection.
 
 The two quail paths answer identically: the kernel-parity cells
 measured the unified paged causal call bit-identical to the
-contiguous causal call the fast path runs
-(`results/attention_parity.json`), and the m1_filter1 cell gates on
-0 answer flips across the full 10,000-document workload (the cell
-also records the A/B walls; see
-`reports/2026-08-22-single-stage-fast-path.md`).
+contiguous causal call the fast path runs, with 0 answer flips at
+scale (measurement cells and data removed in the 2026-08-29
+ablation cleanup; git history).
 
 **`run_join`** (`loop.py:216`): the join driver. The pair list is
 pre-planned by `pack_stream`, then chunks are launched in order.

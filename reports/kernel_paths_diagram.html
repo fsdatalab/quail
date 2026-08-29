@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Per-layer kernels: vLLM unfused, vLLM compiled, Quail unified, Quail merge_quant</title>
+<style>
+  :root {
+    /* Wong (2011) colorblind-safe palette — light fills, full-hue borders */
+    --gemm: #D0E4F2; --gemm-b: #0072B2;
+    --fa3: #FDE7C2; --fa3-b: #E69F00;
+    --kv: #D6EEFB; --kv-b: #56B4E9;
+    --vl: #E5E5E5; --vl-b: #666;
+    --ind: #F0D8E8; --ind-b: #CC79A7;
+    --ql: #C6EDDF; --ql-b: #009E73;
+    --ink: #111827; --mt: #6B7280; --bd: #D1D5DB; --bg: #F8F9FA;
+    --arr: #9CA3AF;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font: 13px/1.3 -apple-system, "Segoe UI", Roboto, Helvetica,
+          Arial, sans-serif;
+    color: var(--ink); background: #fff;
+    padding: 20px 24px; width: 1480px;
+  }
+  h1 { font-size: 15px; margin-bottom: 16px; }
+
+  .g {
+    display: grid;
+    grid-template-columns: 94px repeat(4, 1fr);
+    column-gap: 14px;
+  }
+
+  /* Column header */
+  .hd {
+    padding: 10px 8px; text-align: center; font-weight: 700;
+    font-size: 12.5px; background: var(--bg);
+    border: 1px solid var(--bd);
+    border-radius: 8px 8px 0 0;
+    border-bottom: 2px solid var(--bd);
+  }
+  .hd .n {
+    display: block; font-weight: 400; font-size: 11px;
+    color: var(--mt); margin-top: 2px;
+  }
+
+  /* Gutter label */
+  .op {
+    display: flex; align-items: center; justify-content: flex-end;
+    font-size: 10.5px; color: var(--mt); text-align: right;
+    padding-right: 8px; line-height: 1.25;
+  }
+
+  /* Column cell */
+  .c {
+    background: var(--bg);
+    border-left: 1px solid var(--bd);
+    border-right: 1px solid var(--bd);
+    padding: 5px 10px;
+    display: flex; flex-direction: column; gap: 3px;
+  }
+
+  /* Arrow cell */
+  .ar {
+    background: var(--bg);
+    border-left: 1px solid var(--bd);
+    border-right: 1px solid var(--bd);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    height: 18px;
+  }
+  .ar::before {
+    content: ''; width: 1.5px; height: 8px;
+    background: var(--arr);
+  }
+  .ar::after {
+    content: ''; width: 0; height: 0;
+    border-left: 3.5px solid transparent;
+    border-right: 3.5px solid transparent;
+    border-top: 5px solid var(--arr);
+  }
+
+  /* Taller arrow between attention and MLP blocks */
+  .ar.gap { height: 26px; }
+  .ar.gap::before { height: 14px; }
+
+  /* Column footer */
+  .ft {
+    background: var(--bg);
+    border: 1px solid var(--bd);
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+    height: 8px;
+  }
+
+  /* Kernel block */
+  .k {
+    border-radius: 5px; padding: 6px 10px;
+    font: 11.5px/1.3 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    text-align: center; border: 1.5px solid;
+  }
+  .gemm { background: var(--gemm); border-color: var(--gemm-b); }
+  .fa3  { background: var(--fa3);  border-color: var(--fa3-b); }
+  .kv   { background: var(--kv);   border-color: var(--kv-b); }
+  .vl   { background: var(--vl);   border-color: var(--vl-b); }
+  .ind  { background: var(--ind);  border-color: var(--ind-b); }
+  .ql   { background: var(--ql);   border-color: var(--ql-b); }
+
+  /* Legend */
+  .legend {
+    display: flex; gap: 18px; margin-top: 16px;
+    font-size: 12px; flex-wrap: wrap; color: #374151;
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .ch {
+    width: 14px; height: 14px; border-radius: 4px;
+    display: inline-block; border: 1.5px solid;
+  }
+
+  .note {
+    color: var(--mt); font-size: 11px; margin-top: 12px;
+    max-width: 1100px; line-height: 1.4;
+  }
+</style>
+</head>
+<body>
+
+<h1>Kernels per layer &mdash; Qwen3 4B fp8, one H100</h1>
+
+<div class="g">
+
+  <!-- Column headers -->
+  <div></div>
+  <div class="hd">vLLM ops, unfused<span class="n">18 launches / layer</span></div>
+  <div class="hd">vLLM compiled set<span class="n">15 launches / layer</span></div>
+  <div class="hd">Quail &mdash; unified<span class="n">11 launches / layer</span></div>
+  <div class="hd">Quail &mdash; merge_quant<span class="n">13 launches / layer</span></div>
+
+  <!-- add + norm + quant (attention input) -->
+  <div class="op">add + norm<br>+ quant</div>
+  <div class="c">
+    <div class="k vl">fused_add_rms_norm</div>
+    <div class="k vl">per_token_group_quant_8bit</div>
+  </div>
+  <div class="c">
+    <div class="k ind">triton_red_fused_add_rms_norm</div>
+    <div class="k vl">per_token_group_quant_8bit</div>
+  </div>
+  <div class="c"><div class="k ql">add_rms_norm_quant</div></div>
+  <div class="c"><div class="k ql">add_rms_norm_quant</div></div>
+
+  <div></div><div class="ar"></div><div class="ar"></div><div class="ar"></div><div class="ar"></div>
+
+  <!-- QKV matmul -->
+  <div class="op">QKV matmul</div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (qkv_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (qkv_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (qkv_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (qkv_proj)</div></div>
+
+  <div></div><div class="ar"></div><div class="ar"></div><div class="ar"></div><div class="ar"></div>
+
+  <!-- Q/K norms + rotary -->
+  <div class="op">Q/K norms<br>+ rotary</div>
+  <div class="c">
+    <div class="k vl">copy (q)</div>
+    <div class="k vl">copy (k)</div>
+    <div class="k vl">rms_norm (q heads)</div>
+    <div class="k vl">rms_norm (k heads)</div>
+    <div class="k vl">rotary_embedding</div>
+  </div>
+  <div class="c">
+    <div class="k ind">triton_red_fused (q/k norms)</div>
+    <div class="k ind">triton_poi_fused (rotary)</div>
+  </div>
+  <div class="c"><div class="k ql">qk_norm_rope</div></div>
+  <div class="c"><div class="k ql">qk_norm_rope</div></div>
+
+  <div></div><div class="ar"></div><div class="ar"></div><div class="ar"></div><div class="ar"></div>
+
+  <!-- KV page write -->
+  <div class="op">KV page write</div>
+  <div class="c"><div class="k kv">kv_row_scatter</div></div>
+  <div class="c"><div class="k kv">kv_row_scatter</div></div>
+  <div class="c"><div class="k kv">kv_row_scatter</div></div>
+  <div class="c"><div class="k kv">kv_row_scatter</div></div>
+
+  <div></div><div class="ar"></div><div class="ar"></div><div class="ar"></div><div class="ar"></div>
+
+  <!-- Attention -->
+  <div class="op">attention</div>
+  <div class="c"><div class="k fa3">flash_attn_varlen (paged, causal)</div></div>
+  <div class="c"><div class="k fa3">flash_attn_varlen (paged, causal)</div></div>
+  <div class="c"><div class="k fa3">flash_attn_varlen (paged, causal)</div></div>
+  <div class="c">
+    <div class="k fa3">flash_attn_varlen (causal)</div>
+    <div class="k vl">index_select (suffix rows)</div>
+    <div class="k fa3">flash_attn_varlen (paged cross)</div>
+  </div>
+
+  <div></div><div class="ar"></div><div class="ar"></div><div class="ar"></div><div class="ar"></div>
+
+  <!-- merge + quant for o_proj -->
+  <div class="op">merge + quant<br>for o_proj</div>
+  <div class="c"><div class="k vl">per_token_group_quant_8bit</div></div>
+  <div class="c"><div class="k vl">per_token_group_quant_8bit</div></div>
+  <div class="c"><div class="k vl">per_token_group_quant_8bit</div></div>
+  <div class="c"><div class="k ql">merge_attn_quant</div></div>
+
+  <div></div><div class="ar"></div><div class="ar"></div><div class="ar"></div><div class="ar"></div>
+
+  <!-- Output matmul -->
+  <div class="op">output matmul</div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (o_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (o_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (o_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (o_proj)</div></div>
+
+  <!-- Taller gap between self-attention and feed-forward blocks -->
+  <div></div><div class="ar gap"></div><div class="ar gap"></div><div class="ar gap"></div><div class="ar gap"></div>
+
+  <!-- add + norm + quant (MLP input) -->
+  <div class="op">add + norm<br>+ quant</div>
+  <div class="c">
+    <div class="k vl">fused_add_rms_norm</div>
+    <div class="k vl">per_token_group_quant_8bit</div>
+  </div>
+  <div class="c">
+    <div class="k ind">triton_red_fused_add_rms_norm</div>
+    <div class="k vl">per_token_group_quant_8bit</div>
+  </div>
+  <div class="c"><div class="k ql">add_rms_norm_quant</div></div>
+  <div class="c"><div class="k ql">add_rms_norm_quant</div></div>
+
+  <div></div><div class="ar"></div><div class="ar"></div><div class="ar"></div><div class="ar"></div>
+
+  <!-- Gate/up matmul -->
+  <div class="op">gate/up matmul</div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (gate_up_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (gate_up_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (gate_up_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (gate_up_proj)</div></div>
+
+  <div></div><div class="ar"></div><div class="ar"></div><div class="ar"></div><div class="ar"></div>
+
+  <!-- SiLU · mul + quant -->
+  <div class="op">silu &middot; mul<br>+ quant</div>
+  <div class="c">
+    <div class="k vl">act_and_mul (silu)</div>
+    <div class="k vl">per_token_group_quant_8bit</div>
+  </div>
+  <div class="c">
+    <div class="k ind">triton_poi_fused_mul_silu</div>
+    <div class="k vl">per_token_group_quant_8bit</div>
+  </div>
+  <div class="c"><div class="k ql">silu_mul_quant</div></div>
+  <div class="c"><div class="k ql">silu_mul_quant</div></div>
+
+  <div></div><div class="ar"></div><div class="ar"></div><div class="ar"></div><div class="ar"></div>
+
+  <!-- Down matmul -->
+  <div class="op">down matmul</div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (down_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (down_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (down_proj)</div></div>
+  <div class="c"><div class="k gemm">sm90_fp8_gemm (down_proj)</div></div>
+
+  <!-- Column footers -->
+  <div></div>
+  <div class="ft"></div>
+  <div class="ft"></div>
+  <div class="ft"></div>
+  <div class="ft"></div>
+
+</div>
+
+<div class="legend">
+  <span><span class="ch" style="background:var(--gemm);border-color:var(--gemm-b)"></span>DeepGEMM matmul</span>
+  <span><span class="ch" style="background:var(--fa3);border-color:var(--fa3-b)"></span>FlashAttention-3</span>
+  <span><span class="ch" style="background:var(--kv);border-color:var(--kv-b)"></span>KV page write</span>
+  <span><span class="ch" style="background:var(--vl);border-color:var(--vl-b)"></span>vLLM op</span>
+  <span><span class="ch" style="background:var(--ind);border-color:var(--ind-b)"></span>Inductor-generated</span>
+  <span><span class="ch" style="background:var(--ql);border-color:var(--ql-b)"></span>Quail fused Triton</span>
+</div>
+
+<p class="note">One layer of 36. The two vLLM columns are drawn on the unified
+path. On the join path they run the merge_quant column's attention
+rows, with gather + merge_attn_states + scatter + quant in place of
+merge_attn_quant.</p>
+
+</body>
+</html>

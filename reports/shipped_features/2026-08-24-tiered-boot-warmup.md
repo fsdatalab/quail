@@ -24,7 +24,7 @@ signature (corpus documents + questions) is gone from all callers
 
 ## Why
 
-The audit (report 2026-08-24-boot-tiered-warmup.md) showed the
+The audit (report 2026-08-24-boot-tiered-warmup.md, removed 2026-08-29 - git history) showed the
 per-container sweep only does useful work the first time a
 configuration is ever seen - compiled kernels persist on the volume.
 Splitting the passes lets the compile side afford provable coverage
@@ -35,7 +35,7 @@ the touch cost.
 ## Before/after
 
 Measured 2026-08-24 (4B, H100 SXM; details in
-reports/2026-08-24-boot-tiered-warmup.md):
+reports/2026-08-24-boot-tiered-warmup.md, removed 2026-08-29 - git history):
 
 - Per-container warmup: 3.62 s touch pass, against 3.7-4.9 s for
   the swept warmup it replaces - with compile coverage extended
