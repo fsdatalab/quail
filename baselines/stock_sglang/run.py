@@ -1,10 +1,11 @@
-"""Stock SGLang baseline for the two representative QUAIL-B queries.
+"""Pipelined SGLang baseline for QUAIL-B queries.
 
 Runs on H100s via Modal. Uses the same submission strategy as
-``stock_vllm``: separate requests per filter stage (stage-major waves)
-and one request per document pair for joins (full cross product). The
-prompts, query definitions, and per-query bookkeeping are imported from
-``baselines.stock_vllm.run``, so both baselines measure exactly the
+``pipelined_vllm``: each document's next filter stage is submitted as
+soon as the document passes its current stage, with token-budget
+admission, and every join runs the full cross product. The prompts,
+query definitions, and per-query bookkeeping are imported from
+``baselines.stock_vllm.run``, so the baselines measure exactly the
 same work.
 
 Join pairs are submitted suffix-major in anchor tiles
@@ -13,7 +14,7 @@ anchor-major order: SGLang's radix cache stores KV only for finished
 requests, so each engine gets the pair order its prefix cache can
 exploit, over the identical cross product.
 
-Engine settings mirror the stock vLLM configuration:
+Engine settings mirror the vLLM baseline configuration:
 
     vLLM                              SGLang
     gpu_memory_utilization=0.91       mem_fraction_static=0.78
@@ -28,6 +29,8 @@ Engine settings mirror the stock vLLM configuration:
 Default run (BIO-2 and IMDB-3 at sf=0.1 on qwen3-4b-fp8):
     uv run modal run -m baselines.stock_sglang.run::main
 
+All 30 queries: pass ``--query ""``.
+
 Boot-and-generate probe without benchmark data:
     uv run modal run -m baselines.stock_sglang.run::probe
 """
@@ -39,7 +42,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.quailb import SELECTIVITY_ESTIMATE_COLLECTION
+from quail.bench.quailb import QUERY_ORDER, SELECTIVITY_ESTIMATE_COLLECTION
 
 app = modal.App("quail-milestone1")
 
@@ -74,7 +77,7 @@ GPU_KW = dict(image=image, gpu="H100!", memory=98304,
 
 DATA_DIR = "/results/quailb_data"
 
-BASELINE = "stock_sglang"
+BASELINE = "pipelined_sglang"
 DEFAULT_QUERY_IDS = "BIO-2,IMDB-3"
 # vLLM's gpu_memory_utilization=0.91 covers weights, KV, and the
 # activation working set, because vLLM profiles a full-size forward
@@ -117,10 +120,11 @@ class _RequestOutput:
 
 
 class StockSGLangClient:
-    """The subset of vLLM's LLM surface used by the stage-major client.
+    """The subset of vLLM's LLM surface used by the pipelined client.
 
     Wraps a running sglang Engine so ``run_query`` from
-    ``baselines.stock_vllm.run`` works unchanged. Joins always go
+    ``baselines.stock_vllm.run`` works unchanged. Filters chain per
+    document through ``run_pipelined_filter_chain``; joins always go
     suffix-major in anchor tiles sized to ``join_tile_budget_tokens``
     (``baselines.stock.suffix_major_tiled_order``): the radix cache
     stores a prompt's KV only when its request finishes, so vLLM's
@@ -140,9 +144,76 @@ class StockSGLangClient:
     submit_slice = 16_384
     slice_pause_s = 1.0
 
-    def __init__(self, engine, join_tile_budget_tokens):
+    def __init__(self, engine, capacity):
         self.engine = engine
-        self.join_tile_budget_tokens = join_tile_budget_tokens
+        # Half the KV pool bounds a join tile: in-flight suffixes and
+        # the previous tile's leftovers share the pool with the tile's
+        # anchors. Filter admission gets the whole pool, matching the
+        # budget stock vLLM's pipelined client receives.
+        self.join_tile_budget_tokens = (
+            capacity["kv_cache_size_tokens"] // 2)
+        self.filter_budget_tokens = capacity["kv_cache_size_tokens"]
+
+    def run_pipelined_filter_chain(self, sampling_params, body_ids,
+                                   question_ids, true_ids, tag="q"):
+        """Chain filter stages per document with token-budget admission.
+
+        Mirrors stock vLLM's pipelined client: a document holds one of
+        doc_cap admission slots for its whole chain, and stage j+1 is
+        submitted the moment stage j returns TRUE. Sequential stages
+        keep the radix cache effective here: stage j+1 always finds
+        the document body cached, because stage j finished first.
+
+        Returns:
+            Dict shaped like baselines.stock.run_filter_chain's.
+        """
+        import asyncio
+
+        n_stages = len(question_ids)
+        longest_tail = max(len(q) for q in question_ids)
+        sizes = [len(body) + longest_tail + 1 for body in body_ids]
+        mean_request = sum(sizes) // max(1, len(sizes))
+        cap = min(max(1, self.filter_budget_tokens // mean_request),
+                  MAX_NUM_SEQS)
+        counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
+        answers = {}
+        survivors = []
+
+        async def one_document(slots, index):
+            async with slots:
+                for stage in range(n_stages):
+                    result = await self.engine.async_generate(
+                        input_ids=(body_ids[index]
+                                   + question_ids[stage]),
+                        sampling_params=dict(sampling_params),
+                        rid=f"{tag}-{index}-{stage}")
+                    meta = result["meta_info"]
+                    counters["requests"] += 1
+                    counters["prompt_tokens"] += int(
+                        meta.get("prompt_tokens") or 0)
+                    counters["cached_tokens"] += int(
+                        meta.get("cached_tokens") or 0)
+                    output_ids = result.get("output_ids") or []
+                    got = 1 if (output_ids and
+                                int(output_ids[0]) in true_ids) else 0
+                    answers[(index, stage + 1)] = got
+                    if not got:
+                        return
+                survivors.append(index)
+
+        async def run_all():
+            slots = asyncio.Semaphore(cap)
+            await asyncio.gather(*(one_document(slots, index)
+                                   for index in range(len(body_ids))))
+
+        t0 = time.time()
+        self.engine.loop.run_until_complete(run_all())
+        wall = time.time() - t0
+        return dict(wall=wall, survivors=sorted(survivors),
+                    answers=answers, doc_cap=cap,
+                    budget_tokens=self.filter_budget_tokens,
+                    block_size=1, max_num_seqs=MAX_NUM_SEQS,
+                    **counters)
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
         outputs = []
@@ -252,10 +323,7 @@ def _boot_client(model, mem_fraction_static):
         disable_prefill_cuda_graph=True,
         log_level="warning")
     capacity = _sglang_filter_capacity(engine)
-    # Half the KV pool bounds a join tile: in-flight suffixes and the
-    # previous tile's leftovers share the pool with the tile's anchors.
-    llm = StockSGLangClient(
-        engine, capacity["kv_cache_size_tokens"] // 2)
+    llm = StockSGLangClient(engine, capacity)
     sp = {"temperature": 0.0, "max_new_tokens": 1,
           "logit_bias": {str(t): TRUE_FALSE_LOGIT_BIAS
                          for t in allowed}}
@@ -266,8 +334,8 @@ def _boot_client(model, mem_fraction_static):
 def probe(model: str = "qwen3-4b-fp8",
           mem_fraction_static: float = MEM_FRACTION_STATIC) -> str:
     """Boot the engine and run a few filter and join shaped requests."""
-    from baselines.stock_vllm.run import _run_filter_stage, _run_join
-    from quail.bench.quailb import F1, DISCUSS_ASPECT
+    from baselines.stock_vllm.run import _run_filter_chain, _run_join
+    from quail.bench.quailb import F1, F4, DISCUSS_ASPECT
 
     (llm, boot, sp, tokenizer, true, allowed, hf_name,
      capacity) = _boot_client(model, mem_fraction_static)
@@ -288,8 +356,12 @@ def probe(model: str = "qwen3-4b-fp8",
         "The soundtrack carries several scenes, though the plot "
         "meanders.",
     ]
-    filter_result = _run_filter_stage(llm, sp, true, F1, texts, tokenizer)
-    print(f"[probe] filter answers: {filter_result['answers']} "
+    filter_result = _run_filter_chain(
+        llm, sp, true, [F1, F4], texts, tokenizer, "pipelined",
+        capacity, tag="probe")
+    print(f"[probe] filter chain answers: {filter_result['answers']} "
+          f"survivors={filter_result['survivors']} "
+          f"doc_cap={filter_result['doc_cap']} "
           f"prompt_tokens={filter_result['prompt_tokens']} "
           f"cached_tokens={filter_result['cached_tokens']}", flush=True)
 
@@ -305,7 +377,10 @@ def probe(model: str = "qwen3-4b-fp8",
     print(f"[probe] flush_cache success: {flushed}", flush=True)
     return json.dumps(dict(
         boot=boot, capacity=capacity, settings=settings,
-        filter_answers=filter_result["answers"],
+        filter_answers={f"{index}-{stage}": answer
+                        for (index, stage), answer
+                        in filter_result["answers"].items()},
+        filter_survivors=filter_result["survivors"],
         join_answers=join_answers, join_true=n_true,
         join_pairs=n_pairs, flush=flushed))
 
@@ -390,8 +465,8 @@ def _run_query_batch(model, sf, query_ids_csv, reps,
                     evaluator=evaluator,
                     quail_query=(evaluation_queries[qid][1]()
                                  if evaluator else None),
-                    filter_submission="stage-major",
-                    filter_capacity=None)
+                    filter_submission="pipelined",
+                    filter_capacity=filter_capacity)
             except Exception as e:                      # noqa: BLE001
                 entry = dict(query=qid,
                              error=f"{type(e).__name__}: {e}")
@@ -412,12 +487,12 @@ def _run_query_batch(model, sf, query_ids_csv, reps,
             "reference_model": truth.reference_model,
         }),
         query_ids=ids,
-        filter_submission="stage-major",
+        filter_submission="pipelined",
         filter_capacity=filter_capacity,
         join_submission=llm.join_submission,
         join_tile_budget_tokens=llm.join_tile_budget_tokens,
-        submission=("separate generate() call per filter stage, full "
-                    "cross product per join, join pairs submitted "
+        submission=("pipelined per-document filter chain, full cross "
+                    "product per join, join pairs submitted "
                     "suffix-major in anchor tiles"),
         checkpoint="pre-quantized FP8",
         max_num_seqs=MAX_NUM_SEQS,
@@ -465,7 +540,10 @@ def main(model: str = "qwen3-4b-fp8", sf: float = 0.1,
          ground_truth_collection: str = SELECTIVITY_ESTIMATE_COLLECTION,
          prediction: str = "",
          mem_fraction_static: float = MEM_FRACTION_STATIC):
-    ids = [q.strip() for q in query.split(",") if q.strip()]
+    if query:
+        ids = [q.strip() for q in query.split(",") if q.strip()]
+    else:
+        ids = list(QUERY_ORDER)
     label = f"{time.strftime('%Y-%m-%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     if prediction:
         print(f"PREDICTION: {prediction}", flush=True)

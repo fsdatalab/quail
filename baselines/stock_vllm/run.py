@@ -490,11 +490,15 @@ def _run_pipelined_filter_chain(llm, sp, true_set, templates, texts,
 
     body_ids, question_ids = _filter_chain_inputs(
         templates, texts, tokenizer)
-    result = run_filter_chain(
-        llm.llm_engine, sp, body_ids, question_ids,
-        capacity["kv_cache_size_tokens"], tag=tag, true_ids=true_set,
-        block_size=capacity["block_size"],
-        max_num_seqs=capacity["max_num_seqs"])
+    chain = getattr(llm, "run_pipelined_filter_chain", None)
+    if chain is not None:
+        result = chain(sp, body_ids, question_ids, true_set, tag=tag)
+    else:
+        result = run_filter_chain(
+            llm.llm_engine, sp, body_ids, question_ids,
+            capacity["kv_cache_size_tokens"], tag=tag, true_ids=true_set,
+            block_size=capacity["block_size"],
+            max_num_seqs=capacity["max_num_seqs"])
     stages = []
     for stage in range(1, len(templates) + 1):
         evaluated = [index for index in range(len(texts))
