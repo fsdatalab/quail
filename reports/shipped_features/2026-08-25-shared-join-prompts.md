@@ -30,5 +30,5 @@ Quail was faster than stock vLLM on all six join comparisons. At 4B, BIO-2
 took 31.12 seconds in Quail and 250.00 seconds in stock vLLM. At 32B, BIO-2
 took 181.05 seconds in Quail and 283.96 seconds in stock vLLM.
 
-The full setup and all source volume paths are in
-`reports/old/2026-08-26-stock-vllm-joins.md`.
+The full setup and all source volume paths are in the deleted report
+`2026-08-26-stock-vllm-joins.md` (in git history).

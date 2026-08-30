@@ -82,8 +82,8 @@ count.
 ## Why
 
 The SoL accounting credited filter-to-join KV reuse the engine did
-not perform, and the committed SoL report
-(`reports/old/2026-08-26-sol-quailb.md`, data at
+not perform, and the deleted SoL report
+(`2026-08-26-sol-quailb.md` in git history, data at
 `/results/sol/sol_quailb_sf0.1.json` on the quail-results volume)
 measured the plan-choice half of the remaining gap: seven of nine
 multi-join queries improve under the exact left deep search, FEV-8
@@ -107,7 +107,7 @@ Measured, on the source branch of the retention runtime: one H100!
 check of a filter followed by two joins retained all 7 filter
 survivors, hit all 7 at the report-anchored join, evicted nothing,
 and matched a separate CPU recombination row for row
-(`reports/old/2026-08-26-filter-join-kv-retention.md`, data at
+(`reports/2026-08-26-filter-join-kv-retention.md`, data at
 `/results/runs/run_1787795777696587173.json`). That check ran the
 lifecycle this branch ports verbatim, under the worker it was built
 in. The merged worker re-integrates it and needs its own run. The
