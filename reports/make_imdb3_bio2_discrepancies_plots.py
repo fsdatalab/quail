@@ -437,7 +437,7 @@ def fig_bio2_strips(workdir, stockb):
              f"Quail - {quail_busy:.0%} busy", None),
             (axes[1], stock_evs, RED, DARK,
              f"stock vLLM - {stock_busy:.0%} busy",
-             f"tracing stretches these gaps {stretch:.1f}x"))
+             f"tracing overhead stretches these gaps {stretch:.1f}x"))
     excerpt = 2.0
     for ax, evs, color, text_color, label, note in rows:
         t0 = min(s for s, _ in evs)
@@ -445,9 +445,14 @@ def fig_bio2_strips(workdir, stockb):
         mid = t0 + (t1 - t0 - excerpt * 1e6) / 2
         cut = [(s, e) for s, e in _merged(sorted(evs))
                if e > mid and s < mid + excerpt * 1e6]
+        if note:
+            ax.broken_barh([(0, excerpt)], (0, 1),
+                           facecolor="#fde8e8", hatch="//",
+                           edgecolor="#cc8888", linewidth=0.3,
+                           zorder=1)
         ax.broken_barh(
             [((s - mid) / 1e6, (e - s) / 1e6) for s, e in cut],
-            (0, 1), color=color, linewidth=0)
+            (0, 1), color=color, linewidth=0, zorder=2)
         ax.set_yticks([])
         ax.set_ylabel(None)
         ax.set_ylim(0, 1)

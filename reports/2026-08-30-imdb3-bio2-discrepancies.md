@@ -204,15 +204,16 @@ whole wall per pair (0.23 ms).
 
 Figure: plots/discrepancy_bio2_strips.png
 
-The strips show two-second excerpts of the profiled windows: color
-where the GPU is executing a kernel, blank where it is idle.
-Quail's strip is one solid band; stock's is slivers. Stock's
-excerpt comes from its traced run, and the tracing stretches the
-CPU gaps about 2.4x while kernels run at normal speed. So the blank
-share of stock's strip overstates the idle: raw, the window is 8.4%
-busy; against the unprofiled wall for the same 6,762 requests it is
-18%. The strip's label states the corrected 18%, and the note on
-the strip says why the ink shows more blank than that.
+The strips show two-second excerpts of the profiled windows: solid
+color where the GPU is executing a kernel, hatched fill where it
+idles. Quail's strip is one solid band; stock's is slivers between
+idle gaps. Stock's excerpt comes from its traced run, and tracing
+overhead stretches the CPU gaps about 2.4x while kernels run at
+normal speed. So the hatched share of stock's strip overstates the
+idle: raw, the window is 8.4% busy; against the unprofiled wall
+for the same 6,762 requests it is 18%. The strip's label states
+the corrected 18%, and the note says why the hatching shows more
+idle than that.
 
 The trace's Python stacks say what fills the idle. Over the
 28.3-second window (6,762 requests, 2.1 seconds of merged kernel
