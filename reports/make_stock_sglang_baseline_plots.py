@@ -1,11 +1,12 @@
 """Plot stock SGLang against stock vLLM on BIO-2 and IMDB-3 at sf=0.1.
 
-Pull the two summaries from the quail-results volume, then pass the
+Pull the three summaries from the quail-results volume, then pass the
 work directory to this script:
 
     W=<workdir>
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
-    modal volume get quail-results stock_sglang/2026-08-30_033502_05712d88/summary.json $W/stock_sglang.json
+    modal volume get quail-results stock_sglang/2026-08-30_033502_05712d88/summary.json $W/stock_sglang_anchor_major.json
+    modal volume get quail-results stock_sglang/TILED_LABEL/summary.json $W/stock_sglang_tiled.json
     uv run --with matplotlib python reports/make_stock_sglang_baseline_plots.py $W
 """
 
@@ -21,10 +22,14 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "plots"
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY  # noqa: E402
+from plot_colors import BLUE, GRAY, ORANGE  # noqa: E402
 
 QUERY_IDS = ("BIO-2", "IMDB-3")
-SYSTEMS = (("stock vLLM", GRAY), ("stock SGLang", BLUE))
+SYSTEMS = (
+    ("stock vLLM\n(anchor-major)", GRAY),
+    ("stock SGLang\n(anchor-major)", ORANGE),
+    ("stock SGLang\n(tiled)", BLUE),
+)
 
 
 def load(path):
@@ -32,7 +37,8 @@ def load(path):
         return json.load(source)
 
 
-def check(summary, baseline, memory_key, memory_fraction):
+def check(summary, baseline, memory_key, memory_fraction,
+          join_submission=None):
     if (summary["baseline"] != baseline
             or summary["filter_submission"] != "stage-major"
             or summary["hf_name"] != "Qwen/Qwen3-4B-FP8"
@@ -40,7 +46,8 @@ def check(summary, baseline, memory_key, memory_fraction):
             or summary["checkpoint"] != "pre-quantized FP8"
             or summary[memory_key] != memory_fraction
             or summary["max_num_seqs"] != 4096
-            or summary["max_num_batched_tokens"] != 25_305):
+            or summary["max_num_batched_tokens"] != 25_305
+            or summary.get("join_submission") != join_submission):
         raise ValueError(f"unexpected {baseline} configuration")
 
 
@@ -72,21 +79,25 @@ def metrics(entry):
 def main():
     workdir = Path(sys.argv[1])
     vllm = load(workdir / "stock_vllm.json")
-    sglang = load(workdir / "stock_sglang.json")
+    anchor_major = load(workdir / "stock_sglang_anchor_major.json")
+    tiled = load(workdir / "stock_sglang_tiled.json")
     check(vllm, "stock_vllm", "gpu_memory_utilization", 0.91)
-    check(sglang, "stock_sglang", "mem_fraction_static", 0.78)
+    check(anchor_major, "stock_sglang", "mem_fraction_static", 0.78)
+    check(tiled, "stock_sglang", "mem_fraction_static", 0.78,
+          join_submission="suffix-major-tiled")
 
-    vllm_entries = query_entries(vllm)
-    sglang_entries = query_entries(sglang)
+    entries = [query_entries(summary)
+               for summary in (vllm, anchor_major, tiled)]
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.8))
-    fig.subplots_adjust(wspace=0.35)
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0))
+    fig.subplots_adjust(wspace=0.3)
     for ax, qid in zip(axes, QUERY_IDS):
-        rows = [metrics(vllm_entries[qid]), metrics(sglang_entries[qid])]
+        rows = [metrics(system_entries[qid])
+                for system_entries in entries]
         walls = [row["wall_s"] for row in rows]
-        colors = [color for _name, color in SYSTEMS]
         names = [name for name, _color in SYSTEMS]
-        bars = ax.bar(names, walls, color=colors, width=0.5)
+        colors = [color for _name, color in SYSTEMS]
+        bars = ax.bar(names, walls, color=colors, width=0.6)
         for bar, row in zip(bars, rows):
             ax.annotate(
                 f"{row['wall_s']:,.1f} s\n"
@@ -94,19 +105,22 @@ def main():
                 f"${row['usd']:,.4f}/query",
                 (bar.get_x() + bar.get_width() / 2, bar.get_height()),
                 ha="center", va="bottom", fontsize=9)
-        ratio = walls[0] / walls[1]
+        ratio = walls[0] / walls[2]
         direction = "faster" if ratio >= 1 else "slower"
         factor = ratio if ratio >= 1 else 1 / ratio
-        if rows[0]["pairs"] == rows[1]["pairs"]:
-            pairs_text = f"{rows[0]['pairs']:,} join pairs"
+        pair_counts = sorted({row["pairs"] for row in rows})
+        if len(pair_counts) == 1:
+            pairs_text = f"{pair_counts[0]:,} join pairs"
         else:
-            pairs_text = (f"{rows[0]['pairs']:,} (vLLM) vs "
-                          f"{rows[1]['pairs']:,} (SGLang) join pairs")
+            pairs_text = (
+                f"{min(pair_counts):,}-{max(pair_counts):,} join pairs")
         ax.set_title(
             f"{qid} — {pairs_text}\n"
-            f"stock SGLang {factor:.2f}x {direction}")
+            f"tiled stock SGLang {factor:.2f}x {direction} than "
+            f"stock vLLM")
         ax.set_ylabel("seconds")
-        ax.set_ylim(0, max(walls) * 1.35)
+        ax.set_ylim(0, max(walls) * 1.4)
+        ax.tick_params(axis="x", labelsize=9)
         ax.spines[["top", "right"]].set_visible(False)
 
     OUT.mkdir(exist_ok=True)
@@ -115,10 +129,10 @@ def main():
     print(f"wrote {out_path}")
 
     for qid in QUERY_IDS:
-        for name, entries in (("stock vLLM", vllm_entries),
-                              ("stock SGLang", sglang_entries)):
-            row = metrics(entries[qid])
-            print(f"{qid} {name}: {row['wall_s']:.2f} s, "
+        for (name, _color), system_entries in zip(SYSTEMS, entries):
+            row = metrics(system_entries[qid])
+            label = name.replace("\n", " ")
+            print(f"{qid} {label}: {row['wall_s']:.2f} s, "
                   f"{row['pairs']:,} pairs, "
                   f"{row['pairs_per_s']:.1f} pairs/s, "
                   f"${row['usd']:.4f}/query, "
