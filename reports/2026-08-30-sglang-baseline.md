@@ -37,12 +37,12 @@ Figure: plots/sglang_baseline_comparison.png
 | Query | System | Query time (s) | Document pairs/s | $/query | Answer accuracy |
 |---|---|---:|---:|---:|---:|
 | BIO-2 | SoL estimate | 62.01 | 9,087 | $0.0680 | not applicable |
-| BIO-2 | Quail | 128.46 | 4,386 | $0.1409 | see the QuailB report |
+| BIO-2 | Quail | 128.22 | 4,395 | $0.1406 | see the QuailB report |
 | BIO-2 | stock vLLM | 1,532.25 | 367.8 | $1.6809 | 80.92% |
 | BIO-2 | pipelined vLLM | 1,427.45 | 394.8 | $1.5659 | 80.91% |
 | BIO-2 | pipelined SGLang | 1,256.91 | 448.3 | $1.3788 | 82.03% |
 | IMDB-3 | SoL estimate | 9.56 | 5,024 | $0.0105 | not applicable |
-| IMDB-3 | Quail | 75.00 | 700.8 | $0.0823 | see the QuailB report |
+| IMDB-3 | Quail | 32.79 | 1,603 | $0.0360 | see the QuailB report |
 | IMDB-3 | stock vLLM | 52.65 | 996.9 | $0.0578 | 78.97% |
 | IMDB-3 | pipelined vLLM | 48.21 | 1,088.8 | $0.0529 | 78.97% |
 | IMDB-3 | pipelined SGLang | 79.38 | 639.5 | $0.0871 | 79.94% |
@@ -52,8 +52,8 @@ Figure: plots/sglang_baseline_comparison.png
   faster than stock vLLM. Quail is still 9.8 times faster than it,
   and the SoL estimate 20.3 times.
 - IMDB-3: pipelined SGLang is the slowest measured system — 1.65
-  times slower than pipelined vLLM, and slower than Quail (79.4
-  against 75.0 seconds).
+  times slower than pipelined vLLM and 2.4 times slower than Quail's
+  32.8 seconds.
 - Its answer accuracy against the shared Qwen3 32B ground truth is
   the highest of the three engines on both queries (82.03% and
   79.94%).
@@ -69,7 +69,10 @@ query time. On BIO-2 every system evaluates the same 563,500 pairs.
 On IMDB-3 the filters differ, so the pair counts do too: 48,048 for
 the SoL estimate (4,004 expected survivors), 52,560 for Quail (its
 filter passed 4,380 reviews), 52,488 for the vLLM baselines (4,374),
-and 50,760 for SGLang (4,230). Quail's per-query accuracy is in
+and 50,760 for SGLang (4,230). The Quail times are its
+post-scan-ring runs (`2026-08-30-kv-ring-fix.md`), which cut its
+IMDB-3 from the 75.0 seconds in the 2026-08-29 family run to 32.8;
+BIO-2 was unchanged. Quail's per-query accuracy is in
 `2026-08-27-quailb-sf01-4b.md` (its 30-query weighted answer
 accuracy is 70.06%). $/query uses $3.9492 per H100! hour and excludes
 startup; the SoL row's cost is the floor implied by its time.
@@ -210,8 +213,9 @@ used their own H100! containers on 2026-08-30.
   `/results/stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`
 - Pipelined vLLM:
   `/results/pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`
-- Quail:
-  `/results/benchmarks/quailb/runs/qb_20260829T185407Z_cbb14b36/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json`
+- Quail (scan-ring runs, current engine):
+  `/results/ablations/ringfix_bio2.json` and
+  `/results/ablations/ringfix_tokens_head_imdb3.json`
 - SoL estimate: `/results/sol/sol_quailb_sf0.1.json`
 
 All engine runs scored accuracy against ground truth collection

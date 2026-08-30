@@ -5,7 +5,8 @@ work directory to this script:
 
     W=<workdir>
     modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
-    modal volume get quail-results benchmarks/quailb/runs/qb_20260829T185407Z_cbb14b36/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail.json
+    modal volume get quail-results ablations/ringfix_bio2.json $W/quail_ringfix_bio2.json
+    modal volume get quail-results ablations/ringfix_tokens_head_imdb3.json $W/quail_ringfix_imdb3.json
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm.json
     modal volume get quail-results pipelined_sglang/2026-08-30_063002_bf050db3/summary.json $W/pipelined_sglang.json
@@ -75,7 +76,7 @@ def annotate(ax, bar, wall_s):
         ha="center", va="bottom", fontsize=9)
 
 
-def five_way_figure(sol, quail_rows, entries):
+def five_way_figure(sol, quail_walls, entries):
     systems = (
         ("SoL\nestimate", GRAY),
         ("Quail", BLUE),
@@ -88,7 +89,7 @@ def five_way_figure(sol, quail_rows, entries):
     for ax, qid in zip(axes, QUERY_IDS):
         walls = [
             sol["queries"][qid]["models"][MODEL]["sol_s"],
-            quail_rows[qid]["wall_s"],
+            quail_walls[qid],
             entries["stock_vllm"][qid]["total_wall_s"],
             entries["pipelined_vllm"][qid]["total_wall_s"],
             entries["pipelined_sglang"][qid]["total_wall_s"],
@@ -162,7 +163,8 @@ def join_order_figure(entries):
 def main():
     workdir = Path(sys.argv[1])
     sol = load(workdir / "sol.json")
-    quail_data = load(workdir / "quail.json")
+    quail_runs = [load(workdir / "quail_ringfix_bio2.json"),
+                  load(workdir / "quail_ringfix_imdb3.json")]
     stock_vllm = load(workdir / "stock_vllm.json")
     pipelined_vllm = load(workdir / "pipelined_vllm.json")
     pipelined_sglang = load(workdir / "pipelined_sglang.json")
@@ -171,9 +173,13 @@ def main():
 
     if sol["scale_factor"] != 0.1:
         raise ValueError("unexpected SoL configuration")
-    if (quail_data["model"] != MODEL or quail_data["sf"] != 0.1
-            or quail_data["gpus"] != 1):
-        raise ValueError("unexpected Quail configuration")
+    for run in quail_runs:
+        if run["model"] != MODEL or run["sf"] != 0.1:
+            raise ValueError("unexpected Quail configuration")
+    quail_walls = {run["query"]: run["unprofiled"]["engine_wall_s"]
+                   for run in quail_runs}
+    if sorted(quail_walls) != sorted(QUERY_IDS):
+        raise ValueError("Quail runs do not cover the two queries")
     check(stock_vllm, "stock_vllm", "gpu_memory_utilization", 0.91,
           "stage-major")
     check(pipelined_vllm, "pipelined_vllm", "gpu_memory_utilization",
@@ -185,8 +191,6 @@ def main():
     check(tiled, "stock_sglang", "mem_fraction_static", 0.78,
           "stage-major", join_submission="suffix-major-tiled")
 
-    quail_rows = {row["query"]: row
-                  for row in quail_data["passes"]["single"]["queries"]}
     entries = {
         "stock_vllm": query_entries(stock_vllm),
         "pipelined_vllm": query_entries(pipelined_vllm),
@@ -196,13 +200,13 @@ def main():
     }
 
     OUT.mkdir(exist_ok=True)
-    five_way_figure(sol, quail_rows, entries)
+    five_way_figure(sol, quail_walls, entries)
     join_order_figure(entries)
 
     for qid in QUERY_IDS:
         print(f"{qid} SoL estimate: "
               f"{sol['queries'][qid]['models'][MODEL]['sol_s']:.2f} s")
-        print(f"{qid} Quail: {quail_rows[qid]['wall_s']:.2f} s")
+        print(f"{qid} Quail: {quail_walls[qid]:.2f} s")
         for key in ("stock_vllm", "pipelined_vllm", "pipelined_sglang"):
             entry = entries[key][qid]
             wall = entry["total_wall_s"]
