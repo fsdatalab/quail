@@ -6,6 +6,9 @@ directory to this script:
     W=<workdir>
     modal volume get quail-results ablations/discrepancy_imdb3.json $W/imdb3.json
     modal volume get quail-results ablations/discrepancy_bio2.json $W/bio2.json
+    modal volume get quail-results ablations/discrepancy_stock_imdb3.json $W/stock_imdb3.json
+    modal volume get quail-results ablations/discrepancy_stock_bio2.json $W/stock_bio2.json
+    modal volume get quail-results ablations/discrepancy_traces/stock_kineto/ $W/traces/stock_kineto/
     modal volume get quail-results benchmarks/quailb/runs/qb_20260829T185407Z_cbb14b36/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail.json
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock.json
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined.json
@@ -207,44 +210,96 @@ def fig_bio2_rates(bio2, sol, stock_rows, pipe_rows, quail_rows):
     plt.close(fig)
 
 
-def fig_window_busy(workdir):
+def _stock_trace(workdir, cell, label):
+    files = next(w["files"] for w in cell["windows"]
+                 if w["label"] == label)
+    name = next(Path(f).name for f in files
+                if f.endswith(".pt.trace.json.gz"))
+    return workdir / "traces" / "stock_kineto" / name
+
+
+def fig_window_busy(workdir, stock3, stockb):
     windows = [
-        ("IMDB-3 filter,\nfirst chunks", "imdb3_filter_healthy"),
-        ("IMDB-3 filter,\neviction churn", "imdb3_filter_churn"),
-        ("IMDB-3 join", "imdb3_join"),
-        ("BIO-2 join,\nearly", "bio2_join_early"),
-        ("BIO-2 join,\nlate", "bio2_join_late"),
+        ("Quail filter,\nfirst chunks", BLUE,
+         workdir / "traces" / "imdb3_filter_healthy.chrome.json.gz"),
+        ("Quail filter,\neviction churn", RED,
+         workdir / "traces" / "imdb3_filter_churn.chrome.json.gz"),
+        ("stock filter", GRAY,
+         _stock_trace(workdir, stock3, "stock_imdb3_filter")),
+        ("Quail join", BLUE,
+         workdir / "traces" / "imdb3_join.chrome.json.gz"),
+        ("stock join", GRAY,
+         _stock_trace(workdir, stock3, "stock_imdb3_join")),
+        ("Quail join,\nearly", BLUE,
+         workdir / "traces" / "bio2_join_early.chrome.json.gz"),
+        ("Quail join,\nlate", BLUE,
+         workdir / "traces" / "bio2_join_late.chrome.json.gz"),
+        ("stock join", GRAY,
+         _stock_trace(workdir, stockb, "stock_bio2_join")),
     ]
-    stats = [kernel_busy(workdir / "traces" / f"{t}.chrome.json.gz")
-             for _, t in windows]
-    fig, ax = plt.subplots(figsize=(7.8, 3.6))
+    stats = [kernel_busy(path) for _, _, path in windows]
+    fig, ax = plt.subplots(figsize=(11.0, 3.9))
     x = range(len(windows))
-    colors = [RED if "churn" in t else BLUE for _, t in windows]
-    ax.bar(x, [s[0] for s in stats], color=colors, width=0.55)
+    ax.bar(x, [s[0] for s in stats],
+           color=[c for _, c, _ in windows], width=0.6)
     for xi, (busy, n, mean_us) in zip(x, stats):
         ax.annotate(f"{busy:.0%}", (xi, busy + 0.03), ha="center",
                     color=DARK, fontsize=10)
         ax.annotate(f"mean kernel\n{mean_us:.0f} us",
-                    (xi, max(busy - 0.24, 0.05)), ha="center",
-                    color="white" if busy > 0.3 else DARK,
-                    fontsize=8)
+                    (xi, max(busy - 0.26, 0.04)), ha="center",
+                    color="white" if busy > 0.32 else DARK,
+                    fontsize=7.5)
+    for start, end, label in ((0, 2, "IMDB-3 filter"),
+                              (3, 4, "IMDB-3 join"),
+                              (5, 7, "BIO-2 join")):
+        ax.annotate(label, ((start + end) / 2, 1.16), ha="center",
+                    color=DARK, fontsize=10)
+        if end < len(windows) - 1:
+            ax.axvline(end + 0.5, color="#dddddd", lw=0.8)
     ax.set_ylim(0, 1.12)
     ax.set_xticks(list(x))
-    ax.set_xticklabels([w[0] for w in windows])
+    ax.set_xticklabels([w[0] for w in windows], fontsize=8.5)
     ax.set_ylabel("fraction of the window running kernels")
     ax.set_title("GPU busy time at kernel grain, torch.profiler "
-                 "windows")
+                 "windows\n", fontsize=12)
     fig.savefig(OUT / "discrepancy_window_busy.png", dpi=300)
     plt.close(fig)
-    return {t: dict(busy=round(s[0], 3), kernels=s[1],
-                    mean_kernel_us=round(s[2], 1))
-            for (_, t), s in zip(windows, stats)}
+    return {f"{w[0]} [{i}]": dict(busy=round(s[0], 3), kernels=s[1],
+                                  mean_kernel_us=round(s[2], 1))
+            for i, (w, s) in enumerate(zip(windows, stats))}
+
+
+def fig_regret(imdb3, bio2, stock3, stockb):
+    quail = [imdb3["unprofiled"]["regret_tokens"] / 1e6,
+             bio2["unprofiled"]["regret_tokens"] / 1e6]
+    stock = [stock3["regret_tokens"] / 1e6,
+             stockb["regret_tokens"] / 1e6]
+    fig, ax = plt.subplots(figsize=(6.8, 3.6))
+    x = [0, 1]
+    w = 0.32
+    ax.bar([xi - w / 2 for xi in x], quail, width=w, color=BLUE)
+    ax.bar([xi + w / 2 for xi in x], stock, width=w, color=GRAY)
+    for xi, v, off, name in ((0, quail[0], -w / 2, "Quail"),
+                             (0, stock[0], w / 2, "stock vLLM"),
+                             (1, quail[1], -w / 2, "Quail"),
+                             (1, stock[1], w / 2, "stock vLLM")):
+        ax.annotate(f"{name}\n{v:,.2f}M", (xi + off, v + 0.04),
+                    ha="center", color=DARK, fontsize=8.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(["IMDB-3", "BIO-2"])
+    ax.set_ylim(0, max(quail + stock) * 1.3)
+    ax.set_ylabel("KV regret (millions of tokens)")
+    ax.set_title("KV regret is nearly equal where it exists at all")
+    fig.savefig(OUT / "discrepancy_regret.png", dpi=300)
+    plt.close(fig)
 
 
 def main():
     workdir = Path(sys.argv[1])
     imdb3 = load(workdir / "imdb3.json")
     bio2 = load(workdir / "bio2.json")
+    stock3 = load(workdir / "stock_imdb3.json")
+    stockb = load(workdir / "stock_bio2.json")
     sol = load(workdir / "sol.json")
     quail_rows = by_query(
         load(workdir / "quail.json")["passes"]["single"]["queries"])
@@ -255,7 +310,8 @@ def main():
     fig_imdb3_timeline(imdb3)
     fig_imdb3_composition(imdb3, quail_rows, stock_rows, pipe_rows)
     fig_bio2_rates(bio2, sol, stock_rows, pipe_rows, quail_rows)
-    busy = fig_window_busy(workdir)
+    fig_regret(imdb3, bio2, stock3, stockb)
+    busy = fig_window_busy(workdir, stock3, stockb)
 
     # ---- derived numbers the report cites
     u3 = imdb3["unprofiled"]
@@ -309,6 +365,24 @@ def main():
                 stock_rows["BIO-2"]["steps"][0]["cached_tokens"]
                 / stock_rows["BIO-2"]["steps"][0]["prompt_tokens"],
                 4)),
+        stock_cell=dict(
+            imdb3=dict(
+                filter_wall_s=stock3["filter"]["wall_s"],
+                recorded_filter_wall_s=round(
+                    stock_rows["IMDB-3"]["steps"][0]["wall_s"], 2),
+                join_wall_s=stock3["join"]["wall_s"],
+                recorded_join_wall_s=round(
+                    stock_rows["IMDB-3"]["steps"][1]["wall_s"], 2),
+                regret_tokens=stock3["regret_tokens"],
+                buckets=stock3["join"]["buckets"]),
+            bio2=dict(
+                reports_measured=stockb["reports_measured"],
+                ms_per_pair=stockb["ms_per_pair"],
+                recorded_ms_per_pair=round(
+                    1e3 * stock_rows["BIO-2"]["steps"][0]["wall_s"]
+                    / stock_rows["BIO-2"]["steps"][0]["n_pairs"], 3),
+                regret_tokens=stockb["regret_tokens"],
+                buckets=stockb["buckets"])),
         window_busy=busy), indent=1))
 
 
