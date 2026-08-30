@@ -399,9 +399,7 @@ wherever a later one will read it.
   Recompute value is `prefix_recompute_seconds` - dense work linear
   in length against the fp8 peak plus the causal attention triangle
   against the bf16 peak, both counted. Pinned keys (in use by the
-  running operator) are not eviction candidates. The exact minimum
-  loss calculation is a minimum knapsack cover problem. Its solver
-  remains only as a small test oracle in `executor/retention.py`.
+  running operator) are not eviction candidates.
 - The plan-time half is the *credit*: `keep_split` prices in the
   expected resident fraction the keep budget can hold - the arena
   minus the same two-chunk working reservation the ring makes -
@@ -514,7 +512,6 @@ single forward pass, sharing KV across them through a paged arena.
 | `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: which survivors to price as resident, longest documents first |
 | `RetainedPool` | `executor/retention.py` | Fixed-capacity retained pool: keep while room, then replace lowest value-per-page residents only for strictly greater value |
 | `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the least saved recompute work per page |
-| `minimum_loss_victims` | `executor/retention.py` | Exact small-instance oracle used only by tests |
 | `prefix_recompute_seconds` | `sol.py` | The retention value of one prefix, counted constants only |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
 | `optimize_left_deep` | `leftdeep.py` | Subset DP over joined aliases and a caller supplied physical property, with a nondominated Work frontier |

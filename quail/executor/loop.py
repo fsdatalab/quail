@@ -776,7 +776,7 @@ def _shared_preamble_tokens(question_ids):
 
 
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
-               question_ids, budget, trace=None, timing=None,
+               question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=(),
                retention_values=None):
@@ -787,8 +787,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         doc_ids: Per-document token lists.
         question_ids: Per-stage question token lists.
         budget: Chunk token budget.
-        trace: When given, one dict per chunk is appended with tokens,
-            groups, and fresh admission counts.
         timing: CPU seconds per loop phase accumulate into it.
         pinned: False for pageable blocking copies.
         arena_writes: Whether document KV is written to the arena.
@@ -923,10 +921,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                            attention_mode=pipeline.attention_mode)
         t = _tick(timing, "pack", t)
         tokens += chunk["tokens"]
-        if trace is not None:
-            trace.append(dict(
-                tokens=chunk["tokens"], groups=len(groups),
-                fresh=sum(1 for _, _, f in groups if f)))
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
