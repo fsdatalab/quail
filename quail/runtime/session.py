@@ -55,7 +55,10 @@ def pick_corpus_tokenizer(primary, fast, texts, sample=25):
 
 class Session:
     def __init__(self, config: EngineConfig = EngineConfig(),
-                 device: str = "h100-sxm", tokenizer=None):
+                 device: str = "h100-sxm", tokenizer=None,
+                 source_batch_rows: int = 1_024):
+        if source_batch_rows <= 0:
+            raise ValueError("source_batch_rows must be positive")
         model = resolve_model(config.model)
         if isinstance(model, Refusal):
             raise RefusalError(model)
@@ -64,9 +67,11 @@ class Session:
         self.device = DEVICES[device]
         self.catalog = Catalog()
         self._tok = tokenizer      # injectable for tests; lazy HF load
+        self.source_batch_rows = source_batch_rows
         self._tok_injected = tokenizer is not None
         self._fast = None          # lazy bpe-qwen instance
         self._fast_tried = False
+        self._column_tokenizers = {}
         self.notes = []            # tokenizer picks etc., for reports
         self._scan_cache = {}      # (source, column) -> token lists
         self._app_ctx = None       # the Modal app held open for the
@@ -146,10 +151,7 @@ class Session:
             table = provider.read_column(column)
             ids = table.column(provider.id_col)
             texts = table.column(column)
-            text_sample = texts.slice(0, 25).to_pylist()
-            tok, note = pick_corpus_tokenizer(
-                self.tokenizer, self._fast_tokenizer(), text_sample)
-            self.notes.append(f"{provider_name}.{column}: {note}")
+            tok = self._column_tokenizer(provider_name, column, texts)
             token_rows = [tok(text.as_py()) for chunk in texts.chunks
                           for text in chunk]
             first_token = next(
@@ -161,6 +163,17 @@ class Session:
                 token_rows, type=pa.large_list(token_type))
             self._scan_cache[key] = (ids, texts, toks)
         return self._scan_cache[key]
+
+    def _column_tokenizer(self, provider_name: str, column: str, texts):
+        """Return the chosen tokenizer for one document column."""
+        key = (provider_name, column)
+        if key not in self._column_tokenizers:
+            tok, note = pick_corpus_tokenizer(
+                self.tokenizer, self._fast_tokenizer(),
+                texts.slice(0, 25).to_pylist())
+            self._column_tokenizers[key] = tok
+            self.notes.append(f"{provider_name}.{column}: {note}")
+        return self._column_tokenizers[key]
 
     def column_values(self, provider_name: str, column: str):
         """Return one raw Arrow column, cached."""
@@ -253,12 +266,27 @@ class Query:
 
     def plan(self):
         if self._plan is None:
-            scans, _, _ = _collect(self.logical)
+            scans, filters, joins = _collect(self.logical)
             self._doc_tokens = {}
-            for s in scans:
-                _, _, toks = self.session.scan(s.provider, s.column)
-                self._doc_tokens[s.alias] = pc.list_value_length(
-                    toks).to_pylist()
+            if len(scans) == 1 and filters and not joins:
+                scan = scans[0]
+                provider = self.session.catalog.get(scan.provider)
+                lengths = []
+                for batch in provider.scan_batches(
+                        [scan.column], self.session.source_batch_rows):
+                    texts = batch.column(
+                        batch.schema.get_field_index(scan.column))
+                    tok = self.session._column_tokenizer(
+                        scan.provider, scan.column, texts)
+                    lengths.extend(
+                        len(tok(text.as_py())) for text in texts)
+                self._doc_tokens[scan.alias] = lengths
+            else:
+                for scan in scans:
+                    _, _, toks = self.session.scan(
+                        scan.provider, scan.column)
+                    self._doc_tokens[scan.alias] = pc.list_value_length(
+                        toks).to_pylist()
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
@@ -279,28 +307,276 @@ class Query:
             _execute: Optional callable(payload) -> output for testing.
                 None sends to the Modal worker.
         """
+        scans, filters, joins = _collect(self.logical)
+        if len(scans) == 1 and filters and not joins:
+            return self._run_filter_batches(
+                scans, filters, _execute=_execute)
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
+        payload = self._payload(plan, scans, filters, joins)
+        t0 = time.time()
+        out = self._send_payload(plan, payload, _execute)
+        coordinator_wall = time.time() - t0
+        return self._assemble(plan, scans, filters, joins, out,
+                              coordinator_wall)
+
+    def _send_payload(self, plan, payload, execute):
+        """Execute one planned payload."""
         if plan.workers > 8:
             raise NotImplementedError(
                 "more than 8 GPUs means multiple containers; the "
                 "multi-container coordinator is a later step")
-        scans, filters, joins = _collect(self.logical)
-        payload = self._payload(plan, scans, filters, joins)
-        t0 = time.time()
-        if _execute is None:
-            worker = self.session.worker()
-            k = plan.workers
-            fn = (worker.execute if k == 1 else
-                  worker.execute_2 if k == 2 else
-                  worker.execute_4 if k <= 4 else worker.execute_8)
-            out = fn.remote(payload)
-        else:
-            out = _execute(payload)
-        coordinator_wall = time.time() - t0
-        return self._assemble(plan, scans, filters, joins, out,
-                              coordinator_wall)
+        if execute is not None:
+            return execute(payload)
+        worker = self.session.worker()
+        k = plan.workers
+        fn = (worker.execute if k == 1 else
+              worker.execute_2 if k == 2 else
+              worker.execute_4 if k <= 4 else worker.execute_8)
+        return fn.remote(payload)
+
+    def _run_filter_batches(self, scans, filters, _execute=None):
+        """Execute one filter source without retaining the full input."""
+        from quail.runtime.tokens import encode_token_documents
+
+        scan = scans[0]
+        alias = scan.alias
+        provider = self.session.catalog.get(scan.provider)
+        projection_columns = list(self.logical.root.columns)
+        if any(column.alias != alias for column in projection_columns):
+            raise CompileError(
+                "a filter-only result can project only its filtered alias")
+        source_columns = [scan.column]
+        for column in projection_columns:
+            if column.column not in source_columns:
+                source_columns.append(column.column)
+
+        output_chunks = [[] for _ in projection_columns]
+        output_types = [None] * len(projection_columns)
+        global_answers = {}
+        global_survivors = []
+        answer_parts = {}
+        stage_stats = {}
+        stage_order = []
+        first_plan = None
+        first_out = None
+        result_paths = []
+        tokenizer = None
+        total_wall = 0.0
+        total_fresh = 0
+        total_boot = 0.0
+        peak_gib = None
+        global_offset = 0
+        batches = 0
+        started = time.time()
+
+        for batch in provider.scan_batches(
+                source_columns, self.session.source_batch_rows):
+            if len(batch) == 0:
+                continue
+            texts = batch.column(
+                batch.schema.get_field_index(scan.column))
+            if tokenizer is None:
+                tokenizer = self.session._column_tokenizer(
+                    scan.provider, scan.column, texts)
+            token_rows = [tokenizer(text.as_py()) for text in texts]
+            first_token = next(
+                (token for row in token_rows for token in row), None)
+            token_type = (pa.int32() if first_token is None
+                          or isinstance(first_token, int)
+                          else pa.string())
+            tokens = pa.array(
+                token_rows, type=pa.large_list(token_type))
+            lengths = pc.list_value_length(tokens).to_pylist()
+            plan = plan_query(
+                self.logical, model=self.session.model,
+                device=self.session.device,
+                doc_tokens={alias: lengths},
+                gpus=self.session.config.gpus,
+                order=self.order)
+            if isinstance(plan, Refusal):
+                raise RefusalError(plan)
+            if first_plan is None:
+                first_plan = plan
+                for node in plan.nodes:
+                    if node["op"] == "FilterChain":
+                        stage_order.extend(
+                            stage["written_pos"]
+                            for stage in node["stages"])
+
+            remaining = None
+            if plan.limit is not None:
+                remaining = max(0, plan.limit - len(global_survivors))
+                if remaining == 0:
+                    break
+            payload = self._payload(
+                plan, scans, filters, (),
+                encoded_docs={alias: encode_token_documents(tokens)},
+                limit_override=remaining)
+            out = self._send_payload(plan, payload, _execute)
+            if first_out is None:
+                first_out = out
+            batches += 1
+            total_wall += float(out["wall_s"])
+            total_fresh += int(out["fresh_tokens"])
+            total_boot += float(out.get("boot_s") or 0.0)
+            if out.get("peak_gib") is not None:
+                peak_gib = max(peak_gib or 0.0, float(out["peak_gib"]))
+            if out.get("result_volume_path"):
+                result_paths.append(out["result_volume_path"])
+
+            rows = {
+                int(document): list(bits)
+                for document, bits in out["filters"][alias].items()
+            }
+            global_answers.update({
+                global_offset + document: bits
+                for document, bits in rows.items()
+            })
+            filter_node = next(
+                node for node in plan.nodes
+                if node["op"] == "FilterChain")
+            for stage_index, stage in enumerate(filter_node["stages"]):
+                answered = sorted(
+                    document for document, bits in rows.items()
+                    if len(bits) > stage_index)
+                answers = [bool(rows[document][stage_index])
+                           for document in answered]
+                written_pos = stage["written_pos"]
+                stats = stage_stats.setdefault(
+                    written_pos,
+                    dict(evaluated=0, passed=0,
+                         selectivity=stage["selectivity"]))
+                stats["evaluated"] += len(answered)
+                stats["passed"] += sum(answers)
+                answer_parts.setdefault(written_pos, []).append(
+                    answer_table(
+                        {alias: [global_offset + document
+                                 for document in answered]},
+                        answers,
+                        "filter_answers",
+                        {"alias": alias, "written_pos": written_pos},
+                    ))
+
+            n_stages = len(filter_node["stages"])
+            local_survivors = sorted(
+                document for document, bits in rows.items()
+                if len(bits) == n_stages and all(bits))
+            if remaining is not None:
+                local_survivors = local_survivors[:remaining]
+            indices = pa.array(local_survivors, type=pa.int32())
+            for position, column in enumerate(projection_columns):
+                values = batch.column(
+                    batch.schema.get_field_index(column.column))
+                output_types[position] = values.type
+                output_chunks[position].append(pc.take(values, indices))
+            global_survivors.extend(
+                global_offset + document for document in local_survivors)
+            global_offset += len(batch)
+            if plan.limit is not None \
+                    and len(global_survivors) >= plan.limit:
+                break
+
+        if first_plan is None:
+            first_plan = plan_query(
+                self.logical, model=self.session.model,
+                device=self.session.device,
+                doc_tokens={alias: []},
+                gpus=self.session.config.gpus,
+                order=self.order)
+            if isinstance(first_plan, Refusal):
+                raise RefusalError(first_plan)
+            for node in first_plan.nodes:
+                if node["op"] == "FilterChain":
+                    stage_order.extend(
+                        stage["written_pos"] for stage in node["stages"])
+
+        source_schema = (provider.arrow_schema()
+                         if any(t is None for t in output_types)
+                         else None)
+        arrays = []
+        output_fields = []
+        for position, column in enumerate(projection_columns):
+            value_type = output_types[position]
+            if value_type is None:
+                value_type = source_schema.field(column.column).type
+            chunks = output_chunks[position]
+            arrays.append(pa.chunked_array(chunks, type=value_type))
+            output_fields.append(pa.field(
+                f"{column.alias}.{column.column}",
+                value_type,
+                nullable=any(chunk.null_count > 0 for chunk in chunks),
+                metadata={
+                    b"quail.alias": column.alias.encode("utf-8"),
+                    b"quail.provider": column.provider.encode("utf-8"),
+                    b"quail.column": column.column.encode("utf-8"),
+                },
+            ))
+        output_schema = pa.schema(
+            output_fields,
+            metadata={
+                b"quail.schema_version": b"1",
+                b"quail.kind": b"query_result",
+            })
+
+        compact = pa.array(range(len(global_survivors)), type=pa.int32())
+        declaration, index_schema = build_result_declaration(
+            [], {alias: compact}, alias)
+        survivor_array = pa.array(global_survivors, type=pa.int32())
+        stage_reports = []
+        for stage_index, written_pos in enumerate(stage_order):
+            stats = stage_stats.get(
+                written_pos,
+                dict(evaluated=0, passed=0,
+                     selectivity=filters[alias][written_pos].selectivity))
+            stage_reports.append(dict(
+                op="filter", alias=alias, stage=stage_index,
+                provided_selectivity=stats["selectivity"],
+                observed_selectivity=round(
+                    stats["passed"] / max(1, stats["evaluated"]), 4),
+                evaluated=stats["evaluated"]))
+        report = dict(
+            wall_s=total_wall,
+            boot_s=total_boot,
+            boot_kind=(first_out or {}).get("boot_kind"),
+            boot=(first_out or {}).get("boot"),
+            coordinator_wall_s=round(time.time() - started, 2),
+            fresh_tokens=total_fresh,
+            stages=stage_reports,
+            peak_gib=peak_gib,
+            order_rule=first_plan.order_rule,
+            join_optimizer=None,
+            kv_manager=None,
+            result_volume_path=(result_paths[-1]
+                                if result_paths else None),
+            result_volume_paths=result_paths,
+            source_batches=batches,
+            source_batch_rows=self.session.source_batch_rows,
+            remarks=list(first_plan.remarks) + list(self.session.notes))
+        filter_tables = {}
+        for written_pos in stage_order:
+            parts = answer_parts.get(written_pos)
+            filter_tables[(alias, written_pos)] = (
+                pa.concat_tables(parts) if parts else
+                answer_table(
+                    {alias: []}, [], "filter_answers",
+                    {"alias": alias, "written_pos": written_pos}))
+        return QueryResult(
+            columns=[field.name for field in output_schema],
+            declaration=declaration,
+            document_index_schema=index_schema,
+            output_schema=output_schema,
+            projection=[
+                (alias, array) for array in arrays
+            ],
+            report=report,
+            answer_rows=dict(filters={alias: global_answers}, joins=[]),
+            answer_tables=dict(filters=filter_tables, joins={}),
+            limit=first_plan.limit,
+            survivor_indices={alias: survivor_array},
+            true_join_tables={},
+        )
 
     def execute_stream(self, _execute=None, batch_rows: int = 65_536,
                        limit: int | None = None) -> pa.RecordBatchReader:
@@ -316,18 +592,22 @@ class Query:
 
     # ---- payload -------------------------------------------------------
 
-    def _payload(self, plan, scans, filters, joins) -> dict:
+    def _payload(self, plan, scans, filters, joins, *,
+                 encoded_docs=None, limit_override=None) -> dict:
         from quail.runtime.tokens import encode_token_documents
 
         sess = self.session
-        docs = {}
-        encoded = {}
-        for s in scans:
-            _, _, toks = sess.scan(s.provider, s.column)
-            key = (s.provider, s.column)
-            if key not in encoded:
-                encoded[key] = encode_token_documents(toks)
-            docs[s.alias] = encoded[key]
+        if encoded_docs is None:
+            docs = {}
+            encoded = {}
+            for s in scans:
+                _, _, toks = sess.scan(s.provider, s.column)
+                key = (s.provider, s.column)
+                if key not in encoded:
+                    encoded[key] = encode_token_documents(toks)
+                docs[s.alias] = encoded[key]
+        else:
+            docs = dict(encoded_docs)
         filter_qids = {}
         filter_writes = {}
         for node in plan.nodes:
@@ -382,7 +662,8 @@ class Query:
             # and change the result, so it is only sent for pure
             # filter queries; _assemble truncates the output rows
             # either way
-            limit=plan.limit if not join_specs else None,
+            limit=(limit_override if limit_override is not None
+                   else plan.limit) if not join_specs else None,
             shards=shards,
             true_ids=true_ids, false_ids=false_ids,
             # the engine preamble, once: the worker prepends it to

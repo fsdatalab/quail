@@ -131,6 +131,83 @@ def test_sql_query_streams_and_collects_arrow(sess):
     assert table.column("r.id").to_pylist() == ["r0"]
 
 
+def test_filter_query_reads_and_executes_bounded_source_batches(tmp_path):
+    session = quail.Session(
+        EngineConfig(gpus=1), tokenizer=fake_tok, source_batch_rows=2)
+    session.register("reviews", quail.DocumentProvider.from_parquet(
+        _parquet(tmp_path / "batched.parquet", {
+            "id": [f"r{i}" for i in range(5)],
+            "review": [f"review {i}" for i in range(5)],
+            "unused": list(range(5)),
+        }), id_col="id"))
+    batch_sizes = []
+
+    def execute(payload):
+        from quail.runtime.tokens import decode_payload_documents
+
+        documents = decode_payload_documents(payload["docs"])["r"]
+        batch_sizes.append(len(documents))
+        rows = {
+            index: [int(list(document)[1]) % 2 == 0]
+            for index, document in enumerate(documents)
+        }
+        return dict(
+            filters={"r": rows}, joins=[], wall_s=1.0,
+            fresh_tokens=len(documents))
+
+    query = session.sql("""
+        SELECT r.id, r.review
+        FROM reviews r
+        WHERE AI_FILTER(PROMPT('keep even: {0}', r.review))
+    """)
+    query.explain()
+    assert session._scan_cache == {}
+    result = query.run(_execute=execute)
+
+    assert batch_sizes == [2, 2, 1]
+    assert session._scan_cache == {}
+    assert result.collect().to_pydict() == {
+        "r.id": ["r0", "r2", "r4"],
+        "r.review": ["review 0", "review 2", "review 4"],
+    }
+    assert result.survivor_indices["r"].to_pylist() == [0, 2, 4]
+    assert sorted(result.answer_rows["filters"]["r"]) == list(range(5))
+    assert result.report["source_batches"] == 3
+    assert result.report["stages"][0]["evaluated"] == 5
+    assert result.report["fresh_tokens"] == 5
+
+    batch_sizes.clear()
+    limited = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI_FILTER(PROMPT('keep even: {0}', r.review))
+        LIMIT 2
+    """).collect(_execute=execute)
+    assert batch_sizes == [2, 2]
+    assert limited.column("r.id").to_pylist() == ["r0", "r2"]
+
+
+def test_batched_filter_preserves_empty_result_schema(tmp_path):
+    session = quail.Session(
+        EngineConfig(gpus=1), tokenizer=fake_tok, source_batch_rows=2)
+    session.register("reviews", quail.DocumentProvider.from_parquet(
+        _parquet(tmp_path / "empty.parquet", {
+            "id": pa.array([], type=pa.string()),
+            "review": pa.array([], type=pa.string()),
+        }), id_col="id"))
+
+    result = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI_FILTER(PROMPT('keep: {0}', r.review))
+    """).run(_execute=lambda payload: pytest.fail("empty input executed"))
+
+    assert result.collect().schema.names == ["r.id"]
+    assert result.count() == 0
+    assert result.report["stages"][0]["evaluated"] == 0
+    assert ("r", 0) in result.answer_tables["filters"]
+
+
 def test_join_query_pairs(sess):
     sql = """
         SELECT r.id, p.asin FROM reviews r

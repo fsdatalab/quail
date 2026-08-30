@@ -28,6 +28,11 @@ def test_from_dataset_reads_only_id_and_requested_column():
         "body": ["first", "second"],
     }
 
+    batches = list(provider.scan_batches(["body"], batch_rows=1))
+    assert [len(batch) for batch in batches] == [1, 1]
+    assert all(batch.schema.names == ["id", "body"]
+               for batch in batches)
+
 
 def test_from_dataset_rejects_non_dataset_and_missing_id():
     with pytest.raises(TypeError, match="pyarrow.dataset.Dataset"):
@@ -37,6 +42,12 @@ def test_from_dataset_rejects_non_dataset_and_missing_id():
     dataset = ds.dataset(pa.table({"body": ["first"]}))
     with pytest.raises(CompileError, match="id column 'id'"):
         DocumentProvider.from_dataset(dataset, id_col="id")
+
+    provider = DocumentProvider.from_dataset(
+        ds.dataset(pa.table({"id": ["a"], "body": ["first"]})),
+        id_col="id")
+    with pytest.raises(ValueError, match="batch_rows must be positive"):
+        list(provider.scan_batches(["body"], batch_rows=0))
 
 
 def test_from_parquet_builds_dataset(tmp_path):
