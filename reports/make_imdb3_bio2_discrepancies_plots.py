@@ -26,6 +26,7 @@ directory to this script:
 
 import gzip
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -47,18 +48,42 @@ def by_query(rows):
     return {r["query"]: r for r in rows}
 
 
+_KERNEL_EVENT = re.compile(
+    rb'"cat": "(?:kernel|gpu_memcpy|gpu_memset)".{0,2400}?'
+    rb'"ts": (\d+(?:\.\d+)?)[^,}]*, "dur": (\d+(?:\.\d+)?)', re.S)
+
+
+def _kernel_intervals(path):
+    """Stream (start, end) kernel intervals out of a chrome trace.
+
+    Reads the gzip in chunks with an overlap window, so a trace too
+    large for json.load (vLLM's traces carry every CPU op) parses in
+    constant memory. Regex fields match kineto's fixed field order.
+    """
+    evs = []
+    overlap = 4096
+    tail = b""
+    with gzip.open(path) as f:
+        while True:
+            chunk = f.read(1 << 24)
+            if not chunk:
+                break
+            buf = tail + chunk
+            for m in _KERNEL_EVENT.finditer(buf):
+                ts, dur = float(m.group(1)), float(m.group(2))
+                evs.append((ts, ts + dur))
+            tail = buf[-overlap:]
+    # the overlap can hand the same event to two buffers
+    return sorted(set(evs))
+
+
 def kernel_busy(path):
     """Fraction of a trace window covered by kernel execution.
 
     Kernel intervals are merged before summing, so overlapping
     streams do not double count.
     """
-    with gzip.open(path) as f:
-        d = json.load(f)
-    evs = [(e["ts"], e["ts"] + e["dur"]) for e in d["traceEvents"]
-           if e.get("ph") == "X"
-           and e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")]
-    evs.sort()
+    evs = _kernel_intervals(path)
     span = max(e for _, e in evs) - min(s for s, _ in evs)
     merged = 0.0
     cur_s, cur_e = evs[0]
@@ -70,7 +95,7 @@ def kernel_busy(path):
             cur_s, cur_e = s, e
     merged += cur_e - cur_s
     busy_us = sum(e - s for s, e in evs)
-    return merged / span, len(evs), busy_us / len(evs)
+    return merged / span, len(evs), busy_us / len(evs), merged
 
 
 def fig_imdb3_timeline(imdb3):
@@ -219,54 +244,82 @@ def _stock_trace(workdir, cell, label):
 
 
 def fig_window_busy(workdir, stock3, stockb):
+    """Kernel busy per window.
+
+    Quail windows profiled kernel activity only and their walls match
+    the unprofiled run within 3.5%, so the raw busy fraction stands.
+    vLLM's profiler also traces CPU work, which stretched the stock
+    windows 1.1x to 2.4x; each stock bar is therefore corrected to
+    the unprofiled run: kernel microseconds per request in the
+    window, divided by the unprofiled run's wall per request.
+    """
+    s3f, s3j = stock3["filter"], stock3["join"]
+    w3f, w3j = (next(w for w in stock3["windows"] if w["label"] == l)
+                for l in ("stock_imdb3_filter", "stock_imdb3_join"))
+    wbj = stockb["windows"][0]
     windows = [
-        ("Quail filter,\nfirst chunks", BLUE,
+        ("Quail filter,\nfirst chunks", BLUE, None,
          workdir / "traces" / "imdb3_filter_healthy.chrome.json.gz"),
-        ("Quail filter,\neviction churn", RED,
+        ("Quail filter,\neviction churn", RED, None,
          workdir / "traces" / "imdb3_filter_churn.chrome.json.gz"),
         ("stock filter", GRAY,
+         (w3f["requests"], 1e6 * s3f["wall_s"] / 5000),
          _stock_trace(workdir, stock3, "stock_imdb3_filter")),
-        ("Quail join", BLUE,
+        ("Quail join", BLUE, None,
          workdir / "traces" / "imdb3_join.chrome.json.gz"),
         ("stock join", GRAY,
+         (w3j["requests"], 1e6 * s3j["wall_s"] / s3j["requests"]),
          _stock_trace(workdir, stock3, "stock_imdb3_join")),
-        ("Quail join,\nearly", BLUE,
+        ("Quail join,\nearly", BLUE, None,
          workdir / "traces" / "bio2_join_early.chrome.json.gz"),
-        ("Quail join,\nlate", BLUE,
+        ("Quail join,\nlate", BLUE, None,
          workdir / "traces" / "bio2_join_late.chrome.json.gz"),
         ("stock join", GRAY,
+         (wbj["requests"], 1e6 * stockb["wall_s"] / stockb["pairs"]),
          _stock_trace(workdir, stockb, "stock_bio2_join")),
     ]
-    stats = [kernel_busy(path) for _, _, path in windows]
-    fig, ax = plt.subplots(figsize=(11.0, 3.9))
-    x = range(len(windows))
-    ax.bar(x, [s[0] for s in stats],
-           color=[c for _, c, _ in windows], width=0.6)
-    for xi, (busy, n, mean_us) in zip(x, stats):
-        ax.annotate(f"{busy:.0%}", (xi, busy + 0.03), ha="center",
-                    color=DARK, fontsize=10)
-        ax.annotate(f"mean kernel\n{mean_us:.0f} us",
-                    (xi, max(busy - 0.26, 0.04)), ha="center",
-                    color="white" if busy > 0.32 else DARK,
+    rows = []
+    for label, color, correct, path in windows:
+        busy, n, mean_us, union_us = kernel_busy(path)
+        row = dict(label=label, color=color, raw_busy=busy,
+                   kernels=n, mean_kernel_us=mean_us)
+        if correct is None:
+            row["busy"] = busy
+        else:
+            requests, unprofiled_us = correct
+            row["busy"] = union_us / (requests * unprofiled_us)
+        rows.append(row)
+    fig, ax = plt.subplots(figsize=(11.0, 4.0))
+    x = range(len(rows))
+    ax.bar(x, [r["busy"] for r in rows],
+           color=[r["color"] for r in rows], width=0.6)
+    for xi, r in zip(x, rows):
+        ax.annotate(f"{r['busy']:.0%}", (xi, r["busy"] + 0.03),
+                    ha="center", color=DARK, fontsize=10)
+        ax.annotate(f"mean kernel\n{r['mean_kernel_us']:.0f} us",
+                    (xi, max(r["busy"] - 0.26, 0.04)), ha="center",
+                    color="white" if r["busy"] > 0.32 else DARK,
                     fontsize=7.5)
     for start, end, label in ((0, 2, "IMDB-3 filter"),
                               (3, 4, "IMDB-3 join"),
                               (5, 7, "BIO-2 join")):
-        ax.annotate(label, ((start + end) / 2, 1.16), ha="center",
+        ax.annotate(label, ((start + end) / 2, 1.13), ha="center",
                     color=DARK, fontsize=10)
-        if end < len(windows) - 1:
+        if end < len(rows) - 1:
             ax.axvline(end + 0.5, color="#dddddd", lw=0.8)
-    ax.set_ylim(0, 1.12)
+    ax.set_ylim(0, 1.2)
     ax.set_xticks(list(x))
-    ax.set_xticklabels([w[0] for w in windows], fontsize=8.5)
-    ax.set_ylabel("fraction of the window running kernels")
-    ax.set_title("GPU busy time at kernel grain, torch.profiler "
-                 "windows\n", fontsize=12)
+    ax.set_xticklabels([r["label"] for r in rows], fontsize=8.5)
+    ax.set_ylabel("kernel time over unprofiled wall (fraction)")
+    ax.set_title("GPU busy time at kernel grain; stock bars "
+                 "corrected for vLLM profiler overhead\n",
+                 fontsize=12)
     fig.savefig(OUT / "discrepancy_window_busy.png", dpi=300)
     plt.close(fig)
-    return {f"{w[0]} [{i}]": dict(busy=round(s[0], 3), kernels=s[1],
-                                  mean_kernel_us=round(s[2], 1))
-            for i, (w, s) in enumerate(zip(windows, stats))}
+    return {f"{r['label']} [{i}]":
+            {k: (round(v, 3) if isinstance(v, float) else v)
+             for k, v in r.items() if k != "color"}
+            for i, r in enumerate(rows)}
 
 
 def fig_regret(imdb3, bio2, stock3, stockb):
