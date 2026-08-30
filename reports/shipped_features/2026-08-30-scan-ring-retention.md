@@ -49,7 +49,8 @@ retention competes only with itself, by value.
 
 IMDB-3 (F1 filter into the reviews x aspects join), sf 0.1, Qwen3
 4B fp8, one H100, measured by the same instrumented cell as the
-discrepancy report (`ablations/discrepancy_timeline.py`,
+discrepancy report (`ablations/discrepancy_timeline.py`, since
+generalized into `ablations/profile_quail.py`,
 `--out-prefix ringfix`):
 
 - Filter phase: 50.28 s in 2,916 forward passes (469 mean tokens)

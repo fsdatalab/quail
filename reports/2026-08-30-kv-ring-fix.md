@@ -42,9 +42,10 @@ remains only as a safety valve; with the ring in place it should
 never fire.
 
 Confirming run: `ablations/discrepancy_timeline.py` (the same
-instrumented cell as the discrepancy report; it wraps the engine
-without modifying it) rerun with `--out-prefix ringfix`, sf 0.1,
-Qwen3 4B fp8, one H100, so the unbounded-retention files stay intact for comparison.
+instrumented cell as the discrepancy report, since generalized into
+`ablations/profile_quail.py`; it wraps the engine without modifying
+it) rerun with `--out-prefix ringfix`, sf 0.1, Qwen3 4B fp8, one
+H100, so the unbounded-retention files stay intact for comparison.
 
 ## Prediction
 
@@ -162,11 +163,13 @@ Data on the `quail-results` volume:
 
 ## Rebuild
 
-Rerun the cell (any out-prefix other than `discrepancy` selects
-the post-fix profiler windows):
+Rerun the two queries (a fresh --out-prefix keeps the recorded
+files intact; the recorded run used this cell's predecessor,
+`discrepancy_timeline.py`, whose per-query profiler windows have
+since been replaced by windows derived from the run):
 
-    uv run modal run ablations/discrepancy_timeline.py::run_smoke --out-prefix ringfix
-    uv run modal run ablations/discrepancy_timeline.py::run_queries --out-prefix ringfix
+    uv run modal run ablations/profile_quail.py::run_smoke --queries IMDB-3,BIO-2 --out-prefix rerun
+    uv run modal run ablations/profile_quail.py::run --queries IMDB-3,BIO-2 --out-prefix rerun
 
 Rebuild the figures with `reports/make_kv_ring_fix_plots.py`; its
 docstring holds the `modal volume get` commands.

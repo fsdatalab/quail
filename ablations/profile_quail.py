@@ -1,20 +1,13 @@
-"""GPU timeline and KV regret instrumentation for IMDB-3 and BIO-2.
+"""Run any QuailB query through the engine under instrumentation:
+GPU timeline, KV accounting, and torch.profiler windows.
 
-The 2026-08-27 QuailB SF 0.1 run left two per-query results to
-explain. BIO-2 (the reports x terms join) is Quail's largest win:
-128.5 s against 1,532.3 s for stock vLLM on the same 10.4M fresh
-tokens. IMDB-3 (the F1 filter into the same-shape join) is the one
-query where Quail (75.0 s) loses to stock vLLM (52.7 s), even though
-Quail's own parts predict about 34 s (IMDB-1 filter 15.1 s plus the
-IMDB-2 join scaled to the survivors, 19.2 s).
-
-This cell reruns exactly those two queries through the real planner
-and the real worker execution core and records, per forward pass:
-launch time, packed tokens, and GPU time from the CUDA events the
-loops already create. It also records the KV numbers the benchmark
-run does not keep: per-phase walls, eviction calls over time, and
-KV regret. All instrumentation wraps the engine from this script
-(module attributes and instance attributes); no engine file changes.
+The cell runs each named query through the real planner and the real
+worker execution core and records, per forward pass: launch time,
+packed tokens, and GPU time from the CUDA events the loops already
+create. Per phase it records walls and CPU seconds per loop step;
+across the query, every eviction of retained KV and the KV regret.
+All instrumentation wraps the engine from this script (module
+attributes and instance attributes); no engine file changes.
 
 KV regret: the fresh tokens spent recomputing a document prefix
 whose KV this query already computed once under the same
@@ -23,37 +16,33 @@ those tokens would have been a KV hit. First computations and
 tuple-suffix tokens are not regret; no cache of any size avoids
 them.
 
-torch.profiler windows (kernel activity only, CUDA) cover a few
-forward passes per regime so the kernel timeline of the recorded
-bubbles can be inspected. Chrome traces go to the results volume.
-A second, unprofiled pass of each query supplies the walls the
-report cites, so profiler overhead never touches a headline number.
+torch.profiler windows (kernel activity only, CUDA) are derived
+from the run, not from the query: when a phase (one filter or join
+loop) starts, four candidate windows register - "evicting" (arms on
+the phase's first retained-KV eviction), "early" (chunk 3), "mid"
+(chunk 18), "late" (chunk 60). One capture runs at a time; whichever
+candidate arms first wins, and one that never arms never fires and
+blocks nothing. A second, unprofiled pass of each query supplies the
+walls a report cites, so profiler overhead never touches a headline
+number.
 
-Predictions, stated before the run:
-- IMDB-3: the filter phase is the slow part (about 45-55 s of the
-  75 s), its chunks collapse from the 110,376-token budget to a few
-  thousand tokens once the arena fills (about 1,170 documents in),
-  and evictions run continuously from that point. Regret is about
-  1.22M tokens (the 4,260 recomputed anchors); the join phase alone
-  is healthy (about 20 s).
-- BIO-2: regret is exactly 0, chunks stay near the budget, and GPU
-  busy time covers most of the join wall.
+Run (`--queries` is a comma-separated list of QuailB ids):
 
-Run:
+    uv run modal run ablations/profile_quail.py::run_smoke --queries IMDB-3,BIO-2
+    uv run modal run ablations/profile_quail.py::run --queries IMDB-3,BIO-2 --out-prefix myrun
 
-    uv run modal run ablations/discrepancy_timeline.py::run_smoke
-    uv run modal run ablations/discrepancy_timeline.py::run_queries
+Outputs on the quail-results volume (pick an --out-prefix that does
+not overwrite files a report already cites):
 
-Outputs on the quail-results volume (file names take the entrypoints'
---out-prefix, default "discrepancy", so a rerun against changed
-engine code keeps the recorded files intact):
+    /results/ablations/<prefix>_<queryslug>.json
+    /results/ablations/<prefix>_traces/<slug>_<op><n>_<window>.chrome.json.gz
 
-    /results/ablations/<prefix>_imdb3.json
-    /results/ablations/<prefix>_bio2.json
-    /results/ablations/<prefix>_traces/<query>_<window>.chrome.json.gz
-
-The 2026-08-30 scan-ring run used --out-prefix ringfix; its
-prediction lives in reports/2026-08-30-kv-ring-fix.md.
+The recorded 2026-08-30 runs used prefixes "discrepancy" and
+"ringfix" through this cell's predecessor
+(ablations/discrepancy_timeline.py, which hardcoded the two queries
+and their windows); predictions and results live in
+reports/2026-08-30-imdb3-bio2-discrepancies.md and
+reports/2026-08-30-kv-ring-fix.md.
 """
 
 import json
@@ -103,40 +92,20 @@ GPU_KW = dict(image=image, gpu="H100!", memory=98304,
                        "/results": results_vol})
 
 DATA_DIR = "/results/quailb_data"
-TRACE_DIR = "/results/ablations/discrepancy_traces"
 
-# query id -> (result file suffix, profiler windows). A window arms
-# when its condition first holds, then covers `chunks` forward
-# passes. "evicting" arms on the first retained-KV eviction, which
-# is where the IMDB-3 filter leaves its healthy regime.
-WINDOWS = {
-    "IMDB-3": [
-        dict(name="filter_healthy", op="filter", arm="chunk3",
-             chunks=12),
-        dict(name="filter_churn", op="filter", arm="evicting",
-             chunks=40),
-        dict(name="join", op="join", arm="chunk3", chunks=12),
-    ],
-    "BIO-2": [
-        dict(name="join_early", op="join", arm="chunk3", chunks=12),
-        dict(name="join_late", op="join", arm="chunk60", chunks=12),
-    ],
-}
-# With the scan ring the IMDB-3 filter should never evict, so the
-# "evicting" window would never arm and, windows being ordered, would
-# block the join window. The ringfix run watches the filter early and
-# late by chunk count instead.
-WINDOWS_RINGFIX = {
-    "IMDB-3": [
-        dict(name="filter_early", op="filter", arm="chunk3",
-             chunks=8),
-        dict(name="filter_late", op="filter", arm="chunk12",
-             chunks=8),
-        dict(name="join", op="join", arm="chunk3", chunks=12),
-    ],
-    "BIO-2": WINDOWS["BIO-2"],
-}
-SUFFIX = {"IMDB-3": "imdb3", "BIO-2": "bio2"}
+# Candidate profiler windows per phase: (name, arming rule, chunks
+# covered). Listed in priority order - when several are armed at the
+# same forward pass, the first listed captures.
+WINDOW_TEMPLATE = (
+    ("evicting", "evicting", 24),
+    ("early", "chunk3", 12),
+    ("mid", "chunk18", 12),
+    ("late", "chunk60", 12),
+)
+
+
+def _slug(qid):
+    return qid.lower().replace("-", "")
 
 
 # ------------------------------------------------------------- helpers
@@ -233,64 +202,75 @@ def _cupti_preinit(torch):
 class ProfilerWindows:
     """Short kernel-activity captures driven from forward-pass starts.
 
-    Windows run one at a time, in order. Each arms when its condition
-    first holds, covers `chunks` forward passes, then writes a chrome
-    trace. Kernel activity only (CUDA), so the CPU side of the loop
-    runs untraced.
+    open_phase registers this phase's candidates from WINDOW_TEMPLATE
+    and drops the previous phase's unfired ones. Each candidate arms
+    when its condition first holds; one capture runs at a time,
+    covers `chunks` forward passes, then writes a chrome trace.
+    Kernel activity only (CUDA), so the CPU side of the loop runs
+    untraced.
     """
 
-    def __init__(self, torch, arena, qid, windows,
-                 trace_dir=TRACE_DIR):
+    def __init__(self, torch, arena, slug, trace_dir):
         self.torch = torch
         self.arena = arena
-        self.qid = qid
+        self.slug = slug
         self.trace_dir = trace_dir
-        self.pending = list(windows)
+        self.pending = []
+        self.phase_tag = ""
         self.session = None
         self.left = 0
         self.meta = []
 
-    def _armed(self, spec, op, idx):
-        if spec["op"] != op:
-            return False
+    def open_phase(self, op, ordinal, chunk_seq):
+        if self.session is not None:
+            self._close(chunk_seq)
+        self.phase_tag = f"{op}{ordinal}"
+        self.pending = [
+            dict(name=name, arm=arm, chunks=chunks,
+                 evict_base=self.arena.evicted_keys)
+            for name, arm, chunks in WINDOW_TEMPLATE]
+
+    def _armed(self, spec, idx):
         if spec["arm"] == "evicting":
-            return self.arena.evicted_keys > 0
+            return self.arena.evicted_keys > spec["evict_base"]
         return idx >= int(spec["arm"].removeprefix("chunk"))
 
-    def on_chunk(self, op, idx, chunk_seq):
-        """Called before each forward pass launches."""
+    def on_chunk(self, idx, chunk_seq):
+        """Called before each forward pass launches; idx counts
+        chunks within the phase, chunk_seq across the query."""
         if self.session is not None:
             self.left -= 1
             if self.left <= 0:
                 self._close(chunk_seq)
             return
-        if not self.pending:
+        for i, spec in enumerate(self.pending):
+            if self._armed(spec, idx):
+                self.pending.pop(i)
+                break
+        else:
             return
-        spec = self.pending[0]
-        if not self._armed(spec, op, idx):
-            return
-        self.pending.pop(0)
         prof = self.torch.profiler.profile(
             activities=[self.torch.profiler.ProfilerActivity.CUDA])
         prof.__enter__()
-        self.session = (spec, prof)
+        self.session = (spec, prof, self.phase_tag)
         self.left = spec["chunks"]
-        self.meta.append(dict(name=spec["name"], first_chunk=chunk_seq,
-                              chunks=spec["chunks"]))
+        self.meta.append(dict(
+            name=f"{self.phase_tag}_{spec['name']}",
+            first_chunk=chunk_seq, chunks=spec["chunks"]))
 
     def _close(self, chunk_seq):
-        spec, prof = self.session
+        spec, prof, tag = self.session
         self.session = None
         # enqueued kernels must finish before collection stops
         self.torch.cuda.synchronize()
         prof.__exit__(None, None, None)
         os.makedirs(self.trace_dir, exist_ok=True)
-        path = f"{self.trace_dir}/{SUFFIX[self.qid]}_{spec['name']}" \
+        path = f"{self.trace_dir}/{self.slug}_{tag}_{spec['name']}" \
                ".chrome.json.gz"
         prof.export_chrome_trace(path)
         self.meta[-1]["last_chunk"] = chunk_seq
         self.meta[-1]["trace"] = path
-        print(f"[discrepancy] window {spec['name']} -> {path}",
+        print(f"[profile] window {tag}_{spec['name']} -> {path}",
               flush=True)
 
     def finish(self, chunk_seq):
@@ -348,7 +328,7 @@ class LoopRecorder:
             return self._orig["forward"](chunk)
         record, launches, idx = self._phase
         if self.profiler is not None:
-            self.profiler.on_chunk(record["op"], idx, self.chunk_seq)
+            self.profiler.on_chunk(idx, self.chunk_seq)
         launches.append((self._now(), chunk["tokens"]))
         self._phase = (record, launches, idx + 1)
         self.chunk_seq += 1
@@ -366,6 +346,9 @@ class LoopRecorder:
     def _open_phase(self, op, label, kv=None):
         record = dict(op=op, label=label, t_start=round(self._now(), 4),
                       kv=kv or {})
+        if self.profiler is not None:
+            self.profiler.open_phase(op, len(self.phases),
+                                     self.chunk_seq)
         self._phase = (record, [], 0)
         return record, time.perf_counter()
 
@@ -384,7 +367,7 @@ class LoopRecorder:
             for (t, n), ms in zip(launches, gpu_ms)]
         self._phase = None
         self.phases.append(record)
-        print(f"[discrepancy] {record['op']} {record['label']}: "
+        print(f"[profile] {record['op']} {record['label']}: "
               f"wall {record['wall_s']}s gpu {record['gpu_s']}s "
               f"chunks {record['n_chunks']} tokens {record['tokens']}",
               flush=True)
@@ -395,14 +378,12 @@ class LoopRecorder:
         record, t_call = self._open_phase(
             "filter", f"{len(doc_ids)} docs x {len(question_ids)} stages")
         kw.setdefault("timing", {})
-        kw.setdefault("trace", [])
         out = self._orig["run_filter"](
             torch, arena, pipeline, async_ans, doc_ids, question_ids,
             budget, **kw)
         answers, spans, tokens = out
         record["timing"] = {k: round(v, 4) if isinstance(v, float)
                             else v for k, v in kw["timing"].items()}
-        record["engine_trace"] = kw["trace"]
         # answers is keyed by document position; every answered
         # document's prefix was computed once in this query
         for d in answers:
@@ -448,14 +429,12 @@ class LoopRecorder:
 
 # ------------------------------------------------------------ the cell
 
-def _measure(state, qdefs, qid, profiled, windows_map=WINDOWS,
-             trace_dir=TRACE_DIR):
+def _measure(state, qdefs, qid, profiled, trace_dir):
     torch = state["torch"]
     windows = None
     if profiled:
-        windows = ProfilerWindows(torch, state["arena"], qid,
-                                  windows_map[qid],
-                                  trace_dir=trace_dir)
+        windows = ProfilerWindows(torch, state["arena"], _slug(qid),
+                                  trace_dir)
     recorder = LoopRecorder(state, profiler=windows)
     captured = {}
     try:
@@ -476,34 +455,36 @@ def _measure(state, qdefs, qid, profiled, windows_map=WINDOWS,
 
 @app.function(timeout=3600, **GPU_KW)
 def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
-            queries: tuple = ("IMDB-3", "BIO-2"),
-            out_prefix: str = "discrepancy") -> str:
-    """Both queries, two passes each: unprofiled (the cited walls and
-    the chunk timeline) and profiled (the trace windows).
+            queries: tuple = (),
+            out_prefix: str = "profile") -> str:
+    """Each named query, two passes: unprofiled (the cited walls and
+    the chunk timeline) and profiled (the derived trace windows).
 
-    out_prefix names the output files and trace directory, so a rerun
-    against changed engine code (e.g. "ringfix") never overwrites the
-    recorded files a report already cites. Any prefix other than
-    "discrepancy" uses the WINDOWS_RINGFIX profiler windows.
+    out_prefix names the output files and trace directory; pick one
+    that does not overwrite files a report already cites.
     """
+    if not queries:
+        raise ValueError("pass at least one QuailB query id")
     state, chunk_tokens, warm = _boot_state(model)
     _cupti_preinit(state["torch"])
     sess, qdefs = _quailb_session(model, sf)
-    windows_map = WINDOWS if out_prefix == "discrepancy" \
-        else WINDOWS_RINGFIX
+    missing = [q for q in queries if q not in qdefs]
+    if missing:
+        raise KeyError(f"unknown QuailB queries {missing}; "
+                       f"known: {sorted(qdefs)}")
     trace_dir = f"/results/ablations/{out_prefix}_traces"
-    summary = dict(cell="discrepancy_timeline", model=model, sf=sf,
+    summary = dict(cell="profile_quail", model=model, sf=sf,
                    chunk_tokens=chunk_tokens, warm=warm, queries={})
     for qid in queries:
         result = dict(query=qid, sf=sf, model=model,
                       chunk_tokens=chunk_tokens)
         result["unprofiled"] = _measure(state, qdefs, qid,
-                                        profiled=False)
+                                        profiled=False,
+                                        trace_dir=trace_dir)
         result["profiled"] = _measure(state, qdefs, qid,
                                       profiled=True,
-                                      windows_map=windows_map,
                                       trace_dir=trace_dir)
-        name = f"{out_prefix}_{SUFFIX.get(qid, qid.lower())}"
+        name = f"{out_prefix}_{_slug(qid)}"
         if sf != 0.1:
             name += f"_sf{sf}"
         _write(result, name)
@@ -520,19 +501,28 @@ def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
 
 # ---------------------------------------------------------- entrypoints
 
+def _parse_queries(queries):
+    out = tuple(q.strip() for q in queries.split(",") if q.strip())
+    if not out:
+        raise ValueError("--queries must name at least one QuailB id")
+    return out
+
+
 @app.local_entrypoint()
-def run_queries(model: str = "qwen3-4b-fp8", sf: float = 0.1,
-                out_prefix: str = "discrepancy"):
-    handle = measure.spawn(model, sf, out_prefix=out_prefix)
-    print(f"measure fc: {handle.object_id}", flush=True)
+def run(queries: str, model: str = "qwen3-4b-fp8", sf: float = 0.1,
+        out_prefix: str = "profile"):
+    handle = measure.spawn(model, sf, _parse_queries(queries),
+                           out_prefix)
+    print(f"profile_quail fc: {handle.object_id}", flush=True)
     print(handle.get())
 
 
 @app.local_entrypoint()
-def run_smoke(model: str = "qwen3-4b-fp8",
-              out_prefix: str = "discrepancy"):
+def run_smoke(queries: str, model: str = "qwen3-4b-fp8",
+              out_prefix: str = "profile"):
     """The full harness on the sf 0.01 tables, minutes not tens of
     minutes, before the measured run."""
-    handle = measure.spawn(model, 0.01, out_prefix=out_prefix)
-    print(f"smoke fc: {handle.object_id}", flush=True)
+    handle = measure.spawn(model, 0.01, _parse_queries(queries),
+                           out_prefix)
+    print(f"profile_quail smoke fc: {handle.object_id}", flush=True)
     print(handle.get())
