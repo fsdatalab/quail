@@ -36,8 +36,11 @@ vLLM's `gpu_memory_utilization=0.91` maps to
 activation working set (it profiles a forward, with logits for
 `max_num_seqs` requests, before sizing KV), SGLang's does not, and
 both 0.91 and 0.85 ran out of GPU memory on BIO-2. Prefill CUDA
-graphs are disabled for the same memory reason. The report explains
-both choices with the measured numbers.
+graphs are disabled for the same memory reason. The client also
+submits in slices of 16,384 requests: one `generate()` call with all
+563,500 BIO-2 pairs starved the Modal health heartbeat thread until
+Modal threatened to kill the container. The report explains all
+three choices with the measured numbers.
 
 ## Numbers
 

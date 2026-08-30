@@ -5,7 +5,7 @@ work directory to this script:
 
     W=<workdir>
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
-    modal volume get quail-results stock_sglang/2026-08-30_015521_465020a3/summary.json $W/stock_sglang.json
+    modal volume get quail-results stock_sglang/2026-08-30_033502_05712d88/summary.json $W/stock_sglang.json
     uv run --with matplotlib python reports/make_stock_sglang_baseline_plots.py $W
 """
 
@@ -97,9 +97,14 @@ def main():
         ratio = walls[0] / walls[1]
         direction = "faster" if ratio >= 1 else "slower"
         factor = ratio if ratio >= 1 else 1 / ratio
+        if rows[0]["pairs"] == rows[1]["pairs"]:
+            pairs_text = f"{rows[0]['pairs']:,} join pairs"
+        else:
+            pairs_text = (f"{rows[0]['pairs']:,} (vLLM) vs "
+                          f"{rows[1]['pairs']:,} (SGLang) join pairs")
         ax.set_title(
-            f"{qid} — {metrics(sglang_entries[qid])['pairs']:,} join "
-            f"pairs\nstock SGLang {factor:.2f}x {direction}")
+            f"{qid} — {pairs_text}\n"
+            f"stock SGLang {factor:.2f}x {direction}")
         ax.set_ylabel("seconds")
         ax.set_ylim(0, max(walls) * 1.35)
         ax.spines[["top", "right"]].set_visible(False)
