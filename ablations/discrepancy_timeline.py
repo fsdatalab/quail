@@ -44,11 +44,16 @@ Run:
     uv run modal run ablations/discrepancy_timeline.py::run_smoke
     uv run modal run ablations/discrepancy_timeline.py::run_queries
 
-Outputs on the quail-results volume:
+Outputs on the quail-results volume (file names take the entrypoints'
+--out-prefix, default "discrepancy", so a rerun against changed
+engine code keeps the recorded files intact):
 
-    /results/ablations/discrepancy_imdb3.json
-    /results/ablations/discrepancy_bio2.json
-    /results/ablations/discrepancy_traces/<query>_<window>.chrome.json.gz
+    /results/ablations/<prefix>_imdb3.json
+    /results/ablations/<prefix>_bio2.json
+    /results/ablations/<prefix>_traces/<query>_<window>.chrome.json.gz
+
+The 2026-08-30 scan-ring run used --out-prefix ringfix; its
+prediction lives in reports/2026-08-30-kv-ring-fix.md.
 """
 
 import json
@@ -116,6 +121,20 @@ WINDOWS = {
         dict(name="join_early", op="join", arm="chunk3", chunks=12),
         dict(name="join_late", op="join", arm="chunk60", chunks=12),
     ],
+}
+# With the scan ring the IMDB-3 filter should never evict, so the
+# "evicting" window would never arm and, windows being ordered, would
+# block the join window. The ringfix run watches the filter early and
+# late by chunk count instead.
+WINDOWS_RINGFIX = {
+    "IMDB-3": [
+        dict(name="filter_early", op="filter", arm="chunk3",
+             chunks=8),
+        dict(name="filter_late", op="filter", arm="chunk12",
+             chunks=8),
+        dict(name="join", op="join", arm="chunk3", chunks=12),
+    ],
+    "BIO-2": WINDOWS["BIO-2"],
 }
 SUFFIX = {"IMDB-3": "imdb3", "BIO-2": "bio2"}
 
@@ -220,10 +239,12 @@ class ProfilerWindows:
     runs untraced.
     """
 
-    def __init__(self, torch, arena, qid, windows):
+    def __init__(self, torch, arena, qid, windows,
+                 trace_dir=TRACE_DIR):
         self.torch = torch
         self.arena = arena
         self.qid = qid
+        self.trace_dir = trace_dir
         self.pending = list(windows)
         self.session = None
         self.left = 0
@@ -263,8 +284,8 @@ class ProfilerWindows:
         # enqueued kernels must finish before collection stops
         self.torch.cuda.synchronize()
         prof.__exit__(None, None, None)
-        os.makedirs(TRACE_DIR, exist_ok=True)
-        path = f"{TRACE_DIR}/{SUFFIX[self.qid]}_{spec['name']}" \
+        os.makedirs(self.trace_dir, exist_ok=True)
+        path = f"{self.trace_dir}/{SUFFIX[self.qid]}_{spec['name']}" \
                ".chrome.json.gz"
         prof.export_chrome_trace(path)
         self.meta[-1]["last_chunk"] = chunk_seq
@@ -427,12 +448,14 @@ class LoopRecorder:
 
 # ------------------------------------------------------------ the cell
 
-def _measure(state, qdefs, qid, profiled):
+def _measure(state, qdefs, qid, profiled, windows_map=WINDOWS,
+             trace_dir=TRACE_DIR):
     torch = state["torch"]
     windows = None
     if profiled:
         windows = ProfilerWindows(torch, state["arena"], qid,
-                                  WINDOWS[qid])
+                                  windows_map[qid],
+                                  trace_dir=trace_dir)
     recorder = LoopRecorder(state, profiler=windows)
     captured = {}
     try:
@@ -453,12 +476,22 @@ def _measure(state, qdefs, qid, profiled):
 
 @app.function(timeout=3600, **GPU_KW)
 def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
-            queries: tuple = ("IMDB-3", "BIO-2")) -> str:
+            queries: tuple = ("IMDB-3", "BIO-2"),
+            out_prefix: str = "discrepancy") -> str:
     """Both queries, two passes each: unprofiled (the cited walls and
-    the chunk timeline) and profiled (the trace windows)."""
+    the chunk timeline) and profiled (the trace windows).
+
+    out_prefix names the output files and trace directory, so a rerun
+    against changed engine code (e.g. "ringfix") never overwrites the
+    recorded files a report already cites. Any prefix other than
+    "discrepancy" uses the WINDOWS_RINGFIX profiler windows.
+    """
     state, chunk_tokens, warm = _boot_state(model)
     _cupti_preinit(state["torch"])
     sess, qdefs = _quailb_session(model, sf)
+    windows_map = WINDOWS if out_prefix == "discrepancy" \
+        else WINDOWS_RINGFIX
+    trace_dir = f"/results/ablations/{out_prefix}_traces"
     summary = dict(cell="discrepancy_timeline", model=model, sf=sf,
                    chunk_tokens=chunk_tokens, warm=warm, queries={})
     for qid in queries:
@@ -467,8 +500,10 @@ def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
         result["unprofiled"] = _measure(state, qdefs, qid,
                                         profiled=False)
         result["profiled"] = _measure(state, qdefs, qid,
-                                      profiled=True)
-        name = f"discrepancy_{SUFFIX.get(qid, qid.lower())}"
+                                      profiled=True,
+                                      windows_map=windows_map,
+                                      trace_dir=trace_dir)
+        name = f"{out_prefix}_{SUFFIX.get(qid, qid.lower())}"
         if sf != 0.1:
             name += f"_sf{sf}"
         _write(result, name)
@@ -486,16 +521,18 @@ def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
 # ---------------------------------------------------------- entrypoints
 
 @app.local_entrypoint()
-def run_queries(model: str = "qwen3-4b-fp8", sf: float = 0.1):
-    handle = measure.spawn(model, sf)
+def run_queries(model: str = "qwen3-4b-fp8", sf: float = 0.1,
+                out_prefix: str = "discrepancy"):
+    handle = measure.spawn(model, sf, out_prefix=out_prefix)
     print(f"measure fc: {handle.object_id}", flush=True)
     print(handle.get())
 
 
 @app.local_entrypoint()
-def run_smoke(model: str = "qwen3-4b-fp8"):
+def run_smoke(model: str = "qwen3-4b-fp8",
+              out_prefix: str = "discrepancy"):
     """The full harness on the sf 0.01 tables, minutes not tens of
     minutes, before the measured run."""
-    handle = measure.spawn(model, 0.01)
+    handle = measure.spawn(model, 0.01, out_prefix=out_prefix)
     print(f"smoke fc: {handle.object_id}", flush=True)
     print(handle.get())

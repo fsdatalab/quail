@@ -260,8 +260,9 @@ def keep_split(doc_tokens, budget_tokens: float, survivor_frac: float,
     than a slightly shorter one - so the split is exact in bytes and
     approximate within one page per document.
 
-    The runtime is not bound by the threshold: it retains every
-    passing survivor and evicts by recompute value under pressure.
+    The runtime is not bound by the threshold: it offers every
+    passing survivor to a capped pool where longer documents displace
+    shorter ones by saved recompute per page - the same ordering.
     This split is the capacity-planned credit the cost model and the
     SoL comparison use.
 
@@ -341,9 +342,9 @@ def _keep_timeline(seq, keep_plan, doc_tokens, live0, pre,
     every credited alias's filter mass; after each group, credited
     masses not yet anchored plus the gate-survivor mass of anchors a
     later group re-uses (retention holds every gate survivor, not
-    just the credited split). Within a group, anchors run one at a
-    time, so the per-anchor working set is the headroom the caller
-    adds. Retained prefixes are rewound to preamble + document.
+    just the credited split). The in-flight chunk working set is the
+    headroom the caller adds. Retained prefixes are rewound to
+    preamble + document.
     """
     groups = _group_seq(seq)
     first_use, last_use = {}, {}
@@ -451,23 +452,12 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         live0[_filter_alias(fs[0])] *= surv
     base_work = _filter_work(filters, stats, filter_orders, pre)
 
-    # ---- the largest single admission any operator makes: the keep
-    # arithmetic reserves it as working headroom
-    headroom = 0
-    for s in scans:
-        fq = max((_question_tokens(p.prompt)
-                  for p in filters.get(s.alias, ())), default=0)
-        if fq:
-            headroom = max(headroom,
-                           pre + stats[s.alias].max_doc_tokens + fq)
-    for spec in specs:
-        for a in spec["aliases"]:
-            headroom = max(
-                headroom,
-                pre + stats[a].max_doc_tokens + spec["frame_tokens"][a]
-                + sum(spec["label_tokens"][p] + stats[p].max_doc_tokens
-                      for p in spec["aliases"] if p != a)
-                + spec["tail_tokens"])
+    # ---- the executor loops keep two chunks of document KV in
+    # flight (one running while the next packs), and the runtime
+    # caps retained KV at what is left of the arena beside that
+    # reservation (executor.loop.run_filter): the keep arithmetic
+    # reserves the same working headroom
+    headroom = 2 * chunk
 
     # ---- keep credit candidates, then the search on expectations
     keep_budget = max(0.0, float(admission - headroom)) * workers
@@ -651,8 +641,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 inputs=(ids_src[s.alias],),
                 alias=s.alias, arena_writes=writes,
                 keep_kv=keep,
-                # the capacity-planned credit; the runtime retains
-                # every survivor and evicts by value under pressure
+                # the capacity-planned credit; the runtime offers
+                # every survivor to its capped retained pool
                 keep_min_doc_tokens=(credit["min_doc_tokens"]
                                      if credit else 0),
                 stages=tuple(stages)))

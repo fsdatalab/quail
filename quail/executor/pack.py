@@ -301,6 +301,12 @@ class FilterAdmission:
         """Record one answer. Frees pages on FALSE or last stage;
         otherwise queues the next-stage suffix.
 
+        release=False hands the document to a retained pool outside
+        this chain: the caller rewinds its KV to the document's own
+        tokens, so the pages past that rewind return here, and the
+        rest leave this accounting (add_free_pages returns them if
+        the pool later evicts the document).
+
         Returns docs whose pages were freed."""
         self.in_flight.discard(doc)
         self.answers.setdefault(doc, []).append(1 if passed else 0)
@@ -310,9 +316,14 @@ class FilterAdmission:
         if passed and not last:
             self.ready.append((doc, stage + 1))
             return ()
-        if release and self.free_pages is not None:
-            self.free_pages += self.resident.pop(doc)
+        if self.free_pages is None:
+            return ()
+        held = self.resident.pop(doc)
+        if release:
+            self.free_pages += held
             return (doc,)
+        self.free_pages += held - pages_for(self.doc_tokens[doc],
+                                            self.page_tokens)
         return ()
 
     def add_free_pages(self, pages):

@@ -592,9 +592,10 @@ def test_keep_split_keeps_longest_documents_that_fit():
 
 
 def test_keep_capped_by_arena_length_threshold(catalog):
-    # 3,000-token documents fill the arena; only the long half of the
-    # survivors stays resident and the remark names the threshold
-    toks = {"r": [3000] * 100 + [1000] * 100, "p": [5] * 20}
+    # the 3,000-token documents fill the keep budget (the arena minus
+    # the loop's two-chunk working reservation); only they stay
+    # credited and the remark names the threshold
+    toks = {"r": [3000] * 40 + [1000] * 100, "p": [5] * 20}
     plan = plan_query(_filtered_join(catalog, doc_sel=1.0),
                       model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
