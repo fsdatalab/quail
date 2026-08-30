@@ -15,6 +15,7 @@ where $W holds the files pulled from the quail-results volume:
 
     modal volume get quail-results ablations/discrepancy_imdb3.json $W/
     modal volume get quail-results ablations/ringfix_imdb3.json $W/
+    modal volume get quail-results ablations/ringfix_tokens_head_imdb3.json $W/
     modal volume get quail-results ablations/ringfix_bio2.json $W/
 """
 
@@ -25,7 +26,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
-from plot_colors import BLUE, DARK, GRAY, RED  # noqa: E402
+from plot_colors import BLUE, DARK, GRAY, ORANGE, RED  # noqa: E402
 
 plt.style.use(Path(__file__).parent / "quail.mplstyle")
 
@@ -55,12 +56,10 @@ def timeline(before, after):
     ax.plot(bx, by, ".", color=RED, ms=3,
             label="unbounded retention")
     ax.plot(ax_, ay, "-o", color=BLUE, ms=6, lw=1,
-            label="scan ring")
+            label="scan reserve")
     ax.set_yscale("log")
     ax.set_xlabel("seconds since the filter started")
     ax.set_ylabel("tokens in the forward pass (log scale)")
-    ax.set_title("IMDB-3 filter: each dot is one launched "
-                 "forward pass")
     bw = filter_phase(before)["wall_s"]
     aw = filter_phase(after)["wall_s"]
     ax.annotate(
@@ -68,7 +67,7 @@ def timeline(before, after):
         f"evicted first: {len(by):,} passes, {bw:.1f} s",
         xy=(bx[-1], by[-1]), xytext=(bx[-1] - 26, 3800), color=RED)
     ax.annotate(
-        f"retention capped beside the ring:\n"
+        f"retention capped beside the reserve:\n"
         f"{len(ay)} full passes, {aw:.1f} s",
         xy=(ax_[-1], ay[-1]),
         xytext=(ax_[-1] + 1.5, ay[-1] * 0.45), color=BLUE)
@@ -77,31 +76,35 @@ def timeline(before, after):
     fig.savefig(OUT / "kv_ring_fix_timeline.png", dpi=300)
 
 
-def walls(before, after):
+def walls(before, old_score, after):
     fig, ax = plt.subplots(figsize=(7, 4.2))
     groups = [
         ("filter", filter_phase(before)["wall_s"],
+         filter_phase(old_score)["wall_s"],
          filter_phase(after)["wall_s"]),
         ("join", join_phase(before)["wall_s"],
+         join_phase(old_score)["wall_s"],
          join_phase(after)["wall_s"]),
     ]
     x = range(len(groups))
-    width = 0.38
-    for i, (name, b, a) in enumerate(groups):
-        ax.bar(i - width / 2, b, width, color=GRAY)
-        ax.bar(i + width / 2, a, width, color=BLUE)
-        ax.text(i - width / 2, b + 0.6, f"{b:.1f}", ha="center",
-                color=DARK)
-        ax.text(i + width / 2, a + 0.6, f"{a:.1f}", ha="center",
-                color=DARK)
-    speed = groups[0][1] / groups[0][2]
+    width = 0.25
+    labels = ("unbounded", "saved seconds", "prefix tokens")
+    colors = (GRAY, ORANGE, BLUE)
+    offsets = (-width, 0, width)
+    for i, (_name, *values) in enumerate(groups):
+        for value, label, color, offset in zip(
+                values, labels, colors, offsets):
+            ax.bar(i + offset, value, width, color=color, label=(
+                label if i == 0 else None))
+            ax.text(i + offset, value + 0.6, f"{value:.1f}",
+                    ha="center", color=DARK)
+    speed = groups[0][1] / groups[0][3]
     ax.text(0, groups[0][1] * 0.55, f"{speed:.1f}x", ha="center",
             color=BLUE)
     ax.set_xticks(list(x))
-    ax.set_xticklabels([f"{n} phase" for n, _, _ in groups])
+    ax.set_xticklabels([f"{group[0]} phase" for group in groups])
     ax.set_ylabel("seconds")
-    ax.set_title("IMDB-3 phase walls: unbounded retention (gray) "
-                 "against the scan ring (blue)")
+    ax.legend(frameon=False, ncol=3, loc="upper right")
     fig.tight_layout()
     fig.savefig(OUT / "kv_ring_fix_walls.png", dpi=300)
 
@@ -109,13 +112,15 @@ def walls(before, after):
 def main(workdir):
     w = Path(workdir)
     before = json.loads((w / "discrepancy_imdb3.json").read_text())
-    after = json.loads((w / "ringfix_imdb3.json").read_text())
+    old_score = json.loads((w / "ringfix_imdb3.json").read_text())
+    after = json.loads((w / "ringfix_tokens_head_imdb3.json").read_text())
     OUT.mkdir(exist_ok=True)
     timeline(before, after)
-    walls(before, after)
+    walls(before, old_score, after)
 
     for name, run in (("unbounded retention", before),
-                      ("scan ring", after)):
+                      ("saved seconds", old_score),
+                      ("prefix tokens", after)):
         u = run["unprofiled"]
         f = filter_phase(run)
         print(f"{name}: engine {u['engine_wall_s']}s, filter "

@@ -778,8 +778,7 @@ def _shared_preamble_tokens(question_ids):
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
-               arena_keys=None, retain_survivors=(),
-               retention_values=None):
+               arena_keys=None, retain_survivors=()):
     """The filter chain: continuous admission, survivor priority, pages
     freed on FALSE or after the last stage.
 
@@ -796,7 +795,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         retain_survivors: Passing document positions to keep for
             joins, through a RetainedPool capped at the arena minus
             the scan ring.
-        retention_values: Saved recomputation seconds by document position.
 
     Returns:
         (answers, spans, tokens): answers[d] = 0/1 list up to the
@@ -809,7 +807,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         raise ValueError("arena_keys must match doc_ids")
     retain = (set(range(len(doc_ids))) if retain_survivors is True
               else set(retain_survivors))
-    values = retention_values or {}
     stage_tokens = [len(question_ids[0])] \
         + [len(q) - p for q in question_ids[1:]]
     tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
@@ -872,15 +869,14 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                 keep, victims = pool.offer(
                     keys[doc],
                     arena.accounting.pages_needed(len(doc_ids[doc])),
-                    float(values.get(doc, 0.0)))
+                    len(doc_ids[doc]))
                 for v in victims:
-                    sched.add_free_pages(arena.free_key(v))
+                    sched.add_free_pages(arena.evict_key(v))
             for d in sched.report(doc, stage, passed,
                                   release=not keep):
                 arena.free_key(keys[d])
             if keep:
-                arena.retain(keys[doc], len(doc_ids[doc]),
-                             float(values.get(doc, 0.0)))
+                arena.retain(keys[doc], len(doc_ids[doc]))
         _tick(timing, "report_rest", t)
 
     while not sched.done():

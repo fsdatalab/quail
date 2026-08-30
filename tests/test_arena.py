@@ -65,9 +65,10 @@ def test_pin_retain_rewind_and_free():
 
     a.pin("doc")
     assert "doc" in a.pinned
-    a.retain("doc", 3.5)
+    a.retain("doc")
     assert "doc" not in a.pinned
-    assert a.retained["doc"] == 3.5
+    assert a.retained["doc"] == 7
+    assert a.retained_prefix_tokens == 7
 
     assert a.rewind("doc", 4) == 2
     assert len(a.owned["doc"]) == 1
@@ -84,20 +85,20 @@ def test_grow_uses_only_free_pages():
     assert a.grow("doc", 16) is None
 
 
-def test_retained_victim_uses_saved_work_per_page():
+def test_retained_victim_uses_prefix_tokens_per_page():
     a = PageArena(n_pages=4, page_tokens=16)
     a.alloc("one-page", 16)
     a.alloc("two-pages", 17)
-    a.retain("one-page", 10.0)
-    a.retain("two-pages", 15.0)
+    a.retain("one-page")
+    a.retain("two-pages")
 
-    assert a.pop_retained_victim() == ("two-pages", 2, 15.0)
+    assert a.pop_retained_victim() == ("two-pages", 2, 17)
 
 
 def test_pinned_stale_heap_entry_is_not_a_victim():
     a = PageArena(n_pages=2, page_tokens=16)
     a.alloc("doc", 16)
-    a.retain("doc", 3.0)
+    a.retain("doc")
     a.pin("doc")
 
     assert a.pop_retained_victim() is None

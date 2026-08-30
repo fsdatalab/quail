@@ -6,10 +6,10 @@ import heapq
 class RetainedPool:
     """Fixed-capacity pool of document prefixes kept for a later operator.
 
-    Keeps every offer while capacity lasts. Once full, the lowest
-    value-per-page residents make room only when the newcomer's value
-    strictly exceeds theirs combined, so total retained value only
-    rises and equal value never swaps.
+    Keeps every offer while capacity lasts. Once full, residents with
+    the fewest prefix tokens per page make room only when the newcomer's
+    prefix tokens strictly exceed theirs combined. Total retained prefix
+    tokens only rise, and equal token counts never swap.
     """
 
     def __init__(self, cap_pages: int):
@@ -17,25 +17,26 @@ class RetainedPool:
             raise ValueError("cap_pages must be nonnegative")
         self.cap_pages = cap_pages
         self.pages = 0
-        self.value = 0.0
-        self._entries = {}    # key -> (pages, value)
-        self._heap = []       # (value per page, seq, key); one live
+        self.prefix_tokens = 0
+        self._entries = {}    # key -> (pages, prefix tokens)
+        self._heap = []       # (prefix tokens per page, seq, key)
         #                       record per key - victims leave the heap
         #                       when popped, rejected pops go back
         self._seq = 0
 
-    def _push(self, key, pages: int, value: float):
-        self._entries[key] = (pages, value)
+    def _push(self, key, pages: int, prefix_tokens: int):
+        self._entries[key] = (pages, prefix_tokens)
         self._seq += 1
-        heapq.heappush(self._heap, (value / pages, self._seq, key))
+        heapq.heappush(
+            self._heap, (prefix_tokens / pages, self._seq, key))
 
-    def offer(self, key, pages: int, value: float):
+    def offer(self, key, pages: int, prefix_tokens: int):
         """Consider one prefix for retention.
 
         Args:
             key: The prefix's identity, unique per offer.
             pages: KV pages the retained prefix occupies.
-            value: Seconds of recompute its next use saves.
+            prefix_tokens: Reusable tokens in the prefix.
 
         Returns:
             (kept, victims): whether the prefix is retained, and the
@@ -43,38 +44,39 @@ class RetainedPool:
         """
         if pages <= 0:
             raise ValueError("pages must be positive")
-        if value < 0:
-            raise ValueError("value must be nonnegative")
+        if prefix_tokens <= 0:
+            raise ValueError("prefix_tokens must be positive")
         if key in self._entries:
             raise KeyError(f"{key!r} already retained")
         if self.pages + pages <= self.cap_pages:
-            self._push(key, pages, value)
+            self._push(key, pages, prefix_tokens)
             self.pages += pages
-            self.value += value
+            self.prefix_tokens += prefix_tokens
             return True, ()
         if pages > self.cap_pages:
             return False, ()
         popped = []
         freed = 0
-        loss = 0.0
+        lost_prefix_tokens = 0
         while (self.pages - freed + pages > self.cap_pages
-               and loss < value and self._heap):
+               and lost_prefix_tokens < prefix_tokens and self._heap):
             record = heapq.heappop(self._heap)
             entry = self._entries.get(record[2])
             if entry is None:
                 continue        # evicted through discard, stale record
-            victim_pages, victim_value = entry
+            victim_pages, victim_prefix_tokens = entry
             popped.append(record)
             freed += victim_pages
-            loss += victim_value
-        if self.pages - freed + pages <= self.cap_pages and loss < value:
+            lost_prefix_tokens += victim_prefix_tokens
+        if (self.pages - freed + pages <= self.cap_pages
+                and lost_prefix_tokens < prefix_tokens):
             for _, _, k in popped:
                 del self._entries[k]
             self.pages -= freed
-            self.value -= loss
-            self._push(key, pages, value)
+            self.prefix_tokens -= lost_prefix_tokens
+            self._push(key, pages, prefix_tokens)
             self.pages += pages
-            self.value += value
+            self.prefix_tokens += prefix_tokens
             return True, tuple(k for _, _, k in popped)
         for record in popped:
             heapq.heappush(self._heap, record)
@@ -85,11 +87,10 @@ class RetainedPool:
         entry = self._entries.pop(key, None)
         if entry is not None:
             self.pages -= entry[0]
-            self.value -= entry[1]
+            self.prefix_tokens -= entry[1]
 
     def __contains__(self, key):
         return key in self._entries
 
     def __len__(self):
         return len(self._entries)
-

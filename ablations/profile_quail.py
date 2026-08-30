@@ -5,7 +5,9 @@ The cell runs each named query through the real planner and the real
 worker execution core and records, per forward pass: launch time,
 packed tokens, and GPU time from the CUDA events the loops already
 create. Per phase it records walls and CPU seconds per loop step;
-across the query, every eviction of retained KV and the KV regret.
+across the query, every blocked-admission eviction call and the KV
+regret. The worker's `kv_manager` block counts all evicted documents,
+including retained-pool replacements.
 All instrumentation wraps the engine from this script (module
 attributes and instance attributes); no engine file changes.
 
@@ -285,8 +287,8 @@ class LoopRecorder:
 
     Wraps quail.executor.loop.run_filter / run_join (module
     attributes, bound at the worker's call time), the pipeline's
-    forward_chunk, and the arena's evict_retained (instance
-    attributes). Restores everything in unpatch().
+    forward_chunk, and the arena's blocked-admission eviction method.
+    Restores everything in unpatch().
     """
 
     def __init__(self, state, profiler=None):

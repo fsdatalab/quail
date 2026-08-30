@@ -18,7 +18,7 @@ class PageArena:
         self.owned = {}       # key -> list of page ids
         self.tokens = {}      # key -> resident token count
         self.pinned = set()    # current operators depend on these keys
-        self.retained = {}     # key -> ideal seconds saved at next use
+        self.retained = {}     # key -> reusable prefix tokens
         self._retained_heap = []
         self._retained_versions = {}
         self._retention_version = 0
@@ -61,35 +61,34 @@ class PageArena:
         self._retained_versions.pop(key, None)
         self.pinned.add(key)
 
-    def retain(self, key, value: float) -> None:
+    def retain(self, key) -> None:
         """Make a resident key evictable after its current use."""
 
         if key not in self.owned:
             raise KeyError(key)
-        if value < 0:
-            raise ValueError("retention value must be nonnegative")
         self.pinned.discard(key)
-        self.retained[key] = value
+        prefix_tokens = self.tokens[key]
+        self.retained[key] = prefix_tokens
         self._retention_version += 1
         version = self._retention_version
         self._retained_versions[key] = version
         pages = len(self.owned[key])
         heapq.heappush(
             self._retained_heap,
-            (value / pages, version, key, pages, value),
+            (prefix_tokens / pages, version, key, pages, prefix_tokens),
         )
 
     def pop_retained_victim(self):
-        """Remove and return the lowest saved work per KV page."""
+        """Remove and return the lowest prefix tokens per KV page."""
 
         while self._retained_heap:
-            _, version, key, pages, value = heapq.heappop(
+            _, version, key, pages, prefix_tokens = heapq.heappop(
                 self._retained_heap)
             if self._retained_versions.get(key) != version:
                 continue
             self._retained_versions.pop(key)
             self.retained.pop(key)
-            return key, pages, value
+            return key, pages, prefix_tokens
         return None
 
     def rewind(self, key, tokens: int) -> int:
@@ -144,6 +143,10 @@ class PageArena:
     def retained_pages(self) -> int:
         return sum(len(self.owned[key]) for key in self.retained)
 
+    @property
+    def retained_prefix_tokens(self) -> int:
+        return sum(self.tokens[key] for key in self.retained)
+
 
 class KVArena:
     """The tensor backing: per-layer K and V pools of shape
@@ -174,7 +177,7 @@ class KVArena:
     def reset_stats(self):
         self.evicted_keys = 0
         self.evicted_pages = 0
-        self.evicted_value = 0.0
+        self.evicted_prefix_tokens = 0
 
     def alloc(self, key, tokens: int, capacity_tokens: int | None = None):
         pages = self.accounting.alloc(key, tokens, capacity_tokens)
@@ -204,32 +207,38 @@ class KVArena:
     def pin(self, key):
         self.accounting.pin(key)
 
-    def retain(self, key, tokens: int, value: float):
+    def retain(self, key, tokens: int):
         """Rewind a prefix and make it available for a later operator."""
 
         self.accounting.rewind(key, tokens)
         self._refresh_rows(key, tokens)
-        self.accounting.retain(key, value)
+        self.accounting.retain(key)
 
     def evict_retained(self, pages_needed: int) -> tuple:
-        """Evict retained prefixes with the least saved work per page."""
+        """Evict prefixes with the fewest reusable tokens per page."""
 
         keys = []
         pages = 0
-        value = 0.0
         while pages < pages_needed:
             victim = self.accounting.pop_retained_victim()
             if victim is None:
                 break
-            key, victim_pages, victim_value = victim
+            key, victim_pages, _ = victim
             keys.append(key)
             pages += victim_pages
-            value += victim_value
-            self.free_key(key)
-        self.evicted_keys += len(keys)
-        self.evicted_pages += pages
-        self.evicted_value += value
+            self.evict_key(key)
         return tuple(keys)
+
+    def evict_key(self, key):
+        """Free one retained prefix and record the lost KV."""
+
+        pages = len(self.accounting.owned[key])
+        prefix_tokens = self.accounting.tokens[key]
+        self.free_key(key)
+        self.evicted_keys += 1
+        self.evicted_pages += pages
+        self.evicted_prefix_tokens += prefix_tokens
+        return pages
 
     def activate(self, key, tokens: int, capacity_tokens: int | None = None):
         """Make a prefix active, evicting retained KV when required."""

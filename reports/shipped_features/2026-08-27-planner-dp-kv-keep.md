@@ -58,16 +58,14 @@ The runtime never evicts to admit a cache entry: every admission is
 a computation the query requires, only retention is optional, and
 retaining an already-resident document costs nothing to start. When
 retained KV starves a required admission, the arena evicts document
-prefixes in increasing saved work per page. A heap makes retention
+prefixes in increasing prefix tokens per page. A heap makes retention
 and each eviction take logarithmic time in the number of retained
-documents. The value of a prefix of length L is L dense
-tokens against the fp8 peak plus L(L+1)/2 attention pairs against
-the bf16 peak - both counted from the architecture and the
-datasheet. The linear dense term dominates below the crossover
-(about 12,320 prefix tokens at 4B, 29,760 at 32B), where most
-benchmark documents sit. Pages are rounded to 16 tokens before the
-ratio is computed. Pinned keys in use by the running operator are
-not eviction candidates.
+documents. The score is the exact reusable prefix token count divided
+by the whole KV pages the prefix occupies. A candidate replaces
+complete residents only when it contains more prefix tokens than the
+victims contain together. Pages are rounded to 16 tokens before the
+ratio is computed. Pinned keys in use by the running operator are not
+eviction candidates.
 
 The heap rule is not the exact minimum-loss set. The exact problem
 is a minimum knapsack cover problem. Its running time depends on the
@@ -76,10 +74,10 @@ a small test oracle. It does not run in the planner or worker.
 
 At plan time the same idea appears as a credit, not a rule:
 `keep_split` prices in the expected resident fraction the arena can
-hold, longest documents first. The byte calculation is fractional,
-while the arena allocates whole pages, so the split is an estimate.
-The runtime is not bound by the threshold. The runtime tracks each
-document and uses the exact page count.
+hold with the corpus length distribution. The runtime can favor any
+prefix whose final page is fuller, so the credit does not use a length
+threshold. The runtime tracks each document and uses the exact page
+count.
 
 ## Why
 

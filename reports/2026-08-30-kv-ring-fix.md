@@ -1,175 +1,162 @@
-# The scan ring: KV retention that cannot starve admission
+# KV retention that does not reduce filter admission
 
 ## Setup
 
-The 2026-08-30 discrepancy report
-(`2026-08-30-imdb3-bio2-discrepancies.md`) showed why IMDB-3 was the
-one QuailB query Quail lost: the planner priced 358,861 of the
-362,250-token arena as retained survivor KV while reserving working
-headroom for only one document (3,389 tokens), and the filter loop
-actually keeps up to two chunk budgets of in-flight document KV
-(220,752 tokens). Six chunks in, the arena filled, and every later
-admission first evicted one retained document through the
-blocked-admission path. The filter degenerated into 2,916 forward
-passes of 469 mean tokens; retention cost 35.2 seconds to save 1.3.
+The IMDB 3 discrepancy report found that retained survivor KV consumed nearly
+the full arena. The planner treated 358,861 of the 362,250 arena tokens as
+retained KV and left only 3,389 tokens for active filter work. The filter can
+have two chunks in progress, which require up to 220,752 tokens.
 
-This PR changes how retained KV is managed, in three parts:
+After six chunks, every new admission had to evict retained KV. The filter ran
+2,922 forward passes with a mean of 602 tokens per pass and took 50.28 seconds.
+The same filter takes about 15 seconds when retention does not reduce its chunk
+size.
 
-- **The scan ring.** Before a filter with retention starts, the loop
-  reserves pages for two chunk budgets of document KV - one chunk
-  executing while the next is packed - and caps retained KV at what
-  is left. If an earlier operator's retained KV crowds the ring, the
-  least valuable prefixes are evicted once, in bulk, up front. The
-  admission path never touches retained KV again.
-- **The retained pool** (`quail/executor/retention.py`,
-  `RetainedPool`). Passing survivors are offered to a
-  fixed-capacity pool. While it has room, every offer is kept. Once
-  full, the residents with the least saved recompute per page are
-  candidates to make room, and the newcomer replaces them only when
-  its recompute value strictly exceeds what the victims lose
-  together. Total retained value only rises; equal value never
-  swaps; longer documents displace shorter ones. A replacement costs
-  a heap operation, not a forward pass: it happens in the
-  answer-handling path, never in admission.
-- **Planner agreement** (`quail/planner/decide.py`). The keep credit
-  now reserves the same two-chunk working headroom
-  (`headroom = 2 * chunk`, 220,752 tokens at 4B), so the plan prices
-  as resident only what the runtime can actually hold:
-  141,498 tokens instead of 358,861.
+The current implementation has three parts.
 
-The old one-victim-at-a-time eviction inside blocked admission
-remains only as a safety valve; with the ring in place it should
-never fire.
+* The filter reserves pages for two chunk budgets before it starts. The
+  retained pool can use only the pages outside this scan reserve.
 
-Confirming run: `ablations/discrepancy_timeline.py` (the same
-instrumented cell as the discrepancy report, since generalized into
-`ablations/profile_quail.py`; it wraps the engine without modifying
-it) rerun with `--out-prefix ringfix`, sf 0.1, Qwen3 4B fp8, one
-H100, so the unbounded-retention files stay intact for comparison.
+* A passing survivor stays in its existing pages. The retained pool maximizes
+  reusable prefix tokens under its page limit. When the pool is full, residents
+  with the fewest prefix tokens per page are considered first. A candidate
+  replaces complete resident documents only when it contains more prefix tokens
+  than all victims combined. The policy does not estimate runtime.
+
+* The planner reserves the same two chunk budgets. Because page rounding can
+  favor documents of any length, the planner credits a fraction of filter
+  survivors with the corpus length distribution instead of assuming that the
+  longest survivors remain resident.
+
+The old admission eviction path remains as a safety check. The scan reserve
+should make the path unreachable during a normal filter.
+
+The confirming query was IMDB 3 at scale factor 0.1 with Qwen3 4B fp8 on one
+H100. `ablations/profile_quail.py` recorded an unprofiled pass for query time
+and a profiled pass for the GPU trace. The current run used the prefix
+`ringfix_tokens_head`.
 
 ## Prediction
 
-Stated before the run:
+The following prediction was recorded before the prefix token run.
 
-- IMDB-3: zero eviction calls; the filter runs near-budget chunks
-  for the whole scan (tens of chunks, not 2,916) and takes 15 to
-  17 seconds, matching IMDB-1's 15.06 seconds for identical work;
-  the join stays at about 18.5 to 19.5 seconds; engine wall 34 to
-  38 seconds, against 68.9 measured with unbounded retention in
-  the same harness and 75.0 recorded in the benchmark.
-- IMDB-3 retention: the pool fills to about 8,800 pages
-  (141,000 tokens); the join finds about 400 to 500 anchors
-  resident (the longest survivors), a similar hit mass to the
-  137,397 tokens the unbounded-retention run got - the fix does
-  not buy more
-  hits, it stops paying 35 seconds for them. Regret stays about
-  1.2M tokens; the misses just stop costing batch shape.
-- BIO-2: unchanged within noise (about 128 to 131 seconds, regret
-  0, no evictions) - its plan retains nothing, so only the shared
-  code paths could move it.
-- Smoke first (sf 0.01): corpus fits beside the ring, everything
-  retained, join reuses everything, as with unbounded retention.
+* The filter would remain at 17 near full forward passes and take 14 to 17
+  seconds because the scan reserve did not change.
+
+* The retained pool would fill its 8,843 page limit and hold about 141,000
+  prefix tokens.
+
+* The token policy would retain more than the 171 documents retained by the
+  saved seconds policy because it would no longer prefer long documents.
+
+* The join would remain near 18 seconds. Total engine time would remain between
+  32 and 35 seconds.
+
+* KV regret would remain near 1.22 million tokens because the retained token
+  mass would remain nearly unchanged.
+
+BIO 2 was not rerun for the score change. Its plan retains no filter KV, so it
+does not enter the changed pool. The earlier scan reserve run remains the
+control for the shared filter path.
 
 ## Result
 
-Every prediction held. Smoke (sf 0.01) first: regret 0 on both
-queries, no evictions, answers unchanged. The sf 0.1 numbers below
-are the unprofiled pass; the profiled pass agrees within 5%.
+Every prediction held. The prefix token policy took 32.79 seconds, compared
+with 32.68 seconds for the saved seconds policy. The 0.11 second difference is
+0.3 percent of query time.
 
-### IMDB-3
+### IMDB 3
 
-| | unbounded retention | scan ring |
-|---|---:|---:|
-| Engine wall (s) | 68.93 | 32.68 |
-| Filter phase (s) | 50.28 | 14.54 |
-| Filter forward passes | 2,922 | 17 |
-| Mean filter pass (tokens) | 602 (469 after the arena filled) | 103,484 |
-| Eviction calls in the filter | 2,625 | 0 |
-| Join phase (s) | 18.53 | 18.05 |
-| Retained at the join (docs / pages) | 120 / 8,631 | 171 / 8,843 |
-| Join hit tokens | 137,397 | 140,458 |
-| Regret (tokens) | 1,220,547 | 1,217,486 |
-| Survivors | 4,380 | 4,380 |
+| Metric | Unbounded retention | Saved seconds score | Prefix token score |
+|---|---:|---:|---:|
+| Engine time, seconds | 68.93 | 32.68 | 32.79 |
+| Filter time, seconds | 50.28 | 14.54 | 14.59 |
+| Filter forward passes | 2,922 | 17 | 17 |
+| Mean filter pass, tokens | 602 | 103,484 | 103,484 |
+| Admission eviction calls | 2,625 | 0 | 0 |
+| Join time, seconds | 18.53 | 18.05 | 18.15 |
+| Retained at join, documents | 120 | 171 | 309 |
+| Retained at join, pages | 8,631 | 8,843 | 8,843 |
+| Join hit tokens | 137,397 | 140,458 | 140,212 |
+| KV regret, tokens | 1,220,547 | 1,217,486 | 1,217,732 |
+| Filter survivors | 4,380 | 4,380 | 4,380 |
 
 Figure: plots/kv_ring_fix_timeline.png
 
 Figure: plots/kv_ring_fix_walls.png
 
-- The engine wall halved: 32.68 seconds, compared with 68.93
-  measured with unbounded retention in the same harness, 75.0
-  recorded in the benchmark, and 52.65 recorded for stock vLLM. The filter now runs
-  17 near-budget passes at 99.6% GPU busy (chunk grain) and lands
-  at 14.54 seconds - level with IMDB-1's 15.06 seconds for the
-  identical filter work, so the composition penalty is gone.
-- Retention behaved exactly as designed. The pool filled to
-  8,843 pages, its cap to the page (22,640 free pages at filter
-  start minus the 13,797-page ring), holding 171 of the longest
-  survivors at 140,458 tokens - within 0.7% of the planner's
-  141,498-token credit. Every one of the 171 was still resident at
-  the join and hit. Zero eviction calls anywhere; with unbounded retention, churn
-  evicted 4,260 keys (78,268 pages) during the filter alone. One
-  prediction miss, in the right direction: 400 to 500 resident
-  anchors were predicted from the corpus mean length, but the
-  pool's replacement rule keeps the longest survivors, so the same
-  token mass arrived as 171 documents of 821 mean tokens against
-  the 310-token survivor mean.
-- Regret is unchanged (1.22M tokens in both runs), as
-  predicted: the fix does not buy more hits - the
-  unbounded-retention run ended up with a
-  similar hit mass - it stops paying 35 seconds of collapsed
-  batches for them. Both runs produced the same 4,380 survivors,
-  so the change is performance-only.
-- Benchmark metrics for IMDB-3 at the new wall: 52,560 evaluated
-  document pairs / 32.68 s = 1,608 document pairs/second
-  (recorded with unbounded retention: 701); $0.0359 per query at the H100 rate of
-  $3.9492/hour, compared with $0.0823 recorded with unbounded retention and
-  $0.0578 for stock vLLM's recorded 52.65 seconds.
+* The scan reserve remains the source of the speedup. The current filter took
+  14.59 seconds in 17 passes, compared with 50.28 seconds in 2,922 passes before
+  the reserve. The current filter was 3.4 times faster.
 
-### BIO-2
+* The new score changed which documents remained resident without changing the
+  retained token mass. The pool held 309 documents with a mean prefix length of
+  454 tokens. The saved seconds policy held 171 documents with a mean prefix
+  length of 821 tokens. Both used 8,843 pages and supplied about 140,000 hit
+  tokens to the join.
 
-128.22 seconds, compared with 130.35 with unbounded retention -
-container variance,
-same 98 forward passes at 105,861 mean tokens, 99.4% busy, regret
-0, no evictions. Its plan retains nothing, so this is the expected
-no-change control.
+* The current statistics recorded 285 pool replacement evictions covering
+  4,211 pages and 64,470 prefix tokens. The replacements happened while filter
+  answers were handled. They did not block admission or create another forward
+  pass.
 
-Data on the `quail-results` volume:
+* The token score increased regret by 246 tokens compared with the saved
+  seconds score. The difference is 0.02 percent of total regret. Join time
+  changed from 18.05 to 18.15 seconds.
 
-- `/results/ablations/ringfix_imdb3.json`, `ringfix_bio2.json`
-  (sf 0.1); `ringfix_imdb3_sf0.01.json`, `ringfix_bio2_sf0.01.json`
-  (smoke)
-- `/results/ablations/ringfix_traces/` (five chrome traces)
-- Unbounded-retention comparisons: `discrepancy_imdb3.json`,
-  `discrepancy_bio2.json` from the discrepancy report.
-- Modal function calls: `fc-01M18J895155R1VS59VRPTGWEN` (sf 0.1),
-  `fc-01M18J4YZ2NZH568D71KA1HEG0` (smoke).
+* IMDB 3 evaluates 52,560 document pairs. The current result is 1,603 document
+  pairs per second. Query cost is $0.0360 at the H100 rate of $3.9492 per hour,
+  compared with $0.0823 for unbounded retention and $0.0578 for stock vLLM's
+  recorded 52.65 seconds. Query cost excludes model startup.
+
+### BIO 2
+
+The earlier scan reserve control took 128.22 seconds, compared with 130.35
+seconds before the reserve. Both runs used 98 forward passes, and KV regret was
+zero. BIO 2 retains no filter KV, so the prefix token selection code is not
+called for this query.
+
+## Data
+
+The measured files are on the `quail-results` volume.
+
+* Current prefix token run:
+  `/results/ablations/ringfix_tokens_head_imdb3.json`
+
+* Current traces:
+  `/results/ablations/ringfix_tokens_head_traces/`
+
+* Saved seconds comparison:
+  `/results/ablations/ringfix_imdb3.json`
+
+* BIO 2 control:
+  `/results/ablations/ringfix_bio2.json`
+
+* Unbounded retention comparison:
+  `/results/ablations/discrepancy_imdb3.json`
+
+The current Modal function call was `fc-01M1A2VX8Z1K1F07JP271R4DFQ`. The saved
+seconds run was `fc-01M18J895155R1VS59VRPTGWEN`.
 
 ## Meaning
 
-- The IMDB-3 loss to stock vLLM is gone: 32.68 seconds against
-  stock's 52.65. Quail's parts now compose: filter 14.54 plus join
-  18.05 is the whole query, 0.10 seconds apart from the engine
-  wall.
-- Retention is now safe by construction, not by tuning. Admission
-  owns two chunk budgets for the whole scan; retention competes
-  only with itself, by saved recompute per page, and a replacement
-  costs heap bookkeeping in the answer path rather than a stalled
-  forward pass. The planner prices the same reservation, so the
-  credit (141,498 tokens) matched the runtime pool (140,458) to
-  0.7%.
-- The QuailB headline table should be refreshed by a full benchmark
-  rerun; this report's confirming cell covers only the two queries
-  it re-measured.
+The scan reserve solves the admission problem independently of the retention
+score. The saved seconds score and prefix token score produced the same filter
+and join shape within normal run variation.
+
+The retention objective is now exact and limited. Quail maximizes reusable
+prefix tokens under the retained page limit. It does not claim to predict join
+time. The report measures the resulting join time instead.
+
+The QuailB headline table still needs a full benchmark rerun. The confirming
+cell in this report covers IMDB 3, which is the query that previously exposed
+the admission failure.
 
 ## Rebuild
 
-Rerun the two queries (a fresh --out-prefix keeps the recorded
-files intact; the recorded run used this cell's predecessor,
-`discrepancy_timeline.py`, whose per-query profiler windows have
-since been replaced by windows derived from the run):
+Use a new output prefix so the recorded result remains unchanged.
 
-    uv run modal run ablations/profile_quail.py::run_smoke --queries IMDB-3,BIO-2 --out-prefix rerun
-    uv run modal run ablations/profile_quail.py::run --queries IMDB-3,BIO-2 --out-prefix rerun
+    uv run modal run ablations/profile_quail.py::run --queries IMDB-3 --out-prefix rerun
 
-Rebuild the figures with `reports/make_kv_ring_fix_plots.py`; its
-docstring holds the `modal volume get` commands.
+Rebuild the figures with `reports/make_kv_ring_fix_plots.py`. Its docstring
+contains every `modal volume get` command needed to pull the source files.

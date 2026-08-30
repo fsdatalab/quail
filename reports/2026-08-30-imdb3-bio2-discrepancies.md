@@ -141,7 +141,8 @@ change the shape.
   (12.4%). Retained value never grows; each cycle pays a forward
   pass's overhead.
 - The join found 120 of 4,380 anchors resident (the longest reviews;
-  eviction removes the least saved recompute per page first). Regret
+  eviction removed the least saved recompute per page first in that
+  recorded version). Regret
   measured 1,220,547 tokens, within 0.01% of the offline prediction.
   The 137,397 hit tokens saved about 1.3 seconds. Retention cost
   35.2 seconds to save 1.3.

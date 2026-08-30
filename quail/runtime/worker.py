@@ -202,7 +202,6 @@ def _execute_single(state, payload: dict) -> dict:
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
     from quail.executor.loop import AsyncAnswers, run_filter, run_join
     from quail.planner.joins import search_joins, summarize_alias
-    from quail.planner.sol import prefix_recompute_seconds
     from quail.runtime.coordinator import (
         filter_round_limit,
         gate_group,
@@ -234,10 +233,6 @@ def _execute_single(state, payload: dict) -> dict:
         arena.free_key(key)
     arena.reset_stats()
 
-    def retention_value(alias, document):
-        return prefix_recompute_seconds(
-            len(pre) + len(docs[alias][document]), model_spec, device)
-
     total_tokens = 0
     regret_tokens = 0
     seen = set()        # keys computed in any phase of this query
@@ -261,9 +256,7 @@ def _execute_single(state, payload: dict) -> dict:
                 arena_writes=filter_writes[alias],
                 arena_keys=[(alias, d)
                             for d in range(len(docs[alias]))],
-                retain_survivors=keep,
-                retention_values={d: retention_value(alias, d)
-                                  for d in keep})
+                retain_survivors=keep)
             total_tokens += tokens
             # answers is keyed by document position; every answered
             # document's prefix was computed once in this query
@@ -277,6 +270,8 @@ def _execute_single(state, payload: dict) -> dict:
         kv_stats = dict(
             retained_after_filters=len(arena.accounting.retained),
             retained_pages_after_filters=arena.accounting.retained_pages,
+            retained_prefix_tokens_after_filters=(
+                arena.accounting.retained_prefix_tokens),
             join_anchor_hits=0,
             join_anchor_misses=0)
 
@@ -390,9 +385,7 @@ def _execute_single(state, payload: dict) -> dict:
                          if group[-1]["semantics"] == "anti"
                          else matched)
                 if alive and anchor_alias in future_anchors:
-                    arena.retain(key, len(prefixes[a]),
-                                 retention_value(anchor_alias,
-                                                 anchors_glob[a]))
+                    arena.retain(key, len(prefixes[a]))
                 else:
                     arena.free_key(key)
 
@@ -427,8 +420,7 @@ def _execute_single(state, payload: dict) -> dict:
                 if key not in arena.accounting.owned:
                     continue
                 if g in alive_after and anchor_alias in future_anchors:
-                    arena.retain(key, len(prefix),
-                                 retention_value(anchor_alias, g))
+                    arena.retain(key, len(prefix))
                 else:
                     arena.free_key(key)
             for key in [k for k in list(arena.accounting.retained)
@@ -463,7 +455,7 @@ def _execute_single(state, payload: dict) -> dict:
                     **kv_stats,
                     evicted_keys=arena.evicted_keys,
                     evicted_pages=arena.evicted_pages,
-                    evicted_value_seconds=arena.evicted_value),
+                    evicted_prefix_tokens=arena.evicted_prefix_tokens),
                 peak_gib=round(
                     torch.cuda.max_memory_allocated() / 2**30, 2))
 
@@ -568,15 +560,12 @@ def _child_filters(state, sub):
 
     from quail.executor.attention import FILTER_ATTENTION
     from quail.executor.loop import run_filter
-    from quail.planner.sol import prefix_recompute_seconds
-    from quail.specs import DEVICES
     from quail.runtime.tokens import chain_tokens
 
     _child_boot(state, sub)
     boot = state["boot"]
     torch = state["torch"]
     arena = state["arena"]
-    device = DEVICES["h100-sxm"]
     # a new query begins: nothing kept for the previous one may stay
     for key in list(arena.accounting.owned):
         arena.free_key(key)
@@ -606,12 +595,7 @@ def _child_filters(state, sub):
                 state["chunk_tokens"], limit=limit,
                 arena_writes=filter_writes[alias],
                 arena_keys=[(alias, g) for g in index],
-                retain_survivors=keep,
-                retention_values={
-                    d: prefix_recompute_seconds(
-                        len(pre) + len(sub["docs"][alias][d]),
-                        state["spec"], device)
-                    for d in keep})
+                retain_survivors=keep)
             if alias in retain:
                 out["retained"][alias] = sorted(
                     key[1] for key in arena.accounting.retained
@@ -637,14 +621,11 @@ def _child_joins(state, sub):
 
     from quail.executor.attention import JOIN_ATTENTION
     from quail.executor.loop import run_join
-    from quail.planner.sol import prefix_recompute_seconds
-    from quail.specs import DEVICES
     from quail.runtime.tokens import chain_tokens
 
     _child_boot(state, sub)
     torch = state["torch"]
     arena = state["arena"]
-    device = DEVICES["h100-sxm"]
     pre = sub.get("pre_ids") or []
     anchor_alias = sub["anchor_alias"]
     anchors_glob = list(sub["anchor_index"])
@@ -689,17 +670,12 @@ def _child_joins(state, sub):
             anchor_keys, [len(p) for p in prefixes],
             arena.accounting.owned, seen)
 
-        def value(a):
-            return prefix_recompute_seconds(
-                len(prefixes[a]), state["spec"], device)
-
         def anchor_done(a, row):
             matched = any(row)
             alive = (not matched if group[-1]["semantics"] == "anti"
                      else matched)
             if alive and retain_anchor:
-                arena.retain(anchor_keys[a], len(prefixes[a]),
-                             value(a))
+                arena.retain(anchor_keys[a], len(prefixes[a]))
             else:
                 arena.free_key(anchor_keys[a])
 
@@ -719,7 +695,7 @@ def _child_joins(state, sub):
             alive = (not matched if group[-1]["semantics"] == "anti"
                      else matched)
             if alive and retain_anchor:
-                arena.retain(key, len(prefixes[a]), value(a))
+                arena.retain(key, len(prefixes[a]))
             else:
                 arena.free_key(key)
         tokens_total += tokens
@@ -742,7 +718,7 @@ def _child_joins(state, sub):
                 kv_totals=dict(
                     evicted_keys=arena.evicted_keys,
                     evicted_pages=arena.evicted_pages,
-                    evicted_value_seconds=arena.evicted_value),
+                    evicted_prefix_tokens=arena.evicted_prefix_tokens),
                 wall_s=round(_time.perf_counter() - t0, 2))
 
 
@@ -868,6 +844,15 @@ def _execute_multi(payload: dict) -> dict:
     prior_shards = {}    # alias -> anchor shards its kept KV sits on
     kv_stats = dict(
         retained_after_filters=sum(len(v) for v in retained.values()),
+        retained_pages_after_filters=sum(
+            -(-(pre_len + len(docs[alias][document]))
+              // budgets.PAGE_TOKENS)
+            for alias, documents in retained.items()
+            for document in documents),
+        retained_prefix_tokens_after_filters=sum(
+            pre_len + len(docs[alias][document])
+            for alias, documents in retained.items()
+            for document in documents),
         join_anchor_hits=0, join_anchor_misses=0)
     regret_tokens = 0
     child_totals = [None] * k
