@@ -1,0 +1,501 @@
+"""GPU timeline and KV regret instrumentation for IMDB-3 and BIO-2.
+
+The 2026-08-27 QuailB SF 0.1 run left two per-query results to
+explain. BIO-2 (the reports x terms join) is Quail's largest win:
+128.5 s against 1,532.3 s for stock vLLM on the same 10.4M fresh
+tokens. IMDB-3 (the F1 filter into the same-shape join) is the one
+query where Quail (75.0 s) loses to stock vLLM (52.7 s), even though
+Quail's own parts predict about 34 s (IMDB-1 filter 15.1 s plus the
+IMDB-2 join scaled to the survivors, 19.2 s).
+
+This cell reruns exactly those two queries through the real planner
+and the real worker execution core and records, per forward pass:
+launch time, packed tokens, and GPU time from the CUDA events the
+loops already create. It also records the KV numbers the benchmark
+run does not keep: per-phase walls, eviction calls over time, and
+KV regret. All instrumentation wraps the engine from this script
+(module attributes and instance attributes); no engine file changes.
+
+KV regret: the fresh tokens spent recomputing a document prefix
+whose KV this query already computed once under the same
+(alias, document) key. With an unlimited KV arena every one of
+those tokens would have been a KV hit. First computations and
+tuple-suffix tokens are not regret; no cache of any size avoids
+them.
+
+torch.profiler windows (kernel activity only, CUDA) cover a few
+forward passes per regime so the kernel timeline of the recorded
+bubbles can be inspected. Chrome traces go to the results volume.
+A second, unprofiled pass of each query supplies the walls the
+report cites, so profiler overhead never touches a headline number.
+
+Predictions, stated before the run:
+- IMDB-3: the filter phase is the slow part (about 45-55 s of the
+  75 s), its chunks collapse from the 110,376-token budget to a few
+  thousand tokens once the arena fills (about 1,170 documents in),
+  and evictions run continuously from that point. Regret is about
+  1.22M tokens (the 4,260 recomputed anchors); the join phase alone
+  is healthy (about 20 s).
+- BIO-2: regret is exactly 0, chunks stay near the budget, and GPU
+  busy time covers most of the join wall.
+
+Run:
+
+    uv run modal run ablations/discrepancy_timeline.py::run_smoke
+    uv run modal run ablations/discrepancy_timeline.py::run_queries
+
+Outputs on the quail-results volume:
+
+    /results/ablations/discrepancy_imdb3.json
+    /results/ablations/discrepancy_bio2.json
+    /results/ablations/discrepancy_traces/<query>_<window>.chrome.json.gz
+"""
+
+import json
+import os
+import time
+
+import modal
+
+IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
+
+image = (
+    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
+    .entrypoint([])
+    .pip_install(
+        "vllm==0.26.0",
+        "huggingface_hub[hf_transfer]",
+        "transformers>=5.2.0",
+        "pandas",
+        "pyarrow",
+        "numpy",
+        "datasets",
+    )
+    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+          "VLLM_USE_FLASHINFER_SAMPLER": "0",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+          "HF_HUB_ENABLE_HF_TRANSFER": "1",
+          "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+          "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+          "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
+          "TORCHINDUCTOR_CACHE_DIR":
+              "/root/.cache/kernels/torchinductor"})
+    .add_local_python_source("quail", "baselines")
+)
+
+# House rule: never create new Modal app names - new GPU cells attach
+# to an existing app.
+app = modal.App("quail-milestone1")
+hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+results_vol = modal.Volume.from_name("quail-results",
+                                     create_if_missing=True)
+kernel_cache = modal.Volume.from_name("quail-kernel-cache",
+                                      create_if_missing=True)
+
+GPU_KW = dict(image=image, gpu="H100!", memory=98304,
+              volumes={"/root/.cache/huggingface": hf_cache,
+                       "/root/.cache/kernels": kernel_cache,
+                       "/results": results_vol})
+
+DATA_DIR = "/results/quailb_data"
+TRACE_DIR = "/results/ablations/discrepancy_traces"
+
+# query id -> (result file suffix, profiler windows). A window arms
+# when its condition first holds, then covers `chunks` forward
+# passes. "evicting" arms on the first retained-KV eviction, which
+# is where the IMDB-3 filter leaves its healthy regime.
+WINDOWS = {
+    "IMDB-3": [
+        dict(name="filter_healthy", op="filter", arm="chunk3",
+             chunks=12),
+        dict(name="filter_churn", op="filter", arm="evicting",
+             chunks=40),
+        dict(name="join", op="join", arm="chunk3", chunks=12),
+    ],
+    "BIO-2": [
+        dict(name="join_early", op="join", arm="chunk3", chunks=12),
+        dict(name="join_late", op="join", arm="chunk60", chunks=12),
+    ],
+}
+SUFFIX = {"IMDB-3": "imdb3", "BIO-2": "bio2"}
+
+
+# ------------------------------------------------------------- helpers
+
+def _write(result, name):
+    print(json.dumps(result, indent=2, default=str)[:4000], flush=True)
+    os.makedirs("/results/ablations", exist_ok=True)
+    with open(f"/results/ablations/{name}.json", "w") as f:
+        json.dump(result, f, indent=2)
+    results_vol.commit()
+    kernel_cache.commit()
+
+
+def _boot_state(model):
+    """Boot the worker state dict, as the worker's own boot does.
+
+    Mirrors quail.runtime.worker._execute_payload's boot with the
+    shipping Pipeline; warm_kernels runs the same tiered warmup.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from quail.executor.arena import KVArena
+    from quail.executor.attention import FILTER_ATTENTION, Pipeline
+    from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
+    from quail.executor.model import load_model
+    from quail.planner import budgets
+    from quail.specs import DEVICES, MODELS
+    from transformers import AutoTokenizer
+
+    spec = MODELS[model]
+    device = DEVICES["h100-sxm"]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    model_mod = load_model(spec.hf_name)
+    chunk_tokens = budgets.chunk_budget(spec, device)
+    arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
+    arena = KVArena(n_layers=spec.layers,
+                    n_pages=arena_tok // budgets.PAGE_TOKENS,
+                    page_tokens=budgets.PAGE_TOKENS,
+                    n_kv=spec.n_kv, d_head=spec.d_head,
+                    dtype=torch.bfloat16)
+    pipeline = Pipeline(model_mod, arena,
+                        attention_mode=FILTER_ATTENTION)
+    answerer = Answerer(torch, F, model_mod, tokenizer)
+    async_ans = AsyncAnswers(torch, answerer)
+    with torch.inference_mode():
+        warm = warm_kernels(torch, arena, pipeline, async_ans,
+                            chunk_tokens, model_name=spec.hf_name)
+    torch.cuda.synchronize()
+    kernel_cache.commit()
+    state = dict(model=model_mod, arena=arena, pipeline=pipeline,
+                 spec=spec, torch=torch, F=F)
+    return state, chunk_tokens, warm
+
+
+def _quailb_session(model, sf, gpus=1):
+    """Build the QUAIL-B tables and a registered session."""
+    import quail
+    from quail.bench.quailb import build_sets, queries, register_sets
+    from quail.planner.plan import EngineConfig
+
+    d = build_sets(DATA_DIR, sf)
+    results_vol.commit()
+    sess = quail.Session(EngineConfig(gpus=gpus, model=model))
+    register_sets(sess, d)
+    return sess, queries(sess)
+
+
+def _run_query(state, build, captured):
+    """One query through the real planner and worker core."""
+    from quail.runtime.worker import _execute_single
+
+    def execute(payload):
+        report = _execute_single(state, payload)
+        captured.clear()
+        captured.update(report)
+        return report
+
+    return build().run(_execute=execute)
+
+
+def _cupti_preinit(torch):
+    """One throwaway profiled kernel, so CUPTI's lazy start never
+    lands inside a measured query."""
+    x = torch.ones(1024, device="cuda")
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]):
+        (x * 2.0).sum().item()
+    torch.cuda.synchronize()
+
+
+# ----------------------------------------------------- profiler windows
+
+class ProfilerWindows:
+    """Short kernel-activity captures driven from forward-pass starts.
+
+    Windows run one at a time, in order. Each arms when its condition
+    first holds, covers `chunks` forward passes, then writes a chrome
+    trace. Kernel activity only (CUDA), so the CPU side of the loop
+    runs untraced.
+    """
+
+    def __init__(self, torch, arena, qid, windows):
+        self.torch = torch
+        self.arena = arena
+        self.qid = qid
+        self.pending = list(windows)
+        self.session = None
+        self.left = 0
+        self.meta = []
+
+    def _armed(self, spec, op, idx):
+        if spec["op"] != op:
+            return False
+        if spec["arm"] == "evicting":
+            return self.arena.evicted_keys > 0
+        return idx >= int(spec["arm"].removeprefix("chunk"))
+
+    def on_chunk(self, op, idx, chunk_seq):
+        """Called before each forward pass launches."""
+        if self.session is not None:
+            self.left -= 1
+            if self.left <= 0:
+                self._close(chunk_seq)
+            return
+        if not self.pending:
+            return
+        spec = self.pending[0]
+        if not self._armed(spec, op, idx):
+            return
+        self.pending.pop(0)
+        prof = self.torch.profiler.profile(
+            activities=[self.torch.profiler.ProfilerActivity.CUDA])
+        prof.__enter__()
+        self.session = (spec, prof)
+        self.left = spec["chunks"]
+        self.meta.append(dict(name=spec["name"], first_chunk=chunk_seq,
+                              chunks=spec["chunks"]))
+
+    def _close(self, chunk_seq):
+        spec, prof = self.session
+        self.session = None
+        # enqueued kernels must finish before collection stops
+        self.torch.cuda.synchronize()
+        prof.__exit__(None, None, None)
+        os.makedirs(TRACE_DIR, exist_ok=True)
+        path = f"{TRACE_DIR}/{SUFFIX[self.qid]}_{spec['name']}" \
+               ".chrome.json.gz"
+        prof.export_chrome_trace(path)
+        self.meta[-1]["last_chunk"] = chunk_seq
+        self.meta[-1]["trace"] = path
+        print(f"[discrepancy] window {spec['name']} -> {path}",
+              flush=True)
+
+    def finish(self, chunk_seq):
+        if self.session is not None:
+            self._close(chunk_seq)
+
+
+# --------------------------------------------------------- the recorder
+
+class LoopRecorder:
+    """Records the execution loops from outside the engine.
+
+    Wraps quail.executor.loop.run_filter / run_join (module
+    attributes, bound at the worker's call time), the pipeline's
+    forward_chunk, and the arena's evict_retained (instance
+    attributes). Restores everything in unpatch().
+    """
+
+    def __init__(self, state, profiler=None):
+        import quail.executor.loop as loop_mod
+
+        self.loop_mod = loop_mod
+        self.torch = state["torch"]
+        self.arena = state["arena"]
+        self.pipeline = state["pipeline"]
+        self.profiler = profiler
+        self.t0 = time.perf_counter()
+        self.phases = []
+        self.evictions = []
+        self.seen = {}          # key -> prefix tokens computed before
+        self.chunk_seq = 0
+        self._phase = None      # (record, launches, phase chunk idx)
+        self._orig = dict(run_filter=loop_mod.run_filter,
+                          run_join=loop_mod.run_join,
+                          forward=self.pipeline.forward_chunk,
+                          evict=self.arena.evict_retained)
+        loop_mod.run_filter = self._run_filter
+        loop_mod.run_join = self._run_join
+        self.pipeline.forward_chunk = self._forward_chunk
+        self.arena.evict_retained = self._evict_retained
+
+    def unpatch(self):
+        self.loop_mod.run_filter = self._orig["run_filter"]
+        self.loop_mod.run_join = self._orig["run_join"]
+        self.pipeline.forward_chunk = self._orig["forward"]
+        self.arena.evict_retained = self._orig["evict"]
+
+    def _now(self):
+        return time.perf_counter() - self.t0
+
+    # ---- wrapped engine entry points --------------------------------
+
+    def _forward_chunk(self, chunk):
+        if self._phase is None:     # a forward outside the two loops
+            return self._orig["forward"](chunk)
+        record, launches, idx = self._phase
+        if self.profiler is not None:
+            self.profiler.on_chunk(record["op"], idx, self.chunk_seq)
+        launches.append((self._now(), chunk["tokens"]))
+        self._phase = (record, launches, idx + 1)
+        self.chunk_seq += 1
+        return self._orig["forward"](chunk)
+
+    def _evict_retained(self, pages_needed):
+        keys = self._orig["evict"](pages_needed)
+        self.evictions.append(dict(
+            t=round(self._now(), 4),
+            phase=len(self.phases),
+            pages_needed=int(pages_needed),
+            keys_evicted=len(keys)))
+        return keys
+
+    def _open_phase(self, op, label, kv=None):
+        record = dict(op=op, label=label, t_start=round(self._now(), 4),
+                      kv=kv or {})
+        self._phase = (record, [], 0)
+        return record, time.perf_counter()
+
+    def _close_phase(self, record, t_call, spans, tokens):
+        # the loops drain their answers before returning, so the
+        # events are complete once this synchronize returns
+        self.torch.cuda.synchronize()
+        record["wall_s"] = round(time.perf_counter() - t_call, 4)
+        record["tokens"] = int(tokens)
+        _, launches, _ = self._phase
+        gpu_ms = [e0.elapsed_time(e1) for _, e0, e1 in spans]
+        record["n_chunks"] = len(launches)
+        record["gpu_s"] = round(sum(gpu_ms) / 1e3, 4)
+        record["chunks"] = [
+            dict(t=round(t, 4), tokens=int(n), gpu_ms=round(ms, 3))
+            for (t, n), ms in zip(launches, gpu_ms)]
+        self._phase = None
+        self.phases.append(record)
+        print(f"[discrepancy] {record['op']} {record['label']}: "
+              f"wall {record['wall_s']}s gpu {record['gpu_s']}s "
+              f"chunks {record['n_chunks']} tokens {record['tokens']}",
+              flush=True)
+
+    def _run_filter(self, torch, arena, pipeline, async_ans, doc_ids,
+                    question_ids, budget, **kw):
+        keys = kw.get("arena_keys") or list(range(len(doc_ids)))
+        record, t_call = self._open_phase(
+            "filter", f"{len(doc_ids)} docs x {len(question_ids)} stages")
+        kw.setdefault("timing", {})
+        kw.setdefault("trace", [])
+        out = self._orig["run_filter"](
+            torch, arena, pipeline, async_ans, doc_ids, question_ids,
+            budget, **kw)
+        answers, spans, tokens = out
+        record["timing"] = {k: round(v, 4) if isinstance(v, float)
+                            else v for k, v in kw["timing"].items()}
+        record["engine_trace"] = kw["trace"]
+        # answers is keyed by document position; every answered
+        # document's prefix was computed once in this query
+        for d in answers:
+            self.seen.setdefault(keys[d], len(doc_ids[d]))
+        self._close_phase(record, t_call, spans, tokens)
+        return out
+
+    def _run_join(self, torch, arena, pipeline, async_ans,
+                  anchor_prefixes, stage_suffixes, budget, **kw):
+        keys = kw.get("anchor_keys") or list(range(len(anchor_prefixes)))
+        owned = self.arena.accounting.owned
+        kv = dict(anchors=len(keys), hits=0, hit_tokens=0,
+                  regret_tokens=0, first_tokens=0)
+        for key, prefix in zip(keys, anchor_prefixes):
+            if key in owned:
+                kv["hits"] += 1
+                kv["hit_tokens"] += len(prefix)
+            elif key in self.seen:
+                kv["regret_tokens"] += len(prefix)
+            else:
+                kv["first_tokens"] += len(prefix)
+        tuples = sum(len(s) for s in stage_suffixes)
+        record, t_call = self._open_phase(
+            "join", f"{len(keys)} anchors, {tuples} tuples", kv)
+        out = self._orig["run_join"](
+            torch, arena, pipeline, async_ans, anchor_prefixes,
+            stage_suffixes, budget, **kw)
+        _, spans, tokens = out
+        for k, p in zip(keys, anchor_prefixes):
+            self.seen.setdefault(k, len(p))
+        self._close_phase(record, t_call, spans, tokens)
+        return out
+
+    # ---- results ----------------------------------------------------
+
+    def result(self):
+        return dict(phases=self.phases, evictions=self.evictions,
+                    regret_tokens=sum(p["kv"].get("regret_tokens", 0)
+                                      for p in self.phases),
+                    kv_hit_tokens=sum(p["kv"].get("hit_tokens", 0)
+                                      for p in self.phases))
+
+
+# ------------------------------------------------------------ the cell
+
+def _measure(state, qdefs, qid, profiled):
+    torch = state["torch"]
+    windows = None
+    if profiled:
+        windows = ProfilerWindows(torch, state["arena"], qid,
+                                  WINDOWS[qid])
+    recorder = LoopRecorder(state, profiler=windows)
+    captured = {}
+    try:
+        _run_query(state, qdefs[qid][1], captured)
+    finally:
+        recorder.unpatch()
+    if windows is not None:
+        windows.finish(recorder.chunk_seq)
+    out = recorder.result()
+    out["engine_wall_s"] = captured.get("wall_s")
+    out["fresh_tokens"] = captured.get("fresh_tokens")
+    out["kv_manager"] = captured.get("kv_manager")
+    out["join_optimizer"] = captured.get("join_optimizer")
+    if windows is not None:
+        out["windows"] = windows.meta
+    return out
+
+
+@app.function(timeout=3600, **GPU_KW)
+def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
+            queries: tuple = ("IMDB-3", "BIO-2")) -> str:
+    """Both queries, two passes each: unprofiled (the cited walls and
+    the chunk timeline) and profiled (the trace windows)."""
+    state, chunk_tokens, warm = _boot_state(model)
+    _cupti_preinit(state["torch"])
+    sess, qdefs = _quailb_session(model, sf)
+    summary = dict(cell="discrepancy_timeline", model=model, sf=sf,
+                   chunk_tokens=chunk_tokens, warm=warm, queries={})
+    for qid in queries:
+        result = dict(query=qid, sf=sf, model=model,
+                      chunk_tokens=chunk_tokens)
+        result["unprofiled"] = _measure(state, qdefs, qid,
+                                        profiled=False)
+        result["profiled"] = _measure(state, qdefs, qid,
+                                      profiled=True)
+        name = f"discrepancy_{SUFFIX.get(qid, qid.lower())}"
+        if sf != 0.1:
+            name += f"_sf{sf}"
+        _write(result, name)
+        u = result["unprofiled"]
+        summary["queries"][qid] = dict(
+            engine_wall_s=u["engine_wall_s"],
+            fresh_tokens=u["fresh_tokens"],
+            regret_tokens=u["regret_tokens"],
+            phases=[dict(op=p["op"], wall_s=p["wall_s"],
+                         gpu_s=p["gpu_s"], n_chunks=p["n_chunks"])
+                    for p in u["phases"]])
+    return json.dumps(summary, indent=2)
+
+
+# ---------------------------------------------------------- entrypoints
+
+@app.local_entrypoint()
+def run_queries(model: str = "qwen3-4b-fp8", sf: float = 0.1):
+    handle = measure.spawn(model, sf)
+    print(f"measure fc: {handle.object_id}", flush=True)
+    print(handle.get())
+
+
+@app.local_entrypoint()
+def run_smoke(model: str = "qwen3-4b-fp8"):
+    """The full harness on the sf 0.01 tables, minutes not tens of
+    minutes, before the measured run."""
+    handle = measure.spawn(model, 0.01)
+    print(f"smoke fc: {handle.object_id}", flush=True)
+    print(handle.get())
