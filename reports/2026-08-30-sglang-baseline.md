@@ -64,7 +64,7 @@ with Qwen3 4B fp8 on one H100!:
 
 ## Main metrics
 
-Figure: plots/stock_sglang_vs_stock_vllm.png
+Figure: plots/sglang_join_order.png
 
 | Query | System | Query time (s) | Document pairs/s | $/query | Answer accuracy |
 |---|---|---:|---:|---:|---:|

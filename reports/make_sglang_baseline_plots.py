@@ -1,13 +1,17 @@
-"""Plot stock SGLang against stock vLLM on BIO-2 and IMDB-3 at sf=0.1.
+"""Plot the SGLang baseline against SoL, Quail, and the vLLM baselines.
 
-Pull the three summaries from the quail-results volume, then pass the
+Pull the seven inputs from the quail-results volume, then pass the
 work directory to this script:
 
     W=<workdir>
+    modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
+    modal volume get quail-results benchmarks/quailb/runs/qb_20260829T185407Z_cbb14b36/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail.json
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
+    modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm.json
+    modal volume get quail-results pipelined_sglang/PIPELINED_LABEL/summary.json $W/pipelined_sglang.json
     modal volume get quail-results stock_sglang/2026-08-30_033502_05712d88/summary.json $W/stock_sglang_anchor_major.json
     modal volume get quail-results stock_sglang/2026-08-30_042550_e5f6d2e8/summary.json $W/stock_sglang_tiled.json
-    uv run --with matplotlib python reports/make_stock_sglang_baseline_plots.py $W
+    uv run --with matplotlib python reports/make_sglang_baseline_plots.py $W
 """
 
 import json
@@ -22,14 +26,10 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "plots"
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY, ORANGE  # noqa: E402
+from plot_colors import BLUE, GRAY, ORANGE, RED, TEAL  # noqa: E402
 
 QUERY_IDS = ("BIO-2", "IMDB-3")
-SYSTEMS = (
-    ("stock vLLM\n(anchor-major)", GRAY),
-    ("stock SGLang\n(anchor-major)", ORANGE),
-    ("stock SGLang\n(tiled)", BLUE),
-)
+MODEL = "qwen3-4b-fp8"
 
 
 def load(path):
@@ -38,9 +38,9 @@ def load(path):
 
 
 def check(summary, baseline, memory_key, memory_fraction,
-          join_submission=None):
+          filter_submission, join_submission=None):
     if (summary["baseline"] != baseline
-            or summary["filter_submission"] != "stage-major"
+            or summary["filter_submission"] != filter_submission
             or summary["hf_name"] != "Qwen/Qwen3-4B-FP8"
             or summary["sf"] != 0.1
             or summary["checkpoint"] != "pre-quantized FP8"
@@ -64,79 +64,153 @@ def join_pairs(entry):
                if step["kind"] == "join")
 
 
-def metrics(entry):
-    wall = entry["total_wall_s"]
-    pairs = join_pairs(entry)
-    return dict(
-        wall_s=wall,
-        pairs=pairs,
-        pairs_per_s=pairs / wall,
-        usd=wall / 3600.0 * H100_USD_PER_HOUR,
-        answer_accuracy=entry["accuracy"]["answer_accuracy"]["accuracy"],
+def usd(wall_s):
+    return wall_s / 3600.0 * H100_USD_PER_HOUR
+
+
+def annotate(ax, bar, wall_s):
+    ax.annotate(
+        f"{wall_s:,.1f} s\n${usd(wall_s):,.4f}",
+        (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+        ha="center", va="bottom", fontsize=9)
+
+
+def five_way_figure(sol, quail_rows, entries):
+    systems = (
+        ("SoL\nestimate", GRAY),
+        ("Quail", BLUE),
+        ("stock\nvLLM", ORANGE),
+        ("pipelined\nvLLM", TEAL),
+        ("pipelined\nSGLang", RED),
     )
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0))
+    fig.subplots_adjust(wspace=0.3)
+    for ax, qid in zip(axes, QUERY_IDS):
+        walls = [
+            sol["queries"][qid]["models"][MODEL]["sol_s"],
+            quail_rows[qid]["wall_s"],
+            entries["stock_vllm"][qid]["total_wall_s"],
+            entries["pipelined_vllm"][qid]["total_wall_s"],
+            entries["pipelined_sglang"][qid]["total_wall_s"],
+        ]
+        names = [name for name, _color in systems]
+        colors = [color for _name, color in systems]
+        log = max(walls) / min(walls) > 10
+        bars = ax.bar(names, walls, color=colors, width=0.62)
+        for bar, wall in zip(bars, walls):
+            annotate(ax, bar, wall)
+        if log:
+            ax.set_yscale("log")
+            ax.set_ylabel("seconds (log scale)")
+            ax.set_ylim(min(walls) * 0.5, max(walls) * 3.2)
+        else:
+            ax.set_ylabel("seconds")
+            ax.set_ylim(0, max(walls) * 1.3)
+        ratio = (entries["pipelined_vllm"][qid]["total_wall_s"]
+                 / entries["pipelined_sglang"][qid]["total_wall_s"])
+        direction = "faster" if ratio >= 1 else "slower"
+        factor = ratio if ratio >= 1 else 1 / ratio
+        pairs = join_pairs(entries["pipelined_sglang"][qid])
+        ax.set_title(
+            f"{qid} — {pairs:,} join pairs\n"
+            f"pipelined SGLang {factor:.2f}x {direction} than "
+            f"pipelined vLLM")
+        ax.tick_params(axis="x", labelsize=9)
+        ax.spines[["top", "right"]].set_visible(False)
+    out_path = OUT / "sglang_baseline_comparison.png"
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    print(f"wrote {out_path}")
+
+
+def join_order_figure(entries):
+    systems = (
+        ("stock vLLM\n(anchor-major)", ORANGE),
+        ("SGLang\n(anchor-major)", GRAY),
+        ("SGLang\n(tiled)", RED),
+    )
+    keys = ("stock_vllm", "sglang_anchor_major", "sglang_tiled")
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0))
+    fig.subplots_adjust(wspace=0.3)
+    for ax, qid in zip(axes, QUERY_IDS):
+        rows = [entries[key][qid] for key in keys]
+        walls = [row["total_wall_s"] for row in rows]
+        names = [name for name, _color in systems]
+        colors = [color for _name, color in systems]
+        bars = ax.bar(names, walls, color=colors, width=0.6)
+        for bar, row in zip(bars, rows):
+            pairs = join_pairs(row)
+            ax.annotate(
+                f"{row['total_wall_s']:,.1f} s\n"
+                f"{pairs / row['total_wall_s']:,.0f} pairs/s",
+                (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                ha="center", va="bottom", fontsize=9)
+        ratio = walls[1] / walls[2]
+        direction = "faster" if ratio >= 1 else "slower"
+        factor = ratio if ratio >= 1 else 1 / ratio
+        ax.set_title(
+            f"{qid} — join submission order on SGLang\n"
+            f"tiled {factor:.2f}x {direction} than anchor-major")
+        ax.set_ylabel("seconds")
+        ax.set_ylim(0, max(walls) * 1.35)
+        ax.tick_params(axis="x", labelsize=9)
+        ax.spines[["top", "right"]].set_visible(False)
+    out_path = OUT / "sglang_join_order.png"
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    print(f"wrote {out_path}")
 
 
 def main():
     workdir = Path(sys.argv[1])
-    vllm = load(workdir / "stock_vllm.json")
+    sol = load(workdir / "sol.json")
+    quail_data = load(workdir / "quail.json")
+    stock_vllm = load(workdir / "stock_vllm.json")
+    pipelined_vllm = load(workdir / "pipelined_vllm.json")
+    pipelined_sglang = load(workdir / "pipelined_sglang.json")
     anchor_major = load(workdir / "stock_sglang_anchor_major.json")
     tiled = load(workdir / "stock_sglang_tiled.json")
-    check(vllm, "stock_vllm", "gpu_memory_utilization", 0.91)
-    check(anchor_major, "stock_sglang", "mem_fraction_static", 0.78)
+
+    if sol["scale_factor"] != 0.1:
+        raise ValueError("unexpected SoL configuration")
+    if (quail_data["model"] != MODEL or quail_data["sf"] != 0.1
+            or quail_data["gpus"] != 1):
+        raise ValueError("unexpected Quail configuration")
+    check(stock_vllm, "stock_vllm", "gpu_memory_utilization", 0.91,
+          "stage-major")
+    check(pipelined_vllm, "pipelined_vllm", "gpu_memory_utilization",
+          0.91, "pipelined")
+    check(pipelined_sglang, "pipelined_sglang", "mem_fraction_static",
+          0.78, "pipelined", join_submission="suffix-major-tiled")
+    check(anchor_major, "stock_sglang", "mem_fraction_static", 0.78,
+          "stage-major")
     check(tiled, "stock_sglang", "mem_fraction_static", 0.78,
-          join_submission="suffix-major-tiled")
+          "stage-major", join_submission="suffix-major-tiled")
 
-    entries = [query_entries(summary)
-               for summary in (vllm, anchor_major, tiled)]
-
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0))
-    fig.subplots_adjust(wspace=0.3)
-    for ax, qid in zip(axes, QUERY_IDS):
-        rows = [metrics(system_entries[qid])
-                for system_entries in entries]
-        walls = [row["wall_s"] for row in rows]
-        names = [name for name, _color in SYSTEMS]
-        colors = [color for _name, color in SYSTEMS]
-        bars = ax.bar(names, walls, color=colors, width=0.6)
-        for bar, row in zip(bars, rows):
-            ax.annotate(
-                f"{row['wall_s']:,.1f} s\n"
-                f"{row['pairs_per_s']:,.0f} pairs/s\n"
-                f"${row['usd']:,.4f}/query",
-                (bar.get_x() + bar.get_width() / 2, bar.get_height()),
-                ha="center", va="bottom", fontsize=9)
-        ratio = walls[0] / walls[2]
-        direction = "faster" if ratio >= 1 else "slower"
-        factor = ratio if ratio >= 1 else 1 / ratio
-        pair_counts = sorted({row["pairs"] for row in rows})
-        if len(pair_counts) == 1:
-            pairs_text = f"{pair_counts[0]:,} join pairs"
-        else:
-            pairs_text = (
-                f"{min(pair_counts):,}-{max(pair_counts):,} join pairs")
-        ax.set_title(
-            f"{qid} — {pairs_text}\n"
-            f"tiled stock SGLang {factor:.2f}x {direction} than "
-            f"stock vLLM")
-        ax.set_ylabel("seconds")
-        ax.set_ylim(0, max(walls) * 1.4)
-        ax.tick_params(axis="x", labelsize=9)
-        ax.spines[["top", "right"]].set_visible(False)
+    quail_rows = {row["query"]: row
+                  for row in quail_data["passes"]["single"]["queries"]}
+    entries = {
+        "stock_vllm": query_entries(stock_vllm),
+        "pipelined_vllm": query_entries(pipelined_vllm),
+        "pipelined_sglang": query_entries(pipelined_sglang),
+        "sglang_anchor_major": query_entries(anchor_major),
+        "sglang_tiled": query_entries(tiled),
+    }
 
     OUT.mkdir(exist_ok=True)
-    out_path = OUT / "stock_sglang_vs_stock_vllm.png"
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
-    print(f"wrote {out_path}")
+    five_way_figure(sol, quail_rows, entries)
+    join_order_figure(entries)
 
     for qid in QUERY_IDS:
-        for (name, _color), system_entries in zip(SYSTEMS, entries):
-            row = metrics(system_entries[qid])
-            label = name.replace("\n", " ")
-            print(f"{qid} {label}: {row['wall_s']:.2f} s, "
-                  f"{row['pairs']:,} pairs, "
-                  f"{row['pairs_per_s']:.1f} pairs/s, "
-                  f"${row['usd']:.4f}/query, "
-                  f"answer accuracy {row['answer_accuracy']:.2%}")
+        print(f"{qid} SoL estimate: "
+              f"{sol['queries'][qid]['models'][MODEL]['sol_s']:.2f} s")
+        print(f"{qid} Quail: {quail_rows[qid]['wall_s']:.2f} s")
+        for key in ("stock_vllm", "pipelined_vllm", "pipelined_sglang"):
+            entry = entries[key][qid]
+            wall = entry["total_wall_s"]
+            pairs = join_pairs(entry)
+            accuracy = entry["accuracy"]["answer_accuracy"]["accuracy"]
+            print(f"{qid} {key}: {wall:.2f} s, {pairs:,} pairs, "
+                  f"{pairs / wall:.1f} pairs/s, ${usd(wall):.4f}/query, "
+                  f"answer accuracy {accuracy:.2%}")
 
 
 if __name__ == "__main__":
