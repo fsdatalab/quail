@@ -6,7 +6,7 @@ work directory to this script:
     W=<workdir>
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
     modal volume get quail-results stock_sglang/2026-08-30_033502_05712d88/summary.json $W/stock_sglang_anchor_major.json
-    modal volume get quail-results stock_sglang/TILED_LABEL/summary.json $W/stock_sglang_tiled.json
+    modal volume get quail-results stock_sglang/2026-08-30_042550_e5f6d2e8/summary.json $W/stock_sglang_tiled.json
     uv run --with matplotlib python reports/make_stock_sglang_baseline_plots.py $W
 """
 

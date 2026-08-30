@@ -42,7 +42,18 @@ submits in slices of 16,384 requests: one `generate()` call with all
 Modal threatened to kill the container. The report explains all
 three choices with the measured numbers.
 
+## Join pair order
+
+SGLang's radix cache stores KV only for finished requests, so
+vLLM's anchor-major pair order recomputes an anchor for every
+sibling in flight. `baselines.stock.suffix_major_tiled_order` adds a
+suffix-major order within anchor tiles sized to half the measured KV
+pool; the SGLang client uses it by default and anchor-major stays
+selectable. Answers return in anchor-major order either way. On
+IMDB-3 the tiled order cut the query from 213.2 to 83.9 seconds; on
+BIO-2 it cost 15% despite a higher cache hit rate.
+
 ## Numbers
 
-The first run and the comparison against stock vLLM on BIO-2 and
-IMDB-3 at sf=0.1 are in `reports/2026-08-30-stock-sglang-baseline.md`.
+Both runs and the comparison against stock vLLM on BIO-2 and IMDB-3
+at sf=0.1 are in `reports/2026-08-30-stock-sglang-baseline.md`.
