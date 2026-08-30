@@ -65,7 +65,7 @@ def timeline(before, after):
     bn = len(by)
     an = len(ay)
     ax.annotate(f"{bn:,} passes, {bw:.1f} s",
-                xy=(bx[-1], by[-1]), xytext=(bx[-1] - 12, 120),
+                xy=(bx[-1], by[-1]), xytext=(bx[-1] - 16, 4500),
                 color=RED)
     ax.annotate(f"{an} passes, {aw:.1f} s",
                 xy=(ax_[-1], ay[-1]),

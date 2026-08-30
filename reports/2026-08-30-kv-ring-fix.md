@@ -71,4 +71,100 @@ Stated before the run:
 
 ## Result
 
-(to be filled from the run)
+Every prediction held. Smoke (sf 0.01) first: regret 0 on both
+queries, no evictions, answers unchanged. The sf 0.1 numbers below
+are the unprofiled pass; the profiled pass agrees within 5%.
+
+### IMDB-3
+
+| | pre-fix | scan ring |
+|---|---:|---:|
+| Engine wall (s) | 68.93 | 32.68 |
+| Filter phase (s) | 50.28 | 14.54 |
+| Filter forward passes | 2,922 | 17 |
+| Mean filter pass (tokens) | 602 (469 after the arena filled) | 103,484 |
+| Eviction calls in the filter | 2,625 | 0 |
+| Join phase (s) | 18.53 | 18.05 |
+| Retained at the join (docs / pages) | 120 / 8,631 | 171 / 8,843 |
+| Join hit tokens | 137,397 | 140,458 |
+| Regret (tokens) | 1,220,547 | 1,217,486 |
+| Survivors | 4,380 | 4,380 |
+
+Figure: plots/kv_ring_fix_timeline.png
+
+Figure: plots/kv_ring_fix_walls.png
+
+- The engine wall halved: 32.68 seconds, compared with 68.93
+  measured pre-fix in the same harness, 75.0 recorded in the
+  benchmark, and 52.65 recorded for stock vLLM. The filter now runs
+  17 near-budget passes at 99.6% GPU busy (chunk grain) and lands
+  at 14.54 seconds - level with IMDB-1's 15.06 seconds for the
+  identical filter work, so the composition penalty is gone.
+- Retention behaved exactly as designed. The pool filled to
+  8,843 pages, its cap to the page (22,640 free pages at filter
+  start minus the 13,797-page ring), holding 171 of the longest
+  survivors at 140,458 tokens - within 0.7% of the planner's
+  141,498-token credit. Every one of the 171 was still resident at
+  the join and hit. Zero eviction calls anywhere; pre-fix, churn
+  evicted 4,260 keys (78,268 pages) during the filter alone. One
+  prediction miss, in the right direction: 400 to 500 resident
+  anchors were predicted from the corpus mean length, but the
+  pool's replacement rule keeps the longest survivors, so the same
+  token mass arrived as 171 documents of 821 mean tokens against
+  the 310-token survivor mean.
+- Regret is unchanged (1.22M tokens pre and post), as predicted:
+  the fix does not buy more hits - the pre-fix run ended up with a
+  similar hit mass - it stops paying 35 seconds of collapsed
+  batches for them. Both runs produced the same 4,380 survivors,
+  so the change is performance-only.
+- Benchmark metrics for IMDB-3 at the new wall: 52,560 evaluated
+  document pairs / 32.68 s = 1,608 document pairs/second
+  (recorded pre-fix: 701); $0.0359 per query at the H100 rate of
+  $3.9492/hour, compared with $0.0823 recorded pre-fix and
+  $0.0578 for stock vLLM's recorded 52.65 seconds.
+
+### BIO-2
+
+128.22 seconds, compared with 130.35 pre-fix - container variance,
+same 98 forward passes at 105,861 mean tokens, 99.4% busy, regret
+0, no evictions. Its plan retains nothing, so this is the expected
+no-change control.
+
+Data on the `quail-results` volume:
+
+- `/results/ablations/ringfix_imdb3.json`, `ringfix_bio2.json`
+  (sf 0.1); `ringfix_imdb3_sf0.01.json`, `ringfix_bio2_sf0.01.json`
+  (smoke)
+- `/results/ablations/ringfix_traces/` (five chrome traces)
+- Pre-fix comparisons: `discrepancy_imdb3.json`,
+  `discrepancy_bio2.json` from the discrepancy report.
+- Modal function calls: `fc-01M18J895155R1VS59VRPTGWEN` (sf 0.1),
+  `fc-01M18J4YZ2NZH568D71KA1HEG0` (smoke).
+
+## Meaning
+
+- The IMDB-3 loss to stock vLLM is gone: 32.68 seconds against
+  stock's 52.65. Quail's parts now compose: filter 14.54 plus join
+  18.05 is the whole query, 0.10 seconds apart from the engine
+  wall.
+- Retention is now safe by construction, not by tuning. Admission
+  owns two chunk budgets for the whole scan; retention competes
+  only with itself, by saved recompute per page, and a replacement
+  costs heap bookkeeping in the answer path rather than a stalled
+  forward pass. The planner prices the same reservation, so the
+  credit (141,498 tokens) matched the runtime pool (140,458) to
+  0.7%.
+- The QuailB headline table should be refreshed by a full benchmark
+  rerun; this report's confirming cell covers only the two queries
+  it re-measured.
+
+## Rebuild
+
+Rerun the cell (any out-prefix other than `discrepancy` selects
+the post-fix profiler windows):
+
+    uv run modal run ablations/discrepancy_timeline.py::run_smoke --out-prefix ringfix
+    uv run modal run ablations/discrepancy_timeline.py::run_queries --out-prefix ringfix
+
+Rebuild the figures with `reports/make_kv_ring_fix_plots.py`; its
+docstring holds the `modal volume get` commands.

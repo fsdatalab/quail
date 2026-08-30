@@ -58,10 +58,13 @@ discrepancy report (`ablations/discrepancy_timeline.py`,
   for the identical work.
 - Eviction calls during the filter: 2,625 before; 0 after.
 - Join phase: 18.53 s before, 18.05 s after.
-- Engine wall: 68.93 s before; after-fix value pending the run's
-  result file (the two phase walls above sum to 32.6 s), against
-  the 52.65 s recorded for stock vLLM on this query.
-- BIO-2 unchanged: 128.17 s after against 130.35 s before, regret
+- Engine wall: 68.93 s before, 32.68 s after (2.11x), against the
+  52.65 s recorded for stock vLLM on this query - the one QuailB
+  loss is gone.
+- Retained at the join: 171 documents on 8,843 pages, exactly the
+  pool cap, all 171 hit; regret unchanged at 1.22M tokens; the
+  same 4,380 survivors, so answers are untouched.
+- BIO-2 unchanged: 128.22 s after against 130.35 s before, regret
   0, no evictions (its plan retains nothing).
 
 Full report with the plot and volume paths:
