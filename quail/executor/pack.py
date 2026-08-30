@@ -301,11 +301,9 @@ class FilterAdmission:
         """Record one answer. Frees pages on FALSE or last stage;
         otherwise queues the next-stage suffix.
 
-        release=False hands the document to a retained pool outside
-        this chain: the caller rewinds its KV to the document's own
-        tokens, so the pages past that rewind return here, and the
-        rest leave this accounting (add_free_pages returns them if
-        the pool later evicts the document).
+        release=False assumes the caller rewinds the kept document
+        to its own tokens: the tail pages return here, the rest come
+        back through add_free_pages if the pool evicts it.
 
         Returns docs whose pages were freed."""
         self.in_flight.discard(doc)

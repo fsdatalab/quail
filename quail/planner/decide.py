@@ -452,11 +452,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         live0[_filter_alias(fs[0])] *= surv
     base_work = _filter_work(filters, stats, filter_orders, pre)
 
-    # ---- the executor loops keep two chunks of document KV in
-    # flight (one running while the next packs), and the runtime
-    # caps retained KV at what is left of the arena beside that
-    # reservation (executor.loop.run_filter): the keep arithmetic
-    # reserves the same working headroom
+    # must match the scan ring run_filter reserves: the loops keep
+    # two chunks of document KV in flight
     headroom = 2 * chunk
 
     # ---- keep credit candidates, then the search on expectations

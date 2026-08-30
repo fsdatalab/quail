@@ -6,15 +6,10 @@ import heapq
 class RetainedPool:
     """Fixed-capacity pool of document prefixes kept for a later operator.
 
-    The capacity is what the arena holds beside the filter loop's
-    working reservation, so retention can never starve admission.
-    While the pool has room, every offered prefix is kept. Once full,
-    the residents with the least saved recompute per page are the
-    candidates to make room, and the newcomer replaces them only when
-    its value strictly exceeds what they lose together: total retained
-    value only rises, and equal value never swaps. Saved recompute per
-    page rises with prefix length, so longer documents displace
-    shorter ones.
+    Keeps every offer while capacity lasts. Once full, the lowest
+    value-per-page residents make room only when the newcomer's value
+    strictly exceeds theirs combined, so total retained value only
+    rises and equal value never swaps.
     """
 
     def __init__(self, cap_pages: int):

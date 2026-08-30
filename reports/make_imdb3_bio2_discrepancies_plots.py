@@ -36,7 +36,7 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "plots"
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, DARK, GRAY, RED, TEAL  # noqa: E402
+from plot_colors import BLUE, DARK, GRAY, ORANGE, RED, TEAL  # noqa: E402
 
 
 def load(path):
@@ -75,6 +75,49 @@ def _kernel_intervals(path):
             tail = buf[-overlap:]
     # the overlap can hand the same event to two buffers
     return sorted(set(evs))
+
+
+_PY_EVENT = re.compile(
+    rb'"cat": "python_function", "name": "([^"]{1,200})"'
+    rb'.{0,600}?"ts": (\d+(?:\.\d+)?), "dur": (\d+(?:\.\d+)?)', re.S)
+
+# stack frames the CPU attribution sums; every listed substring must
+# appear in the frame name (one nesting level each, so the buckets
+# subtract cleanly)
+FRAME_KEYS = (
+    ("busy_loop", (b"run_busy_loop",)),
+    ("engine_step", (b"_process_engine_step",)),
+    ("input_queue", (b"_process_input_queue",)),
+    ("schedule", (b"sched/scheduler.py", b"): schedule")),
+    ("cache_probe", (b"kv_cache_coordinator",
+                     b"find_longest_cache_hit")),
+    ("execute_model", (b"gpu/model_runner", b"execute_model")),
+    ("preprocess", (b"preprocess_add_request",)),
+    ("block_hash", (b"request_block_hasher",)),
+)
+
+
+def frame_seconds(path):
+    """On-stack seconds per FRAME_KEYS bucket, streamed like
+    _kernel_intervals; the overlap window can hand an event to two
+    buffers, so events dedup on (bucket, start)."""
+    seen = {key: set() for key, _ in FRAME_KEYS}
+    tail = b""
+    with gzip.open(path) as f:
+        while True:
+            chunk = f.read(1 << 24)
+            if not chunk:
+                break
+            buf = tail + chunk
+            for m in _PY_EVENT.finditer(buf):
+                name = m.group(1)
+                ts, dur = float(m.group(2)), float(m.group(3))
+                for key, needles in FRAME_KEYS:
+                    if all(n in name for n in needles):
+                        seen[key].add((ts, dur))
+            tail = buf[-4096:]
+    return {key: sum(d for _, d in evs) / 1e6
+            for key, evs in seen.items()}
 
 
 def kernel_busy(path):
@@ -347,6 +390,120 @@ def fig_regret(imdb3, bio2, stock3, stockb):
     plt.close(fig)
 
 
+def _stock_bio2_trace(workdir, stockb):
+    name = Path(stockb["windows"][0]["files"][0]).name
+    return workdir / "traces" / "stock_kineto" / name
+
+
+def _merged(intervals):
+    out = []
+    for s, e in intervals:
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def fig_bio2_strips(workdir, stockb):
+    """Kernel activity over two-second excerpts, one strip per
+    system: every mark is one kernel-execution interval, gaps are
+    GPU idle."""
+    quail_evs = _kernel_intervals(
+        workdir / "traces" / "bio2_join_late.chrome.json.gz")
+    stock_evs = _kernel_intervals(_stock_bio2_trace(workdir, stockb))
+    fig, axes = plt.subplots(2, 1, figsize=(9.6, 3.4), sharex=True)
+    rows = ((axes[0], quail_evs, BLUE, "white",
+             "Quail (kernel-only capture)"),
+            (axes[1], stock_evs, RED, DARK,
+             "stock vLLM (profiled run; its CPU tracing stretches "
+             "the wall about 2.4x)"))
+    excerpt = 2.0
+    for ax, evs, color, text_color, label in rows:
+        t0 = min(s for s, _ in evs)
+        t1 = max(e for _, e in evs)
+        mid = t0 + (t1 - t0 - excerpt * 1e6) / 2
+        cut = [(s, e) for s, e in _merged(sorted(evs))
+               if e > mid and s < mid + excerpt * 1e6]
+        ax.broken_barh(
+            [((s - mid) / 1e6, (e - s) / 1e6) for s, e in cut],
+            (0, 1), color=color, linewidth=0)
+        busy = sum(e - s for s, e in _merged(sorted(evs))) / (t1 - t0)
+        ax.set_yticks([])
+        ax.set_ylabel(None)
+        ax.set_ylim(0, 1)
+        ax.text(0.012, 0.5, f"{label} - window {busy:.0%} busy",
+                transform=ax.transAxes, va="center",
+                color=text_color,
+                bbox=(None if text_color == "white" else
+                      dict(facecolor="white", alpha=0.75,
+                           edgecolor="none")))
+        ax.set_xlim(0, excerpt)
+    axes[1].set_xlabel("seconds into the excerpt")
+    axes[0].set_title("BIO-2: when the GPU is running a kernel, "
+                      "two-second excerpts")
+    fig.tight_layout()
+    fig.savefig(OUT / "discrepancy_bio2_strips.png", dpi=300)
+    plt.close(fig)
+    return dict(quail_busy=round(
+        sum(e - s for s, e in _merged(sorted(quail_evs)))
+        / (max(e for _, e in quail_evs)
+           - min(s for s, _ in quail_evs)), 4))
+
+
+def fig_bio2_cpu(workdir, stockb):
+    """Where stock's window wall goes, split exactly by stack frame.
+
+    On-stack seconds include GIL waits and, inside execute_model,
+    the wait for the GPU; the two threads run concurrently but share
+    the GIL.
+    """
+    path = _stock_bio2_trace(workdir, stockb)
+    fr = frame_seconds(path)
+    _, _, _, merged_us = kernel_busy(path)
+    kernels = merged_us / 1e6
+    engine = [
+        ("GPU kernels", kernels, TEAL),
+        ("execute_model, CPU side", fr["execute_model"] - kernels,
+         BLUE),
+        ("prefix-cache hit probe", fr["cache_probe"], RED),
+        ("scheduler, rest", fr["schedule"] - fr["cache_probe"], GRAY),
+        ("step rest (outputs)", fr["engine_step"] - fr["schedule"]
+         - fr["execute_model"], DARK),
+        ("input queue", fr["input_queue"], ORANGE),
+    ]
+    inputt = [
+        ("prefix-cache block hashing", fr["block_hash"], RED),
+        ("request construction, rest",
+         fr["preprocess"] - fr["block_hash"], GRAY),
+    ]
+    fig, ax = plt.subplots(figsize=(9.6, 3.6))
+    for y, (title, parts) in enumerate((
+            ("engine thread", engine), ("input thread", inputt))):
+        x = 0.0
+        for name, sec, color in parts:
+            ax.barh(1 - y, sec, left=x, color=color, height=0.55)
+            if sec > 1.6:
+                ax.text(x + sec / 2, 1 - y, f"{sec:.1f}",
+                        ha="center", va="center", color="white")
+            x += sec
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c)
+               for _, _, c in engine + inputt[:1]]
+    labels = [n for n, _, _ in engine] + [inputt[0][0]]
+    ax.legend(handles, labels, loc="lower right", frameon=False,
+              ncol=2, fontsize=8)
+    ax.set_yticks([1, 0],
+                  labels=["engine thread", "input thread"])
+    ax.set_xlabel("on-stack seconds in the profiled window")
+    ax.set_xlim(0, fr["busy_loop"] * 1.02)
+    ax.set_title("Stock BIO-2: what runs while the GPU waits")
+    fig.tight_layout()
+    fig.savefig(OUT / "discrepancy_bio2_cpu.png", dpi=300)
+    plt.close(fig)
+    return {k: round(v, 3) for k, v in fr.items()} | dict(
+        gpu_kernels_s=round(kernels, 3))
+
+
 def main():
     workdir = Path(sys.argv[1])
     imdb3 = load(workdir / "imdb3.json")
@@ -365,6 +522,8 @@ def main():
     fig_bio2_rates(bio2, sol, stock_rows, pipe_rows, quail_rows)
     fig_regret(imdb3, bio2, stock3, stockb)
     busy = fig_window_busy(workdir, stock3, stockb)
+    strips = fig_bio2_strips(workdir, stockb)
+    cpu = fig_bio2_cpu(workdir, stockb)
 
     # ---- derived numbers the report cites
     u3 = imdb3["unprofiled"]
@@ -436,7 +595,8 @@ def main():
                     / stock_rows["BIO-2"]["steps"][0]["n_pairs"], 3),
                 regret_tokens=stockb["regret_tokens"],
                 buckets=stockb["buckets"])),
-        window_busy=busy), indent=1))
+        window_busy=busy, bio2_strips=strips,
+        bio2_cpu_attribution=cpu), indent=1))
 
 
 if __name__ == "__main__":

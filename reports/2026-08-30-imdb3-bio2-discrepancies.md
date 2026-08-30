@@ -199,13 +199,36 @@ would-hit prefix).
 The profiler window is the finding: 0.31 milliseconds of kernel time
 per pair against the 1.74-millisecond unprofiled wall - the GPU runs
 kernels about 18% of the time (11% against the recorded full-run
-rate). The other ~82% is the engine's own per-request work between
-small steps: scheduling, sampling, detokenization, block-table
-bookkeeping. The steps are small because at most about 117 sequences
-of 4,066 tokens fit the 479,616-token KV space at once, so a step
-carries about 2,000 tokens where Quail's forward pass carries
-106,000. Even stock's kernel time per pair (0.31 ms) exceeds Quail's
+rate). Even stock's kernel time per pair (0.31 ms) exceeds Quail's
 whole wall per pair (0.23 ms).
+
+Figure: plots/discrepancy_bio2_strips.png
+
+The strips show two-second excerpts of the same windows: every mark
+is one kernel-execution interval. Quail's strip is one solid band;
+stock's is slivers with idle between them.
+
+The trace's Python stacks say what fills the idle. Over the
+28.3-second window (6,762 requests, 2.1 seconds of merged kernel
+time), on-stack seconds split exactly across the engine thread's
+busy loop - execute_model 14.8 (2.1 of it kernels; the rest is
+per-layer launch and quantization Python, and waiting), the
+scheduler 7.8 (5.7 of it probing the prefix cache for each
+request's longest cached prefix), output processing 2.4, input-queue
+handling 3.3 - while the input thread, sharing the interpreter lock
+beside it, spent 11.6 seconds building requests, 10.7 of them
+hashing every request's blocks for the prefix cache (1.8 million
+`hash_block_tokens` calls, about 268 blocks per 4,100-token
+request). The prefix cache's own bookkeeping - hashing plus probe,
+16.4 on-stack seconds - costs about eight times the kernel time
+that runs in the window. So the idle is not one mystery gap: it is
+named per-request Python work, dominated by cache bookkeeping and
+small-step launch overhead. The steps are small because at most
+about 117 sequences of 4,066 tokens fit the 479,616-token KV space
+at once, so a step carries about 2,000 tokens where Quail's forward
+pass carries 106,000.
+
+Figure: plots/discrepancy_bio2_cpu.png
 
 Figure: plots/discrepancy_window_busy.png
 
@@ -227,8 +250,10 @@ one order of magnitude.
   retained mass converged on its own) - shipped as the scan ring;
   measured result in `2026-08-30-kv-ring-fix.md`.
 - BIO-2's win is per-request machinery, now measured on the GPU
-  timeline: stock leaves the GPU idle about 82% of the time at a
-  99.55% cache hit rate, while Quail runs 99% busy on the same
+  timeline and named on the CPU stacks: stock leaves the GPU idle
+  about 82% of the time at a 99.55% cache hit rate - most of it
+  prefix-cache hashing and probing plus small-step launch Python -
+  while Quail runs 99% busy on the same
   fresh tokens. The paper sentence: caching is not the bottleneck
   on either side; batch shape is.
 - vLLM's design cannot starve its own admission (cached blocks live

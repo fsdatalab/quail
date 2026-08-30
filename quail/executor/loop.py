@@ -793,11 +793,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             Must be True with multiple stages.
         arena_keys: Stable arena key for each document. List positions are
             used when omitted.
-        retain_survivors: Passing document positions to keep for joins.
-            Kept KV goes into a RetainedPool capped at the arena minus
-            the loop's two-chunk working reservation, so retention
-            never starves admission; once full, longer documents
-            displace shorter ones by saved recompute per page.
+        retain_survivors: Passing document positions to keep for
+            joins, through a RetainedPool capped at the arena minus
+            the scan ring.
         retention_values: Saved recomputation seconds by document position.
 
     Returns:
@@ -832,16 +830,13 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         if unified and arena_writes else 0
     pool = None
     if retain:
-        # The scan ring: the loop keeps up to two chunks of document
-        # KV in flight (one running while the next packs), so those
-        # pages are reserved before anything is retained, and the pool
-        # gets only what is left. Retention then never starves
-        # admission, and the filter runs full chunks the whole scan.
+        # the scan ring: the loop keeps two chunks of document KV in
+        # flight, so retention may take only what is left (the
+        # planner's keep headroom reserves the same two chunks)
         ring_pages = arena.accounting.pages_needed(2 * budget)
         short = ring_pages - arena.accounting.free_pages
         if short > 0:
-            # an earlier operator's retained KV crowds the ring:
-            # release the least valuable prefixes once, up front
+            # an earlier operator's retained KV crowds the ring
             arena.evict_retained(short)
         pool = RetainedPool(
             max(0, arena.accounting.free_pages - ring_pages))

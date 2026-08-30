@@ -94,9 +94,7 @@ GPU_KW = dict(image=image, gpu="H100!", memory=98304,
                        "/results": results_vol})
 
 CACHE_BLOCK = 16
-# profiler window sizing, in requests: a stage warms up on the first
-# slice, the window covers about this many requests (whole anchor
-# groups for joins), the rest replays unprofiled
+# requests per profiler window, rounded to whole anchor groups
 WINDOW_REQUESTS = 1200
 
 
