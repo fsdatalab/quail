@@ -1,0 +1,316 @@
+"""Plots for the IMDB-3 / BIO-2 discrepancy report.
+
+Pull the inputs from the quail-results volume, then pass the work
+directory to this script:
+
+    W=<workdir>
+    modal volume get quail-results ablations/discrepancy_imdb3.json $W/imdb3.json
+    modal volume get quail-results ablations/discrepancy_bio2.json $W/bio2.json
+    modal volume get quail-results benchmarks/quailb/runs/qb_20260829T185407Z_cbb14b36/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail.json
+    modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock.json
+    modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined.json
+    modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
+    mkdir -p $W/traces
+    for t in imdb3_filter_healthy imdb3_filter_churn imdb3_join \
+             bio2_join_early bio2_join_late; do
+        modal volume get quail-results \
+            ablations/discrepancy_traces/$t.chrome.json.gz \
+            $W/traces/$t.chrome.json.gz
+    done
+    uv run --with matplotlib python \
+        reports/make_imdb3_bio2_discrepancies_plots.py $W
+"""
+
+import gzip
+import json
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE / "plots"
+plt.style.use(HERE / "quail.mplstyle")
+sys.path.insert(0, str(HERE))
+from plot_colors import BLUE, DARK, GRAY, RED, TEAL  # noqa: E402
+
+
+def load(path):
+    with path.open() as f:
+        return json.load(f)
+
+
+def by_query(rows):
+    return {r["query"]: r for r in rows}
+
+
+def kernel_busy(path):
+    """Fraction of a trace window covered by kernel execution.
+
+    Kernel intervals are merged before summing, so overlapping
+    streams do not double count.
+    """
+    with gzip.open(path) as f:
+        d = json.load(f)
+    evs = [(e["ts"], e["ts"] + e["dur"]) for e in d["traceEvents"]
+           if e.get("ph") == "X"
+           and e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")]
+    evs.sort()
+    span = max(e for _, e in evs) - min(s for s, _ in evs)
+    merged = 0.0
+    cur_s, cur_e = evs[0]
+    for s, e in evs[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            merged += cur_e - cur_s
+            cur_s, cur_e = s, e
+    merged += cur_e - cur_s
+    busy_us = sum(e - s for s, e in evs)
+    return merged / span, len(evs), busy_us / len(evs)
+
+
+def fig_imdb3_timeline(imdb3):
+    u = imdb3["unprofiled"]
+    filt, join = u["phases"]
+    ev0 = u["evictions"][0]["t"]
+    fig, (top, bot) = plt.subplots(2, 1, figsize=(9.2, 6.2),
+                                   sharex=True)
+
+    for p, color in ((filt, BLUE), (join, TEAL)):
+        top.scatter([c["t"] for c in p["chunks"]],
+                    [c["tokens"] for c in p["chunks"]],
+                    s=5, color=color, linewidths=0)
+    top.set_yscale("log")
+    top.axvline(ev0, color=RED, lw=1, ls="--")
+    top.axvline(join["t_start"], color=GRAY, lw=1)
+    top.set_ylabel("tokens per forward pass (log scale)")
+    top.set_title("IMDB-3: forward-pass size and fresh-token rate, "
+                  "instrumented rerun")
+
+    pre = [c["tokens"] for c in filt["chunks"] if c["t"] < ev0]
+    post = [c["tokens"] for c in filt["chunks"] if c["t"] >= ev0]
+    jt = [c["tokens"] for c in join["chunks"]]
+    top.annotate(
+        f"{len(pre)} chunks,\nmean {sum(pre) // len(pre):,}",
+        (ev0 * 0.45, 25_000), ha="center", color=DARK, fontsize=9)
+    top.annotate(
+        f"first eviction: retained survivor KV\nhas filled the arena "
+        f"({len(post):,} chunks after,\nmean {sum(post) // len(post):,}"
+        " tokens each)",
+        (ev0 + 1.5, 3_500), color=RED, fontsize=9)
+    top.annotate(
+        f"join: {len(jt)} chunks,\nmean {sum(jt) // len(jt):,}",
+        (join["t_start"] + 8, 20_000), ha="center", color=TEAL,
+        fontsize=9)
+
+    # piecewise achieved rate: phase tokens over phase wall, split at
+    # the first eviction inside the filter
+    t_f0 = filt["t_start"]
+    t_j0 = join["t_start"]
+    end = t_j0 + join["wall_s"]
+    segs = [
+        (t_f0, ev0, sum(pre) / (ev0 - t_f0), DARK),
+        (ev0, t_f0 + filt["wall_s"],
+         sum(post) / (t_f0 + filt["wall_s"] - ev0), RED),
+        (t_j0, end, join["tokens"] / join["wall_s"], TEAL),
+    ]
+    for s, e, rate, color in segs:
+        bot.plot([s, e], [rate / 1e3] * 2, color=color, lw=2.2)
+        bot.annotate(f"{rate / 1e3:,.0f}k tokens/s",
+                     ((s + e) / 2, rate / 1e3 + 7), ha="center",
+                     color=color, fontsize=9.5)
+    bot.axvline(ev0, color=RED, lw=1, ls="--")
+    bot.axvline(t_j0, color=GRAY, lw=1)
+    bot.set_ylim(0, 145)
+    bot.set_ylabel("fresh tokens per second (thousands)")
+    bot.set_xlabel("seconds")
+    fig.savefig(OUT / "discrepancy_imdb3_timeline.png", dpi=300)
+    plt.close(fig)
+
+
+def fig_imdb3_composition(imdb3, quail_rows, stock_rows, pipe_rows):
+    u = imdb3["unprofiled"]
+    filt, join = u["phases"]
+    i1 = quail_rows["IMDB-1"]["wall_s"]
+    i2 = quail_rows["IMDB-2"]["wall_s"]
+    pairs3 = 52_560 / 60_000
+    stock_steps = stock_rows["IMDB-3"]["steps"]
+    pipe_steps = pipe_rows["IMDB-3"]["steps"]
+    rows = [
+        ("Quail, IMDB-1 + IMDB-2\nscaled to survivors",
+         i1, i2 * pairs3),
+        ("Quail measured", filt["wall_s"], join["wall_s"]),
+        ("Stock vLLM measured",
+         stock_steps[0]["wall_s"], stock_steps[1]["wall_s"]),
+        ("Pipelined vLLM measured",
+         pipe_steps[0]["wall_s"], pipe_steps[1]["wall_s"]),
+    ]
+    fig, ax = plt.subplots(figsize=(8.8, 3.4))
+    y = list(range(len(rows)))[::-1]
+    for yi, (label, f, j) in zip(y, rows):
+        ax.barh(yi, f, color=BLUE, height=0.55)
+        ax.barh(yi, j, left=f, color=TEAL, height=0.55)
+        ax.annotate(f"filter {f:.1f}", (f / 2, yi), ha="center",
+                    va="center", color="white", fontsize=9)
+        ax.annotate(f"join {j:.1f}", (f + j / 2, yi), ha="center",
+                    va="center", color="white", fontsize=9)
+        ax.annotate(f"{f + j:.1f} s", (f + j + 1, yi), va="center",
+                    color=DARK, fontsize=9.5)
+    recorded = quail_rows["IMDB-3"]["wall_s"]
+    ax.plot([recorded, recorded], [y[1] - 0.38, y[1] + 0.38],
+            color=DARK, lw=1.2)
+    ax.annotate(f"recorded family run: {recorded:.1f} s",
+                (recorded + 1, y[1] + 0.34), color=DARK, fontsize=8.5)
+    ax.set_yticks(y)
+    ax.set_yticklabels([r[0] for r in rows])
+    ax.set_xlabel("seconds")
+    ax.set_title("IMDB-3: the composition penalty is Quail's filter "
+                 "phase")
+    fig.savefig(OUT / "discrepancy_imdb3_composition.png", dpi=300)
+    plt.close(fig)
+
+
+def fig_bio2_rates(bio2, sol, stock_rows, pipe_rows, quail_rows):
+    fresh = bio2["unprofiled"]["fresh_tokens"]
+    sol_s = sol["queries"]["BIO-2"]["models"]["qwen3-4b-fp8"]["sol_s"]
+    quail_s = quail_rows["BIO-2"]["wall_s"]
+    stock = stock_rows["BIO-2"]["steps"][0]
+    pipe = pipe_rows["BIO-2"]["steps"][0]
+    rows = [
+        ("SoL estimate", fresh / sol_s, DARK),
+        ("Quail", fresh / quail_s, BLUE),
+        ("Pipelined vLLM",
+         stock["fresh_tokens"] / pipe["wall_s"], GRAY),
+        ("Stock vLLM",
+         stock["fresh_tokens"] / stock["wall_s"], GRAY),
+    ]
+    fig, ax = plt.subplots(figsize=(7.2, 3.8))
+    x = range(len(rows))
+    ax.bar(x, [r[1] / 1e3 for r in rows],
+           color=[r[2] for r in rows], width=0.55)
+    sol_rate = rows[0][1]
+    for xi, (label, rate, _) in zip(x, rows):
+        ax.annotate(f"{rate / 1e3:,.1f}k", (xi, rate / 1e3 * 1.10),
+                    ha="center", color=DARK, fontsize=9.5)
+        if label != "SoL estimate":
+            ax.annotate(f"{sol_rate / rate:.1f}x below SoL",
+                        (xi, rate / 1e3 * 1.45), ha="center",
+                        color=DARK, fontsize=8.5)
+    ax.set_yscale("log")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([r[0] for r in rows])
+    ax.set_ylabel("fresh tokens per second (thousands, log scale)")
+    ax.set_title("BIO-2: the same 10.4-10.5M fresh tokens at three "
+                 "speeds")
+    fig.savefig(OUT / "discrepancy_bio2_rates.png", dpi=300)
+    plt.close(fig)
+
+
+def fig_window_busy(workdir):
+    windows = [
+        ("IMDB-3 filter,\nfirst chunks", "imdb3_filter_healthy"),
+        ("IMDB-3 filter,\neviction churn", "imdb3_filter_churn"),
+        ("IMDB-3 join", "imdb3_join"),
+        ("BIO-2 join,\nearly", "bio2_join_early"),
+        ("BIO-2 join,\nlate", "bio2_join_late"),
+    ]
+    stats = [kernel_busy(workdir / "traces" / f"{t}.chrome.json.gz")
+             for _, t in windows]
+    fig, ax = plt.subplots(figsize=(7.8, 3.6))
+    x = range(len(windows))
+    colors = [RED if "churn" in t else BLUE for _, t in windows]
+    ax.bar(x, [s[0] for s in stats], color=colors, width=0.55)
+    for xi, (busy, n, mean_us) in zip(x, stats):
+        ax.annotate(f"{busy:.0%}", (xi, busy + 0.03), ha="center",
+                    color=DARK, fontsize=10)
+        ax.annotate(f"mean kernel\n{mean_us:.0f} us",
+                    (xi, max(busy - 0.24, 0.05)), ha="center",
+                    color="white" if busy > 0.3 else DARK,
+                    fontsize=8)
+    ax.set_ylim(0, 1.12)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([w[0] for w in windows])
+    ax.set_ylabel("fraction of the window running kernels")
+    ax.set_title("GPU busy time at kernel grain, torch.profiler "
+                 "windows")
+    fig.savefig(OUT / "discrepancy_window_busy.png", dpi=300)
+    plt.close(fig)
+    return {t: dict(busy=round(s[0], 3), kernels=s[1],
+                    mean_kernel_us=round(s[2], 1))
+            for (_, t), s in zip(windows, stats)}
+
+
+def main():
+    workdir = Path(sys.argv[1])
+    imdb3 = load(workdir / "imdb3.json")
+    bio2 = load(workdir / "bio2.json")
+    sol = load(workdir / "sol.json")
+    quail_rows = by_query(
+        load(workdir / "quail.json")["passes"]["single"]["queries"])
+    stock_rows = by_query(load(workdir / "stock.json")["results"][0])
+    pipe_rows = by_query(load(workdir / "pipelined.json")["results"][0])
+
+    OUT.mkdir(exist_ok=True)
+    fig_imdb3_timeline(imdb3)
+    fig_imdb3_composition(imdb3, quail_rows, stock_rows, pipe_rows)
+    fig_bio2_rates(bio2, sol, stock_rows, pipe_rows, quail_rows)
+    busy = fig_window_busy(workdir)
+
+    # ---- derived numbers the report cites
+    u3 = imdb3["unprofiled"]
+    filt, join = u3["phases"]
+    ev0 = u3["evictions"][0]["t"]
+    pre = [c["tokens"] for c in filt["chunks"] if c["t"] < ev0]
+    post = [c["tokens"] for c in filt["chunks"] if c["t"] >= ev0]
+    i1, i2 = quail_rows["IMDB-1"]["wall_s"], quail_rows["IMDB-2"]["wall_s"]
+    parts = i1 + i2 * 52_560 / 60_000
+    sol3 = sol["queries"]["IMDB-3"]["models"]["qwen3-4b-fp8"]["sol_s"]
+    solb = sol["queries"]["BIO-2"]["models"]["qwen3-4b-fp8"]["sol_s"]
+    ub = bio2["unprofiled"]
+    print(json.dumps(dict(
+        imdb3=dict(
+            recorded_wall_s=quail_rows["IMDB-3"]["wall_s"],
+            rerun_wall_s=u3["engine_wall_s"],
+            parts_prediction_s=round(parts, 2),
+            filter=dict(
+                wall_s=filt["wall_s"], gpu_event_s=filt["gpu_s"],
+                chunks=filt["n_chunks"],
+                first_eviction_t=ev0,
+                chunks_before=len(pre),
+                mean_tokens_before=sum(pre) // len(pre),
+                chunks_after=len(post),
+                mean_tokens_after=sum(post) // len(post),
+                tokens_per_s=round(filt["tokens"] / filt["wall_s"]),
+                launch_cpu_s=filt["timing"]["forward_launch"]),
+            join=dict(
+                wall_s=join["wall_s"], chunks=join["n_chunks"],
+                tokens_per_s=round(join["tokens"] / join["wall_s"]),
+                kv=join["kv"]),
+            evict_calls=len(u3["evictions"]),
+            keys_evicted=sum(e["keys_evicted"]
+                             for e in u3["evictions"]),
+            regret_tokens=u3["regret_tokens"],
+            sol_multiple_recorded=round(
+                quail_rows["IMDB-3"]["wall_s"] / sol3, 2),
+            sol_multiple_parts=round(parts / sol3, 2)),
+        bio2=dict(
+            recorded_wall_s=quail_rows["BIO-2"]["wall_s"],
+            rerun_wall_s=ub["engine_wall_s"],
+            chunks=ub["phases"][0]["n_chunks"],
+            mean_chunk_tokens=ub["phases"][0]["tokens"]
+            // ub["phases"][0]["n_chunks"],
+            regret_tokens=ub["regret_tokens"],
+            quail_sol_multiple=round(
+                quail_rows["BIO-2"]["wall_s"] / solb, 2),
+            stock_sol_multiple=round(
+                stock_rows["BIO-2"]["steps"][0]["wall_s"] / solb, 2),
+            stock_cache_rate=round(
+                stock_rows["BIO-2"]["steps"][0]["cached_tokens"]
+                / stock_rows["BIO-2"]["steps"][0]["prompt_tokens"],
+                4)),
+        window_busy=busy), indent=1))
+
+
+if __name__ == "__main__":
+    main()
