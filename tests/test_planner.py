@@ -10,9 +10,9 @@ from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
 from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
-from quail.planner.sol import speed_of_light
+from quail.planner.sol import prefix_recompute_seconds, speed_of_light
 from quail.planner.work import Work, ask, scan, triangle
-from quail.specs import H100_SXM, QWEN3_4B_FP8
+from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
 def filter_chain(plan, alias=None):
@@ -28,6 +28,17 @@ def join_stages(plan):
 
 def node_kinds(plan):
     return [n["op"] for n in plan.nodes]
+
+
+def test_prefix_recompute_seconds_counts_attention_work():
+    for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
+        one = prefix_recompute_seconds(1, model, H100_SXM)
+        two = prefix_recompute_seconds(2, model, H100_SXM)
+        assert one > 0
+        assert two > 2 * one
+
+    with pytest.raises(ValueError):
+        prefix_recompute_seconds(-1, QWEN3_4B_FP8, H100_SXM)
 
 
 def _parquet(path, columns):
@@ -538,7 +549,8 @@ def test_filter_keep_makes_the_join_anchor_resident(catalog):
     # them
     assert chain["arena_writes"] is True
     assert chain["keep_kv"] is True
-    assert chain["keep_min_doc_tokens"] == 1     # everything fits
+    assert chain["keep_min_doc_tokens"] == 1
+    assert chain["keep_resident_fraction"] == 1.0
     group = plan.nodes_by_op("JoinGroup")[0]
     assert group["anchor"] == "r"
     assert group["anchor_resident"] == "filter"
@@ -571,37 +583,41 @@ def test_unfiltered_anchor_is_not_resident(catalog):
     assert not any("keep KV" in r for r in plan.remarks)
 
 
-def test_keep_split_keeps_longest_documents_that_fit():
+def test_keep_split_credits_a_uniform_survivor_fraction():
     from quail.planner.decide import keep_split
 
     docs_tok = [100, 200, 300, 400]
-    # page-rounded costs at overhead 4, 16-token pages: 416 + 304
+    # Page-rounded costs total 1,040 tokens. A 720-token budget
+    # credits the same fraction from every length class.
     split = keep_split(docs_tok, 720, 1.0, overhead=4, page_tokens=16)
-    assert split["min_doc_tokens"] == 300
+    assert split["resident_fraction"] == pytest.approx(720 / 1040)
     assert split["kept_expected_tokens"] == 720
 
     # survival halves the expected mass, so half the budget keeps the
-    # same documents
+    # same resident fraction
     half = keep_split(docs_tok, 360, 0.5, overhead=4, page_tokens=16)
-    assert half["min_doc_tokens"] == 300
+    assert half["resident_fraction"] == pytest.approx(720 / 1040)
     assert half["kept_expected_tokens"] == 360
 
-    # everything fits -> threshold 1; nothing fits -> None
-    assert keep_split(docs_tok, 1e9, 1.0, 4, 16)["min_doc_tokens"] == 1
+    # Everything fits at fraction 1. A budget smaller than every
+    # complete prefix gets no resident credit.
+    assert keep_split(
+        docs_tok, 1e9, 1.0, 4, 16)["resident_fraction"] == 1.0
     assert keep_split(docs_tok, 100, 1.0, 4, 16) is None
 
 
-def test_keep_capped_by_arena_length_threshold(catalog):
-    # 3,000-token documents fill the arena; only the long half of the
-    # survivors stays resident and the remark names the threshold
-    toks = {"r": [3000] * 100 + [1000] * 100, "p": [5] * 20}
+def test_keep_capped_by_arena_resident_fraction(catalog):
+    # The arena minus the loop's two-chunk working reservation credits
+    # a fraction of the expected survivors at every document length.
+    toks = {"r": [3000] * 40 + [1000] * 100, "p": [5] * 20}
     plan = plan_query(_filtered_join(catalog, doc_sel=1.0),
                       model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
     chain = filter_chain(plan)
     assert chain["keep_kv"] is True
-    assert chain["keep_min_doc_tokens"] == 3000
-    assert any("survivors of 3000+ tokens" in r for r in plan.remarks)
+    assert chain["keep_min_doc_tokens"] == 1
+    assert 0 < chain["keep_resident_fraction"] < 1
+    assert any("% of survivors" in r for r in plan.remarks)
     group = plan.nodes_by_op("JoinGroup")[0]
     assert group["anchor_resident"] == "filter"
 

@@ -17,6 +17,7 @@ from quail.executor.pack import (
     pack_stream,
     partition_anchor_groups,
 )
+from quail.executor.retention import RetainedPool
 
 
 def _tick(timing, key, t0):
@@ -775,10 +776,9 @@ def _shared_preamble_tokens(question_ids):
 
 
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
-               question_ids, budget, trace=None, timing=None,
+               question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
-               arena_keys=None, retain_survivors=(),
-               retention_values=None):
+               arena_keys=None, retain_survivors=()):
     """The filter chain: continuous admission, survivor priority, pages
     freed on FALSE or after the last stage.
 
@@ -786,16 +786,15 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         doc_ids: Per-document token lists.
         question_ids: Per-stage question token lists.
         budget: Chunk token budget.
-        trace: When given, one dict per chunk is appended with tokens,
-            groups, and fresh admission counts.
         timing: CPU seconds per loop phase accumulate into it.
         pinned: False for pageable blocking copies.
         arena_writes: Whether document KV is written to the arena.
             Must be True with multiple stages.
         arena_keys: Stable arena key for each document. List positions are
             used when omitted.
-        retain_survivors: Passing document positions to keep for joins.
-        retention_values: Saved recomputation seconds by document position.
+        retain_survivors: Passing document positions to keep for
+            joins, through a RetainedPool capped at the arena minus
+            the scan ring.
 
     Returns:
         (answers, spans, tokens): answers[d] = 0/1 list up to the
@@ -808,7 +807,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         raise ValueError("arena_keys must match doc_ids")
     retain = (set(range(len(doc_ids))) if retain_survivors is True
               else set(retain_survivors))
-    values = retention_values or {}
     stage_tokens = [len(question_ids[0])] \
         + [len(q) - p for q in question_ids[1:]]
     tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
@@ -827,6 +825,18 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     # longest tail, or zero when every question is pure preamble
     temp_tail = max(0, *(len(q) - p for q in question_ids)) \
         if unified and arena_writes else 0
+    pool = None
+    if retain:
+        # the scan ring: the loop keeps two chunks of document KV in
+        # flight, so retention may take only what is left (the
+        # planner's keep headroom reserves the same two chunks)
+        ring_pages = arena.accounting.pages_needed(2 * budget)
+        short = ring_pages - arena.accounting.free_pages
+        if short > 0:
+            # an earlier operator's retained KV crowds the ring
+            arena.evict_retained(short)
+        pool = RetainedPool(
+            max(0, arena.accounting.free_pages - ring_pages))
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
         arena_pages=(arena.accounting.n_pages if arena_writes
@@ -855,12 +865,18 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             passed = bool(bit)
             last = stage == len(stage_tokens) - 1
             keep = passed and last and doc in retain
+            if keep:
+                keep, victims = pool.offer(
+                    keys[doc],
+                    arena.accounting.pages_needed(len(doc_ids[doc])),
+                    len(doc_ids[doc]))
+                for v in victims:
+                    sched.add_free_pages(arena.evict_key(v))
             for d in sched.report(doc, stage, passed,
                                   release=not keep):
                 arena.free_key(keys[d])
             if keep:
-                arena.retain(keys[doc], len(doc_ids[doc]),
-                             float(values.get(doc, 0.0)))
+                arena.retain(keys[doc], len(doc_ids[doc]))
         _tick(timing, "report_rest", t)
 
     while not sched.done():
@@ -873,7 +889,10 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                 continue
             if sched.blocked_pages:
                 before = arena.accounting.free_pages
-                arena.evict_retained(sched.blocked_pages)
+                evicted = arena.evict_retained(sched.blocked_pages)
+                if pool is not None:
+                    for k in evicted:
+                        pool.discard(k)
                 freed = arena.accounting.free_pages - before
                 if freed:
                     sched.add_free_pages(freed)
@@ -893,10 +912,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                            attention_mode=pipeline.attention_mode)
         t = _tick(timing, "pack", t)
         tokens += chunk["tokens"]
-        if trace is not None:
-            trace.append(dict(
-                tokens=chunk["tokens"], groups=len(groups),
-                fresh=sum(1 for _, _, f in groups if f)))
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()

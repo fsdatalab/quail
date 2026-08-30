@@ -357,41 +357,54 @@ carry written_pos, semantics, and selectivity, so a runtime-chosen
 order assembles into results correctly.
 
 **KV residency across operators** (`plan_keeps`, `keep_split` in
-`decide.py`; the retention runtime in `executor/arena.py`): document
-KV outlives its operator wherever a later one will read it.
+`decide.py`; `RetainedPool` in `executor/retention.py`; the arena
+heap in `executor/arena.py`): document KV outlives its operator
+wherever a later one will read it.
 
 - Every filtered alias the runtime search could anchor writes KV
   (`arena_writes`) and keeps its survivors (`keep_kv` on the
   FilterChain node). At each survivor's final TRUE the runtime
-  retains its prefix: rewound to preamble + document (the question
-  tail's pages return to the free list), marked evictable at its
-  counted recompute value. The join then anchors on KV that is
-  already there.
+  offers its prefix to the retained pool; a kept prefix is rewound
+  to preamble + document (the question tail's pages return to the
+  free list) and marked with its exact prefix token count. The join
+  then anchors on KV that is already there.
+- **The scan ring.** Before a filter with retention starts, the
+  loop reserves pages for two chunk budgets of document KV - one
+  chunk executing while the next is packed - and the retained pool
+  gets a fixed capacity of what is left. If an earlier operator's
+  retained KV crowds the ring, the prefixes with the fewest tokens
+  per page are evicted once, in bulk, up front. Admission never waits
+  on retention, and the filter runs full chunks for the whole scan.
+- **The retained pool** (`RetainedPool.offer`). While the pool has
+  room, every offered survivor is kept. Once full, the residents
+  with the fewest prefix tokens per page are candidates to make room.
+  The newcomer replaces them only when its prefix contains more tokens
+  than the victims contain together. Total retained prefix tokens only
+  rise, and equal token counts never swap. A replacement is heap
+  bookkeeping in the answer path, never a stalled forward pass.
 - A join group whose anchor a later group re-uses retains its gate
   survivors the same way, so a gate between two same-anchor stages
   no longer forces a recompute. Thinned-out documents and retained
   KV with no future consumer are freed the moment that is known,
   and the arena is empty when the query ends.
 - The runtime never evicts to admit a cache entry. Every admission
-  is a computation the query requires; only retention is optional,
-  and retaining an already-resident document costs nothing to
-  start. When retained KV starves a required admission, the arena
-  evicts document prefixes in increasing saved recompute work per
-  page. The arena stores that order in a heap.
-  Recompute value is `prefix_recompute_seconds` - dense work linear
-  in length against the fp8 peak plus the causal attention triangle
-  against the bf16 peak, both counted. Pinned keys (in use by the
-  running operator) are not eviction candidates. The exact minimum
-  loss calculation is a minimum knapsack cover problem. Its solver
-  remains only as a small test oracle in `executor/retention.py`.
+  is a computation the query requires; only retention is optional.
+  During joins, activating a missing anchor under pressure evicts
+  retained prefixes in increasing prefix tokens per page;
+  the arena stores that order in a heap. The same path survives in
+  filter admission only as a safety valve that the ring makes
+  unreachable in normal operation. Pinned keys in use by the running
+  operator are not eviction candidates.
 - The plan-time half is the *credit*: `keep_split` prices in the
-  expected resident fraction the arena can hold, longest documents
-  first. The byte calculation is fractional, while the arena
-  allocates whole pages, so the split is an estimate. The
-  `_keep_timeline` function trims the credit
-  until the peak expected resident tokens fit beside the working
-  headroom. The runtime is not bound by the threshold; the credit
-  keeps the prediction and the SoL comparison honest.
+  expected resident fraction the keep budget can hold - the arena
+  minus the same two-chunk working reservation the ring makes -
+  using the corpus length distribution. The runtime can favor any
+  prefix whose last page is fuller, so the plan does not assume a
+  length threshold. The `_keep_timeline` function
+  trims the credit until the peak expected resident tokens fit
+  beside the working headroom. The runtime is not bound by the
+  threshold; the credit keeps the prediction and the SoL comparison
+  honest.
 
 Every stage records the residency its cost assumed
 (`anchor_resident`: none / filter / kept), so `explain()` shows
@@ -491,10 +504,9 @@ single forward pass, sharing KV across them through a paged arena.
 | `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
 | `unrounded_seconds` | `sol.py` | Component limits without forward pass rounding |
 | `search_joins` | `joins.py` | The join search: order and anchors from live counts, length summaries, document KV summaries, and aliases joined by completed groups; called at plan time and after every completed runtime group |
-| `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: which survivors to price as resident, longest documents first |
-| `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the least saved recompute work per page |
-| `minimum_loss_victims` | `executor/retention.py` | Exact small-instance oracle used only by tests |
-| `prefix_recompute_seconds` | `sol.py` | The retention value of one prefix, counted constants only |
+| `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: the fraction of expected survivors that fits beside the scan reserve |
+| `RetainedPool` | `executor/retention.py` | Fixed-capacity retained pool: keep while room, then replace residents with fewer prefix tokens per page only when total retained prefix tokens rise |
+| `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the fewest prefix tokens per page |
 | `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
 | `optimize_left_deep` | `leftdeep.py` | Subset DP over joined aliases and a caller supplied physical property, with a nondominated Work frontier |
 | `scan` / `ask` / `stream` | `work.py` | The three KV operations as Work records |
@@ -852,13 +864,16 @@ that runs until `FilterAdmission.done()`:
    answers and gate: documents that answered NO have their pages
    freed immediately; survivors advance to their next stage.
    Documents leaving their last stage free their pages too - unless
-   the plan marks the chain `keep_kv`, where each survivor's prefix
-   is retained instead (`arena.retain`): rewound to preamble +
-   document, held under its stable `(alias, doc)` key at its counted
-   recompute value. If retained KV starves a fresh admission, the
-   arena evicts retained prefixes in increasing saved work per page
-   and hands the pages back to the scheduler. The join recomputes an
-   evicted document if it uses that document as an anchor later.
+   the plan marks the chain `keep_kv`, where each survivor is
+   offered to the `RetainedPool`. A kept prefix is rewound to
+   preamble + document (`arena.retain`), held under its stable
+   `(alias, doc)` key with its exact prefix token count. The pool's
+   capacity is the arena minus the scan ring - pages for two chunk
+   budgets reserved before the loop starts - so retention can never
+   starve admission. Once full, a survivor displaces residents with
+   fewer prefix tokens per page only when it contains more tokens than
+   they contain together. The join recomputes any document that was never
+   kept, or was displaced, if it anchors on it later.
 
 Single-stage queries (one question) skip the arena entirely: no
 later stage reads any document's KV, so the alloc, the per-layer KV
@@ -907,7 +922,7 @@ runtime anchor re-pick can land on an alias whose filter reserved a
 smaller frame). With `keep_semantics` set, the group's gate
 survivors keep their pages at the end for a later group on the same
 table. Under allocation pressure the arena frees retained prefixes
-in increasing saved recompute work per page. The
+in increasing prefix tokens per page. The
 worker frees every kept key the moment its last consumer group is
 behind, and sweeps kept keys at query start and end - the arena
 outlives a query, kept KV must not.
@@ -1037,10 +1052,11 @@ anchors' KV is already resident, so their groups do not pack fresh
 prefix tokens.
 
 The same mechanism crosses operator boundaries through retention.
-A filter chain with `keep_kv` retains its survivors' KV; the join
-group anchored on that table finds the keys resident, `activate`
-grows their pages for the frame, and no kept document's prefix is
-packed. A group whose anchor a later group re-uses retains its gate
+A filter chain with `keep_kv` keeps survivors' KV up to the
+retained pool's capacity (the arena minus the scan ring); the join
+group anchored on that table finds the kept keys resident,
+`activate` grows their pages for the frame, and no kept document's
+prefix is packed. A group whose anchor a later group re-uses retains its gate
 survivors the same way (the worker's `anchor_done` callback). On
 several GPUs the KV is already on the right card: join anchors
 follow the shards their KV sits on - the shards of the group that

@@ -17,7 +17,7 @@ import itertools
 from collections import Counter
 from dataclasses import dataclass
 
-from quail.planner.sol import prefix_recompute_seconds, speed_of_light
+from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, triangle
 
 DocumentKey = tuple[str, int]
@@ -41,9 +41,9 @@ class AliasStats:
     squared: int
     maximum: int
     histogram: tuple[tuple[int, int], ...] = ()
-    resident_count: int = 0
-    resident_total: int = 0
-    resident_squared: int = 0
+    resident_count: float = 0
+    resident_total: float = 0
+    resident_squared: float = 0
 
     @property
     def mean(self) -> float:
@@ -64,6 +64,22 @@ class AliasStats:
             resident_total=sum(length * count for length, count in kept),
             resident_squared=sum(
                 length * length * count for length, count in kept),
+        )
+
+    def with_resident_fraction(self, fraction: float) -> "AliasStats":
+        """Credit one length-independent fraction as resident."""
+
+        if fraction < 0 or fraction > 1:
+            raise ValueError("resident fraction must be between 0 and 1")
+        return AliasStats(
+            count=self.count,
+            total=self.total,
+            squared=self.squared,
+            maximum=self.maximum,
+            histogram=self.histogram,
+            resident_count=self.count * fraction,
+            resident_total=self.total * fraction,
+            resident_squared=self.squared * fraction,
         )
 
 
@@ -209,9 +225,9 @@ def _document_keys(resident: dict) -> frozenset[DocumentKey]:
 
 
 def fit_resident_documents(resident: dict, lengths: dict, pre: int,
-                           model, device, arena_tokens: float | None,
+                           arena_tokens: float | None,
                            page_tokens: int = 16) -> dict:
-    """Apply the runtime value-per-page eviction order to a snapshot."""
+    """Apply the runtime prefix token eviction order to a snapshot."""
 
     keys = _document_keys(resident)
     if arena_tokens is None:
@@ -224,8 +240,7 @@ def fit_resident_documents(resident: dict, lengths: dict, pre: int,
             alias, position = key
             tokens = pre + lengths[alias][position]
             pages = -(-tokens // page_tokens)
-            value = prefix_recompute_seconds(tokens, model, device)
-            entries.append((value / pages, key, pages))
+            entries.append((tokens / pages, key, pages))
             total_pages += pages
         kept = set(keys)
         for _, key, pages in sorted(entries):

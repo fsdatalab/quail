@@ -137,9 +137,11 @@ def run_join_grouped(llm, sampling_params, prefixes, suffixes,
     wall = time.time() - t0
     answers = [1 if int(o.outputs[0].token_ids[0]) in true_ids else 0
                for o in outputs]
-    cached = sum(getattr(o, "num_cached_tokens", 0) or 0
-                 for o in outputs)
+    cached_per_request = [
+        int(getattr(o, "num_cached_tokens", 0) or 0) for o in outputs]
+    cached = sum(cached_per_request)
     prompt_tokens = sum(len(o.prompt_token_ids) for o in outputs)
     return dict(wall=wall, answers=answers,
                 fresh_tokens=prompt_tokens - cached,
-                prompt_tokens=prompt_tokens, cached_tokens=cached)
+                prompt_tokens=prompt_tokens, cached_tokens=cached,
+                cached_per_request=cached_per_request)

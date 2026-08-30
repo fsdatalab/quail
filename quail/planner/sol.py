@@ -47,7 +47,7 @@ def unrounded_seconds(work: _workload.Work, model: ModelSpec, device: DeviceSpec
 
 def prefix_recompute_seconds(prefix_tokens: int, model: ModelSpec,
                              device: DeviceSpec) -> float:
-    """Return compute time avoided by retaining one document prefix."""
+    """Return ideal compute time for one document prefix."""
 
     if prefix_tokens < 0:
         raise ValueError("prefix_tokens must be nonnegative")

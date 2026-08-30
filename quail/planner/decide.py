@@ -204,90 +204,38 @@ def _length_stats(doc_tokens) -> joinsearch.AliasStats:
     return joinsearch.summarize_alias(doc_tokens)
 
 
-def _split_at(doc_tokens, threshold: int, survivor_frac: float,
-              overhead: int, page_tokens: int) -> dict | None:
-    """The keep record for one alias at a given length threshold:
-    documents at or above it are credited as resident."""
-    stats = _length_stats(doc_tokens)
-    minimum = max(1, threshold)
-    kept = [(length, count) for length, count in stats.histogram
-            if length >= minimum]
-    if not kept:
-        return None
-    has_unkept = any(length < minimum
-                     for length, _ in stats.histogram)
-    return dict(
-        min_doc_tokens=1 if not has_unkept else threshold,
-        kept_expected_tokens=survivor_frac * sum(
-            count * _page_round(length + overhead, page_tokens)
-            for length, count in kept),
-        survivor_frac=survivor_frac,
-        overhead=overhead)
-
-
-def _raise_threshold(split: dict, doc_tokens, page_tokens: int):
-    """Drop the shortest kept length class: the next split up, or
-    None when only the longest class was left."""
-    stats = _length_stats(doc_tokens)
-    boundary = min(length for length, _ in stats.histogram
-                   if length >= max(1, split["min_doc_tokens"]))
-    higher = [length for length, _ in stats.histogram
-              if length > boundary]
-    if not higher:
-        return None
-    return _split_at(doc_tokens, higher[0], split["survivor_frac"],
-                     split["overhead"], page_tokens)
-
-
 def keep_split(doc_tokens, budget_tokens: float, survivor_frac: float,
                overhead: int, page_tokens: int) -> dict | None:
     """Which survivors of one alias to credit as resident for a join.
 
-    Longest documents first. Resident KV of length L saves L dense
-    tokens (2 FLOPs per parameter each, against the fp8 peak) plus
-    L(L+1)/2 attention pairs (against the bf16 peak) - both counted,
-    no measured constant - while occupying kappa * L bytes. Saved
-    work per byte rises with L under any positive weighting of the
-    two terms, so length orders the documents; the rise comes from
-    the attention term and is small below the dense/attention
-    crossover (about 12,300 tokens at 4B), where the linear dense
-    term dominates. What makes longest-first exact rather than a
-    heuristic is that survival is unknown per document at plan time:
-    the expected kept mass is the survivor fraction of the kept
-    lengths' mass, a fractional knapsack, where taking by value per
-    byte is optimal. Page rounding blurs that at the margins - a
-    document just past a page boundary has a lower value per PAGE
-    than a slightly shorter one - so the split is exact in bytes and
-    approximate within one page per document.
-
-    The runtime is not bound by the threshold: it retains every
-    passing survivor and evicts by recompute value under pressure.
-    This split is the capacity-planned credit the cost model and the
-    SoL comparison use.
+    Runtime retention maximizes reusable prefix tokens under the page
+    limit. Page rounding can favor any document whose last page is
+    fuller, so the planner credits a length-independent fraction of
+    the expected survivors instead of naming a length threshold.
 
     Returns:
-        None when not even the longest document fits, else the
-        _split_at record; min_doc_tokens is 1 when everything fits.
+        The resident fraction and expected page-rounded token mass,
+        or None when no complete survivor fits.
     """
     stats = _length_stats(doc_tokens)
-    if not stats.count:
+    if not stats.count or survivor_frac <= 0 or budget_tokens <= 0:
         return None
-    taken, threshold = 0.0, 0
-    for length, count in reversed(stats.histogram):
-        cost = (survivor_frac * count
-                * _page_round(length + overhead, page_tokens))
-        if taken + cost > budget_tokens:
-            break
-        taken += cost
-        threshold = length
-    if threshold == 0:
+    rounded = [
+        (length, count, _page_round(length + overhead, page_tokens))
+        for length, count in stats.histogram
+    ]
+    if budget_tokens < min(cost for _, _, cost in rounded):
         return None
-    split = _split_at(doc_tokens, threshold, survivor_frac, overhead,
-                      page_tokens)
-    while split is not None and \
-            split["kept_expected_tokens"] > budget_tokens:
-        split = _raise_threshold(split, doc_tokens, page_tokens)
-    return split
+    expected_survivor_tokens = survivor_frac * sum(
+        count * cost for _, count, cost in rounded)
+    resident_fraction = min(
+        1.0, budget_tokens / max(1.0, expected_survivor_tokens))
+    return dict(
+        resident_fraction=resident_fraction,
+        kept_expected_tokens=(
+            resident_fraction * expected_survivor_tokens),
+        survivor_frac=survivor_frac,
+        overhead=overhead)
 
 
 def possible_anchor_aliases(specs) -> set:
@@ -341,9 +289,9 @@ def _keep_timeline(seq, keep_plan, doc_tokens, live0, pre,
     every credited alias's filter mass; after each group, credited
     masses not yet anchored plus the gate-survivor mass of anchors a
     later group re-uses (retention holds every gate survivor, not
-    just the credited split). Within a group, anchors run one at a
-    time, so the per-anchor working set is the headroom the caller
-    adds. Retained prefixes are rewound to preamble + document.
+    just the credited split). The in-flight chunk working set is the
+    headroom the caller adds. Retained prefixes are rewound to
+    preamble + document.
     """
     groups = _group_seq(seq)
     first_use, last_use = {}, {}
@@ -451,23 +399,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         live0[_filter_alias(fs[0])] *= surv
     base_work = _filter_work(filters, stats, filter_orders, pre)
 
-    # ---- the largest single admission any operator makes: the keep
-    # arithmetic reserves it as working headroom
-    headroom = 0
-    for s in scans:
-        fq = max((_question_tokens(p.prompt)
-                  for p in filters.get(s.alias, ())), default=0)
-        if fq:
-            headroom = max(headroom,
-                           pre + stats[s.alias].max_doc_tokens + fq)
-    for spec in specs:
-        for a in spec["aliases"]:
-            headroom = max(
-                headroom,
-                pre + stats[a].max_doc_tokens + spec["frame_tokens"][a]
-                + sum(spec["label_tokens"][p] + stats[p].max_doc_tokens
-                      for p in spec["aliases"] if p != a)
-                + spec["tail_tokens"])
+    # must match the scan ring run_filter reserves: the loops keep
+    # two chunks of document KV in flight
+    headroom = 2 * chunk
 
     # ---- keep credit candidates, then the search on expectations
     keep_budget = max(0.0, float(admission - headroom)) * workers
@@ -476,8 +410,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
     def resident_from(plan_keep):
         return {
-            alias: summary.with_resident_min(
-                max(1, plan_keep[alias]["min_doc_tokens"]))
+            alias: summary.with_resident_fraction(
+                plan_keep[alias]["resident_fraction"])
             if alias in plan_keep else summary
             for alias, summary in length_stats.items()
         }
@@ -512,9 +446,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         return [(specs[wp], a) for wp, a in found["seq"]]
 
     def trim(found, plan_keep):
-        """Raise thresholds until the peak expected resident tokens
-        per worker fit the arena beside the working headroom. The
-        shortest credited documents go first, wherever they are."""
+        """Scale resident credits to fit beside the working headroom."""
         plan_keep = dict(plan_keep)
         while plan_keep:
             peak = _keep_timeline(spec_seq(found), plan_keep,
@@ -522,19 +454,26 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                                   budgets.PAGE_TOKENS, workers)
             if peak + headroom <= admission:
                 break
-            alias = min(
-                plan_keep,
-                key=lambda a: min(
-                    length for length, _ in length_stats[a].histogram
-                    if length >= max(
-                        1, plan_keep[a]["min_doc_tokens"])))
-            split = _raise_threshold(plan_keep[alias],
-                                     length_stats[alias],
-                                     budgets.PAGE_TOKENS)
-            if split is None:
-                del plan_keep[alias]
-            else:
-                plan_keep[alias] = split
+            available = max(0.0, float(admission - headroom))
+            scale = available / max(peak, 1.0)
+            if scale <= 0:
+                return {}
+            plan_keep = {
+                alias: dict(
+                    credit,
+                    resident_fraction=(
+                        credit["resident_fraction"] * scale),
+                    kept_expected_tokens=(
+                        credit["kept_expected_tokens"] * scale),
+                )
+                for alias, credit in plan_keep.items()
+                if credit["resident_fraction"] * scale > 1e-9
+            }
+            new_peak = _keep_timeline(
+                spec_seq(found), plan_keep, length_stats, live0, pre,
+                budgets.PAGE_TOKENS, workers)
+            if new_peak >= peak - 1e-6:
+                return {}
         return plan_keep
 
     found = run_search(candidates)
@@ -565,8 +504,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     stage_records = found["records"]
 
     for alias, k in sorted(keep_plan.items()):
-        what = ("all survivors" if k["min_doc_tokens"] <= 1 else
-                f"survivors of {k['min_doc_tokens']}+ tokens")
+        what = ("all survivors" if k["resident_fraction"] >= 1 else
+                f"{100 * k['resident_fraction']:.1f}% of survivors")
         remarks.append(
             f"keep KV on {alias!r}: {what} priced as resident for "
             f"the join, {k['kept_expected_tokens'] / max(1, workers):,.0f} "
@@ -651,10 +590,11 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 inputs=(ids_src[s.alias],),
                 alias=s.alias, arena_writes=writes,
                 keep_kv=keep,
-                # the capacity-planned credit; the runtime retains
-                # every survivor and evicts by value under pressure
-                keep_min_doc_tokens=(credit["min_doc_tokens"]
-                                     if credit else 0),
+                # the capacity-planned credit; the runtime offers
+                # every survivor to its capped retained pool
+                keep_min_doc_tokens=(1 if credit else 0),
+                keep_resident_fraction=(credit["resident_fraction"]
+                                        if credit else 0.0),
                 stages=tuple(stages)))
             ids_src[s.alias] = (fid, f"ids:{s.alias}")
             if not writes:

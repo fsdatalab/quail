@@ -407,7 +407,7 @@ def simulate_production_planner(query, model: ModelSpec,
 
     The simulation uses exact saved answers after every join group.
     At group boundaries it applies the arena's page limit and the
-    same value-per-page victim order. It does not reproduce temporary
+    same prefix tokens per page victim order. It does not reproduce temporary
     overlap between packed GPU chunks.
 
     The SoL output does not call this function.
@@ -581,7 +581,7 @@ def simulate_production_planner(query, model: ModelSpec,
         resident_rows = fit_resident_documents(
             resident_rows,
             {alias: aliases[alias]["tokens"] for alias in aliases},
-            PRE, model, H100_SXM, plan.admission_tokens,
+            PRE, plan.admission_tokens,
             budgets.PAGE_TOKENS)
         for join_index in node["stage_idxs"]:
             already_joined.update(all_specs[join_index]["aliases"])

@@ -238,6 +238,23 @@ def test_admission_can_leave_a_passing_document_resident():
     assert sched.free_pages == 5
 
 
+def test_admission_keep_credits_the_rewind_tail_pages():
+    # a kept document holds pages_for(doc + kept_extra) while in
+    # flight but is rewound to its own tokens: pages_for(70+30)=7
+    # charged, pages_for(70)=5 kept, 2 back to admission
+    sched = FilterAdmission([70, 60], [10], 200,
+                            arena_pages=7, page_tokens=16,
+                            kept_extra_tokens=30)
+    assert sched.next_chunk() == [(0, 0, True)]
+    assert sched.report(0, 0, True, release=False) == ()
+    assert sched.free_pages == 2
+    assert 0 not in sched.resident
+    # the kept document's remaining 5 pages come back through
+    # add_free_pages when the retained pool evicts it
+    sched.add_free_pages(5)
+    assert sched.next_chunk() == [(1, 0, True)]
+
+
 def test_admission_refuses_impossible_shapes():
     with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 500, 100, 16)     # over chunk
