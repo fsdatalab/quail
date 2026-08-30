@@ -10,7 +10,7 @@ same work.
 Engine settings mirror the stock vLLM configuration:
 
     vLLM                              SGLang
-    gpu_memory_utilization=0.91       mem_fraction_static=0.85
+    gpu_memory_utilization=0.91       mem_fraction_static=0.78
                                       (see MEM_FRACTION_STATIC)
     max_num_seqs=4096                 max_running_requests=4096
     max_num_batched_tokens=25305      chunked_prefill_size=25305,
@@ -72,13 +72,17 @@ BASELINE = "stock_sglang"
 DEFAULT_QUERY_IDS = "BIO-2,IMDB-3"
 # vLLM's gpu_memory_utilization=0.91 covers weights, KV, and the
 # activation working set, because vLLM profiles a full-size forward
-# before sizing its KV pool. SGLang's mem_fraction_static covers only
-# weights plus KV; activations must fit in the remainder, and a
-# 25,305-token batch peaks near 7 GB (measured: 0.91 left 5.9 GB and
-# the BIO-2 join ran out of GPU memory mid-forward). 0.85 leaves the
-# same activation headroom vLLM's profiling reserves, at the cost of a
-# KV pool about 5% smaller than vLLM's 479,248 tokens.
-MEM_FRACTION_STATIC = 0.85
+# (including logits for max_num_seqs requests) before sizing its KV
+# pool. SGLang's mem_fraction_static covers only weights plus KV;
+# everything else must fit in the remainder. Measured on BIO-2, that
+# remainder must hold about 6.5 GB of non-PyTorch allocations (kernel
+# workspaces) plus the answer-step peak: the radix cache packs
+# batches up to max_running_requests=4096, and the final-position
+# logits and the logit-bias tensor are each
+# 4096 x vocab x 4 bytes = 2.3 GB. 0.91 and 0.85 both ran out of GPU
+# memory mid-join; 0.78 leaves about 17 GB for all of it, at the cost
+# of a KV pool about 13% smaller than vLLM's 479,248 tokens.
+MEM_FRACTION_STATIC = 0.78
 MAX_NUM_SEQS = 4096
 MAX_NUM_BATCHED_TOKENS = 25_305
 

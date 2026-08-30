@@ -28,7 +28,7 @@ gets the analytically equivalent settings:
 
 | Setting | Stock vLLM 0.26.0 | Stock SGLang 0.5.18 |
 |---|---|---|
-| GPU memory fraction | `gpu_memory_utilization=0.91` | `mem_fraction_static=0.85` (see below) |
+| GPU memory fraction | `gpu_memory_utilization=0.91` | `mem_fraction_static=0.78` (see below) |
 | Max concurrent requests | `max_num_seqs=4096` | `max_running_requests=4096` |
 | Scheduled token budget | `max_num_batched_tokens=25305` | `chunked_prefill_size=25305`, `max_prefill_tokens=25305` |
 | Prefix caching | on, 16-token blocks | radix cache on (default), 1-token pages |
@@ -45,12 +45,15 @@ logit is 1,000 higher. Raw logit gaps are two orders of magnitude
 smaller than that.
 
 The memory fraction cannot be copied literally, and finding that out
-took two crashed runs:
+took three crashed attempts on BIO-2:
 
-- vLLM sizes its KV pool after profiling a full-size forward, so
-  `gpu_memory_utilization=0.91` already accounts for activation
-  memory. SGLang's `mem_fraction_static` reserves that fraction for
-  weights plus KV only; activations must fit in the remainder.
+- The two fractions mean different things. vLLM sizes its KV pool
+  after profiling a full-size forward, including the final-position
+  logits for `max_num_seqs` requests, so
+  `gpu_memory_utilization=0.91` already accounts for the activation
+  working set. SGLang's `mem_fraction_static` reserves that fraction
+  for weights plus KV only; everything else must fit in the
+  remainder.
 - At `mem_fraction_static=0.91`, SGLang's prefill CUDA graph capture
   (91 shapes up to the 25,305-token budget, each retaining about
   130 MB) ran the remaining 6.3 GB to zero and crashed the boot. The
@@ -59,20 +62,26 @@ took two crashed runs:
   so per-batch launch overhead is already amortized, and this
   workload never reaches a decode batch because every request
   generates its one token during the prefill forward.
-- Still at 0.91, the BIO-2 join then ran out of GPU memory fourteen
-  minutes in, mid-forward, once real batches filled the 25,305-token
-  budget: such a batch peaks near 7 GB of activations (the MLP
-  intermediate alone is about 0.5 GB, and the answer step holds
-  per-request float32 logits and the logit-bias row for every request
-  in the batch).
-- Matching vLLM's exact 479,248-token pool would leave about 6 GB of
-  headroom, below that peak. The run uses `mem_fraction_static=0.85`,
-  which leaves about 12 GB for activations and gives SGLang a
+- Still at 0.91 (a 489,403-token pool), the BIO-2 join ran out of GPU
+  memory fourteen minutes in. At 0.85 (a 455,074-token pool) it ran
+  out again, and the failing allocation identified the mechanism: it
+  was 2.32 GiB, exactly a float32 logits tensor for 4,096 requests
+  over the 151,936-token vocabulary. SGLang's 1-token-page radix
+  cache leaves so few fresh tokens per pair that its scheduler packs
+  batches up to `max_running_requests=4096`, and each such batch's
+  answer step holds those logits plus an equally sized logit-bias
+  tensor. On top of that, 6.5 GiB of the GPU sat in non-PyTorch
+  allocations (kernel workspaces). vLLM never sees this peak: its
+  16-token-block cache leaves about 19 fresh tokens per pair, so its
+  batches stop near 1,350 requests, and its profiling reserved the
+  logits memory anyway.
+- The run uses `mem_fraction_static=0.78`: 79.18 GiB total minus
+  about 6.5 GiB non-PyTorch, about 7 GiB answer-step and forward
+  activations, and a safety margin. That gives SGLang a
   KVTOKENS_TBD-token KV pool, KVDELTA_TBD% smaller than vLLM's
-  479,248. The two queries
-  submit join pairs anchor by anchor, so the live prefix working set
-  is far below either pool size and the difference does not change
-  what gets cached.
+  479,248. The two queries submit join pairs anchor by anchor, so the
+  live prefix working set stays far below either pool size and the
+  difference does not change what gets cached.
 
 Differences that remain, reported rather than hidden:
 
@@ -124,7 +133,7 @@ MEANING_TBD
 
 ## Source data
 
-- Stock SGLang, function call `fc-01M187V2XZ1EPRZ2AT7S17P3JX`:
+- Stock SGLang, function call `fc-01M189RD2CR4H8M2YFPCYG1J88`:
   `/results/stock_sglang/LABEL_TBD/summary.json`
 - Stock vLLM (2026-08-29 family run):
   `/results/stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`

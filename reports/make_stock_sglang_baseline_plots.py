@@ -74,7 +74,7 @@ def main():
     vllm = load(workdir / "stock_vllm.json")
     sglang = load(workdir / "stock_sglang.json")
     check(vllm, "stock_vllm", "gpu_memory_utilization", 0.91)
-    check(sglang, "stock_sglang", "mem_fraction_static", 0.85)
+    check(sglang, "stock_sglang", "mem_fraction_static", 0.78)
 
     vllm_entries = query_entries(vllm)
     sglang_entries = query_entries(sglang)

@@ -32,11 +32,12 @@ ids, which picks the same token under greedy decoding because the
 bias is applied to float32 logits before the argmax.
 
 vLLM's `gpu_memory_utilization=0.91` maps to
-`mem_fraction_static=0.85`, not 0.91: vLLM's fraction includes the
-activation working set (it profiles a forward before sizing KV),
-SGLang's does not, and at 0.91 SGLang ran out of GPU memory. Prefill
-CUDA graphs are disabled for the same memory reason. The report
-explains both choices with the measured numbers.
+`mem_fraction_static=0.78`, not 0.91: vLLM's fraction includes the
+activation working set (it profiles a forward, with logits for
+`max_num_seqs` requests, before sizing KV), SGLang's does not, and
+both 0.91 and 0.85 ran out of GPU memory on BIO-2. Prefill CUDA
+graphs are disabled for the same memory reason. The report explains
+both choices with the measured numbers.
 
 ## Numbers
 
