@@ -44,8 +44,7 @@ never fire.
 Confirming run: `ablations/discrepancy_timeline.py` (the same
 instrumented cell as the discrepancy report; it wraps the engine
 without modifying it) rerun with `--out-prefix ringfix`, sf 0.1,
-Qwen3 4B fp8, one H100, so the pre-fix files stay intact for
-comparison.
+Qwen3 4B fp8, one H100, so the unbounded-retention files stay intact for comparison.
 
 ## Prediction
 
@@ -55,19 +54,20 @@ Stated before the run:
   for the whole scan (tens of chunks, not 2,916) and takes 15 to
   17 seconds, matching IMDB-1's 15.06 seconds for identical work;
   the join stays at about 18.5 to 19.5 seconds; engine wall 34 to
-  38 seconds, against 68.9 measured pre-fix in the same harness and
-  75.0 recorded in the benchmark.
+  38 seconds, against 68.9 measured with unbounded retention in
+  the same harness and 75.0 recorded in the benchmark.
 - IMDB-3 retention: the pool fills to about 8,800 pages
   (141,000 tokens); the join finds about 400 to 500 anchors
   resident (the longest survivors), a similar hit mass to the
-  137,397 tokens the pre-fix run got - the fix does not buy more
+  137,397 tokens the unbounded-retention run got - the fix does
+  not buy more
   hits, it stops paying 35 seconds for them. Regret stays about
   1.2M tokens; the misses just stop costing batch shape.
 - BIO-2: unchanged within noise (about 128 to 131 seconds, regret
   0, no evictions) - its plan retains nothing, so only the shared
   code paths could move it.
 - Smoke first (sf 0.01): corpus fits beside the ring, everything
-  retained, join reuses everything, as pre-fix.
+  retained, join reuses everything, as with unbounded retention.
 
 ## Result
 
@@ -77,7 +77,7 @@ are the unprofiled pass; the profiled pass agrees within 5%.
 
 ### IMDB-3
 
-| | pre-fix | scan ring |
+| | unbounded retention | scan ring |
 |---|---:|---:|
 | Engine wall (s) | 68.93 | 32.68 |
 | Filter phase (s) | 50.28 | 14.54 |
@@ -95,8 +95,8 @@ Figure: plots/kv_ring_fix_timeline.png
 Figure: plots/kv_ring_fix_walls.png
 
 - The engine wall halved: 32.68 seconds, compared with 68.93
-  measured pre-fix in the same harness, 75.0 recorded in the
-  benchmark, and 52.65 recorded for stock vLLM. The filter now runs
+  measured with unbounded retention in the same harness, 75.0
+  recorded in the benchmark, and 52.65 recorded for stock vLLM. The filter now runs
   17 near-budget passes at 99.6% GPU busy (chunk grain) and lands
   at 14.54 seconds - level with IMDB-1's 15.06 seconds for the
   identical filter work, so the composition penalty is gone.
@@ -105,27 +105,29 @@ Figure: plots/kv_ring_fix_walls.png
   start minus the 13,797-page ring), holding 171 of the longest
   survivors at 140,458 tokens - within 0.7% of the planner's
   141,498-token credit. Every one of the 171 was still resident at
-  the join and hit. Zero eviction calls anywhere; pre-fix, churn
+  the join and hit. Zero eviction calls anywhere; with unbounded retention, churn
   evicted 4,260 keys (78,268 pages) during the filter alone. One
   prediction miss, in the right direction: 400 to 500 resident
   anchors were predicted from the corpus mean length, but the
   pool's replacement rule keeps the longest survivors, so the same
   token mass arrived as 171 documents of 821 mean tokens against
   the 310-token survivor mean.
-- Regret is unchanged (1.22M tokens pre and post), as predicted:
-  the fix does not buy more hits - the pre-fix run ended up with a
+- Regret is unchanged (1.22M tokens in both runs), as
+  predicted: the fix does not buy more hits - the
+  unbounded-retention run ended up with a
   similar hit mass - it stops paying 35 seconds of collapsed
   batches for them. Both runs produced the same 4,380 survivors,
   so the change is performance-only.
 - Benchmark metrics for IMDB-3 at the new wall: 52,560 evaluated
   document pairs / 32.68 s = 1,608 document pairs/second
-  (recorded pre-fix: 701); $0.0359 per query at the H100 rate of
-  $3.9492/hour, compared with $0.0823 recorded pre-fix and
+  (recorded with unbounded retention: 701); $0.0359 per query at the H100 rate of
+  $3.9492/hour, compared with $0.0823 recorded with unbounded retention and
   $0.0578 for stock vLLM's recorded 52.65 seconds.
 
 ### BIO-2
 
-128.22 seconds, compared with 130.35 pre-fix - container variance,
+128.22 seconds, compared with 130.35 with unbounded retention -
+container variance,
 same 98 forward passes at 105,861 mean tokens, 99.4% busy, regret
 0, no evictions. Its plan retains nothing, so this is the expected
 no-change control.
@@ -136,7 +138,7 @@ Data on the `quail-results` volume:
   (sf 0.1); `ringfix_imdb3_sf0.01.json`, `ringfix_bio2_sf0.01.json`
   (smoke)
 - `/results/ablations/ringfix_traces/` (five chrome traces)
-- Pre-fix comparisons: `discrepancy_imdb3.json`,
+- Unbounded-retention comparisons: `discrepancy_imdb3.json`,
   `discrepancy_bio2.json` from the discrepancy report.
 - Modal function calls: `fc-01M18J895155R1VS59VRPTGWEN` (sf 0.1),
   `fc-01M18J4YZ2NZH568D71KA1HEG0` (smoke).

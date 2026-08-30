@@ -52,25 +52,27 @@ def timeline(before, after):
     fig, ax = plt.subplots(figsize=(9, 4.8))
     bx, by = chunk_series(filter_phase(before))
     ax_, ay = chunk_series(filter_phase(after))
-    ax.plot(bx, by, ".", color=RED, ms=3, label="pre-fix (churn)")
-    ax.plot(ax_, ay, ".", color=BLUE, ms=7,
-            label="scan ring (this PR)")
+    ax.plot(bx, by, ".", color=RED, ms=3,
+            label="unbounded retention")
+    ax.plot(ax_, ay, "-o", color=BLUE, ms=6, lw=1,
+            label="scan ring")
     ax.set_yscale("log")
     ax.set_xlabel("seconds since the filter started")
-    ax.set_ylabel("tokens per forward pass (log scale)")
-    ax.set_title("IMDB-3: filter forward-pass sizes, "
-                 "pre-fix against the scan ring")
+    ax.set_ylabel("tokens in the forward pass (log scale)")
+    ax.set_title("IMDB-3 filter: each dot is one launched "
+                 "forward pass")
     bw = filter_phase(before)["wall_s"]
     aw = filter_phase(after)["wall_s"]
-    bn = len(by)
-    an = len(ay)
-    ax.annotate(f"{bn:,} passes, {bw:.1f} s",
-                xy=(bx[-1], by[-1]), xytext=(bx[-1] - 16, 4500),
-                color=RED)
-    ax.annotate(f"{an} passes, {aw:.1f} s",
-                xy=(ax_[-1], ay[-1]),
-                xytext=(ax_[-1] + 1.5, ay[-1] * 0.55), color=BLUE)
-    ax.legend(loc="center right", frameon=False)
+    ax.annotate(
+        f"retention filled the arena; every admission\n"
+        f"evicted first: {len(by):,} passes, {bw:.1f} s",
+        xy=(bx[-1], by[-1]), xytext=(bx[-1] - 26, 3800), color=RED)
+    ax.annotate(
+        f"retention capped beside the ring:\n"
+        f"{len(ay)} full passes, {aw:.1f} s",
+        xy=(ax_[-1], ay[-1]),
+        xytext=(ax_[-1] + 1.5, ay[-1] * 0.45), color=BLUE)
+    ax.legend(loc="upper right", frameon=False, markerscale=2.5)
     fig.tight_layout()
     fig.savefig(OUT / "kv_ring_fix_timeline.png", dpi=300)
 
@@ -98,8 +100,8 @@ def walls(before, after):
     ax.set_xticks(list(x))
     ax.set_xticklabels([f"{n} phase" for n, _, _ in groups])
     ax.set_ylabel("seconds")
-    ax.set_title("IMDB-3 phase walls: pre-fix (gray) against "
-                 "the scan ring (blue)")
+    ax.set_title("IMDB-3 phase walls: unbounded retention (gray) "
+                 "against the scan ring (blue)")
     fig.tight_layout()
     fig.savefig(OUT / "kv_ring_fix_walls.png", dpi=300)
 
@@ -112,7 +114,8 @@ def main(workdir):
     timeline(before, after)
     walls(before, after)
 
-    for name, run in (("pre-fix", before), ("scan ring", after)):
+    for name, run in (("unbounded retention", before),
+                      ("scan ring", after)):
         u = run["unprofiled"]
         f = filter_phase(run)
         print(f"{name}: engine {u['engine_wall_s']}s, filter "
