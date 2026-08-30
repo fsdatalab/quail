@@ -117,10 +117,30 @@ class StockSGLangClient:
     ``baselines.stock_vllm.run`` works unchanged.
     """
 
+    # Handing sglang all 563,500 BIO-2 pairs in one generate() call
+    # keeps the driver process pegged for the whole join: one asyncio
+    # task per request, and the Modal health heartbeat thread starves
+    # until Modal marks the container unhealthy. Each slice is still
+    # four times deeper than max_running_requests, so the engine's
+    # queue never runs dry inside a slice; the short pause between
+    # slices lets the heartbeat thread run.
+    submit_slice = 16_384
+    slice_pause_s = 1.0
+
     def __init__(self, engine):
         self.engine = engine
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
+        outputs = []
+        for start in range(0, len(prompts), self.submit_slice):
+            if start:
+                time.sleep(self.slice_pause_s)
+            outputs.extend(self._generate_slice(
+                prompts[start:start + self.submit_slice],
+                sampling_params))
+        return outputs
+
+    def _generate_slice(self, prompts, sampling_params):
         input_ids = [list(p["prompt_token_ids"]) for p in prompts]
         raw = self.engine.generate(
             input_ids=input_ids, sampling_params=dict(sampling_params))

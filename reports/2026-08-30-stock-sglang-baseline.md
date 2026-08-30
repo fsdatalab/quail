@@ -78,7 +78,7 @@ took three crashed attempts on BIO-2:
 - The run uses `mem_fraction_static=0.78`: 79.18 GiB total minus
   about 6.5 GiB non-PyTorch, about 7 GiB answer-step and forward
   activations, and a safety margin. That gives SGLang a
-  KVTOKENS_TBD-token KV pool, KVDELTA_TBD% smaller than vLLM's
+  415,024-token KV pool, 13.4% smaller than vLLM's
   479,248. The two queries submit join pairs anchor by anchor, so the
   live prefix working set stays far below either pool size and the
   difference does not change what gets cached.
