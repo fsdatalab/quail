@@ -11,10 +11,14 @@ from baselines.stock_vllm.run import (
     _filter_chain_inputs,
     _filter_prompts,
     _join_records_by_written_position,
+    _join_regret,
+    _lcp,
     _paired_baseline_order,
     _paired_ground_truth_workload,
     _query_set_name,
     _run_join,
+    _run_pipelined_filter_chain,
+    _run_stage_major_filter_chain,
     _select_join_anchor,
     _split_query_sets,
     _vllm_filter_capacity,
@@ -114,6 +118,71 @@ def test_join_execution_uses_the_selected_anchor(monkeypatch):
 
     assert result[8] == 1
     assert result[5] == [(0, 0), (1, 1)]
+    assert len(result[10]) == 2     # one prefix per anchor document
+
+
+def test_lcp_counts_shared_leading_tokens():
+    assert _lcp([1, 2, 3], [1, 2, 4]) == 2
+    assert _lcp([1, 2], [1, 2, 3]) == 2
+    assert _lcp([], [1]) == 0
+
+
+def test_join_regret_buckets_pair0_and_rest():
+    # Two anchors, two suffixes each, 16-token blocks. Anchor 0 was
+    # computed before (40 seen tokens): pair 0 misses everything
+    # (regret 32, the block floor of 40) and pair 1 hits fully.
+    # Anchor 1 is new: pair 0 owes nothing even though vLLM served 16
+    # tokens, and pair 1 recomputes half its 40-token prefix
+    # (regret 32 - 16 = 16).
+    prefixes = [[7] * 40, [9] * 40]
+    cached = [0, 32, 16, 16]
+
+    assert _join_regret(prefixes, 2, cached, [40, 0], 16) == 48
+
+
+def test_join_regret_is_zero_when_cache_serves_every_would_hit():
+    prefixes = [[7] * 32]
+    assert _join_regret(prefixes, 2, [32, 32], [32], 16) == 0
+
+
+class _FakeFilterLLM:
+    """Returns scripted TRUE/FALSE verdicts, one list per generate."""
+
+    def __init__(self, verdicts):
+        self.verdicts = list(verdicts)
+
+    def generate(self, prompts, _sp, use_tqdm=False):
+        verdicts = self.verdicts.pop(0)
+        assert len(verdicts) == len(prompts)
+        return [SimpleNamespace(
+            prompt_token_ids=prompt["prompt_token_ids"],
+            num_cached_tokens=0,
+            outputs=[SimpleNamespace(
+                token_ids=[1 if verdict else 0], text="")])
+            for prompt, verdict in zip(prompts, verdicts)]
+
+
+def test_stage_major_chain_records_passed_prompts_for_regret():
+    tokenizer = CharTokenizer()
+    templates = ["First about {0}?", "Second about {0}?"]
+    texts = ["doc zero", "doc one", "doc two"]
+    llm = _FakeFilterLLM([[True, False, True], [True, False]])
+
+    result = _run_stage_major_filter_chain(
+        llm, object(), {1}, templates, texts, tokenizer)
+
+    def prompt(template, text):
+        return _filter_prompts(
+            template, [text], tokenizer)[0]["prompt_token_ids"]
+
+    assert result["survivors"] == [0]
+    # documents 0 and 2 passed stage 1; only document 0 passed stage
+    # 2; document 1 passed nothing and computed no reusable KV
+    assert result["prior_prompts"] == {
+        0: [prompt(templates[0], texts[0]),
+            prompt(templates[1], texts[0])],
+        2: [prompt(templates[0], texts[2])],
+    }
 
 
 def test_filter_capacity_comes_from_started_vllm_config():
@@ -178,6 +247,28 @@ def test_filter_chain_submits_next_stage_before_prior_stage_finishes():
     assert engine.events.index(("add", "test-0-1")) < \
         engine.events.index(("finish", "test-1-0"))
     assert result["survivors"] == [0, 1]
+
+
+def test_pipelined_chain_records_passed_prompts_for_regret():
+    engine = _FakeFilterEngine()    # answers TRUE for every request
+    llm = SimpleNamespace(llm_engine=engine)
+    tokenizer = CharTokenizer()
+    templates = ["First about {0}?", "Second about {0}?"]
+    texts = ["short", "a longer document"]
+    capacity = dict(kv_cache_size_tokens=10_000, block_size=16,
+                    max_num_seqs=8)
+
+    result = _run_pipelined_filter_chain(
+        llm, object(), {1}, templates, texts, tokenizer,
+        capacity, tag="t")
+
+    bodies, tails = _filter_chain_inputs(templates, texts, tokenizer)
+    assert result["prior_prompts"] == {
+        0: [bodies[0] + tails[0], bodies[0] + tails[1]],
+        1: [bodies[1] + tails[0], bodies[1] + tails[1]],
+    }
+    assert result["prior_prompts"][0][0] == _filter_prompts(
+        templates[0], [texts[0]], tokenizer)[0]["prompt_token_ids"]
 
 
 def test_stock_query_set_split_uses_one_chunk_per_set():

@@ -173,6 +173,7 @@ def _execute_payload(payload: dict) -> dict:
             wall_s=report["wall_s"], boot_s=report["boot_s"],
             boot_kind=report["boot_kind"], boot=boot,
             fresh_tokens=report["fresh_tokens"],
+            regret_tokens=report.get("regret_tokens"),
             join_optimizer=report.get("join_optimizer"),
             kv_manager=report.get("kv_manager")), f)
     results_vol.commit()
@@ -238,6 +239,8 @@ def _execute_single(state, payload: dict) -> dict:
             len(pre) + len(docs[alias][document]), model_spec, device)
 
     total_tokens = 0
+    regret_tokens = 0
+    seen = set()        # keys computed in any phase of this query
     out_filters = {}
     survivors = {alias: list(range(len(d))) for alias, d in docs.items()}
     # None when the payload has joins: LIMIT caps output rows, and a
@@ -262,6 +265,9 @@ def _execute_single(state, payload: dict) -> dict:
                 retention_values={d: retention_value(alias, d)
                                   for d in keep})
             total_tokens += tokens
+            # answers is keyed by document position; every answered
+            # document's prefix was computed once in this query
+            seen.update((alias, d) for d in answers)
             out_filters[alias] = {int(d): row
                                   for d, row in answers.items()}
             survivors[alias] = sorted(
@@ -368,11 +374,12 @@ def _execute_single(state, payload: dict) -> dict:
             prefixes = [chain_tokens(pre, docs[anchor_alias][g])
                         for g in anchors_glob]
             anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-            kv_stats["join_anchor_hits"] += sum(
-                key in arena.accounting.owned for key in anchor_keys)
-            kv_stats["join_anchor_misses"] += sum(
-                key not in arena.accounting.owned
-                for key in anchor_keys)
+            round_kv = _join_round_kv(
+                anchor_keys, [len(p) for p in prefixes],
+                arena.accounting.owned, seen)
+            kv_stats["join_anchor_hits"] += round_kv["hits"]
+            kv_stats["join_anchor_misses"] += round_kv["misses"]
+            regret_tokens += round_kv["regret_tokens"]
             remaining.difference_update(node["stage_idxs"])
             future_anchors = possible_anchors(remaining)
 
@@ -395,6 +402,7 @@ def _execute_single(state, payload: dict) -> dict:
                 stage_frames=[j.get("frame") or [] for j in group],
                 anchor_keys=anchor_keys, anchor_done=anchor_done)
             total_tokens += tokens
+            seen.update(anchor_keys)
             for si, j in enumerate(group):
                 stage_out = dict(
                     rows={int(a): row for a, row in ans[si].items()},
@@ -443,6 +451,7 @@ def _execute_single(state, payload: dict) -> dict:
     return dict(filters=out_filters, joins=out_joins,
                 wall_s=round(wall, 2),
                 fresh_tokens=total_tokens,
+                regret_tokens=regret_tokens,
                 join_optimizer=(None if not optimizer_runs else dict(
                     states=sum(run["states"] for run in optimizer_runs),
                     generated=sum(run["generated"]
@@ -572,6 +581,10 @@ def _child_filters(state, sub):
     for key in list(arena.accounting.owned):
         arena.free_key(key)
     arena.reset_stats()
+    # the filter round opens every query, so the record of keys this
+    # query computed resets here and accumulates through its join
+    # rounds; each child sees only its own shard's computations
+    state["seen"] = set()
     out = dict(filters={}, survivors={}, retained={}, fresh_tokens=0,
                boot_s=boot["boot_s"], boot_kind=boot["kind"],
                boot=boot)
@@ -604,6 +617,9 @@ def _child_filters(state, sub):
                     key[1] for key in arena.accounting.retained
                     if key[0] == alias)
             out["fresh_tokens"] += tokens
+            # answers is keyed by document position; every answered
+            # document's prefix was computed once in this query
+            state["seen"].update((alias, index[d]) for d in answers)
             out["filters"][alias] = {index[d]: row
                                      for d, row in answers.items()}
             out["survivors"][alias] = sorted(
@@ -646,8 +662,7 @@ def _child_joins(state, sub):
     # just runs the group
     group = sub["joins"]
     retain_anchor = bool(sub.get("retain_anchor"))
-    hits = sum(1 for g in anchors_glob
-               if (anchor_alias, g) in arena.accounting.owned)
+    seen = state.setdefault("seen", set())
     out_joins, tokens_total = [], 0
     t0 = _time.perf_counter()
     with torch.inference_mode():
@@ -670,6 +685,9 @@ def _child_joins(state, sub):
                  for combo in combos])
         prefixes = [chain_tokens(pre, d) for d in anchor_docs]
         anchor_keys = [(anchor_alias, g) for g in anchors_glob]
+        round_kv = _join_round_kv(
+            anchor_keys, [len(p) for p in prefixes],
+            arena.accounting.owned, seen)
 
         def value(a):
             return prefix_recompute_seconds(
@@ -691,6 +709,7 @@ def _child_joins(state, sub):
             state["chunk_tokens"],
             stage_frames=[j.get("frame") or [] for j in group],
             anchor_keys=anchor_keys, anchor_done=anchor_done)
+        seen.update(anchor_keys)
         # settle anchors run_join never called back (no live suffixes)
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
@@ -719,8 +738,7 @@ def _child_joins(state, sub):
     return dict(joins=out_joins, fresh_tokens=tokens_total,
                 retained={alias: sorted(documents)
                           for alias, documents in retained.items()},
-                kv_round=dict(hits=hits,
-                              misses=len(anchors_glob) - hits),
+                kv_round=round_kv,
                 kv_totals=dict(
                     evicted_keys=arena.evicted_keys,
                     evicted_pages=arena.evicted_pages,
@@ -851,6 +869,7 @@ def _execute_multi(payload: dict) -> dict:
     kv_stats = dict(
         retained_after_filters=sum(len(v) for v in retained.values()),
         join_anchor_hits=0, join_anchor_misses=0)
+    regret_tokens = 0
     child_totals = [None] * k
     while remaining:
         node = next_group()
@@ -879,6 +898,7 @@ def _execute_multi(payload: dict) -> dict:
         for i, o in enumerate(jouts):
             kv_stats["join_anchor_hits"] += o["kv_round"]["hits"]
             kv_stats["join_anchor_misses"] += o["kv_round"]["misses"]
+            regret_tokens += o["kv_round"]["regret_tokens"]
             child_totals[i] = o["kv_totals"]
         for stage_out, j in zip(stage_outs, group):
             stage_out["anchor"] = anchor
@@ -926,6 +946,7 @@ def _execute_multi(payload: dict) -> dict:
                   boot_kind=slowest.get("boot_kind"),
                   boot=slowest.get("boot"),
                   fresh_tokens=merged["fresh_tokens"],
+                  regret_tokens=regret_tokens,
                   join_optimizer=(None if not optimizer_runs else dict(
                       states=sum(run["states"] for run in optimizer_runs),
                       generated=sum(run["generated"]
@@ -965,6 +986,32 @@ def execute_4(payload: dict) -> dict:
                        "/results": results_vol})
 def execute_8(payload: dict) -> dict:
     return _execute_multi(payload)
+
+
+def _join_round_kv(anchor_keys, prefix_lens, owned, seen):
+    """Classify each anchor's KV before a join round runs.
+
+    Args:
+        anchor_keys: Arena key per anchor.
+        prefix_lens: Prefix token count per anchor.
+        owned: Keys with resident KV.
+        seen: Keys this query computed in any earlier phase.
+
+    Returns:
+        Dict with hits, misses, and regret_tokens: the prefix tokens
+        of anchors this query computed once but must recompute now.
+        Anchors in neither set are first computations, which no KV
+        capacity avoids, so they add no regret.
+    """
+    hits = 0
+    regret = 0
+    for key, n_tokens in zip(anchor_keys, prefix_lens):
+        if key in owned:
+            hits += 1
+        elif key in seen:
+            regret += n_tokens
+    return dict(hits=hits, misses=len(anchor_keys) - hits,
+                regret_tokens=regret)
 
 
 def _tuple_suffix(join, docs, member):

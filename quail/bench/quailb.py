@@ -1294,6 +1294,10 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             tokens_processed=("sum of fresh tokens sent through model "
                               "forward calls; tokens read from KV are not "
                               "counted again"),
+            regret_tokens=("fresh tokens spent recomputing document "
+                           "prefixes the same query already computed "
+                           "once; joins only - filters are always first "
+                           "computations"),
             input_document_rows=("sum of input table rows for every query "
                                  "alias; a self join counts the table once "
                                  "per alias"),
@@ -1329,6 +1333,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                            boot_kind=res.report.get("boot_kind"),
                            boot=res.report.get("boot"),
                            fresh_tokens=res.report["fresh_tokens"],
+                           regret_tokens=res.report.get("regret_tokens"),
                            rows=result_rows,
                            peak_gib=res.report.get("peak_gib"),
                            stages=res.report["stages"])

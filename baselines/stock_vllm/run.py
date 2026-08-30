@@ -377,6 +377,7 @@ def _run_filter_stage(llm, sp, true_set, template, texts, tokenizer):
         requests=len(outputs),
         prompt_tokens=prompt_tokens,
         cached_tokens=cached_tokens,
+        prompts=prompts,
     )
 
 
@@ -425,6 +426,7 @@ def _run_stage_major_filter_chain(llm, sp, true_set, templates, texts,
     active = list(range(len(texts)))
     answers = {}
     stages = []
+    prior_prompts = {}
     requests = 0
     prompt_tokens = 0
     cached_tokens = 0
@@ -438,6 +440,13 @@ def _run_stage_major_filter_chain(llm, sp, true_set, templates, texts,
                 [texts[index] for index in evaluated], tokenizer)
             for position, answer in enumerate(result["answers"]):
                 answers[(evaluated[position], stage)] = int(answer)
+            # a passed document's prompt computed its KV once; failed
+            # documents leave the live set, so no later request can
+            # reuse theirs
+            for position in result["survivors"]:
+                prior_prompts.setdefault(
+                    evaluated[position], []).append(
+                        result["prompts"][position]["prompt_token_ids"])
             active = [evaluated[position]
                       for position in result["survivors"]]
             requests += result["requests"]
@@ -451,6 +460,7 @@ def _run_stage_major_filter_chain(llm, sp, true_set, templates, texts,
         survivors=active,
         answers=answers,
         stages=stages,
+        prior_prompts=prior_prompts,
         requests=requests,
         prompt_tokens=prompt_tokens,
         cached_tokens=cached_tokens,
@@ -470,6 +480,7 @@ def _run_pipelined_filter_chain(llm, sp, true_set, templates, texts,
             answers={},
             stages=[dict(stage=stage, n_in=0, n_out=0)
                     for stage in range(1, len(templates) + 1)],
+            prior_prompts={},
             requests=0,
             prompt_tokens=0,
             cached_tokens=0,
@@ -492,9 +503,18 @@ def _run_pipelined_filter_chain(llm, sp, true_set, templates, texts,
                      for index in evaluated)
         stages.append(dict(stage=stage, n_in=len(evaluated),
                            n_out=passed))
+    # a passed document's prompt computed its KV once; failed
+    # documents leave the live set, so no later request can reuse
+    # theirs
+    prior_prompts = {}
+    for (index, stage), passed in result["answers"].items():
+        if passed:
+            prior_prompts.setdefault(index, []).append(
+                body_ids[index] + question_ids[stage - 1])
     return dict(
         **result,
         stages=stages,
+        prior_prompts=prior_prompts,
         fresh_tokens=result["prompt_tokens"] - result["cached_tokens"],
     )
 
@@ -517,11 +537,53 @@ def _select_join_anchor(documents):
     return (0 if means[0] >= means[1] else 1), means
 
 
+def _lcp(a, b):
+    """Length of the longest common prefix of two token lists."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
+def _join_regret(prefixes, n_suffixes, cached, seen_prefix_lens,
+                 block_size):
+    """KV regret for one anchor-major join, in tokens.
+
+    Regret is the prompt tokens whose KV the same query already
+    computed once but vLLM did not serve from cache. Pair 0 of an
+    anchor group can hit only what an earlier request computed; pairs
+    1+ can hit the whole prefix pair 0 computed. Would-be hits round
+    down to whole blocks because vLLM caches prefixes block by block.
+
+    Args:
+        prefixes: Anchor prefix token ids, in request order.
+        n_suffixes: Suffixes per anchor group.
+        cached: Cached token count per request, anchor-major order.
+        seen_prefix_lens: Per anchor, the tokens of its prefix an
+            earlier request in the query already computed (0 when the
+            anchor is new to the query).
+        block_size: vLLM cache block size in tokens.
+
+    Returns:
+        Total regret tokens across the join.
+    """
+    regret = 0
+    for a, prefix in enumerate(prefixes):
+        for j in range(n_suffixes):
+            would = seen_prefix_lens[a] if j == 0 else len(prefix)
+            would = (would // block_size) * block_size
+            got = cached[a * n_suffixes + j]
+            regret += max(0, would - got)
+    return regret
+
+
 def _run_join(llm, sp, true_set, template, left_texts, right_texts,
               tokenizer):
     """Run one join as a full cross product.
 
-    Returns the model result, counts, survivors, and true local pairs.
+    Returns the model result, counts, survivors, true local pairs,
+    and the anchor prefix token ids.
     """
     from baselines.stock import build_join_grouped_inputs, run_join_grouped
     from quail.logical import ColumnRef, bind_join_prompt
@@ -566,7 +628,7 @@ def _run_join(llm, sp, true_set, template, left_texts, right_texts,
 
     return (result, n_pairs, surviving_left, surviving_right,
             n_true, true_pairs, pairs, answers, anchor,
-            mean_document_tokens)
+            mean_document_tokens, prefixes)
 
 
 def run_query(llm, sp, true_set, tokenizer, qid, query_def,
@@ -576,6 +638,13 @@ def run_query(llm, sp, true_set, tokenizer, qid, query_def,
     alias_data = _load_alias_data(data_dir, sf, query_def["aliases"])
     live = {a: list(range(len(data[1])))
             for a, data in alias_data.items()}
+
+    # (alias, global row) -> prompt token-id lists that computed this
+    # document's KV earlier in the query; the source of join would-hits
+    prior = {}
+    regret_total = 0
+    cache_block = (filter_capacity["block_size"] if filter_capacity
+                   else 16)
 
     step_results = []
     filter_answer_records = []
@@ -596,6 +665,9 @@ def run_query(llm, sp, true_set, tokenizer, qid, query_def,
                 filter_submission, filter_capacity,
                 tag=f"{qid}-{step_n}-{alias}")
             new_live = [live_idx[index] for index in result["survivors"]]
+            for local, stage_prompts in result["prior_prompts"].items():
+                prior.setdefault((alias, live_idx[local]),
+                                 []).extend(stage_prompts)
 
             for stage, template in enumerate(templates, 1):
                 evaluated = sorted(
@@ -657,10 +729,25 @@ def run_query(llm, sp, true_set, tokenizer, qid, query_def,
             t0 = time.time()
             (result, n_pairs, surv_l, surv_r,
              n_true, true_pairs, pairs, answers, anchor,
-             mean_document_tokens) = _run_join(
+             mean_document_tokens, prefixes) = _run_join(
                 llm, sp, true_set, template, left_texts,
                 right_texts, tokenizer)
             wall = time.time() - t0
+
+            anchor_a = left_a if anchor == 0 else right_a
+            anchor_rows = left_live if anchor == 0 else right_live
+            seen_lens = [
+                max((_lcp(prefixes[a], earlier) for earlier in
+                     prior.get((anchor_a, anchor_rows[a]), [])),
+                    default=0)
+                for a in range(len(prefixes))]
+            regret = _join_regret(
+                prefixes, n_pairs // len(prefixes),
+                result["cached_per_request"], seen_lens, cache_block)
+            regret_total += regret
+            for a in (surv_l if anchor == 0 else surv_r):
+                prior.setdefault((anchor_a, anchor_rows[a]),
+                                 []).append(prefixes[a])
 
             from quail.runtime.result import document_index_table
 
@@ -683,7 +770,7 @@ def run_query(llm, sp, true_set, tokenizer, qid, query_def,
             step_results.append(dict(
                 kind="join", step=step_n, left=left_a,
                 right=right_a, anchor=anchor,
-                anchor_alias=(left_a if anchor == 0 else right_a),
+                anchor_alias=anchor_a,
                 mean_document_tokens={
                     left_a: mean_document_tokens[0],
                     right_a: mean_document_tokens[1],
@@ -693,12 +780,14 @@ def run_query(llm, sp, true_set, tokenizer, qid, query_def,
                 wall_s=wall,
                 fresh_tokens=result["fresh_tokens"],
                 prompt_tokens=result["prompt_tokens"],
-                cached_tokens=result["cached_tokens"]))
+                cached_tokens=result["cached_tokens"],
+                regret_tokens=regret))
             print(f"  join({left_a}x{right_a}): "
                   f"{n_true}/{n_pairs} TRUE "
-                  f"anchor={left_a if anchor == 0 else right_a} "
+                  f"anchor={anchor_a} "
                   f"wall={wall:.2f}s "
-                  f"fresh={result['fresh_tokens']}", flush=True)
+                  f"fresh={result['fresh_tokens']} "
+                  f"regret={regret}", flush=True)
             step_n += 1
 
     import pyarrow as pa
@@ -721,6 +810,7 @@ def run_query(llm, sp, true_set, tokenizer, qid, query_def,
     row_count = count_rows(result_declaration)
     entry = dict(query=qid, steps=step_results,
                 total_wall_s=total_wall, rows=row_count,
+                regret_tokens=regret_total,
                 result_schema=str(result_schema),
                 rows_materialized=False)
     if evaluator is not None:
