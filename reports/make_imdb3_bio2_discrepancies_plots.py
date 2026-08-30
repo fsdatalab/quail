@@ -470,8 +470,8 @@ def fig_bio2_strips(workdir, stockb):
                               edgecolor="none"))
         ax.set_xlim(0, excerpt)
     axes[1].set_xlabel("seconds into the excerpt")
-    axes[0].set_title("BIO-2: filled while the GPU computes, blank "
-                      "while it idles")
+    axes[0].set_title("BIO-2: solid where the GPU computes, hatched "
+                      "where it idles")
     fig.tight_layout()
     fig.savefig(OUT / "discrepancy_bio2_strips.png", dpi=300)
     plt.close(fig)
