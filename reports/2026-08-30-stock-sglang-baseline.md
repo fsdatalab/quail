@@ -133,7 +133,7 @@ MEANING_TBD
 
 ## Source data
 
-- Stock SGLang, function call `fc-01M189RD2CR4H8M2YFPCYG1J88`:
+- Stock SGLang, function call `fc-01M18BR9BP6A74BT3TK5EFM9Z3`:
   `/results/stock_sglang/LABEL_TBD/summary.json`
 - Stock vLLM (2026-08-29 family run):
   `/results/stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`
