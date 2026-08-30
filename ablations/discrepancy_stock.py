@@ -142,13 +142,24 @@ def _boot(model, sf):
     tokenizer = AutoTokenizer.from_pretrained(hf_name)
     true, false = true_false_ids(tokenizer)
     allowed = sorted(true | false)
+    # vLLM 0.26 enables its torch.profiler hooks through the engine's
+    # profiler config; recording still only happens between
+    # start_profile and stop_profile
+    try:
+        from vllm.config import ProfilerConfig
+        prof_cfg = ProfilerConfig(profiler="torch",
+                                  torch_profiler_dir=KINETO_DIR)
+    except ImportError:
+        prof_cfg = {"profiler": "torch",
+                    "torch_profiler_dir": KINETO_DIR}
     llm, boot = time_llm_boot(
         model=hf_name,
         max_num_batched_tokens=25_305,
         max_num_seqs=4096,
         gpu_memory_utilization=0.91,
         enable_prefix_caching=True,
-        disable_log_stats=True)
+        disable_log_stats=True,
+        profiler_config=prof_cfg)
     sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
                         allowed_token_ids=allowed)
     capacity = _vllm_filter_capacity(llm)
@@ -276,6 +287,8 @@ def _measure_imdb3(llm, sp, true_set, tokenizer, sf, profiled):
 
     f_prompts, f_out, survivors = _filter_step(
         llm, sp, true_set, templates[0], texts, tokenizer)
+    print(f"[stock] IMDB-3 filter: {f_out['wall_s']}s, "
+          f"{len(survivors)} survivors", flush=True)
     result["filter"] = dict(
         wall_s=f_out["wall_s"], requests=len(f_prompts),
         prompt_tokens=f_out["prompt_tokens"],
@@ -292,6 +305,8 @@ def _measure_imdb3(llm, sp, true_set, tokenizer, sf, profiled):
     j_out = _generate(llm, sp, _pair_prompts(prefixes, suffixes))
     buckets = _join_accounting(prefixes, suffixes, j_out["cached"],
                                seen)
+    print(f"[stock] IMDB-3 join: {j_out['wall_s']}s, "
+          f"buckets {buckets}", flush=True)
     result["join"] = dict(
         wall_s=j_out["wall_s"],
         requests=len(prefixes) * len(suffixes),
@@ -339,6 +354,8 @@ def _measure_bio2(llm, sp, true_set, tokenizer, sf, profiled,
     # before its own pair 0, so seen is 0 for every report
     buckets = _join_accounting(part, suffixes, out["cached"],
                                [0] * len(part))
+    print(f"[stock] BIO-2 join ({len(part)} reports): "
+          f"{out['wall_s']}s, buckets {buckets}", flush=True)
     result = dict(
         query="BIO-2", sf=sf,
         reports_measured=len(part), reports_total=len(prefixes),
