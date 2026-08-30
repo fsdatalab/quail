@@ -24,13 +24,19 @@ gap is vLLM-specific and which part is the submission pattern itself.
 ## Configuration mapping
 
 The SGLang settings are the analytic equivalents of the stock vLLM
-ones: `mem_fraction_static=0.91`, `max_running_requests=4096`,
-`chunked_prefill_size=25305`, `max_prefill_tokens=25305`, radix cache
-on. vLLM's `allowed_token_ids` restriction has no SGLang equivalent;
-the runner instead adds a +1000 `logit_bias` to the same eight
-TRUE/FALSE token ids, which picks the same token under greedy
-decoding because the bias is applied to float32 logits before the
-argmax.
+ones: `max_running_requests=4096`, `chunked_prefill_size=25305`,
+`max_prefill_tokens=25305`, radix cache on. vLLM's
+`allowed_token_ids` restriction has no SGLang equivalent; the runner
+instead adds a +1000 `logit_bias` to the same eight TRUE/FALSE token
+ids, which picks the same token under greedy decoding because the
+bias is applied to float32 logits before the argmax.
+
+vLLM's `gpu_memory_utilization=0.91` maps to
+`mem_fraction_static=0.85`, not 0.91: vLLM's fraction includes the
+activation working set (it profiles a forward before sizing KV),
+SGLang's does not, and at 0.91 SGLang ran out of GPU memory. Prefill
+CUDA graphs are disabled for the same memory reason. The report
+explains both choices with the measured numbers.
 
 ## Numbers
 

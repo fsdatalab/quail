@@ -32,13 +32,13 @@ def load(path):
         return json.load(source)
 
 
-def check(summary, baseline, filter_submission):
+def check(summary, baseline, memory_key, memory_fraction):
     if (summary["baseline"] != baseline
-            or summary["filter_submission"] != filter_submission
+            or summary["filter_submission"] != "stage-major"
             or summary["hf_name"] != "Qwen/Qwen3-4B-FP8"
             or summary["sf"] != 0.1
             or summary["checkpoint"] != "pre-quantized FP8"
-            or summary["gpu_memory_utilization"] != 0.91
+            or summary[memory_key] != memory_fraction
             or summary["max_num_seqs"] != 4096
             or summary["max_num_batched_tokens"] != 25_305):
         raise ValueError(f"unexpected {baseline} configuration")
@@ -73,8 +73,8 @@ def main():
     workdir = Path(sys.argv[1])
     vllm = load(workdir / "stock_vllm.json")
     sglang = load(workdir / "stock_sglang.json")
-    check(vllm, "stock_vllm", "stage-major")
-    check(sglang, "stock_sglang", "stage-major")
+    check(vllm, "stock_vllm", "gpu_memory_utilization", 0.91)
+    check(sglang, "stock_sglang", "mem_fraction_static", 0.85)
 
     vllm_entries = query_entries(vllm)
     sglang_entries = query_entries(sglang)

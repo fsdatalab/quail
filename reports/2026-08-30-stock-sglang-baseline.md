@@ -28,7 +28,7 @@ gets the analytically equivalent settings:
 
 | Setting | Stock vLLM 0.26.0 | Stock SGLang 0.5.18 |
 |---|---|---|
-| GPU memory fraction | `gpu_memory_utilization=0.91` | `mem_fraction_static=0.91` |
+| GPU memory fraction | `gpu_memory_utilization=0.91` | `mem_fraction_static=0.85` (see below) |
 | Max concurrent requests | `max_num_seqs=4096` | `max_running_requests=4096` |
 | Scheduled token budget | `max_num_batched_tokens=25305` | `chunked_prefill_size=25305`, `max_prefill_tokens=25305` |
 | Prefix caching | on, 16-token blocks | radix cache on (default), 1-token pages |
@@ -44,20 +44,35 @@ restricting the argmax to those ids, as long as no other token's raw
 logit is 1,000 higher. Raw logit gaps are two orders of magnitude
 smaller than that.
 
-One setting required care. vLLM sizes its KV pool after profiling a
-forward pass, so `gpu_memory_utilization=0.91` already accounts for
-activation memory. SGLang's `mem_fraction_static=0.91` reserves 91%
-for weights plus KV only, and SGLang 0.5.18 additionally captures
-prefill CUDA graphs for 91 shapes up to the 25,305-token budget, each
-retaining about 130 MB of capture memory. Those graphs ran the
-remaining 6.3 GB to zero and crashed the first boot. The run
-therefore sets `disable_prefill_cuda_graph=True`, which keeps the
-memory split equivalent to vLLM's. This costs SGLang little here:
-every batch packs hundreds of cached-prefix requests, so per-batch
-launch overhead is already amortized. Decode CUDA graphs stay on
-(their default), though this workload never reaches a decode batch
-because every request generates exactly one token during its prefill
-forward.
+The memory fraction cannot be copied literally, and finding that out
+took two crashed runs:
+
+- vLLM sizes its KV pool after profiling a full-size forward, so
+  `gpu_memory_utilization=0.91` already accounts for activation
+  memory. SGLang's `mem_fraction_static` reserves that fraction for
+  weights plus KV only; activations must fit in the remainder.
+- At `mem_fraction_static=0.91`, SGLang's prefill CUDA graph capture
+  (91 shapes up to the 25,305-token budget, each retaining about
+  130 MB) ran the remaining 6.3 GB to zero and crashed the boot. The
+  runner therefore sets `disable_prefill_cuda_graph=True`. That costs
+  little here: every batch packs hundreds of cached-prefix requests,
+  so per-batch launch overhead is already amortized, and this
+  workload never reaches a decode batch because every request
+  generates its one token during the prefill forward.
+- Still at 0.91, the BIO-2 join then ran out of GPU memory fourteen
+  minutes in, mid-forward, once real batches filled the 25,305-token
+  budget: such a batch peaks near 7 GB of activations (the MLP
+  intermediate alone is about 0.5 GB, and the answer step holds
+  per-request float32 logits and the logit-bias row for every request
+  in the batch).
+- Matching vLLM's exact 479,248-token pool would leave about 6 GB of
+  headroom, below that peak. The run uses `mem_fraction_static=0.85`,
+  which leaves about 12 GB for activations and gives SGLang a
+  KVTOKENS_TBD-token KV pool, KVDELTA_TBD% smaller than vLLM's
+  479,248. The two queries
+  submit join pairs anchor by anchor, so the live prefix working set
+  is far below either pool size and the difference does not change
+  what gets cached.
 
 Differences that remain, reported rather than hidden:
 
@@ -109,7 +124,7 @@ MEANING_TBD
 
 ## Source data
 
-- Stock SGLang, function call `fc-01M185TZ4E1G16TK6EW2ED2R3X`:
+- Stock SGLang, function call `fc-01M187V2XZ1EPRZ2AT7S17P3JX`:
   `/results/stock_sglang/LABEL_TBD/summary.json`
 - Stock vLLM (2026-08-29 family run):
   `/results/stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`

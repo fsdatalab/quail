@@ -10,7 +10,8 @@ same work.
 Engine settings mirror the stock vLLM configuration:
 
     vLLM                              SGLang
-    gpu_memory_utilization=0.91       mem_fraction_static=0.91
+    gpu_memory_utilization=0.91       mem_fraction_static=0.85
+                                      (see MEM_FRACTION_STATIC)
     max_num_seqs=4096                 max_running_requests=4096
     max_num_batched_tokens=25305      chunked_prefill_size=25305,
                                       max_prefill_tokens=25305
@@ -69,7 +70,15 @@ DATA_DIR = "/results/quailb_data"
 
 BASELINE = "stock_sglang"
 DEFAULT_QUERY_IDS = "BIO-2,IMDB-3"
-GPU_MEMORY_UTILIZATION = 0.91
+# vLLM's gpu_memory_utilization=0.91 covers weights, KV, and the
+# activation working set, because vLLM profiles a full-size forward
+# before sizing its KV pool. SGLang's mem_fraction_static covers only
+# weights plus KV; activations must fit in the remainder, and a
+# 25,305-token batch peaks near 7 GB (measured: 0.91 left 5.9 GB and
+# the BIO-2 join ran out of GPU memory mid-forward). 0.85 leaves the
+# same activation headroom vLLM's profiling reserves, at the cost of a
+# KV pool about 5% smaller than vLLM's 479,248 tokens.
+MEM_FRACTION_STATIC = 0.85
 MAX_NUM_SEQS = 4096
 MAX_NUM_BATCHED_TOKENS = 25_305
 
@@ -177,7 +186,7 @@ def _engine_settings(engine):
     return {field: info.get(field) for field in fields}
 
 
-def _boot_client(model, gpu_memory_utilization):
+def _boot_client(model, mem_fraction_static):
     """Boot one sglang Engine plus tokenizer and answer token sets."""
     from baselines.stock_vllm.run import MODELS
     from quail.executor.loop import true_false_ids
@@ -197,7 +206,7 @@ def _boot_client(model, gpu_memory_utilization):
     # prefill batch, so per-batch launch overhead is amortized anyway.
     engine, boot = time_engine_boot(
         model_path=hf_name,
-        mem_fraction_static=gpu_memory_utilization,
+        mem_fraction_static=mem_fraction_static,
         max_running_requests=MAX_NUM_SEQS,
         chunked_prefill_size=MAX_NUM_BATCHED_TOKENS,
         max_prefill_tokens=MAX_NUM_BATCHED_TOKENS,
@@ -213,13 +222,13 @@ def _boot_client(model, gpu_memory_utilization):
 
 @app.function(timeout=2400, **GPU_KW)
 def probe(model: str = "qwen3-4b-fp8",
-          gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION) -> str:
+          mem_fraction_static: float = MEM_FRACTION_STATIC) -> str:
     """Boot the engine and run a few filter and join shaped requests."""
     from baselines.stock_vllm.run import _run_filter_stage, _run_join
     from quail.bench.quailb import F1, DISCUSS_ASPECT
 
     llm, boot, sp, tokenizer, true, allowed, hf_name = _boot_client(
-        model, gpu_memory_utilization)
+        model, mem_fraction_static)
     capacity = _sglang_filter_capacity(llm.engine)
     settings = _engine_settings(llm.engine)
     print(f"[probe] boot: {boot}", flush=True)
@@ -260,7 +269,7 @@ def probe(model: str = "qwen3-4b-fp8",
 
 def _run_query_batch(model, sf, query_ids_csv, reps,
                      ground_truth_collection, prediction,
-                     gpu_memory_utilization, lf=1):
+                     mem_fraction_static, lf=1):
     """Boot one sglang Engine and run the stage-major baseline."""
     from baselines.stock_vllm.run import define_all_queries, run_query
     from quail.bench.quailb import (
@@ -273,7 +282,7 @@ def _run_query_batch(model, sf, query_ids_csv, reps,
 
     data_path = build_sets(DATA_DIR, sf, lf)
     llm, boot, sp, tokenizer, true, allowed, hf_name = _boot_client(
-        model, gpu_memory_utilization)
+        model, mem_fraction_static)
     filter_capacity = _sglang_filter_capacity(llm.engine)
     engine_settings = _engine_settings(llm.engine)
     print(f"[{BASELINE}] boot: {boot}", flush=True)
@@ -366,7 +375,7 @@ def _run_query_batch(model, sf, query_ids_csv, reps,
         checkpoint="pre-quantized FP8",
         max_num_seqs=MAX_NUM_SEQS,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-        gpu_memory_utilization=gpu_memory_utilization,
+        mem_fraction_static=mem_fraction_static,
         enable_prefix_caching=True,
         true_false_logit_bias=TRUE_FALSE_LOGIT_BIAS,
         engine="sglang",
@@ -380,13 +389,13 @@ def run_query_batch(model: str = "qwen3-4b-fp8", sf: float = 0.1,
                     reps: int = 1,
                     ground_truth_collection: str = "",
                     prediction: str = "",
-                    gpu_memory_utilization: float =
-                    GPU_MEMORY_UTILIZATION) -> str:
+                    mem_fraction_static: float =
+                    MEM_FRACTION_STATIC) -> str:
     """Boot one sglang Engine and run one batch of queries."""
 
     report = _run_query_batch(
         model, sf, query_ids_csv, reps, ground_truth_collection,
-        prediction, gpu_memory_utilization)
+        prediction, mem_fraction_static)
     return json.dumps(report)
 
 
@@ -408,7 +417,7 @@ def main(model: str = "qwen3-4b-fp8", sf: float = 0.1,
          query: str = DEFAULT_QUERY_IDS, reps: int = 1,
          ground_truth_collection: str = SELECTIVITY_ESTIMATE_COLLECTION,
          prediction: str = "",
-         gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION):
+         mem_fraction_static: float = MEM_FRACTION_STATIC):
     ids = [q.strip() for q in query.split(",") if q.strip()]
     label = f"{time.strftime('%Y-%m-%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     if prediction:
@@ -418,7 +427,7 @@ def main(model: str = "qwen3-4b-fp8", sf: float = 0.1,
         model=model, sf=sf, query_ids_csv=",".join(ids), reps=reps,
         ground_truth_collection=ground_truth_collection,
         prediction=prediction,
-        gpu_memory_utilization=gpu_memory_utilization)
+        mem_fraction_static=mem_fraction_static)
     print(f"function call id: {fc.object_id}")
     report = json.loads(fc.get())
 
