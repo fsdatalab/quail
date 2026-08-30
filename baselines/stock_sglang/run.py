@@ -1,12 +1,13 @@
 """Pipelined SGLang baseline for QUAIL-B queries.
 
 Runs on H100s via Modal. Uses the same submission strategy as
-``pipelined_vllm``: each document's next filter stage is submitted as
-soon as the document passes its current stage, with token-budget
-admission, and every join runs the full cross product. The prompts,
-query definitions, and per-query bookkeeping are imported from
-``baselines.stock_vllm.run``, so the baselines measure exactly the
-same work.
+``pipelined_vllm``: each document's next filter stage goes in once
+the document passes its current stage, with token-budget admission
+(in waves of blocking generate calls -- see
+``StockSGLangClient.run_pipelined_filter_chain``), and every join
+runs the full cross product. The prompts, query definitions, and
+per-query bookkeeping are imported from ``baselines.stock_vllm.run``,
+so the baselines measure exactly the same work.
 
 Join pairs are submitted suffix-major in anchor tiles
 (``baselines.stock.suffix_major_tiled_order``) instead of vLLM's
@@ -159,16 +160,20 @@ class StockSGLangClient:
         """Chain filter stages per document with token-budget admission.
 
         Mirrors stock vLLM's pipelined client: a document holds one of
-        doc_cap admission slots for its whole chain, and stage j+1 is
-        submitted the moment stage j returns TRUE. Sequential stages
-        keep the radix cache effective here: stage j+1 always finds
-        the document body cached, because stage j finished first.
+        doc_cap admission slots for its whole chain, and a TRUE answer
+        sends the document's next stage while other documents are
+        still on earlier stages. SGLang's scheduler runs in a separate
+        process with no synchronous add_request/step surface, so the
+        chain advances in waves of blocking generate() calls: every
+        alive document has exactly one request per wave, and wave
+        boundaries stand in for vLLM's engine step loop. Sequential
+        stages keep the radix cache effective: a document's stage j+1
+        always finds its body cached, because stage j finished first.
 
         Returns:
             Dict shaped like baselines.stock.run_filter_chain's.
         """
-        import asyncio
-
+        del tag
         n_stages = len(question_ids)
         longest_tail = max(len(q) for q in question_ids)
         sizes = [len(body) + longest_tail + 1 for body in body_ids]
@@ -179,35 +184,33 @@ class StockSGLangClient:
         answers = {}
         survivors = []
 
-        async def one_document(slots, index):
-            async with slots:
-                for stage in range(n_stages):
-                    result = await self.engine.async_generate(
-                        input_ids=(body_ids[index]
-                                   + question_ids[stage]),
-                        sampling_params=dict(sampling_params),
-                        rid=f"{tag}-{index}-{stage}")
-                    meta = result["meta_info"]
-                    counters["requests"] += 1
-                    counters["prompt_tokens"] += int(
-                        meta.get("prompt_tokens") or 0)
-                    counters["cached_tokens"] += int(
-                        meta.get("cached_tokens") or 0)
-                    output_ids = result.get("output_ids") or []
-                    got = 1 if (output_ids and
-                                int(output_ids[0]) in true_ids) else 0
-                    answers[(index, stage + 1)] = got
-                    if not got:
-                        return
-                survivors.append(index)
-
-        async def run_all():
-            slots = asyncio.Semaphore(cap)
-            await asyncio.gather(*(one_document(slots, index)
-                                   for index in range(len(body_ids))))
-
         t0 = time.time()
-        self.engine.loop.run_until_complete(run_all())
+        alive = []                       # (document index, stage)
+        next_doc = 0
+        while alive or next_doc < len(body_ids):
+            while next_doc < len(body_ids) and len(alive) < cap:
+                alive.append((next_doc, 0))
+                next_doc += 1
+            prompts = [
+                {"prompt_token_ids": body_ids[index]
+                 + question_ids[stage]}
+                for index, stage in alive
+            ]
+            outputs = self.generate(prompts, sampling_params)
+            advanced = []
+            for (index, stage), out in zip(alive, outputs):
+                counters["requests"] += 1
+                counters["prompt_tokens"] += len(out.prompt_token_ids)
+                counters["cached_tokens"] += out.num_cached_tokens
+                token_ids = out.outputs[0].token_ids
+                got = 1 if (token_ids and
+                            int(token_ids[0]) in true_ids) else 0
+                answers[(index, stage + 1)] = got
+                if got and stage + 1 < n_stages:
+                    advanced.append((index, stage + 1))
+                elif got:
+                    survivors.append(index)
+            alive = advanced
         wall = time.time() - t0
         return dict(wall=wall, survivors=sorted(survivors),
                     answers=answers, doc_cap=cap,
