@@ -600,7 +600,11 @@ def _run_join(llm, sp, true_set, template, left_texts, right_texts,
         bound, documents, anchor, tok)
     n_pairs = len(prefixes) * len(suffixes)
 
-    result = run_join_grouped(llm, sp, prefixes, suffixes, true_set)
+    result = run_join_grouped(
+        llm, sp, prefixes, suffixes, true_set,
+        submission=getattr(llm, "join_submission", "anchor-major"),
+        tile_budget_tokens=getattr(llm, "join_tile_budget_tokens",
+                                   None))
 
     surviving_left, surviving_right = set(), set()
     pairs = []

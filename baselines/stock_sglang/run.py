@@ -7,6 +7,12 @@ prompts, query definitions, and per-query bookkeeping are imported from
 ``baselines.stock_vllm.run``, so both baselines measure exactly the
 same work.
 
+Join pairs are submitted suffix-major in anchor tiles
+(``baselines.stock.suffix_major_tiled_order``) instead of vLLM's
+anchor-major order: SGLang's radix cache stores KV only for finished
+requests, so each engine gets the pair order its prefix cache can
+exploit, over the identical cross product.
+
 Engine settings mirror the stock vLLM configuration:
 
     vLLM                              SGLang
@@ -210,6 +216,25 @@ def _engine_settings(engine):
     return {field: info.get(field) for field in fields}
 
 
+def _use_tiled_joins(llm, capacity):
+    """Give joins the pair order SGLang's radix cache can exploit.
+
+    The radix cache stores a prompt's KV only when its request
+    finishes, so anchor-major submission recomputes an anchor for
+    every sibling admitted before the anchor's first pair completes.
+    Suffix-major tiles avoid that (see
+    baselines.stock.suffix_major_tiled_order). Half the KV pool
+    bounds a tile because in-flight suffixes and the previous tile's
+    leftovers share the pool with the tile's anchors.
+    """
+    llm.join_submission = "suffix-major-tiled"
+    llm.join_tile_budget_tokens = (
+        capacity["kv_cache_size_tokens"] // 2)
+    print(f"[{BASELINE}] join submission: {llm.join_submission} "
+          f"tile_budget_tokens={llm.join_tile_budget_tokens}",
+          flush=True)
+
+
 def _boot_client(model, mem_fraction_static):
     """Boot one sglang Engine plus tokenizer and answer token sets."""
     from baselines.stock_vllm.run import MODELS
@@ -255,6 +280,7 @@ def probe(model: str = "qwen3-4b-fp8",
         model, mem_fraction_static)
     capacity = _sglang_filter_capacity(llm.engine)
     settings = _engine_settings(llm.engine)
+    _use_tiled_joins(llm, capacity)
     print(f"[probe] boot: {boot}", flush=True)
     print(f"[probe] KV capacity: {capacity}", flush=True)
     print(f"[probe] settings: {settings}", flush=True)
@@ -309,6 +335,7 @@ def _run_query_batch(model, sf, query_ids_csv, reps,
         model, mem_fraction_static)
     filter_capacity = _sglang_filter_capacity(llm.engine)
     engine_settings = _engine_settings(llm.engine)
+    _use_tiled_joins(llm, filter_capacity)
     print(f"[{BASELINE}] boot: {boot}", flush=True)
     print(f"[{BASELINE}] KV capacity: {filter_capacity}", flush=True)
     print(f"[{BASELINE}] settings: {engine_settings}", flush=True)
@@ -394,8 +421,11 @@ def _run_query_batch(model, sf, query_ids_csv, reps,
         query_ids=ids,
         filter_submission="stage-major",
         filter_capacity=filter_capacity,
+        join_submission=llm.join_submission,
+        join_tile_budget_tokens=llm.join_tile_budget_tokens,
         submission=("separate generate() call per filter stage, full "
-                    "cross product per join"),
+                    "cross product per join, join pairs submitted "
+                    "suffix-major in anchor tiles"),
         checkpoint="pre-quantized FP8",
         max_num_seqs=MAX_NUM_SEQS,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,

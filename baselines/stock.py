@@ -126,22 +126,93 @@ def run_filter_chain(engine, sampling_params, body_ids, q_ids,
                 answers=answers, **counters)
 
 
+def suffix_major_tiled_order(prefixes, suffixes, tile_budget_tokens):
+    """Order pairs suffix-major within anchor tiles under a KV budget.
+
+    Within one tile no two pairs share an anchor until the first
+    suffix pass has completed and cached every anchor, so an engine
+    that only caches finished requests (SGLang's radix cache) reuses
+    anchors from the second pass on. The tile bound keeps a tile's
+    anchors resident: a full pass over more anchor tokens than the KV
+    pool holds would evict each anchor before its next use.
+
+    Returns:
+        List of (anchor_index, suffix_index) in submission order.
+    """
+    if tile_budget_tokens <= 0:
+        raise ValueError("tile_budget_tokens must be positive")
+    max_suffix = max(len(s) for s in suffixes)
+    tiles, tile, used = [], [], 0
+    for anchor_index, prefix in enumerate(prefixes):
+        cost = len(prefix) + max_suffix
+        if tile and used + cost > tile_budget_tokens:
+            tiles.append(tile)
+            tile, used = [], 0
+        tile.append(anchor_index)
+        used += cost
+    if tile:
+        tiles.append(tile)
+    return [
+        (anchor_index, suffix_index)
+        for tile in tiles
+        for suffix_index in range(len(suffixes))
+        for anchor_index in tile
+    ]
+
+
 def run_join_grouped(llm, sampling_params, prefixes, suffixes,
-                     true_ids):
-    """Run a join over stock vLLM in anchor-major order."""
-    pair_prompts = [{"prompt_token_ids": p + s}
-                    for p in prefixes for s in suffixes]
+                     true_ids, submission="anchor-major",
+                     tile_budget_tokens=None):
+    """Run a join as one request per pair over the full cross product.
+
+    Args:
+        submission: "anchor-major" submits all suffixes of one anchor
+            before the next anchor. "suffix-major-tiled" submits per
+            suffix_major_tiled_order and needs tile_budget_tokens.
+
+    Returns:
+        Dict with wall time and counters. answers is in anchor-major
+        pair order for either submission.
+    """
+    if submission == "anchor-major":
+        order = None
+        pair_prompts = [{"prompt_token_ids": p + s}
+                        for p in prefixes for s in suffixes]
+    elif submission == "suffix-major-tiled":
+        if tile_budget_tokens is None:
+            raise ValueError(
+                "suffix-major-tiled needs tile_budget_tokens")
+        order = suffix_major_tiled_order(
+            prefixes, suffixes, tile_budget_tokens)
+        pair_prompts = [
+            {"prompt_token_ids": prefixes[i] + suffixes[j]}
+            for i, j in order
+        ]
+    else:
+        raise ValueError(f"unknown join submission {submission!r}")
+
     t0 = time.time()
     outputs = llm.generate(pair_prompts, sampling_params,
                            use_tqdm=False)
     wall = time.time() - t0
-    answers = [1 if int(o.outputs[0].token_ids[0]) in true_ids else 0
-               for o in outputs]
-    cached_per_request = [
+    bits = [1 if int(o.outputs[0].token_ids[0]) in true_ids else 0
+            for o in outputs]
+    cached_by_output = [
         int(getattr(o, "num_cached_tokens", 0) or 0) for o in outputs]
+    if order is None:
+        answers = bits
+        cached_per_request = cached_by_output
+    else:
+        answers = [0] * len(bits)
+        cached_per_request = [0] * len(bits)
+        for position, (i, j) in enumerate(order):
+            pair = i * len(suffixes) + j
+            answers[pair] = bits[position]
+            cached_per_request[pair] = cached_by_output[position]
     cached = sum(cached_per_request)
     prompt_tokens = sum(len(o.prompt_token_ids) for o in outputs)
     return dict(wall=wall, answers=answers,
                 fresh_tokens=prompt_tokens - cached,
                 prompt_tokens=prompt_tokens, cached_tokens=cached,
-                cached_per_request=cached_per_request)
+                cached_per_request=cached_per_request,
+                submission=submission)
