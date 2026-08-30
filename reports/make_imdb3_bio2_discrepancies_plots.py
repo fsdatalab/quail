@@ -413,11 +413,8 @@ def fig_bio2_strips(workdir, stockb):
         workdir / "traces" / "bio2_join_late.chrome.json.gz")
     stock_evs = _kernel_intervals(_stock_bio2_trace(workdir, stockb))
     fig, axes = plt.subplots(2, 1, figsize=(9.6, 3.4), sharex=True)
-    rows = ((axes[0], quail_evs, BLUE, "white",
-             "Quail (kernel-only capture)"),
-            (axes[1], stock_evs, RED, DARK,
-             "stock vLLM (profiled run; its CPU tracing stretches "
-             "the wall about 2.4x)"))
+    rows = ((axes[0], quail_evs, BLUE, "white", "Quail"),
+            (axes[1], stock_evs, RED, DARK, "stock vLLM"))
     excerpt = 2.0
     for ax, evs, color, text_color, label in rows:
         t0 = min(s for s, _ in evs)
@@ -440,8 +437,8 @@ def fig_bio2_strips(workdir, stockb):
                            edgecolor="none")))
         ax.set_xlim(0, excerpt)
     axes[1].set_xlabel("seconds into the excerpt")
-    axes[0].set_title("BIO-2: when the GPU is running a kernel, "
-                      "two-second excerpts")
+    axes[0].set_title("BIO-2: filled while the GPU computes, blank "
+                      "while it idles")
     fig.tight_layout()
     fig.savefig(OUT / "discrepancy_bio2_strips.png", dpi=300)
     plt.close(fig)
@@ -452,20 +449,21 @@ def fig_bio2_strips(workdir, stockb):
 
 
 def fig_bio2_cpu(workdir, stockb):
-    """Where stock's window wall goes, split exactly by stack frame.
+    """Where stock's window wall goes: the GPU's kernel time in its
+    own lane, and the two CPU threads split exactly by stack frame.
 
     On-stack seconds include GIL waits and, inside execute_model,
     the wait for the GPU; the two threads run concurrently but share
-    the GIL.
+    the GIL. The GPU lane is device time, not thread time.
     """
     path = _stock_bio2_trace(workdir, stockb)
     fr = frame_seconds(path)
     _, _, _, merged_us = kernel_busy(path)
     kernels = merged_us / 1e6
+    gpu = [("running kernels", kernels, TEAL)]
     engine = [
-        ("GPU kernels", kernels, TEAL),
-        ("execute_model, CPU side", fr["execute_model"] - kernels,
-         BLUE),
+        ("execute_model (launch Python, waiting on the GPU)",
+         fr["execute_model"], BLUE),
         ("prefix-cache hit probe", fr["cache_probe"], RED),
         ("scheduler, rest", fr["schedule"] - fr["cache_probe"], GRAY),
         ("step rest (outputs)", fr["engine_step"] - fr["schedule"]
@@ -477,26 +475,28 @@ def fig_bio2_cpu(workdir, stockb):
         ("request construction, rest",
          fr["preprocess"] - fr["block_hash"], GRAY),
     ]
-    fig, ax = plt.subplots(figsize=(9.6, 3.6))
-    for y, (title, parts) in enumerate((
-            ("engine thread", engine), ("input thread", inputt))):
+    lanes = (("GPU", gpu), ("engine thread", engine),
+             ("input thread", inputt))
+    fig, ax = plt.subplots(figsize=(9.6, 4.0))
+    for y, (title, parts) in zip((2, 1, 0), lanes):
         x = 0.0
         for name, sec, color in parts:
-            ax.barh(1 - y, sec, left=x, color=color, height=0.55)
+            ax.barh(y, sec, left=x, color=color, height=0.55)
             if sec > 1.6:
-                ax.text(x + sec / 2, 1 - y, f"{sec:.1f}",
+                ax.text(x + sec / 2, y, f"{sec:.1f}",
                         ha="center", va="center", color="white")
             x += sec
     handles = [plt.Rectangle((0, 0), 1, 1, color=c)
-               for _, _, c in engine + inputt[:1]]
-    labels = [n for n, _, _ in engine] + [inputt[0][0]]
+               for _, _, c in gpu + engine + inputt[:1]]
+    labels = ([n for n, _, _ in gpu + engine]
+              + [inputt[0][0]])
     ax.legend(handles, labels, loc="lower right", frameon=False,
-              ncol=2, fontsize=8)
-    ax.set_yticks([1, 0],
-                  labels=["engine thread", "input thread"])
-    ax.set_xlabel("on-stack seconds in the profiled window")
+              ncol=1, fontsize=8)
+    ax.set_yticks([2, 1, 0], labels=[t for t, _ in lanes])
+    ax.set_xlabel("seconds in the profiled window (GPU: device "
+                  "time; threads: on-stack time)")
     ax.set_xlim(0, fr["busy_loop"] * 1.02)
-    ax.set_title("Stock BIO-2: what runs while the GPU waits")
+    ax.set_title("Stock BIO-2: the GPU against the two CPU threads")
     fig.tight_layout()
     fig.savefig(OUT / "discrepancy_bio2_cpu.png", dpi=300)
     plt.close(fig)

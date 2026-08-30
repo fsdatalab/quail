@@ -204,9 +204,12 @@ whole wall per pair (0.23 ms).
 
 Figure: plots/discrepancy_bio2_strips.png
 
-The strips show two-second excerpts of the same windows: every mark
-is one kernel-execution interval. Quail's strip is one solid band;
-stock's is slivers with idle between them.
+The strips show two-second excerpts of the profiled windows: color
+where the GPU is executing a kernel, blank where it is idle.
+Quail's strip is one solid band; stock's is slivers. Stock's strip
+comes from its profiled run, whose CPU tracing stretches the wall
+about 2.4x, so its true idle share is smaller than the strip's 92% -
+the corrected figure is the 82% above.
 
 The trace's Python stacks say what fills the idle. Over the
 28.3-second window (6,762 requests, 2.1 seconds of merged kernel
