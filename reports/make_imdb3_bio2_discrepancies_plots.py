@@ -408,15 +408,38 @@ def _merged(intervals):
 def fig_bio2_strips(workdir, stockb):
     """Kernel activity over two-second excerpts, one strip per
     system: every mark is one kernel-execution interval, gaps are
-    GPU idle."""
+    GPU idle.
+
+    Stock's excerpt comes from its traced run, whose tracing
+    stretches the CPU gaps while kernels run at normal speed, so
+    its busy label divides kernel time by the unprofiled wall for
+    the window's requests, not by the stretched excerpt.
+    """
     quail_evs = _kernel_intervals(
         workdir / "traces" / "bio2_join_late.chrome.json.gz")
     stock_evs = _kernel_intervals(_stock_bio2_trace(workdir, stockb))
+
+    def union_s(evs):
+        return sum(e - s for s, e in _merged(sorted(evs))) / 1e6
+
+    def span_s(evs):
+        return (max(e for _, e in evs) - min(s for s, _ in evs)) / 1e6
+
+    quail_busy = union_s(quail_evs) / span_s(quail_evs)
+    w = stockb["windows"][0]
+    unprof_s = w["requests"] * stockb["wall_s"] / stockb["pairs"]
+    stock_busy = union_s(stock_evs) / unprof_s
+    stock_raw = union_s(stock_evs) / span_s(stock_evs)
+    stretch = w["wall_s"] / unprof_s
+
     fig, axes = plt.subplots(2, 1, figsize=(9.6, 3.4), sharex=True)
-    rows = ((axes[0], quail_evs, BLUE, "white", "Quail"),
-            (axes[1], stock_evs, RED, DARK, "stock vLLM"))
+    rows = ((axes[0], quail_evs, BLUE, "white",
+             f"Quail - {quail_busy:.0%} busy", None),
+            (axes[1], stock_evs, RED, DARK,
+             f"stock vLLM - {stock_busy:.0%} busy",
+             f"tracing stretches these gaps {stretch:.1f}x"))
     excerpt = 2.0
-    for ax, evs, color, text_color, label in rows:
+    for ax, evs, color, text_color, label, note in rows:
         t0 = min(s for s, _ in evs)
         t1 = max(e for _, e in evs)
         mid = t0 + (t1 - t0 - excerpt * 1e6) / 2
@@ -425,16 +448,21 @@ def fig_bio2_strips(workdir, stockb):
         ax.broken_barh(
             [((s - mid) / 1e6, (e - s) / 1e6) for s, e in cut],
             (0, 1), color=color, linewidth=0)
-        busy = sum(e - s for s, e in _merged(sorted(evs))) / (t1 - t0)
         ax.set_yticks([])
         ax.set_ylabel(None)
         ax.set_ylim(0, 1)
-        ax.text(0.012, 0.5, f"{label} - window {busy:.0%} busy",
+        ax.text(0.012, 0.5, label,
                 transform=ax.transAxes, va="center",
                 color=text_color,
                 bbox=(None if text_color == "white" else
                       dict(facecolor="white", alpha=0.75,
                            edgecolor="none")))
+        if note:
+            ax.text(0.988, 0.5, note, transform=ax.transAxes,
+                    va="center", ha="right", color=text_color,
+                    fontsize=8.5,
+                    bbox=dict(facecolor="white", alpha=0.75,
+                              edgecolor="none"))
         ax.set_xlim(0, excerpt)
     axes[1].set_xlabel("seconds into the excerpt")
     axes[0].set_title("BIO-2: filled while the GPU computes, blank "
@@ -442,10 +470,10 @@ def fig_bio2_strips(workdir, stockb):
     fig.tight_layout()
     fig.savefig(OUT / "discrepancy_bio2_strips.png", dpi=300)
     plt.close(fig)
-    return dict(quail_busy=round(
-        sum(e - s for s, e in _merged(sorted(quail_evs)))
-        / (max(e for _, e in quail_evs)
-           - min(s for s, _ in quail_evs)), 4))
+    return dict(quail_busy=round(quail_busy, 4),
+                stock_busy_corrected=round(stock_busy, 4),
+                stock_busy_raw=round(stock_raw, 4),
+                stock_trace_stretch=round(stretch, 2))
 
 
 def fig_bio2_cpu(workdir, stockb):
