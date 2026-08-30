@@ -48,8 +48,9 @@ SGLang's radix cache stores KV only for finished requests, so
 vLLM's anchor-major pair order recomputes an anchor for every
 sibling in flight. `baselines.stock.suffix_major_tiled_order` adds a
 suffix-major order within anchor tiles sized to half the measured KV
-pool; the SGLang client uses it by default and anchor-major stays
-selectable. Answers return in anchor-major order either way. On
+pool; the SGLang client always submits joins in that order, while
+stock vLLM keeps anchor-major. Answers return in anchor-major pair
+order either way. On
 IMDB-3 the tiled order cut the query from 213.2 to 83.9 seconds; on
 BIO-2 it cost 15% despite a higher cache hit rate.
 

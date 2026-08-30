@@ -160,11 +160,13 @@ BIO-2 shows the limit of ordering alone:
   kernels; about 1.2% of BIO-2 pairs net flipped, accuracy slightly
   up on SGLang), not between submission orders.
 
-The runner keeps the tiled order as its default: it caps the
+The runner submits SGLang joins only in the tiled order: it caps the
 downside on queries with few pairs per anchor (IMDB-3 was 4.05 times
 slower than vLLM anchor-major, 1.59 times slower tiled) and costs
-15% on deep-anchor queries like BIO-2. Anchor-major remains
-selectable through `join_submission`.
+15% on deep-anchor queries like BIO-2. The anchor-major SGLang
+measurements above came from the runner before the tiled order
+landed (that code is in git history); stock vLLM still submits
+anchor-major.
 
 ## Configuration
 

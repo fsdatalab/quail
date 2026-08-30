@@ -120,8 +120,15 @@ class StockSGLangClient:
     """The subset of vLLM's LLM surface used by the stage-major client.
 
     Wraps a running sglang Engine so ``run_query`` from
-    ``baselines.stock_vllm.run`` works unchanged.
+    ``baselines.stock_vllm.run`` works unchanged. Joins always go
+    suffix-major in anchor tiles sized to ``join_tile_budget_tokens``
+    (``baselines.stock.suffix_major_tiled_order``): the radix cache
+    stores a prompt's KV only when its request finishes, so vLLM's
+    anchor-major order recomputes an anchor for every sibling that is
+    already in flight.
     """
+
+    join_submission = "suffix-major-tiled"
 
     # Handing sglang all 563,500 BIO-2 pairs in one generate() call
     # keeps the driver process pegged for the whole join: one asyncio
@@ -133,8 +140,9 @@ class StockSGLangClient:
     submit_slice = 16_384
     slice_pause_s = 1.0
 
-    def __init__(self, engine):
+    def __init__(self, engine, join_tile_budget_tokens):
         self.engine = engine
+        self.join_tile_budget_tokens = join_tile_budget_tokens
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
         outputs = []
@@ -216,25 +224,6 @@ def _engine_settings(engine):
     return {field: info.get(field) for field in fields}
 
 
-def _use_tiled_joins(llm, capacity):
-    """Give joins the pair order SGLang's radix cache can exploit.
-
-    The radix cache stores a prompt's KV only when its request
-    finishes, so anchor-major submission recomputes an anchor for
-    every sibling admitted before the anchor's first pair completes.
-    Suffix-major tiles avoid that (see
-    baselines.stock.suffix_major_tiled_order). Half the KV pool
-    bounds a tile because in-flight suffixes and the previous tile's
-    leftovers share the pool with the tile's anchors.
-    """
-    llm.join_submission = "suffix-major-tiled"
-    llm.join_tile_budget_tokens = (
-        capacity["kv_cache_size_tokens"] // 2)
-    print(f"[{BASELINE}] join submission: {llm.join_submission} "
-          f"tile_budget_tokens={llm.join_tile_budget_tokens}",
-          flush=True)
-
-
 def _boot_client(model, mem_fraction_static):
     """Boot one sglang Engine plus tokenizer and answer token sets."""
     from baselines.stock_vllm.run import MODELS
@@ -262,11 +251,15 @@ def _boot_client(model, mem_fraction_static):
         disable_radix_cache=False,
         disable_prefill_cuda_graph=True,
         log_level="warning")
-    llm = StockSGLangClient(engine)
+    capacity = _sglang_filter_capacity(engine)
+    # Half the KV pool bounds a join tile: in-flight suffixes and the
+    # previous tile's leftovers share the pool with the tile's anchors.
+    llm = StockSGLangClient(
+        engine, capacity["kv_cache_size_tokens"] // 2)
     sp = {"temperature": 0.0, "max_new_tokens": 1,
           "logit_bias": {str(t): TRUE_FALSE_LOGIT_BIAS
                          for t in allowed}}
-    return llm, boot, sp, tokenizer, true, allowed, hf_name
+    return llm, boot, sp, tokenizer, true, allowed, hf_name, capacity
 
 
 @app.function(timeout=2400, **GPU_KW)
@@ -276,13 +269,13 @@ def probe(model: str = "qwen3-4b-fp8",
     from baselines.stock_vllm.run import _run_filter_stage, _run_join
     from quail.bench.quailb import F1, DISCUSS_ASPECT
 
-    llm, boot, sp, tokenizer, true, allowed, hf_name = _boot_client(
-        model, mem_fraction_static)
-    capacity = _sglang_filter_capacity(llm.engine)
+    (llm, boot, sp, tokenizer, true, allowed, hf_name,
+     capacity) = _boot_client(model, mem_fraction_static)
     settings = _engine_settings(llm.engine)
-    _use_tiled_joins(llm, capacity)
     print(f"[probe] boot: {boot}", flush=True)
-    print(f"[probe] KV capacity: {capacity}", flush=True)
+    print(f"[probe] KV capacity: {capacity} "
+          f"join_tile_budget_tokens={llm.join_tile_budget_tokens}",
+          flush=True)
     print(f"[probe] settings: {settings}", flush=True)
 
     llm.generate([{"prompt_token_ids": allowed}], sp, use_tqdm=False)
@@ -331,13 +324,13 @@ def _run_query_batch(model, sf, query_ids_csv, reps,
     )
 
     data_path = build_sets(DATA_DIR, sf, lf)
-    llm, boot, sp, tokenizer, true, allowed, hf_name = _boot_client(
-        model, mem_fraction_static)
-    filter_capacity = _sglang_filter_capacity(llm.engine)
+    (llm, boot, sp, tokenizer, true, allowed, hf_name,
+     filter_capacity) = _boot_client(model, mem_fraction_static)
     engine_settings = _engine_settings(llm.engine)
-    _use_tiled_joins(llm, filter_capacity)
     print(f"[{BASELINE}] boot: {boot}", flush=True)
-    print(f"[{BASELINE}] KV capacity: {filter_capacity}", flush=True)
+    print(f"[{BASELINE}] KV capacity: {filter_capacity} "
+          f"join_tile_budget_tokens={llm.join_tile_budget_tokens}",
+          flush=True)
     print(f"[{BASELINE}] settings: {engine_settings}", flush=True)
 
     llm.generate([{"prompt_token_ids": allowed}], sp, use_tqdm=False)
