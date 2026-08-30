@@ -218,13 +218,11 @@ one order of magnitude.
   regret there. Quail loses because retention misfires: the keep
   credit models one document of admission headroom where the loop
   needs about two chunk budgets, and eviction frees one blocked
-  document at a time. The first fix to try is freeze-at-watermark:
-  retain survivors until the arena holds the admission working set
-  beside them (about arena minus two chunk budgets - exactly where
-  the runtime's retained mass converged on its own), then stop
-  retaining and run the rest of the scan on the fast path. Bulk
-  eviction and pricing churn against hit value in the planner are
-  the fallback variants.
+  document at a time. The fix - reserve the loop's two-chunk
+  working set up front and cap retained KV at what is left (about
+  arena minus two chunk budgets, exactly where the runtime's
+  retained mass converged on its own) - shipped as the scan ring;
+  measured result in `2026-08-30-kv-ring-fix.md`.
 - BIO-2's win is per-request machinery, now measured on the GPU
   timeline: stock leaves the GPU idle about 82% of the time at a
   99.55% cache hit rate, while Quail runs 99% busy on the same
