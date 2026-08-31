@@ -18,7 +18,7 @@ exploit, over the identical cross product.
 Engine settings mirror the vLLM baseline configuration:
 
     vLLM                              SGLang
-    gpu_memory_utilization=0.91       mem_fraction_static=0.78
+    gpu_memory_utilization=0.91       mem_fraction_static=0.76
                                       (see MEM_FRACTION_STATIC)
     max_num_seqs=4096                 max_running_requests=4096
     max_num_batched_tokens=25305      chunked_prefill_size=25296,
@@ -94,9 +94,13 @@ DEFAULT_QUERY_IDS = "BIO-2,IMDB-3"
 # batches up to max_running_requests=4096, and the final-position
 # logits and the logit-bias tensor are each
 # 4096 x vocab x 4 bytes = 2.3 GB. 0.91 and 0.85 both ran out of GPU
-# memory mid-join; 0.78 leaves about 17 GB for all of it, at the cost
-# of a KV pool about 13% smaller than vLLM's 479,248 tokens.
-MEM_FRACTION_STATIC = 0.78
+# memory mid-join. 0.78 completed every page_size=1 run without an
+# allocation failure, but under page_size=16 the 2026-08-31 run's
+# allocator cache fragmented until free memory hit 5 MB and the 2.3 GB
+# tensors only fit by stalling CUDA to flush and retry (three times
+# across the run). 0.76 gives them room; it costs about 11,500 KV pool
+# tokens (2.8%).
+MEM_FRACTION_STATIC = 0.76
 MAX_NUM_SEQS = 4096
 MAX_NUM_BATCHED_TOKENS = 25_305
 # Both joins are host-bound, not GPU-bound: the measured BIO-2 join
@@ -154,12 +158,13 @@ class StockSGLangClient:
     # task per request, and the Modal health heartbeat thread starves
     # until Modal marks the container unhealthy. Each slice is still
     # four times deeper than max_running_requests, so the engine's
-    # queue never runs dry inside a slice. The pause between slices
-    # only needs to hand the GIL to the heartbeat thread; the engine's
-    # queue is empty during it, so every extra tenth of a second is
-    # idle GPU time at each of BIO-2's 34 slice boundaries.
+    # queue never runs dry inside a slice. The pause is the heartbeat
+    # thread's only GIL-free window: at 0.1 s the 2026-08-31 run's
+    # heartbeat went unanswered for stretches over four minutes, so
+    # the pause stays at the measured-safe 1.0 s and costs BIO-2 about
+    # 34 idle seconds across its 34 slice boundaries.
     submit_slice = 16_384
-    slice_pause_s = 0.1
+    slice_pause_s = 1.0
 
     def __init__(self, engine, capacity):
         self.engine = engine
