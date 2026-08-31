@@ -21,11 +21,15 @@ Engine settings mirror the vLLM baseline configuration:
     gpu_memory_utilization=0.91       mem_fraction_static=0.78
                                       (see MEM_FRACTION_STATIC)
     max_num_seqs=4096                 max_running_requests=4096
-    max_num_batched_tokens=25305      chunked_prefill_size=25305,
-                                      max_prefill_tokens=25305
+    max_num_batched_tokens=25305      chunked_prefill_size=25296,
+                                      max_prefill_tokens=25296
+                                      (25305 rounded down to a
+                                      16-token page multiple)
+    16-token cache blocks             page_size=16
     enable_prefix_caching=True        radix cache on (default)
     allowed_token_ids=TRUE/FALSE      logit_bias=+1000 on the same ids
     (KV pool sized after profiling)   disable_prefill_cuda_graph=True
+    (tokenizer in-process)            skip_tokenizer_init=True
 
 Default run (BIO-2 and IMDB-3 at sf=0.1 on qwen3-4b-fp8):
     uv run modal run -m baselines.stock_sglang.run::main
@@ -95,6 +99,16 @@ DEFAULT_QUERY_IDS = "BIO-2,IMDB-3"
 MEM_FRACTION_STATIC = 0.78
 MAX_NUM_SEQS = 4096
 MAX_NUM_BATCHED_TOKENS = 25_305
+# Both joins are host-bound, not GPU-bound: the measured BIO-2 join
+# moved 5,545 fresh tokens/s while the per-request bookkeeping ran at
+# 448 pairs/s. 16-token pages (vLLM's block size) cut the radix-tree
+# and KV-index work per request 16x; the cost is that prefix hits
+# round down to a page multiple, about 8 extra fresh tokens per
+# request, which the idle GPU absorbs. sglang requires
+# chunked_prefill_size to be divisible by page_size, so vLLM's 25,305
+# token budget rounds down to 25,296 (9 tokens, 0.04%).
+PAGE_SIZE = 16
+CHUNKED_PREFILL_TOKENS = (MAX_NUM_BATCHED_TOKENS // PAGE_SIZE) * PAGE_SIZE
 
 # vLLM restricts decoding with allowed_token_ids. SGLang has no direct
 # equivalent, so the same token ids get a large additive bias instead.
@@ -140,13 +154,16 @@ class StockSGLangClient:
     # task per request, and the Modal health heartbeat thread starves
     # until Modal marks the container unhealthy. Each slice is still
     # four times deeper than max_running_requests, so the engine's
-    # queue never runs dry inside a slice; the short pause between
-    # slices lets the heartbeat thread run.
+    # queue never runs dry inside a slice. The pause between slices
+    # only needs to hand the GIL to the heartbeat thread; the engine's
+    # queue is empty during it, so every extra tenth of a second is
+    # idle GPU time at each of BIO-2's 34 slice boundaries.
     submit_slice = 16_384
-    slice_pause_s = 1.0
+    slice_pause_s = 0.1
 
     def __init__(self, engine, capacity):
         self.engine = engine
+        self.block_size = capacity["block_size"]
         # Half the KV pool bounds a join tile: in-flight suffixes and
         # the previous tile's leftovers share the pool with the tile's
         # anchors. Filter admission gets the whole pool, matching the
@@ -215,7 +232,8 @@ class StockSGLangClient:
         return dict(wall=wall, survivors=sorted(survivors),
                     answers=answers, doc_cap=cap,
                     budget_tokens=self.filter_budget_tokens,
-                    block_size=1, max_num_seqs=MAX_NUM_SEQS,
+                    block_size=self.block_size,
+                    max_num_seqs=MAX_NUM_SEQS,
                     **counters)
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
@@ -310,18 +328,24 @@ def _boot_client(model, mem_fraction_static):
     allowed = sorted(true | false)
 
     # Prefill CUDA graphs retain ~130 MB of capture memory per shape
-    # (91 shapes up to the 25,305-token budget), which does not fit
+    # (91 shapes up to the 25,296-token budget), which does not fit
     # next to a KV pool sized at 0.91 of the GPU; vLLM sizes its KV
     # pool after profiling, so its 0.91 already accounts for
     # activations. Disabling the prefill graph keeps the memory split
     # equivalent. This workload packs many cached-prefix requests per
     # prefill batch, so per-batch launch overhead is amortized anyway.
+    # skip_tokenizer_init: the client sends token ids and reads token
+    # ids back, so the detokenizer would be pure per-request overhead;
+    # with the flag set the scheduler sends results straight to the
+    # driver and the detokenizer process sits idle.
     engine, boot = time_engine_boot(
         model_path=hf_name,
         mem_fraction_static=mem_fraction_static,
         max_running_requests=MAX_NUM_SEQS,
-        chunked_prefill_size=MAX_NUM_BATCHED_TOKENS,
-        max_prefill_tokens=MAX_NUM_BATCHED_TOKENS,
+        chunked_prefill_size=CHUNKED_PREFILL_TOKENS,
+        max_prefill_tokens=CHUNKED_PREFILL_TOKENS,
+        page_size=PAGE_SIZE,
+        skip_tokenizer_init=True,
         disable_radix_cache=False,
         disable_prefill_cuda_graph=True,
         log_level="warning")
@@ -499,7 +523,9 @@ def _run_query_batch(model, sf, query_ids_csv, reps,
                     "suffix-major in anchor tiles"),
         checkpoint="pre-quantized FP8",
         max_num_seqs=MAX_NUM_SEQS,
-        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        max_num_batched_tokens=CHUNKED_PREFILL_TOKENS,
+        page_size=PAGE_SIZE,
+        skip_tokenizer_init=True,
         mem_fraction_static=mem_fraction_static,
         enable_prefix_caching=True,
         true_false_logit_bias=TRUE_FALSE_LOGIT_BIAS,

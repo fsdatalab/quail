@@ -40,6 +40,7 @@ def _client(engine, budget_tokens):
     client = StockSGLangClient.__new__(StockSGLangClient)
     client.engine = engine
     client.filter_budget_tokens = budget_tokens
+    client.block_size = 16
     return client
 
 
