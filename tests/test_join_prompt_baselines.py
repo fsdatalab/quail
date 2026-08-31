@@ -143,9 +143,12 @@ def test_join_anchor_uses_larger_mean_surviving_document_length():
 def test_join_execution_uses_the_selected_anchor(monkeypatch):
     tokenizer = CharTokenizer()
 
-    def fake_join(_llm, _sp, prefixes, suffixes, _true_set):
+    def fake_join(_llm, _sp, prefixes, suffixes, _true_set,
+                  submission="anchor-major", tile_budget_tokens=None):
         assert len(prefixes) == 2
         assert len(suffixes) == 2
+        assert submission == "anchor-major"
+        assert tile_budget_tokens is None
         return dict(
             answers=[1, 0, 0, 1],
             fresh_tokens=100,
@@ -427,3 +430,77 @@ def test_three_way_stock_join_prompts_match_quail():
                 bound, tuple_documents, anchor=1, tokenizer=tok)
 
     assert members == list(itertools.product(range(2), range(2)))
+
+
+def _tiled_order_tiles(order, n_suffixes):
+    """Split a suffix-major-tiled order back into its anchor tiles."""
+    tiles = []
+    position = 0
+    while position < len(order):
+        tile = []
+        while (position + len(tile) < len(order)
+               and order[position + len(tile)][1] == 0):
+            tile.append(order[position + len(tile)][0])
+        assert tile, "each tile must start with suffix 0"
+        expected = [
+            (anchor_index, suffix_index)
+            for suffix_index in range(n_suffixes)
+            for anchor_index in tile
+        ]
+        assert order[position:position + len(expected)] == expected
+        tiles.append(tile)
+        position += len(expected)
+    return tiles
+
+
+def test_suffix_major_tiles_cover_all_pairs_within_budget():
+    from baselines.stock import suffix_major_tiled_order
+
+    prefixes = [[0] * length for length in (30, 30, 30, 50, 10, 90)]
+    suffixes = [[0] * 5, [0] * 3]
+    budget = 100
+
+    order = suffix_major_tiled_order(prefixes, suffixes, budget)
+    assert sorted(order) == sorted(
+        (i, j) for i in range(len(prefixes))
+        for j in range(len(suffixes)))
+
+    tiles = _tiled_order_tiles(order, len(suffixes))
+    assert [anchor for tile in tiles for anchor in tile] == list(
+        range(len(prefixes)))
+    for tile in tiles:
+        cost = sum(len(prefixes[anchor]) + 5 for anchor in tile)
+        assert cost <= budget or len(tile) == 1
+
+
+def test_tiled_join_answers_match_anchor_major_order():
+    from baselines.stock import run_join_grouped
+
+    prefixes = [[100 + i] * (4 + i) for i in range(5)]
+    suffixes = [[200 + j] * 3 for j in range(4)]
+
+    class ParityLLM:
+        def generate(self, prompts, _sp, use_tqdm=False):
+            outs = []
+            for prompt in prompts:
+                ids = prompt["prompt_token_ids"]
+                bit = 1 if (ids[0] + ids[-1]) % 2 == 0 else 0
+                outs.append(SimpleNamespace(
+                    outputs=[SimpleNamespace(token_ids=[bit])],
+                    prompt_token_ids=ids,
+                    num_cached_tokens=0))
+            return outs
+
+    baseline = run_join_grouped(
+        ParityLLM(), object(), prefixes, suffixes, {1})
+    tiled = run_join_grouped(
+        ParityLLM(), object(), prefixes, suffixes, {1},
+        submission="suffix-major-tiled", tile_budget_tokens=20)
+
+    assert baseline["answers"] == tiled["answers"]
+    assert baseline["prompt_tokens"] == tiled["prompt_tokens"]
+    assert tiled["submission"] == "suffix-major-tiled"
+
+    with pytest.raises(ValueError):
+        run_join_grouped(ParityLLM(), object(), prefixes, suffixes,
+                         {1}, submission="suffix-major-tiled")
