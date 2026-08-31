@@ -94,15 +94,14 @@ DEFAULT_QUERY_IDS = "BIO-2,IMDB-3"
 # batches up to max_running_requests=4096, and the final-position
 # logits and the logit-bias tensor are each
 # 4096 x vocab x 4 bytes = 2.3 GB. 0.91 and 0.85 both ran out of GPU
-# memory mid-join. 0.78 completed every page_size=1 run without an
-# allocation failure. Under page_size=16 the extend batch's row count
+# memory mid-join. Under page_size=16 the extend batch's row count
 # varies step to step, so the float32 logits and logit-bias tensors
 # keep new segment sizes churning through the allocator cache; the
 # cache occasionally fills and a large allocation stalls CUDA to
-# flush and retry. That happens at 0.78 and 0.76 alike (three and
-# five retries in the two 2026-08-31 runs, all recovered), but 0.78
-# ran the post-flush headroom down to 5 MB free while 0.76 kept it
-# near a gigabyte. 0.76 costs about 11,500 KV pool tokens (2.8%).
+# flush and retry. That happens at 0.78 and 0.76 alike (recovered by
+# PyTorch each time), but 0.78 ran the post-flush headroom down to
+# 5 MB free while 0.76 kept it near a gigabyte. 0.76 costs about
+# 11,500 KV pool tokens (2.8%).
 MEM_FRACTION_STATIC = 0.76
 MAX_NUM_SEQS = 4096
 MAX_NUM_BATCHED_TOKENS = 25_305

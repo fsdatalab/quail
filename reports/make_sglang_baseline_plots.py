@@ -9,7 +9,7 @@ work directory to this script:
     modal volume get quail-results ablations/ringfix_tokens_head_imdb3.json $W/quail_ringfix_imdb3.json
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm.json
-    modal volume get quail-results pipelined_sglang/2026-08-31_021203_e40e08d2/summary.json $W/pipelined_sglang.json
+    modal volume get quail-results pipelined_sglang/TBD_VOLUME_LABEL/summary.json $W/pipelined_sglang.json
     uv run --with matplotlib python reports/make_sglang_baseline_plots.py $W
 """
 

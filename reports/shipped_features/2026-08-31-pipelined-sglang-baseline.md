@@ -45,8 +45,7 @@ submission pattern itself.
   cache pages (`page_size=16`, vLLM's block size) instead of
   SGLang's default per-token radix bookkeeping, and no tokenizer or
   detokenizer in the request path (`skip_tokenizer_init=True` —
-  the client already exchanges token ids). These two took BIO-2 from
-  1,256.9 to 1,028.7 seconds.
+  the client already exchanges token ids).
 - vLLM's `allowed_token_ids` restriction has no SGLang equivalent;
   the runner adds a +1000 `logit_bias` to the same eight TRUE/FALSE
   token ids, which picks the same token under greedy decoding
