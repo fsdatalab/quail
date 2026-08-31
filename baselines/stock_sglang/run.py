@@ -267,6 +267,8 @@ class StockSGLangClient:
 
     def reset_prefix_cache(self):
         ret = self.engine.flush_cache()
+        if isinstance(ret, bool):
+            return ret
         return bool(getattr(ret, "success", True))
 
 
