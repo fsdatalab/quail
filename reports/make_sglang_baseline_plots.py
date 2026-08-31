@@ -12,8 +12,8 @@ directory to this script:
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm.json
     modal volume get quail-results stock_vllm/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm_agent.json
     modal volume get quail-results pipelined_vllm/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm_agent.json
-    modal volume get quail-results pipelined_sglang/TBD_VOLUME_LABEL/summary.json $W/pipelined_sglang.json
-    modal volume get quail-results pipelined_sglang/2026-08-31_034457_9032b486/summary.json $W/pipelined_sglang_imdb3.json
+    modal volume get quail-results pipelined_sglang/2026-08-31_034457_9032b486/summary.json $W/pipelined_sglang_clean.json
+    modal volume get quail-results pipelined_sglang/2026-08-31_213347_9f85216d/summary.json $W/pipelined_sglang_agent.json
     uv run --with matplotlib python reports/make_sglang_baseline_plots.py $W
 
 The SoL file does not cover the agent queries, so the AGENT-1 panel
@@ -143,8 +143,8 @@ def main():
     pipelined_vllm = load(workdir / "pipelined_vllm.json")
     stock_vllm_agent = load(workdir / "stock_vllm_agent.json")
     pipelined_vllm_agent = load(workdir / "pipelined_vllm_agent.json")
-    pipelined_sglang = load(workdir / "pipelined_sglang.json")
-    pipelined_sglang_imdb3 = load(workdir / "pipelined_sglang_imdb3.json")
+    pipelined_sglang_clean = load(workdir / "pipelined_sglang_clean.json")
+    pipelined_sglang_agent = load(workdir / "pipelined_sglang_agent.json")
 
     if sol["scale_factor"] != 0.1:
         raise ValueError("unexpected SoL configuration")
@@ -159,7 +159,7 @@ def main():
     for summary in (pipelined_vllm, pipelined_vllm_agent):
         check(summary, "pipelined_vllm", "gpu_memory_utilization",
               0.91, "pipelined")
-    for summary in (pipelined_sglang, pipelined_sglang_imdb3):
+    for summary in (pipelined_sglang_clean, pipelined_sglang_agent):
         check(summary, "pipelined_sglang", "mem_fraction_static",
               0.76, "pipelined", join_submission="suffix-major-tiled",
               batched_tokens=25_296)
@@ -171,7 +171,7 @@ def main():
             "Quail": quail_walls["BIO-2"],
             "stock\nvLLM": entry_for(stock_vllm, "BIO-2"),
             "pipelined\nvLLM": entry_for(pipelined_vllm, "BIO-2"),
-            "pipelined\nSGLang": entry_for(pipelined_sglang, "BIO-2"),
+            "pipelined\nSGLang": entry_for(pipelined_sglang_clean, "BIO-2"),
         },
         "IMDB-3": {
             "SoL\nestimate":
@@ -180,14 +180,14 @@ def main():
             "stock\nvLLM": entry_for(stock_vllm, "IMDB-3"),
             "pipelined\nvLLM": entry_for(pipelined_vllm, "IMDB-3"),
             "pipelined\nSGLang":
-                entry_for(pipelined_sglang_imdb3, "IMDB-3"),
+                entry_for(pipelined_sglang_clean, "IMDB-3"),
         },
         "AGENT-1": {
             "Quail": quail_family_wall(quail_agent, "AGENT-1"),
             "stock\nvLLM": entry_for(stock_vllm_agent, "AGENT-1"),
             "pipelined\nvLLM":
                 entry_for(pipelined_vllm_agent, "AGENT-1"),
-            "pipelined\nSGLang": entry_for(pipelined_sglang, "AGENT-1"),
+            "pipelined\nSGLang": entry_for(pipelined_sglang_agent, "AGENT-1"),
         },
     }
 
