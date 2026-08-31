@@ -6,7 +6,6 @@ directory to this script:
     W=<workdir>
     modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
     modal volume get quail-results ablations/ringfix_bio2.json $W/quail_ringfix_bio2.json
-    modal volume get quail-results ablations/ringfix_tokens_head_imdb3.json $W/quail_ringfix_imdb3.json
     modal volume get quail-results benchmarks/quailb/runs/qb_20260831T062218Z_1192cd76/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail_agent.json
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm.json
@@ -34,7 +33,7 @@ plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
 from plot_colors import BLUE, GRAY, ORANGE, RED, TEAL  # noqa: E402
 
-QUERY_IDS = ("BIO-2", "IMDB-3", "AGENT-1")
+QUERY_IDS = ("BIO-2", "AGENT-1")
 MODEL = "qwen3-4b-fp8"
 SYSTEM_COLORS = {
     "SoL\nestimate": GRAY,
@@ -102,7 +101,9 @@ def annotate(ax, bar, wall_s):
 
 
 def figure(panels):
-    fig, axes = plt.subplots(1, len(panels), figsize=(16.5, 5.0))
+    fig, axes = plt.subplots(1, len(panels), figsize=(11.5, 5.0))
+    if len(panels) == 1:
+        axes = [axes]
     fig.subplots_adjust(wspace=0.3)
     for ax, (qid, subtitle, walls) in zip(axes, panels):
         names = list(walls)
@@ -136,8 +137,7 @@ def figure(panels):
 def main():
     workdir = Path(sys.argv[1])
     sol = load(workdir / "sol.json")
-    quail_runs = [load(workdir / "quail_ringfix_bio2.json"),
-                  load(workdir / "quail_ringfix_imdb3.json")]
+    quail_runs = [load(workdir / "quail_ringfix_bio2.json")]
     quail_agent = load(workdir / "quail_agent.json")
     stock_vllm = load(workdir / "stock_vllm.json")
     pipelined_vllm = load(workdir / "pipelined_vllm.json")
@@ -172,15 +172,6 @@ def main():
             "stock\nvLLM": entry_for(stock_vllm, "BIO-2"),
             "pipelined\nvLLM": entry_for(pipelined_vllm, "BIO-2"),
             "pipelined\nSGLang": entry_for(pipelined_sglang_clean, "BIO-2"),
-        },
-        "IMDB-3": {
-            "SoL\nestimate":
-                sol["queries"]["IMDB-3"]["models"][MODEL]["sol_s"],
-            "Quail": quail_walls["IMDB-3"],
-            "stock\nvLLM": entry_for(stock_vllm, "IMDB-3"),
-            "pipelined\nvLLM": entry_for(pipelined_vllm, "IMDB-3"),
-            "pipelined\nSGLang":
-                entry_for(pipelined_sglang_clean, "IMDB-3"),
         },
         "AGENT-1": {
             "Quail": quail_family_wall(quail_agent, "AGENT-1"),

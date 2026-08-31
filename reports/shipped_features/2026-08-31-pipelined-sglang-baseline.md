@@ -64,5 +64,5 @@ submission pattern itself.
 ## Numbers
 
 The measured comparison against the SoL estimate, Quail, and both
-vLLM baselines on BIO-2, AGENT-1, and IMDB-3 at sf=0.1 is in
+vLLM baselines on BIO-2 and AGENT-1 at sf=0.1 is in
 `reports/2026-08-31-sglang-baseline.md`.
