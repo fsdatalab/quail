@@ -105,18 +105,11 @@ Stated before the run:
   pair against vLLM's 0.6 — even though the tiled order gives SGLang
   the same cache hit rate (89.3% of join prompt tokens, against
   pipelined vLLM's 88.4%).
-- BIO-2's join has now been measured twice on identical code (the
-  tiled order): 1,384.5 seconds in the earlier run and 1,256.9 here,
-  9.2% apart. Single-run comparisons on this query carry error bars
-  of roughly that size; the earlier conclusion that the tiled order
-  costs 15% against anchor-major on BIO-2 (1,204.2 vs 1,384.5) is
-  really 4 to 15%.
-- Three SGLang runs with three different batch compositions
-  (anchor-major, tiled stage-major, tiled wave-chained) returned
-  bit-identical answers, so batch shape moves time, not answers.
-  The remaining answer divergence is between engines (different fp8
-  kernels; about 1.2% of BIO-2 pairs net flipped, accuracy slightly
-  up on SGLang).
+- Batch shape moves time, not answers: earlier SGLang runs with
+  anchor-major and stage-major submission returned bit-identical
+  answers to the pipelined run. The remaining answer divergence is
+  between engines (different fp8 kernels; about 1.2% of BIO-2 pairs
+  net flipped, accuracy slightly up on SGLang).
 - The single-stage IMDB-3 filter cannot show pipelining's real
   benefit (overlapping stage k+1 with stage k stragglers); the
   multi-stage chains in IMDB-4..7, BIO-4/5, FEV-4/6, and LEP-4..8
@@ -161,7 +154,7 @@ data.
   its next use. On BIO-2, where 1,127 pairs per report already hid
   the co-admission miss, the tiled order measures 4 to 15% slower
   than anchor-major; the runner accepts that cost to cap the
-  worst case. Figure: plots/sglang_join_order.png.
+  worst case.
 - Filter chains in waves. vLLM's pipelined client drives the
   in-process engine with a synchronous add_request/step loop. SGLang
   has no such surface, so every alive document keeps exactly one
@@ -202,13 +195,6 @@ used their own H100! containers on 2026-08-30.
 - Pipelined SGLang (the headline run), function call
   `fc-01M18NRQ1GB73P0CAZ9C2B9M7B`:
   `/results/pipelined_sglang/2026-08-30_063002_bf050db3/summary.json`
-- SGLang with stage-major filters and the tiled join order (the
-  join-order figure and the repeat measurement), function call
-  `fc-01M18ENA18EMP18BF43RXQVZK1`:
-  `/results/stock_sglang/2026-08-30_042550_e5f6d2e8/summary.json`
-- SGLang with stage-major filters and vLLM's anchor-major join
-  order, function call `fc-01M18BR9BP6A74BT3TK5EFM9Z3`:
-  `/results/stock_sglang/2026-08-30_033502_05712d88/summary.json`
 - Stock vLLM:
   `/results/stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`
 - Pipelined vLLM:
@@ -225,5 +211,5 @@ label sets under their earlier collection id
 `gt_02ffa2a5720006e8236aa993760e9e29`).
 
 The plot script `reports/make_sglang_baseline_plots.py` takes a work
-directory holding the seven pulled files; its docstring has the
+directory holding the pulled files; its docstring has the
 `modal volume get` commands.

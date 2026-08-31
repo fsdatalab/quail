@@ -1,6 +1,6 @@
 """Plot the SGLang baseline against SoL, Quail, and the vLLM baselines.
 
-Pull the seven inputs from the quail-results volume, then pass the
+Pull the five inputs from the quail-results volume, then pass the
 work directory to this script:
 
     W=<workdir>
@@ -10,8 +10,6 @@ work directory to this script:
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm.json
     modal volume get quail-results pipelined_sglang/2026-08-30_063002_bf050db3/summary.json $W/pipelined_sglang.json
-    modal volume get quail-results stock_sglang/2026-08-30_033502_05712d88/summary.json $W/stock_sglang_anchor_major.json
-    modal volume get quail-results stock_sglang/2026-08-30_042550_e5f6d2e8/summary.json $W/stock_sglang_tiled.json
     uv run --with matplotlib python reports/make_sglang_baseline_plots.py $W
 """
 
@@ -123,43 +121,6 @@ def five_way_figure(sol, quail_walls, entries):
     print(f"wrote {out_path}")
 
 
-def join_order_figure(entries):
-    systems = (
-        ("stock vLLM\n(anchor-major)", ORANGE),
-        ("SGLang\n(anchor-major)", GRAY),
-        ("SGLang\n(tiled)", RED),
-    )
-    keys = ("stock_vllm", "sglang_anchor_major", "sglang_tiled")
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0))
-    fig.subplots_adjust(wspace=0.3)
-    for ax, qid in zip(axes, QUERY_IDS):
-        rows = [entries[key][qid] for key in keys]
-        walls = [row["total_wall_s"] for row in rows]
-        names = [name for name, _color in systems]
-        colors = [color for _name, color in systems]
-        bars = ax.bar(names, walls, color=colors, width=0.6)
-        for bar, row in zip(bars, rows):
-            pairs = join_pairs(row)
-            ax.annotate(
-                f"{row['total_wall_s']:,.1f} s\n"
-                f"{pairs / row['total_wall_s']:,.0f} pairs/s",
-                (bar.get_x() + bar.get_width() / 2, bar.get_height()),
-                ha="center", va="bottom", fontsize=9)
-        ratio = walls[1] / walls[2]
-        direction = "faster" if ratio >= 1 else "slower"
-        factor = ratio if ratio >= 1 else 1 / ratio
-        ax.set_title(
-            f"{qid} — join submission order on SGLang\n"
-            f"tiled {factor:.2f}x {direction} than anchor-major")
-        ax.set_ylabel("seconds")
-        ax.set_ylim(0, max(walls) * 1.35)
-        ax.tick_params(axis="x", labelsize=9)
-        ax.spines[["top", "right"]].set_visible(False)
-    out_path = OUT / "sglang_join_order.png"
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
-    print(f"wrote {out_path}")
-
-
 def main():
     workdir = Path(sys.argv[1])
     sol = load(workdir / "sol.json")
@@ -168,8 +129,6 @@ def main():
     stock_vllm = load(workdir / "stock_vllm.json")
     pipelined_vllm = load(workdir / "pipelined_vllm.json")
     pipelined_sglang = load(workdir / "pipelined_sglang.json")
-    anchor_major = load(workdir / "stock_sglang_anchor_major.json")
-    tiled = load(workdir / "stock_sglang_tiled.json")
 
     if sol["scale_factor"] != 0.1:
         raise ValueError("unexpected SoL configuration")
@@ -186,22 +145,15 @@ def main():
           0.91, "pipelined")
     check(pipelined_sglang, "pipelined_sglang", "mem_fraction_static",
           0.78, "pipelined", join_submission="suffix-major-tiled")
-    check(anchor_major, "stock_sglang", "mem_fraction_static", 0.78,
-          "stage-major")
-    check(tiled, "stock_sglang", "mem_fraction_static", 0.78,
-          "stage-major", join_submission="suffix-major-tiled")
 
     entries = {
         "stock_vllm": query_entries(stock_vllm),
         "pipelined_vllm": query_entries(pipelined_vllm),
         "pipelined_sglang": query_entries(pipelined_sglang),
-        "sglang_anchor_major": query_entries(anchor_major),
-        "sglang_tiled": query_entries(tiled),
     }
 
     OUT.mkdir(exist_ok=True)
     five_way_figure(sol, quail_walls, entries)
-    join_order_figure(entries)
 
     for qid in QUERY_IDS:
         print(f"{qid} SoL estimate: "
