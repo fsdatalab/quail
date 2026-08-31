@@ -393,7 +393,7 @@ def probe(model: str = "qwen3-4b-fp8",
           f"cached_tokens={filter_result['cached_tokens']}", flush=True)
 
     (join_result, n_pairs, _sl, _sr, n_true, _tp, _pairs, join_answers,
-     anchor, _mdt) = _run_join(
+     anchor, _mdt, _prefixes) = _run_join(
         llm, sp, true, DISCUSS_ASPECT, texts, ["the acting", "the plot"],
         tokenizer)
     print(f"[probe] join: {n_true}/{n_pairs} TRUE anchor={anchor} "
