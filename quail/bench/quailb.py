@@ -1,5 +1,7 @@
-"""QUAIL-B: thirty queries over four document sets (IMDB, BioDEX,
-FEVER, LePaRD), plus two optional PrivacyPolicies queries.
+"""QUAIL-B: thirty-two queries over five document sets.
+
+The default sets are IMDB, BioDEX, FEVER, LePaRD, and SWE-Next agent
+trace snapshots. Two optional PrivacyPolicies queries are also available.
 
     uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8 --gpus 1
 """
@@ -21,8 +23,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 DATA_SEED = 20260818
-CACHE_SCHEMA_VERSION = 7
+CACHE_SCHEMA_VERSION = 9
 LEPARD_POSITIVE_PAIRS = 5_000
+AGENT_TRACE_DOCUMENTS = 17_718
+AGENT_TRACE_TURN_INTERVAL = 5
+AGENT_TRACE_MAX_TOKENS = 24_000
+AGENT_TRACE_TOKENIZER = "Qwen/Qwen3-4B-FP8"
+AGENT_TRACE_TOKENIZER_REVISION = (
+    "96b30dc13593a244a5e59e84687309f53c375cfa"
+)
 
 # Exact source snapshots for the benchmark corpus.  The row selection below
 # is deterministic only when the upstream revisions are fixed as well as the
@@ -35,6 +44,8 @@ SOURCE_REVISIONS = {
     # resolved commit for refs/convert/parquet rather than the default branch.
     "fever/fever": "5f577157472532aa1d9924d2df63aac44f70cf2b",
     "rmahari/LePaRD": "0194f95c3091acceab3b887c9b09ef432cf84052",
+    "TIGER-Lab/SWE-Next-SFT-Trajectories":
+        "e378a60ddd7050fe9519a31a4d41d4872eeec6ac",
     "mukund/PrivacyPolicies":
         "8fd6abfc7ca99d1f95c7f3f3a5dd5ea0cf9b7deb",
 }
@@ -45,6 +56,7 @@ SETS = {
     "reviews": 50_000,
     "reports": 5_000,
     "claims": 5_000,
+    "agent_traces": AGENT_TRACE_DOCUMENTS,
     "policies": 1_000_000,
 }
 
@@ -58,6 +70,7 @@ QUERY_ORDER = (
     *(f"BIO-{i}" for i in range(1, 4)),
     *(f"FEV-{i}" for i in range(1, 10)),
     *(f"LEP-{i}" for i in range(1, 9)),
+    *(f"AGENT-{i}" for i in range(1, 3)),
 )
 
 QUERY_FAMILY_WORKLOADS = {
@@ -65,6 +78,7 @@ QUERY_FAMILY_WORKLOADS = {
     "BIO": "biodex",
     "FEV": "fever",
     "LEP": "lepard",
+    "AGENT": "agent",
 }
 
 
@@ -113,6 +127,110 @@ def _n_docs(name, sf):
 
 def _n_lepard_pairs(sf):
     return max(8, int(LEPARD_POSITIVE_PAIRS * sf))
+
+
+def _n_agent_documents(sf):
+    return min(
+        AGENT_TRACE_DOCUMENTS,
+        max(8, round(AGENT_TRACE_DOCUMENTS * sf)),
+    )
+
+
+def _agent_message_text(message) -> str:
+    """Render one agent message in the stored trace format."""
+    content = message.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(
+            content, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False)
+    return f"[{str(message.get('role', '')).upper()}]\n{content}"
+
+
+def _agent_snapshot_boundaries(messages) -> tuple[str, list[tuple[int, int]]]:
+    """Render one trace and return every fifth completed turn."""
+    targets = {}
+    assistant_turn = 0
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        assistant_turn += 1
+        if assistant_turn % AGENT_TRACE_TURN_INTERVAL:
+            continue
+        end = index + 1
+        if end < len(messages) and messages[end].get("role") == "tool":
+            end += 1
+        targets[end] = assistant_turn
+
+    pieces = []
+    boundaries = []
+    length = 0
+    for message_number, message in enumerate(messages, start=1):
+        piece = _agent_message_text(message)
+        if pieces:
+            length += 2
+        pieces.append(piece)
+        length += len(piece)
+        if message_number in targets:
+            boundaries.append((targets[message_number], length))
+    return "\n\n".join(pieces), boundaries
+
+
+def _agent_has_issue(messages) -> bool:
+    """Return whether the trace contains a nonempty user issue."""
+    return any(
+        message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+        and bool(message["content"].strip())
+        for message in messages
+    )
+
+
+def _agent_trace_rows(trace_index, messages, tokenizer) -> list[dict]:
+    """Build the eligible snapshots for one SWE-Next trace."""
+    if not _agent_has_issue(messages):
+        return []
+    text, boundaries = _agent_snapshot_boundaries(messages)
+    rows = []
+    for turn_index, end in boundaries:
+        snapshot = text[:end]
+        token_count = len(tokenizer.encode(
+            snapshot, add_special_tokens=False))
+        if token_count > AGENT_TRACE_MAX_TOKENS:
+            continue
+        rows.append({
+            "id": f"at{trace_index:04d}-t{turn_index:03d}",
+            "trace": snapshot,
+            "trajectory_id": f"at{trace_index:04d}",
+            "turn_index": turn_index,
+            "token_count": token_count,
+        })
+    return rows
+
+
+def _agent_rows(n):
+    """Read SWE-Next and select a nested sample of trace snapshots."""
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    source = load_dataset(
+        "TIGER-Lab/SWE-Next-SFT-Trajectories",
+        split="train",
+        revision=SOURCE_REVISIONS["TIGER-Lab/SWE-Next-SFT-Trajectories"],
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        AGENT_TRACE_TOKENIZER,
+        revision=AGENT_TRACE_TOKENIZER_REVISION,
+    )
+    order = np.random.default_rng(DATA_SEED).permutation(len(source))
+    rows = []
+    for trace_index in order:
+        rows.extend(_agent_trace_rows(
+            int(trace_index), source[int(trace_index)]["messages"],
+            tokenizer))
+        if len(rows) >= n:
+            return rows[:n]
+    raise ValueError(
+        f"SWE-Next produced {len(rows)} eligible snapshots, expected {n}")
 
 
 # ------------------------------------------------------- set builders
@@ -374,8 +492,29 @@ def _build_policies(d, sf, force=False):
     }), scen_path)
 
 
+def _build_agent_traces(d, sf, force=False):
+    """Build the SWE-Next cumulative trace snapshots."""
+    path = d / "agent_traces.parquet"
+    if path.exists() and not force:
+        return
+    rows = _agent_rows(_n_agent_documents(sf))
+    schema = pa.schema([
+        ("id", pa.string()),
+        ("trace", pa.string()),
+        ("trajectory_id", pa.string()),
+        ("turn_index", pa.int32()),
+        ("token_count", pa.int32()),
+    ])
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=schema),
+        path,
+        compression="zstd",
+        use_dictionary=False,
+    )
+
+
 def build_sets(data_dir, sf, lf=1):
-    """All eight tables as parquet files, cached by sf.
+    """Build the benchmark tables as Parquet files, cached by sf.
 
     lf (load factor) is accepted but unused: documents here are real
     and unpadded, so there's nothing to scale. Kept in the signature
@@ -396,10 +535,20 @@ def build_sets(data_dir, sf, lf=1):
             current = None
         if current == expected:
             _build_lepard(d, sf)
+            _build_agent_traces(d, sf)
             return d
-        same_sources = current and all(
-            current.get(key) == expected[key]
-            for key in ("data_seed", "scale_factor", "source_revisions")
+        base_sources = {
+            name: revision for name, revision in SOURCE_REVISIONS.items()
+            if name != "TIGER-Lab/SWE-Next-SFT-Trajectories"
+        }
+        same_sources = (
+            current
+            and current.get("data_seed") == DATA_SEED
+            and current.get("scale_factor") == sf
+            and all(
+                current.get("source_revisions", {}).get(name) == revision
+                for name, revision in base_sources.items()
+            )
         )
         other_tables = (
             "reviews", "aspects", "reports", "terms", "claims", "evidence"
@@ -407,6 +556,7 @@ def build_sets(data_dir, sf, lf=1):
         if same_sources and all((d / f"{name}.parquet").exists()
                                 for name in other_tables):
             _build_lepard(d, sf, force=True)
+            _build_agent_traces(d, sf, force=True)
             marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
             return d
     d.mkdir(parents=True, exist_ok=True)
@@ -449,6 +599,7 @@ def build_sets(data_dir, sf, lf=1):
     }), d / "evidence.parquet")
 
     _build_lepard(d, sf, force=True)
+    _build_agent_traces(d, sf, force=True)
 
     marker.write_text(json.dumps({
         "cache_schema_version": CACHE_SCHEMA_VERSION,
@@ -464,7 +615,7 @@ def register_sets(sess, data_dir):
     from quail.catalog import DocumentProvider
     for name in ("reviews", "aspects", "reports", "terms",
                 "claims", "evidence", "citation_contexts",
-                "citation_passages"):
+                "citation_passages", "agent_traces"):
         sess.register(name, DocumentProvider.from_parquet(
             str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
 
@@ -514,24 +665,28 @@ F7 = ("Judge strictly from the report above whether it describes a "
       "TRUE if the report describes a case involving a female patient, "
       "FALSE otherwise.")
 
-F8 = ("Judge strictly from the report above whether it describes "
-      "combination drug therapy.\n\n{0}\n\nInstruction: answer TRUE if "
-      "the report describes combination drug therapy, FALSE otherwise.")
-
-F9 = ("Judge strictly from the report above whether it describes a "
-      "serious or life-threatening adverse event.\n\n{0}\n\n"
-      "Instruction: answer TRUE if the report describes a serious or "
-      "life-threatening adverse event, FALSE otherwise.")
-
 REACTION = ("Does the medical report in DOCUMENT {0} describe the "
             "reaction in DOCUMENT {1} as something the patient "
             "experienced?")
 
-# BIO-6 only: a second question over the same terms table, joined
-# under alias m2, so the star shape has two distinct stages.
-REACTION_SEVERE = ("Does the medical report in DOCUMENT {0} describe "
-                   "the reaction in DOCUMENT {1} as serious or life "
-                   "threatening for the patient?")
+AGENT_RECOVERED = (
+    "Judge strictly from the agent trace above whether the agent recovered "
+    "after pursuing an approach that did not work. Recovery means the agent "
+    "recognized or moved past the unsuccessful approach and then made useful "
+    "progress with a different or corrected approach.\n\n{0}\n\n"
+    "Instruction: answer TRUE if the trace shows the agent recovering after "
+    "an unsuccessful approach, FALSE otherwise."
+)
+
+AGENT_IMPLEMENTED_FIX = (
+    "Judge strictly from the agent trace above whether, by the end of the "
+    "trace, the agent has implemented a plausible fix that directly addresses "
+    "the reported issue. A fix must include a code or configuration change "
+    "whose purpose is to correct the issue. Inspection, reproduction, tests "
+    "without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: "
+    "answer TRUE if the agent has implemented a plausible fix that directly "
+    "addresses the reported issue. Answer FALSE otherwise."
+)
 
 F11 = ("Judge strictly from the claim above whether it asserts "
        "something about a person, rather than an organization, place, "
@@ -903,16 +1058,16 @@ SCENARIOS = [
 ]
 # Fixed planner inputs from the sf=0.1 Qwen3 32B fp8 labels.
 # They apply at every scale factor so query planning does not read answers.
-SELECTIVITY_ESTIMATE_COLLECTION = "gt_363b5ab570635c33894e1a030c21f57e"
-SELECTIVITY_ESTIMATE_CORPUS = "c_3bd14ed0758287cba9d88fb68de8b7b8"
+SELECTIVITY_ESTIMATE_COLLECTION = "gt_77bb8b128743a79aedddaa24c808c3f8"
+SELECTIVITY_ESTIMATE_CORPUS = "c_1aa2c4f0d0b6c816fd37aa5748c33341"
 SELECTIVITY_ESTIMATE_SCALE_FACTOR = 0.1
 FILTER_SELECTIVITY_ESTIMATES = {
     F1: 4004 / 5000,
     F4: 1218 / 5000,
     F5: 2853 / 5000,
     F7: 306 / 500,
-    F8: 341 / 500,
-    F9: 319 / 500,
+    AGENT_RECOVERED: 570 / 1772,
+    AGENT_IMPLEMENTED_FIX: 537 / 1772,
     F11: 296 / 500,
     F12: 69 / 500,
     F13: 159 / 287,
@@ -927,7 +1082,6 @@ JOIN_SELECTIVITY_ESTIMATES = {
     DISCUSS_ASPECT: 17683 / 60000,
     ASPECT_SENTIMENT: 9635 / 60000,
     REACTION: 19144 / 563500,
-    REACTION_SEVERE: 22921 / 563500,
     SUPPORT: 311 / 143500,
     REFUTE: 477 / 143500,
     LEPJOIN: 500 / 216500,
@@ -1174,6 +1328,13 @@ def queries(sess):
     q["LEP-8"] = ("LEP1..LEP5, 5 filters, no join", make(
         "citation_contexts", "d", "destination_context",
         [LEP1, LEP2, LEP3, LEP4, LEP5], [], ["d.id"]))
+
+    # SWE-Next: semantic filters over cumulative agent trace snapshots.
+    q["AGENT-1"] = ("filter: recovered after an unsuccessful approach", make(
+        "agent_traces", "t", "trace", [AGENT_RECOVERED], [], ["t.id"]))
+    q["AGENT-2"] = ("filter: implemented a plausible fix", make(
+        "agent_traces", "t", "trace", [AGENT_IMPLEMENTED_FIX], [],
+        ["t.id"]))
 
     # PrivacyPolicies: conditional on the corpus being available.
     if "policies" in sess.catalog:

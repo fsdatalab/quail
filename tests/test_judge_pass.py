@@ -5,6 +5,7 @@ from dataclasses import replace
 from quail.bench.judge_pass import (
     MODEL_NAME,
     PREDICATES,
+    _check_reused_label_set,
     _compact_label_parts,
     _corpus_identity,
     _lepard_source_answer,
@@ -26,17 +27,19 @@ def _spec(key):
 
 def test_parse_function_calls_requires_every_workload():
     calls = parse_function_calls(
-        "imdb=fc-imdb,biodex=fc-bio,fever=fc-fever,lepard=fc-lepard")
+        "imdb=fc-imdb,biodex=fc-bio,fever=fc-fever,"
+        "lepard=fc-lepard,agent=fc-agent")
     assert calls == {
         "imdb": "fc-imdb",
         "biodex": "fc-bio",
         "fever": "fc-fever",
         "lepard": "fc-lepard",
+        "agent": "fc-agent",
     }
 
 
 def test_stable_ids_cover_predicate_semantics_and_inputs():
-    assert len(PREDICATES) == 22
+    assert len(PREDICATES) == 21
     assert len({spec.key for spec in PREDICATES}) == len(PREDICATES)
     original = PREDICATES[0]
     renamed = replace(original, legacy_code="ANOTHER_F1")
@@ -78,6 +81,92 @@ def test_corpus_identity_uses_source_rows_and_order():
             != _corpus_identity(reversed_rows, 0.1)["corpus_id"])
     assert (_corpus_identity(rows, 0.1)["corpus_id"]
             != _corpus_identity(changed, 0.1)["corpus_id"])
+
+
+def test_reuse_checks_the_label_sets_original_corpus(monkeypatch, tmp_path):
+    import json
+    import quail.bench.judge_pass as judge_pass
+
+    spec = _spec("quailb.imdb.review.mentions_positive_aspect")
+    label_set_id = "ls_old"
+    table_manifest = {"rows": 2, "ordered_rows_full_hash": "abc"}
+    corpus = {
+        "corpus_id": "c_original",
+        "corpus_full_hash": "full-original",
+        "tables": {"reviews": table_manifest},
+    }
+    corpus_dir = tmp_path / "corpora" / corpus["corpus_id"]
+    corpus_dir.mkdir(parents=True)
+    (corpus_dir / "manifest.json").write_text(json.dumps(corpus))
+    label_dir = (
+        tmp_path / "label_sets" / spec.workload / spec.slug / label_set_id
+    )
+    label_dir.mkdir(parents=True)
+    (label_dir / "manifest.json").write_text(json.dumps({
+        "status": "complete",
+        "label_set_id": label_set_id,
+        "corpus_id": corpus["corpus_id"],
+        "corpus_full_hash": corpus["corpus_full_hash"],
+    }))
+    source_collection = {
+        "collection_id": "gt_middle",
+        "corpus_id": "c_middle",
+        "label_sets": {spec.key: label_set_id},
+    }
+    target = {"tables": {"reviews": dict(table_manifest)}}
+    monkeypatch.setattr(judge_pass, "VOLUME_ROOT", tmp_path)
+
+    reused = _check_reused_label_set(
+        spec, label_set_id, source_collection, target)
+
+    assert reused["source_collection_id"] == "gt_middle"
+    assert reused["source_corpus_id"] == "c_original"
+
+
+def test_reuse_rejects_changed_table_in_target(monkeypatch, tmp_path):
+    import json
+    import quail.bench.judge_pass as judge_pass
+
+    spec = _spec("quailb.imdb.review.mentions_positive_aspect")
+    label_set_id = "ls_old"
+    corpus = {
+        "corpus_id": "c_original",
+        "corpus_full_hash": "full-original",
+        "tables": {
+            "reviews": {"rows": 2, "ordered_rows_full_hash": "abc"},
+        },
+    }
+    corpus_dir = tmp_path / "corpora" / corpus["corpus_id"]
+    corpus_dir.mkdir(parents=True)
+    (corpus_dir / "manifest.json").write_text(json.dumps(corpus))
+    label_dir = (
+        tmp_path / "label_sets" / spec.workload / spec.slug / label_set_id
+    )
+    label_dir.mkdir(parents=True)
+    (label_dir / "manifest.json").write_text(json.dumps({
+        "status": "complete",
+        "label_set_id": label_set_id,
+        "corpus_id": corpus["corpus_id"],
+        "corpus_full_hash": corpus["corpus_full_hash"],
+    }))
+    source_collection = {
+        "collection_id": "gt_middle",
+        "label_sets": {spec.key: label_set_id},
+    }
+    target = {
+        "tables": {
+            "reviews": {"rows": 2, "ordered_rows_full_hash": "changed"},
+        },
+    }
+    monkeypatch.setattr(judge_pass, "VOLUME_ROOT", tmp_path)
+
+    try:
+        _check_reused_label_set(
+            spec, label_set_id, source_collection, target)
+    except ValueError as error:
+        assert "table reviews changed" in str(error)
+    else:
+        raise AssertionError("changed table was reused")
 
 
 def test_filter_and_join_prompts_use_the_engine_layout():

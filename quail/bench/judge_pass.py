@@ -49,13 +49,15 @@ VERIFY_PER_PREDICATE = 16
 VOLUME_ROOT = Path("/results/ground_truth/quailb/schema_v1")
 
 PREDICTION = (
-    "At sf=0.1, 22 predicates require 1,771,220 labels. Qwen3 32B "
-    "produces 1,554,406 judgments, and dataset annotations produce "
-    "216,814 source labels. Revised LePaRD samples 500 known citation "
-    "pairs before deduplicating them into 500 citation contexts and 433 "
-    "citation passages. Four H100! GPUs can run one workload each. The "
-    "deterministic rerun sample should have no answer differences, and "
-    "each run should finish without an out-of-memory failure at "
+    "At sf=0.1, 21 predicates require 1,210,264 labels. Qwen3 32B "
+    "produces 993,450 judgments, and dataset annotations produce 216,814 "
+    "source labels. The agent workload adds 3,544 Qwen judgments over "
+    "1,772 cumulative SWE-Next trace snapshots. Five H100 GPUs can run "
+    "one workload each. Based on the prior agent labeling run, the agent "
+    "workload should take 11 to 14 minutes including model load and cost "
+    "$0.72 to $0.92. The deterministic "
+    "rerun sample should have no answer differences, and each run should "
+    "finish without an out-of-memory failure at "
     "gpu_memory_utilization=0.85."
 )
 REUSE_PREDICTION = (
@@ -109,22 +111,8 @@ PREDICATES = (
         "report_involves_female_patient", "filter", quailb.F7,
         "report", "reports", "report"),
     PredicateSpec(
-        "quailb.biodex.report.describes_combination_therapy", "F8",
-        "biodex", "report_describes_combination_therapy", "filter",
-        quailb.F8, "report", "reports", "report"),
-    PredicateSpec(
-        "quailb.biodex.report.describes_serious_adverse_event", "F9",
-        "biodex", "report_describes_serious_adverse_event", "filter",
-        quailb.F9, "report", "reports", "report"),
-    PredicateSpec(
         "quailb.biodex.report.experienced_reaction", "REACTION", "biodex",
         "report_experienced_reaction", "join", quailb.REACTION,
-        "report", "reports", "report", "reaction", "terms", "term"),
-    PredicateSpec(
-        "quailb.biodex.report.experienced_severe_reaction",
-        "REACTION_SEVERE", "biodex",
-        "report_experienced_severe_reaction", "join",
-        quailb.REACTION_SEVERE,
         "report", "reports", "report", "reaction", "terms", "term"),
     PredicateSpec(
         "quailb.fever.claim.about_person", "F11", "fever",
@@ -177,6 +165,16 @@ PREDICATES = (
         "excerpt", "citation_contexts", "destination_context",
         "passage", "citation_passages", "passage_text",
         "lepard_citation_edge"),
+    PredicateSpec(
+        "quailb.agent.trace.recovered_after_unsuccessful_approach",
+        "AGENT_RECOVERED", "agent", "recovered_after_unsuccessful_approach",
+        "filter", quailb.AGENT_RECOVERED,
+        "agent_trace", "agent_traces", "trace"),
+    PredicateSpec(
+        "quailb.agent.trace.implemented_plausible_fix",
+        "AGENT_IMPLEMENTED_FIX", "agent", "implemented_plausible_fix",
+        "filter", quailb.AGENT_IMPLEMENTED_FIX,
+        "agent_trace", "agent_traces", "trace"),
 )
 
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
@@ -192,7 +190,7 @@ def rows_per_call(prompts_per_row: int) -> int:
     return max(1, PROMPTS_PER_CALL // prompts_per_row)
 
 
-# One GPU container per workload, so the four run side by side. The
+# One GPU container per workload, so the five run side by side. The
 # split is by workload rather than by predicate because a container
 # boots the 32B model once (~107 s) and then amortizes it over
 # everything it judges.
@@ -418,7 +416,7 @@ data_image = (
 corpus_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("numpy", "pyarrow", "pandas", "huggingface_hub",
-                 "datasets")
+                 "datasets", "transformers>=5.2.0")
     .add_local_python_source("quail")
 )
 
@@ -442,6 +440,8 @@ CORPUS_COLUMNS = {
     "citation_contexts": ("id", "destination_context",
                           "cited_passage_ids"),
     "citation_passages": ("id", "passage_text", "passage_ids"),
+    "agent_traces": ("id", "trace", "trajectory_id", "turn_index",
+                     "token_count"),
 }
 
 
@@ -954,7 +954,7 @@ def _label_manifest(label_set_id: str) -> tuple[Path, dict]:
 
 def _check_reused_label_set(
         spec: PredicateSpec, label_set_id: str, source_collection: dict,
-        source_corpus: dict, target_corpus: dict) -> dict:
+        target_corpus: dict) -> dict:
     if source_collection["label_sets"].get(spec.key) != label_set_id:
         raise ValueError(
             f"source collection does not contain {spec.key} as "
@@ -962,23 +962,32 @@ def _check_reused_label_set(
     _, manifest = _label_manifest(label_set_id)
     if manifest.get("status") != "complete":
         raise ValueError(f"label set {label_set_id} is not complete")
-    if (manifest.get("corpus_id") != source_corpus["corpus_id"]
+    label_corpus_id = manifest.get("corpus_id")
+    label_corpus_path = (
+        VOLUME_ROOT / "corpora" / str(label_corpus_id) / "manifest.json")
+    if not label_corpus_path.exists():
+        raise FileNotFoundError(
+            f"label set {label_set_id} refers to missing corpus "
+            f"{label_corpus_id}")
+    with open(label_corpus_path) as f:
+        label_corpus = json.load(f)
+    if (label_corpus.get("corpus_id") != label_corpus_id
             or manifest.get("corpus_full_hash")
-            != source_corpus["corpus_full_hash"]):
+            != label_corpus.get("corpus_full_hash")):
         raise ValueError(f"label set {label_set_id} has the wrong corpus")
 
     tables = _required_tables(spec)
     for table in tables:
-        if source_corpus["tables"].get(table) != target_corpus["tables"].get(
+        if label_corpus["tables"].get(table) != target_corpus["tables"].get(
                 table):
             raise ValueError(
                 f"cannot reuse {spec.key}: table {table} changed")
     return {
         "source_collection_id": source_collection["collection_id"],
-        "source_corpus_id": source_corpus["corpus_id"],
+        "source_corpus_id": label_corpus_id,
         "required_tables": list(tables),
         "verified_table_manifests": {
-            table: source_corpus["tables"][table] for table in tables
+            table: label_corpus["tables"][table] for table in tables
         },
     }
 
@@ -1178,8 +1187,7 @@ def judge_workload(corpus_id: str, workload: str) -> str:
     image=data_image, memory=4096, timeout=1200,
     volumes={"/results": results_vol})
 def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
-    """Assemble the four workloads into one collection and activate it as
-    the ground truth for this corpus."""
+    """Assemble five workloads and activate their ground truth."""
     results_vol.reload()
     _, corpus_manifest, _ = _load_corpus(corpus_id)
     identities = {
@@ -1314,8 +1322,7 @@ def activate_reused_collection(
                     f"source collection has no label set for {spec.key}")
             identity = {"label_set_id": label_set_id}
             reused[spec.key] = _check_reused_label_set(
-                spec, label_set_id, source_collection, source_corpus,
-                target_corpus)
+                spec, label_set_id, source_collection, target_corpus)
             _, manifest = _label_manifest(label_set_id)
         identities[spec.key] = identity
         manifests[spec.key] = manifest
@@ -1378,7 +1385,7 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
          reuse_from_collection: str | None = None,
          relabeled_workloads: str = "lepard",
          target_corpus: str | None = None):
-    """Run the four workloads side by side, then activate the result.
+    """Run the five workloads side by side, then activate the result.
 
     ``--only imdb,fever`` restricts the pass to those workloads; the
     finalize step is skipped because a collection needs all label sets.
