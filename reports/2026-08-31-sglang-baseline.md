@@ -45,26 +45,26 @@ Figure: plots/sglang_baseline_comparison.png
 | BIO-2 | Quail | 128.22 | 4,395 | $0.1406 | see the QuailB report |
 | BIO-2 | stock vLLM | 1,532.25 | 367.8 | $1.6809 | 80.92% |
 | BIO-2 | pipelined vLLM | 1,427.45 | 394.8 | $1.5659 | 80.91% |
-| BIO-2 | pipelined SGLang | TBD_BIO2_WALL | TBD_BIO2_PAIRS_S | TBD_BIO2_USD | TBD_BIO2_ACC |
+| BIO-2 | pipelined SGLang | 868.50 | 648.8 | $0.9527 | 82.03% |
 | IMDB-3 | SoL estimate | 9.56 | 5,024 | $0.0105 | not applicable |
 | IMDB-3 | Quail | 32.79 | 1,603 | $0.0360 | see the QuailB report |
 | IMDB-3 | stock vLLM | 52.65 | 996.9 | $0.0578 | 78.97% |
 | IMDB-3 | pipelined vLLM | 48.21 | 1,088.8 | $0.0529 | 78.97% |
-| IMDB-3 | pipelined SGLang | TBD_IMDB3_WALL | TBD_IMDB3_PAIRS_S | TBD_IMDB3_USD | TBD_IMDB3_ACC |
+| IMDB-3 | pipelined SGLang | 67.21 | 755.3 | $0.0737 | 79.94% |
 
 - BIO-2: pipelined SGLang is the fastest of the three baseline
-  engines — TBD_BIO2_VS_PVLLM times faster than pipelined vLLM and
-  TBD_BIO2_VS_SVLLM times faster than stock vLLM. Quail is still
-  TBD_BIO2_VS_QUAIL times faster than it, and the SoL estimate
-  TBD_BIO2_VS_SOL times.
+  engines — 1.64 times faster than pipelined vLLM and
+  1.76 times faster than stock vLLM. Quail is still
+  6.8 times faster than it, and the SoL estimate
+  14.0 times.
 - IMDB-3: pipelined SGLang is the slowest measured system —
-  TBD_IMDB3_VS_PVLLM times slower than pipelined vLLM and
-  TBD_IMDB3_VS_QUAIL times slower than Quail's 32.8 seconds.
-- The filter: TBD_IMDB3_FILTER seconds for the same 5,000 reviews
+  1.39 times slower than pipelined vLLM and
+  2.0 times slower than Quail's 32.8 seconds.
+- The filter: 17.8 seconds for the same 5,000 reviews
   pipelined vLLM filters in 17.3.
 - Its answer accuracy against the shared Qwen3 32B ground truth is
   the highest of the three engines on both queries.
-- Model startup, excluded from query time: TBD_BOOT seconds (warm
+- Model startup, excluded from query time: 313.3 seconds (warm
   kernel caches), compared with 143.8 to 235.2 seconds for the vLLM
   family containers.
 
@@ -73,7 +73,7 @@ query time. On BIO-2 every system evaluates the same 563,500 pairs.
 On IMDB-3 the filters differ, so the pair counts do too: 48,048 for
 the SoL estimate (4,004 expected survivors), 52,560 for Quail (its
 filter passed 4,380 reviews), 52,488 for the vLLM baselines (4,374),
-and TBD_IMDB3_PAIRS for SGLang (TBD_IMDB3_SURVIVORS). The Quail
+and 50,760 for SGLang (4,230). The Quail
 times are its post-scan-ring runs (`2026-08-30-kv-ring-fix.md`),
 which cut its IMDB-3 from the 75.0 seconds in the 2026-08-29 family
 run to 32.8; BIO-2 was unchanged. Quail's per-query accuracy is in
@@ -85,30 +85,39 @@ startup; the SoL row's cost is the floor implied by its time.
 
 Stated before the run:
 
-- BIO-2 in 950 to 1,040 seconds. TBD_BIO2_VERDICT
-- IMDB-3 in 62 to 69 seconds. TBD_IMDB3_VERDICT
+- BIO-2 in 950 to 1,040 seconds. Miss low: 868.5 seconds, 8% under the band floor. The band
+  treated the removed per-request list copy as a pointer copy
+  worth a few seconds. The copy also wrote every token id
+  object's reference count — one cache-missing memory write per
+  element, 2.3 billion across the join — and the join is
+  driver-bound, so those cycles were wall time. The exact split
+  between the copy and ordinary run-to-run spread was not
+  measured separately; only a rerun with the copy restored would
+  settle it, and it is not worth a run.
+- IMDB-3 in 62 to 69 seconds. Hit: 67.2 seconds (filter 17.8, join 49.4).
 - BIO-2 within about 4.3% of the band center either way: that is the
   run-to-run spread measured on this query with identical code.
 
 ## What the numbers mean
 
 - Both engines' joins are host-bound, not GPU-bound. The BIO-2 join
-  moved TBD_FRESH_RATE fresh tokens per second through a GPU that
+  moved 12,930 fresh tokens per second through a GPU that
   prefills tens of thousands per second, while per-request
-  bookkeeping ran at TBD_BIO2_PAIRS_S pairs/s. The engine
+  bookkeeping ran at 648.8 pairs/s. The engine
   configuration (16-token pages, no detokenizer) exists to cut that
   per-request host work; the rationale section explains each piece.
 - Per-pair time fits a fixed cost plus a per-prompt-token cost.
-  Pipelined SGLang: about TBD_FIXED_MS ms per request plus
-  TBD_PER_TOKEN_US microseconds per prompt token. Pipelined vLLM:
+  Pipelined SGLang: about 0.92 ms per request plus
+  0.15 microseconds per prompt token. Pipelined vLLM:
   about 0.40 ms plus 0.52 microseconds. The crossover sits near
-  TBD_CROSSOVER prompt tokens: vLLM wins IMDB-3's 358-token pairs,
-  SGLang wins BIO-2's 4,124-token pairs. SGLang's larger fixed cost
+  1,400 prompt tokens: vLLM wins IMDB-3's 358-token pairs (0.59
+  against 0.97 ms per pair), SGLang wins BIO-2's 4,124-token pairs
+  (1.54 against 2.55 ms). SGLang's larger fixed cost
   is its process architecture — every request crosses zmq to the
   scheduler process and back — and that floor is not reachable from
   the client side.
-- Cache hit rates are engine-equal: TBD_BIO2_CACHE of join prompt
-  tokens on BIO-2 (vLLM: 99.5%), TBD_IMDB3_CACHE on IMDB-3 (vLLM:
+- Cache hit rates are engine-equal: 99.5% of join prompt
+  tokens on BIO-2 (vLLM: 99.5%), 87.7% on IMDB-3 (vLLM:
   88.4%). The join order does its job; caching explains none of the
   remaining gap.
 - Engine-to-engine answer divergence is small: about 1.2% of BIO-2
@@ -167,7 +176,7 @@ Stated before the run:
   documents admitted into freed slots at wave boundaries. Admission
   uses the same token-budget formula as the vLLM client (KV pool
   tokens divided by mean request size, capped at 4,096): doc_cap was
-  TBD_DOC_CAP for the IMDB-3 filter.
+  1,146 for the IMDB-3 filter.
 - 16-token cache pages (`page_size=16`, vLLM's block size). SGLang
   defaults to 1-token pages, which cost a radix-tree node and a KV
   index entry per token on every request. On the host-bound joins
@@ -214,7 +223,7 @@ used its own H100! container on 2026-08-31.
 ## Source data
 
 - Pipelined SGLang, function call `fc-01M1AYQ53Y29WSWWK4C85HCB7G`:
-  `TBD_VOLUME_PATH`
+  `/results/pipelined_sglang/2026-08-31_034457_9032b486/summary.json`
 - Stock vLLM:
   `/results/stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`
 - Pipelined vLLM:
