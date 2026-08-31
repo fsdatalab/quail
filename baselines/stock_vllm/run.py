@@ -155,6 +155,31 @@ def _vllm_filter_capacity(llm):
         kv_cache_dtype=str(cache.cache_dtype),
     )
 
+
+def _vllm_failure_entry(query_id, error):
+    """Build a saved result for a failed vLLM query."""
+    details = f"{type(error).__name__}: {error}"
+    current = error
+    is_oom = False
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = f"{type(current).__name__}: {current}".lower()
+        if ("out of memory" in message
+                or type(current).__name__ == "EngineDeadError"):
+            is_oom = True
+            break
+        current = current.__cause__ or current.__context__
+    return {
+        "query": query_id,
+        "status": "oom" if is_oom else "error",
+        "error": "oom" if is_oom else details,
+        "error_detail": details,
+        "total_wall_s": None,
+        "regret_tokens": None,
+    }
+
+
 def _split_queries(ids, n):
     """Split query IDs into n roughly equal chunks."""
     k, m = divmod(len(ids), n)
@@ -197,10 +222,11 @@ def define_all_queries():
             ("join", template, left_alias, right_alias)
     """
     from quail.bench.quailb import (
-        F1, F4, F5, F7, F8, F9, F11, F12, F13,
+        F1, F4, F5, F7, F11, F12, F13,
+        AGENT_IMPLEMENTED_FIX, AGENT_RECOVERED,
         LEP1, LEP2, LEP3, LEP4, LEP5, LEPS1,
         DISCUSS_ASPECT, ASPECT_SENTIMENT,
-        REACTION, REACTION_SEVERE,
+        REACTION,
         SUPPORT, REFUTE, LEPJOIN,
     )
 
@@ -212,6 +238,7 @@ def define_all_queries():
     ev = ("evidence", "text")
     dc = ("citation_contexts", "destination_context")
     pt = ("citation_passages", "passage_text")
+    at = ("agent_traces", "trace")
 
     Q = {}
 
@@ -256,26 +283,6 @@ def define_all_queries():
     Q["BIO-3"] = dict(aliases={"r": rp, "m": tm},
                       steps=[("filter", "r", [F7]),
                              ("join", REACTION, "r", "m")])
-    Q["BIO-4"] = dict(aliases={"r": rp, "m": tm},
-                      steps=[("filter", "r", [F7, F8]),
-                             ("join", REACTION, "r", "m")])
-    Q["BIO-5"] = dict(aliases={"r": rp, "m": tm},
-                      steps=[("filter", "r", [F7, F8, F9]),
-                             ("join", REACTION, "r", "m")])
-    Q["BIO-6"] = dict(aliases={"r": rp, "m": tm, "m2": tm},
-                      steps=[("join", REACTION, "r", "m"),
-                             ("join", REACTION_SEVERE, "r", "m2")])
-    Q["BIO-7"] = dict(
-        aliases={"r1": rp, "m1": tm, "r2": rp, "m2": tm},
-        steps=[("join", REACTION, "r1", "m1"),
-               ("join", REACTION_SEVERE, "r2", "m1"),
-               ("join", REACTION, "r2", "m2")])
-    Q["BIO-8"] = dict(
-        aliases={"r1": rp, "m1": tm, "r2": rp, "m2": tm},
-        steps=[("filter", "r1", [F7]),
-               ("join", REACTION, "r1", "m1"),
-               ("join", REACTION_SEVERE, "r2", "m1"),
-               ("join", REACTION, "r2", "m2")])
 
     # ---- FEVER ----
     Q["FEV-1"] = dict(aliases={"c": cl},
@@ -336,6 +343,14 @@ def define_all_queries():
     Q["LEP-8"] = dict(aliases={"d": dc},
                       steps=[("filter", "d",
                               [LEP1, LEP2, LEP3, LEP4, LEP5])])
+
+    # ---- SWE-Next agent traces ----
+    Q["AGENT-1"] = dict(aliases={"t": at},
+                         steps=[("filter", "t", [AGENT_RECOVERED])])
+    Q["AGENT-2"] = dict(
+        aliases={"t": at},
+        steps=[("filter", "t", [AGENT_IMPLEMENTED_FIX])],
+    )
 
     return Q
 
@@ -928,21 +943,27 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
     true, false = true_false_ids(tokenizer)
     allowed = sorted(true | false)
 
-    llm, boot = time_llm_boot(
-        model=hf_name,
-        max_num_batched_tokens=25_305,
-        max_num_seqs=4096,
-        gpu_memory_utilization=gpu_memory_utilization,
-        enable_prefix_caching=True,
-        disable_log_stats=True)
     sp = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1,
                         allowed_token_ids=allowed)
-    filter_capacity = _vllm_filter_capacity(llm)
     run_name = paired_run_id or baselines[0]
+
+    def boot_llm():
+        next_llm, next_boot = time_llm_boot(
+            model=hf_name,
+            max_num_batched_tokens=25_305,
+            max_num_seqs=4096,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enable_prefix_caching=True,
+            disable_log_stats=True)
+        next_capacity = _vllm_filter_capacity(next_llm)
+        next_llm.generate(
+            [{"prompt_token_ids": allowed}], sp, use_tqdm=False)
+        return next_llm, next_boot, next_capacity
+
+    llm, boot, filter_capacity = boot_llm()
+    restart_boots = []
     print(f"[{run_name}] boot: {boot}", flush=True)
     print(f"[{run_name}] KV capacity: {filter_capacity}", flush=True)
-
-    llm.generate([{"prompt_token_ids": allowed}], sp, use_tqdm=False)
 
     queries = define_all_queries()
     if query_ids_csv:
@@ -1004,14 +1025,27 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
         schedule = _baseline_schedule(
             ids, baselines, rep, method_order)
         for baseline, qid in schedule:
-            reset = llm.reset_prefix_cache()
-            if reset is False:
-                raise RuntimeError(
-                    "vLLM refused to reset its prefix cache before "
-                    f"{baseline} {qid}")
             filter_submission = _baseline_configuration(baseline)
             print(f"\n[{baseline}] rep={rep} {qid}", flush=True)
             try:
+                if llm is None:
+                    llm, restart_boot, next_capacity = boot_llm()
+                    restart_boots.append({
+                        "before_baseline": baseline,
+                        "before_query": qid,
+                        "boot": restart_boot,
+                    })
+                    filter_capacity = next_capacity
+                    print(
+                        f"[{run_name}] restarted vLLM before "
+                        f"{baseline} {qid}: {restart_boot}",
+                        flush=True,
+                    )
+                reset = llm.reset_prefix_cache()
+                if reset is False:
+                    raise RuntimeError(
+                        "vLLM refused to reset its prefix cache before "
+                        f"{baseline} {qid}")
                 entry = run_query(
                     llm, sp, true, tokenizer,
                     qid, queries[qid], DATA_DIR, sf,
@@ -1021,9 +1055,14 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
                     filter_submission=filter_submission,
                     filter_capacity=filter_capacity)
             except Exception as e:                      # noqa: BLE001
-                entry = dict(query=qid,
-                             error=f"{type(e).__name__}: {e}")
-                print(f"  ERROR: {e}", flush=True)
+                entry = _vllm_failure_entry(qid, e)
+                print(
+                    f"  {entry['status'].upper()}: "
+                    f"{entry['error_detail']}",
+                    flush=True,
+                )
+                if entry["status"] == "oom":
+                    llm = None
             rep_results[baseline].append(entry)
         for baseline in baselines:
             all_results[baseline].append(rep_results[baseline])
@@ -1044,7 +1083,7 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
         )
         report = dict(
             baseline=baseline, model=model, hf_name=hf_name, sf=sf, lf=lf,
-            boot=boot, reps=reps,
+            boot=boot, restart_boots=restart_boots, reps=reps,
             prediction=prediction,
             ground_truth_workload=(ground_truth_workload or None),
             ground_truth_collection=(None if truth is None else
@@ -1143,6 +1182,10 @@ def _merge_reports(batch_reports, n_containers):
         sf=base["sf"],
         lf=base.get("lf", 1),
         boots=boots,
+        restart_boots=[
+            report.get("restart_boots", [])
+            for report in batch_reports
+        ],
         reps=reps,
         containers=n_containers,
         query_ids=all_query_ids,

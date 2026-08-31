@@ -30,6 +30,8 @@ CORPUS_COLUMNS = {
     "citation_contexts": ("id", "destination_context",
                           "cited_passage_ids"),
     "citation_passages": ("id", "passage_text", "passage_ids"),
+    "agent_traces": ("id", "trace", "trajectory_id", "turn_index",
+                     "token_count"),
 }
 
 
@@ -352,7 +354,8 @@ def _validate_label_set_corpora(files, collection: dict,
             source_collections[source_collection_id] = _read_json(files, path)
         source_collection = source_collections[source_collection_id]
         if (source_collection.get("status") != "complete"
-                or source_collection.get("corpus_id") != source_corpus_id
+                or source_collection.get("collection_id")
+                != source_collection_id
                 or source_collection.get("label_sets", {}).get(key)
                 != manifest["label_set_id"]):
             raise ValueError(

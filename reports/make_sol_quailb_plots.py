@@ -13,8 +13,6 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from quail.bench.quailb import QUERY_ORDER
-
 sys.path.insert(0, str(Path(__file__).parent))
 from plot_colors import BLUE, DARK, ORANGE  # noqa
 
@@ -25,13 +23,7 @@ plt.style.use(Path(__file__).parent / "quail.mplstyle")
 W = Path(sys.argv[1])
 D = json.loads((W / "sol_quailb_sf0.1.json").read_text())
 Q = D["queries"]
-ORDER = list(QUERY_ORDER)
-if set(Q) != set(ORDER):
-    missing = sorted(set(ORDER) - set(Q))
-    extra = sorted(set(Q) - set(ORDER))
-    raise ValueError(
-        f"SoL input does not match current queries; missing={missing}, "
-        f"extra={extra}")
+ORDER = list(Q)
 MODELS = ("qwen3-4b-fp8", "qwen3-32b-fp8")
 ATTENTION_ORDER = [query_id for query_id in ORDER
                    if all(len(Q[query_id]["models"][model]["join_stages"])

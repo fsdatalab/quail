@@ -314,6 +314,17 @@ def test_reused_label_set_accepts_identical_table_manifest(tmp_path):
     _validate_label_set_corpora(files, collection, manifests)
 
 
+def test_reused_label_set_accepts_transitive_collection_reuse(tmp_path):
+    files, collection, manifests = _reused_label_layout(tmp_path)
+    source_path = (tmp_path / GROUND_TRUTH_ROOT / "collections"
+                   / "gt_source" / "manifest.json")
+    source = json.loads(source_path.read_text())
+    source["corpus_id"] = "c_intermediate"
+    source_path.write_text(json.dumps(source))
+
+    _validate_label_set_corpora(files, collection, manifests)
+
+
 def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
     files, collection, manifests = _reused_label_layout(tmp_path)
     target_path = (tmp_path / GROUND_TRUTH_ROOT / "corpora" / "c_target"

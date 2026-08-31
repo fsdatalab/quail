@@ -1,9 +1,9 @@
 # QUAIL-B
 
-QUAIL-B has 30 filter and join queries at scale factor 0.1, plus
+QUAIL-B has 32 filter and join queries at scale factor 0.1, plus
 2 optional PrivacyPolicies queries (PRIV-1, PRIV-2) that run only
 when `register_privacy_sets()` has been called. The saved ground
-truth covers all 22 predicates used by the 30 default queries.
+truth covers all 21 predicates used by the 32 default queries.
 
 A predicate is one exact TRUE or FALSE question, including its prompt and
 the input columns it reads. A query can use one predicate or combine several
@@ -11,7 +11,7 @@ predicates. Ground truth is saved per predicate, document, or document pair.
 
 ## Run the benchmark
 
-Run all 30 queries with Qwen3 4B. Modal starts one H100! container for
+Run all 32 queries with Qwen3 4B. Modal starts one H100! container for
 each query family. Each container runs Quail, stock vLLM, and pipelined
 vLLM on that family:
 

@@ -177,11 +177,11 @@ for key, (table, col) in COLUMNS.items():
 
 # 2. prompt lengths ---------------------------------------------------
 FILTER_TEMPLATES = {c: getattr(Q, c) for c in (
-    "F1", "F4", "F5", "F7", "F8", "F9", "F11", "F12", "F13",
+    "F1", "F4", "F5", "F7", "F11", "F12", "F13",
     "LEP1", "LEP2", "LEP3", "LEP4", "LEP5", "LEPS1")}
 JOIN_TEMPLATES = {c: getattr(Q, c) for c in (
     "DISCUSS_ASPECT", "ASPECT_SENTIMENT", "REACTION",
-    "REACTION_SEVERE", "SUPPORT", "REFUTE", "LEPJOIN")}
+    "SUPPORT", "REFUTE", "LEPJOIN")}
 col_ref = (ColumnRef("x", "t", "c"),)
 question = {c: bind_prompt(t, col_ref, encode).tail_tokens
             for c, t in FILTER_TEMPLATES.items()}
