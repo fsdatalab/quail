@@ -31,7 +31,7 @@ Engine settings mirror the vLLM baseline configuration:
     (KV pool sized after profiling)   disable_prefill_cuda_graph=True
     (tokenizer in-process)            skip_tokenizer_init=True
 
-Default run (BIO-2 and IMDB-3 at sf=0.1 on qwen3-4b-fp8):
+Default run (BIO-2 and AGENT-1 at sf=0.1 on qwen3-4b-fp8):
     uv run modal run -m baselines.stock_sglang.run::main
 
 All 30 queries: pass ``--query ""``.
@@ -83,7 +83,7 @@ GPU_KW = dict(image=image, gpu="H100!", memory=98304,
 DATA_DIR = "/results/quailb_data"
 
 BASELINE = "pipelined_sglang"
-DEFAULT_QUERY_IDS = "BIO-2,IMDB-3"
+DEFAULT_QUERY_IDS = "BIO-2,AGENT-1"
 # vLLM's gpu_memory_utilization=0.91 covers weights, KV, and the
 # activation working set, because vLLM profiles a full-size forward
 # (including logits for max_num_seqs requests) before sizing its KV
