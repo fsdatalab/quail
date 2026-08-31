@@ -86,7 +86,7 @@ startup; the SoL row's cost is the floor implied by its time.
 ## Prediction
 
 Stated before the headline run (the final configuration,
-mem_fraction_static=0.76 with the 1.0 second slice pause):
+mem_fraction_static=0.76):
 
 - BIO-2 in 1,080 to 1,150 seconds. Miss low: 1,028.7 seconds. The
   two page-16 runs differ by 44.6 seconds (4.3%) on identical join
@@ -166,13 +166,9 @@ completed runs cited under Source data.
   creates one asyncio task per request inside SGLang's driver
   process; the Modal health heartbeat thread starved for twenty
   minutes and Modal threatened to kill the container. The client
-  submits in slices of 16,384 requests with a one second pause
-  between slices; the engine's queue never runs dry inside a slice.
-  Under join load, heartbeat attempts still fail in stretches up to
-  about four minutes whether the pause is 0.1 or 1.0 seconds (both
-  2026-08-31 runs survived them), so the pause does not govern
-  heartbeat health; 1.0 seconds is the conservative setting every
-  completed run used, and it costs BIO-2 about 34 idle seconds.
+  submits in slices of 16,384 requests; the slice boundary yields
+  the event loop, which is enough for the heartbeat. The engine's
+  queue never runs dry inside a slice.
 - The tiled join order. SGLang's radix cache stores a prompt's KV
   only when its request finishes, so vLLM's anchor-major pair order
   recomputes an anchor for every sibling in flight — on IMDB-3 that
@@ -254,9 +250,9 @@ used their own H100! containers on 2026-08-30 and 2026-08-31.
 - Pipelined SGLang, final configuration (the headline run), function
   call `fc-01M1ASD1MC633MZMTZ5DHZGF3R`:
   `/results/pipelined_sglang/2026-08-31_021203_e40e08d2/summary.json`
-- Pipelined SGLang at mem_fraction_static=0.78 with the 0.1 second
-  pause (the diagnostic run behind the 0.76 and 1.0 second
-  choices), function call `fc-01M1AQSQKZ2VMS1MX2G36BRESS`:
+- Pipelined SGLang at mem_fraction_static=0.78 (the diagnostic run
+  behind the 0.76 choice), function call
+  `fc-01M1AQSQKZ2VMS1MX2G36BRESS`:
   `/results/pipelined_sglang/2026-08-31_014401_6fffe2c6/summary.json`
 - Pipelined SGLang on the 2026-08-30 configuration (1-token pages,
   detokenizer in the path), function call

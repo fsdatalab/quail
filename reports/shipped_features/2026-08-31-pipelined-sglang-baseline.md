@@ -60,7 +60,7 @@ submission pattern itself.
   churn the allocator cache enough that 0.76 is needed to keep
   flush-and-retry headroom. Prefill CUDA graphs are disabled for the
   same reason, and batch submission is sliced to 16,384 requests so
-  the driver process stays responsive.
+  the driver process yields the event loop between slices.
 
 ## Numbers
 

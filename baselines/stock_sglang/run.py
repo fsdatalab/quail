@@ -161,14 +161,8 @@ class StockSGLangClient:
     # task per request, and the Modal health heartbeat thread starves
     # until Modal marks the container unhealthy. Each slice is still
     # four times deeper than max_running_requests, so the engine's
-    # queue never runs dry inside a slice. Heartbeat attempts still
-    # fail in stretches up to about four minutes under join load at
-    # either 0.1 s or 1.0 s pauses (both 2026-08-31 runs survived
-    # them), so the pause does not govern heartbeat health; 1.0 s is
-    # kept as the conservative setting every completed run used. It
-    # costs BIO-2 about 34 idle seconds across 34 slice boundaries.
+    # queue never runs dry inside a slice.
     submit_slice = 16_384
-    slice_pause_s = 1.0
 
     def __init__(self, engine, capacity):
         self.engine = engine
@@ -248,8 +242,6 @@ class StockSGLangClient:
     def generate(self, prompts, sampling_params, use_tqdm=False):
         outputs = []
         for start in range(0, len(prompts), self.submit_slice):
-            if start:
-                time.sleep(self.slice_pause_s)
             outputs.extend(self._generate_slice(
                 prompts[start:start + self.submit_slice],
                 sampling_params))
