@@ -6,7 +6,7 @@
 (0.5.18) as `pipelined_sglang`, the SGLang counterpart of pipelined
 vLLM: per-document filter chains with token-budget admission, and one
 request per document pair for joins (full cross product). An empty
-`--query` runs all 30 current QuailB queries.
+`--query` runs all 32 current QuailB queries.
 
 The runner does not copy the query logic. It wraps a running
 `sglang.Engine` in `StockSGLangClient`, an adapter with the
@@ -64,5 +64,5 @@ submission pattern itself.
 ## Numbers
 
 The measured comparison against the SoL estimate, Quail, and both
-vLLM baselines on BIO-2 and IMDB-3 at sf=0.1 is in
+vLLM baselines on BIO-2, AGENT-1, and IMDB-3 at sf=0.1 is in
 `reports/2026-08-31-sglang-baseline.md`.

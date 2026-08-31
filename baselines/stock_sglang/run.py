@@ -34,7 +34,7 @@ Engine settings mirror the vLLM baseline configuration:
 Default run (BIO-2 and AGENT-1 at sf=0.1 on qwen3-4b-fp8):
     uv run modal run -m baselines.stock_sglang.run::main
 
-All 30 queries: pass ``--query ""``.
+All 32 queries: pass ``--query ""``.
 
 Boot-and-generate probe without benchmark data:
     uv run modal run -m baselines.stock_sglang.run::probe

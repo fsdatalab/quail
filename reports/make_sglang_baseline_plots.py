@@ -1,16 +1,23 @@
 """Plot the SGLang baseline against SoL, Quail, and the vLLM baselines.
 
-Pull the five inputs from the quail-results volume, then pass the
-work directory to this script:
+Pull the inputs from the quail-results volume, then pass the work
+directory to this script:
 
     W=<workdir>
     modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
     modal volume get quail-results ablations/ringfix_bio2.json $W/quail_ringfix_bio2.json
     modal volume get quail-results ablations/ringfix_tokens_head_imdb3.json $W/quail_ringfix_imdb3.json
+    modal volume get quail-results benchmarks/quailb/runs/qb_20260831T062218Z_1192cd76/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail_agent.json
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm.json
-    modal volume get quail-results pipelined_sglang/2026-08-31_034457_9032b486/summary.json $W/pipelined_sglang.json
+    modal volume get quail-results stock_vllm/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm_agent.json
+    modal volume get quail-results pipelined_vllm/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm_agent.json
+    modal volume get quail-results pipelined_sglang/TBD_VOLUME_LABEL/summary.json $W/pipelined_sglang.json
+    modal volume get quail-results pipelined_sglang/2026-08-31_034457_9032b486/summary.json $W/pipelined_sglang_imdb3.json
     uv run --with matplotlib python reports/make_sglang_baseline_plots.py $W
+
+The SoL file does not cover the agent queries, so the AGENT-1 panel
+has no SoL bar.
 """
 
 import json
@@ -27,8 +34,15 @@ plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
 from plot_colors import BLUE, GRAY, ORANGE, RED, TEAL  # noqa: E402
 
-QUERY_IDS = ("BIO-2", "IMDB-3")
+QUERY_IDS = ("BIO-2", "IMDB-3", "AGENT-1")
 MODEL = "qwen3-4b-fp8"
+SYSTEM_COLORS = {
+    "SoL\nestimate": GRAY,
+    "Quail": BLUE,
+    "stock\nvLLM": ORANGE,
+    "pipelined\nvLLM": TEAL,
+    "pipelined\nSGLang": RED,
+}
 
 
 def load(path):
@@ -51,17 +65,29 @@ def check(summary, baseline, memory_key, memory_fraction,
         raise ValueError(f"unexpected {baseline} configuration")
 
 
-def query_entries(summary):
+def entry_for(summary, qid):
     entries = {row["query"]: row for row in summary["results"][0]}
-    missing = [qid for qid in QUERY_IDS if qid not in entries]
-    if missing:
-        raise ValueError(f"missing queries {missing}")
-    return entries
+    if qid not in entries:
+        raise ValueError(f"summary is missing {qid}")
+    return entries[qid]
+
+
+def quail_family_wall(family_run, qid):
+    if family_run["model"] != MODEL or family_run["sf"] != 0.1:
+        raise ValueError("unexpected Quail family run configuration")
+    for row in family_run["passes"]["single"]["queries"]:
+        if row["query"] == qid:
+            return row["wall_s"]
+    raise ValueError(f"Quail family run is missing {qid}")
 
 
 def join_pairs(entry):
     return sum(step["n_pairs"] for step in entry["steps"]
                if step["kind"] == "join")
+
+
+def filter_documents(entry):
+    return entry["steps"][0]["n_in"]
 
 
 def usd(wall_s):
@@ -75,44 +101,29 @@ def annotate(ax, bar, wall_s):
         ha="center", va="bottom", fontsize=9)
 
 
-def five_way_figure(sol, quail_walls, entries):
-    systems = (
-        ("SoL\nestimate", GRAY),
-        ("Quail", BLUE),
-        ("stock\nvLLM", ORANGE),
-        ("pipelined\nvLLM", TEAL),
-        ("pipelined\nSGLang", RED),
-    )
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0))
+def figure(panels):
+    fig, axes = plt.subplots(1, len(panels), figsize=(16.5, 5.0))
     fig.subplots_adjust(wspace=0.3)
-    for ax, qid in zip(axes, QUERY_IDS):
-        walls = [
-            sol["queries"][qid]["models"][MODEL]["sol_s"],
-            quail_walls[qid],
-            entries["stock_vllm"][qid]["total_wall_s"],
-            entries["pipelined_vllm"][qid]["total_wall_s"],
-            entries["pipelined_sglang"][qid]["total_wall_s"],
-        ]
-        names = [name for name, _color in systems]
-        colors = [color for _name, color in systems]
-        log = max(walls) / min(walls) > 10
-        bars = ax.bar(names, walls, color=colors, width=0.62)
-        for bar, wall in zip(bars, walls):
+    for ax, (qid, subtitle, walls) in zip(axes, panels):
+        names = list(walls)
+        values = [walls[name] for name in names]
+        colors = [SYSTEM_COLORS[name] for name in names]
+        log = max(values) / min(values) > 10
+        bars = ax.bar(names, values, color=colors, width=0.62)
+        for bar, wall in zip(bars, values):
             annotate(ax, bar, wall)
         if log:
             ax.set_yscale("log")
             ax.set_ylabel("seconds (log scale)")
-            ax.set_ylim(min(walls) * 0.5, max(walls) * 3.2)
+            ax.set_ylim(min(values) * 0.5, max(values) * 3.2)
         else:
             ax.set_ylabel("seconds")
-            ax.set_ylim(0, max(walls) * 1.3)
-        ratio = (entries["pipelined_vllm"][qid]["total_wall_s"]
-                 / entries["pipelined_sglang"][qid]["total_wall_s"])
+            ax.set_ylim(0, max(values) * 1.3)
+        ratio = walls["pipelined\nvLLM"] / walls["pipelined\nSGLang"]
         direction = "faster" if ratio >= 1 else "slower"
         factor = ratio if ratio >= 1 else 1 / ratio
-        pairs = join_pairs(entries["pipelined_sglang"][qid])
         ax.set_title(
-            f"{qid} — {pairs:,} join pairs\n"
+            f"{qid} — {subtitle}\n"
             f"pipelined SGLang {factor:.2f}x {direction} than "
             f"pipelined vLLM")
         ax.tick_params(axis="x", labelsize=9)
@@ -127,9 +138,13 @@ def main():
     sol = load(workdir / "sol.json")
     quail_runs = [load(workdir / "quail_ringfix_bio2.json"),
                   load(workdir / "quail_ringfix_imdb3.json")]
+    quail_agent = load(workdir / "quail_agent.json")
     stock_vllm = load(workdir / "stock_vllm.json")
     pipelined_vllm = load(workdir / "pipelined_vllm.json")
+    stock_vllm_agent = load(workdir / "stock_vllm_agent.json")
+    pipelined_vllm_agent = load(workdir / "pipelined_vllm_agent.json")
     pipelined_sglang = load(workdir / "pipelined_sglang.json")
+    pipelined_sglang_imdb3 = load(workdir / "pipelined_sglang_imdb3.json")
 
     if sol["scale_factor"] != 0.1:
         raise ValueError("unexpected SoL configuration")
@@ -138,37 +153,74 @@ def main():
             raise ValueError("unexpected Quail configuration")
     quail_walls = {run["query"]: run["unprofiled"]["engine_wall_s"]
                    for run in quail_runs}
-    if sorted(quail_walls) != sorted(QUERY_IDS):
-        raise ValueError("Quail runs do not cover the two queries")
-    check(stock_vllm, "stock_vllm", "gpu_memory_utilization", 0.91,
-          "stage-major")
-    check(pipelined_vllm, "pipelined_vllm", "gpu_memory_utilization",
-          0.91, "pipelined")
-    check(pipelined_sglang, "pipelined_sglang", "mem_fraction_static",
-          0.76, "pipelined", join_submission="suffix-major-tiled",
-          batched_tokens=25_296)
+    for summary in (stock_vllm, stock_vllm_agent):
+        check(summary, "stock_vllm", "gpu_memory_utilization", 0.91,
+              "stage-major")
+    for summary in (pipelined_vllm, pipelined_vllm_agent):
+        check(summary, "pipelined_vllm", "gpu_memory_utilization",
+              0.91, "pipelined")
+    for summary in (pipelined_sglang, pipelined_sglang_imdb3):
+        check(summary, "pipelined_sglang", "mem_fraction_static",
+              0.76, "pipelined", join_submission="suffix-major-tiled",
+              batched_tokens=25_296)
 
-    entries = {
-        "stock_vllm": query_entries(stock_vllm),
-        "pipelined_vllm": query_entries(pipelined_vllm),
-        "pipelined_sglang": query_entries(pipelined_sglang),
+    sources = {
+        "BIO-2": {
+            "SoL\nestimate":
+                sol["queries"]["BIO-2"]["models"][MODEL]["sol_s"],
+            "Quail": quail_walls["BIO-2"],
+            "stock\nvLLM": entry_for(stock_vllm, "BIO-2"),
+            "pipelined\nvLLM": entry_for(pipelined_vllm, "BIO-2"),
+            "pipelined\nSGLang": entry_for(pipelined_sglang, "BIO-2"),
+        },
+        "IMDB-3": {
+            "SoL\nestimate":
+                sol["queries"]["IMDB-3"]["models"][MODEL]["sol_s"],
+            "Quail": quail_walls["IMDB-3"],
+            "stock\nvLLM": entry_for(stock_vllm, "IMDB-3"),
+            "pipelined\nvLLM": entry_for(pipelined_vllm, "IMDB-3"),
+            "pipelined\nSGLang":
+                entry_for(pipelined_sglang_imdb3, "IMDB-3"),
+        },
+        "AGENT-1": {
+            "Quail": quail_family_wall(quail_agent, "AGENT-1"),
+            "stock\nvLLM": entry_for(stock_vllm_agent, "AGENT-1"),
+            "pipelined\nvLLM":
+                entry_for(pipelined_vllm_agent, "AGENT-1"),
+            "pipelined\nSGLang": entry_for(pipelined_sglang, "AGENT-1"),
+        },
     }
 
-    OUT.mkdir(exist_ok=True)
-    five_way_figure(sol, quail_walls, entries)
-
+    panels = []
     for qid in QUERY_IDS:
-        print(f"{qid} SoL estimate: "
-              f"{sol['queries'][qid]['models'][MODEL]['sol_s']:.2f} s")
-        print(f"{qid} Quail: {quail_walls[qid]:.2f} s")
-        for key in ("stock_vllm", "pipelined_vllm", "pipelined_sglang"):
-            entry = entries[key][qid]
-            wall = entry["total_wall_s"]
-            pairs = join_pairs(entry)
-            accuracy = entry["accuracy"]["answer_accuracy"]["accuracy"]
-            print(f"{qid} {key}: {wall:.2f} s, {pairs:,} pairs, "
-                  f"{pairs / wall:.1f} pairs/s, ${usd(wall):.4f}/query, "
-                  f"answer accuracy {accuracy:.2%}")
+        walls = {}
+        for system, value in sources[qid].items():
+            walls[system] = (value if isinstance(value, (int, float))
+                             else value["total_wall_s"])
+        sglang_entry = sources[qid]["pipelined\nSGLang"]
+        pairs = join_pairs(sglang_entry)
+        subtitle = (f"{pairs:,} join pairs" if pairs
+                    else f"{filter_documents(sglang_entry):,} documents")
+        panels.append((qid, subtitle, walls))
+
+    OUT.mkdir(exist_ok=True)
+    figure(panels)
+
+    for qid, subtitle, walls in panels:
+        for system, wall in walls.items():
+            name = system.replace("\n", " ")
+            line = (f"{qid} {name}: {wall:,.2f} s, "
+                    f"${usd(wall):.4f}/query")
+            entry = sources[qid][system]
+            if isinstance(entry, dict):
+                pairs = join_pairs(entry)
+                rate = ((pairs or filter_documents(entry)) / wall)
+                unit = "pairs/s" if pairs else "documents/s"
+                accuracy = (entry["accuracy"]["answer_accuracy"]
+                            ["accuracy"])
+                line += (f", {rate:,.1f} {unit}, "
+                         f"answer accuracy {accuracy:.2%}")
+            print(line)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# SGLang baseline on BIO-2 and IMDB-3
+# SGLang baseline on BIO-2, AGENT-1, and IMDB-3
 
 Date: 2026-08-31.
 
@@ -29,15 +29,28 @@ pipelined vLLM:
   imported from `baselines.stock_vllm.run`, so the baselines measure
   exactly the same work.
 
-The run covers the two representative queries at scale factor 0.1
-with Qwen3 4B fp8 on one H100!: BIO-2 (one join, REACTION over 500
-reports x 1,127 terms = 563,500 pairs) and IMDB-3 (one filter, F1
-over 5,000 reviews, then one join, DISCUSS_ASPECT over the survivors
-x 12 aspects).
+The measurements cover three queries at scale factor 0.1 with Qwen3
+4B fp8 on one H100!. The default run pair is BIO-2 and AGENT-1;
+IMDB-3 was measured on the identical client code in the run cited
+under Source data.
+
+- BIO-2: one join, REACTION over 500 reports x 1,127 terms =
+  563,500 pairs. Long prompts (about 4,124 tokens per pair).
+- IMDB-3: one filter (F1 over 5,000 reviews), then one join
+  (DISCUSS_ASPECT over the survivors x 12 aspects). Short prompts
+  (about 358 tokens per pair).
+- AGENT-1: one filter (AGENT_RECOVERED) over 1,772 cumulative agent
+  trace snapshots from SWE-Next, each capped at 24,000 tokens. A
+  later snapshot of a trajectory contains the earlier one as a
+  prefix, so the query measures prefix reuse across different
+  documents.
 
 ## Result
 
 Figure: plots/sglang_baseline_comparison.png
+
+The two join queries (document pairs/second divides evaluated join
+pairs by query time):
 
 | Query | System | Query time (s) | Document pairs/s | $/query | Answer accuracy |
 |---|---|---:|---:|---:|---:|
@@ -45,91 +58,114 @@ Figure: plots/sglang_baseline_comparison.png
 | BIO-2 | Quail | 128.22 | 4,395 | $0.1406 | see the QuailB report |
 | BIO-2 | stock vLLM | 1,532.25 | 367.8 | $1.6809 | 80.92% |
 | BIO-2 | pipelined vLLM | 1,427.45 | 394.8 | $1.5659 | 80.91% |
-| BIO-2 | pipelined SGLang | 868.50 | 648.8 | $0.9527 | 82.03% |
+| BIO-2 | pipelined SGLang | TBD2_BIO2_WALL | TBD2_BIO2_RATE | TBD2_BIO2_USD | TBD2_BIO2_ACC |
 | IMDB-3 | SoL estimate | 9.56 | 5,024 | $0.0105 | not applicable |
 | IMDB-3 | Quail | 32.79 | 1,603 | $0.0360 | see the QuailB report |
 | IMDB-3 | stock vLLM | 52.65 | 996.9 | $0.0578 | 78.97% |
 | IMDB-3 | pipelined vLLM | 48.21 | 1,088.8 | $0.0529 | 78.97% |
 | IMDB-3 | pipelined SGLang | 67.21 | 755.3 | $0.0737 | 79.94% |
 
+AGENT-1, filter only (documents/second divides the 1,772 input
+documents by query time; the SoL file does not cover the agent
+queries):
+
+| System | Query time (s) | Documents/s | $/query | Answer accuracy |
+|---|---:|---:|---:|---:|
+| Quail | 235.09 | 7.5 | $0.2579 | 75.00% |
+| stock vLLM | 129.54 | 13.7 | $0.1421 | 74.15% |
+| pipelined vLLM | 96.33 | 18.4 | $0.1057 | 74.15% |
+| pipelined SGLang | TBD2_AG_WALL | TBD2_AG_RATE | TBD2_AG_USD | TBD2_AG_ACC |
+
 - BIO-2: pipelined SGLang is the fastest of the three baseline
-  engines — 1.64 times faster than pipelined vLLM and
-  1.76 times faster than stock vLLM. Quail is still
-  6.8 times faster than it, and the SoL estimate
-  14.0 times.
+  engines — TBD2_BIO2_VS_PVLLM times faster than pipelined vLLM and
+  TBD2_BIO2_VS_SVLLM times faster than stock vLLM. Quail is still
+  TBD2_BIO2_VS_QUAIL times faster than it, and the SoL estimate
+  TBD2_BIO2_VS_SOL times.
 - IMDB-3: pipelined SGLang is the slowest measured system —
   1.39 times slower than pipelined vLLM and
-  2.0 times slower than Quail's 32.8 seconds.
-- The filter: 17.8 seconds for the same 5,000 reviews
-  pipelined vLLM filters in 17.3.
-- Its answer accuracy against the shared Qwen3 32B ground truth is
-  the highest of the three engines on both queries.
-- Model startup, excluded from query time: 313.3 seconds (warm
+  2.0 times slower than Quail's 32.8 seconds. The filter is a tie:
+  17.8 seconds for the same 5,000 reviews pipelined vLLM filters in
+  17.3.
+- AGENT-1: TBD2_AG_BULLET
+- Model startup, excluded from query time: TBD2_BOOT seconds (warm
   kernel caches), compared with 143.8 to 235.2 seconds for the vLLM
   family containers.
 
-Each system's pairs/s divides its own evaluated join pairs by its
-query time. On BIO-2 every system evaluates the same 563,500 pairs.
-On IMDB-3 the filters differ, so the pair counts do too: 48,048 for
-the SoL estimate (4,004 expected survivors), 52,560 for Quail (its
-filter passed 4,380 reviews), 52,488 for the vLLM baselines (4,374),
-and 50,760 for SGLang (4,230). The Quail
-times are its post-scan-ring runs (`2026-08-30-kv-ring-fix.md`),
-which cut its IMDB-3 from the 75.0 seconds in the 2026-08-29 family
-run to 32.8; BIO-2 was unchanged. Quail's per-query accuracy is in
-`2026-08-27-quailb-sf01-4b.md` (its 30-query weighted answer
-accuracy is 70.06%). $/query uses $3.9492 per H100! hour and excludes
-startup; the SoL row's cost is the floor implied by its time.
+On BIO-2 every system evaluates the same 563,500 pairs. On IMDB-3
+the filters differ, so the pair counts do too: 48,048 for the SoL
+estimate (4,004 expected survivors), 52,560 for Quail (its filter
+passed 4,380 reviews), 52,488 for the vLLM baselines (4,374), and
+50,760 for SGLang (4,230). Which run supplies which number: the
+BIO-2 and IMDB-3 vLLM columns come from the 2026-08-29 family run
+and the Quail columns from its post-scan-ring runs
+(`2026-08-30-kv-ring-fix.md`); AGENT-1's Quail and vLLM numbers come
+from the 2026-08-31 family runs that introduced the agent queries;
+SGLang's BIO-2 and AGENT-1 come from this report's headline run and
+its IMDB-3 from the earlier run cited under Source data — the
+measured client path is byte-identical between the two. Quail's
+per-query accuracy is in `2026-08-31-quailb-kv-regret.md` (its
+32-query weighted answer accuracy is 70.07%). $/query uses $3.9492
+per H100! hour and excludes startup; the SoL row's cost is the floor
+implied by its time.
 
 ## Prediction
 
-Stated before the run:
+Stated before the headline run (BIO-2 and AGENT-1; the merge that
+added the agent queries did not touch BIO-2's measured path):
 
-- BIO-2 in 950 to 1,040 seconds. Miss low: 868.5 seconds, 8% under the band floor. The band
-  treated the removed per-request list copy as a pointer copy
-  worth a few seconds. The copy also wrote every token id
-  object's reference count — one cache-missing memory write per
-  element, 2.3 billion across the join — and the join is
-  driver-bound, so those cycles were wall time. The exact split
-  between the copy and ordinary run-to-run spread was not
-  measured separately; only a rerun with the copy restored would
-  settle it, and it is not worth a run.
-- IMDB-3 in 62 to 69 seconds. Hit: 67.2 seconds (filter 17.8, join 49.4).
-- BIO-2 within about 4.3% of the band center either way: that is the
-  run-to-run spread measured on this query with identical code.
+- BIO-2 in 830 to 910 seconds: 868.5 measured previously on the
+  identical path, plus or minus the 4.3% run-to-run spread measured
+  on this query. TBD2_BIO2_VERDICT
+- AGENT-1 in 180 to 300 seconds with 20 to 45% of prompt tokens
+  served from KV. The reasoning: 1,772 requests mean the per-request
+  fixed cost totals about 1.6 seconds, so this query is
+  prefill-bound and the cache hit rate decides it. The radix cache
+  shares only completed requests, so snapshots of the same
+  trajectory admitted in the same wave recompute their common
+  prefix; pipelined vLLM's in-flight sharing reached 68.22%.
+  TBD2_AG_VERDICT
+- IMDB-3, measured earlier on the identical client path: predicted
+  62 to 69 seconds, measured 67.2 (filter 17.8, join 49.4).
 
 ## What the numbers mean
 
 - Both engines' joins are host-bound, not GPU-bound. The BIO-2 join
-  moved 12,930 fresh tokens per second through a GPU that
+  moved TBD2_FRESH_RATE fresh tokens per second through a GPU that
   prefills tens of thousands per second, while per-request
-  bookkeeping ran at 648.8 pairs/s. The engine
+  bookkeeping ran at TBD2_BIO2_RATE pairs/s. The engine
   configuration (16-token pages, no detokenizer) exists to cut that
   per-request host work; the rationale section explains each piece.
 - Per-pair time fits a fixed cost plus a per-prompt-token cost.
-  Pipelined SGLang: about 0.92 ms per request plus
-  0.15 microseconds per prompt token. Pipelined vLLM:
+  Pipelined SGLang: about TBD2_FIXED_MS ms per request plus
+  TBD2_PER_TOKEN_US microseconds per prompt token. Pipelined vLLM:
   about 0.40 ms plus 0.52 microseconds. The crossover sits near
-  1,400 prompt tokens: vLLM wins IMDB-3's 358-token pairs (0.59
-  against 0.97 ms per pair), SGLang wins BIO-2's 4,124-token pairs
-  (1.54 against 2.55 ms). SGLang's larger fixed cost
+  TBD2_CROSSOVER prompt tokens: vLLM wins IMDB-3's 358-token pairs
+  (0.59 against 0.97 ms per pair), SGLang wins BIO-2's 4,124-token
+  pairs (TBD2_BIO2_MS against 2.55 ms). SGLang's larger fixed cost
   is its process architecture — every request crosses zmq to the
   scheduler process and back — and that floor is not reachable from
   the client side.
-- Cache hit rates are engine-equal: 99.5% of join prompt
-  tokens on BIO-2 (vLLM: 99.5%), 87.7% on IMDB-3 (vLLM:
+- Join cache hit rates are engine-equal: TBD2_BIO2_CACHE of join
+  prompt tokens on BIO-2 (vLLM: 99.5%), 87.7% on IMDB-3 (vLLM:
   88.4%). The join order does its job; caching explains none of the
-  remaining gap.
+  remaining join gap.
+- AGENT-1 is where the caches differ. The corpus is cumulative
+  snapshots — a later snapshot of a trajectory contains the earlier
+  one as a prefix — and vLLM's prefix cache shares that text even
+  between co-scheduled requests, serving 68.22% of prompt tokens
+  from KV. SGLang served TBD2_AG_CACHE: the radix cache stores a
+  request's KV only at completion, so a snapshot can only reuse a
+  sibling that finished in an earlier wave. TBD2_AG_MEANING
 - Engine-to-engine answer divergence is small: about 1.2% of BIO-2
   pairs net flipped against vLLM, with accuracy slightly up on
   SGLang. Both engines run the same prompts with greedy decoding;
   the flips are fp8 numeric noise on borderline pairs, which differs
   with which prefix tokens each engine recomputes.
-- The single-stage IMDB-3 filter cannot show pipelining's real
-  benefit (overlapping stage k+1 with stage k stragglers); the
-  multi-stage chains in IMDB-4..7, BIO-4/5, FEV-4/6, and LEP-4..8
-  would. Those queries run with `--query ""` (all 30) but were not
-  measured here.
+- The single-stage IMDB-3 and AGENT-1 filters cannot show
+  pipelining's real benefit (overlapping stage k+1 with stage k
+  stragglers); the multi-stage chains in IMDB-4..7, FEV-4/6, and
+  LEP-4..8 would. Those queries run with `--query ""` (all 32) but
+  were not measured here.
 
 ## Configuration rationale
 
@@ -176,7 +212,8 @@ Stated before the run:
   documents admitted into freed slots at wave boundaries. Admission
   uses the same token-budget formula as the vLLM client (KV pool
   tokens divided by mean request size, capped at 4,096): doc_cap was
-  1,146 for the IMDB-3 filter.
+  1,146 for the IMDB-3 filter and TBD2_AG_CAP for AGENT-1's long
+  documents.
 - 16-token cache pages (`page_size=16`, vLLM's block size). SGLang
   defaults to 1-token pages, which cost a radix-tree node and a KV
   index entry per token on every request. On the host-bound joins
@@ -217,27 +254,39 @@ restricting the argmax to those ids, as long as no other token's raw
 logit is 1,000 higher. Raw logit gaps are two orders of magnitude
 smaller than that.
 
-The vLLM numbers come from the 2026-08-29 family run; the SGLang run
-used its own H100! container on 2026-08-31.
+Every run used its own H100! container; the sources paragraph under
+Result says which run supplies which number.
 
 ## Source data
 
-- Pipelined SGLang, function call `fc-01M1AYQ53Y29WSWWK4C85HCB7G`:
+- Pipelined SGLang, headline run (BIO-2 and AGENT-1), function call
+  `fc-01M1CVW8HTARK3GN2HFH82WH1A`:
+  `TBD2_VOLUME_PATH`
+- Pipelined SGLang, IMDB-3 (identical client path), function call
+  `fc-01M1AYQ53Y29WSWWK4C85HCB7G`:
   `/results/pipelined_sglang/2026-08-31_034457_9032b486/summary.json`
-- Stock vLLM:
+- Stock and pipelined vLLM, BIO-2 and IMDB-3:
   `/results/stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`
-- Pipelined vLLM:
+  and
   `/results/pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`
-- Quail (scan-ring runs, current engine):
+- Stock and pipelined vLLM, AGENT-1:
+  `/results/stock_vllm/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`
+  and
+  `/results/pipelined_vllm/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json`
+- Quail, BIO-2 and IMDB-3 (scan-ring runs, current engine):
   `/results/ablations/ringfix_bio2.json` and
   `/results/ablations/ringfix_tokens_head_imdb3.json`
-- SoL estimate: `/results/sol/sol_quailb_sf0.1.json`
+- Quail, AGENT-1 (2026-08-31 family run):
+  `/results/benchmarks/quailb/runs/qb_20260831T062218Z_1192cd76/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json`
+- SoL estimate (no agent queries):
+  `/results/sol/sol_quailb_sf0.1.json`
 
-All engine runs scored accuracy against ground truth collection
-`gt_363b5ab570635c33894e1a030c21f57e` labels on corpus
-`c_3bd14ed0758287cba9d88fb68de8b7b8` (the vLLM runs recorded the same
-label sets under their earlier collection id
-`gt_02ffa2a5720006e8236aa993760e9e29`).
+Every engine run scored accuracy against the shared Qwen3 32B ground
+truth; each cited summary records the collection and corpus ids it
+used (the headline run uses `gt_77bb8b128743a79aedddaa24c808c3f8` on
+corpus `c_1aa2c4f0d0b6c816fd37aa5748c33341`, the collection that
+added the agent label sets; the earlier runs record the equivalent
+label sets under earlier collection ids).
 
 The plot script `reports/make_sglang_baseline_plots.py` takes a work
 directory holding the pulled files; its docstring has the
