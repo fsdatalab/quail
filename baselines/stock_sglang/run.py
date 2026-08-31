@@ -247,7 +247,7 @@ class StockSGLangClient:
         return outputs
 
     def _generate_slice(self, prompts, sampling_params):
-        input_ids = [list(p["prompt_token_ids"]) for p in prompts]
+        input_ids = [p["prompt_token_ids"] for p in prompts]
         raw = self.engine.generate(
             input_ids=input_ids, sampling_params=dict(sampling_params))
         if isinstance(raw, dict):
