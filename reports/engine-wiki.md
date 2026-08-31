@@ -1386,3 +1386,27 @@ model_name=...)` is the policy wrapper: marker match runs the
 touch pass, mismatch or `force_compile=True` runs the compile pass
 and writes the marker. This keeps JIT compilation out of measured
 walls once ever, and keeps per-container boot at touch-pass cost.
+
+**Cold model load** (`executor/model.py`, `runtime/worker.py`):
+two settings keep `load_model` off the network and off a repeated
+subprocess.
+
+- Every vLLM image sets `VLLM_CACHE_ROOT` to the kernel-cache
+  volume. vLLM resolves the model architecture by running a fresh
+  Python interpreter at engine-config creation (~13 s) and caches
+  the result as JSON under `VLLM_CACHE_ROOT/modelinfos`; the
+  default `~/.cache/vllm` is ephemeral on Modal, so without the
+  volume every container paid the subprocess again. One container
+  seeds the JSON; every later container reads it back in about a
+  second.
+- `ModelSpec.revision` pins each checkpoint to its hub commit
+  hash, and every `load_model` caller passes it. A commit hash
+  resolves from the HF cache volume without the API round trips a
+  branch name pays, and still downloads on a cold cache. The
+  stock vLLM baseline passes the same pin, so engine and baseline
+  boots stay comparable.
+
+Measured on one H100 (report 2026-08-31-load-model-speed): cold
+`load_model` for Qwen3 4B fp8 went from 35.3 s to 24.8 s. The
+remaining floor is the torch+vLLM import (~14 s) and `get_model`
+(~10 s).

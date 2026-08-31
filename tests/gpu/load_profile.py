@@ -59,7 +59,7 @@ IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy")
+    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow")
     .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
           "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
@@ -79,10 +79,10 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
 results_vol = modal.Volume.from_name("quail-results",
                                      create_if_missing=True)
 
-# max_inputs=1: every call gets a cold container, so each record is a
-# true cold load, never a warm-process repeat.
+# single_use_containers: every call gets a cold container, so each
+# record is a true cold load, never a warm-process repeat.
 GPU_KW = dict(image=image, gpu="H100!", memory=65536, timeout=1800,
-              max_inputs=1,
+              single_use_containers=True,
               volumes={"/root/.cache/huggingface": hf_cache,
                        "/root/.cache/kernels": kernel_cache,
                        "/results": results_vol})
