@@ -41,7 +41,12 @@ image = (
     .pip_install("vllm==0.26.0", "huggingface_hub[hf_transfer]",
                  "transformers>=5.2.0", "pandas", "pyarrow",
                  "numpy", "datasets")
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+    .env({# vLLM's architecture-inspection subprocess caches under
+          # VLLM_CACHE_ROOT/modelinfos; the volume makes it run once
+          # ever, not once per container. The baseline gets the same
+          # setting as the engine so cold boots stay comparable.
+          "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+          "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           "HF_HUB_ENABLE_HF_TRANSFER": "1",
@@ -956,8 +961,15 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
     run_name = paired_run_id or baselines[0]
 
     def boot_llm():
+        # the engine pins the hub revision (spec.revision), so the
+        # baseline pins the same one: a commit hash resolves from the
+        # HF cache without API round trips
+        from quail.specs import MODELS as spec_models
+        revision = spec_models[model].revision or None
         next_llm, next_boot = time_llm_boot(
             model=hf_name,
+            revision=revision,
+            tokenizer_revision=revision,
             max_num_batched_tokens=25_305,
             max_num_seqs=4096,
             gpu_memory_utilization=gpu_memory_utilization,

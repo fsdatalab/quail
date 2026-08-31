@@ -72,7 +72,11 @@ image = (
         "numpy",
         "datasets",
     )
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+    .env({# vLLM's architecture-inspection subprocess caches under
+          # VLLM_CACHE_ROOT/modelinfos; the volume makes it run once
+          # ever, not once per container
+          "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+          "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           "HF_HUB_ENABLE_HF_TRANSFER": "1"})
@@ -152,8 +156,13 @@ def _boot(model, sf, kineto_dir):
     except ImportError:
         prof_cfg = {"profiler": "torch",
                     "torch_profiler_dir": kineto_dir}
+    # same pinned hub revision as the engine: a commit hash resolves
+    # from the HF cache without API round trips
+    revision = MODELS[model].revision or None
     llm, boot = time_llm_boot(
         model=hf_name,
+        revision=revision,
+        tokenizer_revision=revision,
         max_num_batched_tokens=25_305,
         max_num_seqs=4096,
         gpu_memory_utilization=0.91,

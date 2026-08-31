@@ -83,6 +83,10 @@ image = (
         "datasets",
     )
     .env({
+        # vLLM's architecture-inspection subprocess caches under
+        # VLLM_CACHE_ROOT/modelinfos; the volume makes it run once
+        # ever, not once per container
+        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
         "VLLM_LOGGING_LEVEL": "WARNING",
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",

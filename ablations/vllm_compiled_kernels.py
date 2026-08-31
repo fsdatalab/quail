@@ -67,7 +67,11 @@ image = (
         "numpy",
         "datasets",
     )
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+    .env({# vLLM's architecture-inspection subprocess caches under
+          # VLLM_CACHE_ROOT/modelinfos; the volume makes it run once
+          # ever, not once per container
+          "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+          "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           "HF_HUB_ENABLE_HF_TRANSFER": "1",
@@ -293,7 +297,7 @@ def _boot_state(model):
     spec = MODELS[model]
     device = DEVICES["h100-sxm"]
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    model_mod = load_model(spec.hf_name)
+    model_mod = load_model(spec.hf_name, revision=spec.revision)
     chunk_tokens = budgets.chunk_budget(spec, device)
     arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
     arena = KVArena(n_layers=spec.layers,

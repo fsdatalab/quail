@@ -16,7 +16,14 @@ image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
     .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow")
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+    .env({# vLLM inspects the model architecture in a fresh Python
+          # subprocess at every engine-config creation (~13 s). It
+          # caches the result under VLLM_CACHE_ROOT/modelinfos;
+          # ~/.cache/vllm is ephemeral on Modal, so the cache must
+          # ride the kernel-cache volume to pay the subprocess once
+          # ever, not once per container.
+          "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+          "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           # JIT artifacts persist on the kernel-cache volume so each
@@ -107,7 +114,7 @@ def _execute_payload(payload: dict) -> dict:
     if booted is None:
         from quail.executor.model import load_model
         t0 = time.perf_counter()
-        model = load_model(spec.hf_name)
+        model = load_model(spec.hf_name, revision=spec.revision)
         boot["load_model_s"] = time.perf_counter() - t0
         # budgets.* is tiny CPU; fold into arena_s so the four phases
         # cover the cold-load span without a leftover residual
@@ -512,7 +519,7 @@ def _child_boot(state, sub):
     t_boot = time.perf_counter()
     if "pipeline" not in state:
         t0 = time.perf_counter()
-        model = load_model(spec.hf_name)
+        model = load_model(spec.hf_name, revision=spec.revision)
         boot["load_model_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
         chunk_tokens = budgets.chunk_budget(spec, device)

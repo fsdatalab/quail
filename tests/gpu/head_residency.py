@@ -26,7 +26,11 @@ image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
     .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow")
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+    .env({# vLLM's architecture-inspection subprocess caches under
+          # VLLM_CACHE_ROOT/modelinfos; the volume makes it run once
+          # ever, not once per container
+          "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+          "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
@@ -93,7 +97,7 @@ def probe(model_name: str) -> str:
     baseline = torch.cuda.memory_allocated()
 
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    model = load_model(spec.hf_name)
+    model = load_model(spec.hf_name, revision=spec.revision)
     allocated = torch.cuda.memory_allocated() - baseline
     head_device = model.lm_head.weight.device.type
 
