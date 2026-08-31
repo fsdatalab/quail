@@ -21,8 +21,11 @@ from baselines.stock_vllm.run import (
     _run_stage_major_filter_chain,
     _select_join_anchor,
     _split_query_sets,
+    _vllm_failure_entry,
     _vllm_filter_capacity,
+    define_all_queries,
 )
+from quail.bench.quailb import AGENT_IMPLEMENTED_FIX, QUERY_ORDER
 from quail.logical import (ColumnRef, bind_join_prompt, bind_prompt,
                            render_filter_prompt_ids,
                            render_join_prompt_ids)
@@ -57,6 +60,21 @@ def test_stock_filter_prompts_match_quail_token_for_token():
     assert stock == expected
 
 
+def test_stock_catalog_matches_current_queries():
+    definitions = define_all_queries()
+
+    assert set(definitions) == set(QUERY_ORDER)
+    assert sorted(
+        query_id for query_id in definitions
+        if query_id.startswith("BIO-")) == [
+            "BIO-1", "BIO-2", "BIO-3"]
+    assert sorted(
+        query_id for query_id in definitions
+        if query_id.startswith("AGENT-")) == ["AGENT-1", "AGENT-2"]
+    assert definitions["AGENT-2"]["steps"] == [
+        ("filter", "t", [AGENT_IMPLEMENTED_FIX])]
+
+
 def test_pipelined_filter_parts_match_complete_filter_prompts():
     tokenizer = CharTokenizer()
     templates = [
@@ -80,6 +98,34 @@ def test_baseline_names_select_only_the_filter_submission():
     assert _baseline_configuration("pipelined_vllm") == "pipelined"
     with pytest.raises(ValueError, match="unknown baseline"):
         _baseline_configuration("other")
+
+
+def test_vllm_failure_entry_marks_cuda_oom():
+    entry = _vllm_failure_entry(
+        "BIO-2", RuntimeError("CUDA out of memory"))
+
+    assert entry["query"] == "BIO-2"
+    assert entry["status"] == "oom"
+    assert entry["error"] == "oom"
+    assert entry["total_wall_s"] is None
+    assert entry["regret_tokens"] is None
+
+
+def test_vllm_failure_entry_marks_dead_engine_as_oom():
+    class EngineDeadError(RuntimeError):
+        pass
+
+    entry = _vllm_failure_entry(
+        "BIO-3", EngineDeadError("engine stopped"))
+
+    assert entry["status"] == "oom"
+
+
+def test_vllm_failure_entry_preserves_other_errors():
+    entry = _vllm_failure_entry("BIO-1", ValueError("bad input"))
+
+    assert entry["status"] == "error"
+    assert entry["error"] == "ValueError: bad input"
 
 
 def test_join_anchor_uses_larger_mean_surviving_document_length():

@@ -1177,11 +1177,11 @@ GPUs (`worker.py:495-519`).
 
 ## 7. The benchmark (QUAIL-B)
 
-QUAIL-B (`bench/quailb.py`) has 30 queries over four document sets
-(IMDB, BioDEX, FEVER, LePaRD), plus 2 optional PrivacyPolicies
+QUAIL-B (`bench/quailb.py`) has 32 queries over five document sets
+(IMDB, BioDEX, FEVER, LePaRD, and SWE-Next), plus 2 optional PrivacyPolicies
 queries. Qwen3 32B answers the filter predicates during the judge pass.
 The FEVER annotations and sampled LePaRD citation edges provide source labels
-for known join pairs. Ground truth covers 22 predicates.
+for known join pairs. The current queries use 21 predicates.
 
 ### Document tables
 
@@ -1192,6 +1192,7 @@ for known join pairs. Ground truth covers 22 predicates.
 | claims | `fever/fever` | 5,000 | Factual claims (train + labelled_dev) |
 | citation_contexts | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Legal citation excerpts |
 | citation_passages | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Cited legal passages |
+| agent_traces | `TIGER-Lab/SWE-Next-SFT-Trajectories` | 17,718 | Cumulative software agent trace snapshots |
 | policies | `mukund/PrivacyPolicies` | 1,000,000 | Privacy policies (optional) |
 
 LePaRD first samples known citation pairs with a stable hash. At scale factor
@@ -1199,6 +1200,13 @@ LePaRD first samples known citation pairs with a stable hash. At scale factor
 text into separate tables, which produce 500 context rows and 433 passage rows.
 The source join label is true when a context's cited passage IDs intersect a
 passage row's passage IDs.
+
+Each SWE-Next document contains the full trace after every fifth assistant
+turn, including the following tool output when one exists. Documents from the
+same trajectory stay together in time order. The builder keeps documents with
+at most 24,000 Qwen3 tokens and excludes trajectories without a user issue.
+Scale factor 0.1 uses 1,772 documents from 376 trajectories. The documents
+contain 17,252,669 tokens. Scale factor 1.0 uses 17,718 documents.
 
 Partner tables (fixed vocabulary, not scaled by SF):
 - **aspects** (12 rows): film aspects ("the acting", "the plot", ...)
@@ -1215,6 +1223,7 @@ graph LR
         reports["reports (10K)"]
         claims["claims (5K)"]
         citation_contexts["citation_contexts"]
+        agent_traces["agent_traces (17,718)"]
         policies["policies (1M, optional)"]
     end
     subgraph Partner tables
@@ -1231,7 +1240,7 @@ graph LR
     policies -. "SCENARIO_MATCH" .-> scenarios
 ```
 
-### The 30 queries
+### The 32 queries
 
 **IMDB** (10 queries): reviews x aspects
 
@@ -1283,6 +1292,13 @@ graph LR
 | LEP-7 | 2F + 1J two-sided | LEP1 + LEP2 on excerpts, LEPS1 on passages |
 | LEP-8 | 5F | LEP1..LEP5, no join |
 
+**SWE-Next** (2 queries): cumulative agent trace snapshots
+
+| Query | Shape | Description |
+|---|---|---|
+| AGENT-1 | 1F | Agent recovered after an unsuccessful approach |
+| AGENT-2 | 1F | Agent implemented a plausible fix for the reported issue |
+
 **PrivacyPolicies** (2 optional queries): policies x scenarios
 
 | Query | Shape | Description |
@@ -1298,19 +1314,20 @@ benchmark runner or judge pass.
 
 Every filter and join carries a fixed selectivity estimate. The estimates
 come from the active sf0.1 Qwen3 32B fp8 collection
-`gt_363b5ab570635c33894e1a030c21f57e` for corpus
-`c_3bd14ed0758287cba9d88fb68de8b7b8`. Planning does not read the ground
+`gt_77bb8b128743a79aedddaa24c808c3f8` for corpus
+`c_1aa2c4f0d0b6c816fd37aa5748c33341`. Planning does not read the ground
 truth labels.
 
 The source collection is
-`/results/ground_truth/quailb/schema_v1/collections/gt_363b5ab570635c33894e1a030c21f57e/manifest.json`
+`/results/ground_truth/quailb/schema_v1/collections/gt_77bb8b128743a79aedddaa24c808c3f8/manifest.json`
 on the `quail-results` volume. Each builder query ends with
 `.select(..., order="by_cost")`, so the benchmark exercises the planner's
-filter and join ordering. The collection reuses 15 IMDB, BioDEX, and FEVER
-label sets from the prior corpus. The collection manifest records the source
-collection and the unchanged table manifests for every reused label set. The
-loader checks those table manifests before it accepts the collection. The
-seven LePaRD label sets belong directly to the current corpus.
+filter and join ordering. The collection contains 21 predicates. It reuses
+the 19 IMDB, BioDEX, FEVER, and LePaRD label sets whose tables did not change.
+The two SWE-Next label sets belong directly to the current corpus. The
+collection manifest records the original corpus and table manifest for every
+reused label set. The loader checks those table manifests before it accepts
+the collection.
 
 ### Protocol and reported values
 
