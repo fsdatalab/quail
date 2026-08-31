@@ -9,7 +9,7 @@ work directory to this script:
     modal volume get quail-results ablations/ringfix_tokens_head_imdb3.json $W/quail_ringfix_imdb3.json
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm.json
-    modal volume get quail-results pipelined_sglang/2026-08-30_063002_bf050db3/summary.json $W/pipelined_sglang.json
+    modal volume get quail-results pipelined_sglang/2026-08-31_021203_e40e08d2/summary.json $W/pipelined_sglang.json
     uv run --with matplotlib python reports/make_sglang_baseline_plots.py $W
 """
 
@@ -37,7 +37,8 @@ def load(path):
 
 
 def check(summary, baseline, memory_key, memory_fraction,
-          filter_submission, join_submission=None):
+          filter_submission, join_submission=None,
+          batched_tokens=25_305):
     if (summary["baseline"] != baseline
             or summary["filter_submission"] != filter_submission
             or summary["hf_name"] != "Qwen/Qwen3-4B-FP8"
@@ -45,7 +46,7 @@ def check(summary, baseline, memory_key, memory_fraction,
             or summary["checkpoint"] != "pre-quantized FP8"
             or summary[memory_key] != memory_fraction
             or summary["max_num_seqs"] != 4096
-            or summary["max_num_batched_tokens"] != 25_305
+            or summary["max_num_batched_tokens"] != batched_tokens
             or summary.get("join_submission") != join_submission):
         raise ValueError(f"unexpected {baseline} configuration")
 
@@ -144,7 +145,8 @@ def main():
     check(pipelined_vllm, "pipelined_vllm", "gpu_memory_utilization",
           0.91, "pipelined")
     check(pipelined_sglang, "pipelined_sglang", "mem_fraction_static",
-          0.78, "pipelined", join_submission="suffix-major-tiled")
+          0.76, "pipelined", join_submission="suffix-major-tiled",
+          batched_tokens=25_296)
 
     entries = {
         "stock_vllm": query_entries(stock_vllm),

@@ -95,11 +95,14 @@ DEFAULT_QUERY_IDS = "BIO-2,IMDB-3"
 # logits and the logit-bias tensor are each
 # 4096 x vocab x 4 bytes = 2.3 GB. 0.91 and 0.85 both ran out of GPU
 # memory mid-join. 0.78 completed every page_size=1 run without an
-# allocation failure, but under page_size=16 the 2026-08-31 run's
-# allocator cache fragmented until free memory hit 5 MB and the 2.3 GB
-# tensors only fit by stalling CUDA to flush and retry (three times
-# across the run). 0.76 gives them room; it costs about 11,500 KV pool
-# tokens (2.8%).
+# allocation failure. Under page_size=16 the extend batch's row count
+# varies step to step, so the float32 logits and logit-bias tensors
+# keep new segment sizes churning through the allocator cache; the
+# cache occasionally fills and a large allocation stalls CUDA to
+# flush and retry. That happens at 0.78 and 0.76 alike (three and
+# five retries in the two 2026-08-31 runs, all recovered), but 0.78
+# ran the post-flush headroom down to 5 MB free while 0.76 kept it
+# near a gigabyte. 0.76 costs about 11,500 KV pool tokens (2.8%).
 MEM_FRACTION_STATIC = 0.76
 MAX_NUM_SEQS = 4096
 MAX_NUM_BATCHED_TOKENS = 25_305
@@ -158,11 +161,12 @@ class StockSGLangClient:
     # task per request, and the Modal health heartbeat thread starves
     # until Modal marks the container unhealthy. Each slice is still
     # four times deeper than max_running_requests, so the engine's
-    # queue never runs dry inside a slice. The pause is the heartbeat
-    # thread's only GIL-free window: at 0.1 s the 2026-08-31 run's
-    # heartbeat went unanswered for stretches over four minutes, so
-    # the pause stays at the measured-safe 1.0 s and costs BIO-2 about
-    # 34 idle seconds across its 34 slice boundaries.
+    # queue never runs dry inside a slice. Heartbeat attempts still
+    # fail in stretches up to about four minutes under join load at
+    # either 0.1 s or 1.0 s pauses (both 2026-08-31 runs survived
+    # them), so the pause does not govern heartbeat health; 1.0 s is
+    # kept as the conservative setting every completed run used. It
+    # costs BIO-2 about 34 idle seconds across 34 slice boundaries.
     submit_slice = 16_384
     slice_pause_s = 1.0
 

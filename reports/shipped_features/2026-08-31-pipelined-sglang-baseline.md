@@ -40,20 +40,30 @@ submission pattern itself.
   anchor-major order would recompute an anchor for every sibling in
   flight. Answers return in anchor-major pair order; stock vLLM
   keeps anchor-major.
+- The joins are host-bound, so the engine is configured to spend as
+  little host time per request as the client side allows: 16-token
+  cache pages (`page_size=16`, vLLM's block size) instead of
+  SGLang's default per-token radix bookkeeping, and no tokenizer or
+  detokenizer in the request path (`skip_tokenizer_init=True` —
+  the client already exchanges token ids). These two took BIO-2 from
+  1,256.9 to 1,028.7 seconds.
 - vLLM's `allowed_token_ids` restriction has no SGLang equivalent;
   the runner adds a +1000 `logit_bias` to the same eight TRUE/FALSE
   token ids, which picks the same token under greedy decoding
   because the bias lands on float32 logits before the argmax.
 - vLLM's `gpu_memory_utilization=0.91` maps to
-  `mem_fraction_static=0.78`, not 0.91: vLLM's fraction includes the
+  `mem_fraction_static=0.76`: vLLM's fraction includes the
   activation working set (it profiles a forward, with logits for
-  `max_num_seqs` requests, before sizing KV), SGLang's does not, and
-  0.91 and 0.85 both ran out of GPU memory on BIO-2. Prefill CUDA
-  graphs are disabled for the same reason, and batch submission is
-  sliced to 16,384 requests so the driver process stays responsive.
+  `max_num_seqs` requests, before sizing KV), SGLang's does not.
+  0.91 and 0.85 ran out of GPU memory on BIO-2; 0.78 held only with
+  1-token pages, and under 16-token pages the variable batch shapes
+  churn the allocator cache enough that 0.76 is needed to keep
+  flush-and-retry headroom. Prefill CUDA graphs are disabled for the
+  same reason, and batch submission is sliced to 16,384 requests so
+  the driver process stays responsive.
 
 ## Numbers
 
 The measured comparison against the SoL estimate, Quail, and both
 vLLM baselines on BIO-2 and IMDB-3 at sf=0.1 is in
-`reports/2026-08-30-sglang-baseline.md`.
+`reports/2026-08-31-sglang-baseline.md`.
