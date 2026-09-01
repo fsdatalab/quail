@@ -16,12 +16,9 @@ image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
     .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow")
-    .env({# vLLM inspects the model architecture in a fresh Python
-          # subprocess at every engine-config creation (~13 s). It
-          # caches the result under VLLM_CACHE_ROOT/modelinfos;
-          # ~/.cache/vllm is ephemeral on Modal, so the cache must
-          # ride the kernel-cache volume to pay the subprocess once
-          # ever, not once per container.
+    .env({# vLLM caches its model-architecture inspection (a ~13 s
+          # subprocess) under VLLM_CACHE_ROOT; the default location
+          # is ephemeral, so it lives on the kernel-cache volume
           "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
           "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",

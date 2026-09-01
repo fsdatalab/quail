@@ -23,11 +23,9 @@ class ModelSpec:
     #                      (gate_up: 2 x intermediate at Qwen3)
     w_bytes: float       # weight bytes per param (fp8 = 1)
     hf_name: str = ""    # the checkpoint (weights + tokenizer)
-    revision: str = ""   # pinned hub commit. A commit hash resolves
-    #                      from the HF cache without API round trips
-    #                      (unlike a branch name) and still downloads
-    #                      on a cold cache. "" tracks the default
-    #                      branch and pays the round trips.
+    revision: str = ""   # pinned hub commit hash; resolves from the
+    #                      HF cache without the API round trips a
+    #                      branch name pays. "" tracks the default.
     kv_bytes: float = 2.0    # KV bytes per element (bf16 default)
     w_mem_bytes: float = 0.0    # measured weight footprint as loaded;
     #                             0 falls back to params * w_bytes.
