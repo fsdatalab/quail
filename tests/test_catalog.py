@@ -6,7 +6,11 @@ import pyarrow.parquet as pq
 import pytest
 from datasets import Dataset
 
-from quail.catalog import DocumentProvider
+from quail.catalog import (
+    ArrowDatasetProvider,
+    DocumentProvider,
+    ScanRequest,
+)
 from quail.logical import CompileError
 
 
@@ -20,7 +24,7 @@ def test_from_dataset_reads_only_id_and_requested_column():
     provider = DocumentProvider.from_dataset(dataset, id_col="id")
     table = provider.read_column("body")
 
-    assert provider.kind == "dataset"
+    assert isinstance(provider, ArrowDatasetProvider)
     assert provider.columns == ("id", "body", "unused")
     assert table.column_names == ["id", "body"]
     assert table.to_pydict() == {
@@ -48,11 +52,28 @@ def test_from_parquet_builds_dataset(tmp_path):
 
     provider = DocumentProvider.from_parquet(str(path), id_col="id")
 
-    assert provider.kind == "dataset"
+    assert isinstance(provider, ArrowDatasetProvider)
     assert provider.read_column("body").to_pydict() == {
         "id": ["a", "b"],
         "body": ["first", "second"],
     }
+
+
+def test_scan_returns_bounded_batches_and_only_requested_columns():
+    dataset = ds.dataset(pa.table({
+        "id": [str(index) for index in range(10)],
+        "body": [f"body {index}" for index in range(10)],
+        "unused": list(range(10)),
+    }))
+    provider = DocumentProvider.from_dataset(dataset, id_col="id")
+
+    reader = provider.scan(ScanRequest(
+        columns=("body",), limit=5, batch_rows=2
+    ))
+    batches = list(reader)
+
+    assert [batch.num_rows for batch in batches] == [2, 2, 1]
+    assert all(batch.schema.names == ["body"] for batch in batches)
 
 
 def test_hugging_face_provider_reads_through_arrow_dataset(monkeypatch):

@@ -1,7 +1,16 @@
 """Data structures produced by planning: PhysicalPlan and Refusal."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from quail.physical import (
+    AdaptiveJoinPlan,
+    AnchoredJoin,
+    PhysicalGraph,
+    PhysicalNode,
+    PortRef,
+)
+from quail.physical.codec import NodeCodec, built_in_codecs, plan_envelope
 
 
 @dataclass(frozen=True)
@@ -43,32 +52,89 @@ class PhysicalPlan:
     admission_tokens: int      # KV residency (the arena)
     order_rule: str            # "as_written" | "by_cost"
     order_source: str          # which rule chose it, for explain()
+    backend: str = "quail"
+    estimated_seconds: float = 0.0
     limit: int | None = None   # output row cap; None = no limit
-    nodes: tuple = ()          # dataflow graph in topological order;
-    #                            each node dict has "id", "op", "inputs"
+    nodes: tuple = ()          # typed nodes in topological order
     remarks: tuple = ()
+    root: PortRef | None = None
+    graph: PhysicalGraph = field(init=False, repr=False)
 
-    def node(self, node_id: str) -> dict:
-        for n in self.nodes:
-            if n["id"] == node_id:
-                return n
-        raise KeyError(node_id)
+    def __post_init__(self) -> None:
+        if not self.nodes:
+            raise ValueError("a physical plan needs at least one node")
+        if not all(isinstance(node, PhysicalNode) for node in self.nodes):
+            raise TypeError("PhysicalPlan nodes must implement PhysicalNode")
+        root = self.root or PortRef(
+            self.nodes[-1].node_id, self.nodes[-1].outputs[0].name
+        )
+        graph = PhysicalGraph(tuple(self.nodes), root)
+        graph.validate()
+        object.__setattr__(self, "nodes", graph.nodes)
+        object.__setattr__(self, "root", graph.root)
+        object.__setattr__(self, "graph", graph)
 
-    def nodes_by_op(self, op: str) -> list:
-        return [n for n in self.nodes if n["op"] == op]
+    def node(self, node_id: str) -> PhysicalNode:
+        return self.graph.node(node_id)
+
+    def nodes_by_type(self, type_name: str) -> list:
+        """Return outer and expected child nodes with one type name."""
+        nodes = list(self.nodes)
+        for node in self.nodes:
+            if isinstance(node, AdaptiveJoinPlan):
+                nodes.extend(node.expected_nodes)
+        return [
+            node for node in nodes
+            if node.type_name == type_name
+        ]
+
+    def expected_join_nodes(self) -> tuple:
+        """Return the join nodes selected from planning estimates."""
+        adaptive = [
+            node for node in self.nodes
+            if isinstance(node, AdaptiveJoinPlan)
+        ]
+        if adaptive:
+            return adaptive[0].expected_nodes
+        return tuple(
+            node for node in self.nodes if isinstance(node, AnchoredJoin)
+        )
+
+    def expected_join_stages(self) -> tuple:
+        """Return expected join stages in execution order."""
+        return tuple(
+            stage
+            for node in self.expected_join_nodes()
+            if isinstance(node, AnchoredJoin)
+            for stage in node.stages
+        )
+
+    def to_envelope(self, codecs, *, include_runtime_data=True) -> dict:
+        """Encode the typed graph for a process boundary."""
+        return plan_envelope(
+            backend=self.backend,
+            model=self.model,
+            device=self.device,
+            workers=self.workers,
+            graph=self.graph,
+            codecs=codecs,
+            include_runtime_data=include_runtime_data,
+        )
 
     def to_json(self) -> str:
         d = dict(self.__dict__)
-        # shard index lists are working data, not part of the report
-        nodes = []
-        for n in self.nodes:
-            n = dict(n)
-            if "shards" in n:
-                n["shard_docs"] = [len(s) for s in n["shards"]]
-                n["shard_tokens"] = n.pop("shard_token_loads", None)
-                del n["shards"]
-            nodes.append(n)
-        d["nodes"] = nodes
+        d.pop("graph")
+        d.pop("nodes")
+        d["root"] = {
+            "node_id": self.graph.root.node_id,
+            "port": self.graph.root.port,
+        }
+        codecs = {codec.type_name: codec for codec in built_in_codecs()}
+        for node in self.graph.nodes:
+            codecs.setdefault(node.type_name, NodeCodec(type(node)))
+        d["physical_plan"] = self.to_envelope(
+            codecs, include_runtime_data=False
+        )
         return json.dumps(d, indent=2)
 
 
@@ -85,6 +151,7 @@ def resolve_model(name: str):
 
 @dataclass(frozen=True)
 class EngineConfig:
-    """Top-level engine configuration: GPU count and model."""
+    """Top-level engine configuration."""
     gpus: int = 1
     model: str = "qwen3-4b-fp8"
+    backend: str = "quail"

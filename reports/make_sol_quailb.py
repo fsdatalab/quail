@@ -101,7 +101,7 @@ from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan
-from quail.runtime.coordinator import runtime_nodes, thin_survivors
+from quail.runtime.coordinator import runtime_join_steps, thin_survivors
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 
 W = Path(sys.argv[1])
@@ -343,9 +343,8 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
         }
     else:
         filter_orders = {
-            node["alias"]: [stage["written_pos"]
-                            for stage in node["stages"]]
-            for node in plan.nodes_by_op("FilterChain")
+            node.alias: [stage.written_pos for stage in node.stages]
+            for node in plan.nodes_by_type("quail.packed_filter.v1")
         }
     survivors = {
         alias: list(range(len(data["ids"])))
@@ -422,9 +421,11 @@ def simulate_production_planner(query, model: ModelSpec,
     # the engine retains KV where the plan says so: survivors of
     # keep_kv filter chains, then gate survivors of anchors a later
     # group re-uses
-    keep_aliases = {node["alias"]
-                    for node in plan.nodes_by_op("FilterChain")
-                    if node.get("keep_kv")}
+    keep_aliases = {
+        node.alias
+        for node in plan.nodes_by_type("quail.packed_filter.v1")
+        if node.keep_kv
+    }
     resident_rows = {alias: (set(rows) if alias in keep_aliases
                              else set())
                      for alias, rows in survivors.items()}
@@ -474,9 +475,9 @@ def simulate_production_planner(query, model: ModelSpec,
             already_joined=already_joined)
         if found is not None:
             search_runs.append(found)
-            nodes = runtime_nodes(found["seq"], markers)
+            nodes = runtime_join_steps(found["seq"], markers)
             return next(node for node in nodes
-                        if node["op"] == "JoinGroup")
+                        if node["op"] == "AnchoredJoin")
 
         ordered = sorted(remaining)
         first = ordered[0]
@@ -489,7 +490,7 @@ def simulate_production_planner(query, model: ModelSpec,
                         or spec["anchor"] != anchor:
                     break
                 group.append(index)
-        return dict(op="JoinGroup", anchor=anchor,
+        return dict(op="AnchoredJoin", anchor=anchor,
                     stage_idxs=tuple(group))
 
     while remaining:

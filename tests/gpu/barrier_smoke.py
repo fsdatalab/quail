@@ -1,4 +1,4 @@
-"""Barrier-path smoke test on GPU: two joins with different anchors, verified on 1 and 2 GPUs."""
+"""Anchor exchange smoke test on one and two GPUs."""
 
 import json
 import sys
@@ -85,7 +85,7 @@ def build_query(sess):
 
 
 def brute_force_rows(res):
-    """Recombine answer rows on CPU as a brute-force reference for the engine's output."""
+    """Combine answer rows on CPU as a direct result check."""
     frows = res.answer_rows["filters"]["r"]
     keep_r = {d for d, row in frows.items()
               if len(row) == 1 and all(row)}
@@ -119,10 +119,10 @@ def run_one(gpus, flags, truth1, truth2, tmp):
         f"{tmp}/labels.parquet", id_col="id"))
     q = build_query(sess)
     plan = q.plan()
-    kinds = [n["op"] for n in plan.nodes]
+    kinds = [type(n).__name__ for n in plan.expected_join_nodes()]
     print(f"[{gpus} gpu] plan nodes: {kinds}", flush=True)
-    assert kinds.count("JoinGroup") == 2, kinds
-    assert kinds.count("Barrier") == 1, kinds
+    assert kinds.count("AnchoredJoin") == 2, kinds
+    assert kinds.count("Exchange") == 1, kinds
     print(q.explain(), flush=True)
 
     res = q.run()

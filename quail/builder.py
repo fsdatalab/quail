@@ -5,8 +5,8 @@ from typing import Optional
 
 from quail.catalog import Catalog
 from quail.logical import (ColumnRef, CompileError, FilterPredicate,
-                           JoinSpec, LogicalPlan, QueryDesc,
-                           assemble_plan, bind_join_prompt, bind_prompt)
+                           JoinSpec, LogicalPlan, LogicalPlanBuilder,
+                           bind_join_prompt, bind_prompt)
 
 
 @dataclass(frozen=True)
@@ -214,14 +214,17 @@ class Query:
                 continue
             spec = col(c) if isinstance(c, str) else c
             columns.append(self._resolve(spec))
-        desc = QueryDesc(
-            tables=tuple(self._tables),
-            doc_columns=dict(self._doc_columns),
-            filters={a: tuple(v) for a, v in self._filters.items()},
-            joins=tuple(self._joins),
-            columns=tuple(columns),
-            limit=self._limit)
-        return assemble_plan(desc)
+        logical = LogicalPlanBuilder()
+        for alias, provider in self._tables:
+            logical.add_scan(
+                alias,
+                provider,
+                self._doc_columns.get(alias, ""),
+                tuple(self._filters.get(alias, ())),
+            )
+        for join in self._joins:
+            logical.add_join(join)
+        return logical.project(tuple(columns), self._limit)
 
 
 def docs(catalog: Catalog, provider: str, tokenizer=None) -> Query:

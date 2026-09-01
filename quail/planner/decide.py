@@ -9,12 +9,28 @@ Costs are Work records priced by counted constants; no calibration
 constant is read anywhere.
 """
 
+from dataclasses import replace
+
 from quail.logical import LogicalPlan, Project, Scan, SemanticFilter, SemanticJoin
 from quail.planner import budgets
 from quail.planner import joins as joinsearch
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.sol import speed_of_light, unrounded_seconds
 from quail.planner.work import Work, ask, scan
+from quail.physical import (
+    AdaptiveJoinPlan,
+    AnchoredJoin,
+    DocumentScan,
+    Exchange,
+    FilterStage,
+    HashJoin,
+    JoinStage,
+    Limit,
+    PackedFilter,
+    PortRef,
+    Project as PhysicalProject,
+)
+from quail.physical.base import input_ports
 from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk
@@ -342,9 +358,9 @@ def balanced_shards(doc_tokens, workers: int):
 
 # ---------------------------------------------------------- the planner
 
-def plan_query(plan: LogicalPlan, *, model: ModelSpec,
-               device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-               order: str | None = None):
+def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
+                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
+                order: str | None = None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
     Args:
@@ -558,21 +574,21 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     for s in scans:
         shards, loads = balanced_shards(doc_tokens[s.alias], workers)
         sid = f"scan:{s.alias}"
-        nodes.append(dict(
-            id=sid, op="DocScan", inputs=(),
+        nodes.append(DocumentScan(
+            node_id=sid,
             alias=s.alias, provider=s.provider,
             column=s.column,
             n_docs=stats[s.alias].n_docs,
             total_tokens=stats[s.alias].total_tokens,
-            shards=shards, shard_token_loads=loads))
-        ids_src[s.alias] = (sid, f"ids:{s.alias}")
+            shards=shards, shard_token_loads=tuple(loads)))
+        ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
         if s.alias in filters:
             order_idx = filter_orders[s.alias]
             n = stats[s.alias].n_docs
             stages, surv = [], 1.0
             for i in order_idx:
                 p = filters[s.alias][i]
-                stages.append(dict(
+                stages.append(FilterStage(
                     written_pos=i,
                     question_tokens=_question_tokens(p.prompt),
                     preamble_tokens=p.prompt.preamble_tokens,
@@ -585,9 +601,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             writes = len(stages) > 1 or keep
             credit = keep_plan.get(s.alias)
             fid = f"filter:{s.alias}"
-            nodes.append(dict(
-                id=fid, op="FilterChain",
-                inputs=(ids_src[s.alias],),
+            nodes.append(PackedFilter(
+                node_id=fid,
+                inputs=input_ports((ids_src[s.alias].to_tuple(),)),
                 alias=s.alias, arena_writes=writes,
                 keep_kv=keep,
                 # the capacity-planned credit; the runtime offers
@@ -596,7 +612,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 keep_resident_fraction=(credit["resident_fraction"]
                                         if credit else 0.0),
                 stages=tuple(stages)))
-            ids_src[s.alias] = (fid, f"ids:{s.alias}")
+            ids_src[s.alias] = PortRef(fid, f"ids:{s.alias}")
             if not writes:
                 remarks.append(
                     f"filter on {s.alias!r}: arena writes off (one "
@@ -619,6 +635,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     for g, group in enumerate(groups):
         group_last_use[group["anchor"]] = g
 
+    outer_ids_src = dict(ids_src)
+    expected_join_nodes = []
     exec_idx = 0
     barrier_n = 0
     prev_anchor = None
@@ -637,21 +655,24 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                             ahead.append(a)
             bid = f"barrier:{barrier_n}"
             barrier_n += 1
-            nodes.append(dict(
-                id=bid, op="Barrier",
-                inputs=tuple(pairs_edges)
-                + tuple(ids_src[a] for a in ahead),
-                next_anchor=anchor, thins=tuple(ahead)))
+            exchange_inputs = tuple(
+                ref.to_tuple() for ref in pairs_edges
+            ) + tuple(ids_src[a].to_tuple() for a in ahead)
+            expected_join_nodes.append(Exchange(
+                node_id=bid,
+                inputs=input_ports(exchange_inputs),
+                next_anchor=anchor,
+                aliases=tuple(ahead)))
             for a in ahead:
-                ids_src[a] = (bid, f"ids:{a}")
+                ids_src[a] = PortRef(bid, f"ids:{a}")
         gid = f"group:{g}"
         stage_dicts = []
         in_aliases = [anchor]
         for spec, record in group["members"]:
             partners = [a for a in spec["aliases"] if a != anchor]
-            stage_dicts.append(dict(
+            stage_dicts.append(JoinStage(
                 written_pos=spec["written_pos"], exec_idx=exec_idx,
-                anchor=anchor, partners=partners,
+                anchor=anchor, partners=tuple(partners),
                 semantics=spec["semantics"],
                 selectivity=spec["selectivity"],
                 expected_tuples=round(record["tuples"], 1),
@@ -664,41 +685,170 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                 if a not in in_aliases:
                     in_aliases.append(a)
             if spec["semantics"] == "full":
-                pairs_edges.append((gid,
-                                    f"pairs:{spec['written_pos']}"))
+                pairs_edges.append(PortRef(
+                    gid, f"pairs:{spec['written_pos']}"
+                ))
                 for a in [anchor] + partners:
                     if a not in out_aliases:
                         out_aliases.append(a)
-        nodes.append(dict(
-            id=gid, op="JoinGroup",
-            inputs=tuple(ids_src[a] for a in in_aliases),
+        expected_join_nodes.append(AnchoredJoin(
+            node_id=gid,
+            inputs=input_ports(tuple(
+                ids_src[a].to_tuple() for a in in_aliases
+            )),
             anchor=anchor,
             anchor_resident=group["members"][0][1]["resident"],
             keep_anchor_kv=group_last_use[anchor] > g,
-            stage_idxs=tuple(s["exec_idx"] for s in stage_dicts),
+            stage_idxs=tuple(stage.exec_idx for stage in stage_dicts),
             stages=tuple(stage_dicts)))
-        ids_src[anchor] = (gid, f"ids:{anchor}")
+        ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
         prev_anchor = anchor
 
+    if expected_join_nodes:
+        adaptive_id = "adaptive-joins"
+        aliases = tuple(scan_node.alias for scan_node in scans)
+        full_join_positions = tuple(
+            spec["written_pos"] for spec in specs
+            if spec["semantics"] == "full"
+        )
+        nodes.append(AdaptiveJoinPlan(
+            node_id=adaptive_id,
+            inputs=input_ports(tuple(
+                outer_ids_src[alias].to_tuple() for alias in aliases
+            )),
+            expected_nodes=tuple(expected_join_nodes),
+            aliases=aliases,
+            full_join_positions=full_join_positions,
+        ))
+        ids_src = {
+            alias: PortRef(adaptive_id, f"ids:{alias}")
+            for alias in aliases
+        }
+        pairs_edges = [
+            PortRef(adaptive_id, f"pairs:{position}")
+            for position in full_join_positions
+        ]
+
     if pairs_edges:
-        nodes.append(dict(
-            id="recombine", op="Recombine",
-            inputs=tuple(pairs_edges)
-            + tuple(ids_src[a] for a in out_aliases),
+        nodes.append(HashJoin(
+            node_id="recombine",
+            inputs=input_ports(
+                tuple(ref.to_tuple() for ref in pairs_edges)
+                + tuple(ids_src[a].to_tuple() for a in out_aliases)
+            ),
             alias_order=tuple(out_aliases)))
-        sink_inputs = (("recombine", "tuples"),)
+        sink_inputs = (PortRef("recombine", "tuples"),)
     else:
         sink_inputs = (ids_src[scans[0].alias],)
-    nodes.append(dict(
-        id="sink", op="Sink", inputs=sink_inputs,
-        columns=[f"{c.alias}.{c.column}" for c in plan.root.columns]))
+    nodes.append(PhysicalProject(
+        node_id="sink",
+        inputs=input_ports(tuple(ref.to_tuple() for ref in sink_inputs)),
+        columns=tuple(f"{c.alias}.{c.column}" for c in plan.root.columns)))
+    if plan.root.limit is not None:
+        nodes.append(Limit(
+            node_id="limit",
+            inputs=input_ports((("sink", "rows"),)),
+            count=plan.root.limit,
+        ))
 
+    estimate = speed_of_light(
+        base_work + found["work"], model, device, chunk
+    ).seconds
     return PhysicalPlan(
         model=model.name, device=device.name, workers=workers,
         tensor_parallel=tp, kv_dtype="bf16", chunk_tokens=chunk,
         admission_tokens=admission, order_rule=rule, order_source=source,
+        backend="quail", estimated_seconds=estimate,
         limit=plan.root.limit,
         nodes=tuple(nodes), remarks=tuple(remarks))
+
+
+def plan_query(plan: LogicalPlan, *, model: ModelSpec,
+               device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
+               order: str | None = None, backend: str = "quail",
+               registry=None):
+    """Plan one query with the selected model backend.
+
+    Args:
+        doc_tokens: Per document token counts for each table alias.
+        backend: Registered model backend name.
+        registry: Optional session extension registry.
+    """
+    if registry is None:
+        from quail.extensions import built_in_registry
+        registry = built_in_registry()
+    try:
+        selected = registry.backend(backend)
+    except ValueError as error:
+        return Refusal(
+            reasons=(str(error),),
+            constraint="unknown_backend",
+            needed=1,
+            available=0,
+            unit="backends",
+        )
+    support = selected.supports(model, device, gpus)
+    if not support.supported:
+        return Refusal(
+            reasons=(support.reason or "unsupported backend configuration",),
+            constraint="unsupported_backend_configuration",
+            needed=1,
+            available=0,
+            unit="configurations",
+        )
+
+    from quail.planning import (
+        ModelRegion,
+        PlanningContext,
+        apply_physical_rules,
+    )
+    context = PlanningContext(
+        model=model,
+        device=device,
+        gpu_count=gpus,
+        document_tokens=doc_tokens,
+        backend=backend,
+        order=order,
+    )
+    region = ModelRegion(plan)
+    candidates = tuple(selected.plan(region, context))
+    for physical_planner in registry.physical_planners.values():
+        candidates += tuple(physical_planner.plan(region, context))
+    if not candidates:
+        return Refusal(
+            reasons=(f"backend {backend!r} produced no physical plan",),
+            constraint="no_physical_plan",
+            needed=1,
+            available=0,
+            unit="plans",
+        )
+    selected_candidate = min(
+        candidates,
+        key=lambda candidate: candidate.estimated_seconds,
+    )
+    selected_plan = selected_candidate.plan
+    if isinstance(selected_plan, Refusal):
+        return selected_plan
+    if selected_plan.backend != backend:
+        raise ValueError(
+            f"physical planner returned backend {selected_plan.backend!r} "
+            f"for selected backend {backend!r}")
+    graph, changed = apply_physical_rules(
+        selected_plan.graph,
+        tuple(registry.physical_rules.values()),
+        context,
+    )
+    if changed:
+        selected_plan = replace(
+            selected_plan,
+            nodes=graph.nodes,
+            root=graph.root,
+            remarks=selected_plan.remarks + tuple(
+                f"physical rule {name} changed the plan"
+                for name in changed
+            ),
+        )
+    return selected_plan
 
 
 def _filter_alias(pred_or_list):
@@ -757,18 +907,25 @@ def explain(logical: LogicalPlan, physical) -> str:
                  "same search on the actual filter survivors")
     lines.append(f"  order={physical.order_rule} ({physical.order_source})")
     for n in physical.nodes:
-        parts = [f"  {n['op']} {n['id']}"]
-        for k, v in n.items():
-            if k in ("op", "id", "inputs", "shards",
-                     "shard_token_loads", "stages"):
+        parts = [f"  {type(n).__name__} {n.node_id}"]
+        for k, v in n.explain_fields().items():
+            if k in ("shards", "shard_token_loads", "stages"):
                 continue
             parts.append(f"{k}={v}")
-        if n.get("inputs"):
+        if n.inputs:
             parts.append("<- " + ", ".join(
-                f"{src}[{port}]" for src, port in n["inputs"]))
+                f"{port.source.node_id}[{port.source.port}]"
+                for port in n.inputs))
         lines.append(" ".join(parts))
-        for st in n.get("stages", []):
-            lines.append(f"    stage {st}")
+        for stage in getattr(n, "stages", ()):
+            lines.append(f"    stage {stage.to_dict()}")
+        if isinstance(n, AdaptiveJoinPlan):
+            for child in n.expected_nodes:
+                lines.append(
+                    f"    expected {type(child).__name__} {child.node_id}"
+                )
+                for stage in getattr(child, "stages", ()):
+                    lines.append(f"      stage {stage.to_dict()}")
     for r in physical.remarks:
         lines.append(f"  remark: {r}")
     return "\n".join(lines)

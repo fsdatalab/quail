@@ -151,6 +151,20 @@ def _boot_state(model):
                     dtype=torch.bfloat16)
     pipeline = Pipeline(model_mod, arena,
                         attention_mode=FILTER_ATTENTION)
+    from quail.backends import GpuContext, QuailBackend
+    execution = QuailBackend().start(GpuContext(
+        gpu_index=0,
+        gpu_count=1,
+        model=spec,
+        device=device,
+        query_settings={
+            "chunk_tokens": chunk_tokens,
+            "kv_dtype": "bf16",
+        },
+    ))
+    execution.bind_loaded_model(
+        model=model_mod, arena=arena, pipeline=pipeline
+    )
     answerer = Answerer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     with torch.inference_mode():
@@ -158,7 +172,8 @@ def _boot_state(model):
                             chunk_tokens, model_name=spec.hf_name)
     torch.cuda.synchronize()
     kernel_cache.commit()
-    state = dict(model=model_mod, arena=arena, pipeline=pipeline,
+    state = dict(model_execution=execution,
+                 model=model_mod, arena=arena, pipeline=pipeline,
                  spec=spec, torch=torch, F=F)
     return state, chunk_tokens, warm
 
@@ -178,9 +193,20 @@ def _quailb_session(model, sf, gpus=1):
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
+    from quail.executor.loop import AsyncAnswers
     from quail.runtime.worker import _execute_single
+    from quail.runtime.worker import _PayloadAnswerer
 
     def execute(payload):
+        answerer = _PayloadAnswerer(
+            state["torch"], state["F"], state["model"],
+            payload["true_ids"], payload["false_ids"],
+        )
+        state["model_execution"].bind_query(
+            torch=state["torch"],
+            async_answers=AsyncAnswers(state["torch"], answerer),
+            chunk_tokens=payload["chunk_tokens"],
+        )
         report = _execute_single(state, payload)
         captured.clear()
         captured.update(report)

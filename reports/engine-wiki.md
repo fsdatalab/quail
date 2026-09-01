@@ -17,10 +17,15 @@ payload to the worker, which calls the executor.
 | Module | What it does | Depends on |
 |---|---|---|
 | `__init__.py` | Public API surface | builder, catalog, planner, runtime |
-| `catalog.py` | Document providers (parquet, HF) and the registry | logical |
-| `logical.py` | Logical operators (Scan, Filter, Join, Project) and plan assembly | nothing |
+| `catalog.py` | Table provider interface and Arrow, Parquet, Hugging Face, and memory providers | logical |
+| `logical.py` | Logical node interface, built in nodes, and the shared plan builder | nothing |
+| `logical_optimizer.py` | Generic logical rule runner | logical |
 | `builder.py` | Builder API entry point | catalog, logical |
 | `sqlfront/compile.py` | AI SQL entry point (sqlglot parser and binder) | catalog, logical |
+| `extensions.py` | Per session backend, codec, runtime, rule, and provider registration | physical, runtime |
+| `planning.py` | Backend planning inputs and physical candidates | physical, specs |
+| `physical/` | Typed physical nodes, graph validation, and JSON codecs | nothing |
+| `backends/` | Model backend interface and the Quail backend | planning, physical |
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
@@ -28,7 +33,7 @@ payload to the worker, which calls the executor.
 | `planner/qwen3_cost.py` | Qwen3 attention projection, MLP, and attention components | specs, work, roofline |
 | `planner/roofline.py` | Generic component compute and memory limits | specs |
 | `planner/sol.py` | Ideal query packing and total component time | work, qwen3_cost, roofline |
-| `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
+| `planner/plan.py` | PhysicalPlan, Refusal, and EngineConfig | physical, specs |
 | `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, plan |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
@@ -37,6 +42,9 @@ payload to the worker, which calls the executor.
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
 | `runtime/session.py` | Session, Query, tokenization, payload assembly | catalog, logical, planner, sqlfront, builder |
 | `runtime/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
+| `runtime/runner.py` | Generic typed graph runner and standard node metrics | physical |
+| `runtime/quail_graph.py` | One GPU Quail node preparation and adaptive join runtime | runner, planner, executor |
+| `runtime/quail_distributed.py` | Several GPU Quail node dispatch and result merging | runner, coordinator |
 | `runtime/worker.py` | Modal worker (boot, execute, multi-GPU dispatch) | executor, planner, coordinator |
 | `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
 
@@ -47,22 +55,27 @@ User
   |
   v
 Session (runtime/session.py)
-  |--- sql() ---> sqlfront/compile.py ---> logical.py (LogicalPlan)
-  |--- docs() --> builder.py ------------> logical.py (LogicalPlan)
+  |--- sql() ---> sqlfront/compile.py ---|
+  |--- docs() --> builder.py ------------|--> LogicalPlanBuilder
   |
   v
-plan_query (planner/decide.py)
-  reads: model and device specs, budgets
-  produces: PhysicalPlan
+logical optimizer rules
+  |
+  v
+selected ModelBackend
+  reads: logical plan, model and device specs, token counts
+  produces: typed PhysicalPlan
   |
   v
 _payload (runtime/session.py)
-  tokenizes documents, builds token-id payload
+  encodes a versioned JSON plan and Arrow token batches
   |
   v
 worker.execute (runtime/worker.py, on Modal GPU)
+  validates the plan version, backend, codecs, model, and GPU count
   boots: model.py -> attention.Pipeline -> arena.KVArena
-  runs: loop.run_filter / loop.run_join
+  runs: GenericRunner -> registered node runtimes
+        -> QuailModelExecution -> loop.run_filter / loop.run_join
   returns: raw answer rows
   |
   v
@@ -84,8 +97,9 @@ predicate?). The model answers each predicate in a single token
 (TRUE or FALSE), constrained at decode time so no autoregressive
 generation ever runs.
 
-The current scope is filter queries and joins, Qwen3 4B fp8 weights,
-bf16 KV, on one or more H100 GPUs hosted on Modal.
+The current scope is filter queries and joins with Qwen3 4B fp8 or
+Qwen3 32B fp8 weights. KV uses bf16. Each H100 has one model copy,
+and one Modal container can use 1, 2, 4, or 8 H100s.
 
 ### End-to-end flow
 
@@ -93,29 +107,27 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    datasets) with a `Session`.
 2. The user writes a query, either as AI SQL or through the builder
    API.
-3. The front end compiles the query into a `LogicalPlan` (a tree of
-   Scan, SemanticFilter, SemanticJoin, and Project operators).
-4. The `Session` tokenizes each scanned column (cached per session)
-   and calls the planner with the token counts.
-5. The planner produces a `PhysicalPlan`: a dataflow graph of nodes
-   (DocScan, FilterChain, JoinGroup, Barrier, Recombine, Sink) whose
-   edges carry either a table's live document ids or one stage's
-   passing pairs - plus the chunk budget, admission budget, and
-   sharding. Stage order and anchors come from one joint search,
-   which the worker re-runs on the actual filter survivors before
-   executing the joins. KV is always bf16. The only wall-time number
-   is the counted speed-of-light ranking the search uses.
-6. The session sends document token columns as Arrow IPC bytes with
-   the planned settings and the plan's node graph. The worker reads
-   each document as an Arrow token slice. It does not build one
-   Python list per document.
-7. The worker executes the graph on the GPU: filter chains,
-   exists/anti gates, and the full join stages (each one a
-   cross-product stage, however many tables it spans). Consecutive
-   full stages sharing an anchor run as one gated group over the
-   anchor's kept KV; a Barrier node between groups thins the live
-   sets to the surviving pairs' documents and, on several GPUs,
-   re-shards the next anchor over the measured live set.
+3. Both front ends use `LogicalPlanBuilder` to create a tree of
+   `Scan`, `SemanticFilter`, `SemanticJoin`, and logical `Project`
+   nodes. Every logical node implements the same traversal, rewrite,
+   validation, schema, and explain interface.
+4. The session runs registered logical optimizer rules. It then asks
+   each table provider for the required columns in bounded Arrow
+   batches and tokenizes those columns.
+5. The selected model backend produces physical candidates. The
+   planner selects one typed `PhysicalGraph`. Quail uses
+   `DocumentScan`, `PackedFilter`, `AdaptiveJoinPlan`, `AnchoredJoin`,
+   `Exchange`, `HashJoin`, physical `Project`, and `Limit`.
+6. `AdaptiveJoinPlan` contains the join steps predicted from planning
+   estimates. At runtime, Quail searches again with the actual filter
+   survivors and current KV state. An anchor change is represented as
+   `Exchange`. There is no physical barrier node.
+7. The session sends a versioned JSON plan envelope and document token
+   columns as Arrow IPC bytes. The worker checks the plan before the
+   first model call. The generic runner executes the typed model graph.
+   `AdaptiveJoinPlan` creates typed `AnchoredJoin` and `Exchange` child
+   graphs. The same `QuailModelExecution` handles every model node on
+   one GPU executor, so the nodes use the same KV.
 8. The worker returns raw answers. The session stores filter and join
    answers in Arrow tables. Arrow Acero equi-joins the TRUE pairs on
    shared SQL alias columns and applies the final survivor sets. Each
@@ -128,12 +140,15 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
 
 ## 2. Query compilation
 
-Both entry points (AI SQL and the builder) produce the same
-intermediate representation: a `QueryDesc` containing the tables,
-document columns, filter predicates, join specs, and projection
-columns. The `assemble_plan` function builds a `LogicalPlan` tree
-from the description, so a query written in SQL and the same query
-written with the builder produce identical plans.
+Both entry points use `LogicalPlanBuilder`. The builder creates the
+same registered logical node types for SQL and Python queries. There
+is no separate query description type or second plan assembly path.
+
+Each logical node has a stable type name. It reports its children,
+expressions, output schema, validation rules, and explain fields. A
+node can also return a copy with different children or expressions.
+The generic logical rule runner uses those methods, so a registered
+logical node does not require another tree traversal function.
 
 ### The logical operators
 
@@ -151,7 +166,7 @@ There are four operators, defined in `logical.py`:
   (the BigQuery/Snowflake AI-join shape). A query may hold several
   `full` joins - each its own predicate and stage, composed by id
   matching at assembly (issue #38); stages may anchor on different
-  tables, split into groups by barriers - plus any number of gates:
+  tables and run as separate anchored joins - plus any number of gates:
   - `full`: produce every matching tuple.
   - `exists`: keep outer documents that match at least one inner
     document (a semi-join; two tables).
@@ -234,8 +249,9 @@ other than the EXISTS form. LIMIT N caps the output rows. For a
 filter-only query that means the filter loop stops once N survivors
 are found (early termination); for a join query the filter round
 gets no limit - one document can appear in zero or many output rows
-(#39) - and the Arrow result stream applies the final limit instead
-(`filter_round_limit` in `runtime/coordinator.py` decides). The
+(#39) - and the Arrow result stream applies the final limit instead.
+The typed filter runtime receives no early limit when the graph contains
+`AdaptiveJoinPlan`. The
 builder equivalent is `.limit(n)` before `.select()`. The rejection
 list is explicit (`compile.py:22-33`), so new SQL surface cannot
 enter silently.
@@ -246,21 +262,22 @@ The builder (`builder.py`) mirrors the SQL constructs: `docs()`,
 `.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. Its default
 is `as_written`, so the chain order is the execution order. A caller can pass
 `.select(..., order="by_cost")` to use the planner's cost order. Both entry
-points collect the same `QueryDesc` and call the same `assemble_plan`, so the
-plans are structurally identical.
+points finish through the same `LogicalPlanBuilder`, so the plans are
+structurally identical.
 
 ### Key functions: query compilation
 
 | Function | File | What it does |
 |---|---|---|
-| `compile_sql` | `sqlfront/compile.py:212` | AI SQL text -> LogicalPlan |
-| `assemble_plan` | `logical.py:117` | QueryDesc -> LogicalPlan tree |
+| `compile_sql` | `sqlfront/compile.py` | AI SQL text to LogicalPlan |
+| `LogicalPlanBuilder` | `logical.py` | Build registered logical nodes for both front ends |
+| `apply_logical_rules` | `logical_optimizer.py` | Rewrite a logical plan through registered rules |
 | `bind_prompt` | `logical.py:207` | Canonicalize, bind column refs, count tokens |
 | `split_template` | `logical.py:168` | Split at the first placeholder into preamble and tail |
 | `split_frame` | `logical.py:177` | Relocate user pre-document text; emit canonical template |
 | `canonicalize_template` | `logical.py:203` | `split_frame` without returning the frame |
-| `DocumentProvider.from_parquet` | `catalog.py:29` | Register a parquet file (metadata only) |
-| `DocumentProvider.read_column` | `catalog.py:53` | Read one column's ids and texts (at scan time) |
+| `DocumentProvider.from_parquet` | `catalog.py` | Create an Arrow dataset provider from Parquet metadata |
+| `TableProvider.scan` | `catalog.py` | Return bounded Arrow batches for requested columns |
 
 ### Key functions: session and runtime
 
@@ -363,7 +380,7 @@ wherever a later one will read it.
 
 - Every filtered alias the runtime search could anchor writes KV
   (`arena_writes`) and keeps its survivors (`keep_kv` on the
-  FilterChain node). At each survivor's final TRUE the runtime
+  `PackedFilter` node). At each survivor's final TRUE the runtime
   offers its prefix to the retained pool; a kept prefix is rewound
   to preamble + document (the question tail's pages return to the
   free list) and marked with its exact prefix token count. The join
@@ -878,9 +895,9 @@ that runs until `FilterAdmission.done()`:
 Single-stage queries (one question) skip the arena entirely: no
 later stage reads any document's KV, so the alloc, the per-layer KV
 scatter, and the paged attention read serve no one. The planner
-makes the call, and only the planner - the FilterChain operator
-carries an `arena_writes` field (False exactly when one stage
-runs), it shows in `explain()`, and the payload forwards it to
+makes the call. The `PackedFilter` node carries an `arena_writes`
+field, which is false exactly when one stage runs. The field appears
+in `explain()`, and the payload forwards it to
 `run_filter`. `run_filter` requires the argument and never derives
 it; direct callers (warmups, the GPU cells, the ablation
 scripts) state their intent explicitly, and False against
@@ -1092,36 +1109,34 @@ own CUDA context and arena. The parent process (inside the same
 Modal container) sends payloads over pipes, so there is no network
 hop between rounds.
 
-### Rounds follow the plan's node graph
+### Rounds follow `AdaptiveJoinPlan`
 
 **The filter round**: every worker filters its shard of every alias.
 Sharding is by token count (the planner's `balanced_shards`). After
 this round, the parent merges survivors.
 
-**One join round per JoinGroup node**: anchors follow the alias's
-filter shard when one exists (locality); an anchor with no filter
-shard - it was a partner before the barrier - gets fresh balanced
-shards over its live documents. That
-re-shard moves no KV: partners never owned any, so the parent ships
-token ids (which every round does anyway) and each GPU computes its
-new anchor slice's KV. Every worker sees every surviving partner
-(replicated), so the partner index space is the same on every worker
-and the merged answer rows are consistent.
+**One join round per selected `AnchoredJoin`**: anchors follow the
+alias's filter shard when one exists. An anchor that was a partner in
+an earlier round gets new balanced shards over its live documents.
+The parent sends token ids, and each GPU computes KV for its new
+anchor slice. Every GPU receives every surviving partner, so every
+GPU uses the same partner index space.
 
-**Barrier nodes between groups**: the parent thins every table the
-stages ahead touch to the documents in some surviving pair of every
-finished full stage (`thin_survivors`, issue #38 step 4.6 - cost
-only, results are enforced at recombination). Anchors were already
-fixed by the worker's post-filter run of the join search, which saw
-the measured live counts; nothing is re-decided at the barrier.
+**An `Exchange` between different anchors**: the parent thins each
+table to documents that still occur in a passing pair. It then
+changes the anchor partitioning. `AdaptiveJoinPlan` runs the join
+search again before each round, using current survivor counts and KV
+residency. The typed physical plan has no barrier node. Each selected
+step is a typed child graph. A child graph contains `AnchoredJoin` and,
+when the anchor changes, `Exchange`.
 
 ### Sharding contract
 
 Filters split documents. Joins split anchors. Every pair belongs to
 exactly one anchor, so gating and each anchor's tuple stream stay
 local to the GPU holding the anchor within a group; groups anchored
-on different tables run as separate rounds with the barrier's
-re-shard between them.
+on different tables run as separate rounds with an exchange between
+them.
 
 ### Pseudocode: multi-GPU coordinator
 
@@ -1133,15 +1148,12 @@ for each worker w:
 collect all filter answers
 merge: union the per-alias answer dicts and survivor lists
 
-# then walk the plan's join nodes in order
-for each node:
-    if node is a Barrier:
-        thin survivors: keep only documents in a surviving pair of
-        every finished full stage that touches their table
-        continue
-    # node is a JoinGroup
-    if the group has one free-anchor full stage:
-        re-pick its anchor from measured live token counts
+# then execute AdaptiveJoinPlan
+while join predicates remain:
+    search with current survivors and current KV residency
+    select the next AnchoredJoin
+    if its anchor differs from the prior anchor:
+        execute Exchange and repartition the new anchor
     for each worker w:
         anchors = live anchor docs in w's shard (filter shard when
                   one exists; fresh balanced shards otherwise)
@@ -1149,25 +1161,26 @@ for each node:
         send (anchors, partners, the group's stages) to child w
     collect, merge (anchors disjoint, partner indices identical)
     gate: the anchor's survivors from the group's last stage
+    thin survivors using all finished full join answers
 ```
 
 ### Key functions: coordinator and worker
 
 | Function | File | What it does |
 |---|---|---|
-| `filter_round_limit` | `coordinator.py:25` | The filter round's limit: None when the payload has joins (#39) |
-| `filter_round_payloads` | `coordinator.py` | Build per-worker filter sub-payloads |
+| `begin_query_payloads` | `coordinator.py` | Start a query on every GPU executor when no filter runs first |
+| `filter_node_payloads` | `coordinator.py` | Split one typed `PackedFilter` across GPU executors |
 | `merge_filter_round` | `coordinator.py` | Merge workers' filter answers |
 | `join_group_payloads` | `coordinator.py` | Build per-worker sub-payloads for one anchor group's round (re-shards an anchor with no filter shard) |
 | `merge_join_round` | `coordinator.py` | Concatenate workers' join answer rows |
 | `stage_for_anchor` | `coordinator.py` | Materialize a stage spec for the round's chosen anchor |
-| `thin_survivors` | `coordinator.py` | The barrier's step-4.6 thinning from finished stages' pairs |
+| `thin_survivors` | `coordinator.py` | Remove documents that no longer occur in finished full-join answers |
 | `gate_group` | `coordinator.py` | Anchor survivors after one group (full/exists/anti keep rules) |
-| `derive_plan_nodes` | `coordinator.py` | Reconstruct group/barrier nodes for hand-built payloads |
-| `execute` | `worker.py:64` | Single-GPU Modal worker entry point |
-| `execute_2/4/8` | `worker.py:495-519` | Multi-GPU Modal worker entry points |
-| `_execute_single` | `worker.py:144` | Single-GPU execution core (shared by all paths) |
-| `_execute_multi` | `worker.py:463` | Multi-GPU orchestration (split, dispatch, merge) |
+| `runtime_join_steps` | `coordinator.py` | Group a runtime join search into anchored joins and exchanges |
+| `execute` | `worker.py:237` | Single-GPU Modal worker entry point |
+| `execute_2/4/8` | `worker.py:670-688` | Multi-GPU Modal worker entry points |
+| `_execute_single` | `worker.py:241` | Single-GPU typed graph entry point |
+| `_execute_multi` | `worker.py:633` | Multi-GPU typed graph entry point |
 
 ### Scaling
 

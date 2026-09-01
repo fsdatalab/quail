@@ -8,23 +8,42 @@ COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "true_ids",
                "false_ids", "pre_ids", "limit")
 
 
-def filter_round_limit(payload: dict):
-    """Return the filter round's limit: the payload's limit for filter-only
-    queries, None when joins are present.
-    """
-    if payload.get("joins"):
-        return None
-    return payload.get("limit")
+def begin_query_payloads(payload: dict, k: int) -> list[dict]:
+    """Build one empty query start payload per GPU executor."""
+    outputs = []
+    for worker in range(k):
+        sub = {key: payload[key] for key in COMMON_KEYS}
+        sub["physical_plan"] = payload["physical_plan"]
+        sub.update(
+            docs={},
+            doc_index={},
+            node_id=None,
+            worker=worker,
+            workers=k,
+        )
+        outputs.append(sub)
+    return outputs
 
 
-def retain_aliases(payload: dict) -> set:
-    """Aliases whose filter survivors keep their KV for the joins,
-    from the plan's FilterChain keep_kv flags. Empty without joins or
-    without a planner-built payload."""
-    if not payload.get("joins"):
-        return set()
-    return {n["alias"] for n in payload.get("plan_nodes") or ()
-            if n.get("op") == "FilterChain" and n.get("keep_kv")}
+def filter_node_payloads(payload: dict, node, shards: dict,
+                         k: int, *, has_joins: bool) -> list[dict]:
+    """Build one typed filter node payload per GPU executor."""
+    outputs = []
+    tokens = payload["docs"][node.alias]
+    for worker in range(k):
+        indices = list(shards[node.alias][worker])
+        sub = {key: payload[key] for key in COMMON_KEYS}
+        sub["physical_plan"] = payload["physical_plan"]
+        sub["limit"] = None if has_joins else payload.get("limit")
+        sub.update(
+            docs={node.alias: [tokens[index] for index in indices]},
+            doc_index={node.alias: indices},
+            node_id=node.node_id,
+            worker=worker,
+            workers=k,
+        )
+        outputs.append(sub)
+    return outputs
 
 
 def search_specs(joins: list) -> list:
@@ -44,13 +63,15 @@ def search_specs(joins: list) -> list:
     return out
 
 
-def runtime_nodes(sequence, joins: list) -> list:
-    """JoinGroup/Barrier nodes for a searched (written_pos, anchor)
-    sequence. stage_idxs index into the payload's join list; gates
-    run alone and anchor switches become barriers, the same grouping
-    the planner emits."""
+def runtime_join_steps(sequence, joins: list) -> tuple:
+    """Build typed anchored join and exchange steps for a search result."""
+    from quail.physical import AnchoredJoin, Exchange
+
     pos_to_idx = {j.get("written_pos", i): i
                   for i, j in enumerate(joins)}
+    aliases = tuple(sorted({
+        alias for join in joins for alias in join.get("aliases", ())
+    }))
     groups = []
     for wp, anchor in sequence:
         idx = pos_to_idx[wp]
@@ -65,44 +86,58 @@ def runtime_nodes(sequence, joins: list) -> list:
     prev = None
     for i, g in enumerate(groups):
         if prev is not None and prev != g["anchor"]:
-            nodes.append(dict(id=f"runtime-barrier:{barriers}",
-                              op="Barrier", inputs=(),
-                              next_anchor=g["anchor"], thins=()))
+            nodes.append(Exchange(
+                node_id=f"runtime-exchange:{barriers}",
+                next_anchor=g["anchor"], aliases=aliases,
+            ))
             barriers += 1
-        nodes.append(dict(id=f"runtime-group:{i}", op="JoinGroup",
-                          inputs=(), anchor=g["anchor"],
-                          stage_idxs=tuple(g["idxs"]), stages=()))
+        nodes.append(AnchoredJoin(
+            node_id=f"runtime-join:{i}",
+            anchor=g["anchor"],
+            stage_idxs=tuple(g["idxs"]),
+        ))
         prev = g["anchor"]
-    return nodes
+    return tuple(nodes)
 
 
-def filter_round_payloads(payload: dict, shards: dict, k: int) -> list:
-    """Build per-worker sub-payloads for the filter round.
+def report_join_plan(sequence, joins: list) -> list:
+    """Return typed join steps for a query report."""
+    pos_to_join = {
+        join.get("written_pos", index): join
+        for index, join in enumerate(joins)
+    }
+    groups = []
+    for written_pos, anchor in sequence:
+        join = pos_to_join[written_pos]
+        full = join["semantics"] == "full"
+        if groups and full and groups[-1]["full"] \
+                and groups[-1]["anchor"] == anchor:
+            groups[-1]["written_positions"].append(written_pos)
+        else:
+            groups.append({
+                "anchor": anchor,
+                "full": full,
+                "written_positions": [written_pos],
+            })
 
-    Args:
-        shards: alias -> tuple of global document indices per worker.
-        k: Number of workers.
-    """
-    subs = []
-    for w in range(k):
-        docs, index = {}, {}
-        for alias in payload["filters"]:
-            toks = payload["docs"][alias]
-            idx = list(shards[alias][w]) if alias in shards \
-                else list(range(len(toks)))
-            docs[alias] = [toks[i] for i in idx]
-            index[alias] = idx
-        sub = {key: payload[key] for key in COMMON_KEYS}
-        # the child never sees the joins, so the join-vs-filter limit
-        # rule (filter_round_limit) must be applied at split time
-        sub["limit"] = filter_round_limit(payload)
-        sub.update(docs=docs, doc_index=index,
-                   filters=payload["filters"],
-                   filter_arena_writes=payload["filter_arena_writes"],
-                   retain_aliases=sorted(retain_aliases(payload)),
-                   worker=w, workers=k)
-        subs.append(sub)
-    return subs
+    records = []
+    previous_anchor = None
+    for index, group in enumerate(groups):
+        if previous_anchor is not None \
+                and previous_anchor != group["anchor"]:
+            records.append({
+                "type": "quail.exchange.v1",
+                "id": f"runtime-exchange:{len(records)}",
+                "next_anchor": group["anchor"],
+            })
+        records.append({
+            "type": "quail.anchored_join.v1",
+            "id": f"runtime-join:{index}",
+            "anchor": group["anchor"],
+            "written_positions": group["written_positions"],
+        })
+        previous_anchor = group["anchor"]
+    return records
 
 
 def merge_filter_round(outs: list, limit: int | None = None) -> dict:
@@ -132,43 +167,6 @@ def stage_for_anchor(spec: dict, anchor: str) -> dict:
                frame=spec["frames"][anchor],
                labels={p: spec["labels"][p] for p in partners})
     return out
-
-
-def derive_plan_nodes(joins: list) -> list:
-    """Reconstruct JoinGroup/Barrier nodes from bare stage specs.
-
-    Used for payloads built without a planner.
-    """
-    nodes = []
-    cur = None
-    n_groups = n_barriers = 0
-
-    def flush():
-        nonlocal cur, n_groups
-        if cur is None:
-            return
-        nodes.append(dict(id=f"group:{n_groups}", op="JoinGroup",
-                          inputs=(), anchor=cur["anchor"],
-                          stage_idxs=tuple(cur["idxs"]), stages=()))
-        n_groups += 1
-        cur = None
-
-    for i, j in enumerate(joins):
-        if (cur is not None and j["semantics"] == "full" and cur["full"]
-                and cur["anchor"] == j["anchor"]):
-            cur["idxs"].append(i)
-            continue
-        prev_anchor = cur["anchor"] if cur is not None else None
-        flush()
-        if prev_anchor is not None and prev_anchor != j["anchor"]:
-            nodes.append(dict(id=f"barrier:{n_barriers}", op="Barrier",
-                              inputs=(), next_anchor=j["anchor"],
-                              thins=()))
-            n_barriers += 1
-        cur = dict(anchor=j["anchor"], full=(j["semantics"] == "full"),
-                   idxs=[i])
-    flush()
-    return nodes
 
 
 def gate_group(stage_out: dict, semantics: str) -> list:
@@ -217,7 +215,9 @@ def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
 
 
 def join_group_payloads(payload: dict, k: int, survivors: dict,
-                        group: list, prior_shards: dict | None = None) -> list:
+                        group: list, prior_shards: dict | None = None,
+                        *, filtered_aliases: set[str] | None = None,
+                        shards: dict | None = None) -> list:
     """Build per-worker sub-payloads for one anchor group's join round.
 
     Anchors follow the shards their KV already sits on - the shards of
@@ -236,7 +236,9 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
         return list(range(len(payload["docs"][alias])))
 
     live = surv(anchor_alias)
-    shards = payload.get("shards") or {}
+    shards = shards if shards is not None else payload.get("shards") or {}
+    filtered_aliases = (filtered_aliases if filtered_aliases is not None
+                        else set(payload.get("filters", ())))
     alive = set(live)
     if prior_shards and anchor_alias in prior_shards:
         anchor_shards = [[g for g in shard if g in alive]
@@ -250,7 +252,7 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
                 [len(toks[g]) for g in missing], k)
             for worker, shard in enumerate(idx_shards):
                 anchor_shards[worker].extend(missing[i] for i in shard)
-    elif anchor_alias in payload["filters"] and anchor_alias in shards:
+    elif anchor_alias in filtered_aliases and anchor_alias in shards:
         anchor_shards = [[g for g in shard if g in alive]
                          for shard in shards[anchor_alias]]
     else:
@@ -267,6 +269,8 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
     subs = []
     for w in range(k):
         sub = {key: payload[key] for key in COMMON_KEYS}
+        if "physical_plan" in payload:
+            sub["physical_plan"] = payload["physical_plan"]
         sub.update(joins=group,
                    anchor_alias=anchor_alias,
                    anchor_index=list(anchor_shards[w]),

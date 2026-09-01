@@ -704,6 +704,7 @@ class BenchmarkEvaluator:
 
     def evaluate(self, query, result) -> dict:
         from quail.planner.decide import _collect
+        from quail.physical import PackedFilter
 
         scans, filters, joins = _collect(query.logical)
         plan = query.plan()
@@ -712,15 +713,15 @@ class BenchmarkEvaluator:
         total = BinaryCounts()
 
         for node in plan.nodes:
-            if node["op"] != "FilterChain":
+            if not isinstance(node, PackedFilter):
                 continue
-            alias = node["alias"]
-            for stage in node["stages"]:
-                predicate = filters[alias][stage["written_pos"]]
+            alias = node.alias
+            for stage in node.stages:
+                predicate = filters[alias][stage.written_pos]
                 key = self._key(predicate.prompt)
                 item = _PredicateCount(key, "filter", alias)
                 table = result.answer_tables["filters"][
-                    (alias, stage["written_pos"])]
+                    (alias, stage.written_pos)]
                 indices = table.column(alias).to_pylist()
                 answers = table.column("answer").to_pylist()
                 for index, predicted in zip(indices, answers):
@@ -731,17 +732,15 @@ class BenchmarkEvaluator:
                 total.merge(item.counts)
                 per_predicate.append(item.as_dict())
 
-        join_plan = [stage for node in plan.nodes
-                     if node["op"] == "JoinGroup"
-                     for stage in node["stages"]]
+        join_plan = plan.expected_join_stages()
         if len(join_plan) != len(result.answer_tables["joins"]):
             raise ValueError(
                 "query plan and returned join stages have different lengths")
         for stage in join_plan:
-            join = joins[stage["written_pos"]]
+            join = joins[stage.written_pos]
             key = self._key(join.predicate)
             item = _PredicateCount(key, "join")
-            table = result.answer_tables["joins"][stage["written_pos"]]
+            table = result.answer_tables["joins"][stage.written_pos]
             aliases = [arg.alias for arg in join.predicate.args]
             index_columns = {
                 alias: table.column(alias).to_pylist()

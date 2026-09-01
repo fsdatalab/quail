@@ -251,10 +251,40 @@ class QueryResult:
         self.survivor_indices = survivor_indices or {}
         self.true_join_tables = true_join_tables or {}
         self._row_count = None
+        self._materialized = None
+
+    @classmethod
+    def from_table(cls, table: pa.Table, report: dict | None = None,
+                   answer_rows: dict | None = None) -> "QueryResult":
+        """Create a result from a table produced by a local runtime."""
+        result = cls.__new__(cls)
+        result.columns = list(table.column_names)
+        result.schema = table.schema
+        result.report = report or {}
+        result.answer_rows = answer_rows or {}
+        result.answer_tables = {"filters": {}, "joins": {}}
+        result.limit = None
+        result._declaration = None
+        result._document_index_schema = None
+        result._projection = []
+        result.survivor_indices = {}
+        result.true_join_tables = {}
+        result._row_count = len(table)
+        result._materialized = table
+        return result
 
     def execute_stream(self, batch_rows: int = DEFAULT_BATCH_ROWS,
                        limit: int | None = None
                        ) -> pa.RecordBatchReader:
+        if batch_rows <= 0:
+            raise ValueError("batch_rows must be positive")
+        if self._materialized is not None:
+            table = self._materialized
+            if limit is not None:
+                if limit < 0:
+                    raise ValueError("limit must be nonnegative")
+                table = table.slice(0, limit)
+            return table.to_reader(max_chunksize=batch_rows)
         effective_limit = self.limit
         if limit is not None:
             effective_limit = (limit if effective_limit is None

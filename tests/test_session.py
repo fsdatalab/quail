@@ -17,6 +17,43 @@ def fake_tok(text):
     return text.split()
 
 
+def runtime_plan(payload):
+    from quail.extensions import built_in_registry
+    from quail.physical import (
+        AdaptiveJoinPlan,
+        DocumentScan,
+        PackedFilter,
+        decode_graph,
+    )
+
+    graph = decode_graph(
+        payload["physical_plan"]["graph"], built_in_registry().codecs
+    )
+    filter_nodes = {
+        node.alias: node for node in graph.nodes
+        if isinstance(node, PackedFilter)
+    }
+    adaptive = next(
+        (node for node in graph.nodes
+         if isinstance(node, AdaptiveJoinPlan)),
+        None,
+    )
+    return {
+        "graph": graph,
+        "filter_nodes": filter_nodes,
+        "filters": {
+            alias: [list(question)
+                    for question in node.question_token_ids]
+            for alias, node in filter_nodes.items()
+        },
+        "joins": [] if adaptive is None else list(adaptive.join_specs),
+        "shards": {
+            node.alias: node.shards for node in graph.nodes
+            if isinstance(node, DocumentScan)
+        },
+    }
+
+
 @pytest.fixture()
 def sess(tmp_path):
     s = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
@@ -48,14 +85,16 @@ def make_executor(filter_truth, join_truth=None, seen=None):
     def _exec(payload):
         from quail.runtime.tokens import decode_payload_documents
 
+        runtime = runtime_plan(payload)
         if seen is not None:
             seen["payload"] = payload
+            seen.update(runtime)
         docs = decode_payload_documents(payload["docs"])
         out = dict(filters={}, joins=[], wall_s=1.0, boot_s=0.5,
                    fresh_tokens=1234)
         survivors = {a: list(range(len(d)))
                      for a, d in docs.items()}
-        for alias, qids in payload["filters"].items():
+        for alias, qids in runtime["filters"].items():
             rows = {}
             for d in range(len(docs[alias])):
                 row = []
@@ -68,7 +107,7 @@ def make_executor(filter_truth, join_truth=None, seen=None):
             out["filters"][alias] = rows
             survivors[alias] = [d for d, r in rows.items()
                                 if len(r) == len(qids) and all(r)]
-        for j in payload["joins"]:
+        for j in runtime["joins"]:
             anchors = list(survivors[j["anchor"]])
             tuples = [list(t) for t in itertools.product(
                 *[survivors[p] for p in j["partners"]])]
@@ -178,12 +217,12 @@ def test_order_by_cost_reorders_payload(sess):
     sess.sql(sql).run(_execute=make_executor(truth, seen=seen))
     # by_cost (the default: every predicate has a selectivity) runs
     # the 0.1 filter first
-    first_q = seen["payload"]["filters"]["r"][0]
+    first_q = seen["filters"]["r"][0]
     assert "q2:" in first_q
     seen2 = {}
     sess.sql(sql, order="as_written").run(
         _execute=make_executor(truth, seen=seen2))
-    assert "q1:" in seen2["payload"]["filters"]["r"][0]
+    assert "q1:" in seen2["filters"]["r"][0]
 
 
 def test_builder_can_request_cost_order(sess):
@@ -211,14 +250,14 @@ def test_payload_carries_filter_arena_writes(sess):
            "PROMPT('q1: {0}', r.review), {'selectivity': 0.5})")
     seen = {}
     sess.sql(sql).run(_execute=make_executor(truth, seen=seen))
-    assert seen["payload"]["filter_arena_writes"] == {"r": False}
+    assert seen["filter_nodes"]["r"].arena_writes is False
     assert "arena_writes=False" in sess.sql(sql).explain()
 
     # a second stage re-reads survivors' KV
     truth2 = {"r": {"q1:": [1] * 6, "q2:": [1] * 6}}
     seen = {}
     sess.sql(FILTER_SQL).run(_execute=make_executor(truth2, seen=seen))
-    assert seen["payload"]["filter_arena_writes"] == {"r": True}
+    assert seen["filter_nodes"]["r"].arena_writes is True
 
 
 def test_payload_carries_arrow_ipc_tokens(sess):
@@ -233,6 +272,28 @@ def test_payload_carries_arrow_ipc_tokens(sess):
     payload = seen["payload"]["docs"]["r"]
     assert isinstance(payload, bytes)
     assert not isinstance(payload, list)
+
+
+def test_wire_payload_does_not_duplicate_physical_node_fields(sess):
+    from quail.planner.decide import _collect
+    from quail.runtime.worker import validate_plan_payload
+
+    query = sess.sql(FILTER_SQL)
+    plan = query.plan()
+    scans, filters, joins = _collect(query.logical)
+    payload = query._payload(plan, scans, filters, joins)
+
+    assert payload["physical_plan"]["version"] == 1
+    assert payload["physical_plan"]["backend"] == "quail"
+    validate_plan_payload(payload)
+    assert "filters" not in payload
+    assert "filter_arena_writes" not in payload
+    assert "joins" not in payload
+    assert "shards" not in payload
+    runtime = runtime_plan(payload)
+    assert runtime["filters"]
+    assert runtime["filter_nodes"]["r"].arena_writes is True
+    assert runtime["shards"]
 
 
 def test_refusal_raises_on_run_prints_in_explain(sess, tmp_path):
@@ -250,6 +311,14 @@ def test_refusal_raises_on_run_prints_in_explain(sess, tmp_path):
     with pytest.raises(quail.RefusalError):
         quail.Session(EngineConfig(model="qwen9-99b"),
                       tokenizer=fake_tok)
+    with pytest.raises(quail.RefusalError) as unknown_backend:
+        quail.Session(EngineConfig(backend="missing"),
+                      tokenizer=fake_tok)
+    assert unknown_backend.value.refusal.constraint == "unknown_backend"
+    with pytest.raises(quail.RefusalError) as unsupported_gpus:
+        quail.Session(EngineConfig(gpus=3), tokenizer=fake_tok)
+    assert unsupported_gpus.value.refusal.constraint == \
+        "unsupported_backend_configuration"
 
 
 def test_pick_corpus_tokenizer_parity_guard():
@@ -286,12 +355,14 @@ def test_payload_carries_workers_and_shards(tmp_path):
         _execute=make_executor(truth, seen=seen))
     p = seen["payload"]
     assert p["workers"] == 2
-    assert len(p["shards"]["r"]) == 2
-    covered = sorted(i for sh in p["shards"]["r"] for i in sh)
+    assert len(seen["shards"]["r"]) == 2
+    covered = sorted(i for sh in seen["shards"]["r"] for i in sh)
     assert covered == list(range(6))
 
 
 def test_payload_carries_true_false_and_join_spec(sess):
+    from quail.runtime.worker import validate_plan_payload
+
     sql = """
         SELECT r.id, p.asin FROM reviews r
         JOIN products p
@@ -304,12 +375,13 @@ def test_payload_carries_true_false_and_join_spec(sess):
     query.run(_execute=make_executor({}, join, seen=seen))
     pred = query.logical.root.input.predicate
     payload = seen["payload"]
+    validate_plan_payload(payload)
     assert payload["true_ids"] and payload["false_ids"]
     # the engine preamble ships once, not inside any join segment
     from quail.logical import (SHARED_PRE, join_label,
                                render_join_frame)
     assert payload["pre_ids"] == fake_tok(SHARED_PRE)
-    j = payload["joins"][0]
+    j = seen["joins"][0]
     assert "pre" not in j
     assert j["anchor"] == "r" and j["partners"] == ["p"]
     assert j["aliases"] == ["r", "p"]
@@ -395,7 +467,7 @@ def test_two_join_chain_recombination(sess, tmp_path):
     res = _chain_query(sess).run(
         _execute=make_executor({}, join, seen=seen))
     # both stages anchored on the shared table, one per payload entry
-    assert [j["anchor"] for j in seen["payload"]["joins"]] == \
+    assert [j["anchor"] for j in seen["joins"]] == \
         ["p", "p"]
     assert sorted(res.to_rows()) == CHAIN_EXPECT
     # p1 was gated after stage 1: stage 2 evaluated 3 anchors, not 4
@@ -486,14 +558,14 @@ def test_chain_with_barrier_recombination(sess, tmp_path):
                   selectivity=0.5, anchor="g")
          .select("r.id", "p.asin", "g.id"))
     plan = q.plan()
-    kinds = [n["op"] for n in plan.nodes]
-    assert kinds.count("JoinGroup") == 2
-    assert kinds.count("Barrier") == 1
+    kinds = [type(n).__name__ for n in plan.expected_join_nodes()]
+    assert kinds.count("AnchoredJoin") == 2
+    assert kinds.count("Exchange") == 1
     seen = {}
     join = {("r", "p"): lambda r, p: J1(p, r),
             ("g", "p"): lambda g, p: J2(p, g)}
     res = q.run(_execute=make_executor({}, join, seen=seen))
-    assert [j["anchor"] for j in seen["payload"]["joins"]] == \
+    assert [j["anchor"] for j in seen["joins"]] == \
         ["r", "g"]
     # same pair semantics as the shared-anchor chain, same triples
     assert sorted(res.to_rows()) == CHAIN_EXPECT

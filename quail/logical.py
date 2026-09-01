@@ -1,7 +1,7 @@
 """Logical plan operators and prompt binding."""
 
-from dataclasses import asdict, dataclass
-from typing import Optional, Union
+from dataclasses import asdict, dataclass, replace
+from typing import Any, ClassVar, Optional, Protocol
 
 
 class CompileError(ValueError):
@@ -148,6 +148,28 @@ class FilterPredicate:
     #                                       pass; ordering only
 
 
+class LogicalNode(Protocol):
+    """Node in a logical query plan."""
+
+    type_name: ClassVar[str]
+
+    def children(self) -> tuple["LogicalNode", ...]: ...
+
+    def expressions(self) -> tuple[Any, ...]: ...
+
+    def output_schema(self) -> tuple[ColumnRef, ...]: ...
+
+    def validate(self) -> None: ...
+
+    def with_children(
+        self, children: tuple["LogicalNode", ...]
+    ) -> "LogicalNode": ...
+
+    def with_expressions(self, expressions: tuple[Any, ...]) -> "LogicalNode": ...
+
+    def explain_fields(self) -> dict[str, Any]: ...
+
+
 @dataclass(frozen=True)
 class Scan:
     """Which column of which provider supplies the document text."""
@@ -155,17 +177,80 @@ class Scan:
     alias: str
     column: str
 
+    type_name: ClassVar[str] = "quail.scan.v1"
+
+    def children(self) -> tuple:
+        return ()
+
+    def expressions(self) -> tuple:
+        return ()
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        return (ColumnRef(self.alias, self.provider, self.column),)
+
+    def validate(self) -> None:
+        if not self.provider or not self.alias or not self.column:
+            raise CompileError("Scan needs a provider, alias, and column")
+
+    def with_children(self, children: tuple) -> "Scan":
+        if children:
+            raise CompileError("Scan has no children")
+        return self
+
+    def with_expressions(self, expressions: tuple) -> "Scan":
+        if expressions:
+            raise CompileError("Scan has no expressions")
+        return self
+
+    def explain_fields(self) -> dict:
+        return {
+            "provider": self.provider,
+            "alias": self.alias,
+            "column": self.column,
+        }
+
 
 @dataclass(frozen=True)
 class SemanticFilter:
-    input: "Operator"
+    input: LogicalNode
     predicates: tuple    # tuple[FilterPredicate, ...], written order
+
+    type_name: ClassVar[str] = "quail.semantic_filter.v1"
+
+    def children(self) -> tuple[LogicalNode, ...]:
+        return (self.input,)
+
+    def expressions(self) -> tuple:
+        return self.predicates
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        return self.input.output_schema()
+
+    def validate(self) -> None:
+        if not self.predicates:
+            raise CompileError("SemanticFilter needs at least one predicate")
+
+    def with_children(self, children: tuple[LogicalNode, ...]):
+        if len(children) != 1:
+            raise CompileError("SemanticFilter needs one child")
+        return replace(self, input=children[0])
+
+    def with_expressions(self, expressions: tuple):
+        if not expressions:
+            raise CompileError("SemanticFilter needs at least one predicate")
+        return replace(self, predicates=expressions)
+
+    def explain_fields(self) -> dict:
+        return {
+            "predicates": len(self.predicates),
+            "selectivities": [p.selectivity for p in self.predicates],
+        }
 
 
 @dataclass(frozen=True)
 class SemanticJoin:
     """One n-way join: cross product filtered by a single prompt."""
-    inputs: tuple    # tuple[Operator]: accumulated tree first, then
+    inputs: tuple    # tuple[LogicalNode]: accumulated tree first, then
     #                  one scan per newly joined table
     predicate: Prompt
     semantics: str = "full"            # full | exists | anti
@@ -173,24 +258,116 @@ class SemanticJoin:
     anchor: Optional[str] = None       # table alias whose KV is kept;
     #                                    None = planner picks
 
+    type_name: ClassVar[str] = "quail.semantic_join.v1"
+
+    def children(self) -> tuple[LogicalNode, ...]:
+        return self.inputs
+
+    def expressions(self) -> tuple:
+        return (self.predicate,)
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        fields = []
+        for child in self.inputs:
+            for field in child.output_schema():
+                if field not in fields:
+                    fields.append(field)
+        return tuple(fields)
+
+    def validate(self) -> None:
+        if not self.inputs:
+            raise CompileError("SemanticJoin needs at least one input")
+        if self.semantics not in {"full", "exists", "anti"}:
+            raise CompileError(
+                f"unknown join semantics {self.semantics!r}")
+
+    def with_children(self, children: tuple[LogicalNode, ...]):
+        if not children:
+            raise CompileError("SemanticJoin needs at least one input")
+        return replace(self, inputs=children)
+
+    def with_expressions(self, expressions: tuple):
+        if len(expressions) != 1:
+            raise CompileError("SemanticJoin needs one prompt")
+        return replace(self, predicate=expressions[0])
+
+    def explain_fields(self) -> dict:
+        return {
+            "semantics": self.semantics,
+            "selectivity": self.selectivity,
+            "anchor": self.anchor,
+        }
+
 
 @dataclass(frozen=True)
 class Project:
     """Column projection. Always the root operator."""
-    input: "Operator"
+    input: LogicalNode
     columns: tuple    # tuple[ColumnRef, ...]
     limit: Optional[int] = None
 
+    type_name: ClassVar[str] = "quail.logical_project.v1"
 
-Operator = Union[Scan, SemanticFilter, SemanticJoin, Project]
+    def children(self) -> tuple[LogicalNode, ...]:
+        return (self.input,)
+
+    def expressions(self) -> tuple:
+        return self.columns
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        return self.columns
+
+    def validate(self) -> None:
+        if not self.columns:
+            raise CompileError("Project needs at least one column")
+        if self.limit is not None and self.limit <= 0:
+            raise CompileError("LIMIT must be a positive integer")
+
+    def with_children(self, children: tuple[LogicalNode, ...]):
+        if len(children) != 1:
+            raise CompileError("Project needs one child")
+        return replace(self, input=children[0])
+
+    def with_expressions(self, expressions: tuple):
+        if not expressions:
+            raise CompileError("Project needs at least one column")
+        return replace(self, columns=expressions)
+
+    def explain_fields(self) -> dict:
+        return {
+            "columns": [
+                f"{column.alias}.{column.column}" for column in self.columns
+            ],
+            "limit": self.limit,
+        }
+
+
+Operator = LogicalNode
 
 
 @dataclass(frozen=True)
 class LogicalPlan:
-    root: Project
+    root: LogicalNode
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def walk(self) -> tuple[LogicalNode, ...]:
+        """Return logical nodes with each child before its parent."""
+        nodes = []
+
+        def visit(node):
+            for child in node.children():
+                visit(child)
+            nodes.append(node)
+
+        visit(self.root)
+        return tuple(nodes)
+
+    def validate(self) -> None:
+        """Validate every logical node."""
+        for node in self.walk():
+            node.validate()
 
 
 @dataclass(frozen=True)
@@ -203,38 +380,52 @@ class JoinSpec:
     anchor: Optional[str] = None
 
 
-@dataclass(frozen=True)
-class QueryDesc:
-    """Intermediate description collected by both entry points before assembly."""
-    tables: tuple               # ((alias, provider), ...) appearance order
-    doc_columns: dict           # alias -> the document column its prompts use
-    filters: dict               # alias -> tuple[FilterPredicate], written order
-    joins: tuple                # tuple[JoinSpec], written order
-    columns: tuple              # tuple[ColumnRef], the projection
-    limit: Optional[int] = None
+class LogicalPlanBuilder:
+    """Build the built in logical nodes used by both front ends."""
 
+    def __init__(self):
+        self._tables = []
+        self._nodes = {}
+        self._root = None
 
-def assemble_plan(desc: QueryDesc) -> LogicalPlan:
-    """Build the operator tree from a QueryDesc."""
-    def subtree(alias: str):
-        provider = dict(desc.tables)[alias]
-        node = Scan(provider=provider, alias=alias,
-                    column=desc.doc_columns.get(alias, ""))
-        preds = desc.filters.get(alias, ())
-        if preds:
-            node = SemanticFilter(input=node, predicates=tuple(preds))
-        return node
+    def add_scan(
+        self,
+        alias: str,
+        provider: str,
+        column: str,
+        predicates: tuple[FilterPredicate, ...] = (),
+    ) -> None:
+        if alias in self._nodes:
+            raise CompileError(f"duplicate table alias {alias!r}")
+        node = Scan(provider=provider, alias=alias, column=column)
+        if predicates:
+            node = SemanticFilter(node, tuple(predicates))
+        self._tables.append(alias)
+        self._nodes[alias] = node
+        if self._root is None:
+            self._root = node
 
-    first = desc.tables[0][0]
-    tree = subtree(first)
-    for j in desc.joins:
-        tree = SemanticJoin(
-            inputs=(tree,) + tuple(subtree(a) for a in j.aliases),
-            predicate=j.prompt, semantics=j.semantics,
-            selectivity=j.selectivity, anchor=j.anchor)
-    return LogicalPlan(root=Project(input=tree,
-                                    columns=tuple(desc.columns),
-                                    limit=desc.limit))
+    def add_join(self, join: JoinSpec) -> None:
+        if self._root is None:
+            raise CompileError("a logical join needs an input table")
+        self._root = SemanticJoin(
+            inputs=(self._root,) + tuple(
+                self._nodes[alias] for alias in join.aliases
+            ),
+            predicate=join.prompt,
+            semantics=join.semantics,
+            selectivity=join.selectivity,
+            anchor=join.anchor,
+        )
+
+    def project(
+        self, columns: tuple[ColumnRef, ...], limit: int | None = None
+    ) -> LogicalPlan:
+        if self._root is None:
+            raise CompileError("a logical plan needs an input table")
+        plan = LogicalPlan(Project(self._root, tuple(columns), limit))
+        plan.validate()
+        return plan
 
 
 def split_template(template: str) -> tuple[str, str]:

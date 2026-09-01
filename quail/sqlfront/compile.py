@@ -5,8 +5,8 @@ from sqlglot import exp
 
 from quail.catalog import Catalog
 from quail.logical import (ColumnRef, CompileError, FilterPredicate,
-                           JoinSpec, LogicalPlan, QueryDesc,
-                           assemble_plan, bind_join_prompt, bind_prompt)
+                           JoinSpec, LogicalPlan, LogicalPlanBuilder,
+                           bind_join_prompt, bind_prompt)
 
 # Every relational operator except the projection, named and refused.
 # OR is rejected separately with its own message.
@@ -273,8 +273,8 @@ def compile_sql(sql: str, catalog: Catalog,
                 f"anchor {anchor!r} is not a table of this join "
                 f"({aliases})")
         # each spec carries the joined tables its prompt references
-        # that no earlier spec carried, so assemble_plan folds every
-        # table into the tree exactly once
+        # that no earlier spec carried, so the logical builder adds
+        # every table to the join tree exactly once
         news = tuple(a for a in joined_aliases
                      if a in aliases and a not in claimed)
         claimed.update(news)
@@ -321,14 +321,17 @@ def compile_sql(sql: str, catalog: Catalog,
                            "scan belongs in the database the ids came "
                            "from")
 
-    desc = QueryDesc(
-        tables=tuple(b.tables),
-        doc_columns=dict(b.doc_columns),
-        filters={a: tuple(v) for a, v in b.filters.items()},
-        joins=tuple(b.joins),
-        columns=tuple(columns),
-        limit=limit)
-    return assemble_plan(desc)
+    logical = LogicalPlanBuilder()
+    for alias, provider in b.tables:
+        logical.add_scan(
+            alias,
+            provider,
+            b.doc_columns.get(alias, ""),
+            tuple(b.filters.get(alias, ())),
+        )
+    for join in b.joins:
+        logical.add_join(join)
+    return logical.project(tuple(columns), limit)
 
 
 def _check_join_coverage(b: _Binder, joined_aliases: list) -> None:
