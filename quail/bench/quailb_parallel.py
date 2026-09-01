@@ -36,6 +36,7 @@ image = (
         "datasets",
     )
     .env({
+        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
         "VLLM_LOGGING_LEVEL": "WARNING",
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",

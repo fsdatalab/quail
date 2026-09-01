@@ -41,7 +41,8 @@ image = (
     .pip_install("vllm==0.26.0", "huggingface_hub[hf_transfer]",
                  "transformers>=5.2.0", "pandas", "pyarrow",
                  "numpy", "datasets")
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+    .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+          "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           "HF_HUB_ENABLE_HF_TRANSFER": "1",
@@ -956,8 +957,13 @@ def _run_query_batches(model: str, sf: float, query_ids_csv: str,
     run_name = paired_run_id or baselines[0]
 
     def boot_llm():
+        # same pinned revision as the engine, so boots stay comparable
+        from quail.specs import MODELS as spec_models
+        revision = spec_models[model].revision or None
         next_llm, next_boot = time_llm_boot(
             model=hf_name,
+            revision=revision,
+            tokenizer_revision=revision,
             max_num_batched_tokens=25_305,
             max_num_seqs=4096,
             gpu_memory_utilization=gpu_memory_utilization,

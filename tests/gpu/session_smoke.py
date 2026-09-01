@@ -93,7 +93,7 @@ def main():
     res = fq.run()
     planted = sorted(f"d{i}" for i in range(len(flags))
                      if flags[i].all())
-    got = sorted(r[0] for r in res.rows)
+    got = sorted(r[0] for r in res.to_rows())
     agree = len(set(got) & set(planted))
     summary["filter"] = dict(
         report=res.report,
@@ -111,8 +111,9 @@ def main():
                         {{'selectivity': 0.5}})
     """).run()
     summary["filter_warm"] = dict(
-        report=res2.report, rows=len(res2.rows),
-        rows_match_first_run=sorted(res2.rows) == sorted(res.rows))
+        report=res2.report, rows=res2.count(),
+        rows_match_first_run=(sorted(res2.to_rows())
+                              == sorted(res.to_rows())))
     print(json.dumps(summary["filter_warm"], indent=2), flush=True)
 
     # ---- the join query, builder entry point
@@ -130,7 +131,7 @@ def main():
     jres = jq.run()
     planted_pairs = {(f"r{i}", f"c{j}") for (i, j), v in truth.items()
                      if v}
-    got_pairs = set(jres.rows)
+    got_pairs = set(jres.to_rows())
     summary["join"] = dict(
         report=jres.report,
         pairs_returned=len(got_pairs),
