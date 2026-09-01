@@ -138,8 +138,9 @@ The implementation must support this exact path:
    device cost model chooses one candidate without a fitted runtime predictor.
 6. The generic planner adds ordinary nodes such as `DocumentScan`, `Exchange`,
    `HashJoin`, `Project`, and `Limit`.
-7. The Modal container coordinator starts one GPU executor for each H100. Each
-   GPU executor creates or reuses one model execution object.
+7. The selected compute provider starts one remote coordinator and one GPU
+   executor for each H100. The current Modal provider places them in one
+   container. Each GPU executor creates or reuses one model execution object.
 8. The runner executes ready physical nodes. Every model node in one GPU
    executor uses the same model execution object.
 9. When the runner reaches `AdaptiveJoinPlan`, the selected backend uses actual
@@ -185,7 +186,7 @@ Each part has one owner:
 | Data movement required by a physical plan | `Exchange` runtime |
 | Exact result relation joins | Arrow `HashJoin` runtime |
 | Source schema and Arrow batches | Table provider |
-| Plan encoding at the Modal boundary | Registered node codecs |
+| Plan encoding at the compute process boundary | Registered node codecs |
 
 The generic engine must not inspect a concrete model node. A model backend must
 not read a table provider directly. Both sides communicate through typed plan
@@ -312,7 +313,8 @@ Each `PhysicalNode` provides:
 * Fields for explain output.
 
 The first version has three execution locations. They are the client, the
-Modal container coordinator, and a GPU executor. A physical node uses one of
+remote coordinator, and a GPU executor. The current Modal provider runs the
+coordinator and GPU executors in one container. A physical node uses one of
 those locations. `Exchange` is required when an input crosses a location or
 changes its partitioning among GPU executors.
 
@@ -534,15 +536,46 @@ The registry contains:
 * Physical node codecs.
 * Physical node runtimes.
 * Table provider factories.
+* Python extension package records.
 
 Quail registers its built in implementations when it creates a session. A
 caller can then register another implementation on that session. Duplicate
 names are errors, and registration order is deterministic.
 
-The first version loads Python extension packages in both the client and Modal
-container environments through the existing deployment setup. Each child GPU
-process inherits that environment. Automatic package installation is outside
-this plan.
+An extension module defines one function named
+`register_quail_extension(registry)`. The caller loads it before creating the
+session:
+
+```python
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.load_extension(
+    "my_package.quail_extension",
+    local_python_sources=("my_package",),
+    pip_packages=("another-dependency==1.2.3",),
+)
+session = quail.Session(registry=registry)
+```
+
+`local_python_sources` names local Python modules or packages that the compute
+provider must copy. `pip_packages` names packages that the compute provider
+must install. An installed extension can omit `local_python_sources` and list
+its package in `pip_packages`.
+
+The plan envelope contains the extension module names. The remote process
+imports those modules and rebuilds the registry before it decodes the physical
+graph. Modal adds the local sources and pip packages to the existing
+`quail-engine` image. Every child GPU process inherits that environment.
+
+The registry does not call Modal. It only records the code needed by a remote
+process. `ModalComputeProvider` handles Modal image construction and function
+calls. A caller can pass another object that implements `ComputeProvider` to
+`Session(compute=...)`.
+
+A model backend owns three process boundary methods. `prepare` builds the
+request on the client. `execute_remote` runs it in the compute process.
+`assemble` builds the public result on the client. Quail implements these
+methods through its current token payload, scheduler, and Arrow result path.
+Another backend can use different request data and remote execution code.
 
 ## Plan encoding
 
@@ -559,6 +592,7 @@ The JSON envelope contains:
 * The typed physical graph.
 * The selected model backend name.
 * The physical node type names required by the graph.
+* The extension modules required to rebuild the remote registry.
 * The expected child plan inside each `AdaptiveJoinPlan`.
 
 Each physical node type registers an encoder and decoder under a stable type
@@ -800,5 +834,4 @@ The redesign does not include:
 * Mixing model backends inside one query.
 * Splitting one model copy across several GPUs.
 * Using more than eight GPUs or more than one Modal container for one query.
-* Automatic extension installation on Modal.
 * A replacement for Arrow result processing.

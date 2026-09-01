@@ -281,7 +281,7 @@ def test_wire_payload_does_not_duplicate_physical_node_fields(sess):
     query = sess.sql(FILTER_SQL)
     plan = query.plan()
     scans, filters, joins = _collect(query.logical)
-    payload = query._payload(plan, scans, filters, joins)
+    payload = query._quail_payload(plan, scans, filters, joins)
 
     assert payload["physical_plan"]["version"] == 1
     assert payload["physical_plan"]["backend"] == "quail"

@@ -7,26 +7,34 @@ import itertools
 import json
 import os
 import time
+from dataclasses import dataclass
+from functools import lru_cache
 
 import modal
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
+CORE_PACKAGES = ("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow")
 
-image = (
-    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
-    .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow")
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
-          "VLLM_USE_FLASHINFER_SAMPLER": "0",
-          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-          # JIT artifacts persist on the kernel-cache volume so each
-          # DeepGEMM/Triton configuration compiles once ever, not
-          # once per container
-          "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail")
-)
+
+def _worker_image(local_python_sources=(), pip_packages=()):
+    """Build the Modal image containing Quail and registered extensions."""
+    packages = tuple(dict.fromkeys((*CORE_PACKAGES, *pip_packages)))
+    sources = tuple(dict.fromkeys(("quail", *local_python_sources)))
+    return (
+        modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
+        .entrypoint([])
+        .pip_install(*packages)
+        .env({"VLLM_LOGGING_LEVEL": "WARNING",
+              "VLLM_USE_FLASHINFER_SAMPLER": "0",
+              "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+              "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+              "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+              "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
+        .add_local_python_source(*sources)
+    )
+
+
+image = _worker_image()
 
 # House rule: never create new Modal app names - caches and warm state
 # ride on the app. The engine worker lives here, permanently.
@@ -42,26 +50,26 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
 # warm container keeps the loaded model and the arena across
 # execute() calls, which is what makes a session's later queries boot
 # in milliseconds.
-_BOOTED = {}      # model name -> dict(model, arena, pipeline)
+_BOOTED = {}      # (backend name, model name) -> loaded execution state
 
 
-def validate_plan_payload(payload: dict) -> None:
-    """Validate the typed plan before any model call."""
-    from quail.extensions import built_in_registry
+def validate_plan_payload(payload: dict):
+    """Validate and decode the typed plan before any backend call."""
+    from quail.extensions import registry_from_modules
     from quail.physical import check_plan_envelope, decode_graph
 
     envelope = payload.get("physical_plan")
     if envelope is None:
         raise ValueError("worker payload has no typed physical plan")
     check_plan_envelope(envelope)
-    if envelope["backend"] != "quail":
-        raise ValueError(
-            f"worker does not have backend {envelope['backend']!r}")
-    if envelope["model"] != payload["model"]:
+    if "model" in payload and envelope["model"] != payload["model"]:
         raise ValueError("physical plan and payload name different models")
-    if envelope["workers"] != payload["workers"]:
+    if "workers" in payload and envelope["workers"] != payload["workers"]:
         raise ValueError("physical plan and payload name different GPU counts")
-    registry = built_in_registry()
+    registry = registry_from_modules(tuple(
+        envelope.get("extension_modules", ())
+    ))
+    backend = registry.backend(envelope["backend"])
     missing = set(envelope["node_types"]) - set(registry.codecs)
     if missing:
         raise ValueError(
@@ -69,6 +77,7 @@ def validate_plan_payload(payload: dict) -> None:
     graph = decode_graph(envelope["graph"], registry.codecs)
     graph.validate(runtime_keys=set(registry.runtimes))
     graph.validate_backend(envelope["backend"])
+    return registry, graph, backend
 
 
 def _release_vllm_parallel_state() -> None:
@@ -106,7 +115,35 @@ def release_booted_models() -> dict:
     }
 
 
+def _execute_registered(payload: dict, gpu_count: int) -> dict:
+    """Run the backend selected by a registered physical plan."""
+    from quail.backends import RemoteExecutionContext
+
+    registry, graph, backend = validate_plan_payload(payload)
+    planned_gpus = payload["physical_plan"]["workers"]
+    if planned_gpus != gpu_count:
+        raise ValueError(
+            f"plan needs {planned_gpus} GPUs but worker has {gpu_count}"
+        )
+    return dict(backend.execute_remote(RemoteExecutionContext(
+        payload=payload,
+        graph=graph,
+        registry=registry,
+        gpu_count=gpu_count,
+        quail_driver=lambda: (
+            _execute_quail_payload(payload, registry, graph, backend)
+            if gpu_count == 1 else
+            _execute_quail_multi(payload, registry, graph)
+        ),
+    )))
+
+
 def _execute_payload(payload: dict) -> dict:
+    """Run one registered backend on one GPU."""
+    return _execute_registered(payload, 1)
+
+
+def _execute_quail_payload(payload, registry, graph, backend) -> dict:
     import torch
     import torch.nn.functional as F
 
@@ -119,7 +156,6 @@ def _execute_payload(payload: dict) -> dict:
     from quail.planner import budgets
     from quail.specs import DEVICES, MODELS
 
-    validate_plan_payload(payload)
     if payload["kv_dtype"] != "bf16":
         raise ValueError(
             f"KV is always bf16; got {payload['kv_dtype']!r}")
@@ -130,7 +166,8 @@ def _execute_payload(payload: dict) -> dict:
     t_boot = time.perf_counter()
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
                 pipeline_s=0.0, warm_kernels_s=0.0)
-    booted = _BOOTED.get(spec.name)
+    boot_key = (backend.name, spec.name)
+    booted = _BOOTED.get(boot_key)
     if booted is None:
         from quail.executor.model import load_model
         t0 = time.perf_counter()
@@ -151,8 +188,8 @@ def _execute_payload(payload: dict) -> dict:
         pipeline = Pipeline(model, arena,
                             attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
-        from quail.backends import GpuContext, QuailBackend
-        execution = QuailBackend().start(GpuContext(
+        from quail.backends import GpuContext
+        execution = backend.start(GpuContext(
             gpu_index=0,
             gpu_count=payload["workers"],
             model=spec,
@@ -166,7 +203,7 @@ def _execute_payload(payload: dict) -> dict:
             model=model, arena=arena, pipeline=pipeline
         )
         booted = dict(execution=execution, warmed=False)
-        _BOOTED[spec.name] = booted
+        _BOOTED[boot_key] = booted
         boot["kind"] = "cold"
     execution = booted["execution"]
     model = execution.state["model"]
@@ -209,7 +246,7 @@ def _execute_payload(payload: dict) -> dict:
     state = dict(model_execution=execution,
                  model=model, arena=arena, pipeline=pipeline,
                  spec=spec, torch=torch, F=F)
-    report = _execute_single(state, payload)
+    report = _execute_single(state, payload, registry, graph)
     report["boot_s"] = boot["boot_s"]
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
@@ -222,6 +259,7 @@ def _execute_payload(payload: dict) -> dict:
             boot_kind=report["boot_kind"], boot=boot,
             fresh_tokens=report["fresh_tokens"],
             regret_tokens=report.get("regret_tokens"),
+            node_metrics=report.get("node_metrics"),
             join_optimizer=report.get("join_optimizer"),
             kv_manager=report.get("kv_manager")), f)
     results_vol.commit()
@@ -238,19 +276,12 @@ def execute(payload: dict) -> dict:
     return _execute_payload(payload)
 
 
-def _execute_single(state, payload: dict) -> dict:
+def _execute_single(state, payload: dict, registry, graph) -> dict:
     """Execute the typed Quail graph on one GPU."""
-    from quail.extensions import built_in_registry
-    from quail.physical import decode_graph
     from quail.runtime.quail_graph import execute_single_graph
     from quail.runtime.tokens import decode_payload_documents
     from quail.specs import DEVICES
 
-    registry = built_in_registry()
-    graph = decode_graph(
-        payload["physical_plan"]["graph"], registry.codecs
-    )
-    graph.validate(runtime_keys=set(registry.runtimes))
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
@@ -304,11 +335,17 @@ def _child_boot(state, sub):
     from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.loop import AsyncAnswers, warm_kernels
     from quail.executor.model import load_model
+    from quail.extensions import registry_from_modules
     from quail.planner import budgets
     from quail.specs import DEVICES, MODELS
 
     spec = MODELS[sub["model"]]
     device = DEVICES["h100-sxm"]
+    envelope = sub["physical_plan"]
+    registry = registry_from_modules(tuple(
+        envelope.get("extension_modules", ())
+    ))
+    backend = registry.backend(envelope["backend"])
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
                 pipeline_s=0.0, warm_kernels_s=0.0)
     t_boot = time.perf_counter()
@@ -329,8 +366,8 @@ def _child_boot(state, sub):
         pipeline = Pipeline(model, arena,
                             attention_mode=FILTER_ATTENTION)
         boot["pipeline_s"] = time.perf_counter() - t0
-        from quail.backends import GpuContext, QuailBackend
-        execution = QuailBackend().start(GpuContext(
+        from quail.backends import GpuContext
+        execution = backend.start(GpuContext(
             gpu_index=state["gpu_index"],
             gpu_count=sub["workers"],
             model=spec,
@@ -356,13 +393,12 @@ def _child_boot(state, sub):
         async_answers=state["async_ans"],
         chunk_tokens=state["chunk_tokens"],
     )
-    if "runtime_context" not in state:
-        from quail.extensions import built_in_registry
-        from quail.runtime.runner import ExecutionContext
-        state["runtime_context"] = ExecutionContext(
-            runtimes=built_in_registry().runtimes,
-            model_execution=state["model_execution"],
-        )
+    from quail.runtime.runner import ExecutionContext
+    state["registry"] = registry
+    state["runtime_context"] = ExecutionContext(
+        runtimes=registry.runtimes,
+        model_execution=state["model_execution"],
+    )
     if not state["warmed"]:
         t0 = time.perf_counter()
         with torch.inference_mode():
@@ -388,7 +424,6 @@ def _child_filters(state, sub):
     import time as _time
 
     from quail.executor.attention import FILTER_ATTENTION
-    from quail.extensions import built_in_registry
     from quail.physical import PackedFilter, decode_graph
     from quail.runtime.tokens import chain_tokens
 
@@ -410,7 +445,7 @@ def _child_filters(state, sub):
         if node_id is not None:
             graph = decode_graph(
                 sub["physical_plan"]["graph"],
-                built_in_registry().codecs,
+                state["registry"].codecs,
             )
             node = graph.node(node_id)
             if not isinstance(node, PackedFilter):
@@ -461,7 +496,6 @@ def _child_joins(state, sub):
     import time as _time
 
     from quail.executor.attention import JOIN_ATTENTION
-    from quail.extensions import built_in_registry
     from quail.physical import AdaptiveJoinPlan, AnchoredJoin, decode_graph
     from quail.runtime.coordinator import stage_for_anchor
     from quail.runtime.quail_graph import _join_round_kv, _tuple_suffix
@@ -473,7 +507,7 @@ def _child_joins(state, sub):
     if sub.get("start_query", False):
         _reset_child_query(state)
     pre = sub.get("pre_ids") or []
-    registry = built_in_registry()
+    registry = state["registry"]
     encoded_node = sub["physical_node"]
     node = registry.codecs[encoded_node["type"]].decode(encoded_node)
     if not isinstance(node, AnchoredJoin):
@@ -631,10 +665,12 @@ def _round(kind, subs):
 
 
 def _execute_multi(payload: dict) -> dict:
+    """Run one registered backend on its requested GPU count."""
+    return _execute_registered(payload, payload["physical_plan"]["workers"])
+
+
+def _execute_quail_multi(payload, registry, graph) -> dict:
     """Execute the typed Quail graph across GPU child processes."""
-    validate_plan_payload(payload)
-    from quail.extensions import built_in_registry
-    from quail.physical import decode_graph
     from quail.runtime.quail_distributed import execute_distributed_graph
     from quail.runtime.tokens import decode_payload_documents
     from quail.specs import DEVICES, MODELS
@@ -643,11 +679,6 @@ def _execute_multi(payload: dict) -> dict:
     payload["docs"] = decode_payload_documents(payload["docs"])
     gpu_count = payload["workers"]
     _ensure_children(gpu_count)
-    registry = built_in_registry()
-    graph = decode_graph(
-        payload["physical_plan"]["graph"], registry.codecs
-    )
-    graph.validate(runtime_keys=set(registry.runtimes))
     report = execute_distributed_graph(
         payload,
         graph,
@@ -656,6 +687,7 @@ def _execute_multi(payload: dict) -> dict:
         MODELS[payload["model"]],
         DEVICES["h100-sxm"],
         registry.runtimes,
+        registry,
     )
     results_vol.commit()
     kernel_cache.commit()
@@ -687,6 +719,98 @@ def execute_4(payload: dict) -> dict:
                        "/results": results_vol})
 def execute_8(payload: dict) -> dict:
     return _execute_multi(payload)
+
+
+@dataclass(frozen=True)
+class ModalWorker:
+    """Modal app and GPU functions for one extension set."""
+
+    app: object
+    execute: object
+    execute_2: object
+    execute_4: object
+    execute_8: object
+
+
+@lru_cache(maxsize=None)
+def modal_worker(local_python_sources=(), pip_packages=()) -> ModalWorker:
+    """Return Modal functions containing the requested extensions."""
+    local_python_sources = tuple(local_python_sources)
+    pip_packages = tuple(pip_packages)
+    if not local_python_sources and not pip_packages:
+        return ModalWorker(app, execute, execute_2, execute_4, execute_8)
+
+    worker_app = modal.App("quail-engine")
+    worker_image = _worker_image(local_python_sources, pip_packages)
+    volumes = {
+        "/root/.cache/huggingface": hf_cache,
+        "/root/.cache/kernels": kernel_cache,
+        "/results": results_vol,
+    }
+
+    @worker_app.function(
+        name="execute",
+        serialized=True,
+        image=worker_image,
+        gpu="H100!",
+        timeout=7200,
+        memory=98304,
+        scaledown_window=300,
+        max_containers=1,
+        volumes=volumes,
+    )
+    def extension_execute(payload: dict) -> dict:
+        return _execute_payload(payload)
+
+    @worker_app.function(
+        name="execute_2",
+        serialized=True,
+        image=worker_image,
+        gpu="H100!:2",
+        timeout=7200,
+        memory=131072,
+        scaledown_window=300,
+        max_containers=1,
+        volumes=volumes,
+    )
+    def extension_execute_2(payload: dict) -> dict:
+        return _execute_multi(payload)
+
+    @worker_app.function(
+        name="execute_4",
+        serialized=True,
+        image=worker_image,
+        gpu="H100!:4",
+        timeout=7200,
+        memory=196608,
+        scaledown_window=300,
+        max_containers=1,
+        volumes=volumes,
+    )
+    def extension_execute_4(payload: dict) -> dict:
+        return _execute_multi(payload)
+
+    @worker_app.function(
+        name="execute_8",
+        serialized=True,
+        image=worker_image,
+        gpu="H100!:8",
+        timeout=7200,
+        memory=262144,
+        scaledown_window=300,
+        max_containers=1,
+        volumes=volumes,
+    )
+    def extension_execute_8(payload: dict) -> dict:
+        return _execute_multi(payload)
+
+    return ModalWorker(
+        worker_app,
+        extension_execute,
+        extension_execute_2,
+        extension_execute_4,
+        extension_execute_8,
+    )
 
 
 class _PayloadAnswerer:

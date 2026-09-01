@@ -63,7 +63,8 @@ def pick_corpus_tokenizer(primary, fast, texts, sample=25):
 class Session:
     def __init__(self, config: EngineConfig = EngineConfig(),
                  device: str = "h100-sxm", tokenizer=None,
-                 registry: ExtensionRegistry | None = None):
+                 registry: ExtensionRegistry | None = None,
+                 compute=None):
         model = resolve_model(config.model)
         if isinstance(model, Refusal):
             raise RefusalError(model)
@@ -98,24 +99,21 @@ class Session:
         self._fast_tried = False
         self.notes = []            # tokenizer picks etc., for reports
         self._scan_cache = {}      # (source, column) -> token lists
-        self._app_ctx = None       # the Modal app held open for the
-        #                            session, so the worker container
-        #                            (its booted model) survives
-        #                            between run() calls
+        if compute is None:
+            from quail.runtime.compute import ModalComputeProvider
+            compute = ModalComputeProvider()
+        self.compute = compute
 
     def worker(self):
-        """Return the worker module, opening this session's Modal app if needed."""
-        from quail.runtime import worker
-        if self._app_ctx is None:
-            self._app_ctx = worker.app.run()
-            self._app_ctx.__enter__()
-        return worker
+        """Return this session's Modal functions for compatibility."""
+        get_worker = getattr(self.compute, "worker", None)
+        if get_worker is None:
+            raise TypeError("the selected compute provider has no Modal worker")
+        return get_worker(self.registry.extension_packages)
 
     def close(self):
-        """Stop the Modal app and release the container."""
-        if self._app_ctx is not None:
-            self._app_ctx.__exit__(None, None, None)
-            self._app_ctx = None
+        """Close the selected compute provider."""
+        self.compute.close()
 
     def __enter__(self):
         return self
@@ -354,20 +352,57 @@ class Query:
                 node.location is not ExecutionLocation.GPU_EXECUTOR
                 for node in plan.nodes):
             return self._run_local(plan, scans)
-        payload = self._payload(plan, scans, filters, joins)
+        from quail.backends import (
+            QueryPreparationContext,
+            ResultAssemblyContext,
+        )
+        from quail.extensions import registry_from_modules
+
+        remote_registry = registry_from_modules(
+            self.session.registry.extension_modules
+        )
+        missing_codecs = {
+            node.type_name for node in plan.nodes
+            if node.type_name not in remote_registry.codecs
+        }
+        missing_runtimes = {
+            node.runtime_key for node in plan.nodes
+            if node.runtime_key not in remote_registry.runtimes
+        }
+        if missing_codecs or missing_runtimes:
+            raise ValueError(
+                "remote extension registration is incomplete; "
+                f"missing codecs={sorted(missing_codecs)}, "
+                f"missing runtimes={sorted(missing_runtimes)}"
+            )
+        remote_registry.backend(plan.backend)
+        backend = self.session.registry.backend(plan.backend)
+        payload = backend.prepare(QueryPreparationContext(
+            query=self,
+            plan=plan,
+            scans=scans,
+            filters=filters,
+            joins=joins,
+        ))
         t0 = time.time()
         if _execute is None:
-            worker = self.session.worker()
-            k = plan.workers
-            fn = (worker.execute if k == 1 else
-                  worker.execute_2 if k == 2 else
-                  worker.execute_4 if k <= 4 else worker.execute_8)
-            out = fn.remote(payload)
+            out = self.session.compute.execute(
+                payload,
+                plan.workers,
+                self.session.registry.extension_packages,
+            )
         else:
             out = _execute(payload)
         coordinator_wall = time.time() - t0
-        return self._assemble(plan, scans, filters, joins, out,
-                              coordinator_wall)
+        return backend.assemble(ResultAssemblyContext(
+            query=self,
+            plan=plan,
+            scans=scans,
+            filters=filters,
+            joins=joins,
+            output=out,
+            coordinator_wall_s=coordinator_wall,
+        ))
 
     def _run_local(self, plan, scans) -> QueryResult:
         """Run a graph that has no GPU executor nodes."""
@@ -441,7 +476,7 @@ class Query:
 
     # ---- payload -------------------------------------------------------
 
-    def _payload(self, plan, scans, filters, joins) -> dict:
+    def _quail_payload(self, plan, scans, filters, joins) -> dict:
         from quail.runtime.tokens import encode_token_documents
 
         sess = self.session
@@ -495,7 +530,9 @@ class Query:
         )
         return dict(
             physical_plan=runtime_plan.to_envelope(
-                sess.registry.codecs, include_runtime_data=True
+                sess.registry.codecs,
+                extension_modules=sess.registry.extension_modules,
+                include_runtime_data=True,
             ),
             model=sess.model.name,
             kv_dtype=plan.kv_dtype,
@@ -518,8 +555,8 @@ class Query:
 
     # ---- sink: gate, replay-check, project ------------------------------
 
-    def _assemble(self, plan, scans, filters, joins, out,
-                  coordinator_wall) -> QueryResult:
+    def _assemble_quail(self, plan, scans, filters, joins, out,
+                        coordinator_wall) -> QueryResult:
         from quail.executor.pack import gate
 
         report = dict(
@@ -544,6 +581,7 @@ class Query:
                 "executed_plan", []
             ),
             kv_manager=out.get("kv_manager"),
+            node_metrics=out.get("node_metrics", {}),
             result_volume_path=out.get("result_volume_path"),
             remarks=list(plan.remarks) + list(self.session.notes))
         answer_rows = dict(filters=out["filters"], joins=out["joins"])

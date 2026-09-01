@@ -12,7 +12,8 @@
 - A small 4B join used two H100s in one Modal container. Each GPU held one
   model copy, so the query did not split one model across two GPUs.
 - A small filter used Qwen3 32B fp8 on one H100.
-- Every run used the existing `quail-milestone1` Modal app.
+- Benchmark confirmation cells used the existing `quail-milestone1` Modal
+  app. The remote extension check used the existing `quail-engine` app.
 
 The main measurements came from:
 
@@ -27,6 +28,7 @@ The new measurements came from:
 - `/results/ablations/extensible_engine_confirmation_32b.json`
 - `/results/ablations/extensible_engine_confirmation_4b_output_check.json`
 - `/results/ablations/extensible_engine_confirmation_4b_timing_check.json`
+- `/results/runs/run_1788235232383076564.json`
 
 The successful Modal function calls were:
 
@@ -36,6 +38,7 @@ The successful Modal function calls were:
 - 32B on one GPU: `fc-01M1DB65VXR2VQPW0E4YKM1C30`
 - Sorted BIO-2 output check: `fc-01M1DBQBMDW63H9BG8MFAPYYGW`
 - BIO-2 timing check: `fc-01M1DCDDKPC67EA1EGJVABD13C`
+- External physical node: `fc-01M1DHYW4S9ZNBHG9JH5FNMFN1`
 
 ## Prediction
 
@@ -84,6 +87,29 @@ The checks for multiple GPUs and both model sizes also passed.
 | Small join | Qwen3 4B fp8 | 2 | 1 | 2.77 s | 11.55 pairs/s | $0.0061 | 32 pairs | 752 | 0 |
 | Small filter | Qwen3 32B fp8 | 1 | 1 | 0.04 s | 200.0 documents/s | $0.00004 | 8 documents | 240 | 0 |
 
+## Remote extension confirmation
+
+The final check loaded `quail_ext_examples.count_documents` into the existing
+`quail-engine` Modal app. This module is not part of Quail's built in registry.
+It registered one physical node, its codec, its runtime, and a physical plan
+rule.
+
+The prediction was that the remote node would count all 4 input documents.
+The measured node record reported 4 input rows, 4 output rows, and 4 evaluated
+documents. The model filter also evaluated all 4 documents and returned 2
+rows.
+
+The query took 0.12 seconds after startup. This is 33.33 documents per second
+and $0.00013 for one H100. Cold model startup took another 43.47 seconds and is
+not included in those primary numbers. The worker processed 118 fresh tokens
+and reported zero KV regret.
+
+The run record is
+`/results/runs/run_1788235232383076564.json` on the `quail-results` volume.
+This result confirms that the plan envelope rebuilt the extension registry in
+the remote process. It also confirms that Modal included the local extension
+package in the worker image.
+
 The query on two GPUs created two model workers in one Modal container. Each
 worker owned one 4B model copy on one H100. The 32B query used the same typed
 plan and runner interfaces as the 4B queries.
@@ -109,6 +135,8 @@ while one does not. The figure includes all three measurements.
 - The 4B and 32B models use the same interfaces.
 - Multiple GPUs run as separate model workers in one container. They do not
   use tensor parallel weight splitting.
+- Engine extensions run through the same Modal compute provider as built in
+  Quail nodes.
 - The slow BIO-2 repeat shows that one Modal timing cannot rule out platform
   variance. The slow run did not coincide with a change in Quail's planned
   or measured model work.

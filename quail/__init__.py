@@ -5,12 +5,21 @@ from quail.catalog import DocumentProvider, ScanRequest, TableProvider
 from quail.extensions import ExtensionRegistry
 from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
 from quail.planner.plan import EngineConfig
-from quail.runtime import Query, QueryResult, RefusalError, Session
+from quail.runtime import (
+    ComputeProvider,
+    ModalComputeProvider,
+    Query,
+    QueryResult,
+    RefusalError,
+    Session,
+)
 
 __all__ = [
+    "ComputeProvider",
     "DocumentProvider",
     "EngineConfig",
     "ExtensionRegistry",
+    "ModalComputeProvider",
     "NodeCodec",
     "PhysicalGraph",
     "PhysicalNode",

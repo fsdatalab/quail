@@ -76,7 +76,7 @@ def main() -> None:
     if isinstance(plan, Refusal):
         raise RuntimeError(str(plan))
     scans, filters, joins = _collect(query.logical)
-    payload = query._payload(plan, scans, filters, joins)
+    payload = query._quail_payload(plan, scans, filters, joins)
     print("built Arrow IPC payload", flush=True)
     if not all(isinstance(value, bytes)
                for value in payload["docs"].values()):

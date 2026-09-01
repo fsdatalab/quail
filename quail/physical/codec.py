@@ -144,6 +144,7 @@ def plan_envelope(
     workers: int,
     graph: PhysicalGraph,
     codecs: Mapping[str, NodeCodec],
+    extension_modules: tuple[str, ...] = (),
     include_runtime_data: bool = True,
 ) -> dict:
     """Encode the physical plan fields sent across a process boundary."""
@@ -154,6 +155,7 @@ def plan_envelope(
         "model": model,
         "device": device,
         "workers": workers,
+        "extension_modules": list(extension_modules),
         "node_types": sorted({node.type_name for node in graph.nodes}),
         "graph": encode_graph(
             graph,
@@ -170,3 +172,9 @@ def check_plan_envelope(value: Mapping[str, Any]) -> None:
         raise ValueError(
             f"unsupported physical plan version {version!r}; "
             f"expected {PLAN_FORMAT_VERSION}")
+    modules = value.get("extension_modules", [])
+    if not isinstance(modules, list) \
+            or not all(isinstance(module, str) and module for module in modules):
+        raise ValueError("physical plan extension_modules must be strings")
+    if len(modules) != len(set(modules)):
+        raise ValueError("physical plan has duplicate extension modules")

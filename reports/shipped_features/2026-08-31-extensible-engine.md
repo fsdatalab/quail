@@ -9,6 +9,13 @@ The main changes are:
   logical node types.
 * A session can register logical rules, physical rules, model backends,
   physical node codecs, physical node runtimes, and table providers.
+* A session can load a Python extension module and tell a compute provider
+  which local sources and pip packages it needs.
+* `ModalComputeProvider` copies that code into the existing `quail-engine`
+  image. The worker imports the modules named by the plan before it resolves
+  the backend, codecs, and runtimes.
+* A different compute provider can be passed to `Session` without changing
+  the planner or model backend.
 * The planner returns an immutable typed `PhysicalGraph` with typed ports,
   schemas, execution locations, partitioning, and resource requirements.
 * Quail represents runtime join planning with `AdaptiveJoinPlan`. Its
@@ -28,6 +35,12 @@ The CPU suite checks built in behavior and extension behavior. One extension
 test registers a model backend, physical planner, physical rule, physical
 node, codec, and runtime without changing generic planner or runner code.
 Another test checks a custom logical node and logical rule.
+
+The remote extension confirmation loaded
+`quail_ext_examples.count_documents` through Modal. Its registered physical
+node ran inside the remote graph and counted all 4 input documents. The query
+took 0.12 seconds after startup. The run record is
+`/results/runs/run_1788235232383076564.json` on `quail-results`.
 
 The Modal confirmation preserved the row counts and measured model work.
 BIO-2 took 128.80 seconds, compared with 129.64 seconds on main. AGENT-1 took

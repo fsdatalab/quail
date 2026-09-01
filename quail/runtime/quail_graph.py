@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import time
+from dataclasses import fields
 from dataclasses import replace
 
 from quail.physical import (
@@ -11,6 +12,7 @@ from quail.physical import (
     AnchoredJoin,
     DocumentScan,
     Exchange,
+    ExecutionLocation,
     JoinStage,
     PackedFilter,
     PhysicalGraph,
@@ -23,6 +25,21 @@ from quail.runtime.runner import (
     NodeMetrics,
     NodeResult,
 )
+
+
+def scalar_node_metrics(nodes) -> dict:
+    """Return JSON values from each physical node's metrics."""
+    scalar_fields = tuple(
+        field.name for field in fields(NodeMetrics)
+        if field.name != "extension"
+    )
+    return {
+        node_id: {
+            name: getattr(result.metrics, name)
+            for name in scalar_fields
+        }
+        for node_id, result in nodes.items()
+    }
 
 
 def _join_round_kv(anchor_keys, prefix_lens, owned, seen) -> dict:
@@ -321,7 +338,6 @@ def _child_graph(node: AnchoredJoin, previous_anchor: str | None,
 def run_adaptive_join(node, inputs, context: ExecutionContext) -> NodeResult:
     """Plan and execute Quail join child graphs from actual survivors."""
     from quail.runtime.coordinator import (
-        gate_group,
         report_join_plan,
         search_specs,
         thin_survivors,
@@ -493,21 +509,33 @@ def run_adaptive_join(node, inputs, context: ExecutionContext) -> NodeResult:
 
 def model_subgraph(graph: PhysicalGraph) -> PhysicalGraph:
     """Return the section executed inside the Modal container."""
+    by_id = {node.node_id: node for node in graph.nodes}
+    selected = {
+        node.node_id for node in graph.nodes
+        if node.location is ExecutionLocation.GPU_EXECUTOR
+        or node.backend is not None
+    }
+
+    def include_inputs(node_id):
+        for input_port in by_id[node_id].inputs:
+            source_id = input_port.source.node_id
+            if source_id not in selected:
+                selected.add(source_id)
+                include_inputs(source_id)
+
+    for node_id in tuple(selected):
+        include_inputs(node_id)
     nodes = tuple(
-        node for node in graph.nodes
-        if isinstance(node, (DocumentScan, PackedFilter, AdaptiveJoinPlan))
+        node for node in graph.topological_nodes()
+        if node.node_id in selected
     )
-    adaptive = next(
-        (node for node in nodes if isinstance(node, AdaptiveJoinPlan)), None
+    if not nodes:
+        raise ValueError("Quail model graph has no remote operation")
+    root_node = nodes[-1]
+    return PhysicalGraph(
+        nodes,
+        PortRef(root_node.node_id, root_node.outputs[0].name),
     )
-    if adaptive is not None:
-        root = PortRef(adaptive.node_id, adaptive.outputs[0].name)
-    else:
-        filters = [node for node in nodes if isinstance(node, PackedFilter)]
-        if not filters:
-            raise ValueError("Quail model graph has no model operation")
-        root = PortRef(filters[-1].node_id, filters[-1].outputs[0].name)
-    return PhysicalGraph(nodes, root)
 
 
 def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
@@ -588,6 +616,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "wall_s": round(wall, 2),
         "fresh_tokens": result.metrics.fresh_tokens,
         "regret_tokens": runtime_state["regret_tokens"],
+        "node_metrics": scalar_node_metrics(result.nodes),
         "join_optimizer": optimizer,
         "kv_manager": kv_manager,
         "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),

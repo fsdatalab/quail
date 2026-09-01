@@ -160,7 +160,7 @@ class KeepFirstDocument:
 
 
 def test_session_runs_registered_physical_extensions_locally():
-    registry = built_in_registry()
+    registry = quail.ExtensionRegistry.with_built_ins()
     backend = LocalFilterBackend()
     planner = PreferredPlanner()
     registry.register_backend(backend)
@@ -200,3 +200,93 @@ def test_session_runs_registered_physical_extensions_locally():
     assert list(result.report["nodes"]) == [
         "scan:d", "filter:d", "project"
     ]
+
+
+def test_extension_module_rebuilds_the_remote_plan_registry():
+    from quail.extensions import registry_from_modules
+    from quail.runtime.quail_graph import model_subgraph
+
+    registry = built_in_registry()
+    registry.load_extension(
+        "quail_ext_examples.count_documents",
+        local_python_sources=("quail_ext_examples",),
+    )
+    session = quail.Session(tokenizer=str.split, registry=registry)
+    session.register("docs", DocumentProvider.from_table(
+        pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
+        id_col="id",
+        identity="remote-extension-docs",
+    ))
+    plan = session.sql(
+        "SELECT d.id FROM docs d WHERE "
+        "AI_FILTER(PROMPT('ok {0}', d.body))"
+    ).plan()
+    envelope = plan.to_envelope(
+        registry.codecs,
+        extension_modules=registry.extension_modules,
+    )
+    remote_registry = registry_from_modules(
+        tuple(envelope["extension_modules"])
+    )
+    remote_graph = decode_graph(envelope["graph"], remote_registry.codecs)
+
+    assert registry.extension_packages[0].local_python_sources == (
+        "quail_ext_examples",
+    )
+    assert envelope["extension_modules"] == [
+        "quail_ext_examples.count_documents"
+    ]
+    assert "example.count_documents.v1" in remote_registry.runtimes
+    assert any(node.type_name == "example.count_documents.v1"
+               for node in model_subgraph(remote_graph).nodes)
+
+
+def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
+    import sys
+    import types
+
+    from quail.physical import plan_envelope
+    from quail.runtime.worker import _execute_payload
+
+    class RemoteBackend:
+        name = "test.remote"
+
+        def execute_remote(self, context):
+            return {
+                "backend": self.name,
+                "nodes": [node.node_id for node in context.graph.nodes],
+            }
+
+    module_name = "test_remote_quail_extension"
+    module = types.ModuleType(module_name)
+
+    def register(registry):
+        registry.register_backend(RemoteBackend())
+
+    module.register_quail_extension = register
+    monkeypatch.setitem(sys.modules, module_name, module)
+    registry = built_in_registry()
+    scan = DocumentScan(
+        node_id="scan:d",
+        alias="d",
+        provider="docs",
+        column="body",
+        n_docs=2,
+    )
+    graph = PhysicalGraph((scan,), PortRef("scan:d", "ids:d"))
+    payload = {
+        "physical_plan": plan_envelope(
+            backend=RemoteBackend.name,
+            model="qwen3-4b-fp8",
+            device="h100-sxm",
+            workers=1,
+            graph=graph,
+            codecs=registry.codecs,
+            extension_modules=(module_name,),
+        )
+    }
+
+    assert _execute_payload(payload) == {
+        "backend": "test.remote",
+        "nodes": ["scan:d"],
+    }

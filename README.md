@@ -17,8 +17,8 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
 - `quail/executor/` is the packed executor: chunk packing, admission,
   the paged KV arena, attention kernels, the overlapped loop, and
   weight loading. The GPU parts run only inside the Modal image.
-- `quail/runtime/` is the run side: the session (plan, payload,
-  recombination), the multi-GPU coordinator, and the Modal worker.
+- `quail/runtime/` is the run side: the session, compute provider,
+  multi-GPU coordinator, and Modal worker.
 - `quail/bench/` has the QUAIL-B benchmark queries. Its
   [README](quail/bench/README.md) explains how to run the benchmark and
   label a new predicate.
@@ -47,6 +47,51 @@ uv run modal run tests/gpu/milestone1.py::run_probe 2>&1 | tee results/m1_probe.
 Committed result summaries (the JSON files reports cite) are in
 `results/`; raw per-item run records live on the `quail-results`
 Modal volume. Teed logs stay local and are not committed.
+
+## Adding an engine extension
+
+An extension is an importable Python module with this function:
+
+```python
+def register_quail_extension(registry):
+    registry.register_codec(...)
+    registry.register_runtime(...)
+    registry.register_physical_rule(...)
+```
+
+The function can register logical rules, physical planners, physical rules,
+model backends, physical node codecs, and physical node runtimes. Load the
+module before creating the session:
+
+```python
+import quail
+
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.load_extension(
+    "my_package.quail_extension",
+    local_python_sources=("my_package",),
+    pip_packages=("another-dependency==1.2.3",),
+)
+session = quail.Session(registry=registry)
+```
+
+The default `ModalComputeProvider` copies `local_python_sources` into the
+existing `quail-engine` image and installs `pip_packages`. The physical plan
+names the extension modules it needs. The Modal worker imports those modules
+before it decodes the plan or selects a runtime.
+
+[`quail_ext_examples/count_documents.py`](quail_ext_examples/count_documents.py)
+is a complete physical node, codec, runtime, and plan rule. Its node runs in
+the remote graph and reports a document count without changing query results.
+
+A model backend implements planning plus three process boundary methods.
+`prepare` builds its request on the client. `execute_remote` runs inside the
+compute process. `assemble` builds the public result on the client. The backend
+owns its scheduler, model calls, and KV.
+
+Modal is one compute provider. To use another provider, pass an object with
+`execute(payload, gpu_count, extensions)` and `close()` methods as
+`Session(compute=provider)`. Planning and backend code do not call Modal.
 
 ## Adding a new model
 

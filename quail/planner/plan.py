@@ -109,7 +109,13 @@ class PhysicalPlan:
             for stage in node.stages
         )
 
-    def to_envelope(self, codecs, *, include_runtime_data=True) -> dict:
+    def to_envelope(
+        self,
+        codecs,
+        *,
+        extension_modules=(),
+        include_runtime_data=True,
+    ) -> dict:
         """Encode the typed graph for a process boundary."""
         return plan_envelope(
             backend=self.backend,
@@ -118,6 +124,7 @@ class PhysicalPlan:
             workers=self.workers,
             graph=self.graph,
             codecs=codecs,
+            extension_modules=tuple(extension_modules),
             include_runtime_data=include_runtime_data,
         )
 

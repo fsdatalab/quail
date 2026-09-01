@@ -228,3 +228,27 @@ class QuailBackend:
 
     def start(self, context: GpuContext) -> QuailModelExecution:
         return QuailModelExecution(context)
+
+    def prepare(self, context) -> Mapping[str, Any]:
+        """Build Quail's token and typed plan request."""
+        return context.query._quail_payload(
+            context.plan,
+            context.scans,
+            context.filters,
+            context.joins,
+        )
+
+    def execute_remote(self, context) -> Mapping[str, Any]:
+        """Run Quail inside the selected compute process."""
+        return context.run_quail()
+
+    def assemble(self, context):
+        """Build a QueryResult from Quail answer relations."""
+        return context.query._assemble_quail(
+            context.plan,
+            context.scans,
+            context.filters,
+            context.joins,
+            context.output,
+            context.coordinator_wall_s,
+        )

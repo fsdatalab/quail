@@ -41,6 +41,7 @@ payload to the worker, which calls the executor.
 | `executor/loop.py` | Execution loops (run_filter, run_join, warm_kernels) | arena, attention, pack |
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
 | `runtime/session.py` | Session, Query, tokenization, payload assembly | catalog, logical, planner, sqlfront, builder |
+| `runtime/compute.py` | Compute provider interface and Modal implementation | runtime worker |
 | `runtime/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `runtime/runner.py` | Generic typed graph runner and standard node metrics | physical |
 | `runtime/quail_graph.py` | One GPU Quail node preparation and adaptive join runtime | runner, planner, executor |
@@ -67,19 +68,24 @@ selected ModelBackend
   produces: typed PhysicalPlan
   |
   v
-_payload (runtime/session.py)
-  encodes a versioned JSON plan and Arrow token batches
+selected ModelBackend.prepare
+  encodes the backend request and versioned physical plan
   |
   v
-worker.execute (runtime/worker.py, on Modal GPU)
+selected ComputeProvider
+  installs extension code and sends the request
+  |
+  v
+worker.execute (runtime/worker.py, with Modal as the default provider)
   validates the plan version, backend, codecs, model, and GPU count
+  imports the extension modules named by the plan
   boots: model.py -> attention.Pipeline -> arena.KVArena
   runs: GenericRunner -> registered node runtimes
         -> QuailModelExecution -> loop.run_filter / loop.run_join
   returns: raw answer rows
   |
   v
-_assemble (runtime/session.py)
+selected ModelBackend.assemble
   converts answers to Arrow tables
   |
   v
@@ -122,9 +128,13 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    estimates. At runtime, Quail searches again with the actual filter
    survivors and current KV state. An anchor change is represented as
    `Exchange`. There is no physical barrier node.
-7. The session sends a versioned JSON plan envelope and document token
-   columns as Arrow IPC bytes. The worker checks the plan before the
-   first model call. The generic runner executes the typed model graph.
+7. The selected backend prepares a request with a versioned JSON plan
+   envelope and document token columns as Arrow IPC bytes. The selected
+   compute provider sends it to a remote process. Modal is the default
+   provider. It adds registered local extension sources and pip packages to
+   the existing `quail-engine` image. The worker imports the extension modules
+   listed in the plan and checks the rebuilt registry before the first model
+   call. The generic runner then executes the typed model graph.
    `AdaptiveJoinPlan` creates typed `AnchoredJoin` and `Exchange` child
    graphs. The same `QuailModelExecution` handles every model node on
    one GPU executor, so the nodes use the same KV.
@@ -287,8 +297,34 @@ structurally identical.
 | `Session.docs` | `session.py:175` | Start the builder API |
 | `Session.scan` | `session.py:210` | Tokenize a column (cached per session) |
 | `Query.plan` | `session.py:310` | Run the planner (cached per Query) |
-| `Query.run` | `session.py:335` | Plan, execute on Modal, replay-check, project |
+| `Query.run` | `session.py:335` | Plan, call the compute provider, assemble the result |
 | `Query.explain` | `session.py:330` | Print the logical tree and physical plan |
+
+### Engine and compute extensions
+
+Every session owns an `ExtensionRegistry`. The registry starts with Quail's
+built in backend, codecs, and runtimes. An extension module defines
+`register_quail_extension(registry)`. That function can register logical
+rules, physical planners, physical rules, model backends, physical node
+codecs, and physical node runtimes.
+
+`ExtensionRegistry.load_extension` imports the module on the client. It also
+records local Python sources and pip packages needed by a remote process. The
+physical plan envelope carries the module names. The worker imports the same
+modules and rebuilds the registry before decoding the graph. A missing backend,
+codec, or runtime fails before model execution.
+
+The selected model backend controls three steps. `prepare` builds its remote
+request. `execute_remote` runs inside the compute process. `assemble` builds
+the public result on the client. Quail's backend uses the existing scheduler,
+KV, and Arrow result code. Another backend can use different request and
+execution code.
+
+`ComputeProvider` only controls where the prepared request runs. The default
+`ModalComputeProvider` selects the 1, 2, 4, or 8 GPU function in the existing
+`quail-engine` app. A different provider can be passed as
+`Session(compute=provider)`. It does not need changes to the planner or a model
+backend.
 
 ### Pushdown
 

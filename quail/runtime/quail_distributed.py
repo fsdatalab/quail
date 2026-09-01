@@ -17,6 +17,7 @@ from quail.runtime.quail_graph import (
     _next_join,
     _possible_anchors,
     model_subgraph,
+    scalar_node_metrics,
 )
 from quail.runtime.runner import (
     ExecutionContext,
@@ -78,7 +79,7 @@ class DistributedQuailExecution:
     """Dispatch typed Quail model nodes to one child per GPU."""
 
     def __init__(self, payload, graph, gpu_count, round_fn,
-                 model_spec, device):
+                 model_spec, device, registry):
         from quail.planner import budgets
 
         self.payload = payload
@@ -87,6 +88,7 @@ class DistributedQuailExecution:
         self.round_fn = round_fn
         self.model_spec = model_spec
         self.device = device
+        self.registry = registry
         self.docs = payload["docs"]
         self.shards = {
             node.alias: node.shards
@@ -237,9 +239,7 @@ class DistributedQuailExecution:
             filtered_aliases=self.filter_aliases,
             shards=self.shards,
         )
-        from quail.extensions import built_in_registry
-        registry = built_in_registry()
-        encoded_node = registry.codecs[node.type_name].encode(node)
+        encoded_node = self.registry.codecs[node.type_name].encode(node)
         for sub in subs:
             sub.pop("joins", None)
             sub.update(
@@ -511,10 +511,16 @@ def run_distributed_adaptive(node, inputs, context):
 
 
 def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
-                              round_fn, model_spec, device, runtimes) -> dict:
+                              round_fn, model_spec, device, runtimes,
+                              registry=None) -> dict:
     """Execute one typed Quail graph across GPU child processes."""
+    if registry is None:
+        from quail.extensions import registry_from_modules
+        registry = registry_from_modules(tuple(
+            payload["physical_plan"].get("extension_modules", ())
+        ))
     execution = DistributedQuailExecution(
-        payload, graph, gpu_count, round_fn, model_spec, device
+        payload, graph, gpu_count, round_fn, model_spec, device, registry
     )
     sources = {
         alias: list(range(len(documents)))
@@ -555,5 +561,6 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         fresh_tokens=result.metrics.fresh_tokens,
         regret_tokens=result.metrics.regret_tokens,
         join_optimizer=optimizer,
+        node_metrics=scalar_node_metrics(result.nodes),
     )
     return report
