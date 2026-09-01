@@ -1,4 +1,4 @@
-"""Figure for reports/2026-08-31-load-model-speed.md.
+"""Figure for reports/shipped_features/2026-08-31-load-model-speed.md.
 
 Draws load_model_speed.png: one stacked horizontal bar per
 configuration, each segment one phase of the cold load, totals and

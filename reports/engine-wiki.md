@@ -1406,7 +1406,8 @@ subprocess.
   stock vLLM baseline passes the same pin, so engine and baseline
   boots stay comparable.
 
-Measured on one H100 (report 2026-08-31-load-model-speed): cold
+Measured on one H100 (see
+`shipped_features/2026-08-31-load-model-speed.md`): cold
 `load_model` for Qwen3 4B fp8 went from 35.3 s to 24.8 s. The
 remaining floor is the torch+vLLM import (~14 s) and `get_model`
 (~10 s).
