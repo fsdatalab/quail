@@ -9,10 +9,12 @@ from quail.runtime import (
     ComputeProvider,
     ModalComputeProvider,
     Query,
+    QueryRequest,
     QueryResult,
     RefusalError,
     Session,
 )
+from quail.sqlfront import SQLDialect
 
 __all__ = [
     "ComputeProvider",
@@ -24,10 +26,12 @@ __all__ = [
     "PhysicalGraph",
     "PhysicalNode",
     "Query",
+    "QueryRequest",
     "QueryResult",
     "RefusalError",
     "ScanRequest",
     "Session",
+    "SQLDialect",
     "TableProvider",
     "col",
     "prompt",

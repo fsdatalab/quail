@@ -11,6 +11,7 @@ from quail.catalog import (
     DocumentProvider,
     ScanRequest,
 )
+from quail.extensions import built_in_registry
 from quail.logical import CompileError
 
 
@@ -22,7 +23,7 @@ def test_from_dataset_reads_only_id_and_requested_column():
     }))
 
     provider = DocumentProvider.from_dataset(dataset, id_col="id")
-    table = provider.read_column("body")
+    table = provider.scan(ScanRequest(("id", "body"))).read_all()
 
     assert isinstance(provider, ArrowDatasetProvider)
     assert provider.columns == ("id", "body", "unused")
@@ -31,6 +32,14 @@ def test_from_dataset_reads_only_id_and_requested_column():
         "id": ["a", "b"],
         "body": ["first", "second"],
     }
+
+
+def test_registry_opens_registered_remote_source():
+    registry = built_in_registry()
+    marker = object()
+    registry.register_source_reader("test-source", lambda value: marker)
+
+    assert registry.open_source({"type": "test-source"}) is marker
 
 
 def test_from_dataset_rejects_non_dataset_and_missing_id():
@@ -53,7 +62,7 @@ def test_from_parquet_builds_dataset(tmp_path):
     provider = DocumentProvider.from_parquet(str(path), id_col="id")
 
     assert isinstance(provider, ArrowDatasetProvider)
-    assert provider.read_column("body").to_pydict() == {
+    assert provider.scan(ScanRequest(("id", "body"))).read_all().to_pydict() == {
         "id": ["a", "b"],
         "body": ["first", "second"],
     }
@@ -95,7 +104,7 @@ def test_hugging_face_provider_reads_through_arrow_dataset(monkeypatch):
 
     provider = DocumentProvider.from_hf(
         "owner/documents", id_col="id", split="test", config="plain")
-    table = provider.read_column("body")
+    table = provider.scan(ScanRequest(("id", "body"))).read_all()
 
     assert table.column_names == ["id", "body"]
     assert table.to_pydict() == {

@@ -1,6 +1,6 @@
 """Logical plan operators and prompt binding."""
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Optional, Protocol
 
 
@@ -120,6 +120,8 @@ class ColumnRef:
     provider: str    # provider name in the catalog ("reviews")
     column: str      # column name ("review")
 
+    type_name: ClassVar[str] = "quail.column_ref"
+
 
 @dataclass(frozen=True)
 class Prompt:
@@ -139,6 +141,11 @@ class Prompt:
     # join prompts only: (alias, label_tokens, anchor_frame_tokens)
     # per placeholder, in order. Empty for filter prompts.
     labels: tuple = ()
+    preamble_token_ids: tuple = ()
+    tail_token_ids: tuple = ()
+    label_token_ids: tuple = ()
+
+    type_name: ClassVar[str] = "quail.prompt"
 
 
 @dataclass(frozen=True)
@@ -146,6 +153,8 @@ class FilterPredicate:
     prompt: Prompt
     selectivity: Optional[float] = None   # fraction of documents that
     #                                       pass; ordering only
+
+    type_name: ClassVar[str] = "quail.filter_predicate"
 
 
 class LogicalNode(Protocol):
@@ -177,7 +186,7 @@ class Scan:
     alias: str
     column: str
 
-    type_name: ClassVar[str] = "quail.scan.v1"
+    type_name: ClassVar[str] = "quail.scan"
 
     def children(self) -> tuple:
         return ()
@@ -215,7 +224,7 @@ class SemanticFilter:
     input: LogicalNode
     predicates: tuple    # tuple[FilterPredicate, ...], written order
 
-    type_name: ClassVar[str] = "quail.semantic_filter.v1"
+    type_name: ClassVar[str] = "quail.semantic_filter"
 
     def children(self) -> tuple[LogicalNode, ...]:
         return (self.input,)
@@ -258,7 +267,7 @@ class SemanticJoin:
     anchor: Optional[str] = None       # table alias whose KV is kept;
     #                                    None = planner picks
 
-    type_name: ClassVar[str] = "quail.semantic_join.v1"
+    type_name: ClassVar[str] = "quail.semantic_join"
 
     def children(self) -> tuple[LogicalNode, ...]:
         return self.inputs
@@ -306,7 +315,7 @@ class Project:
     columns: tuple    # tuple[ColumnRef, ...]
     limit: Optional[int] = None
 
-    type_name: ClassVar[str] = "quail.logical_project.v1"
+    type_name: ClassVar[str] = "quail.logical_project"
 
     def children(self) -> tuple[LogicalNode, ...]:
         return (self.input,)
@@ -342,15 +351,13 @@ class Project:
         }
 
 
-Operator = LogicalNode
-
-
 @dataclass(frozen=True)
 class LogicalPlan:
     root: LogicalNode
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        """Return the columns produced by the root node."""
+        return self.root.output_schema()
 
     def walk(self) -> tuple[LogicalNode, ...]:
         """Return logical nodes with each child before its parent."""
@@ -490,14 +497,18 @@ def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
         ph, question = m.group(1), m.group(2)
         tail = ph + render_filter_question(question)
     pre_tok = tail_tok = frame_tok = None
+    pre_ids = tail_ids = ()
     if tokenizer is not None:
-        pre_tok = len(tokenizer(preamble))
+        pre_ids = tuple(tokenizer(preamble))
+        pre_tok = len(pre_ids)
         tail_text = re.sub(r"\{\d+\}", "", tail)
-        tail_tok = len(tokenizer(tail_text))
+        tail_ids = tuple(tokenizer(tail_text))
+        tail_tok = len(tail_ids)
         frame_tok = len(tokenizer(f"\n\n{frame}")) if frame else 0
     return Prompt(template=template, args=tuple(args), preamble=preamble,
                   tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
-                  frame=frame, frame_tokens=frame_tok)
+                  frame=frame, frame_tokens=frame_tok,
+                  preamble_token_ids=pre_ids, tail_token_ids=tail_ids)
 
 
 def bind_join_prompt(template: str, args: tuple,
@@ -523,14 +534,28 @@ def bind_join_prompt(template: str, args: tuple,
     question = render_join_question(template)
     pre_tok = tail_tok = frame_tok = None
     labels = tuple((a, None, None) for a in aliases)
+    pre_ids = tail_ids = ()
+    label_ids = ()
     if tokenizer is not None:
-        pre_tok = len(tokenizer(SHARED_PRE))
-        tail_tok = len(tokenizer(ANSWER_CUE))
+        pre_ids = tuple(tokenizer(SHARED_PRE))
+        tail_ids = tuple(tokenizer(ANSWER_CUE))
+        pre_tok = len(pre_ids)
+        tail_tok = len(tail_ids)
         frame_tok = len(tokenizer(question))
         labels = tuple((a, len(tokenizer(join_label(i))),
                         len(tokenizer(render_join_frame(template, i))))
                        for i, a in enumerate(aliases))
+        label_ids = tuple(
+            (
+                alias,
+                tuple(tokenizer(join_label(index))),
+                tuple(tokenizer(render_join_frame(template, index))),
+            )
+            for index, alias in enumerate(aliases)
+        )
     return Prompt(template=template, args=tuple(args),
                   preamble=SHARED_PRE, tail=ANSWER_CUE,
                   preamble_tokens=pre_tok, tail_tokens=tail_tok,
-                  frame=question, frame_tokens=frame_tok, labels=labels)
+                  frame=question, frame_tokens=frame_tok, labels=labels,
+                  preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
+                  label_token_ids=label_ids)

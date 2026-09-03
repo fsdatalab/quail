@@ -1352,17 +1352,19 @@ def queries(sess):
 
 # ----------------------------------------------------------- driver
 
-def _artifact_stem(started, sf, lf, model):
+def _artifact_stem(started, sf, lf, model, backend="quail"):
     timestamp = started.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{timestamp}-quailb-sf{sf}-lf{lf}-{model}"
+    return f"{timestamp}-quailb-sf{sf}-lf{lf}-{model}-{backend}"
 
 
 def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
               out_path=None, model="qwen3-4b-fp8",
+              backend="quail",
               accuracy=True, ground_truth_collection=None,
               ground_truth_workload=None,
               h100_usd_per_hour=3.9492, ground_truth_files=None,
-              prediction=None, artifact_stem=None, execute=None):
+              prediction=None, artifact_stem=None,
+              execute_query=None):
     """Run all (or selected) QUAIL-B queries through the engine."""
     import quail
     from quail.bench.evaluate import (
@@ -1404,7 +1406,11 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                 f"benchmark corpus {corpus['corpus_id']} does not match "
                 f"ground truth {truth.corpus_id}")
         evaluator = BenchmarkEvaluator(truth, corpus_rows)
-    sess = quail.Session(EngineConfig(gpus=gpus, model=model))
+    sess = quail.Session(EngineConfig(
+        gpus=gpus,
+        model=model,
+        backend=backend,
+    ))
     register_sets(sess, d)
     qdefs = queries(sess)
     if only is None:
@@ -1415,7 +1421,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         ids = [query_id for query_id in only if query_id in qdefs]
     started = datetime.now(timezone.utc)
     artifact_stem = artifact_stem or _artifact_stem(
-        started, sf, lf, model)
+        started, sf, lf, model, backend)
     run_id = (f"qb_{started.strftime('%Y%m%dT%H%M%SZ')}_"
               f"{uuid.uuid4().hex[:8]}")
     raw_root = f"benchmarks/quailb/runs/{run_id}"
@@ -1425,7 +1431,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         artifact_stem=artifact_stem,
         started_at=started.isoformat(),
         prediction=prediction,
-        sf=sf, lf=lf, gpus=gpus, model=model,
+        sf=sf, lf=lf, gpus=gpus, model=model, backend=backend,
         corpus_id=corpus["corpus_id"],
         selectivity_estimates=dict(
             source_collection=SELECTIVITY_ESTIMATE_COLLECTION,
@@ -1486,18 +1492,26 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             print(f"[quailb] {qid}: {desc}", flush=True)
             try:
                 query = build()
-                res = query.run(_execute=execute)
+                res = (
+                    query.run()
+                    if execute_query is None else execute_query(query)
+                )
                 result_rows = res.count()
                 row = dict(query=qid, desc=desc,
+                           backend=backend,
                            wall_s=res.report["wall_s"],
                            boot_s=res.report["boot_s"],
                            boot_kind=res.report.get("boot_kind"),
                            boot=res.report.get("boot"),
                            fresh_tokens=res.report["fresh_tokens"],
+                           cached_tokens=res.report.get("cached_tokens"),
                            regret_tokens=res.report.get("regret_tokens"),
                            rows=result_rows,
                            peak_gib=res.report.get("peak_gib"),
-                           stages=res.report["stages"])
+                           stages=res.report["stages"],
+                           backend_metrics=res.report.get(
+                               "backend_metrics"
+                           ))
                 if evaluator is not None:
                     evaluation = evaluator.evaluate(query, res)
                     add_query_metrics(
@@ -1580,6 +1594,16 @@ def main():
     ap.add_argument("--model", default="qwen3-4b-fp8",
                     help="registered ModelSpec name, see quail.specs.MODELS")
     ap.add_argument(
+        "--backend",
+        default="quail",
+        choices=(
+            "quail",
+            "stock_vllm",
+            "pipelined_vllm",
+            "pipelined_sglang",
+        ),
+    )
+    ap.add_argument(
         "--accuracy", action=argparse.BooleanOptionalAction, default=True,
         help="compare answers and output rows with the Modal ground truth")
     ap.add_argument("--ground-truth-collection", default=None,
@@ -1600,11 +1624,12 @@ def main():
     only = set(args.only.split(",")) if args.only else None
     started = datetime.now(timezone.utc)
     artifact_stem = _artifact_stem(
-        started, args.sf, args.lf, args.model)
+        started, args.sf, args.lf, args.model, args.backend)
     out = args.out or f"results/benchmark/{artifact_stem}.json"
     suite = run_suite(
         args.data_dir, sf=args.sf, lf=args.lf, gpus=args.gpus,
         only=only, out_path=out, model=args.model,
+        backend=args.backend,
         accuracy=args.accuracy,
         ground_truth_collection=args.ground_truth_collection,
         ground_truth_workload=args.ground_truth_workload,

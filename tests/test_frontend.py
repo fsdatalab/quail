@@ -8,7 +8,7 @@ from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (SHARED_PRE, CompileError, Project, Scan,
                            SemanticFilter, SemanticJoin)
-from quail.sqlfront import compile_sql
+from quail.sqlfront import SQLDialect, compile_sql
 
 
 def _parquet(path, columns):
@@ -78,6 +78,26 @@ def test_filter_join_shape(catalog):
         [("r", "id"), ("r", "review")]
 
 
+def test_snowflake_ai_filter_and_bq_ai_if_compile_equal(catalog):
+    snowflake = compile_sql(
+        "SELECT r.id FROM reviews r WHERE "
+        "AI_FILTER(PROMPT('negative {0}', r.review))",
+        catalog,
+        tok,
+        dialect=SQLDialect.SNOWFLAKE,
+    )
+    bq = compile_sql(
+        "SELECT r.id FROM reviews r WHERE "
+        "AI.IF(PROMPT('negative {0}', r.review))",
+        catalog,
+        tok,
+        dialect="bq",
+    )
+
+    assert SQLDialect.BQ.value == "bq"
+    assert bq == snowflake
+
+
 def test_builder_equals_sql(catalog):
     sql_plan = compile_sql(FILTER_JOIN_SQL, catalog, tok)
     built = (docs(catalog, "reviews", tok).alias("r")
@@ -89,7 +109,7 @@ def test_builder_equals_sql(catalog):
                       selectivity=0.05)
              .select("r.id", "p.asin"))
     assert built == sql_plan
-    assert built.to_dict() == sql_plan.to_dict()
+    assert built == sql_plan
 
 
 THREE_WAY_TEMPLATE = ("Review {0} praises the thread in {1} and the "

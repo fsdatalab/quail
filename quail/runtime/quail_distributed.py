@@ -7,7 +7,7 @@ import time
 from quail.physical import (
     AdaptiveJoinPlan,
     AnchoredJoin,
-    DocumentScan,
+    DocumentInput,
     Exchange,
     PackedFilter,
     PhysicalGraph,
@@ -16,10 +16,10 @@ from quail.runtime.quail_graph import (
     _child_graph,
     _next_join,
     _possible_anchors,
-    model_subgraph,
     scalar_node_metrics,
 )
 from quail.runtime.runner import (
+    compute_subgraph,
     ExecutionContext,
     GenericRunner,
     NodeMetrics,
@@ -93,7 +93,7 @@ class DistributedQuailExecution:
         self.shards = {
             node.alias: node.shards
             for node in graph.nodes
-            if isinstance(node, DocumentScan)
+            if isinstance(node, DocumentInput)
             and len(node.shards) == gpu_count
         }
         self.filter_aliases = {
@@ -167,9 +167,15 @@ class DistributedQuailExecution:
     def _execute_filter(self, node, inputs):
         from quail.runtime import coordinator
 
-        document_ids = list(next(iter(inputs.values())))
+        document_ids = next(iter(inputs.values()))
         shards = self.shards
-        if node.alias in shards:
+        complete = (
+            isinstance(document_ids, range)
+            and document_ids.start == 0
+            and document_ids.stop == len(self.docs[node.alias])
+            and document_ids.step == 1
+        )
+        if node.alias in shards and not complete:
             live = set(document_ids)
             shards = dict(shards)
             shards[node.alias] = tuple(
@@ -196,7 +202,10 @@ class DistributedQuailExecution:
         )
         merged = coordinator.merge_filter_round(
             outputs,
-            limit=None if self.joins else self.payload.get("limit"),
+            limit=(
+                None if self.joins
+                else self.payload.get("filter_limit")
+            ),
         )
         for output in outputs:
             for alias, documents in output.get("retained", {}).items():
@@ -268,7 +277,7 @@ class DistributedQuailExecution:
         self.kv_stats["join_anchor_misses"] += misses
 
         enriched = []
-        pair_outputs = {}
+        answer_outputs = {}
         for stage, output, join in zip(node.stages, stage_outputs, group):
             output.update(
                 anchor=node.anchor,
@@ -278,8 +287,7 @@ class DistributedQuailExecution:
                 written_pos=stage.written_pos,
             )
             enriched.append(output)
-            if stage.semantics == "full":
-                pair_outputs[f"pairs:{stage.written_pos}"] = output
+            answer_outputs[f"join_answers:{stage.written_pos}"] = output
         anchor_survivors = coordinator.gate_group(
             enriched[-1], node.stages[-1].semantics
         )
@@ -297,7 +305,7 @@ class DistributedQuailExecution:
         return NodeResult(
             {
                 f"ids:{node.anchor}": anchor_survivors,
-                **pair_outputs,
+                **answer_outputs,
             },
             NodeMetrics(
                 wall_s=wall,
@@ -415,7 +423,7 @@ def run_distributed_adaptive(node, inputs, context):
     execution.snapshot_after_filters()
     finished_full = []
     all_joins = []
-    pairs = {}
+    join_answers = {}
     previous_anchor = None
     metrics = NodeMetrics()
     while state["remaining"]:
@@ -450,7 +458,7 @@ def run_distributed_adaptive(node, inputs, context):
         for stage, output in zip(selected.stages, stage_outputs):
             if stage.semantics == "full":
                 finished_full.append(output)
-                pairs[stage.written_pos] = output
+            join_answers[stage.written_pos] = output
         survivors[selected.anchor] = list(
             joined.outputs[f"ids:{selected.anchor}"]
         )
@@ -470,8 +478,10 @@ def run_distributed_adaptive(node, inputs, context):
     outputs = {
         f"ids:{alias}": list(survivors[alias]) for alias in node.aliases
     }
-    outputs.update({f"pairs:{position}": pairs[position]
-                    for position in node.full_join_positions})
+    outputs.update({
+        f"join_answers:{position}": join_answers[position]
+        for position in node.join_positions
+    })
     optimizer_runs = state["optimizer_runs"]
     optimizer = None if not optimizer_runs else {
         "states": sum(run["states"] for run in optimizer_runs),
@@ -523,7 +533,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         payload, graph, gpu_count, round_fn, model_spec, device, registry
     )
     sources = {
-        alias: list(range(len(documents)))
+        alias: range(len(documents))
         for alias, documents in payload["docs"].items()
     }
     context = ExecutionContext(
@@ -537,7 +547,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
     started = time.perf_counter()
     if not any(isinstance(node, PackedFilter) for node in graph.nodes):
         execution.begin()
-    result = GenericRunner().run(model_subgraph(graph), context)
+    result = GenericRunner().run(compute_subgraph(graph), context)
     elapsed = time.perf_counter() - started
     filters = {}
     adaptive_result = None
@@ -554,9 +564,12 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
     optimizer = None if adaptive_result is None else \
         adaptive_result.metrics.extension["join_optimizer"]
     report = execution.report()
+    from quail.execution import export_physical_outputs
+
     report.update(
         filters=filters,
         joins=joins,
+        _outputs=export_physical_outputs(compute_subgraph(graph), result),
         wall_s=round(elapsed - report["boot_s"], 2),
         fresh_tokens=result.metrics.fresh_tokens,
         regret_tokens=result.metrics.regret_tokens,

@@ -275,7 +275,7 @@ def _write(result, name):
 def _boot_state(model):
     """Boot the worker state dict with the kernel-source pipeline.
 
-    Mirrors quail.runtime.worker._execute_payload's boot, with the
+    Mirrors quail.runtime.worker._execute_physical's boot, with the
     Pipeline subclass swapped in; warm_kernels runs the same tiered
     warmup the worker runs.
     """
@@ -311,7 +311,6 @@ def _boot_state(model):
         device=device,
         query_settings={
             "chunk_tokens": chunk_tokens,
-            "kv_dtype": "bf16",
         },
     ))
     execution.bind_loaded_model(
@@ -345,11 +344,19 @@ def _quailb_session(model, sf, gpus=1):
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
+    from quail.execution import PhysicalResponse
     from quail.executor.loop import AsyncAnswers
-    from quail.runtime.worker import _execute_single
-    from quail.runtime.worker import _PayloadAnswerer
+    from quail.runtime.worker import (
+        _PayloadAnswerer,
+        _execute_single,
+        _quail_runtime_payload,
+        _validate_physical_request,
+        execute_worker_query,
+    )
 
-    def execute(payload):
+    def execute(request):
+        request, registry, graph, _ = _validate_physical_request(request)
+        payload = _quail_runtime_payload(request, graph)
         answerer = _PayloadAnswerer(
             state["torch"], state["F"], state["model"],
             payload["true_ids"], payload["false_ids"],
@@ -359,12 +366,16 @@ def _run_query(state, build, captured):
             async_answers=AsyncAnswers(state["torch"], answerer),
             chunk_tokens=payload["chunk_tokens"],
         )
-        report = _execute_single(state, payload)
+        report = _execute_single(state, payload, registry, graph)
+        outputs = report.pop("_outputs")
+        report.pop("filters", None)
+        report.pop("joins", None)
         captured.clear()
         captured.update(report)
-        return report
+        return PhysicalResponse(outputs, report)
 
-    return build().run(_execute=execute)
+    query = build()
+    return execute_worker_query(query, physical_executor=execute)
 
 
 def _row_key(table):

@@ -9,13 +9,11 @@ from .base import (
     ExecutionLocation,
     InputPort,
     OutputPort,
-    Partitioning,
-    PartitioningKind,
     PhysicalNode,
     PortRef,
-    ResourceRequirements,
     ValueType,
 )
+
 
 @dataclass(frozen=True)
 class FilterStage:
@@ -33,7 +31,7 @@ class FilterStage:
             written_pos=int(value["written_pos"]),
             question_tokens=int(value["question_tokens"]),
             preamble_tokens=int(value["preamble_tokens"]),
-            selectivity=value.get("selectivity"),
+            selectivity=value["selectivity"],
             expected_docs=float(value["expected_docs"]),
         )
 
@@ -71,7 +69,7 @@ class JoinStage:
             anchor=str(value["anchor"]),
             partners=tuple(value["partners"]),
             semantics=str(value["semantics"]),
-            selectivity=value.get("selectivity"),
+            selectivity=value["selectivity"],
             expected_tuples=float(value["expected_tuples"]),
             anchor_frame_tokens=int(value["anchor_frame_tokens"]),
             pair_tail_tokens=int(value["pair_tail_tokens"]),
@@ -96,20 +94,118 @@ class JoinStage:
 
 
 @dataclass(frozen=True)
-class DocumentScan(PhysicalNode):
-    """Read document ids and token rows for one alias."""
+class RequestFilterSpec:
+    """One filter chain submitted as model requests."""
+
+    alias: str
+    written_positions: tuple[int, ...]
+    question_token_ids: tuple[tuple[Any, ...], ...]
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "RequestFilterSpec":
+        return cls(
+            alias=str(value["alias"]),
+            written_positions=tuple(
+                int(position) for position in value["written_positions"]
+            ),
+            question_token_ids=tuple(
+                tuple(question) for question in value["question_token_ids"]
+            ),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "alias": self.alias,
+            "written_positions": list(self.written_positions),
+            "question_token_ids": [
+                list(question) for question in self.question_token_ids
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class RequestJoinSpec:
+    """One join predicate submitted over its complete cross product."""
+
+    written_pos: int
+    aliases: tuple[str, ...]
+    outer_aliases: tuple[str, ...]
+    anchor: str | None
+    semantics: str
+    selectivity: float | None
+    label_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
+    frame_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
+    tail_token_ids: tuple[Any, ...]
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "RequestJoinSpec":
+        return cls(
+            written_pos=int(value["written_pos"]),
+            aliases=tuple(value["aliases"]),
+            outer_aliases=tuple(value["outer_aliases"]),
+            anchor=value["anchor"],
+            semantics=str(value["semantics"]),
+            selectivity=value["selectivity"],
+            label_token_ids=tuple(
+                (str(alias), tuple(tokens))
+                for alias, tokens in value["label_token_ids"]
+            ),
+            frame_token_ids=tuple(
+                (str(alias), tuple(tokens))
+                for alias, tokens in value["frame_token_ids"]
+            ),
+            tail_token_ids=tuple(value["tail_token_ids"]),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "written_pos": self.written_pos,
+            "aliases": list(self.aliases),
+            "outer_aliases": list(self.outer_aliases),
+            "anchor": self.anchor,
+            "semantics": self.semantics,
+            "selectivity": self.selectivity,
+            "label_token_ids": [
+                [alias, list(tokens)] for alias, tokens in self.label_token_ids
+            ],
+            "frame_token_ids": [
+                [alias, list(tokens)] for alias, tokens in self.frame_token_ids
+            ],
+            "tail_token_ids": list(self.tail_token_ids),
+        }
+
+
+@dataclass(frozen=True)
+class DocumentInput(PhysicalNode):
+    """Read one tokenized document input supplied by the coordinator."""
 
     alias: str = ""
-    provider: str = ""
-    column: str = ""
+    input_id: str = ""
     n_docs: int = 0
     total_tokens: int = 0
-    shards: tuple[tuple[int, ...], ...] = ()
+    shard_ranges: tuple[tuple[int, int], ...] = ()
     shard_token_loads: tuple[int, ...] = ()
 
-    type_name: ClassVar[str] = "quail.document_scan.v1"
+    type_name: ClassVar[str] = "quail.document_input"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    def __post_init__(self) -> None:
+        if len(self.shard_ranges) != len(self.shard_token_loads):
+            raise ValueError(
+                "document shard ranges and token loads must have equal size"
+            )
+        expected = 0
+        for start, stop in self.shard_ranges:
+            if start != expected or stop < start:
+                raise ValueError(
+                    "document shard ranges must be ordered and contiguous"
+                )
+            expected = stop
+        if self.shard_ranges and expected != self.n_docs:
+            raise ValueError(
+                "document shard ranges must cover every document"
+            )
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
@@ -117,27 +213,33 @@ class DocumentScan(PhysicalNode):
             f"ids:{self.alias}",
             ValueType.DOCUMENT_IDS,
             schema=(self.alias,),
-            partitioning=Partitioning(
-                PartitioningKind.HASH,
-                (self.alias,),
-                len(self.shards) or None,
-            ),
         ),)
 
-    def attributes(self, *, include_runtime_data: bool = True) -> dict:
-        value = {
+    def attributes(self) -> dict:
+        return {
             "alias": self.alias,
-            "provider": self.provider,
-            "column": self.column,
+            "input_id": self.input_id,
             "n_docs": self.n_docs,
             "total_tokens": self.total_tokens,
             "shard_token_loads": list(self.shard_token_loads),
+            "shard_ranges": [list(bounds) for bounds in self.shard_ranges],
         }
-        if include_runtime_data:
-            value["shards"] = [list(shard) for shard in self.shards]
-        else:
-            value["shard_docs"] = [len(shard) for shard in self.shards]
-        return value
+
+    @property
+    def shards(self) -> tuple[range, ...]:
+        """Return each worker's contiguous document range."""
+        return tuple(range(start, stop) for start, stop in self.shard_ranges)
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            "alias": self.alias,
+            "input_id": self.input_id,
+            "n_docs": self.n_docs,
+            "total_tokens": self.total_tokens,
+            "shard_token_loads": list(self.shard_token_loads),
+            "shard_docs": [stop - start
+                           for start, stop in self.shard_ranges],
+        }
 
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
@@ -145,13 +247,99 @@ class DocumentScan(PhysicalNode):
             node_id=node_id,
             inputs=inputs,
             alias=attributes["alias"],
-            provider=attributes["provider"],
-            column=attributes["column"],
+            input_id=attributes["input_id"],
             n_docs=int(attributes["n_docs"]),
             total_tokens=int(attributes["total_tokens"]),
-            shards=tuple(tuple(shard) for shard in attributes.get("shards", ())),
-            shard_token_loads=tuple(attributes.get("shard_token_loads", ())),
+            shard_ranges=tuple(
+                (int(start), int(stop))
+                for start, stop in attributes["shard_ranges"]
+            ),
+            shard_token_loads=tuple(attributes["shard_token_loads"]),
         )
+
+
+@dataclass(frozen=True)
+class RequestExecution(PhysicalNode):
+    """Run filters and joins through an independent request engine."""
+
+    backend_name: str = ""
+    aliases: tuple[str, ...] = ()
+    preamble_token_ids: tuple[Any, ...] = ()
+    filters: tuple[RequestFilterSpec, ...] = ()
+    joins: tuple[RequestJoinSpec, ...] = ()
+
+    type_name: ClassVar[str] = "quail.request_execution"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def backend(self) -> str:
+        """Return the backend selected for this model node."""
+        return self.backend_name
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        outputs = [
+            OutputPort(
+                f"ids:{alias}",
+                ValueType.DOCUMENT_IDS,
+                schema=(alias,),
+            )
+            for alias in self.aliases
+        ]
+        outputs.extend(
+            OutputPort(
+                f"filter_answers:{spec.alias}",
+                ValueType.FILTER_ANSWERS,
+                schema=(spec.alias, "predicate", "answer"),
+            )
+            for spec in self.filters
+        )
+        outputs.extend(
+            OutputPort(
+                f"join_answers:{spec.written_pos}",
+                ValueType.JOIN_ANSWERS,
+                schema=(*spec.aliases, "answer"),
+            )
+            for spec in self.joins
+        )
+        return tuple(outputs)
+
+    def attributes(self) -> dict:
+        return {
+            "backend_name": self.backend_name,
+            "aliases": list(self.aliases),
+            "preamble_token_ids": list(self.preamble_token_ids),
+            "filters": [spec.to_dict() for spec in self.filters],
+            "joins": [spec.to_dict() for spec in self.joins],
+        }
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            "backend": self.backend_name,
+            "aliases": list(self.aliases),
+            "filter_chains": len(self.filters),
+            "joins": len(self.joins),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            backend_name=str(attributes["backend_name"]),
+            aliases=tuple(attributes["aliases"]),
+            preamble_token_ids=tuple(attributes["preamble_token_ids"]),
+            filters=tuple(
+                RequestFilterSpec.from_mapping(spec)
+                for spec in attributes["filters"]
+            ),
+            joins=tuple(
+                RequestJoinSpec.from_mapping(spec)
+                for spec in attributes["joins"]
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class PackedFilter(PhysicalNode):
@@ -165,7 +353,7 @@ class PackedFilter(PhysicalNode):
     stages: tuple[FilterStage, ...] = ()
     question_token_ids: tuple[tuple[Any, ...], ...] = ()
 
-    type_name: ClassVar[str] = "quail.packed_filter.v1"
+    type_name: ClassVar[str] = "quail.packed_filter"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
     backend: ClassVar[str] = "quail"
@@ -177,38 +365,31 @@ class PackedFilter(PhysicalNode):
                 f"ids:{self.alias}",
                 ValueType.DOCUMENT_IDS,
                 schema=(self.alias,),
-                partitioning=Partitioning(
-                    PartitioningKind.HASH, (self.alias,)
-                ),
             ),
             OutputPort(
                 f"filter_answers:{self.alias}",
                 ValueType.FILTER_ANSWERS,
-                schema=(self.alias, "answer"),
-                partitioning=Partitioning(
-                    PartitioningKind.HASH, (self.alias,)
-                ),
+                schema=(self.alias, "predicate", "answer"),
             ),
         )
 
-    @property
-    def resources(self) -> ResourceRequirements:
-        return ResourceRequirements(gpus=1)
-
-    def attributes(self, *, include_runtime_data: bool = True) -> dict:
-        attributes = {
+    def attributes(self) -> dict:
+        return {
             "alias": self.alias,
             "arena_writes": self.arena_writes,
             "keep_kv": self.keep_kv,
             "keep_min_doc_tokens": self.keep_min_doc_tokens,
             "keep_resident_fraction": self.keep_resident_fraction,
             "stages": [stage.to_dict() for stage in self.stages],
-        }
-        if include_runtime_data:
-            attributes["question_token_ids"] = [
+            "question_token_ids": [
                 list(question) for question in self.question_token_ids
-            ]
-        return attributes
+            ],
+        }
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        value = self.attributes()
+        value.pop("question_token_ids")
+        return value
 
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
@@ -222,13 +403,14 @@ class PackedFilter(PhysicalNode):
             keep_resident_fraction=float(attributes["keep_resident_fraction"]),
             stages=tuple(
                 FilterStage.from_mapping(stage)
-                for stage in attributes.get("stages", ())
+                for stage in attributes["stages"]
             ),
             question_token_ids=tuple(
                 tuple(question)
-                for question in attributes.get("question_token_ids", ())
+                for question in attributes["question_token_ids"]
             ),
         )
+
 
 @dataclass(frozen=True)
 class Exchange(PhysicalNode):
@@ -237,7 +419,7 @@ class Exchange(PhysicalNode):
     next_anchor: str = ""
     aliases: tuple[str, ...] = ()
 
-    type_name: ClassVar[str] = "quail.exchange.v1"
+    type_name: ClassVar[str] = "quail.exchange"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
@@ -248,14 +430,11 @@ class Exchange(PhysicalNode):
                 f"ids:{alias}",
                 ValueType.DOCUMENT_IDS,
                 schema=(alias,),
-                partitioning=Partitioning(
-                    PartitioningKind.HASH, (self.next_anchor,)
-                ),
             )
             for alias in self.aliases
         )
 
-    def attributes(self, *, include_runtime_data: bool = True) -> dict:
+    def attributes(self) -> dict:
         return {"next_anchor": self.next_anchor, "aliases": list(self.aliases)}
 
     @classmethod
@@ -267,6 +446,7 @@ class Exchange(PhysicalNode):
             aliases=tuple(attributes["aliases"]),
         )
 
+
 @dataclass(frozen=True)
 class AnchoredJoin(PhysicalNode):
     """Evaluate join predicates that use one anchor alias."""
@@ -277,7 +457,7 @@ class AnchoredJoin(PhysicalNode):
     stage_idxs: tuple[int, ...] = ()
     stages: tuple[JoinStage, ...] = ()
 
-    type_name: ClassVar[str] = "quail.anchored_join.v1"
+    type_name: ClassVar[str] = "quail.anchored_join"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
     backend: ClassVar[str] = "quail"
@@ -288,29 +468,15 @@ class AnchoredJoin(PhysicalNode):
             f"ids:{self.anchor}",
             ValueType.DOCUMENT_IDS,
             schema=(self.anchor,),
-            partitioning=Partitioning(
-                PartitioningKind.HASH, (self.anchor,)
-            ),
         )]
-        outputs.extend(
-            OutputPort(
-                f"pairs:{stage.written_pos}",
-                ValueType.JOIN_ANSWERS,
-                schema=(stage.anchor, *stage.partners, "answer"),
-                partitioning=Partitioning(
-                    PartitioningKind.HASH, (stage.anchor,)
-                ),
-            )
-            for stage in self.stages
-            if stage.semantics == "full"
-        )
+        outputs.extend(OutputPort(
+            f"join_answers:{stage.written_pos}",
+            ValueType.JOIN_ANSWERS,
+            schema=(stage.anchor, *stage.partners, "answer"),
+        ) for stage in self.stages)
         return tuple(outputs)
 
-    @property
-    def resources(self) -> ResourceRequirements:
-        return ResourceRequirements(gpus=1)
-
-    def attributes(self, *, include_runtime_data: bool = True) -> dict:
+    def attributes(self) -> dict:
         return {
             "anchor": self.anchor,
             "anchor_resident": self.anchor_resident,
@@ -330,9 +496,10 @@ class AnchoredJoin(PhysicalNode):
             stage_idxs=tuple(attributes["stage_idxs"]),
             stages=tuple(
                 JoinStage.from_mapping(stage)
-                for stage in attributes.get("stages", ())
+                for stage in attributes["stages"]
             ),
         )
+
 
 @dataclass(frozen=True)
 class AdaptiveJoinPlan(PhysicalNode):
@@ -340,10 +507,11 @@ class AdaptiveJoinPlan(PhysicalNode):
 
     expected_nodes: tuple[AnchoredJoin | Exchange, ...] = ()
     aliases: tuple[str, ...] = ()
+    join_positions: tuple[int, ...] = ()
     full_join_positions: tuple[int, ...] = ()
     join_specs: tuple[Mapping[str, Any], ...] = ()
 
-    type_name: ClassVar[str] = "quail.adaptive_join_plan.v1"
+    type_name: ClassVar[str] = "quail.adaptive_join_plan"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
     backend: ClassVar[str] = "quail"
@@ -355,21 +523,18 @@ class AdaptiveJoinPlan(PhysicalNode):
                 f"ids:{alias}",
                 ValueType.DOCUMENT_IDS,
                 schema=(alias,),
-                partitioning=Partitioning(
-                    PartitioningKind.HASH, (alias,)
-                ),
             )
             for alias in self.aliases
         ]
-        outputs.extend(
-            OutputPort(f"pairs:{position}", ValueType.JOIN_ANSWERS)
-            for position in self.full_join_positions
-        )
+        outputs.extend(OutputPort(
+            f"join_answers:{position}", ValueType.JOIN_ANSWERS
+        ) for position in self.join_positions)
         return tuple(outputs)
 
-    def attributes(self, *, include_runtime_data: bool = True) -> dict:
+    def attributes(self) -> dict:
         return {
             "aliases": list(self.aliases),
+            "join_positions": list(self.join_positions),
             "full_join_positions": list(self.full_join_positions),
             "expected_nodes": [
                 {
@@ -387,24 +552,25 @@ class AdaptiveJoinPlan(PhysicalNode):
                         }
                         for port in node.inputs
                     ],
-                    "attributes": node.attributes(
-                        include_runtime_data=include_runtime_data
-                    ),
+                    "attributes": node.attributes(),
                 }
                 for node in self.expected_nodes
             ],
-            **({"join_specs": list(self.join_specs)}
-               if include_runtime_data else {}),
+            "join_specs": list(self.join_specs),
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
         return {
             "aliases": list(self.aliases),
+            "join_positions": list(self.join_positions),
             "full_join_positions": list(self.full_join_positions),
             "expected_steps": [
                 node.type_name for node in self.expected_nodes
             ],
         }
+
+    def embedded_nodes(self) -> tuple[PhysicalNode, ...]:
+        return self.expected_nodes
 
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
@@ -413,7 +579,7 @@ class AdaptiveJoinPlan(PhysicalNode):
             AnchoredJoin.type_name: AnchoredJoin,
             Exchange.type_name: Exchange,
         }
-        for encoded in attributes.get("expected_nodes", ()):
+        for encoded in attributes["expected_nodes"]:
             node_type = node_types.get(encoded["type"])
             if node_type is None:
                 raise ValueError(
@@ -427,9 +593,9 @@ class AdaptiveJoinPlan(PhysicalNode):
                         input_port["source"]["node_id"],
                         input_port["source"]["port"],
                     ),
-                    schema=tuple(input_port.get("schema", ())),
+                    schema=tuple(input_port["schema"]),
                 )
-                for input_port in encoded.get("inputs", ())
+                for input_port in encoded["inputs"]
             )
             expected.append(node_type.from_attributes(
                 encoded["id"], child_inputs, encoded["attributes"]
@@ -438,12 +604,14 @@ class AdaptiveJoinPlan(PhysicalNode):
             node_id=node_id,
             inputs=inputs,
             expected_nodes=tuple(expected),
-            aliases=tuple(attributes.get("aliases", ())),
+            aliases=tuple(attributes["aliases"]),
+            join_positions=tuple(attributes["join_positions"]),
             full_join_positions=tuple(
-                attributes.get("full_join_positions", ())
+                attributes["full_join_positions"]
             ),
-            join_specs=tuple(attributes.get("join_specs", ())),
+            join_specs=tuple(attributes["join_specs"]),
         )
+
 
 @dataclass(frozen=True)
 class HashJoin(PhysicalNode):
@@ -451,7 +619,7 @@ class HashJoin(PhysicalNode):
 
     alias_order: tuple[str, ...] = ()
 
-    type_name: ClassVar[str] = "quail.hash_join.v1"
+    type_name: ClassVar[str] = "quail.hash_join"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
@@ -461,10 +629,9 @@ class HashJoin(PhysicalNode):
             "tuples",
             ValueType.ROWS,
             schema=self.alias_order,
-            partitioning=Partitioning(PartitioningKind.SINGLE),
         ),)
 
-    def attributes(self, *, include_runtime_data: bool = True) -> dict:
+    def attributes(self) -> dict:
         return {"alias_order": list(self.alias_order)}
 
     @classmethod
@@ -475,13 +642,14 @@ class HashJoin(PhysicalNode):
             alias_order=tuple(attributes["alias_order"]),
         )
 
+
 @dataclass(frozen=True)
 class Project(PhysicalNode):
     """Select the requested result columns."""
 
     columns: tuple[str, ...] = ()
 
-    type_name: ClassVar[str] = "quail.project.v1"
+    type_name: ClassVar[str] = "quail.project"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.CLIENT
 
@@ -491,10 +659,9 @@ class Project(PhysicalNode):
             "rows",
             ValueType.ROWS,
             schema=self.columns,
-            partitioning=Partitioning(PartitioningKind.SINGLE),
         ),)
 
-    def attributes(self, *, include_runtime_data: bool = True) -> dict:
+    def attributes(self) -> dict:
         return {"columns": list(self.columns)}
 
     @classmethod
@@ -505,13 +672,14 @@ class Project(PhysicalNode):
             columns=tuple(attributes["columns"]),
         )
 
+
 @dataclass(frozen=True)
 class Limit(PhysicalNode):
     """Stop result output after a fixed number of rows."""
 
     count: int = 0
 
-    type_name: ClassVar[str] = "quail.limit.v1"
+    type_name: ClassVar[str] = "quail.limit"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.CLIENT
 
@@ -519,7 +687,7 @@ class Limit(PhysicalNode):
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort("rows", ValueType.ROWS),)
 
-    def attributes(self, *, include_runtime_data: bool = True) -> dict:
+    def attributes(self) -> dict:
         return {"count": self.count}
 
     @classmethod

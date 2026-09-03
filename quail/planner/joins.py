@@ -49,23 +49,6 @@ class AliasStats:
     def mean(self) -> float:
         return self.total / self.count if self.count else 0.0
 
-    def with_resident_min(self, minimum: int) -> "AliasStats":
-        """Credit documents at or above one length threshold."""
-
-        kept = [(length, count) for length, count in self.histogram
-                if length >= minimum]
-        return AliasStats(
-            count=self.count,
-            total=self.total,
-            squared=self.squared,
-            maximum=self.maximum,
-            histogram=self.histogram,
-            resident_count=sum(count for _, count in kept),
-            resident_total=sum(length * count for length, count in kept),
-            resident_squared=sum(
-                length * length * count for length, count in kept),
-        )
-
     def with_resident_fraction(self, fraction: float) -> "AliasStats":
         """Credit one length-independent fraction as resident."""
 
@@ -348,8 +331,7 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
 
 
 def walk(seq, live0: dict, lengths: dict, resident: dict, pre: int,
-         model, device, *, arena_tokens: float | None = None,
-         page_tokens: int = 16):
+         model, device):
     """Cost one [(spec, anchor)] sequence.
 
     Returns (work, records): per stage, the written position, the
@@ -385,8 +367,6 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
                  pre: int, chunk_tokens: int, model, device, *,
                  base_work: Work = Work(), fixed_order: bool = False,
                  honor_forced: bool = True,
-                 arena_tokens: float | None = None,
-                 page_tokens: int = 16,
                  already_joined=()):
     """Search stage order and anchor choice; return the cheapest.
 
@@ -403,10 +383,6 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
         already_joined: aliases connected by completed join stages.
             Runtime replanning starts from this set instead of losing
             the connectivity established by earlier groups.
-        arena_tokens: Accepted for caller compatibility. The resident
-            input already records the finite KV state at this planning
-            point. The search does not predict later evictions.
-        page_tokens: Accepted for caller compatibility.
         base_work: Work outside the joins (the filter round), so
             candidates rank by whole-query predicted seconds.
         fixed_order: keep the written stage order (order=as_written);
@@ -434,8 +410,7 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
     def run_walk(order_specs, assign):
         seq = list(zip(order_specs, assign))
         work, records = walk(
-            seq, live, lengths, resident, pre, model, device,
-            arena_tokens=arena_tokens, page_tokens=page_tokens)
+            seq, live, lengths, resident, pre, model, device)
         return work, records, seq
 
     if fixed_order or (len(specs) == 1 and not already_joined):

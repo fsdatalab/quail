@@ -13,16 +13,16 @@ ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
 #                         the arena for overlapped chunk construction
 
 
-def tensor_parallel(model: ModelSpec, device: DeviceSpec) -> int:
-    """Smallest power-of-two GPU count whose pooled memory holds the weights.
+def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
+    """Return how many pooled GPU memories would hold the loaded weights.
 
-    Uses the as-loaded footprint: the untied head is on the GPU until
-    the load finishes, so it must fit.
+    Quail does not split weights across GPUs. A result above one causes a
+    planning refusal.
     """
-    tp = 1
-    while model.W_mem > device.mem_bytes * POOL_FRACTION * tp:
-        tp *= 2
-    return tp
+    gpus = 1
+    while model.W_mem > device.mem_bytes * POOL_FRACTION * gpus:
+        gpus *= 2
+    return gpus
 
 
 def kernel_index_cap(model: ModelSpec) -> int:
@@ -137,7 +137,7 @@ def derived_table(model: ModelSpec, device: DeviceSpec) -> dict:
     """Return all derived budget quantities as a dict."""
     chunk = chunk_budget(model, device)
     return {
-        "tensor_parallel": tensor_parallel(model, device),
+        "minimum_weight_gpus": minimum_weight_gpus(model, device),
         "arena_tokens": arena_tokens(model, device, chunk),
         "chunk_memory_bound": chunk_memory_bound(model, device),
         "kernel_index_cap": kernel_index_cap(model),

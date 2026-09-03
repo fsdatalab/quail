@@ -30,8 +30,8 @@ import modal
 from quail.bench.judge_pass import (
     JUDGE_ID,
     PREDICATES,
-    PredicateSpec,
     VOLUME_ROOT,
+    PredicateSpec,
     _atomic_json,
     _atomic_parquet,
     _expected_parts,
@@ -149,7 +149,7 @@ def rehash_label_sets(collection_id: str | None = None,
     for spec in PREDICATES:
         identity = label_set_identity(spec, corpus_manifest["corpus_id"],
                                       corpus_manifest["corpus_full_hash"])
-        step = {"key": spec.key, "legacy_code": spec.legacy_code,
+        step = {"key": spec.key,
                 "old_label_set_id": old_ids.get(spec.key),
                 "new_label_set_id": identity["label_set_id"]}
         if step["old_label_set_id"] is None:

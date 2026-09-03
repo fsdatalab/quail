@@ -4,19 +4,26 @@ from .base import (
     GpuContext,
     ModelBackend,
     ModelExecution,
-    QueryPreparationContext,
-    RemoteExecutionContext,
-    ResultAssemblyContext,
+    BackendExecutionContext,
 )
 from .quail import QuailBackend, QuailModelExecution
+from .sglang import SGLangBackend, SGLangClient
+from .vllm import (
+    VLLMBackend,
+    pipelined_vllm_backend,
+    stock_vllm_backend,
+)
 
 __all__ = [
     "GpuContext",
     "ModelBackend",
     "ModelExecution",
-    "QueryPreparationContext",
     "QuailBackend",
     "QuailModelExecution",
-    "RemoteExecutionContext",
-    "ResultAssemblyContext",
+    "SGLangBackend",
+    "SGLangClient",
+    "VLLMBackend",
+    "pipelined_vllm_backend",
+    "stock_vllm_backend",
+    "BackendExecutionContext",
 ]

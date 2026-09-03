@@ -26,47 +26,12 @@ class ValueType(str, Enum):
     ANY = "any"
 
 
-class PartitioningKind(str, Enum):
-    """How rows are divided across execution locations."""
-
-    UNKNOWN = "unknown"
-    SINGLE = "single"
-    HASH = "hash"
-    REPLICATED = "replicated"
-
-
-@dataclass(frozen=True)
-class Partitioning:
-    """Partitioning promised by one output port."""
-
-    kind: PartitioningKind = PartitioningKind.UNKNOWN
-    keys: tuple[str, ...] = ()
-    partitions: int | None = None
-
-
-@dataclass(frozen=True)
-class ResourceRequirements:
-    """Resources required by one physical node."""
-
-    gpus: int = 0
-    model: str | None = None
-
-
 @dataclass(frozen=True)
 class PortRef:
     """Reference to one output port on another node."""
 
     node_id: str
     port: str
-
-    @classmethod
-    def from_value(cls, value: "PortRef | tuple[str, str]") -> "PortRef":
-        if isinstance(value, cls):
-            return value
-        return cls(str(value[0]), str(value[1]))
-
-    def to_tuple(self) -> tuple[str, str]:
-        return self.node_id, self.port
 
 
 @dataclass(frozen=True)
@@ -86,7 +51,6 @@ class OutputPort:
     name: str
     value_type: ValueType
     schema: tuple[str, ...] = ()
-    partitioning: Partitioning = Partitioning()
 
 
 def value_type_for_port(name: str) -> ValueType:
@@ -95,22 +59,22 @@ def value_type_for_port(name: str) -> ValueType:
         return ValueType.DOCUMENT_IDS
     if name.startswith("filter_answers:"):
         return ValueType.FILTER_ANSWERS
-    if name.startswith("pairs:"):
+    if name.startswith("join_answers:"):
         return ValueType.JOIN_ANSWERS
     if name in {"tuples", "rows"}:
         return ValueType.ROWS
     return ValueType.ANY
 
 
-def input_ports(values: tuple[tuple[str, str], ...]) -> tuple[InputPort, ...]:
-    """Convert legacy input pairs into typed input ports."""
+def input_ports(values: tuple[PortRef, ...]) -> tuple[InputPort, ...]:
+    """Create typed input ports for output references."""
     return tuple(
         InputPort(
             name=f"input:{index}",
-            value_type=value_type_for_port(port),
-            source=PortRef(node_id, port),
+            value_type=value_type_for_port(value.port),
+            source=value,
         )
-        for index, (node_id, port) in enumerate(values)
+        for index, value in enumerate(values)
     )
 
 
@@ -121,8 +85,8 @@ class PhysicalNode:
     node_id: str
     inputs: tuple[InputPort, ...] = ()
 
-    type_name: ClassVar[str] = "quail.physical_node.v1"
-    runtime_key: ClassVar[str] = "quail.physical_node.v1"
+    type_name: ClassVar[str] = "quail.physical_node"
+    runtime_key: ClassVar[str] = "quail.physical_node"
     location: ClassVar[ExecutionLocation] = ExecutionLocation.CLIENT
     backend: ClassVar[str | None] = None
 
@@ -130,11 +94,7 @@ class PhysicalNode:
     def outputs(self) -> tuple[OutputPort, ...]:
         raise NotImplementedError
 
-    @property
-    def resources(self) -> ResourceRequirements:
-        return ResourceRequirements()
-
-    def attributes(self, *, include_runtime_data: bool = True) -> dict:
+    def attributes(self) -> dict:
         """Return node fields encoded by the node codec."""
         return {}
 
@@ -152,9 +112,14 @@ class PhysicalNode:
         """Return the same node with replacement inputs."""
         return replace(self, inputs=inputs)
 
+    def embedded_nodes(self) -> tuple["PhysicalNode", ...]:
+        """Return physical nodes stored inside this planning node."""
+        return ()
+
     def explain_fields(self) -> Mapping[str, Any]:
         """Return fields shown on one explain line."""
-        return self.attributes(include_runtime_data=False)
+        return self.attributes()
+
 
 class GraphValidationError(ValueError):
     """Raised when a physical graph is invalid."""
@@ -172,9 +137,6 @@ class PhysicalGraph:
             if node.node_id == node_id:
                 return node
         raise KeyError(node_id)
-
-    def nodes_by_type(self, type_name: str) -> list[PhysicalNode]:
-        return [node for node in self.nodes if node.type_name == type_name]
 
     def validate(self, runtime_keys: set[str] | None = None) -> None:
         """Validate ids, ports, types, cycles, root, and runtimes."""
@@ -276,6 +238,20 @@ class PhysicalGraph:
         for node in self.nodes:
             visit(node)
         return tuple(ordered)
+
+    def nodes_by_type(self, type_name: str) -> tuple[PhysicalNode, ...]:
+        """Return graph and embedded nodes with one registered type name."""
+        found = []
+
+        def visit(node: PhysicalNode) -> None:
+            if node.type_name == type_name:
+                found.append(node)
+            for child in node.embedded_nodes():
+                visit(child)
+
+        for node in self.nodes:
+            visit(node)
+        return tuple(found)
 
     def explain(self) -> str:
         """Return one line for each node in execution order."""

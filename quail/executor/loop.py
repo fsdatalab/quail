@@ -114,13 +114,6 @@ class Answerer:
         f = scores.index_select(1, self.false_cols).amax(dim=1)
         return (t > f).int().cpu().tolist()
 
-    def margins(self, normed):
-        scores = self.F.linear(normed, self.weights)
-        t = scores.index_select(1, self.true_cols).amax(dim=1)
-        f = scores.index_select(1, self.false_cols).amax(dim=1)
-        return (t - f).float().cpu().tolist()
-
-
 class AsyncAnswers:
     """Non-blocking TRUE/FALSE readout. submit() returns an event and
     pinned host buffer; result() waits on the event and reads the
@@ -801,12 +794,11 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         first FALSE; spans and tokens as in run_join.
     """
     p = _shared_preamble_tokens(question_ids)
-    keys = (list(range(len(doc_ids))) if arena_keys is None
-            else list(arena_keys))
+    keys = range(len(doc_ids)) if arena_keys is None else arena_keys
     if len(keys) != len(doc_ids):
         raise ValueError("arena_keys must match doc_ids")
-    retain = (set(range(len(doc_ids))) if retain_survivors is True
-              else set(retain_survivors))
+    retain_all = retain_survivors is True
+    retain = set() if retain_all else set(retain_survivors)
     stage_tokens = [len(question_ids[0])] \
         + [len(q) - p for q in question_ids[1:]]
     tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
@@ -815,7 +807,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             raise ValueError(
                 f"stage {i} question has no tokens beyond the shared "
                 f"preamble ({p} tokens)")
-    if not arena_writes and (len(question_ids) > 1 or retain):
+    if not arena_writes and (
+        len(question_ids) > 1 or retain_all or retain
+    ):
         # a later stage re-reads the KV, which needs the pages this
         # switch skips
         raise ValueError("arena_writes=False needs a single stage")
@@ -826,7 +820,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     temp_tail = max(0, *(len(q) - p for q in question_ids)) \
         if unified and arena_writes else 0
     pool = None
-    if retain:
+    if retain_all or retain:
         # the scan ring: the loop keeps two chunks of document KV in
         # flight, so retention may take only what is left (the
         # planner's keep headroom reserves the same two chunks)
@@ -864,7 +858,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         for (doc, stage, _fresh), bit in zip(groups, bits):
             passed = bool(bit)
             last = stage == len(stage_tokens) - 1
-            keep = passed and last and doc in retain
+            keep = passed and last and (retain_all or doc in retain)
             if keep:
                 keep, victims = pool.offer(
                     keys[doc],

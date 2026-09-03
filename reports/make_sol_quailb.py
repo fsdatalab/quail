@@ -214,7 +214,7 @@ for m in LABEL_MANIFESTS:
     rows = pq.read_table(Path(m).parent / "labels.parquet",
                          columns=["left_id", "right_id",
                                   "answer"]).to_pylist()
-    code = meta["legacy_code"]
+    code = meta["key"]
     predicate_meta[code] = meta
     left_ref = ColumnRef("left", meta["left_table"], meta["left_column"])
     if meta["kind"] == "filter":
@@ -344,7 +344,7 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
     else:
         filter_orders = {
             node.alias: [stage.written_pos for stage in node.stages]
-            for node in plan.nodes_by_type("quail.packed_filter.v1")
+            for node in plan.graph.nodes_by_type("quail.packed_filter")
         }
     survivors = {
         alias: list(range(len(data["ids"])))
@@ -423,7 +423,7 @@ def simulate_production_planner(query, model: ModelSpec,
     # group re-uses
     keep_aliases = {
         node.alias
-        for node in plan.nodes_by_type("quail.packed_filter.v1")
+        for node in plan.graph.nodes_by_type("quail.packed_filter")
         if node.keep_kv
     }
     resident_rows = {alias: (set(rows) if alias in keep_aliases
@@ -469,9 +469,7 @@ def simulate_production_planner(query, model: ModelSpec,
              for a in involved},
             {},
             PRE, chunk_tokens, model, H100_SXM,
-            fixed_order=(plan.order_rule == "as_written"),
-            arena_tokens=plan.admission_tokens,
-            page_tokens=budgets.PAGE_TOKENS,
+            fixed_order=(plan.settings["order_rule"] == "as_written"),
             already_joined=already_joined)
         if found is not None:
             search_runs.append(found)
@@ -582,7 +580,7 @@ def simulate_production_planner(query, model: ModelSpec,
         resident_rows = fit_resident_documents(
             resident_rows,
             {alias: aliases[alias]["tokens"] for alias in aliases},
-            PRE, plan.admission_tokens,
+            PRE, plan.settings["admission_tokens"],
             budgets.PAGE_TOKENS)
         for join_index in node["stage_idxs"]:
             already_joined.update(all_specs[join_index]["aliases"])

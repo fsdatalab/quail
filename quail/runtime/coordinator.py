@@ -4,15 +4,22 @@ Pure dict-and-list logic (no torch). Called by the worker's parent
 process between child GPUs.
 """
 
-COMMON_KEYS = ("model", "kv_dtype", "chunk_tokens", "true_ids",
-               "false_ids", "pre_ids", "limit")
+def _common_payload(payload: dict) -> dict:
+    return {
+        "model": payload["model"],
+        "chunk_tokens": payload["chunk_tokens"],
+        "true_ids": payload["true_ids"],
+        "false_ids": payload["false_ids"],
+        "pre_ids": payload["pre_ids"],
+        "filter_limit": payload["filter_limit"],
+    }
 
 
 def begin_query_payloads(payload: dict, k: int) -> list[dict]:
     """Build one empty query start payload per GPU executor."""
     outputs = []
     for worker in range(k):
-        sub = {key: payload[key] for key in COMMON_KEYS}
+        sub = _common_payload(payload)
         sub["physical_plan"] = payload["physical_plan"]
         sub.update(
             docs={},
@@ -28,15 +35,20 @@ def begin_query_payloads(payload: dict, k: int) -> list[dict]:
 def filter_node_payloads(payload: dict, node, shards: dict,
                          k: int, *, has_joins: bool) -> list[dict]:
     """Build one typed filter node payload per GPU executor."""
+    from quail.runtime.tokens import select_documents
+
     outputs = []
     tokens = payload["docs"][node.alias]
     for worker in range(k):
-        indices = list(shards[node.alias][worker])
-        sub = {key: payload[key] for key in COMMON_KEYS}
+        shard = shards[node.alias][worker]
+        indices = shard if isinstance(shard, range) else list(shard)
+        sub = _common_payload(payload)
         sub["physical_plan"] = payload["physical_plan"]
-        sub["limit"] = None if has_joins else payload.get("limit")
+        sub["filter_limit"] = (
+            None if has_joins else payload.get("filter_limit")
+        )
         sub.update(
-            docs={node.alias: [tokens[index] for index in indices]},
+            docs={node.alias: select_documents(tokens, indices)},
             doc_index={node.alias: indices},
             node_id=node.node_id,
             worker=worker,
@@ -126,12 +138,12 @@ def report_join_plan(sequence, joins: list) -> list:
         if previous_anchor is not None \
                 and previous_anchor != group["anchor"]:
             records.append({
-                "type": "quail.exchange.v1",
+                "type": "quail.exchange",
                 "id": f"runtime-exchange:{len(records)}",
                 "next_anchor": group["anchor"],
             })
         records.append({
-            "type": "quail.anchored_join.v1",
+            "type": "quail.anchored_join",
             "id": f"runtime-join:{index}",
             "anchor": group["anchor"],
             "written_positions": group["written_positions"],
@@ -159,8 +171,6 @@ def merge_filter_round(outs: list, limit: int | None = None) -> dict:
 
 def stage_for_anchor(spec: dict, anchor: str) -> dict:
     """Return a child-facing copy of one join stage spec with the given anchor."""
-    if "frames" not in spec:
-        return spec
     partners = [a for a in spec["aliases"] if a != anchor]
     out = dict(spec)
     out.update(anchor=anchor, partners=partners,
@@ -227,6 +237,8 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
     """
     if not group:
         return []
+    from quail.runtime.tokens import select_documents
+
     anchor_alias = group[0]["anchor"]
 
     def surv(alias):
@@ -262,20 +274,23 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
                                         k)
         anchor_shards = [[live[i] for i in s] for s in idx_shards]
     partner_aliases = sorted({p for j in group for p in j["partners"]})
-    partners = {alias: dict(index=surv(alias),
-                            docs=[payload["docs"][alias][g]
-                                  for g in surv(alias)])
-                for alias in partner_aliases}
+    partners = {}
+    for alias in partner_aliases:
+        indices = surv(alias)
+        partners[alias] = {
+            "index": indices,
+            "docs": select_documents(payload["docs"][alias], indices),
+        }
     subs = []
     for w in range(k):
-        sub = {key: payload[key] for key in COMMON_KEYS}
-        if "physical_plan" in payload:
-            sub["physical_plan"] = payload["physical_plan"]
+        sub = _common_payload(payload)
+        sub["physical_plan"] = payload["physical_plan"]
         sub.update(joins=group,
                    anchor_alias=anchor_alias,
                    anchor_index=list(anchor_shards[w]),
-                   anchor_docs=[payload["docs"][anchor_alias][g]
-                                for g in anchor_shards[w]],
+                   anchor_docs=select_documents(
+                       payload["docs"][anchor_alias], anchor_shards[w]
+                   ),
                    partners=partners,
                    worker=w, workers=k)
         subs.append(sub)

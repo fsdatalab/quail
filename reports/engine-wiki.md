@@ -11,8 +11,8 @@ noted.
 
 The table below lists every module, what it does, and what it
 depends on. The data flow is top to bottom: the user calls the
-session, which calls the front end, then the planner, then ships a
-payload to the worker, which calls the executor.
+session, which calls the front end, then the planner, then sends an
+execution request to the compute provider.
 
 | Module | What it does | Depends on |
 |---|---|---|
@@ -23,9 +23,10 @@ payload to the worker, which calls the executor.
 | `builder.py` | Builder API entry point | catalog, logical |
 | `sqlfront/compile.py` | AI SQL entry point (sqlglot parser and binder) | catalog, logical |
 | `extensions.py` | Per session backend, codec, runtime, rule, and provider registration | physical, runtime |
+| `execution.py` | Token input, physical request, and Arrow response types | physical |
 | `planning.py` | Backend planning inputs and physical candidates | physical, specs |
-| `physical/` | Typed physical nodes, graph validation, and JSON codecs | nothing |
-| `backends/` | Model backend interface and the Quail backend | planning, physical |
+| `physical/` | Typed physical nodes, graph validation, and plan envelope codecs | nothing |
+| `backends/` | Model backend interface and the Quail, vLLM, and SGLang backends | planning, physical |
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
@@ -34,19 +35,20 @@ payload to the worker, which calls the executor.
 | `planner/roofline.py` | Generic component compute and memory limits | specs |
 | `planner/sol.py` | Ideal query packing and total component time | work, qwen3_cost, roofline |
 | `planner/plan.py` | PhysicalPlan, Refusal, and EngineConfig | physical, specs |
-| `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, plan |
+| `planner/decide.py` | All planner decisions (order, anchor, budgets, sharding) | logical, budgets, plan |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
 | `executor/pack.py` | Chunk packing (pack_stream, FilterAdmission) | nothing |
 | `executor/loop.py` | Execution loops (run_filter, run_join, warm_kernels) | arena, attention, pack |
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
-| `runtime/session.py` | Session, Query, tokenization, payload assembly | catalog, logical, planner, sqlfront, builder |
-| `runtime/compute.py` | Compute provider interface and Modal implementation | runtime worker |
+| `runtime/session.py` | Session, Query, tokenization, input binding, and result assembly | catalog, logical, planner, sqlfront, builder |
+| `runtime/tokens.py` | Memory mapped token files and random document views | Arrow |
+| `runtime/compute.py` | Compute provider interface and Modal Function implementation | catalog, result, worker |
 | `runtime/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `runtime/runner.py` | Generic typed graph runner and standard node metrics | physical |
 | `runtime/quail_graph.py` | One GPU Quail node preparation and adaptive join runtime | runner, planner, executor |
 | `runtime/quail_distributed.py` | Several GPU Quail node dispatch and result merging | runner, coordinator |
-| `runtime/worker.py` | Modal worker (boot, execute, multi-GPU dispatch) | executor, planner, coordinator |
+| `runtime/worker.py` | Modal Function setup, model boot, execution, and multi-GPU dispatch | executor, planner, coordinator |
 | `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
 
 ### Data flow
@@ -60,37 +62,30 @@ Session (runtime/session.py)
   |--- docs() --> builder.py ------------|--> LogicalPlanBuilder
   |
   v
-logical optimizer rules
-  |
-  v
-selected ModelBackend
-  reads: logical plan, model and device specs, token counts
-  produces: typed PhysicalPlan
-  |
-  v
-selected ModelBackend.prepare
-  encodes the backend request and versioned physical plan
-  |
-  v
 selected ComputeProvider
-  installs extension code and sends the request
+  receives one QueryRequest with the logical plan and table providers
+  |
+  |--- ModalComputeProvider
+  |      sends remote source descriptions
+  |      sends needed raw Arrow columns for client-only sources
+  |      calls a Modal Function
   |
   v
-worker.execute (runtime/worker.py, with Modal as the default provider)
-  validates the plan version, backend, codecs, model, and GPU count
+compute worker (runtime/worker.py)
+  opens sources and tokenizes document columns
+  writes tokens, lengths, and projected columns to temporary Arrow files
+  runs logical optimizer rules and physical planning
+  validates the physical plan, backend, codecs, model, and GPU count
   imports the extension modules named by the plan
-  boots: model.py -> attention.Pipeline -> arena.KVArena
+  boots the engine selected by the model backend
   runs: GenericRunner -> registered node runtimes
         -> QuailModelExecution -> loop.run_filter / loop.run_join
-  returns: raw answer rows
+        -> RequestModelExecution -> vLLM or SGLang requests
+  assembles and projects the final Arrow rows
   |
   v
-selected ModelBackend.assemble
-  converts answers to Arrow tables
-  |
-  v
-Arrow Acero
-  hash joins, projects, counts, streams -> QueryResult
+QueryResult
+  Modal returns the final Arrow table and execution report
 ```
 
 ## 1. System overview
@@ -117,34 +112,47 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    `Scan`, `SemanticFilter`, `SemanticJoin`, and logical `Project`
    nodes. Every logical node implements the same traversal, rewrite,
    validation, schema, and explain interface.
-4. The session runs registered logical optimizer rules. It then asks
-   each table provider for the required columns in bounded Arrow
-   batches and tokenizes those columns.
-5. The selected model backend produces physical candidates. The
+4. The session creates one `QueryRequest`. The request contains the logical
+   plan, table providers, model settings, and registered extensions.
+5. The selected compute provider runs the request. Modal is the default.
+   `ModalComputeProvider` sends a source description when the worker can open
+   the source. Otherwise, it sends only the raw Arrow columns used by the
+   query.
+6. The Modal worker opens the sources and reads bounded Arrow batches. It
+   tokenizes each batch and writes the tokens, document lengths, and output
+   columns to a temporary Arrow file. Source batches can be released after the
+   write. The worker runs the registered logical optimizer rules from the
+   memory mapped length column. The selected model backend produces physical
+   candidates. The
    planner selects one typed `PhysicalGraph`. Quail uses
-   `DocumentScan`, `PackedFilter`, `AdaptiveJoinPlan`, `AnchoredJoin`,
+   `DocumentInput`, `PackedFilter`, `AdaptiveJoinPlan`, `AnchoredJoin`,
    `Exchange`, `HashJoin`, physical `Project`, and `Limit`.
-6. `AdaptiveJoinPlan` contains the join steps predicted from planning
+   The vLLM and SGLang backends use `DocumentInput`, `RequestExecution`,
+   `HashJoin`, physical `Project`, and `Limit`. `RequestExecution` stores the
+   tokenized filter and join prompt parts. It does not contain a Quail
+   scheduler.
+   The generic `PhysicalPlan` holds the graph and a backend-owned settings map.
+   Quail's chunk size, KV capacity, predicate order, and filter limit are not
+   fields that another backend must supply.
+7. `AdaptiveJoinPlan` contains the join steps predicted from planning
    estimates. At runtime, Quail searches again with the actual filter
    survivors and current KV state. An anchor change is represented as
    `Exchange`. There is no physical barrier node.
-7. The selected backend prepares a request with a versioned JSON plan
-   envelope and document token columns as Arrow IPC bytes. The selected
-   compute provider sends it to a remote process. Modal is the default
-   provider. It adds registered local extension sources and pip packages to
-   the existing `quail-engine` image. The worker imports the extension modules
-   listed in the plan and checks the rebuilt registry before the first model
-   call. The generic runner then executes the typed model graph.
+8. The worker creates an internal physical request. It imports the extension
+   modules listed in the request and checks that every physical node codec,
+   backend, model, device, and runtime is registered. The generic
+   runner then executes the typed physical graph.
    `AdaptiveJoinPlan` creates typed `AnchoredJoin` and `Exchange` child
    graphs. The same `QuailModelExecution` handles every model node on
    one GPU executor, so the nodes use the same KV.
-8. The worker returns raw answers. The session stores filter and join
-   answers in Arrow tables. Arrow Acero equi-joins the TRUE pairs on
+9. Arrow Acero joins the true pairs on
    shared SQL alias columns and applies the final survivor sets. Each
    alias column contains the source table row number for one document.
-   A `QueryResult` returns projected rows through a
-   `RecordBatchReader`.
-   `collect()` explicitly reads those batches into memory. `count()`
+   The same graph applies the final projection and limit. Projection reads only
+   the selected result positions from memory mapped source columns, so the
+   worker does not scan the source again. The Modal Function
+   returns the final Arrow table and execution report. The provider creates a
+   `QueryResult` from that table. `collect()` returns the Arrow table. `count()`
    runs an Acero aggregate without creating Python row tuples. LIMIT
    stops the result stream after the requested number of rows.
 
@@ -241,10 +249,12 @@ cue once per tuple. See
 
 ### AI SQL front end
 
-The SQL front end (`sqlfront/compile.py`) parses AI SQL using sqlglot
-in the Snowflake dialect. `AI_FILTER(PROMPT(...))` appears in WHERE
-conjuncts; join predicates appear in `JOIN ... ON` clauses; `EXISTS`
-and `NOT EXISTS` subqueries map to exists and anti semantics.
+The SQL front end (`sqlfront/compile.py`) parses AI SQL using sqlglot.
+Snowflake syntax uses `AI_FILTER(PROMPT(...))`. BigQuery syntax uses
+`AI.IF(PROMPT(...))` with `dialect="bq"`. Both compile to the same
+`SemanticFilter` or `SemanticJoin` node. Filter calls appear in WHERE
+conjuncts. Join predicates appear in `JOIN ... ON` clauses. `EXISTS` and
+`NOT EXISTS` subqueries map to exists and anti semantics.
 
 Each multi-table `AI_FILTER(PROMPT(...))` - on a JOIN's ON or as a
 WHERE term - is one join predicate; a query may have several.
@@ -297,34 +307,94 @@ structurally identical.
 | `Session.docs` | `session.py:175` | Start the builder API |
 | `Session.scan` | `session.py:210` | Tokenize a column (cached per session) |
 | `Query.plan` | `session.py:310` | Run the planner (cached per Query) |
-| `Query.run` | `session.py:335` | Plan, call the compute provider, assemble the result |
+| `Query.run` | `session.py` | Build one logical request and call the compute provider |
+| `Query._request` | `session.py` | Bind the logical plan to its table providers and settings |
+| `Query._prepare_physical` | `session.py` | Build the internal physical request inside a worker |
+| `Query.finish` | `session.py` | Build the worker result from physical Arrow outputs |
 | `Query.explain` | `session.py:330` | Print the logical tree and physical plan |
 
 ### Engine and compute extensions
 
 Every session owns an `ExtensionRegistry`. The registry starts with Quail's
-built in backend, codecs, and runtimes. An extension module defines
-`register_quail_extension(registry)`. That function can register logical
-rules, physical planners, physical rules, model backends, physical node
-codecs, and physical node runtimes.
+included backend, models, devices, codecs, and runtimes. An extension module
+defines `register_quail_extension(registry)`. That function can register
+logical rules, physical planners, physical rules, model backends, models,
+devices, physical node codecs, physical node runtimes, remote source readers,
+and execution observers. A concrete table provider is passed directly to
+`Session.register`.
 
 `ExtensionRegistry.load_extension` imports the module on the client. It also
 records local Python sources and pip packages needed by a remote process. The
-physical plan envelope carries the module names. The worker imports the same
-modules and rebuilds the registry before decoding the graph. A missing backend,
-codec, or runtime fails before model execution.
+logical request and internal physical plan carry the module names. The worker
+imports the same modules and rebuilds the registry before planning the query
+or decoding the physical plan. A missing backend, codec, source reader, or
+runtime fails before model execution.
 
-The selected model backend controls three steps. `prepare` builds its remote
-request. `execute_remote` runs inside the compute process. `assemble` builds
-the public result on the client. Quail's backend uses the existing scheduler,
-KV, and Arrow result code. Another backend can use different request and
-execution code.
+Execution observers run over the complete physical graph once. Model nodes
+reuse the metrics reported by the GPU executor. The same observer instance then
+sees `HashJoin`, `Project`, and `Limit` when the worker finishes the graph.
 
-`ComputeProvider` only controls where the prepared request runs. The default
-`ModalComputeProvider` selects the 1, 2, 4, or 8 GPU function in the existing
-`quail-engine` app. A different provider can be passed as
-`Session(compute=provider)`. It does not need changes to the planner or a model
-backend.
+The selected model backend checks whether it supports the requested model,
+device, and GPU count. It proposes physical plans. It creates one model
+execution object per GPU. Its `execute_request` method runs a standard
+`PhysicalResponse`.
+
+The built in backends are separate implementations.
+
+- `QuailBackend` uses pipelining, token based admission, and KV rewind.
+- `stock_vllm` uses one vLLM request wave per filter stage. Joins use one
+  request per document tuple in anchor major order.
+- `pipelined_vllm` submits the next filter stage as soon as one document
+  passes. It uses the same vLLM model and join submission as stock vLLM.
+- `pipelined_sglang` advances filters in SGLang request waves. Its joins use
+  suffix major order within bounded anchor groups so SGLang can reuse finished
+  request prefixes.
+
+The request backends share the `RequestExecution` node format and Arrow output
+format. They do not call `QuailBackend` or Quail's executor.
+
+QUAIL-B runs Quail and both vLLM configurations in one Modal container for
+each query family. Quail runs in one process group. Stock vLLM and pipelined
+vLLM run in a second process group and share one loaded model. After each
+group returns its results, the parent stops every process in the group. The
+parent waits until GPU memory use is below 1 GiB before continuing. The runner
+records the physical GPU UUID and checks that both groups saw the same H100.
+
+SGLang runs in a separate container with its own image. vLLM 0.26.0 requires
+`apache-tvm-ffi` 0.1.10, while SGLang 0.5.18 requires version 0.1.11. Modal can
+therefore assign SGLang another physical H100.
+
+Each physical node has one codec representation that contains everything
+needed for execution. Its separate explain fields omit large runtime values
+when they would make the plan unreadable.
+
+`ComputeProvider` controls where a query runs. It has one `execute` method that
+accepts a `QueryRequest` and returns a `QueryResult`. The request contains the
+logical plan, table providers, model settings, and registered extensions. The
+default `ModalComputeProvider` selects the 1, 2, 4, or 8 GPU function in the
+existing `quail-engine` app. It builds the worker image with the selected
+backend package. Quail and vLLM workers install vLLM. SGLang workers install
+SGLang. Modal supplies the GPU container and function lifecycle. Quail does
+not run FastAPI, ASGI, REST, or another application server. A different
+provider can be passed as
+`Session(compute_provider=provider)`. It
+does not need changes to the planner or a model backend.
+
+`ModalComputeProvider` sets the selected function's minimum container count to
+one while the provider is open. Several queries can therefore reuse the same
+loaded model without an idle scale down between queries. `Session.close()`
+sets the minimum back to zero before it closes the Modal app context.
+
+Quail is the default backend. `Session()` therefore selects Quail without a
+backend argument. `EngineConfig(model="qwen3-32b-fp8")` selects another built
+in model. An extension can register another `ModelSpec` and a backend that
+supports it.
+
+A DataFusion integration can keep DataFusion in charge of scans, ordinary
+relational operators, and final projection. Its custom operator can wrap the
+needed Arrow columns in a Quail table provider and submit a logical Quail
+query. A Rust client would need a public cross-language interface because the
+current Modal provider is a Python interface.
 
 ### Pushdown
 
@@ -525,8 +595,10 @@ with as many as 110,376 tokens each. Therefore, the two memory
 fractions do not produce equal KV capacities. Based on the capacity
 measured at 0.92, vLLM should have about 479,000 KV tokens at 0.91,
 compared with Quail's 362,250 KV tokens at 0.95. The first 0.91 startup
-will give the exact vLLM capacity. Every baseline report records the KV
-capacity that vLLM returns after startup.
+will give the exact vLLM capacity. vLLM captures one CUDA graph with size
+8,192. Every backend report records the KV capacity returned after startup.
+SGLang uses `mem_fraction_static=0.76`, 4,096 running requests, 25,296
+prefill tokens, and 16 token KV pages.
 
 **Compute knee** (`budgets.py:95`): the chunk size where the dense
 projections cross the roofline ridge and become compute-bound rather
@@ -560,7 +632,8 @@ single forward pass, sharing KV across them through a paged arena.
 | `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: the fraction of expected survivors that fits beside the scan reserve |
 | `RetainedPool` | `executor/retention.py` | Fixed-capacity retained pool: keep while room, then replace residents with fewer prefix tokens per page only when total retained prefix tokens rise |
 | `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the fewest prefix tokens per page |
-| `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
+| `contiguous_shards` | `decide.py` | Split the initial scan into compact contiguous ranges with similar token counts |
+| `balanced_shards` | `decide.py` | Reassign a smaller live document set across workers by token count |
 | `optimize_left_deep` | `leftdeep.py` | Subset DP over joined aliases and a caller supplied physical property, with a nondominated Work frontier |
 | `scan` / `ask` / `stream` | `work.py` | The three KV operations as Work records |
 | `qwen3_components` | `qwen3_cost.py` | Build attention projection, MLP, and attention work |
@@ -692,10 +765,9 @@ Key operations:
 | `PageArena.alloc` | `arena.py:29` | Claim pages for a document from the free list |
 | `PageArena.free_key` | `arena.py:42` | Return a document's pages to the free list |
 | `PageArena.row_indices` | `arena.py:49` | Flat row positions of a document's tokens in the pool |
-| `KVArena.alloc` | `arena.py:97` | Claim pages and record the row indices (host-side; the device copy is built lazily) |
-| `KVArena.rows_gpu` | `arena.py:110` | The document's row indices on device, cached per residency |
-| `KVArena.block_table` | `arena.py:125` | Build the block table for paged attention (flat on the host, one staged copy) |
-| `KVArena.paged_kv` | `arena.py:118` | Reshape the flat pool for FlashAttention's block input |
+| `KVArena.alloc` | `arena.py` | Claim pages and record host row indices |
+| `KVArena.block_table` | `arena.py` | Build the block table for paged attention |
+| `KVArena.paged_kv` | `arena.py` | Reshape the flat pool for FlashAttention's block input |
 
 ### 4.3 The attention paths and the workload assignment
 
@@ -1148,14 +1220,18 @@ hop between rounds.
 ### Rounds follow `AdaptiveJoinPlan`
 
 **The filter round**: every worker filters its shard of every alias.
-Sharding is by token count (the planner's `balanced_shards`). After
-this round, the parent merges survivors.
+The plan stores one contiguous range per worker. The range boundaries aim for
+similar token counts without storing every document position in the plan.
+Each child opens the same temporary token file and reads its range. Token values
+do not pass through the parent process pipe. After this round, the parent
+merges survivors.
 
 **One join round per selected `AnchoredJoin`**: anchors follow the
 alias's filter shard when one exists. An anchor that was a partner in
 an earlier round gets new balanced shards over its live documents.
-The parent sends token ids, and each GPU computes KV for its new
-anchor slice. Every GPU receives every surviving partner, so every
+The parent sends file references and survivor positions, and each GPU reads
+the needed token values before it computes KV for its new anchor slice. Every
+GPU receives every surviving partner, so every
 GPU uses the same partner index space.
 
 **An `Exchange` between different anchors**: the parent thins each
@@ -1213,16 +1289,16 @@ while join predicates remain:
 | `thin_survivors` | `coordinator.py` | Remove documents that no longer occur in finished full-join answers |
 | `gate_group` | `coordinator.py` | Anchor survivors after one group (full/exists/anti keep rules) |
 | `runtime_join_steps` | `coordinator.py` | Group a runtime join search into anchored joins and exchanges |
-| `execute` | `worker.py:237` | Single-GPU Modal worker entry point |
-| `execute_2/4/8` | `worker.py:670-688` | Multi-GPU Modal worker entry points |
-| `_execute_single` | `worker.py:241` | Single-GPU typed graph entry point |
-| `_execute_multi` | `worker.py:633` | Multi-GPU typed graph entry point |
+| `ModalComputeProvider.execute` | `compute.py` | Submit one logical query to the selected Modal Function |
+| `execute_worker_query` | `worker.py` | Plan and execute one query in the current Modal worker |
+| `_execute_physical` | `worker.py` | Validate and run one typed physical request |
+| `_execute_single` | `worker.py` | Single-GPU typed graph entry point |
 
 ### Scaling
 
 The measured scaling on two GPUs: filter 1.99x, join 2.02x
-(`dispatch_gate.json`). Modal functions are defined for 2, 4, and 8
-GPUs (`worker.py:495-519`).
+(`dispatch_gate.json`). Modal Functions are defined for 1, 2, 4, and 8
+GPUs. Each GPU runs one model copy in the same container.
 
 ## 7. The benchmark (QUAIL-B)
 
@@ -1377,6 +1453,11 @@ The two SWE-Next label sets belong directly to the current corpus. The
 collection manifest records the original corpus and table manifest for every
 reused label set. The loader checks those table manifests before it accepts
 the collection.
+
+Each predicate has one stable key, such as
+`quailb.imdb.review.mentions_positive_aspect`. The judge pass, label
+manifests, evaluation code, SoL script, and migration scripts all use that
+key. The old short predicate codes are not part of the active benchmark code.
 
 ### Protocol and reported values
 

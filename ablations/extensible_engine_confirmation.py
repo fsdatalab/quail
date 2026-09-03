@@ -88,8 +88,9 @@ def _save(name: str, value: dict) -> str:
 
 def _query_record(query_id, query, execute, gpu_count):
     from quail.bench.evaluate import H100_USD_PER_HOUR
+    from quail.runtime.worker import execute_worker_query
 
-    result = query.run(_execute=execute)
+    result = execute_worker_query(query, physical_executor=execute)
     table = result.collect()
     report = result.report
     join_stages = [
@@ -105,7 +106,6 @@ def _query_record(query_id, query, execute, gpu_count):
         "query": query_id,
         "model": query.session.model.name,
         "gpus": gpu_count,
-        "tensor_parallel": query.plan().tensor_parallel,
         "wall_s": report["wall_s"],
         "throughput": work / report["wall_s"],
         "throughput_unit": (
@@ -145,7 +145,7 @@ def confirm_4b(
     from quail.bench.quailb import build_sets, queries, register_sets
     from quail.planner.plan import EngineConfig
     from quail.runtime.session import Session
-    from quail.runtime.worker import _execute_payload
+    from quail.runtime.worker import _execute_physical
 
     data = build_sets("/results/quailb_data", 0.1)
     session = Session(EngineConfig(model="qwen3-4b-fp8", gpus=1))
@@ -159,7 +159,7 @@ def confirm_4b(
     started = time.time()
     records = [
         _query_record(query_id, definitions[query_id][1](),
-                      _execute_payload, 1)
+                      _execute_physical, 1)
         for query_id in selected
     ]
     result = {
@@ -208,7 +208,7 @@ def _small_session(model: str, gpus: int):
     volumes=volumes,
 )
 def confirm_4b_2gpu(prediction: str) -> str:
-    from quail.runtime.worker import _execute_multi
+    from quail.runtime.worker import _execute_physical
 
     session = _small_session("qwen3-4b-fp8", 2)
     query = session.sql("""
@@ -221,7 +221,7 @@ def confirm_4b_2gpu(prediction: str) -> str:
     """)
     result = {
         "prediction": prediction,
-        "query": _query_record("small-join", query, _execute_multi, 2),
+        "query": _query_record("small-join", query, _execute_physical, 2),
     }
     result["volume_path"] = _save(
         "extensible_engine_confirmation_4b_2gpu", result
@@ -237,7 +237,7 @@ def confirm_4b_2gpu(prediction: str) -> str:
     volumes=volumes,
 )
 def confirm_32b(prediction: str) -> str:
-    from quail.runtime.worker import _execute_payload
+    from quail.runtime.worker import _execute_physical
 
     session = _small_session("qwen3-32b-fp8", 1)
     query = session.sql("""
@@ -249,7 +249,7 @@ def confirm_32b(prediction: str) -> str:
     """)
     result = {
         "prediction": prediction,
-        "query": _query_record("small-filter", query, _execute_payload, 1),
+        "query": _query_record("small-filter", query, _execute_physical, 1),
     }
     result["volume_path"] = _save(
         "extensible_engine_confirmation_32b", result

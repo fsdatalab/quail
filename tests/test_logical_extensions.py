@@ -17,7 +17,7 @@ class TaggedInput:
     input: object
     tag: str
 
-    type_name: ClassVar[str] = "test.tagged_input.v1"
+    type_name: ClassVar[str] = "test.tagged_input"
 
     def children(self):
         return (self.input,)
@@ -68,9 +68,9 @@ def test_custom_logical_node_walks_and_rewrites_without_generic_changes():
     )
 
     assert [node.type_name for node in optimized.walk()] == [
-        "quail.scan.v1",
-        "test.tagged_input.v1",
-        "quail.logical_project.v1",
+        "quail.scan",
+        "test.tagged_input",
+        "quail.logical_project",
     ]
     assert optimized.root.input.tag == "new"
     assert changed == ("rename_tag",)

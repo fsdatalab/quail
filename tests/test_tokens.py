@@ -1,23 +1,24 @@
 """Arrow token payload checks."""
 
+import pickle
+
 import pyarrow as pa
 
 from quail.runtime.tokens import (
     ArrowTokenDocuments,
+    TokenStore,
     chain_tokens,
     decode_token_documents,
-    encode_token_documents,
 )
 
 
-def test_arrow_token_payload_round_trip_keeps_document_views():
+def test_arrow_token_column_keeps_document_views():
     tokens = pa.chunked_array([
         pa.array([[1, 2, 3], [], [4, 5]],
                  type=pa.large_list(pa.int32()))
     ])
 
-    encoded = encode_token_documents(tokens)
-    documents = decode_token_documents(encoded)
+    documents = decode_token_documents(tokens)
 
     assert isinstance(documents, ArrowTokenDocuments)
     assert len(documents) == 3
@@ -37,11 +38,63 @@ def test_token_chain_keeps_parts_until_chunk_packing():
     tokens = pa.chunked_array([
         pa.array([[10, 11]], type=pa.large_list(pa.int32()))
     ])
-    document = decode_token_documents(
-        encode_token_documents(tokens))[0]
+    document = decode_token_documents(tokens)[0]
 
     combined = chain_tokens([1, 2], document, [20])
 
     assert len(combined) == 5
     assert list(combined) == [1, 2, 10, 11, 20]
     assert combined.token_parts[1] is document
+
+
+def test_token_store_keeps_tokens_lengths_and_projection_on_disk(tmp_path):
+    schema = pa.schema({"id": pa.string(), "body": pa.string()})
+    batches = [
+        pa.record_batch(
+            [["a", "b"], ["one two", "three"]],
+            schema=schema,
+        ),
+        pa.record_batch([["c"], ["four five six"]], schema=schema),
+    ]
+    path = tmp_path / "tokens.arrow"
+
+    store = TokenStore.write(
+        str(path),
+        batches,
+        document_column="body",
+        projected_columns=("id",),
+        tokenizer=str.split,
+        token_type=pa.string(),
+        source_schema=schema,
+    )
+
+    assert path.exists()
+    assert list(store.lengths) == [2, 1, 3]
+    assert [list(store[index]) for index in range(len(store))] == [
+        ["one", "two"],
+        ["three"],
+        ["four", "five", "six"],
+    ]
+    assert store.column("id").to_pylist() == ["a", "b", "c"]
+
+
+def test_token_selection_serializes_a_file_reference(tmp_path):
+    schema = pa.schema({"body": pa.string()})
+    path = tmp_path / "tokens.arrow"
+    store = TokenStore.write(
+        str(path),
+        [pa.record_batch([["word " * 1000] * 10], schema=schema)],
+        document_column="body",
+        projected_columns=(),
+        tokenizer=str.split,
+        token_type=pa.string(),
+        source_schema=schema,
+    )
+
+    selection = store.select(range(10))
+    encoded = pickle.dumps(selection)
+    restored = pickle.loads(encoded)
+
+    assert len(encoded) < 1000
+    assert len(restored) == 10
+    assert len(restored[0]) == 1000

@@ -20,9 +20,9 @@ GPU with no reader. Now:
 - `ModelSpec` gains `vocab` and `tied_head`, and a `head_mem_bytes`
   property (0 when tied). `budgets.arena_tokens` and
   `budgets.chunk_memory_bound` now subtract only resident weights
-  (`W_resident = W_mem - head_mem_bytes`). `tensor_parallel` keeps
-  the as-loaded footprint, because the head is on the GPU until the
-  load finishes.
+  (`W_resident = W_mem - head_mem_bytes`). The model support check uses
+  the as-loaded footprint because the head is on the GPU until loading
+  finishes.
 
 Qwen3 4B ties its head to the input embedding, so nothing moves and
 no 4B number changes. Qwen3 32B has a separate bf16 head:

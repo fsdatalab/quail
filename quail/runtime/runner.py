@@ -8,14 +8,18 @@ from typing import Any, Callable, Mapping, Protocol
 from quail.physical import (
     AdaptiveJoinPlan,
     AnchoredJoin,
-    DocumentScan,
+    DocumentInput,
     Exchange,
     HashJoin,
     Limit,
     PackedFilter,
     PhysicalGraph,
     PhysicalNode,
+    PortRef,
     Project,
+    RequestExecution,
+    ValueType,
+    ExecutionLocation,
 )
 
 
@@ -92,6 +96,16 @@ class NodeRuntime(Protocol):
     ) -> NodeResult: ...
 
 
+class ExecutionObserver(Protocol):
+    """Observe node results without changing plan values."""
+
+    name: str
+
+    def after_node(self, node: PhysicalNode, result: NodeResult) -> None: ...
+
+    def report(self) -> Mapping[str, Any]: ...
+
+
 @dataclass
 class ExecutionContext:
     """State shared while one physical graph runs."""
@@ -113,6 +127,7 @@ class ExecutionContext:
         [PhysicalNode, NodeResult, "ExecutionContext"], None,
     ] | None = None
     state: dict[str, Any] = field(default_factory=dict)
+    observers: tuple[ExecutionObserver, ...] = ()
 
     def execute_graph(self, graph: PhysicalGraph) -> RunResult:
         """Execute a child graph with the same model state."""
@@ -126,13 +141,38 @@ class GenericRunner:
         self,
         graph: PhysicalGraph,
         context: ExecutionContext,
+        initial_outputs: Mapping[PortRef, Any] | None = None,
+        initial_metrics: Mapping[str, NodeMetrics] | None = None,
     ) -> RunResult:
         graph.validate(runtime_keys=set(context.runtimes))
-        values: dict[tuple[str, str], Any] = {}
+        values: dict[tuple[str, str], Any] = {
+            (ref.node_id, ref.port): value
+            for ref, value in (initial_outputs or {}).items()
+        }
         node_results: dict[str, NodeResult] = {}
         metrics = NodeMetrics()
 
         for node in graph.topological_nodes():
+            supplied = {
+                output.name: values[(node.node_id, output.name)]
+                for output in node.outputs
+                if (node.node_id, output.name) in values
+            }
+            if supplied:
+                expected = {output.name for output in node.outputs}
+                if set(supplied) != expected:
+                    raise ValueError(
+                        f"initial outputs for {node.node_id!r} are partial"
+                    )
+                result = NodeResult(
+                    supplied,
+                    (initial_metrics or {}).get(node.node_id, NodeMetrics()),
+                )
+                node_results[node.node_id] = result
+                metrics = metrics + result.metrics
+                for observer in context.observers:
+                    observer.after_node(node, result)
+                continue
             inputs = {
                 input_port.name: values[
                     (input_port.source.node_id, input_port.source.port)
@@ -153,20 +193,55 @@ class GenericRunner:
                 values[(node.node_id, port)] = value
             node_results[node.node_id] = result
             metrics = metrics + result.metrics
+            for observer in context.observers:
+                observer.after_node(node, result)
 
         root = (graph.root.node_id, graph.root.port)
         return RunResult(values[root], node_results, metrics)
 
 
-class DocumentScanRuntime:
+def compute_subgraph(graph: PhysicalGraph) -> PhysicalGraph:
+    """Return model nodes and the input nodes they read."""
+    by_id = {node.node_id: node for node in graph.nodes}
+    selected = {
+        node.node_id for node in graph.nodes
+        if node.location is ExecutionLocation.GPU_EXECUTOR
+        or node.backend is not None
+    }
+
+    def include_inputs(node_id: str) -> None:
+        for input_port in by_id[node_id].inputs:
+            source_id = input_port.source.node_id
+            if source_id not in selected:
+                selected.add(source_id)
+                include_inputs(source_id)
+
+    for node_id in tuple(selected):
+        include_inputs(node_id)
+    nodes = tuple(
+        node for node in graph.topological_nodes()
+        if node.node_id in selected
+    )
+    if not nodes:
+        raise ValueError("physical graph has no compute operation")
+    root_node = nodes[-1]
+    return PhysicalGraph(
+        nodes,
+        PortRef(root_node.node_id, root_node.outputs[0].name),
+    )
+
+
+class DocumentInputRuntime:
     """Read a prepared source registered by document alias."""
 
     def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, DocumentScan):
+        if not isinstance(node, DocumentInput):
             raise TypeError(type(node).__name__)
-        if node.alias not in context.sources:
-            raise KeyError(f"no prepared source for alias {node.alias!r}")
-        value = context.sources[node.alias]
+        if node.input_id not in context.sources:
+            raise KeyError(
+                f"no prepared source for input {node.input_id!r}"
+            )
+        value = context.sources[node.input_id]
         return NodeResult({f"ids:{node.alias}": value})
 
 
@@ -193,10 +268,41 @@ class HashJoinRuntime:
         if not isinstance(node, HashJoin):
             raise TypeError(type(node).__name__)
         if context.hash_join is None:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    "HashJoin needs an exact relation join implementation")
-            value = next(iter(inputs.values()))
+            import pyarrow as pa
+
+            from quail.runtime.result import (
+                IndexRelation,
+                build_result_declaration,
+                true_answer_rows,
+            )
+
+            answer_tables = []
+            survivors = {}
+            for input_port in node.inputs:
+                value = inputs[input_port.name]
+                if not isinstance(value, pa.Table):
+                    raise TypeError(
+                        "HashJoin inputs must be Arrow tables"
+                    )
+                if input_port.value_type is ValueType.JOIN_ANSWERS:
+                    answer_tables.append(true_answer_rows(value))
+                elif input_port.value_type is ValueType.DOCUMENT_IDS:
+                    if len(value.column_names) != 1:
+                        raise ValueError(
+                            "a survivor relation needs one alias column"
+                        )
+                    alias = value.column_names[0]
+                    survivors[alias] = value.column(alias).combine_chunks()
+                else:
+                    raise TypeError(
+                        f"HashJoin cannot read {input_port.value_type.value}"
+                    )
+            declaration, schema = build_result_declaration(
+                answer_tables,
+                survivors,
+                node.alias_order[0],
+            )
+            value = IndexRelation(declaration, schema)
         else:
             value = context.hash_join(node, inputs)
         return NodeResult({"tuples": value})
@@ -225,7 +331,11 @@ class LimitRuntime:
         if len(inputs) != 1:
             raise ValueError("Limit needs one input")
         value = next(iter(inputs.values()))
-        if hasattr(value, "slice"):
+        from quail.runtime.result import QueryResult
+
+        if isinstance(value, QueryResult):
+            value = value.with_limit(node.count)
+        elif hasattr(value, "slice"):
             value = value.slice(0, node.count)
         else:
             value = value[:node.count]
@@ -267,12 +377,13 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
     """Return runtimes for the built in physical nodes."""
     model_runtime = ModelNodeRuntime()
     return {
-        DocumentScan.runtime_key: DocumentScanRuntime(),
+        DocumentInput.runtime_key: DocumentInputRuntime(),
         Exchange.runtime_key: ExchangeRuntime(),
         HashJoin.runtime_key: HashJoinRuntime(),
         Project.runtime_key: ProjectRuntime(),
         Limit.runtime_key: LimitRuntime(),
         PackedFilter.runtime_key: model_runtime,
+        RequestExecution.runtime_key: model_runtime,
         AnchoredJoin.runtime_key: model_runtime,
         AdaptiveJoinPlan.runtime_key: AdaptiveJoinRuntime(),
     }

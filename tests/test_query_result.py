@@ -48,7 +48,6 @@ def test_result_streams_bounded_arrow_batches():
         output_schema=schema,
         projection=[("r", values)],
         report={},
-        answer_rows={},
         survivor_indices=survivors,
         true_join_tables={},
     )
@@ -65,4 +64,19 @@ def test_result_streams_bounded_arrow_batches():
     assert result.collect(limit=3).column("r.id").to_pylist() == [
         "r0", "r1", "r2"]
     assert not hasattr(result, "rows")
-    assert relation.schema.metadata[b"quail.schema_version"] == b"1"
+    assert relation.schema.metadata[b"quail.kind"] == b"filter_survivors"
+
+
+def test_ipc_result_limit_preserves_the_known_row_count(tmp_path):
+    table = pa.table({"id": ["a", "b", "c"]})
+    path = tmp_path / "result.arrow"
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+
+    result = QueryResult.from_ipc_file(
+        str(path), table.schema, len(table)
+    ).with_limit(2)
+
+    assert result.count() == 2
+    assert result.collect().to_pydict() == {"id": ["a", "b"]}

@@ -20,7 +20,7 @@ from quail.planner.work import Work, ask, scan
 from quail.physical import (
     AdaptiveJoinPlan,
     AnchoredJoin,
-    DocumentScan,
+    DocumentInput,
     Exchange,
     FilterStage,
     HashJoin,
@@ -51,6 +51,9 @@ def _collect(plan: LogicalPlan):
             filters[node.input.alias] = list(node.predicates)
         elif isinstance(node, Scan):
             scans.append(node)
+        else:
+            for child in node.children():
+                walk(child)
 
     walk(plan.root)
     return scans, filters, joins
@@ -356,6 +359,40 @@ def balanced_shards(doc_tokens, workers: int):
     return tuple(tuple(sorted(s)) for s in shards), loads
 
 
+def contiguous_shards(doc_tokens, workers: int):
+    """Split ordered documents into compact token balanced ranges."""
+    lengths = doc_tokens
+    n_docs = len(lengths)
+    total = sum(lengths)
+    ranges = []
+    loads = []
+    start = 0
+    consumed = 0
+    for worker in range(workers):
+        if worker == workers - 1:
+            stop = n_docs
+            load = total - consumed
+        else:
+            remaining_workers = workers - worker
+            target = (total - consumed) / remaining_workers
+            stop = start
+            load = 0
+            while stop < n_docs:
+                next_length = int(lengths[stop])
+                with_next = load + next_length
+                if load and abs(target - load) <= abs(target - with_next):
+                    break
+                load = with_next
+                stop += 1
+                if load >= target:
+                    break
+        ranges.append((start, stop))
+        loads.append(load)
+        start = stop
+        consumed += load
+    return tuple(ranges), loads
+
+
 # ---------------------------------------------------------- the planner
 
 def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
@@ -380,13 +417,16 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     remarks = []
 
     # ---- refusals first
-    tp = budgets.tensor_parallel(model, device)
-    if tp > gpus:
+    weight_gpus = budgets.minimum_weight_gpus(model, device)
+    if weight_gpus > 1:
         return Refusal(
-            reasons=(f"weights need {tp} cards, {gpus} available",),
+            reasons=(
+                f"one model copy needs the memory of {weight_gpus} GPUs, "
+                "but Quail does not split weights across GPUs",
+            ),
             constraint="weights_need_more_cards",
-            needed=tp, available=gpus, unit="cards")
-    workers = max(1, gpus // tp)
+            needed=weight_gpus, available=1, unit="cards")
+    workers = gpus
 
     chunk = budgets.chunk_budget(model, device)
     admission = budgets.arena_tokens(model, device, chunk)
@@ -436,9 +476,7 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         found = joinsearch.search_joins(
             specs, live0, resident_from(plan_keep), {}, pre,
             chunk, model, device, base_work=base_work,
-            fixed_order=fixed, honor_forced=honor_forced,
-            arena_tokens=float(admission) * workers,
-            page_tokens=budgets.PAGE_TOKENS)
+            fixed_order=fixed, honor_forced=honor_forced)
         if found is None:
             # a join predicate with no alias in common with the rest:
             # no connected left deep order exists, so cost the written
@@ -446,9 +484,7 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             found = joinsearch.search_joins(
                 specs, live0, resident_from(plan_keep), {},
                 pre, chunk, model, device, base_work=base_work,
-                fixed_order=True, honor_forced=honor_forced,
-                arena_tokens=float(admission) * workers,
-                page_tokens=budgets.PAGE_TOKENS)
+                fixed_order=True, honor_forced=honor_forced)
         return found
 
     def consumed_keeps(records, plan_keep):
@@ -564,23 +600,23 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
 
-    remarks.append("kv_dtype=bf16 (always)")
-
     # ---- build the dataflow graph; ids_src tracks each table's
     # current producer node
     retain_aliases = possible_anchor_aliases(specs) & set(filters)
     nodes = []
     ids_src = {}
     for s in scans:
-        shards, loads = balanced_shards(doc_tokens[s.alias], workers)
-        sid = f"scan:{s.alias}"
-        nodes.append(DocumentScan(
+        shard_ranges, loads = contiguous_shards(
+            doc_tokens[s.alias], workers
+        )
+        sid = f"input:{s.alias}"
+        nodes.append(DocumentInput(
             node_id=sid,
-            alias=s.alias, provider=s.provider,
-            column=s.column,
+            alias=s.alias, input_id=s.alias,
             n_docs=stats[s.alias].n_docs,
             total_tokens=stats[s.alias].total_tokens,
-            shards=shards, shard_token_loads=tuple(loads)))
+            shard_ranges=shard_ranges,
+            shard_token_loads=tuple(loads)))
         ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
         if s.alias in filters:
             order_idx = filter_orders[s.alias]
@@ -603,7 +639,7 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             fid = f"filter:{s.alias}"
             nodes.append(PackedFilter(
                 node_id=fid,
-                inputs=input_ports((ids_src[s.alias].to_tuple(),)),
+                inputs=input_ports((ids_src[s.alias],)),
                 alias=s.alias, arena_writes=writes,
                 keep_kv=keep,
                 # the capacity-planned credit; the runtime offers
@@ -655,9 +691,9 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                             ahead.append(a)
             bid = f"barrier:{barrier_n}"
             barrier_n += 1
-            exchange_inputs = tuple(
-                ref.to_tuple() for ref in pairs_edges
-            ) + tuple(ids_src[a].to_tuple() for a in ahead)
+            exchange_inputs = tuple(pairs_edges) + tuple(
+                ids_src[a] for a in ahead
+            )
             expected_join_nodes.append(Exchange(
                 node_id=bid,
                 inputs=input_ports(exchange_inputs),
@@ -686,16 +722,14 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                     in_aliases.append(a)
             if spec["semantics"] == "full":
                 pairs_edges.append(PortRef(
-                    gid, f"pairs:{spec['written_pos']}"
+                    gid, f"join_answers:{spec['written_pos']}"
                 ))
                 for a in [anchor] + partners:
                     if a not in out_aliases:
                         out_aliases.append(a)
         expected_join_nodes.append(AnchoredJoin(
             node_id=gid,
-            inputs=input_ports(tuple(
-                ids_src[a].to_tuple() for a in in_aliases
-            )),
+            inputs=input_ports(tuple(ids_src[a] for a in in_aliases)),
             anchor=anchor,
             anchor_resident=group["members"][0][1]["resident"],
             keep_anchor_kv=group_last_use[anchor] > g,
@@ -714,10 +748,13 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         nodes.append(AdaptiveJoinPlan(
             node_id=adaptive_id,
             inputs=input_ports(tuple(
-                outer_ids_src[alias].to_tuple() for alias in aliases
+                outer_ids_src[alias] for alias in aliases
             )),
             expected_nodes=tuple(expected_join_nodes),
             aliases=aliases,
+            join_positions=tuple(
+                spec["written_pos"] for spec in specs
+            ),
             full_join_positions=full_join_positions,
         ))
         ids_src = {
@@ -725,7 +762,7 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             for alias in aliases
         }
         pairs_edges = [
-            PortRef(adaptive_id, f"pairs:{position}")
+            PortRef(adaptive_id, f"join_answers:{position}")
             for position in full_join_positions
         ]
 
@@ -733,8 +770,8 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         nodes.append(HashJoin(
             node_id="recombine",
             inputs=input_ports(
-                tuple(ref.to_tuple() for ref in pairs_edges)
-                + tuple(ids_src[a].to_tuple() for a in out_aliases)
+                tuple(pairs_edges)
+                + tuple(ids_src[a] for a in out_aliases)
             ),
             alias_order=tuple(out_aliases)))
         sink_inputs = (PortRef("recombine", "tuples"),)
@@ -742,12 +779,12 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         sink_inputs = (ids_src[scans[0].alias],)
     nodes.append(PhysicalProject(
         node_id="sink",
-        inputs=input_ports(tuple(ref.to_tuple() for ref in sink_inputs)),
+        inputs=input_ports(tuple(sink_inputs)),
         columns=tuple(f"{c.alias}.{c.column}" for c in plan.root.columns)))
     if plan.root.limit is not None:
         nodes.append(Limit(
             node_id="limit",
-            inputs=input_ports((("sink", "rows"),)),
+            inputs=input_ports((PortRef("sink", "rows"),)),
             count=plan.root.limit,
         ))
 
@@ -756,17 +793,20 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     ).seconds
     return PhysicalPlan(
         model=model.name, device=device.name, workers=workers,
-        tensor_parallel=tp, kv_dtype="bf16", chunk_tokens=chunk,
-        admission_tokens=admission, order_rule=rule, order_source=source,
         backend="quail", estimated_seconds=estimate,
-        limit=plan.root.limit,
-        nodes=tuple(nodes), remarks=tuple(remarks))
+        nodes=tuple(nodes), remarks=tuple(remarks),
+        settings={
+            "chunk_tokens": chunk,
+            "admission_tokens": admission,
+            "order_rule": rule,
+            "order_source": source,
+        })
 
 
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
-               registry=None):
+               registry=None, tokenizer=None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -809,6 +849,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         document_tokens=doc_tokens,
         backend=backend,
         order=order,
+        tokenizer=tokenizer,
     )
     region = ModelRegion(plan)
     candidates = tuple(selected.plan(region, context))
@@ -880,9 +921,18 @@ def explain(logical: LogicalPlan, physical) -> str:
             lines.append(f"{pad}SemanticFilter (x{len(node.predicates)}, "
                          f"sels={sels})")
             render(node.input, depth + 1)
-        else:
+        elif isinstance(node, Scan):
             lines.append(f"{pad}Scan {node.provider} as {node.alias} "
                          f"[{node.column}]")
+        else:
+            fields = ", ".join(
+                f"{name}={value}"
+                for name, value in node.explain_fields().items()
+            )
+            suffix = f" [{fields}]" if fields else ""
+            lines.append(f"{pad}{node.type_name}{suffix}")
+            for child in node.children():
+                render(child, depth + 1)
 
     render(logical.root, 0)
     if isinstance(physical, Refusal):
@@ -893,23 +943,25 @@ def explain(logical: LogicalPlan, physical) -> str:
             lines.append(f"  {r}")
         return "\n".join(lines)
     lines.append("physical:")
-    lines.append(f"  workers={physical.workers} "
-                 f"tp={physical.tensor_parallel} "
-                 f"kv_dtype={physical.kv_dtype}")
-    lines.append(f"  chunk_tokens={physical.chunk_tokens} "
-                 f"admission_tokens={physical.admission_tokens}")
-    if physical.limit is not None:
-        lines.append(f"  limit={physical.limit}")
+    lines.append(
+        f"  workers={physical.workers} model_copies={physical.workers}"
+    )
+    lines.append("  KV dtype=bf16")
+    settings = physical.settings
+    lines.append(f"  chunk_tokens={settings['chunk_tokens']} "
+                 f"admission_tokens={settings['admission_tokens']}")
     lines.append("  prompt layout: engine preamble + document + "
                  "suffix (preamble_tokens per stage below count the "
                  "shared preamble)")
     lines.append("  the predicted join order; the worker re-runs the "
                  "same search on the actual filter survivors")
-    lines.append(f"  order={physical.order_rule} ({physical.order_source})")
+    lines.append(
+        f"  order={settings['order_rule']} ({settings['order_source']})"
+    )
     for n in physical.nodes:
         parts = [f"  {type(n).__name__} {n.node_id}"]
         for k, v in n.explain_fields().items():
-            if k in ("shards", "shard_token_loads", "stages"):
+            if k in ("shard_ranges", "shard_token_loads", "stages"):
                 continue
             parts.append(f"{k}={v}")
         if n.inputs:

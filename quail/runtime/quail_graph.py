@@ -10,9 +10,8 @@ from dataclasses import replace
 from quail.physical import (
     AdaptiveJoinPlan,
     AnchoredJoin,
-    DocumentScan,
+    DocumentInput,
     Exchange,
-    ExecutionLocation,
     JoinStage,
     PackedFilter,
     PhysicalGraph,
@@ -20,6 +19,7 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.runtime.runner import (
+    compute_subgraph,
     ExecutionContext,
     GenericRunner,
     NodeMetrics,
@@ -130,10 +130,6 @@ def _next_join(state) -> AnchoredJoin:
         state["model_spec"],
         state["device"],
         fixed_order=state["order_rule"] == "as_written",
-        arena_tokens=float(
-            arena.accounting.n_pages * arena.accounting.page_tokens
-        ),
-        page_tokens=arena.accounting.page_tokens,
         already_joined=state["already_joined"],
     )
     if found is not None:
@@ -190,22 +186,19 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
     from quail.runtime.coordinator import stage_for_anchor
-    from quail.runtime.tokens import chain_tokens
+    from quail.runtime.tokens import DocumentPrefixes, chain_tokens
 
     state = context.state
     if isinstance(node, PackedFilter):
         state["pipeline"].attention_mode = FILTER_ATTENTION
-        document_ids = list(next(iter(inputs.values())))
+        document_ids = next(iter(inputs.values()))
         return {
-            "documents": [
-                chain_tokens(state["pre"], state["docs"][node.alias][index])
-                for index in document_ids
-            ],
+            "documents": DocumentPrefixes(
+                state["pre"], state["docs"][node.alias], document_ids
+            ),
             "document_ids": document_ids,
             "limit": state["filter_limit"],
-            "retain_survivors": (
-                range(len(document_ids)) if node.keep_kv else ()
-            ),
+            "retain_survivors": node.keep_kv,
         }
     if not isinstance(node, AnchoredJoin):
         return inputs
@@ -296,16 +289,15 @@ def record_model_result(node, result: NodeResult,
 def _child_graph(node: AnchoredJoin, previous_anchor: str | None,
                  aliases: tuple[str, ...]) -> PhysicalGraph:
     scan_nodes = tuple(
-        DocumentScan(
-            node_id=f"{node.node_id}:scan:{alias}",
+        DocumentInput(
+            node_id=f"{node.node_id}:input:{alias}",
             alias=alias,
-            provider="runtime",
-            column="tokens",
+            input_id=alias,
         )
         for alias in aliases
     )
     sources = {
-        alias: PortRef(f"{node.node_id}:scan:{alias}", f"ids:{alias}")
+        alias: PortRef(f"{node.node_id}:input:{alias}", f"ids:{alias}")
         for alias in aliases
     }
     nodes = list(scan_nodes)
@@ -313,7 +305,7 @@ def _child_graph(node: AnchoredJoin, previous_anchor: str | None,
         exchange = Exchange(
             node_id=f"runtime-exchange:{node.node_id}",
             inputs=input_ports(tuple(
-                sources[alias].to_tuple() for alias in aliases
+                sources[alias] for alias in aliases
             )),
             next_anchor=node.anchor,
             aliases=aliases,
@@ -326,7 +318,7 @@ def _child_graph(node: AnchoredJoin, previous_anchor: str | None,
     anchored = replace(
         node,
         inputs=input_ports(tuple(
-            sources[alias].to_tuple() for alias in aliases
+            sources[alias] for alias in aliases
         )),
     )
     nodes.append(anchored)
@@ -372,7 +364,7 @@ def run_adaptive_join(node, inputs, context: ExecutionContext) -> NodeResult:
     )
     finished_full = []
     out_joins = []
-    pairs = {}
+    join_answers = {}
     remaining = state["remaining"]
 
     initial_anchors = _possible_anchors(remaining, state["search_specs"])
@@ -435,7 +427,7 @@ def run_adaptive_join(node, inputs, context: ExecutionContext) -> NodeResult:
             out_joins.append(stage_out)
             if stage.semantics == "full":
                 finished_full.append(stage_out)
-                pairs[stage.written_pos] = stage_out
+            join_answers[stage.written_pos] = stage_out
 
         survivors[selected.anchor] = list(
             joined.outputs[f"ids:{selected.anchor}"]
@@ -478,8 +470,10 @@ def run_adaptive_join(node, inputs, context: ExecutionContext) -> NodeResult:
     outputs = {
         f"ids:{alias}": list(survivors[alias]) for alias in node.aliases
     }
-    outputs.update({f"pairs:{position}": pairs[position]
-                    for position in node.full_join_positions})
+    outputs.update({
+        f"join_answers:{position}": join_answers[position]
+        for position in node.join_positions
+    })
     optimizer_runs = state["optimizer_runs"]
     optimizer = None if not optimizer_runs else {
         "states": sum(run["states"] for run in optimizer_runs),
@@ -507,37 +501,6 @@ def run_adaptive_join(node, inputs, context: ExecutionContext) -> NodeResult:
     )
 
 
-def model_subgraph(graph: PhysicalGraph) -> PhysicalGraph:
-    """Return the section executed inside the Modal container."""
-    by_id = {node.node_id: node for node in graph.nodes}
-    selected = {
-        node.node_id for node in graph.nodes
-        if node.location is ExecutionLocation.GPU_EXECUTOR
-        or node.backend is not None
-    }
-
-    def include_inputs(node_id):
-        for input_port in by_id[node_id].inputs:
-            source_id = input_port.source.node_id
-            if source_id not in selected:
-                selected.add(source_id)
-                include_inputs(source_id)
-
-    for node_id in tuple(selected):
-        include_inputs(node_id)
-    nodes = tuple(
-        node for node in graph.topological_nodes()
-        if node.node_id in selected
-    )
-    if not nodes:
-        raise ValueError("Quail model graph has no remote operation")
-    root_node = nodes[-1]
-    return PhysicalGraph(
-        nodes,
-        PortRef(root_node.node_id, root_node.outputs[0].name),
-    )
-
-
 def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     """Execute one Quail model graph on one GPU executor."""
     torch = state["torch"]
@@ -547,7 +510,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     arena.reset_stats()
     docs = state["docs"]
     sources = {
-        alias: list(range(len(documents)))
+        alias: range(len(documents))
         for alias, documents in docs.items()
     }
     runtime_state = {
@@ -556,7 +519,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "filter_limit": (
             None if any(isinstance(node, AdaptiveJoinPlan)
                         for node in graph.nodes)
-            else payload.get("limit")
+            else payload.get("filter_limit")
         ),
         "order_rule": payload.get("order_rule", "as_written"),
         "seen": set(),
@@ -580,7 +543,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     )
     started = time.perf_counter()
     with torch.inference_mode():
-        result = GenericRunner().run(model_subgraph(graph), context)
+        result = GenericRunner().run(compute_subgraph(graph), context)
     torch.cuda.synchronize()
     wall = time.perf_counter() - started
 
@@ -610,9 +573,12 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "evicted_pages": arena.evicted_pages,
         "evicted_prefix_tokens": arena.evicted_prefix_tokens,
     }
+    from quail.execution import export_physical_outputs
+
     return {
         "filters": filters,
         "joins": joins,
+        "_outputs": export_physical_outputs(compute_subgraph(graph), result),
         "wall_s": round(wall, 2),
         "fresh_tokens": result.metrics.fresh_tokens,
         "regret_tokens": runtime_state["regret_tokens"],

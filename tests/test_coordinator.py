@@ -12,12 +12,13 @@ from quail.runtime.coordinator import (filter_node_payloads,
 
 def payload():
     return dict(
-        model="qwen3-4b-fp8", kv_dtype="bf16", chunk_tokens=1000,
-        true_ids=[1], false_ids=[2], pre_ids=[9], limit=None,
+        model="qwen3-4b-fp8", chunk_tokens=1000,
+        true_ids=[1], false_ids=[2], pre_ids=[9], filter_limit=None,
         docs={"r": [[i] * (10 + i) for i in range(6)],
               "p": [[i] * 5 for i in range(4)]},
         filters={"r": [[7, 7]]},
         filter_arena_writes={"r": True},
+        physical_plan={},
         joins=[dict(anchor="r", partners=["p"], semantics="full",
                     labels={"p": [2]}, frame=[8], tail=[3])],
         workers=2,
@@ -33,7 +34,6 @@ def filter_node():
 
 def test_filter_round_split():
     p = payload()
-    p["physical_plan"] = {"version": 1}
     subs = filter_node_payloads(
         p, filter_node(), p["shards"], 2, has_joins=True
     )
@@ -174,12 +174,6 @@ def test_stage_for_anchor_materializes_either_side():
     assert p_side["frame"] == [71]
     assert p_side["labels"] == {"r": [80]}
     assert p_side["partners"] == ["r"]
-    # a hand-built spec (no per-table maps) is already materialized
-    hand = dict(anchor="r", partners=["p"], labels={"p": [2]},
-                frame=[8], tail=[3], semantics="full")
-    assert stage_for_anchor(hand, "p") is hand
-
-
 def test_gate_group_full_exists_anti():
     out = dict(rows={0: [1, 0], 1: [0, 0], 2: [0, 1]},
                anchor_index=[5, 7, 9])
@@ -224,14 +218,13 @@ def test_filter_round_limit_rule():
     # so the filter round may stop early. With joins, cutting
     # survivor lists drops output rows (#39), so the round gets None.
     p = payload()
-    p["physical_plan"] = {"version": 1}
-    p["limit"] = 3
-    assert all(s["limit"] is None for s in filter_node_payloads(
+    p["filter_limit"] = 3
+    assert all(s["filter_limit"] is None for s in filter_node_payloads(
         p, filter_node(), p["shards"], 2, has_joins=True))
-    assert all(s["limit"] == 3 for s in filter_node_payloads(
+    assert all(s["filter_limit"] == 3 for s in filter_node_payloads(
         p, filter_node(), p["shards"], 2, has_joins=False))
-    p["limit"] = None
-    assert all(s["limit"] is None for s in filter_node_payloads(
+    p["filter_limit"] = None
+    assert all(s["filter_limit"] is None for s in filter_node_payloads(
         p, filter_node(), p["shards"], 2, has_joins=False))
 
 

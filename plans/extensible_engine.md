@@ -1,837 +1,287 @@
-# Plan for an extensible Quail engine
+# Extensible Quail engine
 
-Status: implemented and confirmed on Modal on the `extensible-engine` branch.
-The measured result is in
-`reports/2026-08-31-extensible-engine-confirmation.md`.
+Status: implemented on the `extensible-engine` branch.
 
-## Goal
+This file records the design decisions. The current implementation details live
+in [the engine wiki](../reports/engine-wiki.md).
 
-Quail should have the same clear boundaries that make database engines such as
-DataFusion and PostgreSQL extensible. A new planner, physical model
-implementation, runtime, or table provider should not require another type
-switch in the session, Modal container runtime, result code, benchmarks, and
-reports.
+## Scope
 
-The redesign must preserve the current query language. Quail continues to
-support model filters and joins. The redesign does not add maps, open ended
-generation, classification, speculation, or forking.
+Quail supports model filters and joins over document collections.
 
-The first version must support these extensions:
+The built in models are Qwen3 4B fp8 and Qwen3 32B fp8. Each GPU owns one model
+copy. Quail does not split one model across several GPUs.
 
-* A new physical implementation of an existing model filter or join.
-* A model backend with its own scheduler and KV implementation.
-* A logical or physical optimizer rule.
-* A physical node and its runtime.
-* A table provider that returns Arrow batches.
+The redesign does not add maps, open ended generation, classification,
+speculation, or forking.
 
-Built in Quail code must use the same interfaces as extension code.
+## Main boundaries
 
-## Main decisions
+Quail has six main interfaces.
 
-The redesign uses these boundaries:
+- Logical nodes describe what a query means.
+- Logical and physical rules rewrite plans.
+- A model backend plans and runs model work.
+- A table provider supplies schemas and bounded Arrow batches.
+- A compute provider chooses where the query runs.
+- An execution observer records physical node metrics.
 
-* Logical nodes describe what the query means.
-* Logical optimizer rules rewrite a logical plan without changing its meaning.
-* Physical planners produce possible ways to execute a logical node or a
-  connected set of model operations.
-* The cost model chooses one physical candidate.
-* Physical optimizer rules add required data movement and ordinary result
-  operations.
-* A generic query runner executes the selected physical graph.
-* A model backend plans model work and creates one model execution object for
-  each GPU executor.
-* A table provider supplies schemas, statistics, and bounded Arrow batches.
+Built in code uses the same interfaces as extension code.
 
-The model backend is the public extension boundary for model execution. Quail
-will not define a public KV interface. The scheduler, KV layout, allocation,
-retention, eviction, KV rewind, and model calls need to change together in some
-backends.
+Quail does not expose a public KV interface. A model backend owns its scheduler,
+KV layout, allocation, retention, eviction, KV rewind, and model calls. These
+parts depend on each other and should change together.
 
-One model execution object owns all model work for one query in one GPU
-executor.
-`PackedFilter`, `AdaptiveJoinPlan`, and any executed `AnchoredJoin` operations
-use that same object. The generic query runner never reads or changes KV.
+## Configuration
 
-`AdaptiveJoinPlan` is a physical node. It owns runtime join planning and can
-select `AnchoredJoin` steps after filter results are known. Planning work is a
-valid purpose for a physical node.
-
-The runtime for `AdaptiveJoinPlan` is supplied by the selected model backend.
-It creates a typed child graph and asks the generic runner to execute that graph
-with the existing execution context. The child graph therefore uses the same
-model execution object and the same KV as the completed filter nodes.
-
-Physical node names do not use an `Exec` suffix. Logical and physical nodes
-live in separate modules and implement different interfaces, so the suffix is
-not needed.
-
-## Configuration and GPU layout
-
-The public engine configuration has these fields:
+The public configuration is:
 
 ```python
 @dataclass(frozen=True)
 class EngineConfig:
-    backend: str = "quail"
-    model: str = "qwen3-4b-fp8"
     gpus: int = 1
+    model: str = "qwen3-4b-fp8"
+    backend: str = "quail"
 ```
 
-`backend` selects the model backend. The first design must cover Quail, stock
-vLLM, and pipelined SGLang. The existing vLLM and SGLang implementations are
-baseline runners today. They do not become engine backends until they implement
-the new backend interface.
+A normal user does not set `backend`. Quail is the default.
 
-`model` selects a registered `ModelSpec`. The supported models are Qwen3 4B fp8
-and Qwen3 32B fp8. A model backend declares whether it supports the requested
-model and device. Different model sizes use the same physical node interfaces.
-Their model specifications produce different memory budgets, chunk limits, KV
-capacity, and work estimates.
+`gpus` can be 1, 2, 4, or 8. All GPUs are in one Modal container. The
+container has one coordinator process and one GPU executor per H100.
 
-`gpus` is the number of H100s allocated to the query. In the first version it
-must be 1, 2, 4, or 8. All allocated GPUs are in one Modal container. The
-container has one parent coordinator process and one GPU executor for each
-H100. Each GPU executor owns one model copy and one model execution object.
-
-For example, `gpus=4` produces this layout:
+Four GPUs therefore means:
 
 ```text
-One Modal container with four H100s
-    One container coordinator
+One Modal container
+    One coordinator
     GPU executor 0 with one model copy
     GPU executor 1 with one model copy
     GPU executor 2 with one model copy
     GPU executor 3 with one model copy
 ```
 
-Quail does not split one model copy across several GPUs. Both supported models
-fit on one H100, so four GPUs mean four independent model copies. The container
-coordinator partitions documents and join anchors among the GPU executors. It
-also redistributes survivor sets when the next join uses a different anchor.
+More than eight GPUs would need several containers and another coordinator.
+That is not implemented.
 
-A GPU executor is one backend execution unit bound to one H100. The Quail
-backend implements it as one child process. A backend such as SGLang may use
-more than one operating system process for its driver and scheduler. The
-generic runtime does not require a particular process layout inside a GPU
-executor.
+## Query path
 
-The planner validates the backend, model, device, and GPU count before it calls
-Modal. An unsupported combination returns a refusal with the failed capability.
-Query cost uses the number of allocated H100s.
+One query follows this path.
 
-More than eight GPUs requires several Modal containers and another coordinator
-above the container coordinators. Support for more than eight GPUs is outside
-the first version.
-
-## One query from start to finish
-
-The implementation must support this exact path:
-
-1. The SQL or builder front end creates one logical plan with `Scan`,
-   `SemanticFilter`, `SemanticJoin`, and `Project` nodes.
-2. Logical optimizer rules validate and rewrite the logical plan.
-3. Document preparation reads the required columns in Arrow batches. It creates
-   token manifests and token sources.
-4. The physical planner finds each connected set of model operations. It asks
-   the selected model backend to plan that set.
-5. The selected backend returns physical candidates. The existing work and
-   device cost model chooses one candidate without a fitted runtime predictor.
-6. The generic planner adds ordinary nodes such as `DocumentScan`, `Exchange`,
-   `HashJoin`, `Project`, and `Limit`.
-7. The selected compute provider starts one remote coordinator and one GPU
-   executor for each H100. The current Modal provider places them in one
-   container. Each GPU executor creates or reuses one model execution object.
-8. The runner executes ready physical nodes. Every model node in one GPU
-   executor uses the same model execution object.
-9. When the runner reaches `AdaptiveJoinPlan`, the selected backend uses actual
-   survivor counts and its private runtime state to choose `AnchoredJoin`
-   operations.
-10. Arrow `HashJoin` nodes combine model answer relations using exact document
-    ids. `Project` and `Limit` produce the final result.
+1. SQL or the builder creates one logical plan.
+2. Logical rules validate and rewrite the plan.
+3. The session creates one `QueryRequest`.
+4. The compute provider sends the logical plan and table bindings to a worker.
+5. The worker opens remote sources or reads Arrow tables sent by the client.
+6. The worker tokenizes only the document columns needed by the query.
+7. The selected backend proposes a typed physical graph.
+8. The worker runs the complete graph.
+9. Arrow combines exact answer relations and applies projection and limit.
+10. The compute provider returns one `QueryResult`.
 
 ```mermaid
 flowchart TD
     A[SQL or builder] --> B[Logical plan]
-    B --> C[Logical optimizer rules]
-    C --> D[Document preparation]
-    D --> E[Physical planners and cost model]
-    E --> F[Physical graph]
-    F --> G[Generic query runner]
-    G --> H[One Modal container coordinator]
-    H --> N[One GPU executor per H100]
-    N --> O[One model execution object per GPU executor]
-    O --> I[PackedFilter]
-    I --> J[AdaptiveJoinPlan]
-    J --> K[AnchoredJoin operations]
-    K --> L[Arrow HashJoin]
-    L --> M[Project and Limit]
+    B --> C[QueryRequest]
+    C --> D[Compute provider]
+    D --> E[Source reading and tokenization]
+    E --> F[Physical planning]
+    F --> G[Physical graph]
+    G --> H[Model backend]
+    H --> I[Arrow joins, projection, and limit]
+    I --> J[QueryResult]
 ```
 
-## Ownership
+The default compute provider uses Modal Functions in the existing
+`quail-engine` app. Quail does not run an application server.
 
-Each part has one owner:
+## Logical plans
 
-| Part | Owner |
-| --- | --- |
-| Logical plan shape and schemas | Generic engine |
-| Logical and physical rule order | Session state |
-| Model physical candidates | Selected model backend |
-| Model and device cost comparison | Generic planner using current Quail cost code |
-| Loaded model and model scheduler | Model execution object |
-| KV and token based admission | Model execution object |
-| Runtime join planning | Runtime for `AdaptiveJoinPlan` supplied by the model backend |
-| Graph scheduling and runtime dispatch | Generic query runner |
-| Work split across GPUs in one container | Container coordinator |
-| One model copy and its CUDA context | GPU executor |
-| Data movement required by a physical plan | `Exchange` runtime |
-| Exact result relation joins | Arrow `HashJoin` runtime |
-| Source schema and Arrow batches | Table provider |
-| Plan encoding at the compute process boundary | Registered node codecs |
+Each logical node supplies:
 
-The generic engine must not inspect a concrete model node. A model backend must
-not read a table provider directly. Both sides communicate through typed plan
-inputs, outputs, and runtime values.
+- A unique type name.
+- Its children and expressions.
+- Its output schema.
+- Its validation rules.
+- Methods that replace children or expressions.
+- Fields for `explain()`.
 
-## Logical plan interface
+The built in nodes are `Scan`, `SemanticFilter`, `SemanticJoin`, and
+logical `Project`.
 
-Replace the closed `Operator` union with a `LogicalNode` interface. Each logical
-node provides:
+Modal serializes the logical plan as a Python value. The extension module that
+defines a custom logical node must be installed in the worker image.
 
-* A stable type name.
-* Its children.
-* Its expressions.
-* Its output schema.
-* Validation specific to the node.
-* Methods that return the same node with replacement children or expressions.
-* Fields for one line of explain output.
+The SQL front end supports Snowflake `AI_FILTER` and BigQuery `AI.IF`.
+Extensions can construct logical nodes through Python. SQL syntax extensions
+are not implemented.
 
-The built in logical nodes remain `Scan`, `SemanticFilter`, `SemanticJoin`, and
-`Project`. The SQL and builder front ends must create the same logical tree
-through one `LogicalPlanBuilder`. Delete `QueryDesc` after both front ends use
-the builder.
+## Physical plans
 
-A generic plan walk must support visiting, rewriting, validating, and
-explaining any registered logical node. A new logical node must not require a
-change to the generic plan walk.
+A physical plan is an immutable directed acyclic graph. Each node has:
 
-The first version does not add SQL syntax hooks. An extension can construct a
-registered logical node through the builder API. SQL syntax extensions can be
-designed later if a concrete extension needs them.
+- A node id and type name.
+- Typed input and output ports.
+- An execution location.
+- A runtime registration key.
+- A backend name when the node belongs to one backend.
+- Fields for `explain()`.
 
-## Document preparation
+The plan wrapper contains only the selected backend, model, device, worker
+count, graph, estimate, remarks, and a backend-owned settings map. Quail keeps
+its chunk size, KV capacity, predicate order, and filter limit in that settings
+map. A different backend does not fill Quail scheduler fields.
 
-Physical planning needs exact document token lengths for work estimates,
-memory checks, retention planning, and balanced GPU partitions. A table schema
-does not contain those lengths.
+A node codec always serializes the complete executable node. `explain()` uses
+a separate method that can omit large fields such as token ids and shard row
+lists.
 
-Document preparation runs after logical optimization and before physical
-planning. For each requested document column, it produces a
-`DocumentManifest` with:
+The built in generic nodes are:
 
-* Provider and content identity.
-* Row identities.
-* Tokenizer identity.
-* Per document token lengths and summary statistics.
-* A `TokenSource` that returns bounded Arrow token batches.
+- `DocumentInput`
+- `Exchange`
+- `HashJoin`
+- `Project`
+- `Limit`
 
-Preparation checks the token cache first. On a cache miss, it reads the
-requested document column once and writes token batches to the cache. Physical
-planning reads the manifest and statistics. Planning rules never read document
-text.
+The Quail backend adds:
 
-The current Arrow dataset and token cache can implement the first version.
-Snowflake and BigQuery providers must be able to use the same interface without
-creating one Python list for every document or reading unused columns.
+- `PackedFilter`
+- `AdaptiveJoinPlan`
+- `AnchoredJoin`
 
-## Planning interfaces
+`AdaptiveJoinPlan` runs after filters. It uses the actual survivors and
+current KV state to choose its next `AnchoredJoin`. It can create
+`AnchoredJoin` and `Exchange` child graphs. Every child uses the same model
+execution object and KV as the completed filters.
 
-Planning has three phases with different jobs.
+There is no barrier node. Dependencies and `Exchange` nodes represent the
+required order and data movement.
 
-### Logical optimizer rules
+The generic runner executes the full graph once. GPU model outputs can be
+supplied as completed node outputs. The same run then executes `HashJoin`,
+`Project`, and `Limit`. Observers see every node once.
 
-A logical optimizer rule receives a logical node and a `PlanningContext`. It
-returns a replacement node or reports no change. The rule runner records which
-rules changed the plan.
+## Model backends
 
-The default rules preserve the current semantics. Filters remain below joins.
+A model backend has four jobs.
 
-### Physical planners
+- Check whether it supports the requested model, device, and GPU count.
+- Propose physical candidates.
+- Create one model execution object per GPU executor.
+- Execute the internal physical request.
 
-A physical planner receives a logical node or connected logical model section,
-already planned inputs, and the `PlanningContext`. It returns zero or more
-`PhysicalCandidate` values.
+The built in `QuailBackend` owns the Quail scheduler, token based admission,
+pipelining, KV rewind, page arena, and retention policy.
 
-Each candidate contains:
+The built in request backends are separate from `QuailBackend`.
 
-* A typed physical graph fragment.
-* Counted work, including fresh tokens, attention pairs, KV reads, and KV
-  writes.
-* Required model, device, memory, and partition properties.
-* Its estimated cost.
-* A reason when the candidate cannot run.
+- `stock_vllm` uses stage major filter requests and anchor major join
+  requests.
+- `pipelined_vllm` uses per document filter pipelining and anchor major join
+  requests.
+- `pipelined_sglang` uses SGLang filter waves and suffix major join requests
+  within bounded anchor groups.
 
-The built in Quail backend plans connected filter and join work because its KV
-decisions can cross logical operator boundaries. Another backend can use a
-different physical plan.
+These backends plan a `RequestExecution` node. The node contains tokenized
+prompt parts and output ports. Each backend owns its model startup, request
+scheduling, KV reset, and metrics.
 
-The `PlanningContext` contains the catalog, document manifests, selected
-backend, `ModelSpec`, `DeviceSpec`, allocated GPU count, chunk limit, order
-rule, and registered extensions. A planner cannot start model execution or
-read document text.
+Another backend can use different physical nodes, scheduling, and KV. It does
+not need to implement Quail's node types.
 
-### Physical optimizer rules
+Physical requests and responses stay inside the compute worker. They use
+`PhysicalRequest` and `PhysicalResponse`. Both contain typed Arrow tables.
+There is one worker entry point for physical execution.
 
-Physical optimizer rules inspect or rewrite the selected physical graph. The
-generic rules perform these tasks:
+## Compute providers
 
-* Insert `Exchange` when location or partitioning changes.
-* Add `HashJoin` nodes that combine answer relations.
-* Add `Project` and `Limit`.
-* Validate that each node can run at its selected location.
-
-The selected model backend owns filter order, join order, anchor choice,
-retention planning, packed filter formation, anchored join formation, candidate
-set pruning, and GPU partition choices for its nodes.
-
-Explain output names the planner or rule that made each choice.
-
-## Physical plan interface
-
-The physical plan is an immutable typed graph. It is a graph because one model
-answer relation can feed candidate set updates and a final hash join.
-
-Each `PhysicalNode` provides:
-
-* A node id and stable type name.
-* Typed input and output ports.
-* Its output schema and partitioning.
-* Its execution location.
-* Its runtime registration key.
-* Its backend name when it is a model node.
-* Resource requirements.
-* A method that returns the same node with replacement inputs.
-* Fields for explain output.
-
-The first version has three execution locations. They are the client, the
-remote coordinator, and a GPU executor. The current Modal provider runs the
-coordinator and GPU executors in one container. A physical node uses one of
-those locations. `Exchange` is required when an input crosses a location or
-changes its partitioning among GPU executors.
-
-The graph validator checks:
-
-* Node ids are unique.
-* Every input refers to an existing output port.
-* Port types and schemas match.
-* The graph has no cycle.
-* Exactly one root output has the query result schema.
-* Every node has a registered runtime and codec at its execution location.
-* All model nodes use one selected model backend in the first version.
-
-## Built in physical nodes
-
-The generic engine provides these nodes:
-
-* `DocumentScan` reads token batches and row identities from a prepared token
-  source.
-* `Exchange` moves data between execution locations or changes its GPU
-  partitioning.
-* `HashJoin` combines Arrow answer relations using exact document ids.
-* `Project` selects the requested output columns.
-* `Limit` stops after the requested number of rows.
-
-The Quail backend provides these nodes:
-
-* `PackedFilter` evaluates one or more model filter predicates on one document
-  input with the Quail scheduler.
-* `AdaptiveJoinPlan` plans and runs the remaining model joins after filter
-  results are available.
-* `AnchoredJoin` evaluates one or more model join predicates that share an
-  anchor. It appears in the executed child plan of `AdaptiveJoinPlan`.
-
-The current records map to the new nodes as follows:
-
-| Current record | New node |
-| --- | --- |
-| `DocScan` | `DocumentScan` |
-| `FilterChain` | `PackedFilter` |
-| `JoinGroup` | `AnchoredJoin` |
-| `Recombine` | One or more `HashJoin` nodes |
-| `Sink` | `Project` and optional `Limit` |
-| `Barrier` | No replacement |
-
-An anchor change is an input dependency or an `Exchange` when data must move.
-The current `Barrier` records do not execute, so the typed graph does not need
-a barrier node.
-
-## Adaptive join planning
-
-`AdaptiveJoinPlan` is present in the selected physical graph before execution.
-It contains:
-
-* The remaining model join predicates.
-* The expected join order and anchors from planning estimates.
-* The registered runtime planning rule.
-* One answer relation output for each full join predicate.
-* One final survivor set output for each document alias.
-
-The logical query fixes the output ports and schemas. Runtime planning can
-change join order, anchor choice, grouping, and GPU partitioning without
-changing the outer graph.
-
-When `AdaptiveJoinPlan` runs, it performs these steps:
-
-1. Read actual survivor counts from completed filters.
-2. Let the backend runtime inspect its own model execution state. The state
-   remains private to that backend.
-3. Select the next `AnchoredJoin` with the backend's runtime planning rule.
-4. Build a typed child graph with the selected `AnchoredJoin` and any required
-   `Exchange`.
-5. Ask the generic runner to execute the child graph with the existing
-   execution context.
-6. Use the same model execution object for every model node in the child graph.
-7. Update candidate document sets.
-8. Repeat until all model join predicates have run.
-9. Return the answer relations, final survivor sets, metrics, and executed child
-   plan.
-
-The query report stores the expected child plan and the executed child plan.
-The executed plan includes each `AnchoredJoin`, anchor choice, input counts,
-output counts, and any `Exchange` used during the operation.
-
-`AdaptiveJoinPlan` does not expose KV to the generic runner. Stock vLLM or
-SGLang can implement the same logical model operations without using
-`AnchoredJoin` or Quail KV.
-
-## Model backend interface
-
-A model backend plans connected model work and creates the shared execution
-object used in each GPU executor. The interface has this shape:
+A compute provider implements:
 
 ```python
-class ModelBackend(Protocol):
-    name: str
-
-    def supports(
-        self,
-        model: ModelSpec,
-        device: DeviceSpec,
-        gpu_count: int,
-    ) -> SupportResult: ...
-
-    def plan(
-        self,
-        region: ModelRegion,
-        context: PlanningContext,
-    ) -> Sequence[PhysicalCandidate]: ...
-
-    def start(self, context: GpuContext) -> ModelExecution: ...
+class ComputeProvider(Protocol):
+    def execute(self, request: QueryRequest) -> QueryResult: ...
+    def close(self) -> None: ...
 ```
 
-`SupportResult` either accepts the configuration or contains a refusal that
-names the unsupported backend, model, device, or GPU count. `GpuContext`
-contains the GPU index, total GPU count, `ModelSpec`, `DeviceSpec`, and the
-query settings shared by model nodes. It represents one GPU executor bound to
-one H100. It does not require a particular process layout and does not
-represent the Modal container.
+`ModalComputeProvider` is the default. It uses one Modal Function for each
+supported GPU count in the existing `quail-engine` app.
 
-The model execution object owns all model runtime state:
+A different compute provider can run the same logical request elsewhere.
+Modal specific function calls are not part of the public query API.
+
+## Table providers
+
+A table provider supplies:
+
+- Its schema and id column.
+- A content identity.
+- Optional statistics.
+- A bounded Arrow batch reader.
+- An optional remote source description.
+
+The built in providers support in memory Arrow tables, Arrow datasets, Parquet,
+and Hugging Face datasets.
+
+A remote Parquet or Hugging Face source is opened by the worker. A client only
+reads enough metadata to check the query. A client-only source sends only the
+columns used by the query.
+
+Remote source readers are registered by source type. Adding a new source does
+not require a change to the worker.
+
+The worker currently keeps the complete token Arrow column while a query runs.
+Very large sources still need query partitioning or a persistent token store.
+This redesign does not claim to solve that limit.
+
+## Extensions
+
+An extension module defines:
 
 ```python
-class ModelExecution(Protocol):
-    def execute(
-        self,
-        node: PhysicalNode,
-        inputs: Mapping[str, RuntimeValue],
-    ) -> NodeResult: ...
+def register_quail_extension(registry):
+    ...
 ```
 
-The built in `QuailBackend` returns Quail physical nodes. Its
-`QuailModelExecution` owns the loaded model, packed forward loop, token based
-admission, KV rewind, page arena, and retention policy.
-
-A stock vLLM backend can return different physical nodes and use vLLM's own
-scheduler and KV. The generic engine does not require a backend to support
-Quail node types.
-
-A pipelined SGLang backend can use SGLang's scheduler and radix cache. The
-current SGLang baseline proves the submission strategy on Qwen3 4B fp8 and one
-H100. A future backend must declare support separately for Qwen3 32B fp8 and
-several GPU executors rather than inheriting that support from the baseline.
-
-The backend interface is approved only after it can describe these cases:
-
-* Quail on Qwen3 4B fp8 and Qwen3 32B fp8.
-* Quail with 1, 2, 4, or 8 model copies in one Modal container.
-* Stock vLLM with its own scheduler and KV.
-* Pipelined SGLang with its own scheduler and radix cache.
-* A Quail configuration with a different retention policy.
-
-An experiment that changes one Quail cache policy can use Quail backend
-configuration or a private Quail component interface. The general engine does
-not promise that every KV component can be replaced independently.
-
-## Runtime interface
-
-Every physical node type has a registered runtime. Ordinary node runtimes use
-this interface:
-
-```python
-class NodeRuntime(Protocol):
-    def execute(
-        self,
-        node: PhysicalNode,
-        inputs: Mapping[str, RuntimeValue],
-        context: ExecutionContext,
-    ) -> NodeResult: ...
-```
-
-The `ExecutionContext` contains the registered runtimes, container and GPU
-executor information, and the selected model execution object. A runtime for
-a model node delegates to that shared model execution object. The context can
-also execute a typed child graph. `AdaptiveJoinPlan` uses that operation after
-it selects the next join step.
-
-The first version does not require every runtime to implement separate
-partition, execute partition, and merge methods. A node declares its input and
-output partitioning. `Exchange` and the model backend perform the required
-partition work.
-
-The generic runner performs these tasks:
-
-* Validate the complete graph before the first model call.
-* Execute a node when all its inputs are ready.
-* Send a remote section to the existing `quail-engine` Modal app.
-* Run one container coordinator and one GPU executor per H100.
-* Resolve each node runtime by its registration key.
-* Keep one active model execution object in each GPU executor.
-* Collect standard metrics from every node.
-* Return the value produced by the root node.
-
-A `NodeResult` contains typed output values and standard metrics. The standard
-metrics include:
-
-* Query time.
-* Input and output rows.
-* Evaluated documents or document pairs.
-* Fresh and cached tokens.
-* KV hits, misses, removals, recomputations, and regret.
-* Peak GPU memory.
-* OOM or another structured error.
-
-Node specific metrics use a field named for the extension. Reports aggregate
-standard fields without checking the concrete node type.
-
-## Session state and registration
-
-Each session owns an `ExtensionRegistry`. Global registration is not allowed
-because tests and concurrent sessions must not change one another.
-
-The registry contains:
-
-* Logical optimizer rules.
-* Physical planners.
-* Physical optimizer rules.
-* Model backends.
-* Physical node codecs.
-* Physical node runtimes.
-* Table provider factories.
-* Python extension package records.
-
-Quail registers its built in implementations when it creates a session. A
-caller can then register another implementation on that session. Duplicate
-names are errors, and registration order is deterministic.
-
-An extension module defines one function named
-`register_quail_extension(registry)`. The caller loads it before creating the
-session:
-
-```python
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.load_extension(
-    "my_package.quail_extension",
-    local_python_sources=("my_package",),
-    pip_packages=("another-dependency==1.2.3",),
-)
-session = quail.Session(registry=registry)
-```
-
-`local_python_sources` names local Python modules or packages that the compute
-provider must copy. `pip_packages` names packages that the compute provider
-must install. An installed extension can omit `local_python_sources` and list
-its package in `pip_packages`.
-
-The plan envelope contains the extension module names. The remote process
-imports those modules and rebuilds the registry before it decodes the physical
-graph. Modal adds the local sources and pip packages to the existing
-`quail-engine` image. Every child GPU process inherits that environment.
-
-The registry does not call Modal. It only records the code needed by a remote
-process. `ModalComputeProvider` handles Modal image construction and function
-calls. A caller can pass another object that implements `ComputeProvider` to
-`Session(compute=...)`.
-
-A model backend owns three process boundary methods. `prepare` builds the
-request on the client. `execute_remote` runs it in the compute process.
-`assemble` builds the public result on the client. Quail implements these
-methods through its current token payload, scheduler, and Arrow result path.
-Another backend can use different request data and remote execution code.
-
-## Plan encoding
-
-The client and Modal container coordinator exchange serialized values with the
-GPU executors. The physical plan therefore needs an explicit wire format.
-
-Use one versioned JSON plan envelope and Arrow IPC for document data and result
-relations. Do not use Python pickle.
-
-The JSON envelope contains:
-
-* The plan format version.
-* Model and device settings.
-* The typed physical graph.
-* The selected model backend name.
-* The physical node type names required by the graph.
-* The extension modules required to rebuild the remote registry.
-* The expected child plan inside each `AdaptiveJoinPlan`.
-
-Each physical node type registers an encoder and decoder under a stable type
-name such as `quail.packed_filter.v1`. The container coordinator checks that it
-knows every required type before it starts the GPU executors. Each GPU executor
-checks the model node types it receives before the first model call.
-
-The first version does not download extensions or negotiate package versions.
-An unknown plan version, backend, node type, or codec produces a clear error
-before execution.
-
-## Table provider interface
-
-Replace the `DocumentProvider.kind` switch with a `TableProvider` interface:
-
-```python
-class TableProvider(Protocol):
-    def schema(self) -> Schema: ...
-
-    def content_identity(self) -> str: ...
-
-    def statistics(self) -> TableStatistics: ...
-
-    def scan(self, request: ScanRequest) -> RecordBatchReader: ...
-```
-
-`ScanRequest` contains the required columns, supported ordinary filters, and an
-optional limit. A provider reads data only when `scan` runs. Schema and planning
-must not load a full table.
-
-The built in Arrow dataset, Parquet, and Hugging Face providers implement the
-same interface. A future Snowflake or BigQuery provider can return Arrow batches
-from its native client and apply column or limit pushdown.
-
-Model filters still run in Quail unless a provider explicitly declares an
-equivalent supported operation. Provider filter pushdown is not required in
-the first version.
-
-## Implementation sequence
-
-The numbered sections are implementation stages in one PR. Each stage should
-leave the CPU tests passing. The final PR should contain the complete change,
-the compatibility removal, the Modal checks, and the documentation.
-
-### 1. Preserve current behavior
-
-Add tests for the current logical plans, physical plans, payloads, result
-schemas, and reports.
-
-The tests must cover:
-
-* One filter.
-* Several filters on one document input.
-* One full join.
-* Exists and anti joins.
-* Several joins that change anchors.
-* Qwen3 4B fp8 and Qwen3 32B fp8 planning.
-* GPU counts 1, 2, 4, and 8.
-* OOM results.
-
-Record planned order, anchors, retention choices, fresh tokens, cached tokens,
-KV regret, and result schemas. No production behavior changes in this stage.
-
-### 2. Add the core interfaces
-
-Add `LogicalNode`, `PhysicalNode`, `PhysicalGraph`, `PhysicalCandidate`,
-`PlanningContext`, `ModelBackend`, `ModelExecution`, `NodeRuntime`, and
-`ExtensionRegistry`.
-
-Add generic graph validation, traversal, rewriting, and explain output. Register
-the built in names, but keep current execution unchanged.
-
-This stage is complete when a unit test can define and traverse a custom physical
-node without changing generic graph code.
-
-### 3. Add typed physical nodes
-
-Convert `plan_query` to return typed built in nodes.
-
-Perform these replacements:
-
-* `DocScan` becomes `DocumentScan`.
-* `FilterChain` becomes `PackedFilter`.
-* Expected `JoinGroup` records become the expected child plan of
-  `AdaptiveJoinPlan`.
-* `Recombine` becomes explicit `HashJoin` nodes.
-* `Sink` becomes `Project` and optional `Limit`.
-* `Barrier` is deleted.
-
-Add JSON codecs and round trip tests for every node. Keep execution running
-through a temporary adapter that produces the current dictionary payload sent
-to the Modal functions.
-
-This stage is complete when all planners, tests, benchmarks, and explain code read
-typed nodes instead of operation strings.
-
-### 4. Add the Quail model backend
-
-Implement `QuailBackend.plan` by wrapping the current physical planning logic.
-Implement `QuailModelExecution` by wrapping the current model, scheduler, and
-KV state.
-
-Create one active `QuailModelExecution` in each Quail GPU executor. Quail
-implements each executor as one child process. A warm executor can reuse its
-loaded model between queries, but it resets query KV state before each query.
-Make `PackedFilter` use that object without changing the packed forward loop,
-token based admission, KV rewind, or retention behavior.
-
-This stage is complete when the existing GPU executor path runs through the backend
-and all measured work counts remain unchanged.
-
-### 5. Add the generic query runner
-
-Add the runtime registry, typed runtime values, `ExecutionContext`,
-`NodeResult`, and generic ready node scheduling.
-
-Implement runtimes for `DocumentScan`, `Exchange`, `HashJoin`, `Project`, and
-`Limit`. Make model node runtimes delegate to the shared model execution
-object.
-
-Keep the current Modal app names and the current one container layout for 1, 2,
-4, or 8 GPUs. Keep one parent coordinator and one GPU executor per H100. The
-Quail backend continues to use one child process for each executor. Remove the
-session switches that build and assemble separate filter and join payloads
-after the generic runner handles those paths.
-
-### 6. Move runtime join planning into `AdaptiveJoinPlan`
-
-Move the current survivor based join search behind the registered runtime
-planning rule. Represent every selected step as a typed `AnchoredJoin` in the
-executed child plan.
-
-Use the same model execution object before and after every anchor change. Remove
-the current barrier records, `runtime_nodes`, `derive_plan_nodes`, and the
-duplicated join control loops for one GPU and several GPUs.
-
-This stage is complete when reports contain both the expected and executed child
-plans and all join answers remain unchanged.
-
-### 7. Make logical planning extensible
-
-Replace the `Operator` union with the `LogicalNode` interface. Add the generic
-logical plan walk and rule runner.
-
-Move the SQL and builder front ends to one `LogicalPlanBuilder`. Delete
-`QueryDesc`, `assemble_plan`, and fixed logical type switches after all callers
-use the new path.
-
-Register the built in logical nodes and planning rules through the session
-registry.
-
-### 8. Add table providers
-
-Replace `DocumentProvider.kind` with `TableProvider`. Convert the Arrow dataset,
-Parquet, and Hugging Face providers.
-
-Make document preparation request only required columns and consume bounded
-Arrow batches. Add a memory provider for unit tests.
-
-This stage is complete when the session and planner have no source kind checks.
-
-### 9. Remove adapters and prove extension support
-
-Delete the temporary payload adapter and all dictionary physical plan support.
-Delete parallel `filters`, `joins`, and `plan_nodes` payload fields.
-
-Add a test extension that supplies:
-
-* A physical planner for the existing `SemanticFilter` logical node.
-* A custom physical filter node.
-* A CPU runtime that returns fixed filter answers.
-* A table provider.
-
-The test must plan and run without changing built in node lists or generic
-dispatch code. Add a failure test that omits a physical node runtime needed in
-the GPU executor. Quail must report the missing runtime before it calls Modal.
-
-## Validation
-
-Run the full CPU test suite after every stage. Add round trip tests for every plan
-codec and graph rewrite tests for shared inputs and port validation.
-
-Add CPU planning tests for both registered models at GPU counts 1, 2, 4, and 8.
-The tests must check the number of GPU executors, one model copy per GPU,
-partition properties, and GPU cost inputs. Unsupported GPU counts and backend
-capabilities must return refusals before a Modal call.
-
-Add one small Modal smoke cell on the existing `quail-milestone1` app. Run a
-planted query with Qwen3 4B fp8 on two H100s in one container and Qwen3 32B fp8
-on one H100. The cell confirms process placement and answer equality. It is not
-a performance sweep.
-
-The implementation PR needs one confirming Modal cell on the existing
-`quail-milestone1` app. Run BIO-2 and AGENT-1 in the same cell. BIO-2 covers the
-join path where Quail performs well. AGENT-1 covers Quail's current worst case,
-where stock vLLM and pipelined vLLM reuse common prefixes across different
-trace rows and Quail does not.
-
-State this prediction before the run:
-
-* Answers, plan choices, evaluated documents or document pairs, fresh tokens,
-  cached tokens, KV hits, KV misses, and KV regret will match current main.
-* Query time, throughput, and GPU cost will remain within 5 percent of current
-  main. A larger change means execution changed and must be investigated before
-  merge.
-
-Tee the Modal output to a file and keep the function call id in that file. Store
-the result under `/results/ablations/` on the `quail-results` volume. Add the
-required report and plot when a PR includes the confirming experiment.
-
-## Documentation and removal work
-
-Update `reports/engine-wiki.md` as the implementation changes the current
-engine. Add a file under `reports/shipped_features/` for the merged feature.
-
-Delete these current structures when their replacements are complete:
-
-* The `Operator` union.
-* `QueryDesc` and `assemble_plan`.
-* Dictionary physical nodes and operation string checks.
-* Parallel `filters`, `joins`, and `plan_nodes` payloads.
-* `Barrier` plan records.
-* `runtime_nodes` and `derive_plan_nodes`.
-* Session result assembly by operation type.
-* `DocumentProvider.kind`.
-* Separate join control loops for one GPU and several GPUs.
-
-Temporary adapters must be named as temporary, tested, and deleted before the
-PR is ready to merge.
-
-## Work outside this plan
-
-The redesign does not include:
-
-* New query operations or new SQL syntax.
-* A public KV component interface.
-* Changes to the KV retention algorithm.
-* Changes to model kernels or attention implementations.
-* Mixing model backends inside one query.
-* Splitting one model copy across several GPUs.
-* Using more than eight GPUs or more than one Modal container for one query.
-* A replacement for Arrow result processing.
+It can register:
+
+- Logical optimizer rules.
+- Physical planners and optimizer rules.
+- Model backends, models, and devices.
+- Physical node codecs and runtimes.
+- Remote source readers.
+- Execution observers.
+
+The client records the extension module and its packages. The Modal provider
+copies or installs them in the existing worker image. The worker imports the
+same module before planning the logical plan or decoding the physical plan.
+
+The plan and request do not have several independent format version globals.
+Registered physical node names identify codecs. Missing codecs, backends,
+models, devices, or runtimes fail before model execution.
+
+## DataFusion use
+
+DataFusion can keep its scans, ordinary joins, and final projection. A custom
+DataFusion operator can submit the Arrow columns needed by a Quail logical
+query through a compute provider.
+
+The current Modal provider is a Python interface. A public Rust client would
+need a separate cross-language interface.
+
+## Checks
+
+The CPU suite covers:
+
+- Physical codec round trips.
+- Registered physical nodes, rules, and source readers.
+- Custom backend dispatch.
+- Full physical graph execution.
+- Observer reports over the complete graph.
+- Local and remote table sources.
+- Modal Function request preparation and Arrow results.
+- Snowflake and BigQuery SQL forms.
+- Planning for both models and 1, 2, 4, and 8 GPUs.
+
+A Modal check completed two sequential filter and join queries through one
+Modal Function session in the existing `quail-engine` app. A second check
+opened a Hugging Face source inside Modal. No new Modal app was created.

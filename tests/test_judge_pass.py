@@ -42,9 +42,6 @@ def test_stable_ids_cover_predicate_semantics_and_inputs():
     assert len(PREDICATES) == 21
     assert len({spec.key for spec in PREDICATES}) == len(PREDICATES)
     original = PREDICATES[0]
-    renamed = replace(original, legacy_code="ANOTHER_F1")
-    assert renamed.key == original.key
-    assert predicate_version(renamed) == predicate_version(original)
 
     join_spec = _spec("quailb.biodex.report.experienced_reaction")
     assert (predicate_payload(join_spec)["render"]

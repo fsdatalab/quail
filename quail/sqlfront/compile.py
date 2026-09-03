@@ -1,4 +1,6 @@
-"""AI SQL front end: parse Snowflake-dialect SQL into a LogicalPlan."""
+"""Parse supported Snowflake and BigQuery AI SQL into a LogicalPlan."""
+
+from enum import StrEnum
 
 import sqlglot
 from sqlglot import exp
@@ -26,6 +28,31 @@ FORBIDDEN = (
 # one option surface: anchor is rejected after parsing when the
 # predicate turns out to be a one-provider filter
 JOIN_OPTION_KEYS = {"selectivity", "anchor"}
+
+
+class SQLDialect(StrEnum):
+    """SQL dialects accepted by the Quail front end."""
+
+    SNOWFLAKE = "snowflake"
+    BQ = "bq"
+
+
+def _normalize_ai_if(sql: str, dialect: SQLDialect) -> str:
+    """Lower BigQuery AI.IF calls to the internal function name."""
+    if dialect is not SQLDialect.BQ:
+        return sql
+    tokens = sqlglot.Dialect.get_or_raise(
+        "bigquery"
+    ).tokenizer().tokenize(sql)
+    edits = []
+    for index in range(len(tokens) - 3):
+        head, dot, name, left = tokens[index:index + 4]
+        if (head.text.upper() == "AI" and dot.text == "."
+                and name.text.upper() == "IF" and left.text == "("):
+            edits.append((head.start, left.end + 1, "AI_FILTER("))
+    for start, end, replacement in reversed(edits):
+        sql = sql[:start] + replacement + sql[end:]
+    return sql
 
 
 def _is_call(node, name: str) -> bool:
@@ -185,8 +212,7 @@ class _Binder:
 
 
 def _from_clause(select):
-    # sqlglot renamed the arg key "from" to "from_" across versions
-    return select.args.get("from_") or select.args.get("from")
+    return select.args.get("from_")
 
 
 def _where_terms(where) -> list:
@@ -219,10 +245,23 @@ def _parse_limit(tree) -> int | None:
 
 
 def compile_sql(sql: str, catalog: Catalog,
-                tokenizer=None) -> LogicalPlan:
+                tokenizer=None,
+                dialect: SQLDialect | str = SQLDialect.SNOWFLAKE,
+                ) -> LogicalPlan:
     """Compile AI SQL text into a LogicalPlan."""
     try:
-        tree = sqlglot.parse_one(sql, dialect="snowflake")
+        dialect = SQLDialect(dialect)
+    except ValueError as error:
+        raise ValueError(
+            f"unsupported SQL dialect {dialect!r}; expected snowflake "
+            "or bq"
+        ) from error
+    sql = _normalize_ai_if(sql, dialect)
+    sqlglot_dialect = (
+        "bigquery" if dialect is SQLDialect.BQ else "snowflake"
+    )
+    try:
+        tree = sqlglot.parse_one(sql, dialect=sqlglot_dialect)
     except sqlglot.errors.ParseError as e:
         raise CompileError(f"parse error: {e}") from e
     if not isinstance(tree, exp.Select):

@@ -1,15 +1,17 @@
 """Physical planning and runtime extension test."""
 
+import copy
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import pyarrow as pa
+import pytest
 
 import quail
 from quail.catalog import DocumentProvider
 from quail.extensions import built_in_registry
 from quail.physical import (
-    DocumentScan,
+    DocumentInput,
     ExecutionLocation,
     InputPort,
     NodeCodec,
@@ -33,7 +35,7 @@ class FirstDocuments(PhysicalNode):
     alias: str = ""
     count: int = 1
 
-    type_name: ClassVar[str] = "test.first_documents.v1"
+    type_name: ClassVar[str] = "test.first_documents"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.CLIENT
 
@@ -45,7 +47,7 @@ class FirstDocuments(PhysicalNode):
             schema=(self.alias,),
         ),)
 
-    def attributes(self, *, include_runtime_data=True):
+    def attributes(self):
         return {"alias": self.alias, "count": self.count}
 
     @classmethod
@@ -65,11 +67,10 @@ class FirstDocumentsRuntime:
 
 
 def local_plan(context, *, count, estimate, source):
-    scan = DocumentScan(
-        node_id="scan:d",
+    scan = DocumentInput(
+        node_id="input:d",
         alias="d",
-        provider="docs",
-        column="body",
+        input_id="d",
         n_docs=len(context.document_tokens["d"]),
     )
     filtered = FirstDocuments(
@@ -77,7 +78,7 @@ def local_plan(context, *, count, estimate, source):
         inputs=(InputPort(
             "input:0",
             ValueType.DOCUMENT_IDS,
-            PortRef("scan:d", "ids:d"),
+            PortRef("input:d", "ids:d"),
             schema=("d",),
         ),),
         alias="d",
@@ -97,15 +98,10 @@ def local_plan(context, *, count, estimate, source):
         model=context.model.name,
         device=context.device.name,
         workers=context.gpu_count,
-        tensor_parallel=1,
-        kv_dtype="bf16",
-        chunk_tokens=1,
-        admission_tokens=1,
-        order_rule="as_written",
-        order_source=source,
         backend="local_filter",
         estimated_seconds=estimate,
         nodes=(scan, filtered, project),
+        settings={"planner_source": source},
     )
     return PhysicalCandidate(plan.graph, plan, estimate)
 
@@ -159,7 +155,7 @@ class KeepFirstDocument:
         )
 
 
-def test_session_runs_registered_physical_extensions_locally():
+def test_session_plans_registered_physical_extensions():
     registry = quail.ExtensionRegistry.with_built_ins()
     backend = LocalFilterBackend()
     planner = PreferredPlanner()
@@ -188,27 +184,72 @@ def test_session_runs_registered_physical_extensions_locally():
     )
 
     plan = query.plan()
-    result = query.run()
     envelope = plan.to_envelope(registry.codecs)
 
     assert backend.called
     assert planner.called
-    assert plan.order_source == "preferred planner"
+    assert plan.settings["planner_source"] == "preferred planner"
     assert "physical rule keep_first_document" in plan.remarks[0]
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
-    assert result.to_rows() == [("a",)]
-    assert list(result.report["nodes"]) == [
-        "scan:d", "filter:d", "project"
-    ]
+
+
+def test_session_resolves_registered_model_for_custom_backend():
+    from dataclasses import replace
+
+    from quail.specs import MODELS
+
+    registry = quail.ExtensionRegistry.with_built_ins()
+    model = replace(
+        MODELS["qwen3-4b-fp8"],
+        name="example-qwen3-4b-fp8",
+    )
+    registry.register_model(model)
+    registry.register_backend(LocalFilterBackend())
+
+    session = quail.Session(
+        EngineConfig(
+            model=model.name,
+            backend="local_filter",
+        ),
+        tokenizer=str.split,
+        registry=registry,
+    )
+
+    assert session.model is model
+
+
+def test_physical_codec_rejects_changed_shapes():
+    registry = built_in_registry()
+    scan = DocumentInput(
+        node_id="input:d",
+        alias="d",
+        input_id="d",
+        n_docs=1,
+        shard_ranges=((0, 1),),
+        shard_token_loads=(1,),
+    )
+    plan = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
+    from quail.physical import encode_graph
+
+    encoded = encode_graph(plan, registry.codecs)
+    missing = copy.deepcopy(encoded)
+    del missing["nodes"][0]["attributes"]["shard_ranges"]
+    with pytest.raises(ValueError, match="missing fields"):
+        decode_graph(missing, registry.codecs)
+
+    extra = copy.deepcopy(encoded)
+    extra["nodes"][0]["unused"] = True
+    with pytest.raises(ValueError, match="unknown fields"):
+        decode_graph(extra, registry.codecs)
 
 
 def test_extension_module_rebuilds_the_remote_plan_registry():
     from quail.extensions import registry_from_modules
-    from quail.runtime.quail_graph import model_subgraph
+    from quail.runtime.runner import ExecutionContext, GenericRunner
 
     registry = built_in_registry()
     registry.load_extension(
-        "quail_ext_examples.count_documents",
+        "quail_ext_examples.plan_trace",
         local_python_sources=("quail_ext_examples",),
     )
     session = quail.Session(tokenizer=str.split, registry=registry)
@@ -234,11 +275,26 @@ def test_extension_module_rebuilds_the_remote_plan_registry():
         "quail_ext_examples",
     )
     assert envelope["extension_modules"] == [
-        "quail_ext_examples.count_documents"
+        "quail_ext_examples.plan_trace"
     ]
-    assert "example.count_documents.v1" in remote_registry.runtimes
-    assert any(node.type_name == "example.count_documents.v1"
-               for node in model_subgraph(remote_graph).nodes)
+    assert "example.plan_trace" in remote_registry.observer_factories
+    observers = remote_registry.new_observers()
+    input_node = next(
+        node for node in remote_graph.nodes
+        if isinstance(node, DocumentInput)
+    )
+    input_graph = PhysicalGraph(
+        (input_node,), PortRef(input_node.node_id, f"ids:{input_node.alias}")
+    )
+    GenericRunner().run(
+        input_graph,
+        ExecutionContext(
+            runtimes=remote_registry.runtimes,
+            sources={input_node.input_id: [0, 1]},
+            observers=observers,
+        ),
+    )
+    assert observers[0].report()["nodes"][0]["node_id"] == input_node.node_id
 
 
 def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
@@ -246,16 +302,18 @@ def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
     import types
 
     from quail.physical import plan_envelope
-    from quail.runtime.worker import _execute_payload
+    from quail.runtime.worker import _execute_physical
 
     class RemoteBackend:
         name = "test.remote"
 
-        def execute_remote(self, context):
-            return {
+        def execute_request(self, context):
+            from quail.execution import PhysicalResponse
+
+            return PhysicalResponse({}, {
                 "backend": self.name,
                 "nodes": [node.node_id for node in context.graph.nodes],
-            }
+            })
 
     module_name = "test_remote_quail_extension"
     module = types.ModuleType(module_name)
@@ -266,16 +324,20 @@ def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
     module.register_quail_extension = register
     monkeypatch.setitem(sys.modules, module_name, module)
     registry = built_in_registry()
-    scan = DocumentScan(
-        node_id="scan:d",
+    scan = DocumentInput(
+        node_id="input:d",
         alias="d",
-        provider="docs",
-        column="body",
+        input_id="d",
         n_docs=2,
     )
-    graph = PhysicalGraph((scan,), PortRef("scan:d", "ids:d"))
-    payload = {
-        "physical_plan": plan_envelope(
+    graph = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
+    from quail.execution import (
+        PhysicalRequest,
+        document_input,
+    )
+
+    request = PhysicalRequest(
+        plan_envelope(
             backend=RemoteBackend.name,
             model="qwen3-4b-fp8",
             device="h100-sxm",
@@ -283,10 +345,12 @@ def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
             graph=graph,
             codecs=registry.codecs,
             extension_modules=(module_name,),
-        )
-    }
+        ),
+        {"d": document_input(pa.array([[1], [2]]))},
+    )
+    response = _execute_physical(request)
 
-    assert _execute_payload(payload) == {
+    assert response.metrics == {
         "backend": "test.remote",
-        "nodes": ["scan:d"],
+        "nodes": ["input:d"],
     }

@@ -170,7 +170,6 @@ class KVArena:
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU
         self._capacity_rows = {}  # key -> every row in the claimed pages
-        self._rows_dev = {}   # key -> device copy, built on first use
         self.device = device
         self.reset_stats()
 
@@ -202,7 +201,6 @@ class KVArena:
             dtype=self.torch.int64)
         self._capacity_rows[key] = cap
         self._rows[key] = cap[:logical]
-        self._rows_dev.pop(key, None)
 
     def pin(self, key):
         self.accounting.pin(key)
@@ -273,16 +271,7 @@ class KVArena:
     def free_key(self, key):
         self._rows.pop(key)
         self._capacity_rows.pop(key)
-        self._rows_dev.pop(key, None)
         return self.accounting.free_key(key)
-
-    def rows_gpu(self, key):
-        """The document's row indices on device, cached per residency."""
-        r = self._rows_dev.get(key)
-        if r is None:
-            r = self._rows[key].to(self.device)
-            self._rows_dev[key] = r
-        return r
 
     def paged_kv(self, layer: int):
         """The pools viewed as (n_pages, page_tokens, n_kv, d_head)

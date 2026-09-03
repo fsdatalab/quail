@@ -27,51 +27,19 @@ class GpuContext:
 
 
 @dataclass(frozen=True)
-class QueryPreparationContext:
-    """Client values available while a backend builds its request."""
+class BackendExecutionContext:
+    """Values available to a backend inside a compute process."""
 
-    query: Any
-    plan: Any
-    scans: Sequence[Any]
-    filters: Mapping[str, Any]
-    joins: Sequence[Any]
-
-    def plan_envelope(self, *, include_runtime_data: bool = True) -> dict:
-        """Encode the plan with every required extension module."""
-        registry = self.query.session.registry
-        return self.plan.to_envelope(
-            registry.codecs,
-            extension_modules=registry.extension_modules,
-            include_runtime_data=include_runtime_data,
-        )
-
-
-@dataclass(frozen=True)
-class RemoteExecutionContext:
-    """Values available to a backend inside the compute process."""
-
-    payload: Mapping[str, Any]
+    request: Any
     graph: Any
     registry: Any
     gpu_count: int
-    quail_driver: Callable[[], Mapping[str, Any]]
+    graph_executor: Callable[[], Any]
+    runtime_state: dict[Any, Any]
 
-    def run_quail(self) -> Mapping[str, Any]:
-        """Run the built in Quail execution path."""
-        return self.quail_driver()
-
-
-@dataclass(frozen=True)
-class ResultAssemblyContext:
-    """Client values available while a backend builds a query result."""
-
-    query: Any
-    plan: Any
-    scans: Sequence[Any]
-    filters: Mapping[str, Any]
-    joins: Sequence[Any]
-    output: Mapping[str, Any]
-    coordinator_wall_s: float
+    def execute_graph(self) -> Any:
+        """Execute the physical graph in this compute process."""
+        return self.graph_executor()
 
 
 class ModelExecution(Protocol):
@@ -104,17 +72,9 @@ class ModelBackend(Protocol):
 
     def start(self, context: GpuContext) -> ModelExecution: ...
 
-    def prepare(self, context: QueryPreparationContext) -> Mapping[str, Any]:
-        """Build the request sent through the compute provider."""
-        ...
-
-    def execute_remote(
+    def execute_request(
         self,
-        context: RemoteExecutionContext,
-    ) -> Mapping[str, Any]:
-        """Execute one prepared request inside the compute process."""
-        ...
-
-    def assemble(self, context: ResultAssemblyContext) -> Any:
-        """Build the public query result from the remote output."""
+        context: BackendExecutionContext,
+    ) -> Any:
+        """Execute one request inside a compute process."""
         ...

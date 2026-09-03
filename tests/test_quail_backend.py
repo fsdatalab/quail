@@ -3,11 +3,12 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+from quail.backends.quail import QuailModelExecution
 from quail.extensions import built_in_registry
 from quail.physical import (
     AdaptiveJoinPlan,
     AnchoredJoin,
-    DocumentScan,
+    DocumentInput,
     FilterStage,
     PackedFilter,
     PhysicalGraph,
@@ -87,17 +88,18 @@ def test_adaptive_join_executes_typed_child_graph(monkeypatch):
             "seq": [(0, "r")], "states": 1, "generated": 1
         },
     )
-    scan_r = DocumentScan(
-        node_id="scan:r", alias="r", provider="reviews", column="body"
+    scan_r = DocumentInput(
+        node_id="input:r", alias="r", input_id="r"
     )
-    scan_p = DocumentScan(
-        node_id="scan:p", alias="p", provider="products", column="body"
+    scan_p = DocumentInput(
+        node_id="input:p", alias="p", input_id="p"
     )
     adaptive = AdaptiveJoinPlan(
         node_id="adaptive",
-        inputs=input_ports((("scan:r", "ids:r"),
-                            ("scan:p", "ids:p"))),
+        inputs=input_ports((PortRef("input:r", "ids:r"),
+                            PortRef("input:p", "ids:p"))),
         aliases=("r", "p"),
+        join_positions=(0,),
         full_join_positions=(0,),
         join_specs=({
             "written_pos": 0,
@@ -123,10 +125,15 @@ def test_adaptive_join_executes_typed_child_graph(monkeypatch):
             return NodeResult(
                 {
                     "ids:r": [0, 1],
-                    "pairs:0": {
+                    "join_answers:0": {
                         "rows": answers[0],
                         "anchor_index": [0, 1],
                         "partner_index": [[0], [1]],
+                        "anchor": "r",
+                        "partners": ["p"],
+                        "semantics": "full",
+                        "selectivity": 0.5,
+                        "written_pos": 0,
                     },
                 },
                 NodeMetrics(
@@ -140,7 +147,7 @@ def test_adaptive_join_executes_typed_child_graph(monkeypatch):
             FixedJoinExecution(),
             {"r": [[1], [2]], "p": [[3], [4]]},
         ),
-        {"joins": [{}], "limit": None, "pre_ids": [],
+        {"joins": [{}], "filter_limit": None, "pre_ids": [],
          "order_rule": "by_cost"},
         graph,
     )
@@ -154,12 +161,11 @@ def test_adaptive_join_executes_typed_child_graph(monkeypatch):
 def distributed_payload(docs, joins=None):
     return {
         "model": "qwen3-4b-fp8",
-        "kv_dtype": "bf16",
         "chunk_tokens": 8192,
         "true_ids": [1],
         "false_ids": [2],
         "pre_ids": [],
-        "limit": None,
+        "filter_limit": None,
         "order_rule": "by_cost",
         "docs": docs,
         "joins": joins or [],
@@ -191,12 +197,12 @@ def attach_plan(payload, graph):
 
 
 def test_distributed_filter_executes_typed_node():
-    scan = DocumentScan(
-        node_id="scan:d", alias="d", provider="docs", column="body"
+    scan = DocumentInput(
+        node_id="input:d", alias="d", input_id="d"
     )
     filtered = PackedFilter(
         node_id="filter:d",
-        inputs=input_ports((("scan:d", "ids:d"),)),
+        inputs=input_ports((PortRef("input:d", "ids:d"),)),
         alias="d",
         stages=(FilterStage(0, 1, 1, None, 4),),
         question_token_ids=((9,),),
@@ -243,3 +249,38 @@ def test_distributed_filter_executes_typed_node():
         0: [True], 1: [False], 2: [True], 3: [False]
     }
     assert result["fresh_tokens"] == 4
+
+
+def test_filter_without_retention_passes_an_empty_selection(monkeypatch):
+    received = {}
+
+    def fake_run_filter(*args, retain_survivors, **kwargs):
+        received["retain_survivors"] = retain_survivors
+        return {0: [True]}, [], 3
+
+    monkeypatch.setattr("quail.executor.loop.run_filter", fake_run_filter)
+    execution = QuailModelExecution(SimpleNamespace())
+    execution.bind_loaded_model(
+        model=object(), arena=FakeArena(), pipeline=SimpleNamespace()
+    )
+    execution.bind_query(
+        torch=fake_torch(), async_answers=object(), chunk_tokens=8192
+    )
+    node = PackedFilter(
+        node_id="filter:d",
+        alias="d",
+        stages=(FilterStage(0, 1, 1, None, 4),),
+        question_token_ids=((9,),),
+    )
+
+    result = execution.execute(
+        node,
+        {
+            "documents": [[1]],
+            "document_ids": [10],
+            "retain_survivors": False,
+        },
+    )
+
+    assert received["retain_survivors"] == ()
+    assert result.outputs["ids:d"] == [10]

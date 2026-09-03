@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from quail.physical import PhysicalGraph
 from quail.specs import DeviceSpec, ModelSpec
@@ -42,6 +42,7 @@ class PlanningContext:
     document_tokens: Mapping[str, Any]
     backend: str
     order: str | None = None
+    tokenizer: Callable[[str], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -51,8 +52,6 @@ class PhysicalCandidate:
     graph: PhysicalGraph | None
     plan: Any
     estimated_seconds: float
-    counted_work: Any = None
-    reason: str | None = None
 
 
 class PhysicalOptimizerRule(Protocol):

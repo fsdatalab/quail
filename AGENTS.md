@@ -58,10 +58,12 @@ change needs one of them, say so instead of quietly adding it back.
  the app. New GPU cells attach to an existing app
  ("quail-milestone1" for cells, "quail-engine" for the worker).
 - Tee every Modal run to a file. The CLI drops old log lines.
-- Do not write Modal return values to local JSON files. Print the
-  function call id (the `fc-...` Modal assigns to one invocation)
-  and keep that id in the tee file. When you need the result, pull
-  it with `modal.FunctionCall.from_id("<id>").get()`.
+- Do not write Modal return values to local JSON files. For a Modal
+  Function, print the function call id (the `fc-...` Modal assigns to
+  one invocation) and keep that id in the tee file. When you need the
+  result, pull it with `modal.FunctionCall.from_id("<id>").get()`.
+  An Arrow Flight server request has no Modal function call id. Print
+  the Flight query id and the result volume path instead.
 - Experiment data lives on the `quail-results` Modal volume, summaries
   as well as per-item records. Do not commit it. Reports cite it by
   volume path: `/results/ablations/<file>.json`.

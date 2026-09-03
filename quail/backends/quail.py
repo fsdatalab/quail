@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from quail.backends.base import GpuContext
-from quail.physical import AnchoredJoin, PackedFilter, PhysicalNode
+from quail.logical import SHARED_PRE
+from quail.physical import (
+    AdaptiveJoinPlan,
+    AnchoredJoin,
+    PackedFilter,
+    PhysicalNode,
+)
 from quail.planning import (
     ModelRegion,
     PhysicalCandidate,
@@ -18,13 +25,8 @@ from quail.planning import (
 class QuailModelExecution:
     """Quail model state shared by model nodes on one GPU executor."""
 
-    def __init__(
-        self,
-        context: GpuContext,
-        dispatch: Callable[[PhysicalNode, Mapping[str, Any]], Any] | None = None,
-    ):
+    def __init__(self, context: GpuContext):
         self.context = context
-        self._dispatch = dispatch
         self._state: dict[str, Any] = {}
 
     @property
@@ -44,13 +46,6 @@ class QuailModelExecution:
             chunk_tokens=chunk_tokens,
         )
 
-    def set_dispatch(
-        self,
-        dispatch: Callable[[PhysicalNode, Mapping[str, Any]], Any],
-    ) -> None:
-        """Set the typed node dispatcher after the GPU loop starts."""
-        self._dispatch = dispatch
-
     def execute(
         self,
         node: PhysicalNode,
@@ -59,9 +54,7 @@ class QuailModelExecution:
         if not isinstance(node, (PackedFilter, AnchoredJoin)):
             raise TypeError(
                 f"Quail cannot execute physical node {node.type_name!r}")
-        if self._dispatch is None:
-            return self._execute_quail_node(node, inputs)
-        return self._dispatch(node, inputs)
+        return self._execute_quail_node(node, inputs)
 
     def _execute_quail_node(
         self,
@@ -85,7 +78,12 @@ class QuailModelExecution:
         chunk_tokens = self._state["chunk_tokens"]
 
         if isinstance(node, PackedFilter):
-            document_ids = list(inputs["document_ids"])
+            from quail.runtime.tokens import DocumentKeys
+
+            document_ids = inputs["document_ids"]
+            retain_survivors = inputs.get("retain_survivors", ())
+            if retain_survivors is False:
+                retain_survivors = ()
             answers, _, tokens = run_filter(
                 torch,
                 arena,
@@ -96,9 +94,8 @@ class QuailModelExecution:
                 chunk_tokens,
                 limit=inputs.get("limit"),
                 arena_writes=node.arena_writes,
-                arena_keys=[(node.alias, document)
-                            for document in document_ids],
-                retain_survivors=inputs.get("retain_survivors", ()),
+                arena_keys=DocumentKeys(node.alias, document_ids),
+                retain_survivors=retain_survivors,
             )
             global_answers = {
                 document_ids[int(local)]: row
@@ -149,19 +146,18 @@ class QuailModelExecution:
                          if document in matched]
         outputs = {f"ids:{node.anchor}": survivors}
         for stage, stage_answers in zip(node.stages, answers):
-            if stage.semantics == "full":
-                outputs[f"pairs:{stage.written_pos}"] = {
-                    "rows": stage_answers,
-                    "anchor_index": anchor_ids,
-                    "partner_index": inputs["partner_indices"][
-                        stage.written_pos
-                    ],
-                    "anchor": node.anchor,
-                    "partners": list(stage.partners),
-                    "semantics": stage.semantics,
-                    "selectivity": stage.selectivity,
-                    "written_pos": stage.written_pos,
-                }
+            outputs[f"join_answers:{stage.written_pos}"] = {
+                "rows": stage_answers,
+                "anchor_index": anchor_ids,
+                "partner_index": inputs["partner_indices"][
+                    stage.written_pos
+                ],
+                "anchor": node.anchor,
+                "partners": list(stage.partners),
+                "semantics": stage.semantics,
+                "selectivity": stage.selectivity,
+                "written_pos": stage.written_pos,
+            }
         return NodeResult(
             outputs=outputs,
             metrics=NodeMetrics(
@@ -177,10 +173,34 @@ class QuailModelExecution:
         )
 
 
+def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:
+    """Return the join nodes selected from Quail's planning estimates."""
+    adaptive = next(
+        (node for node in plan.nodes if isinstance(node, AdaptiveJoinPlan)),
+        None,
+    )
+    if adaptive is not None:
+        return adaptive.expected_nodes
+    return tuple(
+        node for node in plan.nodes if isinstance(node, AnchoredJoin)
+    )
+
+
+def expected_join_stages(plan) -> tuple:
+    """Return Quail's expected join stages in execution order."""
+    return tuple(
+        stage
+        for node in expected_join_nodes(plan)
+        if isinstance(node, AnchoredJoin)
+        for stage in node.stages
+    )
+
+
 class QuailBackend:
     """Plan and start Quail model execution."""
 
     name = "quail"
+    runtime_package = "vllm==0.26.0"
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
         if model.name not in {"qwen3-4b-fp8", "qwen3-32b-fp8"}:
@@ -215,9 +235,9 @@ class QuailBackend:
                     graph=None,
                     plan=plan,
                     estimated_seconds=float("inf"),
-                    reason=getattr(plan, "constraint", "planning refused"),
                 ),
             )
+        plan = self._bind_runtime_data(plan, region, context)
         return (
             PhysicalCandidate(
                 graph=plan.graph,
@@ -229,26 +249,96 @@ class QuailBackend:
     def start(self, context: GpuContext) -> QuailModelExecution:
         return QuailModelExecution(context)
 
-    def prepare(self, context) -> Mapping[str, Any]:
-        """Build Quail's token and typed plan request."""
-        return context.query._quail_payload(
-            context.plan,
-            context.scans,
-            context.filters,
-            context.joins,
+    def _bind_runtime_data(self, plan, region, context):
+        """Put tokenized prompts and answer tokens in the physical plan."""
+        from quail.planner.decide import _collect
+
+        tokenizer = context.tokenizer
+        _, filters, joins = _collect(region.logical_plan)
+        encoded_nodes = []
+        for node in plan.nodes:
+            if isinstance(node, PackedFilter):
+                predicates = filters[node.alias]
+                questions = tuple(
+                    tuple(predicates[stage.written_pos].prompt.tail_token_ids)
+                    for stage in node.stages
+                )
+                if any(not question for question in questions):
+                    raise ValueError("filter prompts have no token ids")
+                node = replace(node, question_token_ids=questions)
+            elif isinstance(node, AdaptiveJoinPlan):
+                specs = []
+                for stage in expected_join_stages(plan):
+                    logical_join = joins[stage.written_pos]
+                    prompt = logical_join.predicate
+                    runtime_ids = {
+                        alias: (list(label), list(frame))
+                        for alias, label, frame in prompt.label_token_ids
+                    }
+                    aliases = [argument.alias for argument in prompt.args]
+                    spec = {
+                        "anchor": stage.anchor,
+                        "partners": list(stage.partners),
+                        "aliases": aliases,
+                        "frames": {
+                            alias: runtime_ids[alias][1]
+                            for alias in aliases
+                        },
+                        "labels": {
+                            alias: runtime_ids[alias][0]
+                            for alias in aliases
+                        },
+                        "tail": list(prompt.tail_token_ids),
+                        "semantics": stage.semantics,
+                        "selectivity": logical_join.selectivity,
+                        "written_pos": stage.written_pos,
+                        "anchor_free": (
+                            logical_join.anchor is None
+                            and logical_join.semantics == "full"
+                        ),
+                    }
+                    specs.append(spec)
+                node = replace(node, join_specs=tuple(specs))
+            encoded_nodes.append(node)
+
+        true_ids = set()
+        false_ids = set()
+        if tokenizer is not None:
+            for word in ("TRUE", " TRUE", "True", " True"):
+                tokens = tokenizer(word)
+                if tokens:
+                    true_ids.add(tokens[0])
+            for word in ("FALSE", " FALSE", "False", " False"):
+                tokens = tokenizer(word)
+                if tokens:
+                    false_ids.add(tokens[0])
+        prompts = [
+            predicate.prompt
+            for predicates in filters.values()
+            for predicate in predicates
+        ] + [logical_join.predicate for logical_join in joins]
+        pre_ids = (
+            list(tokenizer(SHARED_PRE)) if tokenizer is not None else
+            list(prompts[0].preamble_token_ids) if prompts else []
+        )
+        return replace(
+            plan,
+            nodes=tuple(encoded_nodes),
+            root=plan.root,
+            settings={
+                **plan.settings,
+                "true_ids": sorted(true_ids),
+                "false_ids": sorted(false_ids),
+                "pre_ids": pre_ids,
+                "filter_limit": (
+                    None if any(
+                        isinstance(node, AdaptiveJoinPlan)
+                        for node in encoded_nodes
+                    ) else region.logical_plan.root.limit
+                ),
+            },
         )
 
-    def execute_remote(self, context) -> Mapping[str, Any]:
-        """Run Quail inside the selected compute process."""
-        return context.run_quail()
-
-    def assemble(self, context):
-        """Build a QueryResult from Quail answer relations."""
-        return context.query._assemble_quail(
-            context.plan,
-            context.scans,
-            context.filters,
-            context.joins,
-            context.output,
-            context.coordinator_wall_s,
-        )
+    def execute_request(self, context) -> Any:
+        """Run one Quail request inside a compute process."""
+        return context.execute_graph()

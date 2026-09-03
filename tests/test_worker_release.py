@@ -23,11 +23,11 @@ def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
         "_release_vllm_parallel_state",
         lambda: calls.append("release_parallel_state"),
     )
-    worker._BOOTED["test"] = {"model": object()}
+    worker._RUNTIME.booted["test"] = {"model": object()}
 
     result = worker.release_booted_models()
 
-    assert worker._BOOTED == {}
+    assert worker._RUNTIME.booted == {}
     assert calls == [
         "synchronize",
         "release_parallel_state",

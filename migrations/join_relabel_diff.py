@@ -23,8 +23,13 @@ import json
 
 import modal
 
-from quail.bench.judge_pass import (PREDICATES, VOLUME_ROOT, data_image,
-                                    results_vol, _label_dir_by_id)
+from quail.bench.judge_pass import (
+    PREDICATES,
+    VOLUME_ROOT,
+    _label_dir_by_id,
+    data_image,
+    results_vol,
+)
 
 app = modal.App("quail-milestone1")
 
@@ -56,14 +61,14 @@ def compare(before_id: str, after_id: str) -> str:
             continue
         b, a = before[spec.key], after[spec.key]
         if b["rows"] != a["rows"]:
-            predicates[spec.legacy_code] = {
+            predicates[spec.key] = {
                 "compared": False, "reason": "row count changed",
                 "before_rows": b["rows"], "after_rows": a["rows"]}
             continue
         old = answers(spec, b["label_set_id"])
         new = answers(spec, a["label_set_id"])
         shared = old.keys() & new.keys()
-        predicates[spec.legacy_code] = {
+        predicates[spec.key] = {
             "compared": True,
             "predicate_key": spec.key,
             "source_policy": spec.source_policy,

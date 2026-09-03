@@ -113,7 +113,7 @@ def test_all_queries_compile_and_plan(tmp_path):
             "as_written" if qid.startswith("PRIV-")
             else "by_cost"
         )
-        assert plan.order_rule == expected_order, qid
+        assert plan.settings["order_rule"] == expected_order, qid
         assert "physical:" in query.explain(), qid
 
 

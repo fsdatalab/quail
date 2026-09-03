@@ -9,6 +9,7 @@ Length units are tokens. Suffixes are atomic and never split across
 chunks.
 """
 
+from array import array
 from collections import deque
 
 
@@ -152,6 +153,41 @@ def brute_force_triples(ans1_rows, ans2_rows):
 
 # --------------------------------------------- continuous admission
 
+
+class _CompactQueue:
+    """Keep ordered document positions in ranges or integer arrays."""
+
+    def __init__(self, count: int):
+        self._pieces = deque()
+        self._length = 0
+        if count:
+            self._pieces.append([range(count), 0])
+            self._length = count
+
+    def __bool__(self):
+        return bool(self._length)
+
+    def popleft(self) -> int:
+        if not self._pieces:
+            raise IndexError("pop from an empty document queue")
+        values, position = self._pieces[0]
+        value = values[position]
+        position += 1
+        self._length -= 1
+        if position == len(values):
+            self._pieces.popleft()
+        else:
+            self._pieces[0][1] = position
+        return value
+
+    def appendleft(self, value: int) -> None:
+        self.prepend(array("I", [value]))
+
+    def prepend(self, values) -> None:
+        if values:
+            self._pieces.appendleft([values, 0])
+            self._length += len(values)
+
 def pages_for(tokens: int, page_tokens: int) -> int:
     """Pages needed for `tokens` rows (suffix KV is never paged)."""
     return -(-tokens // page_tokens)
@@ -210,7 +246,7 @@ class FilterAdmission:
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
                  arena_pages, page_tokens, kept_extra_tokens=0,
                  limit=None, available_pages=None):
-        self.doc_tokens = list(doc_tokens)
+        self.doc_tokens = doc_tokens
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
         self.page_tokens = page_tokens
@@ -236,7 +272,7 @@ class FilterAdmission:
                     t + kept_extra_tokens, page_tokens) > arena_pages:
                 raise ValueError(f"document {d} needs more pages than "
                                  f"the arena holds")
-        self.pending = deque(range(len(self.doc_tokens)))
+        self.pending = _CompactQueue(len(self.doc_tokens))
         self.ready = deque()       # (doc, stage) gated TRUE, next suffix
         self.in_flight = set()     # docs inside a launched chunk
         self.resident = {}         # doc -> pages held
@@ -267,7 +303,7 @@ class FilterAdmission:
             room -= cost
         # 2) fresh admissions: pages in queue order, chunk room may skip
         blocked_pages = False
-        skipped = deque()
+        skipped = array("I")
         while self.pending and not blocked_pages:
             doc = self.pending.popleft()
             if self.free_pages is not None:
@@ -291,8 +327,7 @@ class FilterAdmission:
             groups.append((doc, 0, True))
             self.in_flight.add(doc)
             room -= cost
-        while skipped:
-            self.pending.appendleft(skipped.pop())
+        self.pending.prepend(skipped)
         return groups
 
     # ---- gating --------------------------------------------------------

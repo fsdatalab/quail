@@ -467,8 +467,8 @@ performance constants):
    per document, partner tokens once per tuple). `{'anchor': ...}`
    overrides; an exists/anti gate always anchors on the outer
    table, because the gate applies to its documents.
-3. **Sharding**: filters split documents by token count across
-   GPUs (`_balanced_shards`); joins split by anchor document.
+3. **Sharding**: filters use contiguous document ranges with similar token
+   counts across GPUs. Joins split by anchor document.
    Every tuple belongs to exactly one anchor, so gating and each
    anchor's tuple stream stay local to the GPU holding the
    anchor; the coordinator re-shards only when another spec

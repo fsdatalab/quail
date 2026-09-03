@@ -74,7 +74,7 @@ def _truth():
     )
 
 
-def _query(tmp_path):
+def _query(tmp_path, backend="quail"):
     pq.write_table(pa.table({
         "id": ["r0", "r1"],
         "body": ["good film", "bad film"],
@@ -83,7 +83,13 @@ def _query(tmp_path):
         "id": ["a0", "a1"],
         "aspect": ["acting", "ending"],
     }), tmp_path / "aspects.parquet")
-    sess = quail.Session(EngineConfig(gpus=1), tokenizer=str.split)
+    def token_ids(text):
+        return [byte + 1 for byte in text.encode("utf-8")]
+
+    tokenizer = str.split if backend == "quail" else token_ids
+    sess = quail.Session(
+        EngineConfig(gpus=1, backend=backend), tokenizer=tokenizer
+    )
     sess.register("reviews", DocumentProvider.from_parquet(
         str(tmp_path / "reviews.parquet"), id_col="id"))
     sess.register("aspects", DocumentProvider.from_parquet(
@@ -100,16 +106,49 @@ def _query(tmp_path):
 
 
 def _run(query, join_answers):
-    def execute(_payload):
-        return {
-            "filters": {"r": {0: [1], 1: [0]}},
-            "joins": [{
-                "rows": {0: join_answers},
-                "anchor_index": [0],
-                "partner_index": [[0], [1]],
-                "anchor": "r",
-                "partners": ["a"],
-            }],
+    def execute(request):
+        from quail.execution import PhysicalResponse, export_physical_outputs
+        from quail.extensions import built_in_registry
+        from quail.physical import (
+            AdaptiveJoinPlan,
+            PackedFilter,
+            decode_graph,
+        )
+        from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
+
+        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+        filtered = next(
+            node for node in graph.nodes if isinstance(node, PackedFilter)
+        )
+        adaptive = next(
+            node for node in graph.nodes
+            if isinstance(node, AdaptiveJoinPlan)
+        )
+        join = adaptive.join_specs[0]
+        nodes = {
+            filtered.node_id: NodeResult({
+                "ids:r": [0],
+                "filter_answers:r": {0: [1], 1: [0]},
+            }),
+            adaptive.node_id: NodeResult({
+                "ids:r": [0] if any(join_answers) else [],
+                "ids:a": [0, 1],
+                "join_answers:0": {
+                    "rows": {0: join_answers},
+                    "anchor_index": [0],
+                    "partner_index": [[0], [1]],
+                    "anchor": "r",
+                    "partners": ["a"],
+                    "semantics": "full",
+                    "selectivity": join["selectivity"],
+                    "written_pos": 0,
+                },
+            }),
+        }
+        outputs = export_physical_outputs(
+            graph, RunResult(None, nodes, NodeMetrics())
+        )
+        return PhysicalResponse(outputs, {
             "wall_s": 2.0,
             "boot_s": 3.0,
             "boot_kind": "cold",
@@ -117,9 +156,73 @@ def _run(query, join_answers):
             "fresh_tokens": 100,
             "store": None,
             "peak_gib": 1.0,
-        }
+        })
 
-    return query.run(_execute=execute)
+    from quail.runtime.worker import execute_worker_query
+
+    return execute_worker_query(query, physical_executor=execute)
+
+
+def _run_request_backend(query, join_answers):
+    def execute(request):
+        from quail.execution import PhysicalResponse, export_physical_outputs
+        from quail.extensions import built_in_registry
+        from quail.physical import RequestExecution, decode_graph
+        from quail.runtime.result import answer_table
+        from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
+
+        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+        model = next(
+            node for node in graph.nodes
+            if isinstance(node, RequestExecution)
+        )
+        filter_table = pa.table({
+            "r": pa.array([0, 1], type=pa.int32()),
+            "predicate": pa.array([0, 0], type=pa.int32()),
+            "answer": pa.array([True, False], type=pa.bool_()),
+        }).replace_schema_metadata({
+            b"quail.kind": b"filter_answers",
+            b"quail.alias": b"r",
+        })
+        join_table = answer_table(
+            {"r": [0, 0], "a": [0, 1]},
+            [bool(answer) for answer in join_answers],
+            "join_answers",
+            metadata={
+                "anchor": "r",
+                "partners": "a",
+                "semantics": "full",
+                "written_pos": 0,
+            },
+        )
+        true_aspects = [
+            index for index, answer in enumerate(join_answers) if answer
+        ]
+        nodes = {
+            model.node_id: NodeResult({
+                "ids:r": [0] if true_aspects else [],
+                "ids:a": true_aspects,
+                "filter_answers:r": filter_table,
+                "join_answers:0": join_table,
+            })
+        }
+        outputs = export_physical_outputs(
+            graph, RunResult(None, nodes, NodeMetrics())
+        )
+        return PhysicalResponse(outputs, {
+            "wall_s": 2.0,
+            "boot_s": 3.0,
+            "boot_kind": "cold",
+            "boot": {},
+            "fresh_tokens": 100,
+            "cached_tokens": 0,
+            "regret_tokens": 0,
+            "peak_gib": 1.0,
+        })
+
+    from quail.runtime.worker import execute_worker_query
+
+    return execute_worker_query(query, physical_executor=execute)
 
 
 def test_evaluator_scores_answers_and_final_rows(tmp_path):
@@ -153,6 +256,29 @@ def test_evaluator_scores_answers_and_final_rows(tmp_path):
     }
     assert evaluation["input_document_rows"] == 4
     assert evaluation["unique_input_documents"] == 4
+
+
+def test_evaluator_scores_request_backend_answer_relations(tmp_path):
+    sess, query = _query(tmp_path, backend="stock_vllm")
+    try:
+        result = _run_request_backend(query, [0, 0])
+        corpus = {
+            "reviews": [{"id": "r0", "body": "good film"},
+                        {"id": "r1", "body": "bad film"}],
+            "aspects": [{"id": "a0", "aspect": "acting"},
+                        {"id": "a1", "aspect": "ending"}],
+        }
+        evaluation = BenchmarkEvaluator(_truth(), corpus).evaluate(
+            query, result
+        )
+    finally:
+        sess.close()
+
+    assert evaluation["answer_accuracy"]["evaluated"] == 4
+    assert evaluation["answer_accuracy"]["correct"] == 3
+    assert [item["op"] for item in evaluation["per_predicate"]] == [
+        "filter", "join"
+    ]
 
 
 def test_query_cost_token_and_document_metrics(tmp_path):
