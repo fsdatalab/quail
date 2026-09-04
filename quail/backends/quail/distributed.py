@@ -12,7 +12,7 @@ from quail.physical import (
     PackedFilter,
     PhysicalGraph,
 )
-from quail.runtime.quail_graph import (
+from quail.backends.quail.graph import (
     _child_graph,
     _next_join,
     _possible_anchors,
@@ -149,7 +149,7 @@ class DistributedQuailExecution:
 
     def begin(self):
         """Start a query that has no filter node."""
-        from quail.runtime import coordinator
+        from quail.backends.quail import coordinator
 
         subs = coordinator.begin_query_payloads(
             self.payload, self.gpu_count
@@ -165,7 +165,7 @@ class DistributedQuailExecution:
         )
 
     def _execute_filter(self, node, inputs):
-        from quail.runtime import coordinator
+        from quail.backends.quail import coordinator
 
         document_ids = next(iter(inputs.values()))
         shards = self.shards
@@ -227,7 +227,7 @@ class DistributedQuailExecution:
         )
 
     def _execute_join(self, node, inputs):
-        from quail.runtime import coordinator
+        from quail.backends.quail import coordinator
 
         survivors = inputs["survivors"]
         group = inputs["group"]
@@ -372,7 +372,7 @@ def prepare_distributed_inputs(node, inputs, context):
     if isinstance(node, PackedFilter):
         return inputs
     if isinstance(node, AnchoredJoin):
-        from quail.runtime.coordinator import stage_for_anchor
+        from quail.backends.quail.coordinator import stage_for_anchor
 
         state = context.state
         return {
@@ -389,7 +389,7 @@ def prepare_distributed_inputs(node, inputs, context):
 
 def run_distributed_adaptive(node, inputs, context):
     """Plan joins and execute typed children across GPU processes."""
-    from quail.runtime.coordinator import (
+    from quail.backends.quail.coordinator import (
         report_join_plan,
         search_specs,
         thin_survivors,

@@ -1,7 +1,7 @@
 """Tests for the coordinator's filter/join round splitting, merging, gating, and thinning."""
 
 from quail.physical import PackedFilter
-from quail.runtime.coordinator import (filter_node_payloads,
+from quail.backends.quail.coordinator import (filter_node_payloads,
                                        gate_group,
                                        join_group_payloads,
                                        merge_filter_round,
@@ -311,7 +311,7 @@ def test_join_group_prior_shards_add_documents_missing_from_kv():
 
 
 def test_search_specs_counts_from_token_lists():
-    from quail.runtime.coordinator import search_specs
+    from quail.backends.quail.coordinator import search_specs
 
     specs = search_specs([dict(
         aliases=["r", "p"], anchor="r", anchor_free=True,

@@ -830,3 +830,11 @@ def execute_request_graph(context, backend, engine_state, boot):
         export_physical_outputs(compute_graph, run),
         report,
     )
+
+
+def request_runtimes() -> dict:
+    """Return runtimes for the request backends' physical node."""
+    from quail.physical import RequestExecution
+    from quail.runtime.runner import ModelNodeRuntime
+
+    return {RequestExecution.runtime_key: ModelNodeRuntime()}

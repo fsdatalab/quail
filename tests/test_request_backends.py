@@ -257,7 +257,6 @@ def test_vllm_backend_executes_a_physical_request(monkeypatch):
         graph=plan.graph,
         registry=session.registry,
         gpu_count=1,
-        graph_executor=lambda: None,
         runtime_state={},
     ))
     result = query.finish(response)

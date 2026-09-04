@@ -5,7 +5,7 @@ The queries are IMDB-7 (three filters over the reviews table, the
 unified attention path) and BIO-2 (the reports x terms join, the
 merge_quant attention path), at scale factor 0.1. Each run goes
 through the real planner and the real worker execution core
-(quail.runtime.worker._execute_single); only the pipeline inside the
+(quail.backends.quail.worker.execute_single); only the pipeline inside the
 worker state is swapped, so packing, admission, the join search, KV
 retention, GEMMs, and attention are identical across configurations.
 
@@ -347,17 +347,19 @@ def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
     from quail.execution import PhysicalResponse
     from quail.executor.loop import AsyncAnswers
-    from quail.runtime.worker import (
+    from quail.backends.quail.worker import (
         _PayloadAnswerer,
-        _execute_single,
-        _quail_runtime_payload,
+        execute_single,
+        quail_runtime_payload,
+    )
+    from quail.runtime.worker import (
         _validate_physical_request,
         execute_worker_query,
     )
 
     def execute(request):
         request, registry, graph, _ = _validate_physical_request(request)
-        payload = _quail_runtime_payload(request, graph)
+        payload = quail_runtime_payload(request, graph)
         answerer = _PayloadAnswerer(
             state["torch"], state["F"], state["model"],
             payload["true_ids"], payload["false_ids"],
@@ -367,7 +369,7 @@ def _run_query(state, build, captured):
             async_answers=AsyncAnswers(state["torch"], answerer),
             chunk_tokens=payload["chunk_tokens"],
         )
-        report = _execute_single(state, payload, registry, graph)
+        report = execute_single(state, payload, registry, graph)
         outputs = report.pop("_outputs")
         report.pop("filters", None)
         report.pop("joins", None)

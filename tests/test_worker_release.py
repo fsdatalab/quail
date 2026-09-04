@@ -3,7 +3,7 @@
 import sys
 from types import SimpleNamespace
 
-from quail.runtime import worker
+from quail.backends.quail import worker
 
 
 def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
@@ -23,11 +23,11 @@ def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
         "_release_vllm_parallel_state",
         lambda: calls.append("release_parallel_state"),
     )
-    worker._RUNTIME.booted["test"] = {"model": object()}
+    booted = {"test": {"model": object()}}
 
-    result = worker.release_booted_models()
+    result = worker.release_booted_models(booted)
 
-    assert worker._RUNTIME.booted == {}
+    assert booted == {}
     assert calls == [
         "synchronize",
         "release_parallel_state",

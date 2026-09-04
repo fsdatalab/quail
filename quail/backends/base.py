@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from quail.physical import PhysicalNode
 from quail.planning import (
@@ -34,12 +34,7 @@ class BackendExecutionContext:
     graph: Any
     registry: Any
     gpu_count: int
-    graph_executor: Callable[[], Any]
     runtime_state: dict[Any, Any]
-
-    def execute_graph(self) -> Any:
-        """Execute the physical graph in this compute process."""
-        return self.graph_executor()
 
 
 class ModelExecution(Protocol):

@@ -15,8 +15,8 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.base import input_ports
-from quail.runtime.quail_graph import execute_single_graph
-from quail.runtime.quail_distributed import execute_distributed_graph
+from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.distributed import execute_distributed_graph
 from quail.runtime.runner import NodeMetrics, NodeResult
 from quail.specs import DEVICES, MODELS
 

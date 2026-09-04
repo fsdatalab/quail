@@ -341,4 +341,6 @@ class QuailBackend:
 
     def execute_request(self, context) -> Any:
         """Run one Quail request inside a compute process."""
-        return context.execute_graph()
+        from quail.backends.quail.worker import execute_quail_request
+
+        return execute_quail_request(context)

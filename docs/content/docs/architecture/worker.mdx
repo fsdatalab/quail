@@ -34,13 +34,13 @@ kernel cache volume so each kernel compiles once ever.
    envelope: every node type, the backend, the model, the device, the
    GPU count, and every runtime must be registered.
 6. It calls `backend.execute_request(context)`. The context gives the
-   backend the request, the graph, the registry, the GPU count, a
-   `graph_executor` closure, and a per container state dict where the
-   backend keeps its loaded model between queries.
-7. For Quail with one GPU, the worker loads the model on first use,
-   builds the arena and the pipeline, warms the kernels, and runs the
-   compute subgraph. With several GPUs it spawns one child per GPU
-   and runs the rounds described in
+   backend the request, the graph, the registry, the GPU count, and a
+   per container state dict where the backend keeps its loaded model
+   between queries.
+7. The Quail backend's own worker module, `quail.backends.quail.worker`,
+   loads the model on first use, builds the arena and the pipeline,
+   warms the kernels, and runs the compute subgraph. With several GPUs
+   it spawns one child per GPU and runs the rounds described in
    [The Quail backend](/docs/architecture/quail-backend).
 8. The model outputs come back as Arrow tables keyed by port. The
    worker runs the full graph again with those outputs supplied, so

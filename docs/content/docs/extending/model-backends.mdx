@@ -68,7 +68,6 @@ Called in the worker with a `BackendExecutionContext`:
 | `graph` | The decoded `PhysicalGraph`. |
 | `registry` | The worker's registry. |
 | `gpu_count` | GPUs in this container. |
-| `graph_executor` | A closure that runs the compute subgraph with Quail's executor. Only the Quail backend uses it. |
 | `runtime_state` | A dict that survives across queries in one container. Keep your loaded engine here. |
 
 Return a `PhysicalResponse(outputs, metrics)`. `outputs` maps every

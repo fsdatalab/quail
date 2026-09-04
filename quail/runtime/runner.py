@@ -7,19 +7,16 @@ from typing import Any, Callable, Mapping, Protocol
 
 from quail.physical import (
     AdaptiveJoinPlan,
-    AnchoredJoin,
     DocumentInput,
     Exchange,
+    ExecutionLocation,
     HashJoin,
     Limit,
-    PackedFilter,
     PhysicalGraph,
     PhysicalNode,
     PortRef,
     Project,
-    RequestExecution,
     ValueType,
-    ExecutionLocation,
 )
 
 
@@ -358,32 +355,12 @@ class ModelNodeRuntime:
         return result
 
 
-class AdaptiveJoinRuntime:
-    """Run adaptive join planning in the container coordinator."""
-
-    def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, AdaptiveJoinPlan):
-            raise TypeError(type(node).__name__)
-        if context.adaptive_join is None:
-            raise RuntimeError(
-                "AdaptiveJoinPlan has no coordinator runtime")
-        result = context.adaptive_join(node, inputs, context)
-        if not isinstance(result, NodeResult):
-            raise TypeError("adaptive join runtime must return NodeResult")
-        return result
-
-
 def built_in_runtimes() -> dict[str, NodeRuntime]:
-    """Return runtimes for the built in physical nodes."""
-    model_runtime = ModelNodeRuntime()
+    """Return runtimes for the backend independent physical nodes."""
     return {
         DocumentInput.runtime_key: DocumentInputRuntime(),
         Exchange.runtime_key: ExchangeRuntime(),
         HashJoin.runtime_key: HashJoinRuntime(),
         Project.runtime_key: ProjectRuntime(),
         Limit.runtime_key: LimitRuntime(),
-        PackedFilter.runtime_key: model_runtime,
-        RequestExecution.runtime_key: model_runtime,
-        AnchoredJoin.runtime_key: model_runtime,
-        AdaptiveJoinPlan.runtime_key: AdaptiveJoinRuntime(),
     }

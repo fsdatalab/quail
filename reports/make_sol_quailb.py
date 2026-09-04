@@ -101,7 +101,7 @@ from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan
-from quail.runtime.coordinator import runtime_join_steps, thin_survivors
+from quail.backends.quail.coordinator import runtime_join_steps, thin_survivors
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 
 W = Path(sys.argv[1])

@@ -158,6 +158,8 @@ def built_in_registry() -> ExtensionRegistry:
         pipelined_vllm_backend,
         stock_vllm_backend,
     )
+    from quail.backends.quail import quail_runtimes
+    from quail.backends.request import request_runtimes
     from quail.catalog import built_in_source_readers
     from quail.runtime.runner import built_in_runtimes
     from quail.specs import DEVICES, MODELS
@@ -173,8 +175,9 @@ def built_in_registry() -> ExtensionRegistry:
     registry.register_backend(SGLangBackend())
     for codec in built_in_codecs():
         registry.register_codec(codec)
-    for runtime_key, runtime in built_in_runtimes().items():
-        registry.register_runtime(runtime_key, runtime)
+    for runtimes in (built_in_runtimes(), quail_runtimes(), request_runtimes()):
+        for runtime_key, runtime in runtimes.items():
+            registry.register_runtime(runtime_key, runtime)
     for name, reader in built_in_source_readers().items():
         registry.register_source_reader(name, reader)
     return registry

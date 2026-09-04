@@ -44,11 +44,12 @@ execution request to the compute provider.
 | `runtime/session.py` | Session, Query, tokenization, input binding, and result assembly | catalog, logical, planner, sqlfront, builder |
 | `runtime/tokens.py` | Memory mapped token files and random document views | Arrow |
 | `runtime/compute.py` | Compute provider interface and Modal Function implementation | catalog, result, worker |
-| `runtime/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `runtime/runner.py` | Generic typed graph runner and standard node metrics | physical |
-| `runtime/quail_graph.py` | One GPU Quail node preparation and adaptive join runtime | runner, planner, executor |
-| `runtime/quail_distributed.py` | Several GPU Quail node dispatch and result merging | runner, coordinator |
-| `runtime/worker.py` | Modal Function setup, model boot, execution, and multi-GPU dispatch | executor, planner, coordinator |
+| `backends/quail/graph.py` | One GPU Quail node preparation, the Quail node runtimes, and the adaptive join runtime | runner, planner, executor |
+| `backends/quail/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
+| `backends/quail/distributed.py` | Several GPU Quail node dispatch and result merging | runner, coordinator |
+| `backends/quail/worker.py` | Quail model boot, single GPU execution, and the GPU child protocol | executor, graph, distributed |
+| `runtime/worker.py` | Modal Function setup, request validation, and backend dispatch | extensions, session |
 | `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
 
 ### Data flow
@@ -1211,7 +1212,7 @@ for each chunk in plan:
 
 ## 6. Multi-GPU dispatch
 
-The coordinator (`runtime/coordinator.py`) splits work across GPU
+The coordinator (`backends/quail/coordinator.py`) splits work across GPU
 workers and merges answers. Each worker is a child process with its
 own CUDA context and arena. The parent process (inside the same
 Modal container) sends payloads over pipes, so there is no network

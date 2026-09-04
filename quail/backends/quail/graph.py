@@ -22,9 +22,35 @@ from quail.runtime.runner import (
     compute_subgraph,
     ExecutionContext,
     GenericRunner,
+    ModelNodeRuntime,
     NodeMetrics,
     NodeResult,
 )
+
+
+class AdaptiveJoinRuntime:
+    """Run adaptive join planning in the container coordinator."""
+
+    def execute(self, node, inputs, context) -> NodeResult:
+        if not isinstance(node, AdaptiveJoinPlan):
+            raise TypeError(type(node).__name__)
+        if context.adaptive_join is None:
+            raise RuntimeError(
+                "AdaptiveJoinPlan has no coordinator runtime")
+        result = context.adaptive_join(node, inputs, context)
+        if not isinstance(result, NodeResult):
+            raise TypeError("adaptive join runtime must return NodeResult")
+        return result
+
+
+def quail_runtimes() -> dict:
+    """Return runtimes for the Quail backend's physical nodes."""
+    model_runtime = ModelNodeRuntime()
+    return {
+        PackedFilter.runtime_key: model_runtime,
+        AnchoredJoin.runtime_key: model_runtime,
+        AdaptiveJoinPlan.runtime_key: AdaptiveJoinRuntime(),
+    }
 
 
 def scalar_node_metrics(nodes) -> dict:
@@ -98,7 +124,7 @@ def _runtime_stage(join, index: int, anchor: str,
 
 def _next_join(state) -> AnchoredJoin:
     from quail.planner.joins import search_joins, summarize_alias
-    from quail.runtime.coordinator import runtime_join_steps
+    from quail.backends.quail.coordinator import runtime_join_steps
 
     remaining = state["remaining"]
     all_specs = state["search_specs"]
@@ -185,7 +211,7 @@ def _next_join(state) -> AnchoredJoin:
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
-    from quail.runtime.coordinator import stage_for_anchor
+    from quail.backends.quail.coordinator import stage_for_anchor
     from quail.runtime.tokens import DocumentPrefixes, chain_tokens
 
     state = context.state
@@ -329,7 +355,7 @@ def _child_graph(node: AnchoredJoin, previous_anchor: str | None,
 
 def run_adaptive_join(node, inputs, context: ExecutionContext) -> NodeResult:
     """Plan and execute Quail join child graphs from actual survivors."""
-    from quail.runtime.coordinator import (
+    from quail.backends.quail.coordinator import (
         report_join_plan,
         search_specs,
         thin_survivors,
