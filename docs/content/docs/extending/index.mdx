@@ -1,0 +1,78 @@
+---
+title: The extension registry
+description: How extensions register, and how they reach the Modal worker.
+---
+
+Every session owns an `ExtensionRegistry`. It starts with Quail's own
+backends, models, devices, node codecs, node runtimes, and source
+readers. An extension adds to it through one function in an
+importable module:
+
+```python
+# my_package/quail_extension.py
+def register_quail_extension(registry):
+    registry.register_observer("my.trace", MyTrace)
+    registry.register_codec(NodeCodec(MyNode))
+    registry.register_runtime(MyNode.runtime_key, MyNodeRuntime())
+```
+
+Load it before creating the session:
+
+```python
+import quail
+
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.load_extension(
+    "my_package.quail_extension",
+    local_python_sources=("my_package",),
+    pip_packages=("some-dependency==1.2.3",),
+)
+session = quail.Session(registry=registry)
+```
+
+## What can be registered
+
+| Method | Registers | Page |
+| --- | --- | --- |
+| `register_logical_rule(name, rule)` | A logical optimizer rule. | [Logical nodes and rules](/docs/extending/logical-rules) |
+| `register_physical_planner(name, planner)` | A planner that offers extra physical candidates. | [Physical nodes](/docs/extending/physical-nodes) |
+| `register_physical_rule(name, rule)` | A physical graph rewrite. | same |
+| `register_codec(codec)` | A `NodeCodec` for a physical node type. | same |
+| `register_runtime(key, runtime)` | The runtime for a physical node type. | same |
+| `register_backend(backend)` | A model backend. | [Model backends](/docs/extending/model-backends) |
+| `register_model(spec)` | A `ModelSpec`. | [Adding a model](/docs/extending/models) |
+| `register_device(spec)` | A `DeviceSpec`. | same |
+| `register_source_reader(type, reader)` | A reader for a remote source type. | [Table providers](/docs/extending/table-providers) |
+| `register_observer(name, factory)` | An execution observer factory. | [Observers](/docs/extending/observers) |
+
+Every name is checked for duplicates. Registering the same name twice
+raises `ValueError`.
+
+A table provider is not registered here. It is passed straight to
+`Session.register(name, provider)`.
+
+## Reaching the worker
+
+The worker runs in a different process, usually a Modal container. It
+needs the same registry. Two things make that work:
+
+- `load_extension` records the module name, its local source
+  directories, and its pip packages. `ModalComputeProvider` adds the
+  sources and packages to the worker image. A change in either set
+  starts a new Modal app with a new image.
+- The `QueryRequest` and the physical plan envelope carry the list of
+  extension module names. The worker imports them and calls each
+  module's `register_quail_extension` on its own registry before it
+  plans or decodes anything. A missing codec, backend, model, device,
+  runtime, or source reader fails before any model work.
+
+Only the module name travels. The worker trusts that the module it
+imports is the same one the client loaded. Pin your package version if
+that matters.
+
+## An example
+
+`quail_ext_examples/plan_trace.py` in the repository is a complete
+extension. It registers one execution observer that records the row
+counts in and out of every physical node and adds them to the result
+report under `observers`. It changes nothing about the plan.

@@ -1,0 +1,69 @@
+---
+title: Execution observers
+description: Recording per node metrics without changing the plan.
+---
+
+An observer sees every physical node once, after it runs, with the
+node's outputs and metrics. It cannot change values. Its report is
+attached to the query result.
+
+```python
+class ExecutionObserver(Protocol):
+    name: str
+    def after_node(self, node: PhysicalNode, result: NodeResult) -> None: ...
+    def report(self) -> Mapping[str, Any]: ...
+```
+
+You register a factory, not an instance. The worker creates a fresh
+observer per query.
+
+## The example extension
+
+`quail_ext_examples/plan_trace.py`:
+
+```python
+class PlanTrace:
+    name = "example.plan_trace"
+
+    def __init__(self):
+        self._nodes = []
+
+    def after_node(self, node, result) -> None:
+        self._nodes.append({
+            "node_id": node.node_id,
+            "node_type": node.type_name,
+            "input_rows": result.metrics.input_rows,
+            "output_rows": result.metrics.output_rows,
+        })
+
+    def report(self) -> dict:
+        return {"nodes": list(self._nodes)}
+
+
+def register_quail_extension(registry) -> None:
+    registry.register_observer(PlanTrace.name, PlanTrace)
+```
+
+Load it and the report gains an `observers` key:
+
+```python
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.load_extension("quail_ext_examples.plan_trace",
+                        local_python_sources=("quail_ext_examples",))
+session = quail.Session(registry=registry)
+...
+result.report["observers"]["example.plan_trace"]["nodes"]
+```
+
+## What metrics a node reports
+
+`NodeMetrics` has `wall_s`, `input_rows`, `output_rows`,
+`evaluated_documents`, `evaluated_document_pairs`, `fresh_tokens`,
+`cached_tokens`, `kv_hits`, `kv_misses`, `kv_removals`,
+`kv_recomputations`, `regret_tokens`, `peak_gpu_bytes`, and an
+`extension` mapping for anything else. Model nodes carry the numbers
+the GPU executor measured. `HashJoin`, `Project`, and `Limit` report
+row counts.
+
+Observers see model nodes and the Arrow nodes in one pass because the
+worker runs the full graph once with the model outputs supplied.

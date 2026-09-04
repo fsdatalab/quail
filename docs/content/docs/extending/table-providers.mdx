@@ -1,0 +1,116 @@
+---
+title: Table providers
+description: Supplying documents from your own storage, on the client or from the worker.
+---
+
+A table provider gives Quail a schema, an id column, and bounded
+Arrow batches. There are two ways to implement one, depending on where
+the data can be read.
+
+## A client-only provider
+
+If only the client process can reach the data, implement `scan` and
+return `None` from `remote_source`. The compute provider reads the
+columns the query needs and sends them to the worker as raw Arrow.
+
+```python
+import pyarrow as pa
+from quail.catalog import ScanRequest, TableStatistics
+
+
+class RowsProvider:
+    id_col = "id"
+
+    def __init__(self, rows: list[dict]):
+        self._table = pa.Table.from_pylist(rows)
+
+    @property
+    def columns(self):
+        return tuple(self._table.column_names)
+
+    def schema(self):
+        return self._table.schema
+
+    def content_identity(self):
+        return f"rows:{len(self._table)}"
+
+    def statistics(self):
+        return TableStatistics(row_count=len(self._table))
+
+    def scan(self, request: ScanRequest):
+        table = self._table.select(list(request.columns))
+        if request.limit is not None:
+            table = table.slice(0, request.limit)
+        return table.to_reader(max_chunksize=request.batch_rows)
+
+    def remote_source(self):
+        return None
+
+
+session.register("docs", RowsProvider(rows))
+```
+
+`content_identity` must change when the content changes. The session
+keys its tokenized copy of each column by it.
+
+## A worker-opened provider
+
+If the worker can open the data itself, return a small description
+from `remote_source` and register a reader for its `type`. The client
+then sends only the description, and the worker streams the rows.
+
+```python
+class WarehouseProvider:
+    id_col = "doc_id"
+
+    def __init__(self, table_name: str, schema: pa.Schema):
+        self._name = table_name
+        self._schema = schema
+
+    @property
+    def columns(self):
+        return tuple(self._schema.names)
+
+    def schema(self):
+        return self._schema
+
+    def content_identity(self):
+        return f"warehouse:{self._name}"
+
+    def statistics(self):
+        return TableStatistics()
+
+    def scan(self, request):
+        raise RuntimeError("scanned only inside the worker")
+
+    def remote_source(self):
+        return {"type": "warehouse", "table": self._name}
+
+
+def open_warehouse(value: dict):
+    """Return a client-only provider the worker can scan."""
+    table = read_whole_table(value["table"])   # your code
+    from quail.catalog import DocumentProvider
+    return DocumentProvider.from_table(table, id_col="doc_id",
+                                       identity=f"warehouse:{value['table']}")
+
+
+def register_quail_extension(registry):
+    registry.register_source_reader("warehouse", open_warehouse)
+```
+
+The reader receives the description and returns any `TableProvider`
+the worker can scan locally. The built in `parquet` and `huggingface`
+readers work the same way.
+
+Credentials the reader needs go in a Modal secret passed to
+`ModalComputeProvider(secrets=...)`.
+
+## What the worker does with the batches
+
+The worker reads batches for the id column, the document column, and
+the projected columns only. It tokenizes the document column and
+writes tokens, lengths, and the projected columns to a temporary
+memory mapped Arrow file. Batches are released as they are written,
+so a provider can be much larger than worker memory as long as the
+token file fits on local disk.

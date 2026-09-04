@@ -1,0 +1,79 @@
+---
+title: Adding a model or device
+description: Registering a ModelSpec or DeviceSpec.
+---
+
+The planner never reads a model config file. Every decision comes from
+a `ModelSpec` and a `DeviceSpec`, so adding a model is adding a spec.
+
+## ModelSpec
+
+```python
+from quail.specs import ModelSpec
+
+QWEN3_4B_FP8 = ModelSpec(
+    name="qwen3-4b-fp8",
+    params=4.0e9,          # dense parameter count
+    layers=36,
+    hidden=2560,
+    n_q=32,                # query heads
+    n_kv=8,                # KV heads
+    d_head=128,
+    ffn_width=19456,       # gate_up output columns, 2 x intermediate
+    w_bytes=1.0,           # fp8
+    hf_name="Qwen/Qwen3-4B-FP8",
+    revision="96b30dc...", # pinned hub commit hash
+    vocab=151936,
+    tied_head=True,
+)
+```
+
+Every field except `params` and `w_mem_bytes` comes from the
+checkpoint's `config.json`. `revision` pins the hub commit so the
+worker resolves the weights from its cache without hub round trips.
+`w_mem_bytes` is the measured weight footprint as loaded; leave it 0
+to fall back to `params * w_bytes`.
+
+Derived properties the planner uses: `kappa` (KV bytes per token),
+`W_resident` (weight bytes on the GPU after the untied head moves to
+host memory), and `act_per_token`.
+
+Register it in `quail/specs/__init__.py` for a built in model, or from
+an extension:
+
+```python
+def register_quail_extension(registry):
+    registry.register_model(MY_MODEL)
+```
+
+Then `EngineConfig(model="my-model")` selects it.
+
+## The kernel constraint
+
+The Quail executor's fused kernels assume the Qwen3 architecture:
+QK-norm before rope, a gated SiLU MLP, and fp8 block-quantized
+weights. Another Qwen3-family fp8 checkpoint works with a spec alone.
+A different architecture needs kernel changes in `quail/executor/`
+first, or a different model backend.
+
+The request backends have no such constraint beyond what vLLM or
+SGLang can load.
+
+## DeviceSpec
+
+```python
+from quail.specs import DeviceSpec
+
+H100_SXM = DeviceSpec(
+    name="h100-sxm",
+    mem_bytes=80e9,
+    hbm_bw=3.35e12,        # bytes per second
+    peak_flops=1.979e15,   # dense fp8
+    bf16_flops=0.989e15,   # dense bf16, used for attention
+)
+```
+
+Register with `registry.register_device(spec)` and select with
+`Session(device="name")`. The Modal worker asks for H100s regardless;
+another device spec is useful for planning experiments, not for
+running on other hardware yet.

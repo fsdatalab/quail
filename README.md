@@ -27,6 +27,8 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
 - `reports/` has experiment reports and plots. `results/` has the
   committed summaries that those reports read.
 - `plans/` has the current extensible design and the archived original design.
+- `docs/` is the documentation site (Fumadocs). See its README to run
+  it locally.
 - `tests/` has CPU tests. `tests/gpu/` has the Modal GPU cells -
   milestone gates, smokes, and benchmarks - which cost GPU time and
   run only when invoked explicitly.

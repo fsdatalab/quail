@@ -1,0 +1,84 @@
+---
+title: Configuration
+description: EngineConfig, session arguments, models, and backends.
+---
+
+Configuration has two layers: `EngineConfig` says what to run, and the
+`Session` arguments say how the client is set up.
+
+## EngineConfig
+
+```python
+@dataclass(frozen=True)
+class EngineConfig:
+    gpus: int = 1
+    model: str = "qwen3-4b-fp8"
+    backend: str = "quail"
+```
+
+- `gpus`: 1, 2, 4, or 8 H100s in one Modal container. Each GPU holds
+  one model copy. The request backends (vLLM and SGLang) accept 1
+  only.
+- `model`: a registered model name. Built in: `qwen3-4b-fp8` and
+  `qwen3-32b-fp8`.
+- `backend`: a registered model backend. Built in: `quail`,
+  `stock_vllm`, `pipelined_vllm`, `pipelined_sglang`. A normal user
+  never sets this. The others exist for comparison runs.
+
+```python
+session = quail.Session(quail.EngineConfig(model="qwen3-32b-fp8", gpus=2))
+```
+
+The session checks the model, device, and backend when it is created.
+An unknown name or an unsupported combination raises
+`quail.RefusalError` before any table is registered.
+
+## Session arguments
+
+```python
+quail.Session(
+    config=EngineConfig(),
+    device="h100-sxm",
+    tokenizer=None,
+    registry=None,
+    compute_provider=None,
+)
+```
+
+- `device`: a registered device spec. Only `h100-sxm` is built in.
+- `tokenizer`: a callable from text to token ids. Leave it unset to
+  load the model's Hugging Face tokenizer on first use. Tests pass a
+  fake tokenizer so they run without downloads.
+- `registry`: an `ExtensionRegistry` with your extensions. See
+  [Extending Quail](/docs/extending).
+- `compute_provider`: where queries run. Unset means
+  `ModalComputeProvider()` created on the first `run()`.
+
+## Tokenizers
+
+Quail tokenizes document columns on the client for planning. It loads
+the model's `transformers` tokenizer and also tries the faster
+`bpe-qwen` tokenizer. It checks both on a sample of 25 documents per
+column and uses the fast one only if they agree. The choice is noted
+in `result.report["remarks"]`.
+
+## The built in backends
+
+| Backend | What it is |
+| --- | --- |
+| `quail` | The Quail executor: pipelining, token-based admission, and KV rewind on a paged KV arena. Supports 1, 2, 4, and 8 GPUs. |
+| `stock_vllm` | vLLM with one request wave per filter stage and one request per join tuple. The baseline. |
+| `pipelined_vllm` | vLLM with the next filter stage submitted as soon as a document passes. Same join submission as stock. |
+| `pipelined_sglang` | SGLang with filter waves and suffix-major join order within bounded anchor groups. |
+
+All four accept the same queries and return the same result shape, so
+a comparison changes one line.
+
+## Model and device specs
+
+A model is a `ModelSpec` with the architecture numbers the planner
+needs: layers, hidden width, heads, head dimension, weight bytes, and
+the Hugging Face checkpoint name pinned to a commit hash. A device is
+a `DeviceSpec` with memory, bandwidth, and peak FLOP rates. Every
+planner decision is computed from these constants. See
+[Adding a model](/docs/extending/models).

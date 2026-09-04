@@ -1,0 +1,54 @@
+---
+title: Reports and plots
+description: What goes in reports/, and how plots are built.
+---
+
+## Reports
+
+Every PR with an experiment adds a report under `reports/` named
+`YYYY-MM-DD-<slug>.md`. It states the setup, the prediction, the
+measured result, and what the numbers mean, and cites the data by its
+`quail-results` volume path.
+
+Every PR that ships a feature adds a short note under
+`reports/shipped_features/` with the same naming: what changed, why,
+and before and after numbers when they exist.
+
+`reports/engine-wiki.md` is the living reference for the engine's
+design. Update it in place when the design changes.
+
+When a report is superseded, delete it along with its plot script and
+its PNGs. Before starting new work, scan `reports/` for stale reports,
+orphaned scripts, and unreferenced PNGs, and delete them.
+
+## Plots
+
+One script per report, `reports/make_<slug>_plots.py`, run from the
+repository root with the directory of pulled volume files as its
+argument:
+
+```bash
+uv run --with matplotlib python reports/make_<slug>_plots.py $W
+```
+
+The `modal volume get` commands that fill that directory go in the
+script's docstring so the figure can be rebuilt from the report alone.
+Percentages and ratios are computed in the script, never stored.
+
+Output PNGs go to `reports/plots/` at 300 DPI and are committed. The
+report references them as `Figure: plots/<name>.png`. A PR body embeds
+the same file by raw GitHub URL pinned to a commit.
+
+Style rules, in short:
+
+- `plt.style.use(Path(__file__).parent / "quail.mplstyle")` and colors
+  from `reports/plot_colors.py`.
+- Every mark encodes data. No background fills, 3D, or decorative
+  gridlines.
+- Label data directly. Use a legend only when labels would overlap.
+- The axis label is the unit and nothing else. Context goes in the
+  title, which names the query, for example "IMDB-7".
+- Put compared things side by side on one axis and annotate the delta
+  next to the data.
+- Log scale only when the data spans more than one order of magnitude,
+  and say so on the axis.

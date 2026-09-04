@@ -1,0 +1,100 @@
+---
+title: Logical nodes and rules
+description: Adding a logical node type and rewriting plans before physical planning.
+---
+
+Logical rules rewrite the plan after the front end builds it and
+before the backend plans it. A rule sees every node, bottom up, and
+returns a replacement or `None`.
+
+## A rule
+
+```python
+from dataclasses import replace
+from quail.logical import SemanticFilter
+
+
+class DefaultSelectivity:
+    """Fill a missing selectivity so the planner can order by cost."""
+
+    name = "default_selectivity"
+
+    def rewrite(self, node, context):
+        if not isinstance(node, SemanticFilter):
+            return None
+        if all(p.selectivity is not None for p in node.predicates):
+            return None
+        predicates = tuple(
+            p if p.selectivity is not None else replace(p, selectivity=0.5)
+            for p in node.predicates
+        )
+        return replace(node, predicates=predicates)
+
+
+def register_quail_extension(registry):
+    registry.register_logical_rule(DefaultSelectivity.name,
+                                   DefaultSelectivity())
+```
+
+The `context` is a `LogicalPlanningContext` with the session's
+`catalog` and `engine_config`. Rules run in registration order. After
+every rule has run, the plan is validated again.
+
+## A node
+
+A custom node implements the `LogicalNode` protocol. This example is
+the one the test suite uses:
+
+```python
+from dataclasses import dataclass, replace
+from typing import ClassVar
+
+
+@dataclass(frozen=True)
+class TaggedInput:
+    input: object
+    tag: str
+
+    type_name: ClassVar[str] = "test.tagged_input"
+
+    def children(self):
+        return (self.input,)
+
+    def expressions(self):
+        return (self.tag,)
+
+    def output_schema(self):
+        return self.input.output_schema()
+
+    def validate(self):
+        if not self.tag:
+            raise ValueError("tag cannot be empty")
+
+    def with_children(self, children):
+        if len(children) != 1:
+            raise ValueError("TaggedInput needs one child")
+        return replace(self, input=children[0])
+
+    def with_expressions(self, expressions):
+        if len(expressions) != 1:
+            raise ValueError("TaggedInput needs one tag")
+        return replace(self, tag=expressions[0])
+
+    def explain_fields(self):
+        return {"tag": self.tag}
+```
+
+`LogicalPlan.walk()`, `validate()`, `apply_logical_rules`, and
+`explain()` handle it without any change to Quail.
+
+## Limits
+
+- The SQL front end has no syntax extension point. A custom logical
+  node is built in Python, usually by a rule that rewrites one of the
+  built in nodes.
+- The Quail backend plans `Scan`, `SemanticFilter`, `SemanticJoin`,
+  and `Project`. A custom node that survives to planning must be
+  planned by a custom backend or a registered physical planner.
+- The logical plan crosses to the worker as a pickled Python value.
+  The module that defines the node must be in the worker image, which
+  `load_extension(local_python_sources=...)` arranges.

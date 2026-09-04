@@ -1,0 +1,15 @@
+{
+  "title": "User guide",
+  "pages": [
+    "index",
+    "quickstart",
+    "sql",
+    "python-api",
+    "data-sources",
+    "configuration",
+    "results",
+    "compute",
+    "benchmark"
+  ],
+  "defaultOpen": true
+}

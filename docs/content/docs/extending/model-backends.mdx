@@ -1,0 +1,116 @@
+---
+title: Model backends
+description: Planning and running model work behind the ModelBackend protocol.
+---
+
+A model backend is the unit that knows how to run a model. It checks
+support, proposes physical plans, creates per GPU model state, and
+executes the request inside the worker. The Quail executor and the
+vLLM and SGLang request backends are all implementations of this one
+protocol.
+
+```python
+class ModelBackend(Protocol):
+    name: str
+
+    def supports(self, model: ModelSpec, device: DeviceSpec,
+                 gpu_count: int) -> SupportResult: ...
+
+    def plan(self, region: ModelRegion,
+             context: PlanningContext) -> Sequence[PhysicalCandidate]: ...
+
+    def start(self, context: GpuContext) -> ModelExecution: ...
+
+    def execute_request(self, context: BackendExecutionContext) -> Any: ...
+```
+
+## supports
+
+Return `SupportResult.accept()` or `SupportResult.reject(reason)`. The
+session calls this when it is created, so an unsupported combination
+fails early with the reason in the `RefusalError`. The request
+backends reject any GPU count other than 1.
+
+## plan
+
+`region.logical_plan` is the logical plan. Return one or more
+`PhysicalCandidate(graph, plan, estimated_seconds)` values. The plan is
+a `PhysicalPlan` whose `backend` equals your name. Put your own
+settings in `plan.settings`; nothing else reads them. See
+[Physical nodes](/docs/extending/physical-nodes) for how to build the
+graph.
+
+The planner also calls every registered physical planner and keeps the
+candidate with the smallest estimate, so a backend that cannot
+estimate should return a large number rather than zero.
+
+## start
+
+Called once per GPU executor with a `GpuContext`: the GPU index and
+count, the model and device specs, and the query settings. Return the
+object that will execute your model nodes:
+
+```python
+class ModelExecution(Protocol):
+    def execute(self, node: PhysicalNode, inputs: Mapping[str, Any]) -> NodeResult: ...
+```
+
+The built in `ModelNodeRuntime` delegates every model node to this
+object. Register your node types with that runtime, or with your own.
+
+## execute_request
+
+Called in the worker with a `BackendExecutionContext`:
+
+| Field | Meaning |
+| --- | --- |
+| `request` | The internal `PhysicalRequest`: the plan envelope and the tokenized inputs by input id. |
+| `graph` | The decoded `PhysicalGraph`. |
+| `registry` | The worker's registry. |
+| `gpu_count` | GPUs in this container. |
+| `graph_executor` | A closure that runs the compute subgraph with Quail's executor. Only the Quail backend uses it. |
+| `runtime_state` | A dict that survives across queries in one container. Keep your loaded engine here. |
+
+Return a `PhysicalResponse(outputs, metrics)`. `outputs` maps every
+model node's output `PortRef` to an Arrow table in the standard
+shapes:
+
+- document ids: one int32 column named by the alias, with
+  `quail.kind = document_ids` metadata;
+- filter answers: alias, `predicate`, `answer` columns with
+  `quail.kind = filter_answers` and `quail.alias` metadata;
+- join answers: one int32 column per alias plus `answer`, with
+  `quail.kind = join_answers`, `quail.anchor`, `quail.partners`,
+  `quail.semantics`, and `quail.written_pos` metadata.
+
+`metrics` is a mapping with at least `wall_s` and `fresh_tokens`, plus
+`node_metrics` keyed by node id if you want per node numbers in the
+report. The worker then runs `HashJoin`, `Project`, and `Limit` over
+your outputs with the generic runner.
+
+The request backends in `quail/backends/request.py` are the reference
+for all of this. They plan one `RequestExecution` node, start an
+engine on first use, keep it in `runtime_state`, and build the Arrow
+tables with the helpers in that module.
+
+## Runtime package
+
+If your backend needs a different inference package in the worker
+image, set a `runtime_package` attribute, for example
+`"sglang==0.5.18"`. `ModalComputeProvider` installs it instead of
+vLLM.
+
+## Registering
+
+```python
+def register_quail_extension(registry):
+    registry.register_backend(MyBackend())
+```
+
+Then select it with `EngineConfig(backend="my_backend")`.
+
+## Extra safeguard in tests
+
+`tests/test_physical.py` has `LocalFilterBackend`, a complete backend
+that plans a client-side node and never touches a GPU. It is the
+smallest working example, and a good starting point.

@@ -1,0 +1,88 @@
+---
+title: Python builder API
+description: Building queries in Python instead of SQL.
+---
+
+The builder mirrors the SQL surface construct for construct. It
+starts from `Session.docs(name)` and ends with `select(...)`, which
+returns a runnable `Query`.
+
+```python
+from quail import col, prompt
+
+query = (session.docs("reviews").alias("r")
+         .ai_filter(prompt("Is this about shipping? {0}", col("r.review")),
+                    selectivity=0.3)
+         .ai_filter(prompt("Is the tone angry? {0}", col("r.review")))
+         .limit(100)
+         .select("r.id", "r.review"))
+```
+
+## Methods
+
+| Method | SQL equivalent |
+| --- | --- |
+| `docs(provider)` | `FROM provider` |
+| `.alias(a)` | `FROM provider a`. Must come right after `docs()`. |
+| `.ai_filter(prompt, selectivity=None)` | A `WHERE AI_FILTER(...)` term over one table. |
+| `.ai_join(others, prompt, selectivity=None, anchor=None, semantics="full")` | `JOIN ... ON AI_FILTER(...)`, or `EXISTS` / `NOT EXISTS`. |
+| `.limit(n)` | `LIMIT n` |
+| `.select(*cols, order="as_written")` | The `SELECT` list. Returns the `Query`. |
+
+`col("r.review")` is a qualified column. `col("review")` is
+unqualified and resolves when exactly one table in scope has that
+column. `"*"` in `select` expands to every column of every table.
+
+## Joins
+
+`others` is one `docs(...)` builder or a list of them. Each side must
+be a single, optionally filtered, `docs(...)` query. Filters on a
+joined side are carried into the combined query.
+
+```python
+q = (session.docs("reviews").alias("r")
+     .ai_join([session.docs("products").alias("p"),
+               session.docs("tags").alias("g")],
+              prompt("Does review {0} match product {1} and tag {2}?",
+                     col("r.review"), col("p.description"), col("g.text")),
+              selectivity=0.02, anchor="p")
+     .select("r.id", "p.asin", "g.id"))
+```
+
+For `semantics="full"` the prompt must reference every table the call
+joins, plus at least one table already in the query, so every join
+connects to the join graph.
+
+`semantics="exists"` and `semantics="anti"` take exactly one inner
+table. The prompt names the inner table and one outer table. The
+anchor is always the outer table.
+
+```python
+q = (session.docs("reviews").alias("r")
+     .ai_join(session.docs("products").alias("p"),
+              prompt("Does {0} mention {1}?", col("r.review"), col("p.name")),
+              semantics="anti")
+     .select("r.id"))
+```
+
+## Filter order
+
+`select(..., order=...)` sets the rule for ordering filter predicates
+over one table:
+
+- `"as_written"`: run predicates in the order you wrote them.
+- `"by_cost"`: order by estimated cost using the selectivities you
+  gave.
+
+The SQL front end takes the same argument as `session.sql(text,
+order=...)`. When `order` is left unset, Quail picks `by_cost` if
+every predicate has a selectivity and `as_written` otherwise. The
+chosen rule is reported as `order_rule` in the result report.
+
+## Errors
+
+Every mistake in the builder raises `quail.logical.CompileError` at
+the call that made it, with a message that names the fix. Examples:
+an alias set after a filter, two document columns on one table, a
+join prompt that does not reference a joined table, or an anchor that
+is not part of the join.

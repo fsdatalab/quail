@@ -1,0 +1,10 @@
+{
+  "title": "Contributing",
+  "pages": [
+    "index",
+    "experiments",
+    "reports",
+    "style"
+  ],
+  "defaultOpen": true
+}

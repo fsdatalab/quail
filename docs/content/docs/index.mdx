@@ -1,0 +1,67 @@
+---
+title: Introduction
+description: What Quail is, what it runs, and where to start.
+---
+
+Quail (QUery-Aware Inference Layer) is a query engine for two operators
+over document collections:
+
+- `AI_FILTER`: does this document satisfy a true or false question?
+- `AI_JOIN`: does this tuple of documents, all in one prompt, satisfy a
+  true or false question?
+
+A language model answers each question with a single token, TRUE or
+FALSE. Quail constrains the decode step to those two tokens, so no
+open-ended generation ever runs.
+
+## What Quail does that a plain inference server does not
+
+A stock inference server treats every question as an independent
+request. Quail knows the whole query up front, and uses that in three
+ways:
+
+- **Pipelining.** A document moves to the next filter question as soon
+  as it passes the current one, instead of waiting for a whole stage
+  to finish.
+- **Token-based admission.** The scheduler admits documents into each
+  forward pass by token count and KV pages, not by request count, so
+  every pass is full.
+- **KV rewind.** A document's KV is computed once and stays on the GPU
+  while every later question about that document runs. Only the
+  question tokens are new work.
+
+KV is the attention key and value tensors the model keeps for tokens it
+has already processed.
+
+## Scope
+
+- Filter and join queries only. Maps, classification, open-ended
+  generation, speculation, and forking are out of scope on purpose.
+- Models: Qwen3 4B fp8 and Qwen3 32B fp8.
+- Hardware: one H100 per model copy. One Modal container can hold 1, 2,
+  4, or 8 H100s. Quail does not split one model across GPUs.
+- Every engine run goes through Modal. There is no local GPU path.
+
+## Where to go next
+
+<Cards>
+  <Card title="Quickstart" href="/docs/user-guide/quickstart"
+        description="Register a table, write a query, read the rows." />
+  <Card title="SQL reference" href="/docs/user-guide/sql"
+        description="The AI SQL subset Quail accepts, with examples." />
+  <Card title="Architecture" href="/docs/architecture"
+        description="How a query moves from SQL to a GPU and back." />
+  <Card title="Extending Quail" href="/docs/extending"
+        description="Table providers, backends, physical nodes, observers." />
+</Cards>
+
+## How the documentation is organized
+
+- **User guide**: installing, writing queries, reading results, and
+  running on Modal.
+- **Architecture**: the logical and physical plans, the Quail backend,
+  the request backends, and the compute worker.
+- **Extending Quail**: the registry and each extension interface, with
+  working code from the test suite.
+- **Contributing**: repository layout, tests, experiment rules, and
+  writing rules.

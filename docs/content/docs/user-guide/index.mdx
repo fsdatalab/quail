@@ -1,0 +1,51 @@
+---
+title: Installation
+description: Setting up the Python package and Modal.
+---
+
+Quail is a Python package managed with `uv`. It needs Python 3.12. It
+does not need a local GPU: every model run happens on Modal.
+
+```bash
+git clone https://github.com/fsdatalab/quail-exploration
+cd quail-exploration
+uv sync
+```
+
+`uv sync` installs the package and its client side dependencies:
+`sqlglot` for SQL parsing, `pyarrow` for tables and results,
+`transformers` and `bpe-qwen` for tokenization, `datasets` and
+`huggingface-hub` for Hugging Face sources, and the `modal` client.
+
+## Modal
+
+The compute side runs as Modal Functions in the existing `quail-engine`
+app. You need a Modal account and a token on the client:
+
+```bash
+uv run modal token new
+```
+
+The first query in a fresh Modal environment builds the worker image
+and downloads the model weights into the `quail-hf-cache` volume.
+Later runs reuse both. Three volumes are attached to every worker:
+
+| Volume | Mounted at | Holds |
+| --- | --- | --- |
+| `quail-hf-cache` | `/root/.cache/huggingface` | Model weights and tokenizers |
+| `quail-kernel-cache` | `/root/.cache/kernels` | Compiled kernels and vLLM's model inspection cache |
+| `quail-results` | `/results` | Run records, benchmark summaries, and per-item data |
+
+Do not create new Modal app names. Caches and warm containers ride on
+the app.
+
+## Check the install
+
+The CPU test suite runs without Modal:
+
+```bash
+uv run pytest
+```
+
+Everything under `tests/gpu/` is a Modal cell that costs GPU time and
+runs only when you invoke it explicitly.

@@ -1,0 +1,12 @@
+{
+  "title": "Architecture",
+  "pages": [
+    "index",
+    "logical-plans",
+    "physical-plans",
+    "quail-backend",
+    "request-backends",
+    "worker"
+  ],
+  "defaultOpen": true
+}

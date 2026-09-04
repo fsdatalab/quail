@@ -1,0 +1,14 @@
+{
+  "title": "Quail",
+  "pages": [
+    "index",
+    "---User guide---",
+    "user-guide",
+    "---Architecture---",
+    "architecture",
+    "---Extending Quail---",
+    "extending",
+    "---Contributing---",
+    "contributing"
+  ]
+}

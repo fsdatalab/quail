@@ -1,0 +1,73 @@
+---
+title: Results and explain
+description: Reading rows, counts, the execution report, and the plan.
+---
+
+`Query.run()` returns a `QueryResult`. Under the default Modal compute
+provider the rows have already been materialized in the worker and
+returned as one Arrow table, so every accessor is cheap.
+
+```python
+result = query.run()
+
+result.collect()            # pyarrow.Table of the projected columns
+result.to_rows()            # list of tuples
+result.count()              # row count; len(result) is the same
+result.execute_stream()     # pyarrow.RecordBatchReader
+result.schema               # pyarrow.Schema
+result.report               # dict, see below
+```
+
+`collect`, `to_rows`, and `execute_stream` accept `limit=` to stop
+early. `execute_stream` also accepts `batch_rows=`.
+
+The two shortcuts on `Query` do the same without keeping the result:
+
+```python
+query.collect()             # run and return one Arrow table
+query.execute_stream()      # run and return a record batch reader
+```
+
+## The execution report
+
+`result.report` is a plain dictionary. The keys that every backend
+fills:
+
+| Key | Meaning |
+| --- | --- |
+| `backend` | The backend that ran the query. |
+| `wall_s` | Query time in seconds, excluding model startup. |
+| `boot_s`, `boot_kind` | Model startup time and whether it was cold or warm. |
+| `fresh_tokens` | Tokens the model computed for this query. |
+| `cached_tokens` | Tokens served from KV already on the GPU. |
+| `stages` | One entry per filter or join stage: documents or tuples evaluated, the selectivity you gave, and the selectivity observed. |
+| `node_metrics` | Per physical node metrics keyed by node id. |
+| `result_volume_path` | Where the worker saved the run record on the `quail-results` volume. |
+| `remarks` | Planner and tokenizer notes. |
+
+The Quail backend adds `regret_tokens`, `kv_manager`, `peak_gib`,
+`order_rule`, `expected_join_plan`, `executed_join_plan`, and
+`join_optimizer`. Registered execution observers add an `observers`
+mapping keyed by observer name.
+
+## Explain
+
+`Query.explain()` plans the query without running it and returns the
+logical and physical plan as text.
+
+```python
+print(session.sql(text).explain())
+```
+
+The logical part shows the `Scan`, `SemanticFilter`, `SemanticJoin`,
+and `Project` tree. The physical part lists every node of the typed
+physical graph in execution order with its explain fields.
+
+If the planner refuses the query, `explain()` prints the refusal
+instead. A refusal names the constraint and the numbers behind it, for
+example a document whose tokens do not fit one chunk. `run()` raises
+`quail.RefusalError` for the same case.
+
+Planning tokenizes the document columns, so the first `explain()` or
+`run()` on a session pays for tokenization. Later queries over the same
+column reuse the token store.

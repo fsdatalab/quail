@@ -1,0 +1,119 @@
+---
+title: Quickstart
+description: Register a table, write a query, read the rows.
+---
+
+This walks one filter query from a small in memory table to result
+rows on an H100.
+
+## 1. Open a session
+
+```python
+import pyarrow as pa
+import quail
+
+session = quail.Session()
+```
+
+`Session()` uses the Quail backend, the Qwen3 4B fp8 model, one H100,
+and the Modal compute provider. See
+[Configuration](/docs/user-guide/configuration) for the other choices.
+
+## 2. Register a table
+
+```python
+reviews = pa.table({
+    "id": ["r0", "r1", "r2"],
+    "review": [
+        "The package arrived two weeks late and the box was crushed.",
+        "Great fit, exactly the color in the photo.",
+        "Shipping was fast but the zipper broke on day one.",
+    ],
+})
+session.register("reviews", quail.DocumentProvider.from_table(
+    reviews, id_col="id",
+))
+```
+
+`id_col` names the column that identifies a document. Other sources
+are described in [Data sources](/docs/user-guide/data-sources).
+
+## 3. Write the query
+
+In SQL:
+
+```python
+query = session.sql("""
+    SELECT r.id
+    FROM reviews r
+    WHERE AI_FILTER(PROMPT('Does this review complain about shipping? {0}',
+                           r.review))
+""")
+```
+
+Or with the Python builder:
+
+```python
+from quail import col, prompt
+
+query = (session.docs("reviews").alias("r")
+         .ai_filter(prompt("Does this review complain about shipping? {0}",
+                           col("r.review")))
+         .select("r.id"))
+```
+
+Both build the same logical plan.
+
+## 4. Look at the plan
+
+```python
+print(query.explain())
+```
+
+This tokenizes the document column, plans the query, and prints the
+logical tree and the physical graph. No GPU is used.
+
+## 5. Run it
+
+```python
+result = query.run()
+print(result.to_rows())
+print(result.report["wall_s"], result.report["fresh_tokens"])
+```
+
+The first call starts a Modal container, loads the model, and runs the
+query. The container stays up until you close the session, so later
+queries skip the model load.
+
+The client prints the Modal function call id for each run. Keep it if
+you tee the output to a log. The result can be pulled again later with
+`modal.FunctionCall.from_id(id).get()`.
+
+## 6. Close the session
+
+```python
+session.close()
+```
+
+Or use `with quail.Session() as session:`. Closing lets the Modal
+function scale to zero and removes the temporary token files.
+
+## A join
+
+```python
+session.register("products", quail.DocumentProvider.from_table(
+    products, id_col="asin",
+))
+
+pairs = session.sql("""
+    SELECT r.id, p.asin
+    FROM reviews r
+    JOIN products p
+      ON AI_FILTER(PROMPT('Is review {0} about product {1}?',
+                          r.review, p.description),
+                   {'selectivity': 0.1})
+""").run()
+```
+
+The prompt names one column per table. Each placeholder is a different
+table. The result has one row per passing pair.
