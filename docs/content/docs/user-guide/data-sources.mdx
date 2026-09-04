@@ -8,12 +8,11 @@ A query reads from tables registered on the session. Each table is a
 in ones.
 
 ```python
-import pyarrow as pa
 import quail
 
 session = quail.Session()
 session.register("reviews", quail.DocumentProvider.from_table(
-    pa.table({"id": ["r0", "r1"], "review": ["...", "..."]}),
+    reviews,          # the IMDB table built in the quickstart
     id_col="id",
 ))
 ```

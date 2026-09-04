@@ -5,18 +5,29 @@ description: Building queries in Python instead of SQL.
 
 The builder mirrors the SQL surface construct for construct. It
 starts from `Session.docs(name)` and ends with `select(...)`, which
-returns a runnable `Query`.
+returns a runnable `Query`. The examples use the QUAIL-B predicates
+over the `reviews` and `aspects` tables from the
+[quickstart](/docs/user-guide/quickstart).
 
 ```python
 from quail import col, prompt
 
+F1 = ("Judge strictly from the review above whether it mentions at "
+      "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
+      "answer TRUE if the review mentions at least one positive aspect "
+      "of the movie, FALSE otherwise.")
+F4 = ("Judge strictly from the review above whether it discusses the "
+      "ending of the movie.\n\n{0}\n\nInstruction: answer TRUE if the "
+      "review discusses the ending of the movie, FALSE otherwise.")
+
 query = (session.docs("reviews").alias("r")
-         .ai_filter(prompt("Is this about shipping? {0}", col("r.review")),
-                    selectivity=0.3)
-         .ai_filter(prompt("Is the tone angry? {0}", col("r.review")))
+         .ai_filter(prompt(F1, col("r.body")), selectivity=0.6)
+         .ai_filter(prompt(F4, col("r.body")), selectivity=0.2)
          .limit(100)
-         .select("r.id", "r.review"))
+         .select("r.id", "r.body"))
 ```
+
+This is QUAIL-B's IMDB-6 with a limit.
 
 ## Methods
 
@@ -29,9 +40,9 @@ query = (session.docs("reviews").alias("r")
 | `.limit(n)` | `LIMIT n` |
 | `.select(*cols, order="as_written")` | The `SELECT` list. Returns the `Query`. |
 
-`col("r.review")` is a qualified column. `col("review")` is
-unqualified and resolves when exactly one table in scope has that
-column. `"*"` in `select` expands to every column of every table.
+`col("r.body")` is a qualified column. `col("body")` is unqualified
+and resolves when exactly one table in scope has that column. `"*"`
+in `select` expands to every column of every table.
 
 ## Joins
 
@@ -40,13 +51,34 @@ be a single, optionally filtered, `docs(...)` query. Filters on a
 joined side are carried into the combined query.
 
 ```python
-q = (session.docs("reviews").alias("r")
-     .ai_join([session.docs("products").alias("p"),
-               session.docs("tags").alias("g")],
-              prompt("Does review {0} match product {1} and tag {2}?",
-                     col("r.review"), col("p.description"), col("g.text")),
-              selectivity=0.02, anchor="p")
-     .select("r.id", "p.asin", "g.id"))
+DISCUSS_ASPECT = ("Does the review in DOCUMENT {0} discuss the movie "
+                  "aspect in DOCUMENT {1}?")
+
+pairs = (session.docs("reviews").alias("r")
+         .ai_filter(prompt(F1, col("r.body")), selectivity=0.6)
+         .ai_join(session.docs("aspects").alias("a"),
+                  prompt(DISCUSS_ASPECT, col("r.body"), col("a.aspect")),
+                  selectivity=0.15)
+         .select("r.id", "a.aspect"))
+```
+
+That is the quickstart's join. A chain over four tables, QUAIL-B's
+IMDB-9, adds one `ai_join` per table:
+
+```python
+ASPECT_SENTIMENT = ("Does the review in DOCUMENT {0} express positive "
+                    "sentiment about the movie aspect in DOCUMENT {1}?")
+
+r1 = session.docs("reviews").alias("r1")
+a1 = session.docs("aspects").alias("a1")
+r2 = session.docs("reviews").alias("r2")
+a2 = session.docs("aspects").alias("a2")
+
+chain = (r1
+         .ai_join(a1, prompt(DISCUSS_ASPECT, col("r1.body"), col("a1.aspect")))
+         .ai_join(r2, prompt(DISCUSS_ASPECT, col("r2.body"), col("a1.aspect")))
+         .ai_join(a2, prompt(ASPECT_SENTIMENT, col("r2.body"), col("a2.aspect")))
+         .select("r1.id", "a1.id", "r2.id", "a2.id", order="by_cost"))
 ```
 
 For `semantics="full"` the prompt must reference every table the call
@@ -58,11 +90,11 @@ table. The prompt names the inner table and one outer table. The
 anchor is always the outer table.
 
 ```python
-q = (session.docs("reviews").alias("r")
-     .ai_join(session.docs("products").alias("p"),
-              prompt("Does {0} mention {1}?", col("r.review"), col("p.name")),
-              semantics="anti")
-     .select("r.id"))
+no_aspect = (session.docs("reviews").alias("r")
+             .ai_join(session.docs("aspects").alias("a"),
+                      prompt(DISCUSS_ASPECT, col("r.body"), col("a.aspect")),
+                      semantics="anti")
+             .select("r.id"))
 ```
 
 ## Filter order
@@ -77,7 +109,8 @@ over one table:
 The SQL front end takes the same argument as `session.sql(text,
 order=...)`. When `order` is left unset, Quail picks `by_cost` if
 every predicate has a selectivity and `as_written` otherwise. The
-chosen rule is reported as `order_rule` in the result report.
+chosen rule is reported as `order_rule` in the result report and in
+`explain()`.
 
 ## Errors
 
