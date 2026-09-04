@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from copy import copy
 from dataclasses import dataclass
@@ -26,17 +25,6 @@ class IndexRelation:
     def from_table(cls, table: pa.Table) -> "IndexRelation":
         """Create a lazy relation from one Arrow table."""
         return cls(_table_source(table), table.schema)
-
-
-class _TemporaryIpcFile:
-    def __init__(self, path: str):
-        self.path = path
-
-    def __del__(self):
-        try:
-            os.unlink(self.path)
-        except FileNotFoundError:
-            pass
 
 
 def document_index_schema(aliases: Iterable[str], kind: str) -> pa.Schema:
@@ -275,7 +263,6 @@ class QueryResult:
         self.true_join_tables = true_join_tables or {}
         self._row_count = None
         self._materialized = None
-        self._ipc_file = None
 
     @classmethod
     def from_table(cls, table: pa.Table,
@@ -294,32 +281,6 @@ class QueryResult:
         result.true_join_tables = {}
         result._row_count = len(table)
         result._materialized = table
-        result._ipc_file = None
-        return result
-
-    @classmethod
-    def from_ipc_file(
-        cls,
-        path: str,
-        schema: pa.Schema,
-        row_count: int,
-        report: dict | None = None,
-    ) -> "QueryResult":
-        """Create a result backed by one temporary Arrow IPC file."""
-        result = cls.__new__(cls)
-        result.columns = list(schema.names)
-        result.schema = schema
-        result.report = report or {}
-        result.answer_tables = {"filters": {}, "joins": {}}
-        result.limit = None
-        result._declaration = None
-        result._document_index_schema = None
-        result._projection = []
-        result.survivor_indices = {}
-        result.true_join_tables = {}
-        result._row_count = row_count
-        result._materialized = None
-        result._ipc_file = _TemporaryIpcFile(path)
         return result
 
     def execute_stream(self, batch_rows: int = DEFAULT_BATCH_ROWS,
@@ -338,31 +299,6 @@ class QueryResult:
             if effective_limit is not None:
                 table = table.slice(0, effective_limit)
             return table.to_reader(max_chunksize=batch_rows)
-        if self._ipc_file is not None:
-            path = self._ipc_file.path
-            schema = self.schema
-
-            def file_batches():
-                remaining = effective_limit
-                with pa.memory_map(path, "r") as source:
-                    file = pa.ipc.open_file(source)
-                    for index in range(file.num_record_batches):
-                        batch = file.get_batch(index)
-                        if remaining == 0:
-                            break
-                        if remaining is not None and len(batch) > remaining:
-                            batch = batch.slice(0, remaining)
-                        offset = 0
-                        while offset < len(batch):
-                            length = min(batch_rows, len(batch) - offset)
-                            yield batch.slice(offset, length)
-                            offset += length
-                            if remaining is not None:
-                                remaining -= length
-                                if remaining == 0:
-                                    break
-
-            return pa.RecordBatchReader.from_batches(schema, file_batches())
         indices = execute_stream(
             self._declaration,
             self._document_index_schema,
@@ -404,15 +340,7 @@ class QueryResult:
 
     def count(self) -> int:
         if self._row_count is None:
-            if self._ipc_file is not None:
-                with pa.memory_map(self._ipc_file.path, "r") as source:
-                    file = pa.ipc.open_file(source)
-                    count = sum(
-                        len(file.get_batch(index))
-                        for index in range(file.num_record_batches)
-                    )
-            else:
-                count = count_rows(self._declaration)
+            count = count_rows(self._declaration)
             self._row_count = (count if self.limit is None
                                else min(count, self.limit))
         return self._row_count

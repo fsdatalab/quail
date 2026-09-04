@@ -92,6 +92,28 @@ QueryResult
   Modal returns the final Arrow table and execution report
 ```
 
+### The result path
+
+Answers take one shape at every hop the runner or a client sees.
+
+- A model backend returns a `PhysicalResponse`: Arrow tables keyed by
+  output `PortRef`, in the standard document id, filter answer, and
+  join answer shapes, plus a metrics mapping.
+- The generic runner finishes the graph from those tables and
+  `Query.finish` builds one `QueryResult` over an Acero plan.
+- A compute provider returns that `QueryResult`. The in-process
+  provider returns it as is. The Modal provider collects it in the
+  worker, returns the Arrow table and the report over the wire, and
+  wraps them in a `QueryResult` on the client.
+- The worker also writes a run record to `/results/runs/` on the
+  `quail-results` volume. That is a record for reports, not a result
+  path.
+
+Inside the Quail backend, GPU child processes send their answers to
+the parent over pipes as plain Python values. That is transport within
+one backend; the parent converts the merged answers to the same Arrow
+tables before they reach the runner.
+
 ## 1. System overview
 
 Quail (QUery-Aware Inference Layer) is a query engine for two
