@@ -15,6 +15,14 @@ MAX_SEQUENCES = 4_096
 MAX_BATCHED_TOKENS = 25_305
 
 
+def longest_common_prefix(left, right) -> int:
+    """Return the length of the shared token prefix."""
+    for index, (left_token, right_token) in enumerate(zip(left, right)):
+        if left_token != right_token:
+            return index
+    return min(len(left), len(right))
+
+
 def true_bit(output, true_ids) -> int:
     """Return 1 when a request's first output token is a TRUE token."""
     token_ids = output.outputs[0].token_ids
@@ -49,24 +57,44 @@ def filter_document_cap(
 
 
 class _FilterChain:
-    """Answers, survivors, and counters for one filter chain."""
+    """Answers, survivors, and counters for one filter chain.
 
-    def __init__(self, question_ids, true_ids):
+    Cached tokens split two ways. A request at stage 1 or later could
+    hit the prefix its own document's previous request computed, up to
+    the shared part of the two prompts rounded to KV blocks; a miss
+    there is per document KV regret. Cached tokens beyond that came
+    from another document's request that shared a prefix.
+    """
+
+    def __init__(self, body_ids, question_ids, true_ids, block_size=1):
+        self.body_ids = body_ids
         self.question_ids = question_ids
         self.true_ids = true_ids
+        self.block_size = block_size
         self.answers = {}
         self.survivors = []
         self.requests = 0
         self.prompt_tokens = 0
         self.cached_tokens = 0
+        self.regret_tokens = 0
+        self.cross_row_cached_tokens = 0
+
+    def _same_row_hit(self, document: int, stage: int) -> int:
+        if stage == 0:
+            return 0
+        shared = len(self.body_ids[document]) + longest_common_prefix(
+            self.question_ids[stage - 1], self.question_ids[stage])
+        return (shared // self.block_size) * self.block_size
 
     def record(self, document: int, stage: int, output) -> bool:
         """Record one answer; return True when the document advances."""
         self.requests += 1
         self.prompt_tokens += len(output.prompt_token_ids)
-        self.cached_tokens += int(
-            getattr(output, "num_cached_tokens", 0) or 0
-        )
+        cached = int(getattr(output, "num_cached_tokens", 0) or 0)
+        self.cached_tokens += cached
+        could_hit = self._same_row_hit(document, stage)
+        self.regret_tokens += max(0, could_hit - cached)
+        self.cross_row_cached_tokens += max(0, cached - could_hit)
         answer = true_bit(output, self.true_ids)
         self.answers[(document, stage + 1)] = answer
         if answer and stage + 1 < len(self.question_ids):
@@ -83,6 +111,8 @@ class _FilterChain:
             "requests": self.requests,
             "prompt_tokens": self.prompt_tokens,
             "cached_tokens": self.cached_tokens,
+            "regret_tokens": self.regret_tokens,
+            "cross_row_cached_tokens": self.cross_row_cached_tokens,
             **settings,
         }
 
@@ -118,7 +148,7 @@ def run_filter_chain(
         body_ids, question_ids, budget_tokens,
         block_size=block_size, max_num_seqs=max_num_seqs,
     )
-    chain = _FilterChain(question_ids, true_ids)
+    chain = _FilterChain(body_ids, question_ids, true_ids, block_size)
     inflight = {}
 
     def submit(document, stage):
@@ -179,7 +209,7 @@ def run_filter_chain_waves(
         body_ids, question_ids, budget_tokens,
         block_size=block_size, max_num_seqs=max_num_seqs,
     )
-    chain = _FilterChain(question_ids, true_ids)
+    chain = _FilterChain(body_ids, question_ids, true_ids, block_size)
     active = []
     next_document = 0
     started = time.perf_counter()
@@ -317,12 +347,37 @@ def run_join_grouped(
     }
 
 
-def longest_common_prefix(left, right) -> int:
-    """Return the length of the shared token prefix."""
-    for index, (left_token, right_token) in enumerate(zip(left, right)):
-        if left_token != right_token:
-            return index
-    return min(len(left), len(right))
+def join_cache_accounting(
+    prefixes,
+    suffix_count: int,
+    cached,
+    seen_prefix_lengths,
+    block_size: int,
+) -> tuple[int, int]:
+    """Split a join's cached tokens into regret and cross row hits.
+
+    The first suffix of an anchor could hit only the part of the
+    prefix an earlier request already computed; later suffixes could
+    hit the whole prefix. Cached tokens short of that are per document
+    KV regret. Cached tokens beyond it were computed by another
+    document's request that shared a prefix.
+
+    Returns:
+        (regret_tokens, cross_row_cached_tokens)
+    """
+    regret = 0
+    cross_row = 0
+    for anchor_index, prefix in enumerate(prefixes):
+        for suffix_index in range(suffix_count):
+            could_hit = (
+                seen_prefix_lengths[anchor_index]
+                if suffix_index == 0 else len(prefix)
+            )
+            could_hit = (could_hit // block_size) * block_size
+            pair = anchor_index * suffix_count + suffix_index
+            regret += max(0, could_hit - int(cached[pair]))
+            cross_row += max(0, int(cached[pair]) - could_hit)
+    return regret, cross_row
 
 
 def join_regret_tokens(
@@ -332,20 +387,7 @@ def join_regret_tokens(
     seen_prefix_lengths,
     block_size: int,
 ) -> int:
-    """Count prefix tokens a request recomputed although it could have hit.
-
-    The first suffix of an anchor could hit only the part of the
-    prefix an earlier request already computed; later suffixes could
-    hit the whole prefix.
-    """
-    regret = 0
-    for anchor_index, prefix in enumerate(prefixes):
-        for suffix_index in range(suffix_count):
-            would_hit = (
-                seen_prefix_lengths[anchor_index]
-                if suffix_index == 0 else len(prefix)
-            )
-            would_hit = (would_hit // block_size) * block_size
-            pair = anchor_index * suffix_count + suffix_index
-            regret += max(0, would_hit - int(cached[pair]))
-    return regret
+    """Count prefix tokens a request recomputed although it could have hit."""
+    return join_cache_accounting(
+        prefixes, suffix_count, cached, seen_prefix_lengths, block_size,
+    )[0]

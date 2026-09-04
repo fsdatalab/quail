@@ -13,7 +13,20 @@ work directory to this script:
     uv run --with matplotlib python reports/make_quailb_sf01_4b_plots.py $W
 
 The SoL file is the ideal work estimate from reports/make_sol_quailb.py
-for all 32 queries.
+for all 32 queries. It carries two estimates per query: sol_s, where each
+distinct token prefix in the corpus is computed once, and
+per_document.sol_s, where each document is computed once and reused only
+across its own questions. The figure marks the distinct prefix estimate;
+the tables list both.
+
+Two KV regrets follow the same split. The per document regret is the one
+the runs recorded. The distinct prefix regret adds the shared prefix
+tokens of every scanned document the engine recomputed, minus the cached
+tokens it received from other documents' requests. Quail never shares
+across documents, so its cross row hits are zero. The measured vLLM runs
+recorded cross row hits only implicitly: on a single stage filter every
+cached token is a cross row hit, so those queries have a value and the
+rest are left blank until a run records cross_row_cached_tokens.
 """
 
 import json
@@ -103,7 +116,7 @@ def load_inputs(workdir):
 
 
 def load_sol(workdir):
-    """Load the SoL estimate: seconds and modeled work per covered query."""
+    """Load both SoL estimates and the corpus prefix statistics."""
     sol = load(workdir / "sol.json")
     if sol["scale_factor"] != 0.1:
         raise ValueError("unexpected SoL scale factor")
@@ -113,9 +126,65 @@ def load_sol(workdir):
         pairs = int(model["join_pair_evaluations"])
         estimates[query] = {
             "seconds": float(model["sol_s"]),
+            "seconds_per_document": float(model["per_document"]["sol_s"]),
             "work": pairs if pairs else int(model["input_document_rows"]),
+            "alias_columns": dict(record["alias_columns"]),
         }
+    estimates["corpora"] = {
+        column: int(stats["shared_prefix_tokens"])
+        for column, stats in sol["corpora"].items()
+    }
     return estimates
+
+
+def scanned_aliases(method, row) -> set[str]:
+    """Return the aliases whose documents were computed as prefixes."""
+    scanned = set()
+    for stage in stages(method, row):
+        if method == "Quail":
+            scanned.add(stage["alias"] if stage["op"] == "filter"
+                        else stage["anchor"])
+        elif stage["kind"] in ("filter", "filter_chain"):
+            scanned.add(stage["alias"])
+        else:
+            scanned.add(stage["anchor_alias"])
+    return scanned
+
+
+def cross_row_cached(method, row):
+    """Return cached tokens other documents' requests supplied, or None."""
+    if method == "Quail":
+        return 0
+    if row.get("cross_row_cached_tokens") is not None:
+        return int(row["cross_row_cached_tokens"])
+    physical = stages(method, row)
+    single_stage_filters = all(
+        stage["kind"] in ("filter", "filter_chain")
+        and int(stage.get("n_stages", 1)) == 1
+        for stage in physical
+    )
+    if single_stage_filters:
+        # a document's first request has nothing of its own to hit
+        return sum(int(stage.get("cached_tokens") or 0) for stage in physical)
+    return None
+
+
+def shared_prefix_tokens(method, row, estimate, corpora) -> int:
+    """Return the shared prefix tokens of the query's scanned documents."""
+    return sum(
+        corpora[estimate["alias_columns"][alias]]
+        for alias in scanned_aliases(method, row)
+    )
+
+
+def distinct_regret(method, row, estimate, corpora):
+    """Return regret against one computation per distinct prefix, or None."""
+    cross_row = cross_row_cached(method, row)
+    if cross_row is None:
+        return None
+    return (int(row["regret_tokens"])
+            + shared_prefix_tokens(method, row, estimate, corpora)
+            - cross_row)
 
 
 def wall_seconds(method, row):
@@ -172,9 +241,19 @@ def answer_counts(row):
     return int(answer["evaluated"]), int(answer["correct"])
 
 
-def aggregate(records, method):
+def aggregate(records, method, sol=None):
     """Compute aggregate metrics for one method."""
     rows = records[method]
+    distinct = None
+    distinct_queries = 0
+    if sol is not None:
+        values = [
+            distinct_regret(method, rows[query], sol[query], sol["corpora"])
+            for query in QUERY_ORDER
+        ]
+        measured = [value for value in values if value is not None]
+        distinct = sum(measured)
+        distinct_queries = len(measured)
     total_seconds = sum(wall_seconds(method, rows[query])
                         for query in QUERY_ORDER)
     total_regret = sum(rows[query]["regret_tokens"]
@@ -204,6 +283,8 @@ def aggregate(records, method):
         "join_throughput": join_throughput,
         "total_regret": total_regret,
         "regret_fraction": total_regret / total_fresh,
+        "distinct_regret": distinct,
+        "distinct_regret_queries": distinct_queries,
         "accuracy": correct / evaluated,
     }
 
@@ -222,14 +303,19 @@ def family_name(query):
 
 def print_tables(records, sol):
     """Print the report's derived Markdown tables."""
-    summaries = {method: aggregate(records, method) for method in METHODS}
+    summaries = {method: aggregate(records, method, sol)
+                 for method in METHODS}
     print("\nAggregate metrics")
     print("| Method | Queries | Total time (s) | Total cost | "
-          "Filter throughput | Join throughput | KV regret | "
-          "Regret / fresh tokens | Accuracy |")
-    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+          "Filter throughput | Join throughput | KV regret, per document | "
+          "Regret / fresh tokens | KV regret, distinct prefix | Accuracy |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for method in METHODS:
         row = summaries[method]
+        distinct = (
+            f"{row['distinct_regret']:,} "
+            f"({row['distinct_regret_queries']} queries)"
+        )
         print(
             f"| {method} | 32 | {row['total_seconds']:,.2f} | "
             f"${row['total_cost']:.4f} | "
@@ -237,6 +323,7 @@ def print_tables(records, sol):
             f"{row['join_throughput']:,.1f} pairs/s | "
             f"{row['total_regret']:,} | "
             f"{row['regret_fraction']:.2%} | "
+            f"{distinct} | "
             f"{row['accuracy']:.2%} |"
         )
 
@@ -269,34 +356,35 @@ def print_tables(records, sol):
             print(f"| {query} | {values[0]:,} | {values[1]:,} | "
                   f"{values[2]:,} |")
 
-    print("\nTime relative to SoL")
-    print("| Method | Total time (s) | SoL total (s) | Time / SoL | "
-          "Median time / SoL | Best query | Worst query |")
-    print("|---|---:|---:|---:|---:|---|---|")
-    covered = [query for query in QUERY_ORDER if query in sol]
-    sol_total = sum(sol[query]["seconds"] for query in covered)
-    for method in METHODS:
-        ratios = {
-            query: wall_seconds(method, records[method][query])
-            / sol[query]["seconds"]
-            for query in covered
-        }
-        total = sum(wall_seconds(method, records[method][query])
-                    for query in covered)
-        best = min(ratios, key=ratios.get)
-        worst = max(ratios, key=ratios.get)
-        print(
-            f"| {method} | {total:,.2f} | {sol_total:,.2f} | "
-            f"{total / sol_total:.2f}x | "
-            f"{float(np.median(list(ratios.values()))):.2f}x | "
-            f"{best} ({ratios[best]:.2f}x) | "
-            f"{worst} ({ratios[worst]:.2f}x) |"
-        )
+    for label, key in (("distinct prefix", "seconds"),
+                       ("per document", "seconds_per_document")):
+        print(f"\nTime relative to SoL, {label}")
+        print("| Method | Total time (s) | SoL total (s) | Time / SoL | "
+              "Median time / SoL | Best query | Worst query |")
+        print("|---|---:|---:|---:|---:|---|---|")
+        sol_total = sum(sol[query][key] for query in QUERY_ORDER)
+        for method in METHODS:
+            ratios = {
+                query: wall_seconds(method, records[method][query])
+                / sol[query][key]
+                for query in QUERY_ORDER
+            }
+            total = sum(wall_seconds(method, records[method][query])
+                        for query in QUERY_ORDER)
+            best = min(ratios, key=ratios.get)
+            worst = max(ratios, key=ratios.get)
+            print(
+                f"| {method} | {total:,.2f} | {sol_total:,.2f} | "
+                f"{total / sol_total:.2f}x | "
+                f"{float(np.median(list(ratios.values()))):.2f}x | "
+                f"{best} ({ratios[best]:.2f}x) | "
+                f"{worst} ({ratios[worst]:.2f}x) |"
+            )
 
     print("\nPer-query metrics")
-    print("| Query | Unit | SoL estimate | Quail | Stock vLLM | "
-          "Pipelined vLLM |")
-    print("|---|---|---:|---:|---:|---:|")
+    print("| Query | Unit | SoL, distinct prefix | SoL, per document | "
+          "Quail | Stock vLLM | Pipelined vLLM |")
+    print("|---|---|---:|---:|---:|---:|---:|")
     for query in QUERY_ORDER:
         cells = []
         unit = None
@@ -311,22 +399,24 @@ def print_tables(records, sol):
             unit = current_unit
             throughput = query_work(method, row) / seconds
             cost = seconds * H100_USD_PER_HOUR / 3600
-            versus_sol = (
-                f"; {seconds / estimate['seconds']:.2f}x SoL"
-                if estimate else ""
+            distinct = distinct_regret(method, row, estimate, sol["corpora"])
+            distinct_text = (
+                "not measured" if distinct is None else f"{distinct:,}"
             )
             cells.append(
                 f"{seconds:.2f} s; {throughput:,.1f} {unit}; "
-                f"${cost:.4f}; {row['regret_tokens']:,} regret{versus_sol}"
+                f"${cost:.4f}; regret {row['regret_tokens']:,} per doc, "
+                f"{distinct_text} distinct; "
+                f"{seconds / estimate['seconds']:.2f}x SoL"
             )
         sol_cell = (
             f"{estimate['seconds']:.2f} s; "
             f"{estimate['work'] / estimate['seconds']:,.1f} {unit}; "
             f"${estimate['seconds'] * H100_USD_PER_HOUR / 3600:.4f}"
-            if estimate else "none"
         )
-        print(f"| {query} | {unit} | {sol_cell} | " + " | ".join(cells)
-              + " |")
+        per_document_cell = f"{estimate['seconds_per_document']:.2f} s"
+        print(f"| {query} | {unit} | {sol_cell} | {per_document_cell} | "
+              + " | ".join(cells) + " |")
 
 
 def annotate_bars(ax, bars, formatter, values):
@@ -445,7 +535,10 @@ def grouped_bars(ax, queries, records, value_fn, sol=None, sol_fn=None):
     for index, (method, color) in enumerate(zip(METHODS, COLORS)):
         values = [value_fn(method, records[method][query])
                   for query in queries]
-        ax.bar(x + (index - 1) * width, values, width,
+        shown = [position for position, value in enumerate(values)
+                 if value is not None]
+        ax.bar(x[shown] + (index - 1) * width,
+               [values[position] for position in shown], width,
                label=method, color=color)
     if sol is not None:
         positions = [position for position, query in enumerate(queries)
@@ -467,9 +560,10 @@ def make_per_query_plot(records, sol):
     join_queries = [query for query in QUERY_ORDER
                     if has_join("Quail", records["Quail"][query])]
     fig, axes = plt.subplots(
-        4, 1, figsize=(19, 19),
-        gridspec_kw={"height_ratios": [1.4, 1.0, 1.25, 1.4]},
+        5, 1, figsize=(19, 23),
+        gridspec_kw={"height_ratios": [1.4, 1.0, 1.25, 1.2, 1.2]},
     )
+    corpora = sol["corpora"]
 
     runtime_ax = axes[0]
     grouped_bars(runtime_ax, QUERY_ORDER, records, wall_seconds,
@@ -521,7 +615,22 @@ def make_per_query_plot(records, sol):
     )
     regret_ax.set_yscale("symlog", linthresh=1_000)
     regret_ax.set_ylabel("recomputed prefix tokens (symlog scale)")
-    regret_ax.set_title("KV regret compared with unlimited KV")
+    regret_ax.set_title(
+        "KV regret, per document: a document's own prefix recomputed")
+
+    distinct_ax = axes[4]
+    grouped_bars(
+        distinct_ax,
+        QUERY_ORDER,
+        records,
+        lambda method, row: distinct_regret(
+            method, row, sol[row["query"]], corpora),
+    )
+    distinct_ax.set_yscale("symlog", linthresh=1_000)
+    distinct_ax.set_ylabel("recomputed prefix tokens (symlog scale)")
+    distinct_ax.set_title(
+        "KV regret, distinct prefix: any prefix recomputed that another "
+        "document had computed (vLLM shown where the run recorded it)")
 
     handles, labels = runtime_ax.get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=4,

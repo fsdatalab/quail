@@ -13,7 +13,11 @@
   active selectivity estimate collection, supplies exact survivors for
   every predicate, including the two agent trace predicates.
 - The full result is at `/results/sol/sol_quailb_sf0.1.json` on the
-  `quail-results` Modal volume.
+  `quail-results` Modal volume. Each query carries two estimates: `sol_s`,
+  where every distinct token prefix in the corpus is computed once, and
+  `per_document.sol_s`, where every document is computed once and reused
+  only across its own questions. The file also records, per corpus, how
+  many tokens are a prefix another document has.
 
 The estimate counts modeled fresh tokens, attention pairs, KV reads, and KV
 writes. It does not include kernel gaps, host work, or scheduling overhead. No
@@ -56,18 +60,18 @@ FEVER claims. The active scale factor 0.1 corpus has 500 of each. The measured
 engine runs also used 500 of each, so the regenerated estimate is the correct
 comparison.
 
-- The 4B estimates total 464.74 seconds over 32 queries. The 30 queries
-  of the 2026-08-29 file total 369.40 seconds, against 370.34 seconds in
-  that file: crediting shared prefixes moves them by 0.3%, because the
-  review, report, claim, and passage corpora share under 1% of their
-  tokens as prefixes.
-- The 32B estimates total 3,425.75 seconds.
+- The distinct prefix 4B estimates total 464.74 seconds over 32 queries;
+  the per document ones total 632.66 seconds. On the 30 non agent queries
+  the two are 369.40 and 370.34 seconds: the review, report, claim, and
+  passage corpora share under 1% of their tokens as prefixes.
+- The distinct prefix 32B estimates total 3,425.75 seconds; the per
+  document ones total 4,466.82 seconds.
 - The two agent queries total 95.34 seconds for 4B and 543.16 seconds for
   32B. Each is one filter over 1,772 traces of 9,736 mean tokens. Trace
   rows sampled from the same trajectory are prefixes of each other, and
   68.9% of the corpus tokens are a prefix some other row already contains.
-  Computed from scratch the two queries would need 262.32 seconds for 4B;
-  with each distinct prefix computed once they need 95.34.
+  The per document estimate for the two queries is 262.32 seconds for 4B;
+  the distinct prefix estimate is 95.34.
 - IMDB totals 108.40 seconds for 4B.
 - BioDEX totals 116.14 seconds for 4B.
 - FEVER totals 80.47 seconds for 4B.

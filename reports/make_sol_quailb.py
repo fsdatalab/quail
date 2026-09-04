@@ -105,6 +105,7 @@ from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan
 from quail.backends.quail.coordinator import runtime_join_steps, thin_survivors
+from quail.runtime.tokens import shared_prefix_lengths
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 
 W = Path(sys.argv[1])
@@ -181,25 +182,15 @@ lengths = {}        # column -> {doc id: token count}
 shared = {}         # column -> {doc id: prefix tokens another doc computed}
 
 
-def longest_common_prefix(left, right) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if left[index] != right[index]:
-            return index
-    return limit
-
-
 for key, (table, col) in COLUMNS.items():
     t = pq.read_table(W / "data" / TAG / f"{table}.parquet",
                       columns=["id", col])
     tokens_by_doc = {i: encode(x) for i, x in
                      zip(t.column("id").to_pylist(), t.column(col).to_pylist())}
     lengths[key] = {i: len(ids) for i, ids in tokens_by_doc.items()}
-    shared[key] = {}
-    previous = ()
-    for doc_id, ids in sorted(tokens_by_doc.items(), key=lambda item: item[1]):
-        shared[key][doc_id] = longest_common_prefix(previous, ids)
-        previous = ids
+    doc_ids = list(tokens_by_doc)
+    shared[key] = dict(zip(doc_ids, shared_prefix_lengths(
+        [tokens_by_doc[doc_id] for doc_id in doc_ids])))
     v = lengths[key].values()
     credited = sum(shared[key].values())
     print(f"{key:32} {len(v):>6} docs  {sum(v):>10,} tokens  "
@@ -296,6 +287,15 @@ def prompt_token_counts(prompt):
     return labels_by_alias, prompt.tail_tokens
 
 
+# Two estimates come out of one run. With CREDIT_SHARED off, a
+# document's first use pays for its whole prefix: the bound for an
+# execution that computes each document once and reuses it only across
+# that document's own questions. With it on, a prefix another document
+# already computed is resident: the bound for an execution that
+# computes each distinct prefix in the corpus once.
+CREDIT_SHARED = True
+
+
 def first_use(alias_data, row, suffix) -> Work:
     """Compute one document's prefix for the first time in a query.
 
@@ -303,7 +303,7 @@ def first_use(alias_data, row, suffix) -> Work:
     the document pays only for the rest of its prefix and the suffix.
     """
     prefix = PRE + alias_data["tokens"][row]
-    shared_tokens = alias_data["shared"][row]
+    shared_tokens = alias_data["shared"][row] if CREDIT_SHARED else 0
     if shared_tokens == 0:
         return scan(prefix, suffix)
     resident = PRE + shared_tokens
@@ -1018,15 +1018,41 @@ for qid in query_ids:
         skipped[qid] = f"no modeled corpus for {', '.join(missing)}"
         print(f"{qid}: skipped, {skipped[qid]}")
         continue
-    rows[qid] = {"description": descriptions.pop(), "models": {}}
+    rows[qid] = {
+        "description": descriptions.pop(),
+        "alias_columns": {
+            scan.alias: f"{scan.provider}.{scan.column}"
+            for scan in probe_scans
+        },
+        "models": {},
+    }
     query_inputs[qid] = {}
     for model in MODELS:
         _, build = query_defs_by_model[model.name][qid]
+        CREDIT_SHARED = False
+        per_document = add_sol_metrics(
+            simulate_optimal_left_deep(
+                build(), model, CHUNK[model.name]),
+            model,
+        )
+        CREDIT_SHARED = True
         optimal = add_sol_metrics(
             simulate_optimal_left_deep(
                 build(), model, CHUNK[model.name]),
             model,
         )
+        optimal["shared_prefix_tokens_credited"] = (
+            per_document["tokens"] - optimal["tokens"])
+        optimal["per_document"] = {
+            key: per_document[key]
+            for key in ("sol_s", "tokens", "pairs", "kv_written",
+                        "kv_read", "passes", "bound_by",
+                        "cost_usd_per_query_at_sol",
+                        "documents_per_second_at_sol",
+                        "document_pairs_per_second_at_sol",
+                        "t_compute", "t_memory", "anchor")
+            if key in per_document
+        }
         rows[qid]["models"][model.name] = optimal
         query_inputs[qid][model.name] = {
             "optimal_left_deep": {
@@ -1037,17 +1063,16 @@ for qid in query_ids:
         }
 
 hdr = (f"{'query':7} {'4B tokens':>11} {'4B anchor':>15} {'4B SoL':>9} "
-       f"{'32B tokens':>11} {'32B anchor':>15} {'32B SoL':>9} "
-       f"{'32B/4B':>7}")
+       f"{'4B per-doc':>10} {'32B SoL':>9} {'32B per-doc':>11} {'32B/4B':>7}")
 print(hdr)
 print("-" * len(hdr))
-for qid, r in rows.items():
-    a, b = r["models"]["qwen3-4b-fp8"], r["models"]["qwen3-32b-fp8"]
+for qid, row in rows.items():
+    a = row["models"]["qwen3-4b-fp8"]
+    b = row["models"]["qwen3-32b-fp8"]
     print(f"{qid:7} {a['tokens']:>11,.0f} {str(a['anchor'] or '-'):>15} "
-          f"{a['sol_s']:>9.3f} {b['tokens']:>11,.0f} "
-          f"{str(b['anchor'] or '-'):>15} {b['sol_s']:>9.3f} "
+          f"{a['sol_s']:>9.3f} {a['per_document']['sol_s']:>10.3f} "
+          f"{b['sol_s']:>9.3f} {b['per_document']['sol_s']:>11.3f} "
           f"{b['sol_s'] / a['sol_s']:>7.2f}")
-
 
 json.dump({
     "what": f"Speed of light for {len(rows)} QUAIL-B queries at "
@@ -1059,6 +1084,19 @@ json.dump({
     "scale_factor": SF,
     "query_count": len(rows),
     "skipped": skipped,
+    "corpora": {
+        key: {
+            "documents": len(lengths[key]),
+            "tokens": sum(lengths[key].values()),
+            "shared_prefix_tokens": sum(shared[key].values()),
+        }
+        for key in COLUMNS
+    },
+    "estimates": {
+        "sol_s": "each distinct token prefix in the corpus computed once",
+        "per_document.sol_s": "each document computed once, reused only "
+                              "across its own questions",
+    },
     "corpus_id": CORPUS_ID,
     "collection_id": COLLECTION_ID,
     "pricing": {

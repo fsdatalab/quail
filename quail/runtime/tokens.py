@@ -355,3 +355,33 @@ def decode_token_documents(value):
 def decode_payload_documents(documents):
     return {alias: decode_token_documents(value)
             for alias, value in documents.items()}
+
+
+def longest_common_prefix(left, right) -> int:
+    """Return the length of the token prefix two sequences share."""
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if left[index] != right[index]:
+            return index
+    return limit
+
+
+def shared_prefix_lengths(sequences) -> list[int]:
+    """Return, per sequence, the prefix tokens another sequence also has.
+
+    The values sum to the tokens a prefix trie over the sequences
+    saves: an execution with unlimited KV that computes every distinct
+    prefix once pays for each sequence only beyond its credited length.
+    The sum does not depend on the order the sequences are computed
+    in; the per sequence credit is the longest common prefix with the
+    lexicographic predecessor.
+    """
+    order = sorted(range(len(sequences)),
+                   key=lambda index: tuple(sequences[index]))
+    credits = [0] * len(sequences)
+    previous = ()
+    for index in order:
+        current = tuple(sequences[index])
+        credits[index] = longest_common_prefix(previous, current)
+        previous = current
+    return credits

@@ -98,3 +98,25 @@ def test_token_selection_serializes_a_file_reference(tmp_path):
     assert len(encoded) < 1000
     assert len(restored) == 10
     assert len(restored[0]) == 1000
+
+
+def test_shared_prefix_lengths_sum_to_the_trie_saving():
+    from quail.runtime.tokens import shared_prefix_lengths
+
+    sequences = [
+        [1, 2, 3, 4],       # shares [1, 2, 3] with the next
+        [1, 2, 3, 9, 9],
+        [1, 2],             # a prefix of both
+        [7, 8],             # shares nothing
+        [7, 8],             # identical to the previous
+    ]
+    credits = shared_prefix_lengths(sequences)
+
+    # 13 tokens in total; the prefix trie has 4 + 2 + 2 = 8 nodes
+    assert sum(len(sequence) for sequence in sequences) - sum(credits) == 8
+    # the credit for a sequence never exceeds its own length
+    assert all(credit <= len(sequence)
+               for credit, sequence in zip(credits, sequences))
+    assert shared_prefix_lengths([]) == []
+    # any order gives the same saving
+    assert sum(shared_prefix_lengths(sequences[::-1])) == sum(credits)

@@ -265,3 +265,55 @@ def test_vllm_backend_executes_a_physical_request(monkeypatch):
     assert result.report["backend_metrics"]["requests"] == 2
     assert result.count() == 0
     session.close()
+
+
+def test_filter_chain_splits_cached_tokens_into_regret_and_cross_row():
+    from quail.backends.request_scheduling import run_filter_chain_waves
+
+    class Output:
+        def __init__(self, prompt, cached):
+            self.prompt_token_ids = prompt
+            self.num_cached_tokens = cached
+            self.outputs = [SimpleNamespace(token_ids=[1])]
+
+    class Client:
+        def __init__(self):
+            self.wave = 0
+
+        def generate(self, prompts, sampling_params, use_tqdm=False):
+            self.wave += 1
+            # wave 1 is stage 0 for both documents: document 1's whole
+            # prompt was cached by a request from another row; wave 2
+            # is stage 1: document 0 hits only part of its own body
+            cached = {1: [0, 6], 2: [2, 6]}[self.wave]
+            return [
+                Output(prompt["prompt_token_ids"], value)
+                for prompt, value in zip(prompts, cached)
+            ]
+
+    result = run_filter_chain_waves(
+        Client(), object(), [[5, 5, 5, 5], [6, 6, 6, 6]],
+        [[8, 8], [9, 9]], 100, true_ids={1}, block_size=1,
+    )
+
+    # stage 0 could hit nothing of its own document, so every cached
+    # token there is a cross row hit: 0 + 6
+    # stage 1 could hit the 4 body tokens: document 0 hit 2 (regret 2),
+    # document 1 hit 6 (2 beyond its body, cross row)
+    assert result["regret_tokens"] == 2
+    assert result["cross_row_cached_tokens"] == 6 + 2
+    assert result["cached_tokens"] == 14
+
+
+def test_join_cache_accounting_returns_both_sides():
+    from quail.backends.request_scheduling import join_cache_accounting
+
+    prefixes = [[1] * 10, [2] * 10]
+    # two suffixes per anchor; the first suffix of anchor 0 could hit
+    # the 4 tokens an earlier request computed
+    cached = [4, 10, 12, 0]
+    regret, cross_row = join_cache_accounting(
+        prefixes, 2, cached, [4, 0], block_size=1)
+
+    assert regret == 0 + 0 + 0 + 10
+    assert cross_row == 0 + 0 + 12 + 0

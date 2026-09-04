@@ -883,3 +883,81 @@ def summarize_queries(rows: list[dict], h100_usd_per_hour: float,
             _divide(cost_with_boot, tokens) * 1_000_000, 6),
         "answer_accuracy": counts.as_dict(),
     }
+
+
+# ---------------------------------------------------- prefix reuse metrics
+#
+# Two KV regrets. The per document regret counts a document's own prefix
+# recomputed after an earlier request had computed it. The distinct prefix
+# regret also counts tokens recomputed although another document's request
+# had computed the same prefix: with unlimited KV every distinct prefix in
+# the corpus is computed once.
+
+_shared_prefix_cache: dict[str, int] = {}
+
+
+def shared_prefix_tokens(store) -> int:
+    """Return the prefix tokens a token store's documents share."""
+    from quail.runtime.tokens import shared_prefix_lengths
+
+    path = getattr(store, "path", None)
+    if path is not None and path in _shared_prefix_cache:
+        return _shared_prefix_cache[path]
+    total = sum(shared_prefix_lengths(
+        [list(document) for document in store]))
+    if path is not None:
+        _shared_prefix_cache[path] = total
+    return total
+
+
+def scanned_aliases(stages) -> set[str]:
+    """Return the aliases whose documents a query computed as prefixes.
+
+    A filtered alias is scanned in full at its first stage. A join
+    anchor's documents are prefixes; its partners are suffixes and
+    cannot be reused.
+    """
+    scanned = set()
+    for stage in stages:
+        if stage.get("op") == "filter":
+            scanned.add(stage["alias"])
+        elif stage.get("op") == "join":
+            scanned.add(stage["anchor"])
+    return scanned
+
+
+def cross_row_cached_tokens(report) -> int | None:
+    """Return cached tokens another document's request computed."""
+    backend_metrics = report.get("backend_metrics") or {}
+    if "cross_row_cached_tokens" in backend_metrics:
+        return int(backend_metrics["cross_row_cached_tokens"])
+    if report.get("backend") == "quail":
+        return 0
+    return None
+
+
+def distinct_prefix_regret(regret_tokens, shared_prefix, cross_row_cached):
+    """Return the regret against one computation per distinct prefix."""
+    if regret_tokens is None or cross_row_cached is None:
+        return None
+    return int(regret_tokens) + int(shared_prefix) - int(cross_row_cached)
+
+
+def add_prefix_metrics(row: dict, query, report: dict) -> dict:
+    """Add shared prefix tokens and both regrets to one result row."""
+    from quail.planner import collect_operators
+
+    scans, _, _ = collect_operators(query.logical)
+    columns = {scan.alias: (scan.provider, scan.column) for scan in scans}
+    shared = 0
+    for alias in scanned_aliases(report.get("stages", ())):
+        provider, column = columns[alias]
+        shared += shared_prefix_tokens(query.session.tokenize(provider, column))
+    cross_row = cross_row_cached_tokens(report)
+    row.update({
+        "shared_prefix_tokens": shared,
+        "cross_row_cached_tokens": cross_row,
+        "regret_distinct_tokens": distinct_prefix_regret(
+            report.get("regret_tokens"), shared, cross_row),
+    })
+    return row

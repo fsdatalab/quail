@@ -11,7 +11,7 @@ import pyarrow as pa
 
 from quail.backends.base import GpuContext
 from quail.backends.request_scheduling import (
-    join_regret_tokens,
+    join_cache_accounting,
     longest_common_prefix,
     run_join_grouped,
     true_bit,
@@ -339,11 +339,13 @@ def _token_list(values) -> list[int]:
     return [int(token) for token in values]
 
 
-def _stage_major_filter(client, sampling_params, bodies, questions, true_ids):
+def _stage_major_filter(client, sampling_params, bodies, questions, true_ids,
+                        block_size):
     active = list(range(len(bodies)))
     answers = {}
     prior = {}
     requests = prompt_tokens = cached_tokens = 0
+    regret_tokens = cross_row_cached = 0
     started = time.perf_counter()
     stages = []
     for stage_index, question in enumerate(questions):
@@ -362,9 +364,21 @@ def _stage_major_filter(client, sampling_params, bodies, questions, true_ids):
             answers[(document, stage_index)] = answer
             requests += 1
             prompt_tokens += len(output.prompt_token_ids)
-            cached_tokens += int(
-                getattr(output, "num_cached_tokens", 0) or 0
+            cached = int(getattr(output, "num_cached_tokens", 0) or 0)
+            cached_tokens += cached
+            # the document's own earlier requests computed a prefix this
+            # one could hit; anything cached beyond it came from another
+            # document sharing a prefix
+            could_hit = max(
+                (
+                    longest_common_prefix(prompt["prompt_token_ids"], earlier)
+                    for earlier in prior.get(document, ())
+                ),
+                default=0,
             )
+            could_hit = (could_hit // block_size) * block_size
+            regret_tokens += max(0, could_hit - cached)
+            cross_row_cached += max(0, cached - could_hit)
             if answer:
                 next_active.append(document)
                 prior.setdefault(document, []).append(prompt["prompt_token_ids"])
@@ -383,6 +397,8 @@ def _stage_major_filter(client, sampling_params, bodies, questions, true_ids):
         "prompt_tokens": prompt_tokens,
         "cached_tokens": cached_tokens,
         "fresh_tokens": prompt_tokens - cached_tokens,
+        "regret_tokens": regret_tokens,
+        "cross_row_cached_tokens": cross_row_cached,
         "stages": stages,
         "doc_cap": None,
     }
@@ -400,6 +416,8 @@ def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
             "prompt_tokens": 0,
             "cached_tokens": 0,
             "fresh_tokens": 0,
+            "regret_tokens": 0,
+            "cross_row_cached_tokens": 0,
             "stages": [],
             "doc_cap": 0,
         }
@@ -442,6 +460,10 @@ def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
         "prompt_tokens": result["prompt_tokens"],
         "cached_tokens": result["cached_tokens"],
         "fresh_tokens": result["prompt_tokens"] - result["cached_tokens"],
+        "regret_tokens": int(result.get("regret_tokens") or 0),
+        "cross_row_cached_tokens": int(
+            result.get("cross_row_cached_tokens") or 0
+        ),
         "stages": stages,
         "doc_cap": result["doc_cap"],
     }
@@ -480,6 +502,8 @@ class RequestModelExecution:
         steps = []
         fresh_tokens = cached_tokens = requests = 0
         evaluated_documents = evaluated_pairs = regret_tokens = 0
+        cross_row_cached = 0
+        block_size = int(self.capacity["block_size"])
 
         for filter_index, spec in enumerate(node.filters):
             document_ids = list(survivors[spec.alias])
@@ -495,6 +519,7 @@ class RequestModelExecution:
                     bodies,
                     spec.question_token_ids,
                     self.true_ids,
+                    block_size,
                 )
             elif self.filter_submission == "pipelined":
                 result = _pipelined_filter(
@@ -535,15 +560,17 @@ class RequestModelExecution:
                 "requests": result["requests"],
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
+                "regret_tokens": result["regret_tokens"],
+                "cross_row_cached_tokens": result["cross_row_cached_tokens"],
                 "doc_cap": result["doc_cap"],
             })
             requests += result["requests"]
             fresh_tokens += result["fresh_tokens"]
             cached_tokens += result["cached_tokens"]
+            regret_tokens += result["regret_tokens"]
+            cross_row_cached += result["cross_row_cached_tokens"]
             evaluated_documents += result["requests"]
 
-
-        block_size = int(self.capacity["block_size"])
         for spec in node.joins:
             alias_documents = {
                 alias: list(survivors[alias]) for alias in spec.aliases
@@ -609,7 +636,7 @@ class RequestModelExecution:
                     )
                     for document, prefix in zip(anchor_ids, prefixes)
                 ]
-                regret = join_regret_tokens(
+                regret, cross_row = join_cache_accounting(
                     prefixes,
                     len(suffixes),
                     result["cached_per_request"],
@@ -625,6 +652,7 @@ class RequestModelExecution:
                 }
                 answers = []
                 regret = 0
+                cross_row = 0
 
             rows = []
             for anchor_id in anchor_ids:
@@ -670,12 +698,14 @@ class RequestModelExecution:
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
                 "regret_tokens": regret,
+                "cross_row_cached_tokens": cross_row,
             })
             requests += len(rows)
             evaluated_pairs += len(rows)
             fresh_tokens += result["fresh_tokens"]
             cached_tokens += result["cached_tokens"]
             regret_tokens += regret
+            cross_row_cached += cross_row
 
         for alias in node.aliases:
             outputs[f"ids:{alias}"] = survivors[alias]
@@ -694,6 +724,7 @@ class RequestModelExecution:
                 extension={
                     "steps": steps,
                     "requests": requests,
+                    "cross_row_cached_tokens": cross_row_cached,
                     "capacity": dict(self.capacity),
                 },
             ),

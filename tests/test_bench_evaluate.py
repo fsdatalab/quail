@@ -554,3 +554,26 @@ def test_report_writer_creates_markdown_and_plot(tmp_path):
     assert data["aggregate_volume_path"] in report
     generated_plot = plot_path_for(data, report_path)
     assert generated_plot.name == f"{data['artifact_stem']}.png"
+
+
+def test_distinct_prefix_regret_adds_shared_prefixes_minus_cross_row_hits():
+    from quail.bench.evaluate import (
+        cross_row_cached_tokens,
+        distinct_prefix_regret,
+        scanned_aliases,
+    )
+
+    stages = [
+        {"op": "filter", "alias": "r", "stage": 0},
+        {"op": "join", "anchor": "r", "partners": ["a"]},
+        {"op": "join", "anchor": "e", "partners": ["c"]},
+    ]
+    assert scanned_aliases(stages) == {"r", "e"}
+    assert cross_row_cached_tokens({"backend": "quail"}) == 0
+    assert cross_row_cached_tokens({
+        "backend": "pipelined_vllm",
+        "backend_metrics": {"cross_row_cached_tokens": 7},
+    }) == 7
+    assert cross_row_cached_tokens({"backend": "stock_vllm"}) is None
+    assert distinct_prefix_regret(100, 50, 30) == 120
+    assert distinct_prefix_regret(100, 50, None) is None

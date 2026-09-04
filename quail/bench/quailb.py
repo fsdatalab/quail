@@ -1371,6 +1371,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         H100_PRICE_SOURCE,
         BenchmarkEvaluator,
         ModalVolumeFiles,
+        add_prefix_metrics,
         add_query_metrics,
         corpus_identity,
         load_ground_truth,
@@ -1461,10 +1462,22 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             tokens_processed=("sum of fresh tokens sent through model "
                               "forward calls; tokens read from KV are not "
                               "counted again"),
-            regret_tokens=("fresh tokens spent recomputing document "
-                           "prefixes the same query already computed "
-                           "once; joins only - filters are always first "
-                           "computations"),
+            regret_tokens=("per document KV regret: fresh tokens spent "
+                           "recomputing a document's own prefix after an "
+                           "earlier request of the query computed it"),
+            shared_prefix_tokens=("tokens of the scanned documents that "
+                                  "are a prefix another scanned document "
+                                  "also has; an execution that computes "
+                                  "each distinct prefix once never "
+                                  "computes them"),
+            cross_row_cached_tokens=("cached tokens a request received "
+                                     "from another document's request; "
+                                     "null when the run did not record "
+                                     "it"),
+            regret_distinct_tokens=("distinct prefix KV regret: "
+                                    "regret_tokens plus "
+                                    "shared_prefix_tokens minus "
+                                    "cross_row_cached_tokens"),
             input_document_rows=("sum of input table rows for every query "
                                  "alias; a self join counts the table once "
                                  "per alias"),
@@ -1509,6 +1522,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                            backend_metrics=res.report.get(
                                "backend_metrics"
                            ))
+                add_prefix_metrics(row, query, res.report)
                 if evaluator is not None:
                     evaluation = evaluator.evaluate(query, res)
                     add_query_metrics(
