@@ -8,26 +8,21 @@ from tempfile import TemporaryDirectory
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail.builder import Query as BuilderQuery
+from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
-from quail.extensions import ExtensionRegistry, built_in_registry
+from quail.execution import document_input, PhysicalRequest
+from quail.extensions import ExtensionRegistry
 from quail.logical import CompileError, LogicalPlan
-from quail.logical_optimizer import (
-    LogicalPlanningContext,
-    apply_logical_rules,
-)
-from quail.planner.decide import _collect, explain, plan_query
+from quail.logical_optimizer import apply_logical_rules, LogicalPlanningContext
+from quail.physical import DocumentInput, PortRef, Project, ValueType
+from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
-from quail.physical import (
-    DocumentInput,
-    PortRef,
-    ValueType,
-)
-from quail.runtime.result import (
-    IndexRelation,
-    QueryResult,
-    true_answer_rows,
-)
-from quail.sqlfront import SQLDialect
+from quail.runtime.compute import ModalComputeProvider, QueryRequest
+from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
+from quail.runtime.runner import ExecutionContext, GenericRunner, NodeMetrics
+from quail.runtime.tokens import TokenStore
+from quail.sqlfront import compile_sql, SQLDialect
 
 
 class RefusalError(RuntimeError):
@@ -124,14 +119,12 @@ class Session:
 
     def sql(self, text: str, order: str | None = None,
             dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> "Query":
-        from quail.sqlfront import compile_sql
         logical = compile_sql(
             text, self.catalog, self.tokenizer, dialect=dialect
         )
         return Query(self, logical, order=order)
 
     def docs(self, name: str) -> "BoundBuilder":
-        from quail.builder import Query as BuilderQuery
         return BoundBuilder(self,
                             BuilderQuery(self.catalog, name,
                                          self.tokenizer))
@@ -167,7 +160,6 @@ class Session:
     def tokenize(self, provider_name: str, column: str,
                  projected_columns=()):
         """Write one document column to a memory mapped token store."""
-        from quail.runtime.tokens import TokenStore
 
         provider = self.catalog.get(provider_name)
         projected_columns = tuple(dict.fromkeys(projected_columns))
@@ -281,7 +273,7 @@ class Query:
                     self.session.catalog, self.session.config
                 ),
             )
-            scans, _, _ = _collect(self.logical)
+            scans, _, _ = collect_operators(self.logical)
             self._doc_tokens = {}
             self._token_inputs = {}
             projected = {}
@@ -314,7 +306,6 @@ class Query:
     def run(self) -> QueryResult:
         """Execute the query through the session compute provider."""
         if self.session.compute_provider is None:
-            from quail.runtime.compute import ModalComputeProvider
 
             self.session.compute_provider = ModalComputeProvider()
         result = self.session.compute_provider.execute(self._request())
@@ -336,7 +327,6 @@ class Query:
 
     def _prepare_physical(self):
         """Build the physical request used inside a compute worker."""
-        from quail.execution import PhysicalRequest, document_input
 
         plan = self.plan()
         if isinstance(plan, Refusal):
@@ -356,9 +346,8 @@ class Query:
 
     def _request(self):
         """Build the logical request sent to a compute provider."""
-        from quail.runtime.compute import QueryRequest
 
-        scans, _, _ = _collect(self.logical)
+        scans, _, _ = collect_operators(self.logical)
         return QueryRequest(
             logical_plan=self.logical,
             providers={
@@ -373,12 +362,6 @@ class Query:
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
         """Finish the physical graph and attach execution details."""
-        from quail.physical import DocumentInput, Project
-        from quail.runtime.runner import (
-            ExecutionContext,
-            GenericRunner,
-            NodeMetrics,
-        )
 
         plan = self.plan()
         out = response.metrics
@@ -416,7 +399,7 @@ class Query:
             result_volume_path=out.get("result_volume_path"),
             remarks=list(plan.remarks) + list(self.session.notes))
 
-        scans, logical_filters, logical_joins = _collect(self.logical)
+        scans, logical_filters, logical_joins = collect_operators(self.logical)
         scans_by_alias = {scan.alias: scan for scan in scans}
 
         def project(node, value):

@@ -4,6 +4,20 @@ from __future__ import annotations
 
 import time
 
+from quail.backends.quail import coordinator
+from quail.backends.quail.coordinator import (
+    report_join_plan,
+    search_specs,
+    stage_for_anchor,
+    thin_survivors,
+)
+from quail.backends.quail.graph import (
+    _child_graph,
+    _next_join,
+    _possible_anchors,
+    scalar_node_metrics,
+)
+from quail.execution import export_physical_outputs
 from quail.physical import (
     AdaptiveJoinPlan,
     AnchoredJoin,
@@ -12,12 +26,7 @@ from quail.physical import (
     PackedFilter,
     PhysicalGraph,
 )
-from quail.backends.quail.graph import (
-    _child_graph,
-    _next_join,
-    _possible_anchors,
-    scalar_node_metrics,
-)
+from quail.planner import balanced_shards, budgets
 from quail.runtime.runner import (
     compute_subgraph,
     ExecutionContext,
@@ -80,7 +89,6 @@ class DistributedQuailExecution:
 
     def __init__(self, payload, graph, gpu_count, round_fn,
                  model_spec, device, registry):
-        from quail.planner import budgets
 
         self.payload = payload
         self.graph = graph
@@ -101,7 +109,6 @@ class DistributedQuailExecution:
             for node in graph.nodes if isinstance(node, PackedFilter)
         }
         if self.filter_aliases - set(self.shards):
-            from quail.planner.decide import balanced_shards
             for alias in self.filter_aliases - set(self.shards):
                 shards, _ = balanced_shards(
                     [len(document) for document in self.docs[alias]],
@@ -149,7 +156,6 @@ class DistributedQuailExecution:
 
     def begin(self):
         """Start a query that has no filter node."""
-        from quail.backends.quail import coordinator
 
         subs = coordinator.begin_query_payloads(
             self.payload, self.gpu_count
@@ -165,7 +171,6 @@ class DistributedQuailExecution:
         )
 
     def _execute_filter(self, node, inputs):
-        from quail.backends.quail import coordinator
 
         document_ids = next(iter(inputs.values()))
         shards = self.shards
@@ -227,7 +232,6 @@ class DistributedQuailExecution:
         )
 
     def _execute_join(self, node, inputs):
-        from quail.backends.quail import coordinator
 
         survivors = inputs["survivors"]
         group = inputs["group"]
@@ -372,7 +376,6 @@ def prepare_distributed_inputs(node, inputs, context):
     if isinstance(node, PackedFilter):
         return inputs
     if isinstance(node, AnchoredJoin):
-        from quail.backends.quail.coordinator import stage_for_anchor
 
         state = context.state
         return {
@@ -389,11 +392,6 @@ def prepare_distributed_inputs(node, inputs, context):
 
 def run_distributed_adaptive(node, inputs, context):
     """Plan joins and execute typed children across GPU processes."""
-    from quail.backends.quail.coordinator import (
-        report_join_plan,
-        search_specs,
-        thin_survivors,
-    )
 
     state = context.state
     execution = state["distributed_execution"]
@@ -522,13 +520,8 @@ def run_distributed_adaptive(node, inputs, context):
 
 def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
                               round_fn, model_spec, device, runtimes,
-                              registry=None) -> dict:
+                              registry) -> dict:
     """Execute one typed Quail graph across GPU child processes."""
-    if registry is None:
-        from quail.extensions import registry_from_modules
-        registry = registry_from_modules(tuple(
-            payload["physical_plan"].get("extension_modules", ())
-        ))
     execution = DistributedQuailExecution(
         payload, graph, gpu_count, round_fn, model_spec, device, registry
     )
@@ -564,7 +557,6 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
     optimizer = None if adaptive_result is None else \
         adaptive_result.metrics.extension["join_optimizer"]
     report = execution.report()
-    from quail.execution import export_physical_outputs
 
     report.update(
         filters=filters,

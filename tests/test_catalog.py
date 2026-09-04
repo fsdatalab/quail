@@ -11,7 +11,7 @@ from quail.catalog import (
     DocumentProvider,
     ScanRequest,
 )
-from quail.extensions import built_in_registry
+from quail.builtins import built_in_registry
 from quail.logical import CompileError
 
 

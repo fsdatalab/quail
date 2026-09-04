@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 from quail.backends.quail import QuailModelExecution
-from quail.extensions import built_in_registry
+from quail.builtins import built_in_registry
 from quail.physical import (
     AdaptiveJoinPlan,
     AnchoredJoin,
@@ -243,6 +243,7 @@ def test_distributed_filter_executes_typed_node():
         MODELS["qwen3-4b-fp8"],
         DEVICES["h100-sxm"],
         registry.runtimes,
+        registry,
     )
 
     assert result["filters"]["d"] == {

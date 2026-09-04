@@ -10,6 +10,11 @@ from typing import Any, Mapping
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
+from quail.backends.request_scheduling import (
+    run_filter_chain,
+    run_join_grouped,
+)
+from quail.execution import export_physical_outputs, PhysicalResponse
 from quail.logical import SHARED_PRE
 from quail.physical import (
     DocumentInput,
@@ -23,10 +28,26 @@ from quail.physical import (
     RequestJoinSpec,
 )
 from quail.physical.base import input_ports
+from quail.planner import (
+    budgets,
+    collect_operators,
+    default_order_rule,
+    join_specs as logical_join_specs,
+    order_filters_indexed,
+    preamble_tokens,
+)
+from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.plan import CorpusStats, PhysicalPlan
 from quail.planning import PhysicalCandidate
 from quail.runtime.result import answer_table
-from quail.runtime.runner import NodeMetrics, NodeResult
+from quail.runtime.runner import (
+    compute_subgraph,
+    ExecutionContext,
+    GenericRunner,
+    ModelNodeRuntime,
+    NodeMetrics,
+    NodeResult,
+)
 
 
 def _answer_ids(tokenizer) -> tuple[list[int], list[int]]:
@@ -52,17 +73,8 @@ def plan_request_backend(
     join_submission: str,
 ) -> tuple[PhysicalCandidate, ...]:
     """Build one physical request plan for a request engine."""
-    from quail.planner import budgets
-    from quail.planner.decide import (
-        _collect,
-        _preamble_tokens,
-        default_order_rule,
-        join_specs as logical_join_specs,
-        order_filters_indexed,
-    )
-    from quail.planner.joins import search_joins, summarize_alias
 
-    scans, filters, joins = _collect(region.logical_plan)
+    scans, filters, joins = collect_operators(region.logical_plan)
     stats = {
         alias: CorpusStats(
             n_docs=len(lengths),
@@ -92,13 +104,13 @@ def plan_request_backend(
 
     rule = context.order or default_order_rule(filters, joins)[0]
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
-    preamble_tokens = _preamble_tokens(filters, joins)
+    shared_preamble = preamble_tokens(filters, joins)
     filter_orders = {
         alias: order_filters_indexed(
             predicates,
             rule,
             prefix_tokens=(
-                preamble_tokens + stats[alias].mean_doc_tokens
+                shared_preamble + stats[alias].mean_doc_tokens
             ),
             model=context.model,
             device=context.device,
@@ -124,7 +136,7 @@ def plan_request_backend(
             for alias, lengths in context.document_tokens.items()
         },
         {},
-        preamble_tokens,
+        shared_preamble,
         chunk_tokens,
         context.model,
         context.device,
@@ -437,7 +449,6 @@ def _pipelined_filter(
             tag=tag,
         )
     else:
-        from quail.backends.request_scheduling import run_filter_chain
 
         result = run_filter_chain(
             client.llm_engine,
@@ -583,7 +594,6 @@ class RequestModelExecution:
             cached_tokens += result["cached_tokens"]
             evaluated_documents += result["requests"]
 
-        from quail.backends.request_scheduling import run_join_grouped
 
         block_size = int(self.capacity["block_size"])
         for spec in node.joins:
@@ -764,13 +774,6 @@ def execute_request_graph(context, backend, engine_state, boot):
     except ImportError:
         torch = None
 
-    from quail.execution import PhysicalResponse, export_physical_outputs
-    from quail.physical import DocumentInput
-    from quail.runtime.runner import (
-        ExecutionContext,
-        GenericRunner,
-        compute_subgraph,
-    )
 
     envelope = context.request.plan
     documents = {
@@ -834,7 +837,5 @@ def execute_request_graph(context, backend, engine_state, boot):
 
 def request_runtimes() -> dict:
     """Return runtimes for the request backends' physical node."""
-    from quail.physical import RequestExecution
-    from quail.runtime.runner import ModelNodeRuntime
 
     return {RequestExecution.runtime_key: ModelNodeRuntime()}

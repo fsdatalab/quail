@@ -16,7 +16,7 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
     tmp_path, monkeypatch
 ):
     from quail.execution import export_physical_outputs
-    from quail.extensions import built_in_registry
+    from quail.builtins import built_in_registry
     from quail.physical import DocumentInput, PackedFilter, decode_graph
     from quail.runtime import worker
     from quail.runtime.runner import NodeMetrics, NodeResult, RunResult

@@ -7,6 +7,15 @@ import time
 from dataclasses import fields
 from dataclasses import replace
 
+from quail.backends.quail.coordinator import (
+    report_join_plan,
+    runtime_join_steps,
+    search_specs,
+    stage_for_anchor,
+    thin_survivors,
+)
+from quail.execution import export_physical_outputs
+from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.physical import (
     AdaptiveJoinPlan,
     AnchoredJoin,
@@ -18,6 +27,7 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.base import input_ports
+from quail.planner.joins import search_joins, summarize_alias
 from quail.runtime.runner import (
     compute_subgraph,
     ExecutionContext,
@@ -26,6 +36,7 @@ from quail.runtime.runner import (
     NodeMetrics,
     NodeResult,
 )
+from quail.runtime.tokens import chain_tokens, DocumentPrefixes
 
 
 class AdaptiveJoinRuntime:
@@ -84,7 +95,6 @@ def _join_round_kv(anchor_keys, prefix_lens, owned, seen) -> dict:
 
 
 def _tuple_suffix(join, docs, member):
-    from quail.runtime.tokens import chain_tokens
 
     parts = []
     for alias, document in zip(join["partners"], member):
@@ -123,8 +133,6 @@ def _runtime_stage(join, index: int, anchor: str,
 
 
 def _next_join(state) -> AnchoredJoin:
-    from quail.planner.joins import search_joins, summarize_alias
-    from quail.backends.quail.coordinator import runtime_join_steps
 
     remaining = state["remaining"]
     all_specs = state["search_specs"]
@@ -210,9 +218,6 @@ def _next_join(state) -> AnchoredJoin:
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
-    from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
-    from quail.backends.quail.coordinator import stage_for_anchor
-    from quail.runtime.tokens import DocumentPrefixes, chain_tokens
 
     state = context.state
     if isinstance(node, PackedFilter):
@@ -355,11 +360,6 @@ def _child_graph(node: AnchoredJoin, previous_anchor: str | None,
 
 def run_adaptive_join(node, inputs, context: ExecutionContext) -> NodeResult:
     """Plan and execute Quail join child graphs from actual survivors."""
-    from quail.backends.quail.coordinator import (
-        report_join_plan,
-        search_specs,
-        thin_survivors,
-    )
 
     state = context.state
     survivors = {}
@@ -599,7 +599,6 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "evicted_pages": arena.evicted_pages,
         "evicted_prefix_tokens": arena.evicted_prefix_tokens,
     }
-    from quail.execution import export_physical_outputs
 
     return {
         "filters": filters,

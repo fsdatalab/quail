@@ -4,18 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 import pyarrow as pa
 
-from quail.catalog import ScanRequest
+from quail.builtins import registry_from_modules
+from quail.catalog import ScanRequest, TableProvider
+from quail.extensions import ExtensionPackage
+from quail.logical import LogicalPlan
+from quail.planner import collect_operators
+from quail.planner.plan import EngineConfig
 from quail.runtime.result import QueryResult
 
-if TYPE_CHECKING:
-    from quail.catalog import TableProvider
-    from quail.extensions import ExtensionPackage
-    from quail.logical import LogicalPlan
-    from quail.planner.plan import EngineConfig
 
 
 @dataclass(frozen=True)
@@ -30,8 +30,6 @@ class QueryRequest:
     extensions: tuple[ExtensionPackage, ...] = ()
 
     def __post_init__(self) -> None:
-        from quail.logical import LogicalPlan
-
         if not isinstance(self.logical_plan, LogicalPlan):
             raise TypeError("query request needs a LogicalPlan")
         if not self.providers:
@@ -57,9 +55,8 @@ class ComputeProvider(Protocol):
 
 def _modal_request(request: QueryRequest) -> dict:
     """Prepare one request for a Modal Function."""
-    from quail.planner.decide import _collect
 
-    scans, _, _ = _collect(request.logical_plan)
+    scans, _, _ = collect_operators(request.logical_plan)
     needed = {
         name: {provider.id_col}
         for name, provider in request.providers.items()
@@ -113,7 +110,6 @@ class ModalComputeProvider:
 
     def _worker_for(self, backend_name: str, extensions=()):
         """Return Modal Functions containing the requested extensions."""
-        from quail.extensions import registry_from_modules
 
         local_sources = tuple(dict.fromkeys(
             source
@@ -136,6 +132,8 @@ class ModalComputeProvider:
         if self._app_context is not None and key != self._extension_key:
             self.close()
         if self._app_context is None:
+            # the worker module imports modal, which is slow to load
+            # and only needed by this provider
             from quail.runtime import worker
 
             self._worker = worker.modal_worker(

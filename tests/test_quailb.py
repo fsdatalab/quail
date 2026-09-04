@@ -28,7 +28,7 @@ from quail.bench.quailb import (
     split_query_ids,
     split_query_families,
 )
-from quail.planner.decide import _collect
+from quail.planner.decide import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
 
 
@@ -96,7 +96,7 @@ def test_all_queries_compile_and_plan(tmp_path):
     assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
     for qid, (_, build) in qdefs.items():
         query = build()
-        _, filters, joins = _collect(query.logical)
+        _, filters, joins = collect_operators(query.logical)
         predicates = [predicate for chain in filters.values()
                       for predicate in chain]
         if qid.startswith("PRIV-"):

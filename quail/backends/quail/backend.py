@@ -7,6 +7,8 @@ from dataclasses import replace
 from typing import Any
 
 from quail.backends.base import GpuContext
+from quail.backends.quail.worker import execute_quail_request
+from quail.executor import loop
 from quail.logical import SHARED_PRE
 from quail.physical import (
     AdaptiveJoinPlan,
@@ -14,12 +16,15 @@ from quail.physical import (
     PackedFilter,
     PhysicalNode,
 )
+from quail.planner import collect_operators, plan_quail
 from quail.planning import (
     ModelRegion,
     PhysicalCandidate,
     PlanningContext,
     SupportResult,
 )
+from quail.runtime.runner import NodeMetrics, NodeResult
+from quail.runtime.tokens import DocumentKeys
 
 
 class QuailModelExecution:
@@ -61,8 +66,6 @@ class QuailModelExecution:
         node: PackedFilter | AnchoredJoin,
         inputs: Mapping[str, Any],
     ) -> Any:
-        from quail.executor.loop import run_filter, run_join
-        from quail.runtime.runner import NodeMetrics, NodeResult
 
         missing = {
             "torch", "async_answers", "chunk_tokens",
@@ -78,13 +81,12 @@ class QuailModelExecution:
         chunk_tokens = self._state["chunk_tokens"]
 
         if isinstance(node, PackedFilter):
-            from quail.runtime.tokens import DocumentKeys
 
             document_ids = inputs["document_ids"]
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
                 retain_survivors = ()
-            answers, _, tokens = run_filter(
+            answers, _, tokens = loop.run_filter(
                 torch,
                 arena,
                 pipeline,
@@ -119,7 +121,7 @@ class QuailModelExecution:
                 ),
             )
 
-        answers, _, tokens = run_join(
+        answers, _, tokens = loop.run_join(
             torch,
             arena,
             pipeline,
@@ -219,9 +221,8 @@ class QuailBackend:
         region: ModelRegion,
         context: PlanningContext,
     ) -> tuple[PhysicalCandidate, ...]:
-        from quail.planner.decide import _plan_quail
 
-        plan = _plan_quail(
+        plan = plan_quail(
             region.logical_plan,
             model=context.model,
             device=context.device,
@@ -251,10 +252,9 @@ class QuailBackend:
 
     def _bind_runtime_data(self, plan, region, context):
         """Put tokenized prompts and answer tokens in the physical plan."""
-        from quail.planner.decide import _collect
 
         tokenizer = context.tokenizer
-        _, filters, joins = _collect(region.logical_plan)
+        _, filters, joins = collect_operators(region.logical_plan)
         encoded_nodes = []
         for node in plan.nodes:
             if isinstance(node, PackedFilter):
@@ -341,6 +341,5 @@ class QuailBackend:
 
     def execute_request(self, context) -> Any:
         """Run one Quail request inside a compute process."""
-        from quail.backends.quail.worker import execute_quail_request
 
         return execute_quail_request(context)

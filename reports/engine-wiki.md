@@ -22,7 +22,8 @@ execution request to the compute provider.
 | `logical_optimizer.py` | Generic logical rule runner | logical |
 | `builder.py` | Builder API entry point | catalog, logical |
 | `sqlfront/compile.py` | AI SQL entry point (sqlglot parser and binder) | catalog, logical |
-| `extensions.py` | Per session backend, codec, runtime, rule, and provider registration | physical, runtime |
+| `extensions.py` | Per session backend, codec, runtime, rule, and provider registration | physical |
+| `builtins.py` | The registry of built in backends, models, devices, codecs, runtimes, and source readers | backends, catalog, runner, specs |
 | `execution.py` | Token input, physical request, and Arrow response types | physical |
 | `planning.py` | Backend planning inputs and physical candidates | physical, specs |
 | `physical/` | Typed physical nodes, graph validation, and plan envelope codecs | nothing |
@@ -35,6 +36,7 @@ execution request to the compute provider.
 | `planner/roofline.py` | Generic component compute and memory limits | specs |
 | `planner/sol.py` | Ideal query packing and total component time | work, qwen3_cost, roofline |
 | `planner/plan.py` | PhysicalPlan, Refusal, and EngineConfig | physical, specs |
+| `planner/__init__.py` | The public planning interface backends import: `collect_operators`, `plan_query`, `plan_quail`, `preamble_tokens`, `order_filters_indexed`, `join_specs`, `balanced_shards` | decide, plan |
 | `planner/decide.py` | All planner decisions (order, anchor, budgets, sharding) | logical, budgets, plan |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |

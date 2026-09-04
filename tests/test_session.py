@@ -24,7 +24,7 @@ def _run(query, execute):
 
 
 def runtime_plan(request):
-    from quail.extensions import built_in_registry
+    from quail.builtins import built_in_registry
     from quail.physical import (
         AdaptiveJoinPlan,
         DocumentInput,

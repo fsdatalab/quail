@@ -4,6 +4,11 @@ Pure dict-and-list logic (no torch). Called by the worker's parent
 process between child GPUs.
 """
 
+from quail.physical import AnchoredJoin, Exchange
+from quail.planner import balanced_shards
+from quail.runtime.tokens import select_documents
+
+
 def _common_payload(payload: dict) -> dict:
     return {
         "model": payload["model"],
@@ -35,7 +40,6 @@ def begin_query_payloads(payload: dict, k: int) -> list[dict]:
 def filter_node_payloads(payload: dict, node, shards: dict,
                          k: int, *, has_joins: bool) -> list[dict]:
     """Build one typed filter node payload per GPU executor."""
-    from quail.runtime.tokens import select_documents
 
     outputs = []
     tokens = payload["docs"][node.alias]
@@ -77,7 +81,6 @@ def search_specs(joins: list) -> list:
 
 def runtime_join_steps(sequence, joins: list) -> tuple:
     """Build typed anchored join and exchange steps for a search result."""
-    from quail.physical import AnchoredJoin, Exchange
 
     pos_to_idx = {j.get("written_pos", i): i
                   for i, j in enumerate(joins)}
@@ -237,7 +240,6 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
     """
     if not group:
         return []
-    from quail.runtime.tokens import select_documents
 
     anchor_alias = group[0]["anchor"]
 
@@ -258,7 +260,6 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
         placed = {g for shard in anchor_shards for g in shard}
         missing = [g for g in live if g not in placed]
         if missing:
-            from quail.planner.decide import balanced_shards
             toks = payload["docs"][anchor_alias]
             idx_shards, _ = balanced_shards(
                 [len(toks[g]) for g in missing], k)
@@ -268,7 +269,6 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
         anchor_shards = [[g for g in shard if g in alive]
                          for shard in shards[anchor_alias]]
     else:
-        from quail.planner.decide import balanced_shards
         toks = payload["docs"][anchor_alias]
         idx_shards, _ = balanced_shards([len(toks[g]) for g in live],
                                         k)

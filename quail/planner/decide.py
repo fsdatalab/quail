@@ -11,12 +11,13 @@ constant is read anywhere.
 
 from dataclasses import replace
 
-from quail.logical import LogicalPlan, Project, Scan, SemanticFilter, SemanticJoin
-from quail.planner import budgets
-from quail.planner import joins as joinsearch
-from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
-from quail.planner.sol import speed_of_light, unrounded_seconds
-from quail.planner.work import Work, ask, scan
+from quail.logical import (
+    LogicalPlan,
+    Project,
+    Scan,
+    SemanticFilter,
+    SemanticJoin,
+)
 from quail.physical import (
     AdaptiveJoinPlan,
     AnchoredJoin,
@@ -31,11 +32,16 @@ from quail.physical import (
     Project as PhysicalProject,
 )
 from quail.physical.base import input_ports
+from quail.planner import budgets, joins as joinsearch
+from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
+from quail.planner.sol import speed_of_light, unrounded_seconds
+from quail.planner.work import ask, scan, Work
+from quail.planning import apply_physical_rules, ModelRegion, PlanningContext
 from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk
 
-def _collect(plan: LogicalPlan):
+def collect_operators(plan: LogicalPlan):
     """Return (scans, filters_by_alias, joins_in_written_order)."""
     scans, filters, joins = [], {}, []
 
@@ -68,7 +74,7 @@ def _question_tokens(prompt) -> int:
     return prompt.tail_tokens
 
 
-def _preamble_tokens(filters, joins) -> int:
+def preamble_tokens(filters, joins) -> int:
     """Return the engine preamble's token count from any bound prompt."""
     for fs in filters.values():
         for p in fs:
@@ -395,7 +401,7 @@ def contiguous_shards(doc_tokens, workers: int):
 
 # ---------------------------------------------------------- the planner
 
-def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
+def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                 order: str | None = None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
@@ -403,7 +409,7 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     Args:
         doc_tokens: alias -> list of per-document token counts.
     """
-    scans, filters, joins = _collect(plan)
+    scans, filters, joins = collect_operators(plan)
     length_stats = {a: joinsearch.summarize_alias(t)
                     for a, t in doc_tokens.items()}
     stats = {
@@ -430,7 +436,7 @@ def _plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
     chunk = budgets.chunk_budget(model, device)
     admission = budgets.arena_tokens(model, device, chunk)
-    pre = _preamble_tokens(filters, joins)
+    pre = preamble_tokens(filters, joins)
     specs = join_specs(joins)
 
     # ---- the order rule first: the search below needs it
@@ -815,7 +821,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         registry: Optional session extension registry.
     """
     if registry is None:
-        from quail.extensions import built_in_registry
+        # the built in registry imports every backend, and backends
+        # import this planner; build it only when no session gave one
+        from quail.builtins import built_in_registry
         registry = built_in_registry()
     try:
         selected = registry.backend(backend)
@@ -837,11 +845,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             unit="configurations",
         )
 
-    from quail.planning import (
-        ModelRegion,
-        PlanningContext,
-        apply_physical_rules,
-    )
     context = PlanningContext(
         model=model,
         device=device,

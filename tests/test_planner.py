@@ -681,7 +681,7 @@ def test_gate_group_retains_anchor_for_runtime_replan(catalog):
 def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
     import itertools as it
 
-    from quail.planner.decide import _collect, join_specs
+    from quail.planner.decide import collect_operators, join_specs
     from quail.planner.joins import _feasible_anchors, search_joins, walk
 
     catalog.register("tags", DocumentProvider.from_parquet(
@@ -699,7 +699,7 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
                .select("r.id"))
     toks = {"r": [900] * 6, "t": [40] * 8, "p": [200] * 5,
             "g": [30] * 9}
-    _, _, joins = _collect(logical)
+    _, _, joins = collect_operators(logical)
     specs = join_specs(joins)
     live0 = {a: float(len(t)) for a, t in toks.items()}
     pre = 1

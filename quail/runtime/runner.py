@@ -18,6 +18,12 @@ from quail.physical import (
     Project,
     ValueType,
 )
+from quail.runtime.result import (
+    build_result_declaration,
+    IndexRelation,
+    QueryResult,
+    true_answer_rows,
+)
 
 
 @dataclass(frozen=True)
@@ -267,11 +273,6 @@ class HashJoinRuntime:
         if context.hash_join is None:
             import pyarrow as pa
 
-            from quail.runtime.result import (
-                IndexRelation,
-                build_result_declaration,
-                true_answer_rows,
-            )
 
             answer_tables = []
             survivors = {}
@@ -328,7 +329,6 @@ class LimitRuntime:
         if len(inputs) != 1:
             raise ValueError("Limit needs one input")
         value = next(iter(inputs.values()))
-        from quail.runtime.result import QueryResult
 
         if isinstance(value, QueryResult):
             value = value.with_limit(node.count)

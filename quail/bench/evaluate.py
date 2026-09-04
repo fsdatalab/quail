@@ -703,10 +703,10 @@ class BenchmarkEvaluator:
         )
 
     def evaluate(self, query, result) -> dict:
-        from quail.planner.decide import _collect
+        from quail.planner.decide import collect_operators
         from quail.physical import PackedFilter, RequestExecution
 
-        scans, filters, joins = _collect(query.logical)
+        scans, filters, joins = collect_operators(query.logical)
         plan = query.plan()
         providers = {scan.alias: scan.provider for scan in scans}
         per_predicate = []

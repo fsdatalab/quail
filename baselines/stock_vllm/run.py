@@ -841,10 +841,10 @@ def run_query(llm, sp, true_set, tokenizer, qid, query_def,
         if quail_query is None:
             raise ValueError("accuracy scoring requires the Quail query")
         from quail.logical import ColumnRef, bind_prompt
-        from quail.planner.decide import _collect
+        from quail.planner.decide import collect_operators
         from quail.runtime.result import answer_table
 
-        _scans, logical_filters, logical_joins = _collect(
+        _scans, logical_filters, logical_joins = collect_operators(
             quail_query.logical)
         filter_records = {}
         for alias, template, indices, answers in filter_answer_records:

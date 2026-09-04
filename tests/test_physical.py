@@ -9,7 +9,7 @@ import pytest
 
 import quail
 from quail.catalog import DocumentProvider
-from quail.extensions import built_in_registry
+from quail.builtins import built_in_registry
 from quail.physical import (
     DocumentInput,
     ExecutionLocation,
@@ -244,7 +244,7 @@ def test_physical_codec_rejects_changed_shapes():
 
 
 def test_extension_module_rebuilds_the_remote_plan_registry():
-    from quail.extensions import registry_from_modules
+    from quail.builtins import registry_from_modules
     from quail.runtime.runner import ExecutionContext, GenericRunner
 
     registry = built_in_registry()

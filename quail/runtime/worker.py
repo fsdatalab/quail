@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 
 import modal
 
+from quail.backends import BackendExecutionContext
+from quail.builtins import registry_from_modules
+from quail.catalog import DocumentProvider
+from quail.execution import PhysicalRequest, PhysicalResponse
+from quail.physical import check_plan_envelope, decode_graph, DocumentInput
+from quail.planner.plan import EngineConfig, Refusal
+from quail.runtime.session import Query, RefusalError, Session
 from quail.runtime.volumes import hf_cache, kernel_cache, results_vol
 
 
@@ -61,9 +68,6 @@ _RUNTIME = _WorkerRuntime()
 
 def _validate_physical_request(request):
     """Validate and decode a physical execution request."""
-    from quail.execution import PhysicalRequest
-    from quail.extensions import registry_from_modules
-    from quail.physical import DocumentInput, check_plan_envelope, decode_graph
 
     if not isinstance(request, PhysicalRequest):
         raise TypeError("the worker needs a PhysicalRequest")
@@ -90,8 +94,6 @@ def _validate_physical_request(request):
 
 def _execute_physical(request):
     """Run the backend selected by a registered physical plan."""
-    from quail.backends import BackendExecutionContext
-    from quail.execution import PhysicalResponse
 
     request, registry, graph, backend = _validate_physical_request(request)
     response = backend.execute_request(BackendExecutionContext(
@@ -136,9 +138,6 @@ def _execute_physical(request):
 
 def execute_worker_query(query, physical_executor=None):
     """Execute one query inside its current worker process."""
-    from quail.execution import PhysicalResponse
-    from quail.planner.plan import Refusal
-    from quail.runtime.session import RefusalError
 
     plan = query.plan()
     if isinstance(plan, Refusal):
@@ -160,10 +159,6 @@ def execute_worker_query(query, physical_executor=None):
 
 def _execute_logical_query(value, gpu_count: int):
     """Read query sources, plan the query, and execute it."""
-    from quail.catalog import DocumentProvider
-    from quail.extensions import registry_from_modules
-    from quail.planner.plan import EngineConfig
-    from quail.runtime.session import Query, Session
 
     config_value = value["config"]
     if not isinstance(config_value, EngineConfig):

@@ -11,6 +11,34 @@ import json
 import os
 import time
 
+from quail.backends.base import GpuContext
+from quail.backends.quail.coordinator import stage_for_anchor
+from quail.backends.quail.distributed import execute_distributed_graph
+from quail.backends.quail.graph import (
+    _join_round_kv,
+    _tuple_suffix,
+    execute_single_graph,
+)
+from quail.execution import PhysicalResponse
+from quail.executor.arena import KVArena
+from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
+from quail.executor.loop import AsyncAnswers, warm_kernels
+from quail.executor.model import load_model
+from quail.physical import (
+    AdaptiveJoinPlan,
+    AnchoredJoin,
+    decode_graph,
+    DocumentInput,
+    PackedFilter,
+)
+from quail.planner import budgets
+from quail.runtime.runner import ExecutionContext
+from quail.runtime.tokens import (
+    chain_tokens,
+    decode_payload_documents,
+    DocumentPrefixes,
+)
+
 
 # GPU child processes, one per H100, kept alive across queries so their
 # models stay loaded for the whole session.
@@ -19,7 +47,6 @@ _CHILDREN: list = []
 
 def quail_runtime_payload(request, graph) -> dict:
     """Build private Quail scheduler state from a standard request."""
-    from quail.physical import DocumentInput
     envelope = request.plan
     docs = {}
     for node in graph.nodes:
@@ -97,11 +124,6 @@ def _boot_gpu(state, backend, spec, device, gpu_index, workers,
     import torch
     import torch.nn.functional as F
 
-    from quail.backends.base import GpuContext
-    from quail.executor.arena import KVArena
-    from quail.executor.attention import FILTER_ATTENTION, Pipeline
-    from quail.executor.model import load_model
-    from quail.planner import budgets
 
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
                 pipeline_s=0.0, warm_kernels_s=0.0)
@@ -143,7 +165,6 @@ def _boot_gpu(state, backend, spec, device, gpu_index, workers,
 
 def _bind_query(state, true_ids, false_ids, chunk_tokens):
     """Attach the answerer and chunk budget for one query."""
-    from quail.executor.loop import AsyncAnswers
 
     torch = state["torch"]
     # the worker has no tokenizer: the TRUE/FALSE token ids ride in the
@@ -161,7 +182,6 @@ def _bind_query(state, true_ids, false_ids, chunk_tokens):
 
 def _warm(state, boot):
     """Compile and touch the kernels once per container."""
-    from quail.executor.loop import warm_kernels
     from quail.runtime.volumes import kernel_cache
 
     if state["warmed"]:
@@ -192,7 +212,6 @@ def _finish_boot(boot, t_boot):
 
 def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     """Execute one Quail payload on the worker's own GPU."""
-    from quail.execution import PhysicalResponse
     from quail.runtime.volumes import kernel_cache, results_vol
 
     spec = registry.model(payload["model"])
@@ -234,8 +253,6 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
 
 def execute_single(state, payload: dict, registry, graph) -> dict:
     """Execute the typed Quail graph on one GPU."""
-    from quail.backends.quail.graph import execute_single_graph
-    from quail.runtime.tokens import decode_payload_documents
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
@@ -277,8 +294,9 @@ def _child_main(gpu_idx, conn):
 
 
 def _child_boot(state, sub):
-    from quail.extensions import registry_from_modules
-    from quail.runtime.runner import ExecutionContext
+    # a spawned child rebuilds its registry from the module names;
+    # quail.builtins imports this module's backend, so it stays here
+    from quail.builtins import registry_from_modules
 
     envelope = sub["physical_plan"]
     registry = registry_from_modules(tuple(envelope["extension_modules"]))
@@ -301,9 +319,6 @@ def _child_boot(state, sub):
 
 
 def _child_filters(state, sub):
-    from quail.executor.attention import FILTER_ATTENTION
-    from quail.physical import PackedFilter, decode_graph
-    from quail.runtime.tokens import DocumentPrefixes
 
     _child_boot(state, sub)
     boot = state["boot"]
@@ -370,11 +385,6 @@ def _child_filters(state, sub):
 
 
 def _child_joins(state, sub):
-    from quail.backends.quail.coordinator import stage_for_anchor
-    from quail.backends.quail.graph import _join_round_kv, _tuple_suffix
-    from quail.executor.attention import JOIN_ATTENTION
-    from quail.physical import AdaptiveJoinPlan, AnchoredJoin, decode_graph
-    from quail.runtime.tokens import chain_tokens
 
     _child_boot(state, sub)
     torch = state["torch"]
@@ -541,9 +551,6 @@ def _round(kind, subs):
 
 def execute_quail_multi(payload, registry, graph):
     """Execute the typed Quail graph across GPU child processes."""
-    from quail.backends.quail.distributed import execute_distributed_graph
-    from quail.execution import PhysicalResponse
-    from quail.runtime.tokens import decode_payload_documents
     from quail.runtime.volumes import kernel_cache, results_vol
 
     payload = dict(payload)

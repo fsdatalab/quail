@@ -15,6 +15,7 @@ from quail.physical import (
     PortRef,
     ValueType,
 )
+from quail.runtime.tokens import decode_token_documents
 
 
 @dataclass(frozen=True)
@@ -36,7 +37,6 @@ class TokenizedInput:
 
 def document_input(tokens) -> TokenizedInput:
     """Build one physical input from a token document sequence."""
-    from quail.runtime.tokens import decode_token_documents
 
     return TokenizedInput(decode_token_documents(tokens))
 

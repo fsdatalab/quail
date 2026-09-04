@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 from quail.physical import PhysicalGraph, PhysicalNode, PortRef
 from quail.physical.codec import plan_envelope
+from quail.specs import MODELS
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,6 @@ class PhysicalPlan:
 def resolve_model(name: str, models=None):
     """Return a ModelSpec by name, or a Refusal if unknown."""
     if models is None:
-        from quail.specs import MODELS
         models = MODELS
     if name in models:
         return models[name]

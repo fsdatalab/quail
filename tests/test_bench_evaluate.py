@@ -108,7 +108,7 @@ def _query(tmp_path, backend="quail"):
 def _run(query, join_answers):
     def execute(request):
         from quail.execution import PhysicalResponse, export_physical_outputs
-        from quail.extensions import built_in_registry
+        from quail.builtins import built_in_registry
         from quail.physical import (
             AdaptiveJoinPlan,
             PackedFilter,
@@ -166,7 +166,7 @@ def _run(query, join_answers):
 def _run_request_backend(query, join_answers):
     def execute(request):
         from quail.execution import PhysicalResponse, export_physical_outputs
-        from quail.extensions import built_in_registry
+        from quail.builtins import built_in_registry
         from quail.physical import RequestExecution, decode_graph
         from quail.runtime.result import answer_table
         from quail.runtime.runner import NodeMetrics, NodeResult, RunResult

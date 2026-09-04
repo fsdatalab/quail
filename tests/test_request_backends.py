@@ -10,7 +10,7 @@ from quail.backends.base import BackendExecutionContext
 from quail.backends import SGLangBackend, stock_vllm_backend
 from quail.backends.base import GpuContext
 from quail.backends.request import RequestModelExecution
-from quail.extensions import built_in_registry
+from quail.builtins import built_in_registry
 from quail.physical import (
     RequestExecution,
     RequestFilterSpec,
