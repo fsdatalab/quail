@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import itertools
 import time
-from dataclasses import fields
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
 from quail.backends.request_scheduling import (
-    run_filter_chain,
+    join_regret_tokens,
+    longest_common_prefix,
     run_join_grouped,
+    true_bit,
 )
 from quail.execution import export_physical_outputs, PhysicalResponse
 from quail.logical import SHARED_PRE
@@ -38,7 +40,7 @@ from quail.planner import (
 )
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.plan import CorpusStats, PhysicalPlan
-from quail.planning import PhysicalCandidate
+from quail.planning import PhysicalCandidate, SupportResult
 from quail.runtime.result import answer_table
 from quail.runtime.runner import (
     compute_subgraph,
@@ -47,6 +49,7 @@ from quail.runtime.runner import (
     ModelNodeRuntime,
     NodeMetrics,
     NodeResult,
+    scalar_node_metrics,
 )
 
 
@@ -281,38 +284,6 @@ def plan_request_backend(
     ),)
 
 
-def _true_bit(output, true_ids: set[int]) -> bool:
-    token_ids = output.outputs[0].token_ids
-    return bool(token_ids and int(token_ids[0]) in true_ids)
-
-
-def _lcp(left, right) -> int:
-    for index, (left_token, right_token) in enumerate(zip(left, right)):
-        if left_token != right_token:
-            return index
-    return min(len(left), len(right))
-
-
-def _join_regret(
-    prefixes,
-    suffix_count: int,
-    cached,
-    seen_prefix_lengths,
-    block_size: int,
-) -> int:
-    regret = 0
-    for anchor_index, prefix in enumerate(prefixes):
-        for suffix_index in range(suffix_count):
-            would_hit = (
-                seen_prefix_lengths[anchor_index]
-                if suffix_index == 0 else len(prefix)
-            )
-            would_hit = (would_hit // block_size) * block_size
-            pair = anchor_index * suffix_count + suffix_index
-            regret += max(0, would_hit - int(cached[pair]))
-    return regret
-
-
 def _filter_answer_table(alias, written_positions, answers) -> pa.Table:
     documents = []
     predicates = []
@@ -387,7 +358,7 @@ def _stage_major_filter(client, sampling_params, bodies, questions, true_ids):
         )
         next_active = []
         for document, prompt, output in zip(evaluated, prompts, outputs):
-            answer = _true_bit(output, true_ids)
+            answer = bool(true_bit(output, true_ids))
             answers[(document, stage_index)] = answer
             requests += 1
             prompt_tokens += len(output.prompt_token_ids)
@@ -417,15 +388,8 @@ def _stage_major_filter(client, sampling_params, bodies, questions, true_ids):
     }
 
 
-def _pipelined_filter(
-    client,
-    sampling_params,
-    bodies,
-    questions,
-    true_ids,
-    capacity,
-    tag,
-):
+def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
+                      tag):
     if not bodies:
         return {
             "wall_s": 0.0,
@@ -439,28 +403,13 @@ def _pipelined_filter(
             "stages": [],
             "doc_cap": 0,
         }
-    chain = getattr(client, "run_pipelined_filter_chain", None)
-    if chain is not None:
-        result = chain(
-            sampling_params,
-            bodies,
-            [list(question) for question in questions],
-            true_ids,
-            tag=tag,
-        )
-    else:
-
-        result = run_filter_chain(
-            client.llm_engine,
-            sampling_params,
-            bodies,
-            [list(question) for question in questions],
-            capacity["kv_cache_size_tokens"],
-            tag=tag,
-            true_ids=true_ids,
-            block_size=capacity["block_size"],
-            max_num_seqs=capacity["max_num_seqs"],
-        )
+    result = client.run_filter_chain(
+        sampling_params,
+        bodies,
+        [list(question) for question in questions],
+        true_ids,
+        tag=tag,
+    )
     prior = {}
     for (document, stage), answer in result["answers"].items():
         if answer:
@@ -554,7 +503,6 @@ class RequestModelExecution:
                     bodies,
                     spec.question_token_ids,
                     self.true_ids,
-                    self.capacity,
                     f"filter-{filter_index}-{spec.alias}",
                 )
             else:
@@ -654,14 +602,14 @@ class RequestModelExecution:
                 seen_lengths = [
                     max(
                         (
-                            _lcp(prefix, earlier)
+                            longest_common_prefix(prefix, earlier)
                             for earlier in prior.get((anchor, document), ())
                         ),
                         default=0,
                     )
                     for document, prefix in zip(anchor_ids, prefixes)
                 ]
-                regret = _join_regret(
+                regret = join_regret_tokens(
                     prefixes,
                     len(suffixes),
                     result["cached_per_request"],
@@ -752,21 +700,6 @@ class RequestModelExecution:
         )
 
 
-def scalar_node_metrics(nodes) -> dict[str, dict[str, Any]]:
-    """Return serializable scalar metrics for physical nodes."""
-    scalar_fields = tuple(
-        field.name for field in fields(NodeMetrics)
-        if field.name != "extension"
-    )
-    return {
-        node_id: {
-            name: getattr(result.metrics, name)
-            for name in scalar_fields
-        }
-        for node_id, result in nodes.items()
-    }
-
-
 def execute_request_graph(context, backend, engine_state, boot):
     """Run a request backend over its compute subgraph."""
     try:
@@ -793,8 +726,7 @@ def execute_request_graph(context, backend, engine_state, boot):
             "documents": documents,
         },
     ))
-    reset = getattr(engine_state["client"], "reset_prefix_cache", None)
-    if reset is not None and reset() is False:
+    if engine_state["client"].reset_prefix_cache() is False:
         raise RuntimeError("request engine did not reset its prefix cache")
     if torch is not None and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -839,3 +771,80 @@ def request_runtimes() -> dict:
     """Return runtimes for the request backends' physical node."""
 
     return {RequestExecution.runtime_key: ModelNodeRuntime()}
+
+
+SUPPORTED_MODELS = frozenset({"qwen3-4b-fp8", "qwen3-32b-fp8"})
+SUPPORTED_DEVICE = "h100-sxm"
+
+
+def _warm_boot() -> dict:
+    return {
+        "kind": "warm",
+        "llm_init_s": 0.0,
+        "weight_load_s": None,
+        "kv_profile_s": None,
+        "boot_s": 0.0,
+    }
+
+
+@dataclass(frozen=True)
+class RequestBackend:
+    """A model backend that submits one request per prompt to an engine.
+
+    The engine adapter boots vLLM or SGLang and returns a client with
+    generate, reset_prefix_cache, and run_filter_chain. The submission
+    strategies decide how filter stages and join tuples become
+    requests.
+    """
+
+    name: str
+    engine: Any
+    filter_submission: str
+    join_submission: str = "anchor-major"
+
+    @property
+    def runtime_package(self) -> str:
+        return self.engine.runtime_package
+
+    def supports(self, model, device, gpu_count: int) -> SupportResult:
+        label = self.engine.label
+        if model.name not in SUPPORTED_MODELS:
+            return SupportResult.reject(
+                f"{label} does not support model {model.name!r}"
+            )
+        if device.name != SUPPORTED_DEVICE:
+            return SupportResult.reject(
+                f"{label} does not support device {device.name!r}"
+            )
+        if gpu_count != 1:
+            return SupportResult.reject(
+                f"the {label} request backends use one model copy on one GPU"
+            )
+        return SupportResult.accept()
+
+    def plan(self, region, context):
+        return plan_request_backend(
+            region,
+            context,
+            backend_name=self.name,
+            filter_submission=self.filter_submission,
+            join_submission=self.join_submission,
+        )
+
+    def start(self, context):
+        return RequestModelExecution(context)
+
+    def execute_request(self, context):
+        envelope = context.request.plan
+        model = context.registry.model(envelope["model"])
+        state_key = ("request-engine", self.engine.kind, model.name)
+        engine_state = context.runtime_state.get(state_key)
+        if engine_state is None:
+            allowed_ids = sorted(set(
+                envelope["settings"]["true_ids"]
+            ) | set(envelope["settings"]["false_ids"]))
+            engine_state, boot = self.engine.boot(model.hf_name, allowed_ids)
+            context.runtime_state[state_key] = engine_state
+        else:
+            boot = _warm_boot()
+        return execute_request_graph(context, self, engine_state, boot)

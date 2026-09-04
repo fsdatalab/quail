@@ -284,7 +284,7 @@ def test_filter_chain_submits_next_stage_before_prior_stage_finishes():
         engine,
         sampling_params=object(),
         body_ids=[[1] * 5, [2] * 17],
-        q_ids=[[3] * 3, [4] * 3],
+        question_ids=[[3] * 3, [4] * 3],
         budget_tokens=100,
         tag="test",
         true_ids={1},

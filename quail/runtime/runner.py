@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.physical import (
@@ -69,6 +69,21 @@ class NodeMetrics:
             peak_gpu_bytes=max(self.peak_gpu_bytes, other.peak_gpu_bytes),
             extension={**self.extension, **other.extension},
         )
+
+
+def scalar_node_metrics(nodes: Mapping[str, "NodeResult"]) -> dict:
+    """Return the scalar metrics of each node, keyed by node id."""
+    scalar_fields = tuple(
+        field.name for field in fields(NodeMetrics)
+        if field.name != "extension"
+    )
+    return {
+        node_id: {
+            name: getattr(result.metrics, name)
+            for name in scalar_fields
+        }
+        for node_id, result in nodes.items()
+    }
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,6 @@ from quail.backends.quail.graph import (
     _child_graph,
     _next_join,
     _possible_anchors,
-    scalar_node_metrics,
 )
 from quail.execution import export_physical_outputs
 from quail.physical import (
@@ -33,6 +32,7 @@ from quail.runtime.runner import (
     GenericRunner,
     NodeMetrics,
     NodeResult,
+    scalar_node_metrics,
 )
 
 

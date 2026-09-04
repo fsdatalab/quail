@@ -7,7 +7,7 @@ import pyarrow as pa
 
 import quail
 from quail.backends.base import BackendExecutionContext
-from quail.backends import SGLangBackend, stock_vllm_backend
+from quail.backends import pipelined_sglang_backend, stock_vllm_backend
 from quail.backends.base import GpuContext
 from quail.backends.request import RequestModelExecution
 from quail.builtins import built_in_registry
@@ -80,7 +80,7 @@ def test_built_in_request_backends_plan_their_own_model_node():
 
 
 def test_request_backends_reject_multiple_gpus():
-    for backend in (stock_vllm_backend(), SGLangBackend()):
+    for backend in (stock_vllm_backend(), pipelined_sglang_backend()):
         support = backend.supports(QWEN3_4B_FP8, H100_SXM, 2)
         assert not support.supported
         assert "one model copy on one GPU" in support.reason
@@ -237,8 +237,8 @@ def test_vllm_backend_executes_a_physical_request(monkeypatch):
     client = _Client()
 
     monkeypatch.setattr(
-        "quail.backends.vllm._boot",
-        lambda model_name, allowed_ids: (
+        "quail.backends.vllm.VLLMEngine.boot",
+        lambda self, model_name, allowed_ids: (
             {
                 "client": client,
                 "sampling_params": object(),

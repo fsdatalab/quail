@@ -557,45 +557,10 @@ def _select_join_anchor(documents):
     return (0 if means[0] >= means[1] else 1), means
 
 
-def _lcp(a, b):
-    """Length of the longest common prefix of two token lists."""
-    n = min(len(a), len(b))
-    for i in range(n):
-        if a[i] != b[i]:
-            return i
-    return n
-
-
-def _join_regret(prefixes, n_suffixes, cached, seen_prefix_lens,
-                 block_size):
-    """KV regret for one anchor-major join, in tokens.
-
-    Regret is the prompt tokens whose KV the same query already
-    computed once but vLLM did not serve from cache. Pair 0 of an
-    anchor group can hit only what an earlier request computed; pairs
-    1+ can hit the whole prefix pair 0 computed. Would-be hits round
-    down to whole blocks because vLLM caches prefixes block by block.
-
-    Args:
-        prefixes: Anchor prefix token ids, in request order.
-        n_suffixes: Suffixes per anchor group.
-        cached: Cached token count per request, anchor-major order.
-        seen_prefix_lens: Per anchor, the tokens of its prefix an
-            earlier request in the query already computed (0 when the
-            anchor is new to the query).
-        block_size: vLLM cache block size in tokens.
-
-    Returns:
-        Total regret tokens across the join.
-    """
-    regret = 0
-    for a, prefix in enumerate(prefixes):
-        for j in range(n_suffixes):
-            would = seen_prefix_lens[a] if j == 0 else len(prefix)
-            would = (would // block_size) * block_size
-            got = cached[a * n_suffixes + j]
-            regret += max(0, would - got)
-    return regret
+from quail.backends.request_scheduling import (  # noqa: E402
+    join_regret_tokens as _join_regret,
+    longest_common_prefix as _lcp,
+)
 
 
 def _run_join(llm, sp, true_set, template, left_texts, right_texts,

@@ -87,10 +87,13 @@ shapes:
 report. The worker then runs `HashJoin`, `Project`, and `Limit` over
 your outputs with the generic runner.
 
-The request backends in `quail/backends/request.py` are the reference
-for all of this. They plan one `RequestExecution` node, start an
-engine on first use, keep it in `runtime_state`, and build the Arrow
-tables with the helpers in that module.
+`RequestBackend` in `quail/backends/request.py` is the reference for
+all of this. It plans one `RequestExecution` node, boots its engine
+adapter on first use, keeps the engine in `runtime_state`, and builds
+the Arrow tables with the helpers in that module. Adding another
+request engine means writing an adapter with `boot`, `kind`, `label`,
+and `runtime_package`, plus a client with `generate`,
+`reset_prefix_cache`, and `run_filter_chain`.
 
 ## Runtime package
 

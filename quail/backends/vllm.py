@@ -1,20 +1,16 @@
-"""vLLM model backends."""
+"""vLLM engine adapter and the two vLLM request backends."""
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 
-from quail.backends.request import (
-    RequestModelExecution,
-    execute_request_graph,
-    plan_request_backend,
+from quail.backends.request import RequestBackend
+from quail.backends.request_scheduling import (
+    MAX_BATCHED_TOKENS,
+    MAX_SEQUENCES,
+    run_filter_chain,
 )
-from quail.planning import SupportResult
 
-
-MAX_BATCHED_TOKENS = 25_305
-MAX_SEQUENCES = 4_096
 GPU_MEMORY_UTILIZATION = 0.91
 CUDA_GRAPH_CAPTURE_SIZE = 8_192
 
@@ -38,123 +34,100 @@ def _capacity(llm) -> dict:
     }
 
 
-def _boot(model_name: str, allowed_ids: list[int]) -> tuple[dict, dict]:
-    from vllm import LLM, SamplingParams
+class VLLMClient:
+    """The request operations the backends need from one vLLM LLM."""
 
-    started = time.perf_counter()
-    llm = LLM(
-        model=model_name,
-        max_num_batched_tokens=MAX_BATCHED_TOKENS,
-        max_num_seqs=MAX_SEQUENCES,
-        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-        enable_prefix_caching=True,
-        disable_log_stats=True,
-        compilation_config={
-            "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
-        },
-    )
-    boot_s = time.perf_counter() - started
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=1,
-        min_tokens=1,
-        allowed_token_ids=allowed_ids,
-    )
-    llm.generate(
-        [{"prompt_token_ids": allowed_ids}],
-        sampling_params,
-        use_tqdm=False,
-    )
-    return (
-        {
-            "client": llm,
-            "sampling_params": sampling_params,
-            "capacity": _capacity(llm),
-        },
-        {
-            "kind": "cold",
-            "llm_init_s": round(boot_s, 2),
-            "weight_load_s": None,
-            "kv_profile_s": None,
-            "boot_s": round(boot_s, 2),
-        },
-    )
+    join_tile_budget_tokens = None
 
+    def __init__(self, llm, capacity: dict):
+        self.llm = llm
+        self.capacity = capacity
 
-@dataclass(frozen=True)
-class VLLMBackend:
-    """Plan and run one vLLM submission strategy."""
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        return self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
-    name: str
-    filter_submission: str
-    join_submission: str = "anchor-major"
-    runtime_package: str = "vllm==0.26.0"
+    def reset_prefix_cache(self):
+        return self.llm.reset_prefix_cache()
 
-    def supports(self, model, device, gpu_count: int) -> SupportResult:
-        if model.name not in {"qwen3-4b-fp8", "qwen3-32b-fp8"}:
-            return SupportResult.reject(
-                f"vLLM does not support model {model.name!r}"
-            )
-        if device.name != "h100-sxm":
-            return SupportResult.reject(
-                f"vLLM does not support device {device.name!r}"
-            )
-        if gpu_count != 1:
-            return SupportResult.reject(
-                "the vLLM request backends use one model copy on one GPU"
-            )
-        return SupportResult.accept()
-
-    def plan(self, region, context):
-        return plan_request_backend(
-            region,
-            context,
-            backend_name=self.name,
-            filter_submission=self.filter_submission,
-            join_submission=self.join_submission,
+    def run_filter_chain(self, sampling_params, body_ids, question_ids,
+                         true_ids, *, tag="q"):
+        """Pipeline filter stages through the engine's step loop."""
+        return run_filter_chain(
+            self.llm.llm_engine,
+            sampling_params,
+            body_ids,
+            question_ids,
+            self.capacity["kv_cache_size_tokens"],
+            tag=tag,
+            true_ids=true_ids,
+            block_size=self.capacity["block_size"],
+            max_num_seqs=self.capacity["max_num_seqs"],
         )
 
-    def start(self, context):
-        return RequestModelExecution(context)
 
-    def execute_request(self, context):
-        envelope = context.request.plan
-        model = context.registry.model(envelope["model"])
-        state_key = ("request-engine", "vllm", model.name)
-        engine_state = context.runtime_state.get(state_key)
-        if engine_state is None:
-            allowed_ids = sorted(set(
-                envelope["settings"]["true_ids"]
-            ) | set(envelope["settings"]["false_ids"]))
-            engine_state, boot = _boot(model.hf_name, allowed_ids)
-            context.runtime_state[state_key] = engine_state
-        else:
-            boot = {
-                "kind": "warm",
-                "llm_init_s": 0.0,
+class VLLMEngine:
+    """Boot vLLM for a request backend."""
+
+    kind = "vllm"
+    label = "vLLM"
+    runtime_package = "vllm==0.26.0"
+
+    def boot(self, model_name: str, allowed_ids: list[int]) -> tuple[dict, dict]:
+        from vllm import LLM, SamplingParams
+
+        started = time.perf_counter()
+        llm = LLM(
+            model=model_name,
+            max_num_batched_tokens=MAX_BATCHED_TOKENS,
+            max_num_seqs=MAX_SEQUENCES,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+            enable_prefix_caching=True,
+            disable_log_stats=True,
+            compilation_config={
+                "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
+            },
+        )
+        boot_s = time.perf_counter() - started
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            min_tokens=1,
+            allowed_token_ids=allowed_ids,
+        )
+        capacity = _capacity(llm)
+        client = VLLMClient(llm, capacity)
+        client.generate(
+            [{"prompt_token_ids": allowed_ids}], sampling_params
+        )
+        return (
+            {
+                "client": client,
+                "sampling_params": sampling_params,
+                "capacity": capacity,
+            },
+            {
+                "kind": "cold",
+                "llm_init_s": round(boot_s, 2),
                 "weight_load_s": None,
                 "kv_profile_s": None,
-                "boot_s": 0.0,
-            }
-        return execute_request_graph(
-            context,
-            self,
-            engine_state,
-            boot,
+                "boot_s": round(boot_s, 2),
+            },
         )
 
 
-def stock_vllm_backend() -> VLLMBackend:
+def stock_vllm_backend() -> RequestBackend:
     """Return stock vLLM with separate requests per filter stage."""
-    return VLLMBackend(
+    return RequestBackend(
         name="stock_vllm",
+        engine=VLLMEngine(),
         filter_submission="stage-major",
     )
 
 
-def pipelined_vllm_backend() -> VLLMBackend:
+def pipelined_vllm_backend() -> RequestBackend:
     """Return vLLM with per document filter pipelining."""
-    return VLLMBackend(
+    return RequestBackend(
         name="pipelined_vllm",
+        engine=VLLMEngine(),
         filter_submission="pipelined",
     )

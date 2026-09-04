@@ -2,7 +2,7 @@
 
 from quail.backends import (
     QuailBackend,
-    SGLangBackend,
+    pipelined_sglang_backend,
     pipelined_vllm_backend,
     stock_vllm_backend,
 )
@@ -25,7 +25,7 @@ def built_in_registry() -> ExtensionRegistry:
     registry.register_backend(QuailBackend())
     registry.register_backend(stock_vllm_backend())
     registry.register_backend(pipelined_vllm_backend())
-    registry.register_backend(SGLangBackend())
+    registry.register_backend(pipelined_sglang_backend())
     for codec in built_in_codecs():
         registry.register_codec(codec)
     for runtimes in (built_in_runtimes(), quail_runtimes(), request_runtimes()):

@@ -176,67 +176,21 @@ class StockSGLangClient:
 
     def run_pipelined_filter_chain(self, sampling_params, body_ids,
                                    question_ids, true_ids, tag="q"):
-        """Chain filter stages per document with token-budget admission.
-
-        Mirrors stock vLLM's pipelined client: a document holds one of
-        doc_cap admission slots for its whole chain, and a TRUE answer
-        sends the document's next stage while other documents are
-        still on earlier stages. SGLang's scheduler runs in a separate
-        process with no synchronous add_request/step surface, so the
-        chain advances in waves of blocking generate() calls: every
-        alive document has exactly one request per wave, and wave
-        boundaries stand in for vLLM's engine step loop. Sequential
-        stages keep the radix cache effective: a document's stage j+1
-        always finds its body cached, because stage j finished first.
+        """Chain filter stages per document in blocking generate waves.
 
         Returns:
-            Dict shaped like baselines.stock.run_filter_chain's.
+            Dict shaped like quail.backends.request_scheduling's
+            run_filter_chain.
         """
-        del tag
-        n_stages = len(question_ids)
-        longest_tail = max(len(q) for q in question_ids)
-        sizes = [len(body) + longest_tail + 1 for body in body_ids]
-        mean_request = sum(sizes) // max(1, len(sizes))
-        cap = min(max(1, self.filter_budget_tokens // mean_request),
-                  MAX_NUM_SEQS)
-        counters = dict(requests=0, prompt_tokens=0, cached_tokens=0)
-        answers = {}
-        survivors = []
+        from quail.backends.request_scheduling import run_filter_chain_waves
 
-        t0 = time.time()
-        alive = []                       # (document index, stage)
-        next_doc = 0
-        while alive or next_doc < len(body_ids):
-            while next_doc < len(body_ids) and len(alive) < cap:
-                alive.append((next_doc, 0))
-                next_doc += 1
-            prompts = [
-                {"prompt_token_ids": body_ids[index]
-                 + question_ids[stage]}
-                for index, stage in alive
-            ]
-            outputs = self.generate(prompts, sampling_params)
-            advanced = []
-            for (index, stage), out in zip(alive, outputs):
-                counters["requests"] += 1
-                counters["prompt_tokens"] += len(out.prompt_token_ids)
-                counters["cached_tokens"] += out.num_cached_tokens
-                token_ids = out.outputs[0].token_ids
-                got = 1 if (token_ids and
-                            int(token_ids[0]) in true_ids) else 0
-                answers[(index, stage + 1)] = got
-                if got and stage + 1 < n_stages:
-                    advanced.append((index, stage + 1))
-                elif got:
-                    survivors.append(index)
-            alive = advanced
-        wall = time.time() - t0
-        return dict(wall=wall, survivors=sorted(survivors),
-                    answers=answers, doc_cap=cap,
-                    budget_tokens=self.filter_budget_tokens,
-                    block_size=self.block_size,
-                    max_num_seqs=MAX_NUM_SEQS,
-                    **counters)
+        del tag
+        # the measured SGLang runs sized admission without rounding to
+        # pages, so the cap stays unrounded here
+        return run_filter_chain_waves(
+            self, sampling_params, body_ids, question_ids,
+            self.filter_budget_tokens, true_ids=true_ids,
+            block_size=1, max_num_seqs=MAX_NUM_SEQS)
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
         outputs = []

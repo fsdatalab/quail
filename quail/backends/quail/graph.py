@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import itertools
 import time
-from dataclasses import fields
 from dataclasses import replace
 
 from quail.backends.quail.coordinator import (
@@ -35,6 +34,7 @@ from quail.runtime.runner import (
     ModelNodeRuntime,
     NodeMetrics,
     NodeResult,
+    scalar_node_metrics,
 )
 from quail.runtime.tokens import chain_tokens, DocumentPrefixes
 
@@ -61,21 +61,6 @@ def quail_runtimes() -> dict:
         PackedFilter.runtime_key: model_runtime,
         AnchoredJoin.runtime_key: model_runtime,
         AdaptiveJoinPlan.runtime_key: AdaptiveJoinRuntime(),
-    }
-
-
-def scalar_node_metrics(nodes) -> dict:
-    """Return JSON values from each physical node's metrics."""
-    scalar_fields = tuple(
-        field.name for field in fields(NodeMetrics)
-        if field.name != "extension"
-    )
-    return {
-        node_id: {
-            name: getattr(result.metrics, name)
-            for name in scalar_fields
-        }
-        for node_id, result in nodes.items()
     }
 
 

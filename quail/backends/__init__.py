@@ -1,29 +1,30 @@
 """Model backend interfaces and built in implementations."""
 
 from .base import (
+    BackendExecutionContext,
     GpuContext,
     ModelBackend,
     ModelExecution,
-    BackendExecutionContext,
 )
 from .quail import QuailBackend, QuailModelExecution
-from .sglang import SGLangBackend, SGLangClient
-from .vllm import (
-    VLLMBackend,
-    pipelined_vllm_backend,
-    stock_vllm_backend,
-)
+from .request import RequestBackend, RequestModelExecution
+from .sglang import SGLangClient, SGLangEngine, pipelined_sglang_backend
+from .vllm import VLLMClient, VLLMEngine, pipelined_vllm_backend, stock_vllm_backend
 
 __all__ = [
+    "BackendExecutionContext",
     "GpuContext",
     "ModelBackend",
     "ModelExecution",
     "QuailBackend",
     "QuailModelExecution",
-    "SGLangBackend",
+    "RequestBackend",
+    "RequestModelExecution",
     "SGLangClient",
-    "VLLMBackend",
+    "SGLangEngine",
+    "VLLMClient",
+    "VLLMEngine",
+    "pipelined_sglang_backend",
     "pipelined_vllm_backend",
     "stock_vllm_backend",
-    "BackendExecutionContext",
 ]

@@ -23,9 +23,15 @@ uses the same rule as Quail, so a comparison is fair on ordering.
 
 ## Execution
 
-`RequestModelExecution` starts the engine on first use, clears its
-prefix cache between queries, submits requests according to the
-strategy, and turns the answers into the standard Arrow tables.
+All three are instances of one `RequestBackend` class. It is
+configured with an engine adapter and two submission strategies. The
+adapter (`VLLMEngine` or `SGLangEngine`) boots the engine once per
+container and returns a client with three operations: `generate`,
+`reset_prefix_cache`, and `run_filter_chain`. `RequestModelExecution`
+submits requests according to the strategy and turns the answers into
+the standard Arrow tables. The scheduling loops live in
+`quail.backends.request_scheduling`, and the stock baselines under
+`baselines/` import the same functions.
 Metrics cover cached tokens, fresh tokens, KV regret, request counts,
 query time, boot time, and KV capacity.
 
