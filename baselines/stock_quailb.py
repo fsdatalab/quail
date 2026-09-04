@@ -11,7 +11,6 @@ import json
 import time
 from pathlib import Path
 
-import modal
 
 from baselines.vllm_opbench import operators
 from baselines.vllm_opbench.config import DATA_DIR, MODEL_NAMES, SF

@@ -393,7 +393,8 @@ image = (
     .entrypoint([])
     .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
                  "numpy", "datasets")
-    .env({"VLLM_LOGGING_LEVEL": "WARNING",
+    .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+          "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",

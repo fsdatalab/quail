@@ -110,13 +110,14 @@ def move_untied_head_to_host(torch, model):
     return freed
 
 
-def load_model(model_name: str):
+def load_model(model_name: str, revision: str | None = None):
     import torch
     from vllm.config import set_current_vllm_config
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.model_loader import get_model
 
     config = EngineArgs(model=model_name, dtype="auto",
+                        revision=revision or None,
                         enforce_eager=True).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):

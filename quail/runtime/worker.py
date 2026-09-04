@@ -34,7 +34,11 @@ def build_worker_image(
             "pyarrow",
         )
         .pip_install(*packages)
-        .env({"VLLM_LOGGING_LEVEL": "WARNING",
+        .env({# vLLM caches its model-architecture inspection (a ~13 s
+              # subprocess) under VLLM_CACHE_ROOT; the default location
+              # is ephemeral, so it lives on the kernel-cache volume
+              "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+              "VLLM_LOGGING_LEVEL": "WARNING",
               "VLLM_USE_FLASHINFER_SAMPLER": "0",
               "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
               "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
@@ -301,7 +305,7 @@ def _execute_quail_payload(payload, registry, graph, backend) -> dict:
     if booted is None:
         from quail.executor.model import load_model
         t0 = time.perf_counter()
-        model = load_model(spec.hf_name)
+        model = load_model(spec.hf_name, revision=spec.revision)
         boot["load_model_s"] = time.perf_counter() - t0
         # budgets.* is tiny CPU; fold into arena_s so the four phases
         # cover the cold-load span without a leftover residual
@@ -467,7 +471,7 @@ def _child_boot(state, sub):
     t_boot = time.perf_counter()
     if "model_execution" not in state:
         t0 = time.perf_counter()
-        model = load_model(spec.hf_name)
+        model = load_model(spec.hf_name, revision=spec.revision)
         boot["load_model_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
         chunk_tokens = budgets.chunk_budget(spec, device)
