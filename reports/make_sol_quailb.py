@@ -28,8 +28,11 @@ KV is computed, used once, and removed (`executor/pack.py` never retains tuple
 suffix KV).
 
 The estimate therefore computes a document prefix once however many questions
-get asked about it. Each later question still reads that prefix from KV. Three
-operations follow:
+get asked about it. Each later question still reads that prefix from KV. The
+same holds across documents: a token prefix that an earlier document already
+computed is resident, so a document pays only for the tokens beyond its
+longest common prefix with the corpus (agent trace rows sampled from one
+trajectory share most of their tokens). Three operations follow:
 
     scan()      compute a prefix and its first suffix, from nothing
     ask()       reuse a resident prefix, attach one more suffix
@@ -165,16 +168,43 @@ COLUMNS = {
     "agent_traces.trace": ("agent_traces", "trace"),
 }
 
-# 1. document lengths -------------------------------------------------
+# 1. document lengths and shared prefixes ----------------------------
+#
+# With unlimited KV, an ideal execution computes each distinct token
+# prefix once, across documents as well as within one. The tokens a
+# corpus needs are the nodes of the prefix trie over its documents,
+# and that count is the sum over the documents in sorted order of the
+# tokens beyond the longest common prefix with the previous document.
+# Each document is credited that shared length: its first use pays
+# only for the tokens no earlier document computed.
 lengths = {}        # column -> {doc id: token count}
+shared = {}         # column -> {doc id: prefix tokens another doc computed}
+
+
+def longest_common_prefix(left, right) -> int:
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if left[index] != right[index]:
+            return index
+    return limit
+
+
 for key, (table, col) in COLUMNS.items():
     t = pq.read_table(W / "data" / TAG / f"{table}.parquet",
                       columns=["id", col])
-    lengths[key] = {i: length(x) for i, x in
-                    zip(t.column("id").to_pylist(), t.column(col).to_pylist())}
+    tokens_by_doc = {i: encode(x) for i, x in
+                     zip(t.column("id").to_pylist(), t.column(col).to_pylist())}
+    lengths[key] = {i: len(ids) for i, ids in tokens_by_doc.items()}
+    shared[key] = {}
+    previous = ()
+    for doc_id, ids in sorted(tokens_by_doc.items(), key=lambda item: item[1]):
+        shared[key][doc_id] = longest_common_prefix(previous, ids)
+        previous = ids
     v = lengths[key].values()
+    credited = sum(shared[key].values())
     print(f"{key:32} {len(v):>6} docs  {sum(v):>10,} tokens  "
-          f"mean {sum(v) / len(v):>8.1f}", flush=True)
+          f"mean {sum(v) / len(v):>8.1f}  shared prefix "
+          f"{credited:>10,} ({credited / sum(v):.1%})", flush=True)
 
 # 2. prompt lengths ---------------------------------------------------
 FILTER_TEMPLATES = {c: getattr(Q, c) for c in (
@@ -266,6 +296,20 @@ def prompt_token_counts(prompt):
     return labels_by_alias, prompt.tail_tokens
 
 
+def first_use(alias_data, row, suffix) -> Work:
+    """Compute one document's prefix for the first time in a query.
+
+    The tokens an earlier document already computed are resident, so
+    the document pays only for the rest of its prefix and the suffix.
+    """
+    prefix = PRE + alias_data["tokens"][row]
+    shared_tokens = alias_data["shared"][row]
+    if shared_tokens == 0:
+        return scan(prefix, suffix)
+    resident = PRE + shared_tokens
+    return ask(resident, prefix - resident + suffix)
+
+
 def join_stage_work(anchor, partners, aliases, survivors, prompt,
                     resident_rows) -> Work:
     """One stage's Work. Anchor rows in resident_rows have their
@@ -288,7 +332,7 @@ def join_stage_work(anchor, partners, aliases, survivors, prompt,
     for row in survivors[anchor]:
         prefix = PRE + aliases[anchor]["tokens"][row]
         work = work + (ask(prefix, frame) if row in resident_rows
-                       else scan(prefix, frame))
+                       else first_use(aliases[anchor], row, frame))
         anchor_prefix = prefix + frame
         work = work + Work(
             tokens=suffix_tokens,
@@ -327,6 +371,7 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
             "column": key,
             "ids": ids,
             "tokens": [lengths[key][doc_id] for doc_id in ids],
+            "shared": [shared[key][doc_id] for doc_id in ids],
         }
     if plan is None:
         rule = (query.order if query.order is not None else
@@ -361,10 +406,12 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
             predicate = filters[alias][written_pos]
             code = prompt_code(predicate.prompt)
             qtokens = predicate.prompt.tail_tokens
-            operation = scan if stage_index == 0 else ask
             for row in live:
-                prefix = PRE + aliases[alias]["tokens"][row]
-                work = work + operation(prefix, qtokens)
+                if stage_index == 0:
+                    work = work + first_use(aliases[alias], row, qtokens)
+                else:
+                    prefix = PRE + aliases[alias]["tokens"][row]
+                    work = work + ask(prefix, qtokens)
             passed = [
                 row for row in live
                 if prompt_answer(predicate.prompt, {alias: row}, aliases)

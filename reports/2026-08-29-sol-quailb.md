@@ -24,8 +24,11 @@ then uses saved ground truth to find the exact rows that reach each later
 stage. Join queries search every supported eager left deep relation order and
 anchor choice. The search supports binary full joins, applies each available
 crossing predicate immediately, and does not consider bushy plans. Document
-prefix KV has unlimited capacity in this estimate. Work is ideally packed
-across the whole query, even across operator barriers. This is separate from
+prefix KV has unlimited capacity in this estimate, and a token prefix that
+another document already computed is resident: each document pays only for
+the tokens beyond its longest common prefix with the rest of its corpus, the
+nodes of the corpus prefix trie. Work is ideally packed across the whole
+query, even across operator barriers. This is separate from
 the production planner, which must work without ground truth and with finite
 KV.
 
@@ -38,7 +41,8 @@ model's actual answers create. Where the model passes many more documents than
 the ground truth does, as on the LePaRD filters, the measured work is a
 multiple of the modeled work and the measured time is a multiple of the SoL
 that no scheduler can close. `reports/2026-08-31-quailb-kv-regret.md` shows
-that effect per query.
+that effect per query, and shows the agent queries, where the engines' own
+prefix reuse falls short of the estimate's.
 
 ## Prediction
 
@@ -52,19 +56,23 @@ FEVER claims. The active scale factor 0.1 corpus has 500 of each. The measured
 engine runs also used 500 of each, so the regenerated estimate is the correct
 comparison.
 
-- The 4B estimates total 632.66 seconds over 32 queries; the 30 queries
-  of the 2026-08-29 file total 370.34 seconds, and the file before that
-  totaled 209.14 seconds.
-- The 32B estimates total 4,466.82 seconds.
-- The two agent queries total 262.32 seconds for 4B and 1,576.24 seconds
-  for 32B. Each is one filter over 1,772 traces of 9,736 mean tokens, and
-  the estimate computes every trace from scratch. Trace rows sampled from
-  the same trajectory share long prefixes, which this estimate does not
-  credit; a prefix cache that does can finish below it.
-- IMDB totals 109.23 seconds for 4B.
-- BioDEX totals 116.17 seconds for 4B.
-- FEVER totals 80.50 seconds for 4B.
-- LePaRD totals 64.44 seconds for 4B.
+- The 4B estimates total 464.74 seconds over 32 queries. The 30 queries
+  of the 2026-08-29 file total 369.40 seconds, against 370.34 seconds in
+  that file: crediting shared prefixes moves them by 0.3%, because the
+  review, report, claim, and passage corpora share under 1% of their
+  tokens as prefixes.
+- The 32B estimates total 3,425.75 seconds.
+- The two agent queries total 95.34 seconds for 4B and 543.16 seconds for
+  32B. Each is one filter over 1,772 traces of 9,736 mean tokens. Trace
+  rows sampled from the same trajectory are prefixes of each other, and
+  68.9% of the corpus tokens are a prefix some other row already contains.
+  Computed from scratch the two queries would need 262.32 seconds for 4B;
+  with each distinct prefix computed once they need 95.34.
+- IMDB totals 108.40 seconds for 4B.
+- BioDEX totals 116.14 seconds for 4B.
+- FEVER totals 80.47 seconds for 4B.
+- LePaRD totals 64.40 seconds for 4B.
+- Agent totals 95.34 seconds for 4B.
 - The five retired BioDEX queries are no longer included.
 
 Figure: plots/sol_quailb_per_query.png
