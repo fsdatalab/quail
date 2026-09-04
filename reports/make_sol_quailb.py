@@ -91,7 +91,7 @@ from quail.bench.sol_dp import PairRelation, exact_live_rows
 from quail.logical import SHARED_PRE, ColumnRef, bind_join_prompt, bind_prompt
 from quail.planner import budgets
 from quail.planner.decide import (
-    _collect,
+    collect_operators,
     default_order_rule,
     join_specs,
     order_filters_indexed,
@@ -315,7 +315,7 @@ class QueryInputs:
 
 def prepare_query(query, model: ModelSpec, chunk_tokens: int,
                   plan=None) -> QueryInputs:
-    scans, filters, joins = _collect(query.logical)
+    scans, filters, joins = collect_operators(query.logical)
     if isinstance(plan, Refusal):
         raise ValueError(f"query was refused: {plan.reasons}")
     aliases = {}
@@ -953,11 +953,23 @@ def add_sol_metrics(simulated, model: ModelSpec):
 
 rows = {}
 query_inputs = {}
+# queries over a corpus this estimate does not tokenize (the agent
+# traces) are recorded as skipped rather than estimated
+skipped = {}
 for qid in query_ids:
     descriptions = {
         query_defs_by_model[model.name][qid][0] for model in MODELS}
     if len(descriptions) != 1:
         raise ValueError(f"model query descriptions differ for {qid}")
+    probe_scans, _, _ = collect_operators(
+        query_defs_by_model[MODELS[0].name][qid][1]().logical)
+    missing = sorted(
+        {f"{scan.provider}.{scan.column}" for scan in probe_scans}
+        - set(lengths))
+    if missing:
+        skipped[qid] = f"no modeled corpus for {', '.join(missing)}"
+        print(f"{qid}: skipped, {skipped[qid]}")
+        continue
     rows[qid] = {"description": descriptions.pop(), "models": {}}
     query_inputs[qid] = {}
     for model in MODELS:
@@ -990,7 +1002,7 @@ for qid, r in rows.items():
 
 
 json.dump({
-    "what": f"Speed of light for all {len(rows)} QUAIL-B queries at "
+    "what": f"Speed of light for {len(rows)} QUAIL-B queries at "
             f"sf={SF:g}, on "
             "Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100! request each. "
             "Every feasible left deep order and anchor choice is considered. "
@@ -998,6 +1010,7 @@ json.dump({
     "method": "plans/sol_model.md, computed by reports/make_sol_quailb.py",
     "scale_factor": SF,
     "query_count": len(rows),
+    "skipped": skipped,
     "corpus_id": CORPUS_ID,
     "collection_id": COLLECTION_ID,
     "pricing": {

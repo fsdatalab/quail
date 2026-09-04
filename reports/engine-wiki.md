@@ -420,12 +420,6 @@ backend argument. `EngineConfig(model="qwen3-32b-fp8")` selects another built
 in model. An extension can register another `ModelSpec` and a backend that
 supports it.
 
-A DataFusion integration can keep DataFusion in charge of scans, ordinary
-relational operators, and final projection. Its custom operator can wrap the
-needed Arrow columns in a Quail table provider and submit a logical Quail
-query. A Rust client would need a public cross-language interface because the
-current Modal provider is a Python interface.
-
 ### Pushdown
 
 Pushdown is unconditional, not a decision. Filters attach directly

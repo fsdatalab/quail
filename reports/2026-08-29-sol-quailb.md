@@ -2,12 +2,18 @@
 
 ## Setup
 
-- The calculation covers the 30 default QuailB queries at scale factor 0.1.
+- The calculation covers 30 of the 32 QuailB queries at scale factor 0.1.
+  The two agent trace queries, AGENT-1 and AGENT-2, are recorded as
+  skipped: the script does not tokenize the agent trace corpus.
 - It runs separately for Qwen3 4B fp8 and Qwen3 32B fp8.
 - Each estimate is for one H100! request and one model copy.
-- The corpus is `c_3bd14ed0758287cba9d88fb68de8b7b8`.
-- Ground truth collection `gt_363b5ab570635c33894e1a030c21f57e`
-  supplies exact survivors for all 22 predicates.
+- The corpus is `c_1aa2c4f0d0b6c816fd37aa5748c33341`.
+- Ground truth collection `gt_77bb8b128743a79aedddaa24c808c3f8`, the
+  active selectivity estimate collection, supplies exact survivors for
+  every predicate. The file was regenerated on 2026-09-04 against this
+  collection; every per query estimate matched the 2026-08-29 file built
+  on `gt_363b5ab570635c33894e1a030c21f57e`, so the numbers below are
+  unchanged.
 - The full result is at `/results/sol/sol_quailb_sf0.1.json` on the
   `quail-results` Modal volume.
 
@@ -27,6 +33,14 @@ KV.
 
 These assumptions make SoL an optimistic comparison point for the modeled
 execution. It is not the exact minimum time for every possible query plan.
+
+Because the survivors come from the ground truth, the SoL models the work of a
+query whose model answers are all correct. A measured run does the work the
+model's actual answers create. Where the model passes many more documents than
+the ground truth does, as on the LePaRD filters, the measured work is a
+multiple of the modeled work and the measured time is a multiple of the SoL
+that no scheduler can close. `reports/2026-08-31-quailb-kv-regret.md` shows
+that effect per query.
 
 ## Prediction
 

@@ -9,7 +9,12 @@ work directory to this script:
     modal volume get quail-results benchmarks/quailb/families/20260831T070520Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/fever.json $W/fever.json
     modal volume get quail-results benchmarks/quailb/families/20260831T070520Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/lepard.json $W/lepard.json
     modal volume get quail-results benchmarks/quailb/families/20260831T070520Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/agent.json $W/agent.json
+    modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
     uv run --with matplotlib python reports/make_quailb_sf01_4b_plots.py $W
+
+The SoL file is the ideal work estimate from reports/make_sol_quailb.py. It
+covers the 30 IMDB, BioDEX, FEVER, and LePaRD queries; the two agent
+queries have no estimate and no marker.
 """
 
 import json
@@ -96,6 +101,22 @@ def load_inputs(workdir):
         if missing:
             raise ValueError(f"{method} lacks KV regret: {missing}")
     return records
+
+
+def load_sol(workdir):
+    """Load the SoL estimate: seconds and modeled work per covered query."""
+    sol = load(workdir / "sol.json")
+    if sol["scale_factor"] != 0.1:
+        raise ValueError("unexpected SoL scale factor")
+    estimates = {}
+    for query, record in sol["queries"].items():
+        model = record["models"]["qwen3-4b-fp8"]
+        pairs = int(model["join_pair_evaluations"])
+        estimates[query] = {
+            "seconds": float(model["sol_s"]),
+            "work": pairs if pairs else int(model["input_document_rows"]),
+        }
+    return estimates
 
 
 def wall_seconds(method, row):
@@ -200,7 +221,7 @@ def family_name(query):
     }[prefix]
 
 
-def print_tables(records):
+def print_tables(records, sol):
     """Print the report's derived Markdown tables."""
     summaries = {method: aggregate(records, method) for method in METHODS}
     print("\nAggregate metrics")
@@ -249,12 +270,38 @@ def print_tables(records):
             print(f"| {query} | {values[0]:,} | {values[1]:,} | "
                   f"{values[2]:,} |")
 
+    print("\nTime relative to SoL, 30 queries with an estimate")
+    print("| Method | Total time (s) | SoL total (s) | Time / SoL | "
+          "Median time / SoL | Best query | Worst query |")
+    print("|---|---:|---:|---:|---:|---|---|")
+    covered = [query for query in QUERY_ORDER if query in sol]
+    sol_total = sum(sol[query]["seconds"] for query in covered)
+    for method in METHODS:
+        ratios = {
+            query: wall_seconds(method, records[method][query])
+            / sol[query]["seconds"]
+            for query in covered
+        }
+        total = sum(wall_seconds(method, records[method][query])
+                    for query in covered)
+        best = min(ratios, key=ratios.get)
+        worst = max(ratios, key=ratios.get)
+        print(
+            f"| {method} | {total:,.2f} | {sol_total:,.2f} | "
+            f"{total / sol_total:.2f}x | "
+            f"{float(np.median(list(ratios.values()))):.2f}x | "
+            f"{best} ({ratios[best]:.2f}x) | "
+            f"{worst} ({ratios[worst]:.2f}x) |"
+        )
+
     print("\nPer-query metrics")
-    print("| Query | Unit | Quail | Stock vLLM | Pipelined vLLM |")
-    print("|---|---|---:|---:|---:|")
+    print("| Query | Unit | SoL estimate | Quail | Stock vLLM | "
+          "Pipelined vLLM |")
+    print("|---|---|---:|---:|---:|---:|")
     for query in QUERY_ORDER:
         cells = []
         unit = None
+        estimate = sol.get(query)
         for method in METHODS:
             row = records[method][query]
             seconds = wall_seconds(method, row)
@@ -265,11 +312,22 @@ def print_tables(records):
             unit = current_unit
             throughput = query_work(method, row) / seconds
             cost = seconds * H100_USD_PER_HOUR / 3600
+            versus_sol = (
+                f"; {seconds / estimate['seconds']:.2f}x SoL"
+                if estimate else ""
+            )
             cells.append(
                 f"{seconds:.2f} s; {throughput:,.1f} {unit}; "
-                f"${cost:.4f}; {row['regret_tokens']:,} regret"
+                f"${cost:.4f}; {row['regret_tokens']:,} regret{versus_sol}"
             )
-        print(f"| {query} | {unit} | " + " | ".join(cells) + " |")
+        sol_cell = (
+            f"{estimate['seconds']:.2f} s; "
+            f"{estimate['work'] / estimate['seconds']:,.1f} {unit}; "
+            f"${estimate['seconds'] * H100_USD_PER_HOUR / 3600:.4f}"
+            if estimate else "none"
+        )
+        print(f"| {query} | {unit} | {sol_cell} | " + " | ".join(cells)
+              + " |")
 
 
 def annotate_bars(ax, bars, formatter, values):
@@ -381,8 +439,8 @@ def make_aggregate_plot(records):
     print(f"wrote {output}")
 
 
-def grouped_bars(ax, queries, records, value_fn):
-    """Draw grouped bars for the requested queries."""
+def grouped_bars(ax, queries, records, value_fn, sol=None, sol_fn=None):
+    """Draw grouped bars for the requested queries, with SoL marks."""
     x = np.arange(len(queries))
     width = 0.25
     for index, (method, color) in enumerate(zip(METHODS, COLORS)):
@@ -390,13 +448,20 @@ def grouped_bars(ax, queries, records, value_fn):
                   for query in queries]
         ax.bar(x + (index - 1) * width, values, width,
                label=method, color=color)
+    if sol is not None:
+        positions = [position for position, query in enumerate(queries)
+                     if query in sol]
+        values = [sol_fn(sol[queries[position]]) for position in positions]
+        # one horizontal mark across each query's three bars
+        ax.scatter(positions, values, marker="_", s=420, linewidths=1.8,
+                   color=DARK, zorder=4, label="SoL estimate")
     ax.set_xticks(x, queries, rotation=60, ha="right")
     for index in range(1, len(queries)):
         if family_name(queries[index - 1]) != family_name(queries[index]):
             ax.axvline(index - 0.5, color=GRAY, linewidth=0.8, zorder=0)
 
 
-def make_per_query_plot(records):
+def make_per_query_plot(records, sol):
     """Plot runtime, throughput, cost, and KV regret per query."""
     filter_queries = [query for query in QUERY_ORDER
                       if not has_join("Quail", records["Quail"][query])]
@@ -408,10 +473,12 @@ def make_per_query_plot(records):
     )
 
     runtime_ax = axes[0]
-    grouped_bars(runtime_ax, QUERY_ORDER, records, wall_seconds)
+    grouped_bars(runtime_ax, QUERY_ORDER, records, wall_seconds,
+                 sol, lambda estimate: estimate["seconds"])
     runtime_ax.set_yscale("log")
     runtime_ax.set_ylabel("seconds per query (log scale)")
-    runtime_ax.set_title("Query time and cost")
+    runtime_ax.set_title(
+        "Query time and cost (dark mark: SoL estimate; none for agent queries)")
     cost_rate = H100_USD_PER_HOUR / 3600
     cost_ax = runtime_ax.secondary_yaxis(
         "right",
@@ -427,6 +494,8 @@ def make_per_query_plot(records):
         records,
         lambda method, row: query_work(method, row)
         / wall_seconds(method, row),
+        sol,
+        lambda estimate: estimate["work"] / estimate["seconds"],
     )
     filter_ax.set_yscale("log")
     filter_ax.set_ylabel("documents per second (log scale)")
@@ -439,6 +508,8 @@ def make_per_query_plot(records):
         records,
         lambda method, row: query_work(method, row)
         / wall_seconds(method, row),
+        sol,
+        lambda estimate: estimate["work"] / estimate["seconds"],
     )
     join_ax.set_ylabel("document pairs per second")
     join_ax.set_title("Throughput for queries with joins")
@@ -455,7 +526,7 @@ def make_per_query_plot(records):
     regret_ax.set_title("KV regret compared with unlimited KV")
 
     handles, labels = runtime_ax.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=3,
+    fig.legend(handles, labels, loc="upper center", ncol=4,
                bbox_to_anchor=(0.5, 1.0))
     for ax in axes:
         legend = ax.get_legend()
@@ -483,10 +554,12 @@ def main():
     """Load inputs, print tables, and write both figures."""
     if len(sys.argv) != 2:
         raise SystemExit(f"usage: {Path(sys.argv[0]).name} WORKDIR")
-    records = load_inputs(Path(sys.argv[1]))
-    print_tables(records)
+    workdir = Path(sys.argv[1])
+    records = load_inputs(workdir)
+    sol = load_sol(workdir)
+    print_tables(records, sol)
     make_aggregate_plot(records)
-    make_per_query_plot(records)
+    make_per_query_plot(records, sol)
 
 
 if __name__ == "__main__":
