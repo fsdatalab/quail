@@ -1364,7 +1364,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
               ground_truth_workload=None,
               h100_usd_per_hour=3.9492, ground_truth_files=None,
               prediction=None, artifact_stem=None,
-              execute_query=None):
+              compute_provider=None):
     """Run all (or selected) QUAIL-B queries through the engine."""
     import quail
     from quail.bench.evaluate import (
@@ -1410,7 +1410,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         gpus=gpus,
         model=model,
         backend=backend,
-    ))
+    ), compute_provider=compute_provider)
     register_sets(sess, d)
     qdefs = queries(sess)
     if only is None:
@@ -1492,10 +1492,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             print(f"[quailb] {qid}: {desc}", flush=True)
             try:
                 query = build()
-                res = (
-                    query.run()
-                    if execute_query is None else execute_query(query)
-                )
+                res = query.run()
                 result_rows = res.count()
                 row = dict(query=qid, desc=desc,
                            backend=backend,

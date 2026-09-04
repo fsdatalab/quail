@@ -18,6 +18,7 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
     from quail.execution import export_physical_outputs
     from quail.builtins import built_in_registry
     from quail.physical import DocumentInput, PackedFilter, decode_graph
+    from quail.runtime import local as local_runtime
     from quail.runtime import worker
     from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
     from quail.runtime.session import Session
@@ -85,7 +86,7 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
             {"wall_s": 1.0, "boot_s": 0.0, "fresh_tokens": 4},
         )
 
-    monkeypatch.setattr(worker, "_execute_physical", execute)
+    monkeypatch.setattr(local_runtime, "_execute_physical", execute)
 
     response = worker._execute_logical_query(request, 1)
 

@@ -89,7 +89,7 @@ def _save(name: str, value: dict) -> str:
 
 def _query_record(query_id, query, execute, gpu_count):
     from quail.bench.evaluate import H100_USD_PER_HOUR
-    from quail.runtime.worker import execute_worker_query
+    from quail.runtime.local import execute_worker_query
 
     result = execute_worker_query(query, physical_executor=execute)
     table = result.collect()
@@ -146,7 +146,7 @@ def confirm_4b(
     from quail.bench.quailb import build_sets, queries, register_sets
     from quail.planner.plan import EngineConfig
     from quail.runtime.session import Session
-    from quail.runtime.worker import _execute_physical
+    from quail.runtime.local import _execute_physical
 
     data = build_sets("/results/quailb_data", 0.1)
     session = Session(EngineConfig(model="qwen3-4b-fp8", gpus=1))
@@ -209,7 +209,7 @@ def _small_session(model: str, gpus: int):
     volumes=volumes,
 )
 def confirm_4b_2gpu(prediction: str) -> str:
-    from quail.runtime.worker import _execute_physical
+    from quail.runtime.local import _execute_physical
 
     session = _small_session("qwen3-4b-fp8", 2)
     query = session.sql("""
@@ -238,7 +238,7 @@ def confirm_4b_2gpu(prediction: str) -> str:
     volumes=volumes,
 )
 def confirm_32b(prediction: str) -> str:
-    from quail.runtime.worker import _execute_physical
+    from quail.runtime.local import _execute_physical
 
     session = _small_session("qwen3-32b-fp8", 1)
     query = session.sql("""

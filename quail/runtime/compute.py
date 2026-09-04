@@ -53,6 +53,27 @@ class ComputeProvider(Protocol):
     def close(self) -> None: ...
 
 
+class InProcessComputeProvider:
+    """Run logical queries in the current process.
+
+    This is the provider for code that already runs where the GPUs
+    are, such as the benchmark runner inside a Modal function, and for
+    tests that fake the physical executor.
+    """
+
+    def __init__(self, physical_executor=None):
+        self._physical_executor = physical_executor
+
+    def execute(self, request: QueryRequest) -> QueryResult:
+        # local imports the session module, which imports this one
+        from quail.runtime.local import execute_query_request
+
+        return execute_query_request(request, self._physical_executor)
+
+    def close(self) -> None:
+        return None
+
+
 def _modal_request(request: QueryRequest) -> dict:
     """Prepare one request for a Modal Function."""
 

@@ -18,7 +18,7 @@ def fake_tok(text):
 
 
 def _run(query, execute):
-    from quail.runtime.worker import execute_worker_query
+    from quail.runtime.local import execute_worker_query
 
     return execute_worker_query(query, physical_executor=execute)
 
@@ -471,7 +471,7 @@ def test_projection_uses_the_tokenization_scan(tmp_path):
 
 
 def test_physical_request_has_one_plan_and_arrow_inputs(sess):
-    from quail.runtime.worker import _validate_physical_request
+    from quail.runtime.local import _validate_physical_request
 
     query = sess.sql(FILTER_SQL)
     request = query._prepare_physical()
@@ -556,7 +556,7 @@ def test_payload_carries_workers_and_shards(tmp_path):
 
 
 def test_plan_carries_true_false_and_join_spec(sess):
-    from quail.runtime.worker import _validate_physical_request
+    from quail.runtime.local import _validate_physical_request
 
     sql = """
         SELECT r.id, p.asin FROM reviews r

@@ -7,6 +7,7 @@ from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
 from quail.planner.plan import EngineConfig
 from quail.runtime.compute import (
     ComputeProvider,
+    InProcessComputeProvider,
     ModalComputeProvider,
     QueryRequest,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "DocumentProvider",
     "EngineConfig",
     "ExtensionRegistry",
+    "InProcessComputeProvider",
     "ModalComputeProvider",
     "NodeCodec",
     "PhysicalGraph",

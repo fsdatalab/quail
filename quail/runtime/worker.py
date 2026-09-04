@@ -1,19 +1,15 @@
-"""Run logical queries on Modal GPU workers."""
+"""The Modal image, volumes, and functions that run logical queries."""
 
-import json
-import os
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import modal
 
-from quail.backends import BackendExecutionContext
 from quail.builtins import registry_from_modules
 from quail.catalog import DocumentProvider
-from quail.execution import PhysicalRequest, PhysicalResponse
-from quail.physical import check_plan_envelope, decode_graph, DocumentInput
-from quail.planner.plan import EngineConfig, Refusal
-from quail.runtime.session import Query, RefusalError, Session
+from quail.extensions import ExtensionPackage
+from quail.planner.plan import EngineConfig
+from quail.runtime.compute import QueryRequest
+from quail.runtime.local import execute_query_request
 from quail.runtime.volumes import hf_cache, kernel_cache, results_vol
 
 
@@ -56,110 +52,8 @@ def build_worker_image(
     )
 
 
-@dataclass
-class _WorkerRuntime:
-    """Per container state that backends keep between queries."""
-
-    booted: dict = field(default_factory=dict)
-
-
-_RUNTIME = _WorkerRuntime()
-
-
-def _validate_physical_request(request):
-    """Validate and decode a physical execution request."""
-
-    if not isinstance(request, PhysicalRequest):
-        raise TypeError("the worker needs a PhysicalRequest")
-    envelope = request.plan
-    check_plan_envelope(envelope)
-    registry = registry_from_modules(tuple(envelope["extension_modules"]))
-    backend = registry.backend(envelope["backend"])
-    graph = decode_graph(envelope["graph"], registry.codecs)
-    graph.validate(runtime_keys=set(registry.runtimes))
-    graph.validate_backend(envelope["backend"])
-    needed_inputs = {
-        node.input_id for node in graph.nodes
-        if isinstance(node, DocumentInput)
-    }
-    missing = needed_inputs - set(request.inputs)
-    extra = set(request.inputs) - needed_inputs
-    if missing or extra:
-        raise ValueError(
-            "execution request has wrong input bindings; "
-            f"missing={sorted(missing)}, extra={sorted(extra)}"
-        )
-    return request, registry, graph, backend
-
-
-def _execute_physical(request):
-    """Run the backend selected by a registered physical plan."""
-
-    request, registry, graph, backend = _validate_physical_request(request)
-    response = backend.execute_request(BackendExecutionContext(
-        request=request,
-        graph=graph,
-        registry=registry,
-        gpu_count=request.gpu_count,
-        runtime_state=_RUNTIME.booted,
-    ))
-    if not isinstance(response, PhysicalResponse):
-        raise TypeError("a model backend must return PhysicalResponse")
-    if (
-        response.metrics.get("result_volume_path") is None
-        and os.path.isdir("/results")
-        and os.access("/results", os.W_OK)
-    ):
-        metrics = dict(response.metrics)
-        os.makedirs("/results/runs", exist_ok=True)
-        result_path = f"/results/runs/run_{time.time_ns()}.json"
-        metrics["result_volume_path"] = result_path
-        with open(result_path, "w") as output:
-            json.dump({
-                key: metrics.get(key)
-                for key in (
-                    "backend",
-                    "wall_s",
-                    "boot_s",
-                    "boot_kind",
-                    "boot",
-                    "fresh_tokens",
-                    "cached_tokens",
-                    "regret_tokens",
-                    "peak_gib",
-                    "node_metrics",
-                    "backend_metrics",
-                )
-            }, output)
-        results_vol.commit()
-        response = PhysicalResponse(response.outputs, metrics)
-    return response
-
-
-def execute_worker_query(query, physical_executor=None):
-    """Execute one query inside its current worker process."""
-
-    plan = query.plan()
-    if isinstance(plan, Refusal):
-        raise RefusalError(plan)
-    plan.graph.validate(runtime_keys=set(query.session.registry.runtimes))
-    plan.graph.validate_backend(plan.backend)
-    if plan.workers > 8:
-        raise NotImplementedError(
-            "more than 8 GPUs means multiple containers; the "
-            "multi-container coordinator is a later step"
-        )
-    request = query._prepare_physical()
-    started = time.perf_counter()
-    response = (physical_executor or _execute_physical)(request)
-    if not isinstance(response, PhysicalResponse):
-        raise TypeError("a physical executor must return PhysicalResponse")
-    return query.finish(response, time.perf_counter() - started)
-
-
 def _execute_logical_query(value, gpu_count: int):
-    """Read query sources, plan the query, and execute it."""
-
+    """Open the query sources and run the query in this container."""
     config_value = value["config"]
     if not isinstance(config_value, EngineConfig):
         raise TypeError("a worker query needs an EngineConfig")
@@ -168,8 +62,8 @@ def _execute_logical_query(value, gpu_count: int):
         raise ValueError(
             f"query needs {requested_gpus} GPUs but worker has {gpu_count}"
         )
-    started = time.perf_counter()
-    registry = registry_from_modules(tuple(value["extension_modules"]))
+    modules = tuple(value["extension_modules"])
+    registry = registry_from_modules(modules)
     providers = {}
     for name, source in value["sources"].items():
         if "remote" in source:
@@ -181,19 +75,14 @@ def _execute_logical_query(value, gpu_count: int):
         else:
             raise ValueError(f"query source {name!r} has no location")
         providers[name] = provider
-    session = Session(
-        config_value,
+    return execute_query_request(QueryRequest(
+        logical_plan=value["logical_plan"],
+        providers=providers,
+        config=config_value,
         device=str(value["device"]),
-        registry=registry,
-    )
-    for name, provider in providers.items():
-        session.register(name, provider)
-    query = Query(session, value["logical_plan"], order=value["order"])
-    result = execute_worker_query(query)
-    result.report["worker_total_s"] = round(
-        time.perf_counter() - started, 4
-    )
-    return result
+        order=value["order"],
+        extensions=tuple(ExtensionPackage(module) for module in modules),
+    ))
 
 
 @dataclass(frozen=True)

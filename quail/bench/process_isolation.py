@@ -42,7 +42,7 @@ def run_backend_group(
         query_family_name,
         run_suite,
     )
-    from quail.runtime.worker import execute_worker_query
+    from quail.runtime.compute import InProcessComputeProvider
 
     query_ids = tuple(query_ids)
     methods = tuple(methods)
@@ -74,7 +74,7 @@ def run_backend_group(
             ground_truth_workload=None,
             prediction=prediction,
             artifact_stem=f"{run_label}-{family}-{method}",
-            execute_query=execute_worker_query,
+            compute_provider=InProcessComputeProvider(),
         )
         suite["query_family"] = {
             "name": family,

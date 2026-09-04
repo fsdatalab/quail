@@ -51,7 +51,8 @@ execution request to the compute provider.
 | `backends/quail/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `backends/quail/distributed.py` | Several GPU Quail node dispatch and result merging | runner, coordinator |
 | `backends/quail/worker.py` | Quail model boot, single GPU execution, and the GPU child protocol | executor, graph, distributed |
-| `runtime/worker.py` | Modal Function setup, request validation, and backend dispatch | extensions, session |
+| `runtime/local.py` | Run one logical query request in the current process: validation, backend dispatch, and result assembly | builtins, session |
+| `runtime/worker.py` | The Modal image, volumes, and functions; opens sources and calls `runtime/local.py` | local, volumes |
 | `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
 
 ### Data flow
@@ -74,7 +75,7 @@ selected ComputeProvider
   |      calls a Modal Function
   |
   v
-compute worker (runtime/worker.py)
+compute worker (runtime/worker.py, then runtime/local.py)
   opens sources and tokenizes document columns
   writes tokens, lengths, and projected columns to temporary Arrow files
   runs logical optimizer rules and physical planning
@@ -1297,7 +1298,8 @@ while join predicates remain:
 | `gate_group` | `coordinator.py` | Anchor survivors after one group (full/exists/anti keep rules) |
 | `runtime_join_steps` | `coordinator.py` | Group a runtime join search into anchored joins and exchanges |
 | `ModalComputeProvider.execute` | `compute.py` | Submit one logical query to the selected Modal Function |
-| `execute_worker_query` | `worker.py` | Plan and execute one query in the current Modal worker |
+| `execute_query_request` | `local.py` | Plan and execute one logical query request in the current process |
+| `execute_worker_query` | `local.py` | Plan and execute one already built query in the current process |
 | `_execute_physical` | `worker.py` | Validate and run one typed physical request |
 | `_execute_single` | `worker.py` | Single-GPU typed graph entry point |
 

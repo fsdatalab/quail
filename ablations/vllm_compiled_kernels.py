@@ -276,7 +276,7 @@ def _write(result, name):
 def _boot_state(model):
     """Boot the worker state dict with the kernel-source pipeline.
 
-    Mirrors quail.runtime.worker._execute_physical's boot, with the
+    Mirrors quail.runtime.local._execute_physical's boot, with the
     Pipeline subclass swapped in; warm_kernels runs the same tiered
     warmup the worker runs.
     """
@@ -352,7 +352,7 @@ def _run_query(state, build, captured):
         execute_single,
         quail_runtime_payload,
     )
-    from quail.runtime.worker import (
+    from quail.runtime.local import (
         _validate_physical_request,
         execute_worker_query,
     )

@@ -37,33 +37,28 @@ session = quail.Session(compute_provider=MyProvider())
    needed columns and send them. `quail.runtime.compute._modal_request`
    shows the column selection: the id column, every scanned document
    column, and every projected column.
-2. Run the query in the worker. `quail.runtime.worker.execute_worker_query`
+2. Run the query in the worker. `quail.runtime.local.execute_query_request`
    is the in-process entry point that tokenizes, plans, validates,
    dispatches to the backend, and finishes the graph. A custom
-   provider can call it in whatever process it controls, as the CPU
-   tests do.
+   provider can call it in whatever process it controls.
 3. Return a `QueryResult`. `QueryResult.from_table(table, report)`
    wraps a materialized Arrow table.
 
-## A local provider for tests
+## The in-process provider
 
-The CPU test suite fakes the GPU and runs the whole path in process.
-A provider that does the same is a few lines:
+`quail.InProcessComputeProvider` runs the request in the current
+process. It is the provider for code that already runs where the GPUs
+are, such as the benchmark runner inside a Modal function, and for
+tests that fake the physical executor:
 
 ```python
-from quail.runtime.worker import execute_worker_query
-
-
-class InProcessProvider:
-    def execute(self, request):
-        return execute_worker_query(request)
-
-    def close(self):
-        pass
+session = quail.Session(compute_provider=quail.InProcessComputeProvider())
 ```
 
-Without a GPU this only works when the selected backend does not need
-one, for example the `LocalFilterBackend` from the physical node tests.
+It takes an optional `physical_executor` callable that replaces the
+backend dispatch, which is how the CPU tests run the whole path
+without a GPU. The QUAIL-B runner uses this provider, so the benchmark
+and production build the same result objects.
 
 ## Modal specifics that are not part of the protocol
 

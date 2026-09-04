@@ -158,7 +158,7 @@ def _run(query, join_answers):
             "peak_gib": 1.0,
         })
 
-    from quail.runtime.worker import execute_worker_query
+    from quail.runtime.local import execute_worker_query
 
     return execute_worker_query(query, physical_executor=execute)
 
@@ -220,7 +220,7 @@ def _run_request_backend(query, join_answers):
             "peak_gib": 1.0,
         })
 
-    from quail.runtime.worker import execute_worker_query
+    from quail.runtime.local import execute_worker_query
 
     return execute_worker_query(query, physical_executor=execute)
 

@@ -302,7 +302,7 @@ def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
     import types
 
     from quail.physical import plan_envelope
-    from quail.runtime.worker import _execute_physical
+    from quail.runtime.local import _execute_physical
 
     class RemoteBackend:
         name = "test.remote"
