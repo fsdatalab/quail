@@ -8,8 +8,7 @@
     "model-backends",
     "compute-providers",
     "observers",
-    "models",
-    "datafusion"
+    "models"
   ],
   "defaultOpen": true
 }

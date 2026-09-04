@@ -75,21 +75,3 @@ would use. The six interfaces:
 - **Execution observers** record per node metrics.
 
 Each has its own page under [Extending Quail](/docs/extending).
-
-## Comparison with DataFusion
-
-If you know Apache DataFusion, the shapes match:
-
-| DataFusion | Quail |
-| --- | --- |
-| `LogicalPlan` and `OptimizerRule` | `LogicalPlan` and `LogicalOptimizerRule` |
-| `ExecutionPlan` and `PhysicalOptimizerRule` | `PhysicalGraph` and `PhysicalOptimizerRule` |
-| `TableProvider` | `TableProvider` |
-| `PhysicalPlanner` / `ExtensionPlanner` | `PhysicalPlanner` and `ModelBackend.plan` |
-| `SessionContext` | `Session` |
-| Physical plan serialization (`datafusion-proto`) | `NodeCodec` and the plan envelope |
-
-The differences: Quail's planner is not cost-based in general, only
-the model backend estimates time; the SQL subset is tiny by design;
-and execution is remote, so the physical graph crosses a process
-boundary and every node type needs a codec.
