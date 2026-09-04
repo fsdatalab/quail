@@ -201,12 +201,6 @@ keeps one function container running until `Session.close()` so several queries
 can reuse the loaded model. Closing the session allows the function to scale to
 zero.
 
-DataFusion can keep its own scans, ordinary joins, and final projection. A
-DataFusion extension can pass an Arrow table to a Quail table provider and run
-a Quail query through the compute provider interface. A Rust client would need
-a public cross-language interface because the current Modal provider is a
-Python interface.
-
 A table provider does not need registry entry. It implements `TableProvider`
 and is passed directly to `Session.register(name, provider)`.
 
