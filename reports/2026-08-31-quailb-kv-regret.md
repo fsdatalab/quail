@@ -185,9 +185,7 @@ Thin vertical lines separate the five query families. The horizontal line
 separates the performance panels from KV regret. The dark horizontal mark on
 each query is the speed of light (SoL) estimate from
 `reports/make_sol_quailb.py`: the ideal one H100 time for the modeled work
-with ideal packing and unlimited KV, priced from counted constants. The two
-agent queries have no estimate, because the SoL script does not model the
-agent trace corpus.
+with ideal packing and unlimited KV, priced from counted constants.
 
 The unit is documents per second for filter-only queries and evaluated document
 pairs per second for queries with at least one join.
@@ -196,14 +194,14 @@ pairs per second for queries with at least one join.
 
 | Method | Total time (s) | SoL total (s) | Time / SoL | Median time / SoL | Best query | Worst query |
 |---|---:|---:|---:|---:|---|---|
-| Quail | 1,149.12 | 370.34 | 3.10x | 2.59x | BIO-1 (1.95x) | LEP-5 (50.85x) |
-| Stock vLLM | 3,179.98 | 370.34 | 8.59x | 6.24x | BIO-1 (2.58x) | LEP-5 (74.08x) |
-| Pipelined vLLM | 3,101.60 | 370.34 | 8.38x | 4.55x | BIO-1 (2.29x) | LEP-5 (81.86x) |
+| Quail | 1,629.61 | 632.66 | 2.58x | 2.48x | AGENT-1 (1.83x) | LEP-5 (50.85x) |
+| Stock vLLM | 3,453.08 | 632.66 | 5.46x | 5.82x | AGENT-1 (1.04x) | LEP-5 (74.08x) |
+| Pipelined vLLM | 3,298.33 | 632.66 | 5.21x | 4.31x | AGENT-1 (0.75x) | LEP-5 (81.86x) |
 
-Quail runs the 30 estimated queries in 3.10 times the SoL total, against 8.59
-times for stock vLLM and 8.38 times for pipelined vLLM. The median query is
-2.59 times SoL for Quail. The BioDEX and most IMDB and FEVER queries sit
-between 2 and 3 times SoL for Quail.
+Quail runs the 32 queries in 2.58 times the SoL total, against 5.46 times for
+stock vLLM and 5.21 times for pipelined vLLM. The median query is 2.48 times
+SoL for Quail. The BioDEX and most IMDB and FEVER queries sit between 2 and 3
+times SoL for Quail.
 
 The LePaRD join queries LEP-3 through LEP-7 sit 19 to 51 times above their
 SoL marks for every method. That gap is not engine overhead. The SoL uses the
@@ -219,6 +217,16 @@ same effect, in a milder form, is why FEV-7 through FEV-9 evaluate 1.6 to 2.1
 times the pairs the SoL models. The three methods do the same model driven
 work, so the comparison between them is unaffected; the SoL column shows what
 the query would cost if the model's answers matched the ground truth.
+
+The agent queries go the other way: pipelined vLLM finishes AGENT-1 in 0.75
+times the SoL and stock vLLM in 1.04 times, while Quail takes 1.83 times. The
+SoL computes every document's prefix once, and so does Quail. The agent trace
+rows are prefixes of each other: the corpus samples one row every five
+assistant turns of the same trajectory, so consecutive rows share most of
+their 9,736 mean tokens. vLLM's prefix cache serves the shared part from KV,
+which is work the SoL charges in full. The regret metric does not count that
+sharing either, which is why both vLLM methods report zero regret on these
+queries while beating Quail.
 
 ### Per-query metrics
 
@@ -257,8 +265,8 @@ work, and cost. Each method's cell ends with its time as a multiple of SoL.
 | LEP-6 | pairs/s | 0.49 s; 1,910.4 pairs/s; $0.0005 | 9.15 s; 1,419.7 pairs/s; $0.0100; 0 regret; 18.74x SoL | 20.03 s; 886.4 pairs/s; $0.0220; 1,888 regret; 41.01x SoL | 17.88 s; 992.9 pairs/s; $0.0196; 1,888 regret; 36.61x SoL |
 | LEP-7 | pairs/s | 1.14 s; 1,542.1 pairs/s; $0.0012 | 39.39 s; 1,599.4 pairs/s; $0.0432; 0 regret; 34.61x SoL | 51.80 s; 1,235.4 pairs/s; $0.0568; 19,440 regret; 45.51x SoL | 48.01 s; 1,332.8 pairs/s; $0.0527; 19,440 regret; 42.19x SoL |
 | LEP-8 | docs/s | 0.49 s; 1,023.8 docs/s; $0.0005 | 1.33 s; 375.9 docs/s; $0.0015; 0 regret; 2.72x SoL | 2.53 s; 197.7 docs/s; $0.0028; 0 regret; 5.18x SoL | 1.97 s; 253.3 docs/s; $0.0022; 0 regret; 4.04x SoL |
-| AGENT-1 | docs/s | none | 239.75 s; 7.4 docs/s; $0.2630; 0 regret | 135.96 s; 13.0 docs/s; $0.1491; 0 regret | 97.99 s; 18.1 docs/s; $0.1075; 0 regret |
-| AGENT-2 | docs/s | none | 240.74 s; 7.4 docs/s; $0.2641; 0 regret | 137.13 s; 12.9 docs/s; $0.1504; 0 regret | 98.74 s; 17.9 docs/s; $0.1083; 0 regret |
+| AGENT-1 | docs/s | 130.96 s; 13.5 docs/s; $0.1437 | 239.75 s; 7.4 docs/s; $0.2630; 0 regret; 1.83x SoL | 135.96 s; 13.0 docs/s; $0.1491; 0 regret; 1.04x SoL | 97.99 s; 18.1 docs/s; $0.1075; 0 regret; 0.75x SoL |
+| AGENT-2 | docs/s | 131.36 s; 13.5 docs/s; $0.1441 | 240.74 s; 7.4 docs/s; $0.2641; 0 regret; 1.83x SoL | 137.13 s; 12.9 docs/s; $0.1504; 0 regret; 1.04x SoL | 98.74 s; 17.9 docs/s; $0.1083; 0 regret; 0.75x SoL |
 wrote /home/user/quail-exploration/reports/plots/quailb_sf01_4b_metrics.png
 wrote /home/user/quail-exploration/reports/plots/quailb_sf01_4b_per_query.png
 

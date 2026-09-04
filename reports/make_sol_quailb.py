@@ -162,6 +162,7 @@ COLUMNS = {
         ("citation_contexts", "destination_context"),
     "citation_passages.passage_text":
         ("citation_passages", "passage_text"),
+    "agent_traces.trace": ("agent_traces", "trace"),
 }
 
 # 1. document lengths -------------------------------------------------
@@ -953,8 +954,8 @@ def add_sol_metrics(simulated, model: ModelSpec):
 
 rows = {}
 query_inputs = {}
-# queries over a corpus this estimate does not tokenize (the agent
-# traces) are recorded as skipped rather than estimated
+# a query over a corpus this estimate does not tokenize is recorded as
+# skipped rather than estimated
 skipped = {}
 for qid in query_ids:
     descriptions = {

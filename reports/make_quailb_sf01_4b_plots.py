@@ -12,9 +12,8 @@ work directory to this script:
     modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
     uv run --with matplotlib python reports/make_quailb_sf01_4b_plots.py $W
 
-The SoL file is the ideal work estimate from reports/make_sol_quailb.py. It
-covers the 30 IMDB, BioDEX, FEVER, and LePaRD queries; the two agent
-queries have no estimate and no marker.
+The SoL file is the ideal work estimate from reports/make_sol_quailb.py
+for all 32 queries.
 """
 
 import json
@@ -270,7 +269,7 @@ def print_tables(records, sol):
             print(f"| {query} | {values[0]:,} | {values[1]:,} | "
                   f"{values[2]:,} |")
 
-    print("\nTime relative to SoL, 30 queries with an estimate")
+    print("\nTime relative to SoL")
     print("| Method | Total time (s) | SoL total (s) | Time / SoL | "
           "Median time / SoL | Best query | Worst query |")
     print("|---|---:|---:|---:|---:|---|---|")
@@ -477,8 +476,7 @@ def make_per_query_plot(records, sol):
                  sol, lambda estimate: estimate["seconds"])
     runtime_ax.set_yscale("log")
     runtime_ax.set_ylabel("seconds per query (log scale)")
-    runtime_ax.set_title(
-        "Query time and cost (dark mark: SoL estimate; none for agent queries)")
+    runtime_ax.set_title("Query time and cost (dark mark: SoL estimate)")
     cost_rate = H100_USD_PER_HOUR / 3600
     cost_ax = runtime_ax.secondary_yaxis(
         "right",

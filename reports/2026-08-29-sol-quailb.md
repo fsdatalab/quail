@@ -1,19 +1,17 @@
-# Speed of light for the 30 current QuailB queries
+# Speed of light for the 32 QuailB queries
 
 ## Setup
 
-- The calculation covers 30 of the 32 QuailB queries at scale factor 0.1.
-  The two agent trace queries, AGENT-1 and AGENT-2, are recorded as
-  skipped: the script does not tokenize the agent trace corpus.
+- The calculation covers all 32 QuailB queries at scale factor 0.1. The
+  two agent trace queries were added on 2026-09-04; the 30 others were
+  regenerated the same day against the active collection and matched
+  the 2026-08-29 file exactly.
 - It runs separately for Qwen3 4B fp8 and Qwen3 32B fp8.
 - Each estimate is for one H100! request and one model copy.
 - The corpus is `c_1aa2c4f0d0b6c816fd37aa5748c33341`.
 - Ground truth collection `gt_77bb8b128743a79aedddaa24c808c3f8`, the
   active selectivity estimate collection, supplies exact survivors for
-  every predicate. The file was regenerated on 2026-09-04 against this
-  collection; every per query estimate matched the 2026-08-29 file built
-  on `gt_363b5ab570635c33894e1a030c21f57e`, so the numbers below are
-  unchanged.
+  every predicate, including the two agent trace predicates.
 - The full result is at `/results/sol/sol_quailb_sf0.1.json` on the
   `quail-results` Modal volume.
 
@@ -54,8 +52,15 @@ FEVER claims. The active scale factor 0.1 corpus has 500 of each. The measured
 engine runs also used 500 of each, so the regenerated estimate is the correct
 comparison.
 
-- The 4B estimates total 370.34 seconds. The old file totaled 209.14 seconds.
-- The 32B estimates total 2,890.58 seconds.
+- The 4B estimates total 632.66 seconds over 32 queries; the 30 queries
+  of the 2026-08-29 file total 370.34 seconds, and the file before that
+  totaled 209.14 seconds.
+- The 32B estimates total 4,466.82 seconds.
+- The two agent queries total 262.32 seconds for 4B and 1,576.24 seconds
+  for 32B. Each is one filter over 1,772 traces of 9,736 mean tokens, and
+  the estimate computes every trace from scratch. Trace rows sampled from
+  the same trajectory share long prefixes, which this estimate does not
+  credit; a prefix cache that does can finish below it.
 - IMDB totals 109.23 seconds for 4B.
 - BioDEX totals 116.17 seconds for 4B.
 - FEVER totals 80.50 seconds for 4B.
