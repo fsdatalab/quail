@@ -193,6 +193,13 @@ prefix KV the first time it is an anchor. The model assumes unlimited KV
 capacity, so reusable prefixes are never removed. Partner suffix KV is never
 reusable.
 
+A column scanned under two aliases, as in a self join, is one set of
+documents. In the distinct prefix estimate, an anchor row whose column another
+alias filtered, or whose row is live under another alias that already holds
+its prefixes, pays only the frame. The per document estimate treats each alias
+separately, which pairs with the per document KV regret: both key reuse by
+alias and row.
+
 The calculation checks every supported eager left deep plan. A left deep plan
 starts with one alias and adds one alias at each step. The current search
 supports binary full joins only. When a new alias is added, it immediately

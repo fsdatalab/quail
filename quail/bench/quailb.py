@@ -1467,9 +1467,10 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                            "earlier request of the query computed it"),
             shared_prefix_tokens=("tokens of the scanned documents that "
                                   "are a prefix another scanned document "
-                                  "also has; an execution that computes "
-                                  "each distinct prefix once never "
-                                  "computes them"),
+                                  "also has, across aliases of one column "
+                                  "as well as within one; an execution "
+                                  "that computes each distinct prefix "
+                                  "once never computes them"),
             cross_row_cached_tokens=("cached tokens inside a document's "
                                      "own tokens that another document's "
                                      "request computed; cached preamble, "

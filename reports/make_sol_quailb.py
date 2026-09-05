@@ -177,7 +177,9 @@ COLUMNS = {
 # and that count is the sum over the documents in sorted order of the
 # tokens beyond the longest common prefix with the previous document.
 # Each document is credited that shared length: its first use pays
-# only for the tokens no earlier document computed.
+# only for the tokens no earlier document computed. A column scanned
+# under two aliases (a self join) is the same trie: a document whose
+# prefix another alias already computed pays only its suffix.
 lengths = {}        # column -> {doc id: token count}
 shared = {}         # column -> {doc id: prefix tokens another doc computed}
 
@@ -311,9 +313,14 @@ def first_use(alias_data, row, suffix) -> Work:
 
 
 def join_stage_work(anchor, partners, aliases, survivors, prompt,
-                    resident_rows) -> Work:
+                    resident_rows, cross_resident_rows=()) -> Work:
     """One stage's Work. Anchor rows in resident_rows have their
-    prefix KV in the arena and pay the frame only; the rest scan."""
+    prefix KV in the arena and pay the frame only; the rest scan.
+
+    cross_resident_rows are anchor rows whose document prefix another
+    alias of the same column computed. With the shared prefix credit
+    on they pay the frame only too; without it they scan.
+    """
     labels_by_alias, tail = prompt_token_counts(prompt)
     partner_rows = list(itertools.product(
         *[survivors[alias] for alias in partners]))
@@ -328,6 +335,8 @@ def join_stage_work(anchor, partners, aliases, survivors, prompt,
                            for suffix in suffixes)
     frame = labels_by_alias[anchor]["frame"]
     resident_rows = set(resident_rows)
+    if CREDIT_SHARED:
+        resident_rows |= set(cross_resident_rows)
     work = Work()
     for row in survivors[anchor]:
         prefix = PRE + aliases[anchor]["tokens"][row]
@@ -356,6 +365,9 @@ class QueryInputs:
     filter_stages: list
     filter_evaluations: int
     post_filter_counts: dict
+    # column -> rows every filtered alias of that column computed as
+    # prefixes; another alias of the column may reuse them
+    computed_rows_by_column: dict
 
 
 def prepare_query(query, model: ModelSpec, chunk_tokens: int,
@@ -399,19 +411,25 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
     resident = set()
     filter_stages = []
     filter_evaluations = 0
+    computed_rows_by_column = {}
 
     for alias, order in filter_orders.items():
         live = survivors[alias]
+        column = aliases[alias]["column"]
+        computed = computed_rows_by_column.setdefault(column, set())
         for stage_index, written_pos in enumerate(order):
             predicate = filters[alias][written_pos]
             code = prompt_code(predicate.prompt)
             qtokens = predicate.prompt.tail_tokens
             for row in live:
-                if stage_index == 0:
+                if stage_index == 0 and not (
+                        CREDIT_SHARED and row in computed):
                     work = work + first_use(aliases[alias], row, qtokens)
                 else:
                     prefix = PRE + aliases[alias]["tokens"][row]
                     work = work + ask(prefix, qtokens)
+            if stage_index == 0:
+                computed.update(live)
             passed = [
                 row for row in live
                 if prompt_answer(predicate.prompt, {alias: row}, aliases)
@@ -445,6 +463,7 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
         filter_stages=filter_stages,
         filter_evaluations=filter_evaluations,
         post_filter_counts=post_filter_counts,
+        computed_rows_by_column=computed_rows_by_column,
     )
 
 
@@ -751,6 +770,20 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
             <= chunk_tokens
         )
 
+    def cross_resident(anchor, live, live_cache):
+        """Rows of anchor whose prefix another alias of its column holds.
+
+        A filtered alias computed every row of its column. An alias in
+        live_cache holds the prefixes of its live rows; it computed at
+        least those, so the credit is conservative.
+        """
+        column = aliases[anchor]["column"]
+        rows = set(prepared.computed_rows_by_column.get(column, ()))
+        for other in live_cache:
+            if other != anchor and aliases[other]["column"] == column:
+                rows.update(live[other])
+        return rows
+
     extension_cache = {}
 
     def extend(relations: frozenset[str], cached: frozenset[str], added: str):
@@ -795,6 +828,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
                     live,
                     join.predicate,
                     live[anchor] if anchor in live_cache else (),
+                    cross_resident(anchor, live, live_cache),
                 )
                 next_edges = active_edges | {edge_index}
                 next_live = live_for(next_edges)
@@ -886,6 +920,8 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
                 joins[0].predicate,
                 start_live[candidate]
                 if candidate in prepared.resident else (),
+                cross_resident(
+                    candidate, start_live, frozenset(prepared.resident)),
             ).tokens
             for side, candidate in zip(("left", "right"), stage_aliases)
             if anchor_fits(
@@ -1093,9 +1129,11 @@ json.dump({
         for key in COLUMNS
     },
     "estimates": {
-        "sol_s": "each distinct token prefix in the corpus computed once",
-        "per_document.sol_s": "each document computed once, reused only "
-                              "across its own questions",
+        "sol_s": "each distinct token prefix in the query's scanned "
+                 "documents computed once, across documents and across "
+                 "aliases of one column",
+        "per_document.sol_s": "each alias's document computed once, "
+                              "reused only across its own questions",
     },
     "corpus_id": CORPUS_ID,
     "collection_id": COLLECTION_ID,
@@ -1131,6 +1169,10 @@ json.dump({
         "survivors": "exact ground truth survivors",
         "persistent_kv_capacity": "unlimited",
         "cached_values": "document prefixes used by filters or as anchors",
+        "cross_alias_prefix_reuse": (
+            "in the distinct prefix estimate an anchor row whose column "
+            "another alias filtered, or whose row is live under another "
+            "cached alias of the column, pays the frame only"),
         "streamed_partner_kv": "not reusable",
         "validation": "unit tests compare DP with complete enumeration",
     },

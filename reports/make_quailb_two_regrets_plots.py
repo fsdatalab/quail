@@ -4,7 +4,7 @@ Every method ran through the same request interface on the refactored
 engine. Pull the family run manifest and the per method suite files it
 lists, plus the SoL file, into one work directory:
 
-    W=<workdir>; R=benchmarks/quailb/family-runs/RUN_ID
+    W=<workdir>; R=benchmarks/quailb/family-runs/20260905T021527Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families
     modal volume get quail-results $R/manifest.json $W/manifest.json
     for m in quail stock_vllm pipelined_vllm pipelined_sglang; do
       p=$(python3 -c "import json; print(json.load(open('$W/manifest.json'))['result_volume_paths']['$m'].removeprefix('/results/'))")
@@ -96,7 +96,7 @@ def load_inputs(workdir):
 
 
 def load_sol(workdir):
-    """Load both SoL estimates per query."""
+    """Load both SoL estimates per query, with the corpus prefix stats."""
     sol = load(workdir / "sol.json")
     if sol["scale_factor"] != 0.1:
         raise ValueError("unexpected SoL scale factor")
@@ -108,8 +108,62 @@ def load_sol(workdir):
             "seconds": float(model["sol_s"]),
             "seconds_per_document": float(model["per_document"]["sol_s"]),
             "work": pairs if pairs else int(model["input_document_rows"]),
+            "alias_columns": dict(record["alias_columns"]),
         }
-    return estimates
+    return estimates, sol["corpora"]
+
+
+def scanned_columns(row, alias_columns):
+    """Return the column each scanned alias reads, one entry per alias."""
+    columns = []
+    seen = set()
+    for stage in row["stages"]:
+        alias = stage["alias"] if stage["op"] == "filter" else stage["anchor"]
+        if alias not in seen:
+            seen.add(alias)
+            columns.append(alias_columns[alias])
+    return columns
+
+
+def shared_prefix_tokens(row, estimate, corpora) -> int:
+    """Derive the shared prefix tokens of a query's scanned documents.
+
+    A column scanned under k aliases is the same prefix trie k times:
+    each copy beyond the first shares every token with the first.
+    """
+    counts = {}
+    for column in scanned_columns(row, estimate["alias_columns"]):
+        counts[column] = counts.get(column, 0) + 1
+    return sum(
+        int(corpora[column]["shared_prefix_tokens"])
+        + (copies - 1) * int(corpora[column]["tokens"])
+        for column, copies in counts.items()
+    )
+
+
+def derive_distinct_regret(records, queries, sol, corpora):
+    """Recompute the distinct prefix regret of every row from its parts.
+
+    The recorded value came from the evaluator that ran with the
+    benchmark; deriving it here keeps the figure on the current
+    definition. Rows whose recorded value differs are reported.
+    """
+    changed = []
+    for label, rows in records.items():
+        for query in queries:
+            row = rows[query]
+            cross = row.get("cross_row_cached_tokens")
+            shared = shared_prefix_tokens(row, sol[query], corpora)
+            derived = (
+                None if cross is None
+                else int(row["regret_tokens"]) + shared - int(cross)
+            )
+            recorded = row.get("regret_distinct_tokens")
+            if recorded != derived or row.get("shared_prefix_tokens") != shared:
+                changed.append((label, query, recorded, derived))
+            row["shared_prefix_tokens"] = shared
+            row["regret_distinct_tokens"] = derived
+    return changed
 
 
 def has_join(row) -> bool:
@@ -204,8 +258,10 @@ def print_tables(records, methods, queries, sol):
             f"{row['filter_throughput']:,.1f} docs/s | "
             f"{row['join_throughput']:,.1f} pairs/s | "
             f"{row['total_regret']:,} | {row['regret_fraction']:.2%} | "
-            f"{row['distinct_regret']:,} "
-            f"({row['distinct_regret_queries']} queries) | "
+            f"{row['distinct_regret']:,}"
+            + (f" ({row['distinct_regret_queries']} queries)"
+               if row['distinct_regret_queries'] < len(queries) else "")
+            + " | "
             f"{row['accuracy']:.2%} |"
         )
 
@@ -362,7 +418,13 @@ def make_aggregate_plot(summaries, methods, query_count):
         annotate_bars(ax, bars, fmt.format)
         ax.set_xticks(range(len(labels)), labels, rotation=20, ha="right")
         ax.set_ylabel(unit)
-    axes[1, 3].set_title("vLLM and SGLang: queries with a recorded value")
+    partial = [
+        label for label in summaries
+        if summaries[label]["distinct_regret_queries"] < query_count
+    ]
+    if partial:
+        axes[1, 3].set_title(
+            f"{', '.join(partial)}: queries with a recorded value only")
     fig.suptitle(f"QUAIL-B, {query_count} queries, Qwen3 4B fp8, one H100")
     fig.tight_layout()
     OUT.mkdir(exist_ok=True)
@@ -446,9 +508,26 @@ def main():
         raise SystemExit(f"usage: {Path(sys.argv[0]).name} WORKDIR")
     workdir = Path(sys.argv[1])
     manifest, records, methods, queries = load_inputs(workdir)
-    sol = load_sol(workdir)
+    sol, corpora = load_sol(workdir)
     print(f"family run {manifest['run_id']}: "
           f"{len(methods)} methods, {len(queries)} queries")
+    changed = derive_distinct_regret(records, queries, sol, corpora)
+    if changed:
+        # the SoL corpus statistics use the transformers tokenizer and
+        # the run's token store uses bpe-qwen; they differ by a few
+        # tokens per corpus, so only material changes are listed
+        material = [
+            (label, query, recorded, derived)
+            for label, query, recorded, derived in changed
+            if recorded is None or derived is None
+            or abs(derived - recorded) > 0.01 * max(
+                abs(recorded), abs(derived), 1)
+        ]
+        print(f"{len(changed)} rows carry a recorded distinct prefix regret "
+              f"that differs from the derived one; {len(material)} by more "
+              "than 1% (recorded -> derived):")
+        for label, query, recorded, derived in material:
+            print(f"  {label} {query}: {recorded:,} -> {derived:,}")
     summaries = print_tables(records, methods, queries, sol)
     make_aggregate_plot(summaries, methods, len(queries))
     make_per_query_plot(records, methods, queries, sol)

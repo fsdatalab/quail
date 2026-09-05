@@ -34,6 +34,16 @@ request backends now includes filter stages, which used to count zero.
 `cross_row_cached_tokens`, and `regret_distinct_tokens` into every
 benchmark row.
 
+Since 2026-09-05 a column scanned under several aliases counts as one
+prefix trie in both places. The SoL's distinct prefix estimate lets an
+anchor row pay only the frame when another alias of its column already
+holds the prefix (FEV-7's second evidence alias, IMDB-9's second reviews
+alias), and `scanned_shared_prefix_tokens` charges every copy beyond the
+first in full. SGLang's radix cache served exactly those prefixes on
+FEV-7, FEV-8, and FEV-9 (125,851 tokens, the whole evidence corpus), and
+before this change that credit had no matching charge and its distinct
+prefix regret came out negative.
+
 On the QUAIL-B corpora the two SoL estimates differ by 0.3% except on the
 agent traces, where 68.9% of tokens are a prefix another row already has
 and the distinct prefix estimate is 2.8 times lower. On AGENT-1 Quail's

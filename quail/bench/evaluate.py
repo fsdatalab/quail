@@ -893,20 +893,55 @@ def summarize_queries(rows: list[dict], h100_usd_per_hour: float,
 # had computed the same prefix: with unlimited KV every distinct prefix in
 # the corpus is computed once.
 
-_shared_prefix_cache: dict[str, int] = {}
+_shared_prefix_cache: dict[str, tuple[int, int]] = {}
 
 
 def shared_prefix_tokens(store) -> int:
     """Return the prefix tokens a token store's documents share."""
+    return _store_prefix_stats(store)[0]
+
+
+def store_token_count(store) -> int:
+    """Return the total tokens of a token store's documents."""
+    return _store_prefix_stats(store)[1]
+
+
+def _store_prefix_stats(store) -> tuple[int, int]:
     from quail.runtime.tokens import shared_prefix_lengths
 
     path = getattr(store, "path", None)
     if path is not None and path in _shared_prefix_cache:
         return _shared_prefix_cache[path]
-    total = sum(shared_prefix_lengths(
-        [list(document) for document in store]))
+    documents = [list(document) for document in store]
+    stats = (
+        sum(shared_prefix_lengths(documents)),
+        sum(len(document) for document in documents),
+    )
     if path is not None:
-        _shared_prefix_cache[path] = total
+        _shared_prefix_cache[path] = stats
+    return stats
+
+
+def scanned_shared_prefix_tokens(scanned_columns, stores) -> int:
+    """Return the shared prefix tokens over every scanned alias's documents.
+
+    Args:
+        scanned_columns: One (provider, column) per scanned alias; a
+            column scanned under several aliases appears that many
+            times.
+        stores: Callable from (provider, column) to the token store.
+
+    A column scanned under k aliases is the same prefix trie k times:
+    each extra copy shares every token with the first.
+    """
+    counts = {}
+    for key in scanned_columns:
+        counts[key] = counts.get(key, 0) + 1
+    total = 0
+    for key, copies in counts.items():
+        store = stores(*key)
+        total += shared_prefix_tokens(store)
+        total += (copies - 1) * store_token_count(store)
     return total
 
 
@@ -949,10 +984,10 @@ def add_prefix_metrics(row: dict, query, report: dict) -> dict:
 
     scans, _, _ = collect_operators(query.logical)
     columns = {scan.alias: (scan.provider, scan.column) for scan in scans}
-    shared = 0
-    for alias in scanned_aliases(report.get("stages", ())):
-        provider, column = columns[alias]
-        shared += shared_prefix_tokens(query.session.tokenize(provider, column))
+    shared = scanned_shared_prefix_tokens(
+        [columns[alias] for alias in scanned_aliases(report.get("stages", ()))],
+        query.session.tokenize,
+    )
     cross_row = cross_row_cached_tokens(report)
     row.update({
         "shared_prefix_tokens": shared,
