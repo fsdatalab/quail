@@ -264,6 +264,43 @@ def print_tables(records, methods, queries, sol):
         print(f"| {query} | {unit} | {sol_cell} | "
               f"{estimate['seconds_per_document']:.2f} s | "
               + " | ".join(cells) + " |")
+
+    print("\nQueries with nonzero per document KV regret")
+    print(f"| Query | {header} |")
+    print("|---|" + "---:|" * len(methods))
+    for query in queries:
+        values = [int(records[label][query]["regret_tokens"])
+                  for label, _ in methods]
+        if any(values):
+            print(f"| {query} | " + " | ".join(f"{v:,}" for v in values)
+                  + " |")
+
+    print("\nDistinct prefix KV regret and its parts")
+    print("| Query | Shared prefix tokens | "
+          + " | ".join(f"{label} cross row | {label} distinct"
+                       for label, _ in methods) + " |")
+    print("|---|---:|" + "---:|---:|" * len(methods))
+    for query in queries:
+        shared = int(records["Quail"][query]["shared_prefix_tokens"])
+        cells = []
+        for label, _ in methods:
+            row = records[label][query]
+            cross = row.get("cross_row_cached_tokens")
+            distinct = distinct_regret(row)
+            cells.append(
+                f"{'not measured' if cross is None else f'{int(cross):,}'}"
+                f" | {'not measured' if distinct is None else f'{distinct:,}'}"
+            )
+        print(f"| {query} | {shared:,} | " + " | ".join(cells) + " |")
+
+    print("\nFastest method per query")
+    wins = {label: [] for label, _ in methods}
+    for query in queries:
+        best = min(methods, key=lambda m: float(records[m[0]][query]["wall_s"]))
+        wins[best[0]].append(query)
+    for label, _ in methods:
+        print(f"- {label}: {len(wins[label])} "
+              f"({', '.join(wins[label]) if wins[label] else 'none'})")
     return summaries
 
 
