@@ -297,11 +297,14 @@ def test_filter_chain_splits_cached_tokens_into_regret_and_cross_row():
     )
 
     # stage 0 could hit nothing of its own document, so every cached
-    # token there is a cross row hit: 0 + 6
+    # token inside the 4 token body is a cross row hit: 0 + 4, and the
+    # 2 beyond the body are the question
     # stage 1 could hit the 4 body tokens: document 0 hit 2 (regret 2),
-    # document 1 hit 6 (2 beyond its body, cross row)
+    # document 1 hit 6 (its body, then 2 question tokens)
     assert result["regret_tokens"] == 2
-    assert result["cross_row_cached_tokens"] == 6 + 2
+    assert result["cross_row_cached_tokens"] == 4
+    assert result["cached_own_tokens"] == 2 + 4
+    assert result["cached_other_tokens"] == 2 + 2
     assert result["cached_tokens"] == 14
 
 
@@ -310,10 +313,44 @@ def test_join_cache_accounting_returns_both_sides():
 
     prefixes = [[1] * 10, [2] * 10]
     # two suffixes per anchor; the first suffix of anchor 0 could hit
-    # the 4 tokens an earlier request computed
-    cached = [4, 10, 12, 0]
-    regret, cross_row = join_cache_accounting(
+    # the 4 tokens an earlier request computed. Anchor 1 is new and its
+    # first suffix hit 8 tokens another anchor's request computed.
+    cached = [4, 10, 8, 0]
+    accounting = join_cache_accounting(
         prefixes, 2, cached, [4, 0], block_size=1)
 
-    assert regret == 0 + 0 + 0 + 10
-    assert cross_row == 0 + 0 + 12 + 0
+    assert accounting["regret_tokens"] == 0 + 0 + 0 + 10
+    assert accounting["cross_row_cached_tokens"] == 0 + 0 + 8 + 0
+    assert accounting["cached_own_tokens"] == 4 + 10 + 0 + 0
+    assert accounting["cached_other_tokens"] == 0
+
+
+def test_join_cache_accounting_ignores_preamble_and_straddling_block():
+    from quail.backends.request_scheduling import join_cache_accounting
+
+    # prefix = 2 preamble tokens, a 20 token document, a 3 token frame;
+    # 16 token blocks. Anchor 0 is new: its first suffix hit the
+    # preamble and 14 document tokens (one block), and its second
+    # suffix hit 32 tokens: the 16 block floor of the 25 token prefix
+    # plus the block that straddles the prefix end and the label.
+    prefixes = [[9] * 25]
+    cached = [16, 32]
+    accounting = join_cache_accounting(
+        prefixes, 2, cached, [0], block_size=16,
+        document_spans=[(2, 22)])
+
+    assert accounting["regret_tokens"] == 0
+    assert accounting["cross_row_cached_tokens"] == 14
+    assert accounting["cached_own_tokens"] == 16
+    assert accounting["cached_other_tokens"] == 2 + 16
+
+
+def test_split_cached_tokens_clips_to_the_document():
+    from quail.backends.request_scheduling import split_cached_tokens
+
+    # the question after a 4 token body was cached too: it is other
+    assert split_cached_tokens(6, 0, 0, 4) == (0, 4, 2)
+    # own prefix hit fully, the rest is inside the document
+    assert split_cached_tokens(6, 2, 0, 8) == (2, 4, 0)
+    # a miss short of the own prefix is only own
+    assert split_cached_tokens(1, 2, 0, 8) == (1, 0, 0)

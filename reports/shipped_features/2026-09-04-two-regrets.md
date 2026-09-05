@@ -17,8 +17,18 @@ predecessor, which sums to the size of the corpus prefix trie.
 `reports/make_sol_quailb.py` produces both estimates in one run and
 records the corpus prefix statistics. The request backends now split
 cached tokens per request into the part the document's own earlier
-request could explain, whose shortfall is per document regret, and the
-part beyond it, `cross_row_cached_tokens`. Per document regret on the
+request could explain, whose shortfall is per document regret, the
+part beyond it that falls inside the document's own tokens,
+`cross_row_cached_tokens`, and the rest (`cached_other_tokens`: the
+preamble, label and question tokens, and the KV block that straddles
+the end of a join prefix), which counts for neither. The first cut of
+this split, on 2026-09-04, credited every cached token beyond the own
+prefix as a cross row hit. On join queries that credited the
+straddling block of every pair, about 7 tokens per pair, and made the
+request backends' distinct prefix regret negative (BIO-2: -4,004,562
+tokens over 563,500 pairs). `split_cached_tokens` in
+`quail.backends.request_scheduling` clips the credit to the document
+since 2026-09-05. Per document regret on the
 request backends now includes filter stages, which used to count zero.
 `quail.bench.evaluate.add_prefix_metrics` writes `shared_prefix_tokens`,
 `cross_row_cached_tokens`, and `regret_distinct_tokens` into every

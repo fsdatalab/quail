@@ -14,6 +14,7 @@ from quail.backends.request_scheduling import (
     join_cache_accounting,
     longest_common_prefix,
     run_join_grouped,
+    split_cached_tokens,
     true_bit,
 )
 from quail.execution import export_physical_outputs, PhysicalResponse
@@ -346,6 +347,7 @@ def _stage_major_filter(client, sampling_params, bodies, questions, true_ids,
     prior = {}
     requests = prompt_tokens = cached_tokens = 0
     regret_tokens = cross_row_cached = 0
+    cached_own = cached_other = 0
     started = time.perf_counter()
     stages = []
     for stage_index, question in enumerate(questions):
@@ -367,8 +369,8 @@ def _stage_major_filter(client, sampling_params, bodies, questions, true_ids,
             cached = int(getattr(output, "num_cached_tokens", 0) or 0)
             cached_tokens += cached
             # the document's own earlier requests computed a prefix this
-            # one could hit; anything cached beyond it came from another
-            # document sharing a prefix
+            # one could hit; cached tokens beyond it but inside the body
+            # came from another document sharing a prefix
             could_hit = max(
                 (
                     longest_common_prefix(prompt["prompt_token_ids"], earlier)
@@ -378,7 +380,11 @@ def _stage_major_filter(client, sampling_params, bodies, questions, true_ids,
             )
             could_hit = (could_hit // block_size) * block_size
             regret_tokens += max(0, could_hit - cached)
-            cross_row_cached += max(0, cached - could_hit)
+            own, shared, other = split_cached_tokens(
+                cached, could_hit, 0, len(bodies[document]))
+            cached_own += own
+            cross_row_cached += shared
+            cached_other += other
             if answer:
                 next_active.append(document)
                 prior.setdefault(document, []).append(prompt["prompt_token_ids"])
@@ -399,6 +405,8 @@ def _stage_major_filter(client, sampling_params, bodies, questions, true_ids,
         "fresh_tokens": prompt_tokens - cached_tokens,
         "regret_tokens": regret_tokens,
         "cross_row_cached_tokens": cross_row_cached,
+        "cached_own_tokens": cached_own,
+        "cached_other_tokens": cached_other,
         "stages": stages,
         "doc_cap": None,
     }
@@ -418,6 +426,8 @@ def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
             "fresh_tokens": 0,
             "regret_tokens": 0,
             "cross_row_cached_tokens": 0,
+            "cached_own_tokens": 0,
+            "cached_other_tokens": 0,
             "stages": [],
             "doc_cap": 0,
         }
@@ -464,6 +474,8 @@ def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
         "cross_row_cached_tokens": int(
             result.get("cross_row_cached_tokens") or 0
         ),
+        "cached_own_tokens": int(result.get("cached_own_tokens") or 0),
+        "cached_other_tokens": int(result.get("cached_other_tokens") or 0),
         "stages": stages,
         "doc_cap": result["doc_cap"],
     }
@@ -562,6 +574,8 @@ class RequestModelExecution:
                 "cached_tokens": result["cached_tokens"],
                 "regret_tokens": result["regret_tokens"],
                 "cross_row_cached_tokens": result["cross_row_cached_tokens"],
+                "cached_own_tokens": result["cached_own_tokens"],
+                "cached_other_tokens": result["cached_other_tokens"],
                 "doc_cap": result["doc_cap"],
             })
             requests += result["requests"]
@@ -593,10 +607,16 @@ class RequestModelExecution:
             labels = dict(spec.label_token_ids)
             frames = dict(spec.frame_token_ids)
             anchor_ids = alias_documents[anchor]
+            preamble = _token_list(node.preamble_token_ids)
             prefixes = [
-                _token_list(node.preamble_token_ids)
+                preamble
                 + _token_list(self.documents[anchor][document])
                 + _token_list(frames[anchor])
+                for document in anchor_ids
+            ]
+            document_spans = [
+                (len(preamble),
+                 len(preamble) + len(self.documents[anchor][document]))
                 for document in anchor_ids
             ]
             members = list(itertools.product(
@@ -636,13 +656,18 @@ class RequestModelExecution:
                     )
                     for document, prefix in zip(anchor_ids, prefixes)
                 ]
-                regret, cross_row = join_cache_accounting(
+                accounting = join_cache_accounting(
                     prefixes,
                     len(suffixes),
                     result["cached_per_request"],
                     seen_lengths,
                     block_size,
+                    document_spans,
                 )
+                regret = accounting["regret_tokens"]
+                cross_row = accounting["cross_row_cached_tokens"]
+                cached_own = accounting["cached_own_tokens"]
+                cached_other = accounting["cached_other_tokens"]
             else:
                 result = {
                     "wall": 0.0,
@@ -653,6 +678,8 @@ class RequestModelExecution:
                 answers = []
                 regret = 0
                 cross_row = 0
+                cached_own = 0
+                cached_other = 0
 
             rows = []
             for anchor_id in anchor_ids:
@@ -699,6 +726,8 @@ class RequestModelExecution:
                 "cached_tokens": result["cached_tokens"],
                 "regret_tokens": regret,
                 "cross_row_cached_tokens": cross_row,
+                "cached_own_tokens": cached_own,
+                "cached_other_tokens": cached_other,
             })
             requests += len(rows)
             evaluated_pairs += len(rows)

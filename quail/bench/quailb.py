@@ -1470,10 +1470,12 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                                   "also has; an execution that computes "
                                   "each distinct prefix once never "
                                   "computes them"),
-            cross_row_cached_tokens=("cached tokens a request received "
-                                     "from another document's request; "
-                                     "null when the run did not record "
-                                     "it"),
+            cross_row_cached_tokens=("cached tokens inside a document's "
+                                     "own tokens that another document's "
+                                     "request computed; cached preamble, "
+                                     "label, question, or block rounding "
+                                     "tokens do not count; null when the "
+                                     "run did not record it"),
             regret_distinct_tokens=("distinct prefix KV regret: "
                                     "regret_tokens plus "
                                     "shared_prefix_tokens minus "
