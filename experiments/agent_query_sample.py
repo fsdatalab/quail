@@ -4,7 +4,7 @@ Run the experiment through the existing Modal app and save the log:
 
     mkdir -p results/benchmark
     sample_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-agent2-sample.log"
-    uv run modal run --detach ablations/agent_query_sample.py 2>&1 | tee "$sample_log"
+    uv run modal run --detach experiments/agent_query_sample.py 2>&1 | tee "$sample_log"
 
 The experiment writes its summary and individual answers to:
 

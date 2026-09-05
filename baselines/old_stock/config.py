@@ -34,7 +34,7 @@ SF = 0.1
 TENSOR_PARALLEL_SIZE = 1
 MAX_NUM_BATCHED_TOKENS = 25_305     # matches the bf16-KV stock knobs
 #                                     already committed in
-#                                     tests/gpu/milestone1.py
+#                                     experiments/cells/milestone1.py
 # The tested stock join needs 4,096 so short suffix requests can fill
 # max_num_batched_tokens. The filter submits only 200 requests here, so
 # this upper bound does not change its effective admission.

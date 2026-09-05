@@ -2,7 +2,7 @@
 
 Run from the repository root and tee every line:
 
-    uv run modal run ablations/extensible_engine_confirmation.py \
+    uv run modal run experiments/extensible_engine_confirmation.py \
       --prediction "State the expected results before starting." \
       2>&1 | tee results/extensible-engine-confirmation.log
 

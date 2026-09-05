@@ -10,9 +10,9 @@ Usage:
 
 where $W holds the files pulled from the quail-results volume:
 
-    modal volume get quail-results ablations/load_model_profile_main.json $W/
-    modal volume get quail-results ablations/load_model_profile_pinned_seed.json $W/
-    modal volume get quail-results ablations/load_model_profile_pinned.json $W/
+    modal volume get quail-results experiments/load_model_profile_main.json $W/
+    modal volume get quail-results experiments/load_model_profile_pinned_seed.json $W/
+    modal volume get quail-results experiments/load_model_profile_pinned.json $W/
 """
 
 import json

@@ -40,10 +40,10 @@ in a Pipeline subclass below):
                  settings, the same standalone group-quant per GEMM
                  input, and the same merge_attn_states join merge
 
-    uv run modal run ablations/vllm_compiled_kernels.py::run_probe
-    uv run modal run ablations/vllm_compiled_kernels.py::run_queries
-    uv run modal run ablations/vllm_compiled_kernels.py::run_profile
-    uv run modal run ablations/vllm_compiled_kernels.py::run_stock_kernels
+    uv run modal run experiments/vllm_compiled_kernels.py::run_probe
+    uv run modal run experiments/vllm_compiled_kernels.py::run_queries
+    uv run modal run experiments/vllm_compiled_kernels.py::run_profile
+    uv run modal run experiments/vllm_compiled_kernels.py::run_stock_kernels
 """
 
 import json

@@ -6,52 +6,47 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
 
 ## Layout
 
-- `quail/specs/` has the model and device structs. Every planner
-  input comes from them.
-- `quail/planner/` has the budget arithmetic, the physical plan,
-  and the planner decisions (stage order, anchor choice,
-  sharding). KV is always bf16.
-- `quail/catalog.py`, `quail/logical.py`, `quail/sqlfront/`, and
-  `quail/builder.py` are the providers, logical operators, and the
-  two query entry points (AI SQL and the builder API).
-- `quail/executor/` is the packed executor: chunk packing, admission,
-  the paged KV arena, attention kernels, the overlapped loop, and
-  weight loading. The GPU parts run only inside the Modal image.
-- `quail/runtime/` is the run side. It contains the session, compute provider,
-  multi-GPU coordinator, and Modal worker.
-- `quail/bench/` has the QUAIL-B benchmark queries. Its
-  [README](quail/bench/README.md) explains how to run the benchmark and
-  label a new predicate.
-- `ablations/` and `baselines/` have experiment entry points and the
-  stock vLLM comparison code.
-- `reports/` has experiment reports and plots. `results/` has the
-  committed summaries that those reports read.
-- `plans/` has the current extensible design and the archived original design.
-- `docs/` is the documentation site (Fumadocs). See its README to run
-  it locally.
-- `tests/` has CPU tests. `tests/gpu/` has the Modal GPU cells -
-  milestone gates, smokes, and benchmarks - which cost GPU time and
-  run only when invoked explicitly.
+- `quail/` is the package. `logical.py`, `sqlfront/`, and `builder.py`
+  are the front ends. `planner/` is planning and the cost model.
+  `physical/` is the typed physical graph. `backends/` holds the backend
+  interface, the Quail backend under `backends/quail/`, and the vLLM and
+  SGLang request backends. `executor/` is the GPU code and runs only
+  inside the Modal image. `runtime/` is the session, compute providers,
+  generic runner, token store, results, and the Modal worker. `bench/`
+  is the QUAIL-B benchmark; its [README](quail/bench/README.md) explains
+  how to run it and label a new predicate.
+- `quail_ext_examples/` has example extensions.
+- `tests/` is the CPU suite. It runs in seconds and needs no GPU.
+- `experiments/` holds every Modal entry point that costs GPU time: the
+  ablation and profiling scripts at the top level, and the smokes,
+  probes, and gates under `experiments/cells/`. They run only when
+  invoked.
+- `baselines/` is the older standalone stock vLLM and SGLang comparison
+  code. The engine never imports it. It is kept until the request
+  backends have produced every family file the reports read.
+- `reports/` has experiment reports, their plot scripts and PNGs,
+  `shipped_features/`, and `engine-wiki.md`. Experiment data is not
+  committed: reports cite it by its path on the `quail-results` volume.
+- `docs/` is the documentation site, including the design decisions
+  and the speed of light model under its architecture section.
 
 ## Setup and tests
 
 ```
 uv sync
 uv run pytest
-uv run ruff check quail tests ablations \
-  reports/make_sol_quailb.py reports/make_quailb_eval_plots.py
+uv run ruff check quail tests experiments reports baselines
 uv run vulture
 ```
 
 GPU cells (Modal, H100). Tee output to a file per house rule:
 
 ```
-uv run modal run tests/gpu/milestone1.py::run_probe 2>&1 | tee results/m1_probe.log
+uv run modal run experiments/cells/session_smoke.py 2>&1 | tee results/session_smoke.log
 ```
 
-Committed result summaries (the JSON files reports cite) are in
-`results/`; raw per-item run records live on the `quail-results`
-Modal volume. Teed logs stay local and are not committed.
+Run records live on the `quail-results` Modal volume. Teed logs go
+under `results/`, which is local and not committed.
 
 ## Using Quail
 

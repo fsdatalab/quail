@@ -1,9 +1,10 @@
-# Extensible Quail engine
+---
+title: Design decisions
+description: The boundaries the extensible engine was built around, and why.
+---
 
-Status: implemented on the `extensible-engine` branch.
-
-This file records the design decisions. The current implementation details live
-in [the engine wiki](../reports/engine-wiki.md).
+This page records the design decisions behind the engine's interfaces. The
+[architecture overview](/docs/architecture) describes what was built.
 
 ## Scope
 
@@ -78,7 +79,7 @@ One query follows this path.
 9. Arrow combines exact answer relations and applies projection and limit.
 10. The compute provider returns one `QueryResult`.
 
-```mermaid
+<Mermaid chart={`
 flowchart TD
     A[SQL or builder] --> B[Logical plan]
     B --> C[QueryRequest]
@@ -89,7 +90,7 @@ flowchart TD
     G --> H[Model backend]
     H --> I[Arrow joins, projection, and limit]
     I --> J[QueryResult]
-```
+`} />
 
 The default compute provider uses Modal Functions in the existing
 `quail-engine` app. Quail does not run an application server.

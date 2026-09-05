@@ -1,4 +1,7 @@
-# Speed of light: an ideal work estimate for one query
+---
+title: The speed of light model
+description: How the ideal work estimate counts tokens, attention pairs, and KV traffic.
+---
 
 Speed of light (SoL) is the ideal time for the execution model in this
 document on one GPU. That model runs filters first, then eager binary full
@@ -14,7 +17,7 @@ every possible execution of the query.
 Nothing in it is fitted or measured on a GPU. It uses the datasheet,
 the model dimensions, and a count of the query's work, and it
 borrows no cost model the engine already carries: no roofline out of
-`planner/budgets.py`, no calibration constant, no efficiency factor.
+`quail/planner/budgets.py`, no calibration constant, no efficiency factor.
 This keeps the estimate independent of measured Quail runtime.
 
 ## 1. Notation

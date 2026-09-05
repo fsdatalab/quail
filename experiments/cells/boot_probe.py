@@ -19,7 +19,7 @@ weight bytes themselves.
 
 Run from the quail/ directory (tee per house rule):
 
-    uv run modal run tests/gpu/boot_probe.py 2>&1 | tee results/boot_probe.log
+    uv run modal run experiments/cells/boot_probe.py 2>&1 | tee results/boot_probe.log
 """
 
 from __future__ import annotations

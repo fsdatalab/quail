@@ -1,7 +1,7 @@
 """Run any QuailB query on stock vLLM under instrumentation: GPU
 profiler windows, per-request cached tokens, and KV regret.
 
-The companion cell (`ablations/profile_quail.py`) measures Quail.
+The companion cell (`experiments/profile_quail.py`) measures Quail.
 This cell measures stock vLLM the same way, reusing the benchmark
 baseline's own code for everything that defines the measured system
 - prompts, boot flags, sampling, submission order, anchor choice,
@@ -36,8 +36,8 @@ recorded BIO-2 run used 60 of its 500 reports.
 
 Run (`--queries` is a comma-separated list of QuailB ids):
 
-    uv run modal run ablations/profile_stock.py::run_smoke --queries IMDB-3,BIO-2
-    uv run modal run ablations/profile_stock.py::run --queries IMDB-3,BIO-2 --out-prefix myrun
+    uv run modal run experiments/profile_stock.py::run_smoke --queries IMDB-3,BIO-2
+    uv run modal run experiments/profile_stock.py::run --queries IMDB-3,BIO-2 --out-prefix myrun
 
 Outputs on the quail-results volume (pick an --out-prefix that does
 not overwrite files a report already cites):
@@ -46,7 +46,7 @@ not overwrite files a report already cites):
     /results/ablations/<prefix>_traces/stock_kineto/  (raw traces)
 
 The recorded 2026-08-30 runs used prefix "discrepancy" through this
-cell's predecessor (ablations/discrepancy_stock.py, which hardcoded
+cell's predecessor (experiments/discrepancy_stock.py, which hardcoded
 IMDB-3 and BIO-2); predictions and results live in
 reports/2026-08-30-imdb3-bio2-discrepancies.md.
 """

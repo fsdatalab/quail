@@ -42,7 +42,7 @@ remaining floor is the torch+vllm import (~12-16 s) plus get_model.
 
 Run from the repository root (tee per house rule):
 
-    uv run modal run -m tests.gpu.load_profile 2>&1 \
+    uv run modal run -m experiments.cells.load_profile 2>&1 \
         | tee /tmp/load_profile.log
 """
 

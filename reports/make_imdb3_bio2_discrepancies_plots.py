@@ -4,11 +4,11 @@ Pull the inputs from the quail-results volume, then pass the work
 directory to this script:
 
     W=<workdir>
-    modal volume get quail-results ablations/discrepancy_imdb3.json $W/imdb3.json
-    modal volume get quail-results ablations/discrepancy_bio2.json $W/bio2.json
-    modal volume get quail-results ablations/discrepancy_stock_imdb3.json $W/stock_imdb3.json
-    modal volume get quail-results ablations/discrepancy_stock_bio2.json $W/stock_bio2.json
-    modal volume get quail-results ablations/discrepancy_traces/stock_kineto/ $W/traces/stock_kineto/
+    modal volume get quail-results experiments/discrepancy_imdb3.json $W/imdb3.json
+    modal volume get quail-results experiments/discrepancy_bio2.json $W/bio2.json
+    modal volume get quail-results experiments/discrepancy_stock_imdb3.json $W/stock_imdb3.json
+    modal volume get quail-results experiments/discrepancy_stock_bio2.json $W/stock_bio2.json
+    modal volume get quail-results experiments/discrepancy_traces/stock_kineto/ $W/traces/stock_kineto/
     modal volume get quail-results benchmarks/quailb/runs/qb_20260829T185407Z_cbb14b36/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail.json
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock.json
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined.json
@@ -17,7 +17,7 @@ directory to this script:
     for t in imdb3_filter_healthy imdb3_filter_churn imdb3_join \
              bio2_join_early bio2_join_late; do
         modal volume get quail-results \
-            ablations/discrepancy_traces/$t.chrome.json.gz \
+            experiments/discrepancy_traces/$t.chrome.json.gz \
             $W/traces/$t.chrome.json.gz
     done
     uv run --with matplotlib python \

@@ -32,7 +32,7 @@ The old admission eviction path remains as a safety check. The scan reserve
 should make the path unreachable during a normal filter.
 
 The confirming query was IMDB 3 at scale factor 0.1 with Qwen3 4B fp8 on one
-H100. `ablations/profile_quail.py` recorded an unprofiled pass for query time
+H100. `experiments/profile_quail.py` recorded an unprofiled pass for query time
 and a profiled pass for the GPU trace. The current run used the prefix
 `ringfix_tokens_head`.
 
@@ -156,7 +156,7 @@ the admission failure.
 
 Use a new output prefix so the recorded result remains unchanged.
 
-    uv run modal run ablations/profile_quail.py::run --queries IMDB-3 --out-prefix rerun
+    uv run modal run experiments/profile_quail.py::run --queries IMDB-3 --out-prefix rerun
 
 Rebuild the figures with `reports/make_kv_ring_fix_plots.py`. Its docstring
 contains every `modal volume get` command needed to pull the source files.

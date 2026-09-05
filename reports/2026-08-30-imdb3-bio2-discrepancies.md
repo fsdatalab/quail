@@ -20,8 +20,8 @@ This experiment measured both systems on both queries, on one H100
 with Qwen3 4B fp8, with two cells that wrap instrumentation around
 unmodified engine and baseline code:
 
-- `ablations/discrepancy_timeline.py` (since generalized into
-  `ablations/profile_quail.py`, which runs any QuailB query) reruns
+- `experiments/discrepancy_timeline.py` (since generalized into
+  `experiments/profile_quail.py`, which runs any QuailB query) reruns
   the two queries through
   Quail's real planner and worker core. Per forward pass it records
   launch time, packed tokens, and GPU time from the CUDA events the
@@ -30,8 +30,8 @@ unmodified engine and baseline code:
   windows (kernel activity only) cover a few forward passes per
   regime. A second, unprofiled pass supplies every cited number;
   profiled and unprofiled walls agree within 3.5%.
-- `ablations/discrepancy_stock.py` (since generalized into
-  `ablations/profile_stock.py`) measures stock vLLM with the
+- `experiments/discrepancy_stock.py` (since generalized into
+  `experiments/profile_stock.py`) measures stock vLLM with the
   benchmark baseline's own prompt, boot, sampling, submission, and
   cache-reset code. It records per-request `num_cached_tokens`
   bucketed by position within the anchor group, per-request KV
@@ -281,8 +281,8 @@ one order of magnitude.
 
 Rerun the cells:
 
-    uv run modal run ablations/profile_quail.py::run --queries IMDB-3,BIO-2 --out-prefix rerun
-    uv run modal run ablations/profile_stock.py::run --queries IMDB-3,BIO-2 --max-join-anchors 60 --out-prefix rerun
+    uv run modal run experiments/profile_quail.py::run --queries IMDB-3,BIO-2 --out-prefix rerun
+    uv run modal run experiments/profile_stock.py::run --queries IMDB-3,BIO-2 --max-join-anchors 60 --out-prefix rerun
 
 (The recorded files came from these cells' predecessors,
 `discrepancy_timeline.py` and `discrepancy_stock.py`, at the

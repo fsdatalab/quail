@@ -1,7 +1,7 @@
 # What the custom kernels add over vLLM's compiled kernel set
 
 Date: 2026-08-29. One H100 on Modal, Qwen3 4B fp8.
-Cell: `ablations/vllm_compiled_kernels.py`.
+Cell: `experiments/vllm_compiled_kernels.py`.
 
 The question: how much speed do our custom JIT kernels add, measured
 against the kernels a user would get from vLLM's own torch.compile of
@@ -231,10 +231,10 @@ Readings:
 
 ## How to reproduce
 
-    uv run modal run ablations/vllm_compiled_kernels.py::run_stock_kernels
-    uv run modal run ablations/vllm_compiled_kernels.py::run_probe
-    uv run modal run ablations/vllm_compiled_kernels.py::run_queries
-    uv run modal run ablations/vllm_compiled_kernels.py::run_profile
+    uv run modal run experiments/vllm_compiled_kernels.py::run_stock_kernels
+    uv run modal run experiments/vllm_compiled_kernels.py::run_probe
+    uv run modal run experiments/vllm_compiled_kernels.py::run_queries
+    uv run modal run experiments/vllm_compiled_kernels.py::run_profile
 
 Modal app `quail-milestone1`, one H100 per cell. Function calls:
 queries `fc-01M17PPYE6361DV4C9N57MAWBF`, profile

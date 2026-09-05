@@ -50,7 +50,7 @@ checks the arithmetic):
 - Chunk budgets unchanged for both models: the 32B chunk is capped
   by the int32 kernel index, not by memory.
 
-The confirming cell is `tests/gpu/head_residency.py`. Prediction,
+The confirming cell is `experiments/cells/head_residency.py`. Prediction,
 stated before the run: the 32B head lands on the CPU with allocated
 memory within 0.3 GB of the 32.81 GB resident figure, the enlarged
 arena allocates next to the weights, the 4B keeps its tied head on

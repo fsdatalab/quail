@@ -10,10 +10,10 @@ five source rows, then return one projected row because the query has LIMIT 1.
 
 Run from the repository root:
 
-    uv run python tests/gpu/modal_function_transport.py 2>&1 \
+    uv run python experiments/cells/modal_function_transport.py 2>&1 \
       | tee results/modal_function_transport.log
 
-    uv run python tests/gpu/modal_function_transport.py remote 2>&1 \
+    uv run python experiments/cells/modal_function_transport.py remote 2>&1 \
       | tee results/remote_source_transport.log
 
 The worker writes its measured run summary to the quail-results volume at

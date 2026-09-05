@@ -49,8 +49,8 @@ retention competes only with itself, by exact prefix tokens.
 
 IMDB-3 (F1 filter into the reviews x aspects join), sf 0.1, Qwen3
 4B fp8, one H100, measured by the same instrumented cell as the
-discrepancy report (`ablations/discrepancy_timeline.py`, since
-generalized into `ablations/profile_quail.py`,
+discrepancy report (`experiments/discrepancy_timeline.py`, since
+generalized into `experiments/profile_quail.py`,
 `--out-prefix ringfix_tokens_head`):
 
 - Filter phase: 50.28 s in 2,922 forward passes (602 mean tokens)

@@ -30,8 +30,8 @@ number.
 
 Run (`--queries` is a comma-separated list of QuailB ids):
 
-    uv run modal run ablations/profile_quail.py::run_smoke --queries IMDB-3,BIO-2
-    uv run modal run ablations/profile_quail.py::run --queries IMDB-3,BIO-2 --out-prefix myrun
+    uv run modal run experiments/profile_quail.py::run_smoke --queries IMDB-3,BIO-2
+    uv run modal run experiments/profile_quail.py::run --queries IMDB-3,BIO-2 --out-prefix myrun
 
 Outputs on the quail-results volume (pick an --out-prefix that does
 not overwrite files a report already cites):
@@ -41,7 +41,7 @@ not overwrite files a report already cites):
 
 The recorded 2026-08-30 runs used prefixes "discrepancy" and
 "ringfix" through this cell's predecessor
-(ablations/discrepancy_timeline.py, which hardcoded the two queries
+(experiments/discrepancy_timeline.py, which hardcoded the two queries
 and their windows); predictions and results live in
 reports/2026-08-30-imdb3-bio2-discrepancies.md and
 reports/2026-08-30-kv-ring-fix.md.

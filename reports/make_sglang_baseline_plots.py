@@ -5,7 +5,7 @@ directory to this script:
 
     W=<workdir>
     modal volume get quail-results sol/sol_quailb_sf0.1.json $W/sol.json
-    modal volume get quail-results ablations/ringfix_bio2.json $W/quail_ringfix_bio2.json
+    modal volume get quail-results experiments/ringfix_bio2.json $W/quail_ringfix_bio2.json
     modal volume get quail-results benchmarks/quailb/runs/qb_20260831T062218Z_1192cd76/20260831T062218Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families.json $W/quail_agent.json
     modal volume get quail-results stock_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/stock_vllm.json
     modal volume get quail-results pipelined_vllm/20260829T185407Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/summary.json $W/pipelined_vllm.json

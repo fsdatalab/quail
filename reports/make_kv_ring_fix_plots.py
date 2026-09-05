@@ -13,10 +13,10 @@ Usage:
 
 where $W holds the files pulled from the quail-results volume:
 
-    modal volume get quail-results ablations/discrepancy_imdb3.json $W/
-    modal volume get quail-results ablations/ringfix_imdb3.json $W/
-    modal volume get quail-results ablations/ringfix_tokens_head_imdb3.json $W/
-    modal volume get quail-results ablations/ringfix_bio2.json $W/
+    modal volume get quail-results experiments/discrepancy_imdb3.json $W/
+    modal volume get quail-results experiments/ringfix_imdb3.json $W/
+    modal volume get quail-results experiments/ringfix_tokens_head_imdb3.json $W/
+    modal volume get quail-results experiments/ringfix_bio2.json $W/
 """
 
 import json

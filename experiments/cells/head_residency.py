@@ -13,7 +13,7 @@ path) are all correct.
 
 Run from the repository root (tee per house rule):
 
-    uv run modal run tests/gpu/head_residency.py 2>&1 | tee results/head_residency.log
+    uv run modal run experiments/cells/head_residency.py 2>&1 | tee results/head_residency.log
 """
 
 import json

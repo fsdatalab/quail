@@ -6,7 +6,9 @@
     "physical-plans",
     "quail-backend",
     "request-backends",
-    "worker"
+    "worker",
+    "design-decisions",
+    "sol-model"
   ],
   "defaultOpen": true
 }

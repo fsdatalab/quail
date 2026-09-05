@@ -11,19 +11,16 @@ description: Where things live and how to check a change.
 | `quail/bench/` | The QUAIL-B benchmark: datasets, queries, ground truth, the evaluator, and the same-GPU runner. |
 | `quail_ext_examples/` | Example extensions. |
 | `tests/` | CPU tests. They fake the GPU and run in seconds. |
-| `tests/gpu/` | Modal cells: probes, smokes, and benchmarks. They cost GPU time and run only when invoked. |
-| `ablations/` | Experiment entry points. |
-| `baselines/` | The stock vLLM and SGLang comparison code and older baselines kept for reproduction. |
-| `reports/` | Experiment reports, plot scripts, PNGs, `shipped_features/`, and `engine-wiki.md`. |
-| `results/` | Committed summaries that reports read. Raw records live on the `quail-results` volume. |
-| `plans/` | The extensible engine design and the archived original design. |
-| `docs/` | This documentation site. |
+| `experiments/` | Every Modal entry point that costs GPU time: ablation and profiling scripts, and the smokes, probes, and gates under `experiments/cells/`. |
+| `baselines/` | The older standalone stock vLLM and SGLang comparison code, kept until the request backends have produced every family file the reports read. |
+| `reports/` | Experiment reports, plot scripts, PNGs, `shipped_features/`, and `engine-wiki.md`. Experiment data lives on the `quail-results` volume, not in git. |
+| `docs/` | This documentation site, including the design decisions and the speed of light model. |
 
 ## Checks
 
 ```bash
 uv run pytest
-uv run ruff check quail tests ablations
+uv run ruff check quail tests experiments
 uv run vulture
 ```
 
@@ -37,7 +34,7 @@ Every GPU run goes through Modal and attaches to an existing app:
 output to a file, because the Modal CLI drops old log lines:
 
 ```bash
-uv run modal run tests/gpu/session_smoke.py 2>&1 | tee results/session_smoke.log
+uv run modal run experiments/cells/session_smoke.py 2>&1 | tee results/session_smoke.log
 ```
 
 Print the function call id and keep it in the tee file. Pull a result

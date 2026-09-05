@@ -13,7 +13,7 @@ deep plans. It is therefore an optimistic comparison point for that modeled
 execution, not the exact minimum for every possible execution. The dollar
 metric uses Modal's published H100! price.
 
-The equations are in plans/sol_model.md. Work counting, model components, and
+The equations are in docs/content/docs/architecture/sol-model.mdx. Work counting, model components, and
 the component calculation live in shared planner modules. The exact SoL join
 search is separate from the production planner.
 
@@ -1080,7 +1080,7 @@ json.dump({
             "Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100! request each. "
             "Every feasible left deep order and anchor choice is considered. "
             "No measured or fitted constant is used.",
-    "method": "plans/sol_model.md, computed by reports/make_sol_quailb.py",
+    "method": "docs/content/docs/architecture/sol-model.mdx, computed by reports/make_sol_quailb.py",
     "scale_factor": SF,
     "query_count": len(rows),
     "skipped": skipped,

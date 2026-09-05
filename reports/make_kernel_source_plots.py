@@ -6,9 +6,9 @@ Pull the measured inputs from the quail-results volume, then pass the
 work directory to this script:
 
     W=<workdir>
-    modal volume get quail-results ablations/kernel_source_imdb7.json $W/
-    modal volume get quail-results ablations/kernel_source_bio2.json $W/
-    modal volume get quail-results ablations/kernel_source_profile.json $W/
+    modal volume get quail-results experiments/kernel_source_imdb7.json $W/
+    modal volume get quail-results experiments/kernel_source_bio2.json $W/
+    modal volume get quail-results experiments/kernel_source_profile.json $W/
     uv run --with matplotlib python reports/make_kernel_source_plots.py $W
 
 Besides the two PNGs it prints the derived per-query metrics table
