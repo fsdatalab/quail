@@ -39,5 +39,5 @@ agent traces, where 68.9% of tokens are a prefix another row already has
 and the distinct prefix estimate is 2.8 times lower. On AGENT-1 Quail's
 distinct prefix regret is 11,882,610 tokens and pipelined vLLM's is
 20,386, which is the whole reason vLLM is faster there. See
-`reports/2026-08-31-quailb-kv-regret.md` and
+`reports/2026-09-05-quailb-two-regrets.md` and
 `reports/2026-08-29-sol-quailb.md`.

@@ -28,4 +28,4 @@ document rows from KV.
 
 The full measurements are in
 `reports/2026-08-30-agent-prefix-reuse.md` and
-`reports/2026-08-31-quailb-kv-regret.md`.
+`reports/2026-09-05-quailb-two-regrets.md`.

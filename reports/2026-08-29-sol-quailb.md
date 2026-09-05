@@ -44,7 +44,7 @@ query whose model answers are all correct. A measured run does the work the
 model's actual answers create. Where the model passes many more documents than
 the ground truth does, as on the LePaRD filters, the measured work is a
 multiple of the modeled work and the measured time is a multiple of the SoL
-that no scheduler can close. `reports/2026-08-31-quailb-kv-regret.md` shows
+that no scheduler can close. `reports/2026-09-05-quailb-two-regrets.md` shows
 that effect per query, and shows the agent queries, where the engines' own
 prefix reuse falls short of the estimate's.
 
