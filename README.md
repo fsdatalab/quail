@@ -21,9 +21,6 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
   ablation and profiling scripts at the top level, and the smokes,
   probes, and gates under `experiments/cells/`. They run only when
   invoked.
-- `baselines/` is the older standalone stock vLLM and SGLang comparison
-  code. The engine never imports it. It is kept until the request
-  backends have produced every family file the reports read.
 - `reports/` has experiment reports, their plot scripts and PNGs,
   `shipped_features/`, and `engine-wiki.md`. Experiment data is not
   committed: reports cite it by its path on the `quail-results` volume.
@@ -35,7 +32,7 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
 ```
 uv sync
 uv run pytest
-uv run ruff check quail tests experiments reports baselines
+uv run ruff check quail tests experiments reports
 uv run vulture
 ```
 

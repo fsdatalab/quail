@@ -30,8 +30,7 @@ container and returns a client with three operations: `generate`,
 `reset_prefix_cache`, and `run_filter_chain`. `RequestModelExecution`
 submits requests according to the strategy and turns the answers into
 the standard Arrow tables. The scheduling loops live in
-`quail.backends.request_scheduling`, and the stock baselines under
-`baselines/` import the same functions.
+`quail.backends.request_scheduling`.
 Metrics cover cached tokens, fresh tokens, KV regret, request counts,
 query time, boot time, and KV capacity.
 

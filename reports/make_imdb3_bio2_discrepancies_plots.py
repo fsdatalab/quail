@@ -297,8 +297,8 @@ def fig_window_busy(workdir, stock3, stockb):
     window, divided by the unprofiled run's wall per request.
     """
     s3f, s3j = stock3["filter"], stock3["join"]
-    w3f, w3j = (next(w for w in stock3["windows"] if w["label"] == l)
-                for l in ("stock_imdb3_filter", "stock_imdb3_join"))
+    w3f, w3j = (next(w for w in stock3["windows"] if w["label"] == label)
+                for label in ("stock_imdb3_filter", "stock_imdb3_join"))
     wbj = stockb["windows"][0]
     windows = [
         ("Quail filter,\nfirst chunks", BLUE, None,

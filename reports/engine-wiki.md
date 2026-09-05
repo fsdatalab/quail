@@ -380,8 +380,9 @@ The three are instances of one `RequestBackend` class with an engine adapter
 (`VLLMEngine` or `SGLangEngine`) and two submission strategies. They share the
 `RequestExecution` node format, the scheduling loops in
 `backends/request_scheduling.py`, and the Arrow output format. They do not
-call `QuailBackend` or Quail's executor. The stock baselines under `baselines/`
-import the same scheduling loops.
+call `QuailBackend` or Quail's executor. The older standalone stock vLLM and
+SGLang runners were removed on 2026-09-05; the request backends are the only
+comparison code.
 
 QUAIL-B runs Quail and both vLLM configurations in one Modal container for
 each query family. Quail runs in one process group. Stock vLLM and pipelined

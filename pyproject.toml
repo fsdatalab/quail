@@ -32,10 +32,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-# baselines rides along so `import baselines` works everywhere (the
-# Modal mount resolves it by import); it stays outside the quail
-# package because the engine must never depend on it
-packages = ["quail", "baselines"]
+packages = ["quail"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

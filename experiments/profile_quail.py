@@ -77,7 +77,7 @@ image = (
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
           "TORCHINDUCTOR_CACHE_DIR":
               "/root/.cache/kernels/torchinductor"})
-    .add_local_python_source("quail", "baselines")
+    .add_local_python_source("quail")
 )
 
 # House rule: never create new Modal app names - new GPU cells attach

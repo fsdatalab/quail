@@ -30,10 +30,11 @@ unmodified engine and baseline code:
   windows (kernel activity only) cover a few forward passes per
   regime. A second, unprofiled pass supplies every cited number;
   profiled and unprofiled walls agree within 3.5%.
-- `experiments/discrepancy_stock.py` (since generalized into
-  `experiments/profile_stock.py`) measures stock vLLM with the
-  benchmark baseline's own prompt, boot, sampling, submission, and
-  cache-reset code. It records per-request `num_cached_tokens`
+- `experiments/discrepancy_stock.py` (later generalized into
+  `experiments/profile_stock.py`, and removed on 2026-09-05 together
+  with the standalone stock runner it wrapped) measured stock vLLM
+  with the benchmark baseline's own prompt, boot, sampling,
+  submission, and cache-reset code. It records per-request `num_cached_tokens`
   bucketed by position within the anchor group, per-request KV
   regret, and torch.profiler windows through vLLM's profiler config.
   vLLM's profiler also traces CPU work, which stretched its windows
