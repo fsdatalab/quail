@@ -159,13 +159,10 @@ before it plans the query or selects a runtime.
 app. Quail does not run an application server. One Modal container receives
 1, 2, 4, or 8 H100s, and it runs one model copy per H100.
 
-`quail_ext_examples/` holds two complete extensions.
-[`cost_ledger.py`](quail_ext_examples/cost_ledger.py) is an execution
-observer that charges each query's GPU seconds, tokens, and dollars to the
-physical nodes that used them, for chargeback or a cost dashboard.
-[`selectivity_hints.py`](quail_ext_examples/selectivity_hints.py) is a
-logical rule that fills missing AI_FILTER selectivities from a table of
-values observed in earlier runs, so the planner orders filters by cost.
+[`quail_ext_examples/cost_ledger.py`](quail_ext_examples/cost_ledger.py)
+is a complete extension: an execution observer that charges each query's
+GPU seconds, tokens, and dollars to the physical nodes that used them, for
+chargeback or a cost dashboard. It measures the plan without changing it.
 
 A model backend decides whether it supports a model and device. It proposes a
 physical plan, creates one model execution object per GPU, and executes the

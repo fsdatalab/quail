@@ -40,21 +40,6 @@ The `context` is a `LogicalPlanningContext` with the session's
 `catalog` and `engine_config`. Rules run in registration order. After
 every rule has run, the plan is validated again.
 
-`quail_ext_examples/selectivity_hints.py` in the repository is the
-complete version of this rule. It fills each missing selectivity from
-a JSON table named by the `QUAIL_SELECTIVITY_HINTS` environment
-variable, keyed by the prompt as written:
-
-```json
-{"Does this review mention the acting? {0}": 0.31,
- "Is the reviewer recommending the film? {0}": 0.58}
-```
-
-The front end moves any text before the first placeholder after the
-document, so the rule canonicalizes each key with
-`quail.logical.split_frame` before matching. A selectivity the query
-wrote stays; only missing ones are filled.
-
 ## A node
 
 A custom node implements the `LogicalNode` protocol. This example is

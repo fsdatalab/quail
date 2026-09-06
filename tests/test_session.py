@@ -795,32 +795,3 @@ def test_gate_after_full_join_filters_partner_tuples(sess, tmp_path):
     # p1 is matched by the anti gate and drops; every (r, p!=1) stays
     assert sorted(res.to_rows()) == sorted(
         (f"r{a}", f"p{p}") for a in range(6) for p in (0, 2, 3))
-
-
-def test_selectivity_hints_fill_only_missing_values(tmp_path):
-    from quail.logical import (ColumnRef, FilterPredicate, SemanticFilter,
-                               bind_prompt)
-    from quail_ext_examples.selectivity_hints import (
-        SelectivityHints,
-        load_hints,
-    )
-
-    ref = ColumnRef("r", "r", "review")
-    first = FilterPredicate(bind_prompt("acting? {0}", (ref,), fake_tok))
-    second = FilterPredicate(
-        bind_prompt("recommend? {0}", (ref,), fake_tok), selectivity=0.9)
-    node = SemanticFilter(input=object(), predicates=(first, second))
-
-    hints_path = tmp_path / "hints.json"
-    hints_path.write_text('{"acting? {0}": 0.31, "recommend? {0}": 0.2}')
-    rule = SelectivityHints(load_hints(str(hints_path)))
-
-    rewritten = rule.rewrite(node, context=None)
-    assert rewritten.predicates[0].selectivity == 0.31
-    # a selectivity the query wrote stays
-    assert rewritten.predicates[1].selectivity == 0.9
-    # nothing to fill: the rule returns None so the plan is unchanged
-    assert rule.rewrite(rewritten, context=None) is None
-    assert SelectivityHints({}).rewrite(node, context=None) is None
-    with pytest.raises(ValueError):
-        SelectivityHints({"acting? {0}": 1.5})
