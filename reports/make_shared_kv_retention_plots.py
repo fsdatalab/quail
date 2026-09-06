@@ -35,10 +35,13 @@ def compare_answers(root):
 
 
 def main(workdir):
-    """Plot query time and document prefix recomputation."""
+    """Plot time, total work, prefix recomputation, and answer agreement."""
     root = Path(workdir)
     records = [json.loads((root / label / "summary.json").read_text())
                for label in ("first_anchor", "shared")]
+    accuracy = json.loads((root / "accuracy.json").read_text())["configurations"]
+    output_accuracy = accuracy["shared"]["output_accuracy"]
+    precision = 100 * output_accuracy["matching_rows"] / output_accuracy["predicted_rows"]
     compare_answers(root)
     assert records[0]["rows"] == records[1]["rows"]
     for row in records:
@@ -50,30 +53,37 @@ def main(workdir):
         delta = values[1] - values[0]
         print(f"{key}: {delta:+,.2f}, {100 * delta / values[0]:+.2f}%")
     plt.style.use(Path(__file__).parent / "quail.mplstyle")
-    figure, axes = plt.subplots(1, 2, figsize=(11, 4.8))
+    figure, axes = plt.subplots(2, 2, figsize=(12, 9))
     metrics = [
         ("FEV-9 query time", "seconds", [row["query_seconds"] for row in records]),
         ("FEV-9 document recomputation", "tokens",
          [row["report"]["regret_tokens"] for row in records]),
+        ("FEV-9 total fresh tokens", "tokens",
+         [row["report"]["fresh_tokens"] for row in records]),
+        ("FEV-9 answer agreement with Qwen3 32B", "percent",
+         [100 * accuracy[row["label"]]["answer_accuracy"]["accuracy"] for row in records]),
     ]
-    for axis, (title, unit, values) in zip(axes, metrics):
+    for axis, (title, unit, values) in zip(axes.flat, metrics):
         axis.bar([0, 1], values, color=[GRAY, BLUE], width=0.6)
         axis.set_xticks([0, 1], ["First anchor only", "Shared retention"])
         axis.set_ylabel(unit)
         axis.set_title(title)
         for position, value in enumerate(values):
-            label = f"{value:,.2f}" if unit == "seconds" else f"{value:,}"
+            label = f"{value:,.2f}" if unit != "tokens" else f"{value:,}"
             axis.annotate(label, (position, value), xytext=(0, 5),
                           textcoords="offset points", ha="center")
         maximum = max(values) or 1
         axis.set_ylim(0, maximum * 1.35)
         delta = values[1] - values[0]
-        change = f"{delta:+,.2f} {unit}" if unit == "seconds" else f"{delta:+,} {unit}"
-        if values[0]:
+        change = f"{delta:+,.2f} {unit}" if unit != "tokens" else f"{delta:+,} {unit}"
+        if unit == "percent":
+            change = f"Identical answers; final output precision {precision:.2g}%"
+            axis.set_ylim(0, 100)
+        elif values[0]:
             change += f" ({100 * delta / values[0]:+.1f}%)"
         axis.text(0.5, 0.96, change, transform=axis.transAxes,
                   ha="center", va="top")
-    figure.subplots_adjust(wspace=0.4, bottom=0.16, top=0.87)
+    figure.subplots_adjust(wspace=0.35, hspace=0.45, bottom=0.07, top=0.94)
     output = Path(__file__).parent / "plots" / "shared_kv_retention.png"
     figure.savefig(output, dpi=300)
     plt.close(figure)
