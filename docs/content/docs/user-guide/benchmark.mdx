@@ -34,10 +34,9 @@ Add `--query IMDB-4` to run one query.
 - Stock vLLM and pipelined vLLM then run in a second process group on
   the same GPU, sharing one loaded model. The runner records the GPU
   UUID both groups saw and stops the family if they differ.
-- Pipelined SGLang runs in a separate container with its own image,
-  because its runtime package (SGLang 0.5.19) replaces vLLM 0.28.0.
-  Before these versions the two also pinned different versions of
-  `apache-tvm-ffi`.
+- Pipelined SGLang runs in a separate container. vLLM 0.26.0 and
+  SGLang 0.5.18 need different exact versions of `apache-tvm-ffi`, so
+  they cannot share an image.
 - The command prints one Modal function call id per family. Results go
   to the `quail-results` volume under
   `/results/benchmarks/quailb/runs/<run_id>/`, with a manifest under

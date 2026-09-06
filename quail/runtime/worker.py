@@ -16,7 +16,7 @@ from quail.runtime.volumes import hf_cache, kernel_cache, results_vol
 def build_worker_image(
     local_python_sources=(),
     pip_packages=(),
-    runtime_package="vllm==0.28.0",
+    runtime_package="vllm==0.26.0",
 ):
     """Build the Modal image containing Quail and registered extensions."""
     packages = tuple(dict.fromkeys((
@@ -28,7 +28,7 @@ def build_worker_image(
     sources = tuple(dict.fromkeys(("quail", *local_python_sources)))
     return (
         modal.Image.from_registry(
-            "nvidia/cuda:13.3.1-devel-ubuntu24.04", add_python="3.12"
+            "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12"
         )
         .entrypoint([])
         .pip_install(
@@ -114,7 +114,7 @@ def modal_worker(
     pip_packages=(),
     *,
     secrets=(),
-    runtime_package="vllm==0.28.0",
+    runtime_package="vllm==0.26.0",
 ) -> ModalWorker:
     """Return Modal Functions containing requested extensions."""
     local_python_sources = tuple(local_python_sources)

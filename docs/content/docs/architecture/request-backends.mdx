@@ -35,11 +35,10 @@ Metrics cover cached tokens, fresh tokens, KV regret, request counts,
 query time, boot time, and KV capacity.
 
 Stock vLLM and pipelined vLLM share one loaded vLLM model when they
-run in the same process. SGLang has its own Modal image because its
-runtime package (SGLang 0.5.19) replaces vLLM 0.28.0; the backend's
-`runtime_package` attribute tells the compute provider which package
-to install. Before these versions the two also pinned different exact
-versions of `apache-tvm-ffi`.
+run in the same process. SGLang needs its own Modal image because
+vLLM 0.26.0 and SGLang 0.5.18 require different exact versions of
+`apache-tvm-ffi`; the backend's `runtime_package` attribute tells the
+compute provider which package to install.
 
 ## Same GPU comparisons
 

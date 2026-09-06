@@ -128,7 +128,7 @@ class SGLangEngine:
 
     kind = "sglang"
     label = "SGLang"
-    runtime_package = "sglang==0.5.19"
+    runtime_package = "sglang==0.5.18"
 
     def boot(self, model_name: str, allowed_ids: list[int]) -> tuple[dict, dict]:
         import sglang as sgl

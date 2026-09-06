@@ -147,7 +147,7 @@ class ModalComputeProvider:
         ))
         backend = registry.backend(backend_name)
         runtime_package = getattr(
-            backend, "runtime_package", "vllm==0.28.0"
+            backend, "runtime_package", "vllm==0.26.0"
         )
         key = (backend_name, runtime_package, local_sources, pip_packages)
         if self._app_context is not None and key != self._extension_key:

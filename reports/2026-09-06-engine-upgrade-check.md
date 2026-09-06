@@ -105,6 +105,9 @@ benchmark is rerun on the new images (about an hour and $16), and vLLM
 0.28.0's slightly different answers would change the accuracy columns.
 Reverting keeps the report and the code consistent.
 
+Decision: the pins went back to vLLM 0.26.0, SGLang 0.5.18, and CUDA
+13.0.1 the same day. This report stays as the record of the check.
+
 ## Source data
 
 New-image run `20260906T011248Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families`:

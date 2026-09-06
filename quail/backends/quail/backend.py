@@ -202,7 +202,7 @@ class QuailBackend:
     """Plan and start Quail model execution."""
 
     name = "quail"
-    runtime_package = "vllm==0.28.0"
+    runtime_package = "vllm==0.26.0"
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
         if model.name not in {"qwen3-4b-fp8", "qwen3-32b-fp8"}:

@@ -26,7 +26,7 @@ from quail.runtime.worker import build_worker_image
 
 
 image = build_worker_image()
-sglang_image = build_worker_image(runtime_package="sglang==0.5.19")
+sglang_image = build_worker_image(runtime_package="sglang==0.5.18")
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)

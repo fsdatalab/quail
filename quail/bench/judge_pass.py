@@ -386,12 +386,12 @@ def render_join_prompt(spec: PredicateSpec, left: str, right: str) -> str:
     return render_join_prompt_text(prompt, (left, right), anchor=0)
 
 
-IMAGE_BASE = "nvidia/cuda:13.3.1-devel-ubuntu24.04"
+IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
-    .pip_install("vllm==0.28.0", "huggingface_hub", "pandas", "pyarrow",
+    .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
                  "numpy", "datasets")
     .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
           "VLLM_LOGGING_LEVEL": "WARNING",
