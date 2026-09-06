@@ -69,5 +69,7 @@ generalized into `experiments/profile_quail.py`,
 - BIO-2 unchanged: 128.22 s after against 130.35 s before, regret
   0, no evictions (its plan retains nothing).
 
-Full report with the plot and volume paths:
-`reports/2026-08-30-kv-ring-fix.md`.
+The full report was removed on 2026-09-06 when the benchmark numbers it
+compared were superseded; its data stays under `/results/ablations/` on
+the `quail-results` volume (`rerun_imdb3.json` and
+`discrepancy_imdb3.json`).

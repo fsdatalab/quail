@@ -27,5 +27,6 @@ query results without using a benchmark-specific execution path.
 
 LEP-1 confirmed all four paths on one H100 per backend. The measured query
 times were 1.27 seconds for Quail, 1.50 seconds for stock vLLM, 1.40 seconds
-for pipelined vLLM, and 1.68 seconds for pipelined SGLang. See
-`reports/2026-09-02-request-backend-confirmation.md`.
+for pipelined vLLM, and 1.68 seconds for pipelined SGLang. The
+confirmation report was removed on 2026-09-06 once the full benchmark
+ran through these backends (`reports/2026-09-05-quailb-two-regrets.md`).

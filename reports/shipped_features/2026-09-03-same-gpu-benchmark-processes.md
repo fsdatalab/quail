@@ -19,4 +19,6 @@ installed together without overriding one backend's declared dependencies.
 
 LEP-1 confirmed the new runner. Both groups used
 `GPU-a4f6d03a-f439-f748-6bc2-2c4da514482c`, and each left 4 MiB in use after
-exit. See `reports/2026-09-03-same-gpu-benchmark-processes.md`.
+exit. The confirmation report was removed on 2026-09-06 once the full
+benchmark ran through this runner
+(`reports/2026-09-05-quailb-two-regrets.md`).

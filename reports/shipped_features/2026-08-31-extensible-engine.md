@@ -30,8 +30,9 @@ The main changes are:
   model backends, models, devices, physical node codecs,
   physical node runtimes, remote source readers, and execution observers.
   Table provider instances are passed directly to `Session.register`.
-* `quail_ext_examples.plan_trace` shows how an extension observes the existing
-  physical plan without adding a node that changes query behavior.
+* `quail_ext_examples.cost_ledger` (first shipped as `plan_trace`) shows how
+  an extension observes the existing physical plan without adding a node
+  that changes query behavior.
 * Snowflake `AI_FILTER` and BigQuery `AI.IF` compile to the same logical
   operator.
 

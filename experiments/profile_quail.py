@@ -42,9 +42,10 @@ not overwrite files a report already cites):
 The recorded 2026-08-30 runs used prefixes "discrepancy" and
 "ringfix" through this cell's predecessor
 (experiments/discrepancy_timeline.py, which hardcoded the two queries
-and their windows); predictions and results live in
-reports/2026-08-30-imdb3-bio2-discrepancies.md and
-reports/2026-08-30-kv-ring-fix.md.
+and their windows). Their reports were removed on 2026-09-06; the data
+stays under /results/ablations/ on the quail-results volume, and the
+KV retention change they led to is described in
+reports/shipped_features/2026-08-30-scan-ring-retention.md.
 """
 
 import json

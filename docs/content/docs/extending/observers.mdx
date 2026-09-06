@@ -17,43 +17,61 @@ class ExecutionObserver(Protocol):
 You register a factory, not an instance. The worker creates a fresh
 observer per query.
 
-## The example extension
+## The example extension: a cost ledger
 
-`quail_ext_examples/plan_trace.py`:
+`quail_ext_examples/cost_ledger.py` charges a query's GPU time and
+tokens to the nodes that used them, which is what a chargeback or a
+query cost dashboard needs:
 
 ```python
-class PlanTrace:
-    name = "example.plan_trace"
+H100_USD_PER_HOUR = 3.9492   # https://modal.com/pricing
+
+
+class CostLedger:
+    name = "example.cost_ledger"
+    usd_per_gpu_hour = H100_USD_PER_HOUR
+    gpus = 1
 
     def __init__(self):
-        self._nodes = []
+        self._rows = []
 
     def after_node(self, node, result) -> None:
-        self._nodes.append({
+        metrics = result.metrics
+        usd = metrics.wall_s / 3600 * self.usd_per_gpu_hour * self.gpus
+        self._rows.append({
             "node_id": node.node_id,
             "node_type": node.type_name,
-            "input_rows": result.metrics.input_rows,
-            "output_rows": result.metrics.output_rows,
+            "wall_s": round(metrics.wall_s, 6),
+            "evaluated_documents": metrics.evaluated_documents,
+            "evaluated_document_pairs": metrics.evaluated_document_pairs,
+            "fresh_tokens": metrics.fresh_tokens,
+            "cached_tokens": metrics.cached_tokens,
+            "usd": round(usd, 8),
         })
 
     def report(self) -> dict:
-        return {"nodes": list(self._nodes)}
+        totals = {key: sum(row[key] for row in self._rows)
+                  for key in ("wall_s", "fresh_tokens", "usd")}
+        return {"nodes": list(self._rows), "totals": totals}
 
 
 def register_quail_extension(registry) -> None:
-    registry.register_observer(PlanTrace.name, PlanTrace)
+    registry.register_observer(CostLedger.name, CostLedger)
 ```
 
 Load it and the report gains an `observers` key:
 
 ```python
 registry = quail.ExtensionRegistry.with_built_ins()
-registry.load_extension("quail_ext_examples.plan_trace",
+registry.load_extension("quail_ext_examples.cost_ledger",
                         local_python_sources=("quail_ext_examples",))
 session = quail.Session(registry=registry)
 ...
-result.report["observers"]["example.plan_trace"]["nodes"]
+result.report["observers"]["example.cost_ledger"]["totals"]
 ```
+
+The ledger prices every node's wall time on one GPU. Set `gpus` on a
+subclass for a node that ran on several.
 
 ## What metrics a node reports
 

@@ -70,9 +70,17 @@ Only the module name travels. The worker trusts that the module it
 imports is the same one the client loaded. Pin your package version if
 that matters.
 
-## An example
+## Two examples
 
-`quail_ext_examples/plan_trace.py` in the repository is a complete
-extension. It registers one execution observer that records the row
-counts in and out of every physical node and adds them to the result
-report under `observers`. It changes nothing about the plan.
+`quail_ext_examples/` in the repository holds two complete extensions.
+
+- `cost_ledger.py` registers an execution observer. After each physical
+  node runs it records the node's wall seconds, evaluated documents or
+  pairs, fresh and cached tokens, and GPU dollars, and adds the rows and
+  the query totals to the result report under `observers`. It changes
+  nothing about the plan. See [Execution observers](/docs/extending/observers).
+- `selectivity_hints.py` registers a logical rule. It fills each
+  `AI_FILTER` predicate's missing selectivity from a table of values
+  observed in earlier runs, keyed by the prompt as written, so the
+  planner orders the filter chain by cost. See
+  [Logical nodes and rules](/docs/extending/logical-rules).

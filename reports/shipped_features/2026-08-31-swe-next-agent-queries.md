@@ -26,6 +26,7 @@ vLLM took 97.99 seconds on AGENT-1 and 98.74 seconds on AGENT-2. Quail took
 prompt tokens from KV, while Quail served none of the shared prefixes across
 document rows from KV.
 
-The full measurements are in
-`reports/2026-08-30-agent-prefix-reuse.md` and
-`reports/2026-09-05-quailb-two-regrets.md`.
+The current measurements are in
+`reports/2026-09-05-quailb-two-regrets.md`. The first agent prefix reuse
+report was removed on 2026-09-06; its data stays on the `quail-results`
+volume.

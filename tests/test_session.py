@@ -263,7 +263,7 @@ def test_filter_query_rows_and_report(sess):
 def test_observer_sees_the_complete_physical_graph(tmp_path):
     registry = quail.ExtensionRegistry.with_built_ins()
     registry.load_extension(
-        "quail_ext_examples.plan_trace",
+        "quail_ext_examples.cost_ledger",
         local_python_sources=("quail_ext_examples",),
     )
     session = quail.Session(
@@ -286,13 +286,17 @@ def test_observer_sees_the_complete_physical_graph(tmp_path):
         "AI_FILTER(PROMPT('q: {0}', r.review)) LIMIT 1"
     ), make_executor(truth))
 
-    nodes = result.report["observers"]["example.plan_trace"]["nodes"]
-    assert [node["node_type"] for node in nodes] == [
+    ledger = result.report["observers"]["example.cost_ledger"]
+    assert [node["node_type"] for node in ledger["nodes"]] == [
         "quail.document_input",
         "quail.packed_filter",
         "quail.project",
         "quail.limit",
     ]
+    assert ledger["totals"]["evaluated_documents"] == sum(
+        node["evaluated_documents"] for node in ledger["nodes"])
+    assert ledger["totals"]["usd"] == round(
+        ledger["totals"]["wall_s"] / 3600 * ledger["usd_per_gpu_hour"], 8)
 
 
 def test_sql_query_streams_and_collects_arrow(sess):
@@ -791,3 +795,32 @@ def test_gate_after_full_join_filters_partner_tuples(sess, tmp_path):
     # p1 is matched by the anti gate and drops; every (r, p!=1) stays
     assert sorted(res.to_rows()) == sorted(
         (f"r{a}", f"p{p}") for a in range(6) for p in (0, 2, 3))
+
+
+def test_selectivity_hints_fill_only_missing_values(tmp_path):
+    from quail.logical import (ColumnRef, FilterPredicate, SemanticFilter,
+                               bind_prompt)
+    from quail_ext_examples.selectivity_hints import (
+        SelectivityHints,
+        load_hints,
+    )
+
+    ref = ColumnRef("r", "r", "review")
+    first = FilterPredicate(bind_prompt("acting? {0}", (ref,), fake_tok))
+    second = FilterPredicate(
+        bind_prompt("recommend? {0}", (ref,), fake_tok), selectivity=0.9)
+    node = SemanticFilter(input=object(), predicates=(first, second))
+
+    hints_path = tmp_path / "hints.json"
+    hints_path.write_text('{"acting? {0}": 0.31, "recommend? {0}": 0.2}')
+    rule = SelectivityHints(load_hints(str(hints_path)))
+
+    rewritten = rule.rewrite(node, context=None)
+    assert rewritten.predicates[0].selectivity == 0.31
+    # a selectivity the query wrote stays
+    assert rewritten.predicates[1].selectivity == 0.9
+    # nothing to fill: the rule returns None so the plan is unchanged
+    assert rule.rewrite(rewritten, context=None) is None
+    assert SelectivityHints({}).rewrite(node, context=None) is None
+    with pytest.raises(ValueError):
+        SelectivityHints({"acting? {0}": 1.5})

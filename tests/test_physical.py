@@ -249,7 +249,7 @@ def test_extension_module_rebuilds_the_remote_plan_registry():
 
     registry = built_in_registry()
     registry.load_extension(
-        "quail_ext_examples.plan_trace",
+        "quail_ext_examples.cost_ledger",
         local_python_sources=("quail_ext_examples",),
     )
     session = quail.Session(tokenizer=str.split, registry=registry)
@@ -275,9 +275,9 @@ def test_extension_module_rebuilds_the_remote_plan_registry():
         "quail_ext_examples",
     )
     assert envelope["extension_modules"] == [
-        "quail_ext_examples.plan_trace"
+        "quail_ext_examples.cost_ledger"
     ]
-    assert "example.plan_trace" in remote_registry.observer_factories
+    assert "example.cost_ledger" in remote_registry.observer_factories
     observers = remote_registry.new_observers()
     input_node = next(
         node for node in remote_graph.nodes
