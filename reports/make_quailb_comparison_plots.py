@@ -13,15 +13,20 @@ Pull the original suite manifest and its four result files:
     uv run modal volume get quail-results \
       ground_truth/quailb/schema_v1/corpora/c_1aa2c4f0d0b6c816fd37aa5748c33341/manifest.json \
       "$W/corpus.json"
+    mkdir -p "$W/fev9"
     uv run modal volume get quail-results \
-      /ablations/shared-kv-retention-20260906T054932Z "$W"
+      benchmarks/quailb/family-runs/20260906T211500Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json \
+      "$W/fev9/manifest.json"
+    for method in quail stock_vllm pipelined_vllm pipelined_sglang; do
+      source_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result_volume_paths"][sys.argv[2]].removeprefix("/results/"))' "$W/fev9/manifest.json" "$method")
+      uv run modal volume get quail-results "$source_path" "$W/fev9/$method.json"
+    done
     uv run modal volume get quail-results \
       /sol/2026-09-06-quailb-prefix-reuse.json "$W/sol.json"
     uv run --with matplotlib python reports/make_quailb_comparison_plots.py "$W"
 
-Use --retention-dir to point to an already pulled retention comparison.
-The current FEV-9 replaces the old Quail measurement. The old baseline FEV-9
-measurements are excluded because they used a different query definition.
+Use --fev9-dir to point to an already pulled FEV-9 comparison.
+All four current FEV-9 measurements replace the old query definition.
 """
 
 import argparse
@@ -188,7 +193,7 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
                         zorder=3, clip_on=False)
     axis.set_xlim(-0.7, len(queries) - 0.3)
     axis.set_xticks(range(len(queries)),
-                   [query + ("*" if query == "FEV-9" else "") for query in queries],
+                   queries,
                    rotation=55 if overview else 35, ha="right")
     axis.tick_params(axis="x", labelsize=9)
     titles = {"seconds": "Latency", "recomputed": "Recomputed KV tokens",
@@ -242,10 +247,8 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
                           ncol=5, fontsize=11, frameon=False)
             footer = ("SoL estimates ideal work with unlimited prefix KV reuse across requests and reference-label survivors. "
                       "It has no measured accuracy.\n"
-                      "Fresh tokens include recomputed KV. A dash marks zero; x marks unavailable. "
+                      "Fresh tokens include recomputed KV. A dash marks zero. "
                       "Stock vLLM uses operator-at-a-time submission.")
-            if "FEV-9" in queries:
-                footer += "\n* FEV-9 uses four filters and shared retention. Older baseline measurements used a different query and are omitted."
             figure.text(0.055, 0.035, footer, fontsize=10, linespacing=1.5)
             figure.subplots_adjust(left=0.075, right=0.97, top=0.83,
                                    bottom=0.24 if overview else 0.20, hspace=0.60, wspace=0.28)
@@ -259,42 +262,50 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
     return destination.name
 
 
-def load_rows(root, retention_root):
-    """Combine saved measurements while excluding obsolete FEV-9 baselines."""
+def load_rows(root, fev9_root):
+    """Combine the saved suite with four current FEV-9 measurements."""
     manifest = json.loads((root / "manifest.json").read_text())
     corpus = json.loads((root / "corpus.json").read_text())
+    fev9_manifest = json.loads((fev9_root / "manifest.json").read_text())
+    assert fev9_manifest["query_ids"] == ["FEV-9"]
     rows = {}
+    predicates = None
     for key, _, _ in METHODS:
         suite = json.loads((root / f"{key}.json").read_text())
-        assert (suite["model"], suite["sf"], suite["lf"], suite["gpus"]) == (
-            "qwen3-4b-fp8", 0.1, 1, 1)
-        assert suite["corpus_id"] == corpus["corpus_id"]
+        current = json.loads((fev9_root / f"{key}.json").read_text())
+        for source in (suite, current):
+            assert (source["model"], source["sf"], source["lf"], source["gpus"]) == (
+                "qwen3-4b-fp8", 0.1, 1, 1)
+            assert source["corpus_id"] == corpus["corpus_id"]
+            assert source["backend"] == key
+        assert current["aggregate_volume_path"] == fev9_manifest["result_volume_paths"][key]
+        assert current["ground_truth"]["fever"] == suite["ground_truth"]["fever"]
+        measured = current["passes"]["single"]["queries"]
+        assert len(measured) == 1 and measured[0]["query"] == "FEV-9"
+        row = measured[0]
+        assert "error" not in row, row
+        filters = [stage for stage in row["stages"] if stage["op"] == "filter"]
+        assert len(filters) == 4 and {stage["alias"] for stage in filters} == {"c1", "c2", "e1", "e2"}
+        assert len([stage for stage in row["stages"] if stage["op"] == "join"]) == 3
+        signature = sorted((p["op"], p.get("alias", ""), p["predicate_key"])
+                           for p in row["accuracy"]["per_predicate"])
+        if predicates is None:
+            predicates = signature
+        assert signature == predicates
         rows[key] = {row["query"]: row for row in suite["passes"]["single"]["queries"]
                      if row["query"] != "FEV-9"}
-    current = json.loads((retention_root / "shared" / "summary.json").read_text())
-    accuracy = json.loads((retention_root / "accuracy.json").read_text())
-    assert accuracy["corpus_tables"] == {
-        name: corpus["tables"][name] for name in ("claims", "evidence")}
-    assert (current["query"], current["model"], current["sf"], current["lf"], current["gpus"]) == (
-        "FEV-9", "qwen3-4b-fp8", 0.1, 1, 1)
-    assert set(current["estimated_plan"]["filter_order"]) == {"c1", "c2", "e1", "e2"}
-    score = accuracy["configurations"]["shared"]
-    assert score["output_accuracy"]["predicted_rows"] == current["rows"]
-    rows["quail"]["FEV-9"] = {
-        **current["report"], "query": "FEV-9", "accuracy": score,
-        "input_document_rows": score["input_document_rows"],
-    }
-    return manifest, rows, accuracy["source_volume_path"]
+        rows[key]["FEV-9"] = row
+    return manifest, rows, fev9_manifest
 
 
-def main(workdir, retention_dir=None):
-    """Regenerate figures and a report from the original suite files."""
+def main(workdir, fev9_dir=None):
+    """Regenerate figures from the saved suite and current FEV-9 runs."""
     root = Path(workdir)
-    retention_root = Path(retention_dir) if retention_dir else root / "shared-kv-retention-20260906T054932Z"
-    manifest, rows, retention_source = load_rows(root, retention_root)
+    fev9_root = Path(fev9_dir) if fev9_dir else root / "fev9"
+    manifest, rows, fev9_manifest = load_rows(root, fev9_root)
     queries = manifest["query_ids"]
     comparable = [query for query in queries if all(query in rows[key] for key in rows)]
-    assert len(queries) == 32 and len(comparable) == 31
+    assert len(queries) == 32 and len(comparable) == 32
     assert all("error" not in row for method in rows.values() for row in method.values())
     faster = sum(rows["quail"][query]["wall_s"] < rows["stock_vllm"][query]["wall_s"]
                  for query in comparable)
@@ -319,17 +330,18 @@ def main(workdir, retention_dir=None):
         "  method colors and definitions for latency, recomputed KV tokens, fresh",
         "  input tokens, accuracy, and input document counts for every relation alias.",
         "- The other 31 queries reuse the original measurements from September 5, 2026.",
-        "  No inference was rerun for this report. These are historical measurements,",
-        "  not a measurement of shared retention on every query.",
+        "  Only FEV-9 was rerun on September 6, 2026, with all four methods.",
+        "  The other queries are not new measurements of shared retention.",
         "- The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.",
         "  Quail and the vLLM configurations shared a physical GPU within each family.",
         "  SGLang used a separate GPU. Stock vLLM used operator-at-a-time submission.",
-        "- FEV-9 now has four filters. The old suite had only one filter for FEV-9,",
-        "  so its old measurements are excluded. The current Quail measurement appears",
-        "  in both the main plot and the FEVER plot. Missing baselines are labeled.",
-        "  The [retention report](2026-09-05-shared-kv-retention.md) gives the change details.",
-        "- The prediction for this update was that scoring and plotting would need no",
-        "  inference. We reused all 124 saved configurations for the other 31 queries.",
+        "- FEV-9 has four filters and three joins. All four methods now use that",
+        "  query definition in both the main plot and the FEVER plot.",
+        "  The [FEV-9 comparison](2026-09-06-fev9-baselines.md) records the new run.",
+        "  The [retention report](2026-09-05-shared-kv-retention.md) records the earlier ablation.",
+        "- We predicted Quail would remain near 39 seconds and beat the baselines.",
+        f"  It took {fev['seconds']:.2f} seconds in the new run. We reused all 124 saved",
+        "  configurations for the other 31 queries.",
         f"- In these saved measurements, Quail was faster than stock vLLM on {faster}",
         f"  of {len(comparable)} comparable queries.",
         "- A horizontal line across each query's bar group shows its SoL estimate.",
@@ -345,7 +357,7 @@ def main(workdir, retention_dir=None):
         "  anchor context is not an identical prefix and is still computed.",
         "- The earlier SoL file used the old FEV-9 definition. We recalculated only",
         "  FEV-9 on the CPU from saved labels and corpus rows. The other 31 estimates",
-        "  are unchanged. No GPU inference was run.",
+        "  are unchanged. Calculating SoL required no GPU inference.",
         f"- FEV-9 SoL is {sol['FEV-9']['sol_s']:.3f} seconds with shared-prefix reuse,",
         f"  compared with {sol['FEV-9']['per_document']['sol_s']:.3f} seconds with reuse only",
         "  within each document. These estimates use reference-label survivors.",
@@ -367,19 +379,19 @@ def main(workdir, retention_dir=None):
         "  per-document accounting, not the separate distinct-prefix metric.",
         "  Token and latency plots use a log scale when positive values span more",
         "  than one order of magnitude. Recomputed KV retains a linear region to",
-        "  include zero. A dash marks zero; x marks an unavailable measurement.",
+        "  include zero. A dash marks zero.",
         "- Document counts come from the saved corpus manifest and describe inputs",
         "  before filtering. Repeated aliases each list their full input count.",
         "  The report tables also show throughput, GPU cost, and final output quality.",
         f"- FEV-9 agrees with the reference on {fev['agreement']:.2f}% of evaluated answers. Its final",
         f"  output matches only {output['matching_rows']:,} reference rows out of {output['predicted_rows']:,} returned rows.",
         f"  The reference has {output['expected_rows']:,} rows, so output precision is approximately {fev['precision']:.8f}%",
-        f"  and recall is {fev['recall']:.2f}%. The retention change preserved all answers.", "",
+        f"  and recall is {fev['recall']:.2f}%.", "",
         "[Open the main vector PDF](plots/quailb_main.pdf)", "",
         f"[![QUAIL-B latency preview](plots/{overview})](plots/quailb_main.pdf)", "",
         f"Figure: plots/{overview}", "",
         f"Source manifest on `quail-results`: `{manifest['manifest_volume_path']}`.", "",
-        f"Current FEV-9 source on `quail-results`: `{retention_source}/`.", "",
+        f"Current FEV-9 manifest on `quail-results`: `{fev9_manifest['manifest_volume_path']}`.", "",
         "SoL estimates on `quail-results`: `/results/sol/2026-09-06-quailb-prefix-reuse.json`.", "",
         "The FEV-9 recalculation is also saved separately at `/results/sol/2026-09-06-fev9-prefix-reuse.json`.", "",
         f"Corpus counts on `quail-results`: `/results/ground_truth/quailb/schema_v1/corpora/{corpus['corpus_id']}/manifest.json`.", "",
@@ -424,12 +436,12 @@ def main(workdir, retention_dir=None):
         lines.append("")
     report = HERE / "2026-09-05-quailb-saved-results.md"
     report.write_text("\n".join(lines))
-    print(f"Updated {report}, the main figure, and five dataset figures from 125 saved configurations.")
+    print(f"Updated {report}, the main figure, and five dataset figures from 128 saved configurations.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workdir")
-    parser.add_argument("--retention-dir")
+    parser.add_argument("--fev9-dir")
     args = parser.parse_args()
-    main(args.workdir, args.retention_dir)
+    main(args.workdir, args.fev9_dir)

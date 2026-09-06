@@ -16,7 +16,9 @@
 Figure: plots/quailb_fev.png
 
 - FEV-9 appears with the other FEVER queries in the standard dataset plot.
-  The first-anchor-only comparison remains in the tables below.
+  The plot uses the September 6 run of all four methods, documented in
+  [the FEV-9 comparison](2026-09-06-fev9-baselines.md). The retention ablation
+  remains in the tables below.
 - The PDF also shows the SoL estimate with prefix reuse across requests.
   SoL assumes unlimited prefix retention and reference-label survivors.
   It is an estimate for that workload, not a measurement of the 4B answers.
@@ -79,8 +81,8 @@ Figure: plots/quailb_fev.png
 - The saved evaluator rounds output precision and F1 to zero at six decimal
   places. The precision above is calculated from the saved integer counts.
 - [The full comparison plots](2026-09-05-quailb-saved-results.md) reuse all 124
-  saved configurations for the other 31 queries. The old suite's FEV-9 had one
-  filter, so its times and accuracy are not compared with the four-filter query.
+  saved configurations for the other 31 queries. FEV-9 uses new measurements
+  of all four methods on the four-filter query.
 
 - The setup was FEV-9 at `sf=0.1`, `lf=1`, Qwen3 4B FP8, and one Modal H100.
   Each configuration ran in a fresh subprocess on the same physical GPU. Each

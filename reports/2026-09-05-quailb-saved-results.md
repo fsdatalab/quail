@@ -8,19 +8,20 @@
   method colors and definitions for latency, recomputed KV tokens, fresh
   input tokens, accuracy, and input document counts for every relation alias.
 - The other 31 queries reuse the original measurements from September 5, 2026.
-  No inference was rerun for this report. These are historical measurements,
-  not a measurement of shared retention on every query.
+  Only FEV-9 was rerun on September 6, 2026, with all four methods.
+  The other queries are not new measurements of shared retention.
 - The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.
   Quail and the vLLM configurations shared a physical GPU within each family.
   SGLang used a separate GPU. Stock vLLM used operator-at-a-time submission.
-- FEV-9 now has four filters. The old suite had only one filter for FEV-9,
-  so its old measurements are excluded. The current Quail measurement appears
-  in both the main plot and the FEVER plot. Missing baselines are labeled.
-  The [retention report](2026-09-05-shared-kv-retention.md) gives the change details.
-- The prediction for this update was that scoring and plotting would need no
-  inference. We reused all 124 saved configurations for the other 31 queries.
-- In these saved measurements, Quail was faster than stock vLLM on 29
-  of 31 comparable queries.
+- FEV-9 has four filters and three joins. All four methods now use that
+  query definition in both the main plot and the FEVER plot.
+  The [FEV-9 comparison](2026-09-06-fev9-baselines.md) records the new run.
+  The [retention report](2026-09-05-shared-kv-retention.md) records the earlier ablation.
+- We predicted Quail would remain near 39 seconds and beat the baselines.
+  It took 41.14 seconds in the new run. We reused all 124 saved
+  configurations for the other 31 queries.
+- In these saved measurements, Quail was faster than stock vLLM on 30
+  of 32 comparable queries.
 - A horizontal line across each query's bar group shows its SoL estimate.
   SoL models ideal computation and memory traffic with unlimited prefix KV.
   It credits matching token prefixes across requests, documents, and aliases.
@@ -34,7 +35,7 @@
   anchor context is not an identical prefix and is still computed.
 - The earlier SoL file used the old FEV-9 definition. We recalculated only
   FEV-9 on the CPU from saved labels and corpus rows. The other 31 estimates
-  are unchanged. No GPU inference was run.
+  are unchanged. Calculating SoL required no GPU inference.
 - FEV-9 SoL is 5.821 seconds with shared-prefix reuse,
   compared with 6.337 seconds with reuse only
   within each document. These estimates use reference-label survivors.
@@ -56,14 +57,14 @@
   per-document accounting, not the separate distinct-prefix metric.
   Token and latency plots use a log scale when positive values span more
   than one order of magnitude. Recomputed KV retains a linear region to
-  include zero. A dash marks zero; x marks an unavailable measurement.
+  include zero. A dash marks zero.
 - Document counts come from the saved corpus manifest and describe inputs
   before filtering. Repeated aliases each list their full input count.
   The report tables also show throughput, GPU cost, and final output quality.
 - FEV-9 agrees with the reference on 67.77% of evaluated answers. Its final
   output matches only 5 reference rows out of 149,783,486 returned rows.
   The reference has 11 rows, so output precision is approximately 0.00000334%
-  and recall is 45.45%. The retention change preserved all answers.
+  and recall is 45.45%.
 
 [Open the main vector PDF](plots/quailb_main.pdf)
 
@@ -73,7 +74,7 @@ Figure: plots/quailb_main.png
 
 Source manifest on `quail-results`: `/results/benchmarks/quailb/family-runs/20260905T021527Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json`.
 
-Current FEV-9 source on `quail-results`: `/results/ablations/shared-kv-retention-20260906T054932Z/`.
+Current FEV-9 manifest on `quail-results`: `/results/benchmarks/quailb/family-runs/20260906T211500Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json`.
 
 SoL estimates on `quail-results`: `/results/sol/2026-09-06-quailb-prefix-reuse.json`.
 
@@ -252,10 +253,10 @@ Figure: plots/quailb_fev.png
 | FEV-8 | Pipelined vLLM | 201.38 | 132,384 | 9,881,067 | 2,107.82 | pairs/s | 0.22091 | 70.80 | 4.6155e-06 | 18.881 |
 | FEV-8 | Pipelined SGLang | 344.00 | 30,784 | 9,801,008 | 1,226.42 | pairs/s | 0.37737 | 74.28 | 5.0116e-06 | 15.385 |
 | FEV-8 | SoL estimate | 19.139 | 0 (assumed) | 4,818,015 | 11,157.11 | pairs/s | 0.02100 | Not measured | Not measured | Not measured |
-| FEV-9 | Quail | 39.02 | 7,309 | 4,314,219 | 4,667.22 | pairs/s | 0.04280 | 67.77 | 3.3382e-06 | 45.455 |
-| FEV-9 | Stock vLLM | Not measured for this query definition | | | | | | | | |
-| FEV-9 | Pipelined vLLM | Not measured for this query definition | | | | | | | | |
-| FEV-9 | Pipelined SGLang | Not measured for this query definition | | | | | | | | |
+| FEV-9 | Quail | 41.14 | 7,309 | 4,314,219 | 4,426.71 | pairs/s | 0.04513 | 67.77 | 3.3382e-06 | 45.455 |
+| FEV-9 | Stock vLLM | 90.07 | 194,016 | 4,593,860 | 2,108.23 | pairs/s | 0.09881 | 67.05 | 2.9055e-06 | 45.455 |
+| FEV-9 | Pipelined vLLM | 89.80 | 193,312 | 4,593,156 | 2,114.57 | pairs/s | 0.09851 | 67.05 | 2.9055e-06 | 45.455 |
+| FEV-9 | Pipelined SGLang | 138.26 | 33,904 | 4,096,274 | 1,238.23 | pairs/s | 0.15167 | 69.08 | 4.2171e-06 | 45.455 |
 | FEV-9 | SoL estimate | 5.821 | 0 (assumed) | 1,474,838 | 9,857.99 | pairs/s | 0.00639 | Not measured | Not measured | Not measured |
 
 ## LEP
