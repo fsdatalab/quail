@@ -141,10 +141,11 @@ and execution observers. Load the module before creating the session:
 ```python
 import quail
 
+from my_package import quail_extension
+
 registry = quail.ExtensionRegistry.with_built_ins()
 registry.load_extension(
-    "my_package.quail_extension",
-    local_python_sources=("my_package",),
+    quail_extension,
     pip_packages=("another-dependency==1.2.3",),
 )
 session = quail.Session(registry=registry)

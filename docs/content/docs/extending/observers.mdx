@@ -59,16 +59,31 @@ def register_quail_extension(registry) -> None:
     registry.register_observer(CostLedger.name, CostLedger)
 ```
 
-Load it and the report gains an `observers` key:
+Load it, run a query, and read the report back through the class:
 
 ```python
+import quail
+from quail_ext_examples import cost_ledger
+
 registry = quail.ExtensionRegistry.with_built_ins()
-registry.load_extension("quail_ext_examples.cost_ledger",
-                        local_python_sources=("quail_ext_examples",))
+registry.load_extension(cost_ledger)
 session = quail.Session(registry=registry)
-...
-result.report["observers"]["example.cost_ledger"]["totals"]
+session.register("reviews", quail.DocumentProvider.from_parquet(
+    "reviews.parquet", id_col="id"))
+
+result = session.sql(
+    "SELECT r.id FROM reviews r "
+    "WHERE AI_FILTER(PROMPT('Is this review positive? {0}', r.body))"
+).run()
+ledger = result.observer(cost_ledger.CostLedger)
+ledger["totals"]["usd"]
 ```
+
+`run()` returns a `QueryResult`: a lazy Arrow result with a `report`
+dict. `result.observer(CostLedger)` looks the report up by the
+observer's `name`, which is the key it travels under inside
+`result.report["observers"]`; the report is a plain dict because it
+crosses the worker boundary as JSON.
 
 The ledger prices every node's wall time on one GPU. Set `gpus` on a
 subclass for a node that ran on several.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from types import ModuleType
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -97,15 +98,31 @@ class ExtensionRegistry:
 
     def load_extension(
         self,
-        module: str,
+        module,
         *,
-        local_python_sources: tuple[str, ...] = (),
+        local_python_sources: tuple[str, ...] | None = None,
         pip_packages: tuple[str, ...] = (),
     ) -> None:
-        """Import an extension and record its remote Python packages."""
+        """Import an extension and record its remote Python packages.
+
+        Args:
+            module: The extension module, or its importable name. The
+                name travels to every compute worker, which imports the
+                module by it.
+            local_python_sources: Local packages the compute provider
+                copies into the worker image. Defaults to the module's
+                top-level package.
+            pip_packages: Packages the compute provider installs.
+        """
+        if isinstance(module, ModuleType):
+            loaded = module
+            module = module.__name__
+        else:
+            loaded = importlib.import_module(module)
         if module in self.extension_modules:
             raise ValueError(f"duplicate extension module {module!r}")
-        loaded = importlib.import_module(module)
+        if local_python_sources is None:
+            local_python_sources = (module.split(".")[0],)
         register = getattr(loaded, "register_quail_extension", None)
         if register is None:
             raise ValueError(

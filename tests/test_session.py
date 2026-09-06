@@ -261,11 +261,12 @@ def test_filter_query_rows_and_report(sess):
 
 
 def test_observer_sees_the_complete_physical_graph(tmp_path):
+    from quail_ext_examples import cost_ledger
+
     registry = quail.ExtensionRegistry.with_built_ins()
-    registry.load_extension(
-        "quail_ext_examples.cost_ledger",
-        local_python_sources=("quail_ext_examples",),
-    )
+    registry.load_extension(cost_ledger)
+    assert registry.extension_packages[0].local_python_sources == (
+        "quail_ext_examples",)
     session = quail.Session(
         EngineConfig(gpus=1),
         tokenizer=fake_tok,
@@ -286,7 +287,10 @@ def test_observer_sees_the_complete_physical_graph(tmp_path):
         "AI_FILTER(PROMPT('q: {0}', r.review)) LIMIT 1"
     ), make_executor(truth))
 
-    ledger = result.report["observers"]["example.cost_ledger"]
+    ledger = result.observer(cost_ledger.CostLedger)
+    assert ledger is result.report["observers"]["example.cost_ledger"]
+    with pytest.raises(KeyError):
+        result.observer("example.missing")
     assert [node["node_type"] for node in ledger["nodes"]] == [
         "quail.document_input",
         "quail.packed_filter",

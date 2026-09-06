@@ -333,6 +333,20 @@ class QueryResult:
         finally:
             reader.close()
 
+    def observer(self, observer) -> dict:
+        """Return the report one execution observer attached.
+
+        Args:
+            observer: The observer class or instance, or its name.
+        """
+        name = observer if isinstance(observer, str) else observer.name
+        reports = self.report.get("observers", {})
+        if name not in reports:
+            raise KeyError(
+                f"no report from observer {name!r}; the query ran with "
+                f"{sorted(reports) or 'no observers'}")
+        return reports[name]
+
     def to_rows(self, limit: int | None = None) -> list[tuple]:
         table = self.collect(limit=limit)
         columns = [column.to_pylist() for column in table.columns]

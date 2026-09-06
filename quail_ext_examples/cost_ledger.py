@@ -6,14 +6,26 @@ model evaluated, the fresh and cached tokens, and the GPU dollars for
 that time. The report carries the per node rows and the query totals,
 which is what a chargeback or a query cost dashboard needs.
 
-Load it like any extension:
+Load it like any extension, run a query, and read the report back
+through the observer class:
+
+    import quail
+    from quail_ext_examples import cost_ledger
 
     registry = quail.ExtensionRegistry.with_built_ins()
-    registry.load_extension("quail_ext_examples.cost_ledger",
-                            local_python_sources=("quail_ext_examples",))
+    registry.load_extension(cost_ledger)
     session = quail.Session(registry=registry)
-    ...
-    result.report["observers"]["example.cost_ledger"]["totals"]
+    session.register("reviews", quail.DocumentProvider.from_parquet(
+        "reviews.parquet", id_col="id"))
+    result = session.sql(
+        "SELECT r.id FROM reviews r "
+        "WHERE AI_FILTER(PROMPT('Is this review positive? {0}', r.body))"
+    ).run()
+    ledger = result.observer(cost_ledger.CostLedger)
+    print(ledger["totals"]["usd"], ledger["totals"]["fresh_tokens"])
+
+The observer's name keys its report inside result.report, which is a
+plain dict because it comes back from the compute worker as JSON.
 """
 
 from __future__ import annotations
