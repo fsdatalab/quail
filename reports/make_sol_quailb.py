@@ -104,6 +104,7 @@ from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan
 from quail.backends.quail.coordinator import thin_survivors
+from quail.backends.quail.retention import policy as retention_policy
 from quail.runtime.tokens import shared_prefix_lengths
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 
@@ -472,8 +473,8 @@ def simulate_production_planner(query, model: ModelSpec,
 
     The simulation executes the saved join order with exact saved answers.
     At group boundaries it applies the arena's page limit and the
-    same prefix tokens per page victim order. It does not reproduce temporary
-    overlap between packed GPU chunks.
+    same computation saved per page priority. It trims complete boundary
+    snapshots and does not reproduce survivor arrival order or packed chunks.
 
     The SoL output does not call this function.
     """
@@ -495,6 +496,12 @@ def simulate_production_planner(query, model: ModelSpec,
     resident_rows = {alias: (set(rows) if alias in keep_aliases
                              else set())
                      for alias, rows in survivors.items()}
+    retention = plan.settings["retention"]
+    capacity = retention["cap_pages"] * budgets.PAGE_TOKENS * plan.workers
+    resident_rows = fit_resident_documents(
+        resident_rows, {alias: aliases[alias]["tokens"] for alias in aliases},
+        PRE, capacity, budgets.PAGE_TOKENS,
+        retention_policy(retention, retention["initial"]))
     filter_stages = prepared.filter_stages
     filter_evaluations = prepared.filter_evaluations
     post_filter_counts = prepared.post_filter_counts
@@ -508,7 +515,7 @@ def simulate_production_planner(query, model: ModelSpec,
         stage_indices = [stage.written_pos for stage in node.stages]
         stage_defs = [joins[index] for index in stage_indices]
         anchor = node.anchor
-        future_anchors = ({anchor} if node.keep_anchor_kv else set())
+        future_anchors = set(retention["after"][node.node_id])
         group_semantics = stage_defs[-1].semantics
         for stage_index, (join_index, join) in enumerate(
                 zip(stage_indices, stage_defs)):
@@ -590,8 +597,8 @@ def simulate_production_planner(query, model: ModelSpec,
         resident_rows = fit_resident_documents(
             resident_rows,
             {alias: aliases[alias]["tokens"] for alias in aliases},
-            PRE, plan.settings["admission_tokens"],
-            budgets.PAGE_TOKENS)
+            PRE, capacity, budgets.PAGE_TOKENS,
+            retention_policy(retention, retention["after"][node.node_id]))
 
     first_alias = scans[0].alias
     input_document_rows = sum(

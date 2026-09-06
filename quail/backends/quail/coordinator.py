@@ -16,6 +16,7 @@ def _common_payload(payload: dict) -> dict:
         "false_ids": payload["false_ids"],
         "pre_ids": payload["pre_ids"],
         "filter_limit": payload["filter_limit"],
+        "retention": payload.get("retention", {}),
     }
 
 

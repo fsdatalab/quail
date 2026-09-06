@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import time
 
+from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution import export_physical_outputs
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.physical import (
@@ -90,11 +91,14 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
             retained_after_filters=len(accounting.retained),
             retained_pages_after_filters=accounting.retained_pages,
             retained_prefix_tokens_after_filters=accounting.retained_prefix_tokens,
+            retained_by_alias_after_filters={
+                alias: sum(key[0] == alias for key in accounting.retained)
+                for alias in state["docs"]
+            },
         )
-    alive = set(anchor_ids)
-    for key in list(state["arena"].accounting.retained):
-        if key[0] != node.anchor or key[1] not in alive:
-            state["arena"].free_key(key)
+    config = state["retention"]
+    apply_retention(state["arena"], config,
+                    config.get("before", {}).get(node.node_id, {}), by_alias)
     group = [stage.runtime_spec() for stage in node.stages]
     stage_suffixes = []
     tuple_indices = {}
@@ -128,7 +132,9 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
         alive = not matched if group[-1]["semantics"] == "anti" \
             else matched
         if alive and node.keep_anchor_kv:
-            state["arena"].retain(key, len(prefixes[local_index]))
+            retain_after_join(
+                state["arena"], key, len(prefixes[local_index]), config,
+                config.get("after", {}).get(node.node_id, {}))
         else:
             state["arena"].free_key(key)
 
@@ -170,7 +176,9 @@ def record_model_result(node, result: NodeResult,
                 prepared["prefixes"]):
             if key in state["arena"].accounting.owned:
                 if node.keep_anchor_kv and document in live:
-                    state["arena"].retain(key, len(prefix))
+                    config = state["retention"]
+                    retain_after_join(state["arena"], key, len(prefix), config,
+                                      config.get("after", {}).get(node.node_id, {}))
                 else:
                     state["arena"].free_key(key)
 
@@ -182,6 +190,8 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     for key in list(arena.accounting.owned):
         arena.free_key(key)
     arena.reset_stats()
+    retention = payload.get("retention", {})
+    apply_retention(arena, retention, retention.get("initial", {}))
     docs = state["docs"]
     sources = {
         alias: range(len(documents))
@@ -190,6 +200,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     runtime_state = {
         **state,
         "pre": payload.get("pre_ids") or [],
+        "retention": retention,
         "filter_limit": (
             None if any(isinstance(node, AnchoredJoin)
                         for node in graph.nodes)

@@ -16,7 +16,7 @@ class KVState:
 
     pending_anchor: str | None = None
     group_open: bool = False
-    at_start: bool = True
+    used_anchors: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -196,8 +196,8 @@ def _document_keys(resident: dict) -> frozenset[DocumentKey]:
 
 def fit_resident_documents(resident: dict, lengths: dict, pre: int,
                            arena_tokens: float | None,
-                           page_tokens: int = 16) -> dict:
-    """Apply the runtime prefix token eviction order to a snapshot."""
+                           page_tokens: int = 16, policy=None) -> dict:
+    """Apply a retention priority to a complete prefix snapshot."""
 
     keys = _document_keys(resident)
     if arena_tokens is None:
@@ -210,7 +210,9 @@ def fit_resident_documents(resident: dict, lengths: dict, pre: int,
             alias, position = key
             tokens = pre + lengths[alias][position]
             pages = -(-tokens // page_tokens)
-            entries.append((tokens / pages, key, pages))
+            priority = (policy.priority(key, tokens, pages) if policy
+                        else (tokens / pages,))
+            entries.append((priority, key, pages))
             total_pages += pages
         kept = set(keys)
         for _, key, pages in sorted(entries):
@@ -230,7 +232,7 @@ def residency(anchor: str, state: KVState, lengths: dict,
     """Name the source of the KV credit recorded for one stage."""
     if same_group:
         return "kept"
-    if state.at_start and lengths[anchor].resident_count:
+    if anchor not in state.used_anchors and lengths[anchor].resident_count:
         return "filter"
     return "none"
 
@@ -240,7 +242,7 @@ def resident_count(anchor: str, state: KVState, lengths: dict,
     """Number of documents credited as resident for one stage."""
     if same_group:
         return lengths[anchor].count
-    if not state.at_start:
+    if anchor in state.used_anchors:
         return 0
     return lengths[anchor].resident_count
 
@@ -338,7 +340,7 @@ def walk(seq, live0: dict, lengths: dict, resident: dict, pre: int,
         kept = resident_count(anchor, state, lengths, same_group)
         w = stage_work(
             spec, anchor, live, lengths, pre,
-            resident_at_start=state.at_start, same_group=same_group)
+            resident_at_start=anchor not in state.used_anchors, same_group=same_group)
         records.append(dict(written_pos=spec["written_pos"],
                             anchor=anchor, resident=kind,
                             resident_docs=kept,
@@ -346,7 +348,8 @@ def walk(seq, live0: dict, lengths: dict, resident: dict, pre: int,
                             tokens=w.tokens))
         total = total + w
         thin(live, spec)
-        state = KVState(anchor, spec["semantics"] == "full", False)
+        state = KVState(anchor, spec["semantics"] == "full",
+                        state.used_anchors | {anchor})
     return total, records
 
 
@@ -492,7 +495,7 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
                                           same_group)
                     work = stage_work(
                         spec, anchor, live_now, lengths, pre,
-                        resident_at_start=state_now.at_start,
+                        resident_at_start=anchor not in state_now.used_anchors,
                         same_group=same_group)
                     step = dict(
                         written_pos=spec["written_pos"], anchor=anchor,
@@ -500,7 +503,8 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
                         tuples=cross_tuples(spec, live_now),
                         tokens=work.tokens)
                     next_state = KVState(
-                        anchor, spec["semantics"] == "full", False)
+                        anchor, spec["semantics"] == "full",
+                        state_now.used_anchors | {anchor})
                     for old in frontier:
                         generated += 1
                         candidate = Candidate(

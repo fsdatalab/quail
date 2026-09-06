@@ -1,11 +1,11 @@
-"""Plot the FEV-9 fixed-plan comparison from pulled volume summaries.
+"""Plot the FEV-9 shared KV retention comparison from pulled volume summaries.
 
 Pull the comparison directory, then pass it as the first argument:
 
     uv run modal volume get quail-results \
-      /ablations/fixed-join-plan-20260906T043918Z /tmp
-    uv run --with matplotlib python reports/make_fixed_join_plan_plots.py \
-      /tmp/fixed-join-plan-20260906T043918Z
+      /ablations/shared-kv-retention-20260906T054932Z /tmp
+    uv run --with matplotlib python reports/make_shared_kv_retention_plots.py \
+      /tmp/shared-kv-retention-20260906T054932Z
 
 The report names the exact comparison directory on the volume.
 """
@@ -22,11 +22,11 @@ from plot_colors import BLUE, GRAY
 
 def compare_answers(root):
     """Compare every saved predicate answer table."""
-    names = {path.name for path in (root / "adaptive").glob("*.parquet")}
-    assert names == {path.name for path in (root / "fixed").glob("*.parquet")}
+    names = {path.name for path in (root / "first_anchor").glob("*.parquet")}
+    assert names == {path.name for path in (root / "shared").glob("*.parquet")}
     assert len(names) == 7
     for name in sorted(names):
-        tables = [pq.read_table(root / label / name) for label in ("adaptive", "fixed")]
+        tables = [pq.read_table(root / label / name) for label in ("first_anchor", "shared")]
         columns = sorted(tables[0].column_names)
         ordered = [table.select(columns).sort_by([(name, "ascending") for name in columns])
                    for table in tables]
@@ -38,7 +38,7 @@ def main(workdir):
     """Plot query time and document prefix recomputation."""
     root = Path(workdir)
     records = [json.loads((root / label / "summary.json").read_text())
-               for label in ("adaptive", "fixed")]
+               for label in ("first_anchor", "shared")]
     compare_answers(root)
     assert records[0]["rows"] == records[1]["rows"]
     for row in records:
@@ -58,7 +58,7 @@ def main(workdir):
     ]
     for axis, (title, unit, values) in zip(axes, metrics):
         axis.bar([0, 1], values, color=[GRAY, BLUE], width=0.6)
-        axis.set_xticks([0, 1], ["Adaptive plan", "Fixed plan"])
+        axis.set_xticks([0, 1], ["First anchor only", "Shared retention"])
         axis.set_ylabel(unit)
         axis.set_title(title)
         for position, value in enumerate(values):
@@ -74,7 +74,7 @@ def main(workdir):
         axis.text(0.5, 0.96, change, transform=axis.transAxes,
                   ha="center", va="top")
     figure.subplots_adjust(wspace=0.4, bottom=0.16, top=0.87)
-    output = Path(__file__).parent / "plots" / "fixed_join_plan.png"
+    output = Path(__file__).parent / "plots" / "shared_kv_retention.png"
     figure.savefig(output, dpi=300)
     plt.close(figure)
 

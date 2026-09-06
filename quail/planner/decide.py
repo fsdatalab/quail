@@ -2,6 +2,9 @@
 
 from dataclasses import replace
 
+from quail.executor.retention import retention_pages
+from quail.planner import retention
+
 from quail.logical import (
     LogicalPlan,
     Project,
@@ -209,48 +212,10 @@ def _filter_work(filters, stats, filter_orders: dict, pre: int) -> Work:
 
 # ----------------------------------------------- KV keep (residency)
 
-def _page_round(tokens: float, page_tokens: int) -> float:
-    return -(-tokens // page_tokens) * page_tokens
-
-
 def _length_stats(doc_tokens) -> joinsearch.AliasStats:
     if isinstance(doc_tokens, joinsearch.AliasStats):
         return doc_tokens
     return joinsearch.summarize_alias(doc_tokens)
-
-
-def keep_split(doc_tokens, budget_tokens: float, survivor_frac: float,
-               overhead: int, page_tokens: int) -> dict | None:
-    """Which survivors of one alias to credit as resident for a join.
-
-    Runtime retention maximizes reusable prefix tokens under the page
-    limit. Page rounding can favor any document whose last page is
-    fuller, so the planner credits a length-independent fraction of
-    the expected survivors instead of naming a length threshold.
-
-    Returns:
-        The resident fraction and expected page-rounded token mass,
-        or None when no complete survivor fits.
-    """
-    stats = _length_stats(doc_tokens)
-    if not stats.count or survivor_frac <= 0 or budget_tokens <= 0:
-        return None
-    rounded = [
-        (length, count, _page_round(length + overhead, page_tokens))
-        for length, count in stats.histogram
-    ]
-    if budget_tokens < min(cost for _, _, cost in rounded):
-        return None
-    expected_survivor_tokens = survivor_frac * sum(
-        count * cost for _, count, cost in rounded)
-    resident_fraction = min(
-        1.0, budget_tokens / max(1.0, expected_survivor_tokens))
-    return dict(
-        resident_fraction=resident_fraction,
-        kept_expected_tokens=(
-            resident_fraction * expected_survivor_tokens),
-        survivor_frac=survivor_frac,
-        overhead=overhead)
 
 
 def possible_anchor_aliases(specs) -> set:
@@ -259,24 +224,6 @@ def possible_anchor_aliases(specs) -> set:
     for spec in specs:
         out.update(joinsearch.anchor_candidates(spec))
     return out
-
-
-def plan_keeps(specs, filters, doc_tokens: dict, pre: int,
-               budget_tokens: float, page_tokens: int) -> dict:
-    """Credit each possible first anchor against the retention budget."""
-    plan = {}
-    anchors = possible_anchor_aliases(specs)
-    for alias, preds in filters.items():
-        if alias not in anchors:
-            continue
-        frac = 1.0
-        for p in preds:
-            frac *= p.selectivity if p.selectivity is not None else 1.0
-        split = keep_split(doc_tokens[alias], budget_tokens, frac,
-                           pre, page_tokens)
-        if split is not None:
-            plan[alias] = split
-    return plan
 
 
 def balanced_shards(doc_tokens, workers: int):
@@ -389,48 +336,39 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         live0[_filter_alias(fs[0])] *= surv
     base_work = _filter_work(filters, stats, filter_orders, pre)
 
-    # must match the scan ring run_filter reserves: the loops keep
-    # two chunks of document KV in flight
-    headroom = 2 * chunk
+    cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
+    costs = retention.coefficients(model, device)
+    possible = possible_anchor_aliases(specs)
+    search_lengths, _ = retention.allocate(
+        length_stats, live0, filters, {alias: [1.0, 0] for alias in possible},
+        pre, cap_pages * workers, budgets.PAGE_TOKENS, costs)
 
-    # ---- keep credit candidates, then the search on expectations
-    keep_budget = max(0.0, float(admission - headroom)) * workers
-    candidates = plan_keeps(specs, filters, length_stats, pre,
-                            keep_budget, budgets.PAGE_TOKENS)
-
-    def resident_from(plan_keep):
-        return {
-            alias: summary.with_resident_fraction(
-                plan_keep[alias]["resident_fraction"])
-            if alias in plan_keep else summary
-            for alias, summary in length_stats.items()
-        }
-
-    def run_search(plan_keep, honor_forced=True):
+    def run_search(honor_forced=True):
         found = joinsearch.search_joins(
-            specs, live0, resident_from(plan_keep), {}, pre,
+            specs, live0, search_lengths, {}, pre,
             chunk, model, device, base_work=base_work,
             fixed_order=fixed, honor_forced=honor_forced)
         if found is None:
-            # a join predicate with no alias in common with the rest:
-            # no connected left deep order exists, so cost the written
-            # order directly
             found = joinsearch.search_joins(
-                specs, live0, resident_from(plan_keep), {},
-                pre, chunk, model, device, base_work=base_work,
-                fixed_order=True, honor_forced=honor_forced)
+                specs, live0, search_lengths, {}, pre, chunk, model, device,
+                base_work=base_work, fixed_order=True, honor_forced=honor_forced)
         return found
 
-    found = run_search(candidates)
+    found = run_search()
     seq = [(specs[position], anchor) for position, anchor in found["seq"]]
     first_anchor = seq[0][1] if seq else None
-    keep_plan = ({first_anchor: candidates[first_anchor]}
-                 if first_anchor in candidates else {})
+    retention_plan = retention.schedule(seq, live0)
+    credited, keep_plan = retention.allocate(
+        length_stats, live0, filters, retention_plan["initial"], pre,
+        cap_pages * workers, budgets.PAGE_TOKENS, costs)
+    found["work"], found["records"] = joinsearch.walk(
+        seq, live0, credited, {}, pre, model, device)
+    retention_plan.update(**costs, cap_pages=cap_pages, expected=keep_plan)
     forced = sorted({s["anchor"] for s in specs
                      if s["semantics"] == "full"
                      and not s["anchor_free"]})
     if forced:
-        free = run_search(candidates, honor_forced=False)
+        free = run_search(honor_forced=False)
         honored_s = speed_of_light(
             base_work + found["work"], model, device, chunk).seconds
         free_s = speed_of_light(
@@ -442,14 +380,11 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 f"seconds)")
     stage_records = found["records"]
 
-    for alias, k in sorted(keep_plan.items()):
-        what = ("all survivors" if k["resident_fraction"] >= 1 else
-                f"{100 * k['resident_fraction']:.1f}% of survivors")
+    for alias, credit in sorted(keep_plan.items()):
         remarks.append(
-            f"keep KV on {alias!r}: {what} priced as resident for "
-            f"the join, {k['kept_expected_tokens'] / max(1, workers):,.0f} "
-            f"expected tokens per worker of the {admission:,}-token "
-            f"arena")
+            f"shared KV on {alias!r}: {credit['documents']:.1f} expected "
+            f"documents, {credit['pages'] / workers:.1f} expected pages per "
+            f"worker of the {cap_pages}-page retention budget")
 
     # ---- refusal checks on the predicted plan
     anchors = {wp: a for wp, a in found["seq"]}
@@ -517,7 +452,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                     selectivity=p.selectivity,
                     expected_docs=round(n * surv, 1)))
                 surv *= p.selectivity if p.selectivity is not None else 1.0
-            keep = s.alias == first_anchor
+            keep = s.alias in retention_plan["initial"]
             writes = len(stages) > 1 or keep
             credit = keep_plan.get(s.alias)
             fid = f"filter:{s.alias}"
@@ -528,9 +463,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 keep_kv=keep,
                 # the capacity-planned credit; the runtime offers
                 # every survivor to its capped retained pool
-                keep_min_doc_tokens=(1 if credit else 0),
-                keep_resident_fraction=(credit["resident_fraction"]
-                                        if credit else 0.0),
+                keep_min_doc_tokens=(1 if credit and credit["documents"] > 0 else 0),
+                keep_resident_fraction=(credit["documents"] / live0[s.alias]
+                                        if credit and live0[s.alias] else 0.0),
                 stages=tuple(stages)))
             ids_src[s.alias] = PortRef(fid, f"ids:{s.alias}")
             if not writes:
@@ -602,8 +537,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             inputs=input_ports(tuple(ids_src[a] for a in in_aliases)),
             anchor=anchor,
             anchor_resident=group["members"][0][1]["resident"],
-            keep_anchor_kv=(g + 1 < len(groups)
-                            and groups[g + 1]["anchor"] == anchor),
+            keep_anchor_kv=anchor in retention_plan["after"][gid],
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 
@@ -639,6 +573,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         settings={
             "chunk_tokens": chunk,
             "admission_tokens": admission,
+            "retention": retention_plan,
             "order_rule": rule,
             "order_source": source,
         })

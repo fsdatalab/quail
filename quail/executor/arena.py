@@ -18,10 +18,14 @@ class PageArena:
         self.owned = {}       # key -> list of page ids
         self.tokens = {}      # key -> resident token count
         self.pinned = set()    # current operators depend on these keys
+        self._retained_sizes = {}
+        self._retained_pages = 0
         self.retained = {}     # key -> reusable prefix tokens
         self._retained_heap = []
         self._retained_versions = {}
         self._retention_version = 0
+        self.retention_policy = None
+        self.retention_cap_pages = None
 
     def pages_needed(self, tokens: int) -> int:
         return -(-tokens // self.page_tokens)
@@ -47,8 +51,7 @@ class PageArena:
         pages = self.owned.pop(key)
         self.tokens.pop(key)
         self.pinned.discard(key)
-        self.retained.pop(key, None)
-        self._retained_versions.pop(key, None)
+        self._forget_retained(key)
         self.free.extend(pages)
         return len(pages)
 
@@ -57,37 +60,57 @@ class PageArena:
 
         if key not in self.owned:
             raise KeyError(key)
-        self.retained.pop(key, None)
-        self._retained_versions.pop(key, None)
+        self._forget_retained(key)
         self.pinned.add(key)
 
-    def retain(self, key) -> None:
+    def _forget_retained(self, key):
+        self._retained_pages -= self._retained_sizes.pop(key, 0)
+        self.retained.pop(key, None)
+        self._retained_versions.pop(key, None)
+
+    def retain(self, key, priority=None) -> None:
         """Make a resident key evictable after its current use."""
 
         if key not in self.owned:
             raise KeyError(key)
         self.pinned.discard(key)
         prefix_tokens = self.tokens[key]
+        self._forget_retained(key)
         self.retained[key] = prefix_tokens
+        self._retained_sizes[key] = len(self.owned[key])
+        self._retained_pages += len(self.owned[key])
         self._retention_version += 1
         version = self._retention_version
         self._retained_versions[key] = version
         pages = len(self.owned[key])
+        if priority is None:
+            priority = (self.retention_policy.priority(key, prefix_tokens, pages)
+                        if self.retention_policy else (prefix_tokens / pages,))
         heapq.heappush(
             self._retained_heap,
-            (prefix_tokens / pages, version, key, pages, prefix_tokens),
+            (priority, version, key, pages, prefix_tokens),
         )
 
+    def configure_retention(self, policy, cap_pages: int) -> None:
+        """Update priorities without making active prefixes evictable."""
+        if not 0 <= cap_pages <= self.n_pages:
+            raise ValueError("retention capacity must fit inside the arena")
+        self.retention_policy = policy
+        self.retention_cap_pages = cap_pages
+        keys = list(self.retained)
+        self._retained_heap.clear()
+        for key in keys:
+            self.retain(key)
+
     def pop_retained_victim(self):
-        """Remove and return the lowest prefix tokens per KV page."""
+        """Remove the retained prefix with the lowest planned reuse priority."""
 
         while self._retained_heap:
             _, version, key, pages, prefix_tokens = heapq.heappop(
                 self._retained_heap)
             if self._retained_versions.get(key) != version:
                 continue
-            self._retained_versions.pop(key)
-            self.retained.pop(key)
+            self._forget_retained(key)
             return key, pages, prefix_tokens
         return None
 
@@ -103,6 +126,8 @@ class PageArena:
         self.owned[key] = self.owned[key][:keep]
         self.tokens[key] = tokens
         self.free.extend(released)
+        if key in self.retained:
+            self.retain(key)
         return len(released)
 
     def grow(self, key, capacity_tokens: int) -> int | None:
@@ -141,7 +166,7 @@ class PageArena:
 
     @property
     def retained_pages(self) -> int:
-        return sum(len(self.owned[key]) for key in self.retained)
+        return self._retained_pages
 
     @property
     def retained_prefix_tokens(self) -> int:
@@ -205,15 +230,20 @@ class KVArena:
     def pin(self, key):
         self.accounting.pin(key)
 
-    def retain(self, key, tokens: int):
+    def retain(self, key, tokens: int, priority=None):
         """Rewind a prefix and make it available for a later operator."""
 
         self.accounting.rewind(key, tokens)
         self._refresh_rows(key, tokens)
-        self.accounting.retain(key)
+        self.accounting.retain(key, priority)
+        cap = self.accounting.retention_cap_pages
+        before = self.accounting.free_pages
+        if cap is not None:
+            self.evict_retained(max(0, self.accounting.retained_pages - cap))
+        return self.accounting.free_pages - before
 
     def evict_retained(self, pages_needed: int) -> tuple:
-        """Evict prefixes with the fewest reusable tokens per page."""
+        """Evict retained prefixes in planned reuse priority order."""
 
         keys = []
         pages = 0

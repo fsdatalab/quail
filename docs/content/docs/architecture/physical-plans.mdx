@@ -115,10 +115,16 @@ combine them.
 ## Fixed join plans
 
 Join order and anchors are chosen before inference. The first anchor's filter
-chain runs last and retains its surviving document KV within capacity. Other
-filter chains release KV when they finish.
+chain runs last. Every filtered set with a future anchor use can retain passing
+document KV in one shared pool. Sets with no future anchor use release their KV.
 
 The executable graph contains the bound `AnchoredJoin` stages and `Exchange`
 nodes that prune actual survivors. `explain()` shows this saved order.
 Older serialized plans containing `quail.adaptive_join_plan` must be regenerated
 from their logical queries. The public query API is unchanged.
+
+The plan records expected retained pages per set and the next anchor use at each
+join boundary. These estimates do not partition memory. Runtime replacement
+prefers the expected prefix computation saved per occupied KV page. The score
+uses document length and the probability of reaching the next planned use.
+Active KV is protected, and prefixes with no further use are released.

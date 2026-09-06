@@ -59,16 +59,21 @@ forward pass.
   arena.
 - **Dedup.** In a chain join, an anchor that matched several partners
   still appears once in the next stage.
-- **Retention.** The first join reuses retained filter KV for its anchor.
+- **Retention.** Join groups reuse retained filter KV for their anchors.
   Evicted documents are processed again.
 
 The planner uses Selinger-style dynamic programming to choose join order and
 anchors before inference. Filter survival is estimated from selectivities,
 with the input document length distribution used for the survivors.
 
-- Other inputs' filter chains run first and release KV when their chains finish.
-- The first anchor's filter chain runs last and retains surviving document KV
-  within the memory limit. Its exact passing row IDs remain unknown until execution.
+- The first anchor's filter chain runs last. Every input used as a later anchor
+  can retain its passing document KV in one shared pool.
+- Runtime retention prefers expected prefix computation saved per KV page.
+  Document lengths determine computation and page counts. The saved plan supplies
+  the probability and position of the next use. Exact survivors are known only
+  during execution.
+- Two execution chunks are reserved before allocating retained pages. Active KV
+  cannot be evicted. Prefixes are released when they have no further planned use.
 - Planned `AnchoredJoin` nodes reuse available KV. Missing KV is recomputed.
 - Planned `Exchange` nodes prune actual survivors before the next join group.
 - Execution keeps the planned order even when actual selectivity differs.

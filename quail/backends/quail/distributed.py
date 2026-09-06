@@ -142,9 +142,7 @@ class DistributedQuailExecution:
                 else self.payload.get("filter_limit")
             ),
         )
-        for output in outputs:
-            for alias, documents in output.get("retained", {}).items():
-                self.retained.setdefault(alias, set()).update(documents)
+        self._retained_placement(outputs)
         survivors = merged["survivors"].get(node.alias, [])
         answers = merged["filters"].get(node.alias, {})
         return NodeResult(
@@ -168,13 +166,6 @@ class DistributedQuailExecution:
         if not self.joins_started:
             self.snapshot_after_filters()
             self.joins_started = True
-        drop = [
-            alias for alias in self.retained
-            if alias != node.anchor
-        ]
-        for alias in drop:
-            self.retained.pop(alias, None)
-            self.prior_shards.pop(alias, None)
         subs = coordinator.join_group_payloads(
             self._runtime_payload(),
             self.gpu_count,
@@ -189,8 +180,8 @@ class DistributedQuailExecution:
             sub.pop("joins", None)
             sub.update(
                 retain_anchor=node.keep_anchor_kv,
-                drop_kept=drop,
-                final_group=not node.keep_anchor_kv,
+                final_group=node.node_id == self.graph.nodes_by_type(
+                    AnchoredJoin.type_name)[-1].node_id,
                 start_query=not self.started,
                 physical_node=encoded_node,
             )
@@ -228,16 +219,7 @@ class DistributedQuailExecution:
             enriched[-1], node.stages[-1].semantics
         )
 
-        self.retained = {}
-        placement = {}
-        for worker, output in enumerate(outputs):
-            for alias, documents in output.get("retained", {}).items():
-                self.retained.setdefault(alias, set()).update(documents)
-                placement.setdefault(
-                    alias, [[] for _ in range(self.gpu_count)]
-                )
-                placement[alias][worker] = list(documents)
-        self.prior_shards = placement
+        self._retained_placement(outputs)
         return NodeResult(
             {
                 f"ids:{node.anchor}": anchor_survivors,
@@ -259,6 +241,18 @@ class DistributedQuailExecution:
             ),
         )
 
+    def _retained_placement(self, outputs):
+        self.retained = {}
+        placement = {}
+        for worker, output in enumerate(outputs):
+            for alias, documents in output.get("retained", {}).items():
+                self.retained.setdefault(alias, set()).update(documents)
+                placement.setdefault(
+                    alias, [[] for _ in range(self.gpu_count)]
+                )
+                placement[alias][worker] = list(documents)
+        self.prior_shards = placement
+
     def snapshot_after_filters(self):
         from quail.planner.budgets import PAGE_TOKENS
 
@@ -269,6 +263,8 @@ class DistributedQuailExecution:
             retained_after_filters=len(lengths),
             retained_pages_after_filters=sum(-(-n // PAGE_TOKENS) for n in lengths),
             retained_prefix_tokens_after_filters=sum(lengths),
+            retained_by_alias_after_filters={
+                alias: len(documents) for alias, documents in self.retained.items()},
         )
 
     def report(self):

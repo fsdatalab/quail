@@ -13,6 +13,7 @@ import time
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
+from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
@@ -314,6 +315,8 @@ def _child_boot(state, sub):
     state["boot"] = boot
 
 
+
+
 def _child_filters(state, sub):
 
     _child_boot(state, sub)
@@ -322,6 +325,8 @@ def _child_filters(state, sub):
     arena = state["arena"]
     if sub.get("start_query", True):
         _reset_child_query(state)
+        config = sub.get("retention", {})
+        apply_retention(arena, config, config.get("initial", {}))
     out = dict(filters={}, survivors={}, retained={}, fresh_tokens=0,
                boot_s=boot["boot_s"], boot_kind=boot["kind"],
                boot=boot)
@@ -373,6 +378,10 @@ def _child_filters(state, sub):
             out["survivors"][alias] = list(
                 result.outputs[f"ids:{alias}"]
             )
+    for alias, document in arena.accounting.retained:
+        out["retained"].setdefault(alias, []).append(document)
+    out["retained"] = {alias: sorted(set(documents))
+                       for alias, documents in out["retained"].items()}
     torch.cuda.synchronize()
     out["wall_s"] = round(time.perf_counter() - t0, 2)
     out["peak_gib"] = round(
@@ -397,14 +406,11 @@ def _child_joins(state, sub):
     anchor_alias = node.anchor
     anchors_glob = list(sub["anchor_index"])
     anchor_docs = sub["anchor_docs"]
-    # kept KV whose consumer groups are behind us, and kept anchors a
-    # barrier thinned off this shard, have no reader here
-    drop = set(sub.get("drop_kept") or ())
-    alive_now = set(anchors_glob)
-    for key in list(arena.accounting.retained):
-        stale = key[0] == anchor_alias and key[1] not in alive_now
-        if key[0] in drop or stale:
-            arena.free_key(key)
+    config = sub.get("retention", {})
+    live = {alias: partner["index"] for alias, partner in sub["partners"].items()}
+    live[anchor_alias] = anchors_glob
+    apply_retention(arena, config,
+                    config.get("before", {}).get(node.node_id, {}), live)
     retain_anchor = bool(sub.get("retain_anchor"))
     seen = state.setdefault("seen", set())
     out_joins, tokens_total = [], 0
@@ -438,7 +444,8 @@ def _child_joins(state, sub):
             alive = (not matched if group[-1]["semantics"] == "anti"
                      else matched)
             if alive and retain_anchor:
-                arena.retain(anchor_keys[a], len(prefixes[a]))
+                retain_after_join(arena, anchor_keys[a], len(prefixes[a]), config,
+                                  config.get("after", {}).get(node.node_id, {}))
             else:
                 arena.free_key(anchor_keys[a])
 
@@ -473,7 +480,8 @@ def _child_joins(state, sub):
             alive = (not matched if group[-1]["semantics"] == "anti"
                      else matched)
             if alive and retain_anchor:
-                arena.retain(key, len(prefixes[a]))
+                retain_after_join(arena, key, len(prefixes[a]), config,
+                                  config.get("after", {}).get(node.node_id, {}))
             else:
                 arena.free_key(key)
         tokens_total += result.metrics.fresh_tokens

@@ -27,6 +27,14 @@ class FakeAccounting:
         self.retained = set()
         self.n_pages = 100
         self.page_tokens = 16
+        self.retention_cap_pages = None
+
+    def configure_retention(self, policy, cap_pages):
+        self.retention_policy = policy
+        self.retention_cap_pages = cap_pages
+
+    def pages_needed(self, tokens):
+        return -(-tokens // self.page_tokens)
 
     @property
     def retained_pages(self):
@@ -48,9 +56,12 @@ class FakeArena:
         self.accounting.owned.discard(key)
         self.accounting.retained.discard(key)
 
-    def retain(self, key, prefix_tokens):
+    def retain(self, key, prefix_tokens, priority=None):
         self.accounting.owned.add(key)
         self.accounting.retained.add(key)
+
+    def evict_retained(self, pages):
+        return ()
 
     def reset_stats(self):
         pass

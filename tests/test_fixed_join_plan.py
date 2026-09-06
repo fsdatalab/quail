@@ -103,10 +103,11 @@ def test_fev9_executes_saved_order_with_actual_survivors(
                 execution_patch.setattr("quail.planner.joins.search_joins", unexpected_search)
                 report = execute_single_graph(state, request.plan["settings"], graph)
             assert model.filters[-1] == (groups[0].anchor, True)
-            assert all(not keep for _, keep in model.filters[:-1])
+            anchors = {group.anchor for group in groups}
+            assert {alias for alias, keep in model.filters if keep} == anchors
             assert not state["arena"].accounting.owned
             assert report["kv_manager"]["retained_after_filters"] == (
-                0 if empty else min(capacity, 2))
+                0 if empty else min(capacity, 2) * len(anchors))
             assert [step["id"] for step in report["executed_join_plan"]
                     if step["type"] == AnchoredJoin.type_name] == [g.node_id for g in groups]
             return PhysicalResponse(report.pop("_outputs"), report)
@@ -126,7 +127,8 @@ def test_every_backend_filters_its_first_anchor_last(backend):
         if backend == "quail":
             first = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0].anchor
             filters = plan.graph.nodes_by_type(PackedFilter.type_name)
-            assert [node.alias for node in filters if node.keep_kv] == [first]
+            assert {node.alias for node in filters if node.keep_kv} == {
+                group.anchor for group in plan.graph.nodes_by_type(AnchoredJoin.type_name)}
         else:
             execution = next(node for node in plan.nodes if hasattr(node, "joins"))
             first = execution.joins[0].anchor
@@ -212,6 +214,10 @@ def test_retention_search_matches_enumeration():
         for anchors in itertools.product(*(spec["aliases"] for spec in order)):
             work, records = walk(list(zip(order, anchors)), live, lengths, {},
                                  5, QWEN3_4B_FP8, H100_SXM)
-            assert all(record["resident"] != "filter" for record in records[1:])
+            seen = set()
+            for record in records:
+                if record["anchor"] in seen:
+                    assert record["resident"] != "filter"
+                seen.add(record["anchor"])
             costs.append(speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 8192).seconds)
     assert speed_of_light(result["work"], QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)

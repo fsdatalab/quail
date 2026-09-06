@@ -38,6 +38,7 @@ execution request to the compute provider.
 | `planner/plan.py` | PhysicalPlan, Refusal, and EngineConfig | physical, specs |
 | `planner/__init__.py` | The public planning interface backends import: `collect_operators`, `plan_query`, `plan_quail`, `preamble_tokens`, `order_filters_indexed`, `join_specs`, `balanced_shards` | decide, plan |
 | `planner/decide.py` | All planner decisions (order, anchor, budgets, sharding) | logical, budgets, plan |
+| `planner/retention.py` | Expected length allocations and future anchor use probabilities | joins, qwen3_cost, executor/retention |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
 | `executor/pack.py` | Chunk packing (pack_stream, FilterAdmission) | nothing |
@@ -160,8 +161,8 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    Quail's chunk size, KV capacity, predicate order, and filter limit are not
    fields that another backend must supply.
 7. The planner chooses the complete join order and anchors from selectivity
-   estimates. It schedules the first anchor's filters last and retains their
-   survivors' KV within capacity. `Exchange` nodes prune actual survivors
+   estimates. It schedules the first anchor's filters last and shares retained
+   KV capacity across inputs with future anchor uses. `Exchange` nodes prune actual survivors
    between the planned join groups. Execution follows this graph without
    searching again.
 8. The worker creates an internal physical request. It uses the query's
@@ -489,8 +490,8 @@ honored, with a remark at plan time when a free choice prices lower.
 
 The search runs during planning with estimated survivor counts and document
 length summaries. Filter survival is assumed independent of document length.
-Multiple filter selectivities are multiplied. Each candidate gets filter KV
-credit only for its first anchor, bounded by the available retention space.
+Multiple filter selectivities are multiplied. Candidates share a bounded filter KV allocation across legal anchors.
+The first use of each anchor can receive retention credit.
 The selected order determines filter scheduling and the executable graph.
 Actual rows and available KV determine the work performed during execution,
 without changing the selected joins or anchors.
@@ -516,51 +517,40 @@ datasheet. No calibration constant is read anywhere. Stage outputs
 carry written_pos, semantics, and selectivity, so reordered
 predicates assemble into results correctly.
 
-**KV residency across operators** (`plan_keeps`, `keep_split` in
-`decide.py`; `RetainedPool` in `executor/retention.py`; the arena
-heap in `executor/arena.py`): document KV outlives its operator
-wherever a later one will read it.
+**KV residency across operators** (`planner/retention.py`,
+`executor/retention.py`, and the arena in `executor/arena.py`):
 
-- Only the first planned anchor's filter chain keeps its survivors' KV
-  after filtering. Other filter chains run first and release their KV when
-  they finish. Their passing row IDs and source tokens remain on CPU.
-  The anchor's filters run last. Passing prefixes are offered to the bounded
-  retained pool and rewound to the preamble and document.
-- **The scan ring.** Before a filter with retention starts, the
-  loop reserves pages for two chunk budgets of document KV - one
-  chunk executing while the next is packed - and the retained pool
-  gets a fixed capacity of what is left. If an earlier operator's
-  retained KV crowds the ring, the prefixes with the fewest tokens
-  per page are evicted once, in bulk, up front. Admission never waits
-  on retention, and the filter runs full chunks for the whole scan.
-- **The retained pool** (`RetainedPool.offer`). While the pool has
-  room, every offered survivor is kept. Once full, the residents
-  with the fewest prefix tokens per page are candidates to make room.
-  The newcomer replaces them only when its prefix contains more tokens
-  than the victims contain together. Total retained prefix tokens only
-  rise, and equal token counts never swap. A replacement is heap
-  bookkeeping in the answer path, never a stalled forward pass.
-- A join group whose anchor the next group reuses retains its gate
-  survivors the same way, so a gate between two same-anchor stages
-  no longer forces a recompute. Thinned-out documents and retained
-  KV with no future consumer are freed the moment that is known,
-  and the arena is empty when the query ends.
-- The runtime never evicts to admit a cache entry. Every admission
-  is a computation the query requires; only retention is optional.
-  During joins, activating a missing anchor under pressure evicts
-  retained prefixes in increasing prefix tokens per page;
-  the arena stores that order in a heap. The same path survives in
-  filter admission only as a safety valve that the ring makes
-  unreachable in normal operation. Pinned keys in use by the running
-  operator are not eviction candidates.
-- The plan-time half is the *credit*: `keep_split` prices in the
-  expected resident fraction the keep budget can hold - the arena
-  minus the same two-chunk working reservation the ring makes -
-  using the corpus length distribution. The runtime can favor any
-  prefix whose last page is fuller, so the plan does not assume a
-  length threshold. Only one filter input receives credit in the selected
-  plan. Actual retention remains bounded when more documents pass than the
-  estimates predicted.
+- All filtered inputs with a planned anchor use can retain document KV. The first
+  anchor's filters still run last. Retention uses one shared pool per GPU.
+- A prefix with `L` tokens occupies `ceil(L / 16)` pages. The priority is
+  `q * C(L) / pages`, where `q` is its predicted probability of reaching its next
+  anchor use and `C(L)` is the ideal prefix computation cost. The cost includes
+  linear dense computation and quadratic causal attention computation.
+- A passing document is offered without multiplying by its completed filter's
+  selectivity again. If the pool exceeds its cap, the lowest priority prefix is
+  evicted. Equal priorities prefer earlier reuse, then lower document position.
+  The new candidate can itself be evicted. This is a replacement heuristic, not
+  an exact solution for indivisible document prefixes.
+- The cap reserves two execution chunks. Evictions return pages to filter
+  admission. Active prefixes stay protected. An arena allocation that still
+  needs more pages uses the same eviction priority.
+- The plan records future use probabilities before and after each join group.
+  At a boundary, the executor releases expired or known dead prefixes and
+  updates retained priorities. Completed anchors with another planned use are
+  offered using their next use's priority. Other sets' useful KV remains retained.
+- Planning scales each input length histogram by filter selectivity and fills
+  expected capacity in priority order. The last length group may receive a
+  fractional allocation. Expected pages per set are estimates, not partitions.
+- Selinger search includes the set of previously used anchors in its state.
+  Filter KV can be credited at a later anchor's first use. The search uses a
+  shared allocation across legal anchor aliases. The selected order then supplies
+  next-use probabilities and a refined allocation for its actual anchors.
+  Search and final allocation are approximate together; no global optimum is
+  claimed. Reuse after a nonconsecutive repeat of an anchor is conservatively
+  priced as recomputation, even though execution may retain it.
+- Both Quail execution paths follow the saved decisions. Child workers report
+  all retained aliases after every round, so the coordinator can preserve the
+  placement of useful KV when another input's filtering evicts prefixes.
 
 Every stage records the residency its cost assumed
 (`anchor_resident`: none / filter / kept), so `explain()` shows
@@ -661,10 +651,10 @@ single forward pass, sharing KV across them through a paged arena.
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
 | `unrounded_seconds` | `sol.py` | Component limits without forward pass rounding |
-| `search_joins` | `joins.py` | Choose join order and anchors before execution from estimated survivors, length summaries, and first-anchor KV credit |
-| `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: the fraction of expected survivors that fits beside the scan reserve |
-| `RetainedPool` | `executor/retention.py` | Fixed-capacity retained pool: keep while room, then replace residents with fewer prefix tokens per page only when total retained prefix tokens rise |
-| `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the fewest prefix tokens per page |
+| `search_joins` | `joins.py` | Choose join order and anchors from estimated survivors, length summaries, and shared retention credit |
+| `allocate` / `schedule` | `retention.py` | Estimate retained length groups and record future anchor use probabilities |
+| `RetentionPolicy` | `executor/retention.py` | Rank document prefixes by expected computation saved per KV page |
+| `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the lowest future reuse priority |
 | `contiguous_shards` | `decide.py` | Split the initial scan into compact contiguous ranges with similar token counts |
 | `balanced_shards` | `decide.py` | Reassign a smaller live document set across workers by token count |
 | `optimize_left_deep` | `leftdeep.py` | Subset DP over joined aliases and a caller supplied physical property, with a nondominated Work frontier |
@@ -1023,14 +1013,14 @@ that runs until `FilterAdmission.done()`:
    freed immediately; survivors advance to their next stage.
    Documents leaving their last stage free their pages too - unless
    the plan marks the chain `keep_kv`, where each survivor is
-   offered to the `RetainedPool`. A kept prefix is rewound to
+   offered to the shared retention pool. A kept prefix is rewound to
    preamble + document (`arena.retain`), held under its stable
    `(alias, doc)` key with its exact prefix token count. The pool's
    capacity is the arena minus the scan ring - pages for two chunk
    budgets reserved before the loop starts - so retention can never
    starve admission. Once full, a survivor displaces residents with
-   fewer prefix tokens per page only when it contains more tokens than
-   they contain together. The join recomputes any document that was never
+   lower expected computation saved per KV page. The new survivor can
+   itself be discarded. The join recomputes any document that was never
    kept, or was displaced, if it anchors on it later.
 
 Single-stage queries (one question) skip the arena entirely: no
@@ -1076,11 +1066,10 @@ survivor, or a kept anchor of an earlier group - packs no prefix
 tokens at all: the frame scatters into the kept pages and the tuple
 suffixes read the document KV that is already there. Kept pages
 without row room for this run's frame are freed and recomputed (a
-runtime anchor re-pick can land on an alias whose filter reserved a
-smaller frame). With `keep_semantics` set, the group's gate
+retained filter prefix can have less space than its join frame needs). With `keep_semantics` set, the group's gate
 survivors keep their pages at the end for a later group on the same
 table. Under allocation pressure the arena frees retained prefixes
-in increasing prefix tokens per page. The
+in increasing expected computation saved per KV page. The
 worker frees every kept key the moment its last consumer group is
 behind, and sweeps kept keys at query start and end - the arena
 outlives a query, kept KV must not.
@@ -1300,7 +1289,7 @@ for node in the planned graph:
             partners = all live partner documents
             send the node and its input document positions to child w
         collect and merge disjoint anchor answers
-        retain surviving anchor KV only if the next group uses it
+        retain surviving anchor KV if any later group uses it
 ```
 
 ### Key functions: coordinator and worker

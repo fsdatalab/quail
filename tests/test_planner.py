@@ -597,7 +597,7 @@ def test_filter_keep_makes_the_join_anchor_resident(catalog):
     stage = group.stages[0]
     assert stage.anchor_resident == "filter"
     assert stage.tuple_tokens == pytest.approx(expect)
-    assert any("keep KV on 'r'" in r for r in plan.remarks)
+    assert any("shared KV on 'r'" in r for r in plan.remarks)
 
 
 def test_unfiltered_anchor_is_not_resident(catalog):
@@ -614,28 +614,6 @@ def test_unfiltered_anchor_is_not_resident(catalog):
     assert not any("keep KV" in r for r in plan.remarks)
 
 
-def test_keep_split_credits_a_uniform_survivor_fraction():
-    from quail.planner.decide import keep_split
-
-    docs_tok = [100, 200, 300, 400]
-    # Page-rounded costs total 1,040 tokens. A 720-token budget
-    # credits the same fraction from every length class.
-    split = keep_split(docs_tok, 720, 1.0, overhead=4, page_tokens=16)
-    assert split["resident_fraction"] == pytest.approx(720 / 1040)
-    assert split["kept_expected_tokens"] == 720
-
-    # survival halves the expected mass, so half the budget keeps the
-    # same resident fraction
-    half = keep_split(docs_tok, 360, 0.5, overhead=4, page_tokens=16)
-    assert half["resident_fraction"] == pytest.approx(720 / 1040)
-    assert half["kept_expected_tokens"] == 360
-
-    # Everything fits at fraction 1. A budget smaller than every
-    # complete prefix gets no resident credit.
-    assert keep_split(
-        docs_tok, 1e9, 1.0, 4, 16)["resident_fraction"] == 1.0
-    assert keep_split(docs_tok, 100, 1.0, 4, 16) is None
-
 
 def test_keep_capped_by_arena_resident_fraction(catalog):
     # The arena minus the loop's two-chunk working reservation credits
@@ -648,7 +626,7 @@ def test_keep_capped_by_arena_resident_fraction(catalog):
     assert chain.keep_kv is True
     assert chain.keep_min_doc_tokens == 1
     assert 0 < chain.keep_resident_fraction < 1
-    assert any("% of survivors" in r for r in plan.remarks)
+    assert any("expected pages per worker" in r for r in plan.remarks)
     group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
     assert group.anchor_resident == "filter"
 
