@@ -277,6 +277,8 @@ class QueryResult:
         result.schema = table.schema
         result.report = report or {}
         result.answer_tables = {"filters": {}, "joins": {}}
+        result.plan = None
+        result.node_metrics = {}
         result.limit = None
         result._declaration = None
         result._document_index_schema = None
@@ -336,6 +338,25 @@ class QueryResult:
             return reader.read_all()
         finally:
             reader.close()
+
+    def attach_executed_plan(self, codecs) -> "QueryResult":
+        """Decode the executed plan and node metrics from the report.
+
+        A result that crossed a process boundary carries them encoded
+        in its report; codecs are the receiving registry's.
+        """
+        from quail.physical import decode_graph
+        from quail.runtime.runner import NodeMetrics
+
+        encoded = self.report.get("executed_plan")
+        if encoded is not None:
+            self.plan = decode_graph(encoded, codecs)
+            self.node_metrics = {
+                node_id: NodeMetrics(**metrics)
+                for node_id, metrics in self.report.get(
+                    "node_metrics", {}).items()
+            }
+        return self
 
     def explain_analyze(self) -> str:
         """Return the executed physical plan with each node's metrics."""

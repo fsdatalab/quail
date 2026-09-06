@@ -15,12 +15,14 @@ from quail.execution import document_input, PhysicalRequest
 from quail.extensions import ExtensionRegistry
 from quail.logical import CompileError, LogicalPlan
 from quail.logical_optimizer import apply_logical_rules, LogicalPlanningContext
-from quail.physical import DocumentInput, PortRef, Project, ValueType
+from quail.physical import (DocumentInput, PortRef, Project, ValueType,
+                            encode_graph)
 from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.runtime.compute import ModalComputeProvider, QueryRequest
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
-from quail.runtime.runner import ExecutionContext, GenericRunner, NodeMetrics
+from quail.runtime.runner import (ExecutionContext, GenericRunner,
+                                  NodeMetrics, scalar_node_metrics)
 from quail.runtime.tokens import TokenStore
 from quail.sqlfront import compile_sql, SQLDialect
 
@@ -477,6 +479,11 @@ class Query:
             node_id: node_result.metrics
             for node_id, node_result in run.nodes.items()
         }
+        # the executed plan and every node's metrics cross a process
+        # boundary inside the report; the client decodes them back
+        report["executed_plan"] = encode_graph(
+            plan.graph, self.session.registry.codecs)
+        report["node_metrics"] = scalar_node_metrics(run.nodes)
         observer_reports = {
             observer.name: dict(observer.report())
             for observer in observers

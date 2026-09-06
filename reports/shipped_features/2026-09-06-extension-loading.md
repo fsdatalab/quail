@@ -26,9 +26,20 @@ Date: 2026-09-06.
 - **Metrics live on the result.** A finished `QueryResult` carries the
   executed `PhysicalGraph` as `plan` and each node's `NodeMetrics` as
   `node_metrics`, and `explain_analyze()` prints them, like DataFusion's
-  `ExecutionPlan::metrics()` and `EXPLAIN ANALYZE`. Observers stay for
-  work that must happen during execution; `result.observer(cls)`
-  returns one's report.
+  `ExecutionPlan::metrics()` and `EXPLAIN ANALYZE`. They cross the
+  Modal boundary encoded in the report (`executed_plan` and
+  `node_metrics`), and `ModalComputeProvider` decodes them with the
+  client's codecs. The generic runner now times every node whose
+  runtime does not time itself, so model nodes in the Quail backend
+  carry wall seconds too. Observers stay for work that must happen
+  during execution; `result.observer(cls)` returns one's report.
+- **A GPU smoke for the round trip.** `experiments/cells/extension_smoke.py`
+  registers an observer from `experiments/cells/row_trace.py`, runs a
+  40-document filter through `ModalComputeProvider`, and prints the
+  executed plan, the observer's report, and the cost ledger totals.
+  Its run on 2026-09-06 (`fc-01M1T8FBS5NXXX8SH8G3W13PZ2`) returned all
+  25 planted rows, the filter node's 0.070 s on the GPU, and 8,720
+  fresh tokens.
 - **The example needs no registration.** `quail_ext_examples/cost_ledger.py`
   is a function, `charge(result)`, that turns the plan and metrics into
   per node rows and totals with GPU dollars. It replaces the observer

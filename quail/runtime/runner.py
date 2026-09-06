@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+import time
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.physical import (
@@ -197,9 +198,17 @@ class GenericRunner:
                 ]
                 for input_port in node.inputs
             }
+            started = time.perf_counter()
             result = context.runtimes[node.runtime_key].execute(
                 node, inputs, context
             )
+            if result.metrics.wall_s == 0.0:
+                # a runtime that does not time itself is timed here, so
+                # every executed node carries its wall seconds
+                result = replace(result, metrics=replace(
+                    result.metrics,
+                    wall_s=time.perf_counter() - started,
+                ))
             expected = {output.name for output in node.outputs}
             missing = expected - set(result.outputs)
             extra = set(result.outputs) - expected

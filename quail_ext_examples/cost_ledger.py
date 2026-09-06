@@ -28,8 +28,8 @@ from __future__ import annotations
 H100_USD_PER_HOUR = 3.9492
 
 _SUMMED = (
-    "wall_s", "evaluated_documents", "evaluated_document_pairs",
-    "fresh_tokens", "cached_tokens", "usd",
+    "evaluated_documents", "evaluated_document_pairs",
+    "fresh_tokens", "cached_tokens",
 )
 
 
@@ -45,8 +45,10 @@ def charge(result, *, usd_per_gpu_hour: float = H100_USD_PER_HOUR,
     if result.plan is None:
         raise ValueError("the query has no executed physical plan")
     rows = []
+    wall_s = 0.0
     for node in result.plan.topological_nodes():
         metrics = result.node_metrics[node.node_id]
+        wall_s += metrics.wall_s
         rows.append({
             "node_id": node.node_id,
             "node_type": node.type_name,
@@ -60,8 +62,8 @@ def charge(result, *, usd_per_gpu_hour: float = H100_USD_PER_HOUR,
             "usd": round(metrics.wall_s / 3600 * usd_per_gpu_hour * gpus, 8),
         })
     totals = {key: sum(row[key] for row in rows) for key in _SUMMED}
-    totals["wall_s"] = round(totals["wall_s"], 6)
-    totals["usd"] = round(totals["usd"], 8)
+    totals["wall_s"] = round(wall_s, 6)
+    totals["usd"] = round(wall_s / 3600 * usd_per_gpu_hour * gpus, 8)
     return {
         "usd_per_gpu_hour": usd_per_gpu_hour,
         "gpus": gpus,

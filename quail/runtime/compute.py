@@ -181,7 +181,9 @@ class ModalComputeProvider:
             raise TypeError("a Modal worker must return an Arrow table")
         if not isinstance(report, Mapping):
             raise TypeError("a Modal worker must return a report mapping")
-        return QueryResult.from_table(table, report=dict(report))
+        result = QueryResult.from_table(table, report=dict(report))
+        return result.attach_executed_plan(
+            registry_from_manifest(request.extensions).codecs)
 
     def close(self) -> None:
         """Release the selected Modal Functions."""

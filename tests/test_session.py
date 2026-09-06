@@ -323,10 +323,11 @@ def test_result_carries_the_executed_plan_and_node_metrics(tmp_path):
     assert set(ledger["totals"]) == {
         "wall_s", "evaluated_documents", "evaluated_document_pairs",
         "fresh_tokens", "cached_tokens", "usd"}
-    assert ledger["totals"]["usd"] == round(
-        ledger["totals"]["wall_s"] / 3600 * ledger["usd_per_gpu_hour"], 8)
-    assert cost_ledger.charge(result, gpus=2)["totals"]["usd"] == round(
-        2 * ledger["totals"]["usd"], 8)
+    assert ledger["totals"]["usd"] == pytest.approx(
+        ledger["totals"]["wall_s"] / 3600 * ledger["usd_per_gpu_hour"],
+        abs=1e-8)
+    assert cost_ledger.charge(result, gpus=2)["totals"]["usd"] == \
+        pytest.approx(2 * ledger["totals"]["usd"], abs=1e-8)
 
 
 def test_observer_sees_the_complete_physical_graph(tmp_path):
@@ -344,3 +345,21 @@ def test_observer_sees_the_complete_physical_graph(tmp_path):
     assert result.observer(NodeTypes) is result.observer("test.node_types")
     with pytest.raises(KeyError):
         result.observer("example.missing")
+
+
+def test_executed_plan_survives_the_report_round_trip(tmp_path):
+    from quail.runtime.result import QueryResult
+
+    registry = quail.ExtensionRegistry.with_built_ins()
+    result = _observed_result(tmp_path, registry)
+    # what a Modal worker returns: the collected table and the report
+    table, report = result.collect(), dict(result.report)
+
+    restored = QueryResult.from_table(table, report=report)
+    assert restored.plan is None
+    restored.attach_executed_plan(registry.codecs)
+
+    assert [node.node_id for node in restored.plan.topological_nodes()] == [
+        node.node_id for node in result.plan.topological_nodes()]
+    assert restored.node_metrics == result.node_metrics
+    assert restored.explain_analyze() == result.explain_analyze()
