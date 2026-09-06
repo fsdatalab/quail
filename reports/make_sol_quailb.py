@@ -73,7 +73,7 @@ The scale factor defaults to 0.1. The collection supplies all four
 query families. The run stops if the collection is for a different
 scale factor than the one requested.
 
-The report is reports/2026-08-29-sol-quailb.md.
+The saved estimates must be regenerated when a query definition changes.
 """
 import collections
 import itertools

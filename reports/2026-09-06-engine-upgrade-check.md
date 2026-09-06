@@ -13,8 +13,8 @@ Date: 2026-09-06. One H100! per query family on Modal, Qwen3 4B fp8.
   new images through the same-GPU runner: IMDB-1, IMDB-2, BIO-1, FEV-4,
   LEP-1, LEP-8. Every method ran all six.
 - The comparison is the same six queries from the full run of
-  2026-09-05 on the old images (`reports/2026-09-05-quailb-two-regrets.md`),
-  on different physical H100s. The two runs were 22 hours apart.
+  2026-09-05 on the old images, on different physical H100s. The two runs
+  were 22 hours apart. Neither comparison includes FEV-9.
 - The new images' kernel caches (Triton, DeepGEMM, vLLM's compile cache)
   started empty. Query time excludes boot, but the first query after a
   cold boot pays any compilation that happens on first use.
@@ -124,7 +124,8 @@ New-image run `20260906T011248Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families`:
   LePaRD `fc-01M1T4D2BVE3N72FKDTMQSQ5ME`, `fc-01M1T4D2E3FWDD3SC7C7GR8ME8`.
 
 Old-image run `20260905T021527Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families`:
-see `reports/2026-09-05-quailb-two-regrets.md`.
+`/results/benchmarks/quailb/family-runs/20260905T021527Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json`
+on the `quail-results` volume.
 
 ## Rebuild
 

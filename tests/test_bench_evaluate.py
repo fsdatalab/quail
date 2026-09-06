@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 import quail
 from quail.bench.evaluate import (
@@ -72,6 +73,57 @@ def _truth():
             ),
         },
     )
+
+
+@pytest.mark.parametrize("backend", [
+    "quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang",
+])
+def test_fev9_filters_every_input_and_reuses_existing_predicate_labels(backend):
+    from quail.bench.judge_pass import PREDICATES, predicate_payload
+    from quail.bench.quailb import F11, F13, REFUTE, SUPPORT, queries
+    from quail.planner import collect_operators
+    from quail.planner.plan import Refusal
+    from quail.runtime.result import build_result_declaration
+
+    corpus = {
+        "claims": pa.table({"id": ["c0", "c1", "c2"],
+                            "claim": ["person one", "person two", "a place"]}),
+        "evidence": pa.table({"id": ["e0", "e1", "e2"],
+                              "text": ["person one", "person two", "a place"]}),
+    }
+    true_pairs = {
+        SUPPORT: {("c0", "e0"), ("c1", "e1"), ("c2", "e0"), ("c1", "e2")},
+        REFUTE: {("c1", "e0"), ("c2", "e0"), ("c0", "e2")},
+    }
+    predicates = {}
+    for spec in PREDICATES:
+        if spec.template not in (F11, F13, SUPPORT, REFUTE):
+            continue
+        ids = corpus[spec.left_table]["id"].to_pylist()
+        answers = (
+            {(row_id, None): index < 2 for index, row_id in enumerate(ids)}
+            if spec.kind == "filter" else {
+                (left, right): (left, right) in true_pairs[spec.template]
+                for left in ids for right in corpus[spec.right_table]["id"].to_pylist()
+            }
+        )
+        predicates[spec.key] = PredicateLabels(
+            spec.key, f"ls_{spec.key}", predicate_payload(spec), answers, {},
+        )
+    truth = GroundTruthCollection("gt_fev9", "c_fev9", 0.1, None, predicates)
+    evaluator = BenchmarkEvaluator(truth, corpus)
+
+    with quail.Session(EngineConfig(backend=backend), tokenizer=lambda text: list(
+        text.encode("utf-8"))) as session:
+        for name, table in corpus.items():
+            session.register(name, DocumentProvider.from_table(table, id_col="id"))
+        query = queries(session)["FEV-9"][1]()
+        assert not isinstance(query.plan(), Refusal)
+        scans, filters, joins = collect_operators(query.logical)
+        survivors, pairs = evaluator._expected_answer_tables(query, scans, filters, joins)
+        result, _ = build_result_declaration(pairs.values(), survivors, "c1")
+        table = result.to_table().select(["c1", "e1", "c2", "e2"])
+        assert table.to_pydict() == {"c1": [0], "e1": [0], "c2": [1], "e2": [1]}
 
 
 def _query(tmp_path, backend="quail"):

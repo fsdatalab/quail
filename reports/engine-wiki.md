@@ -1448,7 +1448,7 @@ graph LR
 | FEV-6 | 3F + 1J two-sided | F11 + F12 on claims, F13 on evidence |
 | FEV-7 | 2J star | SUPPORT + REFUTE, same anchor |
 | FEV-8 | 3J chain | c1-e1-c2-e2 |
-| FEV-9 | F11 + 3J chain | F11 then c1-e1-c2-e2 |
+| FEV-9 | 4 filters + 3 joins | F11 on c1 and c2, F13 on e1 and e2, then c1-e1-c2-e2 |
 
 **LePaRD** (8 queries): citation contexts joined with citation passages
 

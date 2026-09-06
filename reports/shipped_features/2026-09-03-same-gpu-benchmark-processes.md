@@ -20,5 +20,6 @@ installed together without overriding one backend's declared dependencies.
 LEP-1 confirmed the new runner. Both groups used
 `GPU-a4f6d03a-f439-f748-6bc2-2c4da514482c`, and each left 4 MiB in use after
 exit. The confirmation report was removed on 2026-09-06 once the full
-benchmark ran through this runner
-(`reports/2026-09-05-quailb-two-regrets.md`).
+benchmark ran through this runner. The full-run data is on the
+`quail-results` volume at
+`/results/benchmarks/quailb/family-runs/20260905T021527Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json`.

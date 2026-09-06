@@ -56,7 +56,7 @@ scope.
 The values are analytical. No GPU run was needed. The result data is at
 `/results/sol/sol_quailb_sf0.1.json` on the `quail-results` volume. The full
 table and plots are in the deleted report `2026-08-26-sol-quailb.md`
-(in git history), superseded by `reports/2026-08-29-sol-quailb.md`.
+(in git history). These values describe earlier query definitions.
 
 ## Verification
 

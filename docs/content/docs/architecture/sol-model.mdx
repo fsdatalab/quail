@@ -327,8 +327,10 @@ policy are separate from this exact analysis.
 
 ## 7. Every QUAIL-B query
 
-`reports/2026-08-29-sol-quailb.md` applies all of this to the 30 current
-queries at sf=0.1 on Qwen3-4B-fp8 and Qwen3-32B-fp8, from measured
-document lengths, measured prompt lengths, and exact active ground
-truth labels. `reports/make_sol_quailb.py` produces the report data.
-The mounted volume path is `/results/sol/sol_quailb_sf0.1.json`.
+`reports/make_sol_quailb.py` applies this model to the 32 default queries
+at sf=0.1 on Qwen3 4B fp8 and Qwen3 32B fp8. It uses document lengths,
+prompt lengths, and active ground-truth labels.
+
+The saved estimates at `/results/sol/sol_quailb_sf0.1.json` on the
+`quail-results` volume predate the four-filter FEV-9 definition. Regenerate
+them before comparing the current suite with those estimates.

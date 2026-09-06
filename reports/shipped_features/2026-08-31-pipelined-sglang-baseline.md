@@ -64,6 +64,6 @@ submission pattern itself.
 ## Numbers
 
 The first measured comparison covered BIO-2 and AGENT-1 at sf=0.1.
-The current numbers, on all 32 queries through the request backend
-that replaced this runner, are in
-`reports/2026-09-05-quailb-two-regrets.md`.
+The later full-run data is on the `quail-results` volume at
+`/results/benchmarks/quailb/family-runs/20260905T021527Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json`.
+That run used the earlier FEV-9 definition with one filter.

@@ -705,14 +705,9 @@ F14 = ("Judge strictly from the claim above whether it references a "
 SUPPORT = ("Does the Wikipedia passage in DOCUMENT {1} support the "
            "claim in DOCUMENT {0}?")
 
-# FEV-7 only: a second question over the same evidence table, joined
-# under alias e2.
 REFUTE = ("Does the Wikipedia passage in DOCUMENT {1} refute or "
           "contradict the claim in DOCUMENT {0}?")
 
-# FEV-5 only: filters the evidence side of a join, not just the
-# anchor. Mirrors F11's "about a person" judgment so the join pairs
-# claim and passage on the same axis, independently filtered.
 F13 = ("Judge strictly from the Wikipedia passage above whether it "
        "primarily describes a specific person (their life, actions, "
        "or role), rather than an organization, place, or event.\n\n"
@@ -1270,9 +1265,15 @@ def queries(sess):
         c1 = add_filter(
             sess.docs("claims").alias("c1"), F11,
             quail.col("c1.claim"))
-        e1 = sess.docs("evidence").alias("e1")
-        c2 = sess.docs("claims").alias("c2")
-        e2 = sess.docs("evidence").alias("e2")
+        e1 = add_filter(
+            sess.docs("evidence").alias("e1"), F13,
+            quail.col("e1.text"))
+        c2 = add_filter(
+            sess.docs("claims").alias("c2"), F11,
+            quail.col("c2.claim"))
+        e2 = add_filter(
+            sess.docs("evidence").alias("e2"), F13,
+            quail.col("e2.text"))
         qy = add_join(c1, e1, SUPPORT,
                       quail.col("c1.claim"), quail.col("e1.text"))
         qy = add_join(qy, c2, REFUTE,
@@ -1281,7 +1282,8 @@ def queries(sess):
                       quail.col("c2.claim"), quail.col("e2.text"))
         return qy.select(
             "c1.id", "e1.id", "c2.id", "e2.id", order="by_cost")
-    q["FEV-9"] = ("F11 -> 3J chain c1-e1-c2-e2", fev9)
+    q["FEV-9"] = ("4F + 3J: F11 on c1 and c2, F13 on e1 and e2, "
+                  "then the c1-e1-c2-e2 join chain", fev9)
 
     # FEV-7: star shape, both joins anchored on claims.
     q["FEV-7"] = ("2J, same anchor: J1 (SUPPORT) -> J2 (REFUTE), "

@@ -5,6 +5,11 @@ QUAIL-B has 32 filter and join queries at scale factor 0.1, plus
 when `register_privacy_sets()` has been called. The saved ground
 truth covers all 21 predicates used by the 32 default queries.
 
+FEV-9 filters both claim inputs with F11 and both evidence inputs with F13,
+then joins c1 with e1, e1 with c2, and c2 with e2. It has four filters and
+three joins. These filters reuse the existing predicate labels and selectivity
+estimates. Measurements made before this extension used only F11 on c1.
+
 A predicate is one exact TRUE or FALSE question, including its prompt and
 the input columns it reads. A query can use one predicate or combine several
 predicates. Ground truth is saved per predicate, document, or document pair.
