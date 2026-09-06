@@ -6,8 +6,8 @@ Date: 2026-09-05. One H100! per query family on Modal, Qwen3 4B fp8, all
 ## Setup
 
 - Four methods ran every query. Quail uses pipelining, token-based
-  admission, and KV rewind. Stock vLLM submits separate requests in
-  stage-major waves. Pipelined vLLM submits a document's next filter as
+  admission, and KV rewind. Stock vLLM uses operator-at-a-time filter
+  execution. Pipelined vLLM submits a document's next filter as
   soon as its current filter answers. Pipelined SGLang does the same
   through SGLang, in waves of blocking generate calls, and submits join
   pairs suffix-major in anchor tiles. All three request backends are

@@ -86,11 +86,10 @@ dataclass fields exactly, so a changed node shape fails loudly instead
 of silently dropping a field.
 
 `plan_envelope` wraps the encoded graph with the backend, model,
-device, worker count, settings, and the list of extension module
-names. The worker imports those modules, rebuilds its registry, and
-refuses the plan if any codec, backend, model, device, or runtime is
-missing. There is no separate plan version number; the registered
-type names are the contract.
+device, worker count, and settings. The worker uses the registry from
+the query request and refuses the plan if any codec, backend, model,
+device, or runtime is missing. There is no separate plan version number;
+the registered type names are the contract.
 
 `explain_fields()` is separate from `attributes()` so a node can omit
 large values such as token id lists from the printed plan.

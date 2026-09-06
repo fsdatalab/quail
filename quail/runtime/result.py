@@ -340,11 +340,7 @@ class QueryResult:
             reader.close()
 
     def attach_executed_plan(self, codecs) -> "QueryResult":
-        """Decode the executed plan and node metrics from the report.
-
-        A result that crossed a process boundary carries them encoded
-        in its report; codecs are the receiving registry's.
-        """
+        """Decode the executed plan and node metrics from a saved report."""
         from quail.physical import decode_graph
         from quail.runtime.runner import NodeMetrics
 

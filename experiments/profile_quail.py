@@ -207,7 +207,7 @@ def _run_query(state, build, captured):
     )
 
     def execute(request):
-        request, registry, graph, _ = _validate_physical_request(request)
+        request, registry, graph, _ = _validate_physical_request(request, query.session.registry)
         payload = quail_runtime_payload(request, graph)
         answerer = _PayloadAnswerer(
             state["torch"], state["F"], state["model"],

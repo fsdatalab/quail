@@ -340,8 +340,8 @@ def _token_list(values) -> list[int]:
     return [int(token) for token in values]
 
 
-def _stage_major_filter(client, sampling_params, bodies, questions, true_ids,
-                        block_size):
+def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
+                               true_ids, block_size):
     active = list(range(len(bodies)))
     answers = {}
     prior = {}
@@ -524,8 +524,8 @@ class RequestModelExecution:
                 + _token_list(self.documents[spec.alias][document])
                 for document in document_ids
             ]
-            if self.filter_submission == "stage-major":
-                result = _stage_major_filter(
+            if self.filter_submission == "operator-at-a-time":
+                result = _operator_at_a_time_filter(
                     self.client,
                     self.sampling_params,
                     bodies,

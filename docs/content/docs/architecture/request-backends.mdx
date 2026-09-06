@@ -10,7 +10,7 @@ None of them call Quail's executor.
 
 | Backend | Filters | Joins |
 | --- | --- | --- |
-| `stock_vllm` | One request wave per filter stage. Stage 2 starts when every stage 1 request has finished. | One request per tuple, anchor-major order. |
+| `stock_vllm` | Operator-at-a-time execution. Filter 2 starts when every filter 1 request has finished. | One request per tuple, anchor-major order. |
 | `pipelined_vllm` | The next stage's request is submitted as soon as one document passes. | Same as stock. |
 | `pipelined_sglang` | SGLang request waves that advance documents as they pass. | Suffix-major order inside bounded anchor groups so SGLang's prefix cache can reuse the anchor. |
 

@@ -130,30 +130,48 @@ Register objects on the session's registry, the way a DataFusion
 
 ```python
 import quail
-from quail.physical import NodeCodec
 
 from my_package.nodes import MyNode, MyNodeRuntime, PreferAllDocuments
 
 registry = (
     quail.ExtensionRegistry.with_built_ins()
-    .register_codec(NodeCodec(MyNode))
-    .register_runtime(MyNodeRuntime(), key=MyNode.runtime_key)
+    .register_node(MyNode, runtime=MyNodeRuntime())
     .register_physical_rule(PreferAllDocuments())
 )
-session = quail.Session(registry=registry)
+session = quail.Session(
+    registry=registry,
+    compute_provider=quail.ModalComputeProvider(
+        local_python_sources=("my_package",),
+    ),
+)
 ```
 
 The registry takes logical rules, physical planners, physical rules, model
-backends, models, devices, physical node codecs, physical node runtimes,
-remote source readers, and execution observers. Names come from the objects.
+backends, models, devices, physical nodes, remote source readers, and execution
+observers. Names come from the objects. `register_node` adds a node's codec
+and runtime together. The lookup tables are read-only; add objects through
+the registration methods.
 A package can also expose one entry point, `register_quail_extension(registry)`,
-and be loaded with `registry.load_extension(module, pip_packages=...)`.
+and be loaded with `registry.load_extension(module)`. If loading fails, the
+registry stays unchanged.
 
-Registered objects travel to the Modal worker pickled, in the manifest the
-query request and physical plan carry; the worker registers them again before
-it plans the query. The default `ModalComputeProvider` copies each object's
-top-level package into the existing `quail-engine` image and installs any pip
-packages declared through `load_extension`.
+The query sends the registry to Modal as a Python object. The worker uses
+that same registry for source preparation, planning, and execution.
+`load_extension` runs when called; module registration functions are not
+replayed during execution.
+
+Set `local_python_sources` and `pip_packages` on `ModalComputeProvider` to
+copy extension code and install its dependencies. Quail does not infer these
+packages from registered objects. The worker already includes `quail`.
+
+For registrations that create objects inside the worker, pass
+`initialize_worker=callback` to the provider. Quail calls `callback(registry)`
+once per query, before opening sources. The returned `QueryResult` contains
+the materialized Arrow rows, executed plan, and node metrics.
+
+The built-ins are Quail's default model and device specifications, backends,
+node implementations, and source readers. Registering them does not load
+model weights or start GPU processes.
 
 `ModalComputeProvider` calls a Modal Function in the existing `quail-engine`
 app. Quail does not run an application server. One Modal container receives
@@ -180,7 +198,7 @@ class ComputeProvider(Protocol):
 ```
 
 `QueryRequest` contains the logical plan, table providers, model settings, and
-registered extensions. `QueryResult` contains the final Arrow rows and the
+the registry. `QueryResult` contains the final Arrow rows and the
 execution report. A user can pass another provider through
 `Session(compute_provider=provider)`.
 

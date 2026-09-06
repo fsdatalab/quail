@@ -1,11 +1,13 @@
 """Remote source planning and execution tests."""
 
+from threading import Lock
+
+from modal._serialization import deserialize, serialize
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 import quail
 from quail.execution import PhysicalResponse
-from quail.extensions import ExtensionManifest
 from quail.planner.plan import EngineConfig
 
 
@@ -17,7 +19,6 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
     tmp_path, monkeypatch
 ):
     from quail.execution import export_physical_outputs
-    from quail.builtins import built_in_registry
     from quail.physical import DocumentInput, PackedFilter, decode_graph
     from quail.runtime import local as local_runtime
     from quail.runtime import worker
@@ -42,7 +43,7 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
     request = {
         "logical_plan": query.logical,
         "sources": {"docs": {"remote": {
-            "type": "parquet",
+            "type": "test.source",
             "paths": [str(path)],
             "id_col": "id",
         }}},
@@ -51,15 +52,41 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
         ),
         "device": "h100-sxm",
         "order": None,
-        "extensions": ExtensionManifest().to_value(),
+        "registry": local.registry,
     }
 
     monkeypatch.setattr(Session, "tokenizer", property(lambda self: _tokens))
     monkeypatch.setattr(Session, "_fast_tokenizer", lambda self: None)
+    calls = []
 
-    def execute(physical):
+    def initialize(registry):
+        assert registry is local.registry
+        calls.append("initialize")
+        lock = Lock()
+
+        def open_source(source):
+            with lock:
+                calls.append("source")
+            return quail.DocumentProvider.from_parquet(source["paths"], id_col="id")
+
+        class CheckPlanning:
+            name = "test.planning"
+
+            def rewrite(self, graph, context):
+                with lock:
+                    calls.append("plan")
+                return None
+
+        registry.register_source_reader(open_source, source_type="test.source")
+        registry.register_physical_rule(CheckPlanning())
+
+    def execute(physical, registry):
+        assert registry is local.registry
+        assert calls == ["initialize", "source", "plan"]
+        calls.append("execute")
+        assert "extensions" not in physical.plan
         graph = decode_graph(
-            physical.plan["graph"], built_in_registry().codecs
+            physical.plan["graph"], registry.codecs
         )
         source = next(
             node for node in graph.nodes if isinstance(node, DocumentInput)
@@ -89,7 +116,12 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
 
     monkeypatch.setattr(local_runtime, "_execute_physical", execute)
 
-    response = worker._execute_logical_query(request, 1)
+    response = worker._execute_logical_query(request, 1, initialize)
+    received = deserialize(serialize(response), None)
 
     assert response.collect().to_pydict() == {"d.id": ["a"]}
     assert response.report["fresh_tokens"] == 4
+    assert calls == ["initialize", "source", "plan", "execute"]
+    assert received.collect().equals(response.collect())
+    assert received.plan == response.plan
+    assert received.node_metrics == response.node_metrics

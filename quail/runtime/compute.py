@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
-import pyarrow as pa
-
-from quail.builtins import registry_from_manifest
 from quail.catalog import ScanRequest, TableProvider
-from quail.extensions import ExtensionManifest
+from quail.extensions import ExtensionRegistry
 from quail.logical import LogicalPlan
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig
@@ -27,7 +24,7 @@ class QueryRequest:
     config: EngineConfig
     device: str
     order: str | None = None
-    extensions: ExtensionManifest = field(default_factory=ExtensionManifest)
+    registry: ExtensionRegistry = field(default_factory=ExtensionRegistry.with_built_ins)
 
     def __post_init__(self) -> None:
         if not isinstance(self.logical_plan, LogicalPlan):
@@ -112,34 +109,38 @@ def _modal_request(request: QueryRequest) -> dict:
         "config": request.config,
         "device": request.device,
         "order": request.order,
-        "extensions": request.extensions.to_value(),
+        "registry": request.registry,
     }
 
 
 class ModalComputeProvider:
     """Run logical queries with Modal Functions."""
 
-    def __init__(self, *, secrets=(), detach: bool = False):
+    def __init__(self, *, secrets=(), detach: bool = False,
+                 local_python_sources: tuple[str, ...] = (),
+                 pip_packages: tuple[str, ...] = (),
+                 initialize_worker: Callable[[ExtensionRegistry], None] | None = None):
         self._app_context = None
         self._worker = None
-        self._extension_key = None
+        self._worker_key = None
         self._functions = {}
         self._modal_secrets = tuple(secrets)
         self._detach = bool(detach)
+        self._local_python_sources = tuple(local_python_sources)
+        self._pip_packages = tuple(pip_packages)
+        self._initialize_worker = initialize_worker
 
-    def _worker_for(self, backend_name: str,
-                    extensions: ExtensionManifest = ExtensionManifest()):
+    def _worker_for(self, backend_name: str, registry: ExtensionRegistry):
         """Return Modal Functions containing the requested extensions."""
 
-        local_sources = tuple(extensions.local_python_sources)
-        pip_packages = tuple(extensions.pip_packages)
-        registry = registry_from_manifest(extensions)
+        local_sources = tuple(dict.fromkeys(self._local_python_sources))
+        pip_packages = tuple(dict.fromkeys(self._pip_packages))
         backend = registry.backend(backend_name)
         runtime_package = getattr(
             backend, "runtime_package", "vllm==0.26.0"
         )
         key = (backend_name, runtime_package, local_sources, pip_packages)
-        if self._app_context is not None and key != self._extension_key:
+        if self._app_context is not None and key != self._worker_key:
             self.close()
         if self._app_context is None:
             # the worker module imports modal, which is slow to load
@@ -154,11 +155,11 @@ class ModalComputeProvider:
             )
             self._app_context = self._worker.app.run(detach=self._detach)
             self._app_context.__enter__()
-            self._extension_key = key
+            self._worker_key = key
         return self._worker
 
-    def _function(self, gpu_count: int, backend_name: str, extensions=()):
-        worker = self._worker_for(backend_name, extensions)
+    def _function(self, gpu_count: int, backend_name: str, registry: ExtensionRegistry):
+        worker = self._worker_for(backend_name, registry)
         function_key = (backend_name, gpu_count)
         function = self._functions.get(function_key)
         if function is None:
@@ -172,18 +173,14 @@ class ModalComputeProvider:
         function = self._function(
             request.gpu_count,
             request.config.backend,
-            request.extensions,
+            request.registry,
         )
-        call = function.spawn(_modal_request(request))
+        call = function.spawn(_modal_request(request), self._initialize_worker)
         print(f"function call id: {call.object_id}", flush=True)
-        table, report = call.get()
-        if not isinstance(table, pa.Table):
-            raise TypeError("a Modal worker must return an Arrow table")
-        if not isinstance(report, Mapping):
-            raise TypeError("a Modal worker must return a report mapping")
-        result = QueryResult.from_table(table, report=dict(report))
-        return result.attach_executed_plan(
-            registry_from_manifest(request.extensions).codecs)
+        result = call.get()
+        if not isinstance(result, QueryResult):
+            raise TypeError("a Modal worker must return a QueryResult")
+        return result
 
     def close(self) -> None:
         """Release the selected Modal Functions."""
@@ -196,4 +193,4 @@ class ModalComputeProvider:
             self._functions = {}
             self._app_context = None
             self._worker = None
-            self._extension_key = None
+            self._worker_key = None

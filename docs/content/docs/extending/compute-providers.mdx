@@ -21,7 +21,7 @@ class QueryRequest:
     config: EngineConfig
     device: str
     order: str | None = None
-    extensions: tuple[ExtensionPackage, ...] = ()
+    registry: ExtensionRegistry = field(default_factory=ExtensionRegistry.with_built_ins)
 ```
 
 Pass yours to the session:
@@ -40,7 +40,8 @@ session = quail.Session(compute_provider=MyProvider())
 2. Run the query in the worker. `quail.runtime.local.execute_query_request`
    is the in-process entry point that tokenizes, plans, validates,
    dispatches to the backend, and finishes the graph. A custom
-   provider can call it in whatever process it controls.
+   provider can call it in whatever process it controls. Pass the request's
+   registry through preparation and execution in that process.
 3. Return a `QueryResult`. `QueryResult.from_table(table, report)`
    wraps a materialized Arrow table.
 
@@ -67,3 +68,15 @@ extension packages, chooses the function for the GPU count, keeps one
 container warm while the provider is open, prints the function call
 id, and saves a run record on the results volume. None of that is
 required of another provider.
+
+Set `local_python_sources=(...)` and `pip_packages=(...)` on
+`ModalComputeProvider` to copy extension code and install dependencies.
+The registry contains no package configuration.
+
+`initialize_worker=callback` runs `callback(registry)` once per query in
+the Modal process, before sources are opened. Use it for registrations
+that need to create objects inside that process.
+
+Modal receives the registry as a Python object. It returns a materialized
+`QueryResult` with its executed plan and node metrics attached. No extension
+manifest is involved.

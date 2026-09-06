@@ -80,7 +80,6 @@ compute worker (runtime/worker.py, then runtime/local.py)
   writes tokens, lengths, and projected columns to temporary Arrow files
   runs logical optimizer rules and physical planning
   validates the physical plan, backend, codecs, model, and GPU count
-  imports the extension modules named by the plan
   boots the engine selected by the model backend
   runs: GenericRunner -> registered node runtimes
         -> QuailModelExecution -> loop.run_filter / loop.run_join
@@ -89,7 +88,7 @@ compute worker (runtime/worker.py, then runtime/local.py)
   |
   v
 QueryResult
-  Modal returns the final Arrow table and execution report
+  Modal returns a materialized QueryResult with its plan and metrics
 ```
 
 ### The result path
@@ -102,9 +101,9 @@ Answers take one shape at every hop the runner or a client sees.
 - The generic runner finishes the graph from those tables and
   `Query.finish` builds one `QueryResult` over an Acero plan.
 - A compute provider returns that `QueryResult`. The in-process
-  provider returns it as is. The Modal provider collects it in the
-  worker, returns the Arrow table and the report over the wire, and
-  wraps them in a `QueryResult` on the client.
+  provider returns it as is. The Modal provider materializes it in the
+  worker and returns the `QueryResult` as a Python object. The executed
+  plan and node metrics are already attached.
 - The worker also writes a run record to `/results/runs/` on the
   `quail-results` volume. That is a record for reports, not a result
   path.
@@ -164,9 +163,9 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    estimates. At runtime, Quail searches again with the actual filter
    survivors and current KV state. An anchor change is represented as
    `Exchange`. There is no physical barrier node.
-8. The worker creates an internal physical request. It imports the extension
-   modules listed in the request and checks that every physical node codec,
-   backend, model, device, and runtime is registered. The generic
+8. The worker creates an internal physical request. It uses the query's
+   registry to check every physical node codec, backend, model, device,
+   and runtime. The generic
    runner then executes the typed physical graph.
    `AdaptiveJoinPlan` creates typed `AnchoredJoin` and `Exchange` child
    graphs. The same `QuailModelExecution` handles every model node on
@@ -177,9 +176,9 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    The same graph applies the final projection and limit. Projection reads only
    the selected result positions from memory mapped source columns, so the
    worker does not scan the source again. The Modal Function
-   returns the final Arrow table and execution report. The provider creates a
-   `QueryResult` from that table. `collect()` returns the Arrow table. `count()`
-   runs an Acero aggregate without creating Python row tuples. LIMIT
+   returns a materialized `QueryResult` with its report, executed plan, and
+   node metrics attached. `collect()` returns the Arrow table. `count()`
+   counts rows without creating Python row tuples. LIMIT
    stops the result stream after the requested number of rows.
 
 ## 2. Query compilation
@@ -346,21 +345,33 @@ included backend, models, devices, codecs, and runtimes. Extensions are
 registered as objects: `register_logical_rule(rule)`,
 `register_physical_planner(planner)`, `register_physical_rule(rule)`,
 `register_backend(backend)`, `register_model(spec)`, `register_device(spec)`,
-`register_codec(codec)`, `register_runtime(runtime, key=...)`,
+`register_node(node_type, runtime=...)`, `register_codec(codec)`,
+`register_runtime(runtime, key=...)`,
 `register_source_reader(reader, source_type=...)`, and
 `register_observer(factory)`. Names come from the objects. A package can also
 expose `register_quail_extension(registry)` and be loaded with
 `load_extension`. A concrete table provider is passed directly to
-`Session.register`.
+`Session.register`. `register_node` adds the standard codec and runtime
+together, after checking both names. Registration methods specify the
+interfaces their arguments implement. Lookup tables are read-only.
 
-`registry.manifest()` builds an `ExtensionManifest`: every object registered
-after the built-ins, pickled with its kind and name; the entry point module
-names; the local Python sources (each registered object's top-level package,
-unless installed from PyPI); and the pip packages. The logical request and the
-physical plan envelope carry it. The worker rebuilds its registry from it
-(`registry_from_manifest`) before planning the query or decoding the physical
-plan, and re-ships the same manifest to its child processes. A missing
-backend, codec, source reader, or runtime fails before model execution.
+The registry stores ordinary Python objects in registration order.
+`load_extension` calls a module's registration function once, at the call
+site. Failed loads leave the registry unchanged. The built-ins are the
+included specifications and implementations; registering them does not
+load model weights or create processes.
+
+`QueryRequest.registry` contains the session's registry. Modal handles
+moving it to the worker as a Python object. Source preparation, planning,
+and execution use the same registry in that process. Physical plans
+contain no extension manifest. The optional multi-GPU path sends the registry
+to each GPU child once per query and reuses it across stages.
+
+Set `local_python_sources` and `pip_packages` on `ModalComputeProvider`.
+The provider copies and installs those dependencies explicitly. Its optional
+`initialize_worker(registry)` callback runs once per query inside the Modal
+process, before opening sources. It supports registrations that create
+objects inside that process.
 
 A finished `QueryResult` carries the executed `PhysicalGraph` as `plan` and
 each node's `NodeMetrics` as `node_metrics`; `explain_analyze()` prints them.
@@ -377,7 +388,7 @@ execution object per GPU. Its `execute_request` method runs a standard
 The built in backends are separate implementations.
 
 - `QuailBackend` uses pipelining, token based admission, and KV rewind.
-- `stock_vllm` uses one vLLM request wave per filter stage. Joins use one
+- `stock_vllm` uses operator-at-a-time filter execution. Joins use one
   request per document tuple in anchor major order.
 - `pipelined_vllm` submits the next filter stage as soon as one document
   passes. It uses the same vLLM model and join submission as stock vLLM.

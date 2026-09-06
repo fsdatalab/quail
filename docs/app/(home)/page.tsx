@@ -240,7 +240,7 @@ export default function HomePage() {
                 <td className="py-2 text-right">0.001207</td>
               </tr>
               <tr className="border-b border-fd-border">
-                <td className="py-2 pr-4 text-fd-foreground">Stock vLLM, stage-major waves</td>
+                <td className="py-2 pr-4 text-fd-foreground">Stock vLLM, operator-at-a-time</td>
                 <td className="py-2 pr-4 text-right">1.48</td>
                 <td className="py-2 pr-4 text-right">337.84</td>
                 <td className="py-2 text-right">0.001624</td>

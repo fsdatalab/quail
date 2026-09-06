@@ -3,8 +3,9 @@ title: Physical nodes, planners, and rules
 description: Adding a node type with its codec and runtime, offering plans, and rewriting graphs.
 ---
 
-A physical node needs three things: the node class, a `NodeCodec` so
-it can cross to the worker, and a runtime that executes it. A physical
+A physical node needs a node class and a runtime that executes it.
+`register_node` supplies the standard `NodeCodec`, which converts the node
+into a form that can be sent to the worker. A physical
 planner offers graphs that use it. A physical rule rewrites graphs
 after the planner has chosen one. All of this is exercised by
 `tests/test_physical.py`, which the code below is taken from.
@@ -147,16 +148,18 @@ noted in `plan.remarks`.
 ## Registering all of it
 
 ```python
-from quail.physical import NodeCodec
-
 registry = (
     quail.ExtensionRegistry.with_built_ins()
-    .register_codec(NodeCodec(FirstDocuments))
-    .register_runtime(FirstDocumentsRuntime(), key=FirstDocuments.runtime_key)
+    .register_node(FirstDocuments, runtime=FirstDocumentsRuntime())
     .register_physical_planner(PreferredPlanner())
     .register_physical_rule(KeepFirstDocument())
 )
 ```
+
+`register_node` checks both names before adding the codec and runtime.
+If either name is already registered, the registry stays unchanged. Pass
+`codec=...` when the node needs a custom codec. The separate
+`register_codec` and `register_runtime` methods remain available.
 
 `query.explain()` prints the node by its `type_name` and its
 `explain_fields()`, which default to `attributes()`. Override

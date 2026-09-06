@@ -9,7 +9,6 @@ import time
 from dataclasses import dataclass, field
 
 from quail.backends import BackendExecutionContext
-from quail.builtins import registry_from_manifest
 from quail.execution import PhysicalRequest, PhysicalResponse
 from quail.physical import DocumentInput, check_plan_envelope, decode_graph
 from quail.planner.plan import Refusal
@@ -28,14 +27,13 @@ class _WorkerRuntime:
 _RUNTIME = _WorkerRuntime()
 
 
-def _validate_physical_request(request):
+def _validate_physical_request(request, registry):
     """Validate and decode a physical execution request."""
 
     if not isinstance(request, PhysicalRequest):
         raise TypeError("the worker needs a PhysicalRequest")
     envelope = request.plan
     check_plan_envelope(envelope)
-    registry = registry_from_manifest(envelope["extensions"])
     backend = registry.backend(envelope["backend"])
     graph = decode_graph(envelope["graph"], registry.codecs)
     graph.validate(runtime_keys=set(registry.runtimes))
@@ -54,10 +52,10 @@ def _validate_physical_request(request):
     return request, registry, graph, backend
 
 
-def _execute_physical(request):
+def _execute_physical(request, registry):
     """Run the backend selected by a registered physical plan."""
 
-    request, registry, graph, backend = _validate_physical_request(request)
+    request, registry, graph, backend = _validate_physical_request(request, registry)
     response = backend.execute_request(BackendExecutionContext(
         request=request,
         graph=graph,
@@ -115,7 +113,10 @@ def execute_worker_query(query, physical_executor=None):
         )
     request = query._prepare_physical()
     started = time.perf_counter()
-    response = (physical_executor or _execute_physical)(request)
+    response = (
+        physical_executor(request) if physical_executor is not None
+        else _execute_physical(request, query.session.registry)
+    )
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a physical executor must return PhysicalResponse")
     return query.finish(response, time.perf_counter() - started)
@@ -126,9 +127,8 @@ def execute_query_request(
 ) -> QueryResult:
     """Plan and run one logical query request in this process."""
     started = time.perf_counter()
-    registry = registry_from_manifest(request.extensions)
     session = Session(request.config, device=request.device,
-                      registry=registry)
+                      registry=request.registry)
     for name, provider in request.providers.items():
         session.register(name, provider)
     query = Query(session, request.logical_plan, order=request.order)

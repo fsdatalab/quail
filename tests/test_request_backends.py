@@ -124,7 +124,7 @@ def _execution(documents):
                 "block_size": 1,
                 "max_num_seqs": 16,
             },
-            "filter_submission": "stage-major",
+            "filter_submission": "operator-at-a-time",
             "join_submission": "anchor-major",
         },
     ))

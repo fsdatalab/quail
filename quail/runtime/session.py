@@ -340,10 +340,7 @@ class Query:
             inputs[node.input_id] = document_input(
                 self._token_inputs[node.alias]
             )
-        envelope = plan.to_envelope(
-            self.session.registry.codecs,
-            extensions=self.session.registry.manifest().to_value(),
-        )
+        envelope = plan.to_envelope(self.session.registry.codecs)
         return PhysicalRequest(envelope, inputs)
 
     def _request(self):
@@ -359,7 +356,7 @@ class Query:
             config=self.session.config,
             device=self.session.device.name,
             order=self.order,
-            extensions=self.session.registry.manifest(),
+            registry=self.session.registry,
         )
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
@@ -479,8 +476,7 @@ class Query:
             node_id: node_result.metrics
             for node_id, node_result in run.nodes.items()
         }
-        # the executed plan and every node's metrics cross a process
-        # boundary inside the report; the client decodes them back
+        # Saved reports need the graph and metrics without Python objects.
         report["executed_plan"] = encode_graph(
             plan.graph, self.session.registry.codecs)
         report["node_metrics"] = scalar_node_metrics(run.nodes)

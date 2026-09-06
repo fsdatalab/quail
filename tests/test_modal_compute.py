@@ -1,5 +1,8 @@
 """Modal Function compute provider tests."""
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pyarrow as pa
 
 import quail
@@ -99,7 +102,7 @@ def test_modal_provider_calls_function_and_releases_minimum_container(
         object_id = "fc-test"
 
         def get(self):
-            return (
+            return QueryResult.from_table(
                 pa.table({"ok": [True]}),
                 {"wall_s": 1.0, "fresh_tokens": 2},
             )
@@ -108,7 +111,8 @@ def test_modal_provider_calls_function_and_releases_minimum_container(
         def update_autoscaler(self, **settings):
             autoscaler.append(settings)
 
-        def spawn(self, request):
+        def spawn(self, request, initialize_worker):
+            assert initialize_worker is None
             submitted.append(request)
             return Call()
 
@@ -138,3 +142,26 @@ def test_modal_provider_calls_function_and_releases_minimum_container(
     ]
     assert closed == ["app"]
     assert "function call id: fc-test" in capsys.readouterr().out
+
+
+def test_modal_provider_uses_explicit_dependencies(monkeypatch):
+    from quail.runtime import worker
+
+    images = []
+
+    def make_worker(**kwargs):
+        images.append(kwargs)
+        return SimpleNamespace(app=SimpleNamespace(run=lambda **kwargs: nullcontext()))
+
+    monkeypatch.setattr(worker, "modal_worker", make_worker)
+    provider = quail.ModalComputeProvider(
+        local_python_sources=("shared", "extra_source", "shared"),
+        pip_packages=("shared-package==1.0", "extra-package==1.0", "shared-package==1.0"),
+    )
+    registry = quail.ExtensionRegistry.with_built_ins()
+    first = provider._worker_for("quail", registry)
+    assert provider._worker_for("quail", registry) is first
+    assert len(images) == 1
+    assert images[0]["local_python_sources"] == ("shared", "extra_source")
+    assert images[0]["pip_packages"] == ("shared-package==1.0", "extra-package==1.0")
+    provider.close()

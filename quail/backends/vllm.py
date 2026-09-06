@@ -116,11 +116,11 @@ class VLLMEngine:
 
 
 def stock_vllm_backend() -> RequestBackend:
-    """Return stock vLLM with separate requests per filter stage."""
+    """Return stock vLLM with operator-at-a-time filter execution."""
     return RequestBackend(
         name="stock_vllm",
         engine=VLLMEngine(),
-        filter_submission="stage-major",
+        filter_submission="operator-at-a-time",
     )
 
 

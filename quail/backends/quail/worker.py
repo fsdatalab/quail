@@ -284,7 +284,10 @@ def _child_main(gpu_idx, conn):
         if kind == "shutdown":
             break
         try:
-            if kind == "filters":
+            if kind == "registry":
+                state["registry"] = data
+                conn.send(("ok", None))
+            elif kind == "filters":
                 conn.send(("ok", _child_filters(state, data)))
             elif kind == "joins":
                 conn.send(("ok", _child_joins(state, data)))
@@ -294,12 +297,8 @@ def _child_main(gpu_idx, conn):
 
 
 def _child_boot(state, sub):
-    # a spawned child rebuilds its registry from the plan's manifest;
-    # quail.builtins imports this module's backend, so it stays here
-    from quail.builtins import registry_from_manifest
-
     envelope = sub["physical_plan"]
-    registry = registry_from_manifest(envelope["extensions"])
+    registry = state["registry"]
     spec = registry.model(sub["model"])
     device = registry.device(envelope["device"])
     backend = registry.backend(envelope["backend"])
@@ -308,7 +307,6 @@ def _child_boot(state, sub):
                      sub["workers"], sub["chunk_tokens"])
     _bind_query(state, sub["true_ids"], sub["false_ids"],
                 sub["chunk_tokens"])
-    state["registry"] = registry
     state["runtime_context"] = ExecutionContext(
         runtimes=registry.runtimes,
         model_execution=state["model_execution"],
@@ -557,6 +555,7 @@ def execute_quail_multi(payload, registry, graph):
     payload["docs"] = decode_payload_documents(payload["docs"])
     gpu_count = payload["workers"]
     _ensure_children(gpu_count)
+    _round("registry", [registry] * gpu_count)
     report = execute_distributed_graph(
         payload,
         graph,

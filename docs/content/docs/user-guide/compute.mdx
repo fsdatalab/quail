@@ -18,7 +18,7 @@ session = quail.Session(compute_provider=compute)
 
 ## What one run() does
 
-1. The client collects the logical plan and the table providers into
+1. The client collects the logical plan, table providers, and registry into
    a `QueryRequest`.
 2. For each table it either sends a remote source description (the
    worker opens it) or reads the needed columns and sends them as raw
@@ -28,8 +28,9 @@ session = quail.Session(compute_provider=compute)
 4. The worker tokenizes the documents into a memory mapped Arrow file,
    plans the query, loads the model if the container is cold, runs the
    physical graph, joins and projects the answers with Arrow, and
-   returns one Arrow table plus the report.
-5. The client wraps that table in a `QueryResult`.
+   returns a materialized `QueryResult` with the report, executed plan,
+   and node metrics attached.
+5. The client receives that `QueryResult`.
 
 ## Warm containers
 
@@ -39,9 +40,9 @@ reuses the loaded model and reports `boot_kind: warm`.
 `Session.close()` sets the minimum back to zero and exits the app
 context. Always close, or use the session as a context manager.
 
-A backend change, an extension change, or a change of pip packages
-needs a different image, so the provider closes the current app and
-starts a new one.
+The provider selects its image from the backend, its runtime package,
+and the explicit `local_python_sources` and `pip_packages` settings.
+Changing registered objects alone does not rebuild the image.
 
 ## Function call ids
 
@@ -55,7 +56,8 @@ Keep it. If the client disconnects, the result is still retrievable:
 
 ```python
 import modal
-table, report = modal.FunctionCall.from_id("fc-01ABC...").get()
+result = modal.FunctionCall.from_id("fc-01ABC...").get()
+table, report = result.collect(), result.report
 ```
 
 Tee every Modal run to a file, because the CLI drops old log lines.

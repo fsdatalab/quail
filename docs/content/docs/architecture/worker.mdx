@@ -21,8 +21,9 @@ kernel cache volume so each kernel compiles once ever.
 
 1. The Modal Function receives the prepared request: the logical
    plan, the source descriptions or raw Arrow columns, the config, the
-   device, the order rule, and the extension module names.
-2. It imports the extension modules and builds the registry.
+   device, the order rule, and the registry.
+2. It calls `initialize_worker(registry)` if the provider supplied one.
+   The same registry is used throughout the query.
 3. It opens each source. A remote source goes through the registered
    source reader for its `type`. A client-sent table becomes a memory
    provider.
@@ -47,7 +48,8 @@ kernel cache volume so each kernel compiles once ever.
    `HashJoin`, `Project`, and `Limit` run in the same generic runner
    pass.
 9. It writes a run record to `/results/runs/` on the `quail-results`
-   volume, then returns the collected Arrow table and the report.
+   volume, then returns a materialized `QueryResult` with the executed
+   plan and node metrics attached.
 
 ## Boot
 

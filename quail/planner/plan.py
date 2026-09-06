@@ -56,12 +56,7 @@ class PhysicalPlan:
         object.__setattr__(self, "root", graph.root)
         object.__setattr__(self, "graph", graph)
 
-    def to_envelope(
-        self,
-        codecs,
-        *,
-        extensions=None,
-    ) -> dict:
+    def to_envelope(self, codecs) -> dict:
         """Encode the typed graph for a process boundary."""
         return plan_envelope(
             backend=self.backend,
@@ -70,7 +65,6 @@ class PhysicalPlan:
             workers=self.workers,
             graph=self.graph,
             codecs=codecs,
-            extensions=extensions,
             settings=self.settings,
         )
 

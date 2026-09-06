@@ -326,8 +326,9 @@ def test_result_carries_the_executed_plan_and_node_metrics(tmp_path):
     assert ledger["totals"]["usd"] == pytest.approx(
         ledger["totals"]["wall_s"] / 3600 * ledger["usd_per_gpu_hour"],
         abs=1e-8)
+    expected_usd = 2 * ledger["totals"]["wall_s"] / 3600 * ledger["usd_per_gpu_hour"]
     assert cost_ledger.charge(result, gpus=2)["totals"]["usd"] == \
-        pytest.approx(2 * ledger["totals"]["usd"], abs=1e-8)
+        pytest.approx(expected_usd, abs=1e-8)
 
 
 def test_observer_sees_the_complete_physical_graph(tmp_path):
@@ -352,7 +353,7 @@ def test_executed_plan_survives_the_report_round_trip(tmp_path):
 
     registry = quail.ExtensionRegistry.with_built_ins()
     result = _observed_result(tmp_path, registry)
-    # what a Modal worker returns: the collected table and the report
+    # Saved reports can be loaded separately from their result tables.
     table, report = result.collect(), dict(result.report)
 
     restored = QueryResult.from_table(table, report=report)

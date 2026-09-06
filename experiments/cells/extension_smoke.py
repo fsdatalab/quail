@@ -27,14 +27,11 @@ def main():
     flags = make_filter_parquet(f"{tmp}/docs.parquet", n_docs=40)
     registry = quail.ExtensionRegistry.with_built_ins().register_observer(
         RowTrace)
-    manifest = registry.manifest()
-    print("manifest:", json.dumps({
-        "modules": manifest.modules,
-        "registrations": [(r.kind, r.name) for r in manifest.registrations],
-        "local_python_sources": manifest.local_python_sources,
-    }), flush=True)
-
-    session = quail.Session(EngineConfig(gpus=1), registry=registry)
+    session = quail.Session(
+        EngineConfig(gpus=1), registry=registry,
+        compute_provider=quail.ModalComputeProvider(
+            local_python_sources=("experiments",)),
+    )
     session.register("docs", quail.DocumentProvider.from_parquet(
         f"{tmp}/docs.parquet", id_col="id"))
     q1_text = FILTER_Q.replace("{j}", "1")

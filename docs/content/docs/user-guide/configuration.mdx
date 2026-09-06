@@ -67,7 +67,7 @@ in `result.report["remarks"]`.
 | Backend | What it is |
 | --- | --- |
 | `quail` | The Quail executor: pipelining, token-based admission, and KV rewind on a paged KV arena. Supports 1, 2, 4, and 8 GPUs. |
-| `stock_vllm` | vLLM with one request wave per filter stage and one request per join tuple. The baseline. |
+| `stock_vllm` | vLLM with operator-at-a-time filter execution and one request per join tuple. The baseline. |
 | `pipelined_vllm` | vLLM with the next filter stage submitted as soon as a document passes. Same join submission as stock. |
 | `pipelined_sglang` | SGLang with filter waves and suffix-major join order within bounded anchor groups. |
 

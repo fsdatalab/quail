@@ -4,12 +4,11 @@ from dataclasses import dataclass
 
 import modal
 
-from quail.builtins import registry_from_manifest
 from quail.catalog import DocumentProvider
-from quail.extensions import ExtensionManifest
 from quail.planner.plan import EngineConfig
 from quail.runtime.compute import QueryRequest
 from quail.runtime.local import execute_query_request
+from quail.runtime.result import QueryResult
 from quail.runtime.volumes import hf_cache, kernel_cache, results_vol
 
 
@@ -52,7 +51,7 @@ def build_worker_image(
     )
 
 
-def _execute_logical_query(value, gpu_count: int):
+def _execute_logical_query(value, gpu_count: int, initialize_worker=None):
     """Open the query sources and run the query in this container."""
     config_value = value["config"]
     if not isinstance(config_value, EngineConfig):
@@ -62,8 +61,9 @@ def _execute_logical_query(value, gpu_count: int):
         raise ValueError(
             f"query needs {requested_gpus} GPUs but worker has {gpu_count}"
         )
-    manifest = ExtensionManifest.from_value(value["extensions"])
-    registry = registry_from_manifest(manifest)
+    registry = value["registry"]
+    if initialize_worker is not None:
+        initialize_worker(registry)
     providers = {}
     for name, source in value["sources"].items():
         if "remote" in source:
@@ -75,14 +75,18 @@ def _execute_logical_query(value, gpu_count: int):
         else:
             raise ValueError(f"query source {name!r} has no location")
         providers[name] = provider
-    return execute_query_request(QueryRequest(
+    result = execute_query_request(QueryRequest(
         logical_plan=value["logical_plan"],
         providers=providers,
         config=config_value,
         device=str(value["device"]),
         order=value["order"],
-        extensions=manifest,
+        registry=registry,
     ))
+    materialized = QueryResult.from_table(result.collect(), result.report)
+    materialized.plan = result.plan
+    materialized.node_metrics = result.node_metrics
+    return materialized
 
 
 @dataclass(frozen=True)
@@ -149,9 +153,8 @@ def modal_worker(
             timeout=21600,
             volumes=volumes,
         )
-        def execute(value):
-            result = _execute_logical_query(value, gpu_count)
-            return result.collect(), result.report
+        def execute(value, initialize_worker=None):
+            return _execute_logical_query(value, gpu_count, initialize_worker)
 
         return execute
 
@@ -167,4 +170,3 @@ def modal_worker(
         execute_4,
         execute_8,
     )
-

@@ -176,7 +176,7 @@ pipelining, KV rewind, page arena, and retention policy.
 
 The built in request backends are separate from `QuailBackend`.
 
-- `stock_vllm` uses stage major filter requests and anchor major join
+- `stock_vllm` uses operator-at-a-time filter execution and anchor major join
   requests.
 - `pipelined_vllm` uses per document filter pipelining and anchor major join
   requests.

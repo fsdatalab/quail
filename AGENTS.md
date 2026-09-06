@@ -39,7 +39,7 @@ these rules.
 - "Chain mode" is the internal name for KV rewind (one living request
   per document). Either is fine in code; prefer "KV rewind" in prose.
 - The comparison is against "stock vLLM", and say which submission
-  strategy it used: separate requests per stage, or stage-major waves.
+  strategy it used: operator-at-a-time execution or pipelining.
 - `de1|` in request ids is a wire-format version tag, not a product
   name. Leave it alone.
 
