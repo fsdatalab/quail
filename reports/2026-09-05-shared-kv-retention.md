@@ -9,9 +9,12 @@
 - Join order remains fixed before execution. The first anchor's filters still
   run last. Per-set memory estimates are not fixed partitions.
 
-![FEV-9 query time, prefix recomputation, total fresh tokens, and accuracy](plots/shared_kv_retention.png)
+![FEVER latency, recomputed KV, fresh input tokens, accuracy, and input counts](plots/quailb_fev.png)
 
-Figure: plots/shared_kv_retention.png
+Figure: plots/quailb_fev.png
+
+- FEV-9 appears with the other FEVER queries in the standard dataset plot.
+  The first-anchor-only comparison remains in the tables below.
 
 | Configuration | Query time, seconds | Document pairs/second | $/query |
 |---|---:|---:|---:|
@@ -108,8 +111,9 @@ Figure: plots/shared_kv_retention.png
 - `reports/score_shared_kv_retention.py` reproduces accuracy from the saved
   answers and writes the derived result to the volume. Its docstring contains
   the download and scoring commands. It never runs inference.
-- `reports/make_shared_kv_retention_plots.py` contains the exact volume download
-  command. It checks answer equality, derives changes, and regenerates the plot.
+- `reports/make_quailb_comparison_plots.py` contains the exact volume download
+  commands and regenerates the main QUAIL-B plot and every dataset plot.
+  `reports/score_shared_kv_retention.py` checks all seven answer tables for equality.
 - All 231 CPU tests pass. Coverage includes replacement across filter inputs,
   returned admission pages, protected active KV, expired and dead prefixes,
   incorrect estimates, zero capacity, both Quail execution paths, and execution

@@ -132,6 +132,43 @@ Include a figure whenever one carries the point better than text:
 
 Every report with measured results should include at least one plot.
 
+## QUAIL-B plot standard
+
+- Maintain one main plot covering all queries and one plot per dataset.
+  Include every query in its dataset plot. Do not create a separate FEV-9
+  figure or another standalone query figure for the benchmark comparison.
+- Generate the full set with `reports/make_quailb_comparison_plots.py`.
+  Save `reports/plots/quailb_main.png` and `quailb_<dataset>.png`.
+  Keep method order, colors, and metric definitions consistent across them.
+- Show these metrics for each query and configuration:
+  - Latency in seconds, excluding model startup and result collection.
+  - Total recomputed KV tokens across the query (`regret_tokens`). These
+    count reusable document or anchor prefix tokens computed again because
+    their KV was unavailable. Use the existing per-document accounting;
+    do not silently substitute the distinct-prefix metric.
+  - Total fresh input tokens computed across the query (`fresh_tokens`).
+    A fresh token is an input token position processed by a model forward
+    pass instead of read from existing KV. Count repeated computation again.
+    This includes new document and prompt-suffix tokens and recomputed
+    prefix tokens. It is not a count of unique text or generated answers.
+    Recomputed KV tokens are included in fresh tokens, not added to them.
+  - Accuracy as agreement with the saved reference labels on evaluated
+    predicate answers. Name the reference model. Include final output
+    precision and recall in the report so false positive joins are visible.
+  - Input document count for each relation or set, before filters. List
+    every alias separately, including repeated uses of the same set.
+    Put counts beside query labels or in an aligned figure column. Label
+    any survivor counts separately from input counts.
+- Keep throughput and GPU cost in the report tables using the definitions
+  above. Derive totals, percentages, and ratios from saved volume results.
+- Reuse existing results when updating figures unless a rerun is requested.
+  State the source run for updated measurements. If a query definition
+  changed, omit incompatible old measurements and label missing baselines.
+  Do not compare different query definitions or display missing values as zero.
+- When replacing the plot layout, remove obsolete figures and their scripts,
+  and update all report references. A benchmark change should update the
+  main plot and its dataset plot together.
+
 ## Where plotting code lives
 
 - One script per report (or per group of related reports), named

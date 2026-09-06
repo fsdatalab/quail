@@ -34,9 +34,24 @@ COLLECTION = "gt_77bb8b128743a79aedddaa24c808c3f8"
 ROOT = "ground_truth/quailb/schema_v1"
 
 
+def compare_answers(root):
+    """Compare every saved predicate answer table."""
+    names = {path.name for path in (root / "first_anchor").glob("*.parquet")}
+    assert names == {path.name for path in (root / "shared").glob("*.parquet")}
+    assert len(names) == 7
+    for name in sorted(names):
+        tables = [pq.read_table(root / label / name) for label in ("first_anchor", "shared")]
+        columns = sorted(tables[0].column_names)
+        ordered = [table.select(columns).sort_by([(name, "ascending") for name in columns])
+                   for table in tables]
+        assert ordered[0].equals(ordered[1]), name
+        print(f"{name}: {len(ordered[0]):,} identical answers")
+
+
 def main(workdir):
     """Validate corpus identity and score the two saved configurations."""
     root = Path(workdir)
+    compare_answers(root)
     files = ModalVolumeFiles()
     collection = json.loads(files.read_bytes(f"{ROOT}/collections/{COLLECTION}/manifest.json"))
     collection["label_sets"] = {
