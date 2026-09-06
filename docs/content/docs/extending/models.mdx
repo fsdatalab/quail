@@ -42,8 +42,8 @@ Register it in `quail/specs/__init__.py` for a built in model, or from
 an extension:
 
 ```python
-def register_quail_extension(registry):
-    registry.register_model(MY_MODEL)
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_model(MY_MODEL)
 ```
 
 Then `EngineConfig(model="my-model")` selects it.

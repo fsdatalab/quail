@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import pyarrow as pa
 
-from quail.builtins import registry_from_modules
+from quail.builtins import registry_from_manifest
 from quail.catalog import ScanRequest, TableProvider
-from quail.extensions import ExtensionPackage
+from quail.extensions import ExtensionManifest
 from quail.logical import LogicalPlan
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig
@@ -27,7 +27,7 @@ class QueryRequest:
     config: EngineConfig
     device: str
     order: str | None = None
-    extensions: tuple[ExtensionPackage, ...] = ()
+    extensions: ExtensionManifest = field(default_factory=ExtensionManifest)
 
     def __post_init__(self) -> None:
         if not isinstance(self.logical_plan, LogicalPlan):
@@ -112,9 +112,7 @@ def _modal_request(request: QueryRequest) -> dict:
         "config": request.config,
         "device": request.device,
         "order": request.order,
-        "extension_modules": tuple(
-            extension.module for extension in request.extensions
-        ),
+        "extensions": request.extensions.to_value(),
     }
 
 
@@ -129,22 +127,13 @@ class ModalComputeProvider:
         self._modal_secrets = tuple(secrets)
         self._detach = bool(detach)
 
-    def _worker_for(self, backend_name: str, extensions=()):
+    def _worker_for(self, backend_name: str,
+                    extensions: ExtensionManifest = ExtensionManifest()):
         """Return Modal Functions containing the requested extensions."""
 
-        local_sources = tuple(dict.fromkeys(
-            source
-            for extension in extensions
-            for source in extension.local_python_sources
-        ))
-        pip_packages = tuple(dict.fromkeys(
-            package
-            for extension in extensions
-            for package in extension.pip_packages
-        ))
-        registry = registry_from_modules(tuple(
-            extension.module for extension in extensions
-        ))
+        local_sources = tuple(extensions.local_python_sources)
+        pip_packages = tuple(extensions.pip_packages)
+        registry = registry_from_manifest(extensions)
         backend = registry.backend(backend_name)
         runtime_package = getattr(
             backend, "runtime_package", "vllm==0.26.0"

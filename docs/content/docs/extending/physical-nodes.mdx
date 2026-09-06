@@ -149,15 +149,13 @@ noted in `plan.remarks`.
 ```python
 from quail.physical import NodeCodec
 
-
-def register_quail_extension(registry):
-    registry.register_codec(NodeCodec(FirstDocuments))
-    registry.register_runtime(FirstDocuments.runtime_key,
-                              FirstDocumentsRuntime())
-    registry.register_physical_planner(PreferredPlanner.name,
-                                       PreferredPlanner())
-    registry.register_physical_rule(KeepFirstDocument.name,
-                                    KeepFirstDocument())
+registry = (
+    quail.ExtensionRegistry.with_built_ins()
+    .register_codec(NodeCodec(FirstDocuments))
+    .register_runtime(FirstDocumentsRuntime(), key=FirstDocuments.runtime_key)
+    .register_physical_planner(PreferredPlanner())
+    .register_physical_rule(KeepFirstDocument())
+)
 ```
 
 `query.explain()` prints the node by its `type_name` and its

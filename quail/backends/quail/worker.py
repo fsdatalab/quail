@@ -294,12 +294,12 @@ def _child_main(gpu_idx, conn):
 
 
 def _child_boot(state, sub):
-    # a spawned child rebuilds its registry from the module names;
+    # a spawned child rebuilds its registry from the plan's manifest;
     # quail.builtins imports this module's backend, so it stays here
-    from quail.builtins import registry_from_modules
+    from quail.builtins import registry_from_manifest
 
     envelope = sub["physical_plan"]
-    registry = registry_from_modules(tuple(envelope["extension_modules"]))
+    registry = registry_from_manifest(envelope["extensions"])
     spec = registry.model(sub["model"])
     device = registry.device(envelope["device"])
     backend = registry.backend(envelope["backend"])

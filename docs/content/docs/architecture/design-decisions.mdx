@@ -236,14 +236,12 @@ This redesign does not claim to solve that limit.
 
 ## Extensions
 
-An extension module defines:
-
-```python
-def register_quail_extension(registry):
-    ...
-```
-
-It can register:
+Extensions are objects registered on the session's `ExtensionRegistry`,
+for example `registry.register_physical_rule(MyRule())`; a package can
+also expose one entry point, `register_quail_extension(registry)`.
+Registered objects travel to the compute worker pickled, in the
+manifest the query request and the physical plan carry. The registry
+can hold:
 
 - Logical optimizer rules.
 - Physical planners and optimizer rules.

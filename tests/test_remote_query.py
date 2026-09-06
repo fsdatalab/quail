@@ -5,6 +5,7 @@ import pyarrow.parquet as pq
 
 import quail
 from quail.execution import PhysicalResponse
+from quail.extensions import ExtensionManifest
 from quail.planner.plan import EngineConfig
 
 
@@ -50,7 +51,7 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
         ),
         "device": "h100-sxm",
         "order": None,
-        "extension_modules": [],
+        "extensions": ExtensionManifest().to_value(),
     }
 
     monkeypatch.setattr(Session, "tokenizer", property(lambda self: _tokens))

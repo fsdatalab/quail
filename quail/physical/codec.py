@@ -188,17 +188,26 @@ def plan_envelope(
     workers: int,
     graph: PhysicalGraph,
     codecs: Mapping[str, NodeCodec],
-    extension_modules: tuple[str, ...] = (),
+    extensions: Mapping[str, Any] | None = None,
     settings: Mapping[str, Any] | None = None,
 ) -> dict:
-    """Encode the physical plan fields sent across a process boundary."""
+    """Encode the physical plan fields sent across a process boundary.
+
+    Args:
+        extensions: An ExtensionManifest value; the worker rebuilds
+            its registry from it before decoding the graph.
+    """
+    from quail.extensions import ExtensionManifest
+
     graph.validate_backend(backend)
+    if extensions is None:
+        extensions = ExtensionManifest().to_value()
     return {
         "backend": backend,
         "model": model,
         "device": device,
         "workers": workers,
-        "extension_modules": list(extension_modules),
+        "extensions": dict(extensions),
         "settings": dict(settings or {}),
         "graph": encode_graph(graph, codecs),
     }
@@ -207,7 +216,7 @@ def plan_envelope(
 def check_plan_envelope(value: Mapping[str, Any]) -> None:
     """Validate a physical plan envelope."""
     required = {
-        "backend", "model", "device", "workers", "extension_modules",
+        "backend", "model", "device", "workers", "extensions",
         "settings", "graph",
     }
     missing = required - set(value)
@@ -220,12 +229,9 @@ def check_plan_envelope(value: Mapping[str, Any]) -> None:
         raise ValueError(
             f"physical plan has unknown fields {sorted(extra)}"
         )
-    modules = value["extension_modules"]
-    if not isinstance(modules, list) \
-            or not all(isinstance(module, str) and module for module in modules):
-        raise ValueError("physical plan extension_modules must be strings")
-    if len(modules) != len(set(modules)):
-        raise ValueError("physical plan has duplicate extension modules")
+    from quail.extensions import check_manifest_value
+
+    check_manifest_value(value["extensions"])
     if not isinstance(value["settings"], Mapping):
         raise TypeError("physical plan settings must be a mapping")
     for name in ("backend", "model", "device"):

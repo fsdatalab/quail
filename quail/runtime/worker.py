@@ -4,9 +4,9 @@ from dataclasses import dataclass
 
 import modal
 
-from quail.builtins import registry_from_modules
+from quail.builtins import registry_from_manifest
 from quail.catalog import DocumentProvider
-from quail.extensions import ExtensionPackage
+from quail.extensions import ExtensionManifest
 from quail.planner.plan import EngineConfig
 from quail.runtime.compute import QueryRequest
 from quail.runtime.local import execute_query_request
@@ -62,8 +62,8 @@ def _execute_logical_query(value, gpu_count: int):
         raise ValueError(
             f"query needs {requested_gpus} GPUs but worker has {gpu_count}"
         )
-    modules = tuple(value["extension_modules"])
-    registry = registry_from_modules(modules)
+    manifest = ExtensionManifest.from_value(value["extensions"])
+    registry = registry_from_manifest(manifest)
     providers = {}
     for name, source in value["sources"].items():
         if "remote" in source:
@@ -81,7 +81,7 @@ def _execute_logical_query(value, gpu_count: int):
         config=config_value,
         device=str(value["device"]),
         order=value["order"],
-        extensions=tuple(ExtensionPackage(module) for module in modules),
+        extensions=manifest,
     ))
 
 

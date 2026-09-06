@@ -340,7 +340,7 @@ class Query:
             )
         envelope = plan.to_envelope(
             self.session.registry.codecs,
-            extension_modules=self.session.registry.extension_modules,
+            extensions=self.session.registry.manifest().to_value(),
         )
         return PhysicalRequest(envelope, inputs)
 
@@ -357,7 +357,7 @@ class Query:
             config=self.session.config,
             device=self.session.device.name,
             order=self.order,
-            extensions=tuple(self.session.registry.extension_packages),
+            extensions=self.session.registry.manifest(),
         )
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
@@ -472,6 +472,11 @@ class Query:
         if not isinstance(run.value, QueryResult):
             raise TypeError("physical graph root must return QueryResult")
         result = run.value
+        result.plan = plan.graph
+        result.node_metrics = {
+            node_id: node_result.metrics
+            for node_id, node_result in run.nodes.items()
+        }
         observer_reports = {
             observer.name: dict(observer.report())
             for observer in observers

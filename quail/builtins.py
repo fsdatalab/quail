@@ -9,7 +9,7 @@ from quail.backends import (
 from quail.backends.quail import quail_runtimes
 from quail.backends.request import request_runtimes
 from quail.catalog import built_in_source_readers
-from quail.extensions import ExtensionRegistry
+from quail.extensions import ExtensionManifest, ExtensionRegistry
 from quail.physical import built_in_codecs
 from quail.runtime.runner import built_in_runtimes
 from quail.specs import DEVICES, MODELS
@@ -17,7 +17,7 @@ from quail.specs import DEVICES, MODELS
 
 def built_in_registry() -> ExtensionRegistry:
     """Create one registry with Quail built ins."""
-    registry = ExtensionRegistry()
+    registry = ExtensionRegistry(record=False)
     for model in MODELS.values():
         registry.register_model(model)
     for device in DEVICES.values():
@@ -30,15 +30,15 @@ def built_in_registry() -> ExtensionRegistry:
         registry.register_codec(codec)
     for runtimes in (built_in_runtimes(), quail_runtimes(), request_runtimes()):
         for runtime_key, runtime in runtimes.items():
-            registry.register_runtime(runtime_key, runtime)
+            registry.register_runtime(runtime, key=runtime_key)
     for name, reader in built_in_source_readers().items():
-        registry.register_source_reader(name, reader)
+        registry.register_source_reader(reader, source_type=name)
+    registry.record = True
     return registry
 
 
-def registry_from_modules(modules: tuple[str, ...]) -> ExtensionRegistry:
-    """Rebuild a registry from importable extension modules."""
-    registry = built_in_registry()
-    for module in modules:
-        registry.load_extension(module)
-    return registry
+def registry_from_manifest(manifest) -> ExtensionRegistry:
+    """Rebuild a registry in a compute worker from a manifest."""
+    if not isinstance(manifest, ExtensionManifest):
+        manifest = ExtensionManifest.from_value(manifest)
+    return built_in_registry().restore(manifest)

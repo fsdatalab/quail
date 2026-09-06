@@ -125,45 +125,45 @@ fit on the Modal worker's local disk.
 
 ## Adding an engine extension
 
-An extension is an importable Python module with this function:
-
-```python
-def register_quail_extension(registry):
-    registry.register_codec(...)
-    registry.register_runtime(...)
-    registry.register_physical_rule(...)
-```
-
-The function can register logical rules, physical planners, physical rules,
-model backends, models, devices, physical node codecs, physical node runtimes,
-and execution observers. Load the module before creating the session:
+Register objects on the session's registry, the way a DataFusion
+`SessionStateBuilder` takes rules and providers:
 
 ```python
 import quail
+from quail.physical import NodeCodec
 
-from my_package import quail_extension
+from my_package.nodes import MyNode, MyNodeRuntime, PreferAllDocuments
 
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.load_extension(
-    quail_extension,
-    pip_packages=("another-dependency==1.2.3",),
+registry = (
+    quail.ExtensionRegistry.with_built_ins()
+    .register_codec(NodeCodec(MyNode))
+    .register_runtime(MyNodeRuntime(), key=MyNode.runtime_key)
+    .register_physical_rule(PreferAllDocuments())
 )
 session = quail.Session(registry=registry)
 ```
 
-The default `ModalComputeProvider` copies `local_python_sources` into the
-existing `quail-engine` image and installs `pip_packages`. The physical plan
-names the extension modules it needs. The Modal worker imports those modules
-before it plans the query or selects a runtime.
+The registry takes logical rules, physical planners, physical rules, model
+backends, models, devices, physical node codecs, physical node runtimes,
+remote source readers, and execution observers. Names come from the objects.
+A package can also expose one entry point, `register_quail_extension(registry)`,
+and be loaded with `registry.load_extension(module, pip_packages=...)`.
+
+Registered objects travel to the Modal worker pickled, in the manifest the
+query request and physical plan carry; the worker registers them again before
+it plans the query. The default `ModalComputeProvider` copies each object's
+top-level package into the existing `quail-engine` image and installs any pip
+packages declared through `load_extension`.
 
 `ModalComputeProvider` calls a Modal Function in the existing `quail-engine`
 app. Quail does not run an application server. One Modal container receives
 1, 2, 4, or 8 H100s, and it runs one model copy per H100.
 
 [`quail_ext_examples/cost_ledger.py`](quail_ext_examples/cost_ledger.py)
-is a complete extension: an execution observer that charges each query's
-GPU seconds, tokens, and dollars to the physical nodes that used them, for
-chargeback or a cost dashboard. It measures the plan without changing it.
+charges each query's GPU seconds, tokens, and dollars to the physical nodes
+that used them, for chargeback or a cost dashboard. It reads
+`result.plan` and `result.node_metrics`, which every finished query carries,
+and registers nothing; `result.explain_analyze()` prints the same numbers.
 
 A model backend decides whether it supports a model and device. It proposes a
 physical plan, creates one model execution object per GPU, and executes the

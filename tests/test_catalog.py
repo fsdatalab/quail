@@ -37,7 +37,8 @@ def test_from_dataset_reads_only_id_and_requested_column():
 def test_registry_opens_registered_remote_source():
     registry = built_in_registry()
     marker = object()
-    registry.register_source_reader("test-source", lambda value: marker)
+    registry.register_source_reader(
+        lambda value: marker, source_type="test-source")
 
     assert registry.open_source({"type": "test-source"}) is marker
 

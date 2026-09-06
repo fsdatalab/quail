@@ -31,9 +31,8 @@ class DefaultSelectivity:
         return replace(node, predicates=predicates)
 
 
-def register_quail_extension(registry):
-    registry.register_logical_rule(DefaultSelectivity.name,
-                                   DefaultSelectivity())
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_logical_rule(DefaultSelectivity())
 ```
 
 The `context` is a `LogicalPlanningContext` with the session's

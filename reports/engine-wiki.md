@@ -342,23 +342,32 @@ structurally identical.
 ### Engine and compute extensions
 
 Every session owns an `ExtensionRegistry`. The registry starts with Quail's
-included backend, models, devices, codecs, and runtimes. An extension module
-defines `register_quail_extension(registry)`. That function can register
-logical rules, physical planners, physical rules, model backends, models,
-devices, physical node codecs, physical node runtimes, remote source readers,
-and execution observers. A concrete table provider is passed directly to
+included backend, models, devices, codecs, and runtimes. Extensions are
+registered as objects: `register_logical_rule(rule)`,
+`register_physical_planner(planner)`, `register_physical_rule(rule)`,
+`register_backend(backend)`, `register_model(spec)`, `register_device(spec)`,
+`register_codec(codec)`, `register_runtime(runtime, key=...)`,
+`register_source_reader(reader, source_type=...)`, and
+`register_observer(factory)`. Names come from the objects. A package can also
+expose `register_quail_extension(registry)` and be loaded with
+`load_extension`. A concrete table provider is passed directly to
 `Session.register`.
 
-`ExtensionRegistry.load_extension` imports the module on the client. It also
-records local Python sources and pip packages needed by a remote process. The
-logical request and internal physical plan carry the module names. The worker
-imports the same modules and rebuilds the registry before planning the query
-or decoding the physical plan. A missing backend, codec, source reader, or
-runtime fails before model execution.
+`registry.manifest()` builds an `ExtensionManifest`: every object registered
+after the built-ins, pickled with its kind and name; the entry point module
+names; the local Python sources (each registered object's top-level package,
+unless installed from PyPI); and the pip packages. The logical request and the
+physical plan envelope carry it. The worker rebuilds its registry from it
+(`registry_from_manifest`) before planning the query or decoding the physical
+plan, and re-ships the same manifest to its child processes. A missing
+backend, codec, source reader, or runtime fails before model execution.
 
-Execution observers run over the complete physical graph once. Model nodes
-reuse the metrics reported by the GPU executor. The same observer instance then
-sees `HashJoin`, `Project`, and `Limit` when the worker finishes the graph.
+A finished `QueryResult` carries the executed `PhysicalGraph` as `plan` and
+each node's `NodeMetrics` as `node_metrics`; `explain_analyze()` prints them.
+Execution observers, registered by class, run over the complete physical graph
+once when the query finishes. Model nodes reuse the metrics reported by the GPU
+executor. The same observer instance then sees `HashJoin`, `Project`, and
+`Limit`. `result.observer(cls)` returns an observer's report.
 
 The selected model backend checks whether it supports the requested model,
 device, and GPU count. It proposes physical plans. It creates one model

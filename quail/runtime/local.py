@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 
 from quail.backends import BackendExecutionContext
-from quail.builtins import registry_from_modules
+from quail.builtins import registry_from_manifest
 from quail.execution import PhysicalRequest, PhysicalResponse
 from quail.physical import DocumentInput, check_plan_envelope, decode_graph
 from quail.planner.plan import Refusal
@@ -35,7 +35,7 @@ def _validate_physical_request(request):
         raise TypeError("the worker needs a PhysicalRequest")
     envelope = request.plan
     check_plan_envelope(envelope)
-    registry = registry_from_modules(tuple(envelope["extension_modules"]))
+    registry = registry_from_manifest(envelope["extensions"])
     backend = registry.backend(envelope["backend"])
     graph = decode_graph(envelope["graph"], registry.codecs)
     graph.validate(runtime_keys=set(registry.runtimes))
@@ -126,9 +126,7 @@ def execute_query_request(
 ) -> QueryResult:
     """Plan and run one logical query request in this process."""
     started = time.perf_counter()
-    registry = registry_from_modules(tuple(
-        extension.module for extension in request.extensions
-    ))
+    registry = registry_from_manifest(request.extensions)
     session = Session(request.config, device=request.device,
                       registry=registry)
     for name, provider in request.providers.items():

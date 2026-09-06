@@ -160,13 +160,11 @@ def test_session_plans_registered_physical_extensions():
     backend = LocalFilterBackend()
     planner = PreferredPlanner()
     registry.register_backend(backend)
-    registry.register_physical_planner(planner.name, planner)
-    registry.register_physical_rule(
-        KeepFirstDocument.name, KeepFirstDocument()
-    )
+    registry.register_physical_planner(planner)
+    registry.register_physical_rule(KeepFirstDocument())
     registry.register_codec(NodeCodec(FirstDocuments))
     registry.register_runtime(
-        FirstDocuments.runtime_key, FirstDocumentsRuntime()
+        FirstDocumentsRuntime(), key=FirstDocuments.runtime_key
     )
     session = quail.Session(
         EngineConfig(backend="local_filter"),
@@ -243,15 +241,27 @@ def test_physical_codec_rejects_changed_shapes():
         decode_graph(extra, registry.codecs)
 
 
-def test_extension_module_rebuilds_the_remote_plan_registry():
-    from quail.builtins import registry_from_modules
+class RowTrace:
+    """Observer used to check that registrations reach a worker."""
+
+    name = "test.row_trace"
+
+    def __init__(self):
+        self.rows = []
+
+    def after_node(self, node, result) -> None:
+        self.rows.append((node.node_id, result.metrics.output_rows))
+
+    def report(self) -> dict:
+        return {"rows": list(self.rows)}
+
+
+def test_registered_objects_rebuild_the_remote_plan_registry():
+    from quail.builtins import registry_from_manifest
+    from quail.extensions import ExtensionManifest
     from quail.runtime.runner import ExecutionContext, GenericRunner
 
-    registry = built_in_registry()
-    registry.load_extension(
-        "quail_ext_examples.cost_ledger",
-        local_python_sources=("quail_ext_examples",),
-    )
+    registry = built_in_registry().register_observer(RowTrace)
     session = quail.Session(tokenizer=str.split, registry=registry)
     session.register("docs", DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
@@ -262,22 +272,24 @@ def test_extension_module_rebuilds_the_remote_plan_registry():
         "SELECT d.id FROM docs d WHERE "
         "AI_FILTER(PROMPT('ok {0}', d.body))"
     ).plan()
-    envelope = plan.to_envelope(
-        registry.codecs,
-        extension_modules=registry.extension_modules,
-    )
-    remote_registry = registry_from_modules(
-        tuple(envelope["extension_modules"])
+    manifest = registry.manifest()
+    envelope = plan.to_envelope(registry.codecs,
+                                extensions=manifest.to_value())
+    remote_registry = registry_from_manifest(
+        ExtensionManifest.from_value(envelope["extensions"])
     )
     remote_graph = decode_graph(envelope["graph"], remote_registry.codecs)
 
-    assert registry.extension_packages[0].local_python_sources == (
-        "quail_ext_examples",
-    )
-    assert envelope["extension_modules"] == [
-        "quail_ext_examples.cost_ledger"
-    ]
-    assert "example.cost_ledger" in remote_registry.observer_factories
+    # the observer's package travels as a local source; the built ins
+    # do not travel at all
+    assert manifest.modules == ()
+    assert [item.kind for item in manifest.registrations] == ["observer"]
+    assert RowTrace.__module__.split(".")[0] in manifest.local_python_sources
+    assert "quail" not in manifest.local_python_sources
+    assert remote_registry.observer_factories["test.row_trace"] is RowTrace
+    # the worker registry ships the same registrations to its children
+    assert remote_registry.manifest().registrations == manifest.registrations
+
     observers = remote_registry.new_observers()
     input_node = next(
         node for node in remote_graph.nodes
@@ -294,13 +306,57 @@ def test_extension_module_rebuilds_the_remote_plan_registry():
             observers=observers,
         ),
     )
-    assert observers[0].report()["nodes"][0]["node_id"] == input_node.node_id
+    assert [row[0] for row in observers[0].report()["rows"]] == [
+        input_node.node_id]
+
+
+def test_manifest_rejects_objects_that_cannot_travel():
+    registry = built_in_registry()
+    registry.register_source_reader(
+        lambda value: None, source_type="test.local")
+    with pytest.raises(ValueError, match="cannot travel"):
+        registry.manifest()
+
+
+def test_entry_point_modules_register_in_the_worker_not_by_pickle():
+    import sys
+    import types
+
+    from quail.builtins import registry_from_manifest
+
+    module = types.ModuleType("test_entry_point_extension")
+
+    class Marker:
+        name = "test.marker"
+
+        def __init__(self):
+            self.rows = []
+
+        def after_node(self, node, result):
+            pass
+
+        def report(self):
+            return {}
+
+    module.register_quail_extension = lambda registry: (
+        registry.register_observer(Marker))
+    sys.modules[module.__name__] = module
+    try:
+        registry = built_in_registry().load_extension(module)
+        manifest = registry.manifest()
+        assert manifest.modules == (module.__name__,)
+        assert manifest.registrations == ()
+        remote = registry_from_manifest(manifest)
+        assert "test.marker" in remote.observer_factories
+    finally:
+        del sys.modules[module.__name__]
 
 
 def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
     import sys
     import types
 
+    from quail.extensions import ExtensionManifest
     from quail.physical import plan_envelope
     from quail.runtime.local import _execute_physical
 
@@ -344,7 +400,7 @@ def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
             workers=1,
             graph=graph,
             codecs=registry.codecs,
-            extension_modules=(module_name,),
+            extensions=ExtensionManifest(modules=(module_name,)).to_value(),
         ),
         {"d": document_input(pa.array([[1], [2]]))},
     )

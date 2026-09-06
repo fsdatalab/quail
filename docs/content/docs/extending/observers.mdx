@@ -1,10 +1,59 @@
 ---
-title: Execution observers
-description: Recording per node metrics without changing the plan.
+title: Metrics and observers
+description: Reading per node metrics from a finished query, and observing execution.
 ---
 
-An observer sees every physical node once, after it runs, with the
-node's outputs and metrics. It cannot change values. Its report is
+## Metrics on the executed plan
+
+A finished query carries its executed physical plan and each node's
+measured metrics, the way a DataFusion `ExecutionPlan` exposes
+`metrics()` after it runs:
+
+```python
+result = session.sql("SELECT ...").run()
+
+result.plan                 # the executed PhysicalGraph
+result.node_metrics         # node id -> NodeMetrics
+print(result.explain_analyze())
+```
+
+`explain_analyze()` prints one line per node in execution order with
+its fields and its nonzero metrics:
+
+```
+<type_name> <node_id> [<explain fields>]  wall_s=<s> rows=<in>-><out> <nonzero metrics>
+```
+
+For a one-filter query that is a `quail.document_input` line, a
+`quail.packed_filter` line with `evaluated_documents` and
+`fresh_tokens`, and a `quail.project` line with the row counts.
+
+`NodeMetrics` has `wall_s`, `input_rows`, `output_rows`,
+`evaluated_documents`, `evaluated_document_pairs`, `fresh_tokens`,
+`cached_tokens`, `kv_hits`, `kv_misses`, `kv_removals`,
+`kv_recomputations`, `regret_tokens`, `peak_gpu_bytes`, and an
+`extension` mapping for anything else. Model nodes carry the numbers
+the GPU executor measured. `HashJoin`, `Project`, and `Limit` report
+row counts.
+
+`quail_ext_examples/cost_ledger.py` is a complete example built on
+these: it charges the query's GPU seconds, tokens, and dollars to the
+nodes that used them.
+
+```python
+from quail_ext_examples import cost_ledger
+
+ledger = cost_ledger.charge(result)
+ledger["totals"]["usd"]
+ledger["nodes"][1]["fresh_tokens"]
+```
+
+## Observers
+
+An observer sees every physical node once, right after it runs, with
+the node's outputs and metrics. Use one when something has to happen
+during execution, such as streaming progress to a log, rather than to
+read metrics afterwards. It cannot change values. Its report is
 attached to the query result.
 
 ```python
@@ -14,89 +63,35 @@ class ExecutionObserver(Protocol):
     def report(self) -> Mapping[str, Any]: ...
 ```
 
-You register a factory, not an instance. The worker creates a fresh
-observer per query.
-
-## The example extension: a cost ledger
-
-`quail_ext_examples/cost_ledger.py` charges a query's GPU time and
-tokens to the nodes that used them, which is what a chargeback or a
-query cost dashboard needs:
+You register the class (a factory); the runner creates a fresh
+observer per query:
 
 ```python
-H100_USD_PER_HOUR = 3.9492   # https://modal.com/pricing
+import logging
 
 
-class CostLedger:
-    name = "example.cost_ledger"
-    usd_per_gpu_hour = H100_USD_PER_HOUR
-    gpus = 1
+class Progress:
+    name = "my.progress"
 
     def __init__(self):
-        self._rows = []
+        self.seen = []
 
     def after_node(self, node, result) -> None:
-        metrics = result.metrics
-        usd = metrics.wall_s / 3600 * self.usd_per_gpu_hour * self.gpus
-        self._rows.append({
-            "node_id": node.node_id,
-            "node_type": node.type_name,
-            "wall_s": round(metrics.wall_s, 6),
-            "evaluated_documents": metrics.evaluated_documents,
-            "evaluated_document_pairs": metrics.evaluated_document_pairs,
-            "fresh_tokens": metrics.fresh_tokens,
-            "cached_tokens": metrics.cached_tokens,
-            "usd": round(usd, 8),
-        })
+        self.seen.append(node.node_id)
+        logging.info("%s done in %.2fs", node.node_id, result.metrics.wall_s)
 
     def report(self) -> dict:
-        totals = {key: sum(row[key] for row in self._rows)
-                  for key in ("wall_s", "fresh_tokens", "usd")}
-        return {"nodes": list(self._rows), "totals": totals}
+        return {"nodes": list(self.seen)}
 
 
-def register_quail_extension(registry) -> None:
-    registry.register_observer(CostLedger.name, CostLedger)
-```
-
-Load it, run a query, and read the report back through the class:
-
-```python
-import quail
-from quail_ext_examples import cost_ledger
-
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.load_extension(cost_ledger)
+registry = quail.ExtensionRegistry.with_built_ins().register_observer(Progress)
 session = quail.Session(registry=registry)
-session.register("reviews", quail.DocumentProvider.from_parquet(
-    "reviews.parquet", id_col="id"))
-
-result = session.sql(
-    "SELECT r.id FROM reviews r "
-    "WHERE AI_FILTER(PROMPT('Is this review positive? {0}', r.body))"
-).run()
-ledger = result.observer(cost_ledger.CostLedger)
-ledger["totals"]["usd"]
+...
+result.observer(Progress)["nodes"]
 ```
 
-`run()` returns a `QueryResult`: a lazy Arrow result with a `report`
-dict. `result.observer(CostLedger)` looks the report up by the
-observer's `name`, which is the key it travels under inside
-`result.report["observers"]`; the report is a plain dict because it
-crosses the worker boundary as JSON.
-
-The ledger prices every node's wall time on one GPU. Set `gpus` on a
-subclass for a node that ran on several.
-
-## What metrics a node reports
-
-`NodeMetrics` has `wall_s`, `input_rows`, `output_rows`,
-`evaluated_documents`, `evaluated_document_pairs`, `fresh_tokens`,
-`cached_tokens`, `kv_hits`, `kv_misses`, `kv_removals`,
-`kv_recomputations`, `regret_tokens`, `peak_gpu_bytes`, and an
-`extension` mapping for anything else. Model nodes carry the numbers
-the GPU executor measured. `HashJoin`, `Project`, and `Limit` report
-row counts.
+`result.observer(Progress)` looks the report up by the class's `name`,
+which is the key it travels under inside `result.report["observers"]`.
 
 Observers see model nodes and the Arrow nodes in one pass because the
 worker runs the full graph once with the model outputs supplied.

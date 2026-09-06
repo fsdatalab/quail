@@ -105,8 +105,8 @@ vLLM.
 ## Registering
 
 ```python
-def register_quail_extension(registry):
-    registry.register_backend(MyBackend())
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_backend(MyBackend())
 ```
 
 Then select it with `EngineConfig(backend="my_backend")`.

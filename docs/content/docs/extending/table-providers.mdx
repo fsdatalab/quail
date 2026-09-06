@@ -95,9 +95,12 @@ def open_warehouse(value: dict):
                                        identity=f"warehouse:{value['table']}")
 
 
-def register_quail_extension(registry):
-    registry.register_source_reader("warehouse", open_warehouse)
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_source_reader(open_warehouse, source_type="warehouse")
 ```
+
+A reader is a plain function, so it travels to the worker by pickle:
+define it at module level, not inline.
 
 The reader receives the description and returns any `TableProvider`
 the worker can scan locally. The built in `parquet` and `huggingface`

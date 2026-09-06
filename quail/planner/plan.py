@@ -60,7 +60,7 @@ class PhysicalPlan:
         self,
         codecs,
         *,
-        extension_modules=(),
+        extensions=None,
     ) -> dict:
         """Encode the typed graph for a process boundary."""
         return plan_envelope(
@@ -70,7 +70,7 @@ class PhysicalPlan:
             workers=self.workers,
             graph=self.graph,
             codecs=codecs,
-            extension_modules=tuple(extension_modules),
+            extensions=extensions,
             settings=self.settings,
         )
 
