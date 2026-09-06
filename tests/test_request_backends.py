@@ -1,5 +1,6 @@
 """CPU tests for vLLM and SGLang backend interfaces."""
 
+import asyncio
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +11,7 @@ from quail.backends.base import BackendExecutionContext
 from quail.backends import pipelined_sglang_backend, stock_vllm_backend
 from quail.backends.base import GpuContext
 from quail.backends.request import RequestModelExecution
+from quail.backends.sglang import SGLangClient
 from quail.builtins import built_in_registry
 from quail.physical import (
     RequestExecution,
@@ -268,7 +270,7 @@ def test_vllm_backend_executes_a_physical_request(monkeypatch):
 
 
 def test_filter_chain_splits_cached_tokens_into_regret_and_cross_row():
-    from quail.backends.request_scheduling import run_filter_chain_waves
+    from quail.backends.request_scheduling import run_filter_chain_async
 
     class Output:
         def __init__(self, prompt, cached):
@@ -276,25 +278,14 @@ def test_filter_chain_splits_cached_tokens_into_regret_and_cross_row():
             self.num_cached_tokens = cached
             self.outputs = [SimpleNamespace(token_ids=[1])]
 
-    class Client:
-        def __init__(self):
-            self.wave = 0
+    async def generate(prompt, sampling_params):
+        cached = {(5, 8): 0, (6, 8): 6, (5, 9): 2, (6, 9): 6}
+        return Output(prompt, cached[(prompt[0], prompt[-1])])
 
-        def generate(self, prompts, sampling_params, use_tqdm=False):
-            self.wave += 1
-            # wave 1 is stage 0 for both documents: document 1's whole
-            # prompt was cached by a request from another row; wave 2
-            # is stage 1: document 0 hits only part of its own body
-            cached = {1: [0, 6], 2: [2, 6]}[self.wave]
-            return [
-                Output(prompt["prompt_token_ids"], value)
-                for prompt, value in zip(prompts, cached)
-            ]
-
-    result = run_filter_chain_waves(
-        Client(), object(), [[5, 5, 5, 5], [6, 6, 6, 6]],
+    result = asyncio.run(run_filter_chain_async(
+        generate, object(), [[5, 5, 5, 5], [6, 6, 6, 6]],
         [[8, 8], [9, 9]], 100, true_ids={1}, block_size=1,
-    )
+    ))
 
     # stage 0 could hit nothing of its own document, so every cached
     # token inside the 4 token body is a cross row hit: 0 + 4, and the
@@ -354,3 +345,52 @@ def test_split_cached_tokens_clips_to_the_document():
     assert split_cached_tokens(6, 2, 0, 8) == (2, 4, 0)
     # a miss short of the own prefix is only own
     assert split_cached_tokens(1, 2, 0, 8) == (1, 0, 0)
+
+
+def test_sglang_submits_full_join_and_preserves_output_order():
+    class Engine:
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, *, input_ids, sampling_params):
+            self.calls.append(input_ids)
+            return [
+                {"output_ids": [prompt[0] % 2], "meta_info": {"cached_tokens": 1}}
+                for prompt in input_ids
+            ]
+
+    engine = Engine()
+    client = SGLangClient(engine, {})
+    prompts = [{"prompt_token_ids": [index, 9]} for index in range(17_000)]
+    result = client.generate(prompts, {})
+    assert len(engine.calls) == 1
+    assert engine.calls[0] == [prompt["prompt_token_ids"] for prompt in prompts]
+    assert [output.outputs[0].token_ids[0] for output in result] == [index % 2 for index in range(17_000)]
+    assert all(output.num_cached_tokens == 1 for output in result)
+    assert client.generate([], {}) == []
+    assert len(engine.calls) == 1
+
+
+def test_sglang_cancelled_filter_aborts_its_engine_request():
+    async def run():
+        started = asyncio.Event()
+        submitted = []
+        aborted = []
+
+        async def generate(**kwargs):
+            submitted.append(kwargs["rid"])
+            started.set()
+            await asyncio.Event().wait()
+
+        engine = SimpleNamespace(
+            async_generate=generate,
+            tokenizer_manager=SimpleNamespace(abort_request=aborted.append),
+        )
+        task = asyncio.create_task(SGLangClient(engine, {})._generate_one([1, 2], {}))
+        await started.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert aborted == submitted
+        assert len(aborted) == 1
+
+    asyncio.run(run())

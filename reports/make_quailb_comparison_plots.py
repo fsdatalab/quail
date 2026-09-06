@@ -22,6 +22,9 @@ Pull the original suite manifest and its four result files:
       uv run modal volume get quail-results "$source_path" "$W/fev9/$method.json"
     done
     uv run modal volume get quail-results \
+      benchmarks/quailb/families/20260906T220559Z-sglang-baseline-redesign/fever-sglang-process.json \
+      "$W/fev9/sglang_update.json"
+    uv run modal volume get quail-results \
       /sol/2026-09-06-quailb-prefix-reuse.json "$W/sol.json"
     uv run --with matplotlib python reports/make_quailb_comparison_plots.py "$W"
 
@@ -249,6 +252,8 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
                       "It has no measured accuracy.\n"
                       "Fresh tokens include recomputed KV. A dash marks zero. "
                       "Stock vLLM uses operator-at-a-time submission.")
+            footer += ("\nFEV-9 uses the revised SGLang adapter; other SGLang results use the earlier adapter."
+                       if "FEV-9" in queries else "\nSGLang measurements use the earlier adapter.")
             figure.text(0.055, 0.035, footer, fontsize=10, linespacing=1.5)
             figure.subplots_adjust(left=0.075, right=0.97, top=0.83,
                                    bottom=0.24 if overview else 0.20, hspace=0.60, wspace=0.28)
@@ -267,23 +272,33 @@ def load_rows(root, fev9_root):
     manifest = json.loads((root / "manifest.json").read_text())
     corpus = json.loads((root / "corpus.json").read_text())
     fev9_manifest = json.loads((fev9_root / "manifest.json").read_text())
+    sglang_update = json.loads((fev9_root / "sglang_update.json").read_text())
+    assert sglang_update["methods"] == ["pipelined_sglang"]
+    assert all(value < 1024 for value in sglang_update["process_cleanup"]["gpu_memory_used_mib_after_exit"])
     assert fev9_manifest["query_ids"] == ["FEV-9"]
     rows = {}
     predicates = None
     for key, _, _ in METHODS:
         suite = json.loads((root / f"{key}.json").read_text())
-        current = json.loads((fev9_root / f"{key}.json").read_text())
+        current = (sglang_update["suites"][key] if key == "pipelined_sglang" else
+                   json.loads((fev9_root / f"{key}.json").read_text()))
         for source in (suite, current):
             assert (source["model"], source["sf"], source["lf"], source["gpus"]) == (
                 "qwen3-4b-fp8", 0.1, 1, 1)
             assert source["corpus_id"] == corpus["corpus_id"]
             assert source["backend"] == key
-        assert current["aggregate_volume_path"] == fev9_manifest["result_volume_paths"][key]
-        assert current["ground_truth"]["fever"] == suite["ground_truth"]["fever"]
+        if key == "pipelined_sglang":
+            assert current["ground_truth"] == suite["ground_truth"]["fever"]
+        else:
+            assert current["aggregate_volume_path"] == fev9_manifest["result_volume_paths"][key]
+            assert current["ground_truth"]["fever"] == suite["ground_truth"]["fever"]
         measured = current["passes"]["single"]["queries"]
         assert len(measured) == 1 and measured[0]["query"] == "FEV-9"
         row = measured[0]
         assert "error" not in row, row
+        if key == "pipelined_sglang":
+            assert all(step["submission"] == "anchor-major" for step in
+                       row["backend_metrics"]["steps"] if step["kind"] == "join")
         filters = [stage for stage in row["stages"] if stage["op"] == "filter"]
         assert len(filters) == 4 and {stage["alias"] for stage in filters} == {"c1", "c2", "e1", "e2"}
         assert len([stage for stage in row["stages"] if stage["op"] == "join"]) == 3
@@ -295,14 +310,14 @@ def load_rows(root, fev9_root):
         rows[key] = {row["query"]: row for row in suite["passes"]["single"]["queries"]
                      if row["query"] != "FEV-9"}
         rows[key]["FEV-9"] = row
-    return manifest, rows, fev9_manifest
+    return manifest, rows, fev9_manifest, sglang_update["result_volume_path"]
 
 
 def main(workdir, fev9_dir=None):
     """Regenerate figures from the saved suite and current FEV-9 runs."""
     root = Path(workdir)
     fev9_root = Path(fev9_dir) if fev9_dir else root / "fev9"
-    manifest, rows, fev9_manifest = load_rows(root, fev9_root)
+    manifest, rows, fev9_manifest, sglang_source = load_rows(root, fev9_root)
     queries = manifest["query_ids"]
     comparable = [query for query in queries if all(query in rows[key] for key in rows)]
     assert len(queries) == 32 and len(comparable) == 32
@@ -319,6 +334,9 @@ def main(workdir, fev9_dir=None):
     sol = load_sol(root, queries, rows, corpus)
     overview = plot_comparison("QUAIL-B", queries, rows, relations, sol, "quailb_main.png", overview=True)
     fev = row_metrics(rows["quail"]["FEV-9"])
+    sglang = row_metrics(rows["pipelined_sglang"]["FEV-9"])
+    previous_sglang = row_metrics(json.loads(
+        (fev9_root / "pipelined_sglang.json").read_text())["passes"]["single"]["queries"][0])
     output = rows["quail"]["FEV-9"]["accuracy"]["output_accuracy"]
     lines = [
         "# QUAIL-B comparison from saved results", "",
@@ -331,14 +349,21 @@ def main(workdir, fev9_dir=None):
         "  input tokens, accuracy, and input document counts for every relation alias.",
         "- The other 31 queries reuse the original measurements from September 5, 2026.",
         "  Only FEV-9 was rerun on September 6, 2026, with all four methods.",
+        "  FEV-9 uses the revised SGLang adapter with the same join submission as vLLM.",
+        "  Other queries retain historical SGLang measurements with the earlier adapter.",
         "  The other queries are not new measurements of shared retention.",
         "- The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.",
         "  Quail and the vLLM configurations shared a physical GPU within each family.",
         "  SGLang used a separate GPU. Stock vLLM used operator-at-a-time submission.",
         "- FEV-9 has four filters and three joins. All four methods now use that",
         "  query definition in both the main plot and the FEVER plot.",
-        "  The [FEV-9 comparison](2026-09-06-fev9-baselines.md) records the new run.",
+        "  The [FEV-9 comparison](2026-09-06-sglang-baseline.md) records the new run.",
         "  The [retention report](2026-09-05-shared-kv-retention.md) records the earlier ablation.",
+        f"- The revised SGLang adapter took {sglang['seconds']:.2f} seconds on FEV-9,",
+        f"  compared with {previous_sglang['seconds']:.2f} seconds using its earlier submission policy.",
+        f"  Fresh computation rose from {previous_sglang['fresh']:,} to {sglang['fresh']:,} tokens.",
+        "  Matching vLLM's submission rules reduced SGLang prefix reuse on this query.",
+        "  This is not a comparison against the fastest measured SGLang submission policy.",
         "- We predicted Quail would remain near 39 seconds and beat the baselines.",
         f"  It took {fev['seconds']:.2f} seconds in the new run. We reused all 124 saved",
         "  configurations for the other 31 queries.",
@@ -391,7 +416,8 @@ def main(workdir, fev9_dir=None):
         f"[![QUAIL-B latency preview](plots/{overview})](plots/quailb_main.pdf)", "",
         f"Figure: plots/{overview}", "",
         f"Source manifest on `quail-results`: `{manifest['manifest_volume_path']}`.", "",
-        f"Current FEV-9 manifest on `quail-results`: `{fev9_manifest['manifest_volume_path']}`.", "",
+        f"FEV-9 Quail and vLLM manifest on `quail-results`: `{fev9_manifest['manifest_volume_path']}`.", "",
+        f"Current FEV-9 SGLang result on `quail-results`: `{sglang_source}`.", "",
         "SoL estimates on `quail-results`: `/results/sol/2026-09-06-quailb-prefix-reuse.json`.", "",
         "The FEV-9 recalculation is also saved separately at `/results/sol/2026-09-06-fev9-prefix-reuse.json`.", "",
         f"Corpus counts on `quail-results`: `/results/ground_truth/quailb/schema_v1/corpora/{corpus['corpus_id']}/manifest.json`.", "",

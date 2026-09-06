@@ -37,8 +37,6 @@ def _capacity(llm) -> dict:
 class VLLMClient:
     """The request operations the backends need from one vLLM LLM."""
 
-    join_tile_budget_tokens = None
-
     def __init__(self, llm, capacity: dict):
         self.llm = llm
         self.capacity = capacity

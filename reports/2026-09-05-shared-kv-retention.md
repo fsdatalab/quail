@@ -17,7 +17,7 @@ Figure: plots/quailb_fev.png
 
 - FEV-9 appears with the other FEVER queries in the standard dataset plot.
   The plot uses the September 6 run of all four methods, documented in
-  [the FEV-9 comparison](2026-09-06-fev9-baselines.md). The retention ablation
+  [the FEV-9 comparison](2026-09-06-sglang-baseline.md). The retention ablation
   remains in the tables below.
 - The PDF also shows the SoL estimate with prefix reuse across requests.
   SoL assumes unlimited prefix retention and reference-label survivors.

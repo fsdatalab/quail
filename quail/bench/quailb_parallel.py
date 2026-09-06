@@ -160,13 +160,13 @@ def run_sglang_query_family(
     ground_truth_collection: str,
 ) -> str:
     """Run one query family through the SGLang backend."""
-    from quail.bench.process_isolation import run_backend_group
+    from quail.bench.process_isolation import run_backend_group_in_fresh_process
 
     query_ids = tuple(
         query_id.strip() for query_id in query_ids_csv.split(",")
         if query_id.strip()
     )
-    result = run_backend_group(
+    result = run_backend_group_in_fresh_process(
         data_dir=DATA_DIR,
         model=model,
         sf=sf,
@@ -177,6 +177,12 @@ def run_sglang_query_family(
         ground_truth_collection=ground_truth_collection,
         methods=("pipelined_sglang",),
     )
+    result_path = Path(
+        f"/results/benchmarks/quailb/families/{run_label}/"
+        f"{result['query_family']}-sglang-process.json"
+    )
+    result["result_volume_path"] = str(result_path)
+    result_path.write_text(json.dumps(result, indent=2))
     results_vol.commit()
     return json.dumps(result)
 

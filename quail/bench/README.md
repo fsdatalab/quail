@@ -54,7 +54,8 @@ the parent stops the complete process group and waits for GPU memory use to
 fall below 1 GiB. The same container then runs stock vLLM and pipelined vLLM
 in a second process group. Both vLLM configurations share one loaded model.
 The runner records the physical GPU UUID and checks that both process groups
-saw the same H100.
+saw the same H100. SGLang uses the same child-process isolation and cleanup
+in its separate container.
 
 ```bash
 run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"

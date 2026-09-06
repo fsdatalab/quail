@@ -1,14 +1,12 @@
 """Request scheduling shared by the vLLM and SGLang backends.
 
-A filter chain advances each document through its questions one
-request at a time and keeps a bounded number of documents live. The
-streaming form drives an engine that exposes add_request and step;
-the wave form drives a client that only exposes a blocking generate.
-Both use the same admission cap and the same bookkeeping.
+Filter chains advance on individual request completions under a shared
+KV admission calculation. Joins submit one request per document pair.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 MAX_SEQUENCES = 4_096
@@ -42,6 +40,8 @@ def filter_document_cap(
     Each live document holds one request of its body, its longest
     question, and the one answer token, rounded up to whole KV blocks.
     """
+    if not body_ids:
+        return 0
     longest_tail = max(len(question) for question in question_ids)
     rounded_sizes = [
         (
@@ -220,8 +220,8 @@ def run_filter_chain(
     )
 
 
-def run_filter_chain_waves(
-    client,
+async def run_filter_chain_async(
+    generate,
     sampling_params,
     body_ids,
     question_ids,
@@ -231,83 +231,29 @@ def run_filter_chain_waves(
     block_size=1,
     max_num_seqs=None,
 ):
-    """Advance every live document by one filter stage per wave.
-
-    The client exposes only a blocking generate, as SGLang's engine
-    does, so wave boundaries stand in for the engine step loop. A
-    document's next stage always finds its body cached because the
-    previous stage finished first.
-    """
+    """Advance filters and refill admission on individual completions."""
     document_cap = filter_document_cap(
         body_ids, question_ids, budget_tokens,
         block_size=block_size, max_num_seqs=max_num_seqs,
     )
     chain = _FilterChain(body_ids, question_ids, true_ids, block_size)
-    active = []
-    next_document = 0
+    documents = iter(range(len(body_ids)))
+
+    async def worker():
+        for document in documents:
+            for stage, question in enumerate(question_ids):
+                output = await generate(body_ids[document] + question, sampling_params)
+                if not chain.record(document, stage, output):
+                    break
+
     started = time.perf_counter()
-    while active or next_document < len(body_ids):
-        while (
-            next_document < len(body_ids)
-            and len(active) < document_cap
-        ):
-            active.append((next_document, 0))
-            next_document += 1
-        prompts = [
-            {
-                "prompt_token_ids": (
-                    body_ids[document] + question_ids[stage]
-                )
-            }
-            for document, stage in active
-        ]
-        outputs = client.generate(prompts, sampling_params, use_tqdm=False)
-        active = [
-            (document, stage + 1)
-            for (document, stage), output in zip(active, outputs)
-            if chain.record(document, stage, output)
-        ]
+    async with asyncio.TaskGroup() as group:
+        for _ in range(min(document_cap, len(body_ids))):
+            group.create_task(worker())
     return chain.result(
         time.perf_counter() - started,
-        **_cap_settings(document_cap, budget_tokens, block_size,
-                        max_num_seqs),
+        **_cap_settings(document_cap, budget_tokens, block_size, max_num_seqs),
     )
-
-
-def suffix_major_tiled_order(prefixes, suffixes, tile_budget_tokens):
-    """Order pairs suffix-major within anchor tiles under a KV budget.
-
-    Within one tile no two pairs share an anchor until the first
-    suffix pass has completed and cached every anchor, so an engine
-    that only caches finished requests (SGLang's radix cache) reuses
-    anchors from the second pass on. The tile bound keeps a tile's
-    anchors resident.
-
-    Returns:
-        List of (anchor_index, suffix_index) in submission order.
-    """
-    if tile_budget_tokens is None or tile_budget_tokens <= 0:
-        raise ValueError("suffix major joins need a positive tile budget")
-    max_suffix = max(len(suffix) for suffix in suffixes)
-    tiles = []
-    tile = []
-    used = 0
-    for anchor_index, prefix in enumerate(prefixes):
-        cost = len(prefix) + max_suffix
-        if tile and used + cost > tile_budget_tokens:
-            tiles.append(tile)
-            tile = []
-            used = 0
-        tile.append(anchor_index)
-        used += cost
-    if tile:
-        tiles.append(tile)
-    return [
-        (anchor_index, suffix_index)
-        for anchor_tile in tiles
-        for suffix_index in range(len(suffixes))
-        for anchor_index in anchor_tile
-    ]
 
 
 def run_join_grouped(
@@ -318,36 +264,15 @@ def run_join_grouped(
     true_ids,
     *,
     submission="anchor-major",
-    tile_budget_tokens=None,
 ):
-    """Submit one request for every tuple in a full cross product.
-
-    Args:
-        submission: "anchor-major" submits all suffixes of one anchor
-            before the next anchor. "suffix-major-tiled" submits per
-            suffix_major_tiled_order and needs tile_budget_tokens.
-
-    Returns:
-        Dict with wall time and counters. answers is in anchor-major
-        pair order for either submission.
-    """
-    if submission == "anchor-major":
-        order = None
-        prompts = [
-            {"prompt_token_ids": prefix + suffix}
-            for prefix in prefixes
-            for suffix in suffixes
-        ]
-    elif submission == "suffix-major-tiled":
-        order = suffix_major_tiled_order(
-            prefixes, suffixes, tile_budget_tokens
-        )
-        prompts = [
-            {"prompt_token_ids": prefixes[anchor] + suffixes[suffix]}
-            for anchor, suffix in order
-        ]
-    else:
+    """Submit the full cross product in anchor-major order."""
+    if submission != "anchor-major":
         raise ValueError(f"unknown join submission {submission!r}")
+    prompts = [
+        {"prompt_token_ids": prefix + suffix}
+        for prefix in prefixes
+        for suffix in suffixes
+    ]
 
     started = time.perf_counter()
     outputs = client.generate(prompts, sampling_params, use_tqdm=False)
@@ -357,16 +282,8 @@ def run_join_grouped(
         int(getattr(output, "num_cached_tokens", 0) or 0)
         for output in outputs
     ]
-    if order is None:
-        answers = bits
-        cached_per_request = cached_by_output
-    else:
-        answers = [0] * len(bits)
-        cached_per_request = [0] * len(bits)
-        for output_index, (anchor, suffix) in enumerate(order):
-            pair = anchor * len(suffixes) + suffix
-            answers[pair] = bits[output_index]
-            cached_per_request[pair] = cached_by_output[output_index]
+    answers = bits
+    cached_per_request = cached_by_output
     prompt_tokens = sum(len(output.prompt_token_ids) for output in outputs)
     cached_tokens = sum(cached_per_request)
     return {

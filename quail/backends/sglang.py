@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+import uuid
 
 from quail.backends.request import RequestBackend
 from quail.backends.request_scheduling import (
     MAX_BATCHED_TOKENS,
     MAX_SEQUENCES,
-    run_filter_chain_waves,
+    run_filter_chain_async,
 )
 
 PAGE_SIZE = 16
@@ -17,10 +19,6 @@ CHUNKED_PREFILL_TOKENS = (
 ) * PAGE_SIZE
 MEM_FRACTION_STATIC = 0.76
 TRUE_FALSE_LOGIT_BIAS = 1_000.0
-# One generate() call per request keeps the driver process busy with
-# one asyncio task each; a slice bounds that so the Modal health
-# heartbeat thread keeps running.
-SUBMIT_SLICE = 16_384
 
 
 class _Completion:
@@ -43,24 +41,11 @@ class SGLangClient:
     def __init__(self, engine, capacity):
         self.engine = engine
         self.capacity = capacity
-        # Half the KV pool bounds a join tile: in-flight suffixes and
-        # the previous tile's leftovers share the pool with the tile's
-        # anchors.
-        self.join_tile_budget_tokens = (
-            capacity["kv_cache_size_tokens"] // 2
-        )
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
         del use_tqdm
-        outputs = []
-        for start in range(0, len(prompts), SUBMIT_SLICE):
-            outputs.extend(self._generate_slice(
-                prompts[start:start + SUBMIT_SLICE],
-                sampling_params,
-            ))
-        return outputs
-
-    def _generate_slice(self, prompts, sampling_params):
+        if not prompts:
+            return []
         input_ids = [prompt["prompt_token_ids"] for prompt in prompts]
         raw = self.engine.generate(
             input_ids=input_ids,
@@ -83,22 +68,35 @@ class SGLangClient:
             ))
         return outputs
 
+    async def _generate_one(self, input_ids, sampling_params):
+        request_id = uuid.uuid4().hex
+        try:
+            result = await self.engine.async_generate(
+                input_ids=input_ids, sampling_params=dict(sampling_params), rid=request_id,
+            )
+        except asyncio.CancelledError:
+            self.engine.tokenizer_manager.abort_request(request_id)
+            raise
+        return _RequestOutput(
+            input_ids,
+            list(result.get("output_ids") or []),
+            int(result["meta_info"].get("cached_tokens") or 0),
+        )
+
     def run_filter_chain(self, sampling_params, body_ids, question_ids,
                          true_ids, *, tag="q"):
-        """Pipeline filter stages in waves of blocking generate calls."""
+        """Submit each document's next filter as soon as it passes."""
         del tag
-        # the measured SGLang runs sized admission without rounding to
-        # pages, so the cap stays unrounded here
-        return run_filter_chain_waves(
-            self,
+        return self.engine.loop.run_until_complete(run_filter_chain_async(
+            self._generate_one,
             sampling_params,
             body_ids,
             question_ids,
             self.capacity["kv_cache_size_tokens"],
             true_ids=true_ids,
-            block_size=1,
-            max_num_seqs=MAX_SEQUENCES,
-        )
+            block_size=self.capacity["block_size"],
+            max_num_seqs=self.capacity["max_num_seqs"],
+        ))
 
     def reset_prefix_cache(self):
         result = self.engine.flush_cache()
@@ -178,10 +176,9 @@ class SGLangEngine:
 
 
 def pipelined_sglang_backend() -> RequestBackend:
-    """Return SGLang with filter waves and suffix major tiled joins."""
+    """Return SGLang with per-document filter pipelining."""
     return RequestBackend(
         name="pipelined_sglang",
         engine=SGLangEngine(),
         filter_submission="pipelined",
-        join_submission="suffix-major-tiled",
     )

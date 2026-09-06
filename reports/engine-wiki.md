@@ -393,9 +393,11 @@ The built in backends are separate implementations.
   request per document tuple in anchor major order.
 - `pipelined_vllm` submits the next filter stage as soon as one document
   passes. It uses the same vLLM model and join submission as stock vLLM.
-- `pipelined_sglang` advances filters in SGLang request waves. Its joins use
-  suffix major order within bounded anchor groups so SGLang can reuse finished
-  request prefixes.
+- `pipelined_sglang` uses SGLang's asynchronous generation API to advance each
+  document as soon as its filter finishes. It uses the same page-rounded
+  admission calculation and anchor-major join submission as vLLM. Each join is
+  submitted as one batch, and SGLang schedules requests against its full KV
+  capacity. There is no client-side half-KV allocation or fixed request slice.
 
 The three are instances of one `RequestBackend` class with an engine adapter
 (`VLLMEngine` or `SGLangEngine`) and two submission strategies. They share the
@@ -414,7 +416,9 @@ records the physical GPU UUID and checks that both groups saw the same H100.
 
 SGLang runs in a separate container with its own image. vLLM 0.26.0 requires
 `apache-tvm-ffi` 0.1.10, while SGLang 0.5.18 requires version 0.1.11. Modal can
-therefore assign SGLang another physical H100.
+therefore assign SGLang another physical H100. Its driver runs in a child
+process group, with the same cleanup and GPU-memory check as Quail and vLLM.
+The parent Modal process remains free to send its heartbeat messages.
 
 Each physical node has one codec representation that contains everything
 needed for execution. Its separate explain fields omit large runtime values

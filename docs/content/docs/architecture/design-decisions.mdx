@@ -181,8 +181,9 @@ The built in request backends are separate from `QuailBackend`.
   requests.
 - `pipelined_vllm` uses per document filter pipelining and anchor major join
   requests.
-- `pipelined_sglang` uses SGLang filter waves and suffix major join requests
-  within bounded anchor groups.
+- `pipelined_sglang` advances filters on individual asynchronous completions
+  and submits anchor-major join requests, using the same admission calculation
+  as pipelined vLLM.
 
 These backends plan a `RequestExecution` node. The node contains tokenized
 prompt parts and output ports. Each backend owns its model startup, request

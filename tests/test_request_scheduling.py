@@ -1,5 +1,6 @@
 """CPU tests for the scheduling loops the request backends share."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -8,9 +9,8 @@ from quail.backends.request_scheduling import (
     join_regret_tokens,
     longest_common_prefix,
     run_filter_chain,
-    run_filter_chain_waves,
+    run_filter_chain_async,
     run_join_grouped,
-    suffix_major_tiled_order,
 )
 
 
@@ -81,102 +81,80 @@ def test_filter_chain_submits_next_stage_before_prior_stage_finishes():
     assert result["survivors"] == [0, 1]
 
 
-class _WaveRecordingClient:
-    """Answers by a fixed (document, stage) truth table.
+def test_async_filters_advance_and_refill_before_slow_request_finishes():
+    async def run():
+        release = asyncio.Event()
+        events = []
+        active = 0
+        peak = 0
 
-    Documents are identified by their body length, stages by the
-    question length, so the recorded waves can be decoded.
-    """
+        async def generate(prompt, sampling_params):
+            nonlocal active, peak
+            document, question = prompt[0], prompt[-1]
+            events.append(("start", document, question))
+            active += 1
+            peak = max(peak, active)
+            if document == 2 and question == 8:
+                await release.wait()
+            else:
+                await asyncio.sleep(0)
+            if document == 3:
+                release.set()
+            answer = document == 2 or (document == 1 and question == 8)
+            active -= 1
+            events.append(("finish", document, question))
+            return SimpleNamespace(
+                prompt_token_ids=prompt, num_cached_tokens=0,
+                outputs=[SimpleNamespace(token_ids=[1 if answer else 0])],
+            )
 
-    def __init__(self, verdicts, body_lengths, question_lengths):
-        self.verdicts = verdicts
-        self.body_lengths = body_lengths
-        self.question_lengths = question_lengths
-        self.waves = []
+        result = await asyncio.wait_for(run_filter_chain_async(
+            generate, {}, [[1] * 10, [2] * 20, [3] * 30],
+            [[8] * 3, [9] * 4], 64, true_ids={1}, block_size=16,
+            max_num_seqs=10,
+        ), timeout=2)
+        assert result["doc_cap"] == 2
+        assert peak == 2
+        assert events.index(("start", 1, 9)) < events.index(("finish", 2, 8))
+        assert events.index(("start", 3, 8)) < events.index(("finish", 2, 8))
+        assert result["survivors"] == [1]
+        assert result["requests"] == 5
+        assert result["answers"] == {(0, 1): 1, (0, 2): 0, (1, 1): 1, (1, 2): 1, (2, 1): 0}
 
-    def generate(self, prompts, _sampling_params, use_tqdm=False):
-        wave = []
-        outs = []
-        for prompt in prompts:
-            ids = prompt["prompt_token_ids"]
-            found = None
-            for index, body in enumerate(self.body_lengths):
-                for stage, tail in enumerate(self.question_lengths):
-                    if len(ids) == body + tail:
-                        found = (index, stage)
-            wave.append(found)
-            bit = 7 if self.verdicts[found] else 8
-            outs.append(SimpleNamespace(
-                prompt_token_ids=ids,
-                num_cached_tokens=0,
-                outputs=[SimpleNamespace(token_ids=[bit], text="")]))
-        self.waves.append(wave)
-        return outs
-
-
-def test_wave_chain_advances_documents_under_the_cap():
-    # Bodies 10/20/30 tokens, questions 3/4 tokens: every (doc, stage)
-    # pair has a distinct prompt length.
-    verdicts = {(0, 0): True, (0, 1): True,
-                (1, 0): False,
-                (2, 0): True, (2, 1): False}
-    client = _WaveRecordingClient(verdicts, [10, 20, 30], [3, 4])
-
-    # mean request = 20 + 4 + 1 = 25; budget 50 -> two admission
-    # slots. The SGLang client sizes admission without page rounding.
-    result = run_filter_chain_waves(
-        client, {"temperature": 0.0},
-        [[1] * 10, [2] * 20, [3] * 30], [[4] * 3, [5] * 4],
-        50, true_ids={7}, block_size=1)
-
-    assert result["doc_cap"] == 2
-    # Wave 1: documents 0 and 1 on stage 1. Wave 2: document 0 has
-    # advanced to stage 2 while document 2 takes the freed slot: one
-    # request per live document, which is the pipelining property.
-    assert client.waves[0] == [(0, 0), (1, 0)]
-    assert client.waves[1] == [(0, 1), (2, 0)]
-    assert client.waves[2] == [(2, 1)]
-    assert result["survivors"] == [0]
-    assert result["requests"] == 5
+    asyncio.run(run())
 
 
-def _tiled_order_tiles(order, n_suffixes):
-    """Split a suffix-major-tiled order back into its anchor tiles."""
-    tiles = []
-    position = 0
-    while position < len(order):
-        tile = []
-        while (position + len(tile) < len(order)
-               and order[position + len(tile)][1] == 0):
-            tile.append(order[position + len(tile)][0])
-        assert tile, "each tile must start with suffix 0"
-        expected = [
-            (anchor_index, suffix_index)
-            for suffix_index in range(n_suffixes)
-            for anchor_index in tile
-        ]
-        assert order[position:position + len(expected)] == expected
-        position += len(expected)
-        tiles.append(tile)
-    return tiles
+def test_async_filter_failure_cancels_other_requests():
+    async def run():
+        pending = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def generate(prompt, sampling_params):
+            if prompt[0] == 1:
+                await pending.wait()
+                raise RuntimeError("request failed")
+            pending.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        with pytest.raises(ExceptionGroup, match="TaskGroup"):
+            await run_filter_chain_async(
+                generate, {}, [[1], [2]], [[9]], 100, true_ids={1}, max_num_seqs=2,
+            )
+        assert cancelled.is_set()
+
+    asyncio.run(run())
 
 
-def test_suffix_major_tiles_cover_all_pairs_within_budget():
-    prefixes = [[0] * length for length in (30, 30, 30, 50, 10, 90)]
-    suffixes = [[0] * 5, [0] * 3]
-    budget = 100
+def test_async_filter_empty_input_submits_nothing():
+    async def generate(prompt, sampling_params):
+        raise AssertionError("no documents")
 
-    order = suffix_major_tiled_order(prefixes, suffixes, budget)
-    assert sorted(order) == sorted(
-        (i, j) for i in range(len(prefixes))
-        for j in range(len(suffixes)))
-
-    tiles = _tiled_order_tiles(order, len(suffixes))
-    assert [anchor for tile in tiles for anchor in tile] == list(
-        range(len(prefixes)))
-    for tile in tiles:
-        cost = sum(len(prefixes[anchor]) + 5 for anchor in tile)
-        assert cost <= budget or len(tile) == 1
+    result = asyncio.run(run_filter_chain_async(generate, {}, [], [[9]], 100, true_ids={1}))
+    assert result["requests"] == 0
+    assert result["survivors"] == []
 
 
 class _ParityClient:
@@ -192,20 +170,11 @@ class _ParityClient:
         return outs
 
 
-def test_tiled_join_answers_match_anchor_major_order():
+def test_join_answers_preserve_anchor_major_order():
     prefixes = [[100 + i] * (4 + i) for i in range(5)]
     suffixes = [[200 + j] * 3 for j in range(4)]
-
-    baseline = run_join_grouped(
-        _ParityClient(), object(), prefixes, suffixes, {1})
-    tiled = run_join_grouped(
-        _ParityClient(), object(), prefixes, suffixes, {1},
-        submission="suffix-major-tiled", tile_budget_tokens=20)
-
-    assert baseline["answers"] == tiled["answers"]
-    assert baseline["prompt_tokens"] == tiled["prompt_tokens"]
-    assert tiled["submission"] == "suffix-major-tiled"
-
-    with pytest.raises(ValueError):
-        run_join_grouped(_ParityClient(), object(), prefixes, suffixes,
-                         {1}, submission="suffix-major-tiled")
+    result = run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1})
+    assert result["answers"] == [int((i + j) % 2 == 0) for i in range(5) for j in range(4)]
+    assert result["submission"] == "anchor-major"
+    with pytest.raises(ValueError, match="unknown join submission"):
+        run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1}, submission="unknown")

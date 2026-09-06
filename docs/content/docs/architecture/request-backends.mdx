@@ -12,7 +12,7 @@ None of them call Quail's executor.
 | --- | --- | --- |
 | `stock_vllm` | Operator-at-a-time execution. Filter 2 starts when every filter 1 request has finished. | One request per tuple, anchor-major order. |
 | `pipelined_vllm` | The next stage's request is submitted as soon as one document passes. | Same as stock. |
-| `pipelined_sglang` | SGLang request waves that advance documents as they pass. | Suffix-major order inside bounded anchor groups so SGLang's prefix cache can reuse the anchor. |
+| `pipelined_sglang` | The next stage is submitted on each completion through SGLang's asynchronous API. | Same as stock. |
 
 ## Planning
 
@@ -31,6 +31,12 @@ container and returns a client with three operations: `generate`,
 submits requests according to the strategy and turns the answers into
 the standard Arrow tables. The scheduling loops live in
 `quail.backends.request_scheduling`.
+Both pipelined backends use the same admission calculation with the engine's
+reported KV capacity, page size, and maximum active requests. Each join is
+submitted as one batch in anchor-major order. The engines manage KV allocation
+and request scheduling; the client does not reserve half the KV or wait for
+fixed request slices to finish.
+
 Metrics cover cached tokens, fresh tokens, KV regret, request counts,
 query time, boot time, and KV capacity.
 
@@ -47,3 +53,7 @@ physical H100 per query family. It runs Quail in one process group,
 stops the whole group, waits for GPU memory to fall under 1 GiB, and
 then runs both vLLM configurations in a second group. It records the
 GPU UUID each group saw and refuses the family if they differ.
+
+SGLang runs in a separate container with the same child-process isolation and
+cleanup checks. Its inference driver cannot block the parent process's Modal
+heartbeat messages.

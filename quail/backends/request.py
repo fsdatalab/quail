@@ -642,9 +642,6 @@ class RequestModelExecution:
                     suffixes,
                     self.true_ids,
                     submission=self.join_submission,
-                    tile_budget_tokens=getattr(
-                        self.client, "join_tile_budget_tokens", None
-                    ),
                 )
                 answers = [bool(answer) for answer in result["answers"]]
                 seen_lengths = [

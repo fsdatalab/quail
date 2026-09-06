@@ -36,7 +36,8 @@ Add `--query IMDB-4` to run one query.
   UUID both groups saw and stops the family if they differ.
 - Pipelined SGLang runs in a separate container. vLLM 0.26.0 and
   SGLang 0.5.18 need different exact versions of `apache-tvm-ffi`, so
-  they cannot share an image.
+  they cannot share an image. Its driver runs in a child process with the
+  same cleanup and GPU-memory checks.
 - The command prints one Modal function call id per family. Results go
   to the `quail-results` volume under
   `/results/benchmarks/quailb/runs/<run_id>/`, with a manifest under
