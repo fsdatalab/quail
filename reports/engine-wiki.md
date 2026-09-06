@@ -395,7 +395,10 @@ The built in backends are separate implementations.
   passes. It uses the same vLLM model and join submission as stock vLLM.
 - `pipelined_sglang` uses SGLang's asynchronous generation API to advance each
   document as soon as its filter finishes. It uses the same page-rounded
-  admission calculation and anchor-major join submission as vLLM. Each join is
+  admission calculation as vLLM. Joins submit all anchors for one partner before
+  the next partner, separating requests that share an anchor. Earlier requests
+  can then populate reusable KV. Answers and KV counts return in anchor-major
+  order regardless of submission order. Each join is
   submitted as one batch, and SGLang schedules requests against its full KV
   capacity. There is no client-side half-KV allocation or fixed request slice.
 

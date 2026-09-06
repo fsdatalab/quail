@@ -9,7 +9,7 @@
   input tokens, accuracy, and input document counts for every relation alias.
 - The other 31 queries reuse the original measurements from September 5, 2026.
   Only FEV-9 was rerun on September 6, 2026, with all four methods.
-  FEV-9 uses the revised SGLang adapter with the same join submission as vLLM.
+  FEV-9 uses SGLang with all anchors submitted per partner, without client tiles or request slices.
   Other queries retain historical SGLang measurements with the earlier adapter.
   The other queries are not new measurements of shared retention.
 - The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.
@@ -19,11 +19,12 @@
   query definition in both the main plot and the FEVER plot.
   The [FEV-9 comparison](2026-09-06-sglang-baseline.md) records the new run.
   The [retention report](2026-09-05-shared-kv-retention.md) records the earlier ablation.
-- The revised SGLang adapter took 304.92 seconds on FEV-9,
+- The revised SGLang adapter took 135.74 seconds on FEV-9,
   compared with 138.26 seconds using its earlier submission policy.
-  Fresh computation rose from 4,096,274 to 20,388,882 tokens.
-  Matching vLLM's submission rules reduced SGLang prefix reuse on this query.
-  This is not a comparison against the fastest measured SGLang submission policy.
+  Fresh computation was 4,095,266 tokens, compared with 4,096,274 before.
+  The intermediate run with vLLM's pair order took 304.92 seconds
+  and computed 20,388,882 fresh tokens. The current SGLang order
+  separates requests sharing an anchor so earlier requests can populate reusable KV.
 - We predicted Quail would remain near 39 seconds and beat the baselines.
   It took 41.14 seconds in the new run. We reused all 124 saved
   configurations for the other 31 queries.
@@ -83,7 +84,7 @@ Source manifest on `quail-results`: `/results/benchmarks/quailb/family-runs/2026
 
 FEV-9 Quail and vLLM manifest on `quail-results`: `/results/benchmarks/quailb/family-runs/20260906T211500Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json`.
 
-Current FEV-9 SGLang result on `quail-results`: `/results/benchmarks/quailb/families/20260906T220559Z-sglang-baseline-redesign/fever-sglang-process.json`.
+Current FEV-9 SGLang result on `quail-results`: `/results/benchmarks/quailb/families/20260906T222629Z-sglang-suffix-major/fever-sglang-process.json`.
 
 SoL estimates on `quail-results`: `/results/sol/2026-09-06-quailb-prefix-reuse.json`.
 
@@ -265,7 +266,7 @@ Figure: plots/quailb_fev.png
 | FEV-9 | Quail | 41.14 | 7,309 | 4,314,219 | 4,426.71 | pairs/s | 0.04513 | 67.77 | 3.3382e-06 | 45.455 |
 | FEV-9 | Stock vLLM | 90.07 | 194,016 | 4,593,860 | 2,108.23 | pairs/s | 0.09881 | 67.05 | 2.9055e-06 | 45.455 |
 | FEV-9 | Pipelined vLLM | 89.80 | 193,312 | 4,593,156 | 2,114.57 | pairs/s | 0.09851 | 67.05 | 2.9055e-06 | 45.455 |
-| FEV-9 | Pipelined SGLang | 304.92 | 15,673,360 | 20,388,882 | 561.45 | pairs/s | 0.33450 | 69.08 | 4.2171e-06 | 45.455 |
+| FEV-9 | Pipelined SGLang | 135.74 | 33,904 | 4,095,266 | 1,261.21 | pairs/s | 0.14891 | 69.08 | 4.2171e-06 | 45.455 |
 | FEV-9 | SoL estimate | 5.821 | 0 (assumed) | 1,474,838 | 9,857.99 | pairs/s | 0.00639 | Not measured | Not measured | Not measured |
 
 ## LEP

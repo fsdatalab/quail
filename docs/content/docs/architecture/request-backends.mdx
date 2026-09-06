@@ -12,7 +12,7 @@ None of them call Quail's executor.
 | --- | --- | --- |
 | `stock_vllm` | Operator-at-a-time execution. Filter 2 starts when every filter 1 request has finished. | One request per tuple, anchor-major order. |
 | `pipelined_vllm` | The next stage's request is submitted as soon as one document passes. | Same as stock. |
-| `pipelined_sglang` | The next stage is submitted on each completion through SGLang's asynchronous API. | Same as stock. |
+| `pipelined_sglang` | The next stage is submitted on each completion through SGLang's asynchronous API. | One request per tuple, suffix-major order. |
 
 ## Planning
 
@@ -33,7 +33,12 @@ the standard Arrow tables. The scheduling loops live in
 `quail.backends.request_scheduling`.
 Both pipelined backends use the same admission calculation with the engine's
 reported KV capacity, page size, and maximum active requests. Each join is
-submitted as one batch in anchor-major order. The engines manage KV allocation
+submitted as one batch. vLLM submits all partners for one anchor before moving
+to the next anchor. SGLang submits all anchors for one partner before moving
+to the next partner. SGLang's order separates requests sharing an anchor so
+earlier requests can populate reusable KV. Answers and cached-token counts
+are returned in anchor-major order for both strategies.
+The engines manage KV allocation
 and request scheduling; the client does not reserve half the KV or wait for
 fixed request slices to finish.
 

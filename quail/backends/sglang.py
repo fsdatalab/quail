@@ -181,4 +181,5 @@ def pipelined_sglang_backend() -> RequestBackend:
         name="pipelined_sglang",
         engine=SGLangEngine(),
         filter_submission="pipelined",
+        join_submission="suffix-major",
     )

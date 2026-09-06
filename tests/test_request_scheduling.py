@@ -158,7 +158,11 @@ def test_async_filter_empty_input_submits_nothing():
 
 
 class _ParityClient:
+    def __init__(self):
+        self.calls = []
+
     def generate(self, prompts, _sp, use_tqdm=False):
+        self.calls.append(prompts)
         outs = []
         for prompt in prompts:
             ids = prompt["prompt_token_ids"]
@@ -166,15 +170,33 @@ class _ParityClient:
             outs.append(SimpleNamespace(
                 outputs=[SimpleNamespace(token_ids=[bit])],
                 prompt_token_ids=ids,
-                num_cached_tokens=0))
+                num_cached_tokens=ids[0] % 7))
         return outs
 
 
-def test_join_answers_preserve_anchor_major_order():
+@pytest.mark.parametrize("submission", ["anchor-major", "suffix-major"])
+def test_join_answers_preserve_anchor_major_order(submission):
     prefixes = [[100 + i] * (4 + i) for i in range(5)]
     suffixes = [[200 + j] * 3 for j in range(4)]
-    result = run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1})
+    client = _ParityClient()
+    result = run_join_grouped(client, object(), prefixes, suffixes, {1}, submission=submission)
+    expected = ([[100 + i, 200 + j] for i in range(5) for j in range(4)]
+                if submission == "anchor-major" else
+                [[100 + i, 200 + j] for j in range(4) for i in range(5)])
+    assert len(client.calls) == 1
+    assert [[p["prompt_token_ids"][0], p["prompt_token_ids"][-1]] for p in client.calls[0]] == expected
     assert result["answers"] == [int((i + j) % 2 == 0) for i in range(5) for j in range(4)]
-    assert result["submission"] == "anchor-major"
+    assert result["cached_per_request"] == [(100 + i) % 7 for i in range(5) for j in range(4)]
+    assert result["cached_tokens"] == sum(result["cached_per_request"])
+    assert result["fresh_tokens"] == sum(len(p) + len(s) for p in prefixes for s in suffixes) - result["cached_tokens"]
+    assert result["submission"] == submission
     with pytest.raises(ValueError, match="unknown join submission"):
         run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1}, submission="unknown")
+
+
+@pytest.mark.parametrize("prefixes,suffixes", [([], [[1]]), ([[1]], []), ([], [])])
+def test_suffix_major_join_empty_input(prefixes, suffixes):
+    result = run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1}, submission="suffix-major")
+    assert result["answers"] == []
+    assert result["cached_per_request"] == []
+    assert result["fresh_tokens"] == 0

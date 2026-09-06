@@ -265,13 +265,16 @@ def run_join_grouped(
     *,
     submission="anchor-major",
 ):
-    """Submit the full cross product in anchor-major order."""
-    if submission != "anchor-major":
+    """Submit all pairs and return answers and KV counts in anchor-major order."""
+    if submission == "anchor-major":
+        pairs = ((prefix, suffix) for prefix in prefixes for suffix in suffixes)
+    elif submission == "suffix-major":
+        pairs = ((prefix, suffix) for suffix in suffixes for prefix in prefixes)
+    else:
         raise ValueError(f"unknown join submission {submission!r}")
     prompts = [
         {"prompt_token_ids": prefix + suffix}
-        for prefix in prefixes
-        for suffix in suffixes
+        for prefix, suffix in pairs
     ]
 
     started = time.perf_counter()
@@ -282,8 +285,14 @@ def run_join_grouped(
         int(getattr(output, "num_cached_tokens", 0) or 0)
         for output in outputs
     ]
-    answers = bits
-    cached_per_request = cached_by_output
+    if submission == "suffix-major":
+        order = [suffix * len(prefixes) + anchor
+                 for anchor in range(len(prefixes)) for suffix in range(len(suffixes))]
+        answers = [bits[index] for index in order]
+        cached_per_request = [cached_by_output[index] for index in order]
+    else:
+        answers = bits
+        cached_per_request = cached_by_output
     prompt_tokens = sum(len(output.prompt_token_ids) for output in outputs)
     cached_tokens = sum(cached_per_request)
     return {

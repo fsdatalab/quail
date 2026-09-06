@@ -23,6 +23,9 @@ Pull the original suite manifest and its four result files:
     done
     uv run modal volume get quail-results \
       benchmarks/quailb/families/20260906T220559Z-sglang-baseline-redesign/fever-sglang-process.json \
+      "$W/fev9/sglang_anchor_major.json"
+    uv run modal volume get quail-results \
+      benchmarks/quailb/families/20260906T222629Z-sglang-suffix-major/fever-sglang-process.json \
       "$W/fev9/sglang_update.json"
     uv run modal volume get quail-results \
       /sol/2026-09-06-quailb-prefix-reuse.json "$W/sol.json"
@@ -297,7 +300,7 @@ def load_rows(root, fev9_root):
         row = measured[0]
         assert "error" not in row, row
         if key == "pipelined_sglang":
-            assert all(step["submission"] == "anchor-major" for step in
+            assert all(step["submission"] == "suffix-major" for step in
                        row["backend_metrics"]["steps"] if step["kind"] == "join")
         filters = [stage for stage in row["stages"] if stage["op"] == "filter"]
         assert len(filters) == 4 and {stage["alias"] for stage in filters} == {"c1", "c2", "e1", "e2"}
@@ -337,6 +340,8 @@ def main(workdir, fev9_dir=None):
     sglang = row_metrics(rows["pipelined_sglang"]["FEV-9"])
     previous_sglang = row_metrics(json.loads(
         (fev9_root / "pipelined_sglang.json").read_text())["passes"]["single"]["queries"][0])
+    anchor_major_sglang = row_metrics(json.loads(
+        (fev9_root / "sglang_anchor_major.json").read_text())["suites"]["pipelined_sglang"]["passes"]["single"]["queries"][0])
     output = rows["quail"]["FEV-9"]["accuracy"]["output_accuracy"]
     lines = [
         "# QUAIL-B comparison from saved results", "",
@@ -349,7 +354,7 @@ def main(workdir, fev9_dir=None):
         "  input tokens, accuracy, and input document counts for every relation alias.",
         "- The other 31 queries reuse the original measurements from September 5, 2026.",
         "  Only FEV-9 was rerun on September 6, 2026, with all four methods.",
-        "  FEV-9 uses the revised SGLang adapter with the same join submission as vLLM.",
+        "  FEV-9 uses SGLang with all anchors submitted per partner, without client tiles or request slices.",
         "  Other queries retain historical SGLang measurements with the earlier adapter.",
         "  The other queries are not new measurements of shared retention.",
         "- The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.",
@@ -361,9 +366,10 @@ def main(workdir, fev9_dir=None):
         "  The [retention report](2026-09-05-shared-kv-retention.md) records the earlier ablation.",
         f"- The revised SGLang adapter took {sglang['seconds']:.2f} seconds on FEV-9,",
         f"  compared with {previous_sglang['seconds']:.2f} seconds using its earlier submission policy.",
-        f"  Fresh computation rose from {previous_sglang['fresh']:,} to {sglang['fresh']:,} tokens.",
-        "  Matching vLLM's submission rules reduced SGLang prefix reuse on this query.",
-        "  This is not a comparison against the fastest measured SGLang submission policy.",
+        f"  Fresh computation was {sglang['fresh']:,} tokens, compared with {previous_sglang['fresh']:,} before.",
+        f"  The intermediate run with vLLM's pair order took {anchor_major_sglang['seconds']:.2f} seconds",
+        f"  and computed {anchor_major_sglang['fresh']:,} fresh tokens. The current SGLang order",
+        "  separates requests sharing an anchor so earlier requests can populate reusable KV.",
         "- We predicted Quail would remain near 39 seconds and beat the baselines.",
         f"  It took {fev['seconds']:.2f} seconds in the new run. We reused all 124 saved",
         "  configurations for the other 31 queries.",
