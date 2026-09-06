@@ -21,7 +21,8 @@
   inference. We reused all 124 saved configurations for the other 31 queries.
 - In these saved measurements, Quail was faster than stock vLLM on 29
   of 31 comparable queries.
-- SoL models ideal computation and memory traffic with unlimited prefix KV.
+- A horizontal line across each query's bar group shows its SoL estimate.
+  SoL models ideal computation and memory traffic with unlimited prefix KV.
   It credits matching token prefixes across requests, documents, and aliases.
   It uses exact reference-label survivors and searches supported left-deep
   join plans. Different answers can change the work done by measured runs,

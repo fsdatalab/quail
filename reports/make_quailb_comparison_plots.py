@@ -30,6 +30,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
@@ -132,7 +133,7 @@ def series_value(rows, sol, method, query, metric):
 
 
 def metric_bars(axis, queries, rows, sol, metric, overview):
-    """Draw grouped bars, preserving zero and unavailable measurements."""
+    """Draw measured bars and a SoL line across each query group."""
     methods = METHODS + ([] if metric == "agreement" else [("sol", "SoL estimate", DARK)])
     positive = [value for key, _, _ in methods for query in queries
                 if (value := series_value(rows, sol, key, query, metric)) is not None and value > 0]
@@ -156,9 +157,9 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
         axis.set_ylabel("seconds" if metric == "seconds" else "tokens")
         if not maximum:
             axis.set_yticks([0])
-    width = 0.82 / len(methods)
+    width = 0.82 / len(METHODS)
     floor = axis.get_ylim()[0]
-    for method_index, (key, label, color) in enumerate(methods):
+    for method_index, (key, label, color) in enumerate(METHODS):
         xs, values = [], []
         for index, query in enumerate(queries):
             position = index - 0.41 + (method_index + 0.5) * width
@@ -180,6 +181,11 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
                               fontsize=8)
         axis.bar(xs, [value - floor for value in values], bottom=floor, width=width * 0.9,
                  color=color, label=label, edgecolor="none")
+    if metric != "agreement":
+        for index, query in enumerate(queries):
+            axis.hlines(series_value(rows, sol, "sol", query, metric),
+                        index - 0.41, index + 0.41, color=DARK, linewidth=1.7,
+                        zorder=3, clip_on=False)
     axis.set_xlim(-0.7, len(queries) - 0.3)
     axis.set_xticks(range(len(queries)),
                    [query + ("*" if query == "FEV-9" else "") for query in queries],
@@ -229,8 +235,9 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
             for axis, metric in zip(axes, metrics):
                 metric_bars(axis, queries, rows, sol, metric, overview)
             figure.suptitle(f"{title}, Qwen3 4B FP8, sf=0.1, one H100", y=0.97, fontsize=16)
-            methods = METHODS + ([] if metrics == ["agreement"] else [("sol", "SoL estimate", DARK)])
-            handles = [Patch(facecolor=color, label=label) for _, label, color in methods]
+            handles = [Patch(facecolor=color, label=label) for _, label, color in METHODS]
+            if metrics != ["agreement"]:
+                handles.append(Line2D([0], [0], color=DARK, linewidth=1.7, label="SoL estimate"))
             figure.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.925),
                           ncol=5, fontsize=11, frameon=False)
             footer = ("SoL estimates ideal work with unlimited prefix KV reuse across requests and reference-label survivors. "
@@ -325,7 +332,8 @@ def main(workdir, retention_dir=None):
         "  inference. We reused all 124 saved configurations for the other 31 queries.",
         f"- In these saved measurements, Quail was faster than stock vLLM on {faster}",
         f"  of {len(comparable)} comparable queries.",
-        "- SoL models ideal computation and memory traffic with unlimited prefix KV.",
+        "- A horizontal line across each query's bar group shows its SoL estimate.",
+        "  SoL models ideal computation and memory traffic with unlimited prefix KV.",
         "  It credits matching token prefixes across requests, documents, and aliases.",
         "  It uses exact reference-label survivors and searches supported left-deep",
         "  join plans. Different answers can change the work done by measured runs,",

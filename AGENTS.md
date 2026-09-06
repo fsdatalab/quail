@@ -145,8 +145,9 @@ Every report with measured results should include at least one plot.
   and marks as vectors. PNGs may be first-page previews for Markdown;
   link the PDF as the primary artifact and never embed a PNG inside it.
   Keep method order, colors, and metric definitions consistent across them.
-- Include the SoL estimate in latency and token plots. SoL models ideal
-  computation and memory traffic, with prefix KV reused across requests,
+- Show the SoL estimate as a horizontal line across each query's bar group
+  in latency and token plots. Reserve bars for measured configurations.
+  SoL models ideal computation and memory traffic, with prefix KV reused across requests,
   documents, and repeated aliases wherever their token prefixes match.
   Use the distinct-prefix estimate, not the per-document-only estimate.
   State its retained-KV capacity and survivor assumptions. Identify it as
