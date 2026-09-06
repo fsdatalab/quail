@@ -490,7 +490,7 @@ def _measure(state, qdefs, qid, profiled, trace_dir):
     out["engine_wall_s"] = captured.get("wall_s")
     out["fresh_tokens"] = captured.get("fresh_tokens")
     out["kv_manager"] = captured.get("kv_manager")
-    out["join_optimizer"] = captured.get("join_optimizer")
+    out["executed_join_plan"] = captured.get("executed_join_plan")
     if windows is not None:
         out["windows"] = windows.meta
     return out

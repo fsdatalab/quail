@@ -5,27 +5,15 @@ from __future__ import annotations
 import time
 
 from quail.backends.quail import coordinator
-from quail.backends.quail.coordinator import (
-    report_join_plan,
-    search_specs,
-    stage_for_anchor,
-    thin_survivors,
-)
-from quail.backends.quail.graph import (
-    _child_graph,
-    _next_join,
-    _possible_anchors,
-)
+from quail.backends.quail.graph import model_answers, executed_join_plan
 from quail.execution import export_physical_outputs
 from quail.physical import (
-    AdaptiveJoinPlan,
     AnchoredJoin,
     DocumentInput,
-    Exchange,
     PackedFilter,
     PhysicalGraph,
 )
-from quail.planner import balanced_shards, budgets
+from quail.planner import balanced_shards
 from quail.runtime.runner import (
     compute_subgraph,
     ExecutionContext,
@@ -34,54 +22,6 @@ from quail.runtime.runner import (
     NodeResult,
     scalar_node_metrics,
 )
-
-
-class DistributedAccounting:
-    """Combined read only KV accounting for runtime join planning."""
-
-    def __init__(self, execution):
-        self.execution = execution
-        self.n_pages = execution.total_pages
-        self.page_tokens = execution.page_tokens
-
-    @property
-    def owned(self):
-        return {
-            (alias, document)
-            for alias, documents in self.execution.retained.items()
-            for document in documents
-        }
-
-    @property
-    def retained(self):
-        return self.owned
-
-    @property
-    def retained_pages(self):
-        return sum(
-            -(-(
-                len(self.execution.pre)
-                + len(self.execution.docs[alias][document])
-            ) // self.page_tokens)
-            for alias, documents in self.execution.retained.items()
-            for document in documents
-        )
-
-    @property
-    def retained_prefix_tokens(self):
-        return sum(
-            len(self.execution.pre)
-            + len(self.execution.docs[alias][document])
-            for alias, documents in self.execution.retained.items()
-            for document in documents
-        )
-
-
-class DistributedArenaView:
-    """KV capacity and residency visible to the coordinator planner."""
-
-    def __init__(self, execution):
-        self.accounting = DistributedAccounting(execution)
 
 
 class DistributedQuailExecution:
@@ -115,19 +55,10 @@ class DistributedQuailExecution:
                     gpu_count,
                 )
                 self.shards[alias] = shards
-        adaptive = next(
-            (node for node in graph.nodes
-             if isinstance(node, AdaptiveJoinPlan)),
-            None,
-        )
-        self.joins = [] if adaptive is None else list(adaptive.join_specs)
+        self.joins = tuple(stage for node in graph.nodes
+                           if isinstance(node, AnchoredJoin) for stage in node.stages)
         self.pre = payload.get("pre_ids") or []
-        self.page_tokens = budgets.PAGE_TOKENS
-        self.total_pages = (
-            budgets.arena_tokens(
-                model_spec, device, payload["chunk_tokens"]
-            ) // self.page_tokens
-        ) * gpu_count
+        self.joins_started = False
         self.retained: dict[str, set[int]] = {}
         self.prior_shards: dict[str, list[list[int]]] = {}
         self.started = False
@@ -141,7 +72,6 @@ class DistributedQuailExecution:
             "join_anchor_hits": 0,
             "join_anchor_misses": 0,
         }
-        self.arena_view = DistributedArenaView(self)
 
     def _runtime_payload(self):
         return dict(self.payload)
@@ -235,10 +165,12 @@ class DistributedQuailExecution:
 
         survivors = inputs["survivors"]
         group = inputs["group"]
-        future = set(inputs["future_anchors"])
+        if not self.joins_started:
+            self.snapshot_after_filters()
+            self.joins_started = True
         drop = [
             alias for alias in self.retained
-            if alias not in future and alias != node.anchor
+            if alias != node.anchor
         ]
         for alias in drop:
             self.retained.pop(alias, None)
@@ -249,16 +181,16 @@ class DistributedQuailExecution:
             survivors,
             group,
             prior_shards=self.prior_shards,
-            filtered_aliases=self.filter_aliases,
+            filtered_aliases=set(self.retained),
             shards=self.shards,
         )
         encoded_node = self.registry.codecs[node.type_name].encode(node)
         for sub in subs:
             sub.pop("joins", None)
             sub.update(
-                retain_anchor=node.anchor in future,
+                retain_anchor=node.keep_anchor_kv,
                 drop_kept=drop,
-                final_group=not inputs["remaining"],
+                final_group=not node.keep_anchor_kv,
                 start_query=not self.started,
                 physical_node=encoded_node,
             )
@@ -328,27 +260,16 @@ class DistributedQuailExecution:
         )
 
     def snapshot_after_filters(self):
-        accounting = self.arena_view.accounting
-        self.kv_stats.update(
-            retained_after_filters=len(accounting.retained),
-            retained_pages_after_filters=accounting.retained_pages,
-            retained_prefix_tokens_after_filters=(
-                accounting.retained_prefix_tokens
-            ),
-        )
+        from quail.planner.budgets import PAGE_TOKENS
 
-    def reconcile_retained(self, survivors):
-        for alias in list(self.retained):
-            self.retained[alias].intersection_update(survivors[alias])
-            if not self.retained[alias]:
-                self.retained.pop(alias)
-                self.prior_shards.pop(alias, None)
-                continue
-            alive = self.retained[alias]
-            self.prior_shards[alias] = [
-                [document for document in shard if document in alive]
-                for shard in self.prior_shards[alias]
-            ]
+        lengths = [len(self.pre) + len(self.docs[alias][document])
+                   for alias, documents in self.retained.items()
+                   for document in documents]
+        self.kv_stats.update(
+            retained_after_filters=len(lengths),
+            retained_pages_after_filters=sum(-(-n // PAGE_TOKENS) for n in lengths),
+            retained_prefix_tokens_after_filters=sum(lengths),
+        )
 
     def report(self):
         for totals in self.child_totals:
@@ -373,149 +294,14 @@ class DistributedQuailExecution:
 
 
 def prepare_distributed_inputs(node, inputs, context):
-    if isinstance(node, PackedFilter):
-        return inputs
     if isinstance(node, AnchoredJoin):
-
-        state = context.state
         return {
-            "survivors": state["survivors"],
-            "group": [
-                stage_for_anchor(state["joins"][index], node.anchor)
-                for index in node.stage_idxs
-            ],
-            "future_anchors": state["future_anchors"],
-            "remaining": state["remaining"],
+            "survivors": {
+                port.source.port.split(":", 1)[1]: list(inputs[port.name]) for port in node.inputs
+            },
+            "group": [stage.runtime_spec() for stage in node.stages],
         }
     return inputs
-
-
-def run_distributed_adaptive(node, inputs, context):
-    """Plan joins and execute typed children across GPU processes."""
-
-    state = context.state
-    execution = state["distributed_execution"]
-    survivors = {}
-    for input_port in node.inputs:
-        alias = input_port.source.port.split(":", 1)[1]
-        survivors[alias] = list(inputs[input_port.name])
-    for alias, documents in execution.docs.items():
-        survivors.setdefault(alias, list(range(len(documents))))
-    state.update(
-        survivors=survivors,
-        joins=list(node.join_specs),
-        search_specs=search_specs(list(node.join_specs)),
-        remaining=set(range(len(node.join_specs))),
-        already_joined=set(),
-        optimizer_runs=[],
-        optimizer_sequence=[],
-        executed_nodes=[],
-        arena=execution.arena_view,
-        docs=execution.docs,
-        pre=execution.pre,
-        chunk_tokens=execution.payload["chunk_tokens"],
-        model_spec=execution.model_spec,
-        device=execution.device,
-        order_rule=execution.payload.get("order_rule", "as_written"),
-    )
-    execution.snapshot_after_filters()
-    finished_full = []
-    all_joins = []
-    join_answers = {}
-    previous_anchor = None
-    metrics = NodeMetrics()
-    while state["remaining"]:
-        selected = _next_join(state)
-        state["optimizer_sequence"].extend(
-            (
-                state["joins"][index].get("written_pos", index),
-                selected.anchor,
-            )
-            for index in selected.stage_idxs
-        )
-        state["remaining"].difference_update(selected.stage_idxs)
-        state["future_anchors"] = _possible_anchors(
-            state["remaining"], state["search_specs"]
-        )
-        aliases = tuple(dict.fromkeys(
-            alias
-            for stage in selected.stages
-            for alias in (stage.anchor, *stage.partners)
-        ))
-        mutable_sources = context.sources
-        if not isinstance(mutable_sources, dict):
-            raise TypeError("adaptive join needs mutable runtime sources")
-        for alias in aliases:
-            mutable_sources[alias] = list(survivors[alias])
-        child = _child_graph(selected, previous_anchor, aliases)
-        child_result = context.execute_graph(child)
-        joined = child_result.nodes[selected.node_id]
-        metrics = metrics + child_result.metrics
-        stage_outputs = joined.metrics.extension["joins"]
-        all_joins.extend(stage_outputs)
-        for stage, output in zip(selected.stages, stage_outputs):
-            if stage.semantics == "full":
-                finished_full.append(output)
-            join_answers[stage.written_pos] = output
-        survivors[selected.anchor] = list(
-            joined.outputs[f"ids:{selected.anchor}"]
-        )
-        thin_survivors(finished_full, survivors)
-        execution.reconcile_retained(survivors)
-        for index in selected.stage_idxs:
-            state["already_joined"].update(
-                state["search_specs"][index]["aliases"]
-            )
-        state["executed_nodes"].extend(
-            child_node
-            for child_node in child.nodes
-            if isinstance(child_node, (Exchange, AnchoredJoin))
-        )
-        previous_anchor = selected.anchor
-
-    outputs = {
-        f"ids:{alias}": list(survivors[alias]) for alias in node.aliases
-    }
-    outputs.update({
-        f"join_answers:{position}": join_answers[position]
-        for position in node.join_positions
-    })
-    optimizer_runs = state["optimizer_runs"]
-    optimizer = None if not optimizer_runs else {
-        "states": sum(run["states"] for run in optimizer_runs),
-        "generated": sum(run["generated"] for run in optimizer_runs),
-        "replans": len(optimizer_runs),
-        "sequence": [list(step)
-                     for step in state["optimizer_sequence"]],
-        "executed_plan": report_join_plan(
-            state["optimizer_sequence"], state["joins"]
-        ),
-    }
-    extension = dict(metrics.extension)
-    extension.update(
-        joins=all_joins,
-        join_optimizer=optimizer,
-        executed_nodes=tuple(state["executed_nodes"]),
-    )
-    return NodeResult(
-        outputs,
-        NodeMetrics(
-            wall_s=metrics.wall_s,
-            input_rows=metrics.input_rows,
-            output_rows=metrics.output_rows,
-            evaluated_documents=metrics.evaluated_documents,
-            evaluated_document_pairs=metrics.evaluated_document_pairs,
-            fresh_tokens=metrics.fresh_tokens,
-            cached_tokens=metrics.cached_tokens,
-            kv_hits=metrics.kv_hits,
-            kv_misses=metrics.kv_misses,
-            kv_removals=metrics.kv_removals,
-            kv_recomputations=metrics.kv_recomputations,
-            regret_tokens=metrics.regret_tokens,
-            peak_gpu_bytes=metrics.peak_gpu_bytes,
-            extension=extension,
-        ),
-    )
 
 
 def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
@@ -533,7 +319,6 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         runtimes=runtimes,
         model_execution=execution,
         sources=sources,
-        adaptive_join=run_distributed_adaptive,
         model_inputs=prepare_distributed_inputs,
         state={"distributed_execution": execution},
     )
@@ -542,20 +327,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         execution.begin()
     result = GenericRunner().run(compute_subgraph(graph), context)
     elapsed = time.perf_counter() - started
-    filters = {}
-    adaptive_result = None
-    for physical_node in graph.nodes:
-        if isinstance(physical_node, PackedFilter):
-            node_result = result.nodes[physical_node.node_id]
-            filters[physical_node.alias] = node_result.outputs[
-                f"filter_answers:{physical_node.alias}"
-            ]
-        elif isinstance(physical_node, AdaptiveJoinPlan):
-            adaptive_result = result.nodes[physical_node.node_id]
-    joins = [] if adaptive_result is None else \
-        adaptive_result.metrics.extension["joins"]
-    optimizer = None if adaptive_result is None else \
-        adaptive_result.metrics.extension["join_optimizer"]
+    filters, joins = model_answers(graph, result)
     report = execution.report()
 
     report.update(
@@ -565,7 +337,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         wall_s=round(elapsed - report["boot_s"], 2),
         fresh_tokens=result.metrics.fresh_tokens,
         regret_tokens=result.metrics.regret_tokens,
-        join_optimizer=optimizer,
+        executed_join_plan=executed_join_plan(graph),
         node_metrics=scalar_node_metrics(result.nodes),
     )
     return report

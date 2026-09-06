@@ -364,11 +364,10 @@ class Query:
 
         plan = self.plan()
         out = response.metrics
-        expected_nodes = tuple(
-            embedded
-            for node in plan.nodes
-            for embedded in node.embedded_nodes()
-        )
+        from quail.physical import AnchoredJoin, Exchange
+
+        expected_nodes = tuple(node for node in plan.nodes
+                               if isinstance(node, (AnchoredJoin, Exchange)))
         report = dict(
             backend=out.get("backend", plan.backend),
             wall_s=out["wall_s"], boot_s=out.get("boot_s"),
@@ -380,7 +379,6 @@ class Query:
             regret_tokens=out.get("regret_tokens"), stages=[],
             peak_gib=out.get("peak_gib"),
             order_rule=plan.settings.get("order_rule"),
-            join_optimizer=out.get("join_optimizer"),
             expected_join_plan=[
                 {
                     "type": node.type_name,
@@ -389,9 +387,7 @@ class Query:
                 }
                 for node in expected_nodes
             ],
-            executed_join_plan=(out.get("join_optimizer") or {}).get(
-                "executed_plan", []
-            ),
+            executed_join_plan=out.get("executed_join_plan", []),
             kv_manager=out.get("kv_manager"),
             node_metrics=out.get("node_metrics", {}),
             backend_metrics=out.get("backend_metrics"),

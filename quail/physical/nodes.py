@@ -7,10 +7,8 @@ from typing import Any, ClassVar, Mapping
 
 from .base import (
     ExecutionLocation,
-    InputPort,
     OutputPort,
     PhysicalNode,
-    PortRef,
     ValueType,
 )
 
@@ -60,6 +58,9 @@ class JoinStage:
     pair_tail_tokens: int
     anchor_resident: str
     tuple_tokens: float
+    frame_token_ids: tuple[int, ...] = ()
+    label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    tail_token_ids: tuple[int, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "JoinStage":
@@ -75,9 +76,15 @@ class JoinStage:
             pair_tail_tokens=int(value["pair_tail_tokens"]),
             anchor_resident=str(value["anchor_resident"]),
             tuple_tokens=float(value["tuple_tokens"]),
+            frame_token_ids=tuple(value.get("frame_token_ids", ())),
+            label_token_ids=tuple(
+                (alias, tuple(tokens))
+                for alias, tokens in value.get("label_token_ids", ())
+            ),
+            tail_token_ids=tuple(value.get("tail_token_ids", ())),
         )
 
-    def to_dict(self) -> dict:
+    def explain_fields(self) -> dict:
         return {
             "written_pos": self.written_pos,
             "exec_idx": self.exec_idx,
@@ -90,6 +97,28 @@ class JoinStage:
             "pair_tail_tokens": self.pair_tail_tokens,
             "anchor_resident": self.anchor_resident,
             "tuple_tokens": self.tuple_tokens,
+        }
+
+    def to_dict(self) -> dict:
+        return {
+            **self.explain_fields(),
+            "frame_token_ids": list(self.frame_token_ids),
+            "label_token_ids": [[alias, list(tokens)]
+                                for alias, tokens in self.label_token_ids],
+            "tail_token_ids": list(self.tail_token_ids),
+        }
+
+    def runtime_spec(self) -> dict:
+        """Return the bound prompt and predicate for the join driver."""
+        return {
+            "anchor": self.anchor,
+            "partners": list(self.partners),
+            "semantics": self.semantics,
+            "selectivity": self.selectivity,
+            "written_pos": self.written_pos,
+            "frame": self.frame_token_ids,
+            "labels": dict(self.label_token_ids),
+            "tail": self.tail_token_ids,
         }
 
 
@@ -454,7 +483,6 @@ class AnchoredJoin(PhysicalNode):
     anchor: str = ""
     anchor_resident: str = "none"
     keep_anchor_kv: bool = False
-    stage_idxs: tuple[int, ...] = ()
     stages: tuple[JoinStage, ...] = ()
 
     type_name: ClassVar[str] = "quail.anchored_join"
@@ -481,9 +509,12 @@ class AnchoredJoin(PhysicalNode):
             "anchor": self.anchor,
             "anchor_resident": self.anchor_resident,
             "keep_anchor_kv": self.keep_anchor_kv,
-            "stage_idxs": list(self.stage_idxs),
             "stages": [stage.to_dict() for stage in self.stages],
         }
+
+    def explain_fields(self) -> dict:
+        return {**self.attributes(),
+                "stages": [stage.explain_fields() for stage in self.stages]}
 
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
@@ -493,123 +524,10 @@ class AnchoredJoin(PhysicalNode):
             anchor=attributes["anchor"],
             anchor_resident=attributes["anchor_resident"],
             keep_anchor_kv=bool(attributes["keep_anchor_kv"]),
-            stage_idxs=tuple(attributes["stage_idxs"]),
             stages=tuple(
                 JoinStage.from_mapping(stage)
                 for stage in attributes["stages"]
             ),
-        )
-
-
-@dataclass(frozen=True)
-class AdaptiveJoinPlan(PhysicalNode):
-    """Choose and run anchored join steps after filters finish."""
-
-    expected_nodes: tuple[AnchoredJoin | Exchange, ...] = ()
-    aliases: tuple[str, ...] = ()
-    join_positions: tuple[int, ...] = ()
-    full_join_positions: tuple[int, ...] = ()
-    join_specs: tuple[Mapping[str, Any], ...] = ()
-
-    type_name: ClassVar[str] = "quail.adaptive_join_plan"
-    runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
-    backend: ClassVar[str] = "quail"
-
-    @property
-    def outputs(self) -> tuple[OutputPort, ...]:
-        outputs = [
-            OutputPort(
-                f"ids:{alias}",
-                ValueType.DOCUMENT_IDS,
-                schema=(alias,),
-            )
-            for alias in self.aliases
-        ]
-        outputs.extend(OutputPort(
-            f"join_answers:{position}", ValueType.JOIN_ANSWERS
-        ) for position in self.join_positions)
-        return tuple(outputs)
-
-    def attributes(self) -> dict:
-        return {
-            "aliases": list(self.aliases),
-            "join_positions": list(self.join_positions),
-            "full_join_positions": list(self.full_join_positions),
-            "expected_nodes": [
-                {
-                    "type": node.type_name,
-                    "id": node.node_id,
-                    "inputs": [
-                        {
-                            "name": port.name,
-                            "value_type": port.value_type.value,
-                            "schema": list(port.schema),
-                            "source": {
-                                "node_id": port.source.node_id,
-                                "port": port.source.port,
-                            },
-                        }
-                        for port in node.inputs
-                    ],
-                    "attributes": node.attributes(),
-                }
-                for node in self.expected_nodes
-            ],
-            "join_specs": list(self.join_specs),
-        }
-
-    def explain_fields(self) -> Mapping[str, Any]:
-        return {
-            "aliases": list(self.aliases),
-            "join_positions": list(self.join_positions),
-            "full_join_positions": list(self.full_join_positions),
-            "expected_steps": [
-                node.type_name for node in self.expected_nodes
-            ],
-        }
-
-    def embedded_nodes(self) -> tuple[PhysicalNode, ...]:
-        return self.expected_nodes
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        expected = []
-        node_types = {
-            AnchoredJoin.type_name: AnchoredJoin,
-            Exchange.type_name: Exchange,
-        }
-        for encoded in attributes["expected_nodes"]:
-            node_type = node_types.get(encoded["type"])
-            if node_type is None:
-                raise ValueError(
-                    "AdaptiveJoinPlan expected plan contains unknown node "
-                    f"type {encoded['type']!r}")
-            child_inputs = tuple(
-                InputPort(
-                    name=input_port["name"],
-                    value_type=ValueType(input_port["value_type"]),
-                    source=PortRef(
-                        input_port["source"]["node_id"],
-                        input_port["source"]["port"],
-                    ),
-                    schema=tuple(input_port["schema"]),
-                )
-                for input_port in encoded["inputs"]
-            )
-            expected.append(node_type.from_attributes(
-                encoded["id"], child_inputs, encoded["attributes"]
-            ))
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            expected_nodes=tuple(expected),
-            aliases=tuple(attributes["aliases"]),
-            join_positions=tuple(attributes["join_positions"]),
-            full_join_positions=tuple(
-                attributes["full_join_positions"]
-            ),
-            join_specs=tuple(attributes["join_specs"]),
         )
 
 

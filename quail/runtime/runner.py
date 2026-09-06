@@ -7,7 +7,6 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.physical import (
-    AdaptiveJoinPlan,
     DocumentInput,
     Exchange,
     ExecutionLocation,
@@ -134,10 +133,6 @@ class ExecutionContext:
     sources: Mapping[str, Any] = field(default_factory=dict)
     project: Callable[[Project, Any], Any] | None = None
     hash_join: Callable[[HashJoin, Mapping[str, Any]], Any] | None = None
-    adaptive_join: Callable[
-        [AdaptiveJoinPlan, Mapping[str, Any], "ExecutionContext"],
-        NodeResult,
-    ] | None = None
     model_inputs: Callable[
         [PhysicalNode, Mapping[str, Any], "ExecutionContext"],
         Mapping[str, Any],
@@ -273,18 +268,50 @@ class DocumentInputRuntime:
 
 
 class ExchangeRuntime:
-    """Return the survivor ids named by the exchange outputs."""
+    """Prune survivor IDs using completed join answers."""
 
     def execute(self, node, inputs, context) -> NodeResult:
         if not isinstance(node, Exchange):
             raise TypeError(type(node).__name__)
-        by_source_port = {
-            input_port.source.port: inputs[input_port.name]
-            for input_port in node.inputs
-        }
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        from quail.execution import _join_answers_table
+
+        survivors = {}
+        tables = []
+        arrow_inputs = set()
+        for port in node.inputs:
+            value = inputs[port.name]
+            if port.value_type is ValueType.DOCUMENT_IDS:
+                alias = port.source.port.split(":", 1)[1]
+                if isinstance(value, pa.Table):
+                    arrow_inputs.add(alias)
+                    value = value.column(alias).to_pylist()
+                survivors[alias] = list(value)
+            elif port.value_type is ValueType.JOIN_ANSWERS:
+                tables.append(value if isinstance(value, pa.Table)
+                              else _join_answers_table(value))
+        for table in tables:
+            table = true_answer_rows(table)
+            for alias in table.column_names:
+                if alias in survivors:
+                    table = table.filter(pc.is_in(
+                        table[alias], value_set=pa.array(
+                            survivors[alias], type=table.schema.field(alias).type
+                        )
+                    ))
+            for alias in table.column_names:
+                if alias in survivors:
+                    live = set(pc.unique(table[alias]).to_pylist())
+                    survivors[alias] = [document for document in survivors[alias]
+                                        if document in live]
         return NodeResult({
-            output.name: by_source_port[output.name]
-            for output in node.outputs
+            f"ids:{alias}": (
+                pa.table({alias: pa.array(survivors[alias], type=pa.int32())})
+                if alias in arrow_inputs else survivors[alias]
+            )
+            for alias in node.aliases
         })
 
 

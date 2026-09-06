@@ -7,7 +7,6 @@ from typing import Any, Mapping
 
 from .base import InputPort, PhysicalGraph, PhysicalNode, PortRef, ValueType
 from .nodes import (
-    AdaptiveJoinPlan,
     AnchoredJoin,
     DocumentInput,
     Exchange,
@@ -135,7 +134,6 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         RequestExecution,
         Exchange,
         AnchoredJoin,
-        AdaptiveJoinPlan,
         HashJoin,
         Project,
         Limit,

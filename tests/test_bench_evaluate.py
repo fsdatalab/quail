@@ -162,7 +162,8 @@ def _run(query, join_answers):
         from quail.execution import PhysicalResponse, export_physical_outputs
         from quail.builtins import built_in_registry
         from quail.physical import (
-            AdaptiveJoinPlan,
+            AnchoredJoin,
+            DocumentInput,
             PackedFilter,
             decode_graph,
         )
@@ -172,19 +173,21 @@ def _run(query, join_answers):
         filtered = next(
             node for node in graph.nodes if isinstance(node, PackedFilter)
         )
-        adaptive = next(
+        anchored = next(
             node for node in graph.nodes
-            if isinstance(node, AdaptiveJoinPlan)
+            if isinstance(node, AnchoredJoin)
         )
-        join = adaptive.join_specs[0]
+        join = anchored.stages[0].runtime_spec()
         nodes = {
+            **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+                len(request.inputs[node.input_id].documents))})
+               for node in graph.nodes if isinstance(node, DocumentInput)},
             filtered.node_id: NodeResult({
                 "ids:r": [0],
                 "filter_answers:r": {0: [1], 1: [0]},
             }),
-            adaptive.node_id: NodeResult({
+            anchored.node_id: NodeResult({
                 "ids:r": [0] if any(join_answers) else [],
-                "ids:a": [0, 1],
                 "join_answers:0": {
                     "rows": {0: join_answers},
                     "anchor_index": [0],

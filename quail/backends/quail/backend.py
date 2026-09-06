@@ -11,8 +11,8 @@ from quail.backends.quail.worker import execute_quail_request
 from quail.executor import loop
 from quail.logical import SHARED_PRE
 from quail.physical import (
-    AdaptiveJoinPlan,
     AnchoredJoin,
+    Exchange,
     PackedFilter,
     PhysicalNode,
 )
@@ -169,6 +169,9 @@ class QuailModelExecution:
                     sum(len(row) for row in stage.values())
                     for stage in answers
                 ),
+                kv_hits=inputs.get("kv_round", {}).get("hits", 0),
+                kv_misses=inputs.get("kv_round", {}).get("misses", 0),
+                regret_tokens=inputs.get("kv_round", {}).get("regret_tokens", 0),
                 fresh_tokens=tokens,
                 extension={"answers": answers},
             ),
@@ -177,14 +180,8 @@ class QuailModelExecution:
 
 def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:
     """Return the join nodes selected from Quail's planning estimates."""
-    adaptive = next(
-        (node for node in plan.nodes if isinstance(node, AdaptiveJoinPlan)),
-        None,
-    )
-    if adaptive is not None:
-        return adaptive.expected_nodes
     return tuple(
-        node for node in plan.nodes if isinstance(node, AnchoredJoin)
+        node for node in plan.nodes if isinstance(node, (AnchoredJoin, Exchange))
     )
 
 
@@ -266,39 +263,24 @@ class QuailBackend:
                 if any(not question for question in questions):
                     raise ValueError("filter prompts have no token ids")
                 node = replace(node, question_token_ids=questions)
-            elif isinstance(node, AdaptiveJoinPlan):
-                specs = []
-                for stage in expected_join_stages(plan):
-                    logical_join = joins[stage.written_pos]
-                    prompt = logical_join.predicate
+            elif isinstance(node, AnchoredJoin):
+                stages = []
+                for stage in node.stages:
+                    prompt = joins[stage.written_pos].predicate
                     runtime_ids = {
-                        alias: (list(label), list(frame))
+                        alias: (tuple(label), tuple(frame))
                         for alias, label, frame in prompt.label_token_ids
                     }
-                    aliases = [argument.alias for argument in prompt.args]
-                    spec = {
-                        "anchor": stage.anchor,
-                        "partners": list(stage.partners),
-                        "aliases": aliases,
-                        "frames": {
-                            alias: runtime_ids[alias][1]
-                            for alias in aliases
-                        },
-                        "labels": {
-                            alias: runtime_ids[alias][0]
-                            for alias in aliases
-                        },
-                        "tail": list(prompt.tail_token_ids),
-                        "semantics": stage.semantics,
-                        "selectivity": logical_join.selectivity,
-                        "written_pos": stage.written_pos,
-                        "anchor_free": (
-                            logical_join.anchor is None
-                            and logical_join.semantics == "full"
+                    stages.append(replace(
+                        stage,
+                        frame_token_ids=runtime_ids[stage.anchor][1],
+                        label_token_ids=tuple(
+                            (alias, runtime_ids[alias][0])
+                            for alias in stage.partners
                         ),
-                    }
-                    specs.append(spec)
-                node = replace(node, join_specs=tuple(specs))
+                        tail_token_ids=tuple(prompt.tail_token_ids),
+                    ))
+                node = replace(node, stages=tuple(stages))
             encoded_nodes.append(node)
 
         true_ids = set()
@@ -332,7 +314,7 @@ class QuailBackend:
                 "pre_ids": pre_ids,
                 "filter_limit": (
                     None if any(
-                        isinstance(node, AdaptiveJoinPlan)
+                        isinstance(node, AnchoredJoin)
                         for node in encoded_nodes
                     ) else region.logical_plan.root.limit
                 ),

@@ -94,20 +94,16 @@ the keys every backend fills:
 | `worker_total_s` | Everything the worker did for this request, including tokenization and planning. |
 
 The Quail backend adds `regret_tokens`, `kv_manager`, `peak_gib`,
-`order_rule`, `expected_join_plan`, `executed_join_plan`, and
-`join_optimizer`. The join query in the quickstart shows them:
+`order_rule`, `expected_join_plan`, and `executed_join_plan`. The saved
+join order is the executed order. Actual row counts and KV hits can differ
+from the estimates. The join query in the quickstart shows them:
 
 ```json
 {
   "order_rule": "by_cost",
-  "join_optimizer": {
-    "replans": 1,
-    "sequence": [[0, "r"]],
-    "executed_plan": [
-      {"type": "quail.anchored_join", "id": "runtime-join:0",
-       "anchor": "r", "written_positions": [0]}
-    ]
-  },
+  "executed_join_plan": [
+    {"type": "quail.anchored_join", "id": "group:0", "anchor": "r"}
+  ],
   "kv_manager": {
     "retained_after_filters": 4,
     "retained_pages_after_filters": 21,
@@ -145,14 +141,13 @@ physical:
   KV dtype=bf16
   chunk_tokens=110376 admission_tokens=362250
   order=by_cost (default: every gated predicate has a selectivity)
+  DocumentInput input:a alias=a input_id=a n_docs=12 total_tokens=27 shard_docs=[12]
   DocumentInput input:r alias=r input_id=r n_docs=8 total_tokens=693 shard_docs=[8]
   PackedFilter filter:r alias=r arena_writes=True keep_kv=True keep_min_doc_tokens=1 keep_resident_fraction=1.0 <- input:r[ids:r]
     stage {'written_pos': 0, 'question_tokens': 51, 'preamble_tokens': 2, 'selectivity': 0.6, 'expected_docs': 8.0}
-  DocumentInput input:a alias=a input_id=a n_docs=12 total_tokens=27 shard_docs=[12]
-  AdaptiveJoinPlan adaptive-joins aliases=['r', 'a'] join_positions=[0] full_join_positions=[0] expected_steps=['quail.anchored_join'] <- filter:r[ids:r], input:a[ids:a]
-    expected AnchoredJoin group:0
-      stage {'written_pos': 0, 'exec_idx': 0, 'anchor': 'r', 'partners': ['a'], 'semantics': 'full', 'selectivity': 0.15, 'expected_tuples': 57.6, 'anchor_frame_tokens': 36, 'pair_tail_tokens': 4, 'anchor_resident': 'filter', 'tuple_tokens': 878.4}
-  HashJoin recombine alias_order=['r', 'a'] <- adaptive-joins[join_answers:0], adaptive-joins[ids:r], adaptive-joins[ids:a]
+  AnchoredJoin group:0 anchor=r anchor_resident=filter keep_anchor_kv=False <- filter:r[ids:r], input:a[ids:a]
+    stage {'written_pos': 0, 'exec_idx': 0, 'anchor': 'r', 'partners': ['a'], 'semantics': 'full', 'selectivity': 0.15, 'expected_tuples': 57.6, 'anchor_frame_tokens': 36, 'pair_tail_tokens': 4, 'anchor_resident': 'filter', 'tuple_tokens': 878.4}
+  HashJoin recombine alias_order=['r', 'a'] <- group:0[join_answers:0], group:0[ids:r], input:a[ids:a]
   Project sink columns=['r.id', 'a.aspect'] <- recombine[tuples]
   remark: keep KV on 'r': all survivors priced as resident for the join, 451 expected tokens per worker of the 362,250-token arena
 ```

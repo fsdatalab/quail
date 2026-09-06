@@ -1,17 +1,4 @@
-"""The shared join search: stage order and anchors from live counts,
-live document lengths, and resident KV.
-
-One algorithm with different inputs at plan time and at runtime. At
-plan time the inputs are expected counts, corpus length summaries,
-and the keep credit. At runtime the worker calls it after the filter
-round and after every join group with the actual survivors and the
-document KV still resident. The runtime executes the next group from
-each answer, then searches again when new answers are available.
-
-Everything here is counted: costs are Work records priced by
-speed_of_light against the model architecture and the device
-datasheet. No measured constant.
-"""
+"""Choose join order and anchors from estimated survivors and retained KV."""
 
 import itertools
 from collections import Counter
@@ -376,13 +363,12 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
             selectivity, written_pos, frame_tokens and label_tokens
             per alias, tail_tokens.
         live: alias -> live document count (float; expected at plan
-            time, exact after the filter round).
+            time).
         lengths: alias -> live documents' token lengths or AliasStats.
         resident: alias -> positions into lengths[alias] whose prefix
             KV is resident.
         already_joined: aliases connected by completed join stages.
-            Runtime replanning starts from this set instead of losing
-            the connectivity established by earlier groups.
+            Used when costing a continuation of a partial plan.
         base_work: Work outside the joins (the filter round), so
             candidates rank by whole-query predicted seconds.
         fixed_order: keep the written stage order (order=as_written);

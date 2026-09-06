@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from quail.backends.quail import QuailModelExecution
 from quail.builtins import built_in_registry
 from quail.physical import (
-    AdaptiveJoinPlan,
+    JoinStage,
     AnchoredJoin,
     DocumentInput,
     FilterStage,
@@ -81,41 +81,32 @@ def graph_state(model_execution, docs):
     }
 
 
-def test_adaptive_join_executes_typed_child_graph(monkeypatch):
-    monkeypatch.setattr(
-        "quail.planner.joins.search_joins",
-        lambda *args, **kwargs: {
-            "seq": [(0, "r")], "states": 1, "generated": 1
-        },
-    )
+def test_fixed_join_executes_without_optimizer(monkeypatch):
+    def unexpected_search(*args, **kwargs):
+        raise AssertionError("execution called the join optimizer")
+
+    monkeypatch.setattr("quail.planner.joins.search_joins", unexpected_search)
     scan_r = DocumentInput(
         node_id="input:r", alias="r", input_id="r"
     )
     scan_p = DocumentInput(
         node_id="input:p", alias="p", input_id="p"
     )
-    adaptive = AdaptiveJoinPlan(
-        node_id="adaptive",
+    join = AnchoredJoin(
+        node_id="join", anchor="r",
         inputs=input_ports((PortRef("input:r", "ids:r"),
                             PortRef("input:p", "ids:p"))),
-        aliases=("r", "p"),
-        join_positions=(0,),
-        full_join_positions=(0,),
-        join_specs=({
-            "written_pos": 0,
-            "aliases": ["r", "p"],
-            "anchor": "r",
-            "partners": ["p"],
-            "anchor_free": True,
-            "semantics": "full",
-            "selectivity": 0.5,
-            "frames": {"r": [7], "p": [8]},
-            "labels": {"r": [9], "p": [10]},
-            "tail": [11],
-        },),
+        stages=(JoinStage(
+            written_pos=0, exec_idx=0, anchor="r", partners=("p",),
+            semantics="full", selectivity=0.5, expected_tuples=4,
+            anchor_frame_tokens=1, pair_tail_tokens=1,
+            anchor_resident="none", tuple_tokens=0,
+            frame_token_ids=(7,), label_token_ids=(("p", (10,)),),
+            tail_token_ids=(11,),
+        ),),
     )
     graph = PhysicalGraph(
-        (scan_r, scan_p, adaptive), PortRef("adaptive", "ids:r")
+        (scan_r, scan_p, join), PortRef("join", "ids:r")
     )
 
     class FixedJoinExecution:
@@ -154,7 +145,7 @@ def test_adaptive_join_executes_typed_child_graph(monkeypatch):
 
     assert result["fresh_tokens"] == 20
     assert result["joins"][0]["written_pos"] == 0
-    assert result["join_optimizer"]["executed_plan"][0]["type"] == \
+    assert result["executed_join_plan"][0]["type"] == \
         AnchoredJoin.type_name
 
 

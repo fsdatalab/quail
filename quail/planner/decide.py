@@ -1,13 +1,4 @@
-"""Planner decisions: filter order, join order, anchor choice, KV
-residency, and sharding from a logical plan and corpus token counts.
-
-The join search itself lives in quail.planner.joins and runs twice
-per query: here with expectations (the predicted plan - explain,
-refusals, the SoL comparison), and in the worker after the filter
-round with the actual survivors and resident KV (the executed plan).
-Costs are Work records priced by counted constants; no calibration
-constant is read anywhere.
-"""
+"""Choose filter order, joins, anchors, and KV retention before execution."""
 
 from dataclasses import replace
 
@@ -19,7 +10,6 @@ from quail.logical import (
     SemanticJoin,
 )
 from quail.physical import (
-    AdaptiveJoinPlan,
     AnchoredJoin,
     DocumentInput,
     Exchange,
@@ -264,7 +254,7 @@ def keep_split(doc_tokens, budget_tokens: float, survivor_frac: float,
 
 
 def possible_anchor_aliases(specs) -> set:
-    """Every alias the runtime search could anchor a join on."""
+    """Return every legal anchor considered during planning."""
     out = set()
     for spec in specs:
         out.update(joinsearch.anchor_candidates(spec))
@@ -273,10 +263,7 @@ def possible_anchor_aliases(specs) -> set:
 
 def plan_keeps(specs, filters, doc_tokens: dict, pre: int,
                budget_tokens: float, page_tokens: int) -> dict:
-    """Candidate keep credit: every filtered alias the runtime could
-    anchor, each split against the whole budget. plan_query trims to
-    the aliases the predicted plan anchors and re-checks the joint
-    capacity."""
+    """Credit each possible first anchor against the retention budget."""
     plan = {}
     anchors = possible_anchor_aliases(specs)
     for alias, preds in filters.items():
@@ -291,65 +278,6 @@ def plan_keeps(specs, filters, doc_tokens: dict, pre: int,
             plan[alias] = split
     return plan
 
-
-def _group_seq(seq):
-    """Group consecutive full stages on the same anchor, the same
-    rule the node graph uses. seq holds (spec, anchor) pairs."""
-    groups = []
-    for spec, anchor in seq:
-        merge = (groups and spec["semantics"] == "full"
-                 and groups[-1][2] and groups[-1][0] == anchor)
-        if merge:
-            groups[-1][1].append(spec)
-        else:
-            groups.append([anchor, [spec], spec["semantics"] == "full"])
-    return [(a, m) for a, m, _ in groups]
-
-
-def _keep_timeline(seq, keep_plan, doc_tokens, live0, pre,
-                   page_tokens, workers: int):
-    """Peak expected resident tokens per worker across the plan.
-
-    A point per group boundary: the end of the filter round holds
-    every credited alias's filter mass; after each group, credited
-    masses not yet anchored plus the gate-survivor mass of anchors a
-    later group re-uses (retention holds every gate survivor, not
-    just the credited split). The in-flight chunk working set is the
-    headroom the caller adds. Retained prefixes are rewound to
-    preamble + document.
-    """
-    groups = _group_seq(seq)
-    first_use, last_use = {}, {}
-    for g, (anchor, members) in enumerate(groups):
-        first_use.setdefault(anchor, g)
-        last_use[anchor] = g
-
-    def survivor_mass(alias, live_count):
-        stats = _length_stats(doc_tokens[alias])
-        frac = live_count / max(1.0, float(stats.count))
-        return frac * sum(
-            count * _page_round(pre + length, page_tokens)
-            for length, count in stats.histogram)
-
-    live = dict(live0)
-    points = [sum(k["kept_expected_tokens"]
-                  for k in keep_plan.values())]
-    for g, (anchor, members) in enumerate(groups):
-        for spec in members:
-            joinsearch.thin(live, spec)
-        point = 0.0
-        for alias in set(keep_plan) | set(first_use):
-            if alias in keep_plan and first_use.get(
-                    alias, len(groups)) > g:
-                point += keep_plan[alias]["kept_expected_tokens"]
-            elif first_use.get(alias, g + 1) <= g \
-                    < last_use.get(alias, -1):
-                point += survivor_mass(alias, live[alias])
-        points.append(point)
-    return max(points) / workers
-
-
-# --------------------------------------------- sharding (token arithmetic)
 
 def balanced_shards(doc_tokens, workers: int):
     """Greedily partition documents into shards balanced by token count."""
@@ -493,62 +421,16 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 fixed_order=True, honor_forced=honor_forced)
         return found
 
-    def consumed_keeps(records, plan_keep):
-        """The credits the sequence anchors while their filter KV is
-        still resident; the rest have no reader in the prediction."""
-        used = {r["anchor"] for r in records
-                if r["resident"] == "filter"}
-        return {a: k for a, k in plan_keep.items() if a in used}
-
-    def spec_seq(found):
-        return [(specs[wp], a) for wp, a in found["seq"]]
-
-    def trim(found, plan_keep):
-        """Scale resident credits to fit beside the working headroom."""
-        plan_keep = dict(plan_keep)
-        while plan_keep:
-            peak = _keep_timeline(spec_seq(found), plan_keep,
-                                  length_stats, live0, pre,
-                                  budgets.PAGE_TOKENS, workers)
-            if peak + headroom <= admission:
-                break
-            available = max(0.0, float(admission - headroom))
-            scale = available / max(peak, 1.0)
-            if scale <= 0:
-                return {}
-            plan_keep = {
-                alias: dict(
-                    credit,
-                    resident_fraction=(
-                        credit["resident_fraction"] * scale),
-                    kept_expected_tokens=(
-                        credit["kept_expected_tokens"] * scale),
-                )
-                for alias, credit in plan_keep.items()
-                if credit["resident_fraction"] * scale > 1e-9
-            }
-            new_peak = _keep_timeline(
-                spec_seq(found), plan_keep, length_stats, live0, pre,
-                budgets.PAGE_TOKENS, workers)
-            if new_peak >= peak - 1e-6:
-                return {}
-        return plan_keep
-
     found = run_search(candidates)
-    kept0 = consumed_keeps(found["records"], candidates)
-    keep_plan = trim(found, kept0)
-    if keep_plan != kept0:
-        # the credited residency shrank: search once more against
-        # what the arena can actually hold
-        found = run_search(keep_plan)
-        keep_plan = trim(found, consumed_keeps(found["records"],
-                                               keep_plan))
-        found = run_search(keep_plan)
+    seq = [(specs[position], anchor) for position, anchor in found["seq"]]
+    first_anchor = seq[0][1] if seq else None
+    keep_plan = ({first_anchor: candidates[first_anchor]}
+                 if first_anchor in candidates else {})
     forced = sorted({s["anchor"] for s in specs
                      if s["semantics"] == "full"
                      and not s["anchor_free"]})
     if forced:
-        free = run_search(keep_plan, honor_forced=False)
+        free = run_search(candidates, honor_forced=False)
         honored_s = speed_of_light(
             base_work + found["work"], model, device, chunk).seconds
         free_s = speed_of_light(
@@ -558,7 +440,6 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 f"anchors {forced} were forced; a free choice prices "
                 f"lower ({free_s:.3f} vs {honored_s:.3f} predicted "
                 f"seconds)")
-    seq = spec_seq(found)
     stage_records = found["records"]
 
     for alias, k in sorted(keep_plan.items()):
@@ -608,10 +489,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
     # ---- build the dataflow graph; ids_src tracks each table's
     # current producer node
-    retain_aliases = possible_anchor_aliases(specs) & set(filters)
     nodes = []
     ids_src = {}
-    for s in scans:
+    for s in sorted(scans, key=lambda scan: scan.alias == first_anchor):
         shard_ranges, loads = contiguous_shards(
             doc_tokens[s.alias], workers
         )
@@ -637,9 +517,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                     selectivity=p.selectivity,
                     expected_docs=round(n * surv, 1)))
                 surv *= p.selectivity if p.selectivity is not None else 1.0
-            # arena writes when a later stage reads the KV back or
-            # the runtime search could anchor a join on this table
-            keep = s.alias in retain_aliases
+            keep = s.alias == first_anchor
             writes = len(stages) > 1 or keep
             credit = keep_plan.get(s.alias)
             fid = f"filter:{s.alias}"
@@ -673,34 +551,20 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             groups.append(dict(anchor=anchor,
                                full=(spec["semantics"] == "full"),
                                members=[(spec, record)]))
-    group_last_use = {}
-    for g, group in enumerate(groups):
-        group_last_use[group["anchor"]] = g
-
-    outer_ids_src = dict(ids_src)
-    expected_join_nodes = []
     exec_idx = 0
     barrier_n = 0
-    prev_anchor = None
     pairs_edges = []     # every full stage's passing-pairs edge
     out_aliases = []     # recombination's output order
     for g, group in enumerate(groups):
         anchor = group["anchor"]
-        if prev_anchor is not None and anchor != prev_anchor:
-            # barrier: thin tables the remaining stages touch, re-shard
-            # the new anchor over the live set
-            ahead = []
-            for later in groups[g:]:
-                for spec, _ in later["members"]:
-                    for a in spec["aliases"]:
-                        if a not in ahead:
-                            ahead.append(a)
+        if g > 0:
+            ahead = [scan.alias for scan in scans]
             bid = f"barrier:{barrier_n}"
             barrier_n += 1
             exchange_inputs = tuple(pairs_edges) + tuple(
                 ids_src[a] for a in ahead
             )
-            expected_join_nodes.append(Exchange(
+            nodes.append(Exchange(
                 node_id=bid,
                 inputs=input_ports(exchange_inputs),
                 next_anchor=anchor,
@@ -733,44 +597,15 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 for a in [anchor] + partners:
                     if a not in out_aliases:
                         out_aliases.append(a)
-        expected_join_nodes.append(AnchoredJoin(
+        nodes.append(AnchoredJoin(
             node_id=gid,
             inputs=input_ports(tuple(ids_src[a] for a in in_aliases)),
             anchor=anchor,
             anchor_resident=group["members"][0][1]["resident"],
-            keep_anchor_kv=group_last_use[anchor] > g,
-            stage_idxs=tuple(stage.exec_idx for stage in stage_dicts),
+            keep_anchor_kv=(g + 1 < len(groups)
+                            and groups[g + 1]["anchor"] == anchor),
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
-        prev_anchor = anchor
-
-    if expected_join_nodes:
-        adaptive_id = "adaptive-joins"
-        aliases = tuple(scan_node.alias for scan_node in scans)
-        full_join_positions = tuple(
-            spec["written_pos"] for spec in specs
-            if spec["semantics"] == "full"
-        )
-        nodes.append(AdaptiveJoinPlan(
-            node_id=adaptive_id,
-            inputs=input_ports(tuple(
-                outer_ids_src[alias] for alias in aliases
-            )),
-            expected_nodes=tuple(expected_join_nodes),
-            aliases=aliases,
-            join_positions=tuple(
-                spec["written_pos"] for spec in specs
-            ),
-            full_join_positions=full_join_positions,
-        ))
-        ids_src = {
-            alias: PortRef(adaptive_id, f"ids:{alias}")
-            for alias in aliases
-        }
-        pairs_edges = [
-            PortRef(adaptive_id, f"join_answers:{position}")
-            for position in full_join_positions
-        ]
 
     if pairs_edges:
         nodes.append(HashJoin(
@@ -949,18 +784,16 @@ def explain(logical: LogicalPlan, physical) -> str:
     lines.append(
         f"  workers={physical.workers} model_copies={physical.workers}"
     )
-    lines.append("  KV dtype=bf16")
     settings = physical.settings
-    lines.append(f"  chunk_tokens={settings['chunk_tokens']} "
-                 f"admission_tokens={settings['admission_tokens']}")
-    lines.append("  prompt layout: engine preamble + document + "
-                 "suffix (preamble_tokens per stage below count the "
-                 "shared preamble)")
-    lines.append("  the predicted join order; the worker re-runs the "
-                 "same search on the actual filter survivors")
-    lines.append(
-        f"  order={settings['order_rule']} ({settings['order_source']})"
-    )
+    lines.append(f"  backend={physical.backend}")
+    if physical.backend == "quail":
+        lines.append("  KV dtype=bf16")
+        lines.append(f"  chunk_tokens={settings['chunk_tokens']} "
+                     f"admission_tokens={settings['admission_tokens']}")
+    lines.append("  joins follow the saved order and anchors")
+    order_source = settings.get("order_source")
+    source_note = f" ({order_source})" if order_source else ""
+    lines.append(f"  order={settings.get('order_rule', 'as_written')}{source_note}")
     for n in physical.nodes:
         parts = [f"  {type(n).__name__} {n.node_id}"]
         for k, v in n.explain_fields().items():
@@ -973,14 +806,9 @@ def explain(logical: LogicalPlan, physical) -> str:
                 for port in n.inputs))
         lines.append(" ".join(parts))
         for stage in getattr(n, "stages", ()):
-            lines.append(f"    stage {stage.to_dict()}")
-        if isinstance(n, AdaptiveJoinPlan):
-            for child in n.expected_nodes:
-                lines.append(
-                    f"    expected {type(child).__name__} {child.node_id}"
-                )
-                for stage in getattr(child, "stages", ()):
-                    lines.append(f"      stage {stage.to_dict()}")
+            fields = (stage.explain_fields() if isinstance(stage, JoinStage)
+                      else stage.to_dict())
+            lines.append(f"    stage {fields}")
     for r in physical.remarks:
         lines.append(f"  remark: {r}")
     return "\n".join(lines)

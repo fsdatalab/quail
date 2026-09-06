@@ -96,15 +96,14 @@ from quail.planner import budgets
 from quail.planner.decide import (
     collect_operators,
     default_order_rule,
-    join_specs,
     order_filters_indexed,
 )
-from quail.planner.joins import fit_resident_documents, search_joins, summarize_alias
+from quail.planner.joins import fit_resident_documents
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan
-from quail.backends.quail.coordinator import runtime_join_steps, thin_survivors
+from quail.backends.quail.coordinator import thin_survivors
 from quail.runtime.tokens import shared_prefix_lengths
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 
@@ -471,7 +470,7 @@ def simulate_production_planner(query, model: ModelSpec,
                                 chunk_tokens: int):
     """Optional diagnostic for the production planner.
 
-    The simulation uses exact saved answers after every join group.
+    The simulation executes the saved join order with exact saved answers.
     At group boundaries it applies the arena's page limit and the
     same prefix tokens per page victim order. It does not reproduce temporary
     overlap between packed GPU chunks.
@@ -504,71 +503,15 @@ def simulate_production_planner(query, model: ModelSpec,
     join_pair_evaluations = 0
     single_join_options = {}
 
-    all_specs = join_specs(joins)
-    markers = [dict(semantics=j.semantics, written_pos=i)
-               for i, j in enumerate(joins)]
-    remaining = set(range(len(joins)))
-    already_joined = set()
-    search_runs = []
-    search_sequence = []
-
-    def possible_anchors(indices):
-        out = set()
-        for index in indices:
-            spec = all_specs[index]
-            if spec["semantics"] == "full" and spec.get("anchor_free"):
-                out.update(spec["aliases"])
-            else:
-                out.add(spec["anchor"])
-        return out
-
-    def next_group():
-        specs = [all_specs[i] for i in sorted(remaining)]
-        involved = sorted({a for spec in specs
-                           for a in spec["aliases"]})
-        found = search_joins(
-            specs,
-            {a: float(len(survivors[a])) for a in involved},
-            {a: summarize_alias(
-                (aliases[a]["tokens"][row] for row in survivors[a]),
-                resident_flags=(row in resident_rows[a]
-                                for row in survivors[a]))
-             for a in involved},
-            {},
-            PRE, chunk_tokens, model, H100_SXM,
-            fixed_order=(plan.settings["order_rule"] == "as_written"),
-            already_joined=already_joined)
-        if found is not None:
-            search_runs.append(found)
-            nodes = runtime_join_steps(found["seq"], markers)
-            return next(node for node in nodes
-                        if node["op"] == "AnchoredJoin")
-
-        ordered = sorted(remaining)
-        first = ordered[0]
-        anchor = all_specs[first]["anchor"]
-        group = [first]
-        if all_specs[first]["semantics"] == "full":
-            for index in ordered[1:]:
-                spec = all_specs[index]
-                if spec["semantics"] != "full" \
-                        or spec["anchor"] != anchor:
-                    break
-                group.append(index)
-        return dict(op="AnchoredJoin", anchor=anchor,
-                    stage_idxs=tuple(group))
-
-    while remaining:
-        node = next_group()
-        search_sequence.extend((index, node["anchor"])
-                               for index in node["stage_idxs"])
-        stage_defs = [joins[i] for i in node["stage_idxs"]]
-        anchor = node["anchor"]
-        remaining.difference_update(node["stage_idxs"])
-        future_anchors = possible_anchors(remaining)
+    planned_groups = plan.graph.nodes_by_type("quail.anchored_join")
+    for node in planned_groups:
+        stage_indices = [stage.written_pos for stage in node.stages]
+        stage_defs = [joins[index] for index in stage_indices]
+        anchor = node.anchor
+        future_anchors = ({anchor} if node.keep_anchor_kv else set())
         group_semantics = stage_defs[-1].semantics
         for stage_index, (join_index, join) in enumerate(
-                zip(node["stage_idxs"], stage_defs)):
+                zip(stage_indices, stage_defs)):
             prompt = join.predicate
             code = prompt_code(prompt)
             stage_aliases = [arg.alias for arg in prompt.args]
@@ -649,8 +592,6 @@ def simulate_production_planner(query, model: ModelSpec,
             {alias: aliases[alias]["tokens"] for alias in aliases},
             PRE, plan.settings["admission_tokens"],
             budgets.PAGE_TOKENS)
-        for join_index in node["stage_idxs"]:
-            already_joined.update(all_specs[join_index]["aliases"])
 
     first_alias = scans[0].alias
     input_document_rows = sum(
@@ -684,11 +625,6 @@ def simulate_production_planner(query, model: ModelSpec,
         "anchor": anchor,
         "anchor_tokens_both_ways": both,
         "held_column": aliases[held_alias]["column"],
-        "runtime_search": (None if not search_runs else dict(
-            states=sum(run["states"] for run in search_runs),
-            generated=sum(run["generated"] for run in search_runs),
-            replans=len(search_runs),
-            sequence=[list(step) for step in search_sequence])),
     }
 
 

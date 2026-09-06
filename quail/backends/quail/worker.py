@@ -12,7 +12,6 @@ import os
 import time
 
 from quail.backends.base import GpuContext
-from quail.backends.quail.coordinator import stage_for_anchor
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.graph import (
     _join_round_kv,
@@ -25,7 +24,6 @@ from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
 from quail.executor.loop import AsyncAnswers, warm_kernels
 from quail.executor.model import load_model
 from quail.physical import (
-    AdaptiveJoinPlan,
     AnchoredJoin,
     decode_graph,
     DocumentInput,
@@ -244,7 +242,7 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
             fresh_tokens=report["fresh_tokens"],
             regret_tokens=report.get("regret_tokens"),
             node_metrics=report.get("node_metrics"),
-            join_optimizer=report.get("join_optimizer"),
+            executed_join_plan=report.get("executed_join_plan", []),
             kv_manager=report.get("kv_manager")), f)
     results_vol.commit()
     kernel_cache.commit()    # persist any JIT artifacts this run built
@@ -395,17 +393,7 @@ def _child_joins(state, sub):
     node = registry.codecs[encoded_node["type"]].decode(encoded_node)
     if not isinstance(node, AnchoredJoin):
         raise TypeError(f"child join received {node.type_name!r}")
-    graph = decode_graph(
-        sub["physical_plan"]["graph"], registry.codecs
-    )
-    adaptive = next(
-        physical_node for physical_node in graph.nodes
-        if isinstance(physical_node, AdaptiveJoinPlan)
-    )
-    group = [
-        stage_for_anchor(adaptive.join_specs[index], node.anchor)
-        for index in node.stage_idxs
-    ]
+    group = [stage.runtime_spec() for stage in node.stages]
     anchor_alias = node.anchor
     anchors_glob = list(sub["anchor_index"])
     anchor_docs = sub["anchor_docs"]

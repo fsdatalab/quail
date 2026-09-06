@@ -26,7 +26,7 @@ def _run(query, execute):
 def runtime_plan(request):
     from quail.builtins import built_in_registry
     from quail.physical import (
-        AdaptiveJoinPlan,
+        AnchoredJoin,
         DocumentInput,
         PackedFilter,
         decode_graph,
@@ -39,11 +39,6 @@ def runtime_plan(request):
         node.alias: node for node in graph.nodes
         if isinstance(node, PackedFilter)
     }
-    adaptive = next(
-        (node for node in graph.nodes
-         if isinstance(node, AdaptiveJoinPlan)),
-        None,
-    )
     return {
         "graph": graph,
         "filter_nodes": filter_nodes,
@@ -52,7 +47,8 @@ def runtime_plan(request):
                     for question in node.question_token_ids]
             for alias, node in filter_nodes.items()
         },
-        "joins": [] if adaptive is None else list(adaptive.join_specs),
+        "joins": [stage.runtime_spec() for node in graph.nodes
+                  if isinstance(node, AnchoredJoin) for stage in node.stages],
         "shards": {
             node.alias: node.shards for node in graph.nodes
             if isinstance(node, DocumentInput)
@@ -79,8 +75,6 @@ def sess(tmp_path):
 
 def make_executor(filter_truth, join_truth=None, seen=None):
     """Build a fake executor from filter and join truth tables."""
-    import itertools
-
     def _match_key(alias, q):
         for key in filter_truth[alias]:
             if any(t.startswith(key) for t in q):
@@ -89,9 +83,11 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                        f"matches tokens {q[:5]}")
 
     def _exec(request):
-        from quail.execution import PhysicalResponse, export_physical_outputs
-        from quail.physical import AdaptiveJoinPlan, DocumentInput, PackedFilter
-        from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
+        from quail.execution import PhysicalResponse
+        from quail.physical import DocumentInput, PackedFilter
+        from quail.backends.quail.graph import execute_single_graph
+        from quail.runtime.runner import NodeResult
+        from test_quail_backend import graph_state
 
         runtime = runtime_plan(request)
         if seen is not None:
@@ -102,74 +98,53 @@ def make_executor(filter_truth, join_truth=None, seen=None):
             node.alias: request.inputs[node.input_id].documents
             for node in graph.nodes if isinstance(node, DocumentInput)
         }
-        node_results = {}
-        survivors = {
-            alias: list(range(len(table))) for alias, table in docs.items()
-        }
-        for alias, qids in runtime["filters"].items():
-            rows = {}
-            for d in range(len(docs[alias])):
-                row = []
-                for q in qids:
-                    bit = filter_truth[alias][_match_key(alias, q)][d]
-                    row.append(bit)
-                    if not bit:
-                        break
-                rows[d] = row
-            survivors[alias] = [d for d, r in rows.items()
-                                if len(r) == len(qids) and all(r)]
-            node = next(
-                node for node in graph.nodes
-                if isinstance(node, PackedFilter) and node.alias == alias
-            )
-            node_results[node.node_id] = NodeResult({
-                f"ids:{alias}": survivors[alias],
-                f"filter_answers:{alias}": rows,
-            })
-        join_outputs = {}
-        for j in runtime["joins"]:
-            anchors = list(survivors[j["anchor"]])
-            tuples = [list(t) for t in itertools.product(
-                *[survivors[p] for p in j["partners"]])]
-            rule = join_truth[(j["anchor"], *j["partners"])]
-            rows = {ai: [rule(a, *t) for t in tuples]
-                    for ai, a in enumerate(anchors)}
-            join_outputs[f"join_answers:{j['written_pos']}"] = dict(
-                rows=rows,
-                anchor_index=anchors,
-                partner_index=tuples,
-                anchor=j["anchor"],
-                partners=j["partners"],
-                semantics=j["semantics"],
-                selectivity=j["selectivity"],
-                written_pos=j["written_pos"],
-            )
-            kept = {anchors[ai] for ai, r in rows.items() if any(r)}
-            if j["semantics"] == "anti":
-                survivors[j["anchor"]] = [a for a in anchors
-                                          if a not in kept]
-            else:
-                survivors[j["anchor"]] = sorted(kept)
-        adaptive = next(
-            (node for node in graph.nodes
-             if isinstance(node, AdaptiveJoinPlan)),
-            None,
-        )
-        if adaptive is not None:
-            node_results[adaptive.node_id] = NodeResult({
-                **{
-                    f"ids:{alias}": survivors[alias]
-                    for alias in adaptive.aliases
-                },
-                **join_outputs,
-            })
-        outputs = export_physical_outputs(
-            graph, RunResult(None, node_results, NodeMetrics())
-        )
+
+        class FixedAnswers:
+            def execute(self, node, inputs):
+                if isinstance(node, PackedFilter):
+                    rows = {}
+                    for document in inputs["document_ids"]:
+                        row = []
+                        for question in node.question_token_ids:
+                            bit = filter_truth[node.alias][
+                                _match_key(node.alias, question)
+                            ][document]
+                            row.append(bit)
+                            if not bit:
+                                break
+                        rows[document] = row
+                    return NodeResult({
+                        f"ids:{node.alias}": [d for d, row in rows.items()
+                            if len(row) == len(node.stages) and all(row)],
+                        f"filter_answers:{node.alias}": rows,
+                    })
+                anchors = list(inputs["anchor_ids"])
+                outputs = {}
+                for stage in node.stages:
+                    partners = inputs["partner_indices"][stage.written_pos]
+                    rule = join_truth[(stage.anchor, *stage.partners)]
+                    rows = {i: [rule(a, *pair) for pair in partners]
+                            for i, a in enumerate(anchors)}
+                    outputs[f"join_answers:{stage.written_pos}"] = {
+                        "rows": rows, "anchor_index": anchors,
+                        "partner_index": partners, "anchor": stage.anchor,
+                        "partners": list(stage.partners),
+                        "semantics": stage.semantics,
+                        "selectivity": stage.selectivity,
+                        "written_pos": stage.written_pos,
+                    }
+                passing = {anchors[i] for i, row in rows.items() if any(row)}
+                outputs[f"ids:{node.anchor}"] = [a for a in anchors
+                    if (a not in passing if stage.semantics == "anti"
+                        else a in passing)]
+                return NodeResult(outputs)
+
+        report = execute_single_graph(graph_state(FixedAnswers(), docs), {
+            "filter_limit": None, "pre_ids": [],
+        }, graph)
+        outputs = report.pop("_outputs")
         return PhysicalResponse(outputs, {
-            "wall_s": 1.0,
-            "boot_s": 0.5,
-            "fresh_tokens": 1234,
+            **report, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234,
         })
 
     return _exec

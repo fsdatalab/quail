@@ -155,7 +155,8 @@ def plan_request_backend(
 
     filter_specs = []
     prompts = []
-    for alias in aliases:
+    first_anchor = join_sequence[0][1] if join_sequence else None
+    for alias in sorted(aliases, key=lambda alias: alias == first_anchor):
         predicates = filters.get(alias, ())
         if not predicates:
             continue

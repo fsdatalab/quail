@@ -6,7 +6,6 @@ from quail.backends.quail.coordinator import (filter_node_payloads,
                                        join_group_payloads,
                                        merge_filter_round,
                                        merge_join_round,
-                                       stage_for_anchor,
                                        thin_survivors)
 
 
@@ -159,21 +158,6 @@ def test_join_group_two_same_anchor_stages():
     assert subs[1]["anchor_index"] == [1, 3]
 
 
-def test_stage_for_anchor_materializes_either_side():
-    spec = dict(anchor="r", partners=["p"], aliases=["r", "p"],
-                semantics="full",
-                frames={"r": [70], "p": [71]},
-                labels={"r": [80], "p": [81]}, tail=[3])
-    r_side = stage_for_anchor(spec, "r")
-    assert r_side["anchor"] == "r"
-    assert r_side["frame"] == [70]
-    assert r_side["labels"] == {"p": [81]}
-    assert r_side["partners"] == ["p"]
-    p_side = stage_for_anchor(spec, "p")
-    assert p_side["anchor"] == "p"
-    assert p_side["frame"] == [71]
-    assert p_side["labels"] == {"r": [80]}
-    assert p_side["partners"] == ["r"]
 def test_gate_group_full_exists_anti():
     out = dict(rows={0: [1, 0], 1: [0, 0], 2: [0, 1]},
                anchor_index=[5, 7, 9])
@@ -308,18 +292,3 @@ def test_join_group_prior_shards_add_documents_missing_from_kv():
                 for document in sub["anchor_index"]]
     assert sorted(assigned) == survivors["r"]
     assert len(assigned) == len(set(assigned))
-
-
-def test_search_specs_counts_from_token_lists():
-    from quail.backends.quail.coordinator import search_specs
-
-    specs = search_specs([dict(
-        aliases=["r", "p"], anchor="r", anchor_free=True,
-        semantics="full", selectivity=0.1, written_pos=2,
-        frames={"r": [1] * 5, "p": [1] * 4},
-        labels={"r": [1] * 2, "p": [1] * 3}, tail=[1] * 7)])
-    assert specs == [dict(
-        written_pos=2, aliases=["r", "p"], anchor="r",
-        anchor_free=True, semantics="full", selectivity=0.1,
-        frame_tokens={"r": 5, "p": 4},
-        label_tokens={"r": 2, "p": 3}, tail_tokens=7)]

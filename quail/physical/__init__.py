@@ -19,7 +19,6 @@ from .codec import (
     plan_envelope,
 )
 from .nodes import (
-    AdaptiveJoinPlan,
     AnchoredJoin,
     DocumentInput,
     Exchange,
@@ -35,7 +34,6 @@ from .nodes import (
 )
 
 __all__ = [
-    "AdaptiveJoinPlan",
     "AnchoredJoin",
     "DocumentInput",
     "Exchange",

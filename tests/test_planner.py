@@ -7,7 +7,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from quail.builder import col, docs, prompt
-from quail.backends.quail import expected_join_nodes, expected_join_stages
+from quail.backends.quail import expected_join_stages
 from quail.catalog import Catalog, DocumentProvider
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
 from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
@@ -33,9 +33,7 @@ def join_stages(plan):
 
 
 def node_kinds(plan):
-    return ([type(node).__name__ for node in plan.nodes]
-            + [type(node).__name__
-               for node in expected_join_nodes(plan)])
+    return [type(node).__name__ for node in plan.nodes]
 
 
 def test_prefix_recompute_seconds_counts_attention_work():
@@ -349,10 +347,9 @@ def test_chain_splits_into_groups_when_the_long_side_anchors(catalog):
     kinds = node_kinds(plan)
     assert kinds.count("AnchoredJoin") == 2
     assert kinds.count("Exchange") == 1
-    assert kinds.count("AdaptiveJoinPlan") == 1
     barrier = plan.graph.nodes_by_type(Exchange.type_name)[0]
     assert barrier.next_anchor == "p"
-    assert set(barrier.aliases) == {"t", "p"}
+    assert set(barrier.aliases) == {"r", "t", "p"}
     # the barrier's outputs feed the second group's inputs
     group2 = plan.graph.nodes_by_type(AnchoredJoin.type_name)[1]
     assert all(input_port.source.node_id == barrier.node_id
@@ -656,7 +653,7 @@ def test_keep_capped_by_arena_resident_fraction(catalog):
     assert group.anchor_resident == "filter"
 
 
-def test_gate_group_retains_anchor_for_runtime_replan(catalog):
+def test_gate_group_retains_anchor_for_next_planned_group(catalog):
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "products", tok).alias("p"),
                         prompt("m {0} {1}", col("r.review"),

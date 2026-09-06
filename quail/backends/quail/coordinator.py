@@ -4,7 +4,6 @@ Pure dict-and-list logic (no torch). Called by the worker's parent
 process between child GPUs.
 """
 
-from quail.physical import AnchoredJoin, Exchange
 from quail.planner import balanced_shards
 from quail.runtime.tokens import select_documents
 
@@ -62,99 +61,6 @@ def filter_node_payloads(payload: dict, node, shards: dict,
     return outputs
 
 
-def search_specs(joins: list) -> list:
-    """The payload's join specs in the shared search's count form."""
-    out = []
-    for i, j in enumerate(joins):
-        out.append(dict(
-            written_pos=j.get("written_pos", i),
-            aliases=list(j["aliases"]),
-            anchor=j.get("anchor"),
-            anchor_free=bool(j.get("anchor_free")),
-            semantics=j["semantics"],
-            selectivity=j.get("selectivity"),
-            frame_tokens={a: len(t) for a, t in j["frames"].items()},
-            label_tokens={a: len(t) for a, t in j["labels"].items()},
-            tail_tokens=len(j["tail"])))
-    return out
-
-
-def runtime_join_steps(sequence, joins: list) -> tuple:
-    """Build typed anchored join and exchange steps for a search result."""
-
-    pos_to_idx = {j.get("written_pos", i): i
-                  for i, j in enumerate(joins)}
-    aliases = tuple(sorted({
-        alias for join in joins for alias in join.get("aliases", ())
-    }))
-    groups = []
-    for wp, anchor in sequence:
-        idx = pos_to_idx[wp]
-        full = joins[idx]["semantics"] == "full"
-        if groups and full and groups[-1]["full"] \
-                and groups[-1]["anchor"] == anchor:
-            groups[-1]["idxs"].append(idx)
-        else:
-            groups.append(dict(anchor=anchor, full=full, idxs=[idx]))
-    nodes = []
-    barriers = 0
-    prev = None
-    for i, g in enumerate(groups):
-        if prev is not None and prev != g["anchor"]:
-            nodes.append(Exchange(
-                node_id=f"runtime-exchange:{barriers}",
-                next_anchor=g["anchor"], aliases=aliases,
-            ))
-            barriers += 1
-        nodes.append(AnchoredJoin(
-            node_id=f"runtime-join:{i}",
-            anchor=g["anchor"],
-            stage_idxs=tuple(g["idxs"]),
-        ))
-        prev = g["anchor"]
-    return tuple(nodes)
-
-
-def report_join_plan(sequence, joins: list) -> list:
-    """Return typed join steps for a query report."""
-    pos_to_join = {
-        join.get("written_pos", index): join
-        for index, join in enumerate(joins)
-    }
-    groups = []
-    for written_pos, anchor in sequence:
-        join = pos_to_join[written_pos]
-        full = join["semantics"] == "full"
-        if groups and full and groups[-1]["full"] \
-                and groups[-1]["anchor"] == anchor:
-            groups[-1]["written_positions"].append(written_pos)
-        else:
-            groups.append({
-                "anchor": anchor,
-                "full": full,
-                "written_positions": [written_pos],
-            })
-
-    records = []
-    previous_anchor = None
-    for index, group in enumerate(groups):
-        if previous_anchor is not None \
-                and previous_anchor != group["anchor"]:
-            records.append({
-                "type": "quail.exchange",
-                "id": f"runtime-exchange:{len(records)}",
-                "next_anchor": group["anchor"],
-            })
-        records.append({
-            "type": "quail.anchored_join",
-            "id": f"runtime-join:{index}",
-            "anchor": group["anchor"],
-            "written_positions": group["written_positions"],
-        })
-        previous_anchor = group["anchor"]
-    return records
-
-
 def merge_filter_round(outs: list, limit: int | None = None) -> dict:
     """Merge workers' filter answers, survivors, and token counts."""
     filters, survivors = {}, {}
@@ -170,16 +76,6 @@ def merge_filter_round(outs: list, limit: int | None = None) -> dict:
         merged = {a: v[:limit] for a, v in merged.items()}
     return dict(filters=filters, survivors=merged,
                 fresh_tokens=tokens)
-
-
-def stage_for_anchor(spec: dict, anchor: str) -> dict:
-    """Return a child-facing copy of one join stage spec with the given anchor."""
-    partners = [a for a in spec["aliases"] if a != anchor]
-    out = dict(spec)
-    out.update(anchor=anchor, partners=partners,
-               frame=spec["frames"][anchor],
-               labels={p: spec["labels"][p] for p in partners})
-    return out
 
 
 def gate_group(stage_out: dict, semantics: str) -> list:

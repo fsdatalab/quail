@@ -47,7 +47,7 @@ execution request to the compute provider.
 | `runtime/tokens.py` | Memory mapped token files and random document views | Arrow |
 | `runtime/compute.py` | Compute provider interface and Modal Function implementation | catalog, result, worker |
 | `runtime/runner.py` | Generic typed graph runner and standard node metrics | physical |
-| `backends/quail/graph.py` | One GPU Quail node preparation, the Quail node runtimes, and the adaptive join runtime | runner, planner, executor |
+| `backends/quail/graph.py` | One GPU Quail node preparation, fixed graph execution, and KV accounting | runner, executor |
 | `backends/quail/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `backends/quail/distributed.py` | Several GPU Quail node dispatch and result merging | runner, coordinator |
 | `backends/quail/worker.py` | Quail model boot, single GPU execution, and the GPU child protocol | executor, graph, distributed |
@@ -150,7 +150,7 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    memory mapped length column. The selected model backend produces physical
    candidates. The
    planner selects one typed `PhysicalGraph`. Quail uses
-   `DocumentInput`, `PackedFilter`, `AdaptiveJoinPlan`, `AnchoredJoin`,
+   `DocumentInput`, `PackedFilter`, `AnchoredJoin`,
    `Exchange`, `HashJoin`, physical `Project`, and `Limit`.
    The vLLM and SGLang backends use `DocumentInput`, `RequestExecution`,
    `HashJoin`, physical `Project`, and `Limit`. `RequestExecution` stores the
@@ -159,17 +159,17 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    The generic `PhysicalPlan` holds the graph and a backend-owned settings map.
    Quail's chunk size, KV capacity, predicate order, and filter limit are not
    fields that another backend must supply.
-7. `AdaptiveJoinPlan` contains the join steps predicted from planning
-   estimates. At runtime, Quail searches again with the actual filter
-   survivors and current KV state. An anchor change is represented as
-   `Exchange`. There is no physical barrier node.
+7. The planner chooses the complete join order and anchors from selectivity
+   estimates. It schedules the first anchor's filters last and retains their
+   survivors' KV within capacity. `Exchange` nodes prune actual survivors
+   between the planned join groups. Execution follows this graph without
+   searching again.
 8. The worker creates an internal physical request. It uses the query's
    registry to check every physical node codec, backend, model, device,
    and runtime. The generic
    runner then executes the typed physical graph.
-   `AdaptiveJoinPlan` creates typed `AnchoredJoin` and `Exchange` child
-   graphs. The same `QuailModelExecution` handles every model node on
-   one GPU executor, so the nodes use the same KV.
+   The same `QuailModelExecution` handles every model node on one GPU
+   executor, so the nodes use the same KV.
 9. Arrow Acero joins the true pairs on
    shared SQL alias columns and applies the final survivor sets. Each
    alias column contains the source table row number for one document.
@@ -296,7 +296,7 @@ are found (early termination); for a join query the filter round
 gets no limit - one document can appear in zero or many output rows
 (#39) - and the Arrow result stream applies the final limit instead.
 The typed filter runtime receives no early limit when the graph contains
-`AdaptiveJoinPlan`. The
+`AnchoredJoin`. The
 builder equivalent is `.limit(n)` before `.select()`. The rejection
 list is explicit (`compile.py:22-33`), so new SQL surface cannot
 enter silently.
@@ -471,7 +471,7 @@ once. Prefix survivor products and expected costs then let it price each
 predicate as the first scan in constant time. The search takes `O(n log n)`
 work for `n` filters. It does not check every filter permutation.
 
-**Join order and anchors, one search, repeated calls** (`search_joins`
+**Join order and anchors before execution** (`search_joins`
 in `planner/joins.py`): stage order and per-stage anchors are
 decided together, because they interact - anchors set what an order
 is worth, and order sets which stages can reuse an anchor's KV
@@ -487,20 +487,13 @@ the written stage order is kept and only anchors are searched. A
 gate's anchor is fixed to its outer table; a forced anchor is
 honored, with a remark at plan time when a free choice prices lower.
 
-The same function runs whenever new answers can change the decision:
-
-- **Plan time** (`plan_query`): expected live counts from
-  selectivities, summary length statistics, the keep credit as the
-  resident set. The output is the predicted plan - explain(), the
-  refusal checks, and sharding run off it.
-- **At runtime** (the worker; the parent process on several GPUs):
-  the actual survivor counts and summary length statistics, including
-  the count and total length of documents whose KV is resident. The
-  worker executes one join group, applies its answers, and searches
-  the remaining joins again. The next search starts with the aliases
-  joined by every completed group. For example, after joining B and C,
-  both A-B and C-D are legal next predicates. It does not search
-  between chunks inside one group.
+The search runs during planning with estimated survivor counts and document
+length summaries. Filter survival is assumed independent of document length.
+Multiple filter selectivities are multiplied. Each candidate gets filter KV
+credit only for its first anchor, bounded by the available retention space.
+The selected order determines filter scheduling and the executable graph.
+Actual rows and available KV determine the work performed during execution,
+without changing the selected joins or anchors.
 
 Each stage is costed as a `Work` record (`planner/sol.py`: tokens,
 attention pairs, KV written, KV read). Each alias is summarized once.
@@ -511,9 +504,8 @@ calculation. A DP candidate therefore takes constant time, regardless
 of the document count. A resident anchor prefix pays only its question
 frame (`ask`). Consecutive stages in one open anchor group also reuse
 the prefix. Other later groups are priced without predicted reuse.
-The worker searches again after the current group, so its next call
-sees the actual finite KV state. A stage can price some current anchor
-documents as KV hits and the rest as recomputations.
+Later anchor changes are priced as document recomputation. The executor reuses
+KV when available and recomputes missing prefixes within the same saved plan.
 Every tuple then carries partner labels, partner documents, and the
 answer cue over the resident anchor context. After each stage the
 live counts thin by `n * (1 - (1-s)^partner_tuples)`. Per state,
@@ -521,21 +513,19 @@ records survive unless another is no larger in all four work
 categories, and the final candidates rank by predicted seconds -
 `speed_of_light` from counted model constants and the device
 datasheet. No calibration constant is read anywhere. Stage outputs
-carry written_pos, semantics, and selectivity, so a runtime-chosen
-order assembles into results correctly.
+carry written_pos, semantics, and selectivity, so reordered
+predicates assemble into results correctly.
 
 **KV residency across operators** (`plan_keeps`, `keep_split` in
 `decide.py`; `RetainedPool` in `executor/retention.py`; the arena
 heap in `executor/arena.py`): document KV outlives its operator
 wherever a later one will read it.
 
-- Every filtered alias the runtime search could anchor writes KV
-  (`arena_writes`) and keeps its survivors (`keep_kv` on the
-  `PackedFilter` node). At each survivor's final TRUE the runtime
-  offers its prefix to the retained pool; a kept prefix is rewound
-  to preamble + document (the question tail's pages return to the
-  free list) and marked with its exact prefix token count. The join
-  then anchors on KV that is already there.
+- Only the first planned anchor's filter chain keeps its survivors' KV
+  after filtering. Other filter chains run first and release their KV when
+  they finish. Their passing row IDs and source tokens remain on CPU.
+  The anchor's filters run last. Passing prefixes are offered to the bounded
+  retained pool and rewound to the preamble and document.
 - **The scan ring.** Before a filter with retention starts, the
   loop reserves pages for two chunk budgets of document KV - one
   chunk executing while the next is packed - and the retained pool
@@ -550,7 +540,7 @@ wherever a later one will read it.
   than the victims contain together. Total retained prefix tokens only
   rise, and equal token counts never swap. A replacement is heap
   bookkeeping in the answer path, never a stalled forward pass.
-- A join group whose anchor a later group re-uses retains its gate
+- A join group whose anchor the next group reuses retains its gate
   survivors the same way, so a gate between two same-anchor stages
   no longer forces a recompute. Thinned-out documents and retained
   KV with no future consumer are freed the moment that is known,
@@ -568,11 +558,9 @@ wherever a later one will read it.
   minus the same two-chunk working reservation the ring makes -
   using the corpus length distribution. The runtime can favor any
   prefix whose last page is fuller, so the plan does not assume a
-  length threshold. The `_keep_timeline` function
-  trims the credit until the peak expected resident tokens fit
-  beside the working headroom. The runtime is not bound by the
-  threshold; the credit keeps the prediction and the SoL comparison
-  honest.
+  length threshold. Only one filter input receives credit in the selected
+  plan. Actual retention remains bounded when more documents pass than the
+  estimates predicted.
 
 Every stage records the residency its cost assumed
 (`anchor_resident`: none / filter / kept), so `explain()` shows
@@ -673,7 +661,7 @@ single forward pass, sharing KV across them through a paged arena.
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
 | `unrounded_seconds` | `sol.py` | Component limits without forward pass rounding |
-| `search_joins` | `joins.py` | The join search: order and anchors from live counts, length summaries, document KV summaries, and aliases joined by completed groups; called at plan time and after every completed runtime group |
+| `search_joins` | `joins.py` | Choose join order and anchors before execution from estimated survivors, length summaries, and first-anchor KV credit |
 | `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: the fraction of expected survivors that fits beside the scan reserve |
 | `RetainedPool` | `executor/retention.py` | Fixed-capacity retained pool: keep while room, then replace residents with fewer prefix tokens per page only when total retained prefix tokens rise |
 | `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the fewest prefix tokens per page |
@@ -1262,7 +1250,7 @@ own CUDA context and arena. The parent process (inside the same
 Modal container) sends payloads over pipes, so there is no network
 hop between rounds.
 
-### Rounds follow `AdaptiveJoinPlan`
+### Rounds follow the saved physical graph
 
 **The filter round**: every worker filters its shard of every alias.
 The plan stores one contiguous range per worker. The range boundaries aim for
@@ -1272,20 +1260,17 @@ do not pass through the parent process pipe. After this round, the parent
 merges survivors.
 
 **One join round per selected `AnchoredJoin`**: anchors follow the
-alias's filter shard when one exists. An anchor that was a partner in
+alias's filter shard when it holds retained KV. An anchor that was a partner in
 an earlier round gets new balanced shards over its live documents.
 The parent sends file references and survivor positions, and each GPU reads
 the needed token values before it computes KV for its new anchor slice. Every
 GPU receives every surviving partner, so every
 GPU uses the same partner index space.
 
-**An `Exchange` between different anchors**: the parent thins each
-table to documents that still occur in a passing pair. It then
-changes the anchor partitioning. `AdaptiveJoinPlan` runs the join
-search again before each round, using current survivor counts and KV
-residency. The typed physical plan has no barrier node. Each selected
-step is a typed child graph. A child graph contains `AnchoredJoin` and,
-when the anchor changes, `Exchange`.
+**An `Exchange` between join groups** prunes each input to documents that
+remain in passing pairs. All completed full-join answers and current survivor
+IDs are explicit inputs. When the anchor changes, the next join round assigns
+its live documents to workers. No join search runs during these rounds.
 
 ### Sharding contract
 
@@ -1305,20 +1290,17 @@ for each worker w:
 collect all filter answers
 merge: union the per-alias answer dicts and survivor lists
 
-# then execute AdaptiveJoinPlan
-while join predicates remain:
-    search with current survivors and current KV residency
-    select the next AnchoredJoin
-    if its anchor differs from the prior anchor:
-        execute Exchange and repartition the new anchor
-    for each worker w:
-        anchors = live anchor docs in w's shard (filter shard when
-                  one exists; fresh balanced shards otherwise)
-        partners = ALL live partner documents (replicated)
-        send (anchors, partners, the group's stages) to child w
-    collect, merge (anchors disjoint, partner indices identical)
-    gate: the anchor's survivors from the group's last stage
-    thin survivors using all finished full join answers
+# execute the saved join and exchange nodes
+for node in the planned graph:
+    if node is Exchange:
+        prune survivor IDs using completed join answers
+    if node is AnchoredJoin:
+        for each worker w:
+            anchors = live anchor documents assigned to w
+            partners = all live partner documents
+            send the node and its input document positions to child w
+        collect and merge disjoint anchor answers
+        retain surviving anchor KV only if the next group uses it
 ```
 
 ### Key functions: coordinator and worker
@@ -1330,10 +1312,8 @@ while join predicates remain:
 | `merge_filter_round` | `coordinator.py` | Merge workers' filter answers |
 | `join_group_payloads` | `coordinator.py` | Build per-worker sub-payloads for one anchor group's round (re-shards an anchor with no filter shard) |
 | `merge_join_round` | `coordinator.py` | Concatenate workers' join answer rows |
-| `stage_for_anchor` | `coordinator.py` | Materialize a stage spec for the round's chosen anchor |
-| `thin_survivors` | `coordinator.py` | Remove documents that no longer occur in finished full-join answers |
+| `ExchangeRuntime.execute` | `runtime/runner.py` | Prune actual survivor IDs using completed full-join answer relations |
 | `gate_group` | `coordinator.py` | Anchor survivors after one group (full/exists/anti keep rules) |
-| `runtime_join_steps` | `coordinator.py` | Group a runtime join search into anchored joins and exchanges |
 | `ModalComputeProvider.execute` | `compute.py` | Submit one logical query to the selected Modal Function |
 | `execute_query_request` | `local.py` | Plan and execute one logical query request in the current process |
 | `execute_worker_query` | `local.py` | Plan and execute one already built query in the current process |

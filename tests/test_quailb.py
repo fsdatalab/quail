@@ -78,9 +78,13 @@ def _standin_sets(tmp_path):
     return tmp_path
 
 
-def test_all_queries_compile_and_plan(tmp_path):
+@pytest.mark.parametrize("backend", [
+    "quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang",
+])
+def test_all_queries_compile_and_plan(tmp_path, backend):
     _standin_sets(tmp_path)
-    sess = quail.Session(EngineConfig(gpus=1), tokenizer=str.split)
+    sess = quail.Session(EngineConfig(gpus=1, backend=backend),
+                         tokenizer=lambda text: list(text.encode()))
     register_sets(sess, tmp_path)
     register_privacy_sets(sess, tmp_path)
     qdefs = queries(sess)

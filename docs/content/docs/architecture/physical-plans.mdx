@@ -58,8 +58,7 @@ Quail backend nodes:
 | Node | Job |
 | --- | --- |
 | `PackedFilter` | One table's filter stages, with question token ids, arena write flag, and keep-KV flag. |
-| `AnchoredJoin` | One join stage with a fixed anchor alias. |
-| `AdaptiveJoinPlan` | The planned join steps. At runtime it re-plans from actual survivors and KV residency and emits `AnchoredJoin` and `Exchange` child graphs. |
+| `AnchoredJoin` | One join group with a fixed anchor alias and bound prompt tokens. |
 
 Request backend node:
 
@@ -112,3 +111,14 @@ Model node outputs leave the executor as Arrow tables with metadata
 that names the alias, the predicate position, and for joins the
 anchor, partners, and semantics. `HashJoin` needs nothing else to
 combine them.
+
+## Fixed join plans
+
+Join order and anchors are chosen before inference. The first anchor's filter
+chain runs last and retains its surviving document KV within capacity. Other
+filter chains release KV when they finish.
+
+The executable graph contains the bound `AnchoredJoin` stages and `Exchange`
+nodes that prune actual survivors. `explain()` shows this saved order.
+Older serialized plans containing `quail.adaptive_join_plan` must be regenerated
+from their logical queries. The public query API is unchanged.
