@@ -9,12 +9,17 @@
 - Join order remains fixed before execution. The first anchor's filters still
   run last. Per-set memory estimates are not fixed partitions.
 
-![FEVER latency, recomputed KV, fresh input tokens, accuracy, and input counts](plots/quailb_fev.png)
+[Open the FEVER vector PDF](plots/quailb_fev.pdf)
+
+[![FEVER latency, recomputed KV, fresh input tokens, accuracy, and input counts](plots/quailb_fev.png)](plots/quailb_fev.pdf)
 
 Figure: plots/quailb_fev.png
 
 - FEV-9 appears with the other FEVER queries in the standard dataset plot.
   The first-anchor-only comparison remains in the tables below.
+- The PDF also shows the SoL estimate with prefix reuse across requests.
+  SoL assumes unlimited prefix retention and reference-label survivors.
+  It is an estimate for that workload, not a measurement of the 4B answers.
 
 | Configuration | Query time, seconds | Document pairs/second | $/query |
 |---|---:|---:|---:|

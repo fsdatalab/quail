@@ -138,8 +138,21 @@ Every report with measured results should include at least one plot.
   Include every query in its dataset plot. Do not create a separate FEV-9
   figure or another standalone query figure for the benchmark comparison.
 - Generate the full set with `reports/make_quailb_comparison_plots.py`.
-  Save `reports/plots/quailb_main.png` and `quailb_<dataset>.png`.
+  Save vector PDFs as `reports/plots/quailb_main.pdf` and
+  `quailb_<dataset>.pdf`. Use grouped bars for the main comparison.
+  Use readable page sizes and split metrics across pages instead of
+  shrinking all metrics into one wide figure. Keep text as embedded fonts
+  and marks as vectors. PNGs may be first-page previews for Markdown;
+  link the PDF as the primary artifact and never embed a PNG inside it.
   Keep method order, colors, and metric definitions consistent across them.
+- Include the SoL estimate in latency and token plots. SoL models ideal
+  computation and memory traffic, with prefix KV reused across requests,
+  documents, and repeated aliases wherever their token prefixes match.
+  Use the distinct-prefix estimate, not the per-document-only estimate.
+  State its retained-KV capacity and survivor assumptions. Identify it as
+  an estimate, not a measured backend, and do not invent accuracy for it.
+  Validate query definitions and corpus identity before reusing estimates.
+  Recalculate stale estimates on the CPU from saved inputs without inference.
 - Show these metrics for each query and configuration:
   - Latency in seconds, excluding model startup and result collection.
   - Total recomputed KV tokens across the query (`regret_tokens`). These
@@ -157,7 +170,7 @@ Every report with measured results should include at least one plot.
     precision and recall in the report so false positive joins are visible.
   - Input document count for each relation or set, before filters. List
     every alias separately, including repeated uses of the same set.
-    Put counts beside query labels or in an aligned figure column. Label
+    Put counts beside query labels or on a readable table page in the PDF. Label
     any survivor counts separately from input counts.
 - Keep throughput and GPU cost in the report tables using the definitions
   above. Derive totals, percentages, and ratios from saved volume results.
@@ -173,7 +186,7 @@ Every report with measured results should include at least one plot.
 
 - One script per report (or per group of related reports), named
   `make_<slug>_plots.py`, in `reports/`.
-- Output PNGs go to `reports/plots/`. Delete a report's PNGs when
+- Output figures go to `reports/plots/`. Delete a report's figures when
   the report is deleted.
 - Reference plots in the report by relative path:
   `"Figure: plots/<name>.png"`.
@@ -222,6 +235,7 @@ effectiveness research:
   categories need two colors, not five.
 - Use a log scale only when the data spans more than one order of
   magnitude. Say so in the axis label.
-- Use 300 DPI PNG files. No SVG.
+- Use vector PDFs for QUAIL-B, with 300 DPI PNG previews. Other report
+  figures use 300 DPI PNG files. No SVG.
 - Make the canvas large enough that text and data marks remain sharp when
   viewed on GitHub.

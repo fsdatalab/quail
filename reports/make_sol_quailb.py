@@ -62,7 +62,7 @@ answers go back to the volume too:
     modal volume get quail-results /quailb_data/sf$SF $W/data/
     modal volume get quail-results $G/label_sets $W/allabels/
     modal volume get quail-results \
-        $G/collections/gt_363b5ab570635c33894e1a030c21f57e/manifest.json \
+        $G/collections/gt_77bb8b128743a79aedddaa24c808c3f8/manifest.json \
         $W/collection_manifest.json
     uv run --with transformers --with pyarrow \
         python reports/make_sol_quailb.py $W $SF
@@ -74,12 +74,14 @@ query families. The run stops if the collection is for a different
 scale factor than the one requested.
 
 The saved estimates must be regenerated when a query definition changes.
+Pass --queries FEV-9 to recalculate only that query. The output filename then
+includes the selected query IDs so the full suite file is not overwritten.
 """
+import argparse
 import collections
 import itertools
 import json
 import math
-import sys
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -108,12 +110,18 @@ from quail.backends.quail.retention import policy as retention_policy
 from quail.runtime.tokens import shared_prefix_lengths
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 
-W = Path(sys.argv[1])
-SF = float(sys.argv[2]) if len(sys.argv) > 2 else 0.1
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("workdir")
+parser.add_argument("scale_factor", nargs="?", type=float, default=0.1)
+parser.add_argument("--queries", help="Comma-separated query IDs")
+args = parser.parse_args()
+W = Path(args.workdir)
+SF = args.scale_factor
 # "%g" so 0.1 stays "0.1" and 0.01 stays "0.01", matching the volume's
 # own directory names
 TAG = f"sf{SF:g}"
-OUT = W / f"sol_quailb_{TAG}.json"
+selection = "_" + args.queries.replace(",", "_") if args.queries else ""
+OUT = W / f"sol_quailb_{TAG}{selection}.json"
 ROOT = Path(__file__).resolve().parents[1]
 
 # check the workdir holds this scale factor before tokenizing anything:
@@ -917,6 +925,11 @@ for model in MODELS:
 query_ids = list(query_defs_by_model[MODELS[0].name])
 if any(list(query_defs_by_model[model.name]) != query_ids for model in MODELS):
     raise ValueError("4B and 32B query definitions do not have the same ids")
+if args.queries:
+    selected = args.queries.split(",")
+    if set(selected) - set(query_ids):
+        raise ValueError(f"unknown queries: {set(selected) - set(query_ids)}")
+    query_ids = [query for query in query_ids if query in selected]
 
 
 def add_sol_metrics(simulated, model: ModelSpec):

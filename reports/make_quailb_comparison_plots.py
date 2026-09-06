@@ -15,6 +15,8 @@ Pull the original suite manifest and its four result files:
       "$W/corpus.json"
     uv run modal volume get quail-results \
       /ablations/shared-kv-retention-20260906T054932Z "$W"
+    uv run modal volume get quail-results \
+      /sol/2026-09-06-quailb-prefix-reuse.json "$W/sol.json"
     uv run --with matplotlib python reports/make_quailb_comparison_plots.py "$W"
 
 Use --retention-dir to point to an already pulled retention comparison.
@@ -27,8 +29,10 @@ import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.patches import Patch
 
-from plot_colors import BLUE, GRAY, GREEN, ORANGE
+from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
 from quail.bench.evaluate import H100_USD_PER_HOUR
 
 
@@ -94,80 +98,157 @@ def input_relations(queries, corpus):
     return relations
 
 
-def set_metric_scale(axis, metric, values):
-    """Choose a scale that preserves zero recomputation counts."""
+def load_sol(root, queries, rows, corpus):
+    """Load compatible estimates with prefix reuse across requests."""
+    source = json.loads((root / "sol.json").read_text())
+    assert source["corpus_id"] == corpus["corpus_id"]
+    assert source["scale_factor"] == 0.1
+    assert source["optimizer"]["persistent_kv_capacity"] == "unlimited"
+    assert "across documents" in source["estimates"]["sol_s"]
+    estimates = {}
+    for query in queries:
+        estimate = source["queries"][query]["models"]["qwen3-4b-fp8"]
+        measured = rows["quail"][query]
+        expected_filters = [(p["alias"], p["predicate_key"])
+                            for p in measured["accuracy"]["per_predicate"] if p["op"] == "filter"]
+        expected_joins = [p["predicate_key"] for p in measured["accuracy"]["per_predicate"]
+                          if p["op"] == "join"]
+        assert sorted((s["alias"], s["code"]) for s in estimate["filter_stages"]) == sorted(expected_filters), query
+        assert sorted(s["code"] for s in estimate["join_stages"]) == sorted(expected_joins), query
+        assert estimate["input_document_rows"] == measured["input_document_rows"], query
+        assert estimate["tokens"] <= estimate["per_document"]["tokens"], query
+        estimates[query] = estimate
+    return estimates
+
+
+def series_value(rows, sol, method, query, metric):
+    """Return a measured value or an explicitly modeled value."""
+    if method == "sol":
+        return {"seconds": sol[query]["sol_s"], "fresh": sol[query]["tokens"],
+                "recomputed": 0, "agreement": None}[metric]
+    if query not in rows[method]:
+        return None
+    return row_metrics(rows[method][query])[metric]
+
+
+def metric_bars(axis, queries, rows, sol, metric, overview):
+    """Draw grouped bars, preserving zero and unavailable measurements."""
+    methods = METHODS + ([] if metric == "agreement" else [("sol", "SoL estimate", DARK)])
+    positive = [value for key, _, _ in methods for query in queries
+                if (value := series_value(rows, sol, key, query, metric)) is not None and value > 0]
+    maximum = max(positive, default=0)
+    logarithmic = metric != "agreement" and positive and maximum / min(positive) > 10
     if metric == "agreement":
-        axis.set_xlim(0, 115)
-        axis.set_xlabel("percent")
-    elif metric == "recomputed" and max(values) > 10:
-        axis.set_xscale("symlog", linthresh=1)
-        axis.set_xlim(0, max(values) * 15)
-        axis.set_xlabel("tokens (linear to 1, then log)")
-    elif min(values) > 0 and max(values) / min(values) > 10:
-        axis.set_xscale("log")
-        axis.set_xlim(min(values) / 2, max(values) * 6)
-        axis.set_xlabel("seconds (log scale)" if metric == "seconds" else "tokens (log scale)")
+        axis.set_ylim(0, 122)
+        axis.set_yticks([0, 25, 50, 75, 100])
+        axis.set_ylabel("percent")
+    elif logarithmic:
+        if metric == "recomputed":
+            axis.set_yscale("symlog", linthresh=1)
+            axis.set_ylim(0, maximum * 30)
+            axis.set_ylabel("tokens (linear to 1, then log)")
+        else:
+            axis.set_yscale("log")
+            axis.set_ylim(min(positive) / 2, maximum * 8)
+            axis.set_ylabel("seconds (log scale)" if metric == "seconds" else "tokens (log scale)")
     else:
-        axis.set_xlim(0, max(values) * 1.7 if max(values) else 1)
-        axis.set_xlabel("seconds" if metric == "seconds" else "tokens")
-        if not max(values):
-            axis.set_xticks([0])
+        axis.set_ylim(0, maximum * 1.6 if maximum else 1)
+        axis.set_ylabel("seconds" if metric == "seconds" else "tokens")
+        if not maximum:
+            axis.set_yticks([0])
+    width = 0.82 / len(methods)
+    floor = axis.get_ylim()[0]
+    for method_index, (key, label, color) in enumerate(methods):
+        xs, values = [], []
+        for index, query in enumerate(queries):
+            position = index - 0.41 + (method_index + 0.5) * width
+            value = series_value(rows, sol, key, query, metric)
+            if value is None or value == 0:
+                axis.plot(position, 0.015, marker="x" if value is None else "_",
+                          color=color, markersize=4, linestyle="none",
+                          transform=axis.get_xaxis_transform(), clip_on=False)
+                continue
+            xs.append(position)
+            values.append(value)
+            if not overview:
+                shown = f"{value / 1e6:.2f}M" if value >= 1e6 else (
+                    f"{value / 1e3:.1f}k" if value >= 1000 else f"{value:.2f}")
+                if metric in ("fresh", "recomputed") and value < 1000:
+                    shown = f"{value:.0f}"
+                axis.annotate(shown, (position, value), xytext=(0, 3),
+                              textcoords="offset points", rotation=90, ha="center", va="bottom",
+                              fontsize=8)
+        axis.bar(xs, [value - floor for value in values], bottom=floor, width=width * 0.9,
+                 color=color, label=label, edgecolor="none")
+    axis.set_xlim(-0.7, len(queries) - 0.3)
+    axis.set_xticks(range(len(queries)),
+                   [query + ("*" if query == "FEV-9" else "") for query in queries],
+                   rotation=55 if overview else 35, ha="right")
+    axis.tick_params(axis="x", labelsize=9)
+    titles = {"seconds": "Latency", "recomputed": "Recomputed KV tokens",
+              "fresh": "Fresh input tokens", "agreement": "Answer agreement with Qwen3 32B"}
+    axis.set_title(titles[metric], fontsize=13)
 
 
-def plot_comparison(title, queries, rows, relations, name, overview=False):
-    """Plot the standard metrics and per-alias input counts."""
-    height = 19 if overview else 1.25 * len(queries) + 2.8
-    figure, axes = plt.subplots(1, 5, figsize=(23, height), sharey=True,
-                               gridspec_kw={"width_ratios": [1.0, 1.7, 1.7, 1.7, 1.7]})
-    spacing = 1 if overview else 5
-    offsets = [(index - 1.5) * (0.18 if overview else 1) for index in range(4)]
-    positions = [spacing * index for index in range(len(queries))]
-    labels = [query + ("*" if query == "FEV-9" else "") for query in queries]
-    axes[0].set_yticks(positions, labels)
-    axes[0].set_xticks([])
-    axes[0].set_xlim(0, 1)
-    axes[0].set_ylim(positions[-1] + spacing * 0.65, -spacing * 0.65)
-    axes[0].set_title("Input documents\nper relation alias")
-    for query, position in zip(queries, positions):
-        counts = [f"{alias}={count:,}" for alias, _, count in relations[query]]
-        shown = "\n".join(", ".join(counts[index:index + 2]) for index in range(0, len(counts), 2))
-        axes[0].text(0.03, position, shown, va="center", fontsize=9)
-    for axis, (metric, metric_title, _) in zip(axes[1:], METRICS):
-        all_values = []
-        for index, (key, label, color) in enumerate(METHODS):
-            available = [(q, query) for q, query in enumerate(queries) if query in rows[key]]
-            ys = [q * spacing + offsets[index] for q, _ in available]
-            values = [row_metrics(rows[key][query])[metric] for _, query in available]
-            all_values.extend(values)
-            axis.scatter(values, ys, color=color, s=25 if overview else 30,
-                         label=label, clip_on=False)
-            for (_, query), y, value in zip(available, ys, values):
-                if overview and query != "FEV-9":
-                    continue
-                shown = f"{value:,.0f}" if metric in ("recomputed", "fresh") else f"{value:.2f}"
-                if (not overview and metric == "seconds" and key == "quail"
-                        and query in rows["stock_vllm"]):
-                    delta = 100 * (value / rows["stock_vllm"][query]["wall_s"] - 1)
-                    shown += f" ({delta:+.0f}%)"
-                axis.annotate(shown, (value, y), xytext=(5, 0),
-                              textcoords="offset points", va="center", fontsize=9)
-        set_metric_scale(axis, metric, all_values)
-        axis.set_title(metric_title + ("\nQwen3 32B reference" if metric == "agreement" else ""))
-    handles, labels = axes[1].get_legend_handles_labels()
-    figure.suptitle(f"{title}, Qwen3 4B FP8, sf=0.1, one H100", y=0.995, fontsize=15)
-    figure.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.97),
-                  ncol=4, frameon=False, fontsize=11)
-    footer = "Fresh input tokens include recomputed KV tokens. Counts are before filters. Stock vLLM uses operator-at-a-time submission."
-    if not overview:
-        footer += " Quail latency labels show the change relative to stock vLLM."
-    if "FEV-9" in queries:
-        footer += "\n* FEV-9 uses shared retention and four filters. Baselines are unavailable for this definition; their missing points are not zeros."
-        footer += " Other queries reuse the saved suite."
-    figure.text(0.5, 0.015, footer, ha="center", fontsize=9, linespacing=1.6)
-    figure.tight_layout(rect=(0, 0.06 if overview else 0.09, 1, 0.935), w_pad=3)
+def document_page(title, queries, relations):
+    """Create a readable input-count page for the PDF."""
+    figure = plt.figure(figsize=(14, 9))
+    figure.suptitle(f"{title}: input documents before filtering", y=0.96, fontsize=16)
+    axis = figure.add_axes((0.045, 0.12, 0.91, 0.77))
+    axis.axis("off")
+    cells = [[query, "; ".join(f"{alias} ({provider}): {count:,}"
+                               for alias, provider, count in relations[query])]
+             for query in queries]
+    table = axis.table(cellText=cells, colLabels=["Query", "Relation alias (set): input documents"],
+                       colWidths=[0.10, 0.90], cellLoc="left", colLoc="left", loc="upper left")
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    for (row, _), cell in table.get_celld().items():
+        cell.set_linewidth(0)
+        cell.set_height(min(0.065, 0.95 / (len(cells) + 1)))
+        cell.PAD = 0.02
+        if row == 0:
+            cell.set_text_props(weight="bold")
+    figure.text(0.055, 0.075,
+                "Each alias lists its full input before filters. Repeated aliases can refer to the same underlying set.\n"
+                "Counts come from the saved corpus manifest. SoL uses the same inputs and the saved reference labels for survivors.",
+                fontsize=11, linespacing=1.5)
+    return figure
+
+
+def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
+    """Export vector PDF pages and a first-page PNG preview."""
     destination = HERE / "plots" / name
-    figure.savefig(destination, dpi=300)
-    plt.close(figure)
+    groups = [[metric] for metric, _, _ in METRICS] if overview else [
+        ["seconds", "fresh", "recomputed", "agreement"]]
+    with PdfPages(destination.with_suffix(".pdf")) as pdf:
+        for page, metrics in enumerate(groups):
+            figure, axes = plt.subplots(1, 1, figsize=(14, 8.5)) if overview else plt.subplots(
+                2, 2, figsize=(14, 10))
+            axes = [axes] if overview else list(axes.flat)
+            for axis, metric in zip(axes, metrics):
+                metric_bars(axis, queries, rows, sol, metric, overview)
+            figure.suptitle(f"{title}, Qwen3 4B FP8, sf=0.1, one H100", y=0.97, fontsize=16)
+            methods = METHODS + ([] if metrics == ["agreement"] else [("sol", "SoL estimate", DARK)])
+            handles = [Patch(facecolor=color, label=label) for _, label, color in methods]
+            figure.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.925),
+                          ncol=5, fontsize=11, frameon=False)
+            footer = ("SoL estimates ideal work with unlimited prefix KV reuse across requests and reference-label survivors. "
+                      "It has no measured accuracy.\n"
+                      "Fresh tokens include recomputed KV. A dash marks zero; x marks unavailable. "
+                      "Stock vLLM uses operator-at-a-time submission.")
+            if "FEV-9" in queries:
+                footer += "\n* FEV-9 uses four filters and shared retention. Older baseline measurements used a different query and are omitted."
+            figure.text(0.055, 0.035, footer, fontsize=10, linespacing=1.5)
+            figure.subplots_adjust(left=0.075, right=0.97, top=0.83,
+                                   bottom=0.24 if overview else 0.20, hspace=0.60, wspace=0.28)
+            pdf.savefig(figure, bbox_inches=None)
+            if page == 0:
+                figure.savefig(destination, dpi=300, bbox_inches=None)
+            plt.close(figure)
+        figure = document_page(title, queries, relations)
+        pdf.savefig(figure, bbox_inches=None)
+        plt.close(figure)
     return destination.name
 
 
@@ -211,17 +292,23 @@ def main(workdir, retention_dir=None):
     faster = sum(rows["quail"][query]["wall_s"] < rows["stock_vllm"][query]["wall_s"]
                  for query in comparable)
     plt.style.use(HERE / "quail.mplstyle")
+    plt.rcParams.update({"pdf.fonttype": 42, "figure.autolayout": False, "savefig.bbox": None})
     corpus = json.loads((root / "corpus.json").read_text())
     relations = input_relations(queries, corpus)
     for method in rows.values():
         for query, row in method.items():
             assert sum(count for _, _, count in relations[query]) == row["input_document_rows"]
-    overview = plot_comparison("QUAIL-B", queries, rows, relations, "quailb_main.png", overview=True)
+    sol = load_sol(root, queries, rows, corpus)
+    overview = plot_comparison("QUAIL-B", queries, rows, relations, sol, "quailb_main.png", overview=True)
     fev = row_metrics(rows["quail"]["FEV-9"])
     output = rows["quail"]["FEV-9"]["accuracy"]["output_accuracy"]
     lines = [
         "# QUAIL-B comparison from saved results", "",
-        "- The main plot covers all 32 queries. The five dataset plots use the same",
+        "- The main PDF covers all 32 queries with grouped bars and one metric per page.",
+        "  Its final page lists input document counts. Each dataset PDF has a page",
+        "  of four bar charts and a separate input-count page. Text and marks remain",
+        "  vector content when zoomed. The PNGs below are first-page previews.",
+        "- The five dataset plots use the same",
         "  method colors and definitions for latency, recomputed KV tokens, fresh",
         "  input tokens, accuracy, and input document counts for every relation alias.",
         "- The other 31 queries reuse the original measurements from September 5, 2026.",
@@ -237,8 +324,23 @@ def main(workdir, retention_dir=None):
         "- The prediction for this update was that scoring and plotting would need no",
         "  inference. We reused all 124 saved configurations for the other 31 queries.",
         f"- In these saved measurements, Quail was faster than stock vLLM on {faster}",
-        f"  of {len(comparable)} comparable queries. Dataset figures annotate Quail's change in time",
-        "  relative to stock vLLM. Positive percentages mean Quail took longer.",
+        f"  of {len(comparable)} comparable queries.",
+        "- SoL models ideal computation and memory traffic with unlimited prefix KV.",
+        "  It credits matching token prefixes across requests, documents, and aliases.",
+        "  It uses exact reference-label survivors and searches supported left-deep",
+        "  join plans. Different answers can change the work done by measured runs,",
+        "  so the gap from SoL is not purely execution overhead.",
+        "- SoL uses the distinct-prefix estimate, not the per-document-only estimate.",
+        "  Its latency, fresh-token count, and zero prefix recomputation are estimates.",
+        "  No accuracy is assigned to SoL because it is not a measured model run.",
+        "  Matching document prefixes are reusable; a partner suffix after a different",
+        "  anchor context is not an identical prefix and is still computed.",
+        "- The earlier SoL file used the old FEV-9 definition. We recalculated only",
+        "  FEV-9 on the CPU from saved labels and corpus rows. The other 31 estimates",
+        "  are unchanged. No GPU inference was run.",
+        f"- FEV-9 SoL is {sol['FEV-9']['sol_s']:.3f} seconds with shared-prefix reuse,",
+        f"  compared with {sol['FEV-9']['per_document']['sol_s']:.3f} seconds with reuse only",
+        "  within each document. These estimates use reference-label survivors.",
         "- Answer agreement measures evaluated calls against saved Qwen3 32B labels.",
         "  Each method can evaluate different calls after its filters and joins.",
         "  Output precision is the fraction of returned rows matching the reference.",
@@ -255,8 +357,9 @@ def main(workdir, retention_dir=None):
         "- Recomputed KV is the saved `regret_tokens` total for reusable prefixes",
         "  of documents or anchors already computed earlier in the query. This uses",
         "  per-document accounting, not the separate distinct-prefix metric.",
-        "  Its plots use a linear scale from 0 to 1 token and a log scale above 1",
-        "  when counts span a large range. Zero recomputation remains visible.",
+        "  Token and latency plots use a log scale when positive values span more",
+        "  than one order of magnitude. Recomputed KV retains a linear region to",
+        "  include zero. A dash marks zero; x marks an unavailable measurement.",
         "- Document counts come from the saved corpus manifest and describe inputs",
         "  before filtering. Repeated aliases each list their full input count.",
         "  The report tables also show throughput, GPU cost, and final output quality.",
@@ -264,18 +367,23 @@ def main(workdir, retention_dir=None):
         f"  output matches only {output['matching_rows']:,} reference rows out of {output['predicted_rows']:,} returned rows.",
         f"  The reference has {output['expected_rows']:,} rows, so output precision is approximately {fev['precision']:.8f}%",
         f"  and recall is {fev['recall']:.2f}%. The retention change preserved all answers.", "",
-        f"![QUAIL-B main comparison](plots/{overview})", "",
+        "[Open the main vector PDF](plots/quailb_main.pdf)", "",
+        f"[![QUAIL-B latency preview](plots/{overview})](plots/quailb_main.pdf)", "",
         f"Figure: plots/{overview}", "",
         f"Source manifest on `quail-results`: `{manifest['manifest_volume_path']}`.", "",
         f"Current FEV-9 source on `quail-results`: `{retention_source}/`.", "",
+        "SoL estimates on `quail-results`: `/results/sol/2026-09-06-quailb-prefix-reuse.json`.", "",
+        "The FEV-9 recalculation is also saved separately at `/results/sol/2026-09-06-fev9-prefix-reuse.json`.", "",
         f"Corpus counts on `quail-results`: `/results/ground_truth/quailb/schema_v1/corpora/{corpus['corpus_id']}/manifest.json`.", "",
         "The manifest lists all four source suite paths. The download commands are",
         "in `reports/make_quailb_comparison_plots.py`.", "",
     ]
     for family in ("IMDB", "BIO", "FEV", "LEP", "AGENT"):
         selected = [query for query in queries if query.startswith(family + "-")]
-        name = plot_comparison(f"QUAIL-B {family}", selected, rows, relations, f"quailb_{family.lower()}.png")
-        lines.extend([f"## {family}", "", f"![{family} saved results](plots/{name})", "",
+        name = plot_comparison(f"QUAIL-B {family}", selected, rows, relations, sol, f"quailb_{family.lower()}.png")
+        pdf_name = Path(name).with_suffix(".pdf").name
+        lines.extend([f"## {family}", "", f"[Open the {family} vector PDF](plots/{pdf_name})", "",
+                      f"[![{family} preview](plots/{name})](plots/{pdf_name})", "",
                       f"Figure: plots/{name}", "",
                       "| Query | Input documents by alias and set |", "|---|---|"])
         for query in selected:
@@ -295,6 +403,16 @@ def main(workdir, retention_dir=None):
                     f"| {query} | {label} | {m['seconds']:.2f} | {m['recomputed']:,} | {m['fresh']:,} | {m['throughput']:,.2f} "
                     f"| {m['unit']} | {m['cost']:.5f} | {m['agreement']:.2f} "
                     f"| {m['precision']:.5g} | {m['recall']:.5g} |")
+            estimate = sol[query]
+            throughput = estimate["document_pairs_per_second_at_sol"]
+            unit = "pairs/s"
+            if throughput is None:
+                throughput = estimate["documents_per_second_at_sol"]
+                unit = "docs/s"
+            lines.append(
+                f"| {query} | SoL estimate | {estimate['sol_s']:.3f} | 0 (assumed) "
+                f"| {estimate['tokens']:,.0f} | {throughput:,.2f} | {unit} "
+                f"| {estimate['cost_usd_per_query_at_sol']:.5f} | Not measured | Not measured | Not measured |")
         lines.append("")
     report = HERE / "2026-09-05-quailb-saved-results.md"
     report.write_text("\n".join(lines))
