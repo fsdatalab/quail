@@ -10,8 +10,8 @@ faked.
 
 ## The image
 
-`build_worker_image` starts from the CUDA 13 devel image, installs the
-backend's runtime package (`vllm==0.26.0` by default, `sglang==0.5.18`
+`build_worker_image` starts from the CUDA 13.3 devel image, installs the
+backend's runtime package (`vllm==0.28.0` by default, `sglang==0.5.19`
 for the SGLang backend), the Quail dependencies, any extension pip
 packages, and mounts `quail` plus any extension source directories.
 It sets the cache directories for vLLM, DeepGEMM, and Triton to the

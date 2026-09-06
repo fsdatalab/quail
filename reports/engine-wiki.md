@@ -391,9 +391,10 @@ group returns its results, the parent stops every process in the group. The
 parent waits until GPU memory use is below 1 GiB before continuing. The runner
 records the physical GPU UUID and checks that both groups saw the same H100.
 
-SGLang runs in a separate container with its own image. vLLM 0.26.0 requires
-`apache-tvm-ffi` 0.1.10, while SGLang 0.5.18 requires version 0.1.11. Modal can
-therefore assign SGLang another physical H100.
+SGLang runs in a separate container with its own image, because its runtime
+package (SGLang 0.5.19) replaces vLLM 0.28.0. Modal can therefore assign SGLang
+another physical H100. Before these versions the two also pinned different
+versions of `apache-tvm-ffi` (0.1.10 and 0.1.11).
 
 Each physical node has one codec representation that contains everything
 needed for execution. Its separate explain fields omit large runtime values

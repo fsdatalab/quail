@@ -70,7 +70,7 @@ class VLLMEngine:
 
     kind = "vllm"
     label = "vLLM"
-    runtime_package = "vllm==0.26.0"
+    runtime_package = "vllm==0.28.0"
 
     def boot(self, model_name: str, allowed_ids: list[int]) -> tuple[dict, dict]:
         from vllm import LLM, SamplingParams
