@@ -91,7 +91,7 @@ def read_trace(path, window_unix_ns=None):
             elif category in ("cpu_op", "user_annotation", "cuda_runtime"):
                 cpu_totals[name]["count"] += 1
                 cpu_totals[name]["us"] += duration
-                if name.startswith(("scheduler.", "sglang.", "quail.join-")):
+                if name.startswith(("scheduler.", "sglang.", "vllm.", "quail.join-")):
                     scopes[name].append(interval)
     if len(capture) != 1:
         raise ValueError(f"expected one PyTorch capture interval in {path}: {capture}")
@@ -146,3 +146,30 @@ def binned_activity(intervals, start, end, width_us):
         bins.append((left, right, occupied))
         left = right
     return bins
+
+
+def input_preparation_breakdown(join, trace):
+    """Measure preparation stages before the first GPU operation."""
+    window = (trace["start_us"], trace["gpu_busy_intervals"][0][0])
+    names = {
+        "sglang.input.normalize_batch_and_arguments": "normalize_s",
+        "sglang.input._batch_tokenize_and_process": "prepare_s",
+        "sglang.input._send_batch_request": "send_s",
+    }
+    spans = defaultdict(list)
+    for event in join["input_preparation"]["intervals"]:
+        if event["name"] not in names:
+            continue
+        interval = tuple(
+            (event[key] - trace["base_ns"]) / 1000
+            for key in ("start_unix_ns", "end_unix_ns")
+        )
+        clipped = clip_interval(interval, window)
+        if clipped is not None:
+            spans[names[event["name"]]].append(clipped)
+    result = {name: interval_duration(spans[name]) / 1e6 for name in names.values()}
+    result["first_gpu_s"] = (window[1] - window[0]) / 1e6
+    result["other_s"] = result["first_gpu_s"] - sum(result[name] for name in names.values())
+    if result["other_s"] < -1e-6:
+        raise ValueError("input preparation stages overlap")
+    return result

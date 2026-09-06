@@ -39,7 +39,7 @@ def process_cpu_times(engine):
     return result
 
 
-def profile_worker(directory, connection):
+def profile_worker(directory, connection, input_detail=False):
     """Run FEV-9 with profiling scoped to each join call."""
     os.setsid()
     root = Path(directory)
@@ -53,6 +53,11 @@ def profile_worker(directory, connection):
         original = request_module.run_join_grouped
         joins = []
         model_info = {}
+        details = None
+        if input_detail:
+            from experiments.sglang_input_profile_worker import InputProfiler
+
+            details = InputProfiler()
 
         @wraps(original)
         def profiled_join(client, sampling_params, prefixes, suffixes, true_ids, **kwargs):
@@ -60,6 +65,8 @@ def profile_worker(directory, connection):
             destination = root / f"join-{number}"
             destination.mkdir(parents=True)
             engine = client.engine
+            if details is not None:
+                details.reset(number, destination)
             if not model_info:
                 config = engine.tokenizer_manager.model_config.hf_config
                 model_info.update({
@@ -70,7 +77,8 @@ def profile_worker(directory, connection):
                 })
                 assert model_info["model_path"] == "Qwen/Qwen3-4B-FP8"
             engine.start_profile(
-                output_dir=str(destination), activities=["CPU", "GPU"],
+                output_dir=str(destination),
+                activities=["GPU"] if input_detail else ["CPU", "GPU"],
                 with_stack=False, record_shapes=False,
                 profile_id=f"join-{number}",
             )
@@ -112,6 +120,8 @@ def profile_worker(directory, connection):
                 },
                 "traces": [str(path) for path in sorted(destination.glob("*.trace.json.gz"))],
             }
+            if details is not None:
+                record["input_preparation"] = details.summary()
             assert len(record["traces"]) == 2, record["traces"]
             joins.append(record)
             (root / "joins.json").write_text(json.dumps(joins, indent=2))
@@ -129,6 +139,7 @@ def profile_worker(directory, connection):
         result.update({
             "prediction": PREDICTION, "baseline_volume_path": BASELINE_PATH,
             "profiled": True, "joins": joins,
+            "input_detail": input_detail,
             "model_info": model_info,
             "versions": {"torch": torch.__version__, "sglang": sglang.__version__},
         })
