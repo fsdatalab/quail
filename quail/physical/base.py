@@ -252,14 +252,8 @@ class PhysicalGraph:
             visit(node)
         return tuple(found)
 
-    def explain(self) -> str:
-        """Return one line for each node in execution order."""
-        lines = []
-        for node in self.topological_nodes():
-            fields = ", ".join(
-                f"{key}={value}" for key, value in node.explain_fields().items()
-                if value not in (None, (), [], {})
-            )
-            suffix = f" [{fields}]" if fields else ""
-            lines.append(f"{node.node_id}: {node.type_name}{suffix}")
-        return "\n".join(lines)
+    def explain(self, *, verbose: bool = False) -> str:
+        """Return an operator tree, optionally including internal fields."""
+        from quail.explain import physical_tree
+
+        return physical_tree(self, verbose=verbose)
