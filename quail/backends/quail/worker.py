@@ -23,7 +23,7 @@ from quail.execution import PhysicalResponse
 from quail.executor.arena import KVArena
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
 from quail.executor.loop import AsyncAnswers, warm_kernels
-from quail.executor.model import load_model
+from quail.executor.model import answer_weights, load_model
 from quail.physical import (
     AnchoredJoin,
     decode_graph,
@@ -118,7 +118,7 @@ def release_booted_models(runtime_state: dict) -> dict:
 
 
 def _boot_gpu(state, backend, spec, device, gpu_index, workers,
-              chunk_tokens):
+              chunk_tokens, answer_token_ids):
     """Load the model, arena, and pipeline once per GPU executor."""
     import torch
     import torch.nn.functional as F
@@ -128,7 +128,8 @@ def _boot_gpu(state, backend, spec, device, gpu_index, workers,
                 pipeline_s=0.0, warm_kernels_s=0.0)
     if "model_execution" not in state:
         t0 = time.perf_counter()
-        model = load_model(spec.hf_name, revision=spec.revision)
+        model = load_model(spec.hf_name, revision=spec.revision,
+                           answer_token_ids=answer_token_ids)
         boot["load_model_s"] = time.perf_counter() - t0
         # budgets.* is tiny CPU; fold into arena_s so the four phases
         # cover the cold-load span without a leftover residual
@@ -220,7 +221,8 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     boot_key = (backend.name, spec.name)
     state = runtime_state.setdefault(boot_key, {})
     boot = _boot_gpu(state, backend, spec, device, 0, payload["workers"],
-                     payload["chunk_tokens"])
+                     payload["chunk_tokens"],
+                     payload["true_ids"] + payload["false_ids"])
     _bind_query(state, payload["true_ids"], payload["false_ids"],
                 payload["chunk_tokens"])
     _warm(state, boot)
@@ -303,7 +305,8 @@ def _child_boot(state, sub):
     backend = registry.backend(envelope["backend"])
     t_boot = time.perf_counter()
     boot = _boot_gpu(state, backend, spec, device, state["gpu_index"],
-                     sub["workers"], sub["chunk_tokens"])
+                     sub["workers"], sub["chunk_tokens"],
+                     sub["true_ids"] + sub["false_ids"])
     _bind_query(state, sub["true_ids"], sub["false_ids"],
                 sub["chunk_tokens"])
     state["runtime_context"] = ExecutionContext(
@@ -576,12 +579,7 @@ class _PayloadAnswerer:
     def __init__(self, torch, F, model, true_ids, false_ids):
         self.F = F
         self.allowed = sorted(set(true_ids) | set(false_ids))
-        # the head weight lives on the CPU when untied (moved there at
-        # load); slice where it lives, keep only the slice on the GPU
-        weight = model.lm_head.weight
-        sel = torch.tensor(self.allowed, device=weight.device)
-        self.weights = weight.index_select(0, sel).to(
-            device="cuda", dtype=torch.bfloat16)
+        self.weights = answer_weights(model, self.allowed)
         self.true_cols = torch.tensor(
             [i for i, t in enumerate(self.allowed)
              if t in set(true_ids)], device="cuda")

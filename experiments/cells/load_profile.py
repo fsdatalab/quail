@@ -109,7 +109,7 @@ def _profile(model_name: str, revision: str | None) -> dict:
 
     from quail.executor.model import (
         _install_single_rank_groups,
-        move_untied_head_to_host,
+        retain_answer_head,
     )
 
     t0 = time.perf_counter()
@@ -122,7 +122,13 @@ def _profile(model_name: str, revision: str | None) -> dict:
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):
         model = get_model(vllm_config=config)
-    move_untied_head_to_host(torch, model)
+    from transformers import AutoTokenizer
+    from quail.executor.loop import true_false_ids
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
+    true_ids, false_ids = true_false_ids(tokenizer)
+    retain_answer_head(torch, model, true_ids | false_ids)
+    torch.cuda.empty_cache()
     torch.cuda.synchronize()
     phases["get_model_s"] = round(time.perf_counter() - t0, 2)
 

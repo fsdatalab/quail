@@ -36,8 +36,7 @@ def kernel_index_cap(model: ModelSpec) -> int:
 def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
     """Tokens per chunk the activation memory allows, with slack.
 
-    Uses resident weights: the untied head moves to CPU memory at
-    load (executor.model.move_untied_head_to_host).
+    Uses resident weights after the full untied output head is discarded.
     """
     free = device.mem_bytes * POOL_FRACTION - model.W_resident
     return int(free // model.act_per_token) // CHUNK_SLACK
@@ -55,8 +54,8 @@ def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None) -> int:
     """Admission budget: tokens of document KV that can be resident at once.
 
-    Computed from the memory left after resident weights (the untied
-    head moves to CPU memory at load) and the activation reservation.
+    Computed from the memory left after resident weights and the
+    activation reservation.
     """
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)

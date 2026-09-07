@@ -16,8 +16,8 @@ QWEN3_32B_FP8 = ModelSpec(
     w_mem_bytes=34.37e9,   # measured as-loaded footprint: fp8 weights
     #                        + two bf16 vocab matrices (embedding and
     #                        untied lm_head) + block scales. The head
-    #                        (head_mem_bytes, 1.56e9) moves to CPU
-    #                        memory at load, so budgets subtract it.
+    #                        (head_mem_bytes, 1.56e9) is discarded
+    #                        after extracting answer rows.
     vocab=151_936,
-    tied_head=False,       # separate lm_head; moved to CPU at load
+    tied_head=False,       # separate lm_head; discarded after extracting answer rows
 )

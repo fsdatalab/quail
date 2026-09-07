@@ -35,8 +35,8 @@ worker resolves the weights from its cache without hub round trips.
 to fall back to `params * w_bytes`.
 
 Derived properties the planner uses: `kappa` (KV bytes per token),
-`W_resident` (weight bytes on the GPU after the untied head moves to
-host memory), and `act_per_token`.
+`W_resident` (weight bytes on the GPU after the full untied output head
+is discarded), and `act_per_token`.
 
 Register it in `quail/specs/__init__.py` for a built in model, or from
 an extension:

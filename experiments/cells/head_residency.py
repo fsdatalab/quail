@@ -1,19 +1,11 @@
-"""Head residency check: the untied lm_head moves to CPU memory, the
-arena grows by the freed bytes, and answers stay correct.
+"""Check retained answer rows and planted-flag filter answers on H100.
 
-PREDICTION (stated before the run): qwen3-32b-fp8 boots with
-lm_head.weight on the CPU, and CUDA allocated bytes right after load
-are within 0.3 GB of the spec's resident footprint (32.81 GB, the
-34.37 GB as-loaded measurement minus the 1.556 GB head). The arena
-allocates at the enlarged admission budget (103,156 tokens) next to
-the weights. qwen3-4b-fp8 keeps its tied head on the GPU and its
-4.5 GB footprint. On both models, 48 planted-flag filter answers per
-attention path (unified, merge_quant, and the unpaged causal fast
-path) are all correct.
+Prediction: both models retain only TRUE/FALSE output rows on the GPU,
+with no full output-head copy. Input embeddings remain available. GPU
+allocation stays within 0.3 GB of the resident-weight estimate, and all
+48 planted-flag answers per attention path remain correct.
 
-Run from the repository root (tee per house rule):
-
-    uv run modal run experiments/cells/head_residency.py 2>&1 | tee results/head_residency.log
+    uv run modal run experiments/cells/head_residency.py 2>&1 | tee /tmp/answer_head.log
 """
 
 import json
@@ -96,7 +88,9 @@ def probe(model_name: str) -> str:
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
     model = load_model(spec.hf_name, revision=spec.revision)
     allocated = torch.cuda.memory_allocated() - baseline
-    head_device = model.lm_head.weight.device.type
+    head_device = model.quail_answer_weights.device.type
+    full_head_removed = model.lm_head is None
+    answer_rows = model.quail_answer_weights.shape[0]
 
     chunk = budgets.chunk_budget(spec, device)
     arena_tok = budgets.arena_tokens(spec, device, chunk)
@@ -107,6 +101,8 @@ def probe(model_name: str) -> str:
                     dtype=torch.bfloat16)
     pipeline = Pipeline(model, arena, attention_mode=FILTER_ATTENTION)
     answerer = Answerer(torch, F, model, tokenizer)
+    another_answerer = Answerer(torch, F, model, tokenizer)
+    shared_answer_weights = answerer.weights is another_answerer.weights
     async_ans = AsyncAnswers(torch, answerer)
 
     flags, doc_ids, q_ids = _planted(tokenizer)
@@ -131,7 +127,8 @@ def probe(model_name: str) -> str:
     answers_ok = all(c == N_DOCS for c in correct.values())
     result = dict(
         cell="head_residency", model=model_name,
-        head_device=head_device,
+        head_device=head_device, full_head_removed=full_head_removed,
+        answer_rows=answer_rows, shared_answer_weights=shared_answer_weights,
         head_gib=round(spec.head_mem_bytes / 2**30, 3),
         allocated_after_load_gib=round(allocated / 2**30, 3),
         spec_as_loaded_gib=round(spec.W_mem / 2**30, 3),
@@ -142,17 +139,17 @@ def probe(model_name: str) -> str:
         resident_ok=resident_ok, answers_ok=answers_ok)
     result["pass"] = bool(
         resident_ok and answers_ok
-        and head_device == ("cuda" if spec.tied_head else "cpu"))
+        and full_head_removed and shared_answer_weights and head_device == "cuda")
     print(json.dumps(result, indent=2), flush=True)
     os.makedirs("/results/ablations", exist_ok=True)
-    with open(f"/results/ablations/head_residency_{model_name}.json",
+    with open(f"/results/ablations/answer_head_{model_name}.json",
               "w") as f:
         json.dump(result, f, indent=2)
     results_vol.commit()
     kernel_cache.commit()
 
     # leave the container clean for the next model's call
-    del answerer, async_ans, pipeline, arena, model
+    del answerer, another_answerer, async_ans, pipeline, arena, model
     gc.collect()
     torch.cuda.empty_cache()
     return json.dumps(result)

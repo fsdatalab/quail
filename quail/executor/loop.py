@@ -11,6 +11,8 @@ image.
 
 import time
 
+from quail.executor.model import answer_weights
+
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.executor.pack import (
     FilterAdmission,
@@ -94,12 +96,7 @@ class Answerer:
         self.F = F
         self.allowed = sorted(t_ids | f_ids)
         self.true_ids = t_ids
-        # the head weight lives on the CPU when untied (moved there at
-        # load); slice where it lives, keep only the slice on the GPU
-        weight = model.lm_head.weight
-        sel = torch.tensor(self.allowed, device=weight.device)
-        self.weights = weight.index_select(0, sel).to(
-            device="cuda", dtype=torch.bfloat16)
+        self.weights = answer_weights(model, self.allowed)
         self.true_cols = torch.tensor(
             [i for i, t in enumerate(self.allowed) if t in t_ids],
             device="cuda")
