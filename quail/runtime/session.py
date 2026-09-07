@@ -280,14 +280,13 @@ class Query:
             scans, _, _ = collect_operators(self.logical)
             self._doc_tokens = {}
             self._token_inputs = {}
-            projected = {}
-            for field in self.logical.output_schema():
-                projected.setdefault(field.alias, []).append(field.column)
+            # each Scan lists the columns it must load; the projection
+            # pushdown rule filled that in above
             for s in scans:
                 store = self.session.tokenize(
                     s.provider,
                     s.column,
-                    projected.get(s.alias, ()),
+                    s.columns,
                 )
                 self._token_inputs[s.alias] = store
                 self._doc_tokens[s.alias] = store.lengths
@@ -419,7 +418,13 @@ class Query:
                     raise CompileError(
                         f"projection column {name!r} is not in the result"
                     )
-                values = self._token_inputs[alias].column(column)
+                store = self._token_inputs[alias]
+                if column not in store.projected_columns:
+                    raise CompileError(
+                        f"projection column {name!r} was not loaded by the "
+                        f"scan of {alias!r}; the projection_pushdown "
+                        f"logical rule is not registered")
+                values = store.column(column)
                 projection.append((alias, values))
                 fields.append(pa.field(
                     name,

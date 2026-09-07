@@ -199,7 +199,14 @@ logical node does not require another tree traversal function.
 There are four operators, defined in `logical.py`:
 
 - **Scan**: reads one column of one registered provider (e.g.,
-  `reviews.body`).
+  `reviews.body`). That column is tokenized for the model. The Scan
+  also lists the source columns kept as values for the result rows
+  (`columns`). The `projection_pushdown` logical rule fills that list:
+  it fires at the root Project, collects the columns the SELECT list
+  returns, and rewrites each Scan to keep only those. The document
+  column is kept as a value only when the query returns it. The
+  session and the Modal request builder read the pruned Scans, so a
+  provider is never asked for a column the query does not return.
 - **SemanticFilter**: a conjunction of true/false predicates over a
   single scanned column. Each predicate has a prompt template, column
   references, and an optional selectivity (the fraction of documents

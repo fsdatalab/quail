@@ -180,10 +180,18 @@ class LogicalNode(Protocol):
 
 @dataclass(frozen=True)
 class Scan:
-    """Which column of which provider supplies the document text."""
+    """Which column of which provider supplies the document text.
+
+    ``column`` is tokenized for the model. ``columns`` names the source
+    columns kept as values for the result rows, and includes ``column``
+    only when the query returns the document text itself. The
+    projection pushdown rule fills ``columns``; before it runs the
+    tuple is empty.
+    """
     provider: str
     alias: str
     column: str
+    columns: tuple = ()    # tuple[str, ...]
 
     type_name: ClassVar[str] = "quail.scan"
 
@@ -194,11 +202,19 @@ class Scan:
         return ()
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        return (ColumnRef(self.alias, self.provider, self.column),)
+        fields = [ColumnRef(self.alias, self.provider, self.column)]
+        fields.extend(
+            ColumnRef(self.alias, self.provider, column)
+            for column in self.columns if column != self.column
+        )
+        return tuple(fields)
 
     def validate(self) -> None:
         if not self.provider or not self.alias or not self.column:
             raise CompileError("Scan needs a provider, alias, and column")
+        if len(set(self.columns)) != len(self.columns):
+            raise CompileError(
+                f"Scan {self.alias!r} lists a column twice: {self.columns}")
 
     def with_children(self, children: tuple) -> "Scan":
         if children:
@@ -215,6 +231,7 @@ class Scan:
             "provider": self.provider,
             "alias": self.alias,
             "column": self.column,
+            "columns": list(self.columns),
         }
 
 

@@ -9,6 +9,7 @@ from typing import Protocol
 from quail.catalog import ScanRequest, TableProvider
 from quail.extensions import ExtensionRegistry
 from quail.logical import LogicalPlan
+from quail.logical_rules import push_down_projection
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig
 from quail.runtime.result import QueryResult
@@ -73,15 +74,15 @@ class InProcessComputeProvider:
 
 def _modal_request(request: QueryRequest) -> dict:
     """Prepare one request for a Modal Function."""
-    scans, _, _ = collect_operators(request.logical_plan)
+    scans, _, _ = collect_operators(
+        LogicalPlan(push_down_projection(request.logical_plan.root)))
     needed = {
         name: {provider.id_col}
         for name, provider in request.providers.items()
     }
     for scan in scans:
         needed[scan.provider].add(scan.column)
-    for column in request.logical_plan.output_schema():
-        needed[column.provider].add(column.column)
+        needed[scan.provider].update(scan.columns)
 
     sources = {}
     for name, provider in request.providers.items():
