@@ -17,6 +17,17 @@
 - The result projection now raises a clear `CompileError` when a
   column was not loaded, instead of a bare `KeyError`.
 - `Scan.explain_fields()` shows the kept columns.
+- The session token cache is keyed on the document column alone. Value
+  columns live in their own memory mapped files (`ColumnStore`), keyed
+  by provider content and column name. A query that returns columns
+  not yet stored scans only those columns from the provider, in one
+  pass, and reuses the token file. Before, the cache key included the
+  value column set, so two queries with different SELECT lists over the
+  same documents tokenized the corpus twice. On the first query the
+  tokens and the value columns are written in the same pass over the
+  source. A later scan for new value columns must return rows in the
+  same order as the first; the session checks the row count and raises
+  if it differs.
 
 Nothing changes in the Acero join. It already joined int32 document
 index columns only, and values were attached at the end with a take
@@ -25,9 +36,11 @@ set a planner decision instead of a session detail.
 
 Validation: `tests/test_projection_pushdown.py` covers the rule on a
 filter plus join plan, the document column case, idempotence, the
-explain fields, and two end-to-end session queries (`SELECT r.stars,
+explain fields, and three end-to-end session queries (`SELECT r.stars,
 r.id` loads exactly those two columns; `SELECT r.review` and
-`SELECT *` still return the right values). No GPU run; this is a
+`SELECT *` still return the right values; a second query with a
+different SELECT list tokenizes no document again and adds only its
+new column files). No GPU run; this is a
 planning change with no effect on model work.
 
 ```sh

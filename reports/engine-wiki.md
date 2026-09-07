@@ -145,9 +145,13 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    the source. Otherwise, it sends only the raw Arrow columns used by the
    query.
 6. The Modal worker opens the sources and reads bounded Arrow batches. It
-   tokenizes each batch and writes the tokens, document lengths, and output
-   columns to a temporary Arrow file. Source batches can be released after the
-   write. The worker runs the registered logical optimizer rules from the
+   tokenizes each batch and writes the tokens and document lengths to a
+   temporary Arrow file, one per document column. Each value column the
+   query returns goes to its own Arrow file in the same pass. Both are
+   cached on the session by provider content and column name, so a
+   later query over the same documents with a different SELECT list
+   copies only its new value columns and does not tokenize again.
+   Source batches can be released after the write. The worker runs the registered logical optimizer rules from the
    memory mapped length column. The selected model backend produces physical
    candidates. The
    planner selects one typed `PhysicalGraph`. Quail uses

@@ -47,7 +47,7 @@ def test_token_chain_keeps_parts_until_chunk_packing():
     assert combined.token_parts[1] is document
 
 
-def test_token_store_keeps_tokens_lengths_and_projection_on_disk(tmp_path):
+def test_token_store_keeps_tokens_and_lengths_on_disk(tmp_path):
     schema = pa.schema({"id": pa.string(), "body": pa.string()})
     batches = [
         pa.record_batch(
@@ -62,10 +62,8 @@ def test_token_store_keeps_tokens_lengths_and_projection_on_disk(tmp_path):
         str(path),
         batches,
         document_column="body",
-        projected_columns=("id",),
         tokenizer=str.split,
         token_type=pa.string(),
-        source_schema=schema,
     )
 
     assert path.exists()
@@ -75,7 +73,33 @@ def test_token_store_keeps_tokens_lengths_and_projection_on_disk(tmp_path):
         ["three"],
         ["four", "five", "six"],
     ]
-    assert store.column("id").to_pylist() == ["a", "b", "c"]
+    assert store._reader.schema.names == [
+        "__quail_token_ids", "__quail_token_count"]
+
+
+def test_column_store_keeps_one_source_column_on_disk(tmp_path):
+    from quail.runtime.tokens import ColumnStore, ScanInput
+
+    schema = pa.schema({"id": pa.string(), "body": pa.string()})
+    batches = [
+        pa.record_batch([["a", "b"], ["x", "y"]], schema=schema),
+        pa.record_batch([["c"], ["z"]], schema=schema),
+    ]
+    tokens = TokenStore.write(
+        str(tmp_path / "tokens.arrow"), batches,
+        document_column="body", tokenizer=str.split,
+        token_type=pa.string(),
+    )
+    ids = ColumnStore.write(
+        str(tmp_path / "id.arrow"), batches, schema.field("id"))
+
+    assert ids.name == "id"
+    assert len(ids) == 3
+    assert ids.values.to_pylist() == ["a", "b", "c"]
+    scan = ScanInput(tokens, {"id": ids})
+    assert scan.projected_columns == ("id",)
+    assert scan.column("id").to_pylist() == ["a", "b", "c"]
+    assert list(scan.lengths) == [1, 1, 1]
 
 
 def test_token_selection_serializes_a_file_reference(tmp_path):
@@ -85,10 +109,8 @@ def test_token_selection_serializes_a_file_reference(tmp_path):
         str(path),
         [pa.record_batch([["word " * 1000] * 10], schema=schema)],
         document_column="body",
-        projected_columns=(),
         tokenizer=str.split,
         token_type=pa.string(),
-        source_schema=schema,
     )
 
     selection = store.select(range(10))

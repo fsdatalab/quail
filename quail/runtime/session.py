@@ -26,7 +26,11 @@ from quail.runtime.runner import (
     NodeMetrics,
     scalar_node_metrics,
 )
-from quail.runtime.tokens import TokenStore
+from quail.runtime.tokens import (
+    ColumnStoreWriter,
+    ScanInput,
+    TokenStoreWriter,
+)
 from quail.sqlfront import SQLDialect, compile_sql
 
 
@@ -95,6 +99,8 @@ class Session:
         self._fast_tried = False
         self.notes = []            # tokenizer picks etc., for reports
         self._token_stores = {}
+        self._column_stores = {}
+        self._store_count = 0
         self._token_directory = None
         self.compute_provider = compute_provider
 
@@ -107,6 +113,9 @@ class Session:
             for store in self._token_stores.values():
                 store.close()
             self._token_stores.clear()
+            for store in self._column_stores.values():
+                store.close()
+            self._column_stores.clear()
             if self._token_directory is not None:
                 self._token_directory.cleanup()
                 self._token_directory = None
@@ -163,63 +172,138 @@ class Session:
         return self._fast
 
     def tokenize(self, provider_name: str, column: str,
-                 projected_columns=()):
-        """Write one document column to a memory mapped token store."""
+                 projected_columns=()) -> ScanInput:
+        """Tokenize one document column and keep value columns beside it.
+
+        The token file is cached per document column. Each value column
+        is cached in its own file, so a later query that returns other
+        columns reads only those columns from the provider and does not
+        tokenize the documents again.
+        """
         provider = self.catalog.get(provider_name)
+        identity = provider.content_identity()
         projected_columns = tuple(dict.fromkeys(projected_columns))
-        key = (
-            provider.content_identity(),
-            column,
-            projected_columns,
+        token_key = (identity, column)
+        missing = [
+            name for name in projected_columns
+            if (identity, name) not in self._column_stores
+        ]
+        if token_key not in self._token_stores or missing:
+            self._load(
+                provider_name,
+                None if token_key in self._token_stores else column,
+                tuple(missing),
+            )
+        return ScanInput(
+            self._token_stores[token_key],
+            {
+                name: self._column_stores[(identity, name)]
+                for name in projected_columns
+            },
         )
-        if key not in self._token_stores:
-            columns = tuple(dict.fromkeys((column, *projected_columns)))
-            scan_reader = provider.scan(ScanRequest(columns=columns))
-            reader = iter(scan_reader)
+
+    def _store_path(self) -> str:
+        if self._token_directory is None:
+            self._token_directory = TemporaryDirectory(
+                prefix="quail-tokens-"
+            )
+        self._store_count += 1
+        return str(
+            Path(self._token_directory.name)
+            / f"input-{self._store_count}.arrow"
+        )
+
+    def _pick_tokenizer(self, reader, provider_name: str, column: str):
+        """Sample the first documents to choose a tokenizer and token type."""
+        buffered = []
+        text_sample = []
+        while len(text_sample) < 25:
             try:
-                buffered = []
-                text_sample = []
-                while len(text_sample) < 25:
-                    try:
-                        batch = next(reader)
-                    except StopIteration:
-                        break
-                    buffered.append(batch)
-                    texts = batch.column(batch.schema.get_field_index(column))
-                    needed = 25 - len(text_sample)
-                    text_sample.extend(texts.slice(0, needed).to_pylist())
-                tok, note = pick_corpus_tokenizer(
-                    self.tokenizer, self._fast_tokenizer(), text_sample)
-                self.notes.append(f"{provider_name}.{column}: {note}")
-                sample_rows = [tok(text) for text in text_sample]
-                first_token = next(
-                    (token for row in sample_rows for token in row), None
-                )
-                token_type = (
-                    pa.int32()
-                    if first_token is None or isinstance(first_token, Integral)
-                    else pa.string()
-                )
-                if self._token_directory is None:
-                    self._token_directory = TemporaryDirectory(
-                        prefix="quail-tokens-"
-                    )
-                path = Path(self._token_directory.name) / (
-                    f"input-{len(self._token_stores)}.arrow"
-                )
-                store = TokenStore.write(
-                    str(path),
-                    chain(buffered, reader),
+                batch = next(reader)
+            except StopIteration:
+                break
+            buffered.append(batch)
+            texts = batch.column(batch.schema.get_field_index(column))
+            needed = 25 - len(text_sample)
+            text_sample.extend(texts.slice(0, needed).to_pylist())
+        tok, note = pick_corpus_tokenizer(
+            self.tokenizer, self._fast_tokenizer(), text_sample)
+        self.notes.append(f"{provider_name}.{column}: {note}")
+        sample_rows = [tok(text) for text in text_sample]
+        first_token = next(
+            (token for row in sample_rows for token in row), None
+        )
+        token_type = (
+            pa.int32()
+            if first_token is None or isinstance(first_token, Integral)
+            else pa.string()
+        )
+        return buffered, tok, token_type
+
+    def _load(self, provider_name: str, column: str | None,
+              value_columns: tuple[str, ...]) -> None:
+        """Scan the provider once and write the missing store files.
+
+        Args:
+            provider_name: The registered provider.
+            column: The document column to tokenize, or None when its
+                token file already exists.
+            value_columns: Value columns without a column file yet.
+        """
+        provider = self.catalog.get(provider_name)
+        identity = provider.content_identity()
+        scan_columns = tuple(dict.fromkeys(
+            ((column,) if column is not None else ()) + value_columns
+        ))
+        scan_reader = provider.scan(ScanRequest(columns=scan_columns))
+        reader = iter(scan_reader)
+        token_writer = None
+        column_writers = {}
+        try:
+            batches = reader
+            if column is not None:
+                buffered, tok, token_type = self._pick_tokenizer(
+                    reader, provider_name, column)
+                batches = chain(buffered, reader)
+                token_writer = TokenStoreWriter(
+                    self._store_path(),
                     document_column=column,
-                    projected_columns=projected_columns,
                     tokenizer=tok,
                     token_type=token_type,
-                    source_schema=provider.schema(),
                 )
-            finally:
-                scan_reader.close()
-            self._token_stores[key] = store
-        return self._token_stores[key]
+            source_schema = provider.schema()
+            for name in value_columns:
+                column_writers[name] = ColumnStoreWriter(
+                    self._store_path(), source_schema.field(name))
+            writers = [*column_writers.values()]
+            if token_writer is not None:
+                writers.append(token_writer)
+            for batch in batches:
+                for writer in writers:
+                    writer.write_batch(batch)
+        except Exception:
+            for writer in writers:
+                writer.abort()
+            raise
+        finally:
+            scan_reader.close()
+        if token_writer is not None:
+            self._token_stores[(identity, column)] = token_writer.finish()
+        for name, writer in column_writers.items():
+            self._column_stores[(identity, name)] = writer.finish()
+        # a value column read on a later scan must line up row for row
+        # with the token file written on an earlier one
+        token_rows = next(
+            (len(store) for (store_identity, _), store
+             in self._token_stores.items() if store_identity == identity),
+            None)
+        for name in value_columns:
+            rows = len(self._column_stores[(identity, name)])
+            if token_rows is not None and rows != token_rows:
+                raise RuntimeError(
+                    f"{provider_name}.{name} returned {rows} rows but its "
+                    f"documents were tokenized as {token_rows} rows; the "
+                    f"provider does not scan in a stable order")
 
 
 class BoundBuilder:
@@ -338,7 +422,7 @@ class Query:
             if not isinstance(node, DocumentInput):
                 continue
             inputs[node.input_id] = document_input(
-                self._token_inputs[node.alias]
+                self._token_inputs[node.alias].tokens
             )
         envelope = plan.to_envelope(self.session.registry.codecs)
         return PhysicalRequest(envelope, inputs)
