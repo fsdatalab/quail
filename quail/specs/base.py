@@ -97,6 +97,9 @@ class DeviceSpec:
     #                            back to half of peak_flops, the fp8-
     #                            to-bf16 ratio on every tensor core
     #                            generation we run on.
+    usd_per_hour: float = 0.0    # rental price of one device; 0 means
+    #                              no price is known
+    price_source: str = ""       # where usd_per_hour was read from
 
     @property
     def attn_flops(self) -> float:

@@ -111,7 +111,7 @@ change needs one of them, say so instead of quietly adding it back.
     by query runtime in seconds.
   - `$/query` is query runtime in hours multiplied by the number of
     GPUs and the H100! hourly price. Use
-    `quail.bench.evaluate.H100_USD_PER_HOUR`, which is currently
+    `quail.specs.H100_USD_PER_HOUR`, which is currently
     $3.9492 from https://modal.com/pricing.
   - The primary `$/query` number excludes model startup, just as the
     primary query time does. If startup cost is useful, report it as a

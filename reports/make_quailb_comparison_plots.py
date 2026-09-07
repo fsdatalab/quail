@@ -50,7 +50,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
 
-from quail.bench.evaluate import H100_USD_PER_HOUR
+from quail.specs import H100_USD_PER_HOUR
 
 HERE = Path(__file__).resolve().parent
 METHODS = [

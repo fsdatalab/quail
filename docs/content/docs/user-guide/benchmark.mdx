@@ -56,4 +56,8 @@ The definitions are fixed so numbers compare across reports:
 - `document pairs/second` = evaluated pairs across all join stages /
   query seconds.
 - `$/query` = query hours × GPU count × the H100 hourly price from
-  `quail.bench.evaluate.H100_USD_PER_HOUR`.
+  `quail.specs.H100_USD_PER_HOUR`.
+- `regret_tokens`, `shared_prefix_tokens`, `cross_row_cached_tokens`,
+  and `regret_distinct_tokens` come from the engine's own report on
+  every `QueryResult`. The benchmark copies them; it does not compute
+  them from the plan.

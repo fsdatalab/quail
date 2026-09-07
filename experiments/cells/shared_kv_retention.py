@@ -43,11 +43,11 @@ def _run(label, output_dir):
 
     import quail
     from quail.backends.quail import expected_join_nodes
-    from quail.bench.evaluate import H100_USD_PER_HOUR
     from quail.bench.quailb import build_sets, queries, register_sets
     from quail.physical import AnchoredJoin, PackedFilter
     from quail.planner.plan import EngineConfig
     from quail.runtime.compute import InProcessComputeProvider
+    from quail.specs import H100_USD_PER_HOUR
 
     output = Path(output_dir) / label
     output.mkdir(parents=True, exist_ok=True)

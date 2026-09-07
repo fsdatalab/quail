@@ -646,7 +646,7 @@ def build_sets(data_dir, sf, lf=1):
 
 
 def register_sets(sess, data_dir):
-    from quail.catalog import DocumentProvider
+    from quail import DocumentProvider
     for name in ("reviews", "aspects", "reports", "terms",
                 "claims", "evidence", "citation_contexts",
                 "citation_passages", "agent_traces"):
@@ -660,7 +660,7 @@ def register_privacy_sets(sess, data_dir):
     Separate from register_sets so the privacy policy queries do not
     run in the default benchmark suite.
     """
-    from quail.catalog import DocumentProvider
+    from quail import DocumentProvider
     d = Path(data_dir)
     for name in ("policies", "scenarios"):
         sess.register(name, DocumentProvider.from_parquet(
@@ -1267,10 +1267,8 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
     """Run all (or selected) QUAIL-B queries through the engine."""
     import quail
     from quail.bench.evaluate import (
-        H100_PRICE_SOURCE,
         BenchmarkEvaluator,
         ModalVolumeFiles,
-        add_prefix_metrics,
         add_query_metrics,
         corpus_identity,
         load_ground_truth,
@@ -1278,7 +1276,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         read_corpus,
         summarize_queries,
     )
-    from quail.planner.plan import EngineConfig
+    from quail.specs import H100_PRICE_SOURCE
 
     d = build_sets(data_dir, sf, lf)
     corpus_rows = read_corpus(d)
@@ -1306,7 +1304,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                 f"benchmark corpus {corpus['corpus_id']} does not match "
                 f"ground truth {truth.corpus_id}")
         evaluator = BenchmarkEvaluator(truth, corpus_rows)
-    sess = quail.Session(EngineConfig(
+    sess = quail.Session(quail.EngineConfig(
         gpus=gpus,
         model=model,
         backend=backend,
@@ -1423,8 +1421,13 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
                            stages=res.report["stages"],
                            backend_metrics=res.report.get(
                                "backend_metrics"
-                           ))
-                add_prefix_metrics(row, query, res.report)
+                           ),
+                           shared_prefix_tokens=res.report[
+                               "shared_prefix_tokens"],
+                           cross_row_cached_tokens=res.report[
+                               "cross_row_cached_tokens"],
+                           regret_distinct_tokens=res.report[
+                               "regret_distinct_tokens"])
                 if evaluator is not None:
                     evaluation = evaluator.evaluate(query, res)
                     add_query_metrics(

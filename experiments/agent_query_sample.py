@@ -23,7 +23,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.evaluate import H100_USD_PER_HOUR
+from quail.specs import H100_USD_PER_HOUR
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 SAMPLE_SIZE = 200
@@ -245,8 +245,8 @@ def judge_sample(model_name: str, sample_full_hash: str) -> str:
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
+    from quail import true_false_ids
     from quail.bench import quailb
-    from quail.executor.loop import true_false_ids
 
     if model_name not in MODELS:
         raise ValueError(f"unknown model {model_name!r}")

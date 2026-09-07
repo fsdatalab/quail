@@ -50,10 +50,10 @@ def _run(label, output_dir, query_ids):
     import pyarrow.parquet as pq
 
     import quail
-    from quail.bench.evaluate import H100_USD_PER_HOUR
     from quail.bench.quailb import build_sets, queries, register_sets
     from quail.planner.plan import EngineConfig
     from quail.runtime.compute import InProcessComputeProvider
+    from quail.specs import H100_USD_PER_HOUR
 
     output = Path(output_dir) / label
     output.mkdir(parents=True, exist_ok=True)

@@ -14,8 +14,6 @@ from pyarrow import parquet as pq
 
 GROUND_TRUTH_ROOT = "ground_truth/quailb/schema_v1"
 RESULTS_VOLUME = "quail-results"
-H100_USD_PER_HOUR = 3.9492
-H100_PRICE_SOURCE = "https://modal.com/pricing"
 
 # Must match quail.bench.judge_pass.CORPUS_COLUMNS exactly - this is
 # used to recompute corpus_id for verification.
@@ -174,7 +172,7 @@ class GroundTruthCollection:
     predicates: dict[str, PredicateLabels]
 
     def __post_init__(self):
-        from quail.logical import ColumnRef, bind_join_prompt, bind_prompt
+        from quail import ColumnRef, bind_join_prompt, bind_prompt
 
         templates = {}
         for key, labels in self.predicates.items():
@@ -600,7 +598,13 @@ class BenchmarkEvaluator:
     def _key(self, prompt) -> str:
         return self.ground_truth.key_for_template(prompt.template)
 
-    def _answer_for_prompt(self, prompt, assignment: dict[str, int]) -> bool:
+    def answer(self, prompt, assignment: dict[str, int]) -> bool:
+        """Return the saved label for one prompt over one row assignment.
+
+        Args:
+            prompt: A bound filter or join prompt from a query.
+            assignment: Alias to row index in that alias's corpus table.
+        """
         ids = [
             str(_row_id(
                 self.corpus_rows[arg.provider], assignment[arg.alias]))
@@ -622,7 +626,7 @@ class BenchmarkEvaluator:
             kept = []
             for index in range(len(self.corpus_rows[scan.provider])):
                 assignment = {scan.alias: index}
-                if all(self._answer_for_prompt(predicate.prompt, assignment)
+                if all(self.answer(predicate.prompt, assignment)
                        for predicate in filters.get(scan.alias, ())):
                     kept.append(index)
             survivors[scan.alias] = pa.array(kept, type=pa.int32())
@@ -702,67 +706,31 @@ class BenchmarkEvaluator:
         )
 
     def evaluate(self, query, result) -> dict:
-        from quail.physical import PackedFilter, RequestExecution
-        from quail.planner.decide import collect_operators
+        from quail.planner import collect_operators
 
         scans, filters, joins = collect_operators(query.logical)
-        plan = query.plan()
         providers = {scan.alias: scan.provider for scan in scans}
         per_predicate = []
         total = BinaryCounts()
 
-        for node in plan.nodes:
-            if isinstance(node, PackedFilter):
-                planned_filters = (
-                    (node.alias, stage.written_pos)
-                    for stage in node.stages
-                )
-            elif isinstance(node, RequestExecution):
-                planned_filters = (
-                    (spec.alias, written_pos)
-                    for spec in node.filters
-                    for written_pos in spec.written_positions
-                )
-            else:
-                continue
-            for alias, written_pos in planned_filters:
-                predicate = filters[alias][written_pos]
-                key = self._key(predicate.prompt)
-                item = _PredicateCount(key, "filter", alias)
-                table = result.answer_tables["filters"][
-                    (alias, written_pos)]
-                indices = table.column(alias).to_pylist()
-                answers = table.column("answer").to_pylist()
-                for index, predicted in zip(indices, answers):
-                    left_id = str(
-                        _row_id(self.corpus_rows[providers[alias]], index))
-                    expected = self.ground_truth.answer(key, left_id)
-                    item.counts.add(bool(predicted), expected)
-                total.merge(item.counts)
-                per_predicate.append(item.as_dict())
+        for (alias, written_pos), table in result.answer_tables["filters"].items():
+            predicate = filters[alias][written_pos]
+            key = self._key(predicate.prompt)
+            item = _PredicateCount(key, "filter", alias)
+            indices = table.column(alias).to_pylist()
+            answers = table.column("answer").to_pylist()
+            for index, predicted in zip(indices, answers):
+                left_id = str(
+                    _row_id(self.corpus_rows[providers[alias]], index))
+                expected = self.ground_truth.answer(key, left_id)
+                item.counts.add(bool(predicted), expected)
+            total.merge(item.counts)
+            per_predicate.append(item.as_dict())
 
-        request_join_positions = tuple(
-            spec.written_pos
-            for node in plan.nodes
-            if isinstance(node, RequestExecution)
-            for spec in node.joins
-        )
-        if request_join_positions:
-            join_positions = request_join_positions
-        else:
-            from quail.backends.quail import expected_join_stages
-
-            join_positions = tuple(
-                stage.written_pos for stage in expected_join_stages(plan)
-            )
-        if len(join_positions) != len(result.answer_tables["joins"]):
-            raise ValueError(
-                "query plan and returned join stages have different lengths")
-        for written_pos in join_positions:
+        for written_pos, table in result.answer_tables["joins"].items():
             join = joins[written_pos]
             key = self._key(join.predicate)
             item = _PredicateCount(key, "join")
-            table = result.answer_tables["joins"][written_pos]
             aliases = [arg.alias for arg in join.predicate.args]
             index_columns = {
                 alias: table.column(alias).to_pylist()
@@ -774,8 +742,7 @@ class BenchmarkEvaluator:
                     alias: int(index_columns[alias][row_index])
                     for alias in aliases
                 }
-                expected = self._answer_for_prompt(
-                    join.predicate, assignment)
+                expected = self.answer(join.predicate, assignment)
                 item.counts.add(bool(predicted), expected)
             total.merge(item.counts)
             per_predicate.append(item.as_dict())
@@ -882,116 +849,3 @@ def summarize_queries(rows: list[dict], h100_usd_per_hour: float,
             _divide(cost_with_boot, tokens) * 1_000_000, 6),
         "answer_accuracy": counts.as_dict(),
     }
-
-
-# ---------------------------------------------------- prefix reuse metrics
-#
-# Two KV regrets. The per document regret counts a document's own prefix
-# recomputed after an earlier request had computed it. The distinct prefix
-# regret also counts tokens recomputed although another document's request
-# had computed the same prefix: with unlimited KV every distinct prefix in
-# the corpus is computed once.
-
-_shared_prefix_cache: dict[str, tuple[int, int]] = {}
-
-
-def shared_prefix_tokens(store) -> int:
-    """Return the prefix tokens a token store's documents share."""
-    return _store_prefix_stats(store)[0]
-
-
-def store_token_count(store) -> int:
-    """Return the total tokens of a token store's documents."""
-    return _store_prefix_stats(store)[1]
-
-
-def _store_prefix_stats(store) -> tuple[int, int]:
-    from quail.runtime.tokens import shared_prefix_lengths
-
-    path = getattr(store, "path", None)
-    if path is not None and path in _shared_prefix_cache:
-        return _shared_prefix_cache[path]
-    documents = [list(document) for document in store]
-    stats = (
-        sum(shared_prefix_lengths(documents)),
-        sum(len(document) for document in documents),
-    )
-    if path is not None:
-        _shared_prefix_cache[path] = stats
-    return stats
-
-
-def scanned_shared_prefix_tokens(scanned_columns, stores) -> int:
-    """Return the shared prefix tokens over every scanned alias's documents.
-
-    Args:
-        scanned_columns: One (provider, column) per scanned alias; a
-            column scanned under several aliases appears that many
-            times.
-        stores: Callable from (provider, column) to the token store.
-
-    A column scanned under k aliases is the same prefix trie k times:
-    each extra copy shares every token with the first.
-    """
-    counts = {}
-    for key in scanned_columns:
-        counts[key] = counts.get(key, 0) + 1
-    total = 0
-    for key, copies in counts.items():
-        store = stores(*key)
-        total += shared_prefix_tokens(store)
-        total += (copies - 1) * store_token_count(store)
-    return total
-
-
-def scanned_aliases(stages) -> set[str]:
-    """Return the aliases whose documents a query computed as prefixes.
-
-    A filtered alias is scanned in full at its first stage. A join
-    anchor's documents are prefixes; its partners are suffixes and
-    cannot be reused.
-    """
-    scanned = set()
-    for stage in stages:
-        if stage.get("op") == "filter":
-            scanned.add(stage["alias"])
-        elif stage.get("op") == "join":
-            scanned.add(stage["anchor"])
-    return scanned
-
-
-def cross_row_cached_tokens(report) -> int | None:
-    """Return cached tokens another document's request computed."""
-    backend_metrics = report.get("backend_metrics") or {}
-    if "cross_row_cached_tokens" in backend_metrics:
-        return int(backend_metrics["cross_row_cached_tokens"])
-    if report.get("backend") == "quail":
-        return 0
-    return None
-
-
-def distinct_prefix_regret(regret_tokens, shared_prefix, cross_row_cached):
-    """Return the regret against one computation per distinct prefix."""
-    if regret_tokens is None or cross_row_cached is None:
-        return None
-    return int(regret_tokens) + int(shared_prefix) - int(cross_row_cached)
-
-
-def add_prefix_metrics(row: dict, query, report: dict) -> dict:
-    """Add shared prefix tokens and both regrets to one result row."""
-    from quail.planner import collect_operators
-
-    scans, _, _ = collect_operators(query.logical)
-    columns = {scan.alias: (scan.provider, scan.column) for scan in scans}
-    shared = scanned_shared_prefix_tokens(
-        [columns[alias] for alias in scanned_aliases(report.get("stages", ()))],
-        query.session.tokenize,
-    )
-    cross_row = cross_row_cached_tokens(report)
-    row.update({
-        "shared_prefix_tokens": shared,
-        "cross_row_cached_tokens": cross_row,
-        "regret_distinct_tokens": distinct_prefix_regret(
-            report.get("regret_tokens"), shared, cross_row),
-    })
-    return row

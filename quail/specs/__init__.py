@@ -5,7 +5,7 @@ line.
 """
 
 from .base import ACT_BYTES_PER_HIDDEN, DeviceSpec, ModelSpec, Precision
-from .h100_sxm import H100_SXM
+from .h100_sxm import H100_PRICE_SOURCE, H100_SXM, H100_USD_PER_HOUR
 from .qwen3_4b import QWEN3_4B_FP8
 from .qwen3_32b import QWEN3_32B_FP8
 
@@ -15,4 +15,4 @@ DEVICES = {H100_SXM.name: H100_SXM}
 
 __all__ = ["ACT_BYTES_PER_HIDDEN", "DeviceSpec", "ModelSpec", "Precision",
            "MODELS", "DEVICES", "QWEN3_4B_FP8", "QWEN3_32B_FP8",
-           "H100_SXM"]
+           "H100_SXM", "H100_USD_PER_HOUR", "H100_PRICE_SOURCE"]

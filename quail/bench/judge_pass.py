@@ -27,14 +27,14 @@ from pathlib import Path
 
 import modal
 
-from quail.bench import quailb
-from quail.logical import (
+from quail import (
     SHARED_PRE,
     ColumnRef,
     bind_join_prompt,
     bind_prompt,
     render_join_prompt_text,
 )
+from quail.bench import quailb
 
 SCHEMA_VERSION = 1
 SCALE_FACTOR = 0.1
@@ -690,7 +690,7 @@ class ModelJudge:
         from transformers import AutoTokenizer
         from vllm import LLM, SamplingParams
 
-        from quail.executor.loop import true_false_ids
+        from quail import true_false_ids
 
         t0 = time.perf_counter()
         self.tokenizer = AutoTokenizer.from_pretrained(

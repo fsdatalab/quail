@@ -275,8 +275,7 @@ Quail metrics.
 
 ## 5. The code
 
-The implementation is split into four modules shared by the planner and
-the report:
+The implementation is split into five planner modules:
 
 | module | responsibility |
 |---|---|
@@ -284,9 +283,9 @@ the report:
 | `quail/planner/qwen3_cost.py` | Build Qwen3 attention projection, MLP, and attention components |
 | `quail/planner/roofline.py` | Price one component from FLOPs, bytes, precision, and hardware limits |
 | `quail/planner/sol.py` | Apply ideal query-wide packing and add component times |
+| `quail/planner/estimate.py` | Run filters and the exact left deep join search for one query |
 
-`reports/make_sol_quailb.py` measures the inputs and applies the shared
-calculator. Three functions in `work.py` carry section 3:
+Three functions in `work.py` carry section 3:
 
 | function | equation |
 |---|---|
@@ -294,17 +293,22 @@ calculator. Three functions in `work.py` carry section 3:
 | `ask(prefix, suffix)` | stage `s > 1`: `suffix` tokens, `suffix * prefix + T(suffix)` pairs |
 | `stream(prefix, suffixes)` | a join's tuples: `ask` per suffix, one prefix read |
 
-`simulate_optimal_left_deep()` builds the exact join relations from the saved
-labels. `join_stage_work()` counts one stage for each anchor choice.
-`optimize_left_deep()` (`quail/planner/leftdeep.py`) searches relation
-subsets and KV availability. A unit test compares its result with complete
-enumeration on a small query.
+`quail.speed_of_light_estimate(query, answer)` is the public entry point.
+It takes a query built through a session and an `answer(prompt,
+assignment)` callable that returns the exact TRUE or FALSE answer of one
+prompt for one row assignment. The session tokenizes the scanned columns.
+The estimator runs the filters in the planner's order, builds the exact
+join relations from the answers, counts one stage for each anchor choice,
+and searches relation subsets and KV availability with
+`optimize_left_deep()` (`quail/planner/leftdeep.py`). The exact survivors
+of every join subset come from `quail/planner/live_rows.py`. A unit test
+compares the search with complete enumeration on a small query.
 
-The SoL script does not call or simulate the production planner. It runs the
-supported search separately for each model and passes that model's chunk limit.
-`speed_of_light()` is section 4. The production planner imports the same work
-and component equations to rank its candidates. Its search and finite KV
-policy are separate from this exact analysis.
+The estimator does not call or simulate the production planner. It runs
+the search separately for each model and uses that model's chunk budget.
+`speed_of_light()` is section 4. The production planner imports the same
+work and component equations to rank its candidates. Its search and
+finite KV policy are separate from this exact analysis.
 
 ## 6. What the estimate assumes
 
@@ -327,9 +331,11 @@ policy are separate from this exact analysis.
 
 ## 7. Every QUAIL-B query
 
-`reports/make_sol_quailb.py` applies this model to the 32 default queries
-at sf=0.1 on Qwen3 4B fp8 and Qwen3 32B fp8. It uses document lengths,
-prompt lengths, and active ground-truth labels.
+`reports/make_sol_quailb.py` calls the estimator for the 32 default
+queries at sf=0.1 on Qwen3 4B fp8 and Qwen3 32B fp8. The script supplies
+only what the benchmark has: the corpora, the queries, and the saved
+labels, wrapped as the `answer` callable. Document lengths and prompt
+lengths come from the session's tokenizer.
 
 The saved estimates at `/results/sol/sol_quailb_sf0.1.json` on the
 `quail-results` volume predate the four-filter FEV-9 definition. Regenerate

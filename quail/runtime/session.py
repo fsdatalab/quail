@@ -19,6 +19,7 @@ from quail.physical import DocumentInput, PortRef, Project, ValueType, encode_gr
 from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.runtime.compute import ModalComputeProvider, QueryRequest
+from quail.runtime.prefixes import prefix_metrics
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
     ExecutionContext,
@@ -268,8 +269,14 @@ class Query:
 
     # ---- planning (the optimization) ---------------------------------
 
-    def plan(self):
-        if self._plan is None:
+    def token_inputs(self) -> dict:
+        """Return the token store of every scanned alias.
+
+        The logical rules run first, then each scanned column is
+        tokenized once. Planning and the speed of light estimate share
+        these stores.
+        """
+        if self._token_inputs is None:
             self.logical, _ = apply_logical_rules(
                 self.logical,
                 tuple(self.session.registry.logical_rules.values()),
@@ -291,6 +298,11 @@ class Query:
                 )
                 self._token_inputs[s.alias] = store
                 self._doc_tokens[s.alias] = store.lengths
+        return self._token_inputs
+
+    def plan(self):
+        if self._plan is None:
+            self.token_inputs()
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
@@ -635,6 +647,7 @@ class Query:
             ))
             if semantics == "full":
                 true_join_tables[written_pos] = true_answer_rows(table)
+        report.update(prefix_metrics(report, scans, self._token_inputs))
         survivor_arrays = {
             alias: pa.array(indices, type=pa.int32())
             for alias, indices in survivors.items()

@@ -87,8 +87,8 @@ def _save(name: str, value: dict) -> str:
 
 
 def _query_record(query_id, query, gpu_count):
-    from quail.bench.evaluate import H100_USD_PER_HOUR
     from quail.runtime.local import execute_worker_query
+    from quail.specs import H100_USD_PER_HOUR
 
     result = execute_worker_query(query)
     table = result.collect()

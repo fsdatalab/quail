@@ -128,7 +128,7 @@ def load_model(model_name: str, revision: str | None = None, *,
     if answer_token_ids is None:
         from transformers import AutoTokenizer
 
-        from quail.executor.loop import true_false_ids
+        from quail.logical import true_false_ids
 
         tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
         true_ids, false_ids = true_false_ids(tokenizer)
