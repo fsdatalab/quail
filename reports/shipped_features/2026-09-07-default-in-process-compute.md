@@ -26,6 +26,10 @@ path already existed for the benchmark runner inside Modal functions.
 Anyone with their own GPU should be able to install the package and
 run a query in their own process.
 
+A local machine also needs a C compiler and the Python headers
+(`python3.12-dev` on Ubuntu), because Triton compiles a small C helper
+when vLLM starts. The install docs say so.
+
 Costs: the locked Linux install grows by vLLM, torch 2.11 (CUDA 13),
 and the NVIDIA libraries, about 7.8 GB on disk. CI on `ubuntu-latest`
 installs them too.
