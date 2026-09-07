@@ -118,11 +118,7 @@ def execute_worker_query(query, physical_executor=None):
 def execute_query_request(
     request: QueryRequest, physical_executor=None
 ) -> QueryResult:
-    """Plan and run one logical query request in this process.
-
-    Reuses the caller's Query when the request carries one, so documents
-    tokenized for planning or explain() are not tokenized again.
-    """
+    """Plan and run one logical query request in this process."""
     started = time.perf_counter()
     query = request.planned_query
     if not isinstance(query, Query):

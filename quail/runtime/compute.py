@@ -27,9 +27,7 @@ class QueryRequest:
     order: str | None = None
     registry: ExtensionRegistry = field(
         default_factory=ExtensionRegistry.with_built_ins)
-    # The caller's planned Query, when the provider runs in the caller's
-    # process. It already holds the tokenized documents, so the worker
-    # does not tokenize them again. Remote providers ignore it.
+    # the caller's Query, reused by an in-process provider; remote ones ignore it
     planned_query: object | None = None
 
     def __post_init__(self) -> None:
@@ -58,9 +56,7 @@ class ComputeProvider(Protocol):
 
 LOCAL_KERNEL_CACHE = "~/.cache/quail/kernels"
 
-# Same settings the Modal image puts on the kernel-cache volume, so a
-# local GPU keeps its compiled kernels between runs and behaves like a
-# Modal worker. setdefault leaves anything the user already set alone.
+# same cache layout as the Modal image; values already in the environment win
 _LOCAL_ENV_DEFAULTS = (
     ("VLLM_CACHE_ROOT", "vllm"),
     ("DG_CACHE_DIR", "deep_gemm"),
@@ -71,11 +67,7 @@ _LOCAL_ENV_DEFAULTS = (
 
 
 def default_local_caches() -> str:
-    """Point every kernel cache at one directory that survives restarts.
-
-    Returns:
-        The cache root directory.
-    """
+    """Point every kernel cache at one directory and return its root."""
     root = os.path.expanduser(LOCAL_KERNEL_CACHE)
     for name, sub in _LOCAL_ENV_DEFAULTS:
         os.environ.setdefault(name, os.path.join(root, sub))
@@ -96,14 +88,9 @@ def local_gpu_problem() -> str | None:
 
 
 class InProcessComputeProvider:
-    """Run logical queries in the current process.
+    """Run logical queries on the GPU in the current process.
 
-    This is the default provider. The model loads where the Python
-    program runs, so the process needs a CUDA GPU and the backend's
-    runtime package (vLLM for the Quail and vLLM backends). Code that
-    already runs where the GPUs are, such as the benchmark runner
-    inside a Modal function, uses it too. Tests pass a fake physical
-    executor, which skips the GPU check.
+    The default provider. A fake physical executor skips the GPU check.
     """
 
     def __init__(self, physical_executor=None):

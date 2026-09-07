@@ -1,9 +1,4 @@
-"""Progress lines for the long steps of a query.
-
-Every line starts with "quail:" and is flushed at once, so a user
-watching a terminal or a Modal log sees tokenizing, planning, model
-boot, and execution move.
-"""
+"""Progress lines for the long steps of a query."""
 
 import time
 
@@ -14,14 +9,7 @@ def say(message: str) -> None:
 
 
 class Progress:
-    """Report a running count at most every few seconds.
-
-    Args:
-        label: What is being counted, such as "tokenizing reviews.review".
-        total: Expected final count, or None when unknown up front.
-        unit: Plural noun for the count.
-        every: Fewest seconds between two printed lines.
-    """
+    """Report a running count, printing at most once every `every` seconds."""
 
     def __init__(self, label: str, total: int | None = None,
                  unit: str = "documents", every: float = 5.0):

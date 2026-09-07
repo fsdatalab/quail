@@ -1,8 +1,4 @@
-"""Run one filter query on the GPU in this process, without Modal.
-
-Uses the default compute provider, so the model loads onto the GPU
-visible to this process. Prints the matching rows and the parts of the
-report that show where the time went.
+"""Run one filter over four documents on the GPU in this process.
 
     uv run python demos/local_gpu_smoke.py 2>&1 | tee local_gpu_smoke.log
 """

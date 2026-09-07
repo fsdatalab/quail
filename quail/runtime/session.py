@@ -63,9 +63,7 @@ def pick_corpus_tokenizer(primary, fast, texts, sample=25):
     return fast, "tokenizer: bpe-qwen (parity-checked on sample)"
 
 
-# Rows tokenized between two progress checks. Small enough that a line
-# appears every few seconds; large enough that the per slice overhead
-# stays under one percent.
+# rows per progress check; per slice overhead stays under one percent
 TOKENIZE_ROWS = 2048
 
 
@@ -295,8 +293,6 @@ class Session:
                 progress = Progress(f"tokenizing {provider_name}.{column}")
             rows = 0
             for batch in batches:
-                # tokenize in slices so progress shows inside one large
-                # source batch
                 for start in range(0, batch.num_rows, TOKENIZE_ROWS):
                     piece = batch.slice(start, TOKENIZE_ROWS)
                     for writer in writers:

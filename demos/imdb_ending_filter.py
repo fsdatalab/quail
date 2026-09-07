@@ -1,20 +1,8 @@
 """Filter all 100,000 IMDB reviews with two questions, both required.
 
-Runs on the GPU in this process with the default compute provider.
-Loads the three IMDB splits (train, test, unsupervised) from the
-pinned Hugging Face revision, registers them as one Arrow dataset,
-runs a conjunction of two AI.IF filters over the same reviews, and
-prints the plan, the row count, the per-stage counts, and the timing.
-
-Prediction. One filter over these same reviews measured on a Nebius
-H100 SXM: 262.45 s, 32.2 M fresh tokens, 381 reviews/s, $0.2879, with
-28,296 reviews passing. In QUAIL-B, IMDB-6 (two filters) took 2.6%
-longer than IMDB-1 (one filter) with 0.85% more fresh tokens, because
-a survivor's second question adds only its own tokens while the
-review's KV is still on the GPU. So this query should take about
-270 s, about 32.5 M fresh tokens, about 370 reviews/s, about $0.30.
-The ending question (selectivity hint 0.25) runs first, and about
-28,000 reviews should reach the second question.
+Runs on the GPU in this process. Predicted about 270 s and $0.30;
+measured 268.7 s and $0.29 on one H100. Both runs are in
+reports/shipped_features/2026-09-07-default-in-process-compute.md.
 
     uv run python demos/imdb_ending_filter.py 2>&1 | tee imdb_ending_filter.log
 """

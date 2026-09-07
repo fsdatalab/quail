@@ -1,8 +1,4 @@
-"""Modal volumes shared by every worker function.
-
-The commit helpers do nothing outside a Modal container, so the same
-backend code runs on a local GPU, where there is no volume to commit.
-"""
+"""Modal volumes shared by every worker function, no-ops outside Modal."""
 
 import os
 import time
