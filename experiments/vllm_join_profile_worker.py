@@ -1,4 +1,4 @@
-"""Capture vLLM CPU and GPU activity during FEV-9 joins."""
+"""Capture vLLM CPU and GPU activity during benchmark joins."""
 
 import json
 import os
@@ -12,6 +12,15 @@ PREDICTION = (
     "than SGLang's measured 25.6%, with less time in request preparation "
     "and scheduling. Profiling must preserve the saved vLLM answers."
 )
+PREDICTIONS = {
+    "FEV-9": PREDICTION,
+    "BIO-3": (
+        "Request handling and scheduling leave substantial GPU idle time "
+        "during BIO-3's join. The saved unprofiled join took 474.04 seconds "
+        "for 311,052 pairs. Run the filter normally to preserve its KV, then "
+        "record the full join. Compare answers and work counts with the baseline."
+    ),
+}
 
 
 def install_scheduler_scopes(worker):
@@ -38,7 +47,7 @@ class ProfileExtension:
         return install_scheduler_scopes(self)
 
 
-def profile_worker(directory, connection):
+def profile_worker(directory, connection, query="FEV-9"):
     """Run the existing vLLM baseline with profiling around each join."""
     os.setsid()
     root = Path(directory)
@@ -124,13 +133,14 @@ def profile_worker(directory, connection):
         request_module.run_join_grouped = profile_join
         result = run_backend_group(
             data_dir="/results/quailb_data", model="qwen3-4b-fp8", sf=0.1, lf=1,
-            query_ids=("FEV-9",), run_label=root.name, prediction=PREDICTION,
+            query_ids=(query,), run_label=root.name, prediction=PREDICTIONS[query],
             ground_truth_collection="gt_77bb8b128743a79aedddaa24c808c3f8",
             methods=("pipelined_vllm",),
         )
-        assert len(joins) == 3
+        assert len(joins) == {"FEV-9": 3, "BIO-3": 1}[query]
         result.update({
-            "prediction": PREDICTION, "profiled": True, "joins": joins,
+            "prediction": PREDICTIONS[query], "profiled": True, "joins": joins,
+            "query": query,
             "model_info": model_info,
             "versions": {"torch": torch.__version__, "vllm": vllm.__version__},
         })
