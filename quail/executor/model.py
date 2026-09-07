@@ -3,8 +3,8 @@ vLLM's processed module - merged qkv and gate_up, fp8 weights and
 block scales laid out for DeepGEMM. No engine, no scheduler, no KV
 pool. vLLM is a library here (loader and kernels), nothing more.
 
-After load, the TRUE/FALSE output rows are cached for binary scoring.
-The full model remains resident on the GPU.
+After load, only the TRUE/FALSE output rows are retained. The full
+output head is discarded; shared input embeddings remain available.
 
 get_model reads tensor-parallel group objects. Those collectives are
 no-ops at world size 1, so this path installs single-rank stubs
@@ -83,8 +83,8 @@ def _install_single_rank_groups(torch):
     ps._NODE_COUNT = 1
 
 
-def cache_answer_weights(torch, model, token_ids):
-    """Cache the output rows used for TRUE/FALSE scoring."""
+def retain_answer_head(torch, model, token_ids):
+    """Keep the answer rows and release the full output head."""
     allowed = tuple(sorted(set(token_ids)))
     if not allowed:
         raise ValueError("TRUE/FALSE token ids must not be empty")
@@ -96,18 +96,20 @@ def cache_answer_weights(torch, model, token_ids):
     weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
     model.register_buffer("quail_answer_weights", weights, persistent=False)
     model.quail_answer_token_ids = allowed
+    # lm_head can be the same module as embed_tokens; drop only this reference.
+    model.lm_head = None
 
 
 def answer_weights(model, token_ids):
-    """Return the cached rows for a query's answer token ids."""
+    """Return the retained rows for a query's answer token ids."""
     if tuple(token_ids) != model.quail_answer_token_ids:
-        raise ValueError("Query answer token ids differ from the loaded model's cached rows")
+        raise ValueError("Query answer token ids differ from the loaded model's retained rows")
     return model.quail_answer_weights
 
 
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids=None):
-    """Load model weights and cache the TRUE/FALSE output rows."""
+    """Load model weights and retain only TRUE/FALSE output rows."""
     import torch
     from vllm.config import set_current_vllm_config
     from vllm.engine.arg_utils import EngineArgs
@@ -126,7 +128,7 @@ def load_model(model_name: str, revision: str | None = None, *,
         tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
         true_ids, false_ids = true_false_ids(tokenizer)
         answer_token_ids = true_ids | false_ids
-    cache_answer_weights(torch, model, answer_token_ids)
+    retain_answer_head(torch, model, answer_token_ids)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     return model

@@ -109,7 +109,7 @@ def _profile(model_name: str, revision: str | None) -> dict:
 
     from quail.executor.model import (
         _install_single_rank_groups,
-        cache_answer_weights,
+        retain_answer_head,
     )
 
     t0 = time.perf_counter()
@@ -127,7 +127,7 @@ def _profile(model_name: str, revision: str | None) -> dict:
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
     true_ids, false_ids = true_false_ids(tokenizer)
-    cache_answer_weights(torch, model, true_ids | false_ids)
+    retain_answer_head(torch, model, true_ids | false_ids)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     phases["get_model_s"] = round(time.perf_counter() - t0, 2)

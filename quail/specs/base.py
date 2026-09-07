@@ -32,6 +32,8 @@ class ModelSpec:
     #                             Embeddings and quant scales sit
     #                             outside the dense param count, so the
     #                             measured number is larger.
+    vocab: int = 0       # vocabulary rows in the embedding and lm_head
+    tied_head: bool = False    # lm_head shares the embedding tensor
     weight_precision: Precision = "fp8"
     attention_precision: Precision = "bf16"
 
@@ -47,8 +49,25 @@ class ModelSpec:
 
     @property
     def W_mem(self) -> float:
-        """Weight bytes resident on the GPU."""
+        """Weight bytes as loaded, before the full untied head is discarded."""
         return self.w_mem_bytes or self.params * self.w_bytes
+
+    @property
+    def head_mem_bytes(self) -> float:
+        """Bytes of an untied bf16 lm_head weight; 0 when tied.
+
+        The executor discards this matrix after retaining its TRUE/FALSE
+        rows. Both Qwen3 checkpoints store the
+        head in bf16, hence the 2 bytes per element.
+        """
+        if self.tied_head:
+            return 0.0
+        return self.vocab * self.hidden * 2.0
+
+    @property
+    def W_resident(self) -> float:
+        """Weight bytes resident on the GPU after boot."""
+        return self.W_mem - self.head_mem_bytes
 
     @property
     def act_per_token(self) -> float:
