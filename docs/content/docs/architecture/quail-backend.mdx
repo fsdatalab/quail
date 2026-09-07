@@ -89,8 +89,8 @@ image:
   log-sum-exp merge between fresh tokens and arena pages.
 - `loop.py`: `run_filter`, `run_join`, answer readout, and kernel
   warmup.
-- `model.py`: weight loading through vLLM's loader, retaining only
-  TRUE/FALSE output rows. Shared input embeddings remain available.
+- `model.py`: weight loading through vLLM's loader, with cached
+  TRUE/FALSE output rows for scoring. The full model stays on the GPU.
 
 The fused kernels assume the Qwen3 architecture: QK-norm before rope,
 gated SiLU MLP, fp8 block-quantized weights.

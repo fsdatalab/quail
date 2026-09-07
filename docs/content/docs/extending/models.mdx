@@ -23,8 +23,6 @@ QWEN3_4B_FP8 = ModelSpec(
     w_bytes=1.0,           # fp8
     hf_name="Qwen/Qwen3-4B-FP8",
     revision="96b30dc...", # pinned hub commit hash
-    vocab=151936,
-    tied_head=True,
 )
 ```
 
@@ -34,9 +32,9 @@ worker resolves the weights from its cache without hub round trips.
 `w_mem_bytes` is the measured weight footprint as loaded; leave it 0
 to fall back to `params * w_bytes`.
 
-Derived properties the planner uses: `kappa` (KV bytes per token),
-`W_resident` (weight bytes on the GPU after the full untied output head
-is discarded), and `act_per_token`.
+Derived properties the planner uses include `kappa`, which is the KV
+bytes per token, `W_mem`, which is the full weight footprint on the GPU,
+and `act_per_token`, which is the peak activation bytes per token.
 
 Register it in `quail/specs/__init__.py` for a built in model, or from
 an extension:

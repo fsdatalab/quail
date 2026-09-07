@@ -13,11 +13,7 @@ QWEN3_32B_FP8 = ModelSpec(
     w_bytes=1.0,           # fp8 weights
     hf_name="Qwen/Qwen3-32B-FP8",
     revision="aa55da1ecc13d006e8b8e4f54579b1ea8c3db2df",
-    w_mem_bytes=34.37e9,   # measured as-loaded footprint: fp8 weights
-    #                        + two bf16 vocab matrices (embedding and
-    #                        untied lm_head) + block scales. The head
-    #                        (head_mem_bytes, 1.56e9) is discarded
-    #                        after extracting answer rows.
-    vocab=151_936,
-    tied_head=False,       # separate lm_head; discarded after extracting answer rows
+    w_mem_bytes=34.37e9,   # measured as-loaded footprint: fp8 weights,
+    #                        bf16 embedding and output matrices, and
+    #                        block scales
 )

@@ -970,17 +970,11 @@ comparison and the margin are exact: TRUE and FALSE scores shift by
 the same softmax normalizer, so dropping the other vocabulary rows
 changes neither.
 
-`load_model` extracts the TRUE/FALSE output rows once and discards the
-full output head. It keeps the small answer matrix on the GPU for all
-queries using that loaded model. A query with different answer token IDs
-is rejected before inference. The worker supplies those IDs at boot;
-standalone loading derives them from the model's tokenizer.
-
-At Qwen3 32B, the separate output matrix contains 151,936 x 5,120 bf16
-values, or 1.56 GB. No full CPU copy remains. GPU weight accounting still
-subtracts `ModelSpec.head_mem_bytes`, as before. Qwen3 4B shares its output
-weights with the input embeddings; dropping the output-head reference
-preserves the input embeddings. Both answerers reuse the retained rows.
+`load_model` caches the TRUE/FALSE output rows once, and keeps the full
+model resident on the GPU. Both answerers reuse the cached rows. A query
+with different answer token IDs is rejected before inference. The worker
+supplies those IDs at boot, and standalone loading derives them from the
+model's tokenizer.
 
 `AsyncAnswers` (`loop.py:92`) makes the readout non-blocking: it
 computes the answer bits on GPU, copies them to pinned host memory
