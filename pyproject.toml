@@ -37,6 +37,26 @@ packages = ["quail"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I import order, N naming, D docstrings
+# (Google style). D1xx (missing docstrings) stays off until the backlog
+# of undocumented public methods is written.
+select = ["E", "F", "W", "I", "N", "D"]
+# N803/N806: Triton kernels take upper-case constexpr arguments and
+# shape variables (H, KH, D) by convention. N812: torch.nn.functional
+# is imported as F everywhere.
+ignore = ["D1", "N803", "N806", "N812"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["quail", "experiments", "reports"]
+
 [tool.vulture]
 paths = ["quail"]
 min_confidence = 70

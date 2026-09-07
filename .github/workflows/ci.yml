@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - name: Lint (ruff)
+        run: uv run --frozen ruff check quail tests experiments reports tools
+      - name: Long string literals
+        run: uv run --frozen python tools/check_long_strings.py
+      - name: Dead code (vulture)
+        run: uv run --frozen vulture
+      - name: Tests
+        run: uv run --frozen pytest -q
