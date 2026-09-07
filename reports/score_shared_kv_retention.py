@@ -29,7 +29,6 @@ from quail.bench.quailb import queries
 from quail.catalog import DocumentProvider
 from quail.runtime.result import true_answer_rows
 
-
 COLLECTION = "gt_77bb8b128743a79aedddaa24c808c3f8"
 ROOT = "ground_truth/quailb/schema_v1"
 
@@ -40,10 +39,11 @@ def compare_answers(root):
     assert names == {path.name for path in (root / "shared").glob("*.parquet")}
     assert len(names) == 7
     for name in sorted(names):
-        tables = [pq.read_table(root / label / name) for label in ("first_anchor", "shared")]
+        tables = [pq.read_table(root / label / name)
+                  for label in ("first_anchor", "shared")]
         columns = sorted(tables[0].column_names)
-        ordered = [table.select(columns).sort_by([(name, "ascending") for name in columns])
-                   for table in tables]
+        order = [(name, "ascending") for name in columns]
+        ordered = [table.select(columns).sort_by(order) for table in tables]
         assert ordered[0].equals(ordered[1]), name
         print(f"{name}: {len(ordered[0]):,} identical answers")
 
@@ -53,15 +53,17 @@ def main(workdir):
     root = Path(workdir)
     compare_answers(root)
     files = ModalVolumeFiles()
-    collection = json.loads(files.read_bytes(f"{ROOT}/collections/{COLLECTION}/manifest.json"))
+    collection = json.loads(files.read_bytes(
+        f"{ROOT}/collections/{COLLECTION}/manifest.json"))
     collection["label_sets"] = {
         key: value for key, value in collection["label_sets"].items()
         if key.startswith("quailb.fever.") and not key.endswith("contains_date")
     }
     truth = _load_ground_truth_collection(files, collection)
     corpus = {
-        name: pq.read_table(io.BytesIO(files.read_bytes(f"quailb_data/sf0.1/{name}.parquet")),
-                            columns=list(CORPUS_COLUMNS[name]))
+        name: pq.read_table(
+            io.BytesIO(files.read_bytes(f"quailb_data/sf0.1/{name}.parquet")),
+            columns=list(CORPUS_COLUMNS[name]))
         for name in ("claims", "evidence")
     }
     manifest = json.loads(files.read_bytes(

@@ -1,13 +1,14 @@
-"""Plot pre-planned versus continuous join batching on IMDB-8, FEV-7, FEV-9.
+r"""Plot pre-planned versus continuous join batching on IMDB-8, FEV-7, FEV-9.
 
 Pull the comparison directory off the volume (the stamp is in the
 report), then run this script on it:
 
     W=/tmp/quail-join-continuous-batching; mkdir -p "$W"
-    uv run modal volume get quail-results \\
+    uv run modal volume get quail-results \
       ablations/join-continuous-batching-<stamp> "$W" --force
-    uv run --with matplotlib python \\
-      reports/make_join_continuous_batching_plots.py "$W/join-continuous-batching-<stamp>"
+    uv run --with matplotlib python \
+      reports/make_join_continuous_batching_plots.py \
+      "$W/join-continuous-batching-<stamp>"
 
 Writes plots/join_continuous_batching.png: query seconds per query and
 configuration on the left, and the seconds spent inside the join nodes

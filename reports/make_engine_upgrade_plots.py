@@ -1,4 +1,4 @@
-"""Plot query time before and after the engine image upgrade.
+r"""Plot query time before and after the engine image upgrade.
 
 Compares the six-query run on vLLM 0.28.0, SGLang 0.5.19, and CUDA
 13.3.1 with the same queries from the full run on vLLM 0.26.0, SGLang
@@ -10,11 +10,13 @@ files into two work directories:
       R=benchmarks/quailb/family-runs/$2-quailb-sf0.1-lf1-qwen3-4b-fp8-families
       modal volume get quail-results $R/manifest.json $D/manifest.json
       for m in quail stock_vllm pipelined_vllm pipelined_sglang; do
-        p=$(python3 -c "import json; print(json.load(open('$D/manifest.json'))['result_volume_paths']['$m'].removeprefix('/results/'))")
+        p=$(python3 -c "import json; m = json.load(open('$D/manifest.json')); \
+          print(m['result_volume_paths']['$m'].removeprefix('/results/'))")
         modal volume get quail-results $p $D/$m.json
       done
     done
-    uv run --with matplotlib python reports/make_engine_upgrade_plots.py <workdir>/OLD <workdir>/NEW
+    uv run --with matplotlib python reports/make_engine_upgrade_plots.py \
+      <workdir>/OLD <workdir>/NEW
 
 The queries compared are the ones the new run contains. The script
 prints the per query table and writes plots/engine_upgrade_check.png.
