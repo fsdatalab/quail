@@ -16,6 +16,9 @@ calling process, or on Modal.
   generic runner, token store, results, and the Modal worker. `bench/`
   is the QUAIL-B benchmark; its [README](quail/bench/README.md) explains
   how to run it and label a new predicate.
+- `demos/` has runnable examples for a machine with a GPU:
+  `local_gpu_smoke.py` runs one filter over four short documents, and
+  `imdb_ending_filter.py` filters all 100,000 IMDB reviews.
 - `quail_ext_examples/` has example extensions.
 - `tests/` is the CPU suite. It runs in seconds and needs no GPU.
 - `experiments/` holds every Modal entry point that costs GPU time: the

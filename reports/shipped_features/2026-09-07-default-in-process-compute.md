@@ -57,7 +57,7 @@ and the NVIDIA libraries, about 7.8 GB on disk. CI on `ubuntu-latest`
 installs them too.
 
 Measured on a Nebius VM, one H100 SXM, Ubuntu 24.04, CUDA 13 driver,
-running `docs/examples/local_gpu_smoke.py` with the default provider
+running `demos/local_gpu_smoke.py` with the default provider
 and Qwen3 4B fp8, first run on the machine:
 
 | Number | Value | Compared with |
