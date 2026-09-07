@@ -8,12 +8,30 @@
   does not establish a complete breakdown of request preparation,
   communication, or other Python work.
 
-[Open the vector PDF](plots/bio3_join_profile.pdf)
+[Open the interactive CPU flame graph](plots/bio3_join_profile.html) or
+[the vector PDF](plots/bio3_join_profile.pdf).
 
-[![BIO-3 join GPU and scheduler activity](plots/bio3_join_profile.png)](plots/bio3_join_profile.pdf)
+[![BIO-3 recorded CPU operations](plots/bio3_join_profile.png)](plots/bio3_join_profile.pdf)
 
 Figure: plots/bio3_join_profile.png
 
+- Each rectangle's width is summed elapsed seconds across calls with the
+  same recorded name and parent. Children appear below their parent.
+  Horizontal position is not query time. Click to zoom and hover to read
+  the complete name, call count, elapsed time, and time without recorded
+  child operations. The PDF shows the largest operations and first eight
+  levels; the HTML includes smaller operations and deeper levels.
+- This is a graph of nested recorded CPU operations, not sampled Python
+  call stacks. It uses `cpu_op`, `cuda_runtime`, and the explicit
+  `vllm.scheduler.*` annotations on worker thread 92. Broad execution
+  context markers are omitted. Each elapsed interval counts once at its
+  depth, with repeated calls aggregated under their recorded parent.
+- The 406.37 seconds labeled `[no recorded CPU operation]` are time outside
+  those recorded operations. They can include Python work, waiting, and
+  profiling overhead. They are not a measurement of CPU or GPU idle time.
+- The trace does not record Python calls inside `vllm.scheduler.schedule`.
+  Zooming cannot supply that missing breakdown. Other operations, such as
+  the recorded PyTorch attention calls, do have nested recorded children.
 ## Setup
 
 - The experiment runs BIO-3 with Qwen3 4B FP8 on one H100. BIO-3 filters
@@ -67,9 +85,9 @@ Figure: plots/bio3_join_profile.png
 
 | Recorded operation | Elapsed seconds | Seconds while GPU idle |
 |---|---:|---:|
-| Choose next batch | 189.47 | 160.47 |
-| Add request to scheduler | 24.94 | 14.30 |
-| Process model answers in scheduler | 51.41 | 21.82 |
+| `vllm.scheduler.schedule` | 189.47 | 160.47 |
+| `vllm.scheduler.add_request` | 24.94 | 14.30 |
+| `vllm.scheduler.update_from_output` | 51.41 | 21.82 |
 
 - The driver trace's join annotation spans 965.50 seconds. Its small
   difference from the wrapper's 965.53-second timer is profiler context
@@ -127,6 +145,10 @@ uv run modal run --detach experiments/profile_vllm_join.py --query BIO-3 \
 - Profile summary: `result.json` within that directory. The CPU/CUDA
   worker trace is `join-0/worker.trace.json.gz`, and the driver CPU trace
   is `join-0/driver.trace.json.gz`. The worker trace is 229,013,486 bytes.
+- The aggregated CPU flame graph is saved as `cpu-flamegraph.json` in
+  that directory. `experiments/profile_flamegraph.py` constructs it from
+  the worker trace, clipped to the driver's join annotation. CPU intervals
+  are sorted by start time and nesting, and crossing intervals are rejected.
 - Profiled answers and engine report:
   `/results/benchmarks/quailb/runs/qb_20260907T013342Z_31dd2183/single/BIO-3.json`.
   Its `answer_tables` lists the filter and join Parquet files. We compared

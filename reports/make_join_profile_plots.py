@@ -54,11 +54,11 @@ from plot_colors import BLUE, GRAY
 
 HERE = Path(__file__).resolve().parent
 SCOPES = [
-    ("scheduler.get_next_batch_to_run", "Choose next batch", BLUE),
-    ("scheduler.process_batch_result", "Process model answers", BLUE),
-    ("scheduler.recv_requests", "Poll for requests", GRAY),
-    ("scheduler.process_input_requests", "Process incoming requests", GRAY),
-    ("scheduler.run_batch", "Submit model computation", GRAY),
+    ("scheduler.get_next_batch_to_run", "scheduler.get_next_batch_to_run", BLUE),
+    ("scheduler.process_batch_result", "scheduler.process_batch_result", BLUE),
+    ("scheduler.recv_requests", "scheduler.recv_requests", GRAY),
+    ("scheduler.process_input_requests", "scheduler.process_input_requests", GRAY),
+    ("scheduler.run_batch", "scheduler.run_batch", GRAY),
 ]
 
 

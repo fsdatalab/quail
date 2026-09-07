@@ -216,6 +216,9 @@ effectiveness research:
   decorative gridlines.
 - Label data directly on or next to bars/points. Use a legend only
   when direct labels would overlap or repeat.
+- In profiling plots, use the original function or operation names from
+  the trace, such as `vllm.scheduler.schedule` or `scheduler.run_batch`.
+  Do not replace them with descriptive labels.
 - State the unit on every axis, and make the axis label the unit and
   nothing else: "microseconds per fresh token", not "wall
   microseconds per fresh token (IMDB-7, profiled run)". Context
