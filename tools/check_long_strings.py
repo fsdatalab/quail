@@ -9,7 +9,8 @@ clearly content rather than code:
 - it is the value (or inside the list, tuple, or dict value) of an
   assignment to a name containing PROMPT, TEMPLATE, SQL, QUERY, HTML,
   or TEXT, in any case;
-- it lives in a module whose file name contains "prompt";
+- it lives in a prompts module or folder: any part of the file path
+  contains "prompt" (quail/bench/prompts.py, experiments/prompts/x.py);
 - it looks like HTML (starts with "<" and ends with ">") or SQL (starts
   with SELECT, WITH, INSERT, CREATE, or UPDATE).
 
@@ -89,7 +90,7 @@ def _looks_like_content(text):
 
 def long_strings(path, limit):
     """Yield (line, length) for every over-limit literal in one file."""
-    if "prompt" in path.name.lower():
+    if any("prompt" in part.lower() for part in path.parts):
         return
     tree = ast.parse(path.read_text(), filename=str(path))
     exempt = _docstring_ids(tree) | _content_ids(tree)

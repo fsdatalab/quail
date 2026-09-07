@@ -46,8 +46,9 @@ CI runs these on every pull request. Run them before pushing:
   characters, counted after the parser joins adjacent pieces, so a
   long string cannot hide by spanning lines. A long literal is allowed
   when it is clearly content: assigned to a name containing PROMPT,
-  TEMPLATE, SQL, QUERY, HTML, or TEXT, kept in a module whose file
-  name contains "prompt", or plainly HTML or SQL. Docstrings are
+  TEMPLATE, SQL, QUERY, HTML, or TEXT, kept in a prompts module or
+  folder (any part of the path contains "prompt"), or plainly HTML or
+  SQL. Docstrings are
   exempt. Long messages, log lines, and strings built inline in a call
   get shortened; long content gets named for what it is.
 
