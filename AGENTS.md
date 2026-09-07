@@ -42,11 +42,14 @@ CI runs these on every pull request. Run them before pushing:
 - Ruff enforces line length 88, import order, naming, and Google style
   docstrings (`[tool.ruff]` in `pyproject.toml`). Missing docstrings
   are not yet flagged; that rule turns on once the backlog is written.
-- `tools/check_long_strings.py` flags any string literal over 200
+- `tools/check_long_strings.py` flags a string literal over 200
   characters, counted after the parser joins adjacent pieces, so a
-  long string cannot hide by spanning lines. Docstrings are exempt.
-  Long text (prompts, SQL, HTML) lives in a data file next to the
-  code that reads it.
+  long string cannot hide by spanning lines. A long literal is allowed
+  when it is clearly content: assigned to a name containing PROMPT,
+  TEMPLATE, SQL, QUERY, HTML, or TEXT, kept in a module whose file
+  name contains "prompt", or plainly HTML or SQL. Docstrings are
+  exempt. Long messages, log lines, and strings built inline in a call
+  get shortened; long content gets named for what it is.
 
 # Naming in this project
 
