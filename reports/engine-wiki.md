@@ -41,7 +41,7 @@ execution request to the compute provider.
 | `planner/retention.py` | Expected length allocations and future anchor use probabilities | joins, qwen3_cost, executor/retention |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
-| `executor/pack.py` | Chunk packing (pack_stream, FilterAdmission) | nothing |
+| `executor/pack.py` | Chunk admission (JoinAdmission, FilterAdmission) | nothing |
 | `executor/loop.py` | Execution loops (run_filter, run_join, warm_kernels) | arena, attention, pack |
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
 | `runtime/session.py` | Session, Query, tokenization, input binding, and result assembly | catalog, logical, planner, sqlfront, builder |
@@ -676,15 +676,27 @@ single forward pass, sharing KV across them through a paged arena.
 
 There are two packing strategies, one for each query shape:
 
-**For joins: `pack_stream`** (`pack.py:57`). Given a list of anchors
-with their suffix lists (one suffix per partner document), brim-pack
-them into chunks. Each chunk is a list of groups; each group is one
-anchor with a contiguous slice of its partner suffixes. An anchor's
-prefix is packed at most once: if the budget cuts an anchor's stream
-mid-chunk, the anchor continues in the next chunk reading its prefix
-KV from the arena instead of recomputing it. The function returns the
-chunks and the set of anchors whose KV must be written to the arena
-(because their stream was cut or a later stage needs them).
+**For joins: `JoinAdmission`** (`pack.py`). Continuous admission
+keyed on anchors. Each chunk is a list of groups; each group is one
+anchor with a contiguous slice of its partner suffixes at the anchor's
+current stage. Each chunk fills in priority order:
+1. Partner streams the previous chunk cut. The anchor continues
+   reading its prefix KV from the arena instead of recomputing it.
+2. Anchors starting their next stage.
+3. Fresh anchors, in queue order, whenever their page-rounded prefix
+   (plus frame room) fits the free list. Anchors whose prefix KV is
+   already resident go first and pack no prefix tokens.
+
+An anchor's prefix is packed at most once and its KV is always
+written to its pages. Stages mix in one chunk, so the gate between
+stages never leaves the GPU idle: an anchor advances as soon as its
+whole stream at the current stage is launched and one partner
+answered TRUE, and its remaining answers fill in while the next stage
+runs. An anchor whose partners all answered FALSE at a stage before
+the last frees its pages at once. The pre-planned packer this
+replaced (`pack_stream`, removed 2026-09-07) laid out one stage for a
+whole arena-sized group of anchors, then waited for every answer
+before packing the next stage.
 
 **For filters: `FilterAdmission`** (`pack.py:184`). Continuous
 admission with two bins: tokens (the chunk budget) and pages (the
@@ -740,24 +752,48 @@ for each (doc, stage, answer):
         add (doc, stage+1) to the ready queue
 ```
 
-### Pseudocode: pack_stream (join packing)
+### Pseudocode: JoinAdmission scheduling
 
 ```
-for each anchor a in order:
-    placed = (a's KV is already in the arena)
-    for each group of suffixes that fits the chunk budget:
-        if not placed:
-            include a's prefix tokens in the group
-            placed = true
-        else:
-            group reads a's KV from arena (no prefix tokens)
-        add the group to the current chunk
-        if chunk is full:
-            emit chunk, start a new one
-    if a's stream was cut (suffixes remain):
-        mark a's KV for arena write
-    if a later stage needs a:
-        mark a's KV for arena write
+while not done:
+    room = chunk_budget
+    groups = []
+
+    # priority 1 and 2: placed anchors - cut streams at the front of
+    # the ready queue, then anchors starting their next stage
+    for each anchor a in the ready queue (oldest first):
+        j, i = a's stage, a's next partner
+        cost = suffix[j][i] (+ frame[j] when i == 0)
+        if cost > room: break
+        end = the longest partner run from i that fits room
+        add (a, j, i, end, carried=false) to groups
+        room -= tokens of the run
+        if end < partners at stage j: a returns to the front
+
+    # priority 3: fresh anchors
+    for each anchor a in the pending queue (resident first, FIFO):
+        pages_needed = a's prefix + frame room, minus pages it holds
+        if pages_needed > free_pages:
+            stop granting pages behind it (queue-order guarantee);
+            only anchors needing no pages may still pack
+        cost = prefix (0 when resident) + suffix[0][0] + frame[0]
+        if cost > room: skip (chunk room only; retry next chunk)
+        claim pages, add (a, 0, 0, end, carried=not resident)
+
+    return groups
+```
+
+When a group's answers arrive:
+```
+record the bits in a's stage-j row
+if j is before the last stage and a is still at stage j:
+    if a's whole stage-j stream is launched and any bit was TRUE:
+        advance a to stage j+1 (the ready queue)
+    elif every stage-j partner answered and none was TRUE:
+        drop a: free its pages
+if j is the last stage and the row is complete:
+    finish a: anchor_done decides retain or free
+```
 ```
 
 ### 4.2 The paged KV arena
@@ -1001,10 +1037,10 @@ answers. This overlaps GPU compute with answer readback.
 | `Pipeline.custom_norm_quant` | `attention.py:235` | Fused residual-add + RMSNorm + fp8 quant (Triton) |
 | `Pipeline.custom_qk_norm_rope` | `attention.py:248` | Fused QK-norm + RoPE (Triton) |
 | `pack_chunk` | `loop.py:125` | Build GPU tensors for one chunk from group specs. Document tokens stay as Arrow slices until the selected parts are copied once into a pinned CPU tensor, then uploaded to the GPU in one transfer. |
-| `pack_stream` | `pack.py:57` | Brim-pack the join's tuple list into chunks (join path) |
+| `JoinAdmission` | `pack.py` | Continuous anchor admission scheduler (join path) |
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
 | `run_filter` | `loop.py:462` | The filter chain execution loop |
-| `run_join` | `loop.py:241` | The join execution loop (one cross-product stage per join; multi-stage gating stays available to GPU cells) |
+| `run_join` | `loop.py` | The join execution loop: JoinAdmission chunks, stages mixed, anchors gated as their answers return |
 | `warm_kernels` | `loop.py` | Boot warmup policy: compile pass once ever (marker on the kernel-cache volume), touch pass per container |
 | `Answerer` | `loop.py:60` | TRUE/FALSE scoring from final hidden states |
 | `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
@@ -1063,27 +1099,44 @@ contiguous causal call the fast path runs, with 0 answer flips at
 scale (measurement cells and data removed in the 2026-08-29
 ablation cleanup; git history).
 
-**`run_join`** (`loop.py:216`): the join driver. The pair list is
-pre-planned by `pack_stream`, then chunks are launched in order.
-Between stages, answers are gated: anchors with no surviving pairs
-are dropped, and their pages are freed. The driver also prefetches
-the next group's stage-0 chunk while waiting on the current group's
-gate (which cannot be planned past until answers arrive), keeping the
-GPU fed across gate boundaries. A per-stage frame, if present, is
-written into the anchor's kept KV once after the document rows.
+**`run_join`** (`loop.py`): the join driver. It has the same shape as
+`run_filter`. A while loop runs until `JoinAdmission.done()`:
+1. If the last chunk left a fresh anchor waiting for pages, evict
+   retained KV nothing in this join reads, for exactly the shortfall.
+2. Build a chunk from the scheduler's `next_chunk()` against the
+   arena's free list.
+3. Activate each group's anchor key (allocating pages for a fresh
+   anchor, growing a resident one to make frame room), pack the
+   chunk, run the forward pass, submit the answers asynchronously.
+4. While the GPU runs the current chunk, read the previous chunk's
+   answers and report them to the scheduler. An anchor that fails a
+   gate before the last stage has its pages freed immediately. An
+   anchor whose last-stage row is complete goes to `anchor_done`,
+   which retains or frees it.
+
+There are no anchor groups any more. A gate holds back only the
+anchor it belongs to; every other anchor's work keeps the GPU busy
+while that anchor's answers return. A per-stage frame, if present, is
+written into the anchor's kept KV once after the document rows,
+ahead of its first partner at that stage. An anchor cannot start a
+stage while any of its chunks at the previous stage is still
+unlaunched, because the next frame overwrites the previous one in the
+same KV rows; once the whole stream is launched, stream order on the
+GPU keeps the reads ahead of the write.
 
 An anchor whose arena key is already resident - a kept filter
-survivor, or a kept anchor of an earlier group - packs no prefix
+survivor, or a kept anchor of an earlier join - packs no prefix
 tokens at all: the frame scatters into the kept pages and the tuple
-suffixes read the document KV that is already there. Kept pages
-without row room for this run's frame are freed and recomputed (a
-retained filter prefix can have less space than its join frame needs). With `keep_semantics` set, the group's gate
-survivors keep their pages at the end for a later group on the same
-table. Under allocation pressure the arena frees retained prefixes
-in increasing expected computation saved per KV page. The
-worker frees every kept key the moment its last consumer group is
-behind, and sweeps kept keys at query start and end - the arena
-outlives a query, kept KV must not.
+suffixes read the document KV that is already there. Every resident
+anchor is pinned when the join starts, so fresh admissions evict only
+KV this join does not read. A resident prefix short of row room for
+this run's frame grows by the missing pages at admission. With
+`keep_semantics` set, gate survivors keep their pages at the end for
+a later join on the same table. Under allocation pressure the arena
+frees retained prefixes in increasing expected computation saved per
+KV page. The worker frees every kept key the moment its last consumer
+join is behind, and sweeps kept keys at query start and end - the
+arena outlives a query, kept KV must not.
 
 ### 4.7 KV rewind (chain mode)
 
@@ -1163,11 +1216,10 @@ Compare this with stock vLLM, where each pair is a separate request:
 even with prefix caching, the engine re-reads the anchor's KV for
 every pair, and pays per-request scheduling overhead.
 
-The packing works through `pack_stream` (`pack.py:57`): given
-anchors and their suffix lists, brim-pack into chunks. An anchor
-whose stream is cut mid-chunk has its KV written to the arena; the
-continuation chunk reads the KV from the arena instead of
-recomputing it.
+The packing works through `JoinAdmission` (`pack.py`): anchors admit
+continuously and stream their partner lists; an anchor whose stream
+is cut mid-chunk continues at the front of the next chunk, reading
+its KV from the arena instead of recomputing it.
 
 ### Anchor KV sharing
 
@@ -1184,13 +1236,13 @@ Between join stages, gating drops anchors that had no surviving
 pairs. `gate()` (`pack.py:132`) returns anchor indices where any
 answer was TRUE. Dropped anchors' pages are freed immediately.
 
-The runtime gates a group of anchors at once. It adds anchors to a
-group until their page-rounded document and frame KV would fill the
-arena. It packs stage 1 for that group into full token-budget chunks,
-waits for the answers, and then packs the survivors for stage 2. It
-does not force one anchor per group. The page limit keeps every anchor
-needed by the group resident while unrelated retained KV can be
-evicted.
+The runtime gates each anchor on its own as its answers return.
+Anchors admit while their page-rounded document and frame KV fit the
+free list, so the arena, not a fixed group, bounds how many are
+resident at once. An anchor's stage 2 partners pack into whatever
+chunk is being built when its stage 1 answers arrive, beside other
+anchors' stage 1 work. Nothing waits for a whole group of anchors to
+answer.
 
 ### Dedup
 
@@ -1203,10 +1255,10 @@ the unique anchor set is what enters the next stage.
 ### Replay
 
 In a chain or star join, the anchor's KV from stage 1 is reused in
-stage 2. The `pack_stream` `keep` parameter tells the packer which
-anchors a later stage needs; their KV stays in the arena across the
-stage boundary. The `already_kept` parameter tells the packer which
-anchors' KV is already resident, so their groups do not pack fresh
+stage 2. An admitted anchor holds its pages until it fails a gate or
+finishes its last stage, so its KV stays in the arena across every
+stage boundary. `JoinAdmission`'s `resident` argument names the
+anchors whose KV is already in the arena, so their groups pack no
 prefix tokens.
 
 The same mechanism crosses operator boundaries through retention.
@@ -1227,11 +1279,11 @@ retained them, else their filter shards (`join_group_payloads`).
 tuples = cross product of surviving A indices x surviving C indices
 suffixes = for each tuple:
     label_A + doc_A + label_C + doc_C + answer_cue
-plan = pack_stream(anchors, suffixes, budget)
-for each chunk in plan:
+scheduler = JoinAdmission(anchor prefixes, suffixes per stage, budget)
+while not scheduler.done():
     # each stage writes its complete question frame into the anchor's
-    # kept KV, then its tuples stream
-    build, launch, collect answers
+    # kept KV, then its tuples stream; chunks mix anchors and stages
+    build scheduler.next_chunk(free pages), launch, report answers
 
 # an exists/anti gate is the two-table case of the same stage,
 # with the keep rule applied to the anchor's answers
