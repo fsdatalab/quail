@@ -17,6 +17,7 @@ import time
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.executor.model import answer_weights
 from quail.executor.pack import FilterAdmission, JoinAdmission
+from quail.progress import Progress
 
 
 def _tick(timing, key, t0):
@@ -435,6 +436,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order
+    progress = Progress(f"join ({k} stages)", total=n, unit="anchors")
+    finished = [0]
 
     def build(chunk_groups):
         specs = []
@@ -486,9 +489,11 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     a, j, start, end, bits[pos:pos + cnt]):
                 if kind == "finished":
                     settle(anchor)
+                    finished[0] += 1
                 elif keys[anchor] in owned:
                     arena.free_key(keys[anchor])
             pos += cnt
+        progress.update(finished[0])
 
     while not sched.done():
         if sched.blocked_pages:
@@ -515,6 +520,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             report(outstanding.pop(0))
     while outstanding:
         report(outstanding.pop(0))
+    progress.finish(f"join ({k} stages) done", f"{tokens:,} fresh tokens")
     return sched.answers, spans, tokens
 
 
@@ -799,6 +805,10 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         return dict(key=keys[doc], prefix=None, f=len(doc_ids[doc]) + p,
                     suffixes=[tails[stage]])
 
+    progress = Progress(f"filter ({len(question_ids)} stages)",
+                        total=len(doc_ids))
+    finished = [0]
+
     def report(entry):
         t = time.perf_counter() if timing is not None else 0.0
         groups, handle = entry
@@ -814,6 +824,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             if keep:
                 freed = arena.retain(keys[doc], len(doc_ids[doc]))
                 sched.add_free_pages(freed)
+            if not passed or last:
+                finished[0] += 1
+        progress.update(finished[0])
         _tick(timing, "report_rest", t)
 
     while not sched.done():
@@ -864,4 +877,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         report(outstanding.pop(0))
     for doc in sched.drain_ready():
         arena.free_key(keys[doc])
+    progress.finish(f"filter ({len(question_ids)} stages) done",
+                    f"{tokens:,} fresh tokens")
     return sched.answers, spans, tokens

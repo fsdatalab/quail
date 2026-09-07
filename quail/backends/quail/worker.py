@@ -30,6 +30,7 @@ from quail.physical import (
     decode_graph,
 )
 from quail.planner import budgets
+from quail.progress import say
 from quail.runtime.runner import ExecutionContext
 from quail.runtime.tokens import (
     DocumentPrefixes,
@@ -125,6 +126,7 @@ def _boot_gpu(state, backend, spec, device, gpu_index, workers,
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
                 pipeline_s=0.0, warm_kernels_s=0.0)
     if "model_execution" not in state:
+        say(f"loading {spec.hf_name} onto GPU {gpu_index}")
         t0 = time.perf_counter()
         model = load_model(spec.hf_name, revision=spec.revision,
                            answer_token_ids=answer_token_ids)
@@ -228,6 +230,8 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
                 payload["chunk_tokens"])
     _warm(state, boot)
     _finish_boot(boot, t_boot)
+    say(f"model ready, boot {boot['boot_s']} s ({boot['kind']}); "
+        "running the query")
 
     report = execute_single(state, payload, registry, graph)
     outputs = report.pop("_outputs")

@@ -75,6 +75,29 @@ and Qwen3 4B fp8, first run on the machine:
 | `boot_s` | 218.9 s | includes the 189 s one-time kernel compile pass |
 | `worker_total_s` | 225.6 s | boot plus query plus tokenizing |
 
+Then `demos/imdb_ending_filter.py` with one filter over all 100,000
+IMDB reviews (29.7 M document tokens), same machine, kernels cached:
+
+| Number | Value | Compared with |
+| --- | --- | --- |
+| matching reviews | 28,296 of 100,000 | the 0.25 selectivity hint |
+| `boot_s` | 10.87 s | 218.9 s on the first run, before the kernel cache |
+| `wall_s` | 262.45 s | predicted 240 s from document tokens alone |
+| `fresh_tokens` | 32,216,778 | 29.7 M document tokens plus 25 question tokens per review |
+| documents/second | 381 | 351 on QUAIL-B IMDB-1, 5,000 reviews |
+| $/query | $0.2879 | about $4.89 for the same 32.2 M input tokens on GPT-4o mini at $0.15 per 1 M input tokens and $0.60 per 1 M output tokens (list price, 2026-09-07), or $2.45 through its batch API |
+
+The prediction missed by 8% because it counted document tokens only.
+At 32.2 M fresh tokens, the IMDB-1 rate of 123,000 tokens/s gives
+262 s, which is what was measured.
+
+Progress lines: `quail/progress.py` prints one line, prefixed
+`quail:`, when tokenizing starts, every five seconds while it runs,
+when the plan is ready, when the model starts loading and is ready,
+and every five seconds during a filter or join with the count of
+finished documents or anchors. Before, a 100k review query printed
+nothing between the plan and the result.
+
 Validation: `tests/test_default_compute.py` checks the default
 provider type, the error message without a GPU, and that a fake
 executor skips the check. Installed the locked dependencies on a Linux

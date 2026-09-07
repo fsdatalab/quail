@@ -1,6 +1,7 @@
 """Register documents, plan queries, and run them through a compute provider."""
 
 import os
+import time
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
@@ -19,6 +20,7 @@ from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.physical import DocumentInput, PortRef, Project, ValueType, encode_graph
 from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
+from quail.progress import Progress, say
 from quail.runtime.compute import InProcessComputeProvider, QueryRequest
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
@@ -59,6 +61,12 @@ def pick_corpus_tokenizer(primary, fast, texts, sample=25):
             return primary, ("tokenizer: transformers (bpe-qwen "
                              "failed parity on this column's sample)")
     return fast, "tokenizer: bpe-qwen (parity-checked on sample)"
+
+
+# Rows tokenized between two progress checks. Small enough that a line
+# appears every few seconds; large enough that the per slice overhead
+# stays under one percent.
+TOKENIZE_ROWS = 2048
 
 
 class Session:
@@ -280,9 +288,22 @@ class Session:
                 column_writers[name] = ColumnStoreWriter(
                     self._store_path(), source_schema.field(name))
                 writers.append(column_writers[name])
+            progress = None
+            if column is not None:
+                say(f"tokenizing {provider_name}.{column} "
+                    f"({self.notes[-1].split(': ', 1)[-1]})")
+                progress = Progress(f"tokenizing {provider_name}.{column}")
+            rows = 0
             for batch in batches:
-                for writer in writers:
-                    writer.write_batch(batch)
+                # tokenize in slices so progress shows inside one large
+                # source batch
+                for start in range(0, batch.num_rows, TOKENIZE_ROWS):
+                    piece = batch.slice(start, TOKENIZE_ROWS)
+                    for writer in writers:
+                        writer.write_batch(piece)
+                    rows += piece.num_rows
+                    if progress is not None:
+                        progress.update(rows)
         except Exception:
             for writer in writers:
                 writer.abort()
@@ -291,6 +312,9 @@ class Session:
             scan_reader.close()
         token_store = (
             token_writer.finish() if token_writer is not None else None)
+        if progress is not None:
+            progress.finish(f"tokenized {provider_name}.{column}",
+                            f"{sum(token_store.lengths):,} tokens")
         column_stores = {
             name: writer.finish() for name, writer in column_writers.items()
         }
@@ -388,6 +412,7 @@ class Query:
                 )
                 self._token_inputs[s.alias] = store
                 self._doc_tokens[s.alias] = store.lengths
+            started = time.perf_counter()
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
@@ -397,6 +422,7 @@ class Query:
                 backend=self.session.config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer)
+            say(f"plan ready in {time.perf_counter() - started:.2f} s")
         return self._plan
 
     def explain(self) -> str:

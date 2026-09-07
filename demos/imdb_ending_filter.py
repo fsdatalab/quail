@@ -1,16 +1,20 @@
-"""Filter all 100,000 IMDB reviews for ones that discuss the ending.
+"""Filter all 100,000 IMDB reviews with two questions, both required.
 
 Runs on the GPU in this process with the default compute provider.
 Loads the three IMDB splits (train, test, unsupervised) from the
 pinned Hugging Face revision, registers them as one Arrow dataset,
-runs one AI.IF filter, and prints the plan, the row count, and the
-timing.
+runs a conjunction of two AI.IF filters over the same reviews, and
+prints the plan, the row count, the per-stage counts, and the timing.
 
-Prediction. The corpus tokenizes to 29.7 M tokens (mean 297 per
-review; 30.7 s to tokenize and plan on a 16 core CPU). QUAIL-B IMDB-1
-ran one filter over 5,000 reviews at 123,000 fresh tokens per second on
-the Quail backend, so the query should take about 240 s and cost about
-$0.26 of H100 time.
+Prediction. One filter over these same reviews measured on a Nebius
+H100 SXM: 262.45 s, 32.2 M fresh tokens, 381 reviews/s, $0.2879, with
+28,296 reviews passing. In QUAIL-B, IMDB-6 (two filters) took 2.6%
+longer than IMDB-1 (one filter) with 0.85% more fresh tokens, because
+a survivor's second question adds only its own tokens while the
+review's KV is still on the GPU. So this query should take about
+270 s, about 32.5 M fresh tokens, about 370 reviews/s, about $0.30.
+The ending question (selectivity hint 0.25) runs first, and about
+28,000 reviews should reach the second question.
 
     uv run python demos/imdb_ending_filter.py 2>&1 | tee imdb_ending_filter.log
 """
@@ -33,6 +37,13 @@ SQL = """
             r.review
         ),
         {'selectivity': 0.25}
+    )
+    AND AI.IF(
+        PROMPT(
+            'Does the reviewer recommend watching the movie?\\n\\n{0}',
+            r.review
+        ),
+        {'selectivity': 0.5}
     )
 """
 
@@ -69,8 +80,12 @@ def main() -> None:
         report = result.report
         wall_s = report["wall_s"]
         print(f"matching reviews: {table.num_rows} of {n_docs}")
+        for stage in report.get("stages", ()):
+            if stage.get("op") == "filter":
+                print(f"  stage evaluated {stage['evaluated']} reviews, "
+                      f"{stage['observed_selectivity']:.3f} passed")
         print(f"boot_s: {report.get('boot_s')} ({report.get('boot_kind')})")
-        print(f"wall_s: {wall_s}  (predicted about 240 s)")
+        print(f"wall_s: {wall_s}  (predicted about 270 s)")
         print(f"fresh_tokens: {report.get('fresh_tokens')}")
         print(f"documents/second: {n_docs / wall_s:.1f}")
         print(f"$/query: {wall_s / 3600 * H100_USD_PER_HOUR:.4f}")
