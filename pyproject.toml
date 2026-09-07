@@ -40,6 +40,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["quail"]
 
+[tool.uv]
+# uv's own Python builds ship the C headers Triton needs when vLLM
+# compiles its CUDA helper at startup; distro Pythons often do not.
+python-preference = "only-managed"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

@@ -29,13 +29,12 @@ loaded until `Session.close()`. If the process has no CUDA GPU, `run()`
 raises a `RuntimeError` that says so and names the Modal provider.
 
 The machine needs an NVIDIA driver that supports CUDA 13 (version 580
-or newer), a C compiler, and the Python headers. Triton, which vLLM
-uses for GPU kernels, compiles a small C helper at startup and fails
-with a `gcc` error when `Python.h` is missing. On Ubuntu 24.04:
-
-```bash
-sudo apt-get install -y python3.12-dev build-essential
-```
+or newer) and a C compiler. Triton, which vLLM uses for GPU kernels,
+compiles a small C helper at startup with `gcc`. NVIDIA GPU images
+include `gcc`; on a plain Ubuntu install, `sudo apt-get install -y
+build-essential` adds it. `uv sync` downloads its own Python build,
+which carries the C headers that helper needs, so the system Python
+and its header packages are not used.
 
 `docs/examples/local_gpu_smoke.py` runs one filter query in process and
 prints the rows and timing, for checking a new machine.

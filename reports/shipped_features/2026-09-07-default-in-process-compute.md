@@ -26,9 +26,13 @@ path already existed for the benchmark runner inside Modal functions.
 Anyone with their own GPU should be able to install the package and
 run a query in their own process.
 
-A local machine also needs a C compiler and the Python headers
-(`python3.12-dev` on Ubuntu), because Triton compiles a small C helper
-when vLLM starts. The install docs say so.
+A local machine also needs a C compiler, because Triton compiles a
+small C helper when vLLM starts. That helper also needs the Python C
+headers, which Ubuntu's system Python does not ship, so `[tool.uv]`
+now sets `python-preference = "only-managed"`: `uv sync` downloads its
+own Python 3.12 build, which includes them. Found on a Nebius H100 VM
+with Ubuntu 24.04, where the first run failed in `gcc` for the missing
+`Python.h`.
 
 Costs: the locked Linux install grows by vLLM, torch 2.11 (CUDA 13),
 and the NVIDIA libraries, about 7.8 GB on disk. CI on `ubuntu-latest`
