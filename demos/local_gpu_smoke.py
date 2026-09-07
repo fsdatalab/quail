@@ -1,6 +1,6 @@
 """Run one filter over four documents on the GPU in this process.
 
-    uv run python demos/local_gpu_smoke.py 2>&1 | tee local_gpu_smoke.log
+Run with: uv run python demos/local_gpu_smoke.py 2>&1 | tee local_gpu_smoke.log
 """
 
 import pyarrow as pa
