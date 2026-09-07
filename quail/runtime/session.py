@@ -19,7 +19,7 @@ from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.physical import DocumentInput, PortRef, Project, ValueType, encode_graph
 from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
-from quail.runtime.compute import ModalComputeProvider, QueryRequest
+from quail.runtime.compute import InProcessComputeProvider, QueryRequest
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
     ExecutionContext,
@@ -103,13 +103,14 @@ class Session:
         self._column_stores = {}
         self._store_count = 0
         self._token_directory = None
+        if compute_provider is None:
+            compute_provider = InProcessComputeProvider()
         self.compute_provider = compute_provider
 
     def close(self):
         """Close compute and temporary token storage."""
         try:
-            if self.compute_provider is not None:
-                self.compute_provider.close()
+            self.compute_provider.close()
         finally:
             for store in self._token_stores.values():
                 store.close()
@@ -405,9 +406,6 @@ class Query:
 
     def run(self) -> QueryResult:
         """Execute the query through the session compute provider."""
-        if self.session.compute_provider is None:
-
-            self.session.compute_provider = ModalComputeProvider()
         result = self.session.compute_provider.execute(self._request())
         if not isinstance(result, QueryResult):
             raise TypeError("a compute provider must return QueryResult")

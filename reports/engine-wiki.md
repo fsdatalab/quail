@@ -140,11 +140,12 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    validation, schema, and explain interface.
 4. The session creates one `QueryRequest`. The request contains the logical
    plan, table providers, model settings, and registered extensions.
-5. The selected compute provider runs the request. Modal is the default.
-   `ModalComputeProvider` sends a source description when the worker can open
-   the source. Otherwise, it sends only the raw Arrow columns used by the
-   query.
-6. The Modal worker opens the sources and reads bounded Arrow batches. It
+5. The selected compute provider runs the request. The in-process provider
+   is the default and runs the rest of these steps in the calling process,
+   which needs a CUDA GPU. `ModalComputeProvider` sends a source description
+   when the worker can open the source. Otherwise, it sends only the raw
+   Arrow columns used by the query.
+6. The worker (the calling process, or the Modal container) opens the sources and reads bounded Arrow batches. It
    tokenizes each batch and writes the tokens and document lengths to a
    temporary Arrow file, one per document column. Each value column the
    query returns goes to its own Arrow file in the same pass. Both are
@@ -445,8 +446,10 @@ when they would make the plan unreadable.
 `ComputeProvider` controls where a query runs. It has one `execute` method that
 accepts a `QueryRequest` and returns a `QueryResult`. The request contains the
 logical plan, table providers, model settings, and registered extensions. The
-default `ModalComputeProvider` selects the 1, 2, 4, or 8 GPU function in the
-existing `quail-engine` app. It builds the worker image with the selected
+default `InProcessComputeProvider` runs the request in the calling process,
+which needs a CUDA GPU and the backend's runtime package (vLLM is a package
+dependency on Linux). `ModalComputeProvider` selects the 1, 2, 4, or 8 GPU
+function in the existing `quail-engine` app. It builds the worker image with the selected
 backend package. Quail and vLLM workers install vLLM. SGLang workers install
 SGLang. Modal supplies the GPU container and function lifecycle. Quail does
 not run FastAPI, ASGI, REST, or another application server. A different

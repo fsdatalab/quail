@@ -2,7 +2,8 @@
 
 A query engine for AI_FILTER and AI_JOIN over document collections.
 Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
-32B fp8, one H100 per model copy, and workers run through Modal.
+32B fp8, one H100 per model copy. A query runs on the GPU in the
+calling process, or on Modal.
 
 ## Layout
 
@@ -10,8 +11,8 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
   are the front ends. `planner/` is planning and the cost model.
   `physical/` is the typed physical graph. `backends/` holds the backend
   interface, the Quail backend under `backends/quail/`, and the vLLM and
-  SGLang request backends. `executor/` is the GPU code and runs only
-  inside the Modal image. `runtime/` is the session, compute providers,
+  SGLang request backends. `executor/` is the GPU code and runs where
+  the model runs. `runtime/` is the session, compute providers,
   generic runner, token store, results, and the Modal worker. `bench/`
   is the QUAIL-B benchmark; its [README](quail/bench/README.md) explains
   how to run it and label a new predicate.
@@ -53,6 +54,15 @@ Quail is the default model backend. A normal user does not select it:
 import quail
 
 session = quail.Session()
+```
+
+`Session()` runs the model in the calling process. That process needs
+a CUDA GPU and vLLM, which the package installs on Linux. On a machine
+without a GPU, pass the Modal compute provider and the same query runs
+in a Modal Function:
+
+```python
+session = quail.Session(compute_provider=quail.ModalComputeProvider())
 ```
 
 The user selects a built in model through `EngineConfig` when the default
@@ -188,8 +198,11 @@ physical plan, creates one model execution object per GPU, and executes the
 physical plan inside the compute worker. Physical requests and responses are
 internal to the worker.
 
-Modal is the default compute provider. A compute provider implements one
-method:
+`InProcessComputeProvider` is the default compute provider. It runs the
+model in the calling process, so that process needs a CUDA GPU and the
+backend's runtime package. Without a GPU it raises a `RuntimeError` that
+names `ModalComputeProvider`, which runs the same query on Modal. A
+compute provider implements one method:
 
 ```python
 class ComputeProvider(Protocol):

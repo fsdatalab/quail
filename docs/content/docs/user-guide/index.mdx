@@ -1,10 +1,11 @@
 ---
 title: Installation
-description: Setting up the Python package and Modal.
+description: Setting up the Python package, with or without a local GPU.
 ---
 
-Quail is a Python package managed with `uv`. It needs Python 3.12. It
-does not need a local GPU: every model run happens on Modal.
+Quail is a Python package managed with `uv`. It needs Python 3.12. A
+query runs the model in your Python process by default, so that
+process needs a CUDA GPU. Without one, the same query runs on Modal.
 
 ```bash
 git clone https://github.com/fsdatalab/quail-exploration
@@ -12,15 +13,31 @@ cd quail-exploration
 uv sync
 ```
 
-`uv sync` installs the package and its client side dependencies:
-`sqlglot` for SQL parsing, `pyarrow` for tables and results,
-`transformers` and `bpe-qwen` for tokenization, `datasets` and
-`huggingface-hub` for Hugging Face sources, and the `modal` client.
+`uv sync` installs the package and its dependencies: `sqlglot` for SQL
+parsing, `pyarrow` for tables and results, `transformers` and
+`bpe-qwen` for tokenization, `datasets` and `huggingface-hub` for
+Hugging Face sources, the `modal` client, and on Linux the `vllm`
+runtime that loads the model. vLLM publishes Linux wheels only, so on
+macOS and Windows the package installs without it and queries run on
+Modal.
+
+## Local GPU
+
+`quail.Session()` uses `InProcessComputeProvider`. The first `run()`
+loads the model onto the GPU visible to the process and keeps it
+loaded until `Session.close()`. If the process has no CUDA GPU, `run()`
+raises a `RuntimeError` that says so and names the Modal provider.
 
 ## Modal
 
-The compute side runs as Modal Functions in the existing `quail-engine`
-app. You need a Modal account and a token on the client:
+Pass `ModalComputeProvider` to run the compute side as Modal Functions
+in the existing `quail-engine` app:
+
+```python
+session = quail.Session(compute_provider=quail.ModalComputeProvider())
+```
+
+You need a Modal account and a token on the client:
 
 ```bash
 uv run modal token new

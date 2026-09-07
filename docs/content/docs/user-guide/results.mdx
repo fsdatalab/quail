@@ -3,9 +3,13 @@ title: Results and explain
 description: Reading rows, counts, the execution report, and the plan.
 ---
 
-`Query.run()` returns a `QueryResult`. Under the default Modal compute
-provider the rows have already been materialized in the worker and
-returned as one Arrow table, so every accessor is cheap.
+`Query.run()` returns a `QueryResult`. Under `ModalComputeProvider`
+the rows have already been materialized in the worker and returned as
+one Arrow table, so every accessor is cheap. Under the default
+in-process provider the result is lazy: each accessor runs the final
+Arrow projection over the session's memory mapped token files, so call
+`collect()` once and keep the table if you need the rows more than
+once.
 
 ```python
 result = query.run()

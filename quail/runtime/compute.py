@@ -51,18 +51,40 @@ class ComputeProvider(Protocol):
     def close(self) -> None: ...
 
 
+def local_gpu_problem() -> str | None:
+    """Return why this process cannot run a model, or None when it can."""
+    try:
+        import torch
+    except ImportError:
+        return "torch is not installed"
+    if not torch.cuda.is_available():
+        return "no CUDA GPU is visible to this process"
+    return None
+
+
 class InProcessComputeProvider:
     """Run logical queries in the current process.
 
-    This is the provider for code that already runs where the GPUs
-    are, such as the benchmark runner inside a Modal function, and for
-    tests that fake the physical executor.
+    This is the default provider. The model loads where the Python
+    program runs, so the process needs a CUDA GPU and the backend's
+    runtime package (vLLM for the Quail and vLLM backends). Code that
+    already runs where the GPUs are, such as the benchmark runner
+    inside a Modal function, uses it too. Tests pass a fake physical
+    executor, which skips the GPU check.
     """
 
     def __init__(self, physical_executor=None):
         self._physical_executor = physical_executor
 
     def execute(self, request: QueryRequest) -> QueryResult:
+        if self._physical_executor is None:
+            problem = local_gpu_problem()
+            if problem is not None:
+                raise RuntimeError(
+                    f"cannot run the model in this process: {problem}. "
+                    "Pass compute_provider=quail.ModalComputeProvider() "
+                    "to Session to run on Modal instead."
+                )
         # local imports the session module, which imports this one
         from quail.runtime.local import execute_query_request
 

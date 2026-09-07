@@ -17,6 +17,12 @@ dependencies = [
     "modal[api-proxy-support]>=1.5.1",
     "bpe-qwen>=0.1.5",
     "datasets>=5.0.1",
+    # The in-process compute provider runs the model where the Python
+    # program runs, so the package needs the same vLLM the Modal image
+    # installs (`runtime_package` in quail/runtime/worker.py). vLLM
+    # only publishes Linux wheels; on other platforms the package
+    # installs without it and queries run through ModalComputeProvider.
+    "vllm==0.26.0; sys_platform == 'linux'",
 ]
 
 [dependency-groups]
