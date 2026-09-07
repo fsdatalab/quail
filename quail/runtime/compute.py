@@ -14,7 +14,6 @@ from quail.planner.plan import EngineConfig
 from quail.runtime.result import QueryResult
 
 
-
 @dataclass(frozen=True)
 class QueryRequest:
     """A logical query submitted to a compute provider."""
@@ -24,7 +23,8 @@ class QueryRequest:
     config: EngineConfig
     device: str
     order: str | None = None
-    registry: ExtensionRegistry = field(default_factory=ExtensionRegistry.with_built_ins)
+    registry: ExtensionRegistry = field(
+        default_factory=ExtensionRegistry.with_built_ins)
 
     def __post_init__(self) -> None:
         if not isinstance(self.logical_plan, LogicalPlan):
@@ -73,7 +73,6 @@ class InProcessComputeProvider:
 
 def _modal_request(request: QueryRequest) -> dict:
     """Prepare one request for a Modal Function."""
-
     scans, _, _ = collect_operators(request.logical_plan)
     needed = {
         name: {provider.id_col}
@@ -132,7 +131,6 @@ class ModalComputeProvider:
 
     def _worker_for(self, backend_name: str, registry: ExtensionRegistry):
         """Return Modal Functions containing the requested extensions."""
-
         local_sources = tuple(dict.fromkeys(self._local_python_sources))
         pip_packages = tuple(dict.fromkeys(self._pip_packages))
         backend = registry.backend(backend_name)

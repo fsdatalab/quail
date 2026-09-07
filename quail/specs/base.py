@@ -3,7 +3,6 @@
 from dataclasses import dataclass, replace
 from typing import Literal
 
-
 Precision = Literal["fp8", "bf16"]
 
 # Peak per-token activation bytes per hidden dim.
@@ -47,8 +46,10 @@ class ModelSpec:
         """KV elements per token, dtype-free: 2 * L * n_kv * d_head."""
         return 2 * self.layers * self.n_kv * self.d_head
 
+    # W_mem and W_resident are the weight-memory names used throughout
+    # the code and the engine wiki.
     @property
-    def W_mem(self) -> float:
+    def W_mem(self) -> float:  # noqa: N802
         """Weight bytes as loaded, before the full untied head is discarded."""
         return self.w_mem_bytes or self.params * self.w_bytes
 
@@ -65,7 +66,7 @@ class ModelSpec:
         return self.vocab * self.hidden * 2.0
 
     @property
-    def W_resident(self) -> float:
+    def W_resident(self) -> float:  # noqa: N802
         """Weight bytes resident on the GPU after boot."""
         return self.W_mem - self.head_mem_bytes
 
@@ -104,7 +105,6 @@ class DeviceSpec:
 
     def arithmetic_bandwidth(self, precision: Precision) -> float:
         """Return arithmetic throughput for one component precision."""
-
         if precision == "fp8":
             return self.peak_flops
         if precision == "bf16":

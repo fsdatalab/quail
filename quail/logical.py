@@ -106,7 +106,6 @@ def render_filter_question(tail: str) -> str:
 
 def render_filter_prompt_ids(prompt, document_ids, tokenizer) -> list:
     """The complete canonical token ids for one filter document."""
-
     if len(prompt.args) != 1 or not prompt.tail.startswith("{0}"):
         raise ValueError("a filter prompt must start its tail with {0}")
     tail = prompt.tail.replace("{0}", "", 1)
@@ -528,9 +527,9 @@ def bind_join_prompt(template: str, args: tuple,
     if len(set(aliases)) != len(aliases):
         raise CompileError(
             f"each join placeholder must name a distinct table (one "
-            f"document block per table), got aliases {aliases}; refer "
-            f"to a table's document again in the question text with "
-            f"its marker instead of adding a second placeholder")
+            f"document block per table), got aliases {aliases}; to "
+            f"mention a table's document again, use its marker in the "
+            f"question text, not a second placeholder")
     question = render_join_question(template)
     pre_tok = tail_tok = frame_tok = None
     labels = tuple((a, None, None) for a in aliases)

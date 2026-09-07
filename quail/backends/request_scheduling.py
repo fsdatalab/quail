@@ -326,6 +326,13 @@ def join_cache_accounting(
     straddles the prefix end) count for neither.
 
     Args:
+        prefixes: Per-anchor prefix token sequences.
+        suffix_count: Requests (suffixes) per anchor.
+        cached: Cached token count per request, indexed by
+            anchor_index * suffix_count + suffix_index.
+        seen_prefix_lengths: Per anchor, the prefix length an earlier
+            request had already computed.
+        block_size: KV block size in tokens; a hit rounds down to it.
         document_spans: (start, end) of the anchor document inside each
             prefix. Defaults to the whole prefix.
 

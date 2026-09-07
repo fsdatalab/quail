@@ -40,7 +40,6 @@ def begin_query_payloads(payload: dict, k: int) -> list[dict]:
 def filter_node_payloads(payload: dict, node, shards: dict,
                          k: int, *, has_joins: bool) -> list[dict]:
     """Build one typed filter node payload per GPU executor."""
-
     outputs = []
     tokens = payload["docs"][node.alias]
     for worker in range(k):

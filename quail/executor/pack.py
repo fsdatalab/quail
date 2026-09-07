@@ -17,15 +17,20 @@ from collections import deque
 
 
 def orient(mean_left_tokens, mean_right_tokens):
-    """Which side anchors: the longer one. Anchor tokens are paid once
-    per document; partner tokens are paid once per pair."""
+    """Which side anchors: the longer one.
+
+    Anchor tokens are paid once per document; partner tokens are paid
+    once per pair.
+    """
     return "left" if mean_left_tokens >= mean_right_tokens else "right"
 
 
 def gate(answer_rows):
     """Anchors that survive a conjunctive stage: any TRUE in the row.
+
     answer_rows: dict anchor_index -> iterable of 0/1 answers.
-    Returns the sorted surviving anchor indices."""
+    Returns the sorted surviving anchor indices.
+    """
     return sorted(a for a, row in answer_rows.items() if any(row))
 
 
@@ -40,7 +45,8 @@ def assemble(ans1_rows, ans2_rows):
 
     ans1_rows: b -> row of 0/1 over A (stage 1, anchored on b).
     ans2_rows: b -> row of 0/1 over C, present only for gated
-    survivors."""
+    survivors.
+    """
     m1, m2 = matches(ans1_rows), matches(ans2_rows)
     out = []
     for b in sorted(ans2_rows):
@@ -111,8 +117,7 @@ _STRANDED = -3  # advanced into a stage with no partners: stays resident
 
 
 class JoinAdmission:
-    """Join scheduler: continuous anchor admission with stages mixed
-    in one chunk.
+    """Join scheduler: continuous anchor admission, stages mixed in one chunk.
 
     Args:
         prefix_tokens: Per-anchor prefix token counts.
@@ -217,11 +222,13 @@ class JoinAdmission:
         return end < len(self.stages[j])
 
     def next_chunk(self, free_pages):
-        """Groups for the next chunk: [(anchor, stage, start, end,
-        carried)]. carried means the anchor's prefix tokens are
-        packed and its KV written to its pages. free_pages is the
-        arena's free list; fresh anchors admit against it. Returns
-        [] when nothing is buildable."""
+        """Groups for the next chunk: [(anchor, stage, start, end, carried)].
+
+        carried means the anchor's prefix tokens are packed and its KV
+        written to its pages. free_pages is the arena's free list;
+        fresh anchors admit against it. Returns [] when nothing is
+        buildable.
+        """
         self.blocked_pages = 0
         room = self.chunk_budget
         groups = []
@@ -280,7 +287,8 @@ class JoinAdmission:
 
         Returns events: ("dropped", a) when every partner at a stage
         before the last answered FALSE, so the anchor's pages can go;
-        ("finished", a) when its last-stage row is complete."""
+        ("finished", a) when its last-stage row is complete.
+        """
         row = self.answers[j].setdefault(a, [])
         if len(row) != start or len(bits) != end - start:
             raise AssertionError(
@@ -321,8 +329,7 @@ class JoinAdmission:
 
 
 class FilterAdmission:
-    """Filter chain scheduler: builds chunk groups and tracks arena
-    residency.
+    """Filter chain scheduler: builds chunk groups, tracks arena residency.
 
     Args:
         doc_tokens: Per-document token counts.
@@ -380,7 +387,8 @@ class FilterAdmission:
         """Groups for the next chunk: [(doc, stage, fresh)].
 
         fresh means the document's tokens are packed and its KV is
-        written to its pages. Returns [] when nothing is buildable."""
+        written to its pages. Returns [] when nothing is buildable.
+        """
         if self._limit_reached():
             return []
         self.blocked_pages = 0
@@ -429,14 +437,17 @@ class FilterAdmission:
     # ---- gating --------------------------------------------------------
 
     def report(self, doc, stage, passed, release=True):
-        """Record one answer. Frees pages on FALSE or last stage;
-        otherwise queues the next-stage suffix.
+        """Record one answer.
+
+        Frees pages on FALSE or last stage; otherwise queues the
+        next-stage suffix.
 
         release=False assumes the caller rewinds the kept document
         to its own tokens: the tail pages return here, the rest come
         back through add_free_pages if the pool evicts it.
 
-        Returns docs whose pages were freed."""
+        Returns docs whose pages were freed.
+        """
         self.in_flight.discard(doc)
         self.answers.setdefault(doc, []).append(1 if passed else 0)
         last = stage == len(self.stage_tokens) - 1
@@ -457,7 +468,6 @@ class FilterAdmission:
 
     def add_free_pages(self, pages):
         """Add pages released by retained KV outside this chain."""
-
         if pages < 0 or self.free_pages is None:
             raise ValueError("invalid external page release")
         self.free_pages += pages
@@ -475,8 +485,10 @@ class FilterAdmission:
                 and not self.in_flight)
 
     def drain_ready(self):
-        """Free pages of docs still queued when the limit ends the
-        run early. Returns drained docs for arena key cleanup."""
+        """Free pages of docs still queued when the limit ends the run early.
+
+        Returns drained docs for arena key cleanup.
+        """
         out = []
         while self.ready:
             doc, _ = self.ready.popleft()

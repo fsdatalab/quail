@@ -22,6 +22,33 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from quail.bench.prompts import (
+    AGENT_IMPLEMENTED_FIX,
+    AGENT_RECOVERED,
+    ASPECT_SENTIMENT,
+    DISCUSS_ASPECT,
+    F1,
+    F4,
+    F5,
+    F7,
+    F11,
+    F12,
+    F13,
+    LEP1,
+    LEP2,
+    LEP3,
+    LEP4,
+    LEP5,
+    LEPJOIN,
+    LEPS1,
+    P_LOC,
+    P_MSG,
+    REACTION,
+    REFUTE,
+    SCENARIO_MATCH,
+    SUPPORT,
+)
+
 DATA_SEED = 20260818
 CACHE_SCHEMA_VERSION = 9
 LEPARD_POSITIVE_PAIRS = 5_000
@@ -252,8 +279,10 @@ def _imdb_pool():
 
 
 def _biodex_rows(n):
-    """Real BioDEX rows, unpadded, un-concatenated: (text, reactions)
-    per row. `reactions` seeds the `terms` table."""
+    """Real BioDEX rows as (text, reactions), unpadded, un-concatenated.
+
+    `reactions` seeds the `terms` table.
+    """
     from datasets import load_dataset
     ds = load_dataset(
         "BioDEX/BioDEX-Reactions", split="train", streaming=True,
@@ -271,8 +300,10 @@ def _biodex_rows(n):
 
 
 def _fever_data(n_claims):
-    """FEVER claims (SUPPORTS/REFUTES only) and the Wikipedia pages they
-    reference. The evidence pool is bounded by the sampled claims."""
+    """FEVER claims (SUPPORTS/REFUTES only) and their Wikipedia pages.
+
+    The evidence pool is bounded by the sampled claims.
+    """
     from huggingface_hub import hf_hub_download
     seen, claims = set(), []
     for split in ("v1.0/train/0000.parquet",
@@ -381,8 +412,8 @@ def _lepard_rows(n):
     """Read LePaRD and sample known positive citation pairs."""
     import json as _json
 
-    from huggingface_hub import hf_hub_download
     import pandas as pd
+    from huggingface_hub import hf_hub_download
 
     csv_path = hf_hub_download("rmahari/LePaRD", "top_10000_data.csv.gz",
                                repo_type="dataset",
@@ -413,8 +444,10 @@ def _lepard_rows(n):
 
 
 def _vocab_table(rows, idx, cap=None):
-    """A frequency-sorted, deduplicated vocabulary column from one
-    field across sampled rows (the `terms` table, from `reactions`)."""
+    """A frequency-sorted, deduplicated vocabulary column from one field.
+
+    Built across sampled rows (the `terms` table, from `reactions`).
+    """
     freq = {}
     for row in rows:
         for t in row[idx]:
@@ -518,7 +551,8 @@ def build_sets(data_dir, sf, lf=1):
 
     lf (load factor) is accepted but unused: documents here are real
     and unpadded, so there's nothing to scale. Kept in the signature
-    so callers don't have to change when it's wired back up."""
+    so callers don't have to change when it's wired back up.
+    """
     d = Path(data_dir) / f"sf{sf}"
     marker = d / "DONE"
     if marker.exists():
@@ -632,148 +666,6 @@ def register_privacy_sets(sess, data_dir):
         sess.register(name, DocumentProvider.from_parquet(
             str(d / f"{name}.parquet"), id_col="id"))
 
-
-# ---------------------------------------------------------- predicates
-
-F1 = ("Judge strictly from the review above whether it mentions at "
-      "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
-      "answer TRUE if the review mentions at least one positive aspect "
-      "of the movie, FALSE otherwise.")
-
-F4 = ("Judge strictly from the review above whether it discusses the "
-      "ending of the movie.\n\n{0}\n\nInstruction: answer TRUE if the "
-      "review discusses the ending of the movie, FALSE otherwise.")
-
-F5 = ("Judge strictly from the review above whether it mentions any "
-      "specific actor or actress by name.\n\n{0}\n\nInstruction: "
-      "answer TRUE if the review mentions a specific actor or actress "
-      "by name, FALSE otherwise.")
-
-DISCUSS_ASPECT = ("Does the review in DOCUMENT {0} discuss the movie "
-                  "aspect in DOCUMENT {1}?")
-
-
-# IMDB-8 only: a second question over the same aspects table, joined
-# under a second alias (a2) - a 2-join star, both joins anchored on
-# reviews so the second stage runs over whatever DISCUSS_ASPECT
-# already kept.
-ASPECT_SENTIMENT = ("Does the review in DOCUMENT {0} express positive "
-                    "sentiment about the movie aspect in DOCUMENT {1}?")
-
-F7 = ("Judge strictly from the report above whether it describes a "
-      "case involving a female patient.\n\n{0}\n\nInstruction: answer "
-      "TRUE if the report describes a case involving a female patient, "
-      "FALSE otherwise.")
-
-REACTION = ("Does the medical report in DOCUMENT {0} describe the "
-            "reaction in DOCUMENT {1} as something the patient "
-            "experienced?")
-
-AGENT_RECOVERED = (
-    "Judge strictly from the agent trace above whether the agent recovered "
-    "after pursuing an approach that did not work. Recovery means the agent "
-    "recognized or moved past the unsuccessful approach and then made useful "
-    "progress with a different or corrected approach.\n\n{0}\n\n"
-    "Instruction: answer TRUE if the trace shows the agent recovering after "
-    "an unsuccessful approach, FALSE otherwise."
-)
-
-AGENT_IMPLEMENTED_FIX = (
-    "Judge strictly from the agent trace above whether, by the end of the "
-    "trace, the agent has implemented a plausible fix that directly addresses "
-    "the reported issue. A fix must include a code or configuration change "
-    "whose purpose is to correct the issue. Inspection, reproduction, tests "
-    "without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: "
-    "answer TRUE if the agent has implemented a plausible fix that directly "
-    "addresses the reported issue. Answer FALSE otherwise."
-)
-
-F11 = ("Judge strictly from the claim above whether it asserts "
-       "something about a person, rather than an organization, place, "
-       "or event.\n\n{0}\n\nInstruction: answer TRUE if the claim "
-       "asserts something about a person, FALSE otherwise.")
-
-F12 = ("Judge strictly from the claim above whether it contains a "
-       "specific date or year.\n\n{0}\n\nInstruction: answer TRUE if "
-       "the claim contains a specific date or year, FALSE otherwise.")
-
-F14 = ("Judge strictly from the claim above whether it references a "
-       "specific place (a city, country, or other named location).\n\n"
-       "{0}\n\nInstruction: answer TRUE if the claim references a "
-       "specific place, FALSE otherwise.")
-
-SUPPORT = ("Does the Wikipedia passage in DOCUMENT {1} support the "
-           "claim in DOCUMENT {0}?")
-
-REFUTE = ("Does the Wikipedia passage in DOCUMENT {1} refute or "
-          "contradict the claim in DOCUMENT {0}?")
-
-F13 = ("Judge strictly from the Wikipedia passage above whether it "
-       "primarily describes a specific person (their life, actions, "
-       "or role), rather than an organization, place, or event.\n\n"
-       "{0}\n\nInstruction: answer TRUE if the passage primarily "
-       "describes a specific person, FALSE otherwise.")
-
-# LePaRD predicates: "excerpt" for destination_context throughout,
-# to avoid colliding with this dataset's own use of "passage" for
-# the quoted/cited text.
-LEP1 = ("Judge strictly from the excerpt above whether it argues that "
-        "the cited case's reasoning does not apply here.\n\n{0}\n\n"
-        "Instruction: answer TRUE if the excerpt argues the cited "
-        "case's reasoning does not apply here, FALSE otherwise.")
-
-LEP2 = ("Judge strictly from the excerpt above whether it discusses a "
-        "procedural or jurisdictional issue.\n\n{0}\n\nInstruction: "
-        "answer TRUE if the excerpt discusses a procedural or "
-        "jurisdictional issue, FALSE otherwise.")
-
-LEP3 = ("Judge strictly from the excerpt above whether it treats the "
-        "cited passage as binding precedent.\n\n{0}\n\nInstruction: "
-        "answer TRUE if the excerpt treats the cited passage as "
-        "binding precedent, FALSE otherwise.")
-
-LEP4 = ("Judge strictly from the excerpt above whether it cites the "
-        "passage to support a conclusion about a party's liability or "
-        "guilt.\n\n{0}\n\nInstruction: answer TRUE if the excerpt "
-        "cites the passage to support a conclusion about a party's "
-        "liability or guilt, FALSE otherwise.")
-
-LEP5 = ("Judge strictly from the excerpt above whether it acknowledges "
-        "disagreement between courts on the issue.\n\n{0}\n\n"
-        "Instruction: answer TRUE if the excerpt acknowledges "
-        "disagreement between courts on the issue, FALSE otherwise.")
-
-# LEP-7 only: filters the passage side of the self-join, not just the
-# excerpt (anchor) side.
-LEPS1 = ("Judge strictly from the passage above whether it states a "
-         "general legal rule.\n\n{0}\n\nInstruction: answer TRUE if "
-         "the passage states a general legal rule, FALSE otherwise.")
-
-# The LEP-2..LEP-7 join predicate. Ground truth comes from the
-# dataset's own passage_id, not a judge pass.
-LEPJOIN = ("Is the passage in DOCUMENT {1} cited by the legal excerpt "
-           "in DOCUMENT {0}?")
-
-
-# PrivacyPolicies predicates: user-language questions about user
-# outcomes, not legal language about company practices. The vocabulary
-# mismatch means keyword search, regex, and embeddings cannot solve
-# these.
-P_MSG = ("Judge strictly from the policy above whether, if a user sent "
-         "a private message through this service, an employee of the "
-         "company could read it.\n\n{0}\n\nInstruction: answer TRUE if "
-         "an employee could read the user's private messages, FALSE "
-         "otherwise.")
-
-P_LOC = ("Judge strictly from the policy above whether this service "
-         "would keep track of the user's physical location, even when "
-         "the user is not actively using the service.\n\n{0}\n\n"
-         "Instruction: answer TRUE if the service would track the "
-         "user's location while they are not using it, FALSE otherwise.")
-
-SCENARIO_MATCH = ("Based on the privacy policy in DOCUMENT {0}, could "
-                  "the situation described in DOCUMENT {1} happen to a "
-                  "user of this service?")
 
 SCENARIOS = [
     # marketing
@@ -1086,8 +978,10 @@ JOIN_SELECTIVITY_ESTIMATES = {
 # ---------------------------------------------------------- queries
 
 def queries(sess):
-    """id -> (description, callable() -> Query). Fresh Query objects
-    per call so each pass re-plans."""
+    """Id -> (description, callable() -> Query).
+
+    Fresh Query objects per call so each pass re-plans.
+    """
     import quail
 
     def add_filter(query, template, column):
@@ -1102,12 +996,15 @@ def queries(sess):
             selectivity=JOIN_SELECTIVITY_ESTIMATES.get(template))
 
     def make(doc_table, doc_alias, doc_col, filters, joins, select):
-        """filters: list of prompt templates applied in order to the
-        base table. joins: list of (partner_table, partner_alias,
+        """Build one benchmark query from base-table filters and joins.
+
+        filters: list of prompt templates applied in order to the base
+        table. joins: list of (partner_table, partner_alias,
         partner_col, prompt_template[, partner_filters]) applied in
         order, each dependent on whatever survived the stages before
         it; partner_filters push filters onto the partner side before
-        the join (the FEV-5/6 and LEP-7 two-sided shape)."""
+        the join (the FEV-5/6 and LEP-7 two-sided shape).
+        """
         filter_templates = list(filters)
         for _partner, _alias, _column, _join, *rest in joins:
             filter_templates.extend(rest[0] if rest else ())
@@ -1467,10 +1364,10 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             regret_tokens=("per document KV regret: fresh tokens spent "
                            "recomputing a document's own prefix after an "
                            "earlier request of the query computed it"),
-            shared_prefix_tokens=("tokens of the scanned documents that "
-                                  "are a prefix another scanned document "
-                                  "also has, across aliases of one column "
-                                  "as well as within one; an execution "
+            shared_prefix_tokens=("scanned-document tokens that are a "
+                                  "prefix another scanned document also "
+                                  "has, within one alias or across "
+                                  "aliases of one column; an execution "
                                   "that computes each distinct prefix "
                                   "once never computes them"),
             cross_row_cached_tokens=("cached tokens inside a document's "

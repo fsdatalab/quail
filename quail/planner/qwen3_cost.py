@@ -9,7 +9,6 @@ from quail.specs import ModelSpec
 
 def attention_projection_params(model: ModelSpec) -> int:
     """Return Q, K, V, and output projection parameters."""
-
     h = model.hidden
     head = model.d_head
     per_layer = (
@@ -22,32 +21,27 @@ def attention_projection_params(model: ModelSpec) -> int:
 
 def mlp_params(model: ModelSpec) -> int:
     """Return gate, up, and down projection parameters."""
-
     return 3 * model.hidden * model.intermediate * model.layers
 
 
 def dense_params(model: ModelSpec) -> int:
     """Return parameters used by the modeled dense components."""
-
     return attention_projection_params(model) + mlp_params(model)
 
 
 def flops_per_pair(model: ModelSpec) -> int:
     """Return attention FLOPs per query and key pair in one layer."""
-
     return 4 * model.n_q * model.d_head
 
 
 def kv_bytes_per_token(model: ModelSpec) -> float:
     """Return bytes in one token's KV across every layer."""
-
     return model.kappa
 
 
 def qwen3_components(work: Work, model: ModelSpec,
                      passes: float) -> tuple[CostComponent, ...]:
     """Build the modeled Qwen3 components for one work record."""
-
     if passes < 0:
         raise ValueError("passes must be nonnegative")
     attn_proj = attention_projection_params(model)

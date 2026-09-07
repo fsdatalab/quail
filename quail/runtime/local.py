@@ -29,7 +29,6 @@ _RUNTIME = _WorkerRuntime()
 
 def _validate_physical_request(request, registry):
     """Validate and decode a physical execution request."""
-
     if not isinstance(request, PhysicalRequest):
         raise TypeError("the worker needs a PhysicalRequest")
     envelope = request.plan
@@ -54,7 +53,6 @@ def _validate_physical_request(request, registry):
 
 def _execute_physical(request, registry):
     """Run the backend selected by a registered physical plan."""
-
     request, registry, graph, backend = _validate_physical_request(request, registry)
     response = backend.execute_request(BackendExecutionContext(
         request=request,
@@ -100,7 +98,6 @@ def _execute_physical(request, registry):
 
 def execute_worker_query(query, physical_executor=None):
     """Execute one query inside its current worker process."""
-
     plan = query.plan()
     if isinstance(plan, Refusal):
         raise RefusalError(plan)

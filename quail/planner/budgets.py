@@ -1,5 +1,6 @@
-"""Derived budget quantities (chunk budget, admission budget, roofline
-arithmetic) from model and device specs.
+"""Budget quantities derived from model and device specs.
+
+Chunk budget, admission budget, and roofline arithmetic.
 """
 
 from quail.specs import DeviceSpec, ModelSpec
@@ -43,8 +44,9 @@ def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
 
 
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
-    """Effective chunk budget: min(memory bound, kernel index cap),
-    floored at the compute knee.
+    """Effective chunk budget, floored at the compute knee.
+
+    The budget is min(memory bound, kernel index cap) before the floor.
     """
     b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
     return max(b, int(compute_knee(model, device)))
@@ -77,8 +79,9 @@ def _projection_shapes(model: ModelSpec):
 
 
 def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
-    """Chunk size (tokens) where the dense projections cross the
-    roofline ridge and become compute-bound.
+    """Chunk size (tokens) where the dense projections become compute-bound.
+
+    That is where they cross the roofline ridge.
     """
     ridge = device.peak_flops / device.hbm_bw
     tot_p = tot_io = 0.0
@@ -116,8 +119,9 @@ def _attention_time(model: ModelSpec, device: DeviceSpec,
 
 def attention_crossover(model: ModelSpec, device: DeviceSpec,
                         chunk_tokens: int | None = None) -> float:
-    """Document length (tokens) where attention work overtakes dense
-    projections at the given chunk size.
+    """Document length (tokens) where attention overtakes dense projections.
+
+    At the given chunk size.
     """
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)

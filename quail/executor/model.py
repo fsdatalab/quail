@@ -1,14 +1,17 @@
-"""Weight loading through vLLM's public surface: the checkpoint as
-vLLM's processed module - merged qkv and gate_up, fp8 weights and
-block scales laid out for DeepGEMM. No engine, no scheduler, no KV
-pool. vLLM is a library here (loader and kernels), nothing more.
+"""Weight loading through vLLM's public surface.
+
+The checkpoint becomes vLLM's processed module - merged qkv and
+gate_up, fp8 weights and block scales laid out for DeepGEMM. No
+engine, no scheduler, no KV pool. vLLM is a library here (loader and
+kernels), nothing more.
 
 After load, only the TRUE/FALSE output rows are retained. The full
 output head is discarded; shared input embeddings remain available.
 
 get_model reads tensor-parallel group objects. Those collectives are
 no-ops at world size 1, so this path installs single-rank stubs
-instead of starting NCCL or gloo."""
+instead of starting NCCL or gloo.
+"""
 
 
 class _SingleRank:
@@ -103,7 +106,8 @@ def retain_answer_head(torch, model, token_ids):
 def answer_weights(model, token_ids):
     """Return the retained rows for a query's answer token ids."""
     if tuple(token_ids) != model.quail_answer_token_ids:
-        raise ValueError("Query answer token ids differ from the loaded model's retained rows")
+        raise ValueError("Query answer token ids differ from the loaded "
+                         "model's retained rows")
     return model.quail_answer_weights
 
 
@@ -123,6 +127,7 @@ def load_model(model_name: str, revision: str | None = None, *,
         model = get_model(vllm_config=config)
     if answer_token_ids is None:
         from transformers import AutoTokenizer
+
         from quail.executor.loop import true_false_ids
 
         tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)

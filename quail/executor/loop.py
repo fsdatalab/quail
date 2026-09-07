@@ -1,5 +1,6 @@
-"""The overlapped chunk loop: pack on CPU while the GPU runs, gate
-answers, free pages immediately.
+"""The overlapped chunk loop.
+
+Pack on CPU while the GPU runs, gate answers, free pages immediately.
 
 - run_join: continuous anchor admission with JoinAdmission, stages
   mixed in one chunk, pages freed when an anchor fails a gate or
@@ -13,9 +14,8 @@ image.
 
 import time
 
-from quail.executor.model import answer_weights
-
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
+from quail.executor.model import answer_weights
 from quail.executor.pack import FilterAdmission, JoinAdmission
 
 
@@ -28,7 +28,8 @@ def _tick(timing, key, t0):
 def _staged(torch, data, dtype, pinned=True):
     """Host data to device through pinned memory, non-blocking.
 
-    pinned=False reverts to pageable blocking copies."""
+    pinned=False reverts to pageable blocking copies.
+    """
     if torch.is_tensor(data):
         if pinned:
             return data.pin_memory().to("cuda", non_blocking=True)
@@ -86,8 +87,11 @@ def true_false_ids(tok):
 
 
 class Answerer:
-    """TRUE/FALSE from final-position hidden states, scored against
-    only the allowed token rows - no full-vocabulary logits."""
+    """TRUE/FALSE from final-position hidden states.
+
+    Scored against only the allowed token rows - no full-vocabulary
+    logits.
+    """
 
     def __init__(self, torch, F, model, tokenizer):
         t_ids, f_ids = true_false_ids(tokenizer)
@@ -109,9 +113,11 @@ class Answerer:
         return (t > f).int().cpu().tolist()
 
 class AsyncAnswers:
-    """Non-blocking TRUE/FALSE readout. submit() returns an event and
-    pinned host buffer; result() waits on the event and reads the
-    answers without stalling the GPU stream."""
+    """Non-blocking TRUE/FALSE readout.
+
+    submit() returns an event and pinned host buffer; result() waits on
+    the event and reads the answers without stalling the GPU stream.
+    """
 
     def __init__(self, torch, answerer):
         self.torch = torch
@@ -381,10 +387,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None):
-    """The join driver: stream partner lists against anchors, gating
-    survivors between stages.
+    """The join driver: stream partner lists against anchors.
+
+    Survivors are gated between stages.
 
     Args:
+        torch: The torch module, imported by the caller.
+        arena: KVArena holding the anchors' KV pages.
+        pipeline: Pipeline that runs each packed forward chunk.
+        async_ans: AsyncAnswers that reads TRUE/FALSE off the GPU.
         anchor_prefixes: Anchor id (list index) -> prefix token list.
         stage_suffixes: Per stage, the partner suffix token lists.
         budget: Chunk token budget.
@@ -533,9 +544,11 @@ WARMUP_VERSION = 1
 
 
 def _warm_inputs(budget):
-    """Synthetic warmup tokens: a 512-id document and a 16-id
-    question suffix, cycled to any length the passes need. Fixed
-    small ids; only the counts matter to the kernels."""
+    """Synthetic warmup tokens: a 512-id document and a 16-id question suffix.
+
+    Cycled to any length the passes need. Fixed small ids; only the
+    counts matter to the kernels.
+    """
     doc = [10 + (i % 500) for i in range(512)]
     question = list(range(10, 26))
     q_max = len(question)
@@ -548,9 +561,11 @@ def _warm_inputs(budget):
 
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                   join_chunk):
-    """Run real forward passes over every attention path: both modes
-    with arena writes, plus the unpaged causal fast path. join_chunk
-    adds one run_join call."""
+    """Run real forward passes over every attention path.
+
+    Both modes with arena writes, plus the unpaged causal fast path.
+    join_chunk adds one run_join call.
+    """
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
     original_mode = pipeline.attention_mode
@@ -576,14 +591,18 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
 
 
 def compile_kernels(torch, arena, pipeline, async_ans, budget):
-    """Build every DeepGEMM kernel configuration up to the budget,
-    then run forward passes over every attention-path shape.
+    """Build every DeepGEMM kernel configuration, then warm every path.
+
+    Configurations go up to the budget; the warm pass runs forward
+    passes over every attention-path shape.
 
     Runs once per (software stack, GPU, model, budget). Uses vLLM's
     config heuristic generator to enumerate every token count at
-    which the chosen GEMM configuration changes."""
+    which the chosen GEMM configuration changes.
+    """
     from vllm.model_executor.warmup.deep_gemm_warmup import (
-        _generate_optimal_warmup_m_values)
+        _generate_optimal_warmup_m_values,
+    )
     layer = pipeline.layers[0]
     linears = (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
                layer.mlp.gate_up_proj, layer.mlp.down_proj)
@@ -615,8 +634,10 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
 
 
 def touch_kernels(torch, arena, pipeline, async_ans, budget):
-    """Run each hot kernel once per container so cached binaries load
-    at boot instead of mid-run."""
+    """Run each hot kernel once per container.
+
+    Cached binaries then load at boot instead of mid-run.
+    """
     _forward_warm(torch, arena, pipeline, async_ans, budget,
                   join_chunk=False)
 
@@ -644,13 +665,16 @@ def _marker_identity(torch, model_name, budget):
 
 def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                  model_name, force_compile=False):
-    """Boot-time warmup: compile pass once per (stack, GPU, model,
-    budget), touch pass every container after that.
+    """Boot-time warmup: a compile pass once, a touch pass per container.
+
+    The compile pass runs once per (stack, GPU, model, budget); every
+    container after that runs the touch pass.
 
     A marker file records the identity the compile pass ran for.
     Identity match -> touch; mismatch or absent -> compile.
 
-    Returns dict(tier="compile"|"touch", warm_s=seconds)."""
+    Returns dict(tier="compile"|"touch", warm_s=seconds).
+    """
     import json
     import os
 
@@ -695,15 +719,22 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=()):
-    """The filter chain: continuous admission, survivor priority, pages
-    freed on FALSE or after the last stage.
+    """The filter chain: continuous admission with survivor priority.
+
+    Pages are freed on FALSE or after the last stage.
 
     Args:
+        torch: The torch module, imported by the caller.
+        arena: KVArena holding the documents' KV pages.
+        pipeline: Pipeline that runs each packed forward chunk.
+        async_ans: AsyncAnswers that reads TRUE/FALSE off the GPU.
         doc_ids: Per-document token lists.
         question_ids: Per-stage question token lists.
         budget: Chunk token budget.
         timing: CPU seconds per loop phase accumulate into it.
         pinned: False for pageable blocking copies.
+        limit: Stop admitting documents after this many survivors.
+            None runs every document.
         arena_writes: Whether document KV is written to the arena.
             Must be True with multiple stages.
         arena_keys: Stable arena key for each document. List positions are

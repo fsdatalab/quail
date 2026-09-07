@@ -12,8 +12,8 @@ def coefficients(model, device) -> dict:
     return {
         "linear_seconds": 2 * dense_params(model) / device.arithmetic_bandwidth(
             model.weight_precision),
-        "pair_seconds": flops_per_pair(model) * model.layers / device.arithmetic_bandwidth(
-            model.attention_precision),
+        "pair_seconds": flops_per_pair(model) * model.layers
+        / device.arithmetic_bandwidth(model.attention_precision),
     }
 
 
@@ -92,7 +92,8 @@ def schedule(seq, live):
             alias = groups[index][0][1]
             if alias not in upcoming:
                 current = counts[boundary][alias]
-                probability = min(1.0, counts[index][alias] / current) if current else 0.0
+                probability = (min(1.0, counts[index][alias] / current)
+                               if current else 0.0)
                 upcoming[alias] = [probability, index]
         uses.append(upcoming)
     return {

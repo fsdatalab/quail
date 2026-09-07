@@ -72,7 +72,8 @@ class SGLangClient:
         request_id = uuid.uuid4().hex
         try:
             result = await self.engine.async_generate(
-                input_ids=input_ids, sampling_params=dict(sampling_params), rid=request_id,
+                input_ids=input_ids, sampling_params=dict(sampling_params),
+                rid=request_id,
             )
         except asyncio.CancelledError:
             self.engine.tokenizer_manager.abort_request(request_id)

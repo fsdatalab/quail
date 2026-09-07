@@ -13,12 +13,12 @@ import time
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
-from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
     execute_single_graph,
 )
+from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution import PhysicalResponse
 from quail.executor.arena import KVArena
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
@@ -26,18 +26,17 @@ from quail.executor.loop import AsyncAnswers, warm_kernels
 from quail.executor.model import answer_weights, load_model
 from quail.physical import (
     AnchoredJoin,
-    decode_graph,
     DocumentInput,
     PackedFilter,
+    decode_graph,
 )
 from quail.planner import budgets
 from quail.runtime.runner import ExecutionContext
 from quail.runtime.tokens import (
+    DocumentPrefixes,
     chain_tokens,
     decode_payload_documents,
-    DocumentPrefixes,
 )
-
 
 # GPU child processes, one per H100, kept alive across queries so their
 # models stay loaded for the whole session.
@@ -165,7 +164,6 @@ def _boot_gpu(state, backend, spec, device, gpu_index, workers,
 
 def _bind_query(state, true_ids, false_ids, chunk_tokens):
     """Attach the answerer and chunk budget for one query."""
-
     torch = state["torch"]
     # the worker has no tokenizer: the TRUE/FALSE token ids ride in the
     # payload

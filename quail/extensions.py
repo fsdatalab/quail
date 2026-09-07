@@ -41,7 +41,8 @@ class ExtensionRegistry:
 
     def _values(self, kind: str) -> Mapping[str, Any]:
         return MappingProxyType({
-            name: value for (registered_kind, name), value in self._registrations.items()
+            name: value
+            for (registered_kind, name), value in self._registrations.items()
             if registered_kind == kind
         })
 
@@ -82,7 +83,9 @@ class ExtensionRegistry:
         return self._values("observer")
 
     @property
-    def source_readers(self) -> Mapping[str, Callable[[Mapping[str, Any]], TableProvider]]:
+    def source_readers(
+        self,
+    ) -> Mapping[str, Callable[[Mapping[str, Any]], TableProvider]]:
         return self._values("source_reader")
 
     def _check_name(self, kind: str, name: str) -> None:
@@ -165,7 +168,8 @@ class ExtensionRegistry:
         """Register a reader for one remote table source type."""
         return self._add(
             "source_reader",
-            getattr(reader, "source_type", None) if source_type is None else source_type,
+            (getattr(reader, "source_type", None)
+             if source_type is None else source_type),
             reader,
         )
 

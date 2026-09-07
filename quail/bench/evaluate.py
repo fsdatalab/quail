@@ -12,7 +12,6 @@ from pathlib import Path
 import pyarrow as pa
 from pyarrow import parquet as pq
 
-
 GROUND_TRUTH_ROOT = "ground_truth/quailb/schema_v1"
 RESULTS_VOLUME = "quail-results"
 H100_USD_PER_HOUR = 3.9492
@@ -703,8 +702,8 @@ class BenchmarkEvaluator:
         )
 
     def evaluate(self, query, result) -> dict:
-        from quail.planner.decide import collect_operators
         from quail.physical import PackedFilter, RequestExecution
+        from quail.planner.decide import collect_operators
 
         scans, filters, joins = collect_operators(query.logical)
         plan = query.plan()

@@ -38,7 +38,6 @@ class AliasStats:
 
     def with_resident_fraction(self, fraction: float) -> "AliasStats":
         """Credit one length-independent fraction as resident."""
-
         if fraction < 0 or fraction > 1:
             raise ValueError("resident fraction must be between 0 and 1")
         return AliasStats(
@@ -56,7 +55,6 @@ class AliasStats:
 def summarize_alias(lengths, resident_positions=(), *,
                     resident_flags=None) -> AliasStats:
     """Summarize lengths and a resident position subset in one pass."""
-
     resident = set(resident_positions) if resident_flags is None else None
     count = total = squared = maximum = 0
     resident_count = resident_total = resident_squared = 0
@@ -92,7 +90,6 @@ def summarize_alias(lengths, resident_positions=(), *,
 
 def _alias_stats(lengths: dict, resident: dict) -> dict[str, AliasStats]:
     """Normalize raw length lists or accept summaries from a caller."""
-
     out = {}
     for alias, values in lengths.items():
         if isinstance(values, AliasStats):
@@ -146,8 +143,11 @@ def cross_tuples(spec: dict, live: dict) -> float:
 
 
 def anchor_candidates(spec: dict, honor_forced: bool = True) -> list:
-    """Candidate anchors: gates keep their outer table, a forced full
-    anchor is honored, a free full join offers every table."""
+    """Candidate anchors for one join.
+
+    Gates keep their outer table, a forced full anchor is honored, a
+    free full join offers every table.
+    """
     if spec["semantics"] != "full":
         return [spec["anchor"]]
     if honor_forced and not spec.get("anchor_free"):
@@ -178,8 +178,11 @@ def anchor_fits(spec: dict, anchor: str, lengths: dict, pre: int,
 
 
 def _feasible_anchors(spec, honor_forced, lengths, pre, chunk) -> list:
-    """Fitting candidates; every candidate when none fits, so the
-    caller's refusal check can name the least-bad need."""
+    """Fitting candidates, or every candidate when none fits.
+
+    Returning them all lets the caller's refusal check name the
+    least-bad need.
+    """
     cands = anchor_candidates(spec, honor_forced)
     fits = [a for a in cands
             if anchor_fits(spec, a, lengths, pre, chunk)]
@@ -198,7 +201,6 @@ def fit_resident_documents(resident: dict, lengths: dict, pre: int,
                            arena_tokens: float | None,
                            page_tokens: int = 16, policy=None) -> dict:
     """Apply a retention priority to a complete prefix snapshot."""
-
     keys = _document_keys(resident)
     if arena_tokens is None:
         kept = keys
@@ -370,6 +372,10 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
         lengths: alias -> live documents' token lengths or AliasStats.
         resident: alias -> positions into lengths[alias] whose prefix
             KV is resident.
+        pre: Engine preamble token count in front of every prompt.
+        chunk_tokens: Chunk token budget.
+        model: Model spec, for the cost model.
+        device: Device spec, for the cost model.
         already_joined: aliases connected by completed join stages.
             Used when costing a continuation of a partial plan.
         base_work: Work outside the joins (the filter round), so

@@ -1,5 +1,6 @@
-"""The planner: budgets from the specs, decisions from token
-arithmetic. No wall prediction. KV is always bf16.
+"""The planner: budgets from the specs, decisions from token arithmetic.
+
+No wall prediction. KV is always bf16.
 
 The names below are the planning interface a model backend uses.
 """

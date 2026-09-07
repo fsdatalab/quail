@@ -19,9 +19,9 @@ from quail.physical import (
     ValueType,
 )
 from quail.runtime.result import (
-    build_result_declaration,
     IndexRelation,
     QueryResult,
+    build_result_declaration,
     true_answer_rows,
 )
 
