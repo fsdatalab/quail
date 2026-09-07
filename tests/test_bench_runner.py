@@ -271,3 +271,28 @@ def test_fev9_builds_from_its_spec_and_answers_from_labels(backend):
             "c1": 2, "e1": 2, "c2": 2, "e2": 2}
         assert len(estimate.join_stages) == 3
         assert queries(session)["FEV-9"][0] == spec.description
+
+
+def test_benchmark_prompt_text_matches_what_quail_sends():
+    """The labels answer quailb's text; Quail must send the same text."""
+    from quailb.judge_pass import PREDICATES
+    from quailb.rendering import render_filter_prompt, render_join_prompt
+
+    for spec in PREDICATES:
+        left = quail.ColumnRef("left", spec.left_table, spec.left_column)
+        if spec.kind == "filter":
+            prompt = quail.bind_prompt(spec.template, (left,))
+            assert prompt.tail.startswith("{0}")
+            expected = (prompt.preamble + "doc one"
+                        + prompt.tail.replace("{0}", "", 1))
+            assert render_filter_prompt(spec.template, "doc one") == expected
+        else:
+            right = quail.ColumnRef(
+                "right", spec.right_table, spec.right_column)
+            prompt = quail.bind_join_prompt(spec.template, (left, right))
+            for anchor in (0, 1):
+                expected = quail.render_join_prompt_text(
+                    prompt, ("doc one", "doc two"), anchor=anchor)
+                assert render_join_prompt(
+                    spec.template, ("doc one", "doc two"), anchor=anchor
+                ) == expected, (spec.key, anchor)

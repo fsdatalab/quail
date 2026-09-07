@@ -27,14 +27,8 @@ from pathlib import Path
 
 import modal
 
-from quail import (
-    SHARED_PRE,
-    ColumnRef,
-    bind_join_prompt,
-    bind_prompt,
-    render_join_prompt_text,
-)
-from quailb import data, prompts
+from quailb import data, prompts, rendering
+from quailb.rendering import SHARED_PRE
 
 SCHEMA_VERSION = 1
 SCALE_FACTOR = 0.1
@@ -379,18 +373,11 @@ def judgment_identity(label_set_id: str, example_full_hash: str) -> str:
 
 
 def render_filter_prompt(spec: PredicateSpec, document: str) -> str:
-    ref = ColumnRef("d", spec.left_table, spec.left_column)
-    prompt = bind_prompt(spec.template, (ref,))
-    if not prompt.tail.startswith("{0}"):
-        raise ValueError(f"unexpected filter tail for {spec.key}")
-    return prompt.preamble + document + prompt.tail.replace("{0}", "", 1)
+    return rendering.render_filter_prompt(spec.template, document)
 
 
 def render_join_prompt(spec: PredicateSpec, left: str, right: str) -> str:
-    left_ref = ColumnRef("left", spec.left_table, spec.left_column)
-    right_ref = ColumnRef("right", spec.right_table, spec.right_column)
-    prompt = bind_join_prompt(spec.template, (left_ref, right_ref))
-    return render_join_prompt_text(prompt, (left, right), anchor=0)
+    return rendering.render_join_prompt(spec.template, (left, right), anchor=0)
 
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
@@ -407,13 +394,13 @@ image = (
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail", "quailb")
+    .add_local_python_source("quailb")
 )
 
 data_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("numpy", "pyarrow")
-    .add_local_python_source("quail", "quailb")
+    .add_local_python_source("quailb")
 )
 
 # Building the corpus reads the source datasets off HuggingFace, so it
@@ -424,7 +411,7 @@ corpus_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("numpy", "pyarrow", "pandas", "huggingface_hub",
                  "datasets", "transformers>=5.2.0")
-    .add_local_python_source("quail", "quailb")
+    .add_local_python_source("quailb")
 )
 
 # Experiment cells attach to this existing app so its caches remain useful.
@@ -690,7 +677,7 @@ class ModelJudge:
         from transformers import AutoTokenizer
         from vllm import LLM, SamplingParams
 
-        from quail import true_false_ids
+        from quailb.rendering import true_false_ids
 
         t0 = time.perf_counter()
         self.tokenizer = AutoTokenizer.from_pretrained(

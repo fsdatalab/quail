@@ -741,6 +741,7 @@ def build_sets(data_dir, sf, lf=1):
     and unpadded, so there's nothing to scale. Kept in the signature
     so callers don't have to change when it's wired back up.
     """
+    del lf
     d = Path(data_dir) / f"sf{sf}"
     marker = d / "DONE"
     if marker.exists():

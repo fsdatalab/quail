@@ -22,9 +22,10 @@ benchmark is now a top-level package, `quailb/`, that runs no engine.
   (alias, written position), its join answers keyed by written
   position, and its final rows, all in the benchmark's own ids. The
   expected rows come from the labels through pyarrow joins. Nothing in
-  `quailb/` imports `quail`, except the labeling pass, which renders
-  the exact prompt text the engine sends through Quail's public prompt
-  helpers.
+  `quailb/` imports `quail`. The exact prompt text a predicate asks is
+  `quailb/rendering.py`; the labels answer that text, and a test in
+  the Quail runner checks that Quail sends the same text for every
+  predicate.
 - `quail/bench/quailb.py` is the runner. `build_query(session, spec)`
   turns one spec into a Quail query, `run_output(result, spec, corpus)`
   turns a `QueryResult` into a `RunOutput`, and `answer_oracle`
@@ -55,7 +56,7 @@ pyarrow, and Quail's part is a runner in the engine repository.
 | | Before | After |
 | --- | --- | --- |
 | Where the benchmark lives | `quail/bench/` | `quailb/` (definition), `quail/bench/` (Quail runner) |
-| `quail` imports inside the benchmark definition | session, catalog, planner, result relations, plan nodes | none, except public prompt helpers in the labeling pass |
+| `quail` imports inside the benchmark definition | session, catalog, planner, result relations, plan nodes | none |
 | Query definitions | closures over a session | `QuerySpec` records |
 | CPU tests collected | 264 | 268 |
 
