@@ -85,7 +85,21 @@ IMDB reviews (29.7 M document tokens), same machine, kernels cached:
 | `wall_s` | 262.45 s | predicted 240 s from document tokens alone |
 | `fresh_tokens` | 32,216,778 | 29.7 M document tokens plus 25 question tokens per review |
 | documents/second | 381 | 351 on QUAIL-B IMDB-1, 5,000 reviews |
-| $/query | $0.2879 | about $4.89 for the same 32.2 M input tokens on GPT-4o mini at $0.15 per 1 M input tokens and $0.60 per 1 M output tokens (list price, 2026-09-07), or $2.45 through its batch API |
+| $/query | $0.2879 | about $1.65 for the same work on GPT-5 nano at list price, or $0.83 through its batch API (see below) |
+
+The GPT-5 nano figure uses its prices on 2026-09-07: $0.05 per 1 M
+input tokens, $0.005 per 1 M cached input tokens, $0.40 per 1 M output
+tokens; the batch API halves each. The work is 100,000 requests with
+32.2 M input tokens in total and one output token each, so $1.61 of
+input and $0.04 of output at list price. One output token per request
+assumes reasoning effort set to minimal and no reasoning tokens; any
+reasoning tokens are billed as output on top. Cached input pricing does
+not help here: OpenAI caches a prompt prefix only when it is at least
+2,048 tokens for models before GPT-5.6, GPT-5 nano among them (1,024
+from GPT-5.6 on). The shared prefix in this query is the 25 token
+question, and the reviews themselves average 297 tokens, so almost no
+request qualifies even with the review placed first. Token counts under
+OpenAI's tokenizer would differ a little from Qwen's.
 
 The prediction missed by 8% because it counted document tokens only.
 At 32.2 M fresh tokens, the IMDB-1 rate of 123,000 tokens/s gives
