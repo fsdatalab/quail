@@ -1,0 +1,251 @@
+"""CPU checks for judge-pass identities and exact prompt rendering."""
+
+from dataclasses import replace
+
+from quailb.judge_pass import (
+    MODEL_NAME,
+    PREDICATES,
+    _check_reused_label_set,
+    _compact_label_parts,
+    _corpus_identity,
+    _lepard_source_answer,
+    _saved_verification_sample,
+    example_identity,
+    judgment_identity,
+    label_set_identity,
+    parse_function_calls,
+    predicate_payload,
+    predicate_version,
+    render_filter_prompt,
+    render_join_prompt,
+)
+
+
+def _spec(key):
+    return next(spec for spec in PREDICATES if spec.key == key)
+
+
+def test_parse_function_calls_requires_every_workload():
+    calls = parse_function_calls(
+        "imdb=fc-imdb,biodex=fc-bio,fever=fc-fever,"
+        "lepard=fc-lepard,agent=fc-agent")
+    assert calls == {
+        "imdb": "fc-imdb",
+        "biodex": "fc-bio",
+        "fever": "fc-fever",
+        "lepard": "fc-lepard",
+        "agent": "fc-agent",
+    }
+
+
+def test_stable_ids_cover_predicate_semantics_and_inputs():
+    assert len(PREDICATES) == 21
+    assert len({spec.key for spec in PREDICATES}) == len(PREDICATES)
+    original = PREDICATES[0]
+
+    join_spec = _spec("quailb.biodex.report.experienced_reaction")
+    assert (predicate_payload(join_spec)["render"]
+            == "join_arg0_anchor_then_arg1_v1")
+    changed_prompt = replace(join_spec, template=join_spec.template + "\n")
+    changed_roles = replace(join_spec, left_role="medical_report")
+    assert predicate_version(join_spec) != predicate_version(changed_prompt)
+    assert predicate_version(join_spec) != predicate_version(changed_roles)
+
+    left = {"role": "report", "table": "reports", "row_id": "rp0"}
+    right = {"role": "reaction", "table": "terms", "row_id": "tm0"}
+    example, full = example_identity("c_test", [left, right])
+    reversed_example, _ = example_identity("c_test", [right, left])
+    assert example != reversed_example
+    assert (judgment_identity("ls_one", full)
+            != judgment_identity("ls_two", full))
+
+    first = label_set_identity(original, "c_one", "1" * 64)
+    second = label_set_identity(original, "c_two", "2" * 64)
+    assert first["label_set_id"] != second["label_set_id"]
+
+
+def test_corpus_identity_uses_source_rows_and_order():
+    rows = {
+        "reviews": [{"id": "r0", "body": "a"},
+                    {"id": "r1", "body": "b"}],
+    }
+    same = {"reviews": list(rows["reviews"])}
+    reversed_rows = {"reviews": list(reversed(rows["reviews"]))}
+    changed = {"reviews": [{"id": "r0", "body": "a"},
+                           {"id": "r1", "body": "changed"}]}
+    assert _corpus_identity(rows, 0.1) == _corpus_identity(same, 0.1)
+    assert (_corpus_identity(rows, 0.1)["corpus_id"]
+            != _corpus_identity(reversed_rows, 0.1)["corpus_id"])
+    assert (_corpus_identity(rows, 0.1)["corpus_id"]
+            != _corpus_identity(changed, 0.1)["corpus_id"])
+
+
+def test_reuse_checks_the_label_sets_original_corpus(monkeypatch, tmp_path):
+    import json
+
+    import quailb.judge_pass as judge_pass
+
+    spec = _spec("quailb.imdb.review.mentions_positive_aspect")
+    label_set_id = "ls_old"
+    table_manifest = {"rows": 2, "ordered_rows_full_hash": "abc"}
+    corpus = {
+        "corpus_id": "c_original",
+        "corpus_full_hash": "full-original",
+        "tables": {"reviews": table_manifest},
+    }
+    corpus_dir = tmp_path / "corpora" / corpus["corpus_id"]
+    corpus_dir.mkdir(parents=True)
+    (corpus_dir / "manifest.json").write_text(json.dumps(corpus))
+    label_dir = (
+        tmp_path / "label_sets" / spec.workload / spec.slug / label_set_id
+    )
+    label_dir.mkdir(parents=True)
+    (label_dir / "manifest.json").write_text(json.dumps({
+        "status": "complete",
+        "label_set_id": label_set_id,
+        "corpus_id": corpus["corpus_id"],
+        "corpus_full_hash": corpus["corpus_full_hash"],
+    }))
+    source_collection = {
+        "collection_id": "gt_middle",
+        "corpus_id": "c_middle",
+        "label_sets": {spec.key: label_set_id},
+    }
+    target = {"tables": {"reviews": dict(table_manifest)}}
+    monkeypatch.setattr(judge_pass, "VOLUME_ROOT", tmp_path)
+
+    reused = _check_reused_label_set(
+        spec, label_set_id, source_collection, target)
+
+    assert reused["source_collection_id"] == "gt_middle"
+    assert reused["source_corpus_id"] == "c_original"
+
+
+def test_reuse_rejects_changed_table_in_target(monkeypatch, tmp_path):
+    import json
+
+    import quailb.judge_pass as judge_pass
+
+    spec = _spec("quailb.imdb.review.mentions_positive_aspect")
+    label_set_id = "ls_old"
+    corpus = {
+        "corpus_id": "c_original",
+        "corpus_full_hash": "full-original",
+        "tables": {
+            "reviews": {"rows": 2, "ordered_rows_full_hash": "abc"},
+        },
+    }
+    corpus_dir = tmp_path / "corpora" / corpus["corpus_id"]
+    corpus_dir.mkdir(parents=True)
+    (corpus_dir / "manifest.json").write_text(json.dumps(corpus))
+    label_dir = (
+        tmp_path / "label_sets" / spec.workload / spec.slug / label_set_id
+    )
+    label_dir.mkdir(parents=True)
+    (label_dir / "manifest.json").write_text(json.dumps({
+        "status": "complete",
+        "label_set_id": label_set_id,
+        "corpus_id": corpus["corpus_id"],
+        "corpus_full_hash": corpus["corpus_full_hash"],
+    }))
+    source_collection = {
+        "collection_id": "gt_middle",
+        "label_sets": {spec.key: label_set_id},
+    }
+    target = {
+        "tables": {
+            "reviews": {"rows": 2, "ordered_rows_full_hash": "changed"},
+        },
+    }
+    monkeypatch.setattr(judge_pass, "VOLUME_ROOT", tmp_path)
+
+    try:
+        _check_reused_label_set(
+            spec, label_set_id, source_collection, target)
+    except ValueError as error:
+        assert "table reviews changed" in str(error)
+    else:
+        raise AssertionError("changed table was reused")
+
+
+def test_filter_and_join_prompts_use_the_engine_layout():
+    filter_prompt = render_filter_prompt(PREDICATES[0], "review text")
+    assert filter_prompt.startswith("DOCUMENT:\nreview text")
+    assert "Evaluate TRUE or FALSE" in filter_prompt
+    assert filter_prompt.endswith("\nANSWER:")
+
+    join_prompt = render_join_prompt(PREDICATES[3], "review", "aspect")
+    assert join_prompt.startswith("DOCUMENT:\nreview")
+    assert "(The document above is DOCUMENT {0}.)" in join_prompt
+    assert "DOCUMENT {1}:\naspect" in join_prompt
+    assert join_prompt.endswith("\nANSWER:")
+
+
+def test_lepard_source_answer_uses_sampled_citation_edges():
+    assert _lepard_source_answer(["p1", "p2"], ["p2", "p3"])
+    assert not _lepard_source_answer(["p1", "p2"], ["p3"])
+
+
+def test_saved_verification_sample_covers_completed_parts_after_resume(
+        monkeypatch, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import quailb.judge_pass as judge_pass
+
+    spec = _spec("quailb.imdb.review.discusses_ending")
+    identity = {"label_set_id": "ls_test"}
+    monkeypatch.setattr(judge_pass, "VOLUME_ROOT", tmp_path)
+    parts = (tmp_path / "label_sets" / spec.workload / spec.slug
+             / identity["label_set_id"] / "parts")
+    parts.mkdir(parents=True)
+    saved = [{
+        "answer": i % 2 == 0,
+        "label_source": MODEL_NAME,
+        "left_id": f"rv{i}",
+        "right_id": None,
+    } for i in range(85)]
+    # only the first of two parts is on disk, the resume case
+    pq.write_table(pa.Table.from_pylist(saved),
+                   parts / "part_000000_000085.parquet")
+    corpus = {
+        "reviews": [{"id": f"rv{i}", "body": f"review {i}"}
+                    for i in range(170)]
+    }
+
+    sample = _saved_verification_sample(
+        corpus, {spec.key: identity}, specs=(spec,))
+
+    assert len(sample.rows[spec.key]) == 16
+    assert sample.rows[spec.key][0] == (
+        render_filter_prompt(spec, "review 0"), True)
+
+
+def test_compact_label_parts_keeps_every_saved_row(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    parts_dir = tmp_path / "parts"
+    parts_dir.mkdir()
+    pq.write_table(pa.table({"id": ["a", "b"], "answer": [True, False]}),
+                   parts_dir / "part_000000_000002.parquet")
+    pq.write_table(pa.table({"id": ["c"], "answer": [True]}),
+                   parts_dir / "part_000002_000003.parquet")
+    # a leftover generation of boundaries, which the caller does not
+    # name and compaction must therefore ignore
+    pq.write_table(pa.table({"id": ["a", "b", "c"],
+                             "answer": [True, False, True]}),
+                   parts_dir / "part_000000_000003.parquet")
+    parts = [parts_dir / "part_000000_000002.parquet",
+             parts_dir / "part_000002_000003.parquet"]
+
+    path, rows = _compact_label_parts(tmp_path, parts)
+    second_path, second_rows = _compact_label_parts(tmp_path, parts)
+
+    assert rows == second_rows == 3
+    assert path == second_path == tmp_path / "labels.parquet"
+    assert pq.read_table(path).to_pylist() == [
+        {"id": "a", "answer": True},
+        {"id": "b", "answer": False},
+        {"id": "c", "answer": True},
+    ]
