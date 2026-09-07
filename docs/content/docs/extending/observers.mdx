@@ -14,11 +14,13 @@ result = session.sql("SELECT ...").run()
 
 result.plan                 # the executed PhysicalGraph
 result.node_metrics         # node id -> NodeMetrics
-print(result.explain_analyze())
+print(result.explain())
 ```
 
-`explain_analyze()` prints one line per node in execution order with
-its fields and its nonzero metrics:
+`query.explain()` describes the plan before execution.
+`result.explain()` formats the executed plan and measured metrics without
+running the query again. It returns one line per node in execution order
+with its fields and nonzero metrics:
 
 ```
 <type_name> <node_id> [<explain fields>]  wall_s=<s> rows=<in>-><out> <nonzero metrics>

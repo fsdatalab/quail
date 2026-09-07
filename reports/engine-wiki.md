@@ -375,7 +375,7 @@ process, before opening sources. It supports registrations that create
 objects inside that process.
 
 A finished `QueryResult` carries the executed `PhysicalGraph` as `plan` and
-each node's `NodeMetrics` as `node_metrics`; `explain_analyze()` prints them.
+each node's `NodeMetrics` as `node_metrics`; `explain()` prints them.
 Execution observers, registered by class, run over the complete physical graph
 once when the query finishes. Model nodes reuse the metrics reported by the GPU
 executor. The same observer instance then sees `HashJoin`, `Project`, and

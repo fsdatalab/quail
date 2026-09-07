@@ -8,7 +8,7 @@ come back. Run from the repository root as a module:
     uv run python -m experiments.cells.extension_smoke 2>&1 \\
         | tee results/extension_smoke.log
 
-Prints the query's explain_analyze and the cost ledger totals.
+Prints the query's explain and the cost ledger totals.
 """
 
 import json
@@ -46,7 +46,7 @@ def main():
     got = sorted(row[0] for row in result.to_rows())
     print("rows:", len(got), "planted:", len(planted),
           "agree:", len(set(got) & set(planted)), flush=True)
-    print("explain_analyze:\n" + result.explain_analyze(), flush=True)
+    print("explain:\n" + result.explain(), flush=True)
     print("observer:", json.dumps(result.observer(RowTrace)), flush=True)
     print("ledger totals:", json.dumps(cost_ledger.charge(result)["totals"]),
           flush=True)

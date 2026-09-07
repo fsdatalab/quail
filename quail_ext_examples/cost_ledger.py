@@ -19,7 +19,7 @@ registered:
     ).run()
     ledger = cost_ledger.charge(result)
     print(ledger["totals"]["usd"], ledger["totals"]["fresh_tokens"])
-    print(result.explain_analyze())
+    print(result.explain())
 """
 
 from __future__ import annotations

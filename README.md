@@ -181,7 +181,7 @@ app. Quail does not run an application server. One Modal container receives
 charges each query's GPU seconds, tokens, and dollars to the physical nodes
 that used them, for chargeback or a cost dashboard. It reads
 `result.plan` and `result.node_metrics`, which every finished query carries,
-and registers nothing; `result.explain_analyze()` prints the same numbers.
+and registers nothing; `result.explain()` prints the same numbers.
 
 A model backend decides whether it supports a model and device. It proposes a
 physical plan, creates one model execution object per GPU, and executes the

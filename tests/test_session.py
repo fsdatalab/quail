@@ -287,7 +287,7 @@ def test_result_carries_the_executed_plan_and_node_metrics(tmp_path):
     # the fake executor reports no per node metrics, so every node
     # carries the zero metrics; the plan and the shape are what this
     # test checks
-    text = result.explain_analyze()
+    text = result.explain()
     assert text.count("\n") == 3
     assert text.startswith("quail.document_input ")
     assert "quail.packed_filter" in text and "wall_s=0.000" in text
@@ -338,4 +338,4 @@ def test_executed_plan_survives_the_report_round_trip(tmp_path):
     assert [node.node_id for node in restored.plan.topological_nodes()] == [
         node.node_id for node in result.plan.topological_nodes()]
     assert restored.node_metrics == result.node_metrics
-    assert restored.explain_analyze() == result.explain_analyze()
+    assert restored.explain() == result.explain()

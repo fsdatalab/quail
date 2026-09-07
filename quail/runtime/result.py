@@ -354,7 +354,7 @@ class QueryResult:
             }
         return self
 
-    def explain_analyze(self) -> str:
+    def explain(self) -> str:
         """Return the executed physical plan with each node's metrics."""
         # the runner imports this module, so the metrics type is
         # imported here
