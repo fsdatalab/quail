@@ -23,7 +23,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Patch, Rectangle
 
 from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
 
@@ -121,7 +121,7 @@ def plot_window(window):
     start, end = window["start"], window["end"]
     active = sum(b - a for a, b in window["gpu"])
     levels = max(event[2] for event in window["cpu"]) + 1
-    fig = plt.figure(figsize=(18, 5.7 + 0.32 * levels))
+    fig = plt.figure(figsize=(18, 4.9 + 0.32 * levels))
     fig.set_layout_engine("none")
     fig.text(0.09, 0.965, f"BIO-3, pipelined vLLM, {start:g} to {end:g} seconds after join start",
              fontsize=18, weight="bold")
@@ -145,7 +145,7 @@ def plot_window(window):
     gpu.set(xlim=(start, end), ylim=(1.9, -0.1), yticks=[0.4, 1.4],
             yticklabels=["GPU active", "GPU idle"], xticks=range(int(start), int(end) + 1))
     gpu.tick_params(axis="both", labelsize=12)
-    cpu = fig.add_axes((0.09, 0.24, 0.89, 0.34), sharex=gpu)
+    cpu = fig.add_axes((0.09, 0.17, 0.89, 0.40), sharex=gpu)
     cpu.set_title(f"Recorded CPU operations on worker thread {window['thread_id']}", loc="left", fontsize=14)
     vertices, fills = [], []
     for a, b, depth, name in window["cpu"]:
@@ -164,12 +164,12 @@ def plot_window(window):
     cpu.set(xlim=(start, end), ylim=(levels, -0.1), yticks=[], xlabel="seconds")
     cpu.tick_params(axis="x", labelsize=12)
     cpu.xaxis.label.set_size(12)
-    fig.text(0.09, 0.13,
-             "Both panels use the same time axis. CPU children appear below their parent; repeated calls stay separate.\n"
-             "Orange: vllm.scheduler.*. Blue: recorded PyTorch and CUDA API calls. Gray: [no recorded CPU operation].\n"
-             "Gray does not mean CPU idle. Open the HTML and click a rectangle to zoom both panels together.\n"
-             "This window is near the join midpoint. Profiling overhead is included; brief intervals can be narrower than a pixel.",
-             fontsize=11, linespacing=1.6, va="top")
+    fig.legend(handles=[
+        Patch(facecolor=BLUE, label="PyTorch / CUDA API calls (CPU)"),
+        Patch(facecolor=ORANGE, label="vllm.scheduler.*"),
+        Patch(facecolor=GRAY, label="[no recorded CPU operation]"),
+    ], loc="lower left", bbox_to_anchor=(0.09, 0.015), ncol=3, fontsize=12,
+        borderaxespad=0, handlelength=1.2, handleheight=1.2, columnspacing=3)
     destination = HERE / "plots/bio3_join_window"
     fig.savefig(destination.with_suffix(".png"), dpi=300)
     fig.savefig(destination.with_suffix(".pdf"))
@@ -200,6 +200,9 @@ input,select {font:inherit;padding:5px}
 #gpu-timeline {width:100%;height:180px;cursor:crosshair}
 #timeline-status,#timeline-hover {font:14px ui-monospace,monospace;min-height:22px;overflow-wrap:anywhere}
 #cpu-gpu-window {width:100%;cursor:crosshair}
+.cpu-legend {display:flex;gap:28px;flex-wrap:wrap;margin:18px 0;font-size:14px}
+.cpu-legend span {display:inline-flex;align-items:center;gap:8px}
+.cpu-legend i {display:inline-block;width:16px;height:16px}
 #window-status,#window-details {font:14px ui-monospace,monospace;white-space:pre-wrap;min-height:40px}
 button {font:inherit;padding:6px 12px;margin-right:10px;cursor:pointer}
 #chart {width:100%;overflow:auto} canvas {display:block;cursor:pointer}
@@ -214,15 +217,15 @@ button {font:inherit;padding:6px 12px;margin-right:10px;cursor:pointer}
 <p class="caption">Total time grouped by GPU state, not event order. GPU active means at least one recorded kernel or transfer.
 Profiling overhead is included.</p>
 <h2>Five seconds with GPU and CPU on the same time axis</h2>
-<p>This window covers seconds 480 to 485, near the middle of the join.
-CPU children appear below their parent, and repeated calls stay separate.
-Hover for the original function name. Click a rectangle to zoom both panels together.</p>
-<p class="caption">Orange shows scheduler methods. Blue shows PyTorch and CUDA API calls.
-Gray means no recorded CPU operation, which can include Python work or waiting.
-Brief intervals can be narrower than a pixel; click to inspect them.</p>
+<p>480 to 485 seconds. Hover for function names; click to zoom.</p>
 <button id="window-reset">Reset to 5 seconds</button>
 <a href="bio3_join_window.pdf">Download PDF</a>
 <div id="window-status" role="status"></div>
+<div class="cpu-legend" aria-label="CPU operation colors">
+  <span><i style="background:__BLUE__"></i>PyTorch / CUDA API calls (CPU)</span>
+  <span><i style="background:__ORANGE__"></i>vllm.scheduler.*</span>
+  <span><i style="background:__GRAY__"></i>[no recorded CPU operation]</span>
+</div>
 <canvas id="cpu-gpu-window" aria-label="Five seconds of GPU active and idle intervals above nested CPU operations on the same time axis"></canvas>
 <pre id="window-details" role="status">Hover a rectangle for its recorded name and interval.</pre>
 <h2>GPU active and idle over time</h2>
@@ -358,6 +361,7 @@ def write_interactive(root, timeline, window):
     """Save a standalone interactive flame graph."""
     data = json.dumps(root).replace("<", "\\u003c")
     html = HTML.replace("__DARK__", DARK).replace("__GREEN__", GREEN)
+    html = html.replace("__BLUE__", BLUE).replace("__ORANGE__", ORANGE).replace("__GRAY__", GRAY)
     html = html.replace("__DATA__", data).replace("__COLORS__", json.dumps({
         "orange": ORANGE, "blue": BLUE, "gray": GRAY, "green": GREEN, "dark": DARK,
     }))
