@@ -4,12 +4,6 @@ bibliography: references.bib
 link-citations: true
 ---
 
-# Working title and thesis
-
-- The working title is, "Quail, a Query Aware Inference Layer for AI-SQL."
-- The main point is that, after an AI-SQL optimizer has removed every model call it can, executing the calls that remain is still a database systems problem.
-- We will make that point through one BioDEX query, first by running it with vLLM, then by looking at what the query knows that vLLM does not.
-
 # 1. A new class of inference workloads
 
 - For decades, database users have struggled to analyze unstructured text at scale. SQL is primarily good for structured, relational data.
