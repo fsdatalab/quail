@@ -11,13 +11,14 @@ image.
 
 import time
 
+from quail.executor.model import answer_weights
+
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.executor.pack import (
     FilterAdmission,
     pack_stream,
     partition_anchor_groups,
 )
-from quail.executor.retention import RetainedPool
 
 
 def _tick(timing, key, t0):
@@ -95,12 +96,7 @@ class Answerer:
         self.F = F
         self.allowed = sorted(t_ids | f_ids)
         self.true_ids = t_ids
-        # the head weight lives on the CPU when untied (moved there at
-        # load); slice where it lives, keep only the slice on the GPU
-        weight = model.lm_head.weight
-        sel = torch.tensor(self.allowed, device=weight.device)
-        self.weights = weight.index_select(0, sel).to(
-            device="cuda", dtype=torch.bfloat16)
+        self.weights = answer_weights(model, self.allowed)
         self.true_cols = torch.tensor(
             [i for i, t in enumerate(self.allowed) if t in t_ids],
             device="cuda")
@@ -113,13 +109,6 @@ class Answerer:
         t = scores.index_select(1, self.true_cols).amax(dim=1)
         f = scores.index_select(1, self.false_cols).amax(dim=1)
         return (t > f).int().cpu().tolist()
-
-    def margins(self, normed):
-        scores = self.F.linear(normed, self.weights)
-        t = scores.index_select(1, self.true_cols).amax(dim=1)
-        f = scores.index_select(1, self.false_cols).amax(dim=1)
-        return (t - f).float().cpu().tolist()
-
 
 class AsyncAnswers:
     """Non-blocking TRUE/FALSE readout. submit() returns an event and
@@ -793,7 +782,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         arena_keys: Stable arena key for each document. List positions are
             used when omitted.
         retain_survivors: Passing document positions to keep for
-            joins, through a RetainedPool capped at the arena minus
+            joins, through the shared arena retention pool capped at the arena minus
             the scan ring.
 
     Returns:
@@ -801,12 +790,11 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         first FALSE; spans and tokens as in run_join.
     """
     p = _shared_preamble_tokens(question_ids)
-    keys = (list(range(len(doc_ids))) if arena_keys is None
-            else list(arena_keys))
+    keys = range(len(doc_ids)) if arena_keys is None else arena_keys
     if len(keys) != len(doc_ids):
         raise ValueError("arena_keys must match doc_ids")
-    retain = (set(range(len(doc_ids))) if retain_survivors is True
-              else set(retain_survivors))
+    retain_all = retain_survivors is True
+    retain = set() if retain_all else set(retain_survivors)
     stage_tokens = [len(question_ids[0])] \
         + [len(q) - p for q in question_ids[1:]]
     tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
@@ -815,7 +803,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             raise ValueError(
                 f"stage {i} question has no tokens beyond the shared "
                 f"preamble ({p} tokens)")
-    if not arena_writes and (len(question_ids) > 1 or retain):
+    if not arena_writes and (
+        len(question_ids) > 1 or retain_all or retain
+    ):
         # a later stage re-reads the KV, which needs the pages this
         # switch skips
         raise ValueError("arena_writes=False needs a single stage")
@@ -825,18 +815,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     # longest tail, or zero when every question is pure preamble
     temp_tail = max(0, *(len(q) - p for q in question_ids)) \
         if unified and arena_writes else 0
-    pool = None
-    if retain:
-        # the scan ring: the loop keeps two chunks of document KV in
-        # flight, so retention may take only what is left (the
-        # planner's keep headroom reserves the same two chunks)
-        ring_pages = arena.accounting.pages_needed(2 * budget)
-        short = ring_pages - arena.accounting.free_pages
-        if short > 0:
-            # an earlier operator's retained KV crowds the ring
-            arena.evict_retained(short)
-        pool = RetainedPool(
-            max(0, arena.accounting.free_pages - ring_pages))
+    if arena.accounting.retention_cap_pages is None:
+        arena.accounting.retention_cap_pages = max(
+            0, arena.accounting.n_pages - arena.accounting.pages_needed(2 * budget))
     sched = FilterAdmission(
         [len(d) for d in doc_ids], stage_tokens, budget,
         arena_pages=(arena.accounting.n_pages if arena_writes
@@ -864,19 +845,13 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         for (doc, stage, _fresh), bit in zip(groups, bits):
             passed = bool(bit)
             last = stage == len(stage_tokens) - 1
-            keep = passed and last and doc in retain
-            if keep:
-                keep, victims = pool.offer(
-                    keys[doc],
-                    arena.accounting.pages_needed(len(doc_ids[doc])),
-                    len(doc_ids[doc]))
-                for v in victims:
-                    sched.add_free_pages(arena.evict_key(v))
+            keep = passed and last and (retain_all or doc in retain)
             for d in sched.report(doc, stage, passed,
                                   release=not keep):
                 arena.free_key(keys[d])
             if keep:
-                arena.retain(keys[doc], len(doc_ids[doc]))
+                freed = arena.retain(keys[doc], len(doc_ids[doc]))
+                sched.add_free_pages(freed)
         _tick(timing, "report_rest", t)
 
     while not sched.done():
@@ -889,10 +864,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                 continue
             if sched.blocked_pages:
                 before = arena.accounting.free_pages
-                evicted = arena.evict_retained(sched.blocked_pages)
-                if pool is not None:
-                    for k in evicted:
-                        pool.discard(k)
+                arena.evict_retained(sched.blocked_pages)
                 freed = arena.accounting.free_pages - before
                 if freed:
                     sched.add_free_pages(freed)

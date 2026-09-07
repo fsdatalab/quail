@@ -11,16 +11,23 @@ noted.
 
 The table below lists every module, what it does, and what it
 depends on. The data flow is top to bottom: the user calls the
-session, which calls the front end, then the planner, then ships a
-payload to the worker, which calls the executor.
+session, which calls the front end, then the planner, then sends an
+execution request to the compute provider.
 
 | Module | What it does | Depends on |
 |---|---|---|
 | `__init__.py` | Public API surface | builder, catalog, planner, runtime |
-| `catalog.py` | Document providers (parquet, HF) and the registry | logical |
-| `logical.py` | Logical operators (Scan, Filter, Join, Project) and plan assembly | nothing |
+| `catalog.py` | Table provider interface and Arrow, Parquet, Hugging Face, and memory providers | logical |
+| `logical.py` | Logical node interface, built in nodes, and the shared plan builder | nothing |
+| `logical_optimizer.py` | Generic logical rule runner | logical |
 | `builder.py` | Builder API entry point | catalog, logical |
 | `sqlfront/compile.py` | AI SQL entry point (sqlglot parser and binder) | catalog, logical |
+| `extensions.py` | Per session backend, codec, runtime, rule, and provider registration | physical |
+| `builtins.py` | The registry of built in backends, models, devices, codecs, runtimes, and source readers | backends, catalog, runner, specs |
+| `execution.py` | Token input, physical request, and Arrow response types | physical |
+| `planning.py` | Backend planning inputs and physical candidates | physical, specs |
+| `physical/` | Typed physical nodes, graph validation, and plan envelope codecs | nothing |
+| `backends/` | Model backend interface and the Quail, vLLM, and SGLang backends | planning, physical |
 | `specs/base.py` | ModelSpec and DeviceSpec structs | nothing |
 | `specs/qwen3_4b.py`, `specs/h100_sxm.py` | Concrete spec instances | specs/base |
 | `planner/budgets.py` | Derived quantities (chunk budget, arena budget, roofline) | specs |
@@ -28,16 +35,25 @@ payload to the worker, which calls the executor.
 | `planner/qwen3_cost.py` | Qwen3 attention projection, MLP, and attention components | specs, work, roofline |
 | `planner/roofline.py` | Generic component compute and memory limits | specs |
 | `planner/sol.py` | Ideal query packing and total component time | work, qwen3_cost, roofline |
-| `planner/plan.py` | PhysicalPlan and Refusal structs, EngineConfig | specs |
-| `planner/decide.py` | All planner decisions (order, anchor, dtype, sharding) | logical, budgets, plan |
+| `planner/plan.py` | PhysicalPlan, Refusal, and EngineConfig | physical, specs |
+| `planner/__init__.py` | The public planning interface backends import: `collect_operators`, `plan_query`, `plan_quail`, `preamble_tokens`, `order_filters_indexed`, `join_specs`, `balanced_shards` | decide, plan |
+| `planner/decide.py` | All planner decisions (order, anchor, budgets, sharding) | logical, budgets, plan |
+| `planner/retention.py` | Expected length allocations and future anchor use probabilities | joins, qwen3_cost, executor/retention |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
 | `executor/pack.py` | Chunk packing (pack_stream, FilterAdmission) | nothing |
 | `executor/loop.py` | Execution loops (run_filter, run_join, warm_kernels) | arena, attention, pack |
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
-| `runtime/session.py` | Session, Query, tokenization, payload assembly | catalog, logical, planner, sqlfront, builder |
-| `runtime/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
-| `runtime/worker.py` | Modal worker (boot, execute, multi-GPU dispatch) | executor, planner, coordinator |
+| `runtime/session.py` | Session, Query, tokenization, input binding, and result assembly | catalog, logical, planner, sqlfront, builder |
+| `runtime/tokens.py` | Memory mapped token files and random document views | Arrow |
+| `runtime/compute.py` | Compute provider interface and Modal Function implementation | catalog, result, worker |
+| `runtime/runner.py` | Generic typed graph runner and standard node metrics | physical |
+| `backends/quail/graph.py` | One GPU Quail node preparation, fixed graph execution, and KV accounting | runner, executor |
+| `backends/quail/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
+| `backends/quail/distributed.py` | Several GPU Quail node dispatch and result merging | runner, coordinator |
+| `backends/quail/worker.py` | Quail model boot, single GPU execution, and the GPU child protocol | executor, graph, distributed |
+| `runtime/local.py` | Run one logical query request in the current process: validation, backend dispatch, and result assembly | builtins, session |
+| `runtime/worker.py` | The Modal image, volumes, and functions; opens sources and calls `runtime/local.py` | local, volumes |
 | `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
 
 ### Data flow
@@ -47,32 +63,56 @@ User
   |
   v
 Session (runtime/session.py)
-  |--- sql() ---> sqlfront/compile.py ---> logical.py (LogicalPlan)
-  |--- docs() --> builder.py ------------> logical.py (LogicalPlan)
+  |--- sql() ---> sqlfront/compile.py ---|
+  |--- docs() --> builder.py ------------|--> LogicalPlanBuilder
   |
   v
-plan_query (planner/decide.py)
-  reads: model and device specs, budgets
-  produces: PhysicalPlan
+selected ComputeProvider
+  receives one QueryRequest with the logical plan and table providers
+  |
+  |--- ModalComputeProvider
+  |      sends remote source descriptions
+  |      sends needed raw Arrow columns for client-only sources
+  |      calls a Modal Function
   |
   v
-_payload (runtime/session.py)
-  tokenizes documents, builds token-id payload
+compute worker (runtime/worker.py, then runtime/local.py)
+  opens sources and tokenizes document columns
+  writes tokens, lengths, and projected columns to temporary Arrow files
+  runs logical optimizer rules and physical planning
+  validates the physical plan, backend, codecs, model, and GPU count
+  boots the engine selected by the model backend
+  runs: GenericRunner -> registered node runtimes
+        -> QuailModelExecution -> loop.run_filter / loop.run_join
+        -> RequestModelExecution -> vLLM or SGLang requests
+  assembles and projects the final Arrow rows
   |
   v
-worker.execute (runtime/worker.py, on Modal GPU)
-  boots: model.py -> attention.Pipeline -> arena.KVArena
-  runs: loop.run_filter / loop.run_join
-  returns: raw answer rows
-  |
-  v
-_assemble (runtime/session.py)
-  converts answers to Arrow tables
-  |
-  v
-Arrow Acero
-  hash joins, projects, counts, streams -> QueryResult
+QueryResult
+  Modal returns a materialized QueryResult with its plan and metrics
 ```
+
+### The result path
+
+Answers take one shape at every hop the runner or a client sees.
+
+- A model backend returns a `PhysicalResponse`: Arrow tables keyed by
+  output `PortRef`, in the standard document id, filter answer, and
+  join answer shapes, plus a metrics mapping.
+- The generic runner finishes the graph from those tables and
+  `Query.finish` builds one `QueryResult` over an Acero plan.
+- A compute provider returns that `QueryResult`. The in-process
+  provider returns it as is. The Modal provider materializes it in the
+  worker and returns the `QueryResult` as a Python object. The executed
+  plan and node metrics are already attached.
+- The worker also writes a run record to `/results/runs/` on the
+  `quail-results` volume. That is a record for reports, not a result
+  path.
+
+Inside the Quail backend, GPU child processes send their answers to
+the parent over pipes as plain Python values. That is transport within
+one backend; the parent converts the merged answers to the same Arrow
+tables before they reach the runner.
 
 ## 1. System overview
 
@@ -84,8 +124,9 @@ predicate?). The model answers each predicate in a single token
 (TRUE or FALSE), constrained at decode time so no autoregressive
 generation ever runs.
 
-The current scope is filter queries and joins, Qwen3 4B fp8 weights,
-bf16 KV, on one or more H100 GPUs hosted on Modal.
+The current scope is filter queries and joins with Qwen3 4B fp8 or
+Qwen3 32B fp8 weights. KV uses bf16. Each H100 has one model copy,
+and one Modal container can use 1, 2, 4, or 8 H100s.
 
 ### End-to-end flow
 
@@ -93,47 +134,65 @@ bf16 KV, on one or more H100 GPUs hosted on Modal.
    datasets) with a `Session`.
 2. The user writes a query, either as AI SQL or through the builder
    API.
-3. The front end compiles the query into a `LogicalPlan` (a tree of
-   Scan, SemanticFilter, SemanticJoin, and Project operators).
-4. The `Session` tokenizes each scanned column (cached per session)
-   and calls the planner with the token counts.
-5. The planner produces a `PhysicalPlan`: a dataflow graph of nodes
-   (DocScan, FilterChain, JoinGroup, Barrier, Recombine, Sink) whose
-   edges carry either a table's live document ids or one stage's
-   passing pairs - plus the chunk budget, admission budget, and
-   sharding. Stage order and anchors come from one joint search,
-   which the worker re-runs on the actual filter survivors before
-   executing the joins. KV is always bf16. The only wall-time number
-   is the counted speed-of-light ranking the search uses.
-6. The session sends document token columns as Arrow IPC bytes with
-   the planned settings and the plan's node graph. The worker reads
-   each document as an Arrow token slice. It does not build one
-   Python list per document.
-7. The worker executes the graph on the GPU: filter chains,
-   exists/anti gates, and the full join stages (each one a
-   cross-product stage, however many tables it spans). Consecutive
-   full stages sharing an anchor run as one gated group over the
-   anchor's kept KV; a Barrier node between groups thins the live
-   sets to the surviving pairs' documents and, on several GPUs,
-   re-shards the next anchor over the measured live set.
-8. The worker returns raw answers. The session stores filter and join
-   answers in Arrow tables. Arrow Acero equi-joins the TRUE pairs on
+3. Both front ends use `LogicalPlanBuilder` to create a tree of
+   `Scan`, `SemanticFilter`, `SemanticJoin`, and logical `Project`
+   nodes. Every logical node implements the same traversal, rewrite,
+   validation, schema, and explain interface.
+4. The session creates one `QueryRequest`. The request contains the logical
+   plan, table providers, model settings, and registered extensions.
+5. The selected compute provider runs the request. Modal is the default.
+   `ModalComputeProvider` sends a source description when the worker can open
+   the source. Otherwise, it sends only the raw Arrow columns used by the
+   query.
+6. The Modal worker opens the sources and reads bounded Arrow batches. It
+   tokenizes each batch and writes the tokens, document lengths, and output
+   columns to a temporary Arrow file. Source batches can be released after the
+   write. The worker runs the registered logical optimizer rules from the
+   memory mapped length column. The selected model backend produces physical
+   candidates. The
+   planner selects one typed `PhysicalGraph`. Quail uses
+   `DocumentInput`, `PackedFilter`, `AnchoredJoin`,
+   `Exchange`, `HashJoin`, physical `Project`, and `Limit`.
+   The vLLM and SGLang backends use `DocumentInput`, `RequestExecution`,
+   `HashJoin`, physical `Project`, and `Limit`. `RequestExecution` stores the
+   tokenized filter and join prompt parts. It does not contain a Quail
+   scheduler.
+   The generic `PhysicalPlan` holds the graph and a backend-owned settings map.
+   Quail's chunk size, KV capacity, predicate order, and filter limit are not
+   fields that another backend must supply.
+7. The planner chooses the complete join order and anchors from selectivity
+   estimates. It schedules the first anchor's filters last and shares retained
+   KV capacity across inputs with future anchor uses. `Exchange` nodes prune actual survivors
+   between the planned join groups. Execution follows this graph without
+   searching again.
+8. The worker creates an internal physical request. It uses the query's
+   registry to check every physical node codec, backend, model, device,
+   and runtime. The generic
+   runner then executes the typed physical graph.
+   The same `QuailModelExecution` handles every model node on one GPU
+   executor, so the nodes use the same KV.
+9. Arrow Acero joins the true pairs on
    shared SQL alias columns and applies the final survivor sets. Each
    alias column contains the source table row number for one document.
-   A `QueryResult` returns projected rows through a
-   `RecordBatchReader`.
-   `collect()` explicitly reads those batches into memory. `count()`
-   runs an Acero aggregate without creating Python row tuples. LIMIT
+   The same graph applies the final projection and limit. Projection reads only
+   the selected result positions from memory mapped source columns, so the
+   worker does not scan the source again. The Modal Function
+   returns a materialized `QueryResult` with its report, executed plan, and
+   node metrics attached. `collect()` returns the Arrow table. `count()`
+   counts rows without creating Python row tuples. LIMIT
    stops the result stream after the requested number of rows.
 
 ## 2. Query compilation
 
-Both entry points (AI SQL and the builder) produce the same
-intermediate representation: a `QueryDesc` containing the tables,
-document columns, filter predicates, join specs, and projection
-columns. The `assemble_plan` function builds a `LogicalPlan` tree
-from the description, so a query written in SQL and the same query
-written with the builder produce identical plans.
+Both entry points use `LogicalPlanBuilder`. The builder creates the
+same registered logical node types for SQL and Python queries. There
+is no separate query description type or second plan assembly path.
+
+Each logical node has a stable type name. It reports its children,
+expressions, output schema, validation rules, and explain fields. A
+node can also return a copy with different children or expressions.
+The generic logical rule runner uses those methods, so a registered
+logical node does not require another tree traversal function.
 
 ### The logical operators
 
@@ -151,7 +210,7 @@ There are four operators, defined in `logical.py`:
   (the BigQuery/Snowflake AI-join shape). A query may hold several
   `full` joins - each its own predicate and stage, composed by id
   matching at assembly (issue #38); stages may anchor on different
-  tables, split into groups by barriers - plus any number of gates:
+  tables and run as separate anchored joins - plus any number of gates:
   - `full`: produce every matching tuple.
   - `exists`: keep outer documents that match at least one inner
     document (a semi-join; two tables).
@@ -216,10 +275,12 @@ cue once per tuple. See
 
 ### AI SQL front end
 
-The SQL front end (`sqlfront/compile.py`) parses AI SQL using sqlglot
-in the Snowflake dialect. `AI_FILTER(PROMPT(...))` appears in WHERE
-conjuncts; join predicates appear in `JOIN ... ON` clauses; `EXISTS`
-and `NOT EXISTS` subqueries map to exists and anti semantics.
+The SQL front end (`sqlfront/compile.py`) parses AI SQL using sqlglot.
+Snowflake syntax uses `AI_FILTER(PROMPT(...))`. BigQuery syntax uses
+`AI.IF(PROMPT(...))` with `dialect="bq"`. Both compile to the same
+`SemanticFilter` or `SemanticJoin` node. Filter calls appear in WHERE
+conjuncts. Join predicates appear in `JOIN ... ON` clauses. `EXISTS` and
+`NOT EXISTS` subqueries map to exists and anti semantics.
 
 Each multi-table `AI_FILTER(PROMPT(...))` - on a JOIN's ON or as a
 WHERE term - is one join predicate; a query may have several.
@@ -234,8 +295,9 @@ other than the EXISTS form. LIMIT N caps the output rows. For a
 filter-only query that means the filter loop stops once N survivors
 are found (early termination); for a join query the filter round
 gets no limit - one document can appear in zero or many output rows
-(#39) - and the Arrow result stream applies the final limit instead
-(`filter_round_limit` in `runtime/coordinator.py` decides). The
+(#39) - and the Arrow result stream applies the final limit instead.
+The typed filter runtime receives no early limit when the graph contains
+`AnchoredJoin`. The
 builder equivalent is `.limit(n)` before `.select()`. The rejection
 list is explicit (`compile.py:22-33`), so new SQL surface cannot
 enter silently.
@@ -246,21 +308,22 @@ The builder (`builder.py`) mirrors the SQL constructs: `docs()`,
 `.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. Its default
 is `as_written`, so the chain order is the execution order. A caller can pass
 `.select(..., order="by_cost")` to use the planner's cost order. Both entry
-points collect the same `QueryDesc` and call the same `assemble_plan`, so the
-plans are structurally identical.
+points finish through the same `LogicalPlanBuilder`, so the plans are
+structurally identical.
 
 ### Key functions: query compilation
 
 | Function | File | What it does |
 |---|---|---|
-| `compile_sql` | `sqlfront/compile.py:212` | AI SQL text -> LogicalPlan |
-| `assemble_plan` | `logical.py:117` | QueryDesc -> LogicalPlan tree |
+| `compile_sql` | `sqlfront/compile.py` | AI SQL text to LogicalPlan |
+| `LogicalPlanBuilder` | `logical.py` | Build registered logical nodes for both front ends |
+| `apply_logical_rules` | `logical_optimizer.py` | Rewrite a logical plan through registered rules |
 | `bind_prompt` | `logical.py:207` | Canonicalize, bind column refs, count tokens |
 | `split_template` | `logical.py:168` | Split at the first placeholder into preamble and tail |
 | `split_frame` | `logical.py:177` | Relocate user pre-document text; emit canonical template |
 | `canonicalize_template` | `logical.py:203` | `split_frame` without returning the frame |
-| `DocumentProvider.from_parquet` | `catalog.py:29` | Register a parquet file (metadata only) |
-| `DocumentProvider.read_column` | `catalog.py:53` | Read one column's ids and texts (at scan time) |
+| `DocumentProvider.from_parquet` | `catalog.py` | Create an Arrow dataset provider from Parquet metadata |
+| `TableProvider.scan` | `catalog.py` | Return bounded Arrow batches for requested columns |
 
 ### Key functions: session and runtime
 
@@ -270,8 +333,121 @@ plans are structurally identical.
 | `Session.docs` | `session.py:175` | Start the builder API |
 | `Session.scan` | `session.py:210` | Tokenize a column (cached per session) |
 | `Query.plan` | `session.py:310` | Run the planner (cached per Query) |
-| `Query.run` | `session.py:335` | Plan, execute on Modal, replay-check, project |
+| `Query.run` | `session.py` | Build one logical request and call the compute provider |
+| `Query._request` | `session.py` | Bind the logical plan to its table providers and settings |
+| `Query._prepare_physical` | `session.py` | Build the internal physical request inside a worker |
+| `Query.finish` | `session.py` | Build the worker result from physical Arrow outputs |
 | `Query.explain` | `session.py:330` | Print the logical tree and physical plan |
+
+### Engine and compute extensions
+
+Every session owns an `ExtensionRegistry`. The registry starts with Quail's
+included backend, models, devices, codecs, and runtimes. Extensions are
+registered as objects: `register_logical_rule(rule)`,
+`register_physical_planner(planner)`, `register_physical_rule(rule)`,
+`register_backend(backend)`, `register_model(spec)`, `register_device(spec)`,
+`register_node(node_type, runtime=...)`, `register_codec(codec)`,
+`register_runtime(runtime, key=...)`,
+`register_source_reader(reader, source_type=...)`, and
+`register_observer(factory)`. Names come from the objects. A package can also
+expose `register_quail_extension(registry)` and be loaded with
+`load_extension`. A concrete table provider is passed directly to
+`Session.register`. `register_node` adds the standard codec and runtime
+together, after checking both names. Registration methods specify the
+interfaces their arguments implement. Lookup tables are read-only.
+
+The registry stores ordinary Python objects in registration order.
+`load_extension` calls a module's registration function once, at the call
+site. Failed loads leave the registry unchanged. The built-ins are the
+included specifications and implementations; registering them does not
+load model weights or create processes.
+
+`QueryRequest.registry` contains the session's registry. Modal handles
+moving it to the worker as a Python object. Source preparation, planning,
+and execution use the same registry in that process. Physical plans
+contain no extension manifest. The optional multi-GPU path sends the registry
+to each GPU child once per query and reuses it across stages.
+
+Set `local_python_sources` and `pip_packages` on `ModalComputeProvider`.
+The provider copies and installs those dependencies explicitly. Its optional
+`initialize_worker(registry)` callback runs once per query inside the Modal
+process, before opening sources. It supports registrations that create
+objects inside that process.
+
+A finished `QueryResult` carries the executed `PhysicalGraph` as `plan` and
+each node's `NodeMetrics` as `node_metrics`; `explain()` prints them.
+Execution observers, registered by class, run over the complete physical graph
+once when the query finishes. Model nodes reuse the metrics reported by the GPU
+executor. The same observer instance then sees `HashJoin`, `Project`, and
+`Limit`. `result.observer(cls)` returns an observer's report.
+
+The selected model backend checks whether it supports the requested model,
+device, and GPU count. It proposes physical plans. It creates one model
+execution object per GPU. Its `execute_request` method runs a standard
+`PhysicalResponse`.
+
+The built in backends are separate implementations.
+
+- `QuailBackend` uses pipelining, token based admission, and KV rewind.
+- `stock_vllm` uses operator-at-a-time filter execution. Joins use one
+  request per document tuple in anchor major order.
+- `pipelined_vllm` submits the next filter stage as soon as one document
+  passes. It uses the same vLLM model and join submission as stock vLLM.
+- `pipelined_sglang` uses SGLang's asynchronous generation API to advance each
+  document as soon as its filter finishes. It uses the same page-rounded
+  admission calculation as vLLM. Joins submit all anchors for one partner before
+  the next partner, separating requests that share an anchor. Earlier requests
+  can then populate reusable KV. Answers and KV counts return in anchor-major
+  order regardless of submission order. Each join is
+  submitted as one batch, and SGLang schedules requests against its full KV
+  capacity. There is no client-side half-KV allocation or fixed request slice.
+
+The three are instances of one `RequestBackend` class with an engine adapter
+(`VLLMEngine` or `SGLangEngine`) and two submission strategies. They share the
+`RequestExecution` node format, the scheduling loops in
+`backends/request_scheduling.py`, and the Arrow output format. They do not
+call `QuailBackend` or Quail's executor. The older standalone stock vLLM and
+SGLang runners were removed on 2026-09-05; the request backends are the only
+comparison code.
+
+QUAIL-B runs Quail and both vLLM configurations in one Modal container for
+each query family. Quail runs in one process group. Stock vLLM and pipelined
+vLLM run in a second process group and share one loaded model. After each
+group returns its results, the parent stops every process in the group. The
+parent waits until GPU memory use is below 1 GiB before continuing. The runner
+records the physical GPU UUID and checks that both groups saw the same H100.
+
+SGLang runs in a separate container with its own image. vLLM 0.26.0 requires
+`apache-tvm-ffi` 0.1.10, while SGLang 0.5.18 requires version 0.1.11. Modal can
+therefore assign SGLang another physical H100. Its driver runs in a child
+process group, with the same cleanup and GPU-memory check as Quail and vLLM.
+The parent Modal process remains free to send its heartbeat messages.
+
+Each physical node has one codec representation that contains everything
+needed for execution. Its separate explain fields omit large runtime values
+when they would make the plan unreadable.
+
+`ComputeProvider` controls where a query runs. It has one `execute` method that
+accepts a `QueryRequest` and returns a `QueryResult`. The request contains the
+logical plan, table providers, model settings, and registered extensions. The
+default `ModalComputeProvider` selects the 1, 2, 4, or 8 GPU function in the
+existing `quail-engine` app. It builds the worker image with the selected
+backend package. Quail and vLLM workers install vLLM. SGLang workers install
+SGLang. Modal supplies the GPU container and function lifecycle. Quail does
+not run FastAPI, ASGI, REST, or another application server. A different
+provider can be passed as
+`Session(compute_provider=provider)`. It
+does not need changes to the planner or a model backend.
+
+`ModalComputeProvider` sets the selected function's minimum container count to
+one while the provider is open. Several queries can therefore reuse the same
+loaded model without an idle scale down between queries. `Session.close()`
+sets the minimum back to zero before it closes the Modal app context.
+
+Quail is the default backend. `Session()` therefore selects Quail without a
+backend argument. `EngineConfig(model="qwen3-32b-fp8")` selects another built
+in model. An extension can register another `ModelSpec` and a backend that
+supports it.
 
 ### Pushdown
 
@@ -303,7 +479,7 @@ once. Prefix survivor products and expected costs then let it price each
 predicate as the first scan in constant time. The search takes `O(n log n)`
 work for `n` filters. It does not check every filter permutation.
 
-**Join order and anchors, one search, repeated calls** (`search_joins`
+**Join order and anchors before execution** (`search_joins`
 in `planner/joins.py`): stage order and per-stage anchors are
 decided together, because they interact - anchors set what an order
 is worth, and order sets which stages can reuse an anchor's KV
@@ -319,20 +495,13 @@ the written stage order is kept and only anchors are searched. A
 gate's anchor is fixed to its outer table; a forced anchor is
 honored, with a remark at plan time when a free choice prices lower.
 
-The same function runs whenever new answers can change the decision:
-
-- **Plan time** (`plan_query`): expected live counts from
-  selectivities, summary length statistics, the keep credit as the
-  resident set. The output is the predicted plan - explain(), the
-  refusal checks, and sharding run off it.
-- **At runtime** (the worker; the parent process on several GPUs):
-  the actual survivor counts and summary length statistics, including
-  the count and total length of documents whose KV is resident. The
-  worker executes one join group, applies its answers, and searches
-  the remaining joins again. The next search starts with the aliases
-  joined by every completed group. For example, after joining B and C,
-  both A-B and C-D are legal next predicates. It does not search
-  between chunks inside one group.
+The search runs during planning with estimated survivor counts and document
+length summaries. Filter survival is assumed independent of document length.
+Multiple filter selectivities are multiplied. Candidates share a bounded filter KV allocation across legal anchors.
+The first use of each anchor can receive retention credit.
+The selected order determines filter scheduling and the executable graph.
+Actual rows and available KV determine the work performed during execution,
+without changing the selected joins or anchors.
 
 Each stage is costed as a `Work` record (`planner/sol.py`: tokens,
 attention pairs, KV written, KV read). Each alias is summarized once.
@@ -343,9 +512,8 @@ calculation. A DP candidate therefore takes constant time, regardless
 of the document count. A resident anchor prefix pays only its question
 frame (`ask`). Consecutive stages in one open anchor group also reuse
 the prefix. Other later groups are priced without predicted reuse.
-The worker searches again after the current group, so its next call
-sees the actual finite KV state. A stage can price some current anchor
-documents as KV hits and the rest as recomputations.
+Later anchor changes are priced as document recomputation. The executor reuses
+KV when available and recomputes missing prefixes within the same saved plan.
 Every tuple then carries partner labels, partner documents, and the
 answer cue over the resident anchor context. After each stage the
 live counts thin by `n * (1 - (1-s)^partner_tuples)`. Per state,
@@ -353,58 +521,43 @@ records survive unless another is no larger in all four work
 categories, and the final candidates rank by predicted seconds -
 `speed_of_light` from counted model constants and the device
 datasheet. No calibration constant is read anywhere. Stage outputs
-carry written_pos, semantics, and selectivity, so a runtime-chosen
-order assembles into results correctly.
+carry written_pos, semantics, and selectivity, so reordered
+predicates assemble into results correctly.
 
-**KV residency across operators** (`plan_keeps`, `keep_split` in
-`decide.py`; `RetainedPool` in `executor/retention.py`; the arena
-heap in `executor/arena.py`): document KV outlives its operator
-wherever a later one will read it.
+**KV residency across operators** (`planner/retention.py`,
+`executor/retention.py`, and the arena in `executor/arena.py`):
 
-- Every filtered alias the runtime search could anchor writes KV
-  (`arena_writes`) and keeps its survivors (`keep_kv` on the
-  FilterChain node). At each survivor's final TRUE the runtime
-  offers its prefix to the retained pool; a kept prefix is rewound
-  to preamble + document (the question tail's pages return to the
-  free list) and marked with its exact prefix token count. The join
-  then anchors on KV that is already there.
-- **The scan ring.** Before a filter with retention starts, the
-  loop reserves pages for two chunk budgets of document KV - one
-  chunk executing while the next is packed - and the retained pool
-  gets a fixed capacity of what is left. If an earlier operator's
-  retained KV crowds the ring, the prefixes with the fewest tokens
-  per page are evicted once, in bulk, up front. Admission never waits
-  on retention, and the filter runs full chunks for the whole scan.
-- **The retained pool** (`RetainedPool.offer`). While the pool has
-  room, every offered survivor is kept. Once full, the residents
-  with the fewest prefix tokens per page are candidates to make room.
-  The newcomer replaces them only when its prefix contains more tokens
-  than the victims contain together. Total retained prefix tokens only
-  rise, and equal token counts never swap. A replacement is heap
-  bookkeeping in the answer path, never a stalled forward pass.
-- A join group whose anchor a later group re-uses retains its gate
-  survivors the same way, so a gate between two same-anchor stages
-  no longer forces a recompute. Thinned-out documents and retained
-  KV with no future consumer are freed the moment that is known,
-  and the arena is empty when the query ends.
-- The runtime never evicts to admit a cache entry. Every admission
-  is a computation the query requires; only retention is optional.
-  During joins, activating a missing anchor under pressure evicts
-  retained prefixes in increasing prefix tokens per page;
-  the arena stores that order in a heap. The same path survives in
-  filter admission only as a safety valve that the ring makes
-  unreachable in normal operation. Pinned keys in use by the running
-  operator are not eviction candidates.
-- The plan-time half is the *credit*: `keep_split` prices in the
-  expected resident fraction the keep budget can hold - the arena
-  minus the same two-chunk working reservation the ring makes -
-  using the corpus length distribution. The runtime can favor any
-  prefix whose last page is fuller, so the plan does not assume a
-  length threshold. The `_keep_timeline` function
-  trims the credit until the peak expected resident tokens fit
-  beside the working headroom. The runtime is not bound by the
-  threshold; the credit keeps the prediction and the SoL comparison
-  honest.
+- All filtered inputs with a planned anchor use can retain document KV. The first
+  anchor's filters still run last. Retention uses one shared pool per GPU.
+- A prefix with `L` tokens occupies `ceil(L / 16)` pages. The priority is
+  `q * C(L) / pages`, where `q` is its predicted probability of reaching its next
+  anchor use and `C(L)` is the ideal prefix computation cost. The cost includes
+  linear dense computation and quadratic causal attention computation.
+- A passing document is offered without multiplying by its completed filter's
+  selectivity again. If the pool exceeds its cap, the lowest priority prefix is
+  evicted. Equal priorities prefer earlier reuse, then lower document position.
+  The new candidate can itself be evicted. This is a replacement heuristic, not
+  an exact solution for indivisible document prefixes.
+- The cap reserves two execution chunks. Evictions return pages to filter
+  admission. Active prefixes stay protected. An arena allocation that still
+  needs more pages uses the same eviction priority.
+- The plan records future use probabilities before and after each join group.
+  At a boundary, the executor releases expired or known dead prefixes and
+  updates retained priorities. Completed anchors with another planned use are
+  offered using their next use's priority. Other sets' useful KV remains retained.
+- Planning scales each input length histogram by filter selectivity and fills
+  expected capacity in priority order. The last length group may receive a
+  fractional allocation. Expected pages per set are estimates, not partitions.
+- Selinger search includes the set of previously used anchors in its state.
+  Filter KV can be credited at a later anchor's first use. The search uses a
+  shared allocation across legal anchor aliases. The selected order then supplies
+  next-use probabilities and a refined allocation for its actual anchors.
+  Search and final allocation are approximate together; no global optimum is
+  claimed. Reuse after a nonconsecutive repeat of an anchor is conservatively
+  priced as recomputation, even though execution may retain it.
+- Both Quail execution paths follow the saved decisions. Child workers report
+  all retained aliases after every round, so the coordinator can preserve the
+  placement of useful KV when another input's filtering evicts prefixes.
 
 Every stage records the residency its cost assumed
 (`anchor_resident`: none / filter / kept), so `explain()` shows
@@ -472,8 +625,10 @@ with as many as 110,376 tokens each. Therefore, the two memory
 fractions do not produce equal KV capacities. Based on the capacity
 measured at 0.92, vLLM should have about 479,000 KV tokens at 0.91,
 compared with Quail's 362,250 KV tokens at 0.95. The first 0.91 startup
-will give the exact vLLM capacity. Every baseline report records the KV
-capacity that vLLM returns after startup.
+will give the exact vLLM capacity. vLLM captures one CUDA graph with size
+8,192. Every backend report records the KV capacity returned after startup.
+SGLang uses `mem_fraction_static=0.76`, 4,096 running requests, 25,296
+prefill tokens, and 16 token KV pages.
 
 **Compute knee** (`budgets.py:95`): the chunk size where the dense
 projections cross the roofline ridge and become compute-bound rather
@@ -503,11 +658,12 @@ single forward pass, sharing KV across them through a paged arena.
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
 | `unrounded_seconds` | `sol.py` | Component limits without forward pass rounding |
-| `search_joins` | `joins.py` | The join search: order and anchors from live counts, length summaries, document KV summaries, and aliases joined by completed groups; called at plan time and after every completed runtime group |
-| `plan_keeps` / `keep_split` | `decide.py` | The plan-time keep credit: the fraction of expected survivors that fits beside the scan reserve |
-| `RetainedPool` | `executor/retention.py` | Fixed-capacity retained pool: keep while room, then replace residents with fewer prefix tokens per page only when total retained prefix tokens rise |
-| `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the fewest prefix tokens per page |
-| `balanced_shards` | `decide.py` | Greedy-balance documents across workers by token count |
+| `search_joins` | `joins.py` | Choose join order and anchors from estimated survivors, length summaries, and shared retention credit |
+| `allocate` / `schedule` | `retention.py` | Estimate retained length groups and record future anchor use probabilities |
+| `RetentionPolicy` | `executor/retention.py` | Rank document prefixes by expected computation saved per KV page |
+| `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the lowest future reuse priority |
+| `contiguous_shards` | `decide.py` | Split the initial scan into compact contiguous ranges with similar token counts |
+| `balanced_shards` | `decide.py` | Reassign a smaller live document set across workers by token count |
 | `optimize_left_deep` | `leftdeep.py` | Subset DP over joined aliases and a caller supplied physical property, with a nondominated Work frontier |
 | `scan` / `ask` / `stream` | `work.py` | The three KV operations as Work records |
 | `qwen3_components` | `qwen3_cost.py` | Build attention projection, MLP, and attention work |
@@ -639,10 +795,9 @@ Key operations:
 | `PageArena.alloc` | `arena.py:29` | Claim pages for a document from the free list |
 | `PageArena.free_key` | `arena.py:42` | Return a document's pages to the free list |
 | `PageArena.row_indices` | `arena.py:49` | Flat row positions of a document's tokens in the pool |
-| `KVArena.alloc` | `arena.py:97` | Claim pages and record the row indices (host-side; the device copy is built lazily) |
-| `KVArena.rows_gpu` | `arena.py:110` | The document's row indices on device, cached per residency |
-| `KVArena.block_table` | `arena.py:125` | Build the block table for paged attention (flat on the host, one staged copy) |
-| `KVArena.paged_kv` | `arena.py:118` | Reshape the flat pool for FlashAttention's block input |
+| `KVArena.alloc` | `arena.py` | Claim pages and record host row indices |
+| `KVArena.block_table` | `arena.py` | Build the block table for paged attention |
+| `KVArena.paged_kv` | `arena.py` | Reshape the flat pool for FlashAttention's block input |
 
 ### 4.3 The attention paths and the workload assignment
 
@@ -815,13 +970,17 @@ comparison and the margin are exact: TRUE and FALSE scores shift by
 the same softmax normalizer, so dropping the other vocabulary rows
 changes neither.
 
-The full head weight has no other reader, so `load_model` moves an
-untied head to CPU memory right after load
-(`move_untied_head_to_host`). At Qwen3 32B that is 151,936 x 5,120
-bf16 rows, 1.56 GB of freed device memory, counted into the admission
-budget as `ModelSpec.head_mem_bytes`. The 4B head is tied to the
-input embedding tensor and stays. The answerer slices its dozen rows
-from wherever the weight lives and keeps only the slice on the GPU.
+`load_model` extracts the TRUE/FALSE output rows once and discards the
+full output head. It keeps the small answer matrix on the GPU for all
+queries using that loaded model. A query with different answer token IDs
+is rejected before inference. The worker supplies those IDs at boot;
+standalone loading derives them from the model's tokenizer.
+
+At Qwen3 32B, the separate output matrix contains 151,936 x 5,120 bf16
+values, or 1.56 GB. No full CPU copy remains. GPU weight accounting still
+subtracts `ModelSpec.head_mem_bytes`, as before. Qwen3 4B shares its output
+weights with the input embeddings; dropping the output-head reference
+preserves the input embeddings. Both answerers reuse the retained rows.
 
 `AsyncAnswers` (`loop.py:92`) makes the readout non-blocking: it
 computes the answer bits on GPU, copies them to pinned host memory
@@ -865,22 +1024,22 @@ that runs until `FilterAdmission.done()`:
    freed immediately; survivors advance to their next stage.
    Documents leaving their last stage free their pages too - unless
    the plan marks the chain `keep_kv`, where each survivor is
-   offered to the `RetainedPool`. A kept prefix is rewound to
+   offered to the shared retention pool. A kept prefix is rewound to
    preamble + document (`arena.retain`), held under its stable
    `(alias, doc)` key with its exact prefix token count. The pool's
    capacity is the arena minus the scan ring - pages for two chunk
    budgets reserved before the loop starts - so retention can never
    starve admission. Once full, a survivor displaces residents with
-   fewer prefix tokens per page only when it contains more tokens than
-   they contain together. The join recomputes any document that was never
+   lower expected computation saved per KV page. The new survivor can
+   itself be discarded. The join recomputes any document that was never
    kept, or was displaced, if it anchors on it later.
 
 Single-stage queries (one question) skip the arena entirely: no
 later stage reads any document's KV, so the alloc, the per-layer KV
 scatter, and the paged attention read serve no one. The planner
-makes the call, and only the planner - the FilterChain operator
-carries an `arena_writes` field (False exactly when one stage
-runs), it shows in `explain()`, and the payload forwards it to
+makes the call. The `PackedFilter` node carries an `arena_writes`
+field, which is false exactly when one stage runs. The field appears
+in `explain()`, and the payload forwards it to
 `run_filter`. `run_filter` requires the argument and never derives
 it; direct callers (warmups, the GPU cells, the ablation
 scripts) state their intent explicitly, and False against
@@ -918,11 +1077,10 @@ survivor, or a kept anchor of an earlier group - packs no prefix
 tokens at all: the frame scatters into the kept pages and the tuple
 suffixes read the document KV that is already there. Kept pages
 without row room for this run's frame are freed and recomputed (a
-runtime anchor re-pick can land on an alias whose filter reserved a
-smaller frame). With `keep_semantics` set, the group's gate
+retained filter prefix can have less space than its join frame needs). With `keep_semantics` set, the group's gate
 survivors keep their pages at the end for a later group on the same
 table. Under allocation pressure the arena frees retained prefixes
-in increasing prefix tokens per page. The
+in increasing expected computation saved per KV page. The
 worker frees every kept key the moment its last consumer group is
 behind, and sweeps kept keys at query start and end - the arena
 outlives a query, kept KV must not.
@@ -1086,42 +1244,41 @@ for each chunk in plan:
 
 ## 6. Multi-GPU dispatch
 
-The coordinator (`runtime/coordinator.py`) splits work across GPU
+The coordinator (`backends/quail/coordinator.py`) splits work across GPU
 workers and merges answers. Each worker is a child process with its
 own CUDA context and arena. The parent process (inside the same
 Modal container) sends payloads over pipes, so there is no network
 hop between rounds.
 
-### Rounds follow the plan's node graph
+### Rounds follow the saved physical graph
 
 **The filter round**: every worker filters its shard of every alias.
-Sharding is by token count (the planner's `balanced_shards`). After
-this round, the parent merges survivors.
+The plan stores one contiguous range per worker. The range boundaries aim for
+similar token counts without storing every document position in the plan.
+Each child opens the same temporary token file and reads its range. Token values
+do not pass through the parent process pipe. After this round, the parent
+merges survivors.
 
-**One join round per JoinGroup node**: anchors follow the alias's
-filter shard when one exists (locality); an anchor with no filter
-shard - it was a partner before the barrier - gets fresh balanced
-shards over its live documents. That
-re-shard moves no KV: partners never owned any, so the parent ships
-token ids (which every round does anyway) and each GPU computes its
-new anchor slice's KV. Every worker sees every surviving partner
-(replicated), so the partner index space is the same on every worker
-and the merged answer rows are consistent.
+**One join round per selected `AnchoredJoin`**: anchors follow the
+alias's filter shard when it holds retained KV. An anchor that was a partner in
+an earlier round gets new balanced shards over its live documents.
+The parent sends file references and survivor positions, and each GPU reads
+the needed token values before it computes KV for its new anchor slice. Every
+GPU receives every surviving partner, so every
+GPU uses the same partner index space.
 
-**Barrier nodes between groups**: the parent thins every table the
-stages ahead touch to the documents in some surviving pair of every
-finished full stage (`thin_survivors`, issue #38 step 4.6 - cost
-only, results are enforced at recombination). Anchors were already
-fixed by the worker's post-filter run of the join search, which saw
-the measured live counts; nothing is re-decided at the barrier.
+**An `Exchange` between join groups** prunes each input to documents that
+remain in passing pairs. All completed full-join answers and current survivor
+IDs are explicit inputs. When the anchor changes, the next join round assigns
+its live documents to workers. No join search runs during these rounds.
 
 ### Sharding contract
 
 Filters split documents. Joins split anchors. Every pair belongs to
 exactly one anchor, so gating and each anchor's tuple stream stay
 local to the GPU holding the anchor within a group; groups anchored
-on different tables run as separate rounds with the barrier's
-re-shard between them.
+on different tables run as separate rounds with an exchange between
+them.
 
 ### Pseudocode: multi-GPU coordinator
 
@@ -1133,47 +1290,41 @@ for each worker w:
 collect all filter answers
 merge: union the per-alias answer dicts and survivor lists
 
-# then walk the plan's join nodes in order
-for each node:
-    if node is a Barrier:
-        thin survivors: keep only documents in a surviving pair of
-        every finished full stage that touches their table
-        continue
-    # node is a JoinGroup
-    if the group has one free-anchor full stage:
-        re-pick its anchor from measured live token counts
-    for each worker w:
-        anchors = live anchor docs in w's shard (filter shard when
-                  one exists; fresh balanced shards otherwise)
-        partners = ALL live partner documents (replicated)
-        send (anchors, partners, the group's stages) to child w
-    collect, merge (anchors disjoint, partner indices identical)
-    gate: the anchor's survivors from the group's last stage
+# execute the saved join and exchange nodes
+for node in the planned graph:
+    if node is Exchange:
+        prune survivor IDs using completed join answers
+    if node is AnchoredJoin:
+        for each worker w:
+            anchors = live anchor documents assigned to w
+            partners = all live partner documents
+            send the node and its input document positions to child w
+        collect and merge disjoint anchor answers
+        retain surviving anchor KV if any later group uses it
 ```
 
 ### Key functions: coordinator and worker
 
 | Function | File | What it does |
 |---|---|---|
-| `filter_round_limit` | `coordinator.py:25` | The filter round's limit: None when the payload has joins (#39) |
-| `filter_round_payloads` | `coordinator.py` | Build per-worker filter sub-payloads |
+| `begin_query_payloads` | `coordinator.py` | Start a query on every GPU executor when no filter runs first |
+| `filter_node_payloads` | `coordinator.py` | Split one typed `PackedFilter` across GPU executors |
 | `merge_filter_round` | `coordinator.py` | Merge workers' filter answers |
 | `join_group_payloads` | `coordinator.py` | Build per-worker sub-payloads for one anchor group's round (re-shards an anchor with no filter shard) |
 | `merge_join_round` | `coordinator.py` | Concatenate workers' join answer rows |
-| `stage_for_anchor` | `coordinator.py` | Materialize a stage spec for the round's chosen anchor |
-| `thin_survivors` | `coordinator.py` | The barrier's step-4.6 thinning from finished stages' pairs |
+| `ExchangeRuntime.execute` | `runtime/runner.py` | Prune actual survivor IDs using completed full-join answer relations |
 | `gate_group` | `coordinator.py` | Anchor survivors after one group (full/exists/anti keep rules) |
-| `derive_plan_nodes` | `coordinator.py` | Reconstruct group/barrier nodes for hand-built payloads |
-| `execute` | `worker.py:64` | Single-GPU Modal worker entry point |
-| `execute_2/4/8` | `worker.py:495-519` | Multi-GPU Modal worker entry points |
-| `_execute_single` | `worker.py:144` | Single-GPU execution core (shared by all paths) |
-| `_execute_multi` | `worker.py:463` | Multi-GPU orchestration (split, dispatch, merge) |
+| `ModalComputeProvider.execute` | `compute.py` | Submit one logical query to the selected Modal Function |
+| `execute_query_request` | `local.py` | Plan and execute one logical query request in the current process |
+| `execute_worker_query` | `local.py` | Plan and execute one already built query in the current process |
+| `_execute_physical` | `worker.py` | Validate and run one typed physical request |
+| `_execute_single` | `worker.py` | Single-GPU typed graph entry point |
 
 ### Scaling
 
 The measured scaling on two GPUs: filter 1.99x, join 2.02x
-(`dispatch_gate.json`). Modal functions are defined for 2, 4, and 8
-GPUs (`worker.py:495-519`).
+(`dispatch_gate.json`). Modal Functions are defined for 1, 2, 4, and 8
+GPUs. Each GPU runs one model copy in the same container.
 
 ## 7. The benchmark (QUAIL-B)
 
@@ -1277,7 +1428,7 @@ graph LR
 | FEV-6 | 3F + 1J two-sided | F11 + F12 on claims, F13 on evidence |
 | FEV-7 | 2J star | SUPPORT + REFUTE, same anchor |
 | FEV-8 | 3J chain | c1-e1-c2-e2 |
-| FEV-9 | F11 + 3J chain | F11 then c1-e1-c2-e2 |
+| FEV-9 | 4 filters + 3 joins | F11 on c1 and c2, F13 on e1 and e2, then c1-e1-c2-e2 |
 
 **LePaRD** (8 queries): citation contexts joined with citation passages
 
@@ -1328,6 +1479,11 @@ The two SWE-Next label sets belong directly to the current corpus. The
 collection manifest records the original corpus and table manifest for every
 reused label set. The loader checks those table manifests before it accepts
 the collection.
+
+Each predicate has one stable key, such as
+`quailb.imdb.review.mentions_positive_aspect`. The judge pass, label
+manifests, evaluation code, SoL script, and migration scripts all use that
+key. The old short predicate codes are not part of the active benchmark code.
 
 ### Protocol and reported values
 

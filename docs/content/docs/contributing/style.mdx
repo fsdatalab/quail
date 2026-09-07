@@ -1,0 +1,47 @@
+---
+title: Writing and naming
+description: The plain writing rules and the names this project uses.
+---
+
+The project writes plainly. These rules apply to code comments,
+docstrings, reports, PR bodies, and these docs.
+
+## Writing
+
+- Short sentences. One idea per sentence. Lead with the answer, then
+  the reasoning.
+- Everyday words. Define a technical term in one sentence the first
+  time it appears, then use it consistently.
+- No analogies or metaphors. Say the literal thing.
+- No invented shorthand or dramatic verbs. Say saved, finished, set
+  up, running.
+- Give numbers, and say what each number is compared with.
+- When something failed or is uncertain, say so directly and say what
+  would settle it.
+- Bullet points for anything longer than a few sentences.
+- Code comments state constraints the code cannot show, nothing else.
+- Docstrings follow Google style: one-line summary, blank line, then
+  optional Args, Returns, and Raises. Say what the code does, not why
+  it was written or what it replaced.
+
+## Names
+
+- The project is Quail, QUery-Aware Inference Layer. The package is
+  `quail`. Nothing is called DocEngine any more.
+- The three mechanisms are pipelining, token-based admission, and KV
+  rewind. Use those names.
+- Call the KV cache "KV".
+- "Chain mode" is the internal name for KV rewind. Either is fine in
+  code. Prefer "KV rewind" in prose.
+- The comparison is against "stock vLLM", and say which submission
+  strategy it used: operator-at-a-time execution or pipelining.
+- Say "run", "configuration", or the method's name for the runs of an
+  experiment. Never "arm".
+- `de1|` in request ids is a wire-format version tag. Leave it alone.
+
+## Scope
+
+Filter queries and joins only, Qwen3 4B fp8 or Qwen3 32B fp8, one
+H100 per model copy. Maps, classification, speculation, and forking
+were removed on purpose. Do not add them back without being asked. If
+a change needs one of them, say so instead.

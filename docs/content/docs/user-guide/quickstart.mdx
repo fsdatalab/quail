@@ -1,0 +1,293 @@
+---
+title: Quickstart
+description: Eight real IMDB reviews, a filter, a join, and what Quail prints for each.
+---
+
+Every output on this page comes from one run of
+[`docs/examples/quickstart.py`](https://github.com/fsdatalab/quail-exploration/blob/extensible-engine/docs/examples/quickstart.py)
+on an H100 through Modal, with Qwen3 4B fp8. The reviews are the first
+eight short reviews from the pinned `stanfordnlp/imdb` revision the
+QUAIL-B benchmark uses, and the questions are the benchmark's own
+predicates.
+
+<Steps>
+<Step>
+
+## Load real documents
+
+```python
+import pyarrow as pa
+import pyarrow.parquet as pq
+from huggingface_hub import hf_hub_download
+
+path = hf_hub_download(
+    "stanfordnlp/imdb",
+    "plain_text/train-00000-of-00001.parquet",
+    repo_type="dataset",
+    revision="e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+)
+texts = pq.read_table(path, columns=["text"]).column("text").to_pylist()
+picked = [t for t in texts if 250 < len(t) < 600 and "<br" not in t][:8]
+
+reviews = pa.table({"id": [f"rv{i}" for i in range(8)], "body": picked})
+aspects = pa.table({
+    "id": [f"as{i}" for i in range(12)],
+    "aspect": ["the acting", "the plot", "the directing",
+               "the cinematography", "the soundtrack", "the pacing",
+               "the ending", "the dialogue", "the special effects",
+               "the character development", "the screenplay",
+               "the editing"],
+})
+```
+
+Three of the eight reviews, as the model sees them:
+
+```text
+rv0: My interest in Dorothy Stratten caused me to purchase this video.
+     Although it had great actors/actresses, there were just too many
+     subplots going on to retain interest. Plus it just wasn't that
+     interesting. Dialogue was stiff and confusing and the story just
+     flipped around too much to be believable. I was pretty disappointed
+     in what I believe was one of Audrey Hepburn's last movies. I'll
+     always love John Ritter best in slapstick. He was just too pathetic
+     here.
+rv1: I think I will make a movie next weekend. Oh wait, I'm working..oh
+     I'm sure I can fit it in. It looks like whoever made this film fit
+     it in. I hope the makers of this crap have day jobs because this
+     film sucked!!! It looks like someones home movie and I don't think
+     more than $100 was spent making it!!! Total crap!!! Who let's this
+     stuff be released?!?!?!
+rv2: Protocol is an implausible movie whose only saving grace is that it
+     stars Goldie Hawn along with a good cast of supporting actors. The
+     story revolves around a ditzy cocktail waitress who becomes famous
+     after inadvertently saving the life of an Arab dignitary. The story
+     goes downhill halfway through the movie and Goldie's charm just
+     doesn't save this movie. Unless you are a Goldie Hawn fan don't go
+     out of your way to see this film.
+```
+
+</Step>
+<Step>
+
+## Open a session and register the tables
+
+```python
+import quail
+
+session = quail.Session()
+session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
+session.register("aspects", quail.DocumentProvider.from_table(aspects, id_col="id"))
+```
+
+`Session()` selects the Quail backend, Qwen3 4B fp8, one H100, and the
+Modal compute provider. `id_col` names the column that identifies a
+document. See [Configuration](/docs/user-guide/configuration) and
+[Data sources](/docs/user-guide/data-sources) for the other choices.
+
+</Step>
+<Step>
+
+## Write a filter
+
+The question is QUAIL-B's predicate F1. In SQL or with the builder:
+
+<Tabs items={['SQL', 'Python']}>
+<Tab value="SQL">
+
+```python
+query = session.sql("""
+    SELECT r.id
+    FROM reviews r
+    WHERE AI_FILTER(PROMPT('Judge strictly from the review above whether it mentions at least one positive aspect of the movie.
+
+{0}
+
+Instruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body))
+""")
+```
+
+</Tab>
+<Tab value="Python">
+
+```python
+from quail import col, prompt
+
+F1 = ("Judge strictly from the review above whether it mentions at "
+      "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
+      "answer TRUE if the review mentions at least one positive aspect "
+      "of the movie, FALSE otherwise.")
+
+query = (session.docs("reviews").alias("r")
+         .ai_filter(prompt(F1, col("r.body")))
+         .select("r.id"))
+```
+
+</Tab>
+</Tabs>
+
+Both build the same logical plan. The text before `{0}` becomes the
+question suffix after the document, so the document's tokens do not
+depend on the question.
+
+</Step>
+<Step>
+
+## Look at the plan
+
+```python
+print(query.explain())
+```
+
+```text
+logical:
+  Project [r.id]
+    SemanticFilter (x1, sels=[None])
+      Scan reviews as r [body]
+physical:
+  workers=1 model_copies=1
+  KV dtype=bf16
+  chunk_tokens=110376 admission_tokens=362250
+  prompt layout: engine preamble + document + suffix (preamble_tokens per stage below count the shared preamble)
+  joins follow the saved order and anchors
+  order=as_written (default: at least one predicate has no selectivity)
+  DocumentInput input:a alias=a input_id=a n_docs=12 total_tokens=27 shard_docs=[12]
+  DocumentInput input:r alias=r input_id=r n_docs=8 total_tokens=693 shard_docs=[8]
+  PackedFilter filter:r alias=r arena_writes=False keep_kv=False keep_min_doc_tokens=0 keep_resident_fraction=0.0 <- input:r[ids:r]
+    stage {'written_pos': 0, 'question_tokens': 51, 'preamble_tokens': 2, 'selectivity': None, 'expected_docs': 8.0}
+  Project sink columns=['r.id'] <- filter:r[ids:r]
+  remark: filter on 'r': arena writes off (one stage - nothing reads the KV again)
+```
+
+This ran on the client with no GPU. It tokenized the eight reviews
+(693 tokens), planned one `PackedFilter` node with a 51-token
+question, and noted that with a single stage nothing reads the KV
+again, so the arena is not written.
+
+</Step>
+<Step>
+
+## Run it
+
+```python
+result = query.run()
+print(result.to_rows())
+```
+
+```text
+function call id: fc-01M1NGA090GPB4Y80XPG2P6H9G
+[('rv0',), ('rv2',), ('rv3',), ('rv5',)]
+```
+
+Four of the eight reviews mention at least one positive aspect. rv0
+praises the actors and John Ritter, rv2 calls Goldie Hawn the film's
+saving grace. The function call id is Modal's handle on this run; keep
+it in your log.
+
+The report says what the run cost:
+
+```python
+report = result.report
+print(report["wall_s"], report["boot_s"], report["boot_kind"], report["fresh_tokens"])
+print(report["stages"])
+```
+
+```text
+1.3 19.25 cold 1117
+[{'op': 'filter', 'alias': 'r', 'stage': 0, 'provided_selectivity': None,
+  'observed_selectivity': 0.5, 'evaluated': 8}]
+```
+
+The query took 1.3 seconds once the model was loaded. The cold load
+took 19.25 seconds and is reported separately. The model computed
+1,117 fresh tokens: 693 for the documents plus the question suffix for
+each. [Results and explain](/docs/user-guide/results) lists every key.
+
+</Step>
+<Step>
+
+## Join reviews to aspects
+
+The join asks, for each surviving review and each of the twelve
+aspects, whether the review discusses that aspect. It is QUAIL-B's
+IMDB-3 shape: filter F1, then the `DISCUSS_ASPECT` join.
+
+```python
+pairs = session.sql("""
+    SELECT r.id, a.aspect
+    FROM reviews r
+    JOIN aspects a
+      ON AI_FILTER(PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect),
+                   {'selectivity': 0.15})
+    WHERE AI_FILTER(PROMPT('Judge strictly from the review above whether it mentions at least one positive aspect of the movie.
+
+{0}
+
+Instruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body), {'selectivity': 0.6})
+""").run()
+print(pairs.collect().to_pandas().to_string(index=False))
+```
+
+```text
+function call id: fc-01M1NGBWM5Q78NEHG251JZ58D6
+r.id       a.aspect
+ rv0     the acting
+ rv0       the plot
+ rv0     the pacing
+ rv0   the dialogue
+ rv0 the screenplay
+ rv2     the acting
+ rv2       the plot
+ rv2  the directing
+ rv2     the pacing
+ rv2    the editing
+```
+
+The plan for this query keeps the filter survivors' KV resident so
+the join packs no document tokens again:
+
+```text
+  PackedFilter filter:r alias=r arena_writes=True keep_kv=True ... <- input:r[ids:r]
+  AnchoredJoin group:0 anchor=r anchor_resident=filter keep_anchor_kv=False <- filter:r[ids:r], input:a[ids:a]
+    stage {'written_pos': 0, 'anchor': 'r', 'partners': ['a'], 'semantics': 'full', 'selectivity': 0.15, 'expected_tuples': 57.6, ...}
+  HashJoin recombine alias_order=['r', 'a'] <- group:0[join_answers:0], group:0[ids:r], input:a[ids:a]
+  Project sink columns=['r.id', 'a.aspect'] <- recombine[tuples]
+  remark: keep KV on 'r': all survivors priced as resident for the join, 451 expected tokens per worker of the 362,250-token arena
+```
+
+And the report confirms it happened:
+
+```text
+wall_s: 1.53   boot_kind: warm   fresh_tokens: 1849
+stages:
+  filter r   evaluated 8   observed_selectivity 0.5
+  join r x a evaluated 48 tuples   observed_selectivity 0.2083
+kv_manager:
+  retained_after_filters 4   join_anchor_hits 4   join_anchor_misses 0
+```
+
+The second query found a warm container, so `boot_s` is 0. The join
+evaluated 48 tuples (4 surviving reviews times 12 aspects) and every
+anchor hit KV left by the filter. 10 pairs passed.
+
+</Step>
+<Step>
+
+## Close the session
+
+```python
+session.close()
+```
+
+Or run everything under `with quail.Session() as session:`. Closing
+lets the Modal function scale to zero and removes the temporary token
+files.
+
+</Step>
+</Steps>
+
+<Callout title="Reproduce it">
+`uv run python docs/examples/quickstart.py 2>&1 | tee results/docs_quickstart.log`
+prints everything above. The two run records are on the `quail-results`
+volume at `/results/runs/run_1788501944354367580.json` and
+`/results/runs/run_1788501955612819646.json`.
+</Callout>

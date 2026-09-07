@@ -72,7 +72,7 @@ The measured cells for issue #38's benchmark slice - the gate
 against its formula, and the re-shard trade against the forced
 shared-anchor baseline - are in
 `reports/2026-08-24-join-gate-and-reshard.md` (removed 2026-08-29; git history) (script
-`tests/gpu/join_bench.py` (removed 2026-08-29; git history), summary `results/join_bench.json` (removed 2026-08-29; git history)).
+`experiments/cells/join_bench.py` (removed 2026-08-29; git history), summary `results/join_bench.json` (removed 2026-08-29; git history)).
 Headlines: gate mechanics exact and bit-for-bit reproducible; the
 two-group barrier plan measured 11.3x fewer tokens and 11.3x faster
 than the forced shared anchor, with plan-predicted token counts
@@ -82,7 +82,7 @@ feeds issue #43's orientation check.
 
 ## GPU smoke of the barrier path
 
-`tests/gpu/barrier_smoke.py` (Modal, qwen3-4b-fp8): a filter on 10
+`experiments/cells/barrier_smoke.py` (Modal, qwen3-4b-fp8): a filter on 10
 reports, then `ai(r, c)` anchored r and `ai(c, g)` anchored g -
 forced anchors, so the plan is two JoinGroups with one Barrier.
 Reports draw from only 4 of the 6 colors while candidates cover all

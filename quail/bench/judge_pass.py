@@ -69,7 +69,6 @@ REUSE_PREDICTION = (
 @dataclass(frozen=True)
 class PredicateSpec:
     key: str
-    legacy_code: str
     workload: str
     slug: str
     kind: str
@@ -85,94 +84,94 @@ class PredicateSpec:
 
 PREDICATES = (
     PredicateSpec(
-        "quailb.imdb.review.mentions_positive_aspect", "F1", "imdb",
+        "quailb.imdb.review.mentions_positive_aspect", "imdb",
         "review_mentions_positive_aspect", "filter", quailb.F1,
         "review", "reviews", "body"),
     PredicateSpec(
-        "quailb.imdb.review.discusses_ending", "F4", "imdb",
+        "quailb.imdb.review.discusses_ending", "imdb",
         "review_discusses_ending", "filter", quailb.F4,
         "review", "reviews", "body"),
     PredicateSpec(
-        "quailb.imdb.review.mentions_named_actor", "F5", "imdb",
+        "quailb.imdb.review.mentions_named_actor", "imdb",
         "review_mentions_named_actor", "filter", quailb.F5,
         "review", "reviews", "body"),
     PredicateSpec(
-        "quailb.imdb.review.discusses_aspect", "DISCUSS_ASPECT", "imdb",
+        "quailb.imdb.review.discusses_aspect", "imdb",
         "review_discusses_aspect", "join", quailb.DISCUSS_ASPECT,
         "review", "reviews", "body", "aspect", "aspects", "aspect"),
     PredicateSpec(
         "quailb.imdb.review.positive_sentiment_about_aspect",
-        "ASPECT_SENTIMENT", "imdb",
+        "imdb",
         "review_positive_sentiment_about_aspect", "join",
         quailb.ASPECT_SENTIMENT,
         "review", "reviews", "body", "aspect", "aspects", "aspect"),
     PredicateSpec(
-        "quailb.biodex.report.involves_female_patient", "F7", "biodex",
+        "quailb.biodex.report.involves_female_patient", "biodex",
         "report_involves_female_patient", "filter", quailb.F7,
         "report", "reports", "report"),
     PredicateSpec(
-        "quailb.biodex.report.experienced_reaction", "REACTION", "biodex",
+        "quailb.biodex.report.experienced_reaction", "biodex",
         "report_experienced_reaction", "join", quailb.REACTION,
         "report", "reports", "report", "reaction", "terms", "term"),
     PredicateSpec(
-        "quailb.fever.claim.about_person", "F11", "fever",
+        "quailb.fever.claim.about_person", "fever",
         "claim_about_person", "filter", quailb.F11,
         "claim", "claims", "claim"),
     PredicateSpec(
-        "quailb.fever.claim.contains_date", "F12", "fever",
+        "quailb.fever.claim.contains_date", "fever",
         "claim_contains_date", "filter", quailb.F12,
         "claim", "claims", "claim"),
     PredicateSpec(
-        "quailb.fever.passage.about_person", "F13", "fever",
+        "quailb.fever.passage.about_person", "fever",
         "passage_about_person", "filter", quailb.F13,
         "passage", "evidence", "text"),
     PredicateSpec(
-        "quailb.fever.passage.supports_claim", "SUPPORT", "fever",
+        "quailb.fever.passage.supports_claim", "fever",
         "passage_supports_claim", "join", quailb.SUPPORT,
         "claim", "claims", "claim", "passage", "evidence", "text",
         "fever_annotation_then_qwen3_32b"),
     PredicateSpec(
-        "quailb.fever.passage.refutes_claim", "REFUTE", "fever",
+        "quailb.fever.passage.refutes_claim", "fever",
         "passage_refutes_claim", "join", quailb.REFUTE,
         "claim", "claims", "claim", "passage", "evidence", "text"),
     PredicateSpec(
-        "quailb.lepard.excerpt.reasoning_does_not_apply", "LEP1", "lepard",
+        "quailb.lepard.excerpt.reasoning_does_not_apply", "lepard",
         "excerpt_reasoning_does_not_apply", "filter", quailb.LEP1,
         "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
-        "quailb.lepard.excerpt.procedural_or_jurisdictional", "LEP2",
-        "lepard", "excerpt_procedural_or_jurisdictional", "filter",
+        "quailb.lepard.excerpt.procedural_or_jurisdictional", "lepard",
+        "excerpt_procedural_or_jurisdictional", "filter",
         quailb.LEP2, "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
-        "quailb.lepard.excerpt.treats_passage_as_binding", "LEP3", "lepard",
+        "quailb.lepard.excerpt.treats_passage_as_binding", "lepard",
         "excerpt_treats_passage_as_binding", "filter", quailb.LEP3,
         "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
-        "quailb.lepard.excerpt.supports_liability_or_guilt", "LEP4",
-        "lepard", "excerpt_supports_liability_or_guilt", "filter",
+        "quailb.lepard.excerpt.supports_liability_or_guilt", "lepard",
+        "excerpt_supports_liability_or_guilt", "filter",
         quailb.LEP4, "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
-        "quailb.lepard.excerpt.acknowledges_court_disagreement", "LEP5",
-        "lepard", "excerpt_acknowledges_court_disagreement", "filter",
+        "quailb.lepard.excerpt.acknowledges_court_disagreement", "lepard",
+        "excerpt_acknowledges_court_disagreement", "filter",
         quailb.LEP5, "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
-        "quailb.lepard.passage.states_general_rule", "LEPS1", "lepard",
+        "quailb.lepard.passage.states_general_rule", "lepard",
         "passage_states_general_rule", "filter", quailb.LEPS1,
         "passage", "citation_passages", "passage_text"),
     PredicateSpec(
-        "quailb.lepard.excerpt.cites_passage", "LEPJOIN", "lepard",
+        "quailb.lepard.excerpt.cites_passage", "lepard",
         "excerpt_cites_passage", "join", quailb.LEPJOIN,
         "excerpt", "citation_contexts", "destination_context",
         "passage", "citation_passages", "passage_text",
         "lepard_citation_edge"),
     PredicateSpec(
         "quailb.agent.trace.recovered_after_unsuccessful_approach",
-        "AGENT_RECOVERED", "agent", "recovered_after_unsuccessful_approach",
+        "agent", "recovered_after_unsuccessful_approach",
         "filter", quailb.AGENT_RECOVERED,
         "agent_trace", "agent_traces", "trace"),
     PredicateSpec(
         "quailb.agent.trace.implemented_plausible_fix",
-        "AGENT_IMPLEMENTED_FIX", "agent", "implemented_plausible_fix",
+        "agent", "implemented_plausible_fix",
         "filter", quailb.AGENT_IMPLEMENTED_FIX,
         "agent_trace", "agent_traces", "trace"),
 )

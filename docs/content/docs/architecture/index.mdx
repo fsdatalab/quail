@@ -1,0 +1,78 @@
+---
+title: Overview
+description: The layers of the engine and the path one query takes.
+---
+
+Quail is built like a small database engine. A query is compiled to a
+logical plan, planned into a physical graph, and executed by node
+runtimes. The model-specific parts sit behind a backend interface, and
+the "where does it run" question sits behind a compute provider.
+
+## The query path
+
+<Mermaid chart={`
+flowchart TD
+    A[SQL or Python builder] --> B[Logical plan]
+    B --> C[Logical optimizer rules]
+    C --> D[QueryRequest: plan + table providers + config + registry]
+    D --> E[Compute provider]
+    E --> F[Worker: open sources, tokenize into a memory mapped Arrow file]
+    F --> G[Model backend proposes physical candidates]
+    G --> H[Physical rules rewrite the chosen graph]
+    H --> I[Generic runner executes the graph]
+    I --> J[Model nodes run on the GPU executors]
+    I --> K[HashJoin, Project, Limit run with Arrow]
+    K --> L[QueryResult: Arrow table + report]
+`} />
+
+1. The SQL front end or the builder produces a `LogicalPlan` of
+   `Scan`, `SemanticFilter`, `SemanticJoin`, and `Project` nodes.
+2. Registered logical rules rewrite the plan.
+3. The session packs the plan, the table providers, the
+   `EngineConfig`, and the registry into a
+   `QueryRequest`.
+4. The compute provider carries the request to a worker. Modal is the
+   default.
+5. The worker reads bounded Arrow batches from each source and writes
+   tokens, document lengths, and projected columns to a temporary
+   memory mapped Arrow file.
+6. The selected model backend proposes one or more `PhysicalCandidate`
+   graphs with time estimates. Registered physical planners can add
+   more. The cheapest wins, then physical rules rewrite it.
+7. The generic runner walks the typed graph in topological order and
+   calls the runtime registered for each node type. Model nodes are
+   delegated to the backend's model execution object.
+8. Arrow Acero joins the TRUE answers, applies the projection and
+   limit. The worker returns a materialized `QueryResult` with the
+   executed plan and node metrics attached.
+
+## The layers
+
+| Layer | Package | Job |
+| --- | --- | --- |
+| Front ends | `quail.sqlfront`, `quail.builder` | Turn SQL or Python calls into one logical plan through the shared `LogicalPlanBuilder`. |
+| Logical plan | `quail.logical`, `quail.logical_optimizer` | Logical node protocol, the four built in nodes, prompt binding, and the rule runner. |
+| Physical plan | `quail.physical` | Typed nodes with ports, graph validation, and codecs for the process boundary. |
+| Planning | `quail.planning`, `quail.planner` | Backend planning inputs, candidates, physical rules, and the Quail cost model. |
+| Backends | `quail.backends` | The `ModelBackend` protocol and the Quail, vLLM, and SGLang implementations. |
+| Runtime | `quail.runtime` | Session, compute providers, the generic runner, the token store, results, and the Modal worker. |
+| Executor | `quail.executor` | Quail's GPU code: packing, the paged KV arena, attention, the overlapped loop, weight loading. |
+| Specs | `quail.specs` | Model and device constants every planner decision is computed from. |
+| Extensions | `quail.extensions` | The per session registry. |
+
+## Extension points
+
+Every built in piece registers through the same registry an extension
+would use. The six interfaces:
+
+- **Logical nodes and rules** describe what a query means and rewrite
+  it.
+- **Physical planners and rules** propose and rewrite typed graphs.
+- **Model backends** plan and run model work. They own their
+  scheduler, KV layout, and model calls. Quail has no public KV
+  interface on purpose.
+- **Table providers** supply schemas and bounded Arrow batches.
+- **Compute providers** decide where a query runs.
+- **Execution observers** record per node metrics.
+
+Each has its own page under [Extending Quail](/docs/extending).

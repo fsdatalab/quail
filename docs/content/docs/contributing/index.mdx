@@ -1,0 +1,52 @@
+---
+title: Repository layout and tests
+description: Where things live and how to check a change.
+---
+
+## Layout
+
+| Path | Contents |
+| --- | --- |
+| `quail/` | The package. See [Architecture](/docs/architecture) for the module map. |
+| `quail/bench/` | The QUAIL-B benchmark: datasets, queries, ground truth, the evaluator, and the same-GPU runner. |
+| `quail_ext_examples/` | Example extensions. |
+| `tests/` | CPU tests. They fake the GPU and run in seconds. |
+| `experiments/` | Every Modal entry point that costs GPU time: ablation and profiling scripts, and the smokes, probes, and gates under `experiments/cells/`. |
+| `reports/` | Experiment reports, plot scripts, PNGs, `shipped_features/`, and `engine-wiki.md`. Experiment data lives on the `quail-results` volume, not in git. |
+| `docs/` | This documentation site, including the design decisions and the speed of light model. |
+
+## Checks
+
+```bash
+uv run pytest
+uv run ruff check quail tests experiments
+uv run vulture
+```
+
+`vulture` reports unused code in `quail/` at 70 percent confidence.
+Keep all three clean before pushing.
+
+## Running a GPU cell
+
+Every GPU run goes through Modal and attaches to an existing app:
+`quail-milestone1` for cells, `quail-engine` for the worker. Tee the
+output to a file, because the Modal CLI drops old log lines:
+
+```bash
+uv run modal run experiments/cells/session_smoke.py 2>&1 | tee results/session_smoke.log
+```
+
+Print the function call id and keep it in the tee file. Pull a result
+later with `modal.FunctionCall.from_id(id).get()` rather than writing
+Modal return values to local JSON.
+
+## Adding a page here
+
+The site is Fumadocs on Next.js. Pages are MDX under
+`docs/content/docs/`. Each folder's `meta.json` sets the order.
+
+```bash
+cd docs
+pnpm install
+pnpm dev
+```

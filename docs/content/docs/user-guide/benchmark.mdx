@@ -1,0 +1,59 @@
+---
+title: Running QUAIL-B
+description: The benchmark suite and how to run it on Modal.
+---
+
+QUAIL-B is Quail's benchmark: 32 filter and join queries over IMDB,
+BioDEX, FEVER, LePaRD, and SWE-Next agent traces at scale factor 0.1,
+plus two optional PrivacyPolicies queries. Ground truth is saved per
+predicate, so accuracy is scored on exact TRUE or FALSE answers, not
+on model agreement.
+
+The full instructions live in `quail/bench/README.md` in the
+repository. The short version:
+
+```bash
+mkdir -p results/benchmark
+run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb.log"
+
+uv run modal run --detach -m quail.bench.quailb_parallel \
+  --sf 0.1 \
+  --model qwen3-4b-fp8 \
+  --prediction "State the expected runtime and accuracy." \
+  2>&1 | tee "$run_log"
+```
+
+Add `--query IMDB-4` to run one query.
+
+## What one run does
+
+- Modal starts one H100 container per query family.
+- Inside it, Quail runs in one process group. After its results are
+  saved the parent stops that group and waits for GPU memory to fall
+  below 1 GiB.
+- Stock vLLM and pipelined vLLM then run in a second process group on
+  the same GPU, sharing one loaded model. The runner records the GPU
+  UUID both groups saw and stops the family if they differ.
+- Pipelined SGLang runs in a separate container. vLLM 0.26.0 and
+  SGLang 0.5.18 need different exact versions of `apache-tvm-ffi`, so
+  they cannot share an image. Its driver runs in a child process with the
+  same cleanup and GPU-memory checks.
+- The command prints one Modal function call id per family. Results go
+  to the `quail-results` volume under
+  `/results/benchmarks/quailb/runs/<run_id>/`, with a manifest under
+  `family-runs/`.
+
+## What is reported
+
+For every query: query time, documents per second (or document pairs
+per second for joins), GPU cost in dollars per query, tokens, answer
+accuracy, and final-row precision, recall, and F1. Query time and cost
+exclude model startup. Startup is reported separately.
+
+The definitions are fixed so numbers compare across reports:
+
+- `documents/second` = input document rows / query seconds.
+- `document pairs/second` = evaluated pairs across all join stages /
+  query seconds.
+- `$/query` = query hours × GPU count × the H100 hourly price from
+  `quail.bench.evaluate.H100_USD_PER_HOUR`.

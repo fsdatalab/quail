@@ -1,0 +1,74 @@
+---
+title: Running on Modal
+description: How the Modal compute provider runs a query and what it costs.
+---
+
+Quail does not run a server. Each query is one call to a Modal
+Function in the `quail-engine` app. `ModalComputeProvider` is the
+default compute provider and handles that call.
+
+```python
+compute = quail.ModalComputeProvider(secrets=(), detach=False)
+session = quail.Session(compute_provider=compute)
+```
+
+- `secrets`: Modal secrets attached to the worker, for example S3
+  credentials for a remote Parquet source.
+- `detach`: keep the Modal app running after the client exits.
+
+## What one run() does
+
+1. The client collects the logical plan, table providers, and registry into
+   a `QueryRequest`.
+2. For each table it either sends a remote source description (the
+   worker opens it) or reads the needed columns and sends them as raw
+   Arrow.
+3. It picks the Modal Function for the requested GPU count and
+   backend, spawns the call, and prints the function call id.
+4. The worker tokenizes the documents into a memory mapped Arrow file,
+   plans the query, loads the model if the container is cold, runs the
+   physical graph, joins and projects the answers with Arrow, and
+   returns a materialized `QueryResult` with the report, executed plan,
+   and node metrics attached.
+5. The client receives that `QueryResult`.
+
+## Warm containers
+
+While a provider is open, the selected function keeps one container
+running (`min_containers=1`). A second query on the same session
+reuses the loaded model and reports `boot_kind: warm`.
+`Session.close()` sets the minimum back to zero and exits the app
+context. Always close, or use the session as a context manager.
+
+The provider selects its image from the backend, its runtime package,
+and the explicit `local_python_sources` and `pip_packages` settings.
+Changing registered objects alone does not rebuild the image.
+
+## Function call ids
+
+Every `run()` prints:
+
+```text
+function call id: fc-01ABC...
+```
+
+Keep it. If the client disconnects, the result is still retrievable:
+
+```python
+import modal
+result = modal.FunctionCall.from_id("fc-01ABC...").get()
+table, report = result.collect(), result.report
+```
+
+Tee every Modal run to a file, because the CLI drops old log lines.
+
+## Cost
+
+Report GPU cost as query hours × GPU count × the H100 hourly price in
+`quail.bench.evaluate.H100_USD_PER_HOUR`. The primary number excludes
+model startup. `report["boot_s"]` has the startup time if you need it.
+
+The cold model load for Qwen3 4B fp8 is about 25 seconds after the
+first container has seeded the kernel cache volume. The first ever
+load in a fresh Modal environment is longer because it also downloads
+the weights.

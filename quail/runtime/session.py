@@ -1,30 +1,30 @@
-"""Session and Query: the user-facing API for registering documents,
-compiling queries, planning, and executing on Modal.
-"""
+"""Register documents, plan queries, and run them through a compute provider."""
 
-import re
-import time
+from itertools import chain
+from numbers import Integral
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.catalog import Catalog, DocumentProvider
-from quail.logical import (
-    SHARED_PRE,
-    CompileError,
-    LogicalPlan,
-    join_label,
-    render_join_frame,
-)
-from quail.planner.decide import _collect, explain, plan_query
+from quail.builder import Query as BuilderQuery
+from quail.builtins import built_in_registry
+from quail.catalog import Catalog, ScanRequest, TableProvider
+from quail.execution import document_input, PhysicalRequest
+from quail.extensions import ExtensionRegistry
+from quail.logical import CompileError, LogicalPlan
+from quail.logical_optimizer import apply_logical_rules, LogicalPlanningContext
+from quail.physical import (DocumentInput, PortRef, Project, ValueType,
+                            encode_graph)
+from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
-from quail.runtime.result import (
-    QueryResult,
-    answer_table,
-    build_result_declaration,
-    true_answer_rows,
-)
-from quail.specs import DEVICES
+from quail.runtime.compute import ModalComputeProvider, QueryRequest
+from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
+from quail.runtime.runner import (ExecutionContext, GenericRunner,
+                                  NodeMetrics, scalar_node_metrics)
+from quail.runtime.tokens import TokenStore
+from quail.sqlfront import compile_sql, SQLDialect
 
 
 class RefusalError(RuntimeError):
@@ -55,38 +55,58 @@ def pick_corpus_tokenizer(primary, fast, texts, sample=25):
 
 class Session:
     def __init__(self, config: EngineConfig = EngineConfig(),
-                 device: str = "h100-sxm", tokenizer=None):
-        model = resolve_model(config.model)
+                 device: str = "h100-sxm", tokenizer=None,
+                 registry: ExtensionRegistry | None = None,
+                 compute_provider=None):
+        self.registry = registry or built_in_registry()
+        model = resolve_model(config.model, self.registry.models)
         if isinstance(model, Refusal):
             raise RefusalError(model)
         self.config = config
         self.model = model
-        self.device = DEVICES[device]
+        self.device = self.registry.device(device)
+        try:
+            backend = self.registry.backend(config.backend)
+        except ValueError as error:
+            raise RefusalError(Refusal(
+                reasons=(str(error),),
+                constraint="unknown_backend",
+                needed=1,
+                available=0,
+                unit="backends",
+            )) from error
+        support = backend.supports(model, self.device, config.gpus)
+        if not support.supported:
+            raise RefusalError(Refusal(
+                reasons=(support.reason or
+                         "unsupported backend configuration",),
+                constraint="unsupported_backend_configuration",
+                needed=1,
+                available=0,
+                unit="configurations",
+            ))
         self.catalog = Catalog()
         self._tok = tokenizer      # injectable for tests; lazy HF load
         self._tok_injected = tokenizer is not None
         self._fast = None          # lazy bpe-qwen instance
         self._fast_tried = False
         self.notes = []            # tokenizer picks etc., for reports
-        self._scan_cache = {}      # (source, column) -> token lists
-        self._app_ctx = None       # the Modal app held open for the
-        #                            session, so the worker container
-        #                            (its booted model) survives
-        #                            between run() calls
-
-    def worker(self):
-        """Return the worker module, opening this session's Modal app if needed."""
-        from quail.runtime import worker
-        if self._app_ctx is None:
-            self._app_ctx = worker.app.run()
-            self._app_ctx.__enter__()
-        return worker
+        self._token_stores = {}
+        self._token_directory = None
+        self.compute_provider = compute_provider
 
     def close(self):
-        """Stop the Modal app and release the container."""
-        if self._app_ctx is not None:
-            self._app_ctx.__exit__(None, None, None)
-            self._app_ctx = None
+        """Close compute and temporary token storage."""
+        try:
+            if self.compute_provider is not None:
+                self.compute_provider.close()
+        finally:
+            for store in self._token_stores.values():
+                store.close()
+            self._token_stores.clear()
+            if self._token_directory is not None:
+                self._token_directory.cleanup()
+                self._token_directory = None
 
     def __enter__(self):
         return self
@@ -94,18 +114,19 @@ class Session:
     def __exit__(self, *exc):
         self.close()
 
-    def register(self, name: str, provider: DocumentProvider) -> None:
+    def register(self, name: str, provider: TableProvider) -> None:
         self.catalog.register(name, provider)
 
     # ---- the two entry points ---------------------------------------
 
-    def sql(self, text: str, order: str | None = None) -> "Query":
-        from quail.sqlfront import compile_sql
-        logical = compile_sql(text, self.catalog, self.tokenizer)
+    def sql(self, text: str, order: str | None = None,
+            dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> "Query":
+        logical = compile_sql(
+            text, self.catalog, self.tokenizer, dialect=dialect
+        )
         return Query(self, logical, order=order)
 
     def docs(self, name: str) -> "BoundBuilder":
-        from quail.builder import Query as BuilderQuery
         return BoundBuilder(self,
                             BuilderQuery(self.catalog, name,
                                          self.tokenizer))
@@ -138,38 +159,65 @@ class Session:
                 self._fast = None
         return self._fast
 
-    def scan(self, provider_name: str, column: str):
-        """Return Arrow ID, text, and token columns for one scan."""
-        provider = self.catalog.get(provider_name)
-        key = ("scan", provider.source, column)
-        if key not in self._scan_cache:
-            table = provider.read_column(column)
-            ids = table.column(provider.id_col)
-            texts = table.column(column)
-            text_sample = texts.slice(0, 25).to_pylist()
-            tok, note = pick_corpus_tokenizer(
-                self.tokenizer, self._fast_tokenizer(), text_sample)
-            self.notes.append(f"{provider_name}.{column}: {note}")
-            token_rows = [tok(text.as_py()) for chunk in texts.chunks
-                          for text in chunk]
-            first_token = next(
-                (token for row in token_rows for token in row), None)
-            token_type = (pa.int32() if first_token is None
-                          or isinstance(first_token, int)
-                          else pa.string())
-            toks = pa.array(
-                token_rows, type=pa.large_list(token_type))
-            self._scan_cache[key] = (ids, texts, toks)
-        return self._scan_cache[key]
+    def tokenize(self, provider_name: str, column: str,
+                 projected_columns=()):
+        """Write one document column to a memory mapped token store."""
 
-    def column_values(self, provider_name: str, column: str):
-        """Return one raw Arrow column, cached."""
         provider = self.catalog.get(provider_name)
-        key = ("vals", provider.source, column)
-        if key not in self._scan_cache:
-            table = provider.read_column(column)
-            self._scan_cache[key] = table.column(column)
-        return self._scan_cache[key]
+        projected_columns = tuple(dict.fromkeys(projected_columns))
+        key = (
+            provider.content_identity(),
+            column,
+            projected_columns,
+        )
+        if key not in self._token_stores:
+            columns = tuple(dict.fromkeys((column, *projected_columns)))
+            scan_reader = provider.scan(ScanRequest(columns=columns))
+            reader = iter(scan_reader)
+            try:
+                buffered = []
+                text_sample = []
+                while len(text_sample) < 25:
+                    try:
+                        batch = next(reader)
+                    except StopIteration:
+                        break
+                    buffered.append(batch)
+                    texts = batch.column(batch.schema.get_field_index(column))
+                    needed = 25 - len(text_sample)
+                    text_sample.extend(texts.slice(0, needed).to_pylist())
+                tok, note = pick_corpus_tokenizer(
+                    self.tokenizer, self._fast_tokenizer(), text_sample)
+                self.notes.append(f"{provider_name}.{column}: {note}")
+                sample_rows = [tok(text) for text in text_sample]
+                first_token = next(
+                    (token for row in sample_rows for token in row), None
+                )
+                token_type = (
+                    pa.int32()
+                    if first_token is None or isinstance(first_token, Integral)
+                    else pa.string()
+                )
+                if self._token_directory is None:
+                    self._token_directory = TemporaryDirectory(
+                        prefix="quail-tokens-"
+                    )
+                path = Path(self._token_directory.name) / (
+                    f"input-{len(self._token_stores)}.arrow"
+                )
+                store = TokenStore.write(
+                    str(path),
+                    chain(buffered, reader),
+                    document_column=column,
+                    projected_columns=projected_columns,
+                    tokenizer=tok,
+                    token_type=token_type,
+                    source_schema=provider.schema(),
+                )
+            finally:
+                scan_reader.close()
+            self._token_stores[key] = store
+        return self._token_stores[key]
 
 
 class BoundBuilder:
@@ -206,40 +254,6 @@ class BoundBuilder:
                      order=order)
 
 
-def _true_false_ids(tok):
-    """Return (true_ids, false_ids) first-token ids for TRUE/FALSE spellings."""
-    true, false = set(), set()
-    for w in ("TRUE", " TRUE", "True", " True"):
-        ids = tok(w)
-        if ids:
-            true.add(ids[0])
-    for w in ("FALSE", " FALSE", "False", " False"):
-        ids = tok(w)
-        if ids:
-            false.add(ids[0])
-    return sorted(true), sorted(false)
-
-
-def _question_ids(session: Session, prompt) -> list:
-    """Return token ids for the question suffix after the document."""
-    text = re.sub(r"\{\d+\}", "", prompt.tail)
-    return session.tokenizer(text)
-
-
-def _join_spec(session: Session, prompt, anchor: str,
-               partners: list) -> dict:
-    """Build one join stage spec with tokenized frames and labels for all tables."""
-    tok = session.tokenizer
-    slot = {r.alias: i for i, r in enumerate(prompt.args)}
-    aliases = [r.alias for r in prompt.args]
-    return dict(
-        anchor=anchor, partners=list(partners), aliases=aliases,
-        frames={a: tok(render_join_frame(prompt.template, slot[a]))
-                for a in aliases},
-        labels={a: tok(join_label(slot[a])) for a in aliases},
-        tail=tok(prompt.tail))
-
-
 class Query:
     def __init__(self, session: Session, logical: LogicalPlan,
                  order: str | None = None):
@@ -248,23 +262,42 @@ class Query:
         self.order = order
         self._plan = None
         self._doc_tokens = None
+        self._token_inputs = None
 
     # ---- planning (the optimization) ---------------------------------
 
     def plan(self):
         if self._plan is None:
-            scans, _, _ = _collect(self.logical)
+            self.logical, _ = apply_logical_rules(
+                self.logical,
+                tuple(self.session.registry.logical_rules.values()),
+                LogicalPlanningContext(
+                    self.session.catalog, self.session.config
+                ),
+            )
+            scans, _, _ = collect_operators(self.logical)
             self._doc_tokens = {}
+            self._token_inputs = {}
+            projected = {}
+            for field in self.logical.output_schema():
+                projected.setdefault(field.alias, []).append(field.column)
             for s in scans:
-                _, _, toks = self.session.scan(s.provider, s.column)
-                self._doc_tokens[s.alias] = pc.list_value_length(
-                    toks).to_pylist()
+                store = self.session.tokenize(
+                    s.provider,
+                    s.column,
+                    projected.get(s.alias, ()),
+                )
+                self._token_inputs[s.alias] = store
+                self._doc_tokens[s.alias] = store.lengths
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
                 doc_tokens=self._doc_tokens,
                 gpus=self.session.config.gpus,
-                order=self.order)
+                order=self.order,
+                backend=self.session.config.backend,
+                registry=self.session.registry,
+                tokenizer=self.session.tokenizer)
         return self._plan
 
     def explain(self) -> str:
@@ -272,301 +305,342 @@ class Query:
 
     # ---- execution -----------------------------------------------------
 
-    def run(self, _execute=None) -> QueryResult:
-        """Plan, execute on Modal, and return a lazy Arrow result.
+    def run(self) -> QueryResult:
+        """Execute the query through the session compute provider."""
+        if self.session.compute_provider is None:
 
-        Args:
-            _execute: Optional callable(payload) -> output for testing.
-                None sends to the Modal worker.
-        """
+            self.session.compute_provider = ModalComputeProvider()
+        result = self.session.compute_provider.execute(self._request())
+        if not isinstance(result, QueryResult):
+            raise TypeError("a compute provider must return QueryResult")
+        return result
+
+    def execute_stream(self, batch_rows: int = 65_536,
+                       limit: int | None = None) -> pa.RecordBatchReader:
+        """Execute the query and stream Arrow record batches."""
+        return self.run().execute_stream(
+            batch_rows=batch_rows, limit=limit)
+
+    def collect(self, limit: int | None = None,
+                batch_rows: int = 65_536) -> pa.Table:
+        """Execute the query and explicitly collect one Arrow table."""
+        return self.run().collect(
+            limit=limit, batch_rows=batch_rows)
+
+    def _prepare_physical(self):
+        """Build the physical request used inside a compute worker."""
+
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
-        if plan.workers > 8:
-            raise NotImplementedError(
-                "more than 8 GPUs means multiple containers; the "
-                "multi-container coordinator is a later step")
-        scans, filters, joins = _collect(self.logical)
-        payload = self._payload(plan, scans, filters, joins)
-        t0 = time.time()
-        if _execute is None:
-            worker = self.session.worker()
-            k = plan.workers
-            fn = (worker.execute if k == 1 else
-                  worker.execute_2 if k == 2 else
-                  worker.execute_4 if k <= 4 else worker.execute_8)
-            out = fn.remote(payload)
-        else:
-            out = _execute(payload)
-        coordinator_wall = time.time() - t0
-        return self._assemble(plan, scans, filters, joins, out,
-                              coordinator_wall)
-
-    def execute_stream(self, _execute=None, batch_rows: int = 65_536,
-                       limit: int | None = None) -> pa.RecordBatchReader:
-        """Execute the query and stream Arrow record batches."""
-        return self.run(_execute=_execute).execute_stream(
-            batch_rows=batch_rows, limit=limit)
-
-    def collect(self, _execute=None, limit: int | None = None,
-                batch_rows: int = 65_536) -> pa.Table:
-        """Execute the query and explicitly collect one Arrow table."""
-        return self.run(_execute=_execute).collect(
-            limit=limit, batch_rows=batch_rows)
-
-    # ---- payload -------------------------------------------------------
-
-    def _payload(self, plan, scans, filters, joins) -> dict:
-        from quail.runtime.tokens import encode_token_documents
-
-        sess = self.session
-        docs = {}
-        encoded = {}
-        for s in scans:
-            _, _, toks = sess.scan(s.provider, s.column)
-            key = (s.provider, s.column)
-            if key not in encoded:
-                encoded[key] = encode_token_documents(toks)
-            docs[s.alias] = encoded[key]
-        filter_qids = {}
-        filter_writes = {}
+        inputs = {}
         for node in plan.nodes:
-            if node["op"] != "FilterChain":
+            if not isinstance(node, DocumentInput):
                 continue
-            alias = node["alias"]
-            preds = filters[alias]
-            filter_qids[alias] = [
-                _question_ids(sess, preds[st["written_pos"]].prompt)
-                for st in node["stages"]]
-            filter_writes[alias] = node["arena_writes"]
-        # one spec per stage, in execution order (the JoinGroup nodes'
-        # stage_idxs index into this list)
-        join_specs = []
-        for node in plan.nodes:
-            if node["op"] != "JoinGroup":
-                continue
-            for st in node["stages"]:
-                j = joins[st["written_pos"]]
-                spec = _join_spec(sess, j.predicate, st["anchor"],
-                                  st["partners"])
-                spec["semantics"] = st["semantics"]
-                spec["selectivity"] = j.selectivity
-                spec["written_pos"] = st["written_pos"]
-                # a full join without a user override lets the post-filter
-                # join DP choose either orientation
-                spec["anchor_free"] = (j.anchor is None
-                                       and j.semantics == "full")
-                join_specs.append(spec)
-        true_ids, false_ids = _true_false_ids(sess.tokenizer)
-        shards = {node["alias"]: node["shards"] for node in plan.nodes
-                  if node["op"] == "DocScan"}
-        # the plan's node graph rides along so the worker executes the
-        # structure the planner emitted (groups, barriers) instead of
-        # re-deriving it; shard lists already ship separately
-        plan_nodes = []
-        for n in plan.nodes:
-            n = dict(n)
-            n.pop("shards", None)
-            n.pop("shard_token_loads", None)
-            plan_nodes.append(n)
-        return dict(
-            model=sess.model.name,
-            kv_dtype=plan.kv_dtype,
-            chunk_tokens=plan.chunk_tokens,
-            # the worker re-runs the join search on actual survivors
-            # under the same order rule
-            order_rule=plan.order_rule,
-            workers=plan.workers,
-            # the payload limit is the per-filter admission cap. With
-            # joins, capping a table's filter would drop join inputs
-            # and change the result, so it is only sent for pure
-            # filter queries; _assemble truncates the output rows
-            # either way
-            limit=plan.limit if not join_specs else None,
-            shards=shards,
-            true_ids=true_ids, false_ids=false_ids,
-            # the engine preamble, once: the worker prepends it to
-            # every KV-owning document (filter scans, join anchors)
-            pre_ids=sess.tokenizer(SHARED_PRE),
-            docs=docs,
-            filters=filter_qids,
-            # the planner's per-chain call on whether the arena is
-            # written; run_filter requires it and never derives it
-            filter_arena_writes=filter_writes,
-            joins=join_specs,
-            plan_nodes=plan_nodes)
+            inputs[node.input_id] = document_input(
+                self._token_inputs[node.alias]
+            )
+        envelope = plan.to_envelope(self.session.registry.codecs)
+        return PhysicalRequest(envelope, inputs)
 
-    # ---- sink: gate, replay-check, project ------------------------------
+    def _request(self):
+        """Build the logical request sent to a compute provider."""
 
-    def _assemble(self, plan, scans, filters, joins, out,
-                  coordinator_wall) -> QueryResult:
-        from quail.executor.pack import gate
+        scans, _, _ = collect_operators(self.logical)
+        return QueryRequest(
+            logical_plan=self.logical,
+            providers={
+                scan.provider: self.session.catalog.get(scan.provider)
+                for scan in scans
+            },
+            config=self.session.config,
+            device=self.session.device.name,
+            order=self.order,
+            registry=self.session.registry,
+        )
 
+    def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
+        """Finish the physical graph and attach execution details."""
+
+        plan = self.plan()
+        out = response.metrics
+        from quail.physical import AnchoredJoin, Exchange
+
+        expected_nodes = tuple(node for node in plan.nodes
+                               if isinstance(node, (AnchoredJoin, Exchange)))
         report = dict(
+            backend=out.get("backend", plan.backend),
             wall_s=out["wall_s"], boot_s=out.get("boot_s"),
             boot_kind=out.get("boot_kind"),
             boot=out.get("boot"),
             coordinator_wall_s=round(coordinator_wall, 2),
             fresh_tokens=out["fresh_tokens"],
+            cached_tokens=out.get("cached_tokens"),
             regret_tokens=out.get("regret_tokens"), stages=[],
             peak_gib=out.get("peak_gib"),
-            order_rule=plan.order_rule,
-            join_optimizer=out.get("join_optimizer"),
+            order_rule=plan.settings.get("order_rule"),
+            expected_join_plan=[
+                {
+                    "type": node.type_name,
+                    "id": node.node_id,
+                    **node.explain_fields(),
+                }
+                for node in expected_nodes
+            ],
+            executed_join_plan=out.get("executed_join_plan", []),
             kv_manager=out.get("kv_manager"),
+            node_metrics=out.get("node_metrics", {}),
+            backend_metrics=out.get("backend_metrics"),
             result_volume_path=out.get("result_volume_path"),
             remarks=list(plan.remarks) + list(self.session.notes))
-        answer_rows = dict(filters=out["filters"], joins=out["joins"])
-        answer_tables = {"filters": {}, "joins": {}}
 
-        # filter survivors + observed selectivities
-        survivors = {}
-        for s in scans:
-            n = len(self._doc_tokens[s.alias])
-            survivors[s.alias] = list(range(n))
-        for node in plan.nodes:
-            if node["op"] != "FilterChain":
-                continue
-            alias = node["alias"]
-            rows = out["filters"][alias]
-            n_stages = len(node["stages"])
-            for si, st in enumerate(node["stages"]):
-                answered = [d for d, row in rows.items()
-                            if len(row) > si]
-                passed = [d for d in answered if rows[d][si]]
-                written_pos = st["written_pos"]
-                answer_tables["filters"][(alias, written_pos)] = \
-                    answer_table(
-                        {alias: answered},
-                        [bool(rows[d][si]) for d in answered],
-                        "filter_answers",
-                        {"alias": alias, "written_pos": written_pos},
+        scans, logical_filters, logical_joins = collect_operators(self.logical)
+        scans_by_alias = {scan.alias: scan for scan in scans}
+
+        def project(node, value):
+            if not isinstance(node, Project):
+                raise TypeError(type(node).__name__)
+            relation = (
+                IndexRelation.from_table(value)
+                if isinstance(value, pa.Table) else value
+            )
+            if not isinstance(relation, IndexRelation):
+                raise TypeError("Project needs an index relation")
+            projection = []
+            fields = []
+            for name in node.columns:
+                try:
+                    alias, column = name.split(".", 1)
+                    scan = scans_by_alias[alias]
+                except (ValueError, KeyError) as error:
+                    raise CompileError(
+                        f"unknown projection column {name!r}"
+                    ) from error
+                if alias not in relation.schema.names:
+                    raise CompileError(
+                        f"projection column {name!r} is not in the result"
                     )
-                report["stages"].append(dict(
-                    op="filter", alias=alias, stage=si,
-                    provided_selectivity=st["selectivity"],
-                    observed_selectivity=round(
-                        len(passed) / max(1, len(answered)), 4),
-                    evaluated=len(answered)))
-            survivors[alias] = sorted(
-                d for d, row in rows.items()
-                if len(row) == n_stages and all(row))
+                values = self._token_inputs[alias].column(column)
+                projection.append((alias, values))
+                fields.append(pa.field(
+                    name,
+                    values.type,
+                    nullable=values.null_count > 0,
+                    metadata={
+                        b"quail.alias": alias.encode("utf-8"),
+                        b"quail.provider": scan.provider.encode("utf-8"),
+                        b"quail.column": column.encode("utf-8"),
+                    },
+                ))
+            return QueryResult(
+                columns=list(node.columns),
+                declaration=relation.declaration,
+                document_index_schema=relation.schema,
+                output_schema=pa.schema(
+                    fields,
+                    metadata={b"quail.kind": b"query_result"},
+                ),
+                projection=projection,
+                report={},
+            )
 
-        # join stages, in execution order (the plan's JoinGroup nodes
-        # flattened): rows are over local indices; map through the
-        # index lists the worker reports. partner_index entries are
-        # index tuples, one global index per partner alias. The
-        # worker reports each stage's ACTUAL anchor (a barrier-time
-        # re-pick may differ from the compile-time one); the plan's
-        # stage dict is the fallback for executors that do not.
-        stage_plan = []
-        for node in plan.nodes:
-            if node["op"] == "JoinGroup":
-                stage_plan.extend(node["stages"])
+        sources = {
+            node.input_id: range(node.n_docs)
+            for node in plan.nodes
+            if isinstance(node, DocumentInput)
+        }
+        observers = self.session.registry.new_observers()
+        run = GenericRunner().run(
+            plan.graph,
+            ExecutionContext(
+                runtimes=self.session.registry.runtimes,
+                sources=sources,
+                project=project,
+                observers=observers,
+            ),
+            initial_outputs=response.outputs,
+            initial_metrics={
+                node_id: NodeMetrics(**metrics)
+                for node_id, metrics in out.get("node_metrics", {}).items()
+            },
+        )
+        if not isinstance(run.value, QueryResult):
+            raise TypeError("physical graph root must return QueryResult")
+        result = run.value
+        result.plan = plan.graph
+        result.node_metrics = {
+            node_id: node_result.metrics
+            for node_id, node_result in run.nodes.items()
+        }
+        # Saved reports need the graph and metrics without Python objects.
+        report["executed_plan"] = encode_graph(
+            plan.graph, self.session.registry.codecs)
+        report["node_metrics"] = scalar_node_metrics(run.nodes)
+        observer_reports = {
+            observer.name: dict(observer.report())
+            for observer in observers
+        }
+        if observer_reports:
+            report["observers"] = observer_reports
+        result.report = report
+
+        answer_tables = {"filters": {}, "joins": {}}
+        survivors = {
+            scan.alias: list(range(len(self._doc_tokens[scan.alias])))
+            for scan in scans
+        }
+
+        output_types = {
+            PortRef(node.node_id, output.name): output.value_type
+            for node in plan.nodes
+            for output in node.outputs
+        }
+        filter_relations = {}
+        join_relations = {}
+        for ref, table in response.outputs.items():
+            value_type = output_types.get(ref)
+            metadata = table.schema.metadata or {}
+            if value_type is ValueType.FILTER_ANSWERS:
+                alias = metadata.get(b"quail.alias")
+                if alias is None:
+                    raise ValueError(
+                        "a filter answer relation needs quail.alias metadata"
+                    )
+                filter_relations.setdefault(
+                    alias.decode("utf-8"), []
+                ).append(table)
+            elif value_type is ValueType.JOIN_ANSWERS:
+                written_pos = metadata.get(b"quail.written_pos")
+                if written_pos is None:
+                    raise ValueError(
+                        "a join answer relation needs "
+                        "quail.written_pos metadata"
+                    )
+                position = int(written_pos.decode("ascii"))
+                if position in join_relations:
+                    raise ValueError(
+                        f"duplicate join answer relation {position}"
+                    )
+                join_relations[position] = table
+
+        missing_filter_relations = set(logical_filters) - set(
+            filter_relations
+        )
+        if missing_filter_relations:
+            raise ValueError(
+                "execution response is missing filter answer relations for "
+                f"{sorted(missing_filter_relations)}"
+            )
+        missing_join_relations = set(range(len(logical_joins))) - set(
+            join_relations
+        )
+        if missing_join_relations:
+            raise ValueError(
+                "execution response is missing join answer relations for "
+                f"{sorted(missing_join_relations)}"
+            )
+
+        for node in plan.graph.topological_nodes():
+            for output in node.outputs:
+                if output.value_type is not ValueType.DOCUMENT_IDS:
+                    continue
+                ref = PortRef(node.node_id, output.name)
+                if ref not in response.outputs:
+                    continue
+                table = response.outputs[ref]
+                if len(table.column_names) != 1:
+                    raise ValueError(
+                        "a document id relation needs one alias column"
+                    )
+                alias = table.column_names[0]
+                survivors[alias] = table.column(alias).to_pylist()
+
+        for alias, relations in filter_relations.items():
+            table = relations[0] if len(relations) == 1 else \
+                pa.concat_tables(relations)
+            positions = table.column("predicate").to_pylist()
+            predicate_order = list(dict.fromkeys(int(pos) for pos in positions))
+            predicate_order.extend(
+                position for position in range(len(logical_filters[alias]))
+                if position not in predicate_order
+            )
+            for index, written_pos in enumerate(predicate_order):
+                mask = pc.equal(table.column("predicate"), written_pos)
+                stage_table = table.filter(mask)
+                answered = stage_table.column(alias).to_pylist()
+                answers = stage_table.column("answer").to_pylist()
+                passed = sum(bool(answer) for answer in answers)
+                answer_tables["filters"][(alias, written_pos)] = stage_table
+                report["stages"].append(dict(
+                    op="filter", alias=alias, stage=index,
+                    provided_selectivity=(
+                        logical_filters[alias][written_pos].selectivity
+                    ),
+                    observed_selectivity=round(
+                        passed / max(1, len(answered)), 4
+                    ),
+                    evaluated=len(answered),
+                ))
+
         true_join_tables = {}
-        full_join_order = []
-        for st, jout in zip(stage_plan, out["joins"]):
-            written_pos = jout.get("written_pos", st["written_pos"])
-            anchor = jout.get("anchor", st["anchor"])
-            partners = list(jout.get("partners", st["partners"]))
-            semantics = jout.get("semantics", st["semantics"])
-            selectivity = jout.get("selectivity", st["selectivity"])
-            rows = jout["rows"]
-            anchor_map = jout["anchor_index"]
-            partner_map = jout["partner_index"]
-            evaluated = sum(len(r) for r in rows.values())
-            yes = sum(sum(r) for r in rows.values())
+        expected_order = []
+        for node in expected_nodes:
+            for output in node.outputs:
+                if not output.name.startswith("join_answers:"):
+                    continue
+                expected_order.append(int(output.name.split(":", 1)[1]))
+        expected_order.extend(
+            position for position in sorted(join_relations)
+            if position not in expected_order
+        )
+        for written_pos in expected_order:
+            if written_pos not in join_relations:
+                continue
+            table = join_relations[written_pos]
+            metadata = table.schema.metadata or {}
+            logical_join = logical_joins[written_pos]
+            logical_aliases = [
+                argument.alias for argument in logical_join.predicate.args
+            ]
+            required_metadata = {
+                b"quail.anchor", b"quail.partners", b"quail.semantics"
+            }
+            missing = required_metadata - set(metadata)
+            if missing:
+                raise ValueError(
+                    "a join answer relation is missing metadata "
+                    f"{sorted(key.decode('utf-8') for key in missing)}"
+                )
+            anchor = metadata[b"quail.anchor"].decode("utf-8")
+            partner_text = metadata[b"quail.partners"].decode("utf-8")
+            partners = [] if not partner_text else partner_text.split(",")
+            semantics = metadata[b"quail.semantics"].decode("utf-8")
+            missing_columns = set(logical_aliases) - set(table.column_names)
+            if missing_columns:
+                raise ValueError(
+                    "a join answer relation is missing alias columns "
+                    f"{sorted(missing_columns)}"
+                )
+            answers = table.column("answer").to_pylist()
+            answer_tables["joins"][written_pos] = table
             report["stages"].append(dict(
                 op="join", anchor=anchor,
                 partners=partners,
                 semantics=semantics,
-                provided_selectivity=selectivity,
-                observed_selectivity=round(yes / max(1, evaluated), 4),
-                tuples=evaluated))
-            global_rows = {anchor_map[a]: r for a, r in rows.items()}
-            columns = {alias: [] for alias in [anchor, *partners]}
-            bits = []
-            for raw_local, answers in rows.items():
-                global_anchor = anchor_map[int(raw_local)]
-                for tuple_index, answer in enumerate(answers):
-                    columns[anchor].append(global_anchor)
-                    for alias, global_partner in zip(
-                            partners, partner_map[tuple_index]):
-                        columns[alias].append(global_partner)
-                    bits.append(bool(answer))
-            answers_table = answer_table(
-                columns,
-                bits,
-                "join_answers",
-                {
-                    "written_pos": written_pos,
-                    "anchor": anchor,
-                    "partners": ",".join(partners),
-                },
-            )
-            answer_tables["joins"][written_pos] = answers_table
+                provided_selectivity=logical_join.selectivity,
+                observed_selectivity=round(
+                    sum(bool(answer) for answer in answers)
+                    / max(1, len(answers)), 4
+                ),
+                tuples=len(answers),
+            ))
             if semantics == "full":
-                true_join_tables[written_pos] = true_answer_rows(
-                    answers_table)
-                full_join_order.append(written_pos)
-            else:
-                keep = set(gate(global_rows))
-                if semantics == "exists":
-                    survivors[anchor] = [d for d in survivors[anchor]
-                                         if d in keep]
-                else:
-                    survivors[anchor] = [d for d in survivors[anchor]
-                                         if d not in keep]
-
-        cols = [f"{c.alias}.{c.column}" for c in
-                self.logical.root.columns]
+                true_join_tables[written_pos] = true_answer_rows(table)
         survivor_arrays = {
             alias: pa.array(indices, type=pa.int32())
             for alias, indices in survivors.items()
         }
-        result_declaration, result_index_schema = build_result_declaration(
-            [true_join_tables[pos] for pos in full_join_order],
-            survivor_arrays,
-            self.logical.root.columns[0].alias,
-        )
-
-        projection = []
-        output_fields = []
-        for name, column in zip(cols, self.logical.root.columns):
-            if column.alias not in result_index_schema.names:
-                raise CompileError(
-                    f"projection column {name} is not part of the result")
-            values = self.session.column_values(
-                column.provider, column.column)
-            if isinstance(values, pa.ChunkedArray):
-                values = values.combine_chunks()
-            projection.append((column.alias, values))
-            output_fields.append(pa.field(
-                name,
-                values.type,
-                nullable=values.null_count > 0,
-                metadata={
-                    b"quail.alias": column.alias.encode("utf-8"),
-                    b"quail.provider": column.provider.encode("utf-8"),
-                    b"quail.column": column.column.encode("utf-8"),
-                },
-            ))
-        output_schema = pa.schema(
-            output_fields,
-            metadata={
-                b"quail.schema_version": b"1",
-                b"quail.kind": b"query_result",
-            },
-        )
-        return QueryResult(
-            columns=cols,
-            declaration=result_declaration,
-            document_index_schema=result_index_schema,
-            output_schema=output_schema,
-            projection=projection,
-            report=report,
-            answer_rows=answer_rows,
-            answer_tables=answer_tables,
-            limit=plan.limit,
-            survivor_indices=survivor_arrays,
-            true_join_tables=true_join_tables,
-        )
+        result.answer_tables = answer_tables
+        result.survivor_indices = survivor_arrays
+        result.true_join_tables = true_join_tables
+        return result

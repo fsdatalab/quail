@@ -3,9 +3,8 @@ vLLM's processed module - merged qkv and gate_up, fp8 weights and
 block scales laid out for DeepGEMM. No engine, no scheduler, no KV
 pool. vLLM is a library here (loader and kernels), nothing more.
 
-After load, an untied lm_head weight moves to CPU memory
-(move_untied_head_to_host): the engine only ever reads its TRUE/FALSE
-rows, and the freed GPU bytes go to the KV arena.
+After load, only the TRUE/FALSE output rows are retained. The full
+output head is discarded; shared input embeddings remain available.
 
 get_model reads tensor-parallel group objects. Those collectives are
 no-ops at world size 1, so this path installs single-rank stubs
@@ -84,33 +83,33 @@ def _install_single_rank_groups(torch):
     ps._NODE_COUNT = 1
 
 
-def move_untied_head_to_host(torch, model):
-    """Move an untied lm_head weight to CPU memory, freeing GPU memory.
-
-    The engine reads at most a dozen TRUE/FALSE rows of the head (the
-    answerers slice them out), so the full-vocabulary matrix never
-    earns its place on the GPU. A tied head shares the input
-    embedding's tensor and stays. The freed bytes go to the KV arena:
-    budgets subtract ModelSpec.head_mem_bytes from resident weights.
-
-    Returns:
-        Bytes freed on the GPU; 0 when the head is tied or already
-        on the CPU.
-    """
+def retain_answer_head(torch, model, token_ids):
+    """Keep the answer rows and release the full output head."""
+    allowed = tuple(sorted(set(token_ids)))
+    if not allowed:
+        raise ValueError("TRUE/FALSE token ids must not be empty")
+    if hasattr(model, "quail_answer_token_ids"):
+        answer_weights(model, allowed)
+        return
     weight = model.lm_head.weight
-    if weight.device.type != "cuda":
-        return 0
-    if weight.data_ptr() == model.model.embed_tokens.weight.data_ptr():
-        return 0
-    freed = weight.numel() * weight.element_size()
-    model.lm_head.weight = torch.nn.Parameter(
-        weight.detach().to("cpu"), requires_grad=False)
-    del weight
-    torch.cuda.empty_cache()
-    return freed
+    indices = torch.tensor(allowed, device=weight.device, dtype=torch.long)
+    weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
+    model.register_buffer("quail_answer_weights", weights, persistent=False)
+    model.quail_answer_token_ids = allowed
+    # lm_head can be the same module as embed_tokens; drop only this reference.
+    model.lm_head = None
 
 
-def load_model(model_name: str, revision: str | None = None):
+def answer_weights(model, token_ids):
+    """Return the retained rows for a query's answer token ids."""
+    if tuple(token_ids) != model.quail_answer_token_ids:
+        raise ValueError("Query answer token ids differ from the loaded model's retained rows")
+    return model.quail_answer_weights
+
+
+def load_model(model_name: str, revision: str | None = None, *,
+               answer_token_ids=None):
+    """Load model weights and retain only TRUE/FALSE output rows."""
     import torch
     from vllm.config import set_current_vllm_config
     from vllm.engine.arg_utils import EngineArgs
@@ -122,6 +121,14 @@ def load_model(model_name: str, revision: str | None = None):
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):
         model = get_model(vllm_config=config)
-    move_untied_head_to_host(torch, model)
+    if answer_token_ids is None:
+        from transformers import AutoTokenizer
+        from quail.executor.loop import true_false_ids
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
+        true_ids, false_ids = true_false_ids(tokenizer)
+        answer_token_ids = true_ids | false_ids
+    retain_answer_head(torch, model, answer_token_ids)
+    torch.cuda.empty_cache()
     torch.cuda.synchronize()
     return model

@@ -1,0 +1,45 @@
+---
+title: Experiment rules
+description: How an experiment is planned, run, and recorded.
+---
+
+These rules keep numbers comparable across reports.
+
+## Before the run
+
+- State the prediction first. Compute it from measured constants
+  where you can.
+- Run one confirming cell, not a sweep, unless the sweep is the point.
+- Configure the baseline as carefully as the thing it is compared
+  with. If Quail gets a plan-derived setting, the baseline gets the
+  analytically equivalent one. Report the setting next to the result.
+
+## During the run
+
+- Every engine run goes through Modal. There is no local GPU.
+- Never create a new Modal app name. Attach to `quail-milestone1` for
+  cells and `quail-engine` for the worker.
+- Tee every run to a file.
+- Print the Modal function call id and keep it in the tee file. For an
+  Arrow Flight request, print the query id and the result volume path
+  instead.
+- Do not write Modal return values to local JSON. Pull them with
+  `modal.FunctionCall.from_id(id).get()` when needed.
+
+## Data
+
+- Experiment data lives on the `quail-results` volume, summaries and
+  per-item records alike. It is not committed.
+- Reports cite data by volume path, for example
+  `/results/ablations/<file>.json`.
+
+## What to report for a benchmark query
+
+| Number | Definition |
+| --- | --- |
+| Query time | Seconds, excluding model startup. |
+| `documents/second` | Input document rows / query seconds, for a filter-only query. |
+| `document pairs/second` | Evaluated pairs summed over all join stages / query seconds, for a join. |
+| `$/query` | Query hours × GPU count × `quail.bench.evaluate.H100_USD_PER_HOUR`. |
+
+Startup cost, if useful, is a separate clearly labeled number.

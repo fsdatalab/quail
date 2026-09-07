@@ -1,6 +1,6 @@
 """Checks for the worker's KV regret accounting."""
 
-from quail.runtime.worker import _join_round_kv
+from quail.backends.quail.graph import _join_round_kv
 
 
 def test_join_round_classifies_hit_regret_and_first():

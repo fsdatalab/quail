@@ -48,7 +48,6 @@ def test_result_streams_bounded_arrow_batches():
         output_schema=schema,
         projection=[("r", values)],
         report={},
-        answer_rows={},
         survivor_indices=survivors,
         true_join_tables={},
     )
@@ -65,4 +64,4 @@ def test_result_streams_bounded_arrow_batches():
     assert result.collect(limit=3).column("r.id").to_pylist() == [
         "r0", "r1", "r2"]
     assert not hasattr(result, "rows")
-    assert relation.schema.metadata[b"quail.schema_version"] == b"1"
+    assert relation.schema.metadata[b"quail.kind"] == b"filter_survivors"

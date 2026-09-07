@@ -1,0 +1,169 @@
+---
+title: SQL reference
+description: The AI SQL subset Quail accepts, and what it refuses.
+---
+
+Quail accepts a small SQL subset. It runs the model part of a query
+and nothing else. Ordinary relational work such as grouping, ordering,
+and arithmetic belongs in the database the document ids came from.
+
+Two spellings are accepted. Snowflake style uses `AI_FILTER`. BigQuery
+style uses `AI.IF` and is selected with `dialect="bq"`. Both compile to
+the same logical plan.
+
+```python
+session.sql(text)                  # Snowflake spelling, the default
+session.sql(text, dialect="bq")    # BigQuery spelling
+```
+
+The examples below use the QUAIL-B benchmark's predicates over its
+`reviews` (IMDB) and `aspects` tables, the same ones the
+[quickstart](/docs/user-guide/quickstart) runs.
+
+## The shape of a query
+
+```sql
+SELECT <columns>
+FROM <provider> [<alias>]
+[JOIN <provider> [<alias>] ON AI_FILTER(PROMPT(...), {...})]...
+[WHERE <term> [AND <term>]...]
+[LIMIT <n>]
+```
+
+- `SELECT` lists columns only. `*` expands to every column of every
+  table in the query. No expressions, no aliases with computation.
+- `FROM` names one registered provider. The alias is optional and
+  defaults to the provider name.
+- `JOIN` adds a table. Only plain `JOIN` and `CROSS JOIN` are allowed.
+  `LEFT`, `RIGHT`, `FULL`, and `OUTER` are refused.
+- `WHERE` is a conjunction. Each term is an `AI_FILTER` call, an
+  `EXISTS` subquery, or a `NOT EXISTS` subquery.
+- `LIMIT` takes a positive integer literal.
+
+## Prompts
+
+```sql
+PROMPT('<template>', <column>, ...)
+```
+
+The template uses numbered placeholders. `{0}` is the first column
+argument, `{1}` the second, and so on. Every placeholder must be used
+at least once, and the placeholders must be exactly `{0}` through
+`{n-1}` for `n` column arguments.
+
+A filter prompt has one column. A join prompt has one column per
+joined table, and each placeholder must name a different table alias.
+Refer to a document a second time in the question text with its
+marker rather than adding a second placeholder.
+
+Quail rewrites each template into a fixed layout: a document block,
+then a task instruction, then the question, then an answer cue. Text
+you write before the first placeholder is moved after it, so the
+document's KV does not depend on the question and can be shared
+across questions. The benchmark's predicates put the instruction
+first and repeat it after the placeholder, which reads well and
+tokenizes the same way.
+
+## Filters
+
+Two predicates over one table, F1 and F4 from QUAIL-B:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE AI_FILTER(PROMPT('Judge strictly from the review above whether it mentions at least one positive aspect of the movie.
+
+{0}
+
+Instruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body),
+                {'selectivity': 0.6})
+  AND AI_FILTER(PROMPT('Judge strictly from the review above whether it discusses the ending of the movie.
+
+{0}
+
+Instruction: answer TRUE if the review discusses the ending of the movie, FALSE otherwise.', r.body),
+                {'selectivity': 0.2})
+```
+
+Each `AI_FILTER` term over one table is one filter predicate. All
+predicates over one table must read the same document column. That is
+what lets the document's KV be computed once.
+
+The optional second argument is an option object. A one-table filter
+accepts `selectivity` only: the fraction of documents you expect to
+pass. When every predicate has one, Quail orders the predicates by
+estimated cost; here it would ask F4 first because it drops more
+documents. It does not change the answer.
+
+## Joins
+
+Write the join predicate on the `JOIN`'s `ON` clause, Snowflake style:
+
+```sql
+SELECT r.id, a.aspect
+FROM reviews r
+JOIN aspects a
+  ON AI_FILTER(PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?',
+                      r.body, a.aspect),
+               {'selectivity': 0.15, 'anchor': 'r'})
+```
+
+Or cross join in `FROM` and put the predicate in `WHERE`, BigQuery
+style:
+
+```sql
+SELECT r.id, a.aspect
+FROM reviews r, aspects a
+WHERE AI.IF(PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?',
+                   r.body, a.aspect))
+```
+
+One prompt can join more than two tables. It then has one placeholder
+per table. Every joined table must appear in at least one join
+predicate, and the join predicates must connect every table to the
+`FROM` table. QUAIL-B's IMDB-9 chains two reviews and two aspects that
+way.
+
+Join options:
+
+- `selectivity`: the fraction of tuples you expect to pass.
+- `anchor`: the alias whose KV stays on the GPU while its partners
+  stream past it. Leave it out to let the planner choose by token
+  count. In the query above the reviews are long and the aspects are
+  two words, so the planner picks `r` on its own.
+
+## Exists and anti joins
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE NOT EXISTS (SELECT 1 FROM aspects a
+                  WHERE AI_FILTER(PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?',
+                                         r.body, a.aspect)))
+```
+
+`EXISTS` keeps outer documents that match at least one inner document.
+`NOT EXISTS` keeps outer documents that match none, here the reviews
+that discuss none of the twelve aspects. The subquery must be exactly
+`SELECT 1 FROM provider WHERE AI_FILTER(...)`, and the prompt must
+name the inner table and exactly one outer table. The anchor is always
+the outer table.
+
+`NOT` is only accepted as `NOT EXISTS`.
+
+## Refused
+
+The compiler refuses these with a message that says why:
+
+| Construct | Reason |
+| --- | --- |
+| `GROUP BY`, `ORDER BY`, `DISTINCT`, `HAVING`, `QUALIFY`, window functions | Relational work belongs in the source database. |
+| `UNION`, `EXCEPT`, `INTERSECT`, `OFFSET` | Same. |
+| `OR` between AI predicates | Put the disjunction inside one prompt's text. |
+| Any `AI_` function other than `AI_FILTER` | Only filters and joins are supported today. |
+| Subqueries other than `[NOT] EXISTS (SELECT 1 ...)` | Same. |
+| A query with no AI predicate | A plain scan belongs in the source database. |
+| Outer joins | Only inner and cross joins. |
+
+Errors are raised as `quail.logical.CompileError` when the query is
+compiled, before any GPU work.

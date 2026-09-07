@@ -1,0 +1,70 @@
+---
+title: The compute worker
+description: What happens inside the Modal Function.
+---
+
+`quail.runtime.worker` defines the Modal image, the Modal Functions
+for 1, 2, 4, and 8 GPUs, and the entry point that runs one query. The
+same code path also runs in-process in tests, with the GPU parts
+faked.
+
+## The image
+
+`build_worker_image` starts from the CUDA 13 devel image, installs the
+backend's runtime package (`vllm==0.26.0` by default, `sglang==0.5.18`
+for the SGLang backend), the Quail dependencies, any extension pip
+packages, and mounts `quail` plus any extension source directories.
+It sets the cache directories for vLLM, DeepGEMM, and Triton to the
+kernel cache volume so each kernel compiles once ever.
+
+## One query, step by step
+
+1. The Modal Function receives the prepared request: the logical
+   plan, the source descriptions or raw Arrow columns, the config, the
+   device, the order rule, and the registry.
+2. It calls `initialize_worker(registry)` if the provider supplied one.
+   The same registry is used throughout the query.
+3. It opens each source. A remote source goes through the registered
+   source reader for its `type`. A client-sent table becomes a memory
+   provider.
+4. It tokenizes each document column in bounded batches and writes
+   tokens, lengths, and projected columns to a temporary memory mapped
+   Arrow file. Source batches are released as they are written.
+5. It runs logical rules and physical planning exactly as the client
+   would, then encodes the plan through the codecs and validates the
+   envelope: every node type, the backend, the model, the device, the
+   GPU count, and every runtime must be registered.
+6. It calls `backend.execute_request(context)`. The context gives the
+   backend the request, the graph, the registry, the GPU count, and a
+   per container state dict where the backend keeps its loaded model
+   between queries.
+7. The Quail backend's own worker module, `quail.backends.quail.worker`,
+   loads the model on first use, builds the arena and the pipeline,
+   warms the kernels, and runs the compute subgraph. With several GPUs
+   it spawns one child per GPU and runs the rounds described in
+   [The Quail backend](/docs/architecture/quail-backend).
+8. The model outputs come back as Arrow tables keyed by port. The
+   worker runs the full graph again with those outputs supplied, so
+   `HashJoin`, `Project`, and `Limit` run in the same generic runner
+   pass.
+9. It writes a run record to `/results/runs/` on the `quail-results`
+   volume, then returns a materialized `QueryResult` with the executed
+   plan and node metrics attached.
+
+## Boot
+
+A cold container loads the weights through vLLM's loader from the
+Hugging Face cache volume at a pinned commit hash. The model spec's
+`revision` field pins it, which avoids the hub round trips a branch
+name would pay. The measured cold load for Qwen3 4B fp8 is about 25
+seconds once the kernel cache volume holds vLLM's model inspection
+result. The function keeps the loaded model in process state, so the
+next query on a warm container skips the load.
+
+## Limits
+
+- The complete tokenized corpus lives in one temporary Arrow file on
+  the worker's local disk. Very large sources need query partitioning
+  or a persistent token store; that is not built.
+- More than eight GPUs would need several containers and a second
+  level coordinator. Not built.

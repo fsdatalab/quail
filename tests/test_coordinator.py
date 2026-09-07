@@ -1,32 +1,41 @@
 """Tests for the coordinator's filter/join round splitting, merging, gating, and thinning."""
 
-from quail.runtime.coordinator import (derive_plan_nodes,
-                                       filter_round_limit,
-                                       filter_round_payloads,
+from quail.physical import PackedFilter
+from quail.backends.quail.coordinator import (filter_node_payloads,
                                        gate_group,
                                        join_group_payloads,
                                        merge_filter_round,
                                        merge_join_round,
-                                       stage_for_anchor,
                                        thin_survivors)
 
 
 def payload():
     return dict(
-        model="qwen3-4b-fp8", kv_dtype="bf16", chunk_tokens=1000,
-        true_ids=[1], false_ids=[2], pre_ids=[9], limit=None,
+        model="qwen3-4b-fp8", chunk_tokens=1000,
+        true_ids=[1], false_ids=[2], pre_ids=[9], filter_limit=None,
         docs={"r": [[i] * (10 + i) for i in range(6)],
               "p": [[i] * 5 for i in range(4)]},
         filters={"r": [[7, 7]]},
         filter_arena_writes={"r": True},
+        physical_plan={},
         joins=[dict(anchor="r", partners=["p"], semantics="full",
                     labels={"p": [2]}, frame=[8], tail=[3])],
         workers=2,
         shards={"r": ((0, 2, 4), (1, 3, 5)), "p": ((0, 1), (2, 3))})
 
 
+def filter_node():
+    return PackedFilter(
+        node_id="filter:r", alias="r", arena_writes=True,
+        keep_kv=True, question_token_ids=((7, 7),),
+    )
+
+
 def test_filter_round_split():
-    subs = filter_round_payloads(payload(), payload()["shards"], 2)
+    p = payload()
+    subs = filter_node_payloads(
+        p, filter_node(), p["shards"], 2, has_joins=True
+    )
     assert len(subs) == 2
     assert subs[0]["doc_index"]["r"] == [0, 2, 4]
     assert subs[1]["doc_index"]["r"] == [1, 3, 5]
@@ -36,7 +45,11 @@ def test_filter_round_split():
     # cross the pipe twice (here and in the join round) for no work
     assert "p" not in subs[0]["docs"]
     assert subs[0]["model"] == "qwen3-4b-fp8"
-    assert subs[0]["filters"] == payload()["filters"]
+    assert subs[0]["physical_plan"] is p["physical_plan"]
+    assert subs[0]["node_id"] == "filter:r"
+    assert "filters" not in subs[0]
+    assert "filter_arena_writes" not in subs[0]
+    assert "retain_aliases" not in subs[0]
 
 
 def test_merge_filter_round():
@@ -145,51 +158,6 @@ def test_join_group_two_same_anchor_stages():
     assert subs[1]["anchor_index"] == [1, 3]
 
 
-def test_stage_for_anchor_materializes_either_side():
-    spec = dict(anchor="r", partners=["p"], aliases=["r", "p"],
-                semantics="full",
-                frames={"r": [70], "p": [71]},
-                labels={"r": [80], "p": [81]}, tail=[3])
-    r_side = stage_for_anchor(spec, "r")
-    assert r_side["anchor"] == "r"
-    assert r_side["frame"] == [70]
-    assert r_side["labels"] == {"p": [81]}
-    assert r_side["partners"] == ["p"]
-    p_side = stage_for_anchor(spec, "p")
-    assert p_side["anchor"] == "p"
-    assert p_side["frame"] == [71]
-    assert p_side["labels"] == {"r": [80]}
-    assert p_side["partners"] == ["r"]
-    # a hand-built spec (no per-table maps) is already materialized
-    hand = dict(anchor="r", partners=["p"], labels={"p": [2]},
-                frame=[8], tail=[3], semantics="full")
-    assert stage_for_anchor(hand, "p") is hand
-
-
-def test_derive_plan_nodes_groups_and_barriers():
-    # the executor's grouping rule, reconstructed for payloads built
-    # without a planner
-    j1 = dict(anchor="p", semantics="full")
-    j2 = dict(anchor="p", semantics="full")
-    nodes = derive_plan_nodes([j1, j2])
-    assert [n["op"] for n in nodes] == ["JoinGroup"]
-    assert nodes[0]["stage_idxs"] == (0, 1)
-
-    j3 = dict(anchor="r", semantics="full")
-    nodes = derive_plan_nodes([j1, j3])
-    assert [n["op"] for n in nodes] == ["JoinGroup", "Barrier",
-                                        "JoinGroup"]
-    assert nodes[1]["next_anchor"] == "r"
-    assert nodes[2]["stage_idxs"] == (1,)
-
-    # a gate runs alone (its keep rule differs from the in-call
-    # gate); same anchor, so no barrier between the three groups
-    anti = dict(anchor="p", semantics="anti")
-    nodes = derive_plan_nodes([j1, anti, j2])
-    assert [n["op"] for n in nodes] == ["JoinGroup"] * 3
-    assert [n["stage_idxs"] for n in nodes] == [(0,), (1,), (2,)]
-
-
 def test_gate_group_full_exists_anti():
     out = dict(rows={0: [1, 0], 1: [0, 0], 2: [0, 1]},
                anchor_index=[5, 7, 9])
@@ -234,16 +202,14 @@ def test_filter_round_limit_rule():
     # so the filter round may stop early. With joins, cutting
     # survivor lists drops output rows (#39), so the round gets None.
     p = payload()
-    p["limit"] = 3
-    assert filter_round_limit(p) is None      # payload has joins
-    assert all(s["limit"] is None for s in filter_round_payloads(
-        p, p["shards"], 2))
-    p["joins"] = []
-    assert filter_round_limit(p) == 3
-    assert all(s["limit"] == 3 for s in filter_round_payloads(
-        p, p["shards"], 2))
-    p["limit"] = None
-    assert filter_round_limit(p) is None
+    p["filter_limit"] = 3
+    assert all(s["filter_limit"] is None for s in filter_node_payloads(
+        p, filter_node(), p["shards"], 2, has_joins=True))
+    assert all(s["filter_limit"] == 3 for s in filter_node_payloads(
+        p, filter_node(), p["shards"], 2, has_joins=False))
+    p["filter_limit"] = None
+    assert all(s["filter_limit"] is None for s in filter_node_payloads(
+        p, filter_node(), p["shards"], 2, has_joins=False))
 
 
 def test_merge_join_round_two_stages():
@@ -296,29 +262,6 @@ def test_merge_join_round_disjoint_anchors():
                              2: [0, 1, 0]}
 
 
-# ------------------------------------------------ kept KV threading
-
-def test_retain_aliases_reads_plan_nodes():
-    from quail.runtime.coordinator import retain_aliases
-
-    p = payload()
-    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True),
-                       dict(op="FilterChain", alias="p",
-                            keep_kv=False)]
-    assert retain_aliases(p) == {"r"}
-    # without joins there is nothing to keep the KV for
-    p["joins"] = []
-    assert retain_aliases(p) == set()
-
-
-def test_filter_round_carries_retain_aliases():
-    p = payload()
-    p["plan_nodes"] = [dict(op="FilterChain", alias="r", keep_kv=True)]
-    subs = filter_round_payloads(p, p["shards"], 2)
-    for sub in subs:
-        assert sub["retain_aliases"] == ["r"]
-
-
 def test_join_group_prior_shards_align_kept_anchors():
     # an anchor kept by an earlier group stays on the workers that
     # hold its KV, thinned to the live set, instead of re-sharding
@@ -349,35 +292,3 @@ def test_join_group_prior_shards_add_documents_missing_from_kv():
                 for document in sub["anchor_index"]]
     assert sorted(assigned) == survivors["r"]
     assert len(assigned) == len(set(assigned))
-
-
-def test_search_specs_counts_from_token_lists():
-    from quail.runtime.coordinator import search_specs
-
-    specs = search_specs([dict(
-        aliases=["r", "p"], anchor="r", anchor_free=True,
-        semantics="full", selectivity=0.1, written_pos=2,
-        frames={"r": [1] * 5, "p": [1] * 4},
-        labels={"r": [1] * 2, "p": [1] * 3}, tail=[1] * 7)])
-    assert specs == [dict(
-        written_pos=2, aliases=["r", "p"], anchor="r",
-        anchor_free=True, semantics="full", selectivity=0.1,
-        frame_tokens={"r": 5, "p": 4},
-        label_tokens={"r": 2, "p": 3}, tail_tokens=7)]
-
-
-def test_runtime_nodes_group_and_barrier_like_the_planner():
-    from quail.runtime.coordinator import runtime_nodes
-
-    joins = [dict(semantics="full", written_pos=0),
-             dict(semantics="full", written_pos=1),
-             dict(semantics="exists", written_pos=2)]
-    # two fulls share anchor r and merge; the gate runs alone and
-    # its anchor switch to p becomes a barrier
-    nodes = runtime_nodes([(1, "r"), (0, "r"), (2, "p")], joins)
-    assert [n["op"] for n in nodes] == ["JoinGroup", "Barrier",
-                                       "JoinGroup"]
-    assert nodes[0]["anchor"] == "r"
-    assert nodes[0]["stage_idxs"] == (1, 0)
-    assert nodes[1]["next_anchor"] == "p"
-    assert nodes[2]["stage_idxs"] == (2,)

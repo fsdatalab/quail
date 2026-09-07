@@ -1,6 +1,6 @@
 """Checks for the agent query sample experiment."""
 
-from ablations.agent_query_sample import (
+from experiments.agent_query_sample import (
     _comparison,
     parse_function_calls,
     stable_sample_rows,

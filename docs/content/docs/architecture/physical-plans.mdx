@@ -1,0 +1,130 @@
+---
+title: Physical plans
+description: Typed nodes, ports, graph validation, and the codec for the process boundary.
+---
+
+A physical plan is an immutable directed acyclic graph of typed
+nodes. It is what a backend proposes, what physical rules rewrite,
+what crosses the process boundary to the worker, and what the generic
+runner executes.
+
+## Nodes and ports
+
+```python
+@dataclass(frozen=True)
+class PhysicalNode:
+    node_id: str
+    inputs: tuple[InputPort, ...] = ()
+
+    type_name: ClassVar[str]         # registry key for the codec
+    runtime_key: ClassVar[str]       # registry key for the runtime
+    location: ClassVar[ExecutionLocation]   # CLIENT, COORDINATOR, GPU_EXECUTOR
+    backend: ClassVar[str | None]    # set when the node belongs to one backend
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]: ...
+    def attributes(self) -> dict: ...
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes): ...
+    def embedded_nodes(self) -> tuple[PhysicalNode, ...]: ...
+    def explain_fields(self) -> Mapping[str, Any]: ...
+```
+
+An `InputPort` names the input, gives its `ValueType`, and points at
+one `OutputPort` of another node through a `PortRef(node_id, port)`.
+Value types are `DOCUMENT_IDS`, `FILTER_ANSWERS`, `JOIN_ANSWERS`,
+`ROWS`, and `ANY`. Ports can carry a schema, a tuple of alias names,
+and the graph checks that connected ports agree.
+
+`PhysicalGraph.validate()` checks unique ids, that every input reads
+an existing output, that value types and schemas match, that the graph
+is acyclic, that the root port exists, and optionally that every
+`runtime_key` is registered.
+
+## The built in nodes
+
+Generic nodes any backend can use:
+
+| Node | Location | Job |
+| --- | --- | --- |
+| `DocumentInput` | client | Names one tokenized input by alias and input id, with the document count and optional shard ranges. |
+| `Exchange` | coordinator | Passes survivor ids between rounds when the anchor changes. |
+| `HashJoin` | client | Joins TRUE answer relations on shared alias columns with Arrow Acero. |
+| `Project` | client | Reads the selected columns for the surviving positions. |
+| `Limit` | client | Cuts the result stream. |
+
+Quail backend nodes:
+
+| Node | Job |
+| --- | --- |
+| `PackedFilter` | One table's filter stages, with question token ids, arena write flag, and keep-KV flag. |
+| `AnchoredJoin` | One join group with a fixed anchor alias and bound prompt tokens. |
+
+Request backend node:
+
+| Node | Job |
+| --- | --- |
+| `RequestExecution` | The tokenized filter and join prompt parts for vLLM or SGLang, plus output ports. |
+
+There is no barrier node. Order comes from data dependencies.
+
+## The plan wrapper
+
+`PhysicalPlan` holds the selected backend, model, device, worker
+count, the graph, an estimate in seconds, remarks, and a
+backend-owned `settings` mapping. Quail keeps its chunk size, KV
+capacity, predicate order, and filter limit in `settings`. Another
+backend does not fill those fields.
+
+## Crossing the process boundary
+
+Every node type has a `NodeCodec`. The codec encodes `node_id`, the
+input ports, and `attributes()`, and decodes through
+`from_attributes`. The codec checks that the attribute keys match the
+dataclass fields exactly, so a changed node shape fails loudly instead
+of silently dropping a field.
+
+`plan_envelope` wraps the encoded graph with the backend, model,
+device, worker count, and settings. The worker uses the registry from
+the query request and refuses the plan if any codec, backend, model,
+device, or runtime is missing. There is no separate plan version number;
+the registered type names are the contract.
+
+`explain_fields()` is separate from `attributes()` so a node can omit
+large values such as token id lists from the printed plan.
+
+## Execution
+
+`GenericRunner.run(graph, context)` walks the nodes in topological
+order. For each node it gathers the input values by port, calls
+`context.runtimes[node.runtime_key].execute(node, inputs, context)`,
+checks that the returned ports match the declared outputs, adds the
+node's metrics, and notifies every observer.
+
+The run can be seeded with `initial_outputs`. The worker runs the
+compute subgraph (model nodes and their inputs) first, then runs the
+whole graph again with the model outputs supplied, so `HashJoin`,
+`Project`, and `Limit` execute in the same pass and observers see
+every node exactly once.
+
+Model node outputs leave the executor as Arrow tables with metadata
+that names the alias, the predicate position, and for joins the
+anchor, partners, and semantics. `HashJoin` needs nothing else to
+combine them.
+
+## Fixed join plans
+
+Join order and anchors are chosen before inference. The first anchor's filter
+chain runs last. Every filtered set with a future anchor use can retain passing
+document KV in one shared pool. Sets with no future anchor use release their KV.
+
+The executable graph contains the bound `AnchoredJoin` stages and `Exchange`
+nodes that prune actual survivors. `explain()` shows this saved order.
+Older serialized plans containing `quail.adaptive_join_plan` must be regenerated
+from their logical queries. The public query API is unchanged.
+
+The plan records expected retained pages per set and the next anchor use at each
+join boundary. These estimates do not partition memory. Runtime replacement
+prefers the expected prefix computation saved per occupied KV page. The score
+uses document length and the probability of reaching the next planned use.
+Active KV is protected, and prefixes with no further use are released.

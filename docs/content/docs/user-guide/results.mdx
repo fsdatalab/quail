@@ -1,0 +1,166 @@
+---
+title: Results and explain
+description: Reading rows, counts, the execution report, and the plan.
+---
+
+`Query.run()` returns a `QueryResult`. Under the default Modal compute
+provider the rows have already been materialized in the worker and
+returned as one Arrow table, so every accessor is cheap.
+
+```python
+result = query.run()
+
+result.collect()            # pyarrow.Table of the projected columns
+result.to_rows()            # list of tuples
+result.count()              # row count; len(result) is the same
+result.execute_stream()     # pyarrow.RecordBatchReader
+result.schema               # pyarrow.Schema
+result.report               # dict, see below
+```
+
+`collect`, `to_rows`, and `execute_stream` accept `limit=` to stop
+early. `execute_stream` also accepts `batch_rows=`.
+
+The two shortcuts on `Query` do the same without keeping the result:
+
+```python
+query.collect()             # run and return one Arrow table
+query.execute_stream()      # run and return a record batch reader
+```
+
+## The execution report
+
+`result.report` is a plain dictionary. This is the report from the
+[quickstart](/docs/user-guide/quickstart)'s filter query, trimmed to
+the keys every backend fills:
+
+```json
+{
+  "backend": "quail",
+  "wall_s": 1.3,
+  "boot_s": 19.25,
+  "boot_kind": "cold",
+  "boot": {
+    "kind": "cold",
+    "load_model_s": 13.93,
+    "arena_s": 0.36,
+    "pipeline_s": 0.0,
+    "warm_kernels_s": 4.91,
+    "warm_tier": "touch",
+    "boot_s": 19.25
+  },
+  "coordinator_wall_s": 22.99,
+  "fresh_tokens": 1117,
+  "cached_tokens": null,
+  "stages": [
+    {
+      "op": "filter",
+      "alias": "r",
+      "stage": 0,
+      "provided_selectivity": null,
+      "observed_selectivity": 0.5,
+      "evaluated": 8
+    }
+  ],
+  "node_metrics": {
+    "filter:r": {
+      "input_rows": 8,
+      "output_rows": 4,
+      "evaluated_documents": 8,
+      "fresh_tokens": 1117
+    }
+  },
+  "result_volume_path": "/results/runs/run_1788501944354367580.json",
+  "remarks": [
+    "filter on 'r': arena writes off (one stage - nothing reads the KV again)",
+    "reviews.body: tokenizer: bpe-qwen (parity-checked on sample)"
+  ],
+  "worker_total_s": 36.0909
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `backend` | The backend that ran the query. |
+| `wall_s` | Query time in seconds, excluding model startup. |
+| `boot_s`, `boot_kind`, `boot` | Model startup time, whether it was cold or warm, and the phases of a cold start. |
+| `coordinator_wall_s` | Time inside the worker from request to response, including boot. |
+| `fresh_tokens` | Tokens the model computed for this query. |
+| `cached_tokens` | Tokens served from KV already on the GPU. The request backends fill this; Quail reports KV reuse under `kv_manager`. |
+| `stages` | One entry per filter or join stage: documents or tuples evaluated, the selectivity you gave, and the selectivity observed. |
+| `node_metrics` | Per physical node metrics keyed by node id. |
+| `result_volume_path` | Where the worker saved the run record on the `quail-results` volume. |
+| `remarks` | Planner and tokenizer notes. |
+| `worker_total_s` | Everything the worker did for this request, including tokenization and planning. |
+
+The Quail backend adds `regret_tokens`, `kv_manager`, `peak_gib`,
+`order_rule`, `expected_join_plan`, and `executed_join_plan`. The saved
+join order is the executed order. Actual row counts and KV hits can differ
+from the estimates. The join query in the quickstart shows them:
+
+```json
+{
+  "order_rule": "by_cost",
+  "executed_join_plan": [
+    {"type": "quail.anchored_join", "id": "group:0", "anchor": "r"}
+  ],
+  "kv_manager": {
+    "retained_after_filters": 4,
+    "retained_pages_after_filters": 21,
+    "retained_prefix_tokens_after_filters": 320,
+    "join_anchor_hits": 4,
+    "join_anchor_misses": 0,
+    "evicted_keys": 0,
+    "evicted_pages": 0,
+    "evicted_prefix_tokens": 0
+  }
+}
+```
+
+Registered execution observers add an `observers` mapping keyed by
+observer name.
+
+## Explain
+
+`Query.explain()` plans the query without running it and returns the
+logical and physical plan as text.
+
+```python
+print(session.sql(text).explain())
+```
+
+```text
+logical:
+  Project [r.id, a.aspect]
+    SemanticJoin (full, x2 inputs, sel=0.15, anchor=None)
+      SemanticFilter (x1, sels=[0.6])
+        Scan reviews as r [body]
+      Scan aspects as a [aspect]
+physical:
+  workers=1 model_copies=1
+  KV dtype=bf16
+  chunk_tokens=110376 admission_tokens=362250
+  order=by_cost (default: every gated predicate has a selectivity)
+  DocumentInput input:a alias=a input_id=a n_docs=12 total_tokens=27 shard_docs=[12]
+  DocumentInput input:r alias=r input_id=r n_docs=8 total_tokens=693 shard_docs=[8]
+  PackedFilter filter:r alias=r arena_writes=True keep_kv=True keep_min_doc_tokens=1 keep_resident_fraction=1.0 <- input:r[ids:r]
+    stage {'written_pos': 0, 'question_tokens': 51, 'preamble_tokens': 2, 'selectivity': 0.6, 'expected_docs': 8.0}
+  AnchoredJoin group:0 anchor=r anchor_resident=filter keep_anchor_kv=False <- filter:r[ids:r], input:a[ids:a]
+    stage {'written_pos': 0, 'exec_idx': 0, 'anchor': 'r', 'partners': ['a'], 'semantics': 'full', 'selectivity': 0.15, 'expected_tuples': 57.6, 'anchor_frame_tokens': 36, 'pair_tail_tokens': 4, 'anchor_resident': 'filter', 'tuple_tokens': 878.4}
+  HashJoin recombine alias_order=['r', 'a'] <- group:0[join_answers:0], group:0[ids:r], input:a[ids:a]
+  Project sink columns=['r.id', 'a.aspect'] <- recombine[tuples]
+```
+
+The logical part is the `Scan`, `SemanticFilter`, `SemanticJoin`, and
+`Project` tree. The physical part lists every node of the typed graph
+in execution order with its explain fields, then the planner's
+remarks. Each `<-` names the ports a node reads.
+
+If the planner refuses the query, `explain()` prints the refusal
+instead. A refusal names the constraint and the numbers behind it, for
+example a document whose tokens do not fit one chunk. `run()` raises
+`quail.RefusalError` for the same case.
+
+Planning tokenizes the document columns, so the first `explain()` or
+`run()` on a session pays for tokenization. Later queries over the same
+column reuse the token store.

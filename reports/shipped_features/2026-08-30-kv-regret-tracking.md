@@ -31,8 +31,8 @@ Date: 2026-08-30
 
 - Regret separates avoidable recompute (bad retention) from
   unavoidable first computations. Until now it existed only in the
-  standalone instrumentation cells (`ablations/profile_quail.py`,
-  `ablations/profile_stock.py`), which are run on demand per query.
+  standalone instrumentation cells (`experiments/profile_quail.py`,
+  `experiments/profile_stock.py`), which are run on demand per query.
   The 2026-08-30 discrepancy report needed those cells to learn that
   pre-fix Quail wasted 1,220,547 regret tokens on IMDB-3 and stock
   vLLM 1,326,432; now that number comes out of every benchmark run.

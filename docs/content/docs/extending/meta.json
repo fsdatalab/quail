@@ -1,0 +1,14 @@
+{
+  "title": "Extending Quail",
+  "pages": [
+    "index",
+    "table-providers",
+    "logical-rules",
+    "physical-nodes",
+    "model-backends",
+    "compute-providers",
+    "observers",
+    "models"
+  ],
+  "defaultOpen": true
+}

@@ -49,16 +49,15 @@ class ModelSpec:
 
     @property
     def W_mem(self) -> float:
-        """Weight bytes as loaded, before the untied head moves off."""
+        """Weight bytes as loaded, before the full untied head is discarded."""
         return self.w_mem_bytes or self.params * self.w_bytes
 
     @property
     def head_mem_bytes(self) -> float:
         """Bytes of an untied bf16 lm_head weight; 0 when tied.
 
-        The executor moves this matrix to CPU memory at load
-        (executor.model.move_untied_head_to_host): the engine reads
-        only its TRUE/FALSE rows. Both Qwen3 checkpoints store the
+        The executor discards this matrix after retaining its TRUE/FALSE
+        rows. Both Qwen3 checkpoints store the
         head in bf16, hence the 2 bytes per element.
         """
         if self.tied_head:

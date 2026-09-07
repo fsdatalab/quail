@@ -31,9 +31,9 @@ Removed:
 - The store-era reports (`2026-08-18-milestone1-vs-stock-vllm`,
   `2026-08-18-quailb-sf0.1`, `2026-08-19-quailb-sf0.1`), their plot
   script `make_plots.py`, and their two PNGs. Their cold/warm
-  numbers describe removed behavior. `plans/engine_design.md` keeps
-  its original store sections with a note that they no longer
-  describe the engine.
+  numbers describe removed behavior. The original design document,
+  `plans/engine_design.md`, was removed on 2026-09-04 and stays in git
+  history.
 
 ## Why
 

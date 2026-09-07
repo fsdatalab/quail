@@ -31,7 +31,7 @@ API latency.
 
 ## Before and after
 
-`tests/gpu/load_profile.py`, Qwen3 4B fp8 on one H100, one cold
+`experiments/cells/load_profile.py`, Qwen3 4B fp8 on one H100, one cold
 container per run:
 
 | phase | before | after, first container | after, steady state |
@@ -63,7 +63,7 @@ at 2.0-2.6 GiB/s), so the volume is not the bottleneck: `get_model`'s
 ~10 s is module construction and fp8 post-processing, not weight
 bytes.
 
-End to end through the real worker (`tests/gpu/session_smoke.py`):
+End to end through the real worker (`experiments/cells/session_smoke.py`):
 cold boot 24.3 s, of which `load_model` 20.3 s, arena 0.6 s, kernel
 touch pass 3.4 s. Results unchanged, 76 of 76 planted filter
 survivors and 72 of 72 planted join pairs, warm rerun identical.

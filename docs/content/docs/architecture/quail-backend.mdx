@@ -1,0 +1,113 @@
+---
+title: The Quail backend
+description: Pipelining, token-based admission, KV rewind, packed joins, and multi-GPU rounds.
+---
+
+`QuailBackend` is the default model backend. It owns the scheduler,
+the paged KV arena, retention, KV rewind, and the model calls. This
+page is the short version; `reports/engine-wiki.md` in the repository
+has the long one with pseudocode.
+
+## Planning
+
+`QuailBackend.plan` builds one `PhysicalCandidate` from counted
+constants: the model spec, the device spec, and the per document token
+counts. It decides
+
+- the filter order per table (`as_written`, or `by_cost` when every
+  predicate has a selectivity),
+- the anchor of each join by comparing token counts on each side,
+- the chunk token budget and the KV arena budget from the device
+  memory left after the weights,
+- which survivors' KV to keep across stage boundaries,
+- contiguous document shards per GPU when `gpus` is more than one.
+
+A document that cannot fit an empty chunk is refused at plan time, so
+the executor never deadlocks.
+
+## Filters
+
+The filter loop admits documents into each forward pass by two
+budgets, tokens and KV pages. Survivors of the previous stage pack
+first, so residency drains monotonically. Fresh documents fill the
+rest of the chunk in queue order.
+
+- **Pipelining.** A document that passes stage 1 goes into the next
+  chunk with its stage 2 question. It does not wait for the rest of
+  stage 1.
+- **Token-based admission.** A chunk is full when its token budget or
+  the arena's free pages are used up, not when a request count is
+  reached.
+- **KV rewind.** The document's KV, computed at stage 1, stays in the
+  arena. A later stage adds only the question suffix tokens. The
+  shared question preamble is written next to the document's KV so
+  positions stay correct.
+
+Pages are freed the moment a document fails a stage or answers its
+last question.
+
+## Joins
+
+A join stage packs one anchor's prefix once per chunk and streams its
+partner suffixes past it. All the suffixes in a chunk attend to the
+same anchor pages through a paged cross-attention call. On an H100
+with the 4B model, roughly 30 to 50 suffixes share one anchor per
+forward pass.
+
+- **Gating.** Between stages, anchors with no passing pair are dropped
+  and their pages freed. Anchors are gated in groups sized to the
+  arena.
+- **Dedup.** In a chain join, an anchor that matched several partners
+  still appears once in the next stage.
+- **Retention.** Join groups reuse retained filter KV for their anchors.
+  Evicted documents are processed again.
+
+The planner uses Selinger-style dynamic programming to choose join order and
+anchors before inference. Filter survival is estimated from selectivities,
+with the input document length distribution used for the survivors.
+
+- The first anchor's filter chain runs last. Every input used as a later anchor
+  can retain its passing document KV in one shared pool.
+- Runtime retention prefers expected prefix computation saved per KV page.
+  Document lengths determine computation and page counts. The saved plan supplies
+  the probability and position of the next use. Exact survivors are known only
+  during execution.
+- Two execution chunks are reserved before allocating retained pages. Active KV
+  cannot be evicted. Prefixes are released when they have no further planned use.
+- Planned `AnchoredJoin` nodes reuse available KV. Missing KV is recomputed.
+- Planned `Exchange` nodes prune actual survivors before the next join group.
+- Execution keeps the planned order even when actual selectivity differs.
+
+## The executor
+
+`quail.executor` holds the GPU code and runs only inside the Modal
+image:
+
+- `pack.py`: `pack_stream` for joins and `FilterAdmission` for filters.
+- `arena.py`: the paged KV arena, page accounting plus the tensors.
+- `attention.py`: the forward pass with a two-call attention and a
+  log-sum-exp merge between fresh tokens and arena pages.
+- `loop.py`: `run_filter`, `run_join`, answer readout, and kernel
+  warmup.
+- `model.py`: weight loading through vLLM's loader, retaining only
+  TRUE/FALSE output rows. Shared input embeddings remain available.
+
+The fused kernels assume the Qwen3 architecture: QK-norm before rope,
+gated SiLU MLP, fp8 block-quantized weights.
+
+## Several GPUs
+
+One Modal container holds one coordinator process and one GPU child
+per H100. Children have their own CUDA context and arena. The parent
+sends payloads over pipes.
+
+- The filter round: each child filters its contiguous shard of every
+  table, reading token values straight from the shared memory mapped
+  file. The parent merges survivors.
+- One join round per `AnchoredJoin`: anchors follow their filter
+  shard; every child receives every surviving partner.
+- An `Exchange` between anchors: the parent thins each table to
+  documents still in a passing pair and re-partitions the new anchor.
+
+Filters split documents. Joins split anchors. Every pair belongs to
+one anchor, so gating stays local to the child that holds the anchor.

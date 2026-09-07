@@ -39,7 +39,7 @@ these rules.
 - "Chain mode" is the internal name for KV rewind (one living request
   per document). Either is fine in code; prefer "KV rewind" in prose.
 - The comparison is against "stock vLLM", and say which submission
-  strategy it used: separate requests per stage, or stage-major waves.
+  strategy it used: operator-at-a-time execution or pipelining.
 - `de1|` in request ids is a wire-format version tag, not a product
   name. Leave it alone.
 
@@ -58,10 +58,12 @@ change needs one of them, say so instead of quietly adding it back.
  the app. New GPU cells attach to an existing app
  ("quail-milestone1" for cells, "quail-engine" for the worker).
 - Tee every Modal run to a file. The CLI drops old log lines.
-- Do not write Modal return values to local JSON files. Print the
-  function call id (the `fc-...` Modal assigns to one invocation)
-  and keep that id in the tee file. When you need the result, pull
-  it with `modal.FunctionCall.from_id("<id>").get()`.
+- Do not write Modal return values to local JSON files. For a Modal
+  Function, print the function call id (the `fc-...` Modal assigns to
+  one invocation) and keep that id in the tee file. When you need the
+  result, pull it with `modal.FunctionCall.from_id("<id>").get()`.
+  An Arrow Flight server request has no Modal function call id. Print
+  the Flight query id and the result volume path instead.
 - Experiment data lives on the `quail-results` Modal volume, summaries
   as well as per-item records. Do not commit it. Reports cite it by
   volume path: `/results/ablations/<file>.json`.
@@ -130,11 +132,62 @@ Include a figure whenever one carries the point better than text:
 
 Every report with measured results should include at least one plot.
 
+## QUAIL-B plot standard
+
+- Maintain one main plot covering all queries and one plot per dataset.
+  Include every query in its dataset plot. Do not create a separate FEV-9
+  figure or another standalone query figure for the benchmark comparison.
+- Generate the full set with `reports/make_quailb_comparison_plots.py`.
+  Save vector PDFs as `reports/plots/quailb_main.pdf` and
+  `quailb_<dataset>.pdf`. Use grouped bars for the main comparison.
+  Use readable page sizes and split metrics across pages instead of
+  shrinking all metrics into one wide figure. Keep text as embedded fonts
+  and marks as vectors. PNGs may be first-page previews for Markdown;
+  link the PDF as the primary artifact and never embed a PNG inside it.
+  Keep method order, colors, and metric definitions consistent across them.
+- Show the SoL estimate as a horizontal line across each query's bar group
+  in latency and token plots. Reserve bars for measured configurations.
+  SoL models ideal computation and memory traffic, with prefix KV reused across requests,
+  documents, and repeated aliases wherever their token prefixes match.
+  Use the distinct-prefix estimate, not the per-document-only estimate.
+  State its retained-KV capacity and survivor assumptions. Identify it as
+  an estimate, not a measured backend, and do not invent accuracy for it.
+  Validate query definitions and corpus identity before reusing estimates.
+  Recalculate stale estimates on the CPU from saved inputs without inference.
+- Show these metrics for each query and configuration:
+  - Latency in seconds, excluding model startup and result collection.
+  - Total recomputed KV tokens across the query (`regret_tokens`). These
+    count reusable document or anchor prefix tokens computed again because
+    their KV was unavailable. Use the existing per-document accounting;
+    do not silently substitute the distinct-prefix metric.
+  - Total fresh input tokens computed across the query (`fresh_tokens`).
+    A fresh token is an input token position processed by a model forward
+    pass instead of read from existing KV. Count repeated computation again.
+    This includes new document and prompt-suffix tokens and recomputed
+    prefix tokens. It is not a count of unique text or generated answers.
+    Recomputed KV tokens are included in fresh tokens, not added to them.
+  - Accuracy as agreement with the saved reference labels on evaluated
+    predicate answers. Name the reference model. Include final output
+    precision and recall in the report so false positive joins are visible.
+  - Input document count for each relation or set, before filters. List
+    every alias separately, including repeated uses of the same set.
+    Put counts beside query labels or on a readable table page in the PDF. Label
+    any survivor counts separately from input counts.
+- Keep throughput and GPU cost in the report tables using the definitions
+  above. Derive totals, percentages, and ratios from saved volume results.
+- Reuse existing results when updating figures unless a rerun is requested.
+  State the source run for updated measurements. If a query definition
+  changed, omit incompatible old measurements and label missing baselines.
+  Do not compare different query definitions or display missing values as zero.
+- When replacing the plot layout, remove obsolete figures and their scripts,
+  and update all report references. A benchmark change should update the
+  main plot and its dataset plot together.
+
 ## Where plotting code lives
 
 - One script per report (or per group of related reports), named
   `make_<slug>_plots.py`, in `reports/`.
-- Output PNGs go to `reports/plots/`. Delete a report's PNGs when
+- Output figures go to `reports/plots/`. Delete a report's figures when
   the report is deleted.
 - Reference plots in the report by relative path:
   `"Figure: plots/<name>.png"`.
@@ -163,6 +216,9 @@ effectiveness research:
   decorative gridlines.
 - Label data directly on or next to bars/points. Use a legend only
   when direct labels would overlap or repeat.
+- In profiling plots, use the original function or operation names from
+  the trace, such as `vllm.scheduler.schedule` or `scheduler.run_batch`.
+  Do not replace them with descriptive labels.
 - State the unit on every axis, and make the axis label the unit and
   nothing else: "microseconds per fresh token", not "wall
   microseconds per fresh token (IMDB-7, profiled run)". Context
@@ -183,6 +239,7 @@ effectiveness research:
   categories need two colors, not five.
 - Use a log scale only when the data spans more than one order of
   magnitude. Say so in the axis label.
-- Use 300 DPI PNG files. No SVG.
+- Use vector PDFs for QUAIL-B, with 300 DPI PNG previews. Other report
+  figures use 300 DPI PNG files. No SVG.
 - Make the canvas large enough that text and data marks remain sharp when
   viewed on GitHub.

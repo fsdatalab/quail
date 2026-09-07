@@ -3,15 +3,28 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from copy import copy
+from dataclasses import dataclass
 
 import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
 
 
-SCHEMA_VERSION = "1"
-DOCUMENT_INDEX_TYPE = pa.int32()
 DEFAULT_BATCH_ROWS = 65_536
+
+
+@dataclass(frozen=True)
+class IndexRelation:
+    """A lazy Arrow relation over document index columns."""
+
+    declaration: acero.Declaration
+    schema: pa.Schema
+
+    @classmethod
+    def from_table(cls, table: pa.Table) -> "IndexRelation":
+        """Create a lazy relation from one Arrow table."""
+        return cls(_table_source(table), table.schema)
 
 
 def document_index_schema(aliases: Iterable[str], kind: str) -> pa.Schema:
@@ -19,7 +32,7 @@ def document_index_schema(aliases: Iterable[str], kind: str) -> pa.Schema:
     fields = [
         pa.field(
             alias,
-            DOCUMENT_INDEX_TYPE,
+            pa.int32(),
             nullable=False,
             metadata={b"quail.alias": alias.encode("utf-8")},
         )
@@ -28,7 +41,6 @@ def document_index_schema(aliases: Iterable[str], kind: str) -> pa.Schema:
     return pa.schema(
         fields,
         metadata={
-            b"quail.schema_version": SCHEMA_VERSION.encode("ascii"),
             b"quail.kind": kind.encode("utf-8"),
         },
     )
@@ -234,7 +246,7 @@ class QueryResult:
                  document_index_schema: pa.Schema,
                  output_schema: pa.Schema,
                  projection: list[tuple[str, pa.Array | pa.ChunkedArray]],
-                 report: dict, answer_rows: dict,
+                 report: dict,
                  answer_tables: dict | None = None,
                  limit: int | None = None,
                  survivor_indices: dict[str, pa.Array] | None = None,
@@ -242,7 +254,10 @@ class QueryResult:
         self.columns = columns
         self.schema = output_schema
         self.report = report
-        self.answer_rows = answer_rows
+        # the executed physical graph and each node's measured metrics,
+        # filled in by Query.finish
+        self.plan = None
+        self.node_metrics: dict = {}
         self.answer_tables = answer_tables or {"filters": {}, "joins": {}}
         self.limit = limit
         self._declaration = declaration
@@ -251,14 +266,45 @@ class QueryResult:
         self.survivor_indices = survivor_indices or {}
         self.true_join_tables = true_join_tables or {}
         self._row_count = None
+        self._materialized = None
+
+    @classmethod
+    def from_table(cls, table: pa.Table,
+                   report: dict | None = None) -> "QueryResult":
+        """Create a result from a table produced by a local runtime."""
+        result = cls.__new__(cls)
+        result.columns = list(table.column_names)
+        result.schema = table.schema
+        result.report = report or {}
+        result.answer_tables = {"filters": {}, "joins": {}}
+        result.plan = None
+        result.node_metrics = {}
+        result.limit = None
+        result._declaration = None
+        result._document_index_schema = None
+        result._projection = []
+        result.survivor_indices = {}
+        result.true_join_tables = {}
+        result._row_count = len(table)
+        result._materialized = table
+        return result
 
     def execute_stream(self, batch_rows: int = DEFAULT_BATCH_ROWS,
                        limit: int | None = None
                        ) -> pa.RecordBatchReader:
+        if batch_rows <= 0:
+            raise ValueError("batch_rows must be positive")
         effective_limit = self.limit
         if limit is not None:
+            if limit < 0:
+                raise ValueError("limit must be nonnegative")
             effective_limit = (limit if effective_limit is None
                                else min(limit, effective_limit))
+        if self._materialized is not None:
+            table = self._materialized
+            if effective_limit is not None:
+                table = table.slice(0, effective_limit)
+            return table.to_reader(max_chunksize=batch_rows)
         indices = execute_stream(
             self._declaration,
             self._document_index_schema,
@@ -293,6 +339,63 @@ class QueryResult:
         finally:
             reader.close()
 
+    def attach_executed_plan(self, codecs) -> "QueryResult":
+        """Decode the executed plan and node metrics from a saved report."""
+        from quail.physical import decode_graph
+        from quail.runtime.runner import NodeMetrics
+
+        encoded = self.report.get("executed_plan")
+        if encoded is not None:
+            self.plan = decode_graph(encoded, codecs)
+            self.node_metrics = {
+                node_id: NodeMetrics(**metrics)
+                for node_id, metrics in self.report.get(
+                    "node_metrics", {}).items()
+            }
+        return self
+
+    def explain(self) -> str:
+        """Return the executed physical plan with each node's metrics."""
+        # the runner imports this module, so the metrics type is
+        # imported here
+        from quail.runtime.runner import NodeMetrics
+
+        if self.plan is None:
+            return "no physical plan was executed"
+        lines = []
+        for node in self.plan.topological_nodes():
+            metrics = self.node_metrics.get(node.node_id, NodeMetrics())
+            fields = ", ".join(
+                f"{key}={value}"
+                for key, value in node.explain_fields().items())
+            measured = [f"wall_s={metrics.wall_s:.3f}",
+                        f"rows={metrics.input_rows}->{metrics.output_rows}"]
+            for key in ("evaluated_documents", "evaluated_document_pairs",
+                        "fresh_tokens", "cached_tokens", "regret_tokens",
+                        "peak_gpu_bytes"):
+                value = getattr(metrics, key)
+                if value:
+                    measured.append(f"{key}={value}")
+            lines.append(
+                f"{node.type_name} {node.node_id}"
+                + (f" [{fields}]" if fields else "")
+                + "  " + " ".join(measured))
+        return "\n".join(lines)
+
+    def observer(self, observer) -> dict:
+        """Return the report one execution observer attached.
+
+        Args:
+            observer: The observer class or instance, or its name.
+        """
+        name = observer if isinstance(observer, str) else observer.name
+        reports = self.report.get("observers", {})
+        if name not in reports:
+            raise KeyError(
+                f"no report from observer {name!r}; the query ran with "
+                f"{sorted(reports) or 'no observers'}")
+        return reports[name]
+
     def to_rows(self, limit: int | None = None) -> list[tuple]:
         table = self.collect(limit=limit)
         columns = [column.to_pylist() for column in table.columns]
@@ -304,6 +407,16 @@ class QueryResult:
             self._row_count = (count if self.limit is None
                                else min(count, self.limit))
         return self._row_count
+
+    def with_limit(self, limit: int) -> "QueryResult":
+        """Return the same result with a smaller row limit."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        result = copy(self)
+        result.limit = limit if self.limit is None else min(self.limit, limit)
+        if self._row_count is not None:
+            result._row_count = min(self._row_count, result.limit)
+        return result
 
     def __len__(self) -> int:
         return self.count()

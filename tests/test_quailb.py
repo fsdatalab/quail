@@ -28,7 +28,7 @@ from quail.bench.quailb import (
     split_query_ids,
     split_query_families,
 )
-from quail.planner.decide import _collect
+from quail.planner.decide import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
 
 
@@ -78,9 +78,13 @@ def _standin_sets(tmp_path):
     return tmp_path
 
 
-def test_all_queries_compile_and_plan(tmp_path):
+@pytest.mark.parametrize("backend", [
+    "quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang",
+])
+def test_all_queries_compile_and_plan(tmp_path, backend):
     _standin_sets(tmp_path)
-    sess = quail.Session(EngineConfig(gpus=1), tokenizer=str.split)
+    sess = quail.Session(EngineConfig(gpus=1, backend=backend),
+                         tokenizer=lambda text: list(text.encode()))
     register_sets(sess, tmp_path)
     register_privacy_sets(sess, tmp_path)
     qdefs = queries(sess)
@@ -96,7 +100,7 @@ def test_all_queries_compile_and_plan(tmp_path):
     assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
     for qid, (_, build) in qdefs.items():
         query = build()
-        _, filters, joins = _collect(query.logical)
+        _, filters, joins = collect_operators(query.logical)
         predicates = [predicate for chain in filters.values()
                       for predicate in chain]
         if qid.startswith("PRIV-"):
@@ -113,7 +117,7 @@ def test_all_queries_compile_and_plan(tmp_path):
             "as_written" if qid.startswith("PRIV-")
             else "by_cost"
         )
-        assert plan.order_rule == expected_order, qid
+        assert plan.settings["order_rule"] == expected_order, qid
         assert "physical:" in query.explain(), qid
 
 

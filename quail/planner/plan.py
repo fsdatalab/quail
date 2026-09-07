@@ -1,7 +1,11 @@
 """Data structures produced by planning: PhysicalPlan and Refusal."""
 
-import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+from quail.physical import PhysicalGraph, PhysicalNode, PortRef
+from quail.physical.codec import plan_envelope
+from quail.specs import MODELS
 
 
 @dataclass(frozen=True)
@@ -13,13 +17,6 @@ class CorpusStats:
     @property
     def mean_doc_tokens(self) -> float:
         return self.total_tokens / max(1, self.n_docs)
-
-    @classmethod
-    def from_doc_tokens(cls, doc_tokens) -> "CorpusStats":
-        toks = [int(t) for t in doc_tokens]
-        return cls(n_docs=len(toks), total_tokens=sum(toks),
-                   max_doc_tokens=max(toks) if toks else 0)
-
 
 @dataclass(frozen=True)
 class Refusal:
@@ -37,54 +34,55 @@ class PhysicalPlan:
     model: str
     device: str
     workers: int
-    tensor_parallel: int
-    kv_dtype: str              # always "bf16"
-    chunk_tokens: int          # the batch size (activation/index bound)
-    admission_tokens: int      # KV residency (the arena)
-    order_rule: str            # "as_written" | "by_cost"
-    order_source: str          # which rule chose it, for explain()
-    limit: int | None = None   # output row cap; None = no limit
-    nodes: tuple = ()          # dataflow graph in topological order;
-    #                            each node dict has "id", "op", "inputs"
+    backend: str = "quail"
+    estimated_seconds: float = 0.0
+    nodes: tuple = ()          # typed nodes in topological order
     remarks: tuple = ()
+    settings: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    root: PortRef | None = None
+    graph: PhysicalGraph = field(init=False, repr=False)
 
-    def node(self, node_id: str) -> dict:
-        for n in self.nodes:
-            if n["id"] == node_id:
-                return n
-        raise KeyError(node_id)
+    def __post_init__(self) -> None:
+        if not self.nodes:
+            raise ValueError("a physical plan needs at least one node")
+        if not all(isinstance(node, PhysicalNode) for node in self.nodes):
+            raise TypeError("PhysicalPlan nodes must implement PhysicalNode")
+        root = self.root or PortRef(
+            self.nodes[-1].node_id, self.nodes[-1].outputs[0].name
+        )
+        graph = PhysicalGraph(tuple(self.nodes), root)
+        graph.validate()
+        object.__setattr__(self, "nodes", graph.nodes)
+        object.__setattr__(self, "root", graph.root)
+        object.__setattr__(self, "graph", graph)
 
-    def nodes_by_op(self, op: str) -> list:
-        return [n for n in self.nodes if n["op"] == op]
+    def to_envelope(self, codecs) -> dict:
+        """Encode the typed graph for a process boundary."""
+        return plan_envelope(
+            backend=self.backend,
+            model=self.model,
+            device=self.device,
+            workers=self.workers,
+            graph=self.graph,
+            codecs=codecs,
+            settings=self.settings,
+        )
 
-    def to_json(self) -> str:
-        d = dict(self.__dict__)
-        # shard index lists are working data, not part of the report
-        nodes = []
-        for n in self.nodes:
-            n = dict(n)
-            if "shards" in n:
-                n["shard_docs"] = [len(s) for s in n["shards"]]
-                n["shard_tokens"] = n.pop("shard_token_loads", None)
-                del n["shards"]
-            nodes.append(n)
-        d["nodes"] = nodes
-        return json.dumps(d, indent=2)
-
-
-def resolve_model(name: str):
+def resolve_model(name: str, models=None):
     """Return a ModelSpec by name, or a Refusal if unknown."""
-    from quail.specs import MODELS
-    if name in MODELS:
-        return MODELS[name]
+    if models is None:
+        models = MODELS
+    if name in models:
+        return models[name]
     return Refusal(
         reasons=(f"{name!r} names no registered ModelSpec; known: "
-                 f"{sorted(MODELS)}",),
+                 f"{sorted(models)}",),
         constraint="unknown_model", needed=1, available=0, unit="specs")
 
 
 @dataclass(frozen=True)
 class EngineConfig:
-    """Top-level engine configuration: GPU count and model."""
+    """Top-level engine configuration."""
     gpus: int = 1
     model: str = "qwen3-4b-fp8"
+    backend: str = "quail"

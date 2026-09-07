@@ -7,27 +7,33 @@ import pyarrow.parquet as pq
 import pytest
 
 from quail.builder import col, docs, prompt
+from quail.backends.quail import expected_join_stages
 from quail.catalog import Catalog, DocumentProvider
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
 from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
 from quail.planner.sol import prefix_recompute_seconds, speed_of_light
 from quail.planner.work import Work, ask, scan, triangle
+from quail.physical import (
+    AnchoredJoin,
+    DocumentInput,
+    Exchange,
+    PackedFilter,
+)
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
 def filter_chain(plan, alias=None):
-    return next(n for n in plan.nodes if n["op"] == "FilterChain"
-                and (alias is None or n["alias"] == alias))
+    return next(n for n in plan.nodes if isinstance(n, PackedFilter)
+                and (alias is None or n.alias == alias))
 
 
 def join_stages(plan):
-    """Return every join stage in execution order across JoinGroup nodes."""
-    return [st for n in plan.nodes if n["op"] == "JoinGroup"
-            for st in n["stages"]]
+    """Return every expected join stage in execution order."""
+    return [stage.to_dict() for stage in expected_join_stages(plan)]
 
 
 def node_kinds(plan):
-    return [n["op"] for n in plan.nodes]
+    return [type(node).__name__ for node in plan.nodes]
 
 
 def test_prefix_recompute_seconds_counts_attention_work():
@@ -71,6 +77,27 @@ def _five_filter_plan(catalog, sels):
     return q.select("r.id")
 
 
+def test_planner_uses_one_model_copy_per_gpu(catalog):
+    logical = _five_filter_plan(catalog, (0.5,))
+    for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
+        for gpus in (1, 2, 4, 8):
+            plan = plan_query(
+                logical,
+                model=model,
+                device=H100_SXM,
+                doc_tokens={"r": [100] * 8},
+                gpus=gpus,
+            )
+
+            assert plan.model == model.name
+            assert plan.workers == gpus
+            scan_node = next(
+                node for node in plan.nodes
+                if isinstance(node, DocumentInput)
+            )
+            assert len(scan_node.shards) == gpus
+
+
 def test_b3_ordering_by_cost_vs_as_written(catalog):
     # the B3 shape: a 0.2-selectivity filter written third among five
     sels = (0.9, 0.9, 0.2, 0.9, 0.9)
@@ -80,16 +107,16 @@ def test_b3_ordering_by_cost_vs_as_written(catalog):
     by_cost = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                          doc_tokens=toks)
     chain = filter_chain(by_cost)
-    assert by_cost.order_rule == "by_cost"     # every predicate has a sel
-    assert chain["stages"][0]["selectivity"] == 0.2
+    assert by_cost.settings["order_rule"] == "by_cost"
+    assert chain.stages[0].selectivity == 0.2
     # the other four only see the 20% it passes
-    assert chain["stages"][1]["expected_docs"] == pytest.approx(20.0)
+    assert chain.stages[1].expected_docs == pytest.approx(20.0)
 
     as_written = plan_query(logical, model=QWEN3_4B_FP8,
                             device=H100_SXM, doc_tokens=toks,
                             order="as_written")
     chain = filter_chain(as_written)
-    assert [s["selectivity"] for s in chain["stages"]] == list(sels)
+    assert [stage.selectivity for stage in chain.stages] == list(sels)
 
     class Predicate:
         def __init__(self, tail, selectivity):
@@ -207,8 +234,8 @@ def test_plan_uses_roofline_filter_order(catalog):
     plan = plan_query(
         logical, model=QWEN3_4B_FP8, device=H100_SXM,
         doc_tokens={"r": [400] * 100})
-    assert [stage["written_pos"]
-            for stage in filter_chain(plan)["stages"]] == [1, 0]
+    assert [stage.written_pos
+            for stage in filter_chain(plan).stages] == [1, 0]
 
 
 def test_filter_arena_writes_decision(catalog):
@@ -218,7 +245,7 @@ def test_filter_arena_writes_decision(catalog):
     plan = plan_query(single, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100})
     chain = filter_chain(plan)
-    assert chain["arena_writes"] is False
+    assert chain.arena_writes is False
     assert any("arena writes off" in r for r in plan.remarks)
     assert "arena_writes=False" in explain(single, plan)
 
@@ -227,7 +254,7 @@ def test_filter_arena_writes_decision(catalog):
                       model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100})
     chain = filter_chain(plan)
-    assert chain["arena_writes"] is True
+    assert chain.arena_writes is True
     assert not any("arena writes off" in r for r in plan.remarks)
 
 
@@ -239,8 +266,8 @@ def test_default_rule_falls_back_without_selectivity(catalog):
                .select("r.id"))
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [100] * 10})
-    assert plan.order_rule == "as_written"
-    assert "no selectivity" in plan.order_source
+    assert plan.settings["order_rule"] == "as_written"
+    assert "no selectivity" in plan.settings["order_source"]
 
 
 def test_anchor_longer_side_and_override(catalog):
@@ -318,14 +345,15 @@ def test_chain_splits_into_groups_when_the_long_side_anchors(catalog):
     # the second stage sees the gate-thinned live counts
     assert stages[1]["expected_tuples"] < 8 * 6
     kinds = node_kinds(plan)
-    assert kinds.count("JoinGroup") == 2
-    assert kinds.count("Barrier") == 1
-    barrier = plan.nodes_by_op("Barrier")[0]
-    assert barrier["next_anchor"] == "p"
-    assert set(barrier["thins"]) == {"t", "p"}
+    assert kinds.count("AnchoredJoin") == 2
+    assert kinds.count("Exchange") == 1
+    barrier = plan.graph.nodes_by_type(Exchange.type_name)[0]
+    assert barrier.next_anchor == "p"
+    assert set(barrier.aliases) == {"r", "t", "p"}
     # the barrier's outputs feed the second group's inputs
-    group2 = plan.nodes_by_op("JoinGroup")[1]
-    assert all(src == barrier["id"] for src, _ in group2["inputs"])
+    group2 = plan.graph.nodes_by_type(AnchoredJoin.type_name)[1]
+    assert all(input_port.source.node_id == barrier.node_id
+               for input_port in group2.inputs)
 
 
 def test_chain_shares_one_anchor_when_the_shared_table_is_longest(
@@ -340,8 +368,8 @@ def test_chain_shares_one_anchor_when_the_shared_table_is_longest(
     stages = join_stages(plan)
     assert [s["anchor"] for s in stages] == ["t", "t"]
     kinds = node_kinds(plan)
-    assert kinds.count("JoinGroup") == 1
-    assert kinds.count("Barrier") == 0
+    assert kinds.count("AnchoredJoin") == 1
+    assert kinds.count("Exchange") == 0
 
 
 def test_forced_anchor_is_honored_with_a_remark_when_it_prices_worse(
@@ -394,12 +422,12 @@ def test_three_join_chain_plans_with_barriers(catalog, tmp_path):
     kinds = node_kinds(plan)
     # equal lengths and counts: one anchor switch is optimal (any
     # zero-switch plan would need a table in all three predicates)
-    assert kinds.count("JoinGroup") == 2
-    assert kinds.count("Barrier") == 1
+    assert kinds.count("AnchoredJoin") == 2
+    assert kinds.count("Exchange") == 1
     # recombination reads every stage's pairs
-    rec = plan.nodes_by_op("Recombine")[0]
-    pair_ports = [port for _, port in rec["inputs"]
-                  if port.startswith("pairs:")]
+    rec = plan.graph.nodes_by_type("quail.hash_join")[0]
+    pair_ports = [input_port.source.port for input_port in rec.inputs
+                      if input_port.source.port.startswith("join_answers:")]
     assert len(pair_ports) == 3
 
 
@@ -433,11 +461,17 @@ def test_join_order_runs_selective_gate_first(catalog):
 def test_refusal_weights_need_more_cards(catalog):
     big = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
     logical = _five_filter_plan(catalog, (0.9,))
-    r = plan_query(logical, model=big, device=H100_SXM,
-                   doc_tokens={"r": [100] * 10}, gpus=1)
-    assert isinstance(r, Refusal)
-    assert r.constraint == "weights_need_more_cards"
-    assert r.needed > r.available
+    for gpus in (1, 8):
+        result = plan_query(
+            logical,
+            model=big,
+            device=H100_SXM,
+            doc_tokens={"r": [100] * 10},
+            gpus=gpus,
+        )
+        assert isinstance(result, Refusal)
+        assert result.constraint == "weights_need_more_cards"
+        assert result.needed > result.available
 
 
 def test_preamble_counted_once_per_document(catalog):
@@ -446,10 +480,10 @@ def test_preamble_counted_once_per_document(catalog):
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 10})
     chain = filter_chain(plan)
-    st = chain["stages"][0]
+    st = chain.stages[0]
     # the shared preamble is per document (stage 0), never per stage
-    assert st["preamble_tokens"] == len(tok(SHARED_PRE))
-    assert st["question_tokens"] == len(tok(
+    assert st.preamble_tokens == len(tok(SHARED_PRE))
+    assert st.question_tokens == len(tok(
         "Evaluate TRUE or FALSE for the following question: "
         "flag 0 of: ANSWER:"))
 
@@ -502,11 +536,9 @@ def test_kv_is_always_bf16(catalog):
     logical = _five_filter_plan(catalog, (0.9,))
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100})
-    assert plan.kv_dtype == "bf16"
-    assert any("kv_dtype=bf16 (always)" in r for r in plan.remarks)
     from quail.planner import budgets
-    assert plan.admission_tokens == budgets.arena_tokens(
-        QWEN3_4B_FP8, H100_SXM, plan.chunk_tokens)
+    assert plan.settings["admission_tokens"] == budgets.arena_tokens(
+        QWEN3_4B_FP8, H100_SXM, plan.settings["chunk_tokens"])
 
 
 def test_explain_prints_tree_settings_and_source(catalog):
@@ -516,9 +548,8 @@ def test_explain_prints_tree_settings_and_source(catalog):
     text = explain(logical, plan)
     assert "Scan reviews as r" in text
     assert "order=by_cost" in text
-    assert "FilterChain" in text
+    assert "PackedFilter" in text
     assert isinstance(plan, PhysicalPlan)
-    assert plan.to_json()      # JSON-able
 
     refusal = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                          doc_tokens={"r": [150_000]})
@@ -547,14 +578,14 @@ def test_filter_keep_makes_the_join_anchor_resident(catalog):
     chain = filter_chain(plan)
     # one stage would normally turn arena writes off; the keep needs
     # them
-    assert chain["arena_writes"] is True
-    assert chain["keep_kv"] is True
-    assert chain["keep_min_doc_tokens"] == 1
-    assert chain["keep_resident_fraction"] == 1.0
-    group = plan.nodes_by_op("JoinGroup")[0]
-    assert group["anchor"] == "r"
-    assert group["anchor_resident"] == "filter"
-    assert group["keep_anchor_kv"] is False    # nothing consumes r later
+    assert chain.arena_writes is True
+    assert chain.keep_kv is True
+    assert chain.keep_min_doc_tokens == 1
+    assert chain.keep_resident_fraction == 1.0
+    group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
+    assert group.anchor == "r"
+    assert group.anchor_resident == "filter"
+    assert group.keep_anchor_kv is False    # nothing consumes r later
 
     # resident anchors pay the frame only - no preamble, no document
     pred = logical.root.input.predicate
@@ -563,10 +594,10 @@ def test_filter_keep_makes_the_join_anchor_resident(catalog):
     tail = len(tok(pred.tail))
     live = 50 * 0.5
     expect = live * frame + live * 20 * (5 + label + tail)
-    stage = group["stages"][0]
-    assert stage["anchor_resident"] == "filter"
-    assert stage["tuple_tokens"] == pytest.approx(expect)
-    assert any("keep KV on 'r'" in r for r in plan.remarks)
+    stage = group.stages[0]
+    assert stage.anchor_resident == "filter"
+    assert stage.tuple_tokens == pytest.approx(expect)
+    assert any("shared KV on 'r'" in r for r in plan.remarks)
 
 
 def test_unfiltered_anchor_is_not_resident(catalog):
@@ -578,32 +609,10 @@ def test_unfiltered_anchor_is_not_resident(catalog):
                .select("r.id"))
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [300] * 50, "p": [5] * 20})
-    group = plan.nodes_by_op("JoinGroup")[0]
-    assert group["anchor_resident"] == "none"
+    group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
+    assert group.anchor_resident == "none"
     assert not any("keep KV" in r for r in plan.remarks)
 
-
-def test_keep_split_credits_a_uniform_survivor_fraction():
-    from quail.planner.decide import keep_split
-
-    docs_tok = [100, 200, 300, 400]
-    # Page-rounded costs total 1,040 tokens. A 720-token budget
-    # credits the same fraction from every length class.
-    split = keep_split(docs_tok, 720, 1.0, overhead=4, page_tokens=16)
-    assert split["resident_fraction"] == pytest.approx(720 / 1040)
-    assert split["kept_expected_tokens"] == 720
-
-    # survival halves the expected mass, so half the budget keeps the
-    # same resident fraction
-    half = keep_split(docs_tok, 360, 0.5, overhead=4, page_tokens=16)
-    assert half["resident_fraction"] == pytest.approx(720 / 1040)
-    assert half["kept_expected_tokens"] == 360
-
-    # Everything fits at fraction 1. A budget smaller than every
-    # complete prefix gets no resident credit.
-    assert keep_split(
-        docs_tok, 1e9, 1.0, 4, 16)["resident_fraction"] == 1.0
-    assert keep_split(docs_tok, 100, 1.0, 4, 16) is None
 
 
 def test_keep_capped_by_arena_resident_fraction(catalog):
@@ -614,15 +623,15 @@ def test_keep_capped_by_arena_resident_fraction(catalog):
                       model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
     chain = filter_chain(plan)
-    assert chain["keep_kv"] is True
-    assert chain["keep_min_doc_tokens"] == 1
-    assert 0 < chain["keep_resident_fraction"] < 1
-    assert any("% of survivors" in r for r in plan.remarks)
-    group = plan.nodes_by_op("JoinGroup")[0]
-    assert group["anchor_resident"] == "filter"
+    assert chain.keep_kv is True
+    assert chain.keep_min_doc_tokens == 1
+    assert 0 < chain.keep_resident_fraction < 1
+    assert any("expected pages per worker" in r for r in plan.remarks)
+    group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
+    assert group.anchor_resident == "filter"
 
 
-def test_gate_group_retains_anchor_for_runtime_replan(catalog):
+def test_gate_group_retains_anchor_for_next_planned_group(catalog):
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "products", tok).alias("p"),
                         prompt("m {0} {1}", col("r.review"),
@@ -636,18 +645,18 @@ def test_gate_group_retains_anchor_for_runtime_replan(catalog):
     toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    groups = plan.nodes_by_op("JoinGroup")
+    groups = plan.graph.nodes_by_type(AnchoredJoin.type_name)
     assert len(groups) == 2
-    assert [g["anchor"] for g in groups] == ["r", "r"]
-    assert groups[0]["keep_anchor_kv"] is True
-    assert groups[1]["keep_anchor_kv"] is False
-    assert groups[1]["anchor_resident"] == "none"
+    assert [group.anchor for group in groups] == ["r", "r"]
+    assert groups[0].keep_anchor_kv is True
+    assert groups[1].keep_anchor_kv is False
+    assert groups[1].anchor_resident == "none"
 
 
 def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
     import itertools as it
 
-    from quail.planner.decide import _collect, join_specs
+    from quail.planner.decide import collect_operators, join_specs
     from quail.planner.joins import _feasible_anchors, search_joins, walk
 
     catalog.register("tags", DocumentProvider.from_parquet(
@@ -665,12 +674,11 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
                .select("r.id"))
     toks = {"r": [900] * 6, "t": [40] * 8, "p": [200] * 5,
             "g": [30] * 9}
-    _, _, joins = _collect(logical)
+    _, _, joins = collect_operators(logical)
     specs = join_specs(joins)
     live0 = {a: float(len(t)) for a, t in toks.items()}
     pre = 1
     chunk = 10_000
-    arena = 2_500
 
     def key(work):
         seconds = speed_of_light(work, QWEN3_4B_FP8, H100_SXM,
@@ -679,8 +687,7 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
                 work.kv_read)
 
     found = search_joins(specs, live0, toks, {}, pre, chunk,
-                         QWEN3_4B_FP8, H100_SXM,
-                         arena_tokens=arena, page_tokens=16)
+                         QWEN3_4B_FP8, H100_SXM)
 
     # complete enumeration of the same space under the same cost
     # convention: live counts come from the applied edge set, thinned
@@ -693,8 +700,7 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
             if len(applied) == len(specs):
                 work, _ = walk(
                     sequence, live0, toks, {}, pre,
-                    QWEN3_4B_FP8, H100_SXM,
-                    arena_tokens=arena, page_tokens=16)
+                    QWEN3_4B_FP8, H100_SXM)
                 best.append(work)
             return
         added = order[pos]
@@ -754,15 +760,8 @@ def test_join_search_prices_current_partial_document_residency():
     current = search_joins(
         specs, live, lengths, {"a": {1, 2}}, 10, 100_000,
         QWEN3_4B_FP8, H100_SXM, fixed_order=True)
-    with_capacity = search_joins(
-        specs, live, lengths, {"a": {1, 2}}, 10, 100_000,
-        QWEN3_4B_FP8, H100_SXM, fixed_order=True,
-        arena_tokens=41 * 16, page_tokens=16)
-
     assert current["records"][0]["resident_docs"] == 2
     assert current["records"][2]["resident_docs"] == 0
-    assert with_capacity["records"] == current["records"]
-    assert with_capacity["work"] == current["work"]
 
 
 def test_join_replan_starts_from_already_joined_aliases():

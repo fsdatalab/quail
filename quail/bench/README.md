@@ -5,6 +5,11 @@ QUAIL-B has 32 filter and join queries at scale factor 0.1, plus
 when `register_privacy_sets()` has been called. The saved ground
 truth covers all 21 predicates used by the 32 default queries.
 
+FEV-9 filters both claim inputs with F11 and both evidence inputs with F13,
+then joins c1 with e1, e1 with c2, and c2 with e2. It has four filters and
+three joins. These filters reuse the existing predicate labels and selectivity
+estimates. Measurements made before this extension used only F11 on c1.
+
 A predicate is one exact TRUE or FALSE question, including its prompt and
 the input columns it reads. A query can use one predicate or combine several
 predicates. Ground truth is saved per predicate, document, or document pair.
@@ -13,7 +18,8 @@ predicates. Ground truth is saved per predicate, document, or document pair.
 
 Run all 32 queries with Qwen3 4B. Modal starts one H100! container for
 each query family. Each container runs Quail, stock vLLM, and pipelined
-vLLM on that family:
+vLLM on that family. SGLang runs in a separate container because its
+Python package conflicts with the vLLM package:
 
 ```bash
 mkdir -p results/benchmark
@@ -42,10 +48,14 @@ Each command runs every selected query once. It reads ground truth before
 the timers start. It reports runtime, H100 cost, tokens, documents per second,
 answer accuracy, and final-row precision, recall, and F1.
 
-To compare all three methods, use one H100! container for each query family.
-Each container runs Quail for its family, releases Quail GPU memory, then loads
-vLLM once. It runs every stock vLLM query, then every pipelined vLLM query.
-Quail and both baselines use the same data and saved labels.
+To compare the methods, use one H100! container for each query family. The
+container runs Quail in one process group. After the query results are saved,
+the parent stops the complete process group and waits for GPU memory use to
+fall below 1 GiB. The same container then runs stock vLLM and pipelined vLLM
+in a second process group. Both vLLM configurations share one loaded model.
+The runner records the physical GPU UUID and checks that both process groups
+saw the same H100. SGLang uses the same child-process isolation and cleanup
+in its separate container.
 
 ```bash
 run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
@@ -59,8 +69,9 @@ uv run modal run --detach -m quail.bench.quailb_parallel \
 
 The command prints one Modal function call ID for each query family. Quail
 clears KV before each query. vLLM resets its prefix cache before each stock or
-pipelined query. The command saves separate Quail, stock vLLM, and pipelined
-vLLM summaries and one manifest on the `quail-results` volume.
+pipelined query. SGLang has a separate function call ID and may run on another
+physical H100. The command saves separate summaries and one manifest on the
+`quail-results` volume.
 
 By default, the command loads `SELECTIVITY_ESTIMATE_COLLECTION` from
 `quailb.py`. It is the current active collection. Pass

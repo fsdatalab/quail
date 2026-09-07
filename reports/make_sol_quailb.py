@@ -13,7 +13,7 @@ deep plans. It is therefore an optimistic comparison point for that modeled
 execution, not the exact minimum for every possible execution. The dollar
 metric uses Modal's published H100! price.
 
-The equations are in plans/sol_model.md. Work counting, model components, and
+The equations are in docs/content/docs/architecture/sol-model.mdx. Work counting, model components, and
 the component calculation live in shared planner modules. The exact SoL join
 search is separate from the production planner.
 
@@ -28,8 +28,11 @@ KV is computed, used once, and removed (`executor/pack.py` never retains tuple
 suffix KV).
 
 The estimate therefore computes a document prefix once however many questions
-get asked about it. Each later question still reads that prefix from KV. Three
-operations follow:
+get asked about it. Each later question still reads that prefix from KV. The
+same holds across documents: a token prefix that an earlier document already
+computed is resident, so a document pays only for the tokens beyond its
+longest common prefix with the corpus (agent trace rows sampled from one
+trajectory share most of their tokens). Three operations follow:
 
     scan()      compute a prefix and its first suffix, from nothing
     ask()       reuse a resident prefix, attach one more suffix
@@ -59,7 +62,7 @@ answers go back to the volume too:
     modal volume get quail-results /quailb_data/sf$SF $W/data/
     modal volume get quail-results $G/label_sets $W/allabels/
     modal volume get quail-results \
-        $G/collections/gt_363b5ab570635c33894e1a030c21f57e/manifest.json \
+        $G/collections/gt_77bb8b128743a79aedddaa24c808c3f8/manifest.json \
         $W/collection_manifest.json
     uv run --with transformers --with pyarrow \
         python reports/make_sol_quailb.py $W $SF
@@ -70,13 +73,15 @@ The scale factor defaults to 0.1. The collection supplies all four
 query families. The run stops if the collection is for a different
 scale factor than the one requested.
 
-The report is reports/2026-08-29-sol-quailb.md.
+The saved estimates must be regenerated when a query definition changes.
+Pass --queries FEV-9 to recalculate only that query. The output filename then
+includes the selected query IDs so the full suite file is not overwritten.
 """
+import argparse
 import collections
 import itertools
 import json
 import math
-import sys
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -91,25 +96,32 @@ from quail.bench.sol_dp import PairRelation, exact_live_rows
 from quail.logical import SHARED_PRE, ColumnRef, bind_join_prompt, bind_prompt
 from quail.planner import budgets
 from quail.planner.decide import (
-    _collect,
+    collect_operators,
     default_order_rule,
-    join_specs,
     order_filters_indexed,
 )
-from quail.planner.joins import fit_resident_documents, search_joins, summarize_alias
+from quail.planner.joins import fit_resident_documents
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan
-from quail.runtime.coordinator import runtime_nodes, thin_survivors
+from quail.backends.quail.coordinator import thin_survivors
+from quail.backends.quail.retention import policy as retention_policy
+from quail.runtime.tokens import shared_prefix_lengths
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 
-W = Path(sys.argv[1])
-SF = float(sys.argv[2]) if len(sys.argv) > 2 else 0.1
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("workdir")
+parser.add_argument("scale_factor", nargs="?", type=float, default=0.1)
+parser.add_argument("--queries", help="Comma-separated query IDs")
+args = parser.parse_args()
+W = Path(args.workdir)
+SF = args.scale_factor
 # "%g" so 0.1 stays "0.1" and 0.01 stays "0.01", matching the volume's
 # own directory names
 TAG = f"sf{SF:g}"
-OUT = W / f"sol_quailb_{TAG}.json"
+selection = "_" + args.queries.replace(",", "_") if args.queries else ""
+OUT = W / f"sol_quailb_{TAG}{selection}.json"
 ROOT = Path(__file__).resolve().parents[1]
 
 # check the workdir holds this scale factor before tokenizing anything:
@@ -162,18 +174,38 @@ COLUMNS = {
         ("citation_contexts", "destination_context"),
     "citation_passages.passage_text":
         ("citation_passages", "passage_text"),
+    "agent_traces.trace": ("agent_traces", "trace"),
 }
 
-# 1. document lengths -------------------------------------------------
+# 1. document lengths and shared prefixes ----------------------------
+#
+# With unlimited KV, an ideal execution computes each distinct token
+# prefix once, across documents as well as within one. The tokens a
+# corpus needs are the nodes of the prefix trie over its documents,
+# and that count is the sum over the documents in sorted order of the
+# tokens beyond the longest common prefix with the previous document.
+# Each document is credited that shared length: its first use pays
+# only for the tokens no earlier document computed. A column scanned
+# under two aliases (a self join) is the same trie: a document whose
+# prefix another alias already computed pays only its suffix.
 lengths = {}        # column -> {doc id: token count}
+shared = {}         # column -> {doc id: prefix tokens another doc computed}
+
+
 for key, (table, col) in COLUMNS.items():
     t = pq.read_table(W / "data" / TAG / f"{table}.parquet",
                       columns=["id", col])
-    lengths[key] = {i: length(x) for i, x in
-                    zip(t.column("id").to_pylist(), t.column(col).to_pylist())}
+    tokens_by_doc = {i: encode(x) for i, x in
+                     zip(t.column("id").to_pylist(), t.column(col).to_pylist())}
+    lengths[key] = {i: len(ids) for i, ids in tokens_by_doc.items()}
+    doc_ids = list(tokens_by_doc)
+    shared[key] = dict(zip(doc_ids, shared_prefix_lengths(
+        [tokens_by_doc[doc_id] for doc_id in doc_ids])))
     v = lengths[key].values()
+    credited = sum(shared[key].values())
     print(f"{key:32} {len(v):>6} docs  {sum(v):>10,} tokens  "
-          f"mean {sum(v) / len(v):>8.1f}", flush=True)
+          f"mean {sum(v) / len(v):>8.1f}  shared prefix "
+          f"{credited:>10,} ({credited / sum(v):.1%})", flush=True)
 
 # 2. prompt lengths ---------------------------------------------------
 FILTER_TEMPLATES = {c: getattr(Q, c) for c in (
@@ -214,7 +246,7 @@ for m in LABEL_MANIFESTS:
     rows = pq.read_table(Path(m).parent / "labels.parquet",
                          columns=["left_id", "right_id",
                                   "answer"]).to_pylist()
-    code = meta["legacy_code"]
+    code = meta["key"]
     predicate_meta[code] = meta
     left_ref = ColumnRef("left", meta["left_table"], meta["left_column"])
     if meta["kind"] == "filter":
@@ -265,10 +297,38 @@ def prompt_token_counts(prompt):
     return labels_by_alias, prompt.tail_tokens
 
 
+# Two estimates come out of one run. With CREDIT_SHARED off, a
+# document's first use pays for its whole prefix: the bound for an
+# execution that computes each document once and reuses it only across
+# that document's own questions. With it on, a prefix another document
+# already computed is resident: the bound for an execution that
+# computes each distinct prefix in the corpus once.
+CREDIT_SHARED = True
+
+
+def first_use(alias_data, row, suffix) -> Work:
+    """Compute one document's prefix for the first time in a query.
+
+    The tokens an earlier document already computed are resident, so
+    the document pays only for the rest of its prefix and the suffix.
+    """
+    prefix = PRE + alias_data["tokens"][row]
+    shared_tokens = alias_data["shared"][row] if CREDIT_SHARED else 0
+    if shared_tokens == 0:
+        return scan(prefix, suffix)
+    resident = PRE + shared_tokens
+    return ask(resident, prefix - resident + suffix)
+
+
 def join_stage_work(anchor, partners, aliases, survivors, prompt,
-                    resident_rows) -> Work:
+                    resident_rows, cross_resident_rows=()) -> Work:
     """One stage's Work. Anchor rows in resident_rows have their
-    prefix KV in the arena and pay the frame only; the rest scan."""
+    prefix KV in the arena and pay the frame only; the rest scan.
+
+    cross_resident_rows are anchor rows whose document prefix another
+    alias of the same column computed. With the shared prefix credit
+    on they pay the frame only too; without it they scan.
+    """
     labels_by_alias, tail = prompt_token_counts(prompt)
     partner_rows = list(itertools.product(
         *[survivors[alias] for alias in partners]))
@@ -283,11 +343,13 @@ def join_stage_work(anchor, partners, aliases, survivors, prompt,
                            for suffix in suffixes)
     frame = labels_by_alias[anchor]["frame"]
     resident_rows = set(resident_rows)
+    if CREDIT_SHARED:
+        resident_rows |= set(cross_resident_rows)
     work = Work()
     for row in survivors[anchor]:
         prefix = PRE + aliases[anchor]["tokens"][row]
         work = work + (ask(prefix, frame) if row in resident_rows
-                       else scan(prefix, frame))
+                       else first_use(aliases[anchor], row, frame))
         anchor_prefix = prefix + frame
         work = work + Work(
             tokens=suffix_tokens,
@@ -311,11 +373,14 @@ class QueryInputs:
     filter_stages: list
     filter_evaluations: int
     post_filter_counts: dict
+    # column -> rows every filtered alias of that column computed as
+    # prefixes; another alias of the column may reuse them
+    computed_rows_by_column: dict
 
 
 def prepare_query(query, model: ModelSpec, chunk_tokens: int,
                   plan=None) -> QueryInputs:
-    scans, filters, joins = _collect(query.logical)
+    scans, filters, joins = collect_operators(query.logical)
     if isinstance(plan, Refusal):
         raise ValueError(f"query was refused: {plan.reasons}")
     aliases = {}
@@ -326,6 +391,7 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
             "column": key,
             "ids": ids,
             "tokens": [lengths[key][doc_id] for doc_id in ids],
+            "shared": [shared[key][doc_id] for doc_id in ids],
         }
     if plan is None:
         rule = (query.order if query.order is not None else
@@ -343,9 +409,8 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
         }
     else:
         filter_orders = {
-            node["alias"]: [stage["written_pos"]
-                            for stage in node["stages"]]
-            for node in plan.nodes_by_op("FilterChain")
+            node.alias: [stage.written_pos for stage in node.stages]
+            for node in plan.graph.nodes_by_type("quail.packed_filter")
         }
     survivors = {
         alias: list(range(len(data["ids"])))
@@ -354,17 +419,25 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
     resident = set()
     filter_stages = []
     filter_evaluations = 0
+    computed_rows_by_column = {}
 
     for alias, order in filter_orders.items():
         live = survivors[alias]
+        column = aliases[alias]["column"]
+        computed = computed_rows_by_column.setdefault(column, set())
         for stage_index, written_pos in enumerate(order):
             predicate = filters[alias][written_pos]
             code = prompt_code(predicate.prompt)
             qtokens = predicate.prompt.tail_tokens
-            operation = scan if stage_index == 0 else ask
             for row in live:
-                prefix = PRE + aliases[alias]["tokens"][row]
-                work = work + operation(prefix, qtokens)
+                if stage_index == 0 and not (
+                        CREDIT_SHARED and row in computed):
+                    work = work + first_use(aliases[alias], row, qtokens)
+                else:
+                    prefix = PRE + aliases[alias]["tokens"][row]
+                    work = work + ask(prefix, qtokens)
+            if stage_index == 0:
+                computed.update(live)
             passed = [
                 row for row in live
                 if prompt_answer(predicate.prompt, {alias: row}, aliases)
@@ -398,6 +471,7 @@ def prepare_query(query, model: ModelSpec, chunk_tokens: int,
         filter_stages=filter_stages,
         filter_evaluations=filter_evaluations,
         post_filter_counts=post_filter_counts,
+        computed_rows_by_column=computed_rows_by_column,
     )
 
 
@@ -405,10 +479,10 @@ def simulate_production_planner(query, model: ModelSpec,
                                 chunk_tokens: int):
     """Optional diagnostic for the production planner.
 
-    The simulation uses exact saved answers after every join group.
+    The simulation executes the saved join order with exact saved answers.
     At group boundaries it applies the arena's page limit and the
-    same prefix tokens per page victim order. It does not reproduce temporary
-    overlap between packed GPU chunks.
+    same computation saved per page priority. It trims complete boundary
+    snapshots and does not reproduce survivor arrival order or packed chunks.
 
     The SoL output does not call this function.
     """
@@ -422,12 +496,20 @@ def simulate_production_planner(query, model: ModelSpec,
     # the engine retains KV where the plan says so: survivors of
     # keep_kv filter chains, then gate survivors of anchors a later
     # group re-uses
-    keep_aliases = {node["alias"]
-                    for node in plan.nodes_by_op("FilterChain")
-                    if node.get("keep_kv")}
+    keep_aliases = {
+        node.alias
+        for node in plan.graph.nodes_by_type("quail.packed_filter")
+        if node.keep_kv
+    }
     resident_rows = {alias: (set(rows) if alias in keep_aliases
                              else set())
                      for alias, rows in survivors.items()}
+    retention = plan.settings["retention"]
+    capacity = retention["cap_pages"] * budgets.PAGE_TOKENS * plan.workers
+    resident_rows = fit_resident_documents(
+        resident_rows, {alias: aliases[alias]["tokens"] for alias in aliases},
+        PRE, capacity, budgets.PAGE_TOKENS,
+        retention_policy(retention, retention["initial"]))
     filter_stages = prepared.filter_stages
     filter_evaluations = prepared.filter_evaluations
     post_filter_counts = prepared.post_filter_counts
@@ -436,73 +518,15 @@ def simulate_production_planner(query, model: ModelSpec,
     join_pair_evaluations = 0
     single_join_options = {}
 
-    all_specs = join_specs(joins)
-    markers = [dict(semantics=j.semantics, written_pos=i)
-               for i, j in enumerate(joins)]
-    remaining = set(range(len(joins)))
-    already_joined = set()
-    search_runs = []
-    search_sequence = []
-
-    def possible_anchors(indices):
-        out = set()
-        for index in indices:
-            spec = all_specs[index]
-            if spec["semantics"] == "full" and spec.get("anchor_free"):
-                out.update(spec["aliases"])
-            else:
-                out.add(spec["anchor"])
-        return out
-
-    def next_group():
-        specs = [all_specs[i] for i in sorted(remaining)]
-        involved = sorted({a for spec in specs
-                           for a in spec["aliases"]})
-        found = search_joins(
-            specs,
-            {a: float(len(survivors[a])) for a in involved},
-            {a: summarize_alias(
-                (aliases[a]["tokens"][row] for row in survivors[a]),
-                resident_flags=(row in resident_rows[a]
-                                for row in survivors[a]))
-             for a in involved},
-            {},
-            PRE, chunk_tokens, model, H100_SXM,
-            fixed_order=(plan.order_rule == "as_written"),
-            arena_tokens=plan.admission_tokens,
-            page_tokens=budgets.PAGE_TOKENS,
-            already_joined=already_joined)
-        if found is not None:
-            search_runs.append(found)
-            nodes = runtime_nodes(found["seq"], markers)
-            return next(node for node in nodes
-                        if node["op"] == "JoinGroup")
-
-        ordered = sorted(remaining)
-        first = ordered[0]
-        anchor = all_specs[first]["anchor"]
-        group = [first]
-        if all_specs[first]["semantics"] == "full":
-            for index in ordered[1:]:
-                spec = all_specs[index]
-                if spec["semantics"] != "full" \
-                        or spec["anchor"] != anchor:
-                    break
-                group.append(index)
-        return dict(op="JoinGroup", anchor=anchor,
-                    stage_idxs=tuple(group))
-
-    while remaining:
-        node = next_group()
-        search_sequence.extend((index, node["anchor"])
-                               for index in node["stage_idxs"])
-        stage_defs = [joins[i] for i in node["stage_idxs"]]
-        anchor = node["anchor"]
-        remaining.difference_update(node["stage_idxs"])
-        future_anchors = possible_anchors(remaining)
+    planned_groups = plan.graph.nodes_by_type("quail.anchored_join")
+    for node in planned_groups:
+        stage_indices = [stage.written_pos for stage in node.stages]
+        stage_defs = [joins[index] for index in stage_indices]
+        anchor = node.anchor
+        future_anchors = set(retention["after"][node.node_id])
         group_semantics = stage_defs[-1].semantics
         for stage_index, (join_index, join) in enumerate(
-                zip(node["stage_idxs"], stage_defs)):
+                zip(stage_indices, stage_defs)):
             prompt = join.predicate
             code = prompt_code(prompt)
             stage_aliases = [arg.alias for arg in prompt.args]
@@ -581,10 +605,8 @@ def simulate_production_planner(query, model: ModelSpec,
         resident_rows = fit_resident_documents(
             resident_rows,
             {alias: aliases[alias]["tokens"] for alias in aliases},
-            PRE, plan.admission_tokens,
-            budgets.PAGE_TOKENS)
-        for join_index in node["stage_idxs"]:
-            already_joined.update(all_specs[join_index]["aliases"])
+            PRE, capacity, budgets.PAGE_TOKENS,
+            retention_policy(retention, retention["after"][node.node_id]))
 
     first_alias = scans[0].alias
     input_document_rows = sum(
@@ -618,11 +640,6 @@ def simulate_production_planner(query, model: ModelSpec,
         "anchor": anchor,
         "anchor_tokens_both_ways": both,
         "held_column": aliases[held_alias]["column"],
-        "runtime_search": (None if not search_runs else dict(
-            states=sum(run["states"] for run in search_runs),
-            generated=sum(run["generated"] for run in search_runs),
-            replans=len(search_runs),
-            sequence=[list(step) for step in search_sequence])),
     }
 
 
@@ -704,6 +721,20 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
             <= chunk_tokens
         )
 
+    def cross_resident(anchor, live, live_cache):
+        """Rows of anchor whose prefix another alias of its column holds.
+
+        A filtered alias computed every row of its column. An alias in
+        live_cache holds the prefixes of its live rows; it computed at
+        least those, so the credit is conservative.
+        """
+        column = aliases[anchor]["column"]
+        rows = set(prepared.computed_rows_by_column.get(column, ()))
+        for other in live_cache:
+            if other != anchor and aliases[other]["column"] == column:
+                rows.update(live[other])
+        return rows
+
     extension_cache = {}
 
     def extend(relations: frozenset[str], cached: frozenset[str], added: str):
@@ -748,6 +779,7 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
                     live,
                     join.predicate,
                     live[anchor] if anchor in live_cache else (),
+                    cross_resident(anchor, live, live_cache),
                 )
                 next_edges = active_edges | {edge_index}
                 next_live = live_for(next_edges)
@@ -839,6 +871,8 @@ def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
                 joins[0].predicate,
                 start_live[candidate]
                 if candidate in prepared.resident else (),
+                cross_resident(
+                    candidate, start_live, frozenset(prepared.resident)),
             ).tokens
             for side, candidate in zip(("left", "right"), stage_aliases)
             if anchor_fits(
@@ -891,6 +925,11 @@ for model in MODELS:
 query_ids = list(query_defs_by_model[MODELS[0].name])
 if any(list(query_defs_by_model[model.name]) != query_ids for model in MODELS):
     raise ValueError("4B and 32B query definitions do not have the same ids")
+if args.queries:
+    selected = args.queries.split(",")
+    if set(selected) - set(query_ids):
+        raise ValueError(f"unknown queries: {set(selected) - set(query_ids)}")
+    query_ids = [query for query in query_ids if query in selected]
 
 
 def add_sol_metrics(simulated, model: ModelSpec):
@@ -954,20 +993,58 @@ def add_sol_metrics(simulated, model: ModelSpec):
 
 rows = {}
 query_inputs = {}
+# a query over a corpus this estimate does not tokenize is recorded as
+# skipped rather than estimated
+skipped = {}
 for qid in query_ids:
     descriptions = {
         query_defs_by_model[model.name][qid][0] for model in MODELS}
     if len(descriptions) != 1:
         raise ValueError(f"model query descriptions differ for {qid}")
-    rows[qid] = {"description": descriptions.pop(), "models": {}}
+    probe_scans, _, _ = collect_operators(
+        query_defs_by_model[MODELS[0].name][qid][1]().logical)
+    missing = sorted(
+        {f"{scan.provider}.{scan.column}" for scan in probe_scans}
+        - set(lengths))
+    if missing:
+        skipped[qid] = f"no modeled corpus for {', '.join(missing)}"
+        print(f"{qid}: skipped, {skipped[qid]}")
+        continue
+    rows[qid] = {
+        "description": descriptions.pop(),
+        "alias_columns": {
+            scan.alias: f"{scan.provider}.{scan.column}"
+            for scan in probe_scans
+        },
+        "models": {},
+    }
     query_inputs[qid] = {}
     for model in MODELS:
         _, build = query_defs_by_model[model.name][qid]
+        CREDIT_SHARED = False
+        per_document = add_sol_metrics(
+            simulate_optimal_left_deep(
+                build(), model, CHUNK[model.name]),
+            model,
+        )
+        CREDIT_SHARED = True
         optimal = add_sol_metrics(
             simulate_optimal_left_deep(
                 build(), model, CHUNK[model.name]),
             model,
         )
+        optimal["shared_prefix_tokens_credited"] = (
+            per_document["tokens"] - optimal["tokens"])
+        optimal["per_document"] = {
+            key: per_document[key]
+            for key in ("sol_s", "tokens", "pairs", "kv_written",
+                        "kv_read", "passes", "bound_by",
+                        "cost_usd_per_query_at_sol",
+                        "documents_per_second_at_sol",
+                        "document_pairs_per_second_at_sol",
+                        "t_compute", "t_memory", "anchor")
+            if key in per_document
+        }
         rows[qid]["models"][model.name] = optimal
         query_inputs[qid][model.name] = {
             "optimal_left_deep": {
@@ -978,27 +1055,42 @@ for qid in query_ids:
         }
 
 hdr = (f"{'query':7} {'4B tokens':>11} {'4B anchor':>15} {'4B SoL':>9} "
-       f"{'32B tokens':>11} {'32B anchor':>15} {'32B SoL':>9} "
-       f"{'32B/4B':>7}")
+       f"{'4B per-doc':>10} {'32B SoL':>9} {'32B per-doc':>11} {'32B/4B':>7}")
 print(hdr)
 print("-" * len(hdr))
-for qid, r in rows.items():
-    a, b = r["models"]["qwen3-4b-fp8"], r["models"]["qwen3-32b-fp8"]
+for qid, row in rows.items():
+    a = row["models"]["qwen3-4b-fp8"]
+    b = row["models"]["qwen3-32b-fp8"]
     print(f"{qid:7} {a['tokens']:>11,.0f} {str(a['anchor'] or '-'):>15} "
-          f"{a['sol_s']:>9.3f} {b['tokens']:>11,.0f} "
-          f"{str(b['anchor'] or '-'):>15} {b['sol_s']:>9.3f} "
+          f"{a['sol_s']:>9.3f} {a['per_document']['sol_s']:>10.3f} "
+          f"{b['sol_s']:>9.3f} {b['per_document']['sol_s']:>11.3f} "
           f"{b['sol_s'] / a['sol_s']:>7.2f}")
 
-
 json.dump({
-    "what": f"Speed of light for all {len(rows)} QUAIL-B queries at "
+    "what": f"Speed of light for {len(rows)} QUAIL-B queries at "
             f"sf={SF:g}, on "
             "Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100! request each. "
             "Every feasible left deep order and anchor choice is considered. "
             "No measured or fitted constant is used.",
-    "method": "plans/sol_model.md, computed by reports/make_sol_quailb.py",
+    "method": "docs/content/docs/architecture/sol-model.mdx, computed by reports/make_sol_quailb.py",
     "scale_factor": SF,
     "query_count": len(rows),
+    "skipped": skipped,
+    "corpora": {
+        key: {
+            "documents": len(lengths[key]),
+            "tokens": sum(lengths[key].values()),
+            "shared_prefix_tokens": sum(shared[key].values()),
+        }
+        for key in COLUMNS
+    },
+    "estimates": {
+        "sol_s": "each distinct token prefix in the query's scanned "
+                 "documents computed once, across documents and across "
+                 "aliases of one column",
+        "per_document.sol_s": "each alias's document computed once, "
+                              "reused only across its own questions",
+    },
     "corpus_id": CORPUS_ID,
     "collection_id": COLLECTION_ID,
     "pricing": {
@@ -1033,6 +1125,10 @@ json.dump({
         "survivors": "exact ground truth survivors",
         "persistent_kv_capacity": "unlimited",
         "cached_values": "document prefixes used by filters or as anchors",
+        "cross_alias_prefix_reuse": (
+            "in the distinct prefix estimate an anchor row whose column "
+            "another alias filtered, or whose row is live under another "
+            "cached alias of the column, pays the frame only"),
         "streamed_partner_kv": "not reusable",
         "validation": "unit tests compare DP with complete enumeration",
     },
