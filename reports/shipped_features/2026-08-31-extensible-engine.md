@@ -46,7 +46,7 @@ fields separately for `explain()`.
 
 The generic runner now finishes the complete physical graph. GPU model outputs
 are supplied as completed node outputs. The same run then executes
-`HashJoin`, `Project`, and `Limit`. Execution observers see every physical node
+`Recombine`, `Project`, and `Limit`. Execution observers see every physical node
 once.
 
 A DataFusion integration can keep its scans and ordinary relational operators

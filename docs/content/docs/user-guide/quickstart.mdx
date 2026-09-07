@@ -249,7 +249,7 @@ the join packs no document tokens again:
   PackedFilter filter:r alias=r arena_writes=True keep_kv=True ... <- input:r[ids:r]
   AnchoredJoin group:0 anchor=r anchor_resident=filter keep_anchor_kv=False <- filter:r[ids:r], input:a[ids:a]
     stage {'written_pos': 0, 'anchor': 'r', 'partners': ['a'], 'semantics': 'full', 'selectivity': 0.15, 'expected_tuples': 57.6, ...}
-  HashJoin recombine alias_order=['r', 'a'] <- group:0[join_answers:0], group:0[ids:r], input:a[ids:a]
+  Recombine recombine alias_order=['r', 'a'] <- group:0[join_answers:0], group:0[ids:r], input:a[ids:a]
   Project sink columns=['r.id', 'a.aspect'] <- recombine[tuples]
   remark: keep KV on 'r': all survivors priced as resident for the join, 451 expected tokens per worker of the 362,250-token arena
 ```

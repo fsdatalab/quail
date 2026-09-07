@@ -10,10 +10,10 @@ from .nodes import (
     AnchoredJoin,
     DocumentInput,
     Exchange,
-    HashJoin,
     Limit,
     PackedFilter,
     Project,
+    Recombine,
     RequestExecution,
 )
 
@@ -134,7 +134,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         RequestExecution,
         Exchange,
         AnchoredJoin,
-        HashJoin,
+        Recombine,
         Project,
         Limit,
     ))

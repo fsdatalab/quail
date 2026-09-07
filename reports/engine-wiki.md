@@ -156,9 +156,9 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    candidates. The
    planner selects one typed `PhysicalGraph`. Quail uses
    `DocumentInput`, `PackedFilter`, `AnchoredJoin`,
-   `Exchange`, `HashJoin`, physical `Project`, and `Limit`.
+   `Exchange`, `Recombine`, physical `Project`, and `Limit`.
    The vLLM and SGLang backends use `DocumentInput`, `RequestExecution`,
-   `HashJoin`, physical `Project`, and `Limit`. `RequestExecution` stores the
+   `Recombine`, physical `Project`, and `Limit`. `RequestExecution` stores the
    tokenized filter and join prompt parts. It does not contain a Quail
    scheduler.
    The generic `PhysicalPlan` holds the graph and a backend-owned settings map.
@@ -175,7 +175,8 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    runner then executes the typed physical graph.
    The same `QuailModelExecution` handles every model node on one GPU
    executor, so the nodes use the same KV.
-9. Arrow Acero joins the true pairs on
+9. The `Recombine` node hands the true pairs and survivor sets to
+   Arrow Acero, which joins them on
    shared SQL alias columns and applies the final survivor sets. Each
    alias column contains the source table row number for one document.
    The same graph applies the final projection and limit. Projection reads only
@@ -389,7 +390,7 @@ A finished `QueryResult` carries the executed `PhysicalGraph` as `plan` and
 each node's `NodeMetrics` as `node_metrics`; `explain()` prints them.
 Execution observers, registered by class, run over the complete physical graph
 once when the query finishes. Model nodes reuse the metrics reported by the GPU
-executor. The same observer instance then sees `HashJoin`, `Project`, and
+executor. The same observer instance then sees `Recombine`, `Project`, and
 `Limit`. `result.observer(cls)` returns an observer's report.
 
 The selected model backend checks whether it supports the requested model,

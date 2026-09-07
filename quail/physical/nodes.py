@@ -532,12 +532,12 @@ class AnchoredJoin(PhysicalNode):
 
 
 @dataclass(frozen=True)
-class HashJoin(PhysicalNode):
+class Recombine(PhysicalNode):
     """Combine answer relations by exact document ids."""
 
     alias_order: tuple[str, ...] = ()
 
-    type_name: ClassVar[str] = "quail.hash_join"
+    type_name: ClassVar[str] = "quail.recombine"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
@@ -569,7 +569,7 @@ class Project(PhysicalNode):
 
     type_name: ClassVar[str] = "quail.project"
     runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.CLIENT
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
@@ -599,7 +599,7 @@ class Limit(PhysicalNode):
 
     type_name: ClassVar[str] = "quail.limit"
     runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.CLIENT
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:

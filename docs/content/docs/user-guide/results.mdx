@@ -147,7 +147,7 @@ physical:
     stage {'written_pos': 0, 'question_tokens': 51, 'preamble_tokens': 2, 'selectivity': 0.6, 'expected_docs': 8.0}
   AnchoredJoin group:0 anchor=r anchor_resident=filter keep_anchor_kv=False <- filter:r[ids:r], input:a[ids:a]
     stage {'written_pos': 0, 'exec_idx': 0, 'anchor': 'r', 'partners': ['a'], 'semantics': 'full', 'selectivity': 0.15, 'expected_tuples': 57.6, 'anchor_frame_tokens': 36, 'pair_tail_tokens': 4, 'anchor_resident': 'filter', 'tuple_tokens': 878.4}
-  HashJoin recombine alias_order=['r', 'a'] <- group:0[join_answers:0], group:0[ids:r], input:a[ids:a]
+  Recombine recombine alias_order=['r', 'a'] <- group:0[join_answers:0], group:0[ids:r], input:a[ids:a]
   Project sink columns=['r.id', 'a.aspect'] <- recombine[tuples]
 ```
 

@@ -140,7 +140,7 @@ The built in generic nodes are:
 
 - `DocumentInput`
 - `Exchange`
-- `HashJoin`
+- `Recombine`
 - `Project`
 - `Limit`
 
@@ -160,7 +160,7 @@ uses the same model execution object and KV. Execution follows the saved graph
 without running the join optimizer again.
 
 The generic runner executes the full graph once. GPU model outputs can be
-supplied as completed node outputs. The same run then executes `HashJoin`,
+supplied as completed node outputs. The same run then executes `Recombine`,
 `Project`, and `Limit`. Observers see every node once.
 
 ## Model backends

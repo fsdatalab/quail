@@ -21,11 +21,11 @@ from quail.execution import PhysicalResponse, export_physical_outputs
 from quail.logical import SHARED_PRE
 from quail.physical import (
     DocumentInput,
-    HashJoin,
     Limit,
     PhysicalNode,
     PortRef,
     Project,
+    Recombine,
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
@@ -240,7 +240,7 @@ def plan_request_backend(
             PortRef(request_node.node_id, f"ids:{alias}")
             for alias in result_aliases
         )
-        nodes.append(HashJoin(
+        nodes.append(Recombine(
             node_id="recombine",
             inputs=input_ports(edges),
             alias_order=result_aliases,

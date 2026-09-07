@@ -84,7 +84,7 @@ shapes:
 
 `metrics` is a mapping with at least `wall_s` and `fresh_tokens`, plus
 `node_metrics` keyed by node id if you want per node numbers in the
-report. The worker then runs `HashJoin`, `Project`, and `Limit` over
+report. The worker then runs `Recombine`, `Project`, and `Limit` over
 your outputs with the generic runner.
 
 `RequestBackend` in `quail/backends/request.py` is the reference for

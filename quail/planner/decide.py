@@ -15,11 +15,11 @@ from quail.physical import (
     DocumentInput,
     Exchange,
     FilterStage,
-    HashJoin,
     JoinStage,
     Limit,
     PackedFilter,
     PortRef,
+    Recombine,
 )
 from quail.physical import (
     Project as PhysicalProject,
@@ -553,7 +553,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 
     if pairs_edges:
-        nodes.append(HashJoin(
+        nodes.append(Recombine(
             node_id="recombine",
             inputs=input_ports(
                 tuple(pairs_edges)

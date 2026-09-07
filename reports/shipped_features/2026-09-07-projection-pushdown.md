@@ -29,6 +29,20 @@
   same order as the first; the session checks the row count and raises
   if it differs.
 
+Two renames ride along:
+
+- The physical `HashJoin` node is now `Recombine` (type name
+  `quail.recombine`). It combines every join stage's true pairs with
+  the survivor ids into result tuples. Acero still runs a hash join
+  underneath, but the node's job in the graph is recombination, and
+  the planner already named it `recombine`.
+- `ExecutionLocation.CLIENT` is gone. `Project` and `Limit` are
+  `COORDINATOR` nodes like `DocumentInput`, `Exchange`, and
+  `Recombine`. The runner only ever separated `GPU_EXECUTOR` nodes
+  from the rest, and the Modal worker ran every node, so the client
+  label described nothing. Extension nodes that used `CLIENT` must
+  switch to `COORDINATOR`.
+
 Nothing changes in the Acero join. It already joined int32 document
 index columns only, and values were attached at the end with a take
 against the memory mapped token store. This change makes that column
