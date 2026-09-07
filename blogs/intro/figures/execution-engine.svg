@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 820" role="img" aria-labelledby="title desc">
   <title id="title">Quail physical operators and execution engine</title>
-  <desc id="desc">On the left, the running example is lowered into a physical operator plan. A CPU document input feeds a GPU packed filter, which joins a second input through a GPU anchored join. A CPU operator materializes the requested columns from the passing tuple IDs, and a CPU projection produces the result. On the right, the CPU physical plan executor dispatches model operators to a runtime that packs token chunks on the CPU, runs model forward passes on the GPU, and manages KV pages in GPU HBM. It dispatches result materialization to Apache Arrow on the CPU.</desc>
+  <desc id="desc">On the left, the running example is lowered into a physical operator plan. A CPU scan feeds a GPU packed filter, which joins a second scan through a GPU anchored join. A CPU relational operator materializes the join result from the passing tuple IDs, and a CPU projection produces the requested columns. On the right, the CPU physical plan executor dispatches model operators to a runtime that packs token chunks on the CPU, runs model forward passes on the GPU, and manages KV pages in GPU HBM. It dispatches relational operators to a CPU runtime, which uses Arrow Acero to materialize join results.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
@@ -31,8 +31,8 @@
     <text class="label" x="380" y="128">Project, CPU</text>
 
     <rect class="arrowop" x="245" y="200" width="270" height="64" rx="4"/>
-    <text class="small" x="380" y="222">Materialize Result</text>
-    <text class="small" x="380" y="247">from Tuple IDs, CPU</text>
+    <text class="small" x="380" y="222">Materialize Join Result</text>
+    <text class="small" x="380" y="247">CPU</text>
 
     <rect class="model" x="245" y="305" width="270" height="64" rx="4"/>
     <text class="label" x="380" y="338">Anchored Join, GPU</text>
@@ -41,11 +41,11 @@
     <text class="label" x="200" y="473">Packed Filter, GPU</text>
 
     <rect class="input" x="420" y="440" width="280" height="64" rx="4"/>
-    <text class="small" x="560" y="462">Document Input: reactions</text>
+    <text class="small" x="560" y="462">Scan: reactions</text>
     <text class="small" x="560" y="487">CPU</text>
 
     <rect class="input" x="60" y="570" width="280" height="64" rx="4"/>
-    <text class="small" x="200" y="592">Document Input: reports</text>
+    <text class="small" x="200" y="592">Scan: reports</text>
     <text class="small" x="200" y="617">CPU</text>
 
     <path class="thin-arrow" d="M 380 200 L 380 164"/>
@@ -57,9 +57,9 @@
     <rect class="model" x="80" y="665" width="28" height="20"/>
     <text class="legend" x="118" y="676">GPU operator</text>
     <rect class="arrowop" x="285" y="665" width="28" height="20"/>
-    <text class="legend" x="323" y="676">CPU Arrow operator</text>
+    <text class="legend" x="323" y="676">CPU relational operator</text>
     <rect class="input" x="505" y="665" width="28" height="20"/>
-    <text class="legend" x="543" y="676">CPU input operator</text>
+    <text class="legend" x="543" y="676">CPU scan operator</text>
   </g>
 
   <path class="arrow" d="M 720 350 L 800 350"/>
@@ -96,17 +96,17 @@
 
   <path class="arrow" d="M 1105 315 C 1130 250, 1145 210, 1175 185"/>
 
-  <g aria-label="Arrow relational runtime">
+  <g aria-label="Relational operator runtime">
     <rect class="outer" x="1180" y="440" width="540" height="200" rx="4"/>
-    <text class="heading" x="1450" y="482">Arrow Relational Runtime, CPU</text>
+    <text class="heading" x="1450" y="482">Relational Operator Runtime, CPU</text>
 
     <rect class="arrowop" x="1220" y="520" width="210" height="72" rx="4"/>
     <text class="small" x="1325" y="547">Passing</text>
     <text class="small" x="1325" y="572">Tuple IDs</text>
 
     <rect class="arrowop" x="1470" y="520" width="210" height="72" rx="4"/>
-    <text class="small" x="1575" y="547">Projected Arrow</text>
-    <text class="small" x="1575" y="572">Record Batches</text>
+    <text class="small" x="1575" y="547">Materialize Join Result</text>
+    <text class="small" x="1575" y="572">with Arrow Acero</text>
 
     <path class="thin-arrow" d="M 1435 556 L 1465 556"/>
   </g>
