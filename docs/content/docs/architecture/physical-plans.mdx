@@ -49,7 +49,7 @@ Generic nodes any backend can use:
 | --- | --- | --- |
 | `DocumentInput` | coordinator | Names one tokenized input by alias and input id, with the document count and optional shard ranges. |
 | `Exchange` | coordinator | Passes survivor ids between rounds when the anchor changes. |
-| `Recombine` | coordinator | Joins TRUE answer relations on shared alias columns with Arrow Acero. |
+| `Recombine` | coordinator | Joins TRUE answer relations on shared alias columns with Arrow Acero. Planned only when a query has several full joins or a gate; a lone full join feeds its true pairs straight to `Project`. |
 | `Project` | coordinator | Reads the selected columns for the surviving positions. |
 | `Limit` | coordinator | Cuts the result stream. |
 

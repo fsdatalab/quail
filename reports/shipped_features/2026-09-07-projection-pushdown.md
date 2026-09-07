@@ -43,7 +43,16 @@ Two renames ride along:
   label described nothing. Extension nodes that used `CLIENT` must
   switch to `COORDINATOR`.
 
-Nothing changes in the Acero join. It already joined int32 document
+`Recombine` is also skipped when it would do nothing. Filters always
+run before the joins their table feeds, so with one full join and no
+gate the join's true pairs are the result rows. Both planners now wire
+that join's `join_answers` port straight into `Project`, and the
+result projection drops the false rows itself. A query with several
+full joins, or with an `EXISTS` or `NOT EXISTS` gate, still plans a
+`Recombine`. `tests/test_recombine.py` checks both shapes on the Quail
+and request backends and runs a single-join query end to end.
+
+Nothing changes in the Acero join itself. It already joined int32 document
 index columns only, and values were attached at the end with a take
 against the memory mapped token store. This change makes that column
 set a planner decision instead of a session detail.

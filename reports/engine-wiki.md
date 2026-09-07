@@ -175,9 +175,12 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    runner then executes the typed physical graph.
    The same `QuailModelExecution` handles every model node on one GPU
    executor, so the nodes use the same KV.
-9. The `Recombine` node hands the true pairs and survivor sets to
-   Arrow Acero, which joins them on
-   shared SQL alias columns and applies the final survivor sets. Each
+9. When a query has several full joins or a gate, the `Recombine`
+   node hands the true pairs and survivor sets to Arrow Acero, which
+   joins them on shared SQL alias columns and applies the final
+   survivor sets. A query with one full join and no gate has no
+   `Recombine`: the join's true pairs are already the result rows,
+   so `Project` reads them directly. Each
    alias column contains the source table row number for one document.
    The same graph applies the final projection and limit. Projection reads only
    the selected result positions from memory mapped source columns, so the

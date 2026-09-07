@@ -482,6 +482,9 @@ class Query:
         def project(node, value):
             if not isinstance(node, Project):
                 raise TypeError(type(node).__name__)
+            if isinstance(value, pa.Table) and "answer" in value.column_names:
+                # a join answers table read directly: keep the true pairs
+                value = true_answer_rows(value)
             relation = (
                 IndexRelation.from_table(value)
                 if isinstance(value, pa.Table) else value
