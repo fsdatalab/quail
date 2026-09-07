@@ -101,6 +101,24 @@ question, and the reviews themselves average 297 tokens, so almost no
 request qualifies even with the review placed first. Token counts under
 OpenAI's tokenizer would differ a little from Qwen's.
 
+The same demo with two filters, both required (the ending question,
+hint 0.25, then "recommends watching", hint 0.5), same machine:
+
+| Number | Predicted | Measured |
+| --- | --- | --- |
+| `wall_s` | about 270 s | 268.72 s |
+| `fresh_tokens` | about 32.5 M | 32,499,738 |
+| documents/second | about 370 | 372.1 |
+| $/query | about $0.30 | $0.2948 |
+| reviews passing question 1 | about 28,000 | 28,296 (0.283) |
+| reviews passing both | not predicted | 16,057 (0.568 of survivors) |
+
+The second question cost 283,000 fresh tokens, 6.3 s, and $0.007 on
+top of the single filter run, because each survivor's KV was still on
+the GPU. Sent as separate GPT-5 nano requests, the second pass would
+resend the 28,296 reviews, about 9.1 M more input tokens: $2.11 at list
+price for the whole query, or $1.06 in batch, against $0.29 here.
+
 The prediction missed by 8% because it counted document tokens only.
 At 32.2 M fresh tokens, the IMDB-1 rate of 123,000 tokens/s gives
 262 s, which is what was measured.
