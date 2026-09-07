@@ -696,10 +696,14 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
         os.replace(tmp, path)
         tier = "compile"
     else:
+        print(f"quail kernels: compile pass already recorded at {path}; "
+              "running the touch pass", flush=True)
         touch_kernels(torch, arena, pipeline, async_ans, budget)
         tier = "touch"
     torch.cuda.synchronize()
-    return dict(tier=tier, warm_s=round(time.perf_counter() - t0, 2))
+    warm_s = round(time.perf_counter() - t0, 2)
+    print(f"quail kernels: {tier} pass done in {warm_s} s", flush=True)
+    return dict(tier=tier, warm_s=warm_s)
 
 
 # ---------------------------------------------------------- the filter
