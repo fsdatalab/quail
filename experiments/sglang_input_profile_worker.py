@@ -7,7 +7,7 @@ import time
 from collections import defaultdict
 from functools import wraps
 
-PREDICTION = (
+PREDICTION_TEXT = (
     "Preparing and sending all tokenized join requests will account for most "
     "of SGLang's 12 to 14 seconds before GPU work begins. Profile Python "
     "calls during preparation for join 1; use lightweight timers for joins "
@@ -113,8 +113,10 @@ class InputProfiler:
                 for key, value in stats.stats.items()
             ]
             result["python_profile_path"] = str(path)
-            result["top_self"] = sorted(rows, key=lambda r: r["self_s"], reverse=True)[:25]
-            result["top_cumulative"] = sorted(rows, key=lambda r: r["cumulative_s"], reverse=True)[:25]
+            result["top_self"] = sorted(
+                rows, key=lambda r: r["self_s"], reverse=True)[:25]
+            result["top_cumulative"] = sorted(
+                rows, key=lambda r: r["cumulative_s"], reverse=True)[:25]
         return result
 
 
@@ -122,5 +124,5 @@ def profile_worker(directory, connection):
     """Run SGLang with GPU traces and detailed input preparation measurements."""
     import experiments.sglang_join_profile_worker as worker
 
-    worker.PREDICTION = PREDICTION
+    worker.PREDICTION_TEXT = PREDICTION_TEXT
     worker.profile_worker(directory, connection, input_detail=True)

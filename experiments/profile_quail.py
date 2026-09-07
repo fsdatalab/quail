@@ -1,5 +1,6 @@
-"""Run any QuailB query through the engine under instrumentation:
-GPU timeline, KV accounting, and torch.profiler windows.
+"""Run any QuailB query through the engine under instrumentation.
+
+Records the GPU timeline, KV accounting, and torch.profiler windows.
 
 The cell runs each named query through the real planner and the real
 worker execution core and records, per forward pass: launch time,
@@ -31,7 +32,8 @@ number.
 Run (`--queries` is a comma-separated list of QuailB ids):
 
     uv run modal run experiments/profile_quail.py::run_smoke --queries IMDB-3,BIO-2
-    uv run modal run experiments/profile_quail.py::run --queries IMDB-3,BIO-2 --out-prefix myrun
+    uv run modal run experiments/profile_quail.py::run --queries IMDB-3,BIO-2 \
+        --out-prefix myrun
 
 Outputs on the quail-results volume (pick an --out-prefix that does
 not overwrite files a report already cites):
@@ -131,6 +133,7 @@ def _boot_state(model):
     """
     import torch
     import torch.nn.functional as F
+    from transformers import AutoTokenizer
 
     from quail.executor.arena import KVArena
     from quail.executor.attention import FILTER_ATTENTION, Pipeline
@@ -138,7 +141,6 @@ def _boot_state(model):
     from quail.executor.model import load_model
     from quail.planner import budgets
     from quail.specs import DEVICES, MODELS
-    from transformers import AutoTokenizer
 
     spec = MODELS[model]
     device = DEVICES["h100-sxm"]
@@ -194,20 +196,21 @@ def _quailb_session(model, sf, gpus=1):
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
-    from quail.execution import PhysicalResponse
-    from quail.executor.loop import AsyncAnswers
     from quail.backends.quail.worker import (
         _PayloadAnswerer,
         execute_single,
         quail_runtime_payload,
     )
+    from quail.execution import PhysicalResponse
+    from quail.executor.loop import AsyncAnswers
     from quail.runtime.local import (
         _validate_physical_request,
         execute_worker_query,
     )
 
     def execute(request):
-        request, registry, graph, _ = _validate_physical_request(request, query.session.registry)
+        request, registry, graph, _ = _validate_physical_request(
+            request, query.session.registry)
         payload = quail_runtime_payload(request, graph)
         answerer = _PayloadAnswerer(
             state["torch"], state["F"], state["model"],
@@ -231,8 +234,11 @@ def _run_query(state, build, captured):
 
 
 def _cupti_preinit(torch):
-    """One throwaway profiled kernel, so CUPTI's lazy start never
-    lands inside a measured query."""
+    """Run one throwaway profiled kernel before any measured query.
+
+    CUPTI starts lazily on the first profiled kernel, so this keeps that
+    start out of a measured query.
+    """
     x = torch.ones(1024, device="cuda")
     with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA]):
@@ -279,8 +285,12 @@ class ProfilerWindows:
         return idx >= int(spec["arm"].removeprefix("chunk"))
 
     def on_chunk(self, idx, chunk_seq):
-        """Called before each forward pass launches; idx counts
-        chunks within the phase, chunk_seq across the query."""
+        """Called before each forward pass launches.
+
+        Args:
+            idx: Chunk index within the phase.
+            chunk_seq: Chunk index across the query.
+        """
         if self.session is not None:
             self.left -= 1
             if self.left <= 0:
@@ -500,8 +510,10 @@ def _measure(state, qdefs, qid, profiled, trace_dir):
 def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
             queries: tuple = (),
             out_prefix: str = "profile") -> str:
-    """Each named query, two passes: unprofiled (the cited walls and
-    the chunk timeline) and profiled (the derived trace windows).
+    """Run each named query twice, once unprofiled and once profiled.
+
+    The unprofiled pass gives the cited walls and the chunk timeline.
+    The profiled pass gives the derived trace windows.
 
     out_prefix names the output files and trace directory; pick one
     that does not overwrite files a report already cites.
@@ -563,8 +575,10 @@ def run(queries: str, model: str = "qwen3-4b-fp8", sf: float = 0.1,
 @app.local_entrypoint()
 def run_smoke(queries: str, model: str = "qwen3-4b-fp8",
               out_prefix: str = "profile"):
-    """The full harness on the sf 0.01 tables, minutes not tens of
-    minutes, before the measured run."""
+    """Run the full harness on the sf 0.01 tables before the measured run.
+
+    This takes minutes, compared with tens of minutes for the measured run.
+    """
     handle = measure.spawn(model, 0.01, _parse_queries(queries),
                            out_prefix)
     print(f"profile_quail smoke fc: {handle.object_id}", flush=True)

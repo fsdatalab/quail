@@ -4,19 +4,19 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 from quail.backends.quail import QuailModelExecution
+from quail.backends.quail.distributed import execute_distributed_graph
+from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (
-    JoinStage,
     AnchoredJoin,
     DocumentInput,
     FilterStage,
+    JoinStage,
     PackedFilter,
     PhysicalGraph,
     PortRef,
 )
 from quail.physical.base import input_ports
-from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.distributed import execute_distributed_graph
 from quail.runtime.runner import NodeMetrics, NodeResult
 from quail.specs import DEVICES, MODELS
 

@@ -29,4 +29,5 @@ def read_gpu_intervals(path, window_unix_ns):
 
 def encode_intervals(intervals):
     """Encode interval endpoints as gzip-compressed little-endian doubles."""
-    return gzip.compress(b"".join(struct.pack("<dd", *interval) for interval in intervals), mtime=0)
+    return gzip.compress(
+        b"".join(struct.pack("<dd", *interval) for interval in intervals), mtime=0)

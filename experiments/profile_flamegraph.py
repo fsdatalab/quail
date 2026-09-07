@@ -47,7 +47,8 @@ def aggregate_intervals(events, duration_us, gpu_intervals=()):
         stack.append((end, node))
 
     def finish(node):
-        children = sorted(node["children"].values(), key=lambda child: child["us"], reverse=True)
+        children = sorted(node["children"].values(),
+                          key=lambda child: child["us"], reverse=True)
         self_us = node["us"] - sum(child["us"] for child in children)
         self_gpu_us = node["gpu_us"] - sum(child["gpu_us"] for child in children)
         if self_us < -0.01:

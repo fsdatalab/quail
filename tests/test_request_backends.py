@@ -7,9 +7,8 @@ import numpy as np
 import pyarrow as pa
 
 import quail
-from quail.backends.base import BackendExecutionContext
 from quail.backends import pipelined_sglang_backend, stock_vllm_backend
-from quail.backends.base import GpuContext
+from quail.backends.base import BackendExecutionContext, GpuContext
 from quail.backends.request import RequestModelExecution
 from quail.backends.sglang import SGLangClient
 from quail.builtins import built_in_registry
@@ -365,7 +364,8 @@ def test_sglang_submits_full_join_and_preserves_output_order():
     result = client.generate(prompts, {})
     assert len(engine.calls) == 1
     assert engine.calls[0] == [prompt["prompt_token_ids"] for prompt in prompts]
-    assert [output.outputs[0].token_ids[0] for output in result] == [index % 2 for index in range(17_000)]
+    assert [output.outputs[0].token_ids[0] for output in result] == [
+        index % 2 for index in range(17_000)]
     assert all(output.num_cached_tokens == 1 for output in result)
     assert client.generate([], {}) == []
     assert len(engine.calls) == 1

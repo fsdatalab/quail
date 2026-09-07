@@ -82,6 +82,7 @@ def test_corpus_identity_uses_source_rows_and_order():
 
 def test_reuse_checks_the_label_sets_original_corpus(monkeypatch, tmp_path):
     import json
+
     import quail.bench.judge_pass as judge_pass
 
     spec = _spec("quailb.imdb.review.mentions_positive_aspect")
@@ -122,6 +123,7 @@ def test_reuse_checks_the_label_sets_original_corpus(monkeypatch, tmp_path):
 
 def test_reuse_rejects_changed_table_in_target(monkeypatch, tmp_path):
     import json
+
     import quail.bench.judge_pass as judge_pass
 
     spec = _spec("quailb.imdb.review.mentions_positive_aspect")
@@ -188,6 +190,7 @@ def test_saved_verification_sample_covers_completed_parts_after_resume(
         monkeypatch, tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
+
     import quail.bench.judge_pass as judge_pass
 
     spec = _spec("quailb.imdb.review.discusses_ending")

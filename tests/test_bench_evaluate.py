@@ -14,15 +14,14 @@ from quail.bench.evaluate import (
     GroundTruthCollection,
     LocalVolumeFiles,
     PredicateLabels,
-    add_query_metrics,
     _validate_label_set_corpora,
+    add_query_metrics,
     corpus_identity,
     load_ground_truth,
     summarize_queries,
 )
 from quail.catalog import DocumentProvider
 from quail.planner.plan import EngineConfig
-
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
@@ -120,7 +119,8 @@ def test_fev9_filters_every_input_and_reuses_existing_predicate_labels(backend):
         query = queries(session)["FEV-9"][1]()
         assert not isinstance(query.plan(), Refusal)
         scans, filters, joins = collect_operators(query.logical)
-        survivors, pairs = evaluator._expected_answer_tables(query, scans, filters, joins)
+        survivors, pairs = evaluator._expected_answer_tables(
+            query, scans, filters, joins)
         result, _ = build_result_declaration(pairs.values(), survivors, "c1")
         table = result.to_table().select(["c1", "e1", "c2", "e2"])
         assert table.to_pydict() == {"c1": [0], "e1": [0], "c2": [1], "e2": [1]}
@@ -159,8 +159,8 @@ def _query(tmp_path, backend="quail"):
 
 def _run(query, join_answers):
     def execute(request):
-        from quail.execution import PhysicalResponse, export_physical_outputs
         from quail.builtins import built_in_registry
+        from quail.execution import PhysicalResponse, export_physical_outputs
         from quail.physical import (
             AnchoredJoin,
             DocumentInput,
@@ -220,8 +220,8 @@ def _run(query, join_answers):
 
 def _run_request_backend(query, join_answers):
     def execute(request):
-        from quail.execution import PhysicalResponse, export_physical_outputs
         from quail.builtins import built_in_registry
+        from quail.execution import PhysicalResponse, export_physical_outputs
         from quail.physical import RequestExecution, decode_graph
         from quail.runtime.result import answer_table
         from quail.runtime.runner import NodeMetrics, NodeResult, RunResult

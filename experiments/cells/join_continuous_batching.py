@@ -1,4 +1,4 @@
-"""Compare pre-planned and continuous join batching on one Modal H100.
+r"""Compare pre-planned and continuous join batching on one Modal H100.
 
 The baseline checkout is main before JoinAdmission (d7a96e0). Both
 implementations run IMDB-8, FEV-7, and FEV-9 in the same container on
@@ -7,8 +7,8 @@ the same GPU, one warmup and one measured run each.
 Prepare the baseline checkout and tee the invocation:
 
     git worktree add --detach /tmp/quail-preplanned-baseline-d7a96e0 d7a96e0
-    uv run modal run experiments/cells/join_continuous_batching.py \\
-      --prediction "State the prediction before running." \\
+    uv run modal run experiments/cells/join_continuous_batching.py \
+      --prediction "State the prediction before running." \
       2>&1 | tee /tmp/quail-join-continuous-batching.log
 
 Set QUAIL_BASELINE_DIR to use another location for the baseline checkout.
@@ -22,7 +22,6 @@ from pathlib import Path
 import modal
 
 from quail.runtime.worker import build_worker_image
-
 
 QUERIES = ("IMDB-8", "FEV-7", "FEV-9")
 BASELINE_COMMIT = "d7a96e0"

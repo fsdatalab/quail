@@ -1,7 +1,7 @@
 """Shared retention priority, capacity, and eviction tests."""
 
 
-from quail.executor.arena import PageArena, KVArena
+from quail.executor.arena import KVArena, PageArena
 from quail.executor.retention import RetentionPolicy, retention_pages
 
 
@@ -87,6 +87,7 @@ def test_retention_budget_rounds_execution_reservation():
 
 def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
     from types import SimpleNamespace
+
     from quail.executor import loop
     from quail.executor.attention import FILTER_ATTENTION
 
@@ -100,8 +101,10 @@ def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
         return pages
 
     arena.alloc = allocate_rows
-    torch = SimpleNamespace(cuda=SimpleNamespace(Event=lambda **kw: SimpleNamespace(record=lambda: None)))
-    answers = SimpleNamespace(submit=lambda values: values, result=lambda values: values)
+    torch = SimpleNamespace(cuda=SimpleNamespace(
+        Event=lambda **kw: SimpleNamespace(record=lambda: None)))
+    answers = SimpleNamespace(submit=lambda values: values,
+                              result=lambda values: values)
     pipeline = SimpleNamespace(attention_mode=FILTER_ATTENTION,
                                forward_chunk=lambda chunk: [True] * len(chunk['specs']))
     monkeypatch.setattr(loop, 'pack_chunk', lambda torch, arena, specs, **kw: {
@@ -151,11 +154,13 @@ def test_schedule_keeps_future_anchors_and_ends_at_last_use():
 
 def test_priority_matches_the_existing_prefix_cost():
     import pytest
+
     from quail.planner.retention import coefficients
     from quail.planner.sol import prefix_recompute_seconds
-    from quail.specs import QWEN3_4B_FP8, H100_SXM
+    from quail.specs import H100_SXM, QWEN3_4B_FP8
 
-    policy = RetentionPolicy(**coefficients(QWEN3_4B_FP8, H100_SXM), uses={'a': (0.4, 2)})
+    policy = RetentionPolicy(**coefficients(QWEN3_4B_FP8, H100_SXM),
+                             uses={'a': (0.4, 2)})
     for length in (1, 16, 17, 1000, 24000):
         pages = -(-length // 16)
         assert policy.priority(('a', 0), length, pages)[0] == pytest.approx(

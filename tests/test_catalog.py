@@ -6,12 +6,12 @@ import pyarrow.parquet as pq
 import pytest
 from datasets import Dataset
 
+from quail.builtins import built_in_registry
 from quail.catalog import (
     ArrowDatasetProvider,
     DocumentProvider,
     ScanRequest,
 )
-from quail.builtins import built_in_registry
 from quail.logical import CompileError
 
 

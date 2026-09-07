@@ -1,4 +1,7 @@
-"""End-to-end Session tests with a fake executor: gating, tuple assembly, projection, and report."""
+"""End-to-end Session tests with a fake executor.
+
+Covers gating, tuple assembly, projection, and the report.
+"""
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -83,11 +86,12 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                        f"matches tokens {q[:5]}")
 
     def _exec(request):
+        from test_quail_backend import graph_state
+
+        from quail.backends.quail.graph import execute_single_graph
         from quail.execution import PhysicalResponse
         from quail.physical import DocumentInput, PackedFilter
-        from quail.backends.quail.graph import execute_single_graph
         from quail.runtime.runner import NodeResult
-        from test_quail_backend import graph_state
 
         runtime = runtime_plan(request)
         if seen is not None:

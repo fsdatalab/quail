@@ -6,8 +6,14 @@ import pytest
 
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
-from quail.logical import (SHARED_PRE, CompileError, Project, Scan,
-                           SemanticFilter, SemanticJoin)
+from quail.logical import (
+    SHARED_PRE,
+    CompileError,
+    Project,
+    Scan,
+    SemanticFilter,
+    SemanticJoin,
+)
 from quail.sqlfront import SQLDialect, compile_sql
 
 
@@ -162,9 +168,14 @@ def test_three_way_forms_compile_equal(catalog):
 
 
 def test_join_prompt_keeps_markers_and_labels_blocks():
-    from quail.logical import (ANSWER_CUE, bind_join_prompt, join_label,
-                               render_join_frame, render_join_question)
-    from quail.logical import ColumnRef
+    from quail.logical import (
+        ANSWER_CUE,
+        ColumnRef,
+        bind_join_prompt,
+        join_label,
+        render_join_frame,
+        render_join_question,
+    )
     args = (ColumnRef("a", "reviews", "review"),
             ColumnRef("b", "threads", "thread"))
     p = bind_join_prompt("Does {0} praise {1}?", args, tok)

@@ -4,9 +4,16 @@ import random
 
 import pytest
 
-from quail.executor.pack import (FilterAdmission, JoinAdmission,
-                                 assemble, brute_force_triples, gate,
-                                 matches, orient, pages_for)
+from quail.executor.pack import (
+    FilterAdmission,
+    JoinAdmission,
+    assemble,
+    brute_force_triples,
+    gate,
+    matches,
+    orient,
+    pages_for,
+)
 
 
 def test_orient_prefers_longer_side():
@@ -20,9 +27,13 @@ def test_orient_prefers_longer_side():
 
 def _drive_join(sched, truth, arena_pages, resident=None,
                 deliver_lag=1, rng=None):
-    """Drive a JoinAdmission to completion against a simulated free
-    list. truth[a][j] is the 0/1 row for anchor a at stage j.
-    Returns (chunks, events) in launch order."""
+    """Drive a JoinAdmission to completion against a simulated free list.
+
+    truth[a][j] is the 0/1 row for anchor a at stage j.
+
+    Returns:
+        (chunks, events) in launch order.
+    """
     resident = resident or {}
     extra = max(sched.frames)
     held = dict(resident)
@@ -302,7 +313,11 @@ def test_gate_matches_assemble_vs_brute_force():
 # ------------------------------------------- the admission simulator
 
 def _drive(sched, truth, deliver_lag=1, rng=None):
-    """Drive the scheduler to completion, delivering answers with the given lag. Returns per-chunk group lists."""
+    """Drive the scheduler to completion, delivering answers with the given lag.
+
+    Returns:
+        Per-chunk group lists.
+    """
     chunks, outstanding = [], []
     idle = 0
     while not sched.done():
@@ -478,7 +493,7 @@ def test_admission_limit_drain_ready_returns_stranded():
 
 
 def test_admission_limit_reduces_work():
-    """Verify that a limit reduces admitted documents and chunks compared to an unlimited run."""
+    """Check that a limit admits fewer documents and chunks than an unlimited run."""
     rng = random.Random(42)
     n_docs = 80
     n_stages = 3

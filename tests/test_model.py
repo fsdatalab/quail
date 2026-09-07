@@ -1,9 +1,8 @@
 """CPU tests for model initialization and retained answer weights."""
 
-from types import SimpleNamespace
-
 import gc
 import weakref
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,7 +10,7 @@ from quail.executor.model import _SingleRank, answer_weights, retain_answer_head
 
 
 class _Torch:
-    class device:
+    class device:  # noqa: N801  mirrors torch.device's lowercase name
         def __init__(self, name):
             self.name = name
 
@@ -103,7 +102,8 @@ def test_answerers_preserve_scores_and_share_retained_weights(torch):
     cpu_torch = SimpleNamespace(tensor=lambda values, **kwargs: torch.tensor(values))
 
     def tokenizer(word, **kwargs):
-        return {"input_ids": [5 if "false" in word.lower() else 3 if word.startswith(" ") else 1]}
+        return {"input_ids": [
+            5 if "false" in word.lower() else 3 if word.startswith(" ") else 1]}
 
     first = Answerer(cpu_torch, torch.nn.functional, model, tokenizer)
     second = _PayloadAnswerer(cpu_torch, torch.nn.functional, model, [3, 1], [5])

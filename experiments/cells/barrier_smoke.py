@@ -11,8 +11,8 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import quail                                    # noqa: E402
-from quail.planner.plan import EngineConfig     # noqa: E402
+import quail  # noqa: E402
+from quail.planner.plan import EngineConfig  # noqa: E402
 
 SEED = 20260824
 FILLER = ("The projector hummed while the reel changed and nobody in "
@@ -151,12 +151,12 @@ def main():
     planted_thinned = {j for j in range(N_CANDS)
                        if any(truth1[(i, j)] for i in keep_r)}
     print(f"prediction: rows equal the CPU brute-force recombination "
-          f"on both GPU counts; if the model matches the planted "
-          f"truth, {len(planted_thinned)} of {N_CANDS} candidates "
-          f"survive the barrier and stage 2 evaluates "
+          f"on both GPU counts; given planted truth, "
+          f"{len(planted_thinned)} of {N_CANDS} candidates survive "
+          f"the barrier and stage 2 evaluates "
           f"{len(COLORS)} x {len(planted_thinned)} = "
-          f"{len(COLORS) * len(planted_thinned)} tuples; a full "
-          f"{N_CANDS}-candidate survivor set fails the run",
+          f"{len(COLORS) * len(planted_thinned)} tuples; "
+          f"all {N_CANDS} surviving fails the run",
           flush=True)
     summary = {}
     summary["one_gpu"] = run_one(1, flags, truth1, truth2, tmp)

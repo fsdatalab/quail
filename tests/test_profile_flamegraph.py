@@ -45,7 +45,8 @@ def test_gpu_overlap_counts_concurrent_kernels_once_and_covers_unrecorded_time()
     assert parent["children"][0]["gpu_seconds"] == pytest.approx(3e-6)
     assert gap["gpu_seconds"] == pytest.approx(4e-6)
     assert gap["gpu_idle_seconds"] == pytest.approx(1e-6)
-    assert sum(child["gpu_seconds"] for child in result["children"]) == pytest.approx(11e-6)
+    assert sum(child["gpu_seconds"]
+               for child in result["children"]) == pytest.approx(11e-6)
 
 
 def test_reader_aligns_gpu_and_cpu_clocks_and_ignores_other_cpu_threads(tmp_path):
@@ -67,6 +68,7 @@ def test_reader_aligns_gpu_and_cpu_clocks_and_ignores_other_cpu_threads(tmp_path
     result = read_cpu_flamegraph(path, (1_010_000, 1_030_000), 92)
     assert result["seconds"] == pytest.approx(20e-6)
     assert result["gpu_seconds"] == pytest.approx(14e-6)
-    assert {child["name"] for child in result["children"]} == {"cpu", "[no recorded CPU operation]"}
+    assert {child["name"] for child in result["children"]} == {
+        "cpu", "[no recorded CPU operation]"}
     gap = next(child for child in result["children"] if child["calls"] == 0)
     assert gap["gpu_seconds"] == pytest.approx(4e-6)

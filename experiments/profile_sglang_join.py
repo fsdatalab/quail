@@ -13,7 +13,7 @@ import multiprocessing as mp
 from datetime import datetime, timezone
 from pathlib import Path
 
-from experiments.sglang_join_profile_worker import PREDICTION
+from experiments.sglang_join_profile_worker import PREDICTION_TEXT
 from quail.bench.quailb_parallel import VOLUMES, app, results_vol, sglang_image
 
 
@@ -54,7 +54,7 @@ def profile():
 @app.local_entrypoint()
 def profile_joins():
     """Start the join profile and print its saved result path."""
-    print(f"prediction: {PREDICTION}", flush=True)
+    print(f"prediction: {PREDICTION_TEXT}", flush=True)
     call = profile.spawn()
     print(f"function call id: {call.object_id}", flush=True)
     print(f"result volume path: {call.get()}", flush=True)
