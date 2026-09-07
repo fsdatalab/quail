@@ -20,7 +20,6 @@ from quail.specs import DeviceSpec, ModelSpec
 def _latencies(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                passes: float) -> tuple[ComponentLatency, ...]:
     """Return the priced Qwen3 components for one work record."""
-
     return component_latencies(
         qwen3_components(work, model, passes), device)
 
@@ -28,7 +27,6 @@ def _latencies(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
 def compute_seconds(work: _workload.Work, model: ModelSpec,
                     device: DeviceSpec) -> float:
     """Return ideal compute time without memory movement."""
-
     return sum(component.compute_seconds
                for component in _latencies(
                    work, model, device, passes=0.0))
@@ -37,7 +35,6 @@ def compute_seconds(work: _workload.Work, model: ModelSpec,
 def unrounded_seconds(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                       chunk_tokens: int) -> float:
     """Return component time with fractional ideal forward passes."""
-
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be at least 1")
     passes = work.tokens / chunk_tokens
@@ -48,7 +45,6 @@ def unrounded_seconds(work: _workload.Work, model: ModelSpec, device: DeviceSpec
 def prefix_recompute_seconds(prefix_tokens: int, model: ModelSpec,
                              device: DeviceSpec) -> float:
     """Return ideal compute time for one document prefix."""
-
     if prefix_tokens < 0:
         raise ValueError("prefix_tokens must be nonnegative")
     return compute_seconds(
@@ -71,7 +67,6 @@ class SpeedOfLight:
 
     def component(self, name: str) -> ComponentLatency:
         """Return one named component result."""
-
         return next(component for component in self.components
                     if component.name == name)
 
@@ -98,7 +93,6 @@ class SpeedOfLight:
 
     def explain(self) -> str:
         """Return a plain text component breakdown."""
-
         work = self.work
         lines = [
             f"tokens         {work.tokens:>18,.0f}",
@@ -126,7 +120,6 @@ class SpeedOfLight:
 def speed_of_light(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                    chunk_tokens: int) -> SpeedOfLight:
     """Price aggregate query work with ideal query-wide packing."""
-
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be at least 1")
     passes = math.ceil(work.tokens / chunk_tokens) if work.tokens else 0

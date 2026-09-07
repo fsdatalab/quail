@@ -26,7 +26,8 @@ def test_crossing_intervals_are_rejected():
 def test_reader_aligns_to_join_and_selects_recorded_worker_operations(tmp_path):
     pytest.importorskip("ijson")
     events = [
-        {"cat": "user_annotation", "name": "vllm.scheduler.schedule", "ts": 1_000_010, "dur": 500_000},
+        {"cat": "user_annotation", "name": "vllm.scheduler.schedule",
+         "ts": 1_000_010, "dur": 500_000},
         {"cat": "cpu_op", "name": "aten::item", "ts": 1_100_010, "dur": 100_000},
         {"cat": "kernel", "name": "gpu", "ts": 1_000_010, "dur": 500_000},
         {"cat": "user_annotation", "name": "broad_marker", "ts": 10, "dur": 3_000_000},

@@ -1,5 +1,6 @@
-"""Paged KV arena: preallocated per-layer buffers divided into
-fixed-size pages with a free list and block-table access.
+"""Paged KV arena: preallocated per-layer buffers in fixed-size pages.
+
+Pages are handed out from a free list and reached through block tables.
 
 PageArena is the accounting (pure Python, CPU-tested); KVArena is the
 tensor backing and runs only where torch and a GPU exist.
@@ -31,8 +32,10 @@ class PageArena:
         return -(-tokens // self.page_tokens)
 
     def alloc(self, key, tokens: int, capacity_tokens: int | None = None):
-        """The document's pages, or None when the free list is short
-        (the admission scheduler treats None as "wait")."""
+        """The document's pages, or None when the free list is short.
+
+        The admission scheduler treats None as "wait".
+        """
         if key in self.owned:
             raise KeyError(f"{key!r} already resident")
         capacity_tokens = tokens if capacity_tokens is None else capacity_tokens
@@ -57,7 +60,6 @@ class PageArena:
 
     def pin(self, key) -> None:
         """Protect a resident key while an operator uses it."""
-
         if key not in self.owned:
             raise KeyError(key)
         self._forget_retained(key)
@@ -70,7 +72,6 @@ class PageArena:
 
     def retain(self, key, priority=None) -> None:
         """Make a resident key evictable after its current use."""
-
         if key not in self.owned:
             raise KeyError(key)
         self.pinned.discard(key)
@@ -104,7 +105,6 @@ class PageArena:
 
     def pop_retained_victim(self):
         """Remove the retained prefix with the lowest planned reuse priority."""
-
         while self._retained_heap:
             _, version, key, pages, prefix_tokens = heapq.heappop(
                 self._retained_heap)
@@ -116,7 +116,6 @@ class PageArena:
 
     def rewind(self, key, tokens: int) -> int:
         """Keep the first tokens and return unused trailing pages."""
-
         if key not in self.owned:
             raise KeyError(key)
         if tokens < 0 or tokens > len(self.owned[key]) * self.page_tokens:
@@ -132,7 +131,6 @@ class PageArena:
 
     def grow(self, key, capacity_tokens: int) -> int | None:
         """Add pages for capacity_tokens without changing logical tokens."""
-
         if key not in self.owned:
             raise KeyError(key)
         need = self.pages_needed(capacity_tokens) - len(self.owned[key])
@@ -144,9 +142,11 @@ class PageArena:
         return need
 
     def row_indices(self, key, tokens=None):
-        """Flat row positions of the document's tokens inside a pool
-        viewed as (n_pages * page_tokens, ...): page p holds rows
-        p*page_tokens .. p*page_tokens + page_tokens."""
+        """Flat row positions of the document's tokens inside a pool.
+
+        The pool is viewed as (n_pages * page_tokens, ...): page p holds
+        rows p*page_tokens .. p*page_tokens + page_tokens.
+        """
         rows = []
         left = self.tokens[key] if tokens is None else tokens
         for p in self.owned[key]:
@@ -174,10 +174,12 @@ class PageArena:
 
 
 class KVArena:
-    """The tensor backing: per-layer K and V pools of shape
-    (n_pages, page_tokens, n_kv, d_head), plus the accounting above.
-    Import-time torch dependency is deliberate here; this class only
-    exists inside the Modal image."""
+    """The tensor backing for the arena, plus the accounting above.
+
+    Per-layer K and V pools of shape (n_pages, page_tokens, n_kv,
+    d_head). Import-time torch dependency is deliberate here; this
+    class only exists inside the Modal image.
+    """
 
     def __init__(self, n_layers: int, n_pages: int, page_tokens: int,
                  n_kv: int, d_head: int, dtype=None, device="cuda"):
@@ -232,7 +234,6 @@ class KVArena:
 
     def retain(self, key, tokens: int, priority=None):
         """Rewind a prefix and make it available for a later operator."""
-
         self.accounting.rewind(key, tokens)
         self._refresh_rows(key, tokens)
         self.accounting.retain(key, priority)
@@ -244,7 +245,6 @@ class KVArena:
 
     def evict_retained(self, pages_needed: int) -> tuple:
         """Evict retained prefixes in planned reuse priority order."""
-
         keys = []
         pages = 0
         while pages < pages_needed:
@@ -259,7 +259,6 @@ class KVArena:
 
     def evict_key(self, key):
         """Free one retained prefix and record the lost KV."""
-
         pages = len(self.accounting.owned[key])
         prefix_tokens = self.accounting.tokens[key]
         self.free_key(key)
@@ -270,7 +269,6 @@ class KVArena:
 
     def activate(self, key, tokens: int, capacity_tokens: int | None = None):
         """Make a prefix active, evicting retained KV when required."""
-
         capacity = tokens if capacity_tokens is None else capacity_tokens
         if key in self.accounting.owned:
             self.accounting.pin(key)
@@ -304,16 +302,16 @@ class KVArena:
         return self.accounting.free_key(key)
 
     def paged_kv(self, layer: int):
-        """The pools viewed as (n_pages, page_tokens, n_kv, d_head)
-        for the paged attention call."""
+        """Pools as (n_pages, page_tokens, n_kv, d_head) for paged attention."""
         n_kv, d = self.k[layer].shape[-2], self.k[layer].shape[-1]
         shape = (-1, self.page_tokens, n_kv, d)
         return self.k[layer].view(shape), self.v[layer].view(shape)
 
     def block_table(self, keys, pad_to=None):
-        """Block table and seqused_k for the groups reading these
-        documents' KV, built flat on the host and staged through
-        pinned memory."""
+        """Block table and seqused_k for groups reading these documents' KV.
+
+        Built flat on the host and staged through pinned memory.
+        """
         pages = [self.accounting.owned[k] for k in keys]
         table = self.block_table_rows(pages, pad_to=pad_to)
         torch = self.torch

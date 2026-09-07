@@ -28,9 +28,13 @@ from pathlib import Path
 import modal
 
 from quail.bench import quailb
-from quail.logical import (ColumnRef, SHARED_PRE, bind_join_prompt,
-                           bind_prompt, render_join_prompt_text)
-
+from quail.logical import (
+    SHARED_PRE,
+    ColumnRef,
+    bind_join_prompt,
+    bind_prompt,
+    render_join_prompt_text,
+)
 
 SCHEMA_VERSION = 1
 SCALE_FACTOR = 0.1
@@ -48,7 +52,7 @@ VERIFY_PER_PREDICATE = 16
 
 VOLUME_ROOT = Path("/results/ground_truth/quailb/schema_v1")
 
-PREDICTION = (
+PREDICTION_TEXT = (
     "At sf=0.1, 21 predicates require 1,210,264 labels. Qwen3 32B "
     "produces 993,450 judgments, and dataset annotations produce 216,814 "
     "source labels. The agent workload adds 3,544 Qwen judgments over "
@@ -60,7 +64,7 @@ PREDICTION = (
     "finish without an out-of-memory failure at "
     "gpu_memory_utilization=0.85."
 )
-REUSE_PREDICTION = (
+REUSE_PREDICTION_TEXT = (
     "The unchanged table manifests will match exactly. Their label sets "
     "can be reused with the relabeled workloads."
 )
@@ -184,8 +188,11 @@ PROMPTS_PER_CALL = 256
 
 
 def rows_per_call(prompts_per_row: int) -> int:
-    """At least one row, even when a single row already exceeds the
-    target: a part cannot be smaller than one left row."""
+    """Rows per call, never fewer than one.
+
+    A part cannot be smaller than one left row, even when a single row
+    already exceeds the target.
+    """
     return max(1, PROMPTS_PER_CALL // prompts_per_row)
 
 
@@ -598,7 +605,8 @@ def _part_bounds(spec: PredicateSpec,
 
     Must stay in step with _write_filter_parts, _write_qwen_join_parts
     and _write_lepard_source, which is why the batch sizes are derived
-    the same way here rather than restated."""
+    the same way here rather than restated.
+    """
     left = len(corpus_rows[spec.left_table])
     if spec.kind == "filter":
         step = next(n for _table, members, n
@@ -619,11 +627,13 @@ def _expected_parts(spec: PredicateSpec, identity: dict,
 
 
 def _parts_stats(parts: list[Path]) -> dict:
-    """Stats over exactly the parts named, never a glob of the label
-    directory: a directory can hold more than one generation of part
-    files, because a change in filter-group membership or in a join's
-    right-hand table moves the boundaries and leaves the older files
-    in place under their own names. Globbing counts those twice."""
+    """Stats over exactly the parts named, never a glob of the directory.
+
+    A label directory can hold more than one generation of part files:
+    a change in filter-group membership or in a join's right-hand table
+    moves the boundaries and leaves the older files in place under
+    their own names. Globbing counts those twice.
+    """
     import pyarrow.parquet as pq
 
     rows = true_rows = 0
@@ -1073,8 +1083,11 @@ def _fever_source_label(claim: dict, passage: dict):
     volumes={"/root/.cache/huggingface": hf_cache,
              "/results": results_vol})
 def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
-    """Build the corpus and report whether the implied collection is
-    already complete on the volume."""
+    """Build the corpus and check its collection on the volume.
+
+    Reports whether the collection the corpus implies is already
+    complete.
+    """
     if sf != SCALE_FACTOR:
         raise ValueError("the ground-truth pass is fixed at sf=0.1")
     results_vol.reload()
@@ -1110,7 +1123,8 @@ def judge_workload(corpus_id: str, workload: str) -> str:
 
     Every part file is written under a content-addressed path and
     skipped when it already exists, so a container that dies part way
-    resumes where it stopped."""
+    resumes where it stopped.
+    """
     specs = workload_specs(workload)
     if not specs:
         raise ValueError(f"no predicates for workload {workload!r}")
@@ -1213,7 +1227,7 @@ def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
     total_rows = sum(m["rows"] for m in manifests.values())
     summary = {
         "cell": "quailb_judge_pass",
-        "prediction": PREDICTION,
+        "prediction": PREDICTION_TEXT,
         "collection_id": collection["collection_id"],
         "corpus_id": corpus_manifest["corpus_id"],
         "scale_factor": sf,
@@ -1335,7 +1349,7 @@ def activate_reused_collection(
     total_rows = sum(m["rows"] for m in manifests.values())
     summary = {
         "cell": "quailb_ground_truth_collection_reuse",
-        "prediction": REUSE_PREDICTION,
+        "prediction": REUSE_PREDICTION_TEXT,
         "collection_id": collection["collection_id"],
         "corpus_id": target_corpus["corpus_id"],
         "scale_factor": sf,
@@ -1395,7 +1409,8 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
         print(f"function call id: {call.object_id}", flush=True)
         print(call.get(), flush=True)
         return
-    prediction = REUSE_PREDICTION if reuse_from_collection else PREDICTION
+    prediction = (REUSE_PREDICTION_TEXT if reuse_from_collection
+                  else PREDICTION_TEXT)
     print(f"PREDICTION: {prediction}", flush=True)
 
     if reuse_from_collection and target_corpus:

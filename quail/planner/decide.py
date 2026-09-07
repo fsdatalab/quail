@@ -3,8 +3,6 @@
 from dataclasses import replace
 
 from quail.executor.retention import retention_pages
-from quail.planner import retention
-
 from quail.logical import (
     LogicalPlan,
     Project,
@@ -22,14 +20,17 @@ from quail.physical import (
     Limit,
     PackedFilter,
     PortRef,
+)
+from quail.physical import (
     Project as PhysicalProject,
 )
 from quail.physical.base import input_ports
-from quail.planner import budgets, joins as joinsearch
+from quail.planner import budgets, retention
+from quail.planner import joins as joinsearch
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.sol import speed_of_light, unrounded_seconds
-from quail.planner.work import ask, scan, Work
-from quail.planning import apply_physical_rules, ModelRegion, PlanningContext
+from quail.planner.work import Work, ask, scan
+from quail.planning import ModelRegion, PlanningContext, apply_physical_rules
 from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk
@@ -82,8 +83,11 @@ def preamble_tokens(filters, joins) -> int:
 # --------------------------------------------------------- filter order
 
 def default_order_rule(filters, joins) -> tuple[str, str]:
-    """Return (rule, source). 'by_cost' when every predicate has a
-    selectivity, 'as_written' otherwise."""
+    """Return (rule, source).
+
+    'by_cost' when every predicate has a selectivity, 'as_written'
+    otherwise.
+    """
     preds = [p for fs in filters.values() for p in fs]
     sels = [p.selectivity for p in preds] + [j.selectivity for j in joins]
     if sels and all(s is not None for s in sels):
@@ -94,7 +98,6 @@ def default_order_rule(filters, joins) -> tuple[str, str]:
 def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
                 device: DeviceSpec, chunk_tokens: int, *, first: bool) -> float:
     """Return ideal time for one filter evaluation."""
-
     operation = scan if first else ask
     work = operation(prefix_tokens, _question_tokens(predicate.prompt))
     return unrounded_seconds(work, model, device, chunk_tokens)
@@ -195,8 +198,11 @@ def join_specs(joins) -> list:
 
 
 def _filter_work(filters, stats, filter_orders: dict, pre: int) -> Work:
-    """Expected Work of every filter chain: the first stage scans
-    each document, later stages ask over resident KV."""
+    """Expected Work of every filter chain.
+
+    The first stage scans each document, later stages ask over
+    resident KV.
+    """
     total = Work()
     for alias, preds in filters.items():
         mean = stats[alias].mean_doc_tokens
@@ -282,7 +288,13 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
     Args:
+        plan: The logical plan to compile.
+        model: Model spec.
+        device: Device spec.
         doc_tokens: alias -> list of per-document token counts.
+        gpus: GPU count; one model copy runs per GPU.
+        order: Stage order rule, 'by_cost' or 'as_written'; None picks
+            the default rule.
     """
     scans, filters, joins = collect_operators(plan)
     length_stats = {a: joinsearch.summarize_alias(t)
@@ -412,13 +424,12 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 + spec["tail_tokens"])
         if need > chunk:
             return Refusal(
-                reasons=(f"one tuple of the join anchored on "
-                         f"{anchor!r} needs {need} tokens (the anchor "
-                         f"document, every partner document with its "
-                         f"label, and the question, all in one "
-                         f"prompt); the chunk budget is {chunk} and "
-                         f"suffixes are atomic - no chunk can ever "
-                         f"hold it",),
+                reasons=(f"the join anchored on {anchor!r} needs "
+                         f"{need} tokens per tuple (anchor document, "
+                         f"each partner document with its label, and "
+                         f"the question, in one prompt); that is over "
+                         f"the chunk budget of {chunk}, and suffixes "
+                         f"are atomic",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
 
@@ -586,9 +597,17 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     """Plan one query with the selected model backend.
 
     Args:
+        plan: The logical plan to plan.
+        model: Model spec.
+        device: Device spec.
         doc_tokens: Per document token counts for each table alias.
+        gpus: GPU count handed to the backend as gpu_count.
+        order: Stage order rule, 'by_cost' or 'as_written'; None picks
+            the default rule.
         backend: Registered model backend name.
         registry: Optional session extension registry.
+        tokenizer: Optional callable (text -> token list) handed to the
+            planning context.
     """
     if registry is None:
         # the built in registry imports every backend, and backends

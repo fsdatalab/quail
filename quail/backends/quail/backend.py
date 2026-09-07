@@ -249,7 +249,6 @@ class QuailBackend:
 
     def _bind_runtime_data(self, plan, region, context):
         """Put tokenized prompts and answer tokens in the physical plan."""
-
         tokenizer = context.tokenizer
         _, filters, joins = collect_operators(region.logical_plan)
         encoded_nodes = []
@@ -323,5 +322,4 @@ class QuailBackend:
 
     def execute_request(self, context) -> Any:
         """Run one Quail request inside a compute process."""
-
         return execute_quail_request(context)

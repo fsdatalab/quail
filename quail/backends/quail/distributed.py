@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 
 from quail.backends.quail import coordinator
-from quail.backends.quail.graph import model_answers, executed_join_plan
+from quail.backends.quail.graph import executed_join_plan, model_answers
 from quail.execution import export_physical_outputs
 from quail.physical import (
     AnchoredJoin,
@@ -15,11 +15,11 @@ from quail.physical import (
 )
 from quail.planner import balanced_shards
 from quail.runtime.runner import (
-    compute_subgraph,
     ExecutionContext,
     GenericRunner,
     NodeMetrics,
     NodeResult,
+    compute_subgraph,
     scalar_node_metrics,
 )
 
@@ -86,7 +86,6 @@ class DistributedQuailExecution:
 
     def begin(self):
         """Start a query that has no filter node."""
-
         subs = coordinator.begin_query_payloads(
             self.payload, self.gpu_count
         )
@@ -293,7 +292,8 @@ def prepare_distributed_inputs(node, inputs, context):
     if isinstance(node, AnchoredJoin):
         return {
             "survivors": {
-                port.source.port.split(":", 1)[1]: list(inputs[port.name]) for port in node.inputs
+                port.source.port.split(":", 1)[1]: list(inputs[port.name])
+                for port in node.inputs
             },
             "group": [stage.runtime_spec() for stage in node.stages],
         }

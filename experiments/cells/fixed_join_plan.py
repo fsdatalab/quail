@@ -19,8 +19,8 @@ import modal
 
 from quail.runtime.worker import build_worker_image
 
-
-baseline = Path(os.environ.get("QUAIL_BASELINE_DIR", "/tmp/quail-fev9-baseline-b873066"))
+baseline = Path(os.environ.get(
+    "QUAIL_BASELINE_DIR", "/tmp/quail-fev9-baseline-b873066"))
 image = build_worker_image().add_local_dir(
     baseline / "quail", "/opt/quail-baseline/quail", ignore=["__pycache__", "*.pyc"]
 )
@@ -66,12 +66,15 @@ def _run(label, output_dir):
             "filter_order": [node.alias for node in plan.nodes
                              if isinstance(node, PackedFilter)],
             "retained_filter_aliases": [node.alias for node in plan.nodes
-                                        if isinstance(node, PackedFilter) and node.keep_kv],
+                                        if isinstance(node, PackedFilter)
+                                        and node.keep_kv],
             "joins": [{"anchor": node.anchor,
                        "predicates": [stage.written_pos for stage in node.stages]}
-                      for node in expected_join_nodes(plan) if isinstance(node, AnchoredJoin)],
+                      for node in expected_join_nodes(plan)
+                      if isinstance(node, AnchoredJoin)],
         }
-        print(f"[{label}] estimates before inference: {json.dumps(estimates)}", flush=True)
+        print(f"[{label}] estimates before inference: {json.dumps(estimates)}",
+              flush=True)
         warmup = query.run()
         warmup.count()
         result = query.run()
@@ -93,7 +96,8 @@ def _run(label, output_dir):
             "usd_per_query": seconds / 3600 * H100_USD_PER_HOUR,
         }
         (output / "summary.json").write_text(json.dumps(record, indent=2))
-        print(f"[{label}] {seconds} seconds, {pairs} pairs, {row_count} rows", flush=True)
+        print(f"[{label}] {seconds} seconds, {pairs} pairs, {row_count} rows",
+              flush=True)
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600, volumes=volumes)
@@ -114,12 +118,14 @@ def compare(prediction: str) -> str:
         "gpu_uuid": gpu, "order": ["adaptive", "fixed"],
         "warmup": "One unmeasured FEV-9 run per implementation",
     }, indent=2))
-    for label, python_path in (("adaptive", "/opt/quail-baseline:/root"), ("fixed", "/root")):
+    for label, python_path in (("adaptive", "/opt/quail-baseline:/root"),
+                               ("fixed", "/root")):
         environment = {**os.environ, "PYTHONPATH": os.pathsep.join(
             [python_path, *(path for path in sys.path if path)]
         )}
         completed = subprocess.run([
-            sys.executable, "-c", inspect.getsource(_run) + "\nimport sys\n_run(*sys.argv[1:])",
+            sys.executable, "-c",
+            inspect.getsource(_run) + "\nimport sys\n_run(*sys.argv[1:])",
             label, str(output),
         ], env=environment, cwd="/tmp", check=False)
         results.commit()

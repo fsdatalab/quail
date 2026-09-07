@@ -32,7 +32,6 @@ class Work:
 
     def dominates(self, other: "Work") -> bool:
         """Return whether every count is no larger than the other record."""
-
         return (
             self.tokens <= other.tokens
             and self.pairs <= other.pairs
@@ -43,20 +42,17 @@ class Work:
 
 def triangle(n: float) -> float:
     """Return the causal attention pairs for a sequence of length n."""
-
     return n * (n + 1) / 2
 
 
 def scan(prefix: float, suffix: float) -> Work:
     """Compute one document and its first suffix from nothing."""
-
     n = prefix + suffix
     return Work(tokens=n, pairs=triangle(n), kv_written=n)
 
 
 def ask(prefix: float, suffix: float) -> Work:
     """Attach one suffix to a prefix already available in KV."""
-
     return Work(
         tokens=suffix,
         pairs=suffix * prefix + triangle(suffix),
@@ -67,7 +63,6 @@ def ask(prefix: float, suffix: float) -> Work:
 
 def stream(prefix: float, suffixes) -> Work:
     """Attach several independent suffixes to one prefix in KV."""
-
     tokens = 0.0
     pairs = 0.0
     for suffix in suffixes:

@@ -156,7 +156,8 @@ def test_modal_provider_uses_explicit_dependencies(monkeypatch):
     monkeypatch.setattr(worker, "modal_worker", make_worker)
     provider = quail.ModalComputeProvider(
         local_python_sources=("shared", "extra_source", "shared"),
-        pip_packages=("shared-package==1.0", "extra-package==1.0", "shared-package==1.0"),
+        pip_packages=("shared-package==1.0", "extra-package==1.0",
+                      "shared-package==1.0"),
     )
     registry = quail.ExtensionRegistry.with_built_ins()
     first = provider._worker_for("quail", registry)

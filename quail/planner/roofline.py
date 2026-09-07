@@ -54,7 +54,6 @@ class ComponentLatency:
 def component_latency(component: CostComponent,
                       device: DeviceSpec) -> ComponentLatency:
     """Price one component against the device limits."""
-
     return ComponentLatency(
         component=component,
         compute_seconds=(
@@ -67,6 +66,5 @@ def component_latency(component: CostComponent,
 def component_latencies(
         components, device: DeviceSpec) -> tuple[ComponentLatency, ...]:
     """Price model components in execution order."""
-
     return tuple(component_latency(component, device)
                  for component in components)

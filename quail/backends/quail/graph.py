@@ -14,14 +14,14 @@ from quail.physical import (
     PhysicalGraph,
 )
 from quail.runtime.runner import (
-    compute_subgraph,
     ExecutionContext,
     GenericRunner,
     ModelNodeRuntime,
     NodeResult,
+    compute_subgraph,
     scalar_node_metrics,
 )
-from quail.runtime.tokens import chain_tokens, DocumentPrefixes
+from quail.runtime.tokens import DocumentPrefixes, chain_tokens
 
 
 def quail_runtimes() -> dict:
@@ -59,7 +59,6 @@ def _tuple_suffix(join, docs, member):
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
-
     state = context.state
     if isinstance(node, PackedFilter):
         state["pipeline"].attention_mode = FILTER_ATTENTION

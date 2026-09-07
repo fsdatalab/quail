@@ -115,8 +115,7 @@ def _lean(model_name: str, load_format: str | None = None) -> dict:
     import torch  # noqa: F401
     tm.mark("import_torch")
 
-    from vllm.config import (LoadConfig, ModelConfig, VllmConfig,
-                             set_current_vllm_config)
+    from vllm.config import LoadConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import (
         ensure_model_parallel_initialized,
         init_distributed_environment,

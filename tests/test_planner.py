@@ -6,19 +6,19 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from quail.builder import col, docs, prompt
 from quail.backends.quail import expected_join_stages
+from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
-from quail.planner.decide import explain, filter_cost, order_filters, plan_query
-from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
-from quail.planner.sol import prefix_recompute_seconds, speed_of_light
-from quail.planner.work import Work, ask, scan, triangle
 from quail.physical import (
     AnchoredJoin,
     DocumentInput,
     Exchange,
     PackedFilter,
 )
+from quail.planner.decide import explain, filter_cost, order_filters, plan_query
+from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
+from quail.planner.sol import prefix_recompute_seconds, speed_of_light
+from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 

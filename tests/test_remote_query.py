@@ -2,9 +2,9 @@
 
 from threading import Lock
 
-from modal._serialization import deserialize, serialize
 import pyarrow as pa
 import pyarrow.parquet as pq
+from modal._serialization import deserialize, serialize
 
 import quail
 from quail.execution import PhysicalResponse

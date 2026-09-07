@@ -17,7 +17,7 @@ from quail.backends.request_scheduling import (
     split_cached_tokens,
     true_bit,
 )
-from quail.execution import export_physical_outputs, PhysicalResponse
+from quail.execution import PhysicalResponse, export_physical_outputs
 from quail.logical import SHARED_PRE
 from quail.physical import (
     DocumentInput,
@@ -35,21 +35,23 @@ from quail.planner import (
     budgets,
     collect_operators,
     default_order_rule,
-    join_specs as logical_join_specs,
     order_filters_indexed,
     preamble_tokens,
+)
+from quail.planner import (
+    join_specs as logical_join_specs,
 )
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.plan import CorpusStats, PhysicalPlan
 from quail.planning import PhysicalCandidate, SupportResult
 from quail.runtime.result import answer_table
 from quail.runtime.runner import (
-    compute_subgraph,
     ExecutionContext,
     GenericRunner,
     ModelNodeRuntime,
     NodeMetrics,
     NodeResult,
+    compute_subgraph,
     scalar_node_metrics,
 )
 
@@ -77,7 +79,6 @@ def plan_request_backend(
     join_submission: str,
 ) -> tuple[PhysicalCandidate, ...]:
     """Build one physical request plan for a request engine."""
-
     scans, filters, joins = collect_operators(region.logical_plan)
     stats = {
         alias: CorpusStats(
@@ -827,7 +828,6 @@ def execute_request_graph(context, backend, engine_state, boot):
 
 def request_runtimes() -> dict:
     """Return runtimes for the request backends' physical node."""
-
     return {RequestExecution.runtime_key: ModelNodeRuntime()}
 
 

@@ -1,12 +1,14 @@
-"""Tests for the coordinator's filter/join round splitting, merging, gating, and thinning."""
+"""Tests for the coordinator's round splitting, merging, gating, and thinning."""
 
+from quail.backends.quail.coordinator import (
+    filter_node_payloads,
+    gate_group,
+    join_group_payloads,
+    merge_filter_round,
+    merge_join_round,
+    thin_survivors,
+)
 from quail.physical import PackedFilter
-from quail.backends.quail.coordinator import (filter_node_payloads,
-                                       gate_group,
-                                       join_group_payloads,
-                                       merge_filter_round,
-                                       merge_join_round,
-                                       thin_survivors)
 
 
 def payload():

@@ -6,8 +6,8 @@ import pytest
 from experiments.sglang_profile_analysis import (
     binned_activity,
     clip_interval,
-    intersect_intervals,
     input_preparation_breakdown,
+    intersect_intervals,
     interval_duration,
     merge_intervals,
     read_trace,
@@ -24,7 +24,8 @@ def test_activity_bins_preserve_union_duration_and_partial_final_bin():
     intervals = [(5, 15), (10, 20), (30, 43)]
     bins = binned_activity(intervals, 0, 45, 10)
     assert bins == [(0, 10, 5), (10, 20, 10), (20, 30, 0), (30, 40, 10), (40, 45, 3)]
-    assert sum(occupied for _, _, occupied in bins) == pytest.approx(interval_duration(intervals))
+    assert sum(occupied for _, _, occupied in bins) == pytest.approx(
+        interval_duration(intervals))
 
 
 def test_measurement_window_excludes_export_and_clips_crossing_operations():

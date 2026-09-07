@@ -37,7 +37,6 @@ class TokenizedInput:
 
 def document_input(tokens) -> TokenizedInput:
     """Build one physical input from a token document sequence."""
-
     return TokenizedInput(decode_token_documents(tokens))
 
 

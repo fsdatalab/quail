@@ -24,9 +24,11 @@ def test_timeline_clips_to_join_and_merges_concurrent_operations(tmp_path):
         json.dump({"baseTimeNanoseconds": 1_000_000, "traceEvents": events}, stream)
     intervals = read_gpu_intervals(path, (1_010_000, 1_030_000))
     assert intervals == [(0, 8), (10, 20)]
-    assert list(struct.iter_unpack("<dd", gzip.decompress(encode_intervals(intervals)))) == intervals
+    assert list(struct.iter_unpack(
+        "<dd", gzip.decompress(encode_intervals(intervals)))) == intervals
 
 
 def test_encoding_preserves_submicrosecond_boundaries():
     intervals = [(0.0009765625, 17.0283203125), (1_000_000.25, 1_000_000.5)]
-    assert list(struct.iter_unpack("<dd", gzip.decompress(encode_intervals(intervals)))) == intervals
+    assert list(struct.iter_unpack(
+        "<dd", gzip.decompress(encode_intervals(intervals)))) == intervals

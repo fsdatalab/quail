@@ -71,8 +71,7 @@ def probe(model_name: str) -> str:
     from transformers import AutoTokenizer
 
     from quail.executor.arena import KVArena
-    from quail.executor.attention import (FILTER_ATTENTION,
-                                          JOIN_ATTENTION, Pipeline)
+    from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
     from quail.executor.loop import Answerer, AsyncAnswers, run_filter
     from quail.executor.model import load_model
     from quail.planner import budgets

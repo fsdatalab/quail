@@ -24,7 +24,6 @@ import modal
 
 from quail.runtime.worker import build_worker_image
 
-
 image = build_worker_image()
 sglang_image = build_worker_image(runtime_package="sglang==0.5.18")
 

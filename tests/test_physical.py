@@ -8,8 +8,8 @@ import pyarrow as pa
 import pytest
 
 import quail
-from quail.catalog import DocumentProvider
 from quail.builtins import built_in_registry
+from quail.catalog import DocumentProvider
 from quail.physical import (
     DocumentInput,
     ExecutionLocation,

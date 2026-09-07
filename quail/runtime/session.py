@@ -11,20 +11,23 @@ from pyarrow import compute as pc
 from quail.builder import Query as BuilderQuery
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
-from quail.execution import document_input, PhysicalRequest
+from quail.execution import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
 from quail.logical import CompileError, LogicalPlan
-from quail.logical_optimizer import apply_logical_rules, LogicalPlanningContext
-from quail.physical import (DocumentInput, PortRef, Project, ValueType,
-                            encode_graph)
+from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
+from quail.physical import DocumentInput, PortRef, Project, ValueType, encode_graph
 from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.runtime.compute import ModalComputeProvider, QueryRequest
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
-from quail.runtime.runner import (ExecutionContext, GenericRunner,
-                                  NodeMetrics, scalar_node_metrics)
+from quail.runtime.runner import (
+    ExecutionContext,
+    GenericRunner,
+    NodeMetrics,
+    scalar_node_metrics,
+)
 from quail.runtime.tokens import TokenStore
-from quail.sqlfront import compile_sql, SQLDialect
+from quail.sqlfront import SQLDialect, compile_sql
 
 
 class RefusalError(RuntimeError):
@@ -162,7 +165,6 @@ class Session:
     def tokenize(self, provider_name: str, column: str,
                  projected_columns=()):
         """Write one document column to a memory mapped token store."""
-
         provider = self.catalog.get(provider_name)
         projected_columns = tuple(dict.fromkeys(projected_columns))
         key = (
@@ -329,7 +331,6 @@ class Query:
 
     def _prepare_physical(self):
         """Build the physical request used inside a compute worker."""
-
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
@@ -345,7 +346,6 @@ class Query:
 
     def _request(self):
         """Build the logical request sent to a compute provider."""
-
         scans, _, _ = collect_operators(self.logical)
         return QueryRequest(
             logical_plan=self.logical,
@@ -361,7 +361,6 @@ class Query:
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
         """Finish the physical graph and attach execution details."""
-
         plan = self.plan()
         out = response.metrics
         from quail.physical import AnchoredJoin, Exchange

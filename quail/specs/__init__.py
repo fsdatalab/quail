@@ -1,5 +1,8 @@
-"""Model and device specs. One file per model; adding a model is
-adding a file and a registry line."""
+"""Model and device specs.
+
+One file per model; adding a model is adding a file and a registry
+line.
+"""
 
 from .base import ACT_BYTES_PER_HIDDEN, DeviceSpec, ModelSpec, Precision
 from .h100_sxm import H100_SXM

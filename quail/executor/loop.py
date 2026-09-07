@@ -1,7 +1,10 @@
-"""The overlapped chunk loop: pack on CPU while the GPU runs, gate
-answers, free pages immediately.
+"""The overlapped chunk loop.
 
-- run_join: a known pair list, brim-packed by pack_stream.
+Pack on CPU while the GPU runs, gate answers, free pages immediately.
+
+- run_join: continuous anchor admission with JoinAdmission, stages
+  mixed in one chunk, pages freed when an anchor fails a gate or
+  answers its last stage.
 - run_filter: continuous admission with FilterAdmission, pages freed
   on FALSE or after the last stage.
 
@@ -11,14 +14,9 @@ image.
 
 import time
 
-from quail.executor.model import answer_weights
-
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
-from quail.executor.pack import (
-    FilterAdmission,
-    pack_stream,
-    partition_anchor_groups,
-)
+from quail.executor.model import answer_weights
+from quail.executor.pack import FilterAdmission, JoinAdmission
 
 
 def _tick(timing, key, t0):
@@ -30,7 +28,8 @@ def _tick(timing, key, t0):
 def _staged(torch, data, dtype, pinned=True):
     """Host data to device through pinned memory, non-blocking.
 
-    pinned=False reverts to pageable blocking copies."""
+    pinned=False reverts to pageable blocking copies.
+    """
     if torch.is_tensor(data):
         if pinned:
             return data.pin_memory().to("cuda", non_blocking=True)
@@ -88,8 +87,11 @@ def true_false_ids(tok):
 
 
 class Answerer:
-    """TRUE/FALSE from final-position hidden states, scored against
-    only the allowed token rows - no full-vocabulary logits."""
+    """TRUE/FALSE from final-position hidden states.
+
+    Scored against only the allowed token rows - no full-vocabulary
+    logits.
+    """
 
     def __init__(self, torch, F, model, tokenizer):
         t_ids, f_ids = true_false_ids(tokenizer)
@@ -111,9 +113,11 @@ class Answerer:
         return (t > f).int().cpu().tolist()
 
 class AsyncAnswers:
-    """Non-blocking TRUE/FALSE readout. submit() returns an event and
-    pinned host buffer; result() waits on the event and reads the
-    answers without stalling the GPU stream."""
+    """Non-blocking TRUE/FALSE readout.
+
+    submit() returns an event and pinned host buffer; result() waits on
+    the event and reads the answers without stalling the GPU stream.
+    """
 
     def __init__(self, torch, answerer):
         self.torch = torch
@@ -381,17 +385,20 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 # ------------------------------------------------------------ the join
 
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
-             stage_suffixes, budget, group_size=None,
-             stage_frames=None, anchor_keys=None, anchor_done=None):
-    """The join driver: stream partner lists against anchors, gating
-    survivors between stages.
+             stage_suffixes, budget, stage_frames=None,
+             anchor_keys=None, anchor_done=None):
+    """The join driver: stream partner lists against anchors.
+
+    Survivors are gated between stages.
 
     Args:
+        torch: The torch module, imported by the caller.
+        arena: KVArena holding the anchors' KV pages.
+        pipeline: Pipeline that runs each packed forward chunk.
+        async_ans: AsyncAnswers that reads TRUE/FALSE off the GPU.
         anchor_prefixes: Anchor id (list index) -> prefix token list.
         stage_suffixes: Per stage, the partner suffix token lists.
         budget: Chunk token budget.
-        group_size: Maximum anchors gated together between stages. None
-            uses only the KV capacity limit.
         stage_frames: Per stage, task framing token list written into
             each anchor's kept KV after the document rows.
         anchor_keys: Stable arena key for each anchor. List positions are
@@ -406,67 +413,46 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     """
     k = len(stage_suffixes)
     n = len(anchor_prefixes)
-    if n == 0 or k == 0:
+    if n == 0 or k == 0 or not stage_suffixes[0]:
         return [dict() for _ in range(k)], [], 0
-    suffix_lens = [[len(s) for s in sufs] for sufs in stage_suffixes]
     frames = stage_frames or [[] for _ in range(k)]
     keys = list(range(n)) if anchor_keys is None else list(anchor_keys)
     if len(keys) != n:
         raise ValueError("anchor_keys must match anchor_prefixes")
     frame_max = max(len(f) for f in frames)
-    groups = partition_anchor_groups(
-        [len(prefix) for prefix in anchor_prefixes],
-        arena.accounting.n_pages,
-        arena.accounting.page_tokens,
-        extra_tokens=frame_max,
-        max_group_size=group_size)
-    group_pages = [sum(
-        arena.accounting.pages_needed(
-            len(anchor_prefixes[a]) + frame_max)
-        for a in members)
-        for members in groups]
-    ans = [dict() for _ in range(k)]
+    owned = arena.accounting.owned
+    resident = {a: len(owned[keys[a]]) for a in range(n)
+                if keys[a] in owned}
+    # Every resident anchor stays available for the whole join while
+    # fresh admissions evict unrelated retained KV.
+    for a in resident:
+        arena.pin(keys[a])
+    sched = JoinAdmission(
+        [len(p) for p in anchor_prefixes],
+        [[len(s) for s in sufs] for sufs in stage_suffixes],
+        budget, arena.accounting.n_pages, arena.accounting.page_tokens,
+        frame_tokens=[len(f) for f in frames], resident=resident)
     spans = []
     tokens = 0
+    outstanding = []     # (groups, handle) in launch order
 
-    def plan_stage(members, j):
-        live = [a for a in members
-                if j == 0 or any(ans[j - 1].get(a, []))]
-        if not live:
-            return [], [], set()
-        # each anchor's FIRST group of the stage carries the frame at
-        # the head of its first suffix (written into kept KV there),
-        # so the first suffix length is inflated by the frame
-        lens = suffix_lens[j]
-        if frames[j] and lens:
-            lens = [len(frames[j]) + lens[0]] + lens[1:]
-        spec = [(len(anchor_prefixes[a]), lens) for a in live]
-        keep_loc = set(range(len(live))) if j + 1 < k else set()
-        already_loc = {i for i, a in enumerate(live)
-                       if keys[a] in arena.accounting.owned}
-        plan, to_cache = pack_stream(spec, budget, keep=keep_loc,
-                                     already_kept=already_loc)
-        return live, plan, to_cache
-
-    def build(j, idx, chunk_groups):
-        frame = frames[j]
+    def build(chunk_groups):
         specs = []
-        for a, start, end, carried in chunk_groups:
-            anchor = idx[a]
-            key = keys[anchor]
-            f = len(anchor_prefixes[anchor])
-            if key in arena.accounting.owned or carried:
-                got = arena.activate(
-                    key, f, capacity_tokens=f + frame_max)
-                assert got is not None, "arena underprovisioned"
+        for a, j, start, end, carried in chunk_groups:
+            key = keys[a]
+            f = len(anchor_prefixes[a])
+            frame = frames[j]
+            got = arena.activate(key, f, capacity_tokens=f + frame_max)
+            assert got is not None, \
+                "scheduler admitted an anchor the arena cannot hold"
             sufs = stage_suffixes[j][start:end]
-            if frame and start == 0 and sufs:
+            if frame and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows. The pair entry reads doc + frame.
-                # The frame entry's answer bit is skipped by scatter().
+                # The frame entry's answer bit is skipped by report().
                 specs.append(dict(
                     key=key,
-                    prefix=anchor_prefixes[anchor] if carried else None,
+                    prefix=anchor_prefixes[a] if carried else None,
                     f=f, suffixes=[frame],
                     write_suffix_tokens=len(frame)))
                 specs.append(dict(
@@ -475,109 +461,61 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             else:
                 specs.append(dict(
                     key=key,
-                    prefix=anchor_prefixes[anchor] if carried else None,
-                    f=f + (len(frame) if frame else 0),
+                    prefix=anchor_prefixes[a] if carried else None,
+                    f=f + len(frame),
                     suffixes=sufs))
         return pack_chunk(torch, arena, specs,
                           attention_mode=pipeline.attention_mode)
 
-    def launch(j, chunk):
-        nonlocal tokens
+    def settle(anchor):
+        if anchor_done is None:
+            if keys[anchor] in owned:
+                arena.free_key(keys[anchor])
+        else:
+            anchor_done(anchor, sched.answers[k - 1].get(anchor, []))
+
+    def report(entry):
+        groups, handle = entry
+        bits = async_ans.result(handle)
+        pos = 0
+        for a, j, start, end, _ in groups:
+            if frames[j] and start == 0:
+                pos += 1        # the frame entry's bit means nothing
+            cnt = end - start
+            for kind, anchor in sched.report(
+                    a, j, start, end, bits[pos:pos + cnt]):
+                if kind == "finished":
+                    settle(anchor)
+                elif keys[anchor] in owned:
+                    arena.free_key(keys[anchor])
+            pos += cnt
+
+    while not sched.done():
+        if sched.blocked_pages:
+            # the free list is short for the next fresh anchor:
+            # retained KV nothing here reads makes room
+            arena.evict_retained(sched.blocked_pages)
+        groups = sched.next_chunk(arena.accounting.free_pages)
+        if not groups:
+            if outstanding:
+                report(outstanding.pop(0))
+                continue
+            raise AssertionError("nothing buildable and nothing in flight")
+        chunk = build(groups)
         tokens += chunk["tokens"]
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
         normed = pipeline.forward_chunk(chunk)
         e1.record()
-        spans.append((j, e0, e1))
-        return async_ans.submit(normed)
-
-    def scatter(j, idx, chunk_groups, bits):
-        pos = 0
-        for a, start, end, _ in chunk_groups:
-            if frames[j] and start == 0 and end > start:
-                pos += 1        # the frame entry's bit means nothing
-            cnt = end - start
-            ans[j].setdefault(idx[a], []).extend(bits[pos:pos + cnt])
-            pos += cnt
-
-    def free_if_owned(anchor):
-        key = keys[anchor]
-        if key in arena.accounting.owned:
-            arena.free_key(key)
-
-    prefetch = None     # (idx, plan, handle0) of the next group's
-    #                     stage 0, chunk 0 already launched
-    for g, members in enumerate(groups):
-        # Every resident key named by this group must remain available
-        # while missing group keys evict unrelated retained KV.
-        for a in members:
-            key = keys[a]
-            if key in arena.accounting.owned:
-                arena.pin(key)
-        for j in range(k):
-            if j == 0 and prefetch is not None:
-                idx, plan, h0 = prefetch
-                prefetch = None
-            else:
-                idx, plan, _ = plan_stage(members, j)
-                h0 = launch(j, build(j, idx, plan[0])) if plan else None
-            if not plan:
-                continue
-            last_chunk = {}
-            for t, cg in enumerate(plan):
-                for a_l, _, _, _ in cg:
-                    last_chunk[a_l] = t
-            completed = set()
-
-            def finish(handle, t):
-                scatter(j, idx, plan[t], async_ans.result(handle))
-                if j == k - 1:
-                    for a_l, _, _, _ in plan[t]:
-                        anchor = idx[a_l]
-                        if last_chunk[a_l] != t or anchor in completed:
-                            continue
-                        if anchor_done is None:
-                            free_if_owned(anchor)
-                        else:
-                            anchor_done(anchor, ans[j].get(anchor, []))
-                        completed.add(anchor)
-
-            handles = [(h0, 0)]
-            if (j == 0 and k > 1 and g + 1 < len(groups)
-                    and group_pages[g] + group_pages[g + 1]
-                    <= arena.accounting.n_pages):
-                # the gate below cannot be planned past; keep the
-                # GPU fed with the next group's gate-free stage 0
-                nidx, nplan, _ = plan_stage(groups[g + 1], 0)
-                if nplan:
-                    nh = launch(0, build(0, nidx, nplan[0]))
-                    prefetch = (nidx, nplan, nh)
-            for t in range(1, len(plan)):
-                c = build(j, idx, plan[t])   # CPU, GPU busy
-                h = launch(j, c)
-                h_prev, t_prev = handles.pop(0)
-                finish(h_prev, t_prev)
-                handles.append((h, t))
-            while handles:
-                h, t = handles.pop(0)
-                finish(h, t)
-            # free pages nothing later reads: after the last stage
-            # everything in the group is done; between stages, the
-            # gate's casualties are done
-            if j == k - 1:
-                for a in members:
-                    if (a not in completed
-                            and keys[a] in arena.accounting.owned):
-                        if anchor_done is None:
-                            free_if_owned(a)
-                        else:
-                            anchor_done(a, ans[j].get(a, []))
-            else:
-                for a in idx:
-                    if not any(ans[j].get(a, [])):
-                        free_if_owned(a)
-    return ans, spans, tokens
+        spans.append((groups[0][1], e0, e1))
+        outstanding.append((groups, async_ans.submit(normed)))
+        # read the previous chunk's answers while this one runs
+        while len(outstanding) > 1:
+            report(outstanding.pop(0))
+    while outstanding:
+        report(outstanding.pop(0))
+    return sched.answers, spans, tokens
 
 
 # ------------------------------------------------------------- warmup
@@ -606,9 +544,11 @@ WARMUP_VERSION = 1
 
 
 def _warm_inputs(budget):
-    """Synthetic warmup tokens: a 512-id document and a 16-id
-    question suffix, cycled to any length the passes need. Fixed
-    small ids; only the counts matter to the kernels."""
+    """Synthetic warmup tokens: a 512-id document and a 16-id question suffix.
+
+    Cycled to any length the passes need. Fixed small ids; only the
+    counts matter to the kernels.
+    """
     doc = [10 + (i % 500) for i in range(512)]
     question = list(range(10, 26))
     q_max = len(question)
@@ -621,9 +561,11 @@ def _warm_inputs(budget):
 
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                   join_chunk):
-    """Run real forward passes over every attention path: both modes
-    with arena writes, plus the unpaged causal fast path. join_chunk
-    adds one run_join call."""
+    """Run real forward passes over every attention path.
+
+    Both modes with arena writes, plus the unpaged causal fast path.
+    join_chunk adds one run_join call.
+    """
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
     original_mode = pipeline.attention_mode
@@ -649,14 +591,18 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
 
 
 def compile_kernels(torch, arena, pipeline, async_ans, budget):
-    """Build every DeepGEMM kernel configuration up to the budget,
-    then run forward passes over every attention-path shape.
+    """Build every DeepGEMM kernel configuration, then warm every path.
+
+    Configurations go up to the budget; the warm pass runs forward
+    passes over every attention-path shape.
 
     Runs once per (software stack, GPU, model, budget). Uses vLLM's
     config heuristic generator to enumerate every token count at
-    which the chosen GEMM configuration changes."""
+    which the chosen GEMM configuration changes.
+    """
     from vllm.model_executor.warmup.deep_gemm_warmup import (
-        _generate_optimal_warmup_m_values)
+        _generate_optimal_warmup_m_values,
+    )
     layer = pipeline.layers[0]
     linears = (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
                layer.mlp.gate_up_proj, layer.mlp.down_proj)
@@ -688,8 +634,10 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
 
 
 def touch_kernels(torch, arena, pipeline, async_ans, budget):
-    """Run each hot kernel once per container so cached binaries load
-    at boot instead of mid-run."""
+    """Run each hot kernel once per container.
+
+    Cached binaries then load at boot instead of mid-run.
+    """
     _forward_warm(torch, arena, pipeline, async_ans, budget,
                   join_chunk=False)
 
@@ -717,13 +665,16 @@ def _marker_identity(torch, model_name, budget):
 
 def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                  model_name, force_compile=False):
-    """Boot-time warmup: compile pass once per (stack, GPU, model,
-    budget), touch pass every container after that.
+    """Boot-time warmup: a compile pass once, a touch pass per container.
+
+    The compile pass runs once per (stack, GPU, model, budget); every
+    container after that runs the touch pass.
 
     A marker file records the identity the compile pass ran for.
     Identity match -> touch; mismatch or absent -> compile.
 
-    Returns dict(tier="compile"|"touch", warm_s=seconds)."""
+    Returns dict(tier="compile"|"touch", warm_s=seconds).
+    """
     import json
     import os
 
@@ -768,15 +719,22 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=()):
-    """The filter chain: continuous admission, survivor priority, pages
-    freed on FALSE or after the last stage.
+    """The filter chain: continuous admission with survivor priority.
+
+    Pages are freed on FALSE or after the last stage.
 
     Args:
+        torch: The torch module, imported by the caller.
+        arena: KVArena holding the documents' KV pages.
+        pipeline: Pipeline that runs each packed forward chunk.
+        async_ans: AsyncAnswers that reads TRUE/FALSE off the GPU.
         doc_ids: Per-document token lists.
         question_ids: Per-stage question token lists.
         budget: Chunk token budget.
         timing: CPU seconds per loop phase accumulate into it.
         pinned: False for pageable blocking copies.
+        limit: Stop admitting documents after this many survivors.
+            None runs every document.
         arena_writes: Whether document KV is written to the arena.
             Must be True with multiple stages.
         arena_keys: Stable arena key for each document. List positions are

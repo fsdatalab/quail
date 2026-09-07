@@ -14,7 +14,6 @@ from typing import Callable, Generic, Hashable, Iterable, Sequence, TypeVar
 
 from quail.planner.work import Work
 
-
 StateProperty = TypeVar("StateProperty", bound=Hashable)
 Step = TypeVar("Step")
 
@@ -58,7 +57,6 @@ def _insert_nondominated(
     candidate: Candidate[StateProperty, Step],
 ) -> bool:
     """Keep one record unless another is no larger in every category."""
-
     if any(existing.work.dominates(candidate.work) for existing in frontier):
         return False
     frontier[:] = [
@@ -77,7 +75,6 @@ def optimize_left_deep(
     extend: Extend[StateProperty, Step],
 ) -> SearchResult[StateProperty, Step]:
     """Run subset DP over relation subsets and a physical property."""
-
     all_aliases = frozenset(aliases)
     states: dict[
         tuple[frozenset[str], StateProperty],

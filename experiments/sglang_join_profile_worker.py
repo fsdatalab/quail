@@ -9,8 +9,7 @@ import traceback
 from functools import wraps
 from pathlib import Path
 
-
-PREDICTION = (
+PREDICTION_TEXT = (
     "CPU request handling and batch scheduling leave substantial gaps between "
     "GPU operations in the SGLang joins. Expect GPU kernels and transfers to "
     "occupy less than half of the captured join wall time. Compare profiled "
@@ -60,7 +59,8 @@ def profile_worker(directory, connection, input_detail=False):
             details = InputProfiler()
 
         @wraps(original)
-        def profiled_join(client, sampling_params, prefixes, suffixes, true_ids, **kwargs):
+        def profiled_join(client, sampling_params, prefixes, suffixes, true_ids,
+                          **kwargs):
             number = len(joins)
             destination = root / f"join-{number}"
             destination.mkdir(parents=True)
@@ -93,7 +93,8 @@ def profile_worker(directory, connection, input_detail=False):
                 ) as driver:
                     with torch.profiler.record_function(f"quail.join-{number}"):
                         result = original(
-                            client, sampling_params, prefixes, suffixes, true_ids, **kwargs,
+                            client, sampling_params, prefixes, suffixes,
+                            true_ids, **kwargs,
                         )
                 elapsed = time.perf_counter() - started
                 finished_ns = time.time_ns()
@@ -118,7 +119,8 @@ def profile_worker(directory, connection, input_detail=False):
                     }
                     for pid, value in after.items()
                 },
-                "traces": [str(path) for path in sorted(destination.glob("*.trace.json.gz"))],
+                "traces": [str(path) for path
+                           in sorted(destination.glob("*.trace.json.gz"))],
             }
             if details is not None:
                 record["input_preparation"] = details.summary()
@@ -131,13 +133,13 @@ def profile_worker(directory, connection, input_detail=False):
         request_module.run_join_grouped = profiled_join
         result = run_backend_group(
             data_dir="/results/quailb_data", model="qwen3-4b-fp8", sf=0.1, lf=1,
-            query_ids=("FEV-9",), run_label=root.name, prediction=PREDICTION,
+            query_ids=("FEV-9",), run_label=root.name, prediction=PREDICTION_TEXT,
             ground_truth_collection="gt_77bb8b128743a79aedddaa24c808c3f8",
             methods=("pipelined_sglang",),
         )
         assert len(joins) == 3
         result.update({
-            "prediction": PREDICTION, "baseline_volume_path": BASELINE_PATH,
+            "prediction": PREDICTION_TEXT, "baseline_volume_path": BASELINE_PATH,
             "profiled": True, "joins": joins,
             "input_detail": input_detail,
             "model_info": model_info,

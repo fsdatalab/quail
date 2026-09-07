@@ -9,7 +9,6 @@ from types import ModuleType
 from typing import ClassVar
 
 import pytest
-
 from modal._serialization import deserialize, serialize
 
 from quail.builtins import built_in_registry
@@ -185,9 +184,10 @@ def test_explicit_empty_name_is_rejected():
         registry.register_physical_rule(ChangeCount("valid"), name="")
 
 
-def test_registry_crosses_a_fresh_process_without_replaying_modules(tmp_path, monkeypatch):
+def test_registry_crosses_a_fresh_process_without_replaying_modules(
+        tmp_path, monkeypatch):
     source = tmp_path / "fresh_extension.py"
-    source.write_text('''
+    module_text = '''
 from dataclasses import dataclass
 
 calls = 0
@@ -205,7 +205,8 @@ def register_quail_extension(registry):
     calls += 1
     first = registry.physical_rules["first"]
     registry.register_physical_rule(Rule("second", first.amount + 1))
-''')
+'''
+    source.write_text(module_text)
     monkeypatch.syspath_prepend(str(tmp_path))
     module = importlib.import_module("fresh_extension")
     try:
@@ -215,8 +216,7 @@ def register_quail_extension(registry):
             .load_extension(module)
             .register_physical_rule(module.Rule("third", 9))
         )
-        process = subprocess.run(
-            [sys.executable, "-c", '''
+        script_text = '''
 import pickle
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -225,7 +225,9 @@ registry = deserialize(sys.stdin.buffer.read(), None)
 import fresh_extension
 values = [(rule.name, rule.amount) for rule in registry.physical_rules.values()]
 sys.stdout.buffer.write(pickle.dumps((values, fresh_extension.calls)))
-''', str(tmp_path)],
+'''
+        process = subprocess.run(
+            [sys.executable, "-c", script_text, str(tmp_path)],
             input=serialize(registry), capture_output=True, timeout=30,
         )
         assert process.returncode == 0, process.stderr.decode()

@@ -1,6 +1,8 @@
-"""Packed forward pass: DeepGEMM matmuls, fused Triton kernels,
-FlashAttention-3 varlen self-attention, paged cross-attention against
-the arena, and softmax-state merge.
+"""Packed forward pass over the paged arena.
+
+DeepGEMM matmuls, fused Triton kernels, FlashAttention-3 varlen
+self-attention, paged cross-attention against the arena, and
+softmax-state merge.
 
 Two attention paths: merge_quant (two FA3 calls merged with a fused
 kernel) and unified (one causal paged FA3 call after scattering
@@ -20,8 +22,7 @@ JOIN_ATTENTION = "merge_quant"
 
 
 class Pipeline:
-    """Packed forward passes with shared-prefix attention over the
-    paged arena."""
+    """Packed forward passes with shared-prefix attention over the paged arena."""
 
     def __init__(self, model, arena, kernels="quail", *,
                  attention_mode):
@@ -352,8 +353,10 @@ class Pipeline:
     # The same ops the engine's compiled graph runs, called eagerly.
 
     def vllm_norm_quant(self, hidden, norm, residual):
-        """fused-add rms_norm, then a separate quantize: two kernels
-        where custom_norm_quant is one."""
+        """fused-add rms_norm, then a separate quantize.
+
+        Two kernels where custom_norm_quant is one.
+        """
         normed, residual = self.fused_add_rms_norm(hidden, residual,
                                                    norm)
         return self.quant(normed)
@@ -367,8 +370,10 @@ class Pipeline:
         return self.quant(out)
 
     def vllm_qk_norm_rope(self, qkv, positions, attn):
-        """Per-head q/k norms plus rotary: two contiguous copies, two
-        rms_norm calls, one rotary (five kernels total)."""
+        """Per-head q/k norms plus rotary, five kernels in total.
+
+        Two contiguous copies, two rms_norm calls, one rotary.
+        """
         n = qkv.shape[0]
         qw = self.num_q_heads * self.head_dim
         kw = self.num_kv_heads * self.head_dim
@@ -380,8 +385,10 @@ class Pipeline:
         return self.rotary(positions, q, k)
 
     def kv_row_scatter(self, k3, v3, src, dst, layer):
-        """Scatter fresh KV rows from the packed chunk into the arena's
-        pages. One kernel launch per layer."""
+        """Scatter fresh KV rows from the packed chunk into arena pages.
+
+        One kernel launch per layer.
+        """
         assert k3.is_contiguous() and v3.is_contiguous()
         n = src.shape[0]
         row = self.num_kv_heads * self.head_dim
@@ -426,8 +433,10 @@ class Pipeline:
             causal=causal, fa_version=3, return_softmax_lse=True)
 
     def attention_merge_quant(self, q, k, v, meta):
-        """The two-call attention path with the fused merge plus FP8
-        quantization kernel. It returns the input pair for o_proj."""
+        """The two-call attention path with the fused merge plus FP8 quantize.
+
+        Returns the input pair for o_proj.
+        """
         n = q.shape[0]
         H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
         q3 = q.view(n, H, D)
@@ -462,11 +471,13 @@ class Pipeline:
         return q_out, scales
 
     def attention_unified(self, q, k, v, meta):
-        """Write every current token into its cache slot, then run one
-        causal paged FA3 call over retained and current KV.
+        """Write current KV to its cache slots, then one causal paged FA3 call.
+
+        The call reads retained and current KV together.
 
         When meta["unified"] is None (no arena pages), falls back to
-        a plain varlen causal call with no scatter or paged read."""
+        a plain varlen causal call with no scatter or paged read.
+        """
         n = q.shape[0]
         H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
         q3 = q.view(n, H, D)

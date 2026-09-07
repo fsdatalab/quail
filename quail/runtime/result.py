@@ -10,7 +10,6 @@ import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
 
-
 DEFAULT_BATCH_ROWS = 65_536
 
 

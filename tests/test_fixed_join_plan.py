@@ -4,6 +4,7 @@ import itertools
 
 import pyarrow as pa
 import pytest
+from test_quail_backend import graph_state
 
 import quail
 from quail.backends.quail.graph import execute_single_graph
@@ -13,7 +14,6 @@ from quail.physical import AnchoredJoin, DocumentInput, PackedFilter, decode_gra
 from quail.planner.plan import EngineConfig
 from quail.runtime.local import execute_worker_query
 from quail.runtime.runner import NodeMetrics, NodeResult
-from test_quail_backend import graph_state
 
 
 def register_fever(session):
@@ -82,7 +82,8 @@ def test_fev9_executes_saved_order_with_actual_survivors(
         monkeypatch, capacity, empty, estimate):
     monkeypatch.setitem(quailb.FILTER_SELECTIVITY_ESTIMATES, quailb.F11, estimate)
     monkeypatch.setitem(quailb.FILTER_SELECTIVITY_ESTIMATES, quailb.F13, estimate)
-    with quail.Session(EngineConfig(), tokenizer=lambda text: list(text.encode())) as session:
+    with quail.Session(EngineConfig(),
+                       tokenizer=lambda text: list(text.encode())) as session:
         register_fever(session)
         query = quailb.queries(session)["FEV-9"][1]()
 
@@ -100,7 +101,8 @@ def test_fev9_executes_saved_order_with_actual_survivors(
                 raise AssertionError("execution called the join optimizer")
 
             with monkeypatch.context() as execution_patch:
-                execution_patch.setattr("quail.planner.joins.search_joins", unexpected_search)
+                execution_patch.setattr(
+                    "quail.planner.joins.search_joins", unexpected_search)
                 report = execute_single_graph(state, request.plan["settings"], graph)
             assert model.filters[-1] == (groups[0].anchor, True)
             anchors = {group.anchor for group in groups}
@@ -109,7 +111,8 @@ def test_fev9_executes_saved_order_with_actual_survivors(
             assert report["kv_manager"]["retained_after_filters"] == (
                 0 if empty else min(capacity, 2) * len(anchors))
             assert [step["id"] for step in report["executed_join_plan"]
-                    if step["type"] == AnchoredJoin.type_name] == [g.node_id for g in groups]
+                    if step["type"] == AnchoredJoin.type_name] == [
+                        g.node_id for g in groups]
             return PhysicalResponse(report.pop("_outputs"), report)
 
         result = execute_worker_query(query, physical_executor=execute).collect()
@@ -118,7 +121,8 @@ def test_fev9_executes_saved_order_with_actual_survivors(
         }])
 
 
-@pytest.mark.parametrize("backend", ["quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"])
+@pytest.mark.parametrize(
+    "backend", ["quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"])
 def test_every_backend_filters_its_first_anchor_last(backend):
     with quail.Session(EngineConfig(backend=backend),
                        tokenizer=lambda text: list(text.encode())) as session:
@@ -128,7 +132,8 @@ def test_every_backend_filters_its_first_anchor_last(backend):
             first = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0].anchor
             filters = plan.graph.nodes_by_type(PackedFilter.type_name)
             assert {node.alias for node in filters if node.keep_kv} == {
-                group.anchor for group in plan.graph.nodes_by_type(AnchoredJoin.type_name)}
+                group.anchor
+                for group in plan.graph.nodes_by_type(AnchoredJoin.type_name)}
         else:
             execution = next(node for node in plan.nodes if hasattr(node, "joins"))
             first = execution.joins[0].anchor
@@ -165,7 +170,8 @@ def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
                 children.append(state)
 
             def round_fn(kind, subs):
-                function = worker._child_filters if kind == "filters" else worker._child_joins
+                function = (worker._child_filters if kind == "filters"
+                            else worker._child_joins)
                 return [function(state, sub) for state, sub in zip(children, subs)]
 
             def unexpected_search(*args, **kwargs):
@@ -173,7 +179,8 @@ def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
 
             with monkeypatch.context() as execution_patch:
                 execution_patch.setattr(worker, "_child_boot", lambda state, sub: None)
-                execution_patch.setattr("quail.planner.joins.search_joins", unexpected_search)
+                execution_patch.setattr(
+                    "quail.planner.joins.search_joins", unexpected_search)
                 report = execute_distributed_graph(
                     {**request.plan["settings"], "model": "qwen3-4b-fp8",
                      "docs": docs, "physical_plan": request.plan},
@@ -220,4 +227,5 @@ def test_retention_search_matches_enumeration():
                     assert record["resident"] != "filter"
                 seen.add(record["anchor"])
             costs.append(speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 8192).seconds)
-    assert speed_of_light(result["work"], QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)
+    assert speed_of_light(
+        result["work"], QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)

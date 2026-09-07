@@ -119,7 +119,8 @@ def test_async_filters_advance_and_refill_before_slow_request_finishes():
         assert events.index(("start", 3, 8)) < events.index(("finish", 2, 8))
         assert result["survivors"] == [1]
         assert result["requests"] == 5
-        assert result["answers"] == {(0, 1): 1, (0, 2): 0, (1, 1): 1, (1, 2): 1, (2, 1): 0}
+        assert result["answers"] == {
+            (0, 1): 1, (0, 2): 0, (1, 1): 1, (1, 2): 1, (2, 1): 0}
 
     asyncio.run(run())
 
@@ -152,7 +153,8 @@ def test_async_filter_empty_input_submits_nothing():
     async def generate(prompt, sampling_params):
         raise AssertionError("no documents")
 
-    result = asyncio.run(run_filter_chain_async(generate, {}, [], [[9]], 100, true_ids={1}))
+    result = asyncio.run(
+        run_filter_chain_async(generate, {}, [], [[9]], 100, true_ids={1}))
     assert result["requests"] == 0
     assert result["survivors"] == []
 
@@ -179,24 +181,33 @@ def test_join_answers_preserve_anchor_major_order(submission):
     prefixes = [[100 + i] * (4 + i) for i in range(5)]
     suffixes = [[200 + j] * 3 for j in range(4)]
     client = _ParityClient()
-    result = run_join_grouped(client, object(), prefixes, suffixes, {1}, submission=submission)
+    result = run_join_grouped(client, object(), prefixes, suffixes, {1},
+                              submission=submission)
     expected = ([[100 + i, 200 + j] for i in range(5) for j in range(4)]
                 if submission == "anchor-major" else
                 [[100 + i, 200 + j] for j in range(4) for i in range(5)])
     assert len(client.calls) == 1
-    assert [[p["prompt_token_ids"][0], p["prompt_token_ids"][-1]] for p in client.calls[0]] == expected
-    assert result["answers"] == [int((i + j) % 2 == 0) for i in range(5) for j in range(4)]
-    assert result["cached_per_request"] == [(100 + i) % 7 for i in range(5) for j in range(4)]
+    assert [[p["prompt_token_ids"][0], p["prompt_token_ids"][-1]]
+            for p in client.calls[0]] == expected
+    assert result["answers"] == [
+        int((i + j) % 2 == 0) for i in range(5) for j in range(4)]
+    assert result["cached_per_request"] == [
+        (100 + i) % 7 for i in range(5) for j in range(4)]
     assert result["cached_tokens"] == sum(result["cached_per_request"])
-    assert result["fresh_tokens"] == sum(len(p) + len(s) for p in prefixes for s in suffixes) - result["cached_tokens"]
+    assert result["fresh_tokens"] == sum(
+        len(p) + len(s) for p in prefixes for s in suffixes
+    ) - result["cached_tokens"]
     assert result["submission"] == submission
     with pytest.raises(ValueError, match="unknown join submission"):
-        run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1}, submission="unknown")
+        run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1},
+                         submission="unknown")
 
 
-@pytest.mark.parametrize("prefixes,suffixes", [([], [[1]]), ([[1]], []), ([], [])])
+@pytest.mark.parametrize("prefixes,suffixes",
+                         [([], [[1]]), ([[1]], []), ([], [])])
 def test_suffix_major_join_empty_input(prefixes, suffixes):
-    result = run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1}, submission="suffix-major")
+    result = run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1},
+                              submission="suffix-major")
     assert result["answers"] == []
     assert result["cached_per_request"] == []
     assert result["fresh_tokens"] == 0

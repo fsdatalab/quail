@@ -20,7 +20,6 @@ import time
 
 import modal
 
-
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
@@ -175,6 +174,7 @@ def confirm_4b(
 
 def _small_session(model: str, gpus: int):
     import pyarrow as pa
+
     import quail
     from quail.planner.plan import EngineConfig
 

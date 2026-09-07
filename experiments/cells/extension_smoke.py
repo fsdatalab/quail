@@ -1,11 +1,11 @@
-"""Smoke test for extensions crossing to the Modal worker.
+r"""Smoke test for extensions crossing to the Modal worker.
 
 Registers the observer in experiments/cells/row_trace.py, runs one
 filter query through the default ModalComputeProvider, and checks that
 the observer's report, the executed plan, and the per node metrics
 come back. Run from the repository root as a module:
 
-    uv run python -m experiments.cells.extension_smoke 2>&1 \\
+    uv run python -m experiments.cells.extension_smoke 2>&1 \
         | tee results/extension_smoke.log
 
 Prints the query's explain and the cost ledger totals.
@@ -15,11 +15,10 @@ import json
 import tempfile
 
 import quail
-from quail.planner.plan import EngineConfig
-from quail_ext_examples import cost_ledger
-
 from experiments.cells.row_trace import RowTrace
 from experiments.cells.session_smoke import FILTER_Q, make_filter_parquet
+from quail.planner.plan import EngineConfig
+from quail_ext_examples import cost_ledger
 
 
 def main():

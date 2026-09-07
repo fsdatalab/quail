@@ -169,7 +169,8 @@ def input_preparation_breakdown(join, trace):
             spans[names[event["name"]]].append(clipped)
     result = {name: interval_duration(spans[name]) / 1e6 for name in names.values()}
     result["first_gpu_s"] = (window[1] - window[0]) / 1e6
-    result["other_s"] = result["first_gpu_s"] - sum(result[name] for name in names.values())
+    result["other_s"] = result["first_gpu_s"] - sum(
+        result[name] for name in names.values())
     if result["other_s"] < -1e-6:
         raise ValueError("input preparation stages overlap")
     return result

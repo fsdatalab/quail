@@ -6,9 +6,16 @@ import sqlglot
 from sqlglot import exp
 
 from quail.catalog import Catalog
-from quail.logical import (ColumnRef, CompileError, FilterPredicate,
-                           JoinSpec, LogicalPlan, LogicalPlanBuilder,
-                           bind_join_prompt, bind_prompt)
+from quail.logical import (
+    ColumnRef,
+    CompileError,
+    FilterPredicate,
+    JoinSpec,
+    LogicalPlan,
+    LogicalPlanBuilder,
+    bind_join_prompt,
+    bind_prompt,
+)
 
 # Every relational operator except the projection, named and refused.
 # OR is rejected separately with its own message.
@@ -374,8 +381,11 @@ def compile_sql(sql: str, catalog: Catalog,
 
 
 def _check_join_coverage(b: _Binder, joined_aliases: list) -> None:
-    """Check that every JOINed table appears in a join predicate and
-    all predicates form one connected graph with the FROM table."""
+    """Check that the join predicates cover and connect every JOINed table.
+
+    Every JOINed table must appear in a join predicate, and all
+    predicates must form one connected graph with the FROM table.
+    """
     if not joined_aliases:
         return
     preds = [{r.alias for r in j.prompt.args}

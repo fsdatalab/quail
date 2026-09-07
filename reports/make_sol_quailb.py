@@ -13,9 +13,10 @@ deep plans. It is therefore an optimistic comparison point for that modeled
 execution, not the exact minimum for every possible execution. The dollar
 metric uses Modal's published H100! price.
 
-The equations are in docs/content/docs/architecture/sol-model.mdx. Work counting, model components, and
-the component calculation live in shared planner modules. The exact SoL join
-search is separate from the production planner.
+The equations are in docs/content/docs/architecture/sol-model.mdx. Work
+counting, model components, and the component calculation live in shared
+planner modules. The exact SoL join search is separate from the production
+planner.
 
 KV reuse, the part that has to be right
 ---------------------------------------
@@ -90,6 +91,8 @@ import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
 import quail
+from quail.backends.quail.coordinator import thin_survivors
+from quail.backends.quail.retention import policy as retention_policy
 from quail.bench import quailb as Q
 from quail.bench.evaluate import H100_PRICE_SOURCE, H100_USD_PER_HOUR
 from quail.bench.sol_dp import PairRelation, exact_live_rows
@@ -105,8 +108,6 @@ from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan
-from quail.backends.quail.coordinator import thin_survivors
-from quail.backends.quail.retention import policy as retention_policy
 from quail.runtime.tokens import shared_prefix_lengths
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
 
@@ -322,8 +323,10 @@ def first_use(alias_data, row, suffix) -> Work:
 
 def join_stage_work(anchor, partners, aliases, survivors, prompt,
                     resident_rows, cross_resident_rows=()) -> Work:
-    """One stage's Work. Anchor rows in resident_rows have their
-    prefix KV in the arena and pay the frame only; the rest scan.
+    """One stage's Work.
+
+    Anchor rows in resident_rows have their prefix KV in the arena and
+    pay the frame only; the rest scan.
 
     cross_resident_rows are anchor rows whose document prefix another
     alias of the same column computed. With the shared prefix credit
@@ -645,7 +648,6 @@ def simulate_production_planner(query, model: ModelSpec,
 
 def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
     """Find the best exact left deep join plan for this model."""
-
     prepared = prepare_query(query, model, chunk_tokens)
     scans = prepared.scans
     joins = prepared.joins
@@ -934,7 +936,6 @@ if args.queries:
 
 def add_sol_metrics(simulated, model: ModelSpec):
     """Add the one H100! time, cost, and throughput to a simulation."""
-
     simulated = dict(simulated)
     work = simulated.pop("work")
     held = simulated["held_column"]
@@ -1067,12 +1068,13 @@ for qid, row in rows.items():
           f"{b['sol_s'] / a['sol_s']:>7.2f}")
 
 json.dump({
-    "what": f"Speed of light for {len(rows)} QUAIL-B queries at "
+    "what": f"SoL for {len(rows)} QUAIL-B queries at "
             f"sf={SF:g}, on "
             "Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100! request each. "
             "Every feasible left deep order and anchor choice is considered. "
             "No measured or fitted constant is used.",
-    "method": "docs/content/docs/architecture/sol-model.mdx, computed by reports/make_sol_quailb.py",
+    "method": "docs/content/docs/architecture/sol-model.mdx, "
+              "computed by reports/make_sol_quailb.py",
     "scale_factor": SF,
     "query_count": len(rows),
     "skipped": skipped,

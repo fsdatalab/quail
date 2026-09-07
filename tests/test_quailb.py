@@ -25,8 +25,8 @@ from quail.bench.quailb import (
     query_family_name,
     register_privacy_sets,
     register_sets,
-    split_query_ids,
     split_query_families,
+    split_query_ids,
 )
 from quail.planner.decide import collect_operators
 from quail.planner.plan import EngineConfig, Refusal

@@ -83,7 +83,9 @@ with the input document length distribution used for the survivors.
 `quail.executor` holds the GPU code and runs only inside the Modal
 image:
 
-- `pack.py`: `pack_stream` for joins and `FilterAdmission` for filters.
+- `pack.py`: `JoinAdmission` for joins and `FilterAdmission` for filters.
+  Both admit work continuously: a chunk mixes stages, and a document
+  or anchor leaves the moment it fails a gate.
 - `arena.py`: the paged KV arena, page accounting plus the tensors.
 - `attention.py`: the forward pass with a two-call attention and a
   log-sum-exp merge between fresh tokens and arena pages.

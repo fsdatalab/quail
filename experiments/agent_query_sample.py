@@ -44,7 +44,7 @@ CANDIDATE_PROMPT = (
     "addresses the reported issue. Answer FALSE otherwise."
 )
 
-PREDICTION = (
+PREDICTION_TEXT = (
     "On the same fixed sample of 200 trace snapshots, Qwen3 32B will label "
     "35 to 60 percent true. Qwen3 4B selectivity will be within 10 percentage "
     "points of Qwen3 32B, and the two models will agree on at least 75 "
@@ -445,7 +445,7 @@ def save_result(sample_json: str, results_json: str) -> str:
     }
     summary = {
         "cell": "agent2_implemented_fix_sample",
-        "prediction": PREDICTION,
+        "prediction": PREDICTION_TEXT,
         "candidate_prompt": CANDIDATE_PROMPT,
         "acceptance_thresholds": ACCEPTANCE,
         "accepted": accepted,
@@ -469,7 +469,7 @@ def save_result(sample_json: str, results_json: str) -> str:
 @app.local_entrypoint()
 def main(finalize_from: str | None = None):
     """Run the sample preparation, both judges, and result writer."""
-    print(f"PREDICTION: {PREDICTION}", flush=True)
+    print(f"PREDICTION: {PREDICTION_TEXT}", flush=True)
     if finalize_from:
         calls = parse_function_calls(finalize_from)
         sample_json = modal.FunctionCall.from_id(calls["sample"]).get()

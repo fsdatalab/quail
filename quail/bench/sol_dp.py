@@ -31,7 +31,6 @@ def exact_live_rows(
     Tree components use repeated semijoin reduction. Cyclic components use
     exact backtracking because pairwise reduction alone is not exact there.
     """
-
     aliases = tuple(base_rows)
     combined = _combine_parallel_relations(relations)
     neighbors: dict[str, set[str]] = defaultdict(set)

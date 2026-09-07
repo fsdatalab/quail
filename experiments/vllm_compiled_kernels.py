@@ -1,5 +1,7 @@
-"""Kernel-source ablation on two QUAIL-B queries: our fused Triton
-kernels against the kernels stock vLLM's compiled graph runs.
+"""Kernel-source ablation on two QUAIL-B queries.
+
+Compares our fused Triton kernels against the kernels stock vLLM's
+compiled graph runs.
 
 The queries are IMDB-7 (three filters over the reviews table, the
 unified attention path) and BIO-2 (the reports x terms join, the
@@ -245,8 +247,7 @@ class KernelSourcePipeline(Pipeline):
         if self.kernel_source == "quail":
             return super().merge_attn_quant(out_a, lse_a, out_b,
                                             lse_b, source)
-        from vllm.v1.attention.ops.merge_attn_states import (
-            merge_attn_states)
+        from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
         torch = self.torch
         n, heads, dim = out_a.shape
         rows = self._merge_rows
@@ -282,6 +283,7 @@ def _boot_state(model):
     """
     import torch
     import torch.nn.functional as F
+    from transformers import AutoTokenizer
 
     from quail.executor.arena import KVArena
     from quail.executor.attention import FILTER_ATTENTION
@@ -289,7 +291,6 @@ def _boot_state(model):
     from quail.executor.model import load_model
     from quail.planner import budgets
     from quail.specs import DEVICES, MODELS
-    from transformers import AutoTokenizer
 
     spec = MODELS[model]
     device = DEVICES["h100-sxm"]
@@ -345,20 +346,21 @@ def _quailb_session(model, sf, gpus=1):
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
-    from quail.execution import PhysicalResponse
-    from quail.executor.loop import AsyncAnswers
     from quail.backends.quail.worker import (
         _PayloadAnswerer,
         execute_single,
         quail_runtime_payload,
     )
+    from quail.execution import PhysicalResponse
+    from quail.executor.loop import AsyncAnswers
     from quail.runtime.local import (
         _validate_physical_request,
         execute_worker_query,
     )
 
     def execute(request):
-        request, registry, graph, _ = _validate_physical_request(request, query.session.registry)
+        request, registry, graph, _ = _validate_physical_request(
+            request, query.session.registry)
         payload = quail_runtime_payload(request, graph)
         answerer = _PayloadAnswerer(
             state["torch"], state["F"], state["model"],
@@ -408,10 +410,12 @@ def _max_abs(torch, left, right):
 
 @app.function(timeout=3600, **GPU_KW)
 def probe(model: str = "qwen3-4b-fp8") -> str:
-    """Per-kernel parity of the two vLLM sources against the quail
+    """Check the three kernel sources agree before the measured cells run.
+
+    Checks per-kernel parity of the two vLLM sources against the quail
     source, torch.compile sanity for the compiled segments, and row
-    agreement on small QUAIL-B queries (sf 0.01). Runs before the
-    measured cells."""
+    agreement on small QUAIL-B queries (sf 0.01).
+    """
     import time
 
     import torch
@@ -557,11 +561,13 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
 @app.function(timeout=3600, **GPU_KW)
 def stock_kernels(model: str = "qwen3-4b-fp8",
                   n_docs: int = 512) -> str:
-    """Boot stock vLLM at its defaults, profile one prefill-heavy
-    pass over IMDB-1-shaped prompts, and record which kernels its
-    compiled graph actually runs between the GEMMs, plus the resolved
-    compilation config. This is the ground truth the vllm_compiled
-    source mirrors."""
+    """Record which kernels stock vLLM's compiled graph runs between GEMMs.
+
+    Boots stock vLLM at its defaults, profiles one prefill-heavy pass
+    over IMDB-1-shaped prompts, and records the kernels plus the
+    resolved compilation config. This is the ground truth the
+    vllm_compiled source mirrors.
+    """
     import os as _os
 
     # the v1 engine runs the model in a child process by default,
@@ -675,9 +681,11 @@ PREDICTIONS = {
 @app.function(timeout=7200, **GPU_KW)
 def queries(model: str = "qwen3-4b-fp8", sf: float = 0.1,
             reps: int = 2) -> str:
-    """IMDB-7 and BIO-2 through all three kernel sources, one
-    container, one model load, the real planner and worker core.
-    Writes kernel_source_imdb7.json and kernel_source_bio2.json."""
+    """Run IMDB-7 and BIO-2 through all three kernel sources.
+
+    Uses one container, one model load, and the real planner and worker
+    core. Writes kernel_source_imdb7.json and kernel_source_bio2.json.
+    """
     state, tokenizer, chunk_tokens, warm = _boot_state(model)
     pipeline = state["pipeline"]
     print(f"[kernel_source] warm: {warm}", flush=True)
@@ -742,9 +750,12 @@ def queries(model: str = "qwen3-4b-fp8", sf: float = 0.1,
 # ------------------------------------------------------------ profile
 
 def _categorize(name):
-    """Kernel name -> time bucket. Our Triton kernel names contain
-    substrings that also appear in vLLM's op names, so the specific
-    names are checked before the generic ones."""
+    """Map a kernel name to its time bucket.
+
+    Our Triton kernel names contain substrings that also appear in
+    vLLM's op names, so the specific names are checked before the
+    generic ones.
+    """
     low = name.lower()
     if "deep_gemm" in low or "sm90_fp8" in low or "gemm" in low:
         return "gemm"
@@ -842,11 +853,13 @@ LOCKED_MHZ = 1500
 @app.function(timeout=7200, **GPU_KW)
 def profile_queries(model: str = "qwen3-4b-fp8",
                     sf: float = 0.1) -> str:
-    """Per-kernel-category GPU time for the three sources on the
-    IMDB-7 filter query (unified path), with the SM clock and power
-    sampled during an unprofiled run of each source, and - where the
-    driver allows pinning the clock - a locked-clock profiled pass
-    that removes clock behavior from the matmul comparison."""
+    """Measure per-kernel-category GPU time for the three sources on IMDB-7.
+
+    Uses the unified attention path. Samples the SM clock and power
+    during an unprofiled run of each source. Where the driver allows
+    pinning the clock, adds a locked-clock profiled pass that removes
+    clock behavior from the matmul comparison.
+    """
     import torch
 
     state, tokenizer, chunk_tokens, _ = _boot_state(model)

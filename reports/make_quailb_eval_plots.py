@@ -1,6 +1,6 @@
 """Create the plot and Markdown report for one QUAIL-B evaluation.
 
-    uv run --with matplotlib python reports/make_quailb_eval_plots.py \
+uv run --with matplotlib python reports/make_quailb_eval_plots.py \
         --input results/benchmark/<summary>.json \
         --report results/benchmark/<report>.md
 """

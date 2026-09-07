@@ -16,8 +16,8 @@ import multiprocessing as mp
 from datetime import datetime, timezone
 from pathlib import Path
 
-from experiments.vllm_join_profile_worker import PREDICTIONS
-from quail.bench.quailb_parallel import VOLUMES, app, results_vol, image
+from experiments.vllm_join_profile_worker import PREDICTION_TEXTS
+from quail.bench.quailb_parallel import VOLUMES, app, image, results_vol
 
 
 @app.function(
@@ -29,7 +29,7 @@ def profile(query="FEV-9"):
     from experiments.vllm_join_profile_worker import profile_worker
     from quail.bench.process_isolation import _stop_process_group
 
-    if query not in PREDICTIONS:
+    if query not in PREDICTION_TEXTS:
         raise ValueError(f"Unsupported profiling query: {query}")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root = Path(f"/results/ablations/vllm-join-profile-{stamp}")
@@ -59,7 +59,7 @@ def profile(query="FEV-9"):
 @app.local_entrypoint()
 def profile_joins(query: str = "FEV-9"):
     """Start the join profile and print its saved result path."""
-    print(f"query: {query}; prediction: {PREDICTIONS[query]}", flush=True)
+    print(f"query: {query}; prediction: {PREDICTION_TEXTS[query]}", flush=True)
     call = profile.spawn(query)
     print(f"function call id: {call.object_id}", flush=True)
     print(f"result volume path: {call.get()}", flush=True)

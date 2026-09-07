@@ -42,7 +42,8 @@ def read_cpu_window(path, join_window_unix_ns, thread_id, start, end):
     events = []
     with gzip.open(path, "rb") as stream:
         for event in ijson.items(stream, "traceEvents.item", use_float=True):
-            if event.get("ph") != "X" or event.get("tid") != thread_id or "dur" not in event:
+            if (event.get("ph") != "X" or event.get("tid") != thread_id
+                    or "dur" not in event):
                 continue
             category, name = event.get("cat"), event.get("name", "")
             if category not in ("cpu_op", "cuda_runtime") and not (

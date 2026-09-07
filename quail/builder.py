@@ -4,9 +4,16 @@ from dataclasses import dataclass
 from typing import Optional
 
 from quail.catalog import Catalog
-from quail.logical import (ColumnRef, CompileError, FilterPredicate,
-                           JoinSpec, LogicalPlan, LogicalPlanBuilder,
-                           bind_join_prompt, bind_prompt)
+from quail.logical import (
+    ColumnRef,
+    CompileError,
+    FilterPredicate,
+    JoinSpec,
+    LogicalPlan,
+    LogicalPlanBuilder,
+    bind_join_prompt,
+    bind_prompt,
+)
 
 
 @dataclass(frozen=True)

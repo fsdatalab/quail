@@ -11,8 +11,8 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import quail                                    # noqa: E402
-from quail.planner.plan import EngineConfig     # noqa: E402
+import quail  # noqa: E402
+from quail.planner.plan import EngineConfig  # noqa: E402
 
 SEED = 20260818
 FILLER = ("The projector hummed while the reel changed and nobody in "
@@ -38,7 +38,11 @@ COLORS = ("blue", "red", "green", "yellow", "purple", "orange")
 
 
 def make_join_parquets(rdir, cdir, n_reports=12, n_cands=36):
-    """Build report and candidate parquets with planted color matches, returning a truth dict."""
+    """Build report and candidate parquets with planted color matches.
+
+    Returns:
+        The planted truth dict.
+    """
     keys = len(COLORS)
     reports = []
     for i in range(n_reports):

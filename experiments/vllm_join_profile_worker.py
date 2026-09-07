@@ -7,13 +7,13 @@ import traceback
 from functools import wraps
 from pathlib import Path
 
-PREDICTION = (
+PREDICTION_TEXT = (
     "vLLM will spend a larger fraction of join time running GPU operations "
     "than SGLang's measured 25.6%, with less time in request preparation "
     "and scheduling. Profiling must preserve the saved vLLM answers."
 )
-PREDICTIONS = {
-    "FEV-9": PREDICTION,
+PREDICTION_TEXTS = {
+    "FEV-9": PREDICTION_TEXT,
     "BIO-3": (
         "Request handling and scheduling leave substantial GPU idle time "
         "during BIO-3's join. The saved unprofiled join took 474.04 seconds "
@@ -56,6 +56,7 @@ def profile_worker(directory, connection, query="FEV-9"):
     try:
         import torch
         import vllm
+
         import quail.backends.request as request_module
         from quail.bench.process_isolation import run_backend_group
 
@@ -80,7 +81,8 @@ def profile_worker(directory, connection, query="FEV-9"):
         model_info = {}
 
         @wraps(original_join)
-        def profile_join(client, sampling_params, prefixes, suffixes, true_ids, **kwargs):
+        def profile_join(client, sampling_params, prefixes, suffixes, true_ids,
+                         **kwargs):
             number = len(joins)
             destination = root / f"join-{number}"
             destination.mkdir()
@@ -90,9 +92,11 @@ def profile_worker(directory, connection, query="FEV-9"):
                 model_info.update({
                     "model_path": config.model,
                     "revision": getattr(config.hf_config, "_commit_hash", None),
-                    "quantization_config": getattr(config.hf_config, "quantization_config", None),
+                    "quantization_config": getattr(
+                        config.hf_config, "quantization_config", None),
                     "capacity": client.capacity,
-                    "scheduler_process_ids": llm.collective_rpc("install_join_profile_scopes"),
+                    "scheduler_process_ids": llm.collective_rpc(
+                        "install_join_profile_scopes"),
                 })
                 assert config.model == "Qwen/Qwen3-4B-FP8"
             before = set(traces.glob("*.trace.json.gz"))
@@ -106,7 +110,8 @@ def profile_worker(directory, connection, query="FEV-9"):
                 ) as driver:
                     with torch.profiler.record_function(f"quail.join-{number}"):
                         result = original_join(
-                            client, sampling_params, prefixes, suffixes, true_ids, **kwargs,
+                            client, sampling_params, prefixes, suffixes,
+                            true_ids, **kwargs,
                         )
                 elapsed = time.perf_counter() - started
                 finished_ns = time.time_ns()
@@ -118,10 +123,12 @@ def profile_worker(directory, connection, query="FEV-9"):
             driver.export_chrome_trace(str(destination / "driver.trace.json.gz"))
             record = {
                 "join": number, "anchors": len(prefixes), "partners": len(suffixes),
-                "pairs": len(prefixes) * len(suffixes), "submission": result["submission"],
+                "pairs": len(prefixes) * len(suffixes),
+                "submission": result["submission"],
                 "wall_s": elapsed, "generate_wall_s": result["wall"],
                 "started_unix_ns": started_ns, "finished_unix_ns": finished_ns,
-                "fresh_tokens": result["fresh_tokens"], "cached_tokens": result["cached_tokens"],
+                "fresh_tokens": result["fresh_tokens"],
+                "cached_tokens": result["cached_tokens"],
                 "true_pairs": sum(result["answers"]),
                 "traces": [str(p) for p in sorted(destination.glob("*.trace.json.gz"))],
             }
@@ -133,13 +140,14 @@ def profile_worker(directory, connection, query="FEV-9"):
         request_module.run_join_grouped = profile_join
         result = run_backend_group(
             data_dir="/results/quailb_data", model="qwen3-4b-fp8", sf=0.1, lf=1,
-            query_ids=(query,), run_label=root.name, prediction=PREDICTIONS[query],
+            query_ids=(query,), run_label=root.name,
+            prediction=PREDICTION_TEXTS[query],
             ground_truth_collection="gt_77bb8b128743a79aedddaa24c808c3f8",
             methods=("pipelined_vllm",),
         )
         assert len(joins) == {"FEV-9": 3, "BIO-3": 1}[query]
         result.update({
-            "prediction": PREDICTIONS[query], "profiled": True, "joins": joins,
+            "prediction": PREDICTION_TEXTS[query], "profiled": True, "joins": joins,
             "query": query,
             "model_info": model_info,
             "versions": {"torch": torch.__version__, "vllm": vllm.__version__},

@@ -22,8 +22,8 @@ the result_volume_path printed by this script.
 
 from __future__ import annotations
 
-import tempfile
 import sys
+import tempfile
 from pathlib import Path
 
 import pyarrow as pa
@@ -67,16 +67,18 @@ def main() -> None:
         session.register("candidates", quail.DocumentProvider.from_parquet(
             candidates, id_col="id"))
 
+        join_prompt = ("Judge whether the color named in {0} is the candidate "
+                       "color named in {1}. Output only TRUE or FALSE.")
         query = session.sql("""
             SELECT r.id, c.id FROM reports r
             JOIN candidates c
               ON AI_FILTER(PROMPT(
-                  'Judge whether the color named in {0} is the candidate color named in {1}. Output only TRUE or FALSE.',
+                  '%s',
                   r.body, c.body), {'selectivity': 0.25})
             WHERE AI_FILTER(PROMPT(
                 'Read the KEEP marker in {0}. Output only its TRUE or FALSE value.',
                 r.body), {'selectivity': 0.5})
-        """)
+        """ % join_prompt)
         print("compiled SQL", flush=True)
         expected = None
         for index in range(2):
