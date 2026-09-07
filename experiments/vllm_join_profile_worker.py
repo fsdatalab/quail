@@ -14,6 +14,11 @@ PREDICTION_TEXT = (
 )
 PREDICTION_TEXTS = {
     "FEV-9": PREDICTION_TEXT,
+    "AGENT-1": (
+        "vLLM will compute fewer fresh tokens than Quail by reusing shared "
+        "prefixes across agent snapshots. The saved unprofiled filter took "
+        "99.15 seconds, compared with Quail's 240.49 seconds."
+    ),
     "BIO-3": (
         "Request handling and scheduling leave substantial GPU idle time "
         "during BIO-3's join. The saved unprofiled join took 474.04 seconds "
@@ -64,6 +69,9 @@ def profile_worker(directory, connection, query="FEV-9"):
 
         @wraps(original_init)
         def initialize(llm, *args, **kwargs):
+            from quail.specs import MODELS
+
+            kwargs["revision"] = MODELS["qwen3-4b-fp8"].revision
             kwargs["worker_extension_cls"] = (
                 "experiments.vllm_join_profile_worker.ProfileExtension"
             )
@@ -76,15 +84,17 @@ def profile_worker(directory, connection, query="FEV-9"):
             return original_init(llm, *args, **kwargs)
 
         vllm.LLM.__init__ = initialize
-        original_join = request_module.run_join_grouped
+        phase = "filter" if query == "AGENT-1" else "join"
+        function = "_pipelined_filter" if phase == "filter" else "run_join_grouped"
+        original_join = getattr(request_module, function)
         joins = []
         model_info = {}
 
         @wraps(original_join)
         def profile_join(client, sampling_params, prefixes, suffixes, true_ids,
-                         **kwargs):
+                         *args, **kwargs):
             number = len(joins)
-            destination = root / f"join-{number}"
+            destination = root / f"{phase}-{number}"
             destination.mkdir()
             llm = client.llm
             if not model_info:
@@ -100,7 +110,7 @@ def profile_worker(directory, connection, query="FEV-9"):
                 })
                 assert config.model == "Qwen/Qwen3-4B-FP8"
             before = set(traces.glob("*.trace.json.gz"))
-            llm.start_profile(profile_prefix=f"join-{number}")
+            llm.start_profile(profile_prefix=f"{phase}-{number}")
             started_ns = time.time_ns()
             started = time.perf_counter()
             try:
@@ -108,10 +118,10 @@ def profile_worker(directory, connection, query="FEV-9"):
                     activities=[torch.profiler.ProfilerActivity.CPU],
                     with_stack=False, record_shapes=False,
                 ) as driver:
-                    with torch.profiler.record_function(f"quail.join-{number}"):
+                    with torch.profiler.record_function(f"quail.{phase}-{number}"):
                         result = original_join(
                             client, sampling_params, prefixes, suffixes,
-                            true_ids, **kwargs,
+                            true_ids, *args, **kwargs,
                         )
                 elapsed = time.perf_counter() - started
                 finished_ns = time.time_ns()
@@ -122,22 +132,28 @@ def profile_worker(directory, connection, query="FEV-9"):
             next(iter(produced)).rename(destination / "worker.trace.json.gz")
             driver.export_chrome_trace(str(destination / "driver.trace.json.gz"))
             record = {
-                "join": number, "anchors": len(prefixes), "partners": len(suffixes),
-                "pairs": len(prefixes) * len(suffixes),
-                "submission": result["submission"],
-                "wall_s": elapsed, "generate_wall_s": result["wall"],
+                "phase": phase, "wall_s": elapsed,
+                "generate_wall_s": result["wall_s" if phase == "filter" else "wall"],
                 "started_unix_ns": started_ns, "finished_unix_ns": finished_ns,
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
-                "true_pairs": sum(result["answers"]),
                 "traces": [str(p) for p in sorted(destination.glob("*.trace.json.gz"))],
             }
+            if phase == "join":
+                record.update({
+                    "join": number, "anchors": len(prefixes),
+                    "partners": len(suffixes), "pairs": len(prefixes) * len(suffixes),
+                    "submission": result["submission"],
+                    "true_pairs": sum(result["answers"]),
+                })
+            else:
+                record["documents"] = len(prefixes)
             joins.append(record)
-            (root / "joins.json").write_text(json.dumps(joins, indent=2))
-            print(f"[profile] join {number}: {json.dumps(record)}", flush=True)
+            (root / f"{phase}s.json").write_text(json.dumps(joins, indent=2))
+            print(f"[profile] {phase} {number}: {json.dumps(record)}", flush=True)
             return result
 
-        request_module.run_join_grouped = profile_join
+        setattr(request_module, function, profile_join)
         result = run_backend_group(
             data_dir="/results/quailb_data", model="qwen3-4b-fp8", sf=0.1, lf=1,
             query_ids=(query,), run_label=root.name,
@@ -145,9 +161,9 @@ def profile_worker(directory, connection, query="FEV-9"):
             ground_truth_collection="gt_77bb8b128743a79aedddaa24c808c3f8",
             methods=("pipelined_vllm",),
         )
-        assert len(joins) == {"FEV-9": 3, "BIO-3": 1}[query]
+        assert len(joins) == {"FEV-9": 3, "BIO-3": 1, "AGENT-1": 1}[query]
         result.update({
-            "prediction": PREDICTION_TEXTS[query], "profiled": True, "joins": joins,
+            "prediction": PREDICTION_TEXTS[query], "profiled": True, f"{phase}s": joins,
             "query": query,
             "model_info": model_info,
             "versions": {"torch": torch.__version__, "vllm": vllm.__version__},
