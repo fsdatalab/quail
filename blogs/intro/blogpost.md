@@ -398,13 +398,16 @@ session.register(
     ),
 )
 
-table = session.sql("""
+query = session.sql("""
     SELECT d.document_id
     FROM documents AS d
     WHERE AI_FILTER(
         PROMPT('Does {0} describe an adverse event?', d.text)
     )
-""").collect()
+""")
+
+print(query.explain())
+table = query.collect()
 ```
 
 - Quail parses the query locally, sends the logical plan and source description to Modal, reads only the required columns on the worker, and returns Arrow results.
