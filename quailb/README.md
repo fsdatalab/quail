@@ -1,5 +1,13 @@
 # QUAIL-B
 
+This package defines the benchmark: the document sets (`data.py`), the
+prompts (`prompts.py`), the queries as data (`queries.py`), the saved
+reference labels (`labels.py`), the labeling pass (`judge_pass.py`), and
+the scoring of one run (`scoring.py`). It does not run any engine. The
+runner for Quail and the stock vLLM and SGLang baselines is
+`quail/bench/`; it builds Quail queries from the specs and hands the
+answers back as a `RunOutput` to score.
+
 QUAIL-B has 32 filter and join queries at scale factor 0.1, plus
 2 optional PrivacyPolicies queries (PRIV-1, PRIV-2) that run only
 when `register_privacy_sets()` has been called. The saved ground
@@ -74,7 +82,7 @@ physical H100. The command saves separate summaries and one manifest on the
 `quail-results` volume.
 
 By default, the command loads `SELECTIVITY_ESTIMATE_COLLECTION` from
-`quailb.py`. It is the current active collection. Pass
+`queries.py`. It is the current active collection. Pass
 `--ground-truth-collection <collection_id>` only when testing a specific
 older collection.
 
@@ -89,12 +97,12 @@ the `quail-results` Modal volume under
 First decide whether the query reuses existing predicates.
 
 If it uses the same prompt constants with the same input roles, add the query
-to `queries()` in `quailb.py`. No new labeling run is needed. The evaluator
+to `QUERIES` in `queries.py`. No new labeling run is needed. The evaluator
 will use the saved labels for those predicates.
 
 If the query adds a predicate:
 
-1. Add the prompt constant and query to `quailb.py`.
+1. Add the prompt constant to `prompts.py` and the query to `queries.py`.
 2. Add one `PredicateSpec` to `PREDICATES` in `judge_pass.py`. Give it a
    descriptive stable key, the prompt, the input table, the input column, and
    the left and right roles.
@@ -113,7 +121,7 @@ If the query adds a predicate:
 mkdir -p results/benchmark
 label_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-label.log"
 
-uv run modal run -m quail.bench.judge_pass \
+uv run modal run -m quailb.judge_pass \
   2>&1 | tee "$label_log"
 ```
 

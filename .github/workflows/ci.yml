@@ -15,7 +15,7 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen
       - name: Lint (ruff)
-        run: uv run --frozen ruff check quail tests experiments reports tools
+        run: uv run --frozen ruff check quail quailb tests experiments reports tools
       - name: Long string literals
         run: uv run --frozen python tools/check_long_strings.py
       - name: Dead code (vulture)

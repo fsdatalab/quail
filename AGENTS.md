@@ -34,7 +34,7 @@ these rules.
 
 CI runs these on every pull request. Run them before pushing:
 
-    uv run ruff check quail tests experiments reports tools
+    uv run ruff check quail quailb tests experiments reports tools
     uv run python tools/check_long_strings.py
     uv run vulture
     uv run pytest -q

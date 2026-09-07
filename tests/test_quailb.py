@@ -5,14 +5,15 @@ import pyarrow.parquet as pq
 import pytest
 
 import quail
-from quail.bench.quailb import (
+from quail.bench.quailb import queries, register_privacy_sets, register_sets
+from quail.planner.decide import collect_operators
+from quail.planner.plan import EngineConfig, Refusal
+from quailb.data import (
     AGENT_TRACE_DOCUMENTS,
     AGENT_TRACE_MAX_TOKENS,
     AGENT_TRACE_TURN_INTERVAL,
     ASPECTS,
     LEPARD_POSITIVE_PAIRS,
-    QUERY_FAMILY_WORKLOADS,
-    QUERY_ORDER,
     SCENARIOS,
     SETS,
     _agent_snapshot_boundaries,
@@ -21,15 +22,14 @@ from quail.bench.quailb import (
     _n_agent_documents,
     _n_lepard_pairs,
     _sample_lepard_pairs,
-    queries,
+)
+from quailb.queries import (
+    QUERY_FAMILY_WORKLOADS,
+    QUERY_ORDER,
     query_family_name,
-    register_privacy_sets,
-    register_sets,
     split_query_families,
     split_query_ids,
 )
-from quail.planner.decide import collect_operators
-from quail.planner.plan import EngineConfig, Refusal
 
 
 def _standin_sets(tmp_path):

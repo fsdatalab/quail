@@ -13,8 +13,11 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
   SGLang request backends. `executor/` is the GPU code and runs only
   inside the Modal image. `runtime/` is the session, compute providers,
   generic runner, token store, results, and the Modal worker. `bench/`
-  is the QUAIL-B benchmark; its [README](quail/bench/README.md) explains
-  how to run it and label a new predicate.
+  is the QUAIL-B runner for Quail and its request backends.
+- `quailb/` is the QUAIL-B benchmark itself: document sets, prompts,
+  queries as data, saved labels, the labeling pass, and scoring. It runs
+  no engine; its [README](quailb/README.md) explains how to run it on
+  Quail and label a new predicate.
 - `quail_ext_examples/` has example extensions.
 - `tests/` is the CPU suite. It runs in seconds and needs no GPU.
 - `experiments/` holds every Modal entry point that costs GPU time: the

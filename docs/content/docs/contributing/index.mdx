@@ -8,7 +8,8 @@ description: Where things live and how to check a change.
 | Path | Contents |
 | --- | --- |
 | `quail/` | The package. See [Architecture](/docs/architecture) for the module map. |
-| `quail/bench/` | The QUAIL-B benchmark: datasets, queries, ground truth, the evaluator, and the same-GPU runner. |
+| `quailb/` | The QUAIL-B benchmark: document sets, prompts, queries as data, saved labels, the labeling pass, and scoring. It runs no engine. |
+| `quail/bench/` | Quail's QUAIL-B runner: builds Quail queries from the specs, runs them on the same GPU as the baselines, and hands answers to the benchmark's scoring. |
 | `quail_ext_examples/` | Example extensions. |
 | `tests/` | CPU tests. They fake the GPU and run in seconds. |
 | `experiments/` | Every Modal entry point that costs GPU time: ablation and profiling scripts, and the smokes, probes, and gates under `experiments/cells/`. |

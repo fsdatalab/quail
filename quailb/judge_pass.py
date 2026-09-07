@@ -4,11 +4,11 @@ Qwen3 32B labels the predicates without exact source labels. FEVER and
 LePaRD supply source truth where available. The run uses stable label-set
 IDs and skips completed Parquet parts.
 
-    uv run modal run -m quail.bench.judge_pass
+    uv run modal run -m quailb.judge_pass
 
 Reuse labels after an unrelated table changes in a new corpus:
 
-    uv run modal run --detach -m quail.bench.judge_pass \
+    uv run modal run --detach -m quailb.judge_pass \
       --reuse-from-collection <collection> \
       --target-corpus <corpus> \
       --relabeled-workloads lepard
@@ -34,7 +34,7 @@ from quail import (
     bind_prompt,
     render_join_prompt_text,
 )
-from quail.bench import quailb
+from quailb import data, prompts
 
 SCHEMA_VERSION = 1
 SCALE_FACTOR = 0.1
@@ -89,94 +89,94 @@ class PredicateSpec:
 PREDICATES = (
     PredicateSpec(
         "quailb.imdb.review.mentions_positive_aspect", "imdb",
-        "review_mentions_positive_aspect", "filter", quailb.F1,
+        "review_mentions_positive_aspect", "filter", prompts.F1,
         "review", "reviews", "body"),
     PredicateSpec(
         "quailb.imdb.review.discusses_ending", "imdb",
-        "review_discusses_ending", "filter", quailb.F4,
+        "review_discusses_ending", "filter", prompts.F4,
         "review", "reviews", "body"),
     PredicateSpec(
         "quailb.imdb.review.mentions_named_actor", "imdb",
-        "review_mentions_named_actor", "filter", quailb.F5,
+        "review_mentions_named_actor", "filter", prompts.F5,
         "review", "reviews", "body"),
     PredicateSpec(
         "quailb.imdb.review.discusses_aspect", "imdb",
-        "review_discusses_aspect", "join", quailb.DISCUSS_ASPECT,
+        "review_discusses_aspect", "join", prompts.DISCUSS_ASPECT,
         "review", "reviews", "body", "aspect", "aspects", "aspect"),
     PredicateSpec(
         "quailb.imdb.review.positive_sentiment_about_aspect",
         "imdb",
         "review_positive_sentiment_about_aspect", "join",
-        quailb.ASPECT_SENTIMENT,
+        prompts.ASPECT_SENTIMENT,
         "review", "reviews", "body", "aspect", "aspects", "aspect"),
     PredicateSpec(
         "quailb.biodex.report.involves_female_patient", "biodex",
-        "report_involves_female_patient", "filter", quailb.F7,
+        "report_involves_female_patient", "filter", prompts.F7,
         "report", "reports", "report"),
     PredicateSpec(
         "quailb.biodex.report.experienced_reaction", "biodex",
-        "report_experienced_reaction", "join", quailb.REACTION,
+        "report_experienced_reaction", "join", prompts.REACTION,
         "report", "reports", "report", "reaction", "terms", "term"),
     PredicateSpec(
         "quailb.fever.claim.about_person", "fever",
-        "claim_about_person", "filter", quailb.F11,
+        "claim_about_person", "filter", prompts.F11,
         "claim", "claims", "claim"),
     PredicateSpec(
         "quailb.fever.claim.contains_date", "fever",
-        "claim_contains_date", "filter", quailb.F12,
+        "claim_contains_date", "filter", prompts.F12,
         "claim", "claims", "claim"),
     PredicateSpec(
         "quailb.fever.passage.about_person", "fever",
-        "passage_about_person", "filter", quailb.F13,
+        "passage_about_person", "filter", prompts.F13,
         "passage", "evidence", "text"),
     PredicateSpec(
         "quailb.fever.passage.supports_claim", "fever",
-        "passage_supports_claim", "join", quailb.SUPPORT,
+        "passage_supports_claim", "join", prompts.SUPPORT,
         "claim", "claims", "claim", "passage", "evidence", "text",
         "fever_annotation_then_qwen3_32b"),
     PredicateSpec(
         "quailb.fever.passage.refutes_claim", "fever",
-        "passage_refutes_claim", "join", quailb.REFUTE,
+        "passage_refutes_claim", "join", prompts.REFUTE,
         "claim", "claims", "claim", "passage", "evidence", "text"),
     PredicateSpec(
         "quailb.lepard.excerpt.reasoning_does_not_apply", "lepard",
-        "excerpt_reasoning_does_not_apply", "filter", quailb.LEP1,
+        "excerpt_reasoning_does_not_apply", "filter", prompts.LEP1,
         "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.procedural_or_jurisdictional", "lepard",
         "excerpt_procedural_or_jurisdictional", "filter",
-        quailb.LEP2, "excerpt", "citation_contexts", "destination_context"),
+        prompts.LEP2, "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.treats_passage_as_binding", "lepard",
-        "excerpt_treats_passage_as_binding", "filter", quailb.LEP3,
+        "excerpt_treats_passage_as_binding", "filter", prompts.LEP3,
         "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.supports_liability_or_guilt", "lepard",
         "excerpt_supports_liability_or_guilt", "filter",
-        quailb.LEP4, "excerpt", "citation_contexts", "destination_context"),
+        prompts.LEP4, "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.excerpt.acknowledges_court_disagreement", "lepard",
         "excerpt_acknowledges_court_disagreement", "filter",
-        quailb.LEP5, "excerpt", "citation_contexts", "destination_context"),
+        prompts.LEP5, "excerpt", "citation_contexts", "destination_context"),
     PredicateSpec(
         "quailb.lepard.passage.states_general_rule", "lepard",
-        "passage_states_general_rule", "filter", quailb.LEPS1,
+        "passage_states_general_rule", "filter", prompts.LEPS1,
         "passage", "citation_passages", "passage_text"),
     PredicateSpec(
         "quailb.lepard.excerpt.cites_passage", "lepard",
-        "excerpt_cites_passage", "join", quailb.LEPJOIN,
+        "excerpt_cites_passage", "join", prompts.LEPJOIN,
         "excerpt", "citation_contexts", "destination_context",
         "passage", "citation_passages", "passage_text",
         "lepard_citation_edge"),
     PredicateSpec(
         "quailb.agent.trace.recovered_after_unsuccessful_approach",
         "agent", "recovered_after_unsuccessful_approach",
-        "filter", quailb.AGENT_RECOVERED,
+        "filter", prompts.AGENT_RECOVERED,
         "agent_trace", "agent_traces", "trace"),
     PredicateSpec(
         "quailb.agent.trace.implemented_plausible_fix",
         "agent", "implemented_plausible_fix",
-        "filter", quailb.AGENT_IMPLEMENTED_FIX,
+        "filter", prompts.AGENT_IMPLEMENTED_FIX,
         "agent_trace", "agent_traces", "trace"),
 )
 
@@ -309,7 +309,7 @@ JUDGE_SPEC = {
     "temperature": 0.0,
     "max_tokens": 1,
     "min_tokens": 1,
-    "seed": quailb.DATA_SEED,
+    "seed": data.DATA_SEED,
     "allowed_answers": ["TRUE", "FALSE"],
     "prefix_caching": True,
     "max_model_len": MAX_MODEL_LEN,
@@ -320,12 +320,12 @@ JUDGE_ID = _named_id("j", JUDGE_FULL_HASH)
 SOURCE_SPECS = {
     "fever_annotation": {
         "dataset": "fever/fever",
-        "revision": quailb.SOURCE_REVISIONS["fever/fever"],
+        "revision": data.SOURCE_REVISIONS["fever/fever"],
         "rule": "matching evidence_wiki_url; SUPPORTS is true; REFUTES false",
     },
     "lepard_citation_edge": {
         "dataset": "rmahari/LePaRD",
-        "revision": quailb.SOURCE_REVISIONS["rmahari/LePaRD"],
+        "revision": data.SOURCE_REVISIONS["rmahari/LePaRD"],
         "rule": ("anchor cited_passage_ids intersects candidate "
                  "passage_ids"),
     },
@@ -407,13 +407,13 @@ image = (
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail")
+    .add_local_python_source("quail", "quailb")
 )
 
 data_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("numpy", "pyarrow")
-    .add_local_python_source("quail")
+    .add_local_python_source("quail", "quailb")
 )
 
 # Building the corpus reads the source datasets off HuggingFace, so it
@@ -424,7 +424,7 @@ corpus_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("numpy", "pyarrow", "pandas", "huggingface_hub",
                  "datasets", "transformers>=5.2.0")
-    .add_local_python_source("quail")
+    .add_local_python_source("quail", "quailb")
 )
 
 # Experiment cells attach to this existing app so its caches remain useful.
@@ -513,8 +513,8 @@ def _corpus_identity(rows: dict[str, list[dict]], sf: float) -> dict:
         "schema_version": SCHEMA_VERSION,
         "benchmark": "quailb",
         "scale_factor": sf,
-        "data_seed": quailb.DATA_SEED,
-        "source_revisions": quailb.SOURCE_REVISIONS,
+        "data_seed": data.DATA_SEED,
+        "source_revisions": data.SOURCE_REVISIONS,
         "tables": tables,
     }
     full = _full_hash(payload)
@@ -524,7 +524,7 @@ def _corpus_identity(rows: dict[str, list[dict]], sf: float) -> dict:
 
 def _materialize_corpus(sf: float) -> tuple[Path, dict, dict]:
     with tempfile.TemporaryDirectory(prefix="quailb_judge_") as temp:
-        data_dir = quailb.build_sets(temp, sf=sf)
+        data_dir = data.build_sets(temp, sf=sf)
         rows = _read_rows(data_dir)
         identity = _corpus_identity(rows, sf)
         target = VOLUME_ROOT / "corpora" / identity["corpus_id"]
@@ -703,7 +703,7 @@ class ModelJudge:
             model=MODEL_REPO,
             revision=MODEL_REVISION,
             tokenizer_revision=MODEL_REVISION,
-            seed=quailb.DATA_SEED,
+            seed=data.DATA_SEED,
             kv_cache_dtype="auto",
             max_model_len=MAX_MODEL_LEN,
             max_num_batched_tokens=MAX_BATCH_TOKENS,
@@ -714,7 +714,7 @@ class ModelJudge:
         self.sampling = SamplingParams(
             temperature=0.0, max_tokens=1, min_tokens=1,
             allowed_token_ids=allowed, logprobs=len(allowed),
-            seed=quailb.DATA_SEED)
+            seed=data.DATA_SEED)
         self.boot_s = round(time.perf_counter() - t0, 2)
         self.requests = 0
         self.prompt_tokens = 0

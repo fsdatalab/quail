@@ -10,7 +10,7 @@ clearly content rather than code:
   assignment to a name containing PROMPT, TEMPLATE, SQL, QUERY, HTML,
   or TEXT, in any case;
 - it lives in a prompts module or folder: any part of the file path
-  contains "prompt" (quail/bench/prompts.py, experiments/prompts/x.py);
+  contains "prompt" (quailb/prompts.py, experiments/prompts/x.py);
 - it looks like HTML (starts with "<" and ends with ">") or SQL (starts
   with SELECT, WITH, INSERT, CREATE, or UPDATE).
 
@@ -29,7 +29,8 @@ import re
 import sys
 from pathlib import Path
 
-DEFAULT_PATHS = ("quail", "tests", "experiments", "reports", "tools")
+DEFAULT_PATHS = ("quail", "quailb", "tests", "experiments", "reports",
+                 "tools")
 DEFAULT_LIMIT = 200
 CONTENT_NAME = re.compile(r"prompt|template|sql|query|html|text", re.I)
 SQL_START = re.compile(r"^\s*(select|with|insert|create|update)\b", re.I)

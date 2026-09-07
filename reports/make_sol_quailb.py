@@ -65,14 +65,7 @@ import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
 import quail
-from quail.bench import quailb as Q
-from quail.bench.evaluate import (
-    BenchmarkEvaluator,
-    GroundTruthCollection,
-    PredicateLabels,
-    corpus_identity,
-    read_corpus,
-)
+from quail.bench.quailb import answer_oracle, queries, register_sets
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig
 from quail.runtime.prefixes import shared_prefix_tokens
@@ -82,6 +75,14 @@ from quail.specs import (
     QWEN3_4B_FP8,
     QWEN3_32B_FP8,
 )
+from quailb import data, prompts
+from quailb.labels import GroundTruthCollection, PredicateLabels
+from quailb.queries import (
+    SELECTIVITY_ESTIMATE_COLLECTION,
+    SELECTIVITY_ESTIMATE_CORPUS,
+    SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+)
+from quailb.scoring import Evaluator
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("workdir")
@@ -159,13 +160,15 @@ def load_collection(workdir: Path, collection: dict) -> GroundTruthCollection:
 
 
 truth = load_collection(W, COLLECTION)
-corpus_rows = read_corpus(W / "data" / TAG)
-corpus = corpus_identity(corpus_rows, SF, Q.DATA_SEED, Q.SOURCE_REVISIONS)
+corpus_rows = data.read_corpus(W / "data" / TAG)
+corpus = data.corpus_identity(
+    corpus_rows, SF, data.DATA_SEED, data.SOURCE_REVISIONS)
 if corpus["corpus_id"] != truth.corpus_id:
     raise SystemExit(
         f"the corpus in {W} is {corpus['corpus_id']}, but the labels are "
         f"for {truth.corpus_id}")
-evaluator = BenchmarkEvaluator(truth, corpus_rows)
+evaluator = Evaluator(truth, corpus_rows)
+answer = answer_oracle(evaluator)
 
 # ================================================================
 # PART 2: the queries, on one session with the shared Qwen3 tokenizer
@@ -173,8 +176,8 @@ evaluator = BenchmarkEvaluator(truth, corpus_rows)
 
 session = quail.Session(
     EngineConfig(gpus=1, model=QWEN3_4B_FP8.name), tokenizer=encode)
-Q.register_sets(session, W / "data" / TAG)
-query_defs = Q.queries(session)
+register_sets(session, W / "data" / TAG)
+query_defs = queries(session)
 query_ids = list(query_defs)
 if args.queries:
     selected = args.queries.split(",")
@@ -183,10 +186,10 @@ if args.queries:
     query_ids = [query for query in query_ids if query in selected]
 
 # 2. prompt lengths, for the record
-FILTER_TEMPLATES = {c: getattr(Q, c) for c in (
+FILTER_TEMPLATES = {c: getattr(prompts, c) for c in (
     "F1", "F4", "F5", "F7", "F11", "F12", "F13",
     "LEP1", "LEP2", "LEP3", "LEP4", "LEP5", "LEPS1")}
-JOIN_TEMPLATES = {c: getattr(Q, c) for c in (
+JOIN_TEMPLATES = {c: getattr(prompts, c) for c in (
     "DISCUSS_ASPECT", "ASPECT_SENTIMENT", "REACTION",
     "SUPPORT", "REFUTE", "LEPJOIN")}
 col_ref = (quail.ColumnRef("x", "t", "c"),)
@@ -311,10 +314,10 @@ for qid in query_ids:
     query_inputs[qid] = {}
     for model in MODELS:
         per_document = record(quail.speed_of_light_estimate(
-            build(), evaluator.answer, model=model,
+            build(), answer, model=model,
             credit_shared_prefixes=False))
         estimate = quail.speed_of_light_estimate(
-            build(), evaluator.answer, model=model)
+            build(), answer, model=model)
         assumptions.setdefault(model.name, estimate.assumptions())
         optimal = record(estimate)
         optimal["shared_prefix_tokens_credited"] = (
@@ -405,9 +408,9 @@ json.dump({
         "filter_order": (
             "by_cost from fixed benchmark selectivity estimates"),
         "filter_selectivity_sources": {
-            "collection": Q.SELECTIVITY_ESTIMATE_COLLECTION,
-            "corpus": Q.SELECTIVITY_ESTIMATE_CORPUS,
-            "scale_factor": Q.SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+            "collection": SELECTIVITY_ESTIMATE_COLLECTION,
+            "corpus": SELECTIVITY_ESTIMATE_CORPUS,
+            "scale_factor": SELECTIVITY_ESTIMATE_SCALE_FACTOR,
         },
         "plan_space": "all feasible left deep plans",
         "dp_state": "joined alias set and cached prefix alias set",
@@ -425,7 +428,7 @@ json.dump({
         "estimator_assumptions": assumptions,
     },
     "sources": {
-        "corpora": f"/results/quailb_data/{TAG}, seed {Q.DATA_SEED}",
+        "corpora": f"/results/quailb_data/{TAG}, seed {data.DATA_SEED}",
         "labels": "/results/ground_truth/quailb/schema_v1/label_sets on "
                   "quail-results, qwen3-32b-fp8 answering",
         "tokenizer": "Qwen/Qwen3-4B-FP8, shared by every Qwen3 model"},
