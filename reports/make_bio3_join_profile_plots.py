@@ -119,14 +119,11 @@ def plot_window(window):
     """Save a chronological GPU and CPU view of the selected five seconds."""
     plt.style.use(HERE / "quail.mplstyle")
     start, end = window["start"], window["end"]
-    active = sum(b - a for a, b in window["gpu"])
     levels = max(event[2] for event in window["cpu"]) + 1
     fig = plt.figure(figsize=(18, 4.9 + 0.32 * levels))
     fig.set_layout_engine("none")
-    fig.text(0.09, 0.965, f"BIO-3, pipelined vLLM, {start:g} to {end:g} seconds after join start",
+    fig.text(0.09, 0.92, "BIO-3 query with vLLM",
              fontsize=18, weight="bold")
-    fig.text(0.09, 0.92, f"GPU active {active:.2f} seconds; GPU idle {end - start - active:.2f} seconds",
-             fontsize=17)
     gpu = fig.add_axes((0.09, 0.69, 0.89, 0.17))
     position = start
     vertices, fills = [], []
@@ -146,7 +143,7 @@ def plot_window(window):
             yticklabels=["GPU active", "GPU idle"], xticks=range(int(start), int(end) + 1))
     gpu.tick_params(axis="both", labelsize=12)
     cpu = fig.add_axes((0.09, 0.17, 0.89, 0.40), sharex=gpu)
-    cpu.set_title(f"Recorded CPU operations on worker thread {window['thread_id']}", loc="left", fontsize=14)
+    cpu.set_title("CPU operations", loc="left", fontsize=14)
     vertices, fills = [], []
     for a, b, depth, name in window["cpu"]:
         add(a, b, depth, 0.9, color({"name": name}))
@@ -209,7 +206,7 @@ button {font:inherit;padding:6px 12px;margin-right:10px;cursor:pointer}
 #details {white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace;min-height:90px}
 #selected {overflow-wrap:anywhere;margin:16px 0;font-family:ui-monospace,monospace}
 </style>
-<h1>BIO-3, pipelined vLLM, profiled join</h1>
+<h1>BIO-3 query with vLLM</h1>
 <h2 id="headline"></h2>
 <div id="overview-gpu" class="gpu-bar" role="img" aria-label="Total GPU idle and active time">
   <div class="gpu-segment gpu-idle"></div><div class="gpu-segment gpu-active"></div>

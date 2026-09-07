@@ -46,7 +46,7 @@ function drawCpuGpuWindow() {
   windowContext.fillText('GPU active', 0, 46);
   windowContext.fillText('GPU idle', 0, 103);
   windowContext.fillText('CPU', 0, cpuTop + 18);
-  windowContext.fillText('Worker thread ' + cpuWindow.thread_id, left, cpuTop - 16);
+  windowContext.fillText('CPU operations', left, cpuTop - 16);
   const decimals = viewEnd - viewStart < 1 ? 6 : 1;
   windowContext.font = '12px ui-monospace,monospace';
   for (let i = 0; i <= 5; i++) {
