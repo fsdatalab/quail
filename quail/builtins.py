@@ -10,6 +10,7 @@ from quail.backends.quail import quail_runtimes
 from quail.backends.request import request_runtimes
 from quail.catalog import built_in_source_readers
 from quail.extensions import ExtensionRegistry
+from quail.logical_rules import built_in_logical_rules
 from quail.physical import built_in_codecs
 from quail.runtime.runner import built_in_runtimes
 from quail.specs import DEVICES, MODELS
@@ -26,6 +27,8 @@ def built_in_registry() -> ExtensionRegistry:
     registry.register_backend(stock_vllm_backend())
     registry.register_backend(pipelined_vllm_backend())
     registry.register_backend(pipelined_sglang_backend())
+    for rule in built_in_logical_rules():
+        registry.register_logical_rule(rule)
     for codec in built_in_codecs():
         registry.register_codec(codec)
     for runtimes in (built_in_runtimes(), quail_runtimes(), request_runtimes()):

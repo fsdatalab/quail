@@ -372,7 +372,7 @@ json.dump({
     "query_count": len(rows),
     "corpora": {
         key: {
-            "documents": len(store),
+            "documents": len(store.lengths),
             "tokens": sum(store.lengths),
             "shared_prefix_tokens": shared_prefix_tokens(store),
         }

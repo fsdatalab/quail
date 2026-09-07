@@ -16,12 +16,18 @@ from quail.runtime.tokens import shared_prefix_lengths
 _prefix_credit_cache: dict[str, list[int]] = {}
 
 
+def _documents(store):
+    """Return the token documents of a token store or a scan input."""
+    return getattr(store, "tokens", store)
+
+
 def prefix_credits(store) -> list[int]:
     """Return, per document, the prefix tokens another document also has."""
-    path = getattr(store, "path", None)
+    documents = _documents(store)
+    path = getattr(documents, "path", None)
     if path is not None and path in _prefix_credit_cache:
         return _prefix_credit_cache[path]
-    credits = shared_prefix_lengths([list(document) for document in store])
+    credits = shared_prefix_lengths([list(document) for document in documents])
     if path is not None:
         _prefix_credit_cache[path] = credits
     return credits
@@ -34,7 +40,7 @@ def shared_prefix_tokens(store) -> int:
 
 def store_token_count(store) -> int:
     """Return the total tokens of a token store's documents."""
-    return sum(len(document) for document in store)
+    return sum(len(document) for document in _documents(store))
 
 
 def scanned_shared_prefix_tokens(scanned_columns, stores) -> int:

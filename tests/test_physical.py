@@ -36,7 +36,7 @@ class FirstDocuments(PhysicalNode):
 
     type_name: ClassVar[str] = "test.first_documents"
     runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.CLIENT
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
     @property
     def outputs(self):
