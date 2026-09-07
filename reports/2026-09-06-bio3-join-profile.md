@@ -8,10 +8,10 @@
   does not establish a complete breakdown of request preparation,
   communication, or other Python work.
 
-[Open the interactive CPU flame graph](plots/bio3_join_profile.html) or
+[Open the interactive CPU and GPU flame graph](plots/bio3_join_profile.html) or
 [the vector PDF](plots/bio3_join_profile.pdf).
 
-[![BIO-3 recorded CPU operations](plots/bio3_join_profile.png)](plots/bio3_join_profile.pdf)
+[![BIO-3 CPU intervals and concurrent GPU activity](plots/bio3_join_profile.png)](plots/bio3_join_profile.pdf)
 
 Figure: plots/bio3_join_profile.png
 
@@ -21,6 +21,14 @@ Figure: plots/bio3_join_profile.png
   the complete name, call count, elapsed time, and time without recorded
   child operations. The PDF shows the largest operations and first eight
   levels; the HTML includes smaller operations and deeper levels.
+- The bottom strip of each rectangle shows GPU overlap in those CPU
+  intervals. Green is elapsed time covered by at least one GPU kernel,
+  copy, or memset. Dark gray is elapsed time with none. Hover displays
+  both values in seconds. Overlapping GPU operations count once.
+- Strip segments show aggregate durations, not the original event order.
+  GPU work can come from a previously submitted request. The strip shows
+  concurrency, not which CPU operation launched a kernel. CPU and GPU
+  durations overlap and must not be added together.
 - This is a graph of nested recorded CPU operations, not sampled Python
   call stacks. It uses `cpu_op`, `cuda_runtime`, and the explicit
   `vllm.scheduler.*` annotations on worker thread 92. Broad execution
@@ -29,9 +37,13 @@ Figure: plots/bio3_join_profile.png
 - The 406.37 seconds labeled `[no recorded CPU operation]` are time outside
   those recorded operations. They can include Python work, waiting, and
   profiling overhead. They are not a measurement of CPU or GPU idle time.
+  GPU operations cover 91.78 seconds of those intervals; the GPU is idle
+  for the other 314.58 seconds. Determining what the CPU did during those
+  intervals requires recording more Python functions.
 - The trace does not record Python calls inside `vllm.scheduler.schedule`.
   Zooming cannot supply that missing breakdown. Other operations, such as
   the recorded PyTorch attention calls, do have nested recorded children.
+
 ## Setup
 
 - The experiment runs BIO-3 with Qwen3 4B FP8 on one H100. BIO-3 filters
