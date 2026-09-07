@@ -985,7 +985,7 @@ def add_prefix_metrics(row: dict, query, report: dict) -> dict:
     columns = {scan.alias: (scan.provider, scan.column) for scan in scans}
     shared = scanned_shared_prefix_tokens(
         [columns[alias] for alias in scanned_aliases(report.get("stages", ()))],
-        query.session.tokenize,
+        lambda provider, column: query.session.tokenize(provider, column).tokens,
     )
     cross_row = cross_row_cached_tokens(report)
     row.update({
