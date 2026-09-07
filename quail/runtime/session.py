@@ -1,5 +1,6 @@
 """Register documents, plan queries, and run them through a compute provider."""
 
+import os
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
@@ -259,6 +260,7 @@ class Session:
         reader = iter(scan_reader)
         token_writer = None
         column_writers = {}
+        writers = []
         try:
             batches = reader
             if column is not None:
@@ -271,13 +273,12 @@ class Session:
                     tokenizer=tok,
                     token_type=token_type,
                 )
+                writers.append(token_writer)
             source_schema = provider.schema()
             for name in value_columns:
                 column_writers[name] = ColumnStoreWriter(
                     self._store_path(), source_schema.field(name))
-            writers = [*column_writers.values()]
-            if token_writer is not None:
-                writers.append(token_writer)
+                writers.append(column_writers[name])
             for batch in batches:
                 for writer in writers:
                     writer.write_batch(batch)
@@ -287,23 +288,35 @@ class Session:
             raise
         finally:
             scan_reader.close()
-        if token_writer is not None:
-            self._token_stores[(identity, column)] = token_writer.finish()
-        for name, writer in column_writers.items():
-            self._column_stores[(identity, name)] = writer.finish()
-        # a value column read on a later scan must line up row for row
-        # with the token file written on an earlier one
-        token_rows = next(
-            (len(store) for (store_identity, _), store
-             in self._token_stores.items() if store_identity == identity),
+        token_store = (
+            token_writer.finish() if token_writer is not None else None)
+        column_stores = {
+            name: writer.finish() for name, writer in column_writers.items()
+        }
+        # every file for one provider must line up row for row, so a
+        # later scan must return as many rows as the earlier one did
+        known_rows = next(
+            (len(store) for (store_identity, _), store in chain(
+                self._token_stores.items(), self._column_stores.items())
+             if store_identity == identity),
             None)
-        for name in value_columns:
-            rows = len(self._column_stores[(identity, name)])
-            if token_rows is not None and rows != token_rows:
+        written = list(column_stores.items())
+        if token_store is not None:
+            written.append((column, token_store))
+        for name, store in written:
+            rows = len(store)
+            if known_rows is not None and rows != known_rows:
+                for _, bad in written:
+                    bad.close()
+                    os.unlink(bad.path)
                 raise RuntimeError(
-                    f"{provider_name}.{name} returned {rows} rows but its "
-                    f"documents were tokenized as {token_rows} rows; the "
-                    f"provider does not scan in a stable order")
+                    f"{provider_name}.{name} returned {rows} rows but an "
+                    f"earlier scan returned {known_rows}; the provider "
+                    f"does not scan in a stable order")
+        if token_store is not None:
+            self._token_stores[(identity, column)] = token_store
+        for name, store in column_stores.items():
+            self._column_stores[(identity, name)] = store
 
 
 class BoundBuilder:
@@ -482,7 +495,7 @@ class Query:
         def project(node, value):
             if not isinstance(node, Project):
                 raise TypeError(type(node).__name__)
-            if isinstance(value, pa.Table) and "answer" in value.column_names:
+            if node.inputs[0].value_type is ValueType.JOIN_ANSWERS:
                 # a join answers table read directly: keep the true pairs
                 value = true_answer_rows(value)
             relation = (

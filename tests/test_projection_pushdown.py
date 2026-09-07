@@ -1,5 +1,7 @@
 """Projection pushdown rule tests."""
 
+from pathlib import Path
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -202,3 +204,71 @@ def test_second_query_with_other_columns_does_not_tokenize_again(tmp_path):
     assert len(session._token_stores) == 1
     assert sorted(name for _, name in session._column_stores) == [
         "id", "review", "stars"]
+
+
+class _UnstableProvider:
+    """A provider whose row count changes between scans."""
+
+    id_col = "id"
+    columns = ("id", "body", "stars")
+
+    def __init__(self):
+        self.scans = 0
+
+    def schema(self):
+        return pa.schema({"id": pa.string(), "body": pa.string(),
+                          "stars": pa.int64()})
+
+    def content_identity(self):
+        return "unstable"
+
+    def statistics(self):
+        from quail.catalog import TableStatistics
+        return TableStatistics(row_count=3)
+
+    def scan(self, request):
+        self.scans += 1
+        rows = 3 if self.scans == 1 else 2
+        table = pa.table({
+            "id": [f"r{i}" for i in range(rows)],
+            "body": ["one two"] * rows,
+            "stars": list(range(rows)),
+        }).select(list(request.columns))
+        return table.to_reader()
+
+    def remote_source(self):
+        return None
+
+
+def test_misaligned_second_scan_raises_and_caches_nothing():
+    session = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
+    provider = _UnstableProvider()
+    session.register("docs", provider)
+    session.tokenize("docs", "body", ("id",))
+
+    with pytest.raises(RuntimeError, match="stable order"):
+        session.tokenize("docs", "body", ("stars",))
+    with pytest.raises(RuntimeError, match="stable order"):
+        session.tokenize("docs", "body", ("stars",))
+
+    assert ("unstable", "stars") not in session._column_stores
+    assert len(list(Path(session._token_directory.name).iterdir())) == 2
+    session.close()
+
+
+def test_failed_tokenizer_surfaces_its_own_error_and_leaves_no_files(
+        tmp_path):
+    def broken(text):
+        raise ValueError("tokenizer failed")
+
+    session = _session(tmp_path)
+    session._tok = broken
+
+    with pytest.raises(ValueError, match="tokenizer failed"):
+        session.tokenize("reviews", "review", ("id",))
+
+    assert session._token_stores == {}
+    assert session._column_stores == {}
+    assert session._token_directory is None or not list(
+        Path(session._token_directory.name).iterdir())
+    session.close()
