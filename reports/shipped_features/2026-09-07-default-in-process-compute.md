@@ -56,6 +56,17 @@ Costs: the locked Linux install grows by vLLM, torch 2.11 (CUDA 13),
 and the NVIDIA libraries, about 7.8 GB on disk. CI on `ubuntu-latest`
 installs them too.
 
+Measured on a Nebius VM, one H100 SXM, Ubuntu 24.04, CUDA 13 driver,
+running `docs/examples/local_gpu_smoke.py` with the default provider
+and Qwen3 4B fp8, first run on the machine:
+
+| Number | Value | Compared with |
+| --- | --- | --- |
+| rows | r1, r4 | the two reports that name a female patient |
+| `wall_s` (query only) | 0.28 s | 4 documents, 151 fresh tokens |
+| `boot_s` | 218.9 s | includes the 189 s one-time kernel compile pass |
+| `worker_total_s` | 225.6 s | boot plus query plus tokenizing |
+
 Validation: `tests/test_default_compute.py` checks the default
 provider type, the error message without a GPU, and that a fake
 executor skips the check. Installed the locked dependencies on a Linux
