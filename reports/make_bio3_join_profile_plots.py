@@ -5,6 +5,7 @@
     RUN=ablations/vllm-join-profile-20260907T013304Z
     uv run modal volume get quail-results "$RUN/result.json" "$W/result.json"
     uv run modal volume get quail-results "$RUN/cpu-flamegraph.json" "$W/cpu-flamegraph.json"
+    uv run modal volume get quail-results "$RUN/gpu-timeline.f64.gz" "$W/gpu-timeline.f64.gz"
     uv run --with matplotlib python reports/make_bio3_join_profile_plots.py "$W"
 
 The summary aggregates nested CPU intervals from join-0/worker.trace.json.gz
@@ -13,6 +14,7 @@ experiments.profile_flamegraph.read_cpu_flamegraph. Names are unchanged.
 """
 
 import argparse
+import base64
 import json
 from pathlib import Path
 
@@ -48,37 +50,47 @@ def plot_flamegraph(root):
     visible = [(start, depth, node) for start, depth, node in layout(root)
                if depth <= 7 and node["seconds"] >= root["seconds"] / 1500]
     levels = max(depth for _, depth, _ in visible) + 1
-    fig, ax = plt.subplots(figsize=(17, max(6, 2.4 + 0.45 * levels)))
+    fig = plt.figure(figsize=(17, max(8, 4.4 + 0.55 * levels)))
     fig.set_layout_engine("none")
+    fig.text(0.06, 0.965, "BIO-3, pipelined vLLM, profiled join", fontsize=16)
+    fig.text(0.06, 0.90,
+             f"GPU idle for {root['gpu_idle_seconds']:.2f} of {root['seconds']:.2f} seconds",
+             fontsize=25, weight="bold")
+    gpu = fig.add_axes((0.06, 0.70, 0.92, 0.15))
+    idle = root["gpu_idle_seconds"]
+    active = root["gpu_seconds"]
+    gpu.barh(0.5, idle, height=1, left=0, color=DARK)
+    gpu.barh(0.5, active, height=1, left=idle, color=GREEN)
+    gpu.text(idle / 2, 0.5, f"GPU idle\n{idle:.2f} seconds",
+             color="white", fontsize=22, weight="bold", ha="center", va="center")
+    gpu.text(idle + active / 2, 0.5, f"GPU active\n{active:.2f} seconds",
+             color="black", fontsize=22, weight="bold", ha="center", va="center")
+    gpu.set(xlim=(0, root["seconds"]), ylim=(0, 1), xticks=[], yticks=[])
+    fig.text(0.06, 0.665,
+             "Total time grouped by GPU state, not event order. Profiling overhead is included.", fontsize=11)
+    ax = fig.add_axes((0.06, 0.20, 0.92, 0.36))
     total = root["seconds"]
     for start, depth, node in visible:
         patch = Rectangle((start, depth), node["seconds"], 0.92,
                           facecolor=color(node), edgecolor="white", linewidth=0.4)
         ax.add_patch(patch)
-        ax.add_patch(Rectangle((start, depth + 0.78), node["seconds"], 0.14,
-                               facecolor=DARK, linewidth=0))
-        ax.add_patch(Rectangle((start, depth + 0.78), node["gpu_seconds"], 0.14,
-                               facecolor=GREEN, linewidth=0))
         width_fraction = node["seconds"] / total
         if width_fraction > 0.055:
             limit = max(4, int(width_fraction * 170))
             name = node["name"]
             label = name if len(name) <= limit else name[:limit - 3] + "..."
-            text = ax.text(start + node["seconds"] / 2, depth + 0.37,
-                           f"{label}\n{node['seconds']:.2f} s elapsed\nGPU {node['gpu_seconds']:.2f} s",
+            text = ax.text(start + node["seconds"] / 2, depth + 0.46,
+                           f"{label}\n{node['seconds']:.2f} s",
                            ha="center", va="center",
                            fontsize=9, color="black", clip_on=True)
             text.set_clip_path(patch)
     ax.set(xlim=(0, total), ylim=(levels, -0.2), xlabel="seconds", yticks=[])
-    ax.set_title("BIO-3, pipelined vLLM, CPU intervals and concurrent GPU activity", pad=18)
-    fig.text(0.06, 0.05,
-             "Width is total elapsed time across calls. Rows show nested recorded operations; horizontal position is not query time.\n"
+    ax.set_title("Recorded CPU operations", loc="left", pad=18)
+    fig.text(0.06, 0.04,
+             "Flame-graph width is total elapsed time across calls. Children appear below their parent. Horizontal position is not query time.\n"
              "Orange: scheduler methods. Blue: PyTorch and CUDA API operations on the CPU. Gray: thread interval or unrecorded time.\n"
-             "GPU labels and green strips show active seconds; dark gray strips show idle time. Overlap does not imply launch attribution.\n"
-             "Unrecorded CPU time is not CPU idle time. Python call stacks were not recorded.\n"
-             "Open bio3_join_profile.html to zoom and read complete names, small operations, and deeper levels.",
+             "Unrecorded CPU time is not CPU idle time. Open bio3_join_profile.html to inspect functions and their concurrent GPU activity.",
              fontsize=10, linespacing=1.5)
-    fig.subplots_adjust(left=0.06, right=0.98, top=0.87, bottom=0.43)
     destination = HERE / "plots/bio3_join_profile"
     fig.savefig(destination.with_suffix(".png"), dpi=300)
     fig.savefig(destination.with_suffix(".pdf"))
@@ -90,23 +102,74 @@ HTML = r'''<!doctype html>
 <title>BIO-3 CPU and GPU flame graph</title>
 <style>
 body {font:16px system-ui,sans-serif;color:#222;margin:28px;max-width:1800px}
-h1 {font-size:24px} p {max-width:1050px;line-height:1.5}
+h1 {font-size:22px;font-weight:500;margin-bottom:20px} p {max-width:1050px;line-height:1.5}
+h2 {font-size:22px;margin:28px 0 14px}
+#headline {font-size:clamp(25px,3vw,42px);line-height:1.2;margin:0 0 22px}
+.gpu-bar {display:flex;width:100%;height:120px}
+.gpu-segment {display:flex;flex-direction:column;align-items:center;justify-content:center;min-width:0;font-size:clamp(16px,2vw,26px);font-weight:650;line-height:1.5}
+.gpu-idle {background:__DARK__;color:white}
+.gpu-active {background:__GREEN__;color:#111}
+.caption {font-size:14px;color:#555;margin:12px 0 30px}
+#selection-gpu {margin:16px 0 24px}
+#selection-gpu .gpu-bar {height:80px}
+#selection-gpu .gpu-segment {font-size:18px}
+details {margin:18px 0} summary {cursor:pointer}
+input,select {font:inherit;padding:5px}
+.timeline-controls {display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0}
+#timeline-start {width:130px}
+#timeline-position {width:100%;box-sizing:border-box;margin:12px 0}
+#gpu-timeline {width:100%;height:180px;cursor:crosshair}
+#timeline-status,#timeline-hover {font:14px ui-monospace,monospace;min-height:22px;overflow-wrap:anywhere}
 button {font:inherit;padding:6px 12px;margin-right:10px;cursor:pointer}
 #chart {width:100%;overflow:auto} canvas {display:block;cursor:pointer}
 #details {white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace;min-height:90px}
 #selected {overflow-wrap:anywhere;margin:16px 0;font-family:ui-monospace,monospace}
 </style>
-<h1>BIO-3, pipelined vLLM, CPU intervals and concurrent GPU activity</h1>
+<h1>BIO-3, pipelined vLLM, profiled join</h1>
+<h2 id="headline"></h2>
+<div id="overview-gpu" class="gpu-bar" role="img" aria-label="Total GPU idle and active time">
+  <div class="gpu-segment gpu-idle"></div><div class="gpu-segment gpu-active"></div>
+</div>
+<p class="caption">Total time grouped by GPU state, not event order. GPU active means at least one recorded kernel or transfer.
+Profiling overhead is included.</p>
+<h2>GPU active and idle over time</h2>
+<p>Each interval uses its recorded start and end time. There is no averaging into percentages.
+The initial view shows one second around the first GPU operation.
+Zoom in to see brief intervals; some are narrower than a pixel in the whole-join view.</p>
+<div class="timeline-controls">
+  <label>Window <select id="timeline-window">
+    <option value="0.001">1 millisecond</option><option value="0.01">10 milliseconds</option>
+    <option value="0.1">100 milliseconds</option><option value="1" selected>1 second</option>
+    <option value="10">10 seconds</option><option value="60">60 seconds</option>
+    <option value="all">Whole join</option>
+  </select></label>
+  <label>Start <input id="timeline-start" type="number" min="0" step="0.1" value="0"> seconds</label>
+  <button id="timeline-prev">Previous</button><button id="timeline-next">Next</button>
+  <button id="timeline-first">First GPU operation</button>
+</div>
+<div id="timeline-status" role="status">Loading recorded GPU intervals...</div>
+<canvas id="gpu-timeline" aria-label="GPU active and idle intervals on a time axis"></canvas>
+<input id="timeline-position" type="range" min="0" max="1" step="any" value="0" aria-label="Timeline position">
+<div id="timeline-hover" role="status"></div>
+<h2>Recorded CPU operations</h2>
+<p>Click a function to see its GPU active and idle time. Hover for complete names and call counts.</p>
+<details><summary>How to read the CPU flame graph</summary>
 <p>Width is <strong>total elapsed seconds across calls</strong>. Children appear below their parent.
 Horizontal position is not query time. Click a rectangle to zoom; hover or click to read its complete name.</p>
 <p>Orange shows scheduler methods. Blue shows recorded PyTorch and CUDA API operations on the CPU.
 Gray marks the full thread interval or time with no recorded CPU operation.
 <strong>No recorded CPU operation does not mean CPU idle.</strong> Python work and waiting can occur there;
 Python call stacks were not recorded.</p>
-<p>Each bottom strip shows <strong>green for time overlapping GPU activity</strong> and dark gray for GPU idle time.
-Segments show totals, not event order. GPU work may come from an earlier request, so this is overlap, not launch attribution.</p>
+<p>GPU work may come from an earlier request, so the GPU breakdown shows overlap, not launch attribution.</p>
+</details>
 <button id="reset">Reset</button><button id="back">Back</button>
-<div id="selected"></div><p id="gpu-summary"></p>
+<div id="selected"></div>
+<div id="selection-gpu" hidden>
+  <p id="gpu-summary"></p>
+  <div class="gpu-bar" role="img" aria-label="GPU activity during selected CPU intervals">
+    <div class="gpu-segment gpu-idle"></div><div class="gpu-segment gpu-active"></div>
+  </div>
+</div>
 <div id="chart"><canvas id="canvas" aria-label="Interactive CPU flame graph with concurrent GPU activity"></canvas></div>
 <pre id="details" role="status"></pre>
 <script>
@@ -116,6 +179,22 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const details = document.getElementById('details');
 let selected = root, history = [], boxes = [];
+function gpuBar(element,node) {
+  const idle=element.querySelector('.gpu-idle'),active=element.querySelector('.gpu-active');
+  idle.style.width=(100*node.gpu_idle_seconds/node.seconds)+'%';
+  active.style.width=(100*node.gpu_seconds/node.seconds)+'%';
+  idle.textContent='';active.textContent='';
+  for (const [target,label,value] of [[idle,'GPU idle',node.gpu_idle_seconds],[active,'GPU active',node.gpu_seconds]]) {
+    const name=document.createElement('span'),number=document.createElement('span');
+    name.textContent=label;number.textContent=value.toFixed(2)+' seconds';
+    target.append(name,number);
+    target.style.display=value===0?'none':'flex';
+  }
+  element.setAttribute('aria-label','GPU idle '+node.gpu_idle_seconds.toFixed(2)+' seconds; GPU active '+node.gpu_seconds.toFixed(2)+' seconds');
+}
+document.getElementById('headline').textContent='GPU idle for '+root.gpu_idle_seconds.toFixed(2)
+  +' of '+root.seconds.toFixed(2)+' seconds';
+gpuBar(document.getElementById('overview-gpu'),root);
 function color(node) {
   if (node.name.startsWith('vllm.scheduler.')) return colors.orange;
   if (node.name.startsWith('[') || node.name === 'Worker main thread') return colors.gray;
@@ -134,7 +213,7 @@ function draw() {
   function collect(node, x, depth) {
     const w = node.seconds / selected.seconds * width;
     if (w < 0.25) return;
-    boxes.push({node:node,x:x,y:depth*44,w:w,h:42});
+    boxes.push({node:node,x:x,y:depth*34,w:w,h:32});
     let childX = x;
     for (const child of node.children) {
       collect(child, childX, depth+1);
@@ -149,9 +228,6 @@ function draw() {
   ctx.scale(ratio,ratio); ctx.font='12px ui-monospace,monospace';
   for (const box of boxes) {
     ctx.fillStyle = color(box.node); ctx.fillRect(box.x,box.y,Math.max(.25,box.w-1),box.h);
-    ctx.fillStyle=colors.dark;ctx.fillRect(box.x,box.y+34,Math.max(.25,box.w-1),8);
-    const activeWidth=box.w*box.node.gpu_seconds/box.node.seconds;
-    ctx.fillStyle=colors.green;ctx.fillRect(box.x,box.y+34,Math.max(0,activeWidth-1),8);
     if (box.w > 30) {
       ctx.save();ctx.beginPath();ctx.rect(box.x+3,box.y,Math.max(0,box.w-6),box.h);ctx.clip();
       ctx.fillStyle='#111';ctx.fillText(box.node.name,box.x+5,box.y+20);ctx.restore();
@@ -161,8 +237,9 @@ function draw() {
   const label = selected.seconds.toFixed(3)+' s';
   ctx.fillText(label,width-ctx.measureText(label).width,height-8);
   document.getElementById('selected').textContent=selected.name+' ('+selected.seconds.toFixed(3)+' s)';
-  document.getElementById('gpu-summary').textContent='During these intervals: GPU active '
-    +selected.gpu_seconds.toFixed(3)+' s; GPU idle '+selected.gpu_idle_seconds.toFixed(3)+' s.';
+  document.getElementById('selection-gpu').hidden=selected===root;
+  document.getElementById('gpu-summary').textContent='GPU activity during '+selected.name+' intervals';
+  gpuBar(document.querySelector('#selection-gpu .gpu-bar'),selected);
   document.getElementById('back').disabled=history.length===0;
 }
 function hit(event) {
@@ -177,15 +254,20 @@ canvas.addEventListener('click',event=>{
 document.getElementById('reset').onclick=()=>{selected=root;history=[];draw();describe(root);};
 document.getElementById('back').onclick=()=>{if(history.length){selected=history.pop();draw();describe(selected);}};
 window.addEventListener('resize',draw);draw();describe(root);
+const encodedTimeline = '__TIMELINE_DATA__';
+__TIMELINE_JS__
 </script></html>'''
 
 
-def write_interactive(root):
+def write_interactive(root, timeline):
     """Save a standalone interactive flame graph."""
     data = json.dumps(root).replace("<", "\\u003c")
-    html = HTML.replace("__DATA__", data).replace("__COLORS__", json.dumps({
+    html = HTML.replace("__DARK__", DARK).replace("__GREEN__", GREEN)
+    html = html.replace("__DATA__", data).replace("__COLORS__", json.dumps({
         "orange": ORANGE, "blue": BLUE, "gray": GRAY, "green": GREEN, "dark": DARK,
     }))
+    html = html.replace("__TIMELINE_DATA__", base64.b64encode(timeline).decode("ascii"))
+    html = html.replace("__TIMELINE_JS__", (HERE / "gpu_timeline.js").read_text())
     (HERE / "plots/bio3_join_profile.html").write_text(html)
 
 
@@ -198,4 +280,4 @@ if __name__ == "__main__":
     assert result["query"] == "BIO-3"
     assert summary["source"] == result["result_volume_path"]
     plot_flamegraph(summary["flamegraph"])
-    write_interactive(summary["flamegraph"])
+    write_interactive(summary["flamegraph"], (workdir / "gpu-timeline.f64.gz").read_bytes())

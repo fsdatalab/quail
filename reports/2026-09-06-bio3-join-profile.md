@@ -8,25 +8,32 @@
   does not establish a complete breakdown of request preparation,
   communication, or other Python work.
 
-[Open the interactive CPU and GPU flame graph](plots/bio3_join_profile.html) or
+[Open the GPU timeline and CPU flame graph](plots/bio3_join_profile.html) or
 [the vector PDF](plots/bio3_join_profile.pdf).
 
 [![BIO-3 CPU intervals and concurrent GPU activity](plots/bio3_join_profile.png)](plots/bio3_join_profile.pdf)
 
 Figure: plots/bio3_join_profile.png
 
-- Each rectangle's width is summed elapsed seconds across calls with the
-  same recorded name and parent. Children appear below their parent.
+- The large top bar shows whole-join GPU idle and active seconds directly.
+  It groups durations by state, not by event order.
+- The HTML GPU timeline uses the original interval boundaries. Its upper
+  row is active whenever at least one GPU kernel, copy, or memset is
+  running. Its lower row is idle between those intervals. No percentages
+  or time bins are used. Hover shows interval boundaries and durations.
+- The timeline initially shows one second around the first GPU operation.
+  Controls cover windows from one millisecond to the whole join, with
+  position input and previous/next buttons. Subpixel intervals require
+  zooming to distinguish; their timestamps are retained.
+- In the CPU flame graph, each rectangle's width is summed elapsed seconds
+  across calls with the same recorded name and parent. Children appear below their parent.
   Horizontal position is not query time. Click to zoom and hover to read
   the complete name, call count, elapsed time, and time without recorded
   child operations. The PDF shows the largest operations and first eight
   levels; the HTML includes smaller operations and deeper levels.
-- The bottom strip of each rectangle shows GPU overlap in those CPU
-  intervals. Green is elapsed time covered by at least one GPU kernel,
-  copy, or memset. Dark gray is elapsed time with none. Hover displays
-  both values in seconds. Overlapping GPU operations count once.
-- Strip segments show aggregate durations, not the original event order.
-  GPU work can come from a previously submitted request. The strip shows
+- Selecting a CPU function shows a separate bar of GPU idle and active
+  seconds during its intervals. This bar groups durations by state.
+  GPU work can come from a previously submitted request. This bar shows
   concurrency, not which CPU operation launched a kernel. CPU and GPU
   durations overlap and must not be added together.
 - This is a graph of nested recorded CPU operations, not sampled Python
@@ -161,6 +168,13 @@ uv run modal run --detach experiments/profile_vllm_join.py --query BIO-3 \
   that directory. `experiments/profile_flamegraph.py` constructs it from
   the worker trace, clipped to the driver's join annotation. CPU intervals
   are sorted by start time and nesting, and crossing intervals are rejected.
+- The GPU timeline is `gpu-timeline.f64.gz` in the same directory.
+  `experiments/profile_gpu_timeline.py` clips GPU events to the join and
+  merges overlapping operations into 2,044,446 active intervals.
+  It stores start/end pairs as little-endian doubles in microseconds
+  relative to the join start, compressed with gzip. Timestamp boundaries
+  are retained without time bins or rounding. The standalone HTML embeds
+  the compressed timeline and needs no server or network connection.
 - Profiled answers and engine report:
   `/results/benchmarks/quailb/runs/qb_20260907T013342Z_31dd2183/single/BIO-3.json`.
   Its `answer_tables` lists the filter and join Parquet files. We compared
