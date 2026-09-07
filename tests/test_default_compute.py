@@ -67,6 +67,7 @@ def test_in_process_run_reuses_the_planned_query(monkeypatch):
     )
     query = session.sql(FILTER_SQL)
     query.explain()
+    query.wait_for_tokens()
     stores_after_plan = dict(session._token_stores)
 
     def no_second_session(*args, **kwargs):

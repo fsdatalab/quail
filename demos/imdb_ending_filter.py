@@ -73,6 +73,7 @@ def main() -> None:
                 print(f"  stage evaluated {stage['evaluated']} reviews, "
                       f"{stage['observed_selectivity']:.3f} passed")
         print(f"boot_s: {report.get('boot_s')} ({report.get('boot_kind')})")
+        print(f"token_wait_s: {report.get('token_wait_s')}")
         print(f"wall_s: {wall_s}  (predicted about 270 s)")
         print(f"fresh_tokens: {report.get('fresh_tokens')}")
         print(f"documents/second: {n_docs / wall_s:.1f}")

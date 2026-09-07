@@ -104,6 +104,9 @@ def execute_worker_query(query, physical_executor=None):
             "more than 8 GPUs means multiple containers; the "
             "multi-container coordinator is a later step"
         )
+    if physical_executor is None:
+        # the model can load while the token file is still being written
+        _prepare_backend(plan, query.session.registry)
     request = query._prepare_physical()
     started = time.perf_counter()
     response = (
@@ -112,7 +115,25 @@ def execute_worker_query(query, physical_executor=None):
     )
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a physical executor must return PhysicalResponse")
-    return query.finish(response, time.perf_counter() - started)
+    result = query.finish(response, time.perf_counter() - started)
+    result.report["token_wait_s"] = round(query.token_wait_s, 4)
+    return result
+
+
+def _prepare_backend(plan, registry) -> None:
+    """Let the backend boot from the plan alone, before documents arrive."""
+    backend = registry.backend(plan.backend)
+    prepare = getattr(backend, "prepare_request", None)
+    if prepare is None:
+        return
+    envelope = plan.to_envelope(registry.codecs)
+    prepare(BackendExecutionContext(
+        request=PhysicalRequest(envelope, {}),
+        graph=plan.graph,
+        registry=registry,
+        gpu_count=plan.workers,
+        runtime_state=_RUNTIME.booted,
+    ))
 
 
 def execute_query_request(

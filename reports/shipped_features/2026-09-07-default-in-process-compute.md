@@ -20,6 +20,13 @@ What changed:
   caller's query, so `explain()` then `run()` tokenizes once.
 - `quail/progress.py` prints `quail:` lines for tokenizing, planning,
   model boot, and every five seconds of a filter or join.
+- Planning no longer waits for tokenization. The session reads the
+  document column's byte lengths, tokenizes the first 256 documents for
+  a tokens per byte ratio, and plans on the scaled lengths; the token
+  file is written on a background thread, and the Quail backend boots
+  from the plan (`prepare_request`) before that file is done. The
+  report's `token_wait_s` is how long execution then waited for it.
+  Once a column's token file exists, later queries plan on exact counts.
 
 Why: the package only worked through Modal. Anyone with a GPU should
 be able to install it and run a query in their own process.
@@ -46,6 +53,14 @@ still on the GPU.
 
 First boot on the machine was 218.9 s, of which 189 s was the kernel
 compile pass. With the cache, boot is 10.6 s.
+
+Length estimates on the 100,000 reviews, measured on this CPU: total
+29,879,025 estimated against 29,716,778 exact, +0.55%; per document the
+median error is 3.8% and the 90th percentile 9.8%. The byte-length scan
+takes under 10 ms. `explain()` returns after the tokenizer loads (about
+7 s here, once per process) instead of after the full pass (10 to 30 s
+depending on the CPU). Execution then waits only for the part of the
+pass that the model boot did not cover.
 
 GPT-5 nano for the same work, at its prices on 2026-09-07 ($0.05 per 1 M
 input tokens, $0.40 per 1 M output tokens, half in batch), one output

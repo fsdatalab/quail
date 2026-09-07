@@ -60,6 +60,35 @@ def quail_runtime_payload(request, graph) -> dict:
     }
 
 
+def prepare_quail_request(context) -> None:
+    """Boot one GPU from the plan alone; the documents can arrive later."""
+    if context.gpu_count != 1:
+        return
+    envelope = context.request.plan
+    settings = dict(envelope["settings"])
+    registry = context.registry
+    backend = registry.backend(envelope["backend"])
+    spec = registry.model(envelope["model"])
+    device = registry.device(envelope["device"])
+    state = context.runtime_state.setdefault((backend.name, spec.name), {})
+    state["prepared_boot"] = _boot_for_query(
+        state, backend, spec, device, envelope["workers"],
+        settings["chunk_tokens"], settings["true_ids"], settings["false_ids"])
+
+
+def _boot_for_query(state, backend, spec, device, workers, chunk_tokens,
+                    true_ids, false_ids) -> dict:
+    """Load, bind, and warm the GPU for one query; return its boot record."""
+    t_boot = time.perf_counter()
+    boot = _boot_gpu(state, backend, spec, device, 0, workers,
+                     chunk_tokens, true_ids + false_ids)
+    _bind_query(state, true_ids, false_ids, chunk_tokens)
+    _warm(state, boot)
+    _finish_boot(boot, t_boot)
+    say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
+    return boot
+
+
 def execute_quail_request(context):
     """Run one Quail request from a backend execution context."""
     payload = quail_runtime_payload(context.request, context.graph)
@@ -220,18 +249,13 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     spec = registry.model(payload["model"])
     device = registry.device(payload["physical_plan"]["device"])
 
-    t_boot = time.perf_counter()
-    boot_key = (backend.name, spec.name)
-    state = runtime_state.setdefault(boot_key, {})
-    boot = _boot_gpu(state, backend, spec, device, 0, payload["workers"],
-                     payload["chunk_tokens"],
-                     payload["true_ids"] + payload["false_ids"])
-    _bind_query(state, payload["true_ids"], payload["false_ids"],
-                payload["chunk_tokens"])
-    _warm(state, boot)
-    _finish_boot(boot, t_boot)
-    say(f"model ready, boot {boot['boot_s']} s ({boot['kind']}); "
-        "running the query")
+    state = runtime_state.setdefault((backend.name, spec.name), {})
+    boot = state.pop("prepared_boot", None)
+    if boot is None:
+        boot = _boot_for_query(
+            state, backend, spec, device, payload["workers"],
+            payload["chunk_tokens"], payload["true_ids"], payload["false_ids"])
+    say("running the query")
 
     report = execute_single(state, payload, registry, graph)
     outputs = report.pop("_outputs")

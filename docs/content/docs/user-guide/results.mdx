@@ -127,7 +127,12 @@ observer name.
 ## Explain
 
 `Query.explain()` plans the query without running it and returns the
-logical and physical plan as text.
+logical and physical plan as text. The first time a document column is
+seen, the token counts in the plan are estimates: the session reads the
+column's byte lengths and scales them by the tokens per byte of the
+first 256 documents, and a `note:` line says so. Tokenizing starts in
+the background at the same time, so `run()` does not repeat it. Later
+queries over the same column plan on the exact counts.
 
 ```python
 print(session.sql(text).explain())
