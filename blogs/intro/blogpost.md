@@ -41,21 +41,26 @@ WHERE AI_FILTER(PROMPT(
 
 ## Executing the query with vLLM
 
-- Once the database has a logical query plan, an obvious way to execute the remaining LLM calls is to send them to vLLM.
-- For each report in the filter, and each report and reaction pair in the join, the database renders a prompt and submits it as a separate vLLM request.
-- vLLM uses continuous batching, which combines tokens from many requests into one model forward pass on the GPU.
-- While processing a prompt, the model produces key and value state, called KV, which can be reused when a later prompt begins with the same tokens.
-- vLLM automatically keeps completed KV blocks in GPU DRAM, and evicts them in least recently used order when the cache becomes full.
-- Both optimizations should help with the query above, because it provides hundreds of thousands of ready requests, and many join prompts begin with the same medical report.
-
-- Let's try to use vLLM to execute the query plan below, where the filter finishes before the join begins.
+- Let us use vLLM to execute the query plan below, where the filter finishes before the join begins.
 
 ![The vLLM baseline runs AI_FILTER over reports before AI_JOIN, and uses each filtered report as the join anchor.](figures/vllm-query-plan.svg){width=90%}
 
+- While processing a prompt, the model produces key and value state, called KV, which can be reused when a later prompt begins with the same tokens.
 - We place the long medical report first in every join prompt, and call this first document the anchor.
 - The anchor KV can be reused across many pairs, because every prompt for that report begins with the same tokens.
 - We run Qwen3 4B FP8, with BF16 KV, on one H100, over 500 medical reports, averaging 4,066 tokens each, and 1,127 reaction terms, averaging 4.8 tokens each.
-- With this setup, there are two big inefficiencies.
+- AI-SQL queries, like this one, should be "dream" workloads for an inference engine.
+- To execute the plan with vLLM, we render one prompt for each report in the filter, and one prompt for each report and reaction pair in the join.
+- We submit every prompt as a separate inference request.
+- Hundreds of thousands of independent requests are ready at once, so the engine should always have enough work to keep the GPU fully occupied.
+- Each request asks for only a `TRUE` or `FALSE` answer, so the model does not need a separate decode step after processing the prompt.
+- With enough prompt tokens in each batch, the main model operations should be compute bound, rather than memory bound.
+- The inference engine community has made a lot of progress, and mature general purpose inference engines, such as vLLM and SGLang, provide two useful optimizations for this workload.
+- Continuous batching combines tokens from many requests into one model forward pass on the GPU.
+- Automatic prefix caching reuses completed KV when a later request begins with the same tokens.
+- vLLM stores completed KV blocks in GPU HBM, and evicts the least recently used blocks when it needs more space.
+- Continuous batching should keep the GPU busy, and automatic prefix caching should avoid computing the same medical report for every pair in the join.
+- Surprisingly, we find two sources of inefficiency in this setup.
 
 ## Issue #1: KV Regret
 
@@ -83,11 +88,18 @@ WHERE AI_FILTER(PROMPT(
 - The GPU may also use its arithmetic units poorly while a batch is running (low MFU), but that is a separate problem, and we do not address it here.
 - Modal's discussions of [GPU kernel utilization](https://modal.com/blog/gpu-utilization-guide) and [host overhead](https://modal.com/blog/host-overhead-inference-efficiency) provide useful background here.
 
-TODO: ention speed of light estimate and how far off we are??
+- How far is vLLM from a theoretical estimate of the query latency?
+- We compare the measured latency with a speed of light estimate for the same query plan, though we will not go into the full calculation in this post.
+- At a high level, we estimate computation time from the model dimensions, input lengths, and the GPU's arithmetic throughput.
+- We estimate memory time from the amount of data moved, and the GPU's HBM bandwidth.
+- The estimate assumes that CPU work overlaps GPU work, and that the GPU remains fully occupied, with no GPU bubbles.
+- For the query above, 14 percent of the input tokens that vLLM processes are document prefixes that it already processed earlier in the query.
+- Moreover, the run takes almost 12 times the theoretical estimate.
+- Surely, we can do better!
 
 # 3. Introducing Quail
 
-- To address these problems, we built Quail, which stands for Query Aware Inference Layer.
+- We are building Quail, which stands for Query Aware Inference Layer.
 - Quail is an open source query engine for AI-SQL.
 - In this post, we describe the design of Quail at a high level, and explain how you can get started using it.
 
@@ -253,74 +265,79 @@ $$
 
 ## Execution engine
 
-- The planner lowers the logical plan into a graph of physical operators, which specifies how each part of the query will run.
-- Every dataset begins with a `Document Input` operator, and, if the dataset has AI filters, the planner places one `Packed Filter` operator above it.
-- A `Packed Filter` represents the conjunction of all AI predicates on one dataset, and evaluates them as an ordered chain, stopping for a document after the first `FALSE` answer.
-- Each group of consecutive AI joins that uses the same anchor becomes one `Anchored Join` operator, which evaluates the joins while reusing that anchor's KV.
-- An `Anchored Join` evaluates an AI predicate, and returns the tuple IDs for the pairs that passed.
-- The operator does not copy the input columns, or construct the result rows on the GPU.
-- After the model operators finish, we use the tuple IDs to materialize the requested columns on the CPU, as a stream of Arrow record batches.
+### Physical operators
 
-![The physical operator plan for the running example appears on the left. Every rectangle in the tree is a physical operator. The CPU physical plan executor runs an operator after its inputs are available. Model operators pack work on the CPU and run the forward pass on the GPU, while Arrow materializes the result from tuple IDs on the CPU.](figures/execution-engine.svg){width=100%}
+- The planner produces a physical plan, which is a graph of physical operators that specifies how the execution engine will run the query.
+- The physical plan can contain the following operators:
+  - `Scan` reads one input dataset.
+  - `Packed Filter` evaluates all AI filters on one dataset with pipelined execution, in the order chosen by the planner. As soon as a document passes one filter, the executor can send it to the next filter with its existing KV, without waiting for the current filter to finish over every document. The operator stops evaluating a document after its first `FALSE` answer, and returns the IDs of the documents that pass every filter.
+  - `Anchored Join` evaluates one or more consecutive AI joins that use the same dataset as the anchor. It reuses the anchor KV across the joins, and returns the tuple IDs that pass each join predicate.
+  - `Materialize Join Result` uses Arrow Acero to combine the passing tuple IDs into the relation produced by the joins.
+  - `Project` reads the requested columns for those tuples, and returns the query result.
+
+![The physical operator plan for the running example appears on the left. Every rectangle in the tree is a physical operator. The CPU physical plan executor runs an operator after its inputs are available. Model operators pack work on the CPU and run the forward pass on the GPU. Relational operators run on the CPU, where Arrow Acero materializes join results from tuple IDs.](figures/execution-engine.svg){width=100%}
 
 - The physical plan executor visits an operator after its inputs are available, and calls the runtime registered for that operator type.
 - For a `Packed Filter` or `Anchored Join`, the runtime repeatedly packs the next chunk of tokens, manages its KV pages, and runs a model forward pass, until the operator has finished.
-- For ordinary relational operators, the runtime performs the corresponding Arrow work on the CPU.
-- This is the scheduler's job inside a model operator: it decides which documents or pairs enter the next packed chunk, rather than scheduling hundreds of thousands of independent inference requests.
+- Relational operators run on the CPU, and `Materialize Join Result` uses Arrow Acero to combine the passing tuple IDs.
+- Inside each model operator, the scheduler decides which documents or pairs enter the next packed chunk, rather than scheduling hundreds of thousands of independent inference requests.
 
-### Executing filters
+### Managing KV
 
-- For a dataset with several filters, we keep one queue of documents that have not started, and another queue of documents that passed one filter and are ready for the next.
-- For each forward pass, we first pack documents that are ready for their next filter, then use the remaining token budget for documents that have not started.
-- The CPU packs the next chunk while the current chunk runs on the GPU, and reads the previous answers without stopping the current forward pass.
-- When a document fails, we stop evaluating its remaining filters, release its KV pages, and omit its identifier from the filter operator's output.
-- When a document passes the final filter, we retain its document KV only if the physical plan uses the document as an anchor later.
-
-### Managing the KV cache
-
-- We store KV in a preallocated set of fixed size pages in GPU HBM, using the amount of memory assigned by the planner.
-- While an operator is using a document prefix, its pages cannot be evicted.
-- At each operator boundary, we use the physical plan and the provided selectivities to estimate whether each document prefix will reach another join, and when that join will run.
-- When we retain a prefix, we rewind its KV to the end of the document, so filter instructions and completed join prompt tokens do not remain in HBM.
-- For each retained document prefix $d$, we calculate the following retention value:
+- Recall that the planner reserves GPU HBM for the model weights and temporary activations, and assigns the remaining HBM to KV.
+- When the model starts, we allocate the HBM assigned to KV as a fixed pool of pages. Each page stores KV for 16 token positions.
+- Within this pool, we reserve enough pages for the KV written by two full token chunks. We use the remaining pages to retain document prefixes between operators.
+- The KV for the current model work cannot be evicted, because the GPU is reading from, or writing to, those pages.
+- After an operator finishes using a document, we release its KV if the document won't be used later in the query.
+- If the physical plan uses the document as an anchor later, we "rewind" its KV to the end of the document, which removes the filter or join prompt tokens that follow it.
+- Retained document prefixes compete for the remaining KV pages, so we assign each retained prefix $d$ the following value:
 
 $$
 V(d) =
 \frac{
-P(d\text{ reaches its next use})
-\times \operatorname{SOL}(\text{recompute }d)
+P_{\mathrm{reuse}}(a_d)
+\times C_{\mathrm{recompute}}(d)
 }{
 \operatorname{KVPages}(d)
 }.
 $$
 
-- The numerator is the expected time saved if the prefix remains in HBM, and the denominator is the number of KV pages that it occupies.
-- When the KV cache needs more pages, we evict the prefix with the smallest $V(d)$. If two prefixes have the same value, we evict the one whose next use is later.
-- A document that fails a filter has no next use, so we release its pages immediately.
+- Here, $a_d$ is the input dataset that contains $d$, and $P_{\mathrm{reuse}}(a_d)$ is the estimated probability that $d$ survives until its next use as an anchor.
+- If the next anchor use is immediate, then $P_{\mathrm{reuse}}(a_d)=1$.
+- For a join with pair selectivity $\sigma$ and $m$ documents on the other input, we estimate that $d$ survives with probability $1-(1-\sigma)^m$.
+- We apply this estimate across any joins that run before the next anchor use.
+- $C_{\mathrm{recompute}}(d)$ is the ideal model computation time for processing the document prefix again, based on its length, the selected model, and the GPU's arithmetic throughput.
+- Dividing by $\operatorname{KVPages}(d)$ gives the expected recomputation time saved per page of GPU HBM.
+- When an operator needs more pages, we evict the retained prefix with the smallest $V(d)$. If two prefixes have the same value, we first evict the prefix whose next use is later.
+- A document that fails a filter has no future use, so we release its pages immediately, without placing it in the eviction queue.
+
+### Executing filters
+
+- We greedily fill each model batch with as many filter evaluations as fit within the token budget and available KV pages.
+- We give priority to documents that already passed a filter, so the next filter can reuse their document KV.
+- While the GPU processes one batch, the CPU prepares the next batch and reads the answers from the previous batch.
+- As mentioned previously, we stop after the first `FALSE` answer, and release that document's KV. When a document passes every filter, we retain its KV only if a later join uses the document as an anchor.
 
 ### Executing joins
 
-- For each join, the physical plan specifies the anchor, the other input, and the token budget for each forward pass.
-- We group consecutive joins that use the same anchor, so the anchor KV remains available across the joins.
-- We divide the anchors into groups that fit in the KV cache.
-- Within each group, we compute or read each anchor once, then pack as many documents from the other input as fit in the forward pass.
-- vLLM represents every document pair as a separate sequence in the batch, so its block table contains one row for each pair.
-- Automatic prefix caching stores one copy of an anchor's KV, but several block table rows can refer to the same KV pages.
-- Before we pack a batch, we group all document pairs that share an anchor. Our block table contains one row for each anchor, and all query tokens for that anchor belong to the same row.
+- We divide the anchors into groups whose KV fits in GPU HBM, then greedily fill each model batch with as many pair evaluations as fit within the token budget.
+- We compute an anchor's KV once, or reuse it if it is already available, and keep the KV until every pair for that anchor has been evaluated.
+- As mentioned previously, consecutive joins that use the same anchor run in one `Anchored Join` operator, so they can reuse the same anchor KV.
 
-![Both batches evaluate the same four document pairs. vLLM stores one copy of each anchor KV, but its block table contains one row for each pair. Quail uses one block table row for each anchor, so one FlashAttention 3 call can process all query tokens that share that anchor.](figures/packed-join.svg){width=100%}
+TODO: Revisit the join batching diagram.
 
-THIS DIAGRAM ABOVE IS NOT GOOD. I PLAN TO FIX
+- The operator returns the tuple IDs for pairs that return `TRUE`, and releases an anchor's KV after its final use.
+- Processing several anchor groups in one model batch requires a different attention path, which we describe next.
 
-- If the pairs for one anchor do not fit in one forward pass, we keep its KV pages, and continue with the remaining pairs in the next forward pass.
-- After each join, we release anchors that produced no matches, and keep an anchor only when a later join will use it.
-- Each join returns the tuple IDs that pass the predicate, which we use to materialize the query result on the CPU.
+### Running the model forward pass
 
-### Running the model
-
-- Most of the model forward pass is the same as in vLLM, because we load the model through vLLM and use its DeepGEMM kernels for the main matrix multiplications.
-- vLLM can use [cascade attention](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/attention/backends/flash_attn.py#L1397) when every sequence in a batch begins with the same prefix. A join batch can contain several anchors, so no anchor is shared by the entire batch.
-- To process several anchors in one batch, we run the following operations at every transformer layer:
+- Most of the model forward pass is the same as in vLLM, because we load the model through vLLM and use its DeepGEMM kernels for the main matrix multiplications. There are just a few differences.
+- For joins, each pair must attend to the KV for its anchor.
+- An attention kernel uses a block table, which tells it where the KV pages for each sequence are stored in GPU HBM.
+- vLLM represents each pair as a separate sequence, so its block table contains one row for each pair, even when several rows refer to the same physical copy of the anchor KV.
+- Quail uses one block table row for each anchor during attention into the anchor KV, and assigns every pair token that shares the anchor to that row.
+- vLLM can use [cascade attention](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/attention/backends/flash_attn.py#L1397) when every sequence in a batch begins with the same prefix. A join batch can contain several anchors, so no anchor is shared by the entire batch, and cascade attention doesn't apply.
+- So to be able to process several anchors in one batch, we run the following operations at every transformer layer:
   1. We use [FlashAttention 3](https://arxiv.org/abs/2407.08608) to compute causal attention over the part of each prompt after the anchor.
   2. We use the paged form of the same FlashAttention 3 kernel to compute attention from those tokens into the anchor KV.
   3. We merge the two partial attention outputs, using the log sum exp value returned by each call.
@@ -333,9 +350,9 @@ o =
 $$
 
 - The anchor and the rest of the prompt contain disjoint sets of keys and values, so this weighted merge is exactly the result of applying softmax attention to the full prompt.
-- [Hydragen](https://arxiv.org/abs/2402.05099) uses the same shared prefix decomposition, and [FlashInfer's recursive attention](https://docs.flashinfer.ai/tutorials/recursive_attention.html) describes the attention state and merge rule directly.
-- We fuse the merge with the FP8 quantization for the following output projection, so the new path adds one fused kernel around the two FlashAttention 3 calls.
-- We also fuse several small operations around normalization, activation, RoPE, and quantization, which reduces the number of GPU kernel launches.
+- The prefix decomposition, attention state, and merge rule are not new; explained in prior work, e.g., [Hydragen](https://arxiv.org/abs/2402.05099) and [FlashInfer's recursive attention](https://docs.flashinfer.ai/tutorials/recursive_attention.html).
+- Second, we fuse some kernelse: (1) the merge with the FP8 quantization for the following output projection, so the new path adds one fused kernel around the two FlashAttention 3 calls.
+- (2) We also fuse several small operations around normalization, activation, RoPE, and quantization. Overall, the fusion reduces the number of GPU kernel launches.
 - After the final model layer, a standard language model output head would compute one score for every token in the vocabulary.
 - Filters and joins only need to choose between `TRUE` and `FALSE`, so we select the corresponding rows of the output matrix, and compute only those scores.
 
