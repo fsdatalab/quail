@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 820" role="img" aria-labelledby="title desc">
+  <title id="title">Quail physical operators and execution engine</title>
+  <desc id="desc">On the left, the running example is lowered into a physical operator plan. A CPU document input feeds a GPU packed filter, which joins a second input through a GPU anchored join. A CPU operator materializes the requested columns from the passing tuple IDs, and a CPU projection produces the result. On the right, the CPU physical plan executor dispatches model operators to a runtime that packs token chunks on the CPU, runs model forward passes on the GPU, and manages KV pages in GPU HBM. It dispatches result materialization to Apache Arrow on the CPU.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f6368"/>
+    </marker>
+    <style>
+      .outer { fill: #ffffff; stroke: #5f6368; stroke-width: 2; }
+      .model { fill: #dcebd3; stroke: #5f6368; stroke-width: 2; }
+      .arrowop { fill: #dbe7f7; stroke: #5f6368; stroke-width: 2; }
+      .input { fill: #f0f0f0; stroke: #5f6368; stroke-width: 2; }
+      .engine { fill: #fff8e5; stroke: #5f6368; stroke-width: 2; }
+      .arrow { fill: none; stroke: #5f6368; stroke-width: 4; marker-end: url(#arrow); }
+      .thin-arrow { fill: none; stroke: #5f6368; stroke-width: 3; marker-end: url(#arrow); }
+      .heading { fill: #111111; font: 600 29px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .label { fill: #111111; font: 400 23px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .small { fill: #111111; font: 400 19px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .section { fill: #111111; font: 600 31px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .legend { fill: #111111; font: 400 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; dominant-baseline: middle; }
+    </style>
+  </defs>
+
+  <rect class="outer" x="25" y="25" width="1750" height="700"/>
+
+  <g aria-label="Physical operator plan">
+    <text class="heading" x="380" y="72">Physical Operator Plan</text>
+
+    <rect class="arrowop" x="245" y="95" width="270" height="64" rx="4"/>
+    <text class="label" x="380" y="128">Project, CPU</text>
+
+    <rect class="arrowop" x="245" y="200" width="270" height="64" rx="4"/>
+    <text class="small" x="380" y="222">Materialize Result</text>
+    <text class="small" x="380" y="247">from Tuple IDs, CPU</text>
+
+    <rect class="model" x="245" y="305" width="270" height="64" rx="4"/>
+    <text class="label" x="380" y="338">Anchored Join, GPU</text>
+
+    <rect class="model" x="60" y="440" width="280" height="64" rx="4"/>
+    <text class="label" x="200" y="473">Packed Filter, GPU</text>
+
+    <rect class="input" x="420" y="440" width="280" height="64" rx="4"/>
+    <text class="small" x="560" y="462">Document Input: reactions</text>
+    <text class="small" x="560" y="487">CPU</text>
+
+    <rect class="input" x="60" y="570" width="280" height="64" rx="4"/>
+    <text class="small" x="200" y="592">Document Input: reports</text>
+    <text class="small" x="200" y="617">CPU</text>
+
+    <path class="thin-arrow" d="M 380 200 L 380 164"/>
+    <path class="thin-arrow" d="M 380 305 L 380 269"/>
+    <path class="thin-arrow" d="M 200 440 L 345 374"/>
+    <path class="thin-arrow" d="M 560 440 L 415 374"/>
+    <path class="thin-arrow" d="M 200 570 L 200 509"/>
+
+    <rect class="model" x="80" y="665" width="28" height="20"/>
+    <text class="legend" x="118" y="676">GPU operator</text>
+    <rect class="arrowop" x="285" y="665" width="28" height="20"/>
+    <text class="legend" x="323" y="676">CPU Arrow operator</text>
+    <rect class="input" x="505" y="665" width="28" height="20"/>
+    <text class="legend" x="543" y="676">CPU input operator</text>
+  </g>
+
+  <path class="arrow" d="M 720 350 L 800 350"/>
+
+  <g aria-label="Physical plan executor">
+    <rect class="engine" x="825" y="300" width="275" height="100" rx="4"/>
+    <text class="label" x="962.5" y="338">Physical Plan Executor</text>
+    <text class="small" x="962.5" y="372">CPU</text>
+  </g>
+
+  <g aria-label="Model operator runtime">
+    <rect class="outer" x="1180" y="70" width="540" height="285" rx="4"/>
+    <text class="heading" x="1450" y="112">Model Operator Runtime</text>
+
+    <rect class="arrowop" x="1220" y="150" width="210" height="72" rx="4"/>
+    <text class="small" x="1325" y="177">Pack Next</text>
+    <text class="small" x="1325" y="202">Token Chunk, CPU</text>
+
+    <rect class="model" x="1470" y="150" width="210" height="72" rx="4"/>
+    <text class="small" x="1575" y="177">Model</text>
+    <text class="small" x="1575" y="202">Forward Pass, GPU</text>
+
+    <rect class="arrowop" x="1220" y="260" width="210" height="58" rx="4"/>
+    <text class="small" x="1325" y="290">KV Manager, CPU</text>
+
+    <rect class="model" x="1470" y="260" width="210" height="58" rx="4"/>
+    <text class="small" x="1575" y="290">KV Pages, GPU HBM</text>
+
+    <path class="thin-arrow" d="M 1435 186 L 1465 186"/>
+    <path class="thin-arrow" d="M 1325 226 L 1325 255"/>
+    <path class="thin-arrow" d="M 1435 289 L 1465 289"/>
+    <path class="thin-arrow" d="M 1575 255 L 1575 226"/>
+  </g>
+
+  <path class="arrow" d="M 1105 315 C 1130 250, 1145 210, 1175 185"/>
+
+  <g aria-label="Arrow relational runtime">
+    <rect class="outer" x="1180" y="440" width="540" height="200" rx="4"/>
+    <text class="heading" x="1450" y="482">Arrow Relational Runtime, CPU</text>
+
+    <rect class="arrowop" x="1220" y="520" width="210" height="72" rx="4"/>
+    <text class="small" x="1325" y="547">Passing</text>
+    <text class="small" x="1325" y="572">Tuple IDs</text>
+
+    <rect class="arrowop" x="1470" y="520" width="210" height="72" rx="4"/>
+    <text class="small" x="1575" y="547">Projected Arrow</text>
+    <text class="small" x="1575" y="572">Record Batches</text>
+
+    <path class="thin-arrow" d="M 1435 556 L 1465 556"/>
+  </g>
+
+  <path class="arrow" d="M 1105 385 C 1130 455, 1145 515, 1175 545"/>
+
+  <line x1="25" y1="725" x2="1775" y2="725" stroke="#5f6368" stroke-width="2"/>
+  <text class="section" x="380" y="782">Physical Plan</text>
+  <text class="section" x="1320" y="782">Execution Engine</text>
+</svg>
