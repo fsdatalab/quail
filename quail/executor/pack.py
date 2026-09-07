@@ -1,6 +1,8 @@
 """Chunk packing and admission - no GPU, no torch, unit-tested.
 
-- pack_stream: brim-packing a known pair list into chunks (join path).
+- JoinAdmission: continuous anchor admission for joins. Continuing
+  partner streams pack first, then anchors starting their next stage,
+  then fresh anchors whose pages fit the free list.
 - FilterAdmission: continuous admission for filter chains. Survivors
   pack before fresh admissions; fresh documents admit when their
   page-rounded tokens fit the free list.
@@ -10,6 +12,7 @@ chunks.
 """
 
 from array import array
+from bisect import bisect_right
 from collections import deque
 
 
@@ -17,98 +20,6 @@ def orient(mean_left_tokens, mean_right_tokens):
     """Which side anchors: the longer one. Anchor tokens are paid once
     per document; partner tokens are paid once per pair."""
     return "left" if mean_left_tokens >= mean_right_tokens else "right"
-
-
-def plan_groups(prefix_tokens, suffix_tokens, budget):
-    """Split one anchor's suffix stream into (start, end) chunk groups
-    that fit under `budget` together with the prefix."""
-    room = budget - prefix_tokens
-    if room <= 0:
-        raise ValueError(
-            f"prefix {prefix_tokens} tokens leaves no room in a "
-            f"{budget}-token chunk")
-    groups, start, used = [], 0, 0
-    for i, s in enumerate(suffix_tokens):
-        if s > room:
-            raise ValueError(
-                f"suffix {i} has {s} tokens; at most {room} fit beside "
-                f"a {prefix_tokens}-token prefix (suffixes are atomic)")
-        if used + s > room:
-            groups.append((start, i))
-            start, used = i, 0
-        used += s
-    if used or not suffix_tokens:
-        groups.append((start, len(suffix_tokens)))
-    return groups
-
-
-def pack_stream(anchors, budget, keep=(), already_kept=()):
-    """Brim-pack a pair list into chunks, keeping cut prefixes in the
-    arena.
-
-    Args:
-        anchors: List of (prefix_tokens, [suffix_tokens]) in run order.
-        keep: Anchor indices whose prefix KV a later stage needs.
-        already_kept: Anchors whose prefix KV is already resident.
-
-    Returns:
-        (chunks, kv_to_cache). Each chunk is a list of
-        (anchor_index, start, end, carried); carried means the group
-        packs the anchor's prefix tokens. kv_to_cache is the set of
-        anchors whose prefix KV must be written to the arena.
-    """
-    keep, already = set(keep), set(already_kept)
-    chunks, chunk, used = [], [], 0
-    kv_to_cache = set()
-    for a, (prefix, suffixes) in enumerate(anchors):
-        n = len(suffixes)
-        placed = a in already
-        if n == 0:
-            if placed or a not in keep:
-                continue    # nothing streams against it and no later
-                #             stage needs it: computing it serves no one
-            # cache-only placement: a prefix a later stage needs,
-            # with nothing streamed against it in this one
-            if prefix > budget:
-                raise ValueError(
-                    f"anchor {a}: prefix {prefix} tokens exceeds the "
-                    f"{budget}-token chunk budget")
-            if used + prefix > budget:
-                chunks.append(chunk)
-                chunk, used = [], 0
-            chunk.append((a, 0, 0, True))
-            used += prefix
-            if a in keep:
-                kv_to_cache.add(a)
-            continue
-        i = 0
-        while i < n:
-            carried = 0 if placed else prefix
-            if suffixes[i] + carried > budget:
-                raise ValueError(
-                    f"anchor {a} suffix {i} has {suffixes[i]} tokens; "
-                    f"at most {budget - carried} fit beside what its "
-                    f"group must carry (suffixes are atomic)")
-            room = budget - used - carried
-            if room < suffixes[i]:
-                chunks.append(chunk)
-                chunk, used = [], 0
-                continue
-            j, group_tokens = i, 0
-            while j < n and group_tokens + suffixes[j] <= room:
-                group_tokens += suffixes[j]
-                j += 1
-            chunk.append((a, i, j, not placed))
-            used += carried + group_tokens
-            placed = True
-            i = j
-            if i < n and a not in already:
-                kv_to_cache.add(a)  # a later chunk reads this KV
-        if a in keep and a not in already:
-            kv_to_cache.add(a)
-    if chunk:
-        chunks.append(chunk)
-    return chunks, kv_to_cache
 
 
 def gate(answer_rows):
@@ -193,35 +104,220 @@ def pages_for(tokens: int, page_tokens: int) -> int:
     return -(-tokens // page_tokens)
 
 
-def partition_anchor_groups(prefix_tokens, arena_pages, page_tokens,
-                            extra_tokens=0, max_group_size=None):
-    """Partition anchors so every group fits in the KV arena."""
+# --------------------------------------------- join admission
 
-    if arena_pages <= 0 or page_tokens <= 0:
-        raise ValueError("arena_pages and page_tokens must be positive")
-    if max_group_size is not None and max_group_size <= 0:
-        raise ValueError("max_group_size must be positive")
+_DONE = -2      # the anchor's last stage answered, or it failed a gate
+_STRANDED = -3  # advanced into a stage with no partners: stays resident
 
-    groups = []
-    group = []
-    used_pages = 0
-    for anchor, prefix in enumerate(prefix_tokens):
-        pages = pages_for(prefix + extra_tokens, page_tokens)
-        if pages > arena_pages:
-            raise ValueError(
-                f"anchor {anchor} needs {pages} KV pages; the arena "
-                f"holds {arena_pages}")
-        full = max_group_size is not None \
-            and len(group) >= max_group_size
-        if group and (full or used_pages + pages > arena_pages):
-            groups.append(group)
-            group = []
-            used_pages = 0
-        group.append(anchor)
-        used_pages += pages
-    if group:
-        groups.append(group)
-    return groups
+
+class JoinAdmission:
+    """Join scheduler: continuous anchor admission with stages mixed
+    in one chunk.
+
+    Args:
+        prefix_tokens: Per-anchor prefix token counts.
+        stage_suffixes: Per stage, the partner suffix token counts.
+            Every anchor streams the same partner list at a stage.
+        chunk_budget: Tokens per forward pass.
+        arena_pages: Pages in the KV arena.
+        page_tokens: Tokens per arena page.
+        frame_tokens: Per stage, tokens of the framing written into
+            the anchor's KV ahead of its first suffix.
+        resident: anchor -> pages already held. A resident anchor's
+            prefix KV is in the arena, so it packs no prefix tokens.
+
+    Each chunk fills in priority order: partner streams cut by the
+    previous chunk, then anchors starting their next stage, then
+    fresh anchors whose pages fit the free list. Pages are granted in
+    queue order; chunk room may be skipped. An anchor advances to its
+    next stage once its whole stream at the current stage is launched
+    and one partner has answered TRUE; the remaining answers fill in
+    while the next stage runs. It drops out when every partner
+    answered FALSE.
+    """
+
+    def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
+                 arena_pages, page_tokens, frame_tokens=None,
+                 resident=None):
+        self.prefix = list(prefix_tokens)
+        self.stages = [list(s) for s in stage_suffixes]
+        self.frames = (list(frame_tokens) if frame_tokens
+                       else [0] * len(self.stages))
+        if len(self.frames) != len(self.stages):
+            raise ValueError("frame_tokens must match stage_suffixes")
+        if not self.stages or not self.stages[0]:
+            raise ValueError("the first stage needs partners")
+        self.chunk_budget = chunk_budget
+        self.page_tokens = page_tokens
+        resident = dict(resident or {})
+        k = len(self.stages)
+        n = len(self.prefix)
+        self._cum = []
+        for j, (lens, frame) in enumerate(zip(self.stages, self.frames)):
+            cum = [0]
+            for t in lens:
+                cum.append(cum[-1] + t)
+            self._cum.append(cum)
+            if lens and frame + max(lens) > chunk_budget:
+                raise ValueError(
+                    f"stage {j}: a {frame + max(lens)}-token partner "
+                    f"exceeds the {chunk_budget}-token chunk budget "
+                    f"(suffixes are atomic)")
+        extra = max(self.frames)
+        self._page_cost = []
+        first = self.frames[0] + self.stages[0][0]
+        for a, prefix in enumerate(self.prefix):
+            need = pages_for(prefix + extra, page_tokens)
+            if a in resident:
+                need = max(0, need - resident[a])
+            elif need > arena_pages:
+                raise ValueError(
+                    f"anchor {a} needs {need} KV pages; the arena "
+                    f"holds {arena_pages}")
+            elif prefix + first > chunk_budget:
+                raise ValueError(
+                    f"anchor {a}: prefix {prefix} tokens leaves no "
+                    f"room for a partner in a {chunk_budget}-token "
+                    f"chunk")
+            self._page_cost.append(need)
+        self._carried = [0 if a in resident else p
+                         for a, p in enumerate(self.prefix)]
+        self._min_fresh = min(
+            (c + first for c in self._carried), default=0)
+        # resident anchors first: they cost no prefix tokens and few
+        # or no pages, so they never wait behind a page-blocked anchor
+        order = [a for a in range(n) if a in resident] \
+            + [a for a in range(n) if a not in resident]
+        self.pending = deque(order)
+        self._zero_cost = sum(1 for a in order if not self._page_cost[a])
+        self.ready = deque()       # placed anchors with partners left
+        self._stage = [-1] * n     # current stage, or _DONE/_STRANDED
+        self._next = [0] * n       # next partner index at the stage
+        self._true = [[False] * k for _ in range(n)]
+        self.in_flight = 0         # launched groups not yet reported
+        self.blocked_pages = 0
+        self.answers = [dict() for _ in range(k)]
+
+    # ---- chunk building ------------------------------------------------
+
+    def _first_cost(self, j, i):
+        return self.stages[j][i] + (self.frames[j] if i == 0 else 0)
+
+    def _take(self, j, i, room):
+        """(end, tokens): the longest partner run from i that fits."""
+        cum = self._cum[j]
+        frame = self.frames[j] if i == 0 else 0
+        end = bisect_right(cum, cum[i] + room - frame) - 1
+        return end, frame + cum[end] - cum[i]
+
+    def _launch(self, a, j, end):
+        """Record a launched group; True when the stream continues."""
+        self._next[a] = end
+        self.in_flight += 1
+        return end < len(self.stages[j])
+
+    def next_chunk(self, free_pages):
+        """Groups for the next chunk: [(anchor, stage, start, end,
+        carried)]. carried means the anchor's prefix tokens are
+        packed and its KV written to its pages. free_pages is the
+        arena's free list; fresh anchors admit against it. Returns
+        [] when nothing is buildable."""
+        self.blocked_pages = 0
+        room = self.chunk_budget
+        groups = []
+        continued = []
+        # 1) placed anchors: cut streams (front) and next-stage starts
+        for _ in range(len(self.ready)):
+            a = self.ready.popleft()
+            j, i = self._stage[a], self._next[a]
+            if self._first_cost(j, i) > room:
+                self.ready.appendleft(a)    # FIFO; chunk nearly full
+                break
+            end, tokens = self._take(j, i, room)
+            groups.append((a, j, i, end, False))
+            room -= tokens
+            if self._launch(a, j, end):
+                continued.append(a)
+        # 2) fresh anchors: pages in queue order, chunk room may skip
+        held = []
+        blocked = False
+        while self.pending and room >= self._min_fresh:
+            a = self.pending.popleft()
+            need = self._page_cost[a]
+            if blocked and need:
+                held.append(a)
+                if not self._zero_cost:
+                    break
+                continue
+            if need > free_pages:
+                blocked = True
+                self.blocked_pages = need - free_pages
+                held.append(a)
+                if not self._zero_cost:
+                    break
+                continue
+            carried = self._carried[a]
+            if carried + self._first_cost(0, 0) > room:
+                held.append(a)      # chunk room only; retry next chunk
+                continue
+            end, tokens = self._take(0, 0, room - carried)
+            groups.append((a, 0, 0, end, carried > 0))
+            room -= carried + tokens
+            free_pages -= need
+            if not need:
+                self._zero_cost -= 1
+            self._stage[a] = 0
+            if self._launch(a, 0, end):
+                continued.append(a)
+        self.pending.extendleft(reversed(held))
+        self.ready.extendleft(reversed(continued))
+        return groups
+
+    # ---- gating --------------------------------------------------------
+
+    def report(self, a, j, start, end, bits):
+        """Record one group's answers.
+
+        Returns events: ("dropped", a) when every partner at a stage
+        before the last answered FALSE, so the anchor's pages can go;
+        ("finished", a) when its last-stage row is complete."""
+        row = self.answers[j].setdefault(a, [])
+        if len(row) != start or len(bits) != end - start:
+            raise AssertionError(
+                f"anchor {a} stage {j}: answers for partners "
+                f"{start}:{end} arrived with {len(row)} recorded")
+        row.extend(bits)
+        self.in_flight -= 1
+        if any(bits):
+            self._true[a][j] = True
+        k = len(self.stages)
+        n_j = len(self.stages[j])
+        complete = len(row) == n_j
+        events = []
+        if j == self._stage[a] and j + 1 < k:
+            if self._true[a][j] and self._next[a] == n_j:
+                # the whole stream is launched, so every later chunk
+                # is behind it on the stream and the next stage's
+                # frame write cannot race a read of this stage's
+                self._stage[a] = j + 1
+                self._next[a] = 0
+                if self.stages[j + 1]:
+                    self.ready.append(a)
+                else:
+                    self._stage[a] = _STRANDED
+            elif complete and not self._true[a][j]:
+                self._stage[a] = _DONE
+                events.append(("dropped", a))
+        if j == k - 1 and complete:
+            self._stage[a] = _DONE
+            events.append(("finished", a))
+        return events
+
+    # ---- progress ------------------------------------------------------
+
+    def done(self):
+        return not self.pending and not self.ready \
+            and not self.in_flight
 
 
 class FilterAdmission:

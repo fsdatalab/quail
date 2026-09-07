@@ -1,13 +1,12 @@
-"""Tests for pack_stream, FilterAdmission, and gate/assemble against brute force."""
+"""Tests for JoinAdmission, FilterAdmission, and gate/assemble against brute force."""
 
 import random
 
 import pytest
 
-from quail.executor.pack import (FilterAdmission, assemble,
-                                 brute_force_triples, gate, matches,
-                                 orient, pack_stream, pages_for,
-                                 partition_anchor_groups, plan_groups)
+from quail.executor.pack import (FilterAdmission, JoinAdmission,
+                                 assemble, brute_force_triples, gate,
+                                 matches, orient, pages_for)
 
 
 def test_orient_prefers_longer_side():
@@ -16,92 +15,273 @@ def test_orient_prefers_longer_side():
     assert orient(50, 50) == "left"
 
 
-def test_plan_groups_budget_respected_random():
-    rng = random.Random(7)
-    for _ in range(50):
-        budget = rng.randrange(2_000, 30_000)
-        prefix = rng.randrange(100, budget - 600)
-        suffixes = [rng.randrange(20, min(600, budget - prefix))
-                    for _ in range(rng.randrange(1, 400))]
-        groups = plan_groups(prefix, suffixes, budget)
-        seen = []
-        for start, end in groups:
-            assert prefix + sum(suffixes[start:end]) <= budget
-            seen.extend(range(start, end))
-        assert seen == list(range(len(suffixes)))
+# ------------------------------------------------ join admission
 
 
-def test_pack_stream_every_suffix_once_in_order():
-    rng = random.Random(11)
-    for _ in range(50):
-        budget = rng.randrange(3_000, 40_000)
-        anchors = []
-        for _ in range(rng.randrange(1, 30)):
-            prefix = rng.randrange(50, budget // 3)
-            room = budget - prefix
-            suffixes = [rng.randrange(10, max(11, room // 2))
-                        for _ in range(rng.randrange(0, 60))]
-            anchors.append((prefix, suffixes))
-        chunks, kv_to_cache = pack_stream(anchors, budget)
-        covered = {a: [] for a in range(len(anchors))}
-        carried_count = {a: 0 for a in range(len(anchors))}
-        for chunk in chunks:
-            assert chunk
-            tokens = 0
-            for a, start, end, carried in chunk:
-                prefix, suffixes = anchors[a]
-                tokens += (prefix if carried else 0) \
-                    + sum(suffixes[start:end])
-                covered[a].extend(range(start, end))
-                carried_count[a] += carried
-            assert tokens <= budget
-        for a, (prefix, suffixes) in enumerate(anchors):
-            assert covered[a] == list(range(len(suffixes)))
-            # the computed-exactly-once invariant
-            assert carried_count[a] == (1 if suffixes else 0)
+def _drive_join(sched, truth, arena_pages, resident=None,
+                deliver_lag=1, rng=None):
+    """Drive a JoinAdmission to completion against a simulated free
+    list. truth[a][j] is the 0/1 row for anchor a at stage j.
+    Returns (chunks, events) in launch order."""
+    resident = resident or {}
+    extra = max(sched.frames)
+    held = dict(resident)
+    free = arena_pages - sum(held.values())
+    chunks, outstanding, events = [], [], []
+    idle = 0
+
+    def settle(a):
+        nonlocal free
+        free += held.pop(a)
+
+    while not sched.done():
+        groups = sched.next_chunk(free)
+        if groups:
+            for a, j, start, end, carried in groups:
+                if j == 0 and start == 0:
+                    need = pages_for(sched.prefix[a] + extra,
+                                     sched.page_tokens)
+                    free -= need - held.get(a, 0)
+                    assert free >= 0, "admitted past the free list"
+                    held[a] = need
+                    assert carried == (a not in resident)
+            chunks.append(groups)
+            outstanding.append(groups)
+            idle = 0
+        else:
+            idle += 1
+            assert outstanding, \
+                "no chunk buildable and nothing in flight: stuck"
+            assert idle < 3, "scheduler stopped making progress"
+        lag = deliver_lag if groups else 0
+        if rng is not None and groups:
+            lag = rng.choice((0, deliver_lag))
+        while len(outstanding) > lag:
+            for a, j, start, end, _ in outstanding.pop(0):
+                bits = truth[a][j][start:end]
+                for kind, anchor in sched.report(a, j, start, end, bits):
+                    events.append((kind, anchor))
+                    settle(anchor)
+    stranded = {a for a, st in enumerate(sched._stage) if st == -3}
+    assert free == arena_pages - sum(held[a] for a in stranded) \
+        - sum(held[a] for a in held if a not in stranded
+              and a in resident and sched._stage[a] == -1)
+    return chunks, events
 
 
-def test_pack_stream_cut_stream_continues_without_prefix():
-    chunks, kv_to_cache = pack_stream([(100, [400, 400, 400])], 600)
-    assert chunks == [[(0, 0, 1, True)],
-                      [(0, 1, 2, False)],
-                      [(0, 2, 3, False)]]
-    assert kv_to_cache == {0}
+def _check_join_invariants(sched, chunks, events, truth, prefix,
+                           stages, frames, budget, resident=None):
+    resident = resident or {}
+    n, k = len(prefix), len(stages)
+    covered = {(a, j): [] for a in range(n) for j in range(k)}
+    carried_count = [0] * n
+    for groups in chunks:
+        tokens = 0
+        seen = set()
+        for a, j, start, end, carried in groups:
+            assert a not in seen, "one anchor twice in a chunk"
+            seen.add(a)
+            assert end > start
+            tokens += (prefix[a] if carried else 0) \
+                + (frames[j] if start == 0 else 0) \
+                + sum(stages[j][start:end])
+            covered[(a, j)].extend(range(start, end))
+            carried_count[a] += carried
+        assert tokens <= budget, "over-budget chunk"
+    # which stages each anchor should reach, from the planted truth
+    for a in range(n):
+        reach = 0
+        for j in range(k):
+            if not stages[j]:
+                break
+            reach = j + 1
+            if not any(truth[a][j]):
+                break
+        for j in range(k):
+            if j < reach:
+                assert covered[(a, j)] == list(range(len(stages[j]))), \
+                    f"anchor {a} stage {j} partners not streamed once"
+                assert sched.answers[j][a] == truth[a][j]
+            else:
+                assert covered[(a, j)] == []
+                assert a not in sched.answers[j]
+        # the prefix is computed at most once, never when resident
+        assert carried_count[a] == (0 if a in resident else 1)
+        finished = reach == k
+        dropped = reach < k and stages[reach - 1] and \
+            not any(truth[a][reach - 1]) if reach else False
+        kinds = [kind for kind, anchor in events if anchor == a]
+        if finished:
+            assert kinds == ["finished"]
+        elif dropped:
+            assert kinds == ["dropped"]
+        else:
+            assert kinds == []
 
 
-def test_pack_stream_keep_and_already_kept():
-    chunks, kv = pack_stream([(100, [50, 50])], 1000, keep={0})
-    assert chunks == [[(0, 0, 2, True)]]
-    assert kv == {0}
-    chunks, kv = pack_stream([(100, [400, 400])], 600,
-                             already_kept={0})
-    assert chunks == [[(0, 0, 1, False)], [(0, 1, 2, False)]]
-    assert kv == set()
+def _random_join(rng, n_anchors=None):
+    k = rng.randrange(1, 4)
+    page_tokens = 16
+    budget = rng.randrange(2_000, 20_000)
+    frames = [rng.choice((0, 0, rng.randrange(1, 40))) for _ in range(k)]
+    stages = []
+    for j in range(k):
+        count = rng.randrange(1, 80)
+        stages.append([rng.randrange(10, max(11, budget // 4))
+                       for _ in range(count)])
+    top = budget - max(frames) - max(max(s) for s in stages if s)
+    n = n_anchors or rng.randrange(1, 40)
+    prefix = [rng.randrange(20, max(21, top)) for _ in range(n)]
+    truth = [[[1 if rng.random() < 0.5 else 0 for _ in stages[j]]
+              for j in range(k)] for _ in range(n)]
+    return prefix, stages, frames, budget, page_tokens, truth
 
 
-def test_pack_stream_atomicity_error():
-    with pytest.raises(ValueError):
-        pack_stream([(100, [950])], 1000)
+def test_join_admission_random_shapes():
+    rng = random.Random(17)
+    for _ in range(60):
+        prefix, stages, frames, budget, page_tokens, truth = \
+            _random_join(rng)
+        need = [pages_for(p + max(frames), page_tokens) for p in prefix]
+        arena_pages = max(max(need), rng.randrange(4, 400))
+        # resident anchors hold some of their pages; the rest (frame
+        # room) must fit the arena together, or the run cannot start
+        resident = {}
+        for a in range(len(prefix)):
+            if rng.random() < 0.3:
+                resident[a] = rng.randrange(1, need[a] + 1)
+        while sum(need[a] for a in resident) > arena_pages:
+            resident.popitem()
+        sched = JoinAdmission(prefix, stages, budget, arena_pages,
+                              page_tokens, frame_tokens=frames,
+                              resident=resident)
+        chunks, events = _drive_join(sched, truth, arena_pages,
+                                     resident, deliver_lag=1, rng=rng)
+        _check_join_invariants(sched, chunks, events, truth, prefix,
+                               stages, frames, budget, resident)
 
 
-def test_partition_anchor_groups_respects_page_capacity():
-    groups = partition_anchor_groups(
-        [17, 15, 16, 1], arena_pages=3, page_tokens=16,
-        extra_tokens=1)
-    assert groups == [[0, 1], [2, 3]]
+def test_join_admission_cut_stream_continues_first():
+    # anchor 0's stream is cut; its continuation leads the next chunk
+    # and packs no prefix, ahead of fresh anchor 1
+    sched = JoinAdmission([100, 50], [[400, 50]], 520,
+                          arena_pages=100, page_tokens=16)
+    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
+    assert sched.next_chunk(100) == [(0, 0, 1, 2, False),
+                                     (1, 0, 0, 1, True)]
+    assert sched.next_chunk(100) == [(1, 0, 1, 2, False)]
 
 
-def test_partition_anchor_groups_respects_maximum_size():
-    groups = partition_anchor_groups(
-        [8, 8, 8], arena_pages=10, page_tokens=16,
-        max_group_size=1)
-    assert groups == [[0], [1], [2]]
+def test_join_admission_mixes_stages_in_one_chunk():
+    # anchor 0 answers TRUE at stage 0 and its stage-1 partners lead
+    # the next chunk, followed by fresh anchor 1's stage 0
+    sched = JoinAdmission([100, 100], [[50], [30, 30]], 250,
+                          arena_pages=100, page_tokens=16)
+    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
+    assert sched.report(0, 0, 0, 1, [1]) == []
+    assert sched.next_chunk(100) == [(0, 1, 0, 2, False),
+                                     (1, 0, 0, 1, True)]
+    assert sched.report(0, 1, 0, 2, [0, 1]) == [("finished", 0)]
+    assert sched.report(1, 0, 0, 1, [0]) == [("dropped", 1)]
+    assert sched.done()
+    assert sched.answers == [{0: [1], 1: [0]}, {0: [0, 1]}]
 
 
-def test_partition_anchor_groups_rejects_one_oversized_anchor():
+def test_join_admission_advances_before_the_stream_is_answered():
+    # the whole stage-0 stream is launched over two chunks; the first
+    # answers TRUE, so stage 1 starts while the second is in flight
+    sched = JoinAdmission([100], [[400, 400], [50]], 600,
+                          arena_pages=100, page_tokens=16)
+    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
+    assert sched.next_chunk(100) == [(0, 0, 1, 2, False)]
+    assert sched.report(0, 0, 0, 1, [1]) == []
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+    assert sched.report(0, 0, 1, 2, [0]) == []
+    assert sched.report(0, 1, 0, 1, [1]) == [("finished", 0)]
+    assert sched.answers == [{0: [1, 0]}, {0: [1]}]
+
+
+def test_join_admission_waits_for_a_true_before_advancing():
+    # a cut stream whose first chunk answered FALSE does not advance
+    # until a later chunk answers TRUE; all FALSE drops the anchor
+    sched = JoinAdmission([100], [[400, 400], [50]], 600,
+                          arena_pages=100, page_tokens=16)
+    sched.next_chunk(100)
+    sched.next_chunk(100)
+    assert sched.report(0, 0, 0, 1, [0]) == []
+    assert sched.next_chunk(100) == []
+    assert sched.report(0, 0, 1, 2, [0]) == [("dropped", 0)]
+    assert sched.done()
+
+
+def test_join_admission_pages_block_in_order():
+    # the arena holds one anchor; the second waits for pages even
+    # though it would fit the chunk, and admits once the first drops
+    sched = JoinAdmission([160, 160], [[10]], 400,
+                          arena_pages=10, page_tokens=16)
+    assert sched.next_chunk(10) == [(0, 0, 0, 1, True)]
+    assert sched.blocked_pages == 10
+    assert sched.next_chunk(0) == []
+    assert sched.blocked_pages == 10
+    assert sched.report(0, 0, 0, 1, [0]) == [("finished", 0)]
+    assert sched.next_chunk(10) == [(1, 0, 0, 1, True)]
+
+
+def test_join_admission_resident_anchors_pass_a_page_block():
+    # anchor 1 is resident (no prefix, no pages) and packs even while
+    # fresh anchor 0 waits for pages; resident anchors also go first
+    sched = JoinAdmission([160, 160], [[10]], 400,
+                          arena_pages=10, page_tokens=16,
+                          resident={1: 10})
+    assert sched.next_chunk(0) == [(1, 0, 0, 1, False)]
+    assert sched.blocked_pages == 10
+    assert sched.report(1, 0, 0, 1, [1]) == [("finished", 1)]
+    assert sched.next_chunk(10) == [(0, 0, 0, 1, True)]
+
+
+def test_join_admission_resident_growth_costs_pages():
+    # a resident anchor short of frame room needs the difference
+    sched = JoinAdmission([160], [[10]], 400, arena_pages=20,
+                          page_tokens=16, frame_tokens=[20],
+                          resident={0: 10})
+    assert sched.next_chunk(1) == []
+    assert sched.blocked_pages == 1
+    assert sched.next_chunk(2) == [(0, 0, 0, 1, False)]
+
+
+def test_join_admission_frame_counts_against_the_first_partner():
+    # 100 prefix + 30 frame + 100 partner = 230: the anchor's first
+    # partner alone fills the chunk; later partners fit two at a time
+    sched = JoinAdmission([100], [[100, 100, 100]], 230,
+                          arena_pages=100, page_tokens=16,
+                          frame_tokens=[30])
+    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
+    assert sched.next_chunk(100) == [(0, 0, 1, 3, False)]
+
+
+def test_join_admission_empty_later_stage_strands_survivors():
+    # stage 1 has no partners: a stage-0 survivor stays resident with
+    # no event, and the run still finishes
+    sched = JoinAdmission([100], [[10], []], 400,
+                          arena_pages=100, page_tokens=16)
+    sched.next_chunk(100)
+    assert sched.report(0, 0, 0, 1, [1]) == []
+    assert sched.done()
+    assert sched.answers == [{0: [1]}, {}]
+
+
+def test_join_admission_refuses_impossible_shapes():
+    with pytest.raises(ValueError, match="first stage"):
+        JoinAdmission([100], [[]], 400, 100, 16)
+    with pytest.raises(ValueError, match="suffixes are atomic"):
+        JoinAdmission([100], [[1050]], 1000, 100, 16)
+    with pytest.raises(ValueError, match="no room for a partner"):
+        JoinAdmission([950], [[100]], 1000, 100, 16)
     with pytest.raises(ValueError, match="anchor 0 needs 3 KV pages"):
-        partition_anchor_groups(
-            [33], arena_pages=2, page_tokens=16)
+        JoinAdmission([33], [[10]], 1000, arena_pages=2, page_tokens=16)
+    # a resident anchor is never refused for pages: it already fits
+    JoinAdmission([33], [[10]], 1000, arena_pages=2, page_tokens=16,
+                  resident={0: 3})
 
 
 def test_gate_matches_assemble_vs_brute_force():
