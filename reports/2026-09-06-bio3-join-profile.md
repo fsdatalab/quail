@@ -11,18 +11,18 @@
 [Open the GPU timeline and CPU flame graph](plots/bio3_join_profile.html) or
 [the vector PDF](plots/bio3_join_profile.pdf).
 
-[![BIO-3 GPU and CPU from 480 to 490 seconds](plots/bio3_join_window.png)](plots/bio3_join_window.pdf)
+[![BIO-3 GPU and CPU from 480 to 485 seconds](plots/bio3_join_window.png)](plots/bio3_join_window.pdf)
 
 Figure: plots/bio3_join_window.png
 
-- The 10-second figure shows GPU activity above nested CPU operations on
-  the same time axis. It covers seconds 480 to 490, chosen near the join
-  midpoint. GPU activity covers 3.74 seconds, with 6.26 seconds idle.
+- The 5-second figure shows GPU activity above nested CPU operations on
+  the same time axis. It covers seconds 480 to 485, chosen near the join
+  midpoint. GPU activity covers 1.89 seconds, with 3.11 seconds idle.
   These totals describe this window, not the complete join.
 - CPU calls retain their original names, order, and nesting. The window
-  contains 107,119 recorded calls. Most are too short to label at this
+  contains 53,608 recorded calls. Most are too short to label at this
   scale. In the HTML, hover shows a call's name and interval, and clicking
-  zooms both panels together. Reset restores the full 10 seconds.
+  zooms both panels together. Reset restores the full 5 seconds.
 - Gray CPU intervals mean no selected CPU operation was recorded. They
   can include Python work and waiting; they do not establish CPU idle time.
 
@@ -195,8 +195,8 @@ uv run modal run --detach experiments/profile_vllm_join.py --query BIO-3 \
   same operation categories as the aggregate flame graph. It clips calls
   to seconds 480 to 490 and retains their order and nesting. The start is
   the join midpoint rounded down to a multiple of 10 seconds. The plot
-  script clips the saved GPU intervals to that same window. No inference
-  was rerun to produce this figure.
+  script clips both CPU and GPU intervals to seconds 480 to 485 for the
+  5-second figure. No inference was rerun to produce this figure.
 - Profiled answers and engine report:
   `/results/benchmarks/quailb/runs/qb_20260907T013342Z_31dd2183/single/BIO-3.json`.
   Its `answer_tables` lists the filter and join Parquet files. We compared

@@ -105,7 +105,10 @@ def load_window(workdir, timeline, source):
     """Combine the saved CPU window with GPU intervals on the same clock."""
     window = json.loads((workdir / "cpu-window.json").read_text())
     assert window["source"] == source
+    window["end"] = min(window["end"], window["start"] + 5)
     start, end = window["start"], window["end"]
+    window["cpu"] = [[max(start, a), min(end, b), depth, name]
+                     for a, b, depth, name in window["cpu"] if b > start and a < end]
     window["gpu"] = [(max(start, a / 1e6), min(end, b / 1e6))
                      for a, b in struct.iter_unpack("<dd", gzip.decompress(timeline))
                      if b / 1e6 > start and a / 1e6 < end]
@@ -113,7 +116,7 @@ def load_window(workdir, timeline, source):
 
 
 def plot_window(window):
-    """Save a chronological GPU and CPU view of the selected ten seconds."""
+    """Save a chronological GPU and CPU view of the selected five seconds."""
     plt.style.use(HERE / "quail.mplstyle")
     start, end = window["start"], window["end"]
     active = sum(b - a for a, b in window["gpu"])
@@ -210,17 +213,17 @@ button {font:inherit;padding:6px 12px;margin-right:10px;cursor:pointer}
 </div>
 <p class="caption">Total time grouped by GPU state, not event order. GPU active means at least one recorded kernel or transfer.
 Profiling overhead is included.</p>
-<h2>Ten seconds with GPU and CPU on the same time axis</h2>
-<p>This window covers seconds 480 to 490, near the middle of the join.
+<h2>Five seconds with GPU and CPU on the same time axis</h2>
+<p>This window covers seconds 480 to 485, near the middle of the join.
 CPU children appear below their parent, and repeated calls stay separate.
 Hover for the original function name. Click a rectangle to zoom both panels together.</p>
 <p class="caption">Orange shows scheduler methods. Blue shows PyTorch and CUDA API calls.
 Gray means no recorded CPU operation, which can include Python work or waiting.
 Brief intervals can be narrower than a pixel; click to inspect them.</p>
-<button id="window-reset">Reset to 10 seconds</button>
+<button id="window-reset">Reset to 5 seconds</button>
 <a href="bio3_join_window.pdf">Download PDF</a>
 <div id="window-status" role="status"></div>
-<canvas id="cpu-gpu-window" aria-label="Ten seconds of GPU active and idle intervals above nested CPU operations on the same time axis"></canvas>
+<canvas id="cpu-gpu-window" aria-label="Five seconds of GPU active and idle intervals above nested CPU operations on the same time axis"></canvas>
 <pre id="window-details" role="status">Hover a rectangle for its recorded name and interval.</pre>
 <h2>GPU active and idle over time</h2>
 <p>Each interval uses its recorded start and end time. There is no averaging into percentages.
