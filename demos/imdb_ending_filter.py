@@ -6,9 +6,11 @@ pinned Hugging Face revision, registers them as one Arrow dataset,
 runs one AI.IF filter, and prints the plan, the row count, and the
 timing.
 
-Prediction, from the QUAIL-B IMDB-1 result (one filter over 5,000
-reviews: 14.25 s, 351 reviews/s, 352 fresh tokens per review): about
-285 s for the query, about 35 M fresh tokens, about $0.31 of H100 time.
+Prediction. The corpus tokenizes to 29.7 M tokens (mean 297 per
+review; 30.7 s to tokenize and plan on a 16 core CPU). QUAIL-B IMDB-1
+ran one filter over 5,000 reviews at 123,000 fresh tokens per second on
+the Quail backend, so the query should take about 240 s and cost about
+$0.26 of H100 time.
 
     uv run python demos/imdb_ending_filter.py 2>&1 | tee imdb_ending_filter.log
 """
@@ -68,7 +70,7 @@ def main() -> None:
         wall_s = report["wall_s"]
         print(f"matching reviews: {table.num_rows} of {n_docs}")
         print(f"boot_s: {report.get('boot_s')} ({report.get('boot_kind')})")
-        print(f"wall_s: {wall_s}  (predicted about 285 s)")
+        print(f"wall_s: {wall_s}  (predicted about 240 s)")
         print(f"fresh_tokens: {report.get('fresh_tokens')}")
         print(f"documents/second: {n_docs / wall_s:.1f}")
         print(f"$/query: {wall_s / 3600 * H100_USD_PER_HOUR:.4f}")

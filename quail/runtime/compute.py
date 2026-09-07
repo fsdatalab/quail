@@ -27,6 +27,10 @@ class QueryRequest:
     order: str | None = None
     registry: ExtensionRegistry = field(
         default_factory=ExtensionRegistry.with_built_ins)
+    # The caller's planned Query, when the provider runs in the caller's
+    # process. It already holds the tokenized documents, so the worker
+    # does not tokenize them again. Remote providers ignore it.
+    planned_query: object | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.logical_plan, LogicalPlan):

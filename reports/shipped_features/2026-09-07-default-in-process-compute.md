@@ -52,6 +52,14 @@ already set in the environment win. The warm-kernel marker derives its
 path from `DG_CACHE_DIR`, so it lands next to the compiled kernels and
 the second run on a machine does the touch pass instead of the compile.
 
+`QueryRequest` carries the caller's planned `Query` as `planned_query`.
+`execute_query_request` runs that Query when it is present instead of
+building a second session, so documents tokenized for `explain()` are
+not tokenized again by `run()`. Remote providers ignore the field; the
+Modal worker still tokenizes on its own machine. Measured on 100,000
+IMDB reviews on this CPU: tokenizing and planning takes 30.7 s, and a
+second query on the same session reuses the token file in 0.3 s.
+
 Costs: the locked Linux install grows by vLLM, torch 2.11 (CUDA 13),
 and the NVIDIA libraries, about 7.8 GB on disk. CI on `ubuntu-latest`
 installs them too.

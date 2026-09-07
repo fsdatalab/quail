@@ -451,6 +451,7 @@ class Query:
             device=self.session.device.name,
             order=self.order,
             registry=self.session.registry,
+            planned_query=self,
         )
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:

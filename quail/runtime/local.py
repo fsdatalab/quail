@@ -118,13 +118,19 @@ def execute_worker_query(query, physical_executor=None):
 def execute_query_request(
     request: QueryRequest, physical_executor=None
 ) -> QueryResult:
-    """Plan and run one logical query request in this process."""
+    """Plan and run one logical query request in this process.
+
+    Reuses the caller's Query when the request carries one, so documents
+    tokenized for planning or explain() are not tokenized again.
+    """
     started = time.perf_counter()
-    session = Session(request.config, device=request.device,
-                      registry=request.registry)
-    for name, provider in request.providers.items():
-        session.register(name, provider)
-    query = Query(session, request.logical_plan, order=request.order)
+    query = request.planned_query
+    if not isinstance(query, Query):
+        session = Session(request.config, device=request.device,
+                          registry=request.registry)
+        for name, provider in request.providers.items():
+            session.register(name, provider)
+        query = Query(session, request.logical_plan, order=request.order)
     result = execute_worker_query(query, physical_executor)
     result.report["worker_total_s"] = round(
         time.perf_counter() - started, 4

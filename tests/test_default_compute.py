@@ -55,3 +55,25 @@ def test_fake_physical_executor_skips_gpu_check(monkeypatch):
     result = session.sql(FILTER_SQL).run()
     assert result.to_rows() == [("a",)]
     session.close()
+
+
+def test_in_process_run_reuses_the_planned_query(monkeypatch):
+    from quail.runtime import local
+
+    session = _session(
+        compute_provider=quail.InProcessComputeProvider(
+            make_executor({"d": {"question": [1, 0]}})
+        ),
+    )
+    query = session.sql(FILTER_SQL)
+    query.explain()
+    stores_after_plan = dict(session._token_stores)
+
+    def no_second_session(*args, **kwargs):
+        raise AssertionError("run() must not build a worker session")
+
+    # a worker session would tokenize the documents a second time
+    monkeypatch.setattr(local, "Session", no_second_session)
+    assert query.run().to_rows() == [("a",)]
+    assert session._token_stores == stores_after_plan
+    session.close()
