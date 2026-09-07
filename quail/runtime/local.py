@@ -4,7 +4,6 @@ The Modal worker and the in-process compute provider both come here.
 """
 
 import json
-import os
 import time
 from dataclasses import dataclass, field
 
@@ -15,6 +14,7 @@ from quail.planner.plan import Refusal
 from quail.runtime.compute import QueryRequest
 from quail.runtime.result import QueryResult
 from quail.runtime.session import Query, RefusalError, Session
+from quail.runtime.volumes import commit_results, run_record_path
 
 
 @dataclass
@@ -63,14 +63,12 @@ def _execute_physical(request, registry):
     ))
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a model backend must return PhysicalResponse")
-    if (
-        response.metrics.get("result_volume_path") is None
-        and os.path.isdir("/results")
-        and os.access("/results", os.W_OK)
-    ):
+    result_path = (
+        run_record_path()
+        if response.metrics.get("result_volume_path") is None else None
+    )
+    if result_path is not None:
         metrics = dict(response.metrics)
-        os.makedirs("/results/runs", exist_ok=True)
-        result_path = f"/results/runs/run_{time.time_ns()}.json"
         metrics["result_volume_path"] = result_path
         with open(result_path, "w") as output:
             json.dump({
@@ -89,9 +87,7 @@ def _execute_physical(request, registry):
                     "backend_metrics",
                 )
             }, output)
-        from quail.runtime.volumes import results_vol
-
-        results_vol.commit()
+        commit_results()
         response = PhysicalResponse(response.outputs, metrics)
     return response
 

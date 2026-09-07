@@ -36,6 +36,15 @@ build-essential` adds it. `uv sync` downloads its own Python build,
 which carries the C headers that helper needs, so the system Python
 and its header packages are not used.
 
+The first run on a machine compiles the Quail backend's kernels, which
+takes about three minutes on an H100. The compiled kernels and the
+marker that records the compile go under `~/.cache/quail/kernels`, the
+same layout the Modal image keeps on its kernel-cache volume, so later
+runs skip the compile. Set `DG_CACHE_DIR`, `TRITON_CACHE_DIR`,
+`VLLM_CACHE_ROOT`, or `TORCHINDUCTOR_CACHE_DIR` before the first query
+to put them elsewhere. Model weights go to the Hugging Face cache,
+`~/.cache/huggingface` by default.
+
 `docs/examples/local_gpu_smoke.py` runs one filter query in process and
 prints the rows and timing, for checking a new machine.
 

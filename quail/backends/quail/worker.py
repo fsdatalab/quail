@@ -8,7 +8,6 @@ worker process over pipes.
 import gc
 import itertools
 import json
-import os
 import time
 
 from quail.backends.base import GpuContext
@@ -180,7 +179,7 @@ def _bind_query(state, true_ids, false_ids, chunk_tokens):
 
 def _warm(state, boot):
     """Compile and touch the kernels once per container."""
-    from quail.runtime.volumes import kernel_cache
+    from quail.runtime.volumes import commit_kernel_cache
 
     if state["warmed"]:
         return
@@ -195,7 +194,7 @@ def _warm(state, boot):
                             state["async_ans"], state["chunk_tokens"],
                             model_name=state["spec"].hf_name)
     torch.cuda.synchronize()
-    kernel_cache.commit()   # keep the compiles even if the run dies
+    commit_kernel_cache()   # keep the compiles even if the run dies
     boot["warm_kernels_s"] = time.perf_counter() - t0
     boot["warm_tier"] = warm["tier"]
     state["warmed"] = True
@@ -210,7 +209,11 @@ def _finish_boot(boot, t_boot):
 
 def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     """Execute one Quail payload on the worker's own GPU."""
-    from quail.runtime.volumes import kernel_cache, results_vol
+    from quail.runtime.volumes import (
+        commit_kernel_cache,
+        commit_results,
+        run_record_path,
+    )
 
     spec = registry.model(payload["model"])
     device = registry.device(payload["physical_plan"]["device"])
@@ -233,20 +236,20 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     report["boot_s"] = boot["boot_s"]
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
-    os.makedirs("/results/runs", exist_ok=True)
-    result_path = f"/results/runs/run_{time.time_ns()}.json"
+    result_path = run_record_path()
     report["result_volume_path"] = result_path
-    with open(result_path, "w") as f:
-        json.dump(dict(
-            wall_s=report["wall_s"], boot_s=report["boot_s"],
-            boot_kind=report["boot_kind"], boot=boot,
-            fresh_tokens=report["fresh_tokens"],
-            regret_tokens=report.get("regret_tokens"),
-            node_metrics=report.get("node_metrics"),
-            executed_join_plan=report.get("executed_join_plan", []),
-            kv_manager=report.get("kv_manager")), f)
-    results_vol.commit()
-    kernel_cache.commit()    # persist any JIT artifacts this run built
+    if result_path is not None:
+        with open(result_path, "w") as f:
+            json.dump(dict(
+                wall_s=report["wall_s"], boot_s=report["boot_s"],
+                boot_kind=report["boot_kind"], boot=boot,
+                fresh_tokens=report["fresh_tokens"],
+                regret_tokens=report.get("regret_tokens"),
+                node_metrics=report.get("node_metrics"),
+                executed_join_plan=report.get("executed_join_plan", []),
+                kv_manager=report.get("kv_manager")), f)
+    commit_results()
+    commit_kernel_cache()    # persist any JIT artifacts this run built
     return PhysicalResponse(outputs, report)
 
 
@@ -546,7 +549,7 @@ def _round(kind, subs):
 
 def execute_quail_multi(payload, registry, graph):
     """Execute the typed Quail graph across GPU child processes."""
-    from quail.runtime.volumes import kernel_cache, results_vol
+    from quail.runtime.volumes import commit_kernel_cache, commit_results
 
     payload = dict(payload)
     payload["docs"] = decode_payload_documents(payload["docs"])
@@ -563,8 +566,8 @@ def execute_quail_multi(payload, registry, graph):
         registry.runtimes,
         registry,
     )
-    results_vol.commit()
-    kernel_cache.commit()
+    commit_results()
+    commit_kernel_cache()
     outputs = report.pop("_outputs")
     report.pop("filters", None)
     report.pop("joins", None)

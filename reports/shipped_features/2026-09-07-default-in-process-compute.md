@@ -34,6 +34,24 @@ own Python 3.12 build, which includes them. Found on a Nebius H100 VM
 with Ubuntu 24.04, where the first run failed in `gcc` for the missing
 `Python.h`.
 
+The Quail backend committed the Modal kernel-cache and results volumes
+after every warmup and query, and wrote a run record under `/results`.
+On a machine outside Modal the commit raised `modal.exception.AuthError`
+after the three minute kernel compile. `quail/runtime/volumes.py` now
+has `commit_results`, `commit_kernel_cache`, and `run_record_path`; the
+commits do nothing when `modal.is_local()` is true and the record is
+skipped when `/results` is not a writable directory. Inside Modal the
+behavior is unchanged.
+
+Before the model loads, the in-process provider points the kernel
+caches (`DG_CACHE_DIR`, `DG_JIT_CACHE_DIR`, `TRITON_CACHE_DIR`,
+`VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`) at
+`~/.cache/quail/kernels`, and sets `PYTORCH_CUDA_ALLOC_CONF` and
+`VLLM_USE_FLASHINFER_SAMPLER` the way the Modal image does. Values
+already set in the environment win. The warm-kernel marker derives its
+path from `DG_CACHE_DIR`, so it lands next to the compiled kernels and
+the second run on a machine does the touch pass instead of the compile.
+
 Costs: the locked Linux install grows by vLLM, torch 2.11 (CUDA 13),
 and the NVIDIA libraries, about 7.8 GB on disk. CI on `ubuntu-latest`
 installs them too.

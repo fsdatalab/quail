@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -51,6 +52,34 @@ class ComputeProvider(Protocol):
     def close(self) -> None: ...
 
 
+LOCAL_KERNEL_CACHE = "~/.cache/quail/kernels"
+
+# Same settings the Modal image puts on the kernel-cache volume, so a
+# local GPU keeps its compiled kernels between runs and behaves like a
+# Modal worker. setdefault leaves anything the user already set alone.
+_LOCAL_ENV_DEFAULTS = (
+    ("VLLM_CACHE_ROOT", "vllm"),
+    ("DG_CACHE_DIR", "deep_gemm"),
+    ("DG_JIT_CACHE_DIR", "deep_gemm"),
+    ("TRITON_CACHE_DIR", "triton"),
+    ("TORCHINDUCTOR_CACHE_DIR", "torchinductor"),
+)
+
+
+def default_local_caches() -> str:
+    """Point every kernel cache at one directory that survives restarts.
+
+    Returns:
+        The cache root directory.
+    """
+    root = os.path.expanduser(LOCAL_KERNEL_CACHE)
+    for name, sub in _LOCAL_ENV_DEFAULTS:
+        os.environ.setdefault(name, os.path.join(root, sub))
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    return root
+
+
 def local_gpu_problem() -> str | None:
     """Return why this process cannot run a model, or None when it can."""
     try:
@@ -78,6 +107,8 @@ class InProcessComputeProvider:
 
     def execute(self, request: QueryRequest) -> QueryResult:
         if self._physical_executor is None:
+            # before torch loads, so the allocator setting takes effect
+            default_local_caches()
             problem = local_gpu_problem()
             if problem is not None:
                 raise RuntimeError(
