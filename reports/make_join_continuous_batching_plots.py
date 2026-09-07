@@ -42,7 +42,7 @@ def load(workdir):
             join_seconds = sum(
                 node["metrics"]["wall_s"]
                 for node in summary["nodes"].values()
-                if node["type"] == "AnchoredJoin" and node["metrics"])
+                if node["type"].endswith("anchored_join") and node["metrics"])
             rows[(key, qid)] = dict(
                 seconds=summary["query_seconds"], join_seconds=join_seconds,
                 pairs=summary["evaluated_document_pairs"],

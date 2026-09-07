@@ -21,7 +21,9 @@
   `group_size`. Every resident anchor is pinned for the whole join, so
   fresh admissions evict only KV the join does not read.
 - The [comparison report](../2026-09-07-join-continuous-batching.md)
-  has the measured before and after numbers.
+  measured IMDB-8 at 25.53 seconds, compared with 26.63 seconds before,
+  with identical answers and fresh tokens. FEV-7 and FEV-9, whose joins
+  fit one arena group, changed by less than 0.4%.
 
 ```mermaid
 flowchart LR
