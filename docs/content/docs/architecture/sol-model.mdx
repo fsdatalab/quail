@@ -337,15 +337,14 @@ only what the benchmark has: the corpora, the queries, and the saved
 labels, wrapped as the `answer` callable. Document lengths and prompt
 lengths come from the session's tokenizer.
 
-The saved estimates at `/results/sol/sol_quailb_sf0.1.json` on the
-`quail-results` volume predate the four-filter FEV-9 definition. Regenerate
-them before comparing the current suite with those estimates.
-
-The current plot inputs are saved at
-`/results/sol/2026-09-06-quailb-prefix-reuse.json`. They preserve the other
-31 estimates and replace FEV-9 with a CPU calculation for its four-filter
-definition. This uses the estimate with prefix reuse across requests,
-documents, and repeated aliases. For FEV-9 on 4B, it is 5.821 seconds,
+The saved estimates are at `/results/sol/sol_quailb_sf0.1.json` on the
+`quail-results` volume, regenerated on 2026-09-07 with the four-filter
+FEV-9 definition; a dated copy is at
+`/results/sol/2026-09-07-sol_quailb_sf0.1.json`. They equal the earlier
+plot inputs at `/results/sol/2026-09-06-quailb-prefix-reuse.json` on
+every query and both models. The file holds the estimate with prefix
+reuse across requests, documents, and repeated aliases, and the per
+document estimate beside it. For FEV-9 on 4B, it is 5.821 seconds,
 compared with 6.337 seconds when reuse is limited to each document's own
 requests. The estimates use reference-label survivors and unlimited prefix
 retention. They do not predict the accuracy of a measured model run.

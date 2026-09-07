@@ -58,9 +58,15 @@ function any other engine could replace with its own.
 | CPU tests collected | 259 | 264 |
 
 No GPU run. The estimator is the same arithmetic as the script it
-replaces; the unit tests check the filter work by hand on a three
-document corpus and the join search against the anchor choices. The
-saved estimates on the volume were not regenerated.
+replaces. The rewritten script was run on the CPU against the sf=0.1
+corpus and the active label collection, and its output equals
+`/results/sol/2026-09-06-quailb-prefix-reuse.json` on every query and
+both models: seconds, tokens, pairs, KV bytes, stage order, and anchor
+choices all match with zero difference. The result is saved at
+`/results/sol/sol_quailb_sf0.1.json` and
+`/results/sol/2026-09-07-sol_quailb_sf0.1.json`. The unit tests check
+the filter work by hand on a three document corpus and the join search
+against the anchor choices.
 
 ```sh
 uv run ruff check quail tests experiments reports tools
