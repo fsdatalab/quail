@@ -1,4 +1,4 @@
-"""Plot the BIO-3 CPU flame graph from saved quail-results summaries.
+"""Rebuild the BIO-3 interactive HTML and five-second PDF with PNG preview.
 
     W=/tmp/quail-bio3-vllm-profile
     mkdir -p "$W"
@@ -31,14 +31,6 @@ from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
 HERE = Path(__file__).resolve().parent
 
 
-def layout(node, start=0, depth=0):
-    """Yield aggregate intervals with children placed inside their parent."""
-    yield start, depth, node
-    for child in node["children"]:
-        yield from layout(child, start, depth + 1)
-        start += child["seconds"]
-
-
 def color(node):
     """Return the color for a recorded operation category."""
     if node["name"].startswith("vllm.scheduler."):
@@ -46,59 +38,6 @@ def color(node):
     if node["name"].startswith("[") or node["name"] == "Worker main thread":
         return GRAY
     return BLUE
-
-
-def plot_flamegraph(root):
-    """Save a static view of the largest recorded CPU operations."""
-    plt.style.use(HERE / "quail.mplstyle")
-    visible = [(start, depth, node) for start, depth, node in layout(root)
-               if depth <= 7 and node["seconds"] >= root["seconds"] / 1500]
-    levels = max(depth for _, depth, _ in visible) + 1
-    fig = plt.figure(figsize=(17, max(8, 4.4 + 0.55 * levels)))
-    fig.set_layout_engine("none")
-    fig.text(0.06, 0.965, "BIO-3, pipelined vLLM, profiled join", fontsize=16)
-    fig.text(0.06, 0.90,
-             f"GPU idle for {root['gpu_idle_seconds']:.2f} of {root['seconds']:.2f} seconds",
-             fontsize=25, weight="bold")
-    gpu = fig.add_axes((0.06, 0.70, 0.92, 0.15))
-    idle = root["gpu_idle_seconds"]
-    active = root["gpu_seconds"]
-    gpu.barh(0.5, idle, height=1, left=0, color=DARK)
-    gpu.barh(0.5, active, height=1, left=idle, color=GREEN)
-    gpu.text(idle / 2, 0.5, f"GPU idle\n{idle:.2f} seconds",
-             color="white", fontsize=22, weight="bold", ha="center", va="center")
-    gpu.text(idle + active / 2, 0.5, f"GPU active\n{active:.2f} seconds",
-             color="black", fontsize=22, weight="bold", ha="center", va="center")
-    gpu.set(xlim=(0, root["seconds"]), ylim=(0, 1), xticks=[], yticks=[])
-    fig.text(0.06, 0.665,
-             "Total time grouped by GPU state, not event order. Profiling overhead is included.", fontsize=11)
-    ax = fig.add_axes((0.06, 0.20, 0.92, 0.36))
-    total = root["seconds"]
-    for start, depth, node in visible:
-        patch = Rectangle((start, depth), node["seconds"], 0.92,
-                          facecolor=color(node), edgecolor="white", linewidth=0.4)
-        ax.add_patch(patch)
-        width_fraction = node["seconds"] / total
-        if width_fraction > 0.055:
-            limit = max(4, int(width_fraction * 170))
-            name = node["name"]
-            label = name if len(name) <= limit else name[:limit - 3] + "..."
-            text = ax.text(start + node["seconds"] / 2, depth + 0.46,
-                           f"{label}\n{node['seconds']:.2f} s",
-                           ha="center", va="center",
-                           fontsize=9, color="black", clip_on=True)
-            text.set_clip_path(patch)
-    ax.set(xlim=(0, total), ylim=(levels, -0.2), xlabel="seconds", yticks=[])
-    ax.set_title("Recorded CPU operations", loc="left", pad=18)
-    fig.text(0.06, 0.04,
-             "Flame-graph width is total elapsed time across calls. Children appear below their parent. Horizontal position is not query time.\n"
-             "Orange: scheduler methods. Blue: PyTorch and CUDA API operations on the CPU. Gray: thread interval or unrecorded time.\n"
-             "Unrecorded CPU time is not CPU idle time. Open bio3_join_profile.html to inspect functions and their concurrent GPU activity.",
-             fontsize=10, linespacing=1.5)
-    destination = HERE / "plots/bio3_join_profile"
-    fig.savefig(destination.with_suffix(".png"), dpi=300)
-    fig.savefig(destination.with_suffix(".pdf"))
-    plt.close(fig)
 
 
 def load_window(workdir, timeline, source):
@@ -379,6 +318,5 @@ if __name__ == "__main__":
     assert summary["source"] == result["result_volume_path"]
     timeline = (workdir / "gpu-timeline.f64.gz").read_bytes()
     window = load_window(workdir, timeline, summary["source"])
-    plot_flamegraph(summary["flamegraph"])
     plot_window(window)
     write_interactive(summary["flamegraph"], timeline, window)

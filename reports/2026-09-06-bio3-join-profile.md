@@ -9,7 +9,7 @@
   communication, or other Python work.
 
 [Open the GPU timeline and CPU flame graph](plots/bio3_join_profile.html) or
-[the vector PDF](plots/bio3_join_profile.pdf).
+[the five-second PDF](plots/bio3_join_window.pdf).
 
 [![BIO-3 GPU and CPU from 480 to 485 seconds](plots/bio3_join_window.png)](plots/bio3_join_window.pdf)
 
@@ -26,11 +26,7 @@ Figure: plots/bio3_join_window.png
 - Gray CPU intervals mean no selected CPU operation was recorded. They
   can include Python work and waiting; they do not establish CPU idle time.
 
-[![BIO-3 CPU intervals and concurrent GPU activity](plots/bio3_join_profile.png)](plots/bio3_join_profile.pdf)
-
-Figure: plots/bio3_join_profile.png
-
-- The large top bar shows whole-join GPU idle and active seconds directly.
+- The HTML's large top bar shows whole-join GPU idle and active seconds directly.
   It groups durations by state, not by event order.
 - The HTML GPU timeline uses the original interval boundaries. Its upper
   row is active whenever at least one GPU kernel, copy, or memset is
@@ -44,8 +40,7 @@ Figure: plots/bio3_join_profile.png
   across calls with the same recorded name and parent. Children appear below their parent.
   Horizontal position is not query time. Click to zoom and hover to read
   the complete name, call count, elapsed time, and time without recorded
-  child operations. The PDF shows the largest operations and first eight
-  levels; the HTML includes smaller operations and deeper levels.
+  child operations. This aggregate view is available in the HTML.
 - Selecting a CPU function shows a separate bar of GPU idle and active
   seconds during its intervals. This bar groups durations by state.
   GPU work can come from a previously submitted request. This bar shows
