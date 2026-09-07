@@ -35,7 +35,7 @@ For a one-filter query that is a `quail.document_input` line, a
 `cached_tokens`, `kv_hits`, `kv_misses`, `kv_removals`,
 `kv_recomputations`, `regret_tokens`, `peak_gpu_bytes`, and an
 `extension` mapping for anything else. Model nodes carry the numbers
-the GPU executor measured. `HashJoin`, `Project`, and `Limit` report
+the GPU executor measured. `Recombine`, `Project`, and `Limit` report
 row counts.
 
 `quail_ext_examples/cost_ledger.py` is a complete example built on

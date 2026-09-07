@@ -425,7 +425,7 @@ def test_three_join_chain_plans_with_barriers(catalog, tmp_path):
     assert kinds.count("AnchoredJoin") == 2
     assert kinds.count("Exchange") == 1
     # recombination reads every stage's pairs
-    rec = plan.graph.nodes_by_type("quail.hash_join")[0]
+    rec = plan.graph.nodes_by_type("quail.recombine")[0]
     pair_ports = [input_port.source.port for input_port in rec.inputs
                       if input_port.source.port.startswith("join_answers:")]
     assert len(pair_ports) == 3

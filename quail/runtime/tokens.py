@@ -132,6 +132,139 @@ class TokenLengths(Sequence):
         return self._store._length_batches[batch_index][local].as_py()
 
 
+def _write_all(writer, batches):
+    """Write every batch through one store writer and open the store."""
+    try:
+        for batch in batches:
+            writer.write_batch(batch)
+    except Exception:
+        writer.abort()
+        raise
+    return writer.finish()
+
+
+class _StoreWriter:
+    """Write one memory mappable Arrow IPC file batch by batch."""
+
+    def __init__(self, path: str, schema: pa.Schema):
+        self.path = path
+        self._schema = schema
+        self._sink = pa.OSFile(path, "wb")
+        self._writer = pa.ipc.new_file(self._sink, schema)
+
+    def _write(self, arrays) -> None:
+        self._writer.write_batch(
+            pa.RecordBatch.from_arrays(arrays, schema=self._schema)
+        )
+
+    def _close(self) -> None:
+        self._writer.close()
+        self._sink.close()
+
+    def abort(self) -> None:
+        """Close the file and delete it."""
+        try:
+            self._close()
+        finally:
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+
+
+class TokenStoreWriter(_StoreWriter):
+    """Tokenize source batches into a token store file."""
+
+    def __init__(self, path: str, *, document_column: str, tokenizer,
+                 token_type: pa.DataType):
+        self._document_column = document_column
+        self._tokenizer = tokenizer
+        self._token_list_type = pa.large_list(token_type)
+        schema = pa.schema(
+            [
+                pa.field(TokenStore._token_column, self._token_list_type,
+                         nullable=False),
+                pa.field(TokenStore._count_column, pa.int64(),
+                         nullable=False),
+            ],
+            metadata={b"quail.kind": b"token_store"},
+        )
+        super().__init__(path, schema)
+
+    def write_batch(self, batch: pa.RecordBatch) -> None:
+        """Tokenize the document column of one source batch."""
+        texts = batch.column(
+            batch.schema.get_field_index(self._document_column)
+        )
+        tokens = pa.array(
+            [self._tokenizer(text.as_py()) for text in texts],
+            type=self._token_list_type,
+        )
+        counts = pc.list_value_length(tokens).cast(pa.int64())
+        self._write([tokens, counts])
+
+    def finish(self) -> "TokenStore":
+        """Close the file and open it as a token store."""
+        self._close()
+        return TokenStore(self.path)
+
+
+class ColumnStoreWriter(_StoreWriter):
+    """Copy one source column into a column store file."""
+
+    def __init__(self, path: str, field: pa.Field):
+        self._name = field.name
+        super().__init__(
+            path,
+            pa.schema([field], metadata={b"quail.kind": b"column_store"}),
+        )
+
+    def write_batch(self, batch: pa.RecordBatch) -> None:
+        """Copy the stored column out of one source batch."""
+        self._write([batch.column(batch.schema.get_field_index(self._name))])
+
+    def finish(self) -> "ColumnStore":
+        """Close the file and open it as a column store."""
+        self._close()
+        return ColumnStore(self.path)
+
+
+class ColumnStore:
+    """Provide one memory mapped source column for result rows."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._source = pa.memory_map(path, "r")
+        self._reader = pa.ipc.open_file(self._source)
+        self.name = self._reader.schema.names[0]
+        self._values = None
+
+    @classmethod
+    def write(cls, path: str, batches, field: pa.Field) -> "ColumnStore":
+        """Copy one column of bounded input batches into an Arrow IPC file."""
+        return _write_all(ColumnStoreWriter(path, field), batches)
+
+    @property
+    def values(self) -> pa.ChunkedArray:
+        """Return the column as one memory mapped chunked array."""
+        if self._values is None:
+            self._values = pa.chunked_array(
+                [
+                    self._reader.get_batch(index).column(0)
+                    for index in range(self._reader.num_record_batches)
+                ],
+                type=self._reader.schema.field(0).type,
+            )
+        return self._values
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def close(self) -> None:
+        """Close the memory mapped Arrow file."""
+        self._source.close()
+
+
 class TokenStore(Sequence):
     """Provide random token access from one memory mapped Arrow file."""
 
@@ -163,82 +296,22 @@ class TokenStore(Sequence):
         batches,
         *,
         document_column: str,
-        projected_columns: tuple[str, ...],
         tokenizer,
         token_type: pa.DataType,
-        source_schema: pa.Schema,
     ) -> "TokenStore":
         """Tokenize bounded input batches into one Arrow IPC file."""
-        reserved = {cls._token_column, cls._count_column}
-        conflict = reserved & set(projected_columns)
-        if conflict:
-            raise ValueError(
-                f"source columns use reserved Quail names {sorted(conflict)}"
-            )
-        token_list_type = pa.large_list(token_type)
-        fields = [
-            pa.field(cls._token_column, token_list_type, nullable=False),
-            pa.field(cls._count_column, pa.int64(), nullable=False),
-        ]
-        fields.extend(source_schema.field(name) for name in projected_columns)
-        schema = pa.schema(
-            fields,
-            metadata={b"quail.kind": b"token_store"},
+        writer = TokenStoreWriter(
+            path,
+            document_column=document_column,
+            tokenizer=tokenizer,
+            token_type=token_type,
         )
-        try:
-            with pa.OSFile(path, "wb") as sink:
-                with pa.ipc.new_file(sink, schema) as writer:
-                    for batch in batches:
-                        texts = batch.column(
-                            batch.schema.get_field_index(document_column)
-                        )
-                        tokens = pa.array(
-                            [tokenizer(text.as_py()) for text in texts],
-                            type=token_list_type,
-                        )
-                        counts = pc.list_value_length(tokens).cast(
-                            pa.int64()
-                        )
-                        arrays = [tokens, counts]
-                        arrays.extend(
-                            batch.column(batch.schema.get_field_index(name))
-                            for name in projected_columns
-                        )
-                        writer.write_batch(
-                            pa.RecordBatch.from_arrays(arrays, schema=schema)
-                        )
-        except Exception:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-            raise
-        return cls(path)
+        return _write_all(writer, batches)
 
     @property
     def lengths(self) -> TokenLengths:
         """Return the file backed document length sequence."""
         return self._lengths
-
-    @property
-    def projected_columns(self) -> tuple[str, ...]:
-        """Return source columns stored beside the token batches."""
-        return tuple(
-            name for name in self._reader.schema.names
-            if name not in {self._token_column, self._count_column}
-        )
-
-    def column(self, name: str) -> pa.ChunkedArray:
-        """Return one memory mapped source column."""
-        if name not in self.projected_columns:
-            raise KeyError(name)
-        return pa.chunked_array(
-            [
-                self._reader.get_batch(index).column(name)
-                for index in range(self._reader.num_record_batches)
-            ],
-            type=self._reader.schema.field(name).type,
-        )
 
     def _locate(self, index: int) -> tuple[int, int]:
         if index < 0:
@@ -265,6 +338,28 @@ class TokenStore(Sequence):
     def select(self, indices) -> "TokenSelection":
         """Return a file reference for selected document positions."""
         return TokenSelection(self.path, indices)
+
+
+class ScanInput:
+    """The tokenized documents of one scan and its stored value columns."""
+
+    def __init__(self, tokens: "TokenStore", columns: dict):
+        self.tokens = tokens
+        self._columns = dict(columns)
+
+    @property
+    def lengths(self) -> TokenLengths:
+        """Return the document token lengths."""
+        return self.tokens.lengths
+
+    @property
+    def projected_columns(self) -> tuple[str, ...]:
+        """Return the value columns stored for this scan."""
+        return tuple(self._columns)
+
+    def column(self, name: str) -> pa.ChunkedArray:
+        """Return one stored value column."""
+        return self._columns[name].values
 
 
 class TokenSelection(Sequence):

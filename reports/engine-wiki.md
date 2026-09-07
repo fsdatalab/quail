@@ -145,16 +145,20 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    the source. Otherwise, it sends only the raw Arrow columns used by the
    query.
 6. The Modal worker opens the sources and reads bounded Arrow batches. It
-   tokenizes each batch and writes the tokens, document lengths, and output
-   columns to a temporary Arrow file. Source batches can be released after the
-   write. The worker runs the registered logical optimizer rules from the
+   tokenizes each batch and writes the tokens and document lengths to a
+   temporary Arrow file, one per document column. Each value column the
+   query returns goes to its own Arrow file in the same pass. Both are
+   cached on the session by provider content and column name, so a
+   later query over the same documents with a different SELECT list
+   copies only its new value columns and does not tokenize again.
+   Source batches can be released after the write. The worker runs the registered logical optimizer rules from the
    memory mapped length column. The selected model backend produces physical
    candidates. The
    planner selects one typed `PhysicalGraph`. Quail uses
    `DocumentInput`, `PackedFilter`, `AnchoredJoin`,
-   `Exchange`, `HashJoin`, physical `Project`, and `Limit`.
+   `Exchange`, `Recombine`, physical `Project`, and `Limit`.
    The vLLM and SGLang backends use `DocumentInput`, `RequestExecution`,
-   `HashJoin`, physical `Project`, and `Limit`. `RequestExecution` stores the
+   `Recombine`, physical `Project`, and `Limit`. `RequestExecution` stores the
    tokenized filter and join prompt parts. It does not contain a Quail
    scheduler.
    The generic `PhysicalPlan` holds the graph and a backend-owned settings map.
@@ -171,8 +175,12 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    runner then executes the typed physical graph.
    The same `QuailModelExecution` handles every model node on one GPU
    executor, so the nodes use the same KV.
-9. Arrow Acero joins the true pairs on
-   shared SQL alias columns and applies the final survivor sets. Each
+9. When a query has several full joins or a gate, the `Recombine`
+   node hands the true pairs and survivor sets to Arrow Acero, which
+   joins them on shared SQL alias columns and applies the final
+   survivor sets. A query with one full join and no gate has no
+   `Recombine`: the join's true pairs are already the result rows,
+   so `Project` reads them directly. Each
    alias column contains the source table row number for one document.
    The same graph applies the final projection and limit. Projection reads only
    the selected result positions from memory mapped source columns, so the
@@ -199,7 +207,14 @@ logical node does not require another tree traversal function.
 There are four operators, defined in `logical.py`:
 
 - **Scan**: reads one column of one registered provider (e.g.,
-  `reviews.body`).
+  `reviews.body`). That column is tokenized for the model. The Scan
+  also lists the source columns kept as values for the result rows
+  (`columns`). The `projection_pushdown` logical rule fills that list:
+  it fires at the root Project, collects the columns the SELECT list
+  returns, and rewrites each Scan to keep only those. The document
+  column is kept as a value only when the query returns it. The
+  session and the Modal request builder read the pruned Scans, so a
+  provider is never asked for a column the query does not return.
 - **SemanticFilter**: a conjunction of true/false predicates over a
   single scanned column. Each predicate has a prompt template, column
   references, and an optional selectivity (the fraction of documents
@@ -378,7 +393,7 @@ A finished `QueryResult` carries the executed `PhysicalGraph` as `plan` and
 each node's `NodeMetrics` as `node_metrics`; `explain()` prints them.
 Execution observers, registered by class, run over the complete physical graph
 once when the query finishes. Model nodes reuse the metrics reported by the GPU
-executor. The same observer instance then sees `HashJoin`, `Project`, and
+executor. The same observer instance then sees `Recombine`, `Project`, and
 `Limit`. `result.observer(cls)` returns an observer's report.
 
 The selected model backend checks whether it supports the requested model,

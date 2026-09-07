@@ -21,7 +21,7 @@ flowchart TD
     G --> H[Physical rules rewrite the chosen graph]
     H --> I[Generic runner executes the graph]
     I --> J[Model nodes run on the GPU executors]
-    I --> K[HashJoin, Project, Limit run with Arrow]
+    I --> K[Recombine, Project, Limit run with Arrow]
     K --> L[QueryResult: Arrow table + report]
 `} />
 

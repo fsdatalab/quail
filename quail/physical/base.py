@@ -11,7 +11,6 @@ from typing import Any, ClassVar
 class ExecutionLocation(str, Enum):
     """Location where a physical node runs."""
 
-    CLIENT = "client"
     COORDINATOR = "coordinator"
     GPU_EXECUTOR = "gpu_executor"
 
@@ -87,7 +86,7 @@ class PhysicalNode:
 
     type_name: ClassVar[str] = "quail.physical_node"
     runtime_key: ClassVar[str] = "quail.physical_node"
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.CLIENT
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
     backend: ClassVar[str | None] = None
 
     @property

@@ -15,11 +15,11 @@ from quail.physical import (
     DocumentInput,
     Exchange,
     FilterStage,
-    HashJoin,
     JoinStage,
     Limit,
     PackedFilter,
     PortRef,
+    Recombine,
 )
 from quail.physical import (
     Project as PhysicalProject,
@@ -552,8 +552,12 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 
-    if pairs_edges:
-        nodes.append(HashJoin(
+    if len(pairs_edges) == 1 and len(seq) == 1:
+        # one full join and nothing after it: its true pairs are the
+        # result rows, so no recombination is needed
+        sink_inputs = (pairs_edges[0],)
+    elif pairs_edges:
+        nodes.append(Recombine(
             node_id="recombine",
             inputs=input_ports(
                 tuple(pairs_edges)

@@ -10,12 +10,12 @@ from quail.physical import (
     DocumentInput,
     Exchange,
     ExecutionLocation,
-    HashJoin,
     Limit,
     PhysicalGraph,
     PhysicalNode,
     PortRef,
     Project,
+    Recombine,
     ValueType,
 )
 from quail.runtime.result import (
@@ -132,7 +132,7 @@ class ExecutionContext:
     model_execution: Any = None
     sources: Mapping[str, Any] = field(default_factory=dict)
     project: Callable[[Project, Any], Any] | None = None
-    hash_join: Callable[[HashJoin, Mapping[str, Any]], Any] | None = None
+    recombine: Callable[[Recombine, Mapping[str, Any]], Any] | None = None
     model_inputs: Callable[
         [PhysicalNode, Mapping[str, Any], "ExecutionContext"],
         Mapping[str, Any],
@@ -315,13 +315,13 @@ class ExchangeRuntime:
         })
 
 
-class HashJoinRuntime:
+class RecombineRuntime:
     """Run the configured exact answer relation join."""
 
     def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, HashJoin):
+        if not isinstance(node, Recombine):
             raise TypeError(type(node).__name__)
-        if context.hash_join is None:
+        if context.recombine is None:
             import pyarrow as pa
 
 
@@ -331,7 +331,7 @@ class HashJoinRuntime:
                 value = inputs[input_port.name]
                 if not isinstance(value, pa.Table):
                     raise TypeError(
-                        "HashJoin inputs must be Arrow tables"
+                        "Recombine inputs must be Arrow tables"
                     )
                 if input_port.value_type is ValueType.JOIN_ANSWERS:
                     answer_tables.append(true_answer_rows(value))
@@ -344,7 +344,7 @@ class HashJoinRuntime:
                     survivors[alias] = value.column(alias).combine_chunks()
                 else:
                     raise TypeError(
-                        f"HashJoin cannot read {input_port.value_type.value}"
+                        f"Recombine cannot read {input_port.value_type.value}"
                     )
             declaration, schema = build_result_declaration(
                 answer_tables,
@@ -353,7 +353,7 @@ class HashJoinRuntime:
             )
             value = IndexRelation(declaration, schema)
         else:
-            value = context.hash_join(node, inputs)
+            value = context.recombine(node, inputs)
         return NodeResult({"tuples": value})
 
 
@@ -411,7 +411,7 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
     return {
         DocumentInput.runtime_key: DocumentInputRuntime(),
         Exchange.runtime_key: ExchangeRuntime(),
-        HashJoin.runtime_key: HashJoinRuntime(),
+        Recombine.runtime_key: RecombineRuntime(),
         Project.runtime_key: ProjectRuntime(),
         Limit.runtime_key: LimitRuntime(),
     }

@@ -18,7 +18,7 @@ class PhysicalNode:
 
     type_name: ClassVar[str]         # registry key for the codec
     runtime_key: ClassVar[str]       # registry key for the runtime
-    location: ClassVar[ExecutionLocation]   # CLIENT, COORDINATOR, GPU_EXECUTOR
+    location: ClassVar[ExecutionLocation]   # COORDINATOR or GPU_EXECUTOR
     backend: ClassVar[str | None]    # set when the node belongs to one backend
 
     @property
@@ -47,11 +47,11 @@ Generic nodes any backend can use:
 
 | Node | Location | Job |
 | --- | --- | --- |
-| `DocumentInput` | client | Names one tokenized input by alias and input id, with the document count and optional shard ranges. |
+| `DocumentInput` | coordinator | Names one tokenized input by alias and input id, with the document count and optional shard ranges. |
 | `Exchange` | coordinator | Passes survivor ids between rounds when the anchor changes. |
-| `HashJoin` | client | Joins TRUE answer relations on shared alias columns with Arrow Acero. |
-| `Project` | client | Reads the selected columns for the surviving positions. |
-| `Limit` | client | Cuts the result stream. |
+| `Recombine` | coordinator | Joins TRUE answer relations on shared alias columns with Arrow Acero. Planned only when a query has several full joins or a gate; a lone full join feeds its true pairs straight to `Project`. |
+| `Project` | coordinator | Reads the selected columns for the surviving positions. |
+| `Limit` | coordinator | Cuts the result stream. |
 
 Quail backend nodes:
 
@@ -103,13 +103,13 @@ node's metrics, and notifies every observer.
 
 The run can be seeded with `initial_outputs`. The worker runs the
 compute subgraph (model nodes and their inputs) first, then runs the
-whole graph again with the model outputs supplied, so `HashJoin`,
+whole graph again with the model outputs supplied, so `Recombine`,
 `Project`, and `Limit` execute in the same pass and observers see
 every node exactly once.
 
 Model node outputs leave the executor as Arrow tables with metadata
 that names the alias, the predicate position, and for joins the
-anchor, partners, and semantics. `HashJoin` needs nothing else to
+anchor, partners, and semantics. `Recombine` needs nothing else to
 combine them.
 
 ## Fixed join plans

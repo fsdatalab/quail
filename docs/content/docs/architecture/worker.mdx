@@ -45,7 +45,7 @@ kernel cache volume so each kernel compiles once ever.
    [The Quail backend](/docs/architecture/quail-backend).
 8. The model outputs come back as Arrow tables keyed by port. The
    worker runs the full graph again with those outputs supplied, so
-   `HashJoin`, `Project`, and `Limit` run in the same generic runner
+   `Recombine`, `Project`, and `Limit` run in the same generic runner
    pass.
 9. It writes a run record to `/results/runs/` on the `quail-results`
    volume, then returns a materialized `QueryResult` with the executed
