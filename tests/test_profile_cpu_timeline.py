@@ -29,6 +29,8 @@ def test_reader_aligns_to_join_and_selects_recorded_worker_operations(tmp_path):
         {"cat": "user_annotation", "name": "vllm.scheduler.schedule",
          "ts": 1_000_010, "dur": 500_000},
         {"cat": "cpu_op", "name": "aten::item", "ts": 1_100_010, "dur": 100_000},
+        {"cat": "user_annotation", "name": "quail.executor.loop.pack_chunk",
+         "ts": 1_600_010, "dur": 100_000},
         {"cat": "kernel", "name": "gpu", "ts": 1_000_010, "dur": 500_000},
         {"cat": "user_annotation", "name": "broad_marker", "ts": 10, "dur": 3_000_000},
         {"cat": "cpu_op", "name": "other_thread", "ts": 10, "dur": 3_000_000, "tid": 9},
@@ -41,5 +43,7 @@ def test_reader_aligns_to_join_and_selects_recorded_worker_operations(tmp_path):
     result = read_cpu_window(path, [1_010_000, 3_001_010_000], 92, 1, 2)
     assert result["cpu"] == [
         [1, 1.5, 0, "vllm.scheduler.schedule"], [1.1, 1.2, 1, "aten::item"],
-        [1.5, 2, 0, "[no recorded CPU operation]"],
+        [1.5, 1.6, 0, "[no recorded CPU operation]"],
+        [1.6, 1.7, 0, "quail.executor.loop.pack_chunk"],
+        [1.7, 2, 0, "[no recorded CPU operation]"],
     ]

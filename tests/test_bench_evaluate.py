@@ -660,3 +660,20 @@ def test_scanned_shared_prefix_tokens_counts_repeated_columns_in_full():
     # are all shared with the first alias
     assert scanned_shared_prefix_tokens(
         [("reviews", "text"), ("reviews", "text")], lookup) == 2 + 7
+
+
+def test_prefix_metrics_use_scan_tokens_with_projected_columns():
+    from quail.bench.evaluate import add_prefix_metrics
+
+    with quail.Session(tokenizer=lambda text: list(text.encode())) as session:
+        session.register("reviews", DocumentProvider.from_table(
+            pa.table({"id": [0, 1], "body": ["abc", "abd"]}), id_col="id"))
+        query = (session.docs("reviews").alias("r")
+                 .ai_filter(quail.prompt(FILTER, quail.col("r.body")))
+                 .select("r.id"))
+        row = add_prefix_metrics({}, query, {
+            "backend": "quail", "regret_tokens": 3,
+            "stages": [{"op": "filter", "alias": "r"}],
+        })
+        assert row == {"shared_prefix_tokens": 2, "cross_row_cached_tokens": 0,
+                       "regret_distinct_tokens": 5}

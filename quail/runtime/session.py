@@ -398,8 +398,10 @@ class Query:
                 tokenizer=self.session.tokenizer)
         return self._plan
 
-    def explain(self) -> str:
-        return explain(self.logical, self.plan())
+    def explain(self, *, verbose: bool = False) -> str:
+        """Return the optimized plan, optionally including runtime settings."""
+        physical = self.plan()
+        return explain(self.logical, physical, verbose=verbose)
 
     # ---- execution -----------------------------------------------------
 

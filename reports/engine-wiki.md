@@ -390,7 +390,18 @@ process, before opening sources. It supports registrations that create
 objects inside that process.
 
 A finished `QueryResult` carries the executed `PhysicalGraph` as `plan` and
-each node's `NodeMetrics` as `node_metrics`; `explain()` prints them.
+each node's `NodeMetrics` as `node_metrics`. `result.explain()` prints an
+operator tree with actual output rows and time. `result.explain(verbose=True)`
+includes every recorded metric and internal node field.
+
+Before execution, `query.explain()` prints logical and physical trees with
+predicates and estimated output rows. Physical predicates follow the saved
+execution order. Unknown output estimates are labeled `unknown`, including
+join outputs where the planner records only evaluation counts. Shared inputs
+appear once, with references at subsequent uses. The default output includes
+Quail token budgets, KV rewind, survivor retention, and anchor KV reuse.
+`query.explain(verbose=True)`
+adds node ids, ports, stage estimates, and runtime settings.
 Execution observers, registered by class, run over the complete physical graph
 once when the query finishes. Model nodes reuse the metrics reported by the GPU
 executor. The same observer instance then sees `Recombine`, `Project`, and
@@ -575,7 +586,7 @@ predicates assemble into results correctly.
   placement of useful KV when another input's filtering evicts prefixes.
 
 Every stage records the residency its cost assumed
-(`anchor_resident`: none / filter / kept), so `explain()` shows
+(`anchor_resident`: none / filter / kept), so `explain(verbose=True)` shows
 which stages the planner priced as KV reuse.
 
 ### Pseudocode: filter order decision
