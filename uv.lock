@@ -2492,7 +2492,7 @@ dependencies = [
 dev = [
     { name = "matplotlib" },
     { name = "pytest" },
-    { name = "quail-bench" },
+    { name = "quail-b" },
     { name = "ruff" },
     { name = "vulture" },
 ]
@@ -2514,19 +2514,18 @@ requires-dist = [
 dev = [
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "pytest", specifier = ">=8.0" },
-    { name = "quail-bench", git = "https://github.com/fsdatalab/quail-bench.git?rev=8a98a7c816ed3ac2abe29544e90dc5f49f0f8fea" },
+    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=1c68d7fcfbeeba9657035e996f74a5c6ce784eb7" },
     { name = "ruff", specifier = "==0.12.9" },
     { name = "vulture", specifier = ">=2.16,<3" },
 ]
 
 [[package]]
-name = "quail-bench"
+name = "quail-b"
 version = "0.1.0"
-source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=8a98a7c816ed3ac2abe29544e90dc5f49f0f8fea#8a98a7c816ed3ac2abe29544e90dc5f49f0f8fea" }
+source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=1c68d7fcfbeeba9657035e996f74a5c6ce784eb7#1c68d7fcfbeeba9657035e996f74a5c6ce784eb7" }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },
-    { name = "modal", extra = ["api-proxy-support"] },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
     { name = "pandas" },

@@ -28,7 +28,7 @@ BASELINE_COMMIT = "d7a96e0"
 
 baseline = Path(os.environ.get(
     "QUAIL_BASELINE_DIR", f"/tmp/quail-preplanned-baseline-{BASELINE_COMMIT}"))
-image = build_worker_image(local_python_sources=("quail_bench",)).add_local_dir(
+image = build_worker_image(local_python_sources=("quail_b",)).add_local_dir(
     baseline / "quail", "/opt/quail-baseline/quail",
     ignore=["__pycache__", "*.pyc"])
 app = modal.App("quail-milestone1")
@@ -54,7 +54,7 @@ def _run(label, output_dir, query_ids):
     from quail.planner.plan import EngineConfig
     from quail.runtime.compute import InProcessComputeProvider
     from quail.specs import H100_USD_PER_HOUR
-    from quail_bench.data import build_sets
+    from quail_b.data import build_sets
 
     output = Path(output_dir) / label
     output.mkdir(parents=True, exist_ok=True)

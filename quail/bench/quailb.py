@@ -11,6 +11,7 @@ benchmark's scoring as a `RunOutput`.
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ from pathlib import Path
 import pyarrow as pa
 
 import quail
-from quail_bench.data import (
+from quail_b.data import (
     DATA_SEED,
     SOURCE_REVISIONS,
     _ids,
@@ -30,19 +31,21 @@ from quail_bench.data import (
     corpus_identity,
     read_corpus,
 )
-from quail_bench.labels import (
+from quail_b.labels import (
+    LocalVolumeFiles,
     ModalVolumeFiles,
+    S3Files,
     load_ground_truth,
     load_ground_truth_workload,
 )
-from quail_bench.queries import (
+from quail_b.queries import (
     SELECTIVITY_ESTIMATE_COLLECTION,
     SELECTIVITY_ESTIMATE_CORPUS,
     SELECTIVITY_ESTIMATE_SCALE_FACTOR,
     QuerySpec,
 )
-from quail_bench.queries import queries as query_specs
-from quail_bench.scoring import (
+from quail_b.queries import queries as query_specs
+from quail_b.scoring import (
     Evaluator,
     RunOutput,
     add_query_metrics,
@@ -196,9 +199,15 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
               accuracy=True, ground_truth_collection=None,
               ground_truth_workload=None,
               h100_usd_per_hour=3.9492, ground_truth_files=None,
-              prediction=None, artifact_stem=None,
+              result_files=None, prediction=None, artifact_stem=None,
               compute_provider=None):
-    """Run all (or selected) QUAIL-B queries through the engine."""
+    """Run all (or selected) QUAIL-B queries through the engine.
+
+    Labels are read from `ground_truth_files`: the mounted volume inside
+    a Modal container, the public bucket anywhere else. Run records go
+    to `result_files`: the quail-results volume inside Modal, the local
+    `results/` directory otherwise.
+    """
     from quail.specs import H100_PRICE_SOURCE
 
     d = build_sets(data_dir, sf, lf)
@@ -207,11 +216,14 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
         corpus_rows, sf, DATA_SEED, SOURCE_REVISIONS)
     evaluator = None
     truth = None
-    result_files = ground_truth_files or ModalVolumeFiles()
+    if ground_truth_files is None:
+        ground_truth_files = default_ground_truth_files()
+    if result_files is None:
+        result_files = default_result_files()
     if accuracy:
         if ground_truth_workload:
             truth = load_ground_truth_workload(
-                result_files,
+                ground_truth_files,
                 scale_factor=sf,
                 corpus_id=corpus["corpus_id"],
                 corpus_full_hash=corpus["corpus_full_hash"],
@@ -219,7 +231,7 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             )
         else:
             truth = load_ground_truth(
-                result_files, scale_factor=sf,
+                ground_truth_files, scale_factor=sf,
                 corpus_id=corpus["corpus_id"],
                 collection_id=ground_truth_collection)
         if truth.corpus_id != corpus["corpus_id"]:
@@ -412,10 +424,37 @@ def run_suite(data_dir, sf=0.1, lf=1, gpus=1, only=None,
             json.dump(suite, f, indent=2)
         print(f"[quailb] saved {out_path}", flush=True)
     result_files.write_json(aggregate_volume_path, suite)
-    print(
-        f"[quailb] saved /results/{aggregate_volume_path} on quail-results",
-        flush=True)
+    print(f"[quailb] saved {aggregate_volume_path} to {_describe(result_files)}",
+          flush=True)
     return suite
+
+
+def _in_modal_container() -> bool:
+    # the same check the Modal client uses for its own is_remote()
+    return os.environ.get("MODAL_IS_REMOTE") == "1"
+
+
+def default_ground_truth_files():
+    """The label store for this process: the volume on Modal, else the bucket."""
+    mounted = Path("/results")
+    if _in_modal_container() and mounted.is_dir():
+        return LocalVolumeFiles(mounted)
+    return S3Files()
+
+
+def default_result_files():
+    """Where run records go: the quail-results volume on Modal, else results/."""
+    if _in_modal_container():
+        return ModalVolumeFiles()
+    return LocalVolumeFiles("results")
+
+
+def _describe(files) -> str:
+    if isinstance(files, ModalVolumeFiles):
+        return "the quail-results volume"
+    if isinstance(files, S3Files):
+        return f"s3://{files.bucket}"
+    return str(files.root)
 
 
 def main():
@@ -446,7 +485,7 @@ def main():
     )
     ap.add_argument(
         "--accuracy", action=argparse.BooleanOptionalAction, default=True,
-        help="compare answers and output rows with the Modal ground truth")
+        help="compare answers and output rows with the saved labels")
     ap.add_argument("--ground-truth-collection", default=None,
                     help="collection id; default is the one matching the corpus")
     ap.add_argument("--ground-truth-workload", default=None,

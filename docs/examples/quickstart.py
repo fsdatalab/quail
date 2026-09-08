@@ -15,8 +15,8 @@ import pyarrow.parquet as pq
 from huggingface_hub import hf_hub_download
 
 import quail
-from quail_bench.data import ASPECTS, SOURCE_REVISIONS
-from quail_bench.prompts import DISCUSS_ASPECT, F1
+from quail_b.data import ASPECTS, SOURCE_REVISIONS
+from quail_b.prompts import DISCUSS_ASPECT, F1
 
 
 def load_reviews(count: int = 8) -> pa.Table:

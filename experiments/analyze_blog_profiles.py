@@ -18,7 +18,7 @@ from pathlib import Path
 
 from experiments.profile_cpu_timeline import read_cpu_window
 from experiments.profile_gpu_timeline import read_gpu_intervals
-from quail_bench.labels import ModalVolumeFiles
+from quail_b.labels import ModalVolumeFiles
 
 
 def main_thread(path):

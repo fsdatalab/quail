@@ -75,14 +75,14 @@ from quail.specs import (
     QWEN3_4B_FP8,
     QWEN3_32B_FP8,
 )
-from quail_bench import data, prompts
-from quail_bench.labels import GroundTruthCollection, PredicateLabels
-from quail_bench.queries import (
+from quail_b import data, prompts
+from quail_b.labels import GroundTruthCollection, PredicateLabels
+from quail_b.queries import (
     SELECTIVITY_ESTIMATE_COLLECTION,
     SELECTIVITY_ESTIMATE_CORPUS,
     SELECTIVITY_ESTIMATE_SCALE_FACTOR,
 )
-from quail_bench.scoring import Evaluator
+from quail_b.scoring import Evaluator
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("workdir")

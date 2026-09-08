@@ -4,17 +4,17 @@ Date: 2026-09-07.
 
 Second step of moving QUAIL-B out of the engine repository. The
 benchmark is now its own private repository,
-https://github.com/fsdatalab/quail-bench, installed here as the
-`quail_bench` package and pinned to a commit in `pyproject.toml`. It runs
+https://github.com/fsdatalab/quail-b, installed here as the
+`quail_b` package and pinned to a commit in `pyproject.toml`. It runs
 no engine. `quail/bench/` is Quail's runner for it.
 
 ## What changed
 
-- The `quail_bench` package holds the benchmark: `data.py` (document sets, pinned
+- The `quail_b` package holds the benchmark: `data.py` (document sets, pinned
   sources, sampling, corpus identity), `prompts.py`, `queries.py`,
   `labels.py` (saved reference labels and collections), `judge_pass.py`
   (the labeling pass on Modal), `scoring.py`, and the README.
-- The 32 queries are data. `quail_bench.queries.QUERIES` is a tuple of
+- The 32 queries are data. `quail_b.queries.QUERIES` is a tuple of
   `QuerySpec` records: aliases with their tables, text columns, and
   filter templates in written order; binary joins with their aliases
   in placeholder order; and the select list. The two PrivacyPolicies
@@ -24,8 +24,8 @@ no engine. `quail/bench/` is Quail's runner for it.
   (alias, written position), its join answers keyed by written
   position, and its final rows, all in the benchmark's own ids. The
   expected rows come from the labels through pyarrow joins. Nothing in
-  `quail_bench/` imports `quail`. The exact prompt text a predicate asks is
-  `quail_bench/rendering.py`; the labels answer that text, and a test in
+  `quail_b/` imports `quail`. The exact prompt text a predicate asks is
+  `quail_b/rendering.py`; the labels answer that text, and a test in
   the Quail runner checks that Quail sends the same text for every
   predicate.
 - `quail/bench/quailb.py` is the runner. `build_query(session, spec)`
@@ -38,10 +38,10 @@ no engine. `quail/bench/` is Quail's runner for it.
 - `rows_from_answers` derives final rows from saved answers, for runs
   that kept their answers and not their rows; the shared KV retention
   scorer uses it.
-- `quail_bench` is a dev dependency from the private repository. CI reads
+- `quail_b` is a dev dependency from the private repository. CI reads
   it with the `QUAILB_TOKEN` secret, a token with read access to that
   repository. Every Modal image that runs the benchmark ships the
-  installed `quail_bench` next to `quail`: the same-GPU runner and the
+  installed `quail_b` next to `quail`: the same-GPU runner and the
   experiment cells that import it. The labeling pass runs from the
   benchmark repository.
 - The benchmark repository carries the same `AGENTS.md` as this one,
@@ -62,7 +62,7 @@ pyarrow, and Quail's part is a runner in the engine repository.
 
 | | Before | After |
 | --- | --- | --- |
-| Where the benchmark lives | `quail/bench/` | `fsdatalab/quail-bench` (definition), `quail/bench/` (Quail runner) |
+| Where the benchmark lives | `quail/bench/` | `fsdatalab/quail-b` (definition), `quail/bench/` (Quail runner) |
 | `quail` imports inside the benchmark definition | session, catalog, planner, result relations, plan nodes | none |
 | Query definitions | closures over a session | `QuerySpec` records |
 | CPU tests collected here | 264 | 256, plus 33 in the benchmark repository |
@@ -72,7 +72,7 @@ The scoring reproduces the previous evaluator's numbers on the unit
 tests, including the FEV-9 expected rows over a three claim corpus.
 
 ```sh
-uv run ruff check quail quail_bench tests experiments reports tools
+uv run ruff check quail quail_b tests experiments reports tools
 uv run python tools/check_long_strings.py
 uv run vulture
 uv run pytest -q

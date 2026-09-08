@@ -17,10 +17,10 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from quail_bench.data import CORPUS_COLUMNS, _ids, corpus_identity
-from quail_bench.labels import ModalVolumeFiles, _load_ground_truth_collection
-from quail_bench.queries import queries
-from quail_bench.scoring import Evaluator, RunOutput, rows_from_answers
+from quail_b.data import CORPUS_COLUMNS, _ids, corpus_identity
+from quail_b.labels import ModalVolumeFiles, _load_ground_truth_collection
+from quail_b.queries import queries
+from quail_b.scoring import Evaluator, RunOutput, rows_from_answers
 
 COLLECTION = "gt_77bb8b128743a79aedddaa24c808c3f8"
 ROOT = "ground_truth/quailb/schema_v1"

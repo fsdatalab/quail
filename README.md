@@ -18,10 +18,10 @@ calling process, or on Modal.
   generic runner, token store, results, and the Modal worker. `bench/`
   is the QUAIL-B runner for Quail and its request backends.
 - QUAIL-B, the benchmark, is its own repository:
-  [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench). It
+  [fsdatalab/quail-b](https://github.com/fsdatalab/quail-b). It
   holds the document sets, prompts, queries as data, saved labels, the
   labeling pass, and scoring, and runs no engine. It is installed here
-  as the `quail_bench` package, pinned in `pyproject.toml`. Its README
+  as the `quail_b` package, pinned in `pyproject.toml`. Its README
   explains how to run it on Quail and label a new predicate.
 - `demos/` has runnable examples for a machine with a GPU:
   `local_gpu_smoke.py` runs one filter over four short documents, and
