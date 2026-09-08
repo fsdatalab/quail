@@ -14,10 +14,6 @@ dependencies = [
     "transformers>=4.48",
 ]
 
-[project.optional-dependencies]
-# the judge model for the labeling pass
-judge = ["vllm==0.26.0; sys_platform == 'linux'"]
-
 [dependency-groups]
 dev = [
     "pytest>=8.0",

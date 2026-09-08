@@ -77,13 +77,14 @@ Add `--only IMDB-4` to run one query. The same repository has a Modal runner, `q
 
 1. Add the query to `QUERIES` in `quail_b/queries.py`. A query that reuses existing predicates needs no new labels, so stop here.
 2. Add the new prompt constant to `quail_b/prompts.py`.
-3. Add one `PredicateSpec` to `PREDICATES` in `quail_b/labeling.py`: a stable key, the prompt, the input table and column, and the left and right roles.
+3. Add one `PredicateSpec` to `PREDICATES` in `quail_b/predicates.py`: a stable key, the prompt, the input table and column, and the left and right roles.
 4. Use a source label only when the dataset gives the exact answer the prompt asks for. Otherwise keep the default Qwen3 32B fp8 source.
 5. Update the predicate count test; add a prompt-rendering test if the input shape is new.
-6. Run the labeling pass on a machine with one GPU of at least 80 GB:
-   `uv run --extra judge python -m quail_b.labeling --root ~/quail-b-data`.
+6. Run the labeling pass from Quail's repository on a machine with one GPU of at least 80 GB:
+   `uv run python -m quail.bench.labeling --root ~/quail-b-data`, or on Modal with
+   `uv run modal run -m quail.bench.judge_pass`.
 
-A changed prompt or input role makes a new predicate version and needs a new label set. The labeling run resumes, skipping finished parts, then writes a new collection and makes it active. Label-set and collection ids depend only on the corpus, the prompts, and the judge settings, so a pass on any machine writes the same files; copy `~/quail-b-data/ground_truth` to the bucket to publish it. Quail's repository wraps the same pass in Modal functions, one H100 per workload.
+A changed prompt or input role makes a new predicate version and needs a new label set. The labeling run resumes, skipping finished parts, then writes a new collection and makes it active. Label-set and collection ids depend only on the corpus, the prompts, and the judge settings in `quail_b/predicates.py`, so a pass on any machine writes the same files; copy `~/quail-b-data/ground_truth` to the bucket to publish it.
 
 ## Layout
 
@@ -95,5 +96,5 @@ A changed prompt or input role makes a new predicate version and needs a new lab
 | `quail_b/rendering.py` | the exact prompt text a predicate asks |
 | `quail_b/store.py` | the public bucket and the local directory that hold corpus and labels |
 | `quail_b/labels.py` | saved label sets and collections |
-| `quail_b/labeling.py` | the 21 predicates and the labeling pass, on one GPU |
+| `quail_b/predicates.py` | the 21 predicates and the identity of their labels |
 | `quail_b/scoring.py` | `RunOutput` and the scoring of one run |

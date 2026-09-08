@@ -333,7 +333,7 @@ def load_ground_truth_workload(files, scale_factor: float, corpus_id: str,
                                corpus_full_hash: str, workload: str
                                ) -> GroundTruthCollection:
     """Load completed label sets for one benchmark workload."""
-    from quail_b.labeling import MODEL_NAME, PREDICATES, label_set_identity
+    from quail_b.predicates import MODEL_NAME, PREDICATES, label_set_identity
 
     specs = [spec for spec in PREDICATES if spec.workload == workload]
     if not specs:

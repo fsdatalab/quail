@@ -5,7 +5,6 @@ import json
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from quail_b.data import corpus_identity
 from quail_b.labels import (
     GroundTruthCollection,
     PredicateLabels,
@@ -161,7 +160,7 @@ def test_query_cost_token_and_document_metrics():
 
 def fever_truth():
     """Labels for FEV-9 over a three claim, three evidence corpus."""
-    from quail_b.labeling import PREDICATES, predicate_payload
+    from quail_b.predicates import PREDICATES, predicate_payload
     from quail_b.prompts import F11, F13, REFUTE, SUPPORT
 
     corpus = {
@@ -363,13 +362,3 @@ def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
     else:
         raise AssertionError("changed table manifest was accepted")
 
-
-def test_corpus_identity_matches_judge_pass_implementation():
-    from quail_b.data import DATA_SEED, SOURCE_REVISIONS
-    from quail_b.labeling import _corpus_identity
-
-    rows = {"reviews": [{"id": "r0", "body": "text"}]}
-    expected = _corpus_identity(rows, 0.1)
-    got = corpus_identity(rows, 0.1, DATA_SEED, SOURCE_REVISIONS)
-
-    assert got == expected
