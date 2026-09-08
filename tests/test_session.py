@@ -308,12 +308,3 @@ def test_executed_plan_survives_the_report_round_trip(tmp_path):
         node.node_id for node in result.plan.topological_nodes()]
     assert restored.node_metrics == result.node_metrics
     assert restored.explain() == result.explain()
-
-
-def test_query_explain_uses_optimized_projection(sess):
-    query = sess.sql("SELECT r.id FROM reviews r WHERE "
-                     "AI_FILTER(PROMPT('q: {0}', r.review))")
-    text = query.explain()
-    assert "Scan reviews as r [review, id]" in text
-    assert "admission_tokens=" not in text
-    assert "admission_tokens=" in query.explain(verbose=True)

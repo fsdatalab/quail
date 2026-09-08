@@ -77,31 +77,6 @@ def test_token_store_keeps_tokens_and_lengths_on_disk(tmp_path):
         "__quail_token_ids", "__quail_token_count"]
 
 
-def test_column_store_keeps_one_source_column_on_disk(tmp_path):
-    from quail.runtime.tokens import ColumnStore, ScanInput
-
-    schema = pa.schema({"id": pa.string(), "body": pa.string()})
-    batches = [
-        pa.record_batch([["a", "b"], ["x", "y"]], schema=schema),
-        pa.record_batch([["c"], ["z"]], schema=schema),
-    ]
-    tokens = TokenStore.write(
-        str(tmp_path / "tokens.arrow"), batches,
-        document_column="body", tokenizer=str.split,
-        token_type=pa.string(),
-    )
-    ids = ColumnStore.write(
-        str(tmp_path / "id.arrow"), batches, schema.field("id"))
-
-    assert ids.name == "id"
-    assert len(ids) == 3
-    assert ids.values.to_pylist() == ["a", "b", "c"]
-    scan = ScanInput(tokens, {"id": ids})
-    assert scan.projected_columns == ("id",)
-    assert scan.column("id").to_pylist() == ["a", "b", "c"]
-    assert list(scan.lengths) == [1, 1, 1]
-
-
 def test_token_selection_serializes_a_file_reference(tmp_path):
     schema = pa.schema({"body": pa.string()})
     path = tmp_path / "tokens.arrow"

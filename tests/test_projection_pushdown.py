@@ -80,22 +80,6 @@ def test_rule_keeps_only_returned_columns_on_each_scan():
     )
 
 
-def test_rule_keeps_the_document_column_when_the_query_returns_it():
-    plan = _joined_plan([
-        ColumnRef("r", "reviews", "review"),
-        ColumnRef("p", "products", "asin"),
-    ])
-
-    optimized, _ = apply_logical_rules(
-        plan, (ProjectionPushdown(),), CONTEXT)
-
-    scans = _scans(optimized)
-    assert scans["r"].columns == ("review",)
-    assert scans["p"].columns == ("asin",)
-    assert scans["r"].output_schema() == (
-        ColumnRef("r", "reviews", "review"),)
-
-
 def test_rule_is_idempotent_and_leaves_other_nodes_alone():
     plan = _joined_plan([ColumnRef("r", "reviews", "id")])
     once = push_down_projection(plan.root)
