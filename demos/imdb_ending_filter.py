@@ -31,7 +31,13 @@ SQL = """
 
 def load_reviews() -> ds.Dataset:
     """Return every IMDB review as an Arrow dataset with one id column."""
-    imdb = load_dataset("stanfordnlp/imdb", revision=IMDB_REVISION)
+    try:
+        imdb = load_dataset(
+            "stanfordnlp/imdb", revision=IMDB_REVISION,
+            local_files_only=True,
+        )
+    except FileNotFoundError:
+        imdb = load_dataset("stanfordnlp/imdb", revision=IMDB_REVISION)
     all_reviews = concatenate_datasets([
         imdb["train"],
         imdb["test"],
