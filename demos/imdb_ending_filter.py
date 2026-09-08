@@ -1,12 +1,15 @@
 """Filter all 100,000 IMDB reviews with two questions, both required."""
 
 import os
+import time
 
 import pyarrow as pa
 import pyarrow.dataset as ds
 
 import quail
 from quail.bench.evaluate import H100_USD_PER_HOUR
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 IMDB_REVISION = "e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
 
@@ -33,15 +36,10 @@ SQL = """
 def load_reviews() -> ds.Dataset:
     """Return every IMDB review as an Arrow dataset with one id column."""
     from datasets import concatenate_datasets, load_dataset
-    old = os.environ.get("HF_HUB_OFFLINE")
-    os.environ["HF_HUB_OFFLINE"] = "1"
     try:
         imdb = load_dataset("stanfordnlp/imdb", revision=IMDB_REVISION)
     except Exception:
-        if old is None:
-            os.environ.pop("HF_HUB_OFFLINE", None)
-        else:
-            os.environ["HF_HUB_OFFLINE"] = old
+        os.environ.pop("HF_HUB_OFFLINE", None)
         imdb = load_dataset("stanfordnlp/imdb", revision=IMDB_REVISION)
     all_reviews = concatenate_datasets([
         imdb["train"],
@@ -55,9 +53,11 @@ def load_reviews() -> ds.Dataset:
 
 
 def main() -> None:
+    t0 = time.perf_counter()
     reviews = load_reviews()
     n_docs = reviews.count_rows()
-    print(f"reviews: {n_docs}", flush=True)
+    print(f"reviews: {n_docs}, loaded in {time.perf_counter() - t0:.1f} s",
+          flush=True)
 
     with quail.Session() as session:
         session.register(
