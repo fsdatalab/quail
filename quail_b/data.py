@@ -17,6 +17,10 @@ import pyarrow.parquet as pq
 
 DATA_SEED = 20260818
 CACHE_SCHEMA_VERSION = 9
+# The labeled corpus for each scale factor, saved beside its labels in
+# the public bucket. build_sets downloads it instead of rebuilding from
+# the sources; the corpus id is checked after download.
+PUBLISHED_CORPORA = {0.1: "c_1aa2c4f0d0b6c816fd37aa5748c33341"}
 LEPARD_POSITIVE_PAIRS = 5_000
 AGENT_TRACE_DOCUMENTS = 17_718
 AGENT_TRACE_TURN_INTERVAL = 5
@@ -734,24 +738,66 @@ def _build_agent_traces(d, sf, force=False):
     )
 
 
-def build_sets(data_dir, sf, lf=1):
+def _fetch_published_corpus(d, sf, files=None) -> bool:
+    """Download the labeled corpus for this scale factor into d.
+
+    Returns False when no corpus is published for sf, the bucket is
+    unreachable, or the downloaded tables do not hash to the published
+    corpus id; the caller then builds from the sources.
+    """
+    import urllib.error
+
+    from quail_b.store import GROUND_TRUTH_ROOT, S3Files
+
+    corpus_id = PUBLISHED_CORPORA.get(sf)
+    if corpus_id is None:
+        return False
+    files = S3Files() if files is None else files
+    prefix = f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}"
+    try:
+        paths = [path for path in files.list_files(prefix)
+                 if path.endswith(".parquet")]
+    except (OSError, urllib.error.URLError) as error:
+        print(f"[data] cannot reach the published corpus: {error}", flush=True)
+        return False
+    if not paths:
+        return False
+    d.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        (d / Path(path).name).write_bytes(files.read_bytes(path))
+    identity = corpus_identity(read_corpus(d), sf, DATA_SEED, SOURCE_REVISIONS)
+    if identity["corpus_id"] != corpus_id:
+        for path in paths:
+            (d / Path(path).name).unlink()
+        print(f"[data] published corpus {corpus_id} does not match this "
+              "code; building from the sources", flush=True)
+        return False
+    print(f"[data] fetched corpus {corpus_id} from the public bucket",
+          flush=True)
+    return True
+
+
+def build_sets(data_dir, sf, lf=1, fetch=True):
     """Build the benchmark tables as Parquet files, cached by sf.
 
-    lf (load factor) is accepted but unused: documents here are real
-    and unpadded, so there's nothing to scale. Kept in the signature
-    so callers don't have to change when it's wired back up.
+    With `fetch`, a published corpus for this scale factor is
+    downloaded from the public bucket instead of being rebuilt from
+    the sources. lf (load factor) is accepted but unused: documents
+    here are real and unpadded, so there's nothing to scale. Kept in
+    the signature so callers don't have to change when it's wired
+    back up.
     """
     del lf
     d = Path(data_dir) / f"sf{sf}"
     marker = d / "DONE"
+    expected = {
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "data_seed": DATA_SEED,
+        "lepard_positive_pairs": LEPARD_POSITIVE_PAIRS,
+        "scale_factor": sf,
+        "source_revisions": SOURCE_REVISIONS,
+    }
     if marker.exists():
-        expected = {
-            "cache_schema_version": CACHE_SCHEMA_VERSION,
-            "data_seed": DATA_SEED,
-            "lepard_positive_pairs": LEPARD_POSITIVE_PAIRS,
-            "scale_factor": sf,
-            "source_revisions": SOURCE_REVISIONS,
-        }
         try:
             current = json.loads(marker.read_text())
         except json.JSONDecodeError:
@@ -782,6 +828,9 @@ def build_sets(data_dir, sf, lf=1):
             _build_agent_traces(d, sf, force=True)
             marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
             return d
+    if fetch and _fetch_published_corpus(d, sf):
+        marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
+        return d
     d.mkdir(parents=True, exist_ok=True)
 
     def write(name, ids, col_name, values):
@@ -824,13 +873,7 @@ def build_sets(data_dir, sf, lf=1):
     _build_lepard(d, sf, force=True)
     _build_agent_traces(d, sf, force=True)
 
-    marker.write_text(json.dumps({
-        "cache_schema_version": CACHE_SCHEMA_VERSION,
-        "data_seed": DATA_SEED,
-        "lepard_positive_pairs": LEPARD_POSITIVE_PAIRS,
-        "scale_factor": sf,
-        "source_revisions": SOURCE_REVISIONS,
-    }, indent=2, sort_keys=True))
+    marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
     return d
 
 

@@ -5,8 +5,7 @@ sets. This repository defines the benchmark and runs no engine: the
 document sets (`quail_b/data.py`), the prompts (`quail_b/prompts.py`),
 the queries as data (`quail_b/queries.py`), the saved reference labels
 (`quail_b/labels.py`), the exact prompt text a predicate asks
-(`quail_b/rendering.py`), the labeling pass (`quail_b/labeling.py`,
-wrapped for Modal in `quail_b/judge_pass.py`),
+(`quail_b/rendering.py`), the labeling pass (`quail_b/labeling.py`),
 and the scoring of one run (`quail_b/scoring.py`). An engine's runner
 turns a `QuerySpec` into that engine's query and hands the answers back
 as a `RunOutput` to score. Quail's runner lives in the Quail repository
@@ -90,8 +89,9 @@ change needs one of them, say so instead of quietly adding it back.
 
 # Experiments
 
-- The labeling pass runs on one local GPU (`quail_b.labeling`) or on
-  Modal (`quail_b.judge_pass`); the saved labels are the same either way.
+- Nothing here needs Modal. The labeling pass runs on one GPU
+  (`quail_b.labeling`); Quail's repository wraps it in Modal functions.
+  The rules below about Modal apply to runs made from that repository.
 - Never create new Modal app names; caches and warm state ride on
  the app. New GPU cells attach to an existing app
  ("quail-milestone1" for cells, "quail-engine" for the worker).

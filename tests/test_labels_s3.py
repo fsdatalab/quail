@@ -4,7 +4,7 @@ import urllib.error
 
 import pytest
 
-from quail_b.labels import GROUND_TRUTH_ROOT, S3Files
+from quail_b.store import GROUND_TRUTH_ROOT, S3Files
 
 _PAGE = """<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">

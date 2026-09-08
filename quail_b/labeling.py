@@ -29,8 +29,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from quail_b import data, prompts, rendering
-from quail_b.labels import GROUND_TRUTH_ROOT
 from quail_b.rendering import SHARED_PRE
+from quail_b.store import GROUND_TRUTH_ROOT
 
 SCHEMA_VERSION = 1
 SCALE_FACTOR = 0.1

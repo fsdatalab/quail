@@ -2,7 +2,6 @@
 
 from dataclasses import replace
 
-from quail_b.judge_pass import parse_function_calls
 from quail_b.labeling import (
     MODEL_NAME,
     PREDICATES,
@@ -24,18 +23,6 @@ from quail_b.labeling import (
 def _spec(key):
     return next(spec for spec in PREDICATES if spec.key == key)
 
-
-def test_parse_function_calls_requires_every_workload():
-    calls = parse_function_calls(
-        "imdb=fc-imdb,biodex=fc-bio,fever=fc-fever,"
-        "lepard=fc-lepard,agent=fc-agent")
-    assert calls == {
-        "imdb": "fc-imdb",
-        "biodex": "fc-bio",
-        "fever": "fc-fever",
-        "lepard": "fc-lepard",
-        "agent": "fc-agent",
-    }
 
 
 def test_stable_ids_cover_predicate_semantics_and_inputs():

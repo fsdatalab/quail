@@ -3,7 +3,7 @@ name = "quail-b"
 version = "0.1.0"
 description = "quail-b: a benchmark of AI filter and join queries over document sets"
 readme = "README.md"
-# <3.13: the Modal images run 3.12
+# <3.13: vllm 0.26 ships wheels up to 3.12
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "pyarrow>=17.0",
@@ -15,16 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# running the labeling pass on Modal instead of a local GPU
-# (api-proxy-support pulls python-socks, which the Modal client needs
-# to connect from behind an HTTPS proxy)
-modal = ["modal[api-proxy-support]>=1.5.1"]
-# the judge model for a local labeling pass; same vLLM as the Modal image
+# the judge model for the labeling pass
 judge = ["vllm==0.26.0; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = [
-    "modal[api-proxy-support]>=1.5.1",
     "pytest>=8.0",
     "ruff==0.12.9",
     "vulture>=2.16,<3",

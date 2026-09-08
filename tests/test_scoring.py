@@ -7,9 +7,7 @@ import pyarrow.parquet as pq
 
 from quail_b.data import corpus_identity
 from quail_b.labels import (
-    GROUND_TRUTH_ROOT,
     GroundTruthCollection,
-    LocalVolumeFiles,
     PredicateLabels,
     _validate_label_set_corpora,
     load_ground_truth,
@@ -22,6 +20,7 @@ from quail_b.scoring import (
     rows_from_answers,
     summarize_queries,
 )
+from quail_b.store import GROUND_TRUTH_ROOT, LocalFiles
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
@@ -261,7 +260,7 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
     ]), label_dir / "parts" / "part_000.parquet")
 
     loaded = load_ground_truth(
-        LocalVolumeFiles(tmp_path), scale_factor=0.1,
+        LocalFiles(tmp_path), scale_factor=0.1,
         corpus_id="c_test")
 
     assert loaded.collection_id == collection_id
@@ -269,7 +268,7 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
     assert loaded.answer(predicate_key, "r1") is False
     assert loaded.key_for_template(FILTER) == predicate_key
 
-    files = LocalVolumeFiles(tmp_path)
+    files = LocalFiles(tmp_path)
     files.write_json("benchmarks/quailb/runs/qb_test/query.json",
                      {"query": "TEST-1"})
     saved = json.loads((tmp_path / "benchmarks/quailb/runs/qb_test"
@@ -285,7 +284,7 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
 
 
 def _reused_label_layout(tmp_path):
-    files = LocalVolumeFiles(tmp_path)
+    files = LocalFiles(tmp_path)
     predicate_key = "test.review.filter"
     table_manifest = {
         "rows": 2,

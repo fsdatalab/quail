@@ -6,7 +6,7 @@ Reference labels are saved, so accuracy is scored exactly rather than judged.
 
 ## Document sets
 
-Counts are at scale factor 0.1, the default. One seed (`DATA_SEED`) and one pinned revision per source (`SOURCE_REVISIONS`), both in `quail_b/data.py`, mean a scale factor names one exact corpus.
+Counts are at scale factor 0.1, the default. One seed (`DATA_SEED`) and one pinned revision per source (`SOURCE_REVISIONS`), both in `quail_b/data.py`, mean a scale factor names one exact corpus. `build_sets()` downloads the sf=0.1 corpus as Parquet from the public bucket, 13 MB, and checks its id; any other scale factor is built from the sources.
 
 | Set | Source | Rows at sf=0.1 |
 | --- | --- | --- |
@@ -55,26 +55,23 @@ document or document pair. A complete label set for every predicate over one cor
 FEVER and LePaRD use source labels where the dataset gives the exact answer. `evaluate()` in
 `quail_b/scoring.py` scores a run against a collection.
 
-The labels are public, 1.1 GB in the `quail-bench` S3 bucket under
-`s3://quail-bench/ground_truth/quailb/schema_v1/`, readable without an AWS account.
-`load_ground_truth()` in `quail_b/labels.py` reads from there by default; pass `LocalVolumeFiles(dir)`
-for a directory that holds the same layout, or `ModalVolumeFiles()` for the `quail-results` Modal
-volume. The corpus each collection was labeled on sits beside it under `corpora/<corpus_id>/`.
+Corpus and labels are public in the `quail-bench` S3 bucket under
+`s3://quail-bench/ground_truth/quailb/schema_v1/`, 1.1 GB, readable without an AWS account.
+`load_ground_truth()` in `quail_b/labels.py` reads from there by default. `LocalFiles(dir)` in
+`quail_b/store.py` reads a directory with the same layout instead.
 
 ## Running it
 
 This repository defines the benchmark and runs no engine. An engine's runner turns each `QuerySpec`
-into that engine's own query and hands the answers back as a `RunOutput` to score. Install it, then
-run the benchmark from the Quail repository, `fsdatalab/quail-exploration`:
+into that engine's own query and hands the answers back as a `RunOutput` to score. Quail's runner
+lives in `fsdatalab/quail-exploration`; on a machine with a GPU:
 
 ```bash
 uv add "quail-b @ git+https://github.com/fsdatalab/quail-b.git"
-uv run modal run --detach -m quail.bench.quailb_parallel \
-  --sf 0.1 --model qwen3-4b-fp8 \
-  --prediction "State the expected runtime and accuracy."
+uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8
 ```
 
-Add `--query IMDB-4` to run one query. Modal starts one H100 container per query family, running Quail, stock vLLM, and pipelined vLLM in it; SGLang runs in its own container.
+Add `--only IMDB-4` to run one query. The same repository has a Modal runner, `quail.bench.quailb_parallel`, that runs one query family per H100 with the baselines.
 
 ## Adding a query or predicate
 
@@ -83,11 +80,10 @@ Add `--query IMDB-4` to run one query. Modal starts one H100 container per query
 3. Add one `PredicateSpec` to `PREDICATES` in `quail_b/labeling.py`: a stable key, the prompt, the input table and column, and the left and right roles.
 4. Use a source label only when the dataset gives the exact answer the prompt asks for. Otherwise keep the default Qwen3 32B fp8 source.
 5. Update the predicate count test; add a prompt-rendering test if the input shape is new.
-6. Run the labeling pass. On a machine with one GPU of at least 80 GB:
+6. Run the labeling pass on a machine with one GPU of at least 80 GB:
    `uv run --extra judge python -m quail_b.labeling --root ~/quail-b-data`.
-   On Modal, one H100 per workload: `uv run --extra modal modal run -m quail_b.judge_pass`.
 
-A changed prompt or input role makes a new predicate version and needs a new label set. The labeling run resumes, skipping finished parts, then writes a new collection and makes it active. Label-set and collection ids depend only on the corpus, the prompts, and the judge settings, so both routes write the same files; copy a local pass to the bucket to publish it.
+A changed prompt or input role makes a new predicate version and needs a new label set. The labeling run resumes, skipping finished parts, then writes a new collection and makes it active. Label-set and collection ids depend only on the corpus, the prompts, and the judge settings, so a pass on any machine writes the same files; copy `~/quail-b-data/ground_truth` to the bucket to publish it. Quail's repository wraps the same pass in Modal functions, one H100 per workload.
 
 ## Layout
 
@@ -97,7 +93,7 @@ A changed prompt or input role makes a new predicate version and needs a new lab
 | `quail_b/prompts.py` | the filter and join prompt templates |
 | `quail_b/queries.py` | the 32 queries as data, with selectivity estimates |
 | `quail_b/rendering.py` | the exact prompt text a predicate asks |
-| `quail_b/labels.py` | saved label sets and collections: public bucket, Modal volume, or local directory |
-| `quail_b/labeling.py` | the 21 predicates and the labeling pass, on one local GPU |
-| `quail_b/judge_pass.py` | the same pass on Modal, one H100 per workload |
+| `quail_b/store.py` | the public bucket and the local directory that hold corpus and labels |
+| `quail_b/labels.py` | saved label sets and collections |
+| `quail_b/labeling.py` | the 21 predicates and the labeling pass, on one GPU |
 | `quail_b/scoring.py` | `RunOutput` and the scoring of one run |
