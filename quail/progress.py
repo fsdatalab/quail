@@ -1,11 +1,26 @@
 """Progress lines for the long steps of a query."""
 
+import contextlib
 import time
+
+_QUIET = 0
 
 
 def say(message: str) -> None:
-    """Print one progress line right away."""
-    print(f"quail: {message}", flush=True)
+    """Print one progress line right away, unless inside quiet()."""
+    if not _QUIET:
+        print(f"quail: {message}", flush=True)
+
+
+@contextlib.contextmanager
+def quiet():
+    """Suppress progress lines, for warmup passes that reuse the loops."""
+    global _QUIET
+    _QUIET += 1
+    try:
+        yield
+    finally:
+        _QUIET -= 1
 
 
 class Progress:

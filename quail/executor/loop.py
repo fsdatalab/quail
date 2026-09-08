@@ -17,7 +17,7 @@ import time
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.executor.model import answer_weights
 from quail.executor.pack import FilterAdmission, JoinAdmission
-from quail.progress import Progress
+from quail.progress import Progress, quiet
 
 
 def _tick(timing, key, t0):
@@ -684,32 +684,33 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
     import json
     import os
 
-    path = _marker_path(model_name, budget)
-    identity = _marker_identity(torch, model_name, budget)
-    on_disk = None
-    try:
-        with open(path) as f:
-            on_disk = json.load(f)
-    except (OSError, ValueError):
-        pass
-    t0 = time.perf_counter()
-    if force_compile or on_disk != identity:
-        compile_kernels(torch, arena, pipeline, async_ans, budget)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(identity, f, indent=1)
-        os.replace(tmp, path)
-        tier = "compile"
-    else:
-        print(f"quail kernels: compile pass already recorded at {path}; "
-              "running the touch pass", flush=True)
-        touch_kernels(torch, arena, pipeline, async_ans, budget)
-        tier = "touch"
-    torch.cuda.synchronize()
-    warm_s = round(time.perf_counter() - t0, 2)
-    print(f"quail kernels: {tier} pass done in {warm_s} s", flush=True)
-    return dict(tier=tier, warm_s=warm_s)
+    with quiet():
+        path = _marker_path(model_name, budget)
+        identity = _marker_identity(torch, model_name, budget)
+        on_disk = None
+        try:
+            with open(path) as f:
+                on_disk = json.load(f)
+        except (OSError, ValueError):
+            pass
+        t0 = time.perf_counter()
+        if force_compile or on_disk != identity:
+            compile_kernels(torch, arena, pipeline, async_ans, budget)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(identity, f, indent=1)
+            os.replace(tmp, path)
+            tier = "compile"
+        else:
+            print(f"quail kernels: compile pass already recorded at {path}; "
+                  "running the touch pass", flush=True)
+            touch_kernels(torch, arena, pipeline, async_ans, budget)
+            tier = "touch"
+        torch.cuda.synchronize()
+        warm_s = round(time.perf_counter() - t0, 2)
+        print(f"quail kernels: {tier} pass done in {warm_s} s", flush=True)
+        return dict(tier=tier, warm_s=warm_s)
 
 
 # ---------------------------------------------------------- the filter
