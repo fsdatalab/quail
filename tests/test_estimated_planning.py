@@ -51,7 +51,7 @@ def test_plan_uses_estimates_and_run_uses_exact_tokens():
 
     # a second query on the same session plans on the exact counts
     again = session.sql(SQL)
-    assert "estimated" not in again.explain()
+    assert "estimated from a" not in again.explain()
     assert again._estimated == ()
     session.close()
 

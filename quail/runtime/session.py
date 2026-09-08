@@ -511,8 +511,11 @@ class Query:
             say(f"plan ready in {time.perf_counter() - started:.2f} s")
         return self._plan
 
-    def explain(self) -> str:
-        text = explain(self.logical, self.plan())
+    def explain(self, *, verbose: bool = False) -> str:
+        """Return the optimized plan, optionally including runtime settings."""
+        # plan() first: it replaces self.logical with the optimized tree
+        physical = self.plan()
+        text = explain(self.logical, physical, verbose=verbose)
         if self._estimated:
             text += ("\n\n  note: token counts for "
                      + ", ".join(repr(a) for a in self._estimated)

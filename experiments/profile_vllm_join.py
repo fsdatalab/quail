@@ -6,6 +6,9 @@
     uv run modal run --detach experiments/profile_vllm_join.py --query BIO-3 \
       2>&1 | tee /tmp/quail-bio3-vllm-join-profile.log
 
+    uv run modal run --detach experiments/profile_vllm_join.py --query AGENT-1 \
+      2>&1 | tee /tmp/quail-agent1-vllm-filter-profile.log
+
 Scheduler CPU/CUDA traces, driver CPU traces, answers, and process timings
 are saved on quail-results under /results/ablations/vllm-join-profile-<UTC>/.
 Profiler timings are diagnostic and do not replace benchmark measurements.

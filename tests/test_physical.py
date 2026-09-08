@@ -294,3 +294,45 @@ def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
         "backend": "test.remote",
         "nodes": ["input:d"],
     }
+
+
+def test_explain_shared_inputs_and_extension_fields():
+    from quail.physical.base import input_ports
+
+    source = DocumentInput(node_id="input:d", alias="d", n_docs=100)
+    first = FirstDocuments(
+        node_id="first", alias="d", count=5,
+        inputs=input_ports((PortRef(source.node_id, "ids:d"),)))
+    second = FirstDocuments(
+        node_id="second", alias="d", count=10,
+        inputs=input_ports((PortRef(source.node_id, "ids:d"),)))
+    project = Project(
+        node_id="project", columns=("d.id",),
+        inputs=input_ports((PortRef(first.node_id, "ids:d"),
+                            PortRef(second.node_id, "ids:d"))))
+    graph = PhysicalGraph((source, first, second, project),
+                          PortRef(project.node_id, "rows"))
+    text = graph.explain()
+    assert text.startswith("Project: d.id")
+    assert text.count("DocumentInput: d [1]") == 1
+    assert text.count("Reuse [1]") == 1
+    assert "count=5" in text and "count=10" in text
+    assert "test.first_documents" in text
+    assert "input:d" not in text
+    assert "input:d[ids:d]" in graph.explain(verbose=True)
+
+
+def test_explain_missing_metrics_are_not_zero():
+    from quail.explain import physical_tree
+    from quail.runtime.runner import NodeMetrics
+
+    node = DocumentInput(node_id="input:d", alias="d", n_docs=100)
+    graph = PhysicalGraph((node,), PortRef(node.node_id, "ids:d"))
+    assert "metrics unavailable" in physical_tree(graph, metrics={})
+    measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,
+                                         fresh_tokens=200)}
+    text = physical_tree(graph, metrics=measured)
+    assert "actual_rows=42, wall_s=1.250" in text
+    assert "estimated_rows" not in text
+    assert "fresh_tokens=200" in physical_tree(
+        graph, metrics=measured, verbose=True)

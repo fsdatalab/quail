@@ -292,9 +292,9 @@ def test_result_carries_the_executed_plan_and_node_metrics(tmp_path):
     # carries the zero metrics; the plan and the shape are what this
     # test checks
     text = result.explain()
-    assert text.count("\n") == 3
-    assert text.startswith("quail.document_input ")
-    assert "quail.packed_filter" in text and "wall_s=0.000" in text
+    assert text.startswith("Limit: 1 (actual_rows=0, wall_s=0.000)")
+    assert "PackedFilter: r" in text
+    assert "node_id=filter:r" in result.explain(verbose=True)
 
     ledger = cost_ledger.charge(result)
     assert [row["node_type"] for row in ledger["nodes"]] == [
@@ -343,3 +343,12 @@ def test_executed_plan_survives_the_report_round_trip(tmp_path):
         node.node_id for node in result.plan.topological_nodes()]
     assert restored.node_metrics == result.node_metrics
     assert restored.explain() == result.explain()
+
+
+def test_query_explain_uses_optimized_projection(sess):
+    query = sess.sql("SELECT r.id FROM reviews r WHERE "
+                     "AI_FILTER(PROMPT('q: {0}', r.review))")
+    text = query.explain()
+    assert "Scan reviews as r [review, id]" in text
+    assert "admission_tokens=" not in text
+    assert "admission_tokens=" in query.explain(verbose=True)
