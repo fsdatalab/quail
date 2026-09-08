@@ -2,8 +2,8 @@
 
 import pytest
 
-from quailb.prompts import DISCUSS_ASPECT, F1
-from quailb.rendering import (
+from quail_bench.prompts import DISCUSS_ASPECT, F1
+from quail_bench.rendering import (
     ANSWER_CUE,
     SHARED_PRE,
     render_filter_prompt,

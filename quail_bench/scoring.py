@@ -12,9 +12,9 @@ from dataclasses import dataclass, field
 
 import pyarrow as pa
 
-from quailb.data import _ids
-from quailb.labels import GroundTruthCollection
-from quailb.queries import QuerySpec
+from quail_bench.data import _ids
+from quail_bench.labels import GroundTruthCollection
+from quail_bench.queries import QuerySpec
 
 
 @dataclass

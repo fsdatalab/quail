@@ -2,7 +2,7 @@
 
 import pytest
 
-from quailb.queries import (
+from quail_bench.queries import (
     PRIVACY_QUERIES,
     QUERIES,
     QUERY_FAMILY_WORKLOADS,

@@ -1,7 +1,7 @@
 [project]
-name = "quailb"
+name = "quail-bench"
 version = "0.1.0"
-description = "QUAIL-B: a benchmark of AI filter and join queries over document sets"
+description = "quail-bench: a benchmark of AI filter and join queries over document sets"
 readme = "README.md"
 # <3.13: the Modal images run 3.12
 requires-python = ">=3.12,<3.13"
@@ -29,7 +29,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["quailb"]
+packages = ["quail_bench"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -48,8 +48,8 @@ ignore = ["D1"]
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["quailb"]
+known-first-party = ["quail_bench"]
 
 [tool.vulture]
-paths = ["quailb"]
+paths = ["quail_bench"]
 min_confidence = 70

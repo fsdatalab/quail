@@ -1,148 +1,90 @@
-# QUAIL-B
+# quail-bench
 
-This repository defines the benchmark: the document sets (`data.py`),
-the prompts (`prompts.py`), the queries as data (`queries.py`), the
-saved reference labels (`labels.py`), the exact prompt text a predicate
-asks (`rendering.py`), the labeling pass (`judge_pass.py`), and the
-scoring of one run (`scoring.py`). It does not run any engine. An
-engine's runner turns each `QuerySpec` into that engine's query and
-hands the answers back as a `RunOutput` to score. The runner for Quail
-and the stock vLLM and SGLang baselines lives in the Quail repository
-under `quail/bench/`; the commands below run from there.
+quail-bench is a benchmark of AI filter and AI join queries over document sets. Every predicate is one
+exact TRUE or FALSE question, answered by a language model about one document or one document pair.
+Reference labels are saved, so accuracy is scored exactly rather than judged.
 
-Install the package from this repository:
+## Document sets
+
+Counts are at scale factor 0.1, the default. One seed (`DATA_SEED`) and one pinned revision per source (`SOURCE_REVISIONS`), both in `quail_bench/data.py`, mean a scale factor names one exact corpus.
+
+| Set | Source | Rows at sf=0.1 |
+| --- | --- | --- |
+| `reviews` | `stanfordnlp/imdb` | 5,000 |
+| `aspects` | fixed movie-aspect list in `data.py` | 12 |
+| `reports` | `BioDEX/BioDEX-Reactions` | 500 |
+| `terms` | reaction terms of the sampled BioDEX reports | 1,127 |
+| `claims` | `fever/fever` | 500 |
+| `evidence` | Wikipedia pages cited by the sampled claims | 287 |
+| `citation_contexts` | `rmahari/LePaRD` | 500 |
+| `citation_passages` | `rmahari/LePaRD` | 433 |
+| `agent_traces` | `TIGER-Lab/SWE-Next-SFT-Trajectories` | 1,772 |
+
+## Queries
+
+`QUERIES` in `quail_bench/queries.py` holds 32 queries in five families. A query has a base document
+set, filters on each set, joins that each add one more set, and a projection. Filters and joins apply
+in the order written. Two more queries, PRIV-1 and PRIV-2, need `register_privacy_sets()` first.
+
+| Family | Ids | Shapes |
+| --- | --- | --- |
+| IMDB | IMDB-1 to IMDB-10 | filter only, single join, filter chains into a join, star join, three-join chains |
+| BIO | BIO-1 to BIO-3 | filter only, single join, filter into a join, on long medical reports |
+| FEV | FEV-1 to FEV-9 | filter only, single join, filter chains into a join, two-sided filters, star join, three-join chains |
+| LEP | LEP-1 to LEP-8 | filter only, single join, filter chains up to five deep into a join, two-sided filters |
+| AGENT | AGENT-1, AGENT-2 | filter only |
+
+## Metrics
+
+- Query time: seconds to run the query, excluding model startup.
+- Documents per second, filter-only query: input document rows / query seconds.
+- Document pairs per second, join query: evaluated pairs across all join stages / query seconds.
+- `$/query`: query hours x GPU count x the H100 hourly price.
+- Answer accuracy: agreement with the labels on the predicate answers the engine evaluated.
+- Final rows: precision, recall, and F1 against the rows derived from the labels.
+
+## Reference labels
+
+Labels come from Qwen3 32B fp8 answering the exact prompt text in `quail_bench/rendering.py`, at
+temperature 0 with the answer restricted to TRUE or FALSE. One label covers one predicate and one
+document or document pair. A complete label set for every predicate over one corpus is a collection,
+saved on the `quail-results` Modal volume. FEVER and LePaRD use source labels where the dataset gives
+the exact answer. `evaluate()` in `quail_bench/scoring.py` scores a run against a collection.
+
+## Running it
+
+This repository defines the benchmark and runs no engine. An engine's runner turns each `QuerySpec`
+into that engine's own query and hands the answers back as a `RunOutput` to score. Install it, then
+run the benchmark from the Quail repository, `fsdatalab/quail-exploration`:
 
 ```bash
-uv add "quailb @ git+https://github.com/fsdatalab/quail-bench.git"
-```
-
-QUAIL-B has 32 filter and join queries at scale factor 0.1, plus
-2 optional PrivacyPolicies queries (PRIV-1, PRIV-2) that run only
-when `register_privacy_sets()` has been called. The saved ground
-truth covers all 21 predicates used by the 32 default queries.
-
-FEV-9 filters both claim inputs with F11 and both evidence inputs with F13,
-then joins c1 with e1, e1 with c2, and c2 with e2. It has four filters and
-three joins. These filters reuse the existing predicate labels and selectivity
-estimates. Measurements made before this extension used only F11 on c1.
-
-A predicate is one exact TRUE or FALSE question, including its prompt and
-the input columns it reads. A query can use one predicate or combine several
-predicates. Ground truth is saved per predicate, document, or document pair.
-
-## Run the benchmark
-
-Run all 32 queries with Qwen3 4B. Modal starts one H100! container for
-each query family. Each container runs Quail, stock vLLM, and pipelined
-vLLM on that family. SGLang runs in a separate container because its
-Python package conflicts with the vLLM package:
-
-```bash
-mkdir -p results/benchmark
-run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb.log"
-
+uv add "quail-bench @ git+https://github.com/fsdatalab/quail-bench.git"
 uv run modal run --detach -m quail.bench.quailb_parallel \
-  --sf 0.1 \
-  --model qwen3-4b-fp8 \
-  --prediction "State the expected runtime and accuracy." \
-  2>&1 | tee "$run_log"
+  --sf 0.1 --model qwen3-4b-fp8 \
+  --prediction "State the expected runtime and accuracy."
 ```
 
-Do not pass `--query` when every query should run. To run one query, add its
-ID:
+Add `--query IMDB-4` to run one query. Modal starts one H100 container per query family, running Quail, stock vLLM, and pipelined vLLM in it; SGLang runs in its own container.
 
-```bash
-uv run modal run --detach -m quail.bench.quailb_parallel \
-  --sf 0.1 \
-  --model qwen3-4b-fp8 \
-  --query IMDB-4 \
-  --prediction "State the expected runtime and accuracy." \
-  2>&1 | tee results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-IMDB-4.log
-```
+## Adding a query or predicate
 
-Each command runs every selected query once. It reads ground truth before
-the timers start. It reports runtime, H100 cost, tokens, documents per second,
-answer accuracy, and final-row precision, recall, and F1.
+1. Add the query to `QUERIES` in `quail_bench/queries.py`. A query that reuses existing predicates needs no new labels, so stop here.
+2. Add the new prompt constant to `quail_bench/prompts.py`.
+3. Add one `PredicateSpec` to `PREDICATES` in `quail_bench/judge_pass.py`: a stable key, the prompt, the input table and column, and the left and right roles.
+4. Use a source label only when the dataset gives the exact answer the prompt asks for. Otherwise keep the default Qwen3 32B fp8 source.
+5. Update the predicate count test; add a prompt-rendering test if the input shape is new.
+6. Run the labeling pass: `uv run modal run -m quail_bench.judge_pass`
 
-To compare the methods, use one H100! container for each query family. The
-container runs Quail in one process group. After the query results are saved,
-the parent stops the complete process group and waits for GPU memory use to
-fall below 1 GiB. The same container then runs stock vLLM and pipelined vLLM
-in a second process group. Both vLLM configurations share one loaded model.
-The runner records the physical GPU UUID and checks that both process groups
-saw the same H100. SGLang uses the same child-process isolation and cleanup
-in its separate container.
+A changed prompt or input role makes a new predicate version and needs a new label set. The labeling run resumes, skipping finished parts, then writes a new collection and makes it active.
 
-```bash
-run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
+## Layout
 
-uv run modal run --detach -m quail.bench.quailb_parallel \
-  --sf 0.1 \
-  --model qwen3-4b-fp8 \
-  --prediction "State the expected runtime and accuracy." \
-  2>&1 | tee "$run_log"
-```
-
-The command prints one Modal function call ID for each query family. Quail
-clears KV before each query. vLLM resets its prefix cache before each stock or
-pipelined query. SGLang has a separate function call ID and may run on another
-physical H100. The command saves separate summaries and one manifest on the
-`quail-results` volume.
-
-By default, the command loads `SELECTIVITY_ESTIMATE_COLLECTION` from
-`queries.py`. It is the current active collection. Pass
-`--ground-truth-collection <collection_id>` only when testing a specific
-older collection.
-
-The local JSON and Markdown files use the same UTC timestamp prefix under
-`results/benchmark/`. The PNG uses that prefix under
-`reports/plots/benchmark/`. The JSON and raw query records are also saved on
-the `quail-results` Modal volume under
-`/results/benchmarks/quailb/runs/<run_id>/`.
-
-## Add a query
-
-First decide whether the query reuses existing predicates.
-
-If it uses the same prompt constants with the same input roles, add the query
-to `QUERIES` in `queries.py`. No new labeling run is needed. The evaluator
-will use the saved labels for those predicates.
-
-If the query adds a predicate:
-
-1. Add the prompt constant to `prompts.py` and the query to `queries.py`.
-2. Add one `PredicateSpec` to `PREDICATES` in `judge_pass.py`. Give it a
-   descriptive stable key, the prompt, the input table, the input column, and
-   the left and right roles.
-3. `judge_workload()` derives the filter and join labeling work from
-   `PREDICATES`. Filters label every row in their input table. Joins label
-   every left and right row pair.
-4. Use source labels only when the dataset gives the exact answer required by
-   the prompt. Otherwise keep the default Qwen3 32B label source. BioDEX
-   reactions do not count as source truth.
-5. Update the predicate count test and add a prompt-rendering test when the
-   new input shape differs from an existing one.
-6. State the expected label count, runtime, cost, and repeat differences.
-7. Run the label command below.
-
-```bash
-mkdir -p results/benchmark
-label_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-label.log"
-
-uv run modal run -m quailb.judge_pass \
-  2>&1 | tee "$label_log"
-```
-
-The command prints the Modal function call ID into the log. If the call stops,
-run the same command again. Completed Parquet parts have stable IDs and are
-skipped. Existing predicate label sets are reused, so only missing predicate
-rows are sent to Qwen3 32B.
-
-When the run finishes, it writes a new complete collection and makes that
-collection active for the corpus. The next benchmark run reads it by default.
-Use `--ground-truth-collection <collection_id>` only when testing a specific
-older collection.
-
-Changing an existing prompt or its input roles creates a new predicate
-version and a new label set. The old labels remain on the volume. Run the same
-label command to create and activate the replacement collection.
+| Module | What it holds |
+| --- | --- |
+| `quail_bench/data.py` | document sets, pinned sources, sampling, corpus identity |
+| `quail_bench/prompts.py` | the filter and join prompt templates |
+| `quail_bench/queries.py` | the 32 queries as data, with selectivity estimates |
+| `quail_bench/rendering.py` | the exact prompt text a predicate asks |
+| `quail_bench/labels.py` | saved label sets and collections on the volume |
+| `quail_bench/judge_pass.py` | the 21 predicates and the labeling pass |
+| `quail_bench/scoring.py` | `RunOutput` and the scoring of one run |

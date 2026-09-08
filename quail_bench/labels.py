@@ -16,7 +16,7 @@ from pathlib import Path
 import pyarrow as pa
 from pyarrow import parquet as pq
 
-from quailb.data import _full_hash
+from quail_bench.data import _full_hash
 
 GROUND_TRUTH_ROOT = "ground_truth/quailb/schema_v1"
 RESULTS_VOLUME = "quail-results"
@@ -388,7 +388,7 @@ def load_ground_truth_workload(files, scale_factor: float, corpus_id: str,
                                corpus_full_hash: str, workload: str
                                ) -> GroundTruthCollection:
     """Load completed label sets for one benchmark workload."""
-    from quailb.judge_pass import MODEL_NAME, PREDICATES, label_set_identity
+    from quail_bench.judge_pass import MODEL_NAME, PREDICATES, label_set_identity
 
     specs = [spec for spec in PREDICATES if spec.workload == workload]
     if not specs:

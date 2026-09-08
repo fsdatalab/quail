@@ -2,11 +2,11 @@
 
 QUAIL-B is a benchmark of AI filter and join queries over document
 sets. This repository defines the benchmark and runs no engine: the
-document sets (`quailb/data.py`), the prompts (`quailb/prompts.py`),
-the queries as data (`quailb/queries.py`), the saved reference labels
-(`quailb/labels.py`), the exact prompt text a predicate asks
-(`quailb/rendering.py`), the labeling pass (`quailb/judge_pass.py`),
-and the scoring of one run (`quailb/scoring.py`). An engine's runner
+document sets (`quail_bench/data.py`), the prompts (`quail_bench/prompts.py`),
+the queries as data (`quail_bench/queries.py`), the saved reference labels
+(`quail_bench/labels.py`), the exact prompt text a predicate asks
+(`quail_bench/rendering.py`), the labeling pass (`quail_bench/judge_pass.py`),
+and the scoring of one run (`quail_bench/scoring.py`). An engine's runner
 turns a `QuerySpec` into that engine's query and hands the answers back
 as a `RunOutput` to score. Quail's runner lives in the Quail repository
 under `quail/bench/`. The rules below are the Quail project's rules and
@@ -48,7 +48,7 @@ these rules.
 
 CI runs these on every pull request. Run them before pushing:
 
-    uv run ruff check quailb tests tools
+    uv run ruff check quail_bench tests tools
     uv run python tools/check_long_strings.py
     uv run vulture
     uv run pytest -q

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from quailb.prompts import (
+from quail_bench.prompts import (
     AGENT_IMPLEMENTED_FIX,
     AGENT_RECOVERED,
     ASPECT_SENTIMENT,

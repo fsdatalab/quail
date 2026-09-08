@@ -4,11 +4,11 @@ Qwen3 32B labels the predicates without exact source labels. FEVER and
 LePaRD supply source truth where available. The run uses stable label-set
 IDs and skips completed Parquet parts.
 
-    uv run modal run -m quailb.judge_pass
+    uv run modal run -m quail_bench.judge_pass
 
 Reuse labels after an unrelated table changes in a new corpus:
 
-    uv run modal run --detach -m quailb.judge_pass \
+    uv run modal run --detach -m quail_bench.judge_pass \
       --reuse-from-collection <collection> \
       --target-corpus <corpus> \
       --relabeled-workloads lepard
@@ -27,8 +27,8 @@ from pathlib import Path
 
 import modal
 
-from quailb import data, prompts, rendering
-from quailb.rendering import SHARED_PRE
+from quail_bench import data, prompts, rendering
+from quail_bench.rendering import SHARED_PRE
 
 SCHEMA_VERSION = 1
 SCALE_FACTOR = 0.1
@@ -394,13 +394,13 @@ image = (
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quailb")
+    .add_local_python_source("quail_bench")
 )
 
 data_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("numpy", "pyarrow")
-    .add_local_python_source("quailb")
+    .add_local_python_source("quail_bench")
 )
 
 # Building the corpus reads the source datasets off HuggingFace, so it
@@ -411,7 +411,7 @@ corpus_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("numpy", "pyarrow", "pandas", "huggingface_hub",
                  "datasets", "transformers>=5.2.0")
-    .add_local_python_source("quailb")
+    .add_local_python_source("quail_bench")
 )
 
 # Experiment cells attach to this existing app so its caches remain useful.
@@ -677,7 +677,7 @@ class ModelJudge:
         from transformers import AutoTokenizer
         from vllm import LLM, SamplingParams
 
-        from quailb.rendering import true_false_ids
+        from quail_bench.rendering import true_false_ids
 
         t0 = time.perf_counter()
         self.tokenizer = AutoTokenizer.from_pretrained(
