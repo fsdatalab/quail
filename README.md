@@ -18,7 +18,7 @@ Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
   [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench). It
   holds the document sets, prompts, queries as data, saved labels, the
   labeling pass, and scoring, and runs no engine. It is installed here
-  as the `quailb` package, pinned in `pyproject.toml`. Its README
+  as the `quail_bench` package, pinned in `pyproject.toml`. Its README
   explains how to run it on Quail and label a new predicate.
 - `quail_ext_examples/` has example extensions.
 - `tests/` is the CPU suite. It runs in seconds and needs no GPU.

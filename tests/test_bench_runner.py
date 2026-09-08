@@ -12,10 +12,10 @@ from quail.bench.quailb import answer_oracle, build_query, queries, run_output
 from quail.catalog import DocumentProvider
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
-from quailb.labels import GroundTruthCollection, PredicateLabels
-from quailb.queries import AliasSpec, JoinSpec, QuerySpec
-from quailb.queries import queries as query_specs
-from quailb.scoring import Evaluator
+from quail_bench.labels import GroundTruthCollection, PredicateLabels
+from quail_bench.queries import AliasSpec, JoinSpec, QuerySpec
+from quail_bench.queries import queries as query_specs
+from quail_bench.scoring import Evaluator
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
@@ -83,8 +83,8 @@ def _truth():
 
 def fever_truth():
     """Labels for FEV-9 over a three claim, three evidence corpus."""
-    from quailb.judge_pass import PREDICATES, predicate_payload
-    from quailb.prompts import F11, F13, REFUTE, SUPPORT
+    from quail_bench.judge_pass import PREDICATES, predicate_payload
+    from quail_bench.prompts import F11, F13, REFUTE, SUPPORT
 
     corpus = {
         "claims": pa.table({"id": ["c0", "c1", "c2"],
@@ -376,8 +376,8 @@ def test_fev9_builds_from_its_spec_and_answers_from_labels(backend):
 
 def test_benchmark_prompt_text_matches_what_quail_sends():
     """The labels answer quailb's text; Quail must send the same text."""
-    from quailb.judge_pass import PREDICATES
-    from quailb.rendering import render_filter_prompt, render_join_prompt
+    from quail_bench.judge_pass import PREDICATES
+    from quail_bench.rendering import render_filter_prompt, render_join_prompt
 
     for spec in PREDICATES:
         left = quail.ColumnRef("left", spec.left_table, spec.left_column)

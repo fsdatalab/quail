@@ -80,7 +80,7 @@ image = (
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
           "TORCHINDUCTOR_CACHE_DIR":
               "/root/.cache/kernels/torchinductor"})
-    .add_local_python_source("quail", "quailb")
+    .add_local_python_source("quail", "quail_bench")
 )
 
 # House rule: never create new Modal app names - new GPU cells attach
@@ -186,7 +186,7 @@ def _quailb_session(model, sf, gpus=1):
     import quail
     from quail.bench.quailb import queries, register_sets
     from quail.planner.plan import EngineConfig
-    from quailb.data import build_sets
+    from quail_bench.data import build_sets
 
     d = build_sets(DATA_DIR, sf)
     results_vol.commit()

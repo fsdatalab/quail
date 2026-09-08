@@ -39,7 +39,7 @@ def run_backend_group(
     """Run backend methods while sharing one loaded model when possible."""
     from quail import InProcessComputeProvider
     from quail.bench.quailb import run_suite
-    from quailb.queries import SELECTIVITY_ESTIMATE_COLLECTION, query_family_name
+    from quail_bench.queries import SELECTIVITY_ESTIMATE_COLLECTION, query_family_name
 
     query_ids = tuple(query_ids)
     methods = tuple(methods)

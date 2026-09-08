@@ -56,14 +56,9 @@ CI runs these on every pull request. Run them before pushing:
 
 - The project is Quail (QUery-Aware Inference Layer). The package is
   `quail`. Nothing is called DocEngine any more.
-- QUAIL-B, the benchmark, is its own repository:
+- quail-bench, the benchmark, is its own repository:
   https://github.com/fsdatalab/quail-bench, installed here as the
-  `quailb` package and pinned to a commit in `pyproject.toml`.
-  `quail/bench/` is Quail's runner for it. A query or label change
-  goes to that repository first, then the pin moves here.
-- QUAIL-B, the benchmark, is its own repository:
-  https://github.com/fsdatalab/quail-bench, installed here as the
-  `quailb` package and pinned to a commit in `pyproject.toml`.
+  `quail_bench` package and pinned to a commit in `pyproject.toml`.
   `quail/bench/` is Quail's runner for it. A query or label change
   goes to that repository first, then the pin moves here.
 - The three mechanisms are "pipelining", "token-based admission", and

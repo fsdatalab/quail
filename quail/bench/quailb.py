@@ -22,7 +22,7 @@ from pathlib import Path
 import pyarrow as pa
 
 import quail
-from quailb.data import (
+from quail_bench.data import (
     DATA_SEED,
     SOURCE_REVISIONS,
     _ids,
@@ -30,19 +30,19 @@ from quailb.data import (
     corpus_identity,
     read_corpus,
 )
-from quailb.labels import (
+from quail_bench.labels import (
     ModalVolumeFiles,
     load_ground_truth,
     load_ground_truth_workload,
 )
-from quailb.queries import (
+from quail_bench.queries import (
     SELECTIVITY_ESTIMATE_COLLECTION,
     SELECTIVITY_ESTIMATE_CORPUS,
     SELECTIVITY_ESTIMATE_SCALE_FACTOR,
     QuerySpec,
 )
-from quailb.queries import queries as query_specs
-from quailb.scoring import (
+from quail_bench.queries import queries as query_specs
+from quail_bench.scoring import (
     Evaluator,
     RunOutput,
     add_query_metrics,

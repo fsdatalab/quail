@@ -14,8 +14,8 @@ from quail.physical import AnchoredJoin, DocumentInput, PackedFilter, decode_gra
 from quail.planner.plan import EngineConfig
 from quail.runtime.local import execute_worker_query
 from quail.runtime.runner import NodeMetrics, NodeResult
-from quailb import prompts
-from quailb.queries import FILTER_SELECTIVITY_ESTIMATES
+from quail_bench import prompts
+from quail_bench.queries import FILTER_SELECTIVITY_ESTIMATES
 
 
 def register_fever(session):

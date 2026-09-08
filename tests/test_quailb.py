@@ -8,8 +8,8 @@ import quail
 from quail.bench.quailb import queries, register_privacy_sets, register_sets
 from quail.planner.decide import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
-from quailb.data import ASPECTS, SCENARIOS
-from quailb.queries import QUERY_ORDER
+from quail_bench.data import ASPECTS, SCENARIOS
+from quail_bench.queries import QUERY_ORDER
 
 
 def _standin_sets(tmp_path):

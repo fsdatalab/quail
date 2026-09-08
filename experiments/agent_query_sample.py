@@ -91,7 +91,7 @@ image = (
         "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
     })
-    .add_local_python_source("quail", "quailb")
+    .add_local_python_source("quail", "quail_bench")
 )
 
 data_image = (
@@ -104,13 +104,13 @@ data_image = (
         "datasets",
         "transformers>=5.2.0",
     )
-    .add_local_python_source("quail", "quailb")
+    .add_local_python_source("quail", "quail_bench")
 )
 
 finalize_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("pyarrow")
-    .add_local_python_source("quail", "quailb")
+    .add_local_python_source("quail", "quail_bench")
 )
 
 app = modal.App("quail-milestone1")
@@ -182,7 +182,7 @@ def prepare_sample() -> str:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from quailb import data
+    from quail_bench import data
 
     results_vol.reload()
     data_dir = data.build_sets(DATA_DIR, sf=SCALE_FACTOR)
@@ -246,7 +246,7 @@ def judge_sample(model_name: str, sample_full_hash: str) -> str:
     from vllm import LLM, SamplingParams
 
     from quail import true_false_ids
-    from quailb import data
+    from quail_bench import data
 
     if model_name not in MODELS:
         raise ValueError(f"unknown model {model_name!r}")

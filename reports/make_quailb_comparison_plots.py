@@ -95,7 +95,7 @@ METRICS = (
 
 def input_relations(queries, corpus):
     """Resolve each query alias to its saved input table count."""
-    from quailb.queries import queries as query_specs
+    from quail_bench.queries import queries as query_specs
 
     specs = query_specs()
     return {
