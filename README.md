@@ -67,7 +67,7 @@ into that engine's own query and hands the answers back as a `RunOutput` to scor
 lives in `fsdatalab/quail-exploration`; on a machine with a GPU:
 
 ```bash
-uv add "quail-b @ git+https://github.com/fsdatalab/quail-b.git"
+uv add "quail-b @ git+https://github.com/fsdatalab/quail-bench.git"
 uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8
 ```
 
