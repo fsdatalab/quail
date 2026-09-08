@@ -10,7 +10,7 @@ predicate, so accuracy is scored on exact TRUE or FALSE answers, not
 on model agreement.
 
 The full instructions live in the README of the benchmark's own
-repository, [fsdatalab/quail-b](https://github.com/fsdatalab/quail-b). The short version:
+repository, [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench). The short version:
 
 ```bash
 mkdir -p results/benchmark
@@ -24,6 +24,13 @@ uv run modal run --detach -m quail.bench.quailb_parallel \
 ```
 
 Add `--query IMDB-4` to run one query.
+
+On a machine with a GPU and no Modal account, the same runner reads the
+corpus and labels from the public bucket:
+
+```bash
+uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8
+```
 
 ## What one run does
 

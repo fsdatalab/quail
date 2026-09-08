@@ -18,7 +18,7 @@ calling process, or on Modal.
   generic runner, token store, results, and the Modal worker. `bench/`
   is the QUAIL-B runner for Quail and its request backends.
 - QUAIL-B, the benchmark, is its own repository:
-  [fsdatalab/quail-b](https://github.com/fsdatalab/quail-b). It
+  [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench). It
   holds the document sets, prompts, queries as data, the predicates and
   their label identities, saved labels, and scoring, and runs no engine
   or model. Corpus and labels are public in the `quail-bench` S3

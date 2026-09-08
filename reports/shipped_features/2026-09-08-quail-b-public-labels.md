@@ -1,11 +1,41 @@
-# QUAIL-B corpus and labels on a public bucket, no Modal in the benchmark
+# QUAIL-B in its own repository, with public data and Quail as one runner
 
-The benchmark package is `quail-b` (import `quail_b`), from
-[fsdatalab/quail-b](https://github.com/fsdatalab/quail-b). Stored data
-keeps its `quailb` identifiers, because predicate keys and the
+Date: 2026-09-08.
+
+The benchmark is its own repository,
+[fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench),
+installed here as the `quail_b` package (distribution `quail-b`) and
+pinned to a commit in `pyproject.toml`. It runs no engine and no
+model. `quail/bench/` is Quail's runner for it. Stored data keeps its
+`quailb` identifiers, because predicate keys and the
 `ground_truth/quailb/schema_v1` path are hashed into label-set ids.
 
 ## What changed
+
+- The `quail_b` package holds the benchmark: `data.py` (document sets,
+  pinned sources, sampling, corpus identity), `prompts.py`,
+  `queries.py`, `predicates.py` (the 21 predicates and the identity of
+  their labels), `rendering.py` (the exact prompt text a predicate
+  asks), `store.py` (the public bucket and a local directory),
+  `labels.py`, and `scoring.py`. Nothing in it imports `quail`.
+- The 32 queries are data. `quail_b.queries.QUERIES` is a tuple of
+  `QuerySpec` records: aliases with their tables, text columns, and
+  filter templates in written order; binary joins with their aliases
+  in placeholder order; and the select list. Before, the queries
+  existed only as closures over a Quail session.
+- Scoring takes a `RunOutput`: the engine's filter answers keyed by
+  (alias, written position), its join answers keyed by written
+  position, and its final rows, all in the benchmark's own ids. The
+  expected rows come from the labels through pyarrow joins. A test in
+  the runner checks that Quail sends the same prompt text as the
+  labels answered, for every predicate.
+- `quail/bench/quailb.py` is the runner. `build_query(session, spec)`
+  turns one spec into a Quail query, `run_output(result, spec, corpus)`
+  turns a `QueryResult` into a `RunOutput`, and `answer_oracle` wraps
+  the labels as the callable `quail.speed_of_light_estimate` takes.
+  `run_suite` and the same-GPU Modal runner measure and save what they
+  did before. `rows_from_answers` derives final rows from saved
+  answers; the shared KV retention scorer uses it.
 
 - Corpus and labels are public: 1.07 GB at
   `s3://quail-bench/ground_truth/quailb/schema_v1/`, readable without
