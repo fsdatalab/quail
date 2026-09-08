@@ -311,10 +311,14 @@ def main():
     ax.set_aspect("equal")
     ax.axis("off")
 
-    out = Path(__file__).resolve().parent.parent / "figures" / "quailb_anatomy.png"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=300)
-    print(f"wrote {out}")
+    base = Path(__file__).resolve().parent.parent / "figures"
+    base.mkdir(parents=True, exist_ok=True)
+    pdf = base / "quailb_anatomy.pdf"
+    fig.savefig(pdf)
+    png = base / "quailb_anatomy.png"
+    fig.savefig(png, dpi=300)
+    print(f"wrote {pdf}")
+    print(f"wrote {png}")
 
 
 if __name__ == "__main__":

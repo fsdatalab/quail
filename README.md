@@ -36,6 +36,8 @@ in the order written. Two more queries, PRIV-1 and PRIV-2, need `register_privac
 
 ![QUAIL-B query anatomy](figures/quailb_anatomy.png)
 
+The vector PDF is at [`figures/quailb_anatomy.pdf`](figures/quailb_anatomy.pdf).
+
 ## Metrics
 
 - Query time: seconds to run the query, excluding model startup.
