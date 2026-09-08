@@ -1,119 +1,104 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 820" role="img" aria-labelledby="title desc">
-  <title id="title">Quail physical operators and execution engine</title>
-  <desc id="desc">On the left, the running example is lowered into a physical operator plan. A CPU scan feeds a GPU packed filter, which joins a second scan through a GPU anchored join. A CPU relational operator materializes the join result from the passing tuple IDs, and a CPU projection produces the requested columns. On the right, the CPU physical plan executor dispatches model operators to a runtime that packs token chunks on the CPU, runs model forward passes on the GPU, and manages KV pages in GPU HBM. It dispatches relational operators to a CPU runtime, which uses Arrow Acero to materialize join results.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 880" role="img" aria-labelledby="title desc">
+  <title id="title">BIO-3 physical plan and Quail execution engine</title>
+  <desc id="desc">The BIO-3 physical plan appears on the left. On the right, a CPU region contains document tokenization, the physical plan executor, the packed filter and anchored join schedulers, the KV manager, and answer processing. A GPU region contains one model copy, one KV pool in HBM, and the model forward pass.</desc>
 
   <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f6368"/>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#667085"/>
     </marker>
     <style>
-      .outer { fill: #ffffff; stroke: #5f6368; stroke-width: 2; }
-      .model { fill: #dcebd3; stroke: #5f6368; stroke-width: 2; }
-      .arrowop { fill: #dbe7f7; stroke: #5f6368; stroke-width: 2; }
-      .input { fill: #f0f0f0; stroke: #5f6368; stroke-width: 2; }
-      .engine { fill: #fff8e5; stroke: #5f6368; stroke-width: 2; }
-      .arrow { fill: none; stroke: #5f6368; stroke-width: 4; marker-end: url(#arrow); }
-      .thin-arrow { fill: none; stroke: #5f6368; stroke-width: 3; marker-end: url(#arrow); }
-      .heading { fill: #111111; font: 600 29px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
-      .label { fill: #111111; font: 400 23px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
-      .small { fill: #111111; font: 400 19px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
-      .section { fill: #111111; font: 600 31px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
-      .legend { fill: #111111; font: 400 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; dominant-baseline: middle; }
+      .frame { fill: #ffffff; stroke: #667085; stroke-width: 2; }
+      .cpu-zone { fill: #f5f8fd; stroke: #8ba6c9; stroke-width: 2; }
+      .gpu-zone { fill: #f5faf2; stroke: #8fad7d; stroke-width: 2; }
+      .cpu { fill: #dbe7f7; stroke: #667085; stroke-width: 2; }
+      .gpu { fill: #dcebd3; stroke: #667085; stroke-width: 2; }
+      .input { fill: #f2f4f7; stroke: #667085; stroke-width: 2; }
+      .edge { fill: none; stroke: #667085; stroke-width: 3; marker-end: url(#arrow); }
+      .edge-light { fill: none; stroke: #98a2b3; stroke-width: 2.5; marker-end: url(#arrow); }
+      .heading { fill: #101828; font: 600 28px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .zone-heading { fill: #344054; font: 600 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .label { fill: #101828; font: 500 21px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .small { fill: #344054; font: 400 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .arrow-label { fill: #475467; font: 400 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
     </style>
   </defs>
 
-  <rect class="outer" x="25" y="25" width="1750" height="700"/>
+  <rect class="frame" x="25" y="25" width="1750" height="820" rx="4"/>
+  <line x1="700" y1="25" x2="700" y2="845" stroke="#d0d5dd" stroke-width="2"/>
 
-  <g aria-label="Physical operator plan">
-    <text class="heading" x="380" y="72">Physical Operator Plan</text>
+  <g aria-label="BIO-3 physical plan">
+    <text class="heading" x="355" y="75">1. BIO-3 Physical Plan</text>
 
-    <rect class="arrowop" x="245" y="95" width="270" height="64" rx="4"/>
-    <text class="label" x="380" y="128">Project, CPU</text>
+    <rect class="cpu" x="225" y="115" width="260" height="64" rx="4"/>
+    <text class="label" x="355" y="148">Project</text>
 
-    <rect class="arrowop" x="245" y="200" width="270" height="64" rx="4"/>
-    <text class="small" x="380" y="222">Materialize Join Result</text>
-    <text class="small" x="380" y="247">CPU</text>
+    <rect class="gpu" x="225" y="230" width="260" height="64" rx="4"/>
+    <text class="label" x="355" y="263">Anchored Join</text>
 
-    <rect class="model" x="245" y="305" width="270" height="64" rx="4"/>
-    <text class="label" x="380" y="338">Anchored Join, GPU</text>
+    <rect class="gpu" x="55" y="370" width="280" height="64" rx="4"/>
+    <text class="label" x="195" y="403">Packed Filter</text>
 
-    <rect class="model" x="60" y="440" width="280" height="64" rx="4"/>
-    <text class="label" x="200" y="473">Packed Filter, GPU</text>
+    <rect class="input" x="395" y="370" width="260" height="64" rx="4"/>
+    <text class="small" x="525" y="393">Document Input</text>
+    <text class="small" x="525" y="417">reaction terms</text>
 
-    <rect class="input" x="420" y="440" width="280" height="64" rx="4"/>
-    <text class="small" x="560" y="462">Scan: reactions</text>
-    <text class="small" x="560" y="487">CPU</text>
+    <rect class="input" x="55" y="510" width="280" height="64" rx="4"/>
+    <text class="small" x="195" y="533">Document Input</text>
+    <text class="small" x="195" y="557">medical reports</text>
 
-    <rect class="input" x="60" y="570" width="280" height="64" rx="4"/>
-    <text class="small" x="200" y="592">Scan: reports</text>
-    <text class="small" x="200" y="617">CPU</text>
-
-    <path class="thin-arrow" d="M 380 200 L 380 164"/>
-    <path class="thin-arrow" d="M 380 305 L 380 269"/>
-    <path class="thin-arrow" d="M 200 440 L 345 374"/>
-    <path class="thin-arrow" d="M 560 440 L 415 374"/>
-    <path class="thin-arrow" d="M 200 570 L 200 509"/>
-
-    <rect class="model" x="80" y="665" width="28" height="20"/>
-    <text class="legend" x="118" y="676">GPU operator</text>
-    <rect class="arrowop" x="285" y="665" width="28" height="20"/>
-    <text class="legend" x="323" y="676">CPU relational operator</text>
-    <rect class="input" x="505" y="665" width="28" height="20"/>
-    <text class="legend" x="543" y="676">CPU scan operator</text>
+    <path class="edge" d="M 355 230 L 355 185"/>
+    <path class="edge" d="M 195 370 C 195 330, 280 330, 320 299"/>
+    <path class="edge" d="M 525 370 C 525 330, 430 330, 390 299"/>
+    <path class="edge" d="M 195 510 L 195 440"/>
   </g>
 
-  <path class="arrow" d="M 720 350 L 800 350"/>
+  <path class="edge" d="M 665 297 L 769 297"/>
 
-  <g aria-label="Physical plan executor">
-    <rect class="engine" x="825" y="300" width="275" height="100" rx="4"/>
-    <text class="label" x="962.5" y="338">Physical Plan Executor</text>
-    <text class="small" x="962.5" y="372">CPU</text>
+  <g aria-label="Execution engine">
+    <text class="heading" x="1235" y="75">Execution Engine</text>
+
+    <rect class="cpu-zone" x="735" y="105" width="590" height="705" rx="8"/>
+    <text class="zone-heading" x="1030" y="142">CPU</text>
+
+    <rect class="gpu-zone" x="1360" y="105" width="380" height="705" rx="8"/>
+    <text class="zone-heading" x="1550" y="142">GPU</text>
+
+    <rect class="input" x="775" y="165" width="510" height="60" rx="4"/>
+    <text class="label" x="1030" y="196">2. Tokenize Documents</text>
+
+    <rect class="cpu" x="775" y="265" width="510" height="64" rx="4"/>
+    <text class="label" x="1030" y="298">Physical Plan Executor</text>
+
+    <rect class="cpu" x="775" y="375" width="510" height="126" rx="4"/>
+    <text class="label" x="1030" y="411">4. Packed Filter Scheduler</text>
+    <line x1="800" y1="438" x2="1260" y2="438" stroke="#a5b4c8" stroke-width="2"/>
+    <text class="label" x="1030" y="472">5. Anchored Join Scheduler</text>
+
+    <rect class="cpu" x="775" y="570" width="235" height="64" rx="4"/>
+    <text class="small" x="892" y="603">Read Previous Answers</text>
+
+    <rect class="cpu" x="1050" y="570" width="235" height="64" rx="4"/>
+    <text class="label" x="1167" y="603">3. KV Manager</text>
+
+    <rect class="gpu" x="1400" y="165" width="300" height="60" rx="4"/>
+    <text class="label" x="1550" y="196">2. Model Copy</text>
+
+    <rect class="gpu" x="1400" y="375" width="300" height="64" rx="4"/>
+    <text class="label" x="1550" y="408">6. Model Forward Pass</text>
+
+    <rect class="gpu" x="1400" y="570" width="300" height="64" rx="4"/>
+    <text class="label" x="1550" y="603">KV Pages in HBM</text>
+
+    <path class="edge-light" d="M 1030 231 L 1030 259"/>
+    <path class="edge-light" d="M 1030 335 L 1030 369"/>
+    <path class="edge-light" d="M 892 564 L 892 507"/>
+    <path class="edge-light" d="M 1167 507 L 1167 564"/>
+    <path class="edge-light" d="M 1291 602 L 1394 602"/>
+    <path class="edge-light" d="M 1285 438 L 1394 408"/>
+    <text class="arrow-label" x="1340" y="390">token chunk</text>
+    <path class="edge-light" d="M 1550 231 L 1550 369"/>
+    <path class="edge-light" d="M 1550 564 L 1550 445"/>
+    <path class="edge-light" d="M 1706 408 C 1730 408, 1730 725, 892 725 L 892 640"/>
+    <text class="arrow-label" x="1320" y="750">TRUE / FALSE answers</text>
   </g>
-
-  <g aria-label="Model operator runtime">
-    <rect class="outer" x="1180" y="70" width="540" height="285" rx="4"/>
-    <text class="heading" x="1450" y="112">Model Operator Runtime</text>
-
-    <rect class="arrowop" x="1220" y="150" width="210" height="72" rx="4"/>
-    <text class="small" x="1325" y="177">Pack Next</text>
-    <text class="small" x="1325" y="202">Token Chunk, CPU</text>
-
-    <rect class="model" x="1470" y="150" width="210" height="72" rx="4"/>
-    <text class="small" x="1575" y="177">Model</text>
-    <text class="small" x="1575" y="202">Forward Pass, GPU</text>
-
-    <rect class="arrowop" x="1220" y="260" width="210" height="58" rx="4"/>
-    <text class="small" x="1325" y="290">KV Manager, CPU</text>
-
-    <rect class="model" x="1470" y="260" width="210" height="58" rx="4"/>
-    <text class="small" x="1575" y="290">KV Pages, GPU HBM</text>
-
-    <path class="thin-arrow" d="M 1435 186 L 1465 186"/>
-    <path class="thin-arrow" d="M 1325 226 L 1325 255"/>
-    <path class="thin-arrow" d="M 1435 289 L 1465 289"/>
-    <path class="thin-arrow" d="M 1575 255 L 1575 226"/>
-  </g>
-
-  <path class="arrow" d="M 1105 315 C 1130 250, 1145 210, 1175 185"/>
-
-  <g aria-label="Relational operator runtime">
-    <rect class="outer" x="1180" y="440" width="540" height="200" rx="4"/>
-    <text class="heading" x="1450" y="482">Relational Operator Runtime, CPU</text>
-
-    <rect class="arrowop" x="1220" y="520" width="210" height="72" rx="4"/>
-    <text class="small" x="1325" y="547">Passing</text>
-    <text class="small" x="1325" y="572">Tuple IDs</text>
-
-    <rect class="arrowop" x="1470" y="520" width="210" height="72" rx="4"/>
-    <text class="small" x="1575" y="547">Materialize Join Result</text>
-    <text class="small" x="1575" y="572">with Arrow Acero</text>
-
-    <path class="thin-arrow" d="M 1435 556 L 1465 556"/>
-  </g>
-
-  <path class="arrow" d="M 1105 385 C 1130 455, 1145 515, 1175 545"/>
-
-  <line x1="25" y1="725" x2="1775" y2="725" stroke="#5f6368" stroke-width="2"/>
-  <text class="section" x="380" y="782">Physical Plan</text>
-  <text class="section" x="1320" y="782">Execution Engine</text>
 </svg>
