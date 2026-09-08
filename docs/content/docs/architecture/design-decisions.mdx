@@ -92,8 +92,9 @@ flowchart TD
     I --> J[QueryResult]
 `} />
 
-The default compute provider uses Modal Functions in the existing
-`quail-engine` app. Quail does not run an application server.
+The default compute provider runs the model in the calling process.
+`ModalComputeProvider` runs it in Modal Functions in the existing
+`quail-engine` app instead. Quail does not run an application server.
 
 ## Logical plans
 
@@ -207,7 +208,8 @@ class ComputeProvider(Protocol):
     def close(self) -> None: ...
 ```
 
-`ModalComputeProvider` is the default. It uses one Modal Function for each
+`InProcessComputeProvider` is the default. It runs the model on the GPU in
+the calling process. `ModalComputeProvider` uses one Modal Function for each
 supported GPU count in the existing `quail-engine` app.
 
 A different compute provider can run the same logical request elsewhere.

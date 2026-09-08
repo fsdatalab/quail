@@ -140,11 +140,23 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    validation, schema, and explain interface.
 4. The session creates one `QueryRequest`. The request contains the logical
    plan, table providers, model settings, and registered extensions.
-5. The selected compute provider runs the request. Modal is the default.
-   `ModalComputeProvider` sends a source description when the worker can open
-   the source. Otherwise, it sends only the raw Arrow columns used by the
-   query.
-6. The Modal worker opens the sources and reads bounded Arrow batches. It
+5. The selected compute provider runs the request. The in-process provider
+   is the default and runs the rest of these steps in the calling process,
+   which needs a CUDA GPU. `ModalComputeProvider` sends a source description
+   when the worker can open the source. Otherwise, it sends only the raw
+   Arrow columns used by the query.
+6. Planning does not wait for tokenization. The session reads each
+   document column's byte lengths, tokenizes the first 256 documents to
+   measure tokens per byte, and plans on the scaled lengths (within about
+   1% of the exact total on IMDB, 4% per document). The token file is
+   written on a background thread meanwhile, and `explain()` marks the
+   counts as estimated. Once a column's token file exists, later queries
+   plan on the exact counts.
+7. The worker boots the model from the plan alone, before the token file
+   is finished (`prepare_request` on the backend), then waits for the
+   file. The report's `token_wait_s` is that wait. The Quail backend
+   boots this way; the request backends load on the first request.
+8. The worker (the calling process, or the Modal container) opens the sources and reads bounded Arrow batches. It
    tokenizes each batch and writes the tokens and document lengths to a
    temporary Arrow file, one per document column. Each value column the
    query returns goes to its own Arrow file in the same pass. Both are
@@ -164,18 +176,18 @@ and one Modal container can use 1, 2, 4, or 8 H100s.
    The generic `PhysicalPlan` holds the graph and a backend-owned settings map.
    Quail's chunk size, KV capacity, predicate order, and filter limit are not
    fields that another backend must supply.
-7. The planner chooses the complete join order and anchors from selectivity
+9. The planner chooses the complete join order and anchors from selectivity
    estimates. It schedules the first anchor's filters last and shares retained
    KV capacity across inputs with future anchor uses. `Exchange` nodes prune actual survivors
    between the planned join groups. Execution follows this graph without
    searching again.
-8. The worker creates an internal physical request. It uses the query's
+10. The worker creates an internal physical request. It uses the query's
    registry to check every physical node codec, backend, model, device,
    and runtime. The generic
    runner then executes the typed physical graph.
    The same `QuailModelExecution` handles every model node on one GPU
    executor, so the nodes use the same KV.
-9. When a query has several full joins or a gate, the `Recombine`
+11. When a query has several full joins or a gate, the `Recombine`
    node hands the true pairs and survivor sets to Arrow Acero, which
    joins them on shared SQL alias columns and applies the final
    survivor sets. A query with one full join and no gate has no
@@ -456,8 +468,10 @@ when they would make the plan unreadable.
 `ComputeProvider` controls where a query runs. It has one `execute` method that
 accepts a `QueryRequest` and returns a `QueryResult`. The request contains the
 logical plan, table providers, model settings, and registered extensions. The
-default `ModalComputeProvider` selects the 1, 2, 4, or 8 GPU function in the
-existing `quail-engine` app. It builds the worker image with the selected
+default `InProcessComputeProvider` runs the request in the calling process,
+which needs a CUDA GPU and the backend's runtime package (vLLM is a package
+dependency on Linux). `ModalComputeProvider` selects the 1, 2, 4, or 8 GPU
+function in the existing `quail-engine` app. It builds the worker image with the selected
 backend package. Quail and vLLM workers install vLLM. SGLang workers install
 SGLang. Modal supplies the GPU container and function lifecycle. Quail does
 not run FastAPI, ASGI, REST, or another application server. A different

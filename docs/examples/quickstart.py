@@ -51,7 +51,9 @@ def main() -> None:
     section("aspects")
     print(aspects.to_pydict())
 
-    with quail.Session() as session:
+    with quail.Session(
+        compute_provider=quail.ModalComputeProvider()
+    ) as session:
         session.register("reviews", quail.DocumentProvider.from_table(
             reviews, id_col="id"))
         session.register("aspects", quail.DocumentProvider.from_table(

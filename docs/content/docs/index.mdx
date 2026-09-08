@@ -49,7 +49,8 @@ are the next step and are not built yet.
 - Models: Qwen3 4B fp8 and Qwen3 32B fp8.
 - Hardware: one H100 per model copy, 1, 2, 4, or 8 H100s in one Modal
   container. Quail does not split one model across GPUs.
-- Every engine run goes through Modal. There is no local GPU path.
+- A query runs on the GPU in the calling process by default, or on
+  Modal through `ModalComputeProvider`.
 - Stock vLLM, pipelined vLLM, and pipelined SGLang run the same
   queries behind the same backend interface, for comparison.
 

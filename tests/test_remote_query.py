@@ -115,6 +115,8 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
         )
 
     monkeypatch.setattr(local_runtime, "_execute_physical", execute)
+    monkeypatch.setattr(local_runtime, "_prepare_backend",
+                        lambda plan, registry: None)
 
     response = worker._execute_logical_query(request, 1, initialize)
     received = deserialize(serialize(response), None)

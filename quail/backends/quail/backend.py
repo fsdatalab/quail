@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import Any
 
 from quail.backends.base import GpuContext
-from quail.backends.quail.worker import execute_quail_request
+from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.executor import loop
 from quail.logical import SHARED_PRE
 from quail.physical import (
@@ -319,6 +319,10 @@ class QuailBackend:
                 ),
             },
         )
+
+    def prepare_request(self, context) -> None:
+        """Boot the GPU for a request before its documents are ready."""
+        prepare_quail_request(context)
 
     def execute_request(self, context) -> Any:
         """Run one Quail request inside a compute process."""

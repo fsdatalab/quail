@@ -713,6 +713,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
                      f"{physical.available}")
         lines.extend(f"  {reason}" for reason in physical.reasons)
         return "\n".join(lines)
+    lines.append("")
     lines.append(f"physical: (backend={physical.backend}, "
                  f"model={physical.model}, workers={physical.workers})")
     if physical.backend == "quail":
@@ -727,6 +728,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
     lines.extend("  " + line for line in physical_tree(
         physical.graph, logical=logical, verbose=verbose).splitlines())
     if verbose:
+        lines.append("")
         lines.append("settings:")
         lines.extend(_fields({"model": physical.model,
                               "device": physical.device,

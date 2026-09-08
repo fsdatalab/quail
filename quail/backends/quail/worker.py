@@ -8,7 +8,6 @@ worker process over pipes.
 import gc
 import itertools
 import json
-import os
 import time
 
 from quail.backends.base import GpuContext
@@ -31,6 +30,7 @@ from quail.physical import (
     decode_graph,
 )
 from quail.planner import budgets
+from quail.progress import say
 from quail.runtime.runner import ExecutionContext
 from quail.runtime.tokens import (
     DocumentPrefixes,
@@ -58,6 +58,35 @@ def quail_runtime_payload(request, graph) -> dict:
         "docs": docs,
         **dict(envelope["settings"]),
     }
+
+
+def prepare_quail_request(context) -> None:
+    """Boot one GPU from the plan alone; the documents can arrive later."""
+    if context.gpu_count != 1:
+        return
+    envelope = context.request.plan
+    settings = dict(envelope["settings"])
+    registry = context.registry
+    backend = registry.backend(envelope["backend"])
+    spec = registry.model(envelope["model"])
+    device = registry.device(envelope["device"])
+    state = context.runtime_state.setdefault((backend.name, spec.name), {})
+    state["prepared_boot"] = _boot_for_query(
+        state, backend, spec, device, envelope["workers"],
+        settings["chunk_tokens"], settings["true_ids"], settings["false_ids"])
+
+
+def _boot_for_query(state, backend, spec, device, workers, chunk_tokens,
+                    true_ids, false_ids) -> dict:
+    """Load, bind, and warm the GPU for one query; return its boot record."""
+    t_boot = time.perf_counter()
+    boot = _boot_gpu(state, backend, spec, device, 0, workers,
+                     chunk_tokens, true_ids + false_ids)
+    _bind_query(state, true_ids, false_ids, chunk_tokens)
+    _warm(state, boot)
+    _finish_boot(boot, t_boot)
+    say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
+    return boot
 
 
 def execute_quail_request(context):
@@ -126,6 +155,7 @@ def _boot_gpu(state, backend, spec, device, gpu_index, workers,
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
                 pipeline_s=0.0, warm_kernels_s=0.0)
     if "model_execution" not in state:
+        say(f"loading {spec.hf_name} onto GPU {gpu_index}")
         t0 = time.perf_counter()
         model = load_model(spec.hf_name, revision=spec.revision,
                            answer_token_ids=answer_token_ids)
@@ -180,7 +210,7 @@ def _bind_query(state, true_ids, false_ids, chunk_tokens):
 
 def _warm(state, boot):
     """Compile and touch the kernels once per container."""
-    from quail.runtime.volumes import kernel_cache
+    from quail.runtime.volumes import commit_kernel_cache
 
     if state["warmed"]:
         return
@@ -195,7 +225,7 @@ def _warm(state, boot):
                             state["async_ans"], state["chunk_tokens"],
                             model_name=state["spec"].hf_name)
     torch.cuda.synchronize()
-    kernel_cache.commit()   # keep the compiles even if the run dies
+    commit_kernel_cache()   # keep the compiles even if the run dies
     boot["warm_kernels_s"] = time.perf_counter() - t0
     boot["warm_tier"] = warm["tier"]
     state["warmed"] = True
@@ -210,21 +240,22 @@ def _finish_boot(boot, t_boot):
 
 def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     """Execute one Quail payload on the worker's own GPU."""
-    from quail.runtime.volumes import kernel_cache, results_vol
+    from quail.runtime.volumes import (
+        commit_kernel_cache,
+        commit_results,
+        run_record_path,
+    )
 
     spec = registry.model(payload["model"])
     device = registry.device(payload["physical_plan"]["device"])
 
-    t_boot = time.perf_counter()
-    boot_key = (backend.name, spec.name)
-    state = runtime_state.setdefault(boot_key, {})
-    boot = _boot_gpu(state, backend, spec, device, 0, payload["workers"],
-                     payload["chunk_tokens"],
-                     payload["true_ids"] + payload["false_ids"])
-    _bind_query(state, payload["true_ids"], payload["false_ids"],
-                payload["chunk_tokens"])
-    _warm(state, boot)
-    _finish_boot(boot, t_boot)
+    state = runtime_state.setdefault((backend.name, spec.name), {})
+    boot = state.pop("prepared_boot", None)
+    if boot is None:
+        boot = _boot_for_query(
+            state, backend, spec, device, payload["workers"],
+            payload["chunk_tokens"], payload["true_ids"], payload["false_ids"])
+    say("running the query")
 
     report = execute_single(state, payload, registry, graph)
     outputs = report.pop("_outputs")
@@ -233,20 +264,20 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     report["boot_s"] = boot["boot_s"]
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
-    os.makedirs("/results/runs", exist_ok=True)
-    result_path = f"/results/runs/run_{time.time_ns()}.json"
+    result_path = run_record_path()
     report["result_volume_path"] = result_path
-    with open(result_path, "w") as f:
-        json.dump(dict(
-            wall_s=report["wall_s"], boot_s=report["boot_s"],
-            boot_kind=report["boot_kind"], boot=boot,
-            fresh_tokens=report["fresh_tokens"],
-            regret_tokens=report.get("regret_tokens"),
-            node_metrics=report.get("node_metrics"),
-            executed_join_plan=report.get("executed_join_plan", []),
-            kv_manager=report.get("kv_manager")), f)
-    results_vol.commit()
-    kernel_cache.commit()    # persist any JIT artifacts this run built
+    if result_path is not None:
+        with open(result_path, "w") as f:
+            json.dump(dict(
+                wall_s=report["wall_s"], boot_s=report["boot_s"],
+                boot_kind=report["boot_kind"], boot=boot,
+                fresh_tokens=report["fresh_tokens"],
+                regret_tokens=report.get("regret_tokens"),
+                node_metrics=report.get("node_metrics"),
+                executed_join_plan=report.get("executed_join_plan", []),
+                kv_manager=report.get("kv_manager")), f)
+    commit_results()
+    commit_kernel_cache()    # persist any JIT artifacts this run built
     return PhysicalResponse(outputs, report)
 
 
@@ -546,7 +577,7 @@ def _round(kind, subs):
 
 def execute_quail_multi(payload, registry, graph):
     """Execute the typed Quail graph across GPU child processes."""
-    from quail.runtime.volumes import kernel_cache, results_vol
+    from quail.runtime.volumes import commit_kernel_cache, commit_results
 
     payload = dict(payload)
     payload["docs"] = decode_payload_documents(payload["docs"])
@@ -563,8 +594,8 @@ def execute_quail_multi(payload, registry, graph):
         registry.runtimes,
         registry,
     )
-    results_vol.commit()
-    kernel_cache.commit()
+    commit_results()
+    commit_kernel_cache()
     outputs = report.pop("_outputs")
     report.pop("filters", None)
     report.pop("joins", None)

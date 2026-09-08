@@ -4,7 +4,6 @@ The Modal worker and the in-process compute provider both come here.
 """
 
 import json
-import os
 import time
 from dataclasses import dataclass, field
 
@@ -15,6 +14,7 @@ from quail.planner.plan import Refusal
 from quail.runtime.compute import QueryRequest
 from quail.runtime.result import QueryResult
 from quail.runtime.session import Query, RefusalError, Session
+from quail.runtime.volumes import commit_results, run_record_path
 
 
 @dataclass
@@ -63,14 +63,12 @@ def _execute_physical(request, registry):
     ))
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a model backend must return PhysicalResponse")
-    if (
-        response.metrics.get("result_volume_path") is None
-        and os.path.isdir("/results")
-        and os.access("/results", os.W_OK)
-    ):
+    result_path = (
+        run_record_path()
+        if response.metrics.get("result_volume_path") is None else None
+    )
+    if result_path is not None:
         metrics = dict(response.metrics)
-        os.makedirs("/results/runs", exist_ok=True)
-        result_path = f"/results/runs/run_{time.time_ns()}.json"
         metrics["result_volume_path"] = result_path
         with open(result_path, "w") as output:
             json.dump({
@@ -89,9 +87,7 @@ def _execute_physical(request, registry):
                     "backend_metrics",
                 )
             }, output)
-        from quail.runtime.volumes import results_vol
-
-        results_vol.commit()
+        commit_results()
         response = PhysicalResponse(response.outputs, metrics)
     return response
 
@@ -108,6 +104,9 @@ def execute_worker_query(query, physical_executor=None):
             "more than 8 GPUs means multiple containers; the "
             "multi-container coordinator is a later step"
         )
+    if physical_executor is None:
+        # the model can load while the token file is still being written
+        _prepare_backend(plan, query.session.registry)
     request = query._prepare_physical()
     started = time.perf_counter()
     response = (
@@ -116,7 +115,25 @@ def execute_worker_query(query, physical_executor=None):
     )
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a physical executor must return PhysicalResponse")
-    return query.finish(response, time.perf_counter() - started)
+    result = query.finish(response, time.perf_counter() - started)
+    result.report["token_wait_s"] = round(query.token_wait_s, 4)
+    return result
+
+
+def _prepare_backend(plan, registry) -> None:
+    """Let the backend boot from the plan alone, before documents arrive."""
+    backend = registry.backend(plan.backend)
+    prepare = getattr(backend, "prepare_request", None)
+    if prepare is None:
+        return
+    envelope = plan.to_envelope(registry.codecs)
+    prepare(BackendExecutionContext(
+        request=PhysicalRequest(envelope, {}),
+        graph=plan.graph,
+        registry=registry,
+        gpu_count=plan.workers,
+        runtime_state=_RUNTIME.booted,
+    ))
 
 
 def execute_query_request(
@@ -124,11 +141,13 @@ def execute_query_request(
 ) -> QueryResult:
     """Plan and run one logical query request in this process."""
     started = time.perf_counter()
-    session = Session(request.config, device=request.device,
-                      registry=request.registry)
-    for name, provider in request.providers.items():
-        session.register(name, provider)
-    query = Query(session, request.logical_plan, order=request.order)
+    query = request.planned_query
+    if not isinstance(query, Query):
+        session = Session(request.config, device=request.device,
+                          registry=request.registry)
+        for name, provider in request.providers.items():
+            session.register(name, provider)
+        query = Query(session, request.logical_plan, order=request.order)
     result = execute_worker_query(query, physical_executor)
     result.report["worker_total_s"] = round(
         time.perf_counter() - started, 4

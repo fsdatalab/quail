@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -26,6 +27,8 @@ class QueryRequest:
     order: str | None = None
     registry: ExtensionRegistry = field(
         default_factory=ExtensionRegistry.with_built_ins)
+    # the caller's Query, reused by an in-process provider; remote ones ignore it
+    planned_query: object | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.logical_plan, LogicalPlan):
@@ -51,18 +54,59 @@ class ComputeProvider(Protocol):
     def close(self) -> None: ...
 
 
-class InProcessComputeProvider:
-    """Run logical queries in the current process.
+LOCAL_KERNEL_CACHE = "~/.cache/quail/kernels"
 
-    This is the provider for code that already runs where the GPUs
-    are, such as the benchmark runner inside a Modal function, and for
-    tests that fake the physical executor.
+# same cache layout as the Modal image; values already in the environment win
+_LOCAL_ENV_DEFAULTS = (
+    ("VLLM_CACHE_ROOT", "vllm"),
+    ("DG_CACHE_DIR", "deep_gemm"),
+    ("DG_JIT_CACHE_DIR", "deep_gemm"),
+    ("TRITON_CACHE_DIR", "triton"),
+    ("TORCHINDUCTOR_CACHE_DIR", "torchinductor"),
+)
+
+
+def default_local_caches() -> str:
+    """Point every kernel cache at one directory and return its root."""
+    root = os.path.expanduser(LOCAL_KERNEL_CACHE)
+    for name, sub in _LOCAL_ENV_DEFAULTS:
+        os.environ.setdefault(name, os.path.join(root, sub))
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    return root
+
+
+def local_gpu_problem() -> str | None:
+    """Return why this process cannot run a model, or None when it can."""
+    try:
+        import torch
+    except ImportError:
+        return "torch is not installed"
+    if not torch.cuda.is_available():
+        return "no CUDA GPU is visible to this process"
+    return None
+
+
+class InProcessComputeProvider:
+    """Run logical queries on the GPU in the current process.
+
+    The default provider. A fake physical executor skips the GPU check.
     """
 
     def __init__(self, physical_executor=None):
         self._physical_executor = physical_executor
 
     def execute(self, request: QueryRequest) -> QueryResult:
+        if self._physical_executor is None:
+            # before torch loads, so the allocator setting takes effect
+            default_local_caches()
+            problem = local_gpu_problem()
+            if problem is not None:
+                raise RuntimeError(
+                    f"cannot run the model in this process: {problem}. "
+                    "Pass compute_provider=quail.ModalComputeProvider() "
+                    "to Session to run on Modal instead."
+                )
         # local imports the session module, which imports this one
         from quail.runtime.local import execute_query_request
 
