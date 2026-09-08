@@ -17,11 +17,20 @@ keeps its `quailb` identifiers, because predicate keys and the
 - `load_ground_truth()` reads the bucket by default. Loading the full
   sf=0.1 collection, 21 predicates and 1,210,264 labels, took 15.5
   seconds from a remote container.
-- `quail-b` has no Modal dependency. The labeling pass is
-  `quail_b.labeling`, one GPU of at least 80 GB. Its Modal wrapper,
-  one H100 per workload, moved here as `quail/bench/judge_pass.py`
-  and uses this repository's volumes. `ModalVolumeFiles` moved to
-  `quail.runtime.volumes` next to the volume it reads.
+- `quail-b` runs no model and has no Modal dependency. It keeps the
+  predicate table and the label identities in `quail_b/predicates.py`.
+- The pass that writes the labels is `quail/bench/labeling.py` here.
+  It runs each predicate as a Quail query with Qwen3 32B fp8 on one
+  GPU: a filter over every document, a full join over every pair.
+  `quail/bench/judge_pass.py` runs it on Modal, one H100 per workload,
+  on this repository's volumes; `--publish` uploads a finished pass to
+  the bucket. A different engine can flip a borderline answer, so
+  labels from the Quail judge get their own judge id and label-set
+  ids; the published collection, judged by vLLM, stays the reference
+  until a full Quail-judged pass replaces it. That pass has not been
+  run.
+- `ModalVolumeFiles` moved to `quail.runtime.volumes` next to the
+  volume it reads.
 - The runner reads labels from the mounted volume inside a Modal
   container and from the bucket anywhere else, and writes run records
   to the volume on Modal or to `results/` locally. With main's

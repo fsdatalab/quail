@@ -83,7 +83,7 @@ def _truth():
 
 def fever_truth():
     """Labels for FEV-9 over a three claim, three evidence corpus."""
-    from quail_b.labeling import PREDICATES, predicate_payload
+    from quail_b.predicates import PREDICATES, predicate_payload
     from quail_b.prompts import F11, F13, REFUTE, SUPPORT
 
     corpus = {
@@ -376,7 +376,7 @@ def test_fev9_builds_from_its_spec_and_answers_from_labels(backend):
 
 def test_benchmark_prompt_text_matches_what_quail_sends():
     """The labels answer quailb's text; Quail must send the same text."""
-    from quail_b.labeling import PREDICATES
+    from quail_b.predicates import PREDICATES
     from quail_b.rendering import render_filter_prompt, render_join_prompt
 
     for spec in PREDICATES:

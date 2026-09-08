@@ -19,11 +19,13 @@ calling process, or on Modal.
   is the QUAIL-B runner for Quail and its request backends.
 - QUAIL-B, the benchmark, is its own repository:
   [fsdatalab/quail-b](https://github.com/fsdatalab/quail-b). It
-  holds the document sets, prompts, queries as data, saved labels, the
-  labeling pass, and scoring, and runs no engine. Corpus and labels are
-  public in the `quail-bench` S3 bucket. It is installed here as the
-  `quail_b` package, pinned in `pyproject.toml`; its Modal wrapper for
-  the labeling pass is `quail/bench/judge_pass.py`.
+  holds the document sets, prompts, queries as data, the predicates and
+  their label identities, saved labels, and scoring, and runs no engine
+  or model. Corpus and labels are public in the `quail-bench` S3
+  bucket. It is installed here as the `quail_b` package, pinned in
+  `pyproject.toml`. The pass that writes the labels is
+  `quail/bench/labeling.py`, one GPU; `quail/bench/judge_pass.py` runs
+  it on Modal.
 - `demos/` has runnable examples for a machine with a GPU:
   `local_gpu_smoke.py` runs one filter over four short documents, and
   `imdb_ending_filter.py` filters all 100,000 IMDB reviews.

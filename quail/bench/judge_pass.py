@@ -1,7 +1,8 @@
 """Build the sf=0.1 QUAIL-B reference labels on Modal, one H100 per workload.
 
-The labeling itself is `quail_b.labeling`, which runs on one GPU; this
-module wraps it in Modal functions that mount the results volume.
+The labeling itself is `quail.bench.labeling`, which runs the judge
+through Quail on one GPU; this module wraps it in Modal functions that
+mount the results volume.
 
     uv run modal run -m quail.bench.judge_pass
 
@@ -20,58 +21,31 @@ from pathlib import Path
 
 import modal
 
-from quail.runtime.volumes import hf_cache, kernel_cache, results_vol
-from quail_b import labeling
-from quail_b.labeling import (
+from quail.bench import labeling
+from quail.bench.labeling import (
     PREDICTION_TEXT,
     REUSE_PREDICTION_TEXT,
     SCALE_FACTOR,
     WORKLOADS,
 )
+from quail.runtime.volumes import hf_cache, kernel_cache, results_vol
+from quail.runtime.worker import build_worker_image
 from quail_b.store import GROUND_TRUTH_ROOT
 
-IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
-
-image = (
-    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
-    .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
-                 "numpy", "datasets")
-    .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-          "VLLM_LOGGING_LEVEL": "WARNING",
-          "VLLM_USE_FLASHINFER_SAMPLER": "0",
-          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-          "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail_b")
-)
-
-data_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("numpy", "pyarrow")
-    .add_local_python_source("quail_b")
-)
-
-# Building the corpus reads the source datasets off HuggingFace, so it
-# needs more than parquet - but not vllm. Its own image keeps
-# prepare_corpus light, where data_image is only enough to read parquet
-# back.
-corpus_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("numpy", "pyarrow", "pandas", "huggingface_hub",
-                 "datasets", "transformers>=5.2.0")
-    .add_local_python_source("quail_b")
-)
+# The judge runs through Quail's executor, so every function uses the
+# worker image the benchmark runner uses.
+image = build_worker_image(local_python_sources=("quail_b",))
 
 # Experiment cells attach to this existing app so its caches remain useful.
 app = modal.App("quail-milestone1")
 
-# Inside a container the labels live on the volume and every part
-# file is committed as it lands; on the launching machine these
-# assignments are harmless.
-labeling.ROOT = Path("/results") / GROUND_TRUTH_ROOT
-labeling.after_write = results_vol.commit
+
+
+def _mount() -> None:
+    """Point the pass at the volume: labels live there, parts commit as written."""
+    results_vol.reload()
+    labeling.ROOT = Path("/results") / GROUND_TRUTH_ROOT
+    labeling.after_write = results_vol.commit
 
 
 def parse_function_calls(value: str) -> dict[str, str]:
@@ -99,34 +73,34 @@ def parse_function_calls(value: str) -> dict[str, str]:
 
 
 @app.function(
-    image=data_image, memory=4096, timeout=1200,
+    image=image, memory=4096, timeout=1200,
     volumes={"/results": results_vol})
 def compact_ground_truth(collection_id: str) -> str:
-    results_vol.reload()
+    _mount()
     result = labeling.compact_ground_truth(collection_id)
     results_vol.commit()
     return json.dumps(result, sort_keys=True)
 
 
 @app.function(
-    image=corpus_image, memory=4096, timeout=1800,
+    image=image, memory=4096, timeout=1800,
     volumes={"/root/.cache/huggingface": hf_cache,
              "/results": results_vol})
 def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
-    results_vol.reload()
+    _mount()
     result = labeling.prepare_corpus(sf)
     results_vol.commit()
     return json.dumps(result, sort_keys=True)
 
 
 @app.function(
-    image=image, gpu="H100!", memory=98304, timeout=7200,
+    image=image, gpu="H100!", memory=98304, timeout=14400,
     volumes={"/root/.cache/huggingface": hf_cache,
              "/root/.cache/kernels": kernel_cache,
              "/results": results_vol})
 def judge_workload(corpus_id: str, workload: str) -> str:
     """Label one workload's predicates on one GPU."""
-    results_vol.reload()
+    _mount()
     partial = labeling.judge_workload(corpus_id, workload)
     results_vol.commit()
     kernel_cache.commit()
@@ -134,24 +108,24 @@ def judge_workload(corpus_id: str, workload: str) -> str:
 
 
 @app.function(
-    image=data_image, memory=4096, timeout=1200,
+    image=image, memory=4096, timeout=1200,
     volumes={"/results": results_vol})
 def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
     """Assemble five workloads and activate their ground truth."""
-    results_vol.reload()
+    _mount()
     summary = labeling.finalize_collection(sf, corpus_id, json.loads(partials))
     results_vol.commit()
     return json.dumps(summary, sort_keys=True)
 
 
 @app.function(
-    image=data_image, memory=4096, timeout=1200,
+    image=image, memory=4096, timeout=1200,
     volumes={"/results": results_vol})
 def activate_reused_collection(
         sf: float, target_corpus_id: str, source_collection_id: str,
         relabeled_workloads: str) -> str:
     """Build one collection from new labels and verified unchanged tables."""
-    results_vol.reload()
+    _mount()
     summary = labeling.activate_reused_collection(
         sf, target_corpus_id, source_collection_id, relabeled_workloads)
     results_vol.commit()
