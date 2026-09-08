@@ -34,6 +34,8 @@ in the order written. Two more queries, PRIV-1 and PRIV-2, need `register_privac
 | LEP | LEP-1 to LEP-8 | filter only, single join, filter chains up to five deep into a join, two-sided filters |
 | AGENT | AGENT-1, AGENT-2 | filter only |
 
+![QUAIL-B query anatomy](figures/quailb_anatomy.png)
+
 ## Metrics
 
 - Query time: seconds to run the query, excluding model startup.
