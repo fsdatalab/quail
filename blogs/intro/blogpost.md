@@ -147,10 +147,10 @@ A low rank favors a filter that is cheap, rejects many documents, or both, becau
 
 **Estimating filter cost.** For an LLM filter, $c_i$ depends on the document length, the filter prompt length, the selected model and GPU, the forward pass size, and whether the document KV is already in GPU HBM. We therefore calculate two versions of $c_i$. The first cost, $c_i^{\mathrm{first}}$, is the estimated time when filter $i$ runs first, so the model must process both the document and the filter prompt. The later cost, $c_i^{\mathrm{later}}$, is the estimated time when another filter has already computed the document KV, so the model processes only the new filter prompt and attends to the cached document.
 
-We calculate both costs with a speed of light estimate. At a high level, we count the fresh tokens, attention pairs, KV tokens written, and KV tokens read. A fresh token is a token that the model must process, rather than a token whose KV is already available. We translate these counts into arithmetic work and HBM traffic for each part of the model. Let $r$ index the model parts that run one after another. For either cost, the calculation is:
+We calculate both costs with a speed of light estimate. At a high level, we count the fresh tokens, attention pairs, KV tokens written, and KV tokens read. A fresh token is a token that the model must process, rather than a token whose KV is already available. We translate these counts into arithmetic work and HBM traffic for each part of the model. Let $r$ index the model parts that run one after another. For either cost, the estimated latency is:
 
 $$
-c = \sum_r \max\left(
+\sum_r \max\left(
 \frac{\mathrm{FLOPs}_{r}}{\mathrm{arithmetic\ throughput}_r},
 \frac{\mathrm{bytes}_{r}}{\mathrm{HBM\ bandwidth}}
 \right).
