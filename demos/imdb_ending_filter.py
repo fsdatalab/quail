@@ -1,11 +1,4 @@
-"""Filter all 100,000 IMDB reviews with two questions, both required.
-
-Runs on the GPU in this process. Predicted about 270 s and $0.30;
-measured 268.7 s and $0.29 on one H100. Both runs are in
-reports/shipped_features/2026-09-07-default-in-process-compute.md.
-
-    uv run python demos/imdb_ending_filter.py 2>&1 | tee imdb_ending_filter.log
-"""
+"""Filter all 100,000 IMDB reviews with two questions, both required."""
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -74,7 +67,7 @@ def main() -> None:
                       f"{stage['observed_selectivity']:.3f} passed")
         print(f"boot_s: {report.get('boot_s')} ({report.get('boot_kind')})")
         print(f"token_wait_s: {report.get('token_wait_s')}")
-        print(f"wall_s: {wall_s}  (predicted about 270 s)")
+        print(f"wall_s: {wall_s}")
         print(f"fresh_tokens: {report.get('fresh_tokens')}")
         print(f"documents/second: {n_docs / wall_s:.1f}")
         print(f"$/query: {wall_s / 3600 * H100_USD_PER_HOUR:.4f}")
