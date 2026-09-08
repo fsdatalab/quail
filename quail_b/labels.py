@@ -9,6 +9,11 @@ from __future__ import annotations
 
 import io
 import json
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ElementTree
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,10 +21,75 @@ from pathlib import Path
 import pyarrow as pa
 from pyarrow import parquet as pq
 
-from quail_bench.data import _full_hash
+from quail_b.data import _full_hash
 
+# The same relative layout under every store: the public bucket, the
+# quail-results Modal volume, and a local directory.
 GROUND_TRUTH_ROOT = "ground_truth/quailb/schema_v1"
+PUBLIC_BUCKET = "quail-bench"
 RESULTS_VOLUME = "quail-results"
+
+
+class S3Files:
+    """Read-only, anonymous access to a public bucket.
+
+    Plain HTTPS against the S3 REST API, so no AWS SDK or credentials
+    are needed to run the benchmark.
+    """
+
+    _NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+
+    def __init__(self, bucket: str = PUBLIC_BUCKET, retries: int = 3):
+        self.bucket = bucket
+        self.base_url = f"https://{bucket}.s3.amazonaws.com/"
+        self.retries = retries
+
+    def _get(self, url: str) -> bytes:
+        for attempt in range(self.retries):
+            try:
+                with urllib.request.urlopen(url, timeout=120) as response:
+                    return response.read()
+            except urllib.error.HTTPError as error:
+                if error.code < 500 or attempt == self.retries - 1:
+                    raise
+            except urllib.error.URLError:
+                if attempt == self.retries - 1:
+                    raise
+            time.sleep(2 ** attempt)
+        raise AssertionError("unreachable")
+
+    def read_bytes(self, path: str) -> bytes:
+        key = path.lstrip("/")
+        try:
+            return self._get(self.base_url + urllib.parse.quote(key))
+        except urllib.error.HTTPError as error:
+            if error.code in (403, 404):
+                raise FileNotFoundError(
+                    f"s3://{self.bucket}/{key}") from error
+            raise
+
+    def list_files(self, path: str) -> list[str]:
+        prefix = path.lstrip("/").rstrip("/") + "/"
+        keys = []
+        token = None
+        while True:
+            query = {"list-type": "2", "prefix": prefix}
+            if token:
+                query["continuation-token"] = token
+            page = ElementTree.fromstring(
+                self._get(self.base_url + "?" + urllib.parse.urlencode(query)))
+            keys.extend(
+                key.text for key in page.iter(f"{self._NS}Key")
+                if key.text.endswith((".json", ".parquet")))
+            token = page.findtext(f"{self._NS}NextContinuationToken")
+            if not token:
+                return sorted(keys)
+
+    def write_json(self, path: str, payload: dict) -> None:
+        raise PermissionError("the public bucket is read-only")
+
+    def write_parquet(self, path: str, table: pa.Table) -> None:
+        raise PermissionError("the public bucket is read-only")
 
 
 class LocalVolumeFiles:
@@ -206,10 +276,12 @@ def _choose_collection(files, scale_factor: float,
     return matches[0]
 
 
-def load_ground_truth(files, scale_factor: float = 0.1,
+def load_ground_truth(files=None, scale_factor: float = 0.1,
                       corpus_id: str | None = None,
                       collection_id: str | None = None
                       ) -> GroundTruthCollection:
+    """Load one complete collection; the public bucket when no store is given."""
+    files = S3Files() if files is None else files
     _path, collection = _choose_collection(
         files, scale_factor, corpus_id, collection_id)
     return _load_ground_truth_collection(files, collection)
@@ -388,7 +460,7 @@ def load_ground_truth_workload(files, scale_factor: float, corpus_id: str,
                                corpus_full_hash: str, workload: str
                                ) -> GroundTruthCollection:
     """Load completed label sets for one benchmark workload."""
-    from quail_bench.judge_pass import MODEL_NAME, PREDICATES, label_set_identity
+    from quail_b.labeling import MODEL_NAME, PREDICATES, label_set_identity
 
     specs = [spec for spec in PREDICATES if spec.workload == workload]
     if not specs:

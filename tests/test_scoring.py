@@ -5,8 +5,8 @@ import json
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from quail_bench.data import corpus_identity
-from quail_bench.labels import (
+from quail_b.data import corpus_identity
+from quail_b.labels import (
     GROUND_TRUTH_ROOT,
     GroundTruthCollection,
     LocalVolumeFiles,
@@ -14,8 +14,8 @@ from quail_bench.labels import (
     _validate_label_set_corpora,
     load_ground_truth,
 )
-from quail_bench.queries import AliasSpec, JoinSpec, QuerySpec, queries
-from quail_bench.scoring import (
+from quail_b.queries import AliasSpec, JoinSpec, QuerySpec, queries
+from quail_b.scoring import (
     Evaluator,
     RunOutput,
     add_query_metrics,
@@ -162,8 +162,8 @@ def test_query_cost_token_and_document_metrics():
 
 def fever_truth():
     """Labels for FEV-9 over a three claim, three evidence corpus."""
-    from quail_bench.judge_pass import PREDICATES, predicate_payload
-    from quail_bench.prompts import F11, F13, REFUTE, SUPPORT
+    from quail_b.labeling import PREDICATES, predicate_payload
+    from quail_b.prompts import F11, F13, REFUTE, SUPPORT
 
     corpus = {
         "claims": pa.table({"id": ["c0", "c1", "c2"],
@@ -197,7 +197,7 @@ def fever_truth():
 
 def test_fev9_expected_rows_follow_the_join_chain_and_every_filter():
     corpus, truth = fever_truth()
-    from quail_bench.prompts import F11, F13
+    from quail_b.prompts import F11, F13
 
     spec = queries()["FEV-9"]
     assert [alias.filters for alias in spec.aliases] == [
@@ -366,8 +366,8 @@ def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
 
 
 def test_corpus_identity_matches_judge_pass_implementation():
-    from quail_bench.data import DATA_SEED, SOURCE_REVISIONS
-    from quail_bench.judge_pass import _corpus_identity
+    from quail_b.data import DATA_SEED, SOURCE_REVISIONS
+    from quail_b.labeling import _corpus_identity
 
     rows = {"reviews": [{"id": "r0", "body": "text"}]}
     expected = _corpus_identity(rows, 0.1)

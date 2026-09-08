@@ -1,21 +1,24 @@
-"""Build the sf=0.1 QUAIL-B ground-truth collection on Modal.
+"""Build the sf=0.1 QUAIL-B reference labels with one GPU.
 
 Qwen3 32B labels the predicates without exact source labels. FEVER and
-LePaRD supply source truth where available. The run uses stable label-set
-IDs and skips completed Parquet parts.
+LePaRD supply source truth where available. Every part file is written
+under a content-addressed path and skipped when it already exists, so
+an interrupted pass resumes where it stopped.
 
-    uv run modal run -m quail_bench.judge_pass
+On a machine with one GPU of at least 80 GB:
 
-Reuse labels after an unrelated table changes in a new corpus:
+    uv run --extra judge python -m quail_b.labeling --root ~/quail-b-data
 
-    uv run modal run --detach -m quail_bench.judge_pass \
-      --reuse-from-collection <collection> \
-      --target-corpus <corpus> \
-      --relabeled-workloads lepard
+`ROOT` is where this process reads and writes labels; the Modal wrapper
+in `judge_pass.py` points it at the results volume. Label-set and
+collection ids depend only on the corpus, the prompts, and the judge
+settings, so a pass made here and a pass made on Modal write the same
+files.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -25,10 +28,9 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import modal
-
-from quail_bench import data, prompts, rendering
-from quail_bench.rendering import SHARED_PRE
+from quail_b import data, prompts, rendering
+from quail_b.labels import GROUND_TRUTH_ROOT
+from quail_b.rendering import SHARED_PRE
 
 SCHEMA_VERSION = 1
 SCALE_FACTOR = 0.1
@@ -44,7 +46,15 @@ MAX_SEQS = 4_096
 GPU_MEMORY_UTILIZATION = 0.85
 VERIFY_PER_PREDICATE = 16
 
-VOLUME_ROOT = Path("/results/ground_truth/quailb/schema_v1")
+ROOT = Path.home() / ".cache" / "quail-b" / GROUND_TRUTH_ROOT
+
+
+def _no_commit() -> None:
+    return None
+
+
+# called after every part file lands; the Modal wrapper commits the volume
+after_write = _no_commit
 
 PREDICTION_TEXT = (
     "At sf=0.1, 21 predicates require 1,210,264 labels. Qwen3 32B "
@@ -201,29 +211,6 @@ def workload_specs(workload: str) -> tuple:
     return tuple(p for p in PREDICATES if p.workload == workload)
 
 
-def parse_function_calls(value: str) -> dict[str, str]:
-    calls = {}
-    for item in value.split(","):
-        try:
-            workload, function_call_id = item.split("=", 1)
-        except ValueError as exc:
-            raise ValueError(
-                "function calls must use workload=fc-id") from exc
-        workload = workload.strip()
-        function_call_id = function_call_id.strip()
-        if workload in calls:
-            raise ValueError(f"duplicate workload {workload!r}")
-        calls[workload] = function_call_id
-    missing = set(WORKLOADS) - set(calls)
-    unknown = set(calls) - set(WORKLOADS)
-    if missing or unknown:
-        raise ValueError(
-            f"function calls have missing={sorted(missing)}, "
-            f"unknown={sorted(unknown)}")
-    if any(not value.startswith("fc-") for value in calls.values()):
-        raise ValueError("every function call id must start with fc-")
-    return calls
-
 
 def filter_groups(specs) -> list:
     """Filter predicates grouped by the column they read, in spec order."""
@@ -242,7 +229,7 @@ def join_specs(specs) -> tuple:
 
 def _load_corpus(corpus_id: str) -> tuple[Path, dict, dict]:
     """Read a corpus already materialized on the volume."""
-    target = VOLUME_ROOT / "corpora" / corpus_id
+    target = ROOT / "corpora" / corpus_id
     with open(target / "manifest.json") as f:
         manifest = json.load(f)
     return target, manifest, _read_rows(target)
@@ -380,46 +367,6 @@ def render_join_prompt(spec: PredicateSpec, left: str, right: str) -> str:
     return rendering.render_join_prompt(spec.template, (left, right), anchor=0)
 
 
-IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
-
-image = (
-    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
-    .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "pandas", "pyarrow",
-                 "numpy", "datasets")
-    .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-          "VLLM_LOGGING_LEVEL": "WARNING",
-          "VLLM_USE_FLASHINFER_SAMPLER": "0",
-          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-          "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})
-    .add_local_python_source("quail_bench")
-)
-
-data_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("numpy", "pyarrow")
-    .add_local_python_source("quail_bench")
-)
-
-# Building the corpus reads the source datasets off HuggingFace, so it
-# needs more than parquet - but not vllm. Its own image keeps
-# prepare_corpus light, where data_image is only enough to read parquet
-# back.
-corpus_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("numpy", "pyarrow", "pandas", "huggingface_hub",
-                 "datasets", "transformers>=5.2.0")
-    .add_local_python_source("quail_bench")
-)
-
-# Experiment cells attach to this existing app so its caches remain useful.
-app = modal.App("quail-milestone1")
-hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
-results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
-kernel_cache = modal.Volume.from_name("quail-kernel-cache",
-                                      create_if_missing=True)
 
 
 # Every table here feeds corpus_id, so adding or removing one
@@ -514,7 +461,7 @@ def _materialize_corpus(sf: float) -> tuple[Path, dict, dict]:
         data_dir = data.build_sets(temp, sf=sf)
         rows = _read_rows(data_dir)
         identity = _corpus_identity(rows, sf)
-        target = VOLUME_ROOT / "corpora" / identity["corpus_id"]
+        target = ROOT / "corpora" / identity["corpus_id"]
         target.mkdir(parents=True, exist_ok=True)
         for source in data_dir.glob("*.parquet"):
             destination = target / source.name
@@ -543,7 +490,7 @@ def _operand(role: str, table: str, row: dict, column: str) -> dict:
 
 
 def _label_dir(spec: PredicateSpec, identity: dict) -> Path:
-    return (VOLUME_ROOT / "label_sets" / spec.workload / spec.slug
+    return (ROOT / "label_sets" / spec.workload / spec.slug
             / identity["label_set_id"])
 
 
@@ -677,7 +624,7 @@ class ModelJudge:
         from transformers import AutoTokenizer
         from vllm import LLM, SamplingParams
 
-        from quail_bench.rendering import true_false_ids
+        from quail_b.rendering import true_false_ids
 
         t0 = time.perf_counter()
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -825,7 +772,7 @@ def _write_filter_parts(judge: ModelJudge, verification: VerificationSample,
             _atomic_parquet(
                 _part_path(spec, identities[spec.key], start, end),
                 by_predicate[spec.key])
-        results_vol.commit()
+        after_write()
         print(f"[judge] filters {specs[0].workload} rows {start}:{end}",
               flush=True)
 
@@ -867,7 +814,7 @@ def _write_qwen_join_parts(judge: ModelJudge,
             verification.add(spec.key, prompt, answer)
         output_rows.sort(key=lambda row: (row["left_id"], row["right_id"]))
         _atomic_parquet(part, output_rows)
-        results_vol.commit()
+        after_write()
         print(f"[judge] join {spec.workload} anchors {start}:{end}, "
               f"qwen={len(qwen_cases)}, source={len(source_rows)}",
               flush=True)
@@ -897,7 +844,7 @@ def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
                     _lepard_source_answer(cited_passage_ids, passage_ids),
                     "lepard_citation_edge", None))
         _atomic_parquet(part, output)
-        results_vol.commit()
+        after_write()
         print(f"[judge] LePaRD source anchors {start}:{end}", flush=True)
 
 
@@ -927,7 +874,7 @@ def _collection_identity(corpus_manifest: dict,
 
 def _activate_collection(corpus_id: str, collection_id: str) -> None:
     _atomic_json(
-        VOLUME_ROOT / "corpora" / corpus_id / "active_collection.json",
+        ROOT / "corpora" / corpus_id / "active_collection.json",
         {"collection_id": collection_id})
 
 
@@ -939,7 +886,7 @@ def _required_tables(spec: PredicateSpec) -> tuple[str, ...]:
 
 
 def _label_manifest(label_set_id: str) -> tuple[Path, dict]:
-    matches = list((VOLUME_ROOT / "label_sets").glob(
+    matches = list((ROOT / "label_sets").glob(
         f"*/*/{label_set_id}/manifest.json"))
     if len(matches) != 1:
         raise FileNotFoundError(
@@ -961,7 +908,7 @@ def _check_reused_label_set(
         raise ValueError(f"label set {label_set_id} is not complete")
     label_corpus_id = manifest.get("corpus_id")
     label_corpus_path = (
-        VOLUME_ROOT / "corpora" / str(label_corpus_id) / "manifest.json")
+        ROOT / "corpora" / str(label_corpus_id) / "manifest.json")
     if not label_corpus_path.exists():
         raise FileNotFoundError(
             f"label set {label_set_id} refers to missing corpus "
@@ -1014,16 +961,12 @@ def _complete_manifest(spec: PredicateSpec, identity: dict,
 
 
 def _label_dir_by_id(spec: PredicateSpec, label_set_id: str) -> Path:
-    return (VOLUME_ROOT / "label_sets" / spec.workload / spec.slug
+    return (ROOT / "label_sets" / spec.workload / spec.slug
             / label_set_id)
 
 
-@app.function(
-    image=data_image, memory=4096, timeout=1200,
-    volumes={"/results": results_vol})
-def compact_ground_truth(collection_id: str) -> str:
-    results_vol.reload()
-    collection_path = (VOLUME_ROOT / "collections" / collection_id
+def compact_ground_truth(collection_id: str) -> dict:
+    collection_path = (ROOT / "collections" / collection_id
                        / "manifest.json")
     if not collection_path.exists():
         raise FileNotFoundError(f"unknown collection {collection_id}")
@@ -1048,7 +991,6 @@ def compact_ground_truth(collection_id: str) -> str:
         manifest["compact_rows"] = rows
         _atomic_json(manifest_path, manifest)
         compacted[key] = {"path": str(compact_path), "rows": rows}
-    results_vol.commit()
     result = {
         "collection_id": collection_id,
         "label_sets": len(compacted),
@@ -1056,7 +998,7 @@ def compact_ground_truth(collection_id: str) -> str:
         "compacted": compacted,
     }
     print(json.dumps(result, indent=2, sort_keys=True), flush=True)
-    return json.dumps(result, sort_keys=True)
+    return result
 
 
 def _fever_source_label(claim: dict, passage: dict):
@@ -1065,11 +1007,7 @@ def _fever_source_label(claim: dict, passage: dict):
     return claim["label"] == "SUPPORTS", "fever_annotation"
 
 
-@app.function(
-    image=corpus_image, memory=4096, timeout=1800,
-    volumes={"/root/.cache/huggingface": hf_cache,
-             "/results": results_vol})
-def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
+def prepare_corpus(sf: float = SCALE_FACTOR) -> dict:
     """Build the corpus and check its collection on the volume.
 
     Reports whether the collection the corpus implies is already
@@ -1077,9 +1015,7 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
     """
     if sf != SCALE_FACTOR:
         raise ValueError("the ground-truth pass is fixed at sf=0.1")
-    results_vol.reload()
     _, corpus_manifest, _ = _materialize_corpus(sf)
-    results_vol.commit()
     identities = {
         spec.key: label_set_identity(
             spec, corpus_manifest["corpus_id"],
@@ -1087,7 +1023,7 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
         for spec in PREDICATES
     }
     collection = _collection_identity(corpus_manifest, identities)
-    path = (VOLUME_ROOT / "collections" / collection["collection_id"]
+    path = (ROOT / "collections" / collection["collection_id"]
             / "manifest.json")
     complete = False
     if path.exists():
@@ -1095,17 +1031,12 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> str:
             complete = json.load(f).get("status") == "complete"
     print(f"[judge] corpus {corpus_manifest['corpus_id']}, collection "
           f"{collection['collection_id']}, complete={complete}", flush=True)
-    return json.dumps({"corpus": corpus_manifest,
-                       "collection_id": collection["collection_id"],
-                       "complete": complete}, sort_keys=True)
+    return {"corpus": corpus_manifest,
+            "collection_id": collection["collection_id"],
+            "complete": complete}
 
 
-@app.function(
-    image=image, gpu="H100!", memory=98304, timeout=7200,
-    volumes={"/root/.cache/huggingface": hf_cache,
-             "/root/.cache/kernels": kernel_cache,
-             "/results": results_vol})
-def judge_workload(corpus_id: str, workload: str) -> str:
+def judge_workload(corpus_id: str, workload: str) -> dict:
     """Label one workload's predicates on one GPU.
 
     Every part file is written under a content-addressed path and
@@ -1116,7 +1047,6 @@ def judge_workload(corpus_id: str, workload: str) -> str:
     if not specs:
         raise ValueError(f"no predicates for workload {workload!r}")
     t_total = time.perf_counter()
-    results_vol.reload()
     _, corpus_manifest, rows = _load_corpus(corpus_id)
     identities = {
         spec.key: label_set_identity(
@@ -1134,7 +1064,6 @@ def judge_workload(corpus_id: str, workload: str) -> str:
                 "predicate": asdict(spec),
                 "expected_rows": _expected_rows(spec, rows),
             })
-    results_vol.commit()
 
     t_boot = time.perf_counter()
     judge = ModelJudge()
@@ -1164,11 +1093,9 @@ def judge_workload(corpus_id: str, workload: str) -> str:
     manifests = {spec.key: _complete_manifest(
         spec, identities[spec.key], rows)
         for spec in specs}
-    results_vol.commit()
 
     saved = _saved_verification_sample(rows, identities, specs)
     deterministic = saved.run(judge)
-    kernel_cache.commit()
     partial = {
         "workload": workload,
         "manifests": manifests,
@@ -1181,15 +1108,12 @@ def judge_workload(corpus_id: str, workload: str) -> str:
     }
     print(f"[judge] {workload} done in {partial['total_wall_s']:.1f}s",
           flush=True)
-    return json.dumps(partial, sort_keys=True)
+    return partial
 
 
-@app.function(
-    image=data_image, memory=4096, timeout=1200,
-    volumes={"/results": results_vol})
-def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
+def finalize_collection(sf: float, corpus_id: str,
+                        partials: dict[str, dict]) -> dict:
     """Assemble five workloads and activate their ground truth."""
-    results_vol.reload()
     _, corpus_manifest, _ = _load_corpus(corpus_id)
     identities = {
         spec.key: label_set_identity(
@@ -1198,10 +1122,10 @@ def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
         for spec in PREDICATES
     }
     collection = _collection_identity(corpus_manifest, identities)
-    collection_dir = (VOLUME_ROOT / "collections"
+    collection_dir = (ROOT / "collections"
                       / collection["collection_id"])
 
-    by_workload = json.loads(partials)
+    by_workload = partials
     manifests = {}
     for partial in by_workload.values():
         manifests.update(partial["manifests"])
@@ -1252,27 +1176,22 @@ def finalize_collection(sf: float, corpus_id: str, partials: str) -> str:
     _atomic_json(collection_dir / "manifest.json", {
         **collection, "status": "complete",
         "corpus_manifest": str(
-            VOLUME_ROOT / "corpora" / corpus_id / "manifest.json"),
+            ROOT / "corpora" / corpus_id / "manifest.json"),
         "summary": summary})
     _atomic_json(collection_dir / "summary.json", summary)
     _activate_collection(corpus_manifest["corpus_id"],
                          collection["collection_id"])
-    results_vol.commit()
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
-    return json.dumps(summary, sort_keys=True)
+    return summary
 
 
-@app.function(
-    image=data_image, memory=4096, timeout=1200,
-    volumes={"/results": results_vol})
 def activate_reused_collection(
         sf: float, target_corpus_id: str, source_collection_id: str,
-        relabeled_workloads: str) -> str:
+        relabeled_workloads: str) -> dict:
     """Build one collection from new labels and verified unchanged tables."""
-    results_vol.reload()
     _, target_corpus, _ = _load_corpus(target_corpus_id)
     source_collection_path = (
-        VOLUME_ROOT / "collections" / source_collection_id / "manifest.json")
+        ROOT / "collections" / source_collection_id / "manifest.json")
     with open(source_collection_path) as f:
         source_collection = json.load(f)
     if (source_collection.get("status") != "complete"
@@ -1286,7 +1205,7 @@ def activate_reused_collection(
             f"{source_collection['scale_factor']}, expected {sf}")
 
     source_corpus_id = source_collection["corpus_id"]
-    with open(VOLUME_ROOT / "corpora" / source_corpus_id / "manifest.json") as f:
+    with open(ROOT / "corpora" / source_corpus_id / "manifest.json") as f:
         source_corpus = json.load(f)
     if source_corpus.get("corpus_id") != source_corpus_id:
         raise ValueError(f"source corpus {source_corpus_id} is invalid")
@@ -1330,7 +1249,7 @@ def activate_reused_collection(
 
     collection = _collection_identity(target_corpus, identities)
     collection_dir = (
-        VOLUME_ROOT / "collections" / collection["collection_id"])
+        ROOT / "collections" / collection["collection_id"])
     qwen_rows = sum(m["source_rows"].get(MODEL_NAME, 0)
                     for m in manifests.values())
     total_rows = sum(m["rows"] for m in manifests.values())
@@ -1367,7 +1286,7 @@ def activate_reused_collection(
         **collection,
         "status": "complete",
         "corpus_manifest": str(
-            VOLUME_ROOT / "corpora" / target_corpus_id / "manifest.json"),
+            ROOT / "corpora" / target_corpus_id / "manifest.json"),
         "reused_label_sets": reused,
         "summary": summary,
     }
@@ -1375,90 +1294,51 @@ def activate_reused_collection(
     _atomic_json(collection_dir / "summary.json", summary)
     _activate_collection(target_corpus["corpus_id"],
                          collection["collection_id"])
-    results_vol.commit()
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
-    return json.dumps(summary, sort_keys=True)
+    return summary
 
 
-@app.local_entrypoint()
-def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
-         only: str | None = None, finalize_from: str | None = None,
-         reuse_from_collection: str | None = None,
-         relabeled_workloads: str = "lepard",
-         target_corpus: str | None = None):
-    """Run the five workloads side by side, then activate the result.
-
-    ``--only imdb,fever`` restricts the pass to those workloads; the
-    finalize step is skipped because a collection needs all label sets.
-    """
-    if compact_collection:
-        call = compact_ground_truth.spawn(compact_collection)
-        print(f"function call id: {call.object_id}", flush=True)
-        print(call.get(), flush=True)
-        return
-    prediction = (REUSE_PREDICTION_TEXT if reuse_from_collection
-                  else PREDICTION_TEXT)
-    print(f"PREDICTION: {prediction}", flush=True)
-
-    if reuse_from_collection and target_corpus:
-        corpus_id = target_corpus
-        prepared = None
-    else:
-        call = prepare_corpus.spawn(sf)
-        print(f"function call id (prepare_corpus): {call.object_id}",
-              flush=True)
-        prepared = json.loads(call.get())
-        corpus_id = prepared["corpus"]["corpus_id"]
-    if reuse_from_collection:
-        call = activate_reused_collection.spawn(
-            sf, corpus_id, reuse_from_collection, relabeled_workloads)
-        print("function call id (activate_reused_collection): "
-              f"{call.object_id}", flush=True)
-        print(call.get(), flush=True)
-        return
-    if finalize_from:
-        partials = {}
-        for workload, function_call_id in parse_function_calls(
-                finalize_from).items():
-            result = modal.FunctionCall.from_id(function_call_id).get()
-            partial = json.loads(result)
-            if partial["workload"] != workload:
-                raise ValueError(
-                    f"{function_call_id} returned workload "
-                    f"{partial['workload']!r}, expected {workload!r}")
-            partials[workload] = partial
-        call = finalize_collection.spawn(
-            sf, corpus_id, json.dumps(partials))
-        print(f"function call id (finalize_collection): {call.object_id}",
-              flush=True)
-        print(call.get(), flush=True)
-        return
+def run_workloads(sf: float, only: list[str] | None = None) -> dict:
+    """Build the corpus, label the workloads one after another, finalize."""
+    prepared = prepare_corpus(sf)
+    corpus_id = prepared["corpus"]["corpus_id"]
     if prepared["complete"] and not only:
         print(f"collection {prepared['collection_id']} is already complete",
               flush=True)
-        return
-
-    names = ([w.strip() for w in only.split(",")] if only
-             else list(WORKLOADS))
+        return prepared
+    names = list(only) if only else list(WORKLOADS)
     unknown = [w for w in names if w not in WORKLOADS]
     if unknown:
         raise ValueError(f"unknown workloads: {unknown}")
-
-    calls = {w: judge_workload.spawn(corpus_id, w) for w in names}
-    for w, c in calls.items():
-        print(f"function call id (judge_workload {w}): {c.object_id}",
-              flush=True)
     partials = {}
-    for w, c in calls.items():
-        partials[w] = json.loads(c.get())
-        print(f"[main] {w} finished in "
-              f"{partials[w]['total_wall_s']:.1f}s", flush=True)
-
+    for workload in names:
+        partials[workload] = judge_workload(corpus_id, workload)
+        print(f"[main] {workload} finished in "
+              f"{partials[workload]['total_wall_s']:.1f}s", flush=True)
     if only:
         print("--only was given, so the collection is not finalized",
               flush=True)
-        return
-    call = finalize_collection.spawn(sf, corpus_id, json.dumps(partials))
-    print(f"function call id (finalize_collection): {call.object_id}",
-          flush=True)
-    print(call.get(), flush=True)
+        return partials
+    return finalize_collection(sf, corpus_id, partials)
+
+
+def main() -> None:
+    global ROOT
+
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--root", type=Path, default=Path.home() / ".cache" / "quail-b",
+        help="directory that holds ground_truth/quailb/schema_v1")
+    parser.add_argument("--sf", type=float, default=SCALE_FACTOR)
+    parser.add_argument("--only", default=None,
+                        help="comma-separated workloads, no finalize")
+    args = parser.parse_args()
+    ROOT = args.root.expanduser() / GROUND_TRUTH_ROOT
+    print(f"PREDICTION: {PREDICTION_TEXT}", flush=True)
+    only = [w.strip() for w in args.only.split(",")] if args.only else None
+    result = run_workloads(args.sf, only)
+    print(json.dumps(result, indent=2, sort_keys=True), flush=True)
+
+
+if __name__ == "__main__":
+    main()

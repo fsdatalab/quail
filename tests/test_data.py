@@ -1,6 +1,6 @@
 """CPU checks for the QUAIL-B document sets."""
 
-from quail_bench.data import (
+from quail_b.data import (
     AGENT_TRACE_DOCUMENTS,
     AGENT_TRACE_MAX_TOKENS,
     AGENT_TRACE_TURN_INTERVAL,

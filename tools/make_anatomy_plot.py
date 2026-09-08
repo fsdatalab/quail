@@ -15,7 +15,7 @@ import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 
-from quail_bench.prompts import (
+from quail_b.prompts import (
     AGENT_IMPLEMENTED_FIX,
     AGENT_RECOVERED,
     ASPECT_SENTIMENT,
@@ -38,7 +38,7 @@ from quail_bench.prompts import (
     REFUTE,
     SUPPORT,
 )
-from quail_bench.queries import (
+from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
     QUERIES,

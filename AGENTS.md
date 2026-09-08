@@ -2,11 +2,12 @@
 
 QUAIL-B is a benchmark of AI filter and join queries over document
 sets. This repository defines the benchmark and runs no engine: the
-document sets (`quail_bench/data.py`), the prompts (`quail_bench/prompts.py`),
-the queries as data (`quail_bench/queries.py`), the saved reference labels
-(`quail_bench/labels.py`), the exact prompt text a predicate asks
-(`quail_bench/rendering.py`), the labeling pass (`quail_bench/judge_pass.py`),
-and the scoring of one run (`quail_bench/scoring.py`). An engine's runner
+document sets (`quail_b/data.py`), the prompts (`quail_b/prompts.py`),
+the queries as data (`quail_b/queries.py`), the saved reference labels
+(`quail_b/labels.py`), the exact prompt text a predicate asks
+(`quail_b/rendering.py`), the labeling pass (`quail_b/labeling.py`,
+wrapped for Modal in `quail_b/judge_pass.py`),
+and the scoring of one run (`quail_b/scoring.py`). An engine's runner
 turns a `QuerySpec` into that engine's query and hands the answers back
 as a `RunOutput` to score. Quail's runner lives in the Quail repository
 under `quail/bench/`. The rules below are the Quail project's rules and
@@ -48,7 +49,7 @@ these rules.
 
 CI runs these on every pull request. Run them before pushing:
 
-    uv run ruff check quail_bench tests tools
+    uv run ruff check quail_b tests tools
     uv run python tools/check_long_strings.py
     uv run vulture
     uv run pytest -q
@@ -89,7 +90,8 @@ change needs one of them, say so instead of quietly adding it back.
 
 # Experiments
 
-- Every engine run goes through Modal; there is no local GPU.
+- The labeling pass runs on one local GPU (`quail_b.labeling`) or on
+  Modal (`quail_b.judge_pass`); the saved labels are the same either way.
 - Never create new Modal app names; caches and warm state ride on
  the app. New GPU cells attach to an existing app
  ("quail-milestone1" for cells, "quail-engine" for the worker).
