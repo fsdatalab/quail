@@ -60,17 +60,21 @@ def main() -> None:
         table = result.collect()
         report = result.report
         wall_s = report["wall_s"]
+        boot_s = report.get("boot_s", 0.0)
+        total_s = wall_s + boot_s
+        cost = total_s / 3600 * H100_USD_PER_HOUR
         print(f"matching reviews: {table.num_rows} of {n_docs}")
         for stage in report.get("stages", ()):
             if stage.get("op") == "filter":
                 print(f"  stage evaluated {stage['evaluated']} reviews, "
                       f"{stage['observed_selectivity']:.3f} passed")
-        print(f"boot_s: {report.get('boot_s')} ({report.get('boot_kind')})")
+        print(f"boot_s: {boot_s} ({report.get('boot_kind')})")
         print(f"token_wait_s: {report.get('token_wait_s')}")
         print(f"wall_s: {wall_s}")
+        print(f"total_s: {total_s:.2f} (boot + query)")
         print(f"fresh_tokens: {report.get('fresh_tokens')}")
         print(f"documents/second: {n_docs / wall_s:.1f}")
-        print(f"$/query: {wall_s / 3600 * H100_USD_PER_HOUR:.4f}")
+        print(f"GPU cost: ${cost:.4f}")
 
 
 if __name__ == "__main__":
