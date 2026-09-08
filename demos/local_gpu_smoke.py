@@ -1,11 +1,16 @@
 """Run one filter over four documents on the GPU in this process.
 
 Run with: uv run python demos/local_gpu_smoke.py 2>&1 | tee local_gpu_smoke.log
+For RTX, add --device rtx-pro-6000-blackwell-server. Use --gpus to select
+1, 2, 4, or 8 model copies on the host.
 """
+
+import argparse
 
 import pyarrow as pa
 
 import quail
+from quail.specs import DEVICES
 
 REPORTS = pa.table({
     "report_id": ["r1", "r2", "r3", "r4"],
@@ -28,7 +33,12 @@ SQL = """
 
 
 def main() -> None:
-    with quail.Session() as session:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", choices=sorted(DEVICES), default="h100-sxm")
+    parser.add_argument("--gpus", type=int, choices=(1, 2, 4, 8), default=1)
+    args = parser.parse_args()
+    config = quail.EngineConfig(device=args.device, gpus=args.gpus)
+    with quail.Session(config) as session:
         print("compute provider:", type(session.compute_provider).__name__)
         session.register(
             "reports",

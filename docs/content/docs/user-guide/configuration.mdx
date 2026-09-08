@@ -17,9 +17,10 @@ class EngineConfig:
     device: str = "h100-sxm"
 ```
 
-- `device`: the registered hardware specification used for planning. Only
-  `h100-sxm` is built in. This setting does not attach a GPU to a local process.
-- `gpus`: 1, 2, 4, or 8 H100s in one Modal container. Each GPU holds
+- `device`: the registered hardware specification used for planning. Built in:
+  `h100-sxm` and `rtx-pro-6000-blackwell-server`. This setting must match the
+  hardware where the model runs. It does not attach a GPU to a local process.
+- `gpus`: 1, 2, 4, or 8 GPUs on one host. Each GPU holds
   one model copy. The request backends (vLLM and SGLang) accept 1
   only.
 - `model`: a registered model name. Built in: `qwen3-4b-fp8` and
@@ -37,6 +38,19 @@ session = quail.Session(quail.EngineConfig(
 The session checks the model, device, and backend when it is created.
 An unknown name or an unsupported combination raises
 `quail.RefusalError` before any table is registered.
+
+For an eight-GPU RTX PRO 6000 Blackwell Server Edition host:
+
+```python
+session = quail.Session(quail.EngineConfig(
+    device="rtx-pro-6000-blackwell-server", gpus=8,
+))
+```
+
+This runs on the GPUs in the calling process. RTX support includes planning
+constants and FlashAttention-2 selection; execution still needs validation on
+RTX hardware. H100 uses FlashAttention-3. `ModalComputeProvider` provisions
+H100s only and rejects an RTX configuration before starting a worker.
 
 ## Session arguments
 

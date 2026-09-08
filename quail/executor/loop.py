@@ -546,7 +546,7 @@ TINY_WARM_TOKENS = (64, 128, 256, 512, 1024, 2048)
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass and re-commits the cache.
-WARMUP_VERSION = 1
+WARMUP_VERSION = 2
 
 
 def _warm_inputs(budget):
@@ -576,6 +576,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     q_max = len(question)
     original_mode = pipeline.attention_mode
     for mode in (FILTER_ATTENTION, JOIN_ATTENTION):
+        logger.debug("kernels: warming %s attention, full chunk", mode)
         pipeline.attention_mode = mode
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
                    [question], budget, arena_writes=True)
@@ -584,14 +585,17 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         for t in TINY_WARM_TOKENS:
             if t >= budget:
                 continue
+            logger.debug("kernels: warming %s attention, %s tokens", mode, t)
             body = (doc * (t // len(doc) + 1))[:max(8, t - q_max)]
             run_filter(torch, arena, pipeline, async_ans, [body],
                        [question], budget, arena_writes=True)
     if join_chunk:
+        logger.debug("kernels: warming join forward pass")
         pipeline.attention_mode = JOIN_ATTENTION
         run_join(torch, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
     pipeline.attention_mode = original_mode
+    logger.debug("kernels: warming filter without KV writes")
     run_filter(torch, arena, pipeline, async_ans, warm_docs,
                [question], budget, arena_writes=False)
 
@@ -615,17 +619,14 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     work = [(m, lin) for lin in linears
             for m in _generate_optimal_warmup_m_values(
                 budget, lin.weight.shape[0], torch.device("cuda"))]
-    try:
-        from tqdm import tqdm
-        work = tqdm(work, desc="quail kernel compile pass",
-                    unit="gemm")
-    except ImportError:
-        pass
+    progress = Progress("kernels: GEMM warmup", total=len(work),
+                        unit="configurations", emit=logger.info)
+    logger.info("kernels: starting %s GEMM warmup configurations", len(work))
     with torch.inference_mode():
         # one buffer per linear, row-sliced per call; the sweep only
         # needs each kernel launched once
         cur, buf = None, None
-        for m, lin in work:
+        for done, (m, lin) in enumerate(work, 1):
             if lin is not cur:
                 buf = torch.randn(budget, lin.weight.shape[1],
                                   device="cuda",
@@ -633,19 +634,22 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
                 cur = lin
             q, s = pipeline.quant(buf[:m])
             pipeline.gemm(q, s, lin)
+            progress.update(done)
         buf = None
         torch.cuda.synchronize()
+    progress.finish("kernels: GEMM warmup done")
+    logger.info("kernels: warming filter and join forward passes")
     _forward_warm(torch, arena, pipeline, async_ans, budget,
                   join_chunk=True)
 
 
 def touch_kernels(torch, arena, pipeline, async_ans, budget):
-    """Run each hot kernel once per container.
+    """Run each hot kernel once per GPU process.
 
     Cached binaries then load at boot instead of mid-run.
     """
     _forward_warm(torch, arena, pipeline, async_ans, budget,
-                  join_chunk=False)
+                  join_chunk=True)
 
 
 def _marker_path(model_name, budget):
@@ -671,46 +675,54 @@ def _marker_identity(torch, model_name, budget):
 
 def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                  model_name, force_compile=False):
-    """Boot-time warmup: a compile pass once, a touch pass per container.
+    """Compile once under a file lock, then warm each GPU process.
 
-    The compile pass runs once per (stack, GPU, model, budget); every
-    container after that runs the touch pass.
-
-    A marker file records the identity the compile pass ran for.
-    Identity match -> touch; mismatch or absent -> compile.
-
-    Returns dict(tier="compile"|"touch", warm_s=seconds).
+    Returns:
+        A dict with the selected tier and elapsed warmup seconds.
     """
+    import fcntl
     import json
     import os
 
     with quiet():
         path = _marker_path(model_name, budget)
         identity = _marker_identity(torch, model_name, budget)
-        on_disk = None
-        try:
-            with open(path) as f:
-                on_disk = json.load(f)
-        except (OSError, ValueError):
-            pass
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         t0 = time.perf_counter()
-        if force_compile or on_disk != identity:
-            compile_kernels(torch, arena, pipeline, async_ans, budget)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(identity, f, indent=1)
-            os.replace(tmp, path)
-            tier = "compile"
-        else:
-            logger.info("kernels: compile pass already recorded at %s; "
-                        "running the touch pass", path)
+        tier = "touch"
+        # The marker check, compilation, and publication must be one
+        # operation across processes sharing the kernel directory.
+        with open(path + ".lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                logger.info("kernels: waiting for another worker to compile")
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            wait_s = time.perf_counter() - t0
+            on_disk = None
+            try:
+                with open(path) as f:
+                    on_disk = json.load(f)
+            except (OSError, ValueError):
+                pass
+            if force_compile or on_disk != identity:
+                logger.info("kernels: starting compile pass")
+                compile_kernels(torch, arena, pipeline, async_ans, budget)
+                torch.cuda.synchronize()
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(identity, f, indent=1)
+                os.replace(tmp, path)
+                tier = "compile"
+        if tier == "touch":
+            logger.info("kernels: warming cached filter and join kernels")
             touch_kernels(torch, arena, pipeline, async_ans, budget)
-            tier = "touch"
         torch.cuda.synchronize()
-        warm_s = round(time.perf_counter() - t0, 2)
-        logger.info("kernels: %s pass done in %s s", tier, warm_s)
-        return dict(tier=tier, warm_s=warm_s)
+        warm_s = round(time.perf_counter() - t0 - wait_s, 2)
+        wait_s = round(wait_s, 2)
+        logger.info("kernels: %s pass done in %s s; waited %s s for compilation",
+                    tier, warm_s, wait_s)
+        return dict(tier=tier, warm_s=warm_s, wait_s=wait_s)
 
 
 # ---------------------------------------------------------- the filter

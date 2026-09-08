@@ -205,12 +205,12 @@ class QuailBackend:
         if model.name not in {"qwen3-4b-fp8", "qwen3-32b-fp8"}:
             return SupportResult.reject(
                 f"Quail does not support model {model.name!r}")
-        if device.name != "h100-sxm":
+        if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:
             return SupportResult.reject(
                 f"Quail does not support device {device.name!r}")
         if gpu_count not in {1, 2, 4, 8}:
             return SupportResult.reject(
-                "Quail requires 1, 2, 4, or 8 GPUs in one container")
+                "Quail requires 1, 2, 4, or 8 GPUs")
         return SupportResult.accept()
 
     def plan(

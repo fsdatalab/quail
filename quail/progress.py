@@ -5,6 +5,20 @@ import logging
 import sys
 import time
 
+_GPU_INDEX = None
+
+
+def set_gpu_index(index: int | None) -> None:
+    """Label this process's Quail messages with its GPU index."""
+    global _GPU_INDEX
+    _GPU_INDEX = index
+
+
+class _GpuFilter(logging.Filter):
+    def filter(self, record):
+        record.gpu = "" if _GPU_INDEX is None else f"[GPU {_GPU_INDEX}]"
+        return True
+
 
 class _StdoutHandler(logging.StreamHandler):
     """Write to the sys.stdout of the moment, so output capture sees it."""
@@ -23,10 +37,11 @@ if not logger.handlers:
     # INFO lines reach stdout unless the program configures the logger itself
     _handler = _StdoutHandler()
     _handler.setFormatter(logging.Formatter(
-        "%(levelname)s %(asctime)s [quail] %(message)s",
+        "%(levelname)s %(asctime)s [quail]%(gpu)s %(message)s",
         datefmt="%m-%d %H:%M:%S",
     ))
     logger.addHandler(_handler)
+    logger.addFilter(_GpuFilter())
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
@@ -54,11 +69,12 @@ class Progress:
     """Report a running count, logging at most once every `every` seconds."""
 
     def __init__(self, label: str, total: int | None = None,
-                 unit: str = "documents", every: float = 5.0):
+                 unit: str = "documents", every: float = 5.0, *, emit=say):
         self.label = label
         self.total = total
         self.unit = unit
         self.every = every
+        self.emit = emit
         self.done = 0
         self.started = time.perf_counter()
         self._last = self.started
@@ -69,12 +85,12 @@ class Progress:
         now = time.perf_counter()
         if now - self._last >= self.every:
             self._last = now
-            say(self._line(self.label, now))
+            self.emit(self._line(self.label, now))
 
     def finish(self, label: str, extra: str = "") -> None:
         """Log the final line under a past tense label."""
         line = self._line(label, time.perf_counter())
-        say(f"{line}, {extra}" if extra else line)
+        self.emit(f"{line}, {extra}" if extra else line)
 
     def _line(self, label: str, now: float) -> str:
         elapsed = now - self.started

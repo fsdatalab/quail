@@ -211,6 +211,10 @@ class ModalComputeProvider:
 
     def execute(self, request: QueryRequest) -> QueryResult:
         """Execute one logical query with a Modal Function."""
+        if request.config.device != "h100-sxm":
+            raise ValueError(
+                "ModalComputeProvider currently provisions H100s only; "
+                "use InProcessComputeProvider on an RTX PRO 6000 host")
         function = self._function(
             request.gpu_count,
             request.config.backend,

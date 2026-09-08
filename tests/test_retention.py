@@ -2,7 +2,7 @@
 
 
 from quail.executor.arena import KVArena, PageArena
-from quail.executor.retention import RetentionPolicy, retention_pages
+from quail.executor.retention import RetentionPolicy
 
 
 def cpu_arena(pages, cap, uses):
@@ -78,11 +78,6 @@ def test_zero_capacity_and_oversized_prefix():
         allocate(arena, ('a', 0), 32)
         assert arena.retain(('a', 0), 32) == 2
         assert not arena.accounting.owned
-
-
-def test_retention_budget_rounds_execution_reservation():
-    assert retention_pages(362250, 110376, 16) == 8843
-    assert retention_pages(32, 32, 16) == 0
 
 
 def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):

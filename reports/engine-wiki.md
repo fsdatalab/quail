@@ -125,8 +125,18 @@ predicate?). The model answers each predicate in a single token
 generation ever runs.
 
 The current scope is filter queries and joins with Qwen3 4B fp8 or
-Qwen3 32B fp8 weights. KV uses bf16. Each H100 has one model copy,
-and one Modal container can use 1, 2, 4, or 8 H100s.
+Qwen3 32B fp8 weights. KV uses bf16. Each GPU has one model copy,
+with 1, 2, 4, or 8 GPUs per host. The built in device specifications are
+`h100-sxm` and `rtx-pro-6000-blackwell-server`. RTX support includes
+planning and kernel selection; GPU validation is pending. Modal provisions
+H100s only and rejects RTX configurations before starting a worker.
+
+The RTX specification uses 96 GB of GDDR7 memory and 1.597 TB/s of memory
+bandwidth. Its estimated dense peak rates are 1 PFLOP/s for FP8 and
+0.5 PFLOP/s for BF16, derived by assuming NVIDIA's rounded server tensor
+rates include sparsity and halving them. The server page does not explicitly
+label sparsity, so these remain approximate planning assumptions. See the [device report](shipped_features/2026-09-07-rtx-pro-6000.md)
+for sources and validation status. Memory budgets remain per GPU.
 
 ### End-to-end flow
 
@@ -890,9 +900,11 @@ time the anchor is packed). The suffixes are the partner documents
 (for joins) or the question texts (for filters).
 
 The Pipeline has two attention implementations, selected per
-workload by `attention_mode` (issue #24):
+workload by `attention_mode` (issue #24). Both use FlashAttention-3 on
+H100 and FlashAttention-2 on RTX PRO 6000 Blackwell.
+`flash_attention_version()` selects the version from CUDA capability:
 
-- **`unified`** - one causal FlashAttention-3 paged call per layer.
+- **`unified`** - one causal FlashAttention paged call per layer.
   Current KV (prefix and suffix) is scattered into the document's
   arena pages first (the arena reserves capacity pages for the
   suffix beyond the document's logical length), then a single
@@ -963,12 +975,12 @@ The `merge_quant` two-call pattern runs per layer as follows
 
 **Call A** (self-attention): causal attention over the segment
 boundaries. Each prefix attends to itself; each suffix attends to
-itself. This is a standard FlashAttention-3 varlen call with
+itself. This is a standard FlashAttention varlen call with
 cumulative sequence lengths (`cu_seqlens`).
 
 **Call B** (cross-attention): every suffix token attends to its
 group's kept context in the arena. The kept context is the anchor's
-KV, stored in the arena's pages. Call B uses FlashAttention-3's paged
+KV, stored in the arena's pages. Call B uses FlashAttention's paged
 attention variant, reading KV through the block table. Call B is
 non-causal (the suffix needs to see the full prefix, not just
 earlier tokens).
@@ -1619,8 +1631,8 @@ values, so both passes run on synthetic ids.
 
 - **Compile pass** (`compile_kernels`), once per (software stack,
   GPU, model, budget): sweeps DeepGEMM over the full list of token
-  counts from vLLM's config-boundary generator up to the budget
-  (guessed grid only as an import fallback), for each of the four
+  counts from vLLM's config-boundary generator up to the budget,
+  for each of the four
   linear projections, then builds every attention-path shape as
   real forward passes: a budget-sized chunk and the tiny-chunk
   ladder (`TINY_WARM_TOKENS`) under both attention modes, one join
@@ -1629,21 +1641,34 @@ values, so both passes run on synthetic ids.
   (`WARMUP_VERSION`, model, budget, vLLM/torch/CUDA versions, GPU
   name); one volume commit persists compiled kernels and marker
   together.
-- **Touch pass** (`touch_kernels`), every container whose marker
-  matches: the same forward passes without the GEMM sweep and
-  without the join chunk. Each hot kernel runs once so cached
+- **Touch pass** (`touch_kernels`), every GPU process whose marker
+  matches: the same forward passes, including the join chunk, without
+  the GEMM sweep. Each hot kernel runs once so cached
   binaries load into the process (milliseconds each) at boot
   instead of inside the first measured query.
 
 `warm_kernels(torch, arena, pipeline, async_ans, budget,
 model_name=...)` is the policy wrapper: marker match runs the
 touch pass, mismatch or `force_compile=True` runs the compile pass
-and writes the marker. This keeps JIT compilation out of measured
-walls once ever, and keeps per-container boot at touch-pass cost.
+and writes the marker after GPU synchronization. A file lock covers the
+marker check, compile pass, and marker write. Other workers sharing the
+cache wait for that operation, then run their touch passes in parallel.
+Failures release the lock without publishing completion.
+
+Warmup emits INFO messages for the GEMM sweep and phase summaries.
+Individual attention shapes and forward passes appear at DEBUG level.
+GPU worker logs include the GPU index, including filter and join progress. A completed GEMM sweep does not mean the forward passes have
+finished.
 
 **Cold model load** (`executor/model.py`, `runtime/worker.py`):
-two settings keep `load_model` off the network and off a repeated
-subprocess.
+the parent resolves and downloads the pinned model snapshot once before
+starting GPU children. An explicit boot request sends the local directory
+and registry to every child. The coordinator waits for all GPUs to finish
+warming before starting any filter or join operator.
+`load_model` passes that directory to vLLM. A single-GPU call uses the same
+resolver. Resolution is cached by model and revision for the process lifetime.
+Startup time includes model file preparation, process startup, loading, and
+warmup. Query time begins after all GPU workers are ready.
 
 - Every vLLM image sets `VLLM_CACHE_ROOT` to the kernel-cache
   volume. vLLM resolves the model architecture by running a fresh
@@ -1654,9 +1679,9 @@ subprocess.
   seeds the JSON; every later container reads it back in about a
   second.
 - `ModelSpec.revision` pins each checkpoint to its hub commit
-  hash, and every `load_model` caller passes it. A commit hash
-  resolves from the HF cache volume without the API round trips a
-  branch name pays, and still downloads on a cold cache. The
+  hash. `resolve_model_path` downloads that revision through the HF cache
+  and returns its local directory. GPU children load files from that
+  directory without repeating Hub resolution. The
   stock vLLM baseline passes the same pin, so engine and baseline
   boots stay comparable.
 

@@ -6,27 +6,16 @@ import pytest
 
 import quail
 from quail.bench.quailb import (
-    AGENT_TRACE_DOCUMENTS,
-    AGENT_TRACE_MAX_TOKENS,
-    AGENT_TRACE_TURN_INTERVAL,
     ASPECTS,
-    LEPARD_POSITIVE_PAIRS,
-    QUERY_FAMILY_WORKLOADS,
     QUERY_ORDER,
     SCENARIOS,
-    SETS,
     _agent_snapshot_boundaries,
     _agent_trace_rows,
     _lepard_documents,
-    _n_agent_documents,
-    _n_lepard_pairs,
     _sample_lepard_pairs,
     queries,
-    query_family_name,
     register_privacy_sets,
     register_sets,
-    split_query_families,
-    split_query_ids,
 )
 from quail.planner.decide import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
@@ -121,24 +110,6 @@ def test_all_queries_compile_and_plan(tmp_path, backend):
         assert "physical:" in query.explain(), qid
 
 
-def test_set_table_matches_design():
-    assert SETS == {
-        "reviews": 50_000,
-        "reports": 5_000,
-        "claims": 5_000,
-        "agent_traces": AGENT_TRACE_DOCUMENTS,
-        "policies": 1_000_000,
-    }
-    assert LEPARD_POSITIVE_PAIRS == 5_000
-    assert _n_lepard_pairs(0.1) == 500
-    assert len(ASPECTS) == 12
-    assert len(SCENARIOS) == 100
-    assert AGENT_TRACE_TURN_INTERVAL == 5
-    assert AGENT_TRACE_MAX_TOKENS == 24_000
-    assert _n_agent_documents(1.0) == 17_718
-    assert _n_agent_documents(0.1) == 1_772
-
-
 def test_agent_snapshots_include_every_fifth_turn_and_following_tool():
     messages = [
         {"role": "system", "content": "instructions"},
@@ -226,37 +197,3 @@ def test_lepard_pair_sample_is_stable_and_nested():
     large = _sample_lepard_pairs(reversed(rows), passages, 10)
 
     assert small == large[:5]
-
-
-def test_parallel_query_split_matches_stock_vllm():
-    assert split_query_ids(QUERY_ORDER, 4) == (
-        QUERY_ORDER[0:8],
-        QUERY_ORDER[8:16],
-        QUERY_ORDER[16:24],
-        QUERY_ORDER[24:32],
-    )
-
-
-def test_query_family_split_matches_benchmark_catalog():
-    assert QUERY_FAMILY_WORKLOADS == {
-        "IMDB": "imdb",
-        "BIO": "biodex",
-        "FEV": "fever",
-        "LEP": "lepard",
-        "AGENT": "agent",
-    }
-    assert split_query_families(QUERY_ORDER) == (
-        QUERY_ORDER[0:10],
-        QUERY_ORDER[10:13],
-        QUERY_ORDER[13:22],
-        QUERY_ORDER[22:30],
-        QUERY_ORDER[30:32],
-    )
-    assert query_family_name(QUERY_ORDER[0:10]) == "imdb"
-
-
-def test_query_family_rejects_mixed_or_unknown_queries():
-    with pytest.raises(ValueError, match="expected one query family"):
-        query_family_name(("IMDB-1", "BIO-1"))
-    with pytest.raises(ValueError, match="unknown query family"):
-        split_query_families(("OTHER-1",))

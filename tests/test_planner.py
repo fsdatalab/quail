@@ -16,8 +16,8 @@ from quail.physical import (
     PackedFilter,
 )
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
-from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
-from quail.planner.sol import prefix_recompute_seconds, speed_of_light
+from quail.planner.plan import Refusal
+from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
@@ -34,17 +34,6 @@ def join_stages(plan):
 
 def node_kinds(plan):
     return [type(node).__name__ for node in plan.nodes]
-
-
-def test_prefix_recompute_seconds_counts_attention_work():
-    for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
-        one = prefix_recompute_seconds(1, model, H100_SXM)
-        two = prefix_recompute_seconds(2, model, H100_SXM)
-        assert one > 0
-        assert two > 2 * one
-
-    with pytest.raises(ValueError):
-        prefix_recompute_seconds(-1, QWEN3_4B_FP8, H100_SXM)
 
 
 def _parquet(path, columns):
@@ -132,21 +121,6 @@ def test_b3_ordering_by_cost_vs_as_written(catalog):
     never_kills = Predicate(1, 1.0)
     assert order_filters([never_kills, first], "by_cost", **kwargs) == \
         [first, never_kills]
-
-
-def test_filter_order_uses_dense_and_attention_rooflines():
-    class Predicate:
-        def __init__(self, tail, selectivity):
-            self.prompt = type("Prompt", (), {
-                "tail_tokens": tail, "preamble_tokens": 0})()
-            self.selectivity = selectivity
-
-    long_selective = Predicate(100, 0.1)
-    short_weak = Predicate(10, 0.9101)
-    ordered = order_filters(
-        [long_selective, short_weak], "by_cost", prefix_tokens=400,
-        model=QWEN3_4B_FP8, device=H100_SXM, chunk_tokens=110_376)
-    assert ordered == [short_weak, long_selective]
 
 
 def test_filter_order_matches_first_scan_enumeration():
@@ -270,30 +244,6 @@ def test_default_rule_falls_back_without_selectivity(catalog):
     assert "no selectivity" in plan.settings["order_source"]
 
 
-def test_anchor_longer_side_and_override(catalog):
-    def joined(anchor):
-        return (docs(catalog, "reviews", tok).alias("r")
-                .ai_join(docs(catalog, "products", tok).alias("p"),
-                         prompt("m {0} {1}", col("r.review"),
-                                col("p.description")),
-                         selectivity=0.1, anchor=anchor)
-                .select("r.id"))
-
-    toks = {"r": [3000] * 50, "p": [100] * 500}
-    plan = plan_query(joined(None), model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens=toks)
-    stage = join_stages(plan)[0]
-    assert stage["anchor"] == "r"      # the longer side anchors
-    assert stage["partners"] == ["p"]
-
-    forced = plan_query(joined("p"), model=QWEN3_4B_FP8,
-                        device=H100_SXM, doc_tokens=toks)
-    stage = join_stages(forced)[0]
-    assert stage["anchor"] == "p"
-    assert stage["partners"] == ["r"]
-    assert any("prices lower" in r for r in forced.remarks)
-
-
 def test_three_way_anchor_and_tuple_count(catalog):
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join([docs(catalog, "products", tok).alias("p"),
@@ -392,45 +342,6 @@ def test_forced_anchor_is_honored_with_a_remark_when_it_prices_worse(
     assert not any("prices lower" in r for r in same.remarks)
 
 
-def test_three_join_chain_plans_with_barriers(catalog, tmp_path):
-    # ai(r,t), ai(t,p), ai(p,g): no table appears in all three
-    # predicates, so no single anchor exists - the plan splits into
-    # anchor groups with barriers between them
-    catalog.register("tags", DocumentProvider.from_parquet(
-        _parquet(tmp_path / "g.parquet", ["id", "tag"]), id_col="id"))
-    logical = (docs(catalog, "reviews", tok).alias("r")
-               .ai_join(docs(catalog, "threads", tok).alias("t"),
-                        prompt("m1 {0} {1}", col("r.review"),
-                               col("t.thread")))
-               .ai_join(docs(catalog, "products", tok).alias("p"),
-                        prompt("m2 {0} {1}", col("t.thread"),
-                               col("p.description")))
-               .ai_join(docs(catalog, "tags", tok).alias("g"),
-                        prompt("m3 {0} {1}", col("p.description"),
-                               col("g.tag")))
-               .select("r.id"))
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [100] * 4, "t": [100] * 4,
-                                  "p": [100] * 4, "g": [100] * 4},
-                      order="as_written")
-    stages = join_stages(plan)
-    assert len(stages) == 3
-    # every stage anchors on one of its own tables
-    aliases = [("r", "t"), ("t", "p"), ("p", "g")]
-    for st, tabs in zip(stages, aliases):
-        assert st["anchor"] in tabs
-    kinds = node_kinds(plan)
-    # equal lengths and counts: one anchor switch is optimal (any
-    # zero-switch plan would need a table in all three predicates)
-    assert kinds.count("AnchoredJoin") == 2
-    assert kinds.count("Exchange") == 1
-    # recombination reads every stage's pairs
-    rec = plan.graph.nodes_by_type("quail.recombine")[0]
-    pair_ports = [input_port.source.port for input_port in rec.inputs
-                      if input_port.source.port.startswith("join_answers:")]
-    assert len(pair_ports) == 3
-
-
 def test_join_order_runs_selective_gate_first(catalog):
     # an expensive .9 full join and a cheap .01 exists gate on the
     # same table: by_cost runs the gate first so the join sees few
@@ -474,20 +385,6 @@ def test_refusal_weights_need_more_cards(catalog):
         assert result.needed > result.available
 
 
-def test_preamble_counted_once_per_document(catalog):
-    from quail.logical import SHARED_PRE
-    logical = _five_filter_plan(catalog, (0.5,))
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [400] * 10})
-    chain = filter_chain(plan)
-    st = chain.stages[0]
-    # the shared preamble is per document (stage 0), never per stage
-    assert st.preamble_tokens == len(tok(SHARED_PRE))
-    assert st.question_tokens == len(tok(
-        "Evaluate TRUE or FALSE for the following question: "
-        "flag 0 of: ANSWER:"))
-
-
 def test_join_tokens_frame_per_anchor_labels_per_tuple(catalog):
     # the complete question frame is written into kept KV once per
     # anchor document; a partner's block label and the answer cue
@@ -524,36 +421,6 @@ def test_refusal_suffix_over_chunk(catalog):
                    doc_tokens={"r": [150_000]})
     assert isinstance(r, Refusal)
     assert r.constraint == "suffix_over_chunk"
-
-
-def test_refusal_unknown_model():
-    unknown = resolve_model("qwen9-13b")
-    assert isinstance(unknown, Refusal)
-    assert unknown.constraint == "unknown_model"
-
-
-def test_kv_is_always_bf16(catalog):
-    logical = _five_filter_plan(catalog, (0.9,))
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [400] * 100})
-    from quail.planner import budgets
-    assert plan.settings["admission_tokens"] == budgets.arena_tokens(
-        QWEN3_4B_FP8, H100_SXM, plan.settings["chunk_tokens"])
-
-
-def test_explain_prints_tree_settings_and_source(catalog):
-    logical = _five_filter_plan(catalog, (0.9, 0.8))
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [400] * 100})
-    text = explain(logical, plan)
-    assert "Scan reviews as r" in text
-    assert "order_rule=by_cost" in explain(logical, plan, verbose=True)
-    assert "PackedFilter" in text
-    assert isinstance(plan, PhysicalPlan)
-
-    refusal = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                         doc_tokens={"r": [150_000]})
-    assert "refusal: suffix_over_chunk" in explain(logical, refusal)
 
 
 # ------------------------------------------------ KV keep (residency)

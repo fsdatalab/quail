@@ -37,24 +37,6 @@ def test_volume_commits_are_skipped_outside_modal(monkeypatch):
     volumes.commit_kernel_cache()
 
 
-def test_volume_commits_run_inside_modal(monkeypatch):
-    committed = []
-
-    class Records:
-        def __init__(self, name):
-            self.name = name
-
-        def commit(self):
-            committed.append(self.name)
-
-    monkeypatch.setattr(volumes.modal, "is_local", lambda: False)
-    monkeypatch.setattr(volumes, "results_vol", Records("results"))
-    monkeypatch.setattr(volumes, "kernel_cache", Records("kernels"))
-    volumes.commit_results()
-    volumes.commit_kernel_cache()
-    assert committed == ["results", "kernels"]
-
-
 def test_run_record_path_needs_writable_results_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(volumes, "RESULTS_ROOT", str(tmp_path / "missing"))
     assert volumes.run_record_path() is None

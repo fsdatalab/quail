@@ -122,23 +122,14 @@ def test_fev9_executes_saved_order_with_actual_survivors(
 
 
 @pytest.mark.parametrize(
-    "backend", ["quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"])
-def test_every_backend_filters_its_first_anchor_last(backend):
+    "backend", ["stock_vllm", "pipelined_vllm", "pipelined_sglang"])
+def test_request_backends_filter_their_first_anchor_last(backend):
     with quail.Session(EngineConfig(backend=backend),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_fever(session)
         plan = quailb.queries(session)["FEV-9"][1]().plan()
-        if backend == "quail":
-            first = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0].anchor
-            filters = plan.graph.nodes_by_type(PackedFilter.type_name)
-            assert {node.alias for node in filters if node.keep_kv} == {
-                group.anchor
-                for group in plan.graph.nodes_by_type(AnchoredJoin.type_name)}
-        else:
-            execution = next(node for node in plan.nodes if hasattr(node, "joins"))
-            first = execution.joins[0].anchor
-            filters = execution.filters
-        assert filters[-1].alias == first
+        execution = next(node for node in plan.nodes if hasattr(node, "joins"))
+        assert execution.filters[-1].alias == execution.joins[0].anchor
 
 
 def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):

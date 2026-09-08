@@ -2,7 +2,9 @@
 
 A query engine for AI_FILTER and AI_JOIN over document collections.
 Filter queries and joins only. The models are Qwen3 4B fp8 and Qwen3
-32B fp8, one H100 per model copy. A query runs on the GPU in the
+32B fp8, one GPU per model copy. H100 execution is tested; RTX PRO 6000
+Blackwell Server Edition has planning and kernel selection support, with
+GPU validation pending. A query runs on the GPU in the
 calling process, or on Modal.
 
 ## Layout
@@ -75,6 +77,24 @@ Qwen3 4B fp8 model is not the one they want:
 session = quail.Session(quail.EngineConfig(
     model="qwen3-32b-fp8", gpus=1, device="h100-sxm",
 ))
+```
+
+On an RTX PRO 6000 Blackwell Server Edition host, select its hardware
+specification explicitly. For a host with eight GPUs:
+
+```python
+session = quail.Session(quail.EngineConfig(
+    device="rtx-pro-6000-blackwell-server", gpus=8,
+))
+```
+
+This runs one model copy per GPU on that host. The Modal provider supports
+H100 configurations only.
+
+Try the four-document filter on one RTX GPU:
+
+```sh
+uv run python demos/local_gpu_smoke.py --device rtx-pro-6000-blackwell-server 2>&1 | tee rtx-smoke.log
 ```
 
 The benchmark backends use the same query and result interface:
