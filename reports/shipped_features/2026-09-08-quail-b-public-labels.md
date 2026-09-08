@@ -7,8 +7,10 @@ The benchmark is its own repository,
 installed here as the `quail_b` package (distribution `quail-b`) and
 pinned to a commit in `pyproject.toml`. It runs no engine and no
 model. `quail/bench/` is Quail's runner for it. Stored data keeps its
-`quailb` identifiers, because predicate keys and the
-`ground_truth/quailb/schema_v1` path are hashed into label-set ids.
+`quailb` identifiers: the predicate keys are hashed into label-set
+ids, and the `ground_truth/quailb/schema_v1` path is the one the
+volume already uses, so bucket, volume, and a local directory share
+one layout.
 
 ## What changed
 
