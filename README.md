@@ -56,7 +56,7 @@ FEVER and LePaRD use source labels where the dataset gives the exact answer. `ev
 `quail_b/scoring.py` scores a run against a collection.
 
 Corpus and labels are public in the `quail-bench` S3 bucket under
-`s3://quail-bench/ground_truth/quailb/schema_v1/`, 1.1 GB, readable without an AWS account.
+`s3://quail-bench/ground_truth/quailb/schema_v1/`, 145 MB, readable without an AWS account.
 `load_ground_truth()` in `quail_b/labels.py` reads from there by default. `LocalFiles(dir)` in
 `quail_b/store.py` reads a directory with the same layout instead.
 
