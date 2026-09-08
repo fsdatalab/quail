@@ -141,11 +141,13 @@ class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#c
 a plan that invokes an LLM on <em>each row</em> for the filter, then
 makes another LLM call on <em>each pair of rows</em> in the join. Query
 execution can therefore be incredibly costly, because a filter over
-<span class="math inline">\(n\)</span> rows requires <span
-class="math inline">\(n\)</span> LLM calls, while a naive join between
-tables with <span class="math inline">\(n\)</span> and <span
-class="math inline">\(m\)</span> rows requires <span
-class="math inline">\(n \times m\)</span> LLM calls.</p>
+<span class="math inline">\(N\)</span> rows requires <span
+class="math inline">\(N\)</span> LLM calls, while a naive join between
+tables <span class="math inline">\(A\)</span> and <span
+class="math inline">\(B\)</span>, with <span
+class="math inline">\(n_A\)</span> and <span
+class="math inline">\(n_B\)</span> rows, requires <span
+class="math inline">\(n_A n_B\)</span> LLM calls.</p>
 <p>The database community has proposed a number of logical optimizations
 that reduce the number of LLM calls, for example, by pushing filters
 below joins, reordering predicates, choosing cheaper implementations, or
@@ -184,10 +186,10 @@ step after processing the prompt. So the engine should always have
 enough work to keep the GPU fully occupied (i.e., be compute-bound). We
 set a very large max_num_batch_tokens (&gt;25k) and max_num_seq (4096)
 such that the GPU will always be busy. We’ll run Qwen3 4B FP8, with BF16
-KV, on one H100, and our query will cover ~500 medical reports,
-averaging 4,066 tokens each, and 1,127 reaction terms, averaging 4.8
-tokens each. Surprisingly, we find two sources of inefficiency in the
-vLLM baseline.</p>
+KV, on one H100, and our query will cover 500 medical reports, averaging
+4,066 tokens each, and 1,127 reaction terms, averaging 4.8 tokens each.
+Surprisingly, we find two sources of inefficiency in the vLLM
+baseline.</p>
 <h2 id="issue-1-kv-regret">Issue #1: KV Regret</h2>
 <p>The filter has 55 percent selectivity, so it rejects 45 percent of
 the reports. KV for the rejected reports will never be used again in
@@ -196,12 +198,13 @@ KV. It stores KV from every filter request, and evicts the least
 recently used blocks when the cache fills. As a result, vLLM may keep KV
 for a rejected report, while evicting KV for a report that will be used
 in the join. The evicted report prefix must then be computed again
-during the join. We call these unnecessarily recomputed prefix tokens
-<em>KV regret</em>. Our vLLM implementation incurs 1.08 million KV
-regret tokens on this query! Then, during the join, vLLM also stores KV
-for the entire prompt, even though later requests reuse only the report
-prefix. The additional waste is small here, because the reaction terms
-are short, but it could be much larger if both tables contained long
+during the join. We call any prefix token that the engine recomputes
+after the same token prefix was computed earlier in the query <em>KV
+regret</em>. Our vLLM implementation incurs 1.08 million KV regret
+tokens on this query! Then, during the join, vLLM also stores KV for the
+entire prompt, even though later requests reuse only the report prefix.
+The additional waste is small here, because the reaction terms are
+short, but it could be much larger if both tables contained long
 documents.</p>
 <h2 id="issue-2-high-host-overhead">Issue #2: High Host Overhead</h2>
 <p>The join submits hundreds of thousands of report and reaction pairs
@@ -230,24 +233,25 @@ href="https://modal.com/blog/gpu-utilization-guide">GPU utilization</a>
 and <a
 href="https://modal.com/blog/host-overhead-inference-efficiency">host
 overhead</a>.</p>
-<p>We can compare vLLM’s measured latency with a speed-of-light estimate
+<p>We can compare vLLM’s measured latency with a speed of light estimate
 for the same query plan. Although we don’t go into the full calculation
 in this post, we use a <a
 href="https://modal.com/gpu-glossary/perf/roofline-model">roofline
 model</a> to estimate the time for each model operation. The roofline
-model takes the larger of an operation’s arithmetic time and HBM memory
-time, reflecting the operation’s limiting hardware resource. We then
-combine these operation-level estimates according to the query plan. We
-assume that CPU and GPU work overlap—that the GPU never sits idle. We
-also assume that every model operation reaches the relevant peak
-hardware rate, and that the engine retains all reusable KV. Of course,
-no implementation can satisfy all of these assumptions in practice, so
-the estimate is an intentionally optimistic lower bound. The <a
+model takes the larger of an operation’s arithmetic time and the time
+required to move its data through GPU high bandwidth memory, or HBM. We
+then combine these operation level estimates according to the query
+plan. We assume that CPU and GPU work overlap, so the GPU never sits
+idle. We also assume that every model operation reaches the relevant
+peak hardware rate, and that the engine retains all reusable KV. Of
+course, no implementation can satisfy all of these assumptions in
+practice, so the estimate is an intentionally optimistic lower bound.
+The <a
 href="https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py">implementation
 in Quail</a> contains the full calculation.</p>
 <p>For BIO-3, vLLM computes 14 percent of its input tokens more than
 once, because it evicted their KV. The vLLM run takes almost 12 times
-the speed-of-light estimate. Surely, we can do better!</p>
+the speed of light estimate. Surely, we can do better!</p>
 <h1 id="introducing-quail">3. Introducing Quail</h1>
 <p>We are building Quail, an open source query engine for AI-SQL. Quail
 stands for Query Aware Inference Layer. In this post, we describe how
@@ -378,22 +382,22 @@ class="math inline">\(i\)</span>, let <span
 class="math inline">\(\sigma_i\)</span> be its provided selectivity, or
 the fraction of documents expected to pass. Let <span
 class="math inline">\(c_i\)</span> be the estimated latency, in seconds,
-of evaluating the filter on one document. We calculate <span
-class="math inline">\(c_i\)</span> with our speed of light model. Their
-rule orders filters by increasing rank:</p>
+of evaluating the filter on one document. Their rule orders filters by
+increasing rank:</p>
 <p><span class="math display">\[
 \rho_i = \frac{c_i}{1 - \sigma_i}.
 \]</span></p>
 <p>A low rank favors a filter that is cheap, rejects many documents, or
 both, because running it early prevents more expensive filters from
 seeing those documents.</p>
-<p><strong>Estimating filter cost.</strong> For an LLM filter, the cost
-depends on the document length, the filter prompt length, the selected
-model and GPU, the forward pass size, and whether the document KV is
-already in GPU HBM. We therefore calculate two costs. The first cost,
-<span class="math inline">\(c_i^{\mathrm{first}}\)</span>, is the
-estimated time when filter <span class="math inline">\(i\)</span> runs
-first, so the model must process both the document and the filter
+<p><strong>Estimating filter cost.</strong> For an LLM filter, <span
+class="math inline">\(c_i\)</span> depends on the document length, the
+filter prompt length, the selected model and GPU, the forward pass size,
+and whether the document KV is already in GPU HBM. We therefore
+calculate two versions of <span class="math inline">\(c_i\)</span>. The
+first cost, <span class="math inline">\(c_i^{\mathrm{first}}\)</span>,
+is the estimated time when filter <span class="math inline">\(i\)</span>
+runs first, so the model must process both the document and the filter
 prompt. The later cost, <span
 class="math inline">\(c_i^{\mathrm{later}}\)</span>, is the estimated
 time when another filter has already computed the document KV, so the
@@ -404,11 +408,12 @@ level, we count the fresh tokens, attention pairs, KV tokens written,
 and KV tokens read. A fresh token is a token that the model must
 process, rather than a token whose KV is already available. We translate
 these counts into arithmetic work and HBM traffic for each part of the
-model. For either cost, the calculation is:</p>
+model. Let <span class="math inline">\(r\)</span> index the model parts
+that run one after another. For either cost, the calculation is:</p>
 <p><span class="math display">\[
-c = \sum_k \max\left(
-\frac{\mathrm{FLOPs}_{k}}{\mathrm{arithmetic\ throughput}_k},
-\frac{\mathrm{bytes}_{k}}{\mathrm{HBM\ bandwidth}}
+c = \sum_r \max\left(
+\frac{\mathrm{FLOPs}_{r}}{\mathrm{arithmetic\ throughput}_r},
+\frac{\mathrm{bytes}_{r}}{\mathrm{HBM\ bandwidth}}
 \right).
 \]</span></p>
 <p>The maximum accounts for whether each part of the model is limited by
@@ -616,24 +621,26 @@ probability that the document reaches its next planned use as an anchor.
 We estimate this probability from the selectivities of the filters and
 joins that run before that use. <span
 class="math inline">\(C_{\mathrm{recompute}}(d)\)</span> is the speed of
-light estimate for computing the document prefix again. Dividing by the
-number of KV pages gives the expected recomputation time saved by each
-page. We evict the prefix with the smallest value, and break ties by
-evicting the prefix used later. A document that fails a filter has no
-future use in the query, so we release its pages immediately.</p>
+light estimate, in seconds, for computing the document prefix again.
+<span class="math inline">\(\mathrm{KVPages}(d)\)</span> is the number
+of pages needed to store its KV. Therefore, <span
+class="math inline">\(V(d)\)</span> is the expected recomputation time
+saved per KV page. We evict the prefix with the smallest value, and
+break ties by evicting the prefix used later. A document that fails a
+filter has no future use in the query, so we release its pages
+immediately.</p>
 <h3 id="executing-filters-and-joins-4-and-5-in-figure-6">Executing
 filters and joins, #4 and #5 in Figure 6</h3>
 <p><strong>Overlapping CPU and GPU work.</strong>
 <code>Packed Filter</code> and <code>Anchored Join</code> use the same
 execution loop. The CPU builds a token chunk up to the budget chosen by
 the planner, subject to the available KV pages, then launches one model
-forward pass on the GPU. While the GPU runs chunk <span
-class="math inline">\(k\)</span>, the CPU reads the <code>TRUE</code> or
-<code>FALSE</code> answers from chunk <span
-class="math inline">\(k-1\)</span>, updates the scheduler and KV
-manager, and prepares chunk <span class="math inline">\(k+1\)</span>.
-The GPU can therefore begin the next forward pass without waiting for
-the CPU, as long as the CPU prepares the next chunk in time.</p>
+forward pass on the GPU. While the GPU runs the current chunk, the CPU
+reads the <code>TRUE</code> or <code>FALSE</code> answers from the
+previous chunk, updates the scheduler and KV manager, and prepares the
+next chunk. The GPU can therefore begin the next forward pass without
+waiting for the CPU, as long as the CPU prepares the next chunk in
+time.</p>
 <p><strong>Executing filters.</strong> A <code>Packed Filter</code>
 evaluates all AI predicates on one dataset, in the order chosen by the
 planner. The scheduler first adds documents that passed an earlier
@@ -678,14 +685,17 @@ several different anchors. We split attention into two parts at every
 model layer. One FlashAttention 3 call computes causal attention among
 the new tokens for each tuple, and another computes attention from those
 tokens into the corresponding anchor KV. We then merge the two outputs.
-If the two calls return outputs <span class="math inline">\(o_r\)</span>
-and <span class="math inline">\(o_a\)</span>, with log sum exp values
-<span class="math inline">\(\ell_r\)</span> and <span
-class="math inline">\(\ell_a\)</span>, the full attention output is:</p>
+Let <span class="math inline">\(o_{\mathrm{new}}\)</span> and <span
+class="math inline">\(o_{\mathrm{anchor}}\)</span> be the outputs of
+these two calls, and let <span
+class="math inline">\(\ell_{\mathrm{new}}\)</span> and <span
+class="math inline">\(\ell_{\mathrm{anchor}}\)</span> be their log sum
+exp values. The full attention output is:</p>
 <p><span class="math display">\[
 o =
-\frac{e^{\ell_r}o_r + e^{\ell_a}o_a}
-     {e^{\ell_r} + e^{\ell_a}}.
+\frac{e^{\ell_{\mathrm{new}}}o_{\mathrm{new}} +
+e^{\ell_{\mathrm{anchor}}}o_{\mathrm{anchor}}}
+     {e^{\ell_{\mathrm{new}}} + e^{\ell_{\mathrm{anchor}}}}.
 \]</span></p>
 <p><strong>Merging the attention outputs.</strong> The two calls attend
 to separate parts of the same prompt, so the weighted merge is exactly
@@ -769,9 +779,9 @@ cost uses Modal’s H100 price of $3.9492 per hour.</li>
 <li>Fresh input tokens count every input token that the GPU computes
 across the query, including document prefixes that it computes more than
 once.</li>
-<li>KV regret includes both recomputing the same document prefix, and
-missing reuse between different documents that share the same token
-prefix.</li>
+<li>KV regret in this post uses the distinct prefix definition. It
+includes both recomputing the same document prefix, and recomputing a
+token prefix that an earlier document already computed.</li>
 <li>We also compare the measured latency with the speed of light
 estimate from Section 2, which assumes peak GPU throughput, no host
 overhead, and enough GPU HBM to retain all reusable prefix KV.</li>
@@ -824,8 +834,8 @@ the surviving reports with 1,127 possible reaction terms.</li>
 </tr>
 <tr>
 <td>Latency relative to the speed of light estimate, 43.09 seconds</td>
-<td style="text-align: right;">2.09x</td>
-<td style="text-align: right;">11.86x</td>
+<td style="text-align: right;">2.09×</td>
+<td style="text-align: right;">11.86×</td>
 </tr>
 </tbody>
 </table>
@@ -934,8 +944,8 @@ class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#c
 </tr>
 <tr>
 <td>Latency relative to the speed of light estimate, 47.47 seconds</td>
-<td style="text-align: right;">5.07x</td>
-<td style="text-align: right;">2.09x</td>
+<td style="text-align: right;">5.07×</td>
+<td style="text-align: right;">2.09×</td>
 </tr>
 </tbody>
 </table>
