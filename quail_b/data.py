@@ -22,6 +22,9 @@ CACHE_SCHEMA_VERSION = 9
 # the sources; the corpus id is checked after download.
 PUBLISHED_CORPORA = {0.1: "c_1aa2c4f0d0b6c816fd37aa5748c33341"}
 LEPARD_POSITIVE_PAIRS = 5_000
+# The base count for scaling. SWE-Next at the pinned revision yields
+# 17,711 eligible snapshots, so the full scale takes every one of them
+# while smaller scale factors keep their first round(17,718 * sf) rows.
 AGENT_TRACE_DOCUMENTS = 17_718
 AGENT_TRACE_TURN_INTERVAL = 5
 AGENT_TRACE_MAX_TOKENS = 24_000
@@ -426,7 +429,27 @@ def _agent_trace_rows(trace_index, messages, tokenizer) -> list[dict]:
     return rows
 
 
-def _agent_rows(n):
+def _select_agent_snapshots(snapshots, n, full=False):
+    """Take the first n snapshots in trace order, or every one at full scale.
+
+    Args:
+        snapshots: The eligible snapshot rows of each trace, in order.
+        n: The number of rows wanted.
+        full: Whether fewer than n rows is acceptable because n is the
+            base count and the source has run out.
+    """
+    rows = []
+    for trace_rows in snapshots:
+        rows.extend(trace_rows)
+        if len(rows) >= n:
+            return rows[:n]
+    if full:
+        return rows
+    raise ValueError(
+        f"SWE-Next produced {len(rows)} eligible snapshots, expected {n}")
+
+
+def _agent_rows(n, full=False):
     """Read SWE-Next and select a nested sample of trace snapshots."""
     from datasets import load_dataset
     from transformers import AutoTokenizer
@@ -441,15 +464,12 @@ def _agent_rows(n):
         revision=AGENT_TRACE_TOKENIZER_REVISION,
     )
     order = np.random.default_rng(DATA_SEED).permutation(len(source))
-    rows = []
-    for trace_index in order:
-        rows.extend(_agent_trace_rows(
+    snapshots = (
+        _agent_trace_rows(
             int(trace_index), source[int(trace_index)]["messages"],
-            tokenizer))
-        if len(rows) >= n:
-            return rows[:n]
-    raise ValueError(
-        f"SWE-Next produced {len(rows)} eligible snapshots, expected {n}")
+            tokenizer)
+        for trace_index in order)
+    return _select_agent_snapshots(snapshots, n, full)
 
 
 # ------------------------------------------------------- set builders
@@ -722,7 +742,8 @@ def _build_agent_traces(d, sf, force=False):
     path = d / "agent_traces.parquet"
     if path.exists() and not force:
         return
-    rows = _agent_rows(_n_agent_documents(sf))
+    n = _n_agent_documents(sf)
+    rows = _agent_rows(n, full=n == AGENT_TRACE_DOCUMENTS)
     schema = pa.schema([
         ("id", pa.string()),
         ("trace", pa.string()),

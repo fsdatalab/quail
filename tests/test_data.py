@@ -14,6 +14,7 @@ from quail_b.data import (
     _n_agent_documents,
     _n_lepard_pairs,
     _sample_lepard_pairs,
+    _select_agent_snapshots,
 )
 
 
@@ -122,3 +123,16 @@ def test_lepard_pair_sample_is_stable_and_nested():
     large = _sample_lepard_pairs(reversed(rows), passages, 10)
 
     assert small == large[:5]
+
+
+def test_full_scale_takes_every_eligible_snapshot():
+    import pytest
+
+    snapshots = [[{"id": "a"}, {"id": "b"}], [{"id": "c"}]]
+
+    assert _select_agent_snapshots(iter(snapshots), 2) == [
+        {"id": "a"}, {"id": "b"}]
+    assert _select_agent_snapshots(iter(snapshots), 5, full=True) == [
+        {"id": "a"}, {"id": "b"}, {"id": "c"}]
+    with pytest.raises(ValueError, match="expected 5"):
+        _select_agent_snapshots(iter(snapshots), 5)
