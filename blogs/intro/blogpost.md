@@ -32,7 +32,7 @@ WHERE AI.IF(PROMPT(
 ```
 
 At a high level, the database compiles the aforementioned query into a plan that invokes an LLM on *each row* for the filter, then makes another LLM call on *each pair of rows* in the join.
-Query execution can therefore be incredibly costly, because a filter over $n$ rows requires $n$ LLM calls, while a naive join between tables with $n$ and $m$ rows requires $n \times m$ LLM calls.
+Query execution can therefore be incredibly costly, because a filter over $N$ rows requires $N$ LLM calls, while a naive join between tables $A$ and $B$, with $n_A$ and $n_B$ rows, requires $n_A n_B$ LLM calls.
 
 The database community has proposed a number of logical optimizations that reduce the number of LLM calls, for example, by pushing filters below joins, reordering predicates, choosing cheaper implementations, or pruning candidate pairs [[1]](https://arxiv.org/abs/2512.02289) [[2]](https://arxiv.org/abs/2505.14661) [[3]](https://arxiv.org/abs/2407.11418) [[4]](https://arxiv.org/abs/2512.05399) [[5]](https://cloud.google.com/blog/products/data-analytics/more-than-100x-faster-and-cheaper-llm-powered-sql-queries-with-proxy-models).
 But still, the resulting query plans can end up needing hundreds of thousands, or even millions, of LLM calls.
@@ -52,12 +52,12 @@ To execute the plan with vLLM, we'd render one prompt for each report in the fil
 
 Now, each request asks for only a `TRUE` or `FALSE` answer, so the model does not need a separate decode step after processing the prompt. So the engine should always have enough work to keep the GPU fully occupied (i.e., be compute-bound).
 We set a very large max_num_batch_tokens (>25k) and max_num_seq (4096) such that the GPU will always be busy.
-We'll run Qwen3 4B FP8, with BF16 KV, on one H100, and our query will cover ~500 medical reports, averaging 4,066 tokens each, and 1,127 reaction terms, averaging 4.8 tokens each.
+We'll run Qwen3 4B FP8, with BF16 KV, on one H100, and our query will cover 500 medical reports, averaging 4,066 tokens each, and 1,127 reaction terms, averaging 4.8 tokens each.
 Surprisingly, we find two sources of inefficiency in the vLLM baseline.
 
 ## Issue #1: KV Regret
 
-The filter has 55 percent selectivity, so it rejects 45 percent of the reports. KV for the rejected reports will never be used again in this query. However, vLLM does not use the filter results when managing KV. It stores KV from every filter request, and evicts the least recently used blocks when the cache fills. As a result, vLLM may keep KV for a rejected report, while evicting KV for a report that will be used in the join. The evicted report prefix must then be computed again during the join. We call these unnecessarily recomputed prefix tokens _KV regret_. Our vLLM implementation incurs 1.08 million KV regret tokens on this query! Then, during the join, vLLM also stores KV for the entire prompt, even though later requests reuse only the report prefix. The additional waste is small here, because the reaction terms are short, but it could be much larger if both tables contained long documents.
+The filter has 55 percent selectivity, so it rejects 45 percent of the reports. KV for the rejected reports will never be used again in this query. However, vLLM does not use the filter results when managing KV. It stores KV from every filter request, and evicts the least recently used blocks when the cache fills. As a result, vLLM may keep KV for a rejected report, while evicting KV for a report that will be used in the join. The evicted report prefix must then be computed again during the join. We call any prefix token that the engine recomputes after the same token prefix was computed earlier in the query _KV regret_. Our vLLM implementation incurs 1.08 million KV regret tokens on this query! Then, during the join, vLLM also stores KV for the entire prompt, even though later requests reuse only the report prefix. The additional waste is small here, because the reaction terms are short, but it could be much larger if both tables contained long documents.
 
 ## Issue #2: High Host Overhead
 
@@ -69,9 +69,9 @@ The join submits hundreds of thousands of report and reaction pairs to vLLM as s
 
 More than 99 percent of the prompt tokens come from the prefix cache, so each batch contains very little model computation. The GPU finishes each batch quickly, but the CPU still has to process and schedule every request in the next batch. When the CPU does not prepare the next batch in time, the GPU sits idle, even though hundreds of thousands of pairs are waiting. The GPU may also use its arithmetic units poorly while a batch is running, which is known as low model FLOPs utilization, or MFU. We do not address low MFU here. Modal provides useful background on [GPU utilization](https://modal.com/blog/gpu-utilization-guide) and [host overhead](https://modal.com/blog/host-overhead-inference-efficiency).
 
-We can compare vLLM's measured latency with a speed-of-light estimate for the same query plan. Although we don't go into the full calculation in this post, we use a [roofline model](https://modal.com/gpu-glossary/perf/roofline-model) to estimate the time for each model operation. The roofline model takes the larger of an operation's arithmetic time and HBM memory time, reflecting the operation's limiting hardware resource. We then combine these operation-level estimates according to the query plan. We assume that CPU and GPU work overlap---that the GPU never sits idle. We also assume that every model operation reaches the relevant peak hardware rate, and that the engine retains all reusable KV. Of course, no implementation can satisfy all of these assumptions in practice, so the estimate is an intentionally optimistic lower bound. The [implementation in Quail](https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py) contains the full calculation.
+We can compare vLLM's measured latency with a speed of light estimate for the same query plan. Although we don't go into the full calculation in this post, we use a [roofline model](https://modal.com/gpu-glossary/perf/roofline-model) to estimate the time for each model operation. The roofline model takes the larger of an operation's arithmetic time and the time required to move its data through GPU high bandwidth memory, or HBM. We then combine these operation level estimates according to the query plan. We assume that CPU and GPU work overlap, so the GPU never sits idle. We also assume that every model operation reaches the relevant peak hardware rate, and that the engine retains all reusable KV. Of course, no implementation can satisfy all of these assumptions in practice, so the estimate is an intentionally optimistic lower bound. The [implementation in Quail](https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py) contains the full calculation.
 
-For BIO-3, vLLM computes 14 percent of its input tokens more than once, because it evicted their KV. The vLLM run takes almost 12 times the speed-of-light estimate. Surely, we can do better!
+For BIO-3, vLLM computes 14 percent of its input tokens more than once, because it evicted their KV. The vLLM run takes almost 12 times the speed of light estimate. Surely, we can do better!
 
 # 3. Introducing Quail
 
@@ -137,7 +137,7 @@ AI.IF(
 
 ### Ordering filters
 
-**Filter rank.** In 1993, [Hellerstein and Stonebraker](https://dsf.berkeley.edu/jmh/miscpapers/sigmod93.pdf) showed that expensive predicates over one table can be ordered optimally with a simple rank formula. For each filter $i$, let $\sigma_i$ be its provided selectivity, or the fraction of documents expected to pass. Let $c_i$ be the estimated latency, in seconds, of evaluating the filter on one document. We calculate $c_i$ with our speed of light model. Their rule orders filters by increasing rank:
+**Filter rank.** In 1993, [Hellerstein and Stonebraker](https://dsf.berkeley.edu/jmh/miscpapers/sigmod93.pdf) showed that expensive predicates over one table can be ordered optimally with a simple rank formula. For each filter $i$, let $\sigma_i$ be its provided selectivity, or the fraction of documents expected to pass. Let $c_i$ be the estimated latency, in seconds, of evaluating the filter on one document. Their rule orders filters by increasing rank:
 
 $$
 \rho_i = \frac{c_i}{1 - \sigma_i}.
@@ -145,14 +145,14 @@ $$
 
 A low rank favors a filter that is cheap, rejects many documents, or both, because running it early prevents more expensive filters from seeing those documents.
 
-**Estimating filter cost.** For an LLM filter, the cost depends on the document length, the filter prompt length, the selected model and GPU, the forward pass size, and whether the document KV is already in GPU HBM. We therefore calculate two costs. The first cost, $c_i^{\mathrm{first}}$, is the estimated time when filter $i$ runs first, so the model must process both the document and the filter prompt. The later cost, $c_i^{\mathrm{later}}$, is the estimated time when another filter has already computed the document KV, so the model processes only the new filter prompt and attends to the cached document.
+**Estimating filter cost.** For an LLM filter, $c_i$ depends on the document length, the filter prompt length, the selected model and GPU, the forward pass size, and whether the document KV is already in GPU HBM. We therefore calculate two versions of $c_i$. The first cost, $c_i^{\mathrm{first}}$, is the estimated time when filter $i$ runs first, so the model must process both the document and the filter prompt. The later cost, $c_i^{\mathrm{later}}$, is the estimated time when another filter has already computed the document KV, so the model processes only the new filter prompt and attends to the cached document.
 
-We calculate both costs with a speed of light estimate. At a high level, we count the fresh tokens, attention pairs, KV tokens written, and KV tokens read. A fresh token is a token that the model must process, rather than a token whose KV is already available. We translate these counts into arithmetic work and HBM traffic for each part of the model. For either cost, the calculation is:
+We calculate both costs with a speed of light estimate. At a high level, we count the fresh tokens, attention pairs, KV tokens written, and KV tokens read. A fresh token is a token that the model must process, rather than a token whose KV is already available. We translate these counts into arithmetic work and HBM traffic for each part of the model. Let $r$ index the model parts that run one after another. For either cost, the calculation is:
 
 $$
-c = \sum_k \max\left(
-\frac{\mathrm{FLOPs}_{k}}{\mathrm{arithmetic\ throughput}_k},
-\frac{\mathrm{bytes}_{k}}{\mathrm{HBM\ bandwidth}}
+c = \sum_r \max\left(
+\frac{\mathrm{FLOPs}_{r}}{\mathrm{arithmetic\ throughput}_r},
+\frac{\mathrm{bytes}_{r}}{\mathrm{HBM\ bandwidth}}
 \right).
 $$
 
@@ -243,11 +243,11 @@ P_{\mathrm{reuse}}(a_d)
 }.
 $$
 
-**Eviction value.** $a_d$ is the input dataset that contains document $d$, and $P_{\mathrm{reuse}}(a_d)$ is the probability that the document reaches its next planned use as an anchor. We estimate this probability from the selectivities of the filters and joins that run before that use. $C_{\mathrm{recompute}}(d)$ is the speed of light estimate for computing the document prefix again. Dividing by the number of KV pages gives the expected recomputation time saved by each page. We evict the prefix with the smallest value, and break ties by evicting the prefix used later. A document that fails a filter has no future use in the query, so we release its pages immediately.
+**Eviction value.** $a_d$ is the input dataset that contains document $d$, and $P_{\mathrm{reuse}}(a_d)$ is the probability that the document reaches its next planned use as an anchor. We estimate this probability from the selectivities of the filters and joins that run before that use. $C_{\mathrm{recompute}}(d)$ is the speed of light estimate, in seconds, for computing the document prefix again. $\mathrm{KVPages}(d)$ is the number of pages needed to store its KV. Therefore, $V(d)$ is the expected recomputation time saved per KV page. We evict the prefix with the smallest value, and break ties by evicting the prefix used later. A document that fails a filter has no future use in the query, so we release its pages immediately.
 
 ### Executing filters and joins, #4 and #5 in Figure 6
 
-**Overlapping CPU and GPU work.** `Packed Filter` and `Anchored Join` use the same execution loop. The CPU builds a token chunk up to the budget chosen by the planner, subject to the available KV pages, then launches one model forward pass on the GPU. While the GPU runs chunk $k$, the CPU reads the `TRUE` or `FALSE` answers from chunk $k-1$, updates the scheduler and KV manager, and prepares chunk $k+1$. The GPU can therefore begin the next forward pass without waiting for the CPU, as long as the CPU prepares the next chunk in time.
+**Overlapping CPU and GPU work.** `Packed Filter` and `Anchored Join` use the same execution loop. The CPU builds a token chunk up to the budget chosen by the planner, subject to the available KV pages, then launches one model forward pass on the GPU. While the GPU runs the current chunk, the CPU reads the `TRUE` or `FALSE` answers from the previous chunk, updates the scheduler and KV manager, and prepares the next chunk. The GPU can therefore begin the next forward pass without waiting for the CPU, as long as the CPU prepares the next chunk in time.
 
 **Executing filters.** A `Packed Filter` evaluates all AI predicates on one dataset, in the order chosen by the planner. The scheduler first adds documents that passed an earlier predicate, because their KV is already in HBM, then uses the remaining token budget for documents that have not started. When a document returns `TRUE`, the scheduler adds its next predicate to a later chunk, if another predicate remains. When a document returns `FALSE`, the scheduler stops evaluating it and releases its KV pages. A document that passes the final predicate keeps its KV only when a later join uses the document as an anchor.
 
@@ -261,12 +261,12 @@ TODO: Revisit the join batching diagram.
 
 **Reusing existing kernels.** Most of Quail's model forward pass is the same as vLLM's, and we load the model through vLLM. We use DeepGEMM for the main matrix multiplications, and [FlashAttention 3](https://arxiv.org/abs/2407.08608) for attention. Quail changes how join attention is represented. It also fuses several small operations, and computes only the output scores needed for a Boolean answer.
 
-**Computing join attention.** The new tokens for each tuple must attend to the KV for their anchor, but one chunk may contain several different anchors. We split attention into two parts at every model layer. One FlashAttention 3 call computes causal attention among the new tokens for each tuple, and another computes attention from those tokens into the corresponding anchor KV. We then merge the two outputs. If the two calls return outputs $o_r$ and $o_a$, with log sum exp values $\ell_r$ and $\ell_a$, the full attention output is:
+**Computing join attention.** The new tokens for each tuple must attend to the KV for their anchor, but one chunk may contain several different anchors. We split attention into two parts at every model layer. One FlashAttention 3 call computes causal attention among the new tokens for each tuple, and another computes attention from those tokens into the corresponding anchor KV. We then merge the two outputs. Let $o_{\mathrm{new}}$ and $o_{\mathrm{anchor}}$ be the outputs of these two calls, and let $\ell_{\mathrm{new}}$ and $\ell_{\mathrm{anchor}}$ be their log sum exp values. The full attention output is:
 
 $$
 o =
-\frac{e^{\ell_r}o_r + e^{\ell_a}o_a}
-     {e^{\ell_r} + e^{\ell_a}}.
+\frac{e^{\ell_{\mathrm{new}}}o_{\mathrm{new}} + e^{\ell_{\mathrm{anchor}}}o_{\mathrm{anchor}}}
+     {e^{\ell_{\mathrm{new}}} + e^{\ell_{\mathrm{anchor}}}}.
 $$
 
 **Merging the attention outputs.** The two calls attend to separate parts of the same prompt, so the weighted merge is exactly equal to one softmax attention operation over the full prompt. [Hydragen](https://arxiv.org/abs/2402.05099) and [FlashInfer's recursive attention](https://docs.flashinfer.ai/tutorials/recursive_attention.html) use the same decomposition and merge rule.
@@ -305,7 +305,7 @@ $$
 - **Metrics:** For each query, we measure query latency, GPU cost, fresh input tokens, and KV regret tokens.
   - Query latency excludes model startup and result collection, and GPU cost uses Modal's H100 price of $3.9492 per hour.
   - Fresh input tokens count every input token that the GPU computes across the query, including document prefixes that it computes more than once.
-  - KV regret includes both recomputing the same document prefix, and missing reuse between different documents that share the same token prefix.
+  - KV regret in this post uses the distinct prefix definition. It includes both recomputing the same document prefix, and recomputing a token prefix that an earlier document already computed.
   - We also compare the measured latency with the speed of light estimate from Section 2, which assumes peak GPU throughput, no host overhead, and enough GPU HBM to retain all reusable prefix KV.
 - Across the 32 queries, Quail is faster than the vLLM baseline on 30 queries.
 - We focus below on the BioDEX query from the beginning of the post, and on an agent trace query where Quail is slower.
@@ -321,7 +321,7 @@ $$
 | GPU cost per query | $0.09864 | $0.56047 |
 | Fresh input tokens | 7,547,348 | 7,875,694 |
 | KV regret tokens | 920,895 | 1,081,310 |
-| Latency relative to the speed of light estimate, 43.09 seconds | 2.09x | 11.86x |
+| Latency relative to the speed of light estimate, 43.09 seconds | 2.09× | 11.86× |
 
 - Quail is 5.68 times faster than the vLLM baseline.
 - Quail reduces KV regret, but does not eliminate it, because the KV for all surviving medical reports does not fit in GPU HBM.
@@ -362,7 +362,7 @@ WHERE AI.IF(
 | GPU cost per query | $0.26382 | $0.10877 |
 | Fresh input tokens | 17,389,113 | 5,526,889 |
 | KV regret tokens | 11,882,610 | 20,386 |
-| Latency relative to the speed of light estimate, 47.47 seconds | 5.07x | 2.09x |
+| Latency relative to the speed of light estimate, 47.47 seconds | 5.07× | 2.09× |
 
 - The vLLM baseline is 2.43 times faster than Quail on AGENT-1.
 
