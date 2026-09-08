@@ -22,7 +22,7 @@ from quail.execution import PhysicalResponse
 from quail.executor.arena import KVArena
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
 from quail.executor.loop import AsyncAnswers, warm_kernels
-from quail.executor.model import answer_weights, load_model
+from quail.executor.model import answer_weights, load_model, resolve_model_path
 from quail.physical import (
     AnchoredJoin,
     DocumentInput,
@@ -30,7 +30,7 @@ from quail.physical import (
     decode_graph,
 )
 from quail.planner import budgets
-from quail.progress import say
+from quail.progress import say, set_gpu_index
 from quail.runtime.runner import ExecutionContext
 from quail.runtime.tokens import (
     DocumentPrefixes,
@@ -38,7 +38,7 @@ from quail.runtime.tokens import (
     decode_payload_documents,
 )
 
-# GPU child processes, one per H100, kept alive across queries so their
+# GPU child processes, one per GPU, kept alive across queries so their
 # models stay loaded for the whole session.
 _CHILDREN: list = []
 
@@ -146,18 +146,19 @@ def release_booted_models(runtime_state: dict) -> dict:
 
 
 def _boot_gpu(state, backend, spec, device, gpu_index, workers,
-              chunk_tokens, answer_token_ids):
+              chunk_tokens, answer_token_ids, *, model_path=None):
     """Load the model, arena, and pipeline once per GPU executor."""
     import torch
     import torch.nn.functional as F
 
-
+    set_gpu_index(gpu_index)
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
                 pipeline_s=0.0, warm_kernels_s=0.0)
     if "model_execution" not in state:
         say(f"loading {spec.hf_name} onto GPU {gpu_index}")
         t0 = time.perf_counter()
-        model = load_model(spec.hf_name, revision=spec.revision,
+        model = load_model(model_path or spec.hf_name,
+                           revision=None if model_path else spec.revision,
                            answer_token_ids=answer_token_ids)
         boot["load_model_s"] = time.perf_counter() - t0
         # budgets.* is tiny CPU; fold into arena_s so the four phases
@@ -305,6 +306,7 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
 def _child_main(gpu_idx, conn):
     import os as _os
     _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+    set_gpu_index(gpu_idx)
     state = {"gpu_index": gpu_idx}
     while True:
         try:
@@ -315,7 +317,7 @@ def _child_main(gpu_idx, conn):
             break
         try:
             if kind == "registry":
-                state["registry"] = data
+                state.update(data)
                 conn.send(("ok", None))
             elif kind == "filters":
                 conn.send(("ok", _child_filters(state, data)))
@@ -335,7 +337,8 @@ def _child_boot(state, sub):
     t_boot = time.perf_counter()
     boot = _boot_gpu(state, backend, spec, device, state["gpu_index"],
                      sub["workers"], sub["chunk_tokens"],
-                     sub["true_ids"] + sub["false_ids"])
+                     sub["true_ids"] + sub["false_ids"],
+                     model_path=state["model_path"])
     _bind_query(state, sub["true_ids"], sub["false_ids"],
                 sub["chunk_tokens"])
     state["runtime_context"] = ExecutionContext(
@@ -582,18 +585,28 @@ def execute_quail_multi(payload, registry, graph):
     payload = dict(payload)
     payload["docs"] = decode_payload_documents(payload["docs"])
     gpu_count = payload["workers"]
+    spec = registry.model(payload["model"])
+    started = time.perf_counter()
+    model_path = resolve_model_path(spec.hf_name, spec.revision)
+    model_files_s = time.perf_counter() - started
     _ensure_children(gpu_count)
-    _round("registry", [registry] * gpu_count)
+    _round("registry", [dict(registry=registry, model_path=model_path)] * gpu_count)
     report = execute_distributed_graph(
         payload,
         graph,
         gpu_count,
         _round,
-        registry.model(payload["model"]),
+        spec,
         registry.device(payload["physical_plan"]["device"]),
         registry.runtimes,
         registry,
     )
+    report["boot_s"] = round(report["boot_s"] + model_files_s, 2)
+    report["boot"] = {
+        **(report.get("boot") or {}),
+        "model_files_s": round(model_files_s, 2),
+        "boot_s": report["boot_s"],
+    }
     commit_results()
     commit_kernel_cache()
     outputs = report.pop("_outputs")

@@ -1631,8 +1631,8 @@ values, so both passes run on synthetic ids.
 
 - **Compile pass** (`compile_kernels`), once per (software stack,
   GPU, model, budget): sweeps DeepGEMM over the full list of token
-  counts from vLLM's config-boundary generator up to the budget
-  (guessed grid only as an import fallback), for each of the four
+  counts from vLLM's config-boundary generator up to the budget,
+  for each of the four
   linear projections, then builds every attention-path shape as
   real forward passes: a budget-sized chunk and the tiny-chunk
   ladder (`TINY_WARM_TOKENS`) under both attention modes, one join
@@ -1641,21 +1641,31 @@ values, so both passes run on synthetic ids.
   (`WARMUP_VERSION`, model, budget, vLLM/torch/CUDA versions, GPU
   name); one volume commit persists compiled kernels and marker
   together.
-- **Touch pass** (`touch_kernels`), every container whose marker
-  matches: the same forward passes without the GEMM sweep and
-  without the join chunk. Each hot kernel runs once so cached
+- **Touch pass** (`touch_kernels`), every GPU process whose marker
+  matches: the same forward passes, including the join chunk, without
+  the GEMM sweep. Each hot kernel runs once so cached
   binaries load into the process (milliseconds each) at boot
   instead of inside the first measured query.
 
 `warm_kernels(torch, arena, pipeline, async_ans, budget,
 model_name=...)` is the policy wrapper: marker match runs the
 touch pass, mismatch or `force_compile=True` runs the compile pass
-and writes the marker. This keeps JIT compilation out of measured
-walls once ever, and keeps per-container boot at touch-pass cost.
+and writes the marker after GPU synchronization. A file lock covers the
+marker check, compile pass, and marker write. Other workers sharing the
+cache wait for that operation, then run their touch passes in parallel.
+Failures release the lock without publishing completion.
+
+Warmup emits INFO messages for the GEMM sweep and subsequent forward
+passes. GPU worker logs include the GPU index, including filter and join
+progress. A completed GEMM sweep does not mean the forward passes have
+finished.
 
 **Cold model load** (`executor/model.py`, `runtime/worker.py`):
-two settings keep `load_model` off the network and off a repeated
-subprocess.
+the parent resolves and downloads the pinned model snapshot once before
+starting GPU children. It sends the local directory with their registry.
+`load_model` passes that directory to vLLM. A single-GPU call uses the same
+resolver. Resolution is cached by model and revision for the process lifetime.
+The parent adds file preparation time to startup time, outside query time.
 
 - Every vLLM image sets `VLLM_CACHE_ROOT` to the kernel-cache
   volume. vLLM resolves the model architecture by running a fresh
@@ -1666,9 +1676,9 @@ subprocess.
   seeds the JSON; every later container reads it back in about a
   second.
 - `ModelSpec.revision` pins each checkpoint to its hub commit
-  hash, and every `load_model` caller passes it. A commit hash
-  resolves from the HF cache volume without the API round trips a
-  branch name pays, and still downloads on a cold cache. The
+  hash. `resolve_model_path` downloads that revision through the HF cache
+  and returns its local directory. GPU children load files from that
+  directory without repeating Hub resolution. The
   stock vLLM baseline passes the same pin, so engine and baseline
   boots stay comparable.
 
