@@ -264,7 +264,9 @@ class Session:
                     )
         finally:
             reader.close()
-        tok, _ = self._corpus_tokenizer(provider_name, column, sample)
+        # the primary tokenizer loads in about a second; the fast one
+        # builds its tables for longer and is picked on the background pass
+        tok = self.tokenizer
         sample_tokens = sum(len(tok(text)) for text in sample)
         sample_bytes = sum(len(text.encode("utf-8")) for text in sample)
         ratio = sample_tokens / sample_bytes if sample_bytes else 0.0

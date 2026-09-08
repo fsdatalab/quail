@@ -57,10 +57,12 @@ compile pass. With the cache, boot is 10.6 s.
 Length estimates on the 100,000 reviews, measured on this CPU: total
 29,879,025 estimated against 29,716,778 exact, +0.55%; per document the
 median error is 3.8% and the 90th percentile 9.8%. The byte-length scan
-takes under 10 ms. `explain()` returns after the tokenizer loads (about
-7 s here, once per process) instead of after the full pass (10 to 30 s
-depending on the CPU). Execution then waits only for the part of the
-pass that the model boot did not cover.
+takes under 10 ms and `explain()` returns in 0.26 s, against 10 to
+30 s for the full pass depending on the CPU. The sample uses the
+transformers tokenizer, which loads in under a second; bpe-qwen builds
+its tables for about 12 s at load, so it is loaded on the background
+thread. Execution then waits only for the part of the pass that the
+model boot did not cover.
 
 GPT-5 nano for the same work, at its prices on 2026-09-07 ($0.05 per 1 M
 input tokens, $0.40 per 1 M output tokens, half in batch), one output
