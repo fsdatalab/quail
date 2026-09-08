@@ -22,7 +22,10 @@ logger = logging.getLogger("quail")
 if not logger.handlers:
     # INFO lines reach stdout unless the program configures the logger itself
     _handler = _StdoutHandler()
-    _handler.setFormatter(logging.Formatter("[quail] %(message)s"))
+    _handler.setFormatter(logging.Formatter(
+        "%(levelname)s %(asctime)s [quail] %(message)s",
+        datefmt="%m-%d %H:%M:%S",
+    ))
     logger.addHandler(_handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False

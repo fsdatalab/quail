@@ -69,7 +69,7 @@ def pick_corpus_tokenizer(primary, fast, texts, sample=25):
 TOKENIZE_ROWS = 2048
 
 # documents tokenized to measure tokens per byte for a length estimate
-ESTIMATE_SAMPLE = 256
+ESTIMATE_SAMPLE = 1024
 
 
 class Session:
@@ -514,7 +514,7 @@ class Query:
     def explain(self) -> str:
         text = explain(self.logical, self.plan())
         if self._estimated:
-            text += ("\n  note: token counts for "
+            text += ("\n\n  note: token counts for "
                      + ", ".join(repr(a) for a in self._estimated)
                      + f" are estimated from a {ESTIMATE_SAMPLE} document "
                      "sample")

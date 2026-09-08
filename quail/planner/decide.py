@@ -738,6 +738,7 @@ def explain(logical: LogicalPlan, physical) -> str:
         for r in physical.reasons:
             lines.append(f"  {r}")
         return "\n".join(lines)
+    lines.append("")
     lines.append("physical:")
     lines.append(
         f"  workers={physical.workers} model_copies={physical.workers}"
