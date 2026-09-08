@@ -1,13 +1,16 @@
 """Filter all 100,000 IMDB reviews with two questions, both required."""
 
+from pathlib import Path
+
 import pyarrow as pa
 import pyarrow.dataset as ds
-from datasets import concatenate_datasets, load_dataset
+import pyarrow.parquet as pq
 
 import quail
 from quail.bench.evaluate import H100_USD_PER_HOUR
 
 IMDB_REVISION = "e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
+_CACHE = Path("~/.cache/quail/datasets/imdb_reviews.parquet").expanduser()
 
 SQL = """
     SELECT r.review_id
@@ -31,22 +34,22 @@ SQL = """
 
 def load_reviews() -> ds.Dataset:
     """Return every IMDB review as an Arrow dataset with one id column."""
-    try:
-        imdb = load_dataset(
-            "stanfordnlp/imdb", revision=IMDB_REVISION,
-            local_files_only=True,
-        )
-    except FileNotFoundError:
-        imdb = load_dataset("stanfordnlp/imdb", revision=IMDB_REVISION)
+    if _CACHE.exists():
+        return ds.dataset(_CACHE)
+    from datasets import concatenate_datasets, load_dataset
+    imdb = load_dataset("stanfordnlp/imdb", revision=IMDB_REVISION)
     all_reviews = concatenate_datasets([
         imdb["train"],
         imdb["test"],
         imdb["unsupervised"],
     ])
-    return ds.dataset(pa.table({
+    table = pa.table({
         "review_id": [f"review-{i}" for i in range(len(all_reviews))],
         "review": all_reviews["text"],
-    }))
+    })
+    _CACHE.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, _CACHE)
+    return ds.dataset(_CACHE)
 
 
 def main() -> None:
