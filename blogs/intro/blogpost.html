@@ -409,9 +409,10 @@ and KV tokens read. A fresh token is a token that the model must
 process, rather than a token whose KV is already available. We translate
 these counts into arithmetic work and HBM traffic for each part of the
 model. Let <span class="math inline">\(r\)</span> index the model parts
-that run one after another. For either cost, the calculation is:</p>
+that run one after another. For either cost, the estimated latency
+is:</p>
 <p><span class="math display">\[
-c = \sum_r \max\left(
+\sum_r \max\left(
 \frac{\mathrm{FLOPs}_{r}}{\mathrm{arithmetic\ throughput}_r},
 \frac{\mathrm{bytes}_{r}}{\mathrm{HBM\ bandwidth}}
 \right).
