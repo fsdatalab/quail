@@ -24,6 +24,7 @@ from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
 from quail.runtime.compute import InProcessComputeProvider, QueryRequest
+from quail.runtime.prefixes import prefix_metrics
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
     ExecutionContext,
@@ -142,7 +143,7 @@ class Session:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *_exc):
         self.close()
 
     def register(self, name: str, provider: TableProvider) -> None:
@@ -467,6 +468,16 @@ class Query:
         self.token_wait_s = 0.0
 
     # ---- planning (the optimization) ---------------------------------
+
+    def token_inputs(self) -> dict:
+        """Return the token store of every scanned alias.
+
+        Plans first, then waits for any background tokenization, so
+        planning and the speed of light estimate share these stores.
+        """
+        self.plan()
+        self.wait_for_tokens()
+        return self._token_inputs
 
     def plan(self):
         if self._plan is None:
@@ -868,6 +879,7 @@ class Query:
             ))
             if semantics == "full":
                 true_join_tables[written_pos] = true_answer_rows(table)
+        report.update(prefix_metrics(report, scans, self._token_inputs))
         survivor_arrays = {
             alias: pa.array(indices, type=pa.int32())
             for alias, indices in survivors.items()

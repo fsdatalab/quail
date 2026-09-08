@@ -16,8 +16,16 @@ calling process, or on Modal.
   SGLang request backends. `executor/` is the GPU code and runs where
   the model runs. `runtime/` is the session, compute providers,
   generic runner, token store, results, and the Modal worker. `bench/`
-  is the QUAIL-B benchmark; its [README](quail/bench/README.md) explains
-  how to run it and label a new predicate.
+  is the QUAIL-B runner for Quail and its request backends.
+- QUAIL-B, the benchmark, is its own repository:
+  [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench). It
+  holds the document sets, prompts, queries as data, the predicates and
+  their label identities, saved labels, and scoring, and runs no engine
+  or model. Corpus and labels are public in the `quail-bench` S3
+  bucket. It is installed here as the `quail_b` package, pinned in
+  `pyproject.toml`. The pass that writes the labels is
+  `quail/bench/labeling.py`, one GPU; `quail/bench/judge_pass.py` runs
+  it on Modal.
 - `demos/` has runnable examples for a machine with a GPU:
   `local_gpu_smoke.py` runs one filter over four short documents, and
   `imdb_ending_filter.py` filters all 100,000 IMDB reviews.

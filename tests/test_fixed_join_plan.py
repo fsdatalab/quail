@@ -14,6 +14,8 @@ from quail.physical import AnchoredJoin, DocumentInput, PackedFilter, decode_gra
 from quail.planner.plan import EngineConfig
 from quail.runtime.local import execute_worker_query
 from quail.runtime.runner import NodeMetrics, NodeResult
+from quail_b import prompts
+from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
 
 def register_fever(session):
@@ -80,8 +82,8 @@ class FixedFeverAnswers:
 ])
 def test_fev9_executes_saved_order_with_actual_survivors(
         monkeypatch, capacity, empty, estimate):
-    monkeypatch.setitem(quailb.FILTER_SELECTIVITY_ESTIMATES, quailb.F11, estimate)
-    monkeypatch.setitem(quailb.FILTER_SELECTIVITY_ESTIMATES, quailb.F13, estimate)
+    monkeypatch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
+    monkeypatch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
     with quail.Session(EngineConfig(),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_fever(session)

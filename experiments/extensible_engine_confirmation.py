@@ -45,7 +45,7 @@ image = (
         "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
     })
-    .add_local_python_source("quail")
+    .add_local_python_source("quail", "quail_b")
 )
 
 app = modal.App("quail-milestone1")
@@ -87,8 +87,8 @@ def _save(name: str, value: dict) -> str:
 
 
 def _query_record(query_id, query, gpu_count):
-    from quail.bench.evaluate import H100_USD_PER_HOUR
     from quail.runtime.local import execute_worker_query
+    from quail.specs import H100_USD_PER_HOUR
 
     result = execute_worker_query(query)
     table = result.collect()
@@ -142,9 +142,10 @@ def confirm_4b(
 ) -> str:
     import torch
 
-    from quail.bench.quailb import build_sets, queries, register_sets
+    from quail.bench.quailb import queries, register_sets
     from quail.planner.plan import EngineConfig
     from quail.runtime.session import Session
+    from quail_b.data import build_sets
 
     data = build_sets("/results/quailb_data", 0.1)
     session = Session(EngineConfig(model="qwen3-4b-fp8", gpus=1))

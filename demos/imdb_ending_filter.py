@@ -8,8 +8,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 
 import quail
-from quail.bench.evaluate import MODAL_GPU_USD_PER_HOUR
-from quail.specs import DEVICES
+from quail.specs import DEVICES, MODAL_GPU_USD_PER_HOUR
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 

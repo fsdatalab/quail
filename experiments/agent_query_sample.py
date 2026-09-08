@@ -23,7 +23,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.evaluate import H100_USD_PER_HOUR
+from quail.specs import H100_USD_PER_HOUR
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 SAMPLE_SIZE = 200
@@ -91,7 +91,7 @@ image = (
         "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
     })
-    .add_local_python_source("quail")
+    .add_local_python_source("quail", "quail_b")
 )
 
 data_image = (
@@ -104,13 +104,13 @@ data_image = (
         "datasets",
         "transformers>=5.2.0",
     )
-    .add_local_python_source("quail")
+    .add_local_python_source("quail", "quail_b")
 )
 
 finalize_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("pyarrow")
-    .add_local_python_source("quail")
+    .add_local_python_source("quail", "quail_b")
 )
 
 app = modal.App("quail-milestone1")
@@ -182,10 +182,10 @@ def prepare_sample() -> str:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from quail.bench import quailb
+    from quail_b import data
 
     results_vol.reload()
-    data_dir = quailb.build_sets(DATA_DIR, sf=SCALE_FACTOR)
+    data_dir = data.build_sets(DATA_DIR, sf=SCALE_FACTOR)
     rows = pq.read_table(
         Path(data_dir) / "agent_traces.parquet",
         columns=["id", "trace", "trajectory_id", "turn_index", "token_count"],
@@ -212,9 +212,9 @@ def prepare_sample() -> str:
     os.replace(temp, SAMPLE_PATH)
     results_vol.commit()
     result = {
-        "data_seed": quailb.DATA_SEED,
-        "cache_schema_version": quailb.CACHE_SCHEMA_VERSION,
-        "source_revision": quailb.SOURCE_REVISIONS[
+        "data_seed": data.DATA_SEED,
+        "cache_schema_version": data.CACHE_SCHEMA_VERSION,
+        "source_revision": data.SOURCE_REVISIONS[
             "TIGER-Lab/SWE-Next-SFT-Trajectories"],
         "sample_size": len(sample),
         "sample_full_hash": _sample_hash(sample),
@@ -245,8 +245,8 @@ def judge_sample(model_name: str, sample_full_hash: str) -> str:
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
-    from quail.bench import quailb
-    from quail.executor.loop import true_false_ids
+    from quail import true_false_ids
+    from quail_b import data
 
     if model_name not in MODELS:
         raise ValueError(f"unknown model {model_name!r}")
@@ -267,7 +267,7 @@ def judge_sample(model_name: str, sample_full_hash: str) -> str:
         model=spec["repo"],
         revision=spec["revision"],
         tokenizer_revision=spec["revision"],
-        seed=quailb.DATA_SEED,
+        seed=data.DATA_SEED,
         kv_cache_dtype="auto",
         max_model_len=32_768,
         max_num_batched_tokens=25_305,
@@ -282,7 +282,7 @@ def judge_sample(model_name: str, sample_full_hash: str) -> str:
         min_tokens=1,
         allowed_token_ids=allowed,
         logprobs=len(allowed),
-        seed=quailb.DATA_SEED,
+        seed=data.DATA_SEED,
     )
     boot_s = time.perf_counter() - t_boot
     t_model = time.perf_counter()

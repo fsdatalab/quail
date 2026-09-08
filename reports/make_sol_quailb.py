@@ -1,6 +1,7 @@
-"""Ideal SoL work estimate for every QuailB query.
+r"""Ideal SoL estimate for every QUAIL-B query.
 
-The estimate prices three model components on one H100! request:
+The estimate is Quail's own, `quail.speed_of_light_estimate`. It prices
+three model components on one H100! request:
 
   1. attention projections, with their weight bytes and fp8 FLOPs
   2. the MLP, with its weight bytes and fp8 FLOPs
@@ -13,46 +14,21 @@ deep plans. It is therefore an optimistic comparison point for that modeled
 execution, not the exact minimum for every possible execution. The dollar
 metric uses Modal's published H100! price.
 
-The equations are in docs/content/docs/architecture/sol-model.mdx. Work
-counting, model components, and the component calculation live in shared
-planner modules. The exact SoL join search is separate from the production
-planner.
+The equations are in docs/content/docs/architecture/sol-model.mdx. This
+script only supplies what the benchmark has: the corpora, the queries,
+and the saved labels that give the exact survivors at every stage. The
+survivors, the work counting, the left deep search, and the component
+pricing are the estimator's.
 
-KV reuse, the part that has to be right
----------------------------------------
-Every document has a PREFIX: the shared preamble plus the document text. In
-this estimate, its KV is computed once and stays resident. A filter appends
-its question and removes the question KV after the answer. A join appends one
-anchor frame, then streams many tuple suffixes over that framed context. Each
-tuple suffix contains the partner label, partner document, and answer cue. Its
-KV is computed, used once, and removed (`executor/pack.py` never retains tuple
-suffix KV).
-
-The estimate therefore computes a document prefix once however many questions
-get asked about it. Each later question still reads that prefix from KV. The
-same holds across documents: a token prefix that an earlier document already
-computed is resident, so a document pays only for the tokens beyond its
-longest common prefix with the corpus (agent trace rows sampled from one
-trajectory share most of their tokens). Three operations follow:
-
-    scan()      compute a prefix and its first suffix, from nothing
-    ask()       reuse a resident prefix, attach one more suffix
-    stream()    reuse a resident prefix, attach many suffixes (a join)
-
-`ask` and `stream` never charge for the document again; `scan` is
-the only one that does.
-
-Join search
------------
-All filters run first. The script then checks every eager binary full left
-deep relation order and anchor choice supported by the search. It immediately
-applies every available crossing predicate. It does not check bushy plans or
-plans that delay a crossing predicate. It uses exact ground truth survivors at
-every step and unlimited KV. The search runs separately for 4B and 32B. It
-does not call or simulate the production planner.
+Two estimates come out of one run. `per_document` computes each alias's
+document once and reuses it only across that document's own questions.
+The main estimate also credits a prefix another document already
+computed: with unlimited KV every distinct prefix in the corpus is
+computed once.
 
 Running it
 ----------
+
 The corpora and the per-document ground-truth labels are raw data
 and live on the quail-results volume, so pull them first. The
 answers go back to the volume too:
@@ -78,12 +54,10 @@ The saved estimates must be regenerated when a query definition changes.
 Pass --queries FEV-9 to recalculate only that query. The output filename then
 includes the selected query IDs so the full suite file is not overwritten.
 """
+
 import argparse
 import collections
-import itertools
 import json
-import math
-from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 
@@ -91,25 +65,24 @@ import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
 import quail
-from quail.backends.quail.coordinator import thin_survivors
-from quail.backends.quail.retention import policy as retention_policy
-from quail.bench import quailb as Q
-from quail.bench.evaluate import H100_PRICE_SOURCE, H100_USD_PER_HOUR
-from quail.bench.sol_dp import PairRelation, exact_live_rows
-from quail.logical import SHARED_PRE, ColumnRef, bind_join_prompt, bind_prompt
-from quail.planner import budgets
-from quail.planner.decide import (
-    collect_operators,
-    default_order_rule,
-    order_filters_indexed,
+from quail.bench.quailb import answer_oracle, queries, register_sets
+from quail.planner import collect_operators
+from quail.planner.plan import EngineConfig
+from quail.runtime.prefixes import shared_prefix_tokens
+from quail.specs import (
+    H100_PRICE_SOURCE,
+    H100_USD_PER_HOUR,
+    QWEN3_4B_FP8,
+    QWEN3_32B_FP8,
 )
-from quail.planner.joins import fit_resident_documents
-from quail.planner.leftdeep import Extension, optimize_left_deep
-from quail.planner.plan import EngineConfig, Refusal
-from quail.planner.sol import speed_of_light
-from quail.planner.work import Work, ask, scan
-from quail.runtime.tokens import shared_prefix_lengths
-from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8, ModelSpec
+from quail_b import data, prompts
+from quail_b.labels import GroundTruthCollection, PredicateLabels
+from quail_b.queries import (
+    SELECTIVITY_ESTIMATE_COLLECTION,
+    SELECTIVITY_ESTIMATE_CORPUS,
+    SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+)
+from quail_b.scoring import Evaluator
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("workdir")
@@ -123,7 +96,7 @@ SF = args.scale_factor
 TAG = f"sf{SF:g}"
 selection = "_" + args.queries.replace(",", "_") if args.queries else ""
 OUT = W / f"sol_quailb_{TAG}{selection}.json"
-ROOT = Path(__file__).resolve().parents[1]
+MODELS = [QWEN3_4B_FP8, QWEN3_32B_FP8]
 
 # check the workdir holds this scale factor before tokenizing anything:
 # both of these otherwise surface much later as a missing parquet file
@@ -136,8 +109,6 @@ if COLLECTION["scale_factor"] != SF:
         f"the collection in {W} is scale factor "
         f"{COLLECTION['scale_factor']:g}, not {SF:g}: pull the labels for "
         f"the corpus you are asking about")
-COLLECTION_ID = COLLECTION["collection_id"]
-CORPUS_ID = COLLECTION["corpus_id"]
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-FP8")
 
 
@@ -146,83 +117,89 @@ def encode(text):
     return tuple(tok(text, add_special_tokens=False)["input_ids"])
 
 
-def length(text):
-    return len(encode(text))
-
-
-PRE = length(SHARED_PRE)   # the engine preamble, 2 tokens
-
-# The batch size each model's forward pass runs at: (2^31 - 1) over
-# the widest projection, the fused kernels' 32-bit offset limit. It
-# decides how often the weights are re-read, and it is a planner
-# choice rather than a hardware property, so it is stated here.
-CHUNK = {"qwen3-4b-fp8": 110_376, "qwen3-32b-fp8": 41_943}
-MODELS = [QWEN3_4B_FP8, QWEN3_32B_FP8]
-
-
 # ================================================================
-# PART 2: measuring the three inputs
+# PART 1: the labels, as the exact answer to every prompt
 # ================================================================
 
-COLUMNS = {
-    "reviews.body": ("reviews", "body"),
-    "aspects.aspect": ("aspects", "aspect"),
-    "reports.report": ("reports", "report"),
-    "terms.term": ("terms", "term"),
-    "claims.claim": ("claims", "claim"),
-    "evidence.text": ("evidence", "text"),
-    "citation_contexts.destination_context":
-        ("citation_contexts", "destination_context"),
-    "citation_passages.passage_text":
-        ("citation_passages", "passage_text"),
-    "agent_traces.trace": ("agent_traces", "trace"),
-}
+def load_collection(workdir: Path, collection: dict) -> GroundTruthCollection:
+    """Read the pulled label sets of one collection."""
+    active = dict(collection["label_sets"])
+    predicates = {}
+    for manifest_path in (workdir / "allabels" / "label_sets").glob(
+            "*/*/*/manifest.json"):
+        label_set_id = manifest_path.parent.name
+        if label_set_id not in active.values():
+            continue
+        manifest = json.load(open(manifest_path))
+        rows = pq.read_table(
+            manifest_path.parent / "labels.parquet",
+            columns=["left_id", "right_id", "answer"]).to_pylist()
+        key = manifest["predicate"]["key"]
+        predicates[key] = PredicateLabels(
+            key=key,
+            label_set_id=label_set_id,
+            predicate=manifest["predicate"],
+            answers={
+                (str(row["left_id"]),
+                 None if row["right_id"] is None else str(row["right_id"])):
+                bool(row["answer"])
+                for row in rows},
+            source_rows=manifest.get("source_rows", {}),
+        )
+    if len(predicates) != len(active):
+        raise ValueError(
+            f"loaded {len(predicates)} active predicates, expected "
+            f"{len(active)}")
+    return GroundTruthCollection(
+        collection_id=collection["collection_id"],
+        corpus_id=collection["corpus_id"],
+        scale_factor=float(collection["scale_factor"]),
+        reference_model=collection.get("summary", {}).get("model"),
+        predicates=predicates,
+    )
 
-# 1. document lengths and shared prefixes ----------------------------
-#
-# With unlimited KV, an ideal execution computes each distinct token
-# prefix once, across documents as well as within one. The tokens a
-# corpus needs are the nodes of the prefix trie over its documents,
-# and that count is the sum over the documents in sorted order of the
-# tokens beyond the longest common prefix with the previous document.
-# Each document is credited that shared length: its first use pays
-# only for the tokens no earlier document computed. A column scanned
-# under two aliases (a self join) is the same trie: a document whose
-# prefix another alias already computed pays only its suffix.
-lengths = {}        # column -> {doc id: token count}
-shared = {}         # column -> {doc id: prefix tokens another doc computed}
 
+truth = load_collection(W, COLLECTION)
+corpus_rows = data.read_corpus(W / "data" / TAG)
+corpus = data.corpus_identity(
+    corpus_rows, SF, data.DATA_SEED, data.SOURCE_REVISIONS)
+if corpus["corpus_id"] != truth.corpus_id:
+    raise SystemExit(
+        f"the corpus in {W} is {corpus['corpus_id']}, but the labels are "
+        f"for {truth.corpus_id}")
+evaluator = Evaluator(truth, corpus_rows)
+answer = answer_oracle(evaluator)
 
-for key, (table, col) in COLUMNS.items():
-    t = pq.read_table(W / "data" / TAG / f"{table}.parquet",
-                      columns=["id", col])
-    tokens_by_doc = {i: encode(x) for i, x in
-                     zip(t.column("id").to_pylist(), t.column(col).to_pylist())}
-    lengths[key] = {i: len(ids) for i, ids in tokens_by_doc.items()}
-    doc_ids = list(tokens_by_doc)
-    shared[key] = dict(zip(doc_ids, shared_prefix_lengths(
-        [tokens_by_doc[doc_id] for doc_id in doc_ids])))
-    v = lengths[key].values()
-    credited = sum(shared[key].values())
-    print(f"{key:32} {len(v):>6} docs  {sum(v):>10,} tokens  "
-          f"mean {sum(v) / len(v):>8.1f}  shared prefix "
-          f"{credited:>10,} ({credited / sum(v):.1%})", flush=True)
+# ================================================================
+# PART 2: the queries, on one session with the shared Qwen3 tokenizer
+# ================================================================
 
-# 2. prompt lengths ---------------------------------------------------
-FILTER_TEMPLATES = {c: getattr(Q, c) for c in (
+session = quail.Session(
+    EngineConfig(gpus=1, model=QWEN3_4B_FP8.name), tokenizer=encode)
+register_sets(session, W / "data" / TAG)
+query_defs = queries(session)
+query_ids = list(query_defs)
+if args.queries:
+    selected = args.queries.split(",")
+    if set(selected) - set(query_ids):
+        raise ValueError(f"unknown queries: {set(selected) - set(query_ids)}")
+    query_ids = [query for query in query_ids if query in selected]
+
+# 2. prompt lengths, for the record
+FILTER_TEMPLATES = {c: getattr(prompts, c) for c in (
     "F1", "F4", "F5", "F7", "F11", "F12", "F13",
     "LEP1", "LEP2", "LEP3", "LEP4", "LEP5", "LEPS1")}
-JOIN_TEMPLATES = {c: getattr(Q, c) for c in (
+JOIN_TEMPLATES = {c: getattr(prompts, c) for c in (
     "DISCUSS_ASPECT", "ASPECT_SENTIMENT", "REACTION",
     "SUPPORT", "REFUTE", "LEPJOIN")}
-col_ref = (ColumnRef("x", "t", "c"),)
-question = {c: bind_prompt(t, col_ref, encode).tail_tokens
+col_ref = (quail.ColumnRef("x", "t", "c"),)
+question = {c: quail.bind_prompt(t, col_ref, encode).tail_tokens
             for c, t in FILTER_TEMPLATES.items()}
-join_refs = (ColumnRef("left", "left_table", "text"),
-             ColumnRef("right", "right_table", "text"))
+join_refs = (quail.ColumnRef("left", "left_table", "text"),
+             quail.ColumnRef("right", "right_table", "text"))
 join_prompt = {}
 for code, template in JOIN_TEMPLATES.items():
-    prompt = bind_join_prompt(template, join_refs, encode)
+    prompt = quail.bind_join_prompt(template, join_refs, encode)
     join_prompt[code] = {
         "left_frame": prompt.labels[0][2],
         "right_frame": prompt.labels[1][2],
@@ -230,810 +207,119 @@ for code, template in JOIN_TEMPLATES.items():
         "right_label": prompt.labels[1][1],
         "tail": prompt.tail_tokens,
     }
-
-# 3. labels -----------------------------------------------------------
-active_by_predicate = dict(COLLECTION["label_sets"])
-ACTIVE = set(active_by_predicate.values())
-LABEL_MANIFESTS = list(
-    (W / "allabels" / "label_sets").glob("*/*/*/manifest.json"))
-filter_answers = {}
-join_answers = {}
-predicate_meta = {}
-template_codes = {}
-for m in LABEL_MANIFESTS:
-    if Path(m).parent.name not in ACTIVE:
-        continue
-    meta = json.load(open(m))["predicate"]
-    rows = pq.read_table(Path(m).parent / "labels.parquet",
-                         columns=["left_id", "right_id",
-                                  "answer"]).to_pylist()
-    code = meta["key"]
-    predicate_meta[code] = meta
-    left_ref = ColumnRef("left", meta["left_table"], meta["left_column"])
-    if meta["kind"] == "filter":
-        prompt = bind_prompt(meta["template"], (left_ref,), encode)
-        filter_answers[code] = {
-            str(row["left_id"]): bool(row["answer"]) for row in rows}
-    else:
-        right_ref = ColumnRef(
-            "right", meta["right_table"], meta["right_column"])
-        prompt = bind_join_prompt(
-            meta["template"], (left_ref, right_ref), encode)
-        join_answers[code] = {
-            (str(row["left_id"]), str(row["right_id"])):
-                bool(row["answer"])
-            for row in rows}
-    if prompt.template in template_codes:
-        raise ValueError(f"duplicate prompt template for {code}")
-    template_codes[prompt.template] = code
-
-if len(predicate_meta) != len(ACTIVE):
-    raise ValueError(
-        f"loaded {len(predicate_meta)} active predicates, expected "
-        f"{len(ACTIVE)}")
-
-
-def prompt_code(prompt) -> str:
-    try:
-        return template_codes[prompt.template]
-    except KeyError as error:
-        raise KeyError("query prompt has no active ground truth") from error
-
-
-def prompt_answer(prompt, assignment, aliases) -> bool:
-    code = prompt_code(prompt)
-    ids = [str(aliases[arg.alias]["ids"][assignment[arg.alias]])
-           for arg in prompt.args]
-    if len(ids) == 1:
-        return filter_answers[code][ids[0]]
-    if len(ids) == 2:
-        return join_answers[code][(ids[0], ids[1])]
-    raise NotImplementedError("SoL supports prompts with one or two documents")
-
-
-def prompt_token_counts(prompt):
-    labels_by_alias = {
-        alias: {"label": label_tokens, "frame": frame_tokens}
-        for alias, label_tokens, frame_tokens in prompt.labels}
-    return labels_by_alias, prompt.tail_tokens
-
-
-# Two estimates come out of one run. With CREDIT_SHARED off, a
-# document's first use pays for its whole prefix: the bound for an
-# execution that computes each document once and reuses it only across
-# that document's own questions. With it on, a prefix another document
-# already computed is resident: the bound for an execution that
-# computes each distinct prefix in the corpus once.
-CREDIT_SHARED = True
-
-
-def first_use(alias_data, row, suffix) -> Work:
-    """Compute one document's prefix for the first time in a query.
-
-    The tokens an earlier document already computed are resident, so
-    the document pays only for the rest of its prefix and the suffix.
-    """
-    prefix = PRE + alias_data["tokens"][row]
-    shared_tokens = alias_data["shared"][row] if CREDIT_SHARED else 0
-    if shared_tokens == 0:
-        return scan(prefix, suffix)
-    resident = PRE + shared_tokens
-    return ask(resident, prefix - resident + suffix)
-
-
-def join_stage_work(anchor, partners, aliases, survivors, prompt,
-                    resident_rows, cross_resident_rows=()) -> Work:
-    """One stage's Work.
-
-    Anchor rows in resident_rows have their prefix KV in the arena and
-    pay the frame only; the rest scan.
-
-    cross_resident_rows are anchor rows whose document prefix another
-    alias of the same column computed. With the shared prefix credit
-    on they pay the frame only too; without it they scan.
-    """
-    labels_by_alias, tail = prompt_token_counts(prompt)
-    partner_rows = list(itertools.product(
-        *[survivors[alias] for alias in partners]))
-    suffixes = [
-        tail + sum(labels_by_alias[alias]["label"]
-                   + aliases[alias]["tokens"][row]
-                   for alias, row in zip(partners, partner_row))
-        for partner_row in partner_rows
-    ]
-    suffix_tokens = sum(suffixes)
-    suffix_triangles = sum(suffix * (suffix + 1) / 2
-                           for suffix in suffixes)
-    frame = labels_by_alias[anchor]["frame"]
-    resident_rows = set(resident_rows)
-    if CREDIT_SHARED:
-        resident_rows |= set(cross_resident_rows)
-    work = Work()
-    for row in survivors[anchor]:
-        prefix = PRE + aliases[anchor]["tokens"][row]
-        work = work + (ask(prefix, frame) if row in resident_rows
-                       else first_use(aliases[anchor], row, frame))
-        anchor_prefix = prefix + frame
-        work = work + Work(
-            tokens=suffix_tokens,
-            pairs=anchor_prefix * suffix_tokens + suffix_triangles,
-            kv_written=suffix_tokens,
-            kv_read=anchor_prefix,
-        )
-    return work
-
-
-@dataclass
-class QueryInputs:
-    plan: object
-    scans: list
-    filters: dict
-    joins: list
-    aliases: dict
-    survivors: dict
-    work: Work
-    resident: set
-    filter_stages: list
-    filter_evaluations: int
-    post_filter_counts: dict
-    # column -> rows every filtered alias of that column computed as
-    # prefixes; another alias of the column may reuse them
-    computed_rows_by_column: dict
-
-
-def prepare_query(query, model: ModelSpec, chunk_tokens: int,
-                  plan=None) -> QueryInputs:
-    scans, filters, joins = collect_operators(query.logical)
-    if isinstance(plan, Refusal):
-        raise ValueError(f"query was refused: {plan.reasons}")
-    aliases = {}
-    for scan_node in scans:
-        key = f"{scan_node.provider}.{scan_node.column}"
-        ids = list(lengths[key])
-        aliases[scan_node.alias] = {
-            "column": key,
-            "ids": ids,
-            "tokens": [lengths[key][doc_id] for doc_id in ids],
-            "shared": [shared[key][doc_id] for doc_id in ids],
-        }
-    if plan is None:
-        rule = (query.order if query.order is not None else
-                default_order_rule(filters, joins)[0])
-        filter_orders = {
-            alias: order_filters_indexed(
-                predicates, rule,
-                prefix_tokens=(PRE + (
-                    sum(aliases[alias]["tokens"])
-                    / len(aliases[alias]["tokens"])
-                    if aliases[alias]["tokens"] else 0)),
-                model=model, device=H100_SXM,
-                chunk_tokens=chunk_tokens)
-            for alias, predicates in filters.items()
-        }
-    else:
-        filter_orders = {
-            node.alias: [stage.written_pos for stage in node.stages]
-            for node in plan.graph.nodes_by_type("quail.packed_filter")
-        }
-    survivors = {
-        alias: list(range(len(data["ids"])))
-        for alias, data in aliases.items()}
-    work = Work()
-    resident = set()
-    filter_stages = []
-    filter_evaluations = 0
-    computed_rows_by_column = {}
-
-    for alias, order in filter_orders.items():
-        live = survivors[alias]
-        column = aliases[alias]["column"]
-        computed = computed_rows_by_column.setdefault(column, set())
-        for stage_index, written_pos in enumerate(order):
-            predicate = filters[alias][written_pos]
-            code = prompt_code(predicate.prompt)
-            qtokens = predicate.prompt.tail_tokens
-            for row in live:
-                if stage_index == 0 and not (
-                        CREDIT_SHARED and row in computed):
-                    work = work + first_use(aliases[alias], row, qtokens)
-                else:
-                    prefix = PRE + aliases[alias]["tokens"][row]
-                    work = work + ask(prefix, qtokens)
-            if stage_index == 0:
-                computed.update(live)
-            passed = [
-                row for row in live
-                if prompt_answer(predicate.prompt, {alias: row}, aliases)
-            ]
-            filter_evaluations += len(live)
-            filter_stages.append({
-                "alias": alias,
-                "code": code,
-                "question_tokens": qtokens,
-                "provided_selectivity": predicate.selectivity,
-                "evaluated": len(live),
-                "passed": len(passed),
-                "selectivity": (round(len(passed) / len(live), 6)
-                                if live else 0.0),
-            })
-            live = passed
-        survivors[alias] = live
-        resident.add(alias)
-
-    post_filter_counts = {
-        alias: len(rows) for alias, rows in survivors.items()}
-    return QueryInputs(
-        plan=plan,
-        scans=scans,
-        filters=filters,
-        joins=joins,
-        aliases=aliases,
-        survivors=survivors,
-        work=work,
-        resident=resident,
-        filter_stages=filter_stages,
-        filter_evaluations=filter_evaluations,
-        post_filter_counts=post_filter_counts,
-        computed_rows_by_column=computed_rows_by_column,
-    )
-
-
-def simulate_production_planner(query, model: ModelSpec,
-                                chunk_tokens: int):
-    """Optional diagnostic for the production planner.
-
-    The simulation executes the saved join order with exact saved answers.
-    At group boundaries it applies the arena's page limit and the
-    same computation saved per page priority. It trims complete boundary
-    snapshots and does not reproduce survivor arrival order or packed chunks.
-
-    The SoL output does not call this function.
-    """
-    prepared = prepare_query(query, model, chunk_tokens, query.plan())
-    plan = prepared.plan
-    scans = prepared.scans
-    joins = prepared.joins
-    aliases = prepared.aliases
-    survivors = prepared.survivors
-    work = prepared.work
-    # the engine retains KV where the plan says so: survivors of
-    # keep_kv filter chains, then gate survivors of anchors a later
-    # group re-uses
-    keep_aliases = {
-        node.alias
-        for node in plan.graph.nodes_by_type("quail.packed_filter")
-        if node.keep_kv
-    }
-    resident_rows = {alias: (set(rows) if alias in keep_aliases
-                             else set())
-                     for alias, rows in survivors.items()}
-    retention = plan.settings["retention"]
-    capacity = retention["cap_pages"] * budgets.PAGE_TOKENS * plan.workers
-    resident_rows = fit_resident_documents(
-        resident_rows, {alias: aliases[alias]["tokens"] for alias in aliases},
-        PRE, capacity, budgets.PAGE_TOKENS,
-        retention_policy(retention, retention["initial"]))
-    filter_stages = prepared.filter_stages
-    filter_evaluations = prepared.filter_evaluations
-    post_filter_counts = prepared.post_filter_counts
-    finished_full = []
-    join_stages = []
-    join_pair_evaluations = 0
-    single_join_options = {}
-
-    planned_groups = plan.graph.nodes_by_type("quail.anchored_join")
-    for node in planned_groups:
-        stage_indices = [stage.written_pos for stage in node.stages]
-        stage_defs = [joins[index] for index in stage_indices]
-        anchor = node.anchor
-        future_anchors = set(retention["after"][node.node_id])
-        group_semantics = stage_defs[-1].semantics
-        for stage_index, (join_index, join) in enumerate(
-                zip(stage_indices, stage_defs)):
-            prompt = join.predicate
-            code = prompt_code(prompt)
-            stage_aliases = [arg.alias for arg in prompt.args]
-            partners = [alias for alias in stage_aliases if alias != anchor]
-            anchor_rows = list(survivors[anchor])
-            partner_rows = list(itertools.product(
-                *[survivors[alias] for alias in partners]))
-            if stage_index > 0:
-                stage_resident = set(anchor_rows)
-            else:
-                stage_resident = resident_rows[anchor] & set(anchor_rows)
-
-            if len(joins) == 1:
-                single_join_options = {
-                    candidate: join_stage_work(
-                        candidate,
-                        [alias for alias in stage_aliases
-                         if alias != candidate],
-                        aliases, survivors, prompt,
-                        resident_rows[candidate]
-                        & set(survivors[candidate])).tokens
-                    for candidate in stage_aliases}
-
-            stage_work = join_stage_work(
-                anchor, partners, aliases, survivors, prompt,
-                stage_resident)
-            work = work + stage_work
-            rows = {}
-            matched = []
-            passing_pairs = 0
-            for local_anchor, anchor_row in enumerate(anchor_rows):
-                answers = []
-                for partner_row in partner_rows:
-                    assignment = {anchor: anchor_row}
-                    assignment.update(zip(partners, partner_row))
-                    answer = prompt_answer(prompt, assignment, aliases)
-                    answers.append(answer)
-                    passing_pairs += int(answer)
-                rows[local_anchor] = answers
-                if any(answers):
-                    matched.append(anchor_row)
-            evaluated = len(anchor_rows) * len(partner_rows)
-            join_pair_evaluations += evaluated
-            stage_out = {
-                "anchor": anchor,
-                "partners": partners,
-                "anchor_index": anchor_rows,
-                "partner_index": partner_rows,
-                "rows": rows,
-            }
-            if join.semantics == "full":
-                finished_full.append(stage_out)
-            last = stage_index == len(stage_defs) - 1
-            if last and group_semantics == "anti":
-                survivors[anchor] = [row for row in anchor_rows
-                                     if row not in set(matched)]
-            else:
-                survivors[anchor] = matched
-            join_stages.append({
-                "code": code,
-                "anchor": anchor,
-                "partners": partners,
-                "evaluated_pairs": evaluated,
-                "passing_pairs": passing_pairs,
-                "fresh_tokens": stage_work.tokens,
-            })
-        if anchor in future_anchors:
-            resident_rows[anchor] = set(survivors[anchor])
-        else:
-            resident_rows[anchor] = set()
-        thin_survivors(finished_full, survivors)
-        for alias, rows in survivors.items():
-            resident_rows[alias] &= set(rows)
-            if alias not in future_anchors:
-                resident_rows[alias].clear()
-        resident_rows = fit_resident_documents(
-            resident_rows,
-            {alias: aliases[alias]["tokens"] for alias in aliases},
-            PRE, capacity, budgets.PAGE_TOKENS,
-            retention_policy(retention, retention["after"][node.node_id]))
-
-    first_alias = scans[0].alias
-    input_document_rows = sum(
-        len(aliases[scan_node.alias]["ids"]) for scan_node in scans)
-    held_alias = (join_stages[0]["anchor"] if join_stages else first_alias)
-    anchor = None
-    both = {}
-    if len(joins) == 1:
-        stage_aliases = [arg.alias for arg in joins[0].predicate.args]
-        anchor = ("left" if join_stages[0]["anchor"] == stage_aliases[0]
-                  else "right")
-        both = {
-            "left": single_join_options[stage_aliases[0]],
-            "right": single_join_options[stage_aliases[1]],
-        }
-    elif joins:
-        anchor = ",".join(stage["anchor"] for stage in join_stages)
-
-    return {
-        "work": work,
-        "document_column": aliases[first_alias]["column"],
-        "partner_column": (aliases[scans[1].alias]["column"]
-                           if len(scans) > 1 else None),
-        "documents": len(aliases[first_alias]["ids"]),
-        "documents_after_filters": post_filter_counts[first_alias],
-        "input_document_rows": input_document_rows,
-        "filter_evaluations": filter_evaluations,
-        "join_pair_evaluations": join_pair_evaluations,
-        "filter_stages": filter_stages,
-        "join_stages": join_stages,
-        "anchor": anchor,
-        "anchor_tokens_both_ways": both,
-        "held_column": aliases[held_alias]["column"],
-    }
-
-
-def simulate_optimal_left_deep(query, model: ModelSpec, chunk_tokens: int):
-    """Find the best exact left deep join plan for this model."""
-    prepared = prepare_query(query, model, chunk_tokens)
-    scans = prepared.scans
-    joins = prepared.joins
-    aliases = prepared.aliases
-    base_rows = {
-        alias: tuple(rows) for alias, rows in prepared.survivors.items()}
-    alias_order = tuple(scan.alias for scan in scans)
-
-    edge_relations = []
-    edge_aliases = []
-    for edge_index, join in enumerate(joins):
-        stage_aliases = tuple(arg.alias for arg in join.predicate.args)
-        if join.semantics != "full":
-            raise NotImplementedError(
-                "optimal SoL join search requires full join semantics")
-        if len(stage_aliases) != 2:
-            raise NotImplementedError(
-                "optimal SoL join search requires binary predicates")
-        left, right = stage_aliases
-        passing = frozenset(
-            (left_row, right_row)
-            for left_row in base_rows[left]
-            for right_row in base_rows[right]
-            if prompt_answer(
-                join.predicate,
-                {left: left_row, right: right_row},
-                aliases,
-            )
-        )
-        edge_relations.append(PairRelation(left, right, passing))
-        edge_aliases.append(frozenset((left, right)))
-
-    logical_cache = {}
-
-    def live_for(active_edges: frozenset[int]):
-        if active_edges not in logical_cache:
-            logical_cache[active_edges] = exact_live_rows(
-                base_rows,
-                tuple(edge_relations[index]
-                      for index in sorted(active_edges)),
-            )
-        return logical_cache[active_edges]
-
-    def active_inside(relations: frozenset[str]) -> frozenset[int]:
-        return frozenset(
-            index for index, endpoints in enumerate(edge_aliases)
-            if endpoints <= relations
-        )
-
-    def anchor_fits(prompt, anchor, stage_aliases, live) -> bool:
-        labels_by_alias, tail = prompt_token_counts(prompt)
-        anchor_max = max(
-            (aliases[anchor]["tokens"][row] for row in live[anchor]),
-            default=0,
-        )
-        partners = [alias for alias in stage_aliases if alias != anchor]
-        prefix = (PRE + anchor_max
-                  + labels_by_alias[anchor]["frame"])
-        if not live[anchor] or any(not live[partner] for partner in partners):
-            return prefix <= chunk_tokens
-        return (
-            prefix
-            + tail
-            + sum(
-                labels_by_alias[partner]["label"]
-                + max(
-                    (aliases[partner]["tokens"][row]
-                     for row in live[partner]),
-                    default=0,
-                )
-                for partner in partners
-            )
-            <= chunk_tokens
-        )
-
-    def cross_resident(anchor, live, live_cache):
-        """Rows of anchor whose prefix another alias of its column holds.
-
-        A filtered alias computed every row of its column. An alias in
-        live_cache holds the prefixes of its live rows; it computed at
-        least those, so the credit is conservative.
-        """
-        column = aliases[anchor]["column"]
-        rows = set(prepared.computed_rows_by_column.get(column, ()))
-        for other in live_cache:
-            if other != anchor and aliases[other]["column"] == column:
-                rows.update(live[other])
-        return rows
-
-    extension_cache = {}
-
-    def extend(relations: frozenset[str], cached: frozenset[str], added: str):
-        cache_key = (relations, cached, added)
-        if cache_key in extension_cache:
-            return extension_cache[cache_key]
-        crossing = tuple(
-            index for index, endpoints in enumerate(edge_aliases)
-            if added in endpoints and endpoints & relations
-        )
-        if not crossing:
-            extension_cache[cache_key] = ()
-            return ()
-
-        initial_edges = active_inside(relations)
-        extensions = []
-
-        def visit_edges(order, position, active_edges, live, live_cache,
-                        work, steps):
-            if position == len(order):
-                extensions.append(Extension(
-                    work=work,
-                    state_property=live_cache,
-                    steps=tuple(steps),
-                ))
-                return
-
-            edge_index = order[position]
-            join = joins[edge_index]
-            relation = edge_relations[edge_index]
-            stage_aliases = tuple(arg.alias for arg in join.predicate.args)
-            for anchor in stage_aliases:
-                if not anchor_fits(
-                        join.predicate, anchor, stage_aliases, live):
-                    continue
-                partners = [alias for alias in stage_aliases
-                            if alias != anchor]
-                stage_work = join_stage_work(
-                    anchor,
-                    partners,
-                    aliases,
-                    live,
-                    join.predicate,
-                    live[anchor] if anchor in live_cache else (),
-                    cross_resident(anchor, live, live_cache),
-                )
-                next_edges = active_edges | {edge_index}
-                next_live = live_for(next_edges)
-                next_cache = live_cache | {anchor}
-                evaluated = math.prod(
-                    len(live[alias]) for alias in stage_aliases)
-                passing = sum(
-                    1
-                    for left_row in live[relation.left]
-                    for right_row in live[relation.right]
-                    if (left_row, right_row) in relation.pairs
-                )
-                step = {
-                    "code": prompt_code(join.predicate),
-                    "added_alias": added,
-                    "anchor": anchor,
-                    "partners": partners,
-                    "evaluated_pairs": evaluated,
-                    "passing_pairs": passing,
-                    "fresh_tokens": stage_work.tokens,
-                    "cached_prefixes_after": sorted(next_cache),
-                }
-                visit_edges(
-                    order,
-                    position + 1,
-                    next_edges,
-                    next_live,
-                    next_cache,
-                    work + stage_work,
-                    steps + [step],
-                )
-
-        for order in itertools.permutations(crossing):
-            visit_edges(
-                order,
-                0,
-                initial_edges,
-                live_for(initial_edges),
-                cached,
-                Work(),
-                [],
-            )
-        extension_cache[cache_key] = tuple(extensions)
-        return extension_cache[cache_key]
-
-    search = optimize_left_deep(
-        alias_order,
-        frozenset(prepared.resident),
-        prepared.work,
-        extend,
-    )
-    if not search.candidates:
-        raise ValueError("query join graph has no connected left deep plan")
-
-    def candidate_seconds(candidate):
-        return speed_of_light(
-            candidate.work, model, H100_SXM, chunk_tokens).seconds
-
-    best = min(
-        search.candidates,
-        key=lambda candidate: (
-            candidate_seconds(candidate),
-            candidate.work.tokens,
-            candidate.work.pairs,
-            candidate.work.kv_written,
-            candidate.work.kv_read,
-            candidate.relation_order,
-        ),
-    )
-
-    first_alias = scans[0].alias
-    join_stages = list(best.steps)
-    input_document_rows = sum(
-        len(aliases[scan.alias]["ids"]) for scan in scans)
-    held_alias = join_stages[0]["anchor"] if join_stages else first_alias
-    anchor = None
-    both = {}
-    if len(joins) == 1:
-        stage_aliases = [arg.alias for arg in joins[0].predicate.args]
-        anchor = ("left" if join_stages[0]["anchor"] == stage_aliases[0]
-                  else "right")
-        start_live = live_for(frozenset())
-        both = {
-            side: join_stage_work(
-                candidate,
-                [alias for alias in stage_aliases if alias != candidate],
-                aliases,
-                start_live,
-                joins[0].predicate,
-                start_live[candidate]
-                if candidate in prepared.resident else (),
-                cross_resident(
-                    candidate, start_live, frozenset(prepared.resident)),
-            ).tokens
-            for side, candidate in zip(("left", "right"), stage_aliases)
-            if anchor_fits(
-                joins[0].predicate, candidate, stage_aliases, start_live)
-        }
-    elif joins:
-        anchor = ",".join(stage["anchor"] for stage in join_stages)
-
-    return {
-        "work": best.work,
-        "document_column": aliases[first_alias]["column"],
-        "partner_column": (aliases[scans[1].alias]["column"]
-                           if len(scans) > 1 else None),
-        "documents": len(aliases[first_alias]["ids"]),
-        "documents_after_filters": prepared.post_filter_counts[first_alias],
-        "input_document_rows": input_document_rows,
-        "filter_evaluations": prepared.filter_evaluations,
-        "join_pair_evaluations": sum(
-            stage["evaluated_pairs"] for stage in join_stages),
-        "filter_stages": prepared.filter_stages,
-        "join_stages": join_stages,
-        "anchor": anchor,
-        "anchor_tokens_both_ways": both,
-        "held_column": aliases[held_alias]["column"],
-        "optimizer": {
-            "plan_space": "all feasible left deep plans",
-            "relation_order": list(best.relation_order),
-            "cached_prefixes": sorted(best.state_property),
-            "persistent_kv_capacity": "unlimited",
-            "gpu_count": 1,
-            "dp_states": search.state_count,
-            "dp_records_generated": search.generated_count,
-            "dp_final_records": len(search.candidates),
-        },
-    }
+PRE = len(encode(quail.SHARED_PRE))
 
 
 # ================================================================
 # PART 3: every query, on both models
 # ================================================================
 
-query_defs_by_model = {}
-for model in MODELS:
-    session = quail.Session(
-        EngineConfig(gpus=1, model=model.name),
-        tokenizer=encode)
-    Q.register_sets(session, W / "data" / TAG)
-    query_defs_by_model[model.name] = Q.queries(session)
-
-query_ids = list(query_defs_by_model[MODELS[0].name])
-if any(list(query_defs_by_model[model.name]) != query_ids for model in MODELS):
-    raise ValueError("4B and 32B query definitions do not have the same ids")
-if args.queries:
-    selected = args.queries.split(",")
-    if set(selected) - set(query_ids):
-        raise ValueError(f"unknown queries: {set(selected) - set(query_ids)}")
-    query_ids = [query for query in query_ids if query in selected]
+stores = {}     # "table.column" -> the session's token store
 
 
-def add_sol_metrics(simulated, model: ModelSpec):
-    """Add the one H100! time, cost, and throughput to a simulation."""
-    simulated = dict(simulated)
-    work = simulated.pop("work")
-    held = simulated["held_column"]
-    s = speed_of_light(work, model, H100_SXM, CHUNK[model.name])
-    attn_proj = s.component("attn_proj")
-    mlp = s.component("mlp")
-    attention = s.component("attention")
-    dense_compute = attn_proj.compute_seconds + mlp.compute_seconds
-    dense_memory = attn_proj.memory_seconds + mlp.memory_seconds
-    dense_seconds = attn_proj.seconds + mlp.seconds
+def with_codes(stages, truth: GroundTruthCollection) -> list[dict]:
+    """Name each stage's predicate by its ground truth key."""
+    return [
+        {**stage, "code": truth.key_for_template(stage["template"])}
+        for stage in stages
+    ]
+
+
+def record(estimate: quail.SpeedOfLightEstimate) -> dict:
+    """Return one estimate in the saved file's layout."""
+    data = estimate.as_dict()
+    latency = estimate.latency
+    attn_proj = latency.component("attn_proj")
+    mlp = latency.component("mlp")
+    attention = latency.component("attention")
+    scans = list(estimate.alias_columns)
+    first_alias = scans[0]
+    join_stages = with_codes(estimate.join_stages, truth)
+    held_alias = join_stages[0]["anchor"] if join_stages else first_alias
+    anchor = None
+    if len(join_stages) == 1:
+        stage = join_stages[0]
+        anchor = "left" if stage["anchor"] == stage["aliases"][0] else "right"
+    elif join_stages:
+        anchor = ",".join(stage["anchor"] for stage in join_stages)
+    held_tokens = stores[estimate.alias_columns[held_alias]].lengths
     return {
-        **simulated,
-        "chunk_tokens": CHUNK[model.name],
-        "tuples": simulated["join_pair_evaluations"],
-        "tokens": work.tokens,
-        "pairs": work.pairs,
-        "kv_written": work.kv_written,
-        "kv_read": work.kv_read,
-        "held_mean_doc_tokens": (
-            sum(lengths[held].values()) / len(lengths[held])),
-        "passes": s.passes,
-        "bytes_moved": s.bytes_moved,
-        "components": [
-            {
-                "name": component.name,
-                "precision": component.precision,
-                "flops": component.flops,
-                "bytes_moved": component.bytes_moved,
-                "t_compute": component.compute_seconds,
-                "t_memory": component.memory_seconds,
-                "seconds": component.seconds,
-                "bound_by": component.bound_by,
-            }
-            for component in s.components
-        ],
-        "t_dense": dense_compute,
-        "t_dense_memory": dense_memory,
-        "t_dense_roofline": dense_seconds,
+        "chunk_tokens": estimate.chunk_tokens,
+        "document_column": estimate.alias_columns[first_alias],
+        "partner_column": (estimate.alias_columns[scans[1]]
+                           if len(scans) > 1 else None),
+        "documents": estimate.documents_by_alias[first_alias],
+        "documents_after_filters": estimate.post_filter_counts[first_alias],
+        "input_document_rows": estimate.input_document_rows,
+        "filter_evaluations": estimate.filter_evaluations,
+        "join_pair_evaluations": estimate.join_pair_evaluations,
+        "tuples": estimate.join_pair_evaluations,
+        "filter_stages": with_codes(estimate.filter_stages, truth),
+        "join_stages": join_stages,
+        "anchor": anchor,
+        "held_column": estimate.alias_columns[held_alias],
+        "held_mean_doc_tokens": sum(held_tokens) / len(held_tokens),
+        "tokens": data["tokens"],
+        "pairs": data["pairs"],
+        "kv_written": data["kv_written"],
+        "kv_read": data["kv_read"],
+        "passes": data["passes"],
+        "bytes_moved": data["bytes_moved"],
+        "components": data["components"],
+        "t_dense": attn_proj.compute_seconds + mlp.compute_seconds,
+        "t_dense_memory": attn_proj.memory_seconds + mlp.memory_seconds,
+        "t_dense_roofline": attn_proj.seconds + mlp.seconds,
         "t_attention": attention.compute_seconds,
         "t_attention_memory": attention.memory_seconds,
         "t_attention_roofline": attention.seconds,
-        "t_compute": s.compute,
-        "t_memory": s.memory,
-        "sol_s": s.seconds,
-        "bound_by": s.bound_by,
-        "cost_usd_per_query_at_sol": (
-            s.seconds * H100_USD_PER_HOUR / 3600),
+        "t_compute": data["t_compute"],
+        "t_memory": data["t_memory"],
+        "sol_s": data["sol_s"],
+        "bound_by": data["bound_by"],
+        "cost_usd_per_query_at_sol": estimate.usd_per_query,
         "documents_per_second_at_sol": (
-            simulated["input_document_rows"] / s.seconds
-            if not simulated["join_stages"] and s.seconds else None),
+            estimate.input_document_rows / estimate.seconds
+            if not join_stages and estimate.seconds else None),
         "document_pairs_per_second_at_sol": (
-            simulated["join_pair_evaluations"] / s.seconds
-            if simulated["join_stages"] and s.seconds else None),
+            estimate.join_pair_evaluations / estimate.seconds
+            if join_stages and estimate.seconds else None),
+        "optimizer": {
+            "plan_space": data["assumptions"]["plan_space"],
+            "relation_order": data["relation_order"],
+            "cached_prefixes": data["cached_prefixes"],
+            "persistent_kv_capacity": (
+                data["assumptions"]["persistent_kv_capacity"]),
+            "gpu_count": data["assumptions"]["gpu_count"],
+            **data["search"],
+        },
     }
 
 
 rows = {}
 query_inputs = {}
-# a query over a corpus this estimate does not tokenize is recorded as
-# skipped rather than estimated
-skipped = {}
+assumptions = {}
 for qid in query_ids:
-    descriptions = {
-        query_defs_by_model[model.name][qid][0] for model in MODELS}
-    if len(descriptions) != 1:
-        raise ValueError(f"model query descriptions differ for {qid}")
-    probe_scans, _, _ = collect_operators(
-        query_defs_by_model[MODELS[0].name][qid][1]().logical)
-    missing = sorted(
-        {f"{scan.provider}.{scan.column}" for scan in probe_scans}
-        - set(lengths))
-    if missing:
-        skipped[qid] = f"no modeled corpus for {', '.join(missing)}"
-        print(f"{qid}: skipped, {skipped[qid]}")
-        continue
+    description, build = query_defs[qid]
+    probe = build()
+    scans = collect_operators(probe.logical)[0]
+    for scan in scans:
+        stores.setdefault(
+            f"{scan.provider}.{scan.column}", probe.token_inputs()[scan.alias])
     rows[qid] = {
-        "description": descriptions.pop(),
+        "description": description,
         "alias_columns": {
-            scan.alias: f"{scan.provider}.{scan.column}"
-            for scan in probe_scans
-        },
+            scan.alias: f"{scan.provider}.{scan.column}" for scan in scans},
         "models": {},
     }
     query_inputs[qid] = {}
     for model in MODELS:
-        _, build = query_defs_by_model[model.name][qid]
-        CREDIT_SHARED = False
-        per_document = add_sol_metrics(
-            simulate_optimal_left_deep(
-                build(), model, CHUNK[model.name]),
-            model,
-        )
-        CREDIT_SHARED = True
-        optimal = add_sol_metrics(
-            simulate_optimal_left_deep(
-                build(), model, CHUNK[model.name]),
-            model,
-        )
+        per_document = record(quail.speed_of_light_estimate(
+            build(), answer, model=model,
+            credit_shared_prefixes=False))
+        estimate = quail.speed_of_light_estimate(
+            build(), answer, model=model)
+        assumptions.setdefault(model.name, estimate.assumptions())
+        optimal = record(estimate)
         optimal["shared_prefix_tokens_credited"] = (
             per_document["tokens"] - optimal["tokens"])
         optimal["per_document"] = {
@@ -1044,7 +330,6 @@ for qid in query_ids:
                         "documents_per_second_at_sol",
                         "document_pairs_per_second_at_sol",
                         "t_compute", "t_memory", "anchor")
-            if key in per_document
         }
         rows[qid]["models"][model.name] = optimal
         query_inputs[qid][model.name] = {
@@ -1067,6 +352,13 @@ for qid, row in rows.items():
           f"{b['sol_s']:>9.3f} {b['per_document']['sol_s']:>11.3f} "
           f"{b['sol_s'] / a['sol_s']:>7.2f}")
 
+for key, store in stores.items():
+    lengths = list(store.lengths)
+    credited = shared_prefix_tokens(store)
+    print(f"{key:32} {len(lengths):>6} docs  {sum(lengths):>10,} tokens  "
+          f"mean {sum(lengths) / len(lengths):>8.1f}  shared prefix "
+          f"{credited:>10,} ({credited / sum(lengths):.1%})", flush=True)
+
 json.dump({
     "what": f"SoL for {len(rows)} QUAIL-B queries at "
             f"sf={SF:g}, on "
@@ -1074,17 +366,17 @@ json.dump({
             "Every feasible left deep order and anchor choice is considered. "
             "No measured or fitted constant is used.",
     "method": "docs/content/docs/architecture/sol-model.mdx, "
-              "computed by reports/make_sol_quailb.py",
+              "quail.speed_of_light_estimate called by "
+              "reports/make_sol_quailb.py",
     "scale_factor": SF,
     "query_count": len(rows),
-    "skipped": skipped,
     "corpora": {
         key: {
-            "documents": len(lengths[key]),
-            "tokens": sum(lengths[key].values()),
-            "shared_prefix_tokens": sum(shared[key].values()),
+            "documents": len(store.lengths),
+            "tokens": sum(store.lengths),
+            "shared_prefix_tokens": shared_prefix_tokens(store),
         }
-        for key in COLUMNS
+        for key, store in stores.items()
     },
     "estimates": {
         "sol_s": "each distinct token prefix in the query's scanned "
@@ -1093,8 +385,8 @@ json.dump({
         "per_document.sol_s": "each alias's document computed once, "
                               "reused only across its own questions",
     },
-    "corpus_id": CORPUS_ID,
-    "collection_id": COLLECTION_ID,
+    "corpus_id": truth.corpus_id,
+    "collection_id": truth.collection_id,
     "pricing": {
         "gpu": "H100!",
         "h100_usd_per_hour": H100_USD_PER_HOUR,
@@ -1116,9 +408,9 @@ json.dump({
         "filter_order": (
             "by_cost from fixed benchmark selectivity estimates"),
         "filter_selectivity_sources": {
-            "collection": Q.SELECTIVITY_ESTIMATE_COLLECTION,
-            "corpus": Q.SELECTIVITY_ESTIMATE_CORPUS,
-            "scale_factor": Q.SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+            "collection": SELECTIVITY_ESTIMATE_COLLECTION,
+            "corpus": SELECTIVITY_ESTIMATE_CORPUS,
+            "scale_factor": SELECTIVITY_ESTIMATE_SCALE_FACTOR,
         },
         "plan_space": "all feasible left deep plans",
         "dp_state": "joined alias set and cached prefix alias set",
@@ -1133,23 +425,28 @@ json.dump({
             "cached alias of the column, pays the frame only"),
         "streamed_partner_kv": "not reusable",
         "validation": "unit tests compare DP with complete enumeration",
+        "estimator_assumptions": assumptions,
     },
     "sources": {
-        "corpora": f"/results/quailb_data/{TAG}, seed 20260818",
+        "corpora": f"/results/quailb_data/{TAG}, seed {data.DATA_SEED}",
         "labels": "/results/ground_truth/quailb/schema_v1/label_sets on "
                   "quail-results, qwen3-32b-fp8 answering",
         "tokenizer": "Qwen/Qwen3-4B-FP8, shared by every Qwen3 model"},
-    "chunk_tokens": CHUNK,
+    "chunk_tokens": {
+        model.name: rows[query_ids[0]]["models"][model.name]["chunk_tokens"]
+        for model in MODELS},
     "measured_inputs": {
         "preamble_tokens": PRE,
         "document_lengths": {
-            k: dict(sorted(collections.Counter(v.values()).items()))
-            for k, v in lengths.items()},
+            key: dict(sorted(collections.Counter(
+                int(length) for length in store.lengths).items()))
+            for key, store in stores.items()},
         "filter_question_tokens": question,
         "join_prompt_tokens": join_prompt,
         "query_stages_by_model": query_inputs},
     "queries": rows,
 }, open(OUT, "w"), indent=1)
+session.close()
 print(f"\nwrote {OUT}\n"
       "put it on the volume:\n"
       f"  modal volume put quail-results {OUT} /sol/{OUT.name}")

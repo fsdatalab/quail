@@ -23,11 +23,18 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    # uploads a finished labeling pass to the public bucket
+    "boto3>=1.34",
     "matplotlib>=3.9",
     "pytest>=8.0",
+    # the quail-b benchmark; quail/bench/ is its runner for Quail
+    "quail-b",
     "ruff==0.12.9",
     "vulture>=2.16,<3",
 ]
+
+[tool.uv.sources]
+quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "cd469a8d3bfb4d96737ba05bf14fe3da7b205afd" }
 
 [build-system]
 requires = ["hatchling"]
@@ -61,7 +68,7 @@ ignore = ["D1", "N803", "N806", "N812"]
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["quail", "experiments", "reports"]
+known-first-party = ["quail", "quail_b", "experiments", "reports"]
 
 [tool.vulture]
 paths = ["quail"]

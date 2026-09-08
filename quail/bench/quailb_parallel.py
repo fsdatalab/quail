@@ -24,8 +24,9 @@ import modal
 
 from quail.runtime.worker import build_worker_image
 
-image = build_worker_image()
-sglang_image = build_worker_image(runtime_package="sglang==0.5.18")
+image = build_worker_image(local_python_sources=("quail_b",))
+sglang_image = build_worker_image(
+    local_python_sources=("quail_b",), runtime_package="sglang==0.5.18")
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
@@ -44,7 +45,7 @@ DATA_DIR = "/results/quailb_data"
 
 @app.function(image=image, timeout=1200, volumes=VOLUMES)
 def ensure_data(sf: float, lf: int):
-    from quail.bench.quailb import build_sets
+    from quail_b.data import build_sets
 
     build_sets(DATA_DIR, sf, lf)
     results_vol.commit()
@@ -71,7 +72,7 @@ def run_query_family(
     from quail.bench.process_isolation import (
         run_backend_group_in_fresh_process,
     )
-    from quail.bench.quailb import query_family_name
+    from quail_b.queries import query_family_name
 
     query_ids = tuple(
         query_id.strip() for query_id in query_ids_csv.split(",")
@@ -188,7 +189,7 @@ def run_sglang_query_family(
 
 def _merge_suites(parts, query_ids, run_label, started, elapsed,
                   function_call_ids, methods):
-    from quail.bench.evaluate import summarize_queries
+    from quail_b.scoring import summarize_queries
 
     base = parts[0]
     for part in parts[1:]:
@@ -285,7 +286,7 @@ def run_all(
     include_baselines: bool = True,
     include_sglang: bool = True,
 ):
-    from quail.bench.quailb import (
+    from quail_b.queries import (
         QUERY_ORDER,
         query_family_name,
         split_query_families,

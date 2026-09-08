@@ -112,6 +112,54 @@ every predicate has a selectivity and `as_written` otherwise. The
 chosen rule is reported as `order_rule` in the result report and in
 `explain()`.
 
+## Speed of light estimate
+
+`quail.speed_of_light_estimate(query, answer)` returns the ideal time of
+a query on one device without running it: every distinct document prefix
+computed once and kept in KV, forward passes packed across the whole
+query, and no host or scheduling overhead. The
+[SoL model](/docs/architecture/sol-model) page has the equations.
+
+`answer(prompt, assignment)` must return the exact TRUE or FALSE answer
+of one prompt for one row assignment. `assignment` maps each alias in
+the prompt to a row index of that alias's table. The estimator uses it
+for the survivors at every filter and join stage, so it needs labels for
+every row and every pair the query can evaluate. QUAIL-B passes its
+saved reference labels.
+
+```python
+def answer(prompt, assignment):
+    return labels[prompt.template][tuple(assignment.values())]
+
+estimate = quail.speed_of_light_estimate(query, answer)
+estimate.seconds          # ideal time on the session's device
+estimate.fresh_tokens     # input tokens a model forward pass processes
+estimate.usd_per_query    # seconds times the device's hourly price
+estimate.assumptions()    # KV capacity, plan space, prefix reuse
+estimate.as_dict()        # everything above plus per stage records
+```
+
+Keyword arguments: `model` and `device` price another spec than the
+session's, `chunk_tokens` overrides the planner's chunk budget, and
+`credit_shared_prefixes=False` computes each document once and reuses it
+only across that document's own questions instead of sharing prefixes
+across documents.
+
+The estimate uses the answers you give it and unlimited KV. It is an
+estimate, not a measured run, and says nothing about accuracy.
+
+## Prompt helpers
+
+The text the engine sends for a prompt is available without a session.
+`quail.bind_prompt(template, (quail.ColumnRef(alias, table, column),))`
+and `quail.bind_join_prompt(...)` return the bound prompt with its
+preamble, tail, and token counts when given a tokenizer.
+`quail.render_join_prompt_text(prompt, documents, anchor)` renders one
+join tuple, and `quail.true_false_ids(tokenizer)` returns the token ids
+the engine reads as TRUE and FALSE. `quail.SHARED_PRE` is the preamble
+every document prefix starts with. QUAIL-B's labeling pass uses these
+to ask the reference model the exact question the engine asks.
+
 ## Errors
 
 Every mistake in the builder raises `quail.logical.CompileError` at

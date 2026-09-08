@@ -56,6 +56,11 @@ CI runs these on every pull request. Run them before pushing:
 
 - The project is Quail (QUery-Aware Inference Layer). The package is
   `quail`. Nothing is called DocEngine any more.
+- quail-b, the benchmark, is its own repository:
+  https://github.com/fsdatalab/quail-bench, installed here as the
+  `quail_b` package and pinned to a commit in `pyproject.toml`.
+  `quail/bench/` is Quail's runner for it. A query or label change
+  goes to that repository first, then the pin moves here.
 - The three mechanisms are "pipelining", "token-based admission", and
   "KV rewind". Say those names.
 - "Chain mode" is the internal name for KV rewind (one living request
@@ -111,7 +116,7 @@ change needs one of them, say so instead of quietly adding it back.
     by query runtime in seconds.
   - `$/query` is query runtime in hours multiplied by the number of
     GPUs and the H100! hourly price. Use
-    `quail.bench.evaluate.H100_USD_PER_HOUR`, which is currently
+    `quail.specs.H100_USD_PER_HOUR`, which is currently
     $3.9492 from https://modal.com/pricing.
   - The primary `$/query` number excludes model startup, just as the
     primary query time does. If startup cost is useful, report it as a

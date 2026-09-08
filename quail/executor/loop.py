@@ -17,6 +17,7 @@ import time
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.executor.model import answer_weights
 from quail.executor.pack import FilterAdmission, JoinAdmission
+from quail.logical import true_false_ids
 from quail.progress import Progress, logger, quiet
 
 
@@ -71,20 +72,6 @@ def _staged_token_parts(torch, sequences, total, pinned=True):
         raise AssertionError(
             f"packed {offset} token ids into a {total}-token chunk")
     return host.to("cuda", non_blocking=pinned)
-
-
-def true_false_ids(tok):
-    """The token ids that mean TRUE and FALSE."""
-    true, false = set(), set()
-    for w in ("TRUE", " TRUE", "True", " True"):
-        ids = tok(w, add_special_tokens=False)["input_ids"]
-        if ids:
-            true.add(ids[0])
-    for w in ("FALSE", " FALSE", "False", " False"):
-        ids = tok(w, add_special_tokens=False)["input_ids"]
-        if ids:
-            false.add(ids[0])
-    return true, false
 
 
 class Answerer:

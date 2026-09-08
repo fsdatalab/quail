@@ -79,7 +79,7 @@ image = (
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
           "TORCHINDUCTOR_CACHE_DIR":
               "/root/.cache/kernels/torchinductor"})
-    .add_local_python_source("quail")
+    .add_local_python_source("quail", "quail_b")
 )
 
 # House rule: never create new Modal app names - new GPU cells attach
@@ -334,8 +334,9 @@ def _boot_state(model):
 def _quailb_session(model, sf, gpus=1):
     """Build the QUAIL-B tables and a registered session."""
     import quail
-    from quail.bench.quailb import build_sets, queries, register_sets
+    from quail.bench.quailb import queries, register_sets
     from quail.planner.plan import EngineConfig
+    from quail_b.data import build_sets
 
     d = build_sets(DATA_DIR, sf)
     results_vol.commit()
@@ -579,9 +580,10 @@ def stock_kernels(model: str = "qwen3-4b-fp8",
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
-    from quail.bench.quailb import F1, build_sets
     from quail.logical import bind_prompt, render_filter_prompt_ids
     from quail.specs import MODELS
+    from quail_b.data import build_sets
+    from quail_b.prompts import F1
 
     spec = MODELS[model]
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)

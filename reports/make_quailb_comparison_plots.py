@@ -50,7 +50,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
 
-from quail.bench.evaluate import H100_USD_PER_HOUR
+from quail.specs import H100_USD_PER_HOUR
 
 HERE = Path(__file__).resolve().parent
 METHODS = [
@@ -95,26 +95,15 @@ METRICS = (
 
 def input_relations(queries, corpus):
     """Resolve each query alias to its saved input table count."""
-    import pyarrow as pa
+    from quail_b.queries import queries as query_specs
 
-    import quail
-    from quail.bench.evaluate import CORPUS_COLUMNS
-    from quail.bench.quailb import queries as builders
-    from quail.catalog import DocumentProvider
-    from quail.planner import collect_operators
-
-    relations = {}
-    with quail.Session(tokenizer=lambda text: []) as session:
-        for name, columns in CORPUS_COLUMNS.items():
-            session.register(name, DocumentProvider.from_table(
-                pa.table({column: [] for column in columns}), id_col="id"))
-        available = builders(session)
-        for query in queries:
-            scans, _, _ = collect_operators(available[query][1]().logical)
-            relations[query] = [
-                (scan.alias, scan.provider, corpus["tables"][scan.provider]["rows"])
-                for scan in scans]
-    return relations
+    specs = query_specs()
+    return {
+        query: [
+            (alias.alias, alias.table, corpus["tables"][alias.table]["rows"])
+            for alias in specs[query].aliases]
+        for query in queries
+    }
 
 
 def load_sol(root, queries, rows, corpus):

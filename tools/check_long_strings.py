@@ -10,7 +10,7 @@ clearly content rather than code:
   assignment to a name containing PROMPT, TEMPLATE, SQL, QUERY, HTML,
   or TEXT, in any case;
 - it lives in a prompts module or folder: any part of the file path
-  contains "prompt" (quail/bench/prompts.py, experiments/prompts/x.py);
+  contains "prompt" (experiments/prompts/x.py);
 - it looks like HTML (starts with "<" and ends with ">") or SQL (starts
   with SELECT, WITH, INSERT, CREATE, or UPDATE).
 

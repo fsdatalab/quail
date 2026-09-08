@@ -13,6 +13,24 @@ class CompileError(ValueError):
 # completions.
 SHARED_PRE = "DOCUMENT:\n"
 
+
+def true_false_ids(tok):
+    """The token ids that mean TRUE and FALSE.
+
+    Args:
+        tok: A HuggingFace tokenizer; called with add_special_tokens=False.
+    """
+    true, false = set(), set()
+    for w in ("TRUE", " TRUE", "True", " True"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            true.add(ids[0])
+    for w in ("FALSE", " FALSE", "False", " False"):
+        ids = tok(w, add_special_tokens=False)["input_ids"]
+        if ids:
+            false.add(ids[0])
+    return true, false
+
 # Fixed strings for join prompt layout.
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"

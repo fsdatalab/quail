@@ -1,9 +1,8 @@
-"""Exact ground truth survivors for the QUAIL-B speed of light model.
+"""Exact surviving rows under a set of binary join relations.
 
-The left deep search itself lives in quail.planner.leftdeep; this
-module holds what only the benchmark has: the saved TRUE/FALSE pairs
-per join predicate, and the exact rows that occur in at least one
-satisfying assignment.
+The speed of light estimate asks, for every join subset its search
+visits, which rows occur in at least one satisfying assignment. The
+left deep search itself lives in quail.planner.leftdeep.
 """
 
 from __future__ import annotations

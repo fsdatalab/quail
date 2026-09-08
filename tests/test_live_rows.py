@@ -1,5 +1,5 @@
-from quail.bench.sol_dp import PairRelation, exact_live_rows
 from quail.planner.leftdeep import Extension, optimize_left_deep
+from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.work import Work
 
 

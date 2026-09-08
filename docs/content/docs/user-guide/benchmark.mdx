@@ -9,8 +9,8 @@ plus two optional PrivacyPolicies queries. Ground truth is saved per
 predicate, so accuracy is scored on exact TRUE or FALSE answers, not
 on model agreement.
 
-The full instructions live in `quail/bench/README.md` in the
-repository. The short version:
+The full instructions live in the README of the benchmark's own
+repository, [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench). The short version:
 
 ```bash
 mkdir -p results/benchmark
@@ -24,6 +24,13 @@ uv run modal run --detach -m quail.bench.quailb_parallel \
 ```
 
 Add `--query IMDB-4` to run one query.
+
+On a machine with a GPU and no Modal account, the same runner reads the
+corpus and labels from the public bucket:
+
+```bash
+uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8
+```
 
 ## What one run does
 
@@ -56,4 +63,8 @@ The definitions are fixed so numbers compare across reports:
 - `document pairs/second` = evaluated pairs across all join stages /
   query seconds.
 - `$/query` = query hours × GPU count × the H100 hourly price from
-  `quail.bench.evaluate.H100_USD_PER_HOUR`.
+  `quail.specs.H100_USD_PER_HOUR`.
+- `regret_tokens`, `shared_prefix_tokens`, `cross_row_cached_tokens`,
+  and `regret_distinct_tokens` come from the engine's own report on
+  every `QueryResult`. The benchmark copies them; it does not compute
+  them from the plan.

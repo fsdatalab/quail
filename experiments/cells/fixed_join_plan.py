@@ -21,7 +21,7 @@ from quail.runtime.worker import build_worker_image
 
 baseline = Path(os.environ.get(
     "QUAIL_BASELINE_DIR", "/tmp/quail-fev9-baseline-b873066"))
-image = build_worker_image().add_local_dir(
+image = build_worker_image(local_python_sources=("quail_b",)).add_local_dir(
     baseline / "quail", "/opt/quail-baseline/quail", ignore=["__pycache__", "*.pyc"]
 )
 app = modal.App("quail-milestone1")
@@ -43,11 +43,12 @@ def _run(label, output_dir):
 
     import quail
     from quail.backends.quail import expected_join_nodes
-    from quail.bench.evaluate import H100_USD_PER_HOUR
-    from quail.bench.quailb import build_sets, queries, register_sets
+    from quail.bench.quailb import queries, register_sets
     from quail.physical import AnchoredJoin, PackedFilter
     from quail.planner.plan import EngineConfig
     from quail.runtime.compute import InProcessComputeProvider
+    from quail.specs import H100_USD_PER_HOUR
+    from quail_b.data import build_sets
 
     output = Path(output_dir) / label
     output.mkdir(parents=True, exist_ok=True)
