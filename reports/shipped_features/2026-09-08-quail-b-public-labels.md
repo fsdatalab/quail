@@ -39,9 +39,12 @@ one layout.
   did before. `rows_from_answers` derives final rows from saved
   answers; the shared KV retention scorer uses it.
 
-- Corpus and labels are public: 1.07 GB at
+- Corpus and labels are public: 67 files, 145 MB, at
   `s3://quail-bench/ground_truth/quailb/schema_v1/`, readable without
   an AWS account, in the same layout as the `quail-results` volume.
+  The bucket holds only the current collection, its corpus, and the
+  manifests of the collections it reuses labels from; the volume keeps
+  the full history.
   `quail_b.store.S3Files` reads it over plain HTTPS with no AWS SDK.
 - `build_sets` downloads the sf=0.1 corpus from the bucket, 13 MB in
   5 seconds, and checks that it hashes to the pinned corpus id. A new
