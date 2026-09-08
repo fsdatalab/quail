@@ -20,9 +20,10 @@ calling process, or on Modal.
 - QUAIL-B, the benchmark, is its own repository:
   [fsdatalab/quail-b](https://github.com/fsdatalab/quail-b). It
   holds the document sets, prompts, queries as data, saved labels, the
-  labeling pass, and scoring, and runs no engine. It is installed here
-  as the `quail_b` package, pinned in `pyproject.toml`. Its README
-  explains how to run it on Quail and label a new predicate.
+  labeling pass, and scoring, and runs no engine. Corpus and labels are
+  public in the `quail-bench` S3 bucket. It is installed here as the
+  `quail_b` package, pinned in `pyproject.toml`; its Modal wrapper for
+  the labeling pass is `quail/bench/judge_pass.py`.
 - `demos/` has runnable examples for a machine with a GPU:
   `local_gpu_smoke.py` runs one filter over four short documents, and
   `imdb_ending_filter.py` filters all 100,000 IMDB reviews.

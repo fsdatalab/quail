@@ -17,8 +17,9 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from quail.runtime.volumes import ModalVolumeFiles
 from quail_b.data import CORPUS_COLUMNS, _ids, corpus_identity
-from quail_b.labels import ModalVolumeFiles, _load_ground_truth_collection
+from quail_b.labels import _load_ground_truth_collection
 from quail_b.queries import queries
 from quail_b.scoring import Evaluator, RunOutput, rows_from_answers
 

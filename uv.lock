@@ -2514,7 +2514,7 @@ requires-dist = [
 dev = [
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "pytest", specifier = ">=8.0" },
-    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=1c68d7fcfbeeba9657035e996f74a5c6ce784eb7" },
+    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=222644e7e09ac65d61d1286b8728d03d917568f0" },
     { name = "ruff", specifier = "==0.12.9" },
     { name = "vulture", specifier = ">=2.16,<3" },
 ]
@@ -2522,7 +2522,7 @@ dev = [
 [[package]]
 name = "quail-b"
 version = "0.1.0"
-source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=1c68d7fcfbeeba9657035e996f74a5c6ce784eb7#1c68d7fcfbeeba9657035e996f74a5c6ce784eb7" }
+source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=222644e7e09ac65d61d1286b8728d03d917568f0#222644e7e09ac65d61d1286b8728d03d917568f0" }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },

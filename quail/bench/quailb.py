@@ -23,6 +23,7 @@ from pathlib import Path
 import pyarrow as pa
 
 import quail
+from quail.runtime.volumes import ModalVolumeFiles
 from quail_b.data import (
     DATA_SEED,
     SOURCE_REVISIONS,
@@ -32,9 +33,6 @@ from quail_b.data import (
     read_corpus,
 )
 from quail_b.labels import (
-    LocalVolumeFiles,
-    ModalVolumeFiles,
-    S3Files,
     load_ground_truth,
     load_ground_truth_workload,
 )
@@ -51,6 +49,7 @@ from quail_b.scoring import (
     add_query_metrics,
     summarize_queries,
 )
+from quail_b.store import LocalFiles, S3Files
 
 DEFAULT_SETS = ("reviews", "aspects", "reports", "terms",
                 "claims", "evidence", "citation_contexts",
@@ -438,7 +437,7 @@ def default_ground_truth_files():
     """The label store for this process: the volume on Modal, else the bucket."""
     mounted = Path("/results")
     if _in_modal_container() and mounted.is_dir():
-        return LocalVolumeFiles(mounted)
+        return LocalFiles(mounted)
     return S3Files()
 
 
@@ -446,7 +445,7 @@ def default_result_files():
     """Where run records go: the quail-results volume on Modal, else results/."""
     if _in_modal_container():
         return ModalVolumeFiles()
-    return LocalVolumeFiles("results")
+    return LocalFiles("results")
 
 
 def _describe(files) -> str:
