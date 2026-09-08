@@ -1119,15 +1119,19 @@ def run_workloads(sf: float, only: list[str] | None = None) -> dict:
     return finalize_collection(sf, corpus_id, partials)
 
 
-def publish(root: Path, bucket: str = PUBLIC_BUCKET) -> int:
+def publish(root: Path, bucket: str = PUBLIC_BUCKET, client=None) -> int:
     """Upload every file under root that the bucket lacks; return the count.
 
-    Needs AWS credentials with write access to the bucket. Files are
-    content-addressed, so an existing key of the same size is skipped.
+    root is the directory that holds collections/, corpora/, and
+    label_sets/; each file lands under GROUND_TRUTH_ROOT at the same
+    relative path, which is where the loader reads it. Part files of a
+    compacted label set stay home: the loader takes labels.parquet
+    when it exists. Needs AWS credentials with write access.
     """
-    import boto3
+    if client is None:
+        import boto3
 
-    client = boto3.client("s3")
+        client = boto3.client("s3")
     prefix = GROUND_TRUTH_ROOT
     existing = {}
     paginator = client.get_paginator("list_objects_v2")
@@ -1137,6 +1141,9 @@ def publish(root: Path, bucket: str = PUBLIC_BUCKET) -> int:
     uploaded = 0
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix == ".tmp":
+            continue
+        if (path.parent.name == "parts"
+                and (path.parent.parent / "labels.parquet").exists()):
             continue
         key = f"{prefix}/{path.relative_to(root).as_posix()}"
         if existing.get(key) == path.stat().st_size:

@@ -1,5 +1,7 @@
 """CPU checks for the QUAIL-B labeling pass."""
 
+from pathlib import Path
+
 import quail.bench.labeling as labeling
 from quail.bench.labeling import (
     _check_reused_label_set,
@@ -297,3 +299,98 @@ def test_join_parts_keep_source_labels_over_model_answers(
         ("cl1", "page0"): (False, MODEL_NAME),
         ("cl1", "page1"): (True, "fever_annotation"),
     }
+
+
+class _FakeS3:
+    """Records uploads by key; lists what it holds like the real client."""
+
+    def __init__(self):
+        self.objects = {}
+
+    def get_paginator(self, _name):
+        fake = self
+
+        class _Pages:
+            def paginate(self, Bucket, Prefix):  # noqa: N803
+                contents = [{"Key": k, "Size": len(v)}
+                            for k, v in fake.objects.items()
+                            if k.startswith(Prefix)]
+                return [{"Contents": contents}]
+        return _Pages()
+
+    def upload_file(self, path, _bucket, key):
+        self.objects[key] = Path(path).read_bytes()
+
+
+class _DictFiles:
+    """The reader side of the round trip: a store over the fake bucket."""
+
+    def __init__(self, objects):
+        self.objects = objects
+
+    def read_bytes(self, path):
+        return self.objects[path.lstrip("/")]
+
+    def list_files(self, path):
+        prefix = path.lstrip("/").rstrip("/") + "/"
+        return sorted(k for k in self.objects if k.startswith(prefix))
+
+
+def _label_tree(root):
+    """A complete collection with one filter predicate, compacted."""
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    key, label_set_id = "test.review.filter", "ls_filter"
+    predicate = {"key": key, "template": "Judge {0}. TRUE or FALSE.",
+                 "kind": "filter", "left_table": "reviews",
+                 "left_column": "body", "right_table": None,
+                 "right_column": None}
+    collection_dir = root / "collections" / "gt_test"
+    label_dir = root / "label_sets" / "test" / "review_filter" / label_set_id
+    corpus_dir = root / "corpora" / "c_test"
+    for directory in (collection_dir, label_dir / "parts", corpus_dir):
+        directory.mkdir(parents=True)
+    (collection_dir / "manifest.json").write_text(json.dumps({
+        "status": "complete", "collection_id": "gt_test",
+        "corpus_id": "c_test", "scale_factor": 0.1,
+        "label_sets": {key: label_set_id},
+        "summary": {"model": "qwen3-32b-fp8"}}))
+    (corpus_dir / "active_collection.json").write_text(
+        json.dumps({"collection_id": "gt_test"}))
+    (label_dir / "manifest.json").write_text(json.dumps({
+        "status": "complete", "rows": 2,
+        "source_rows": {"qwen3-32b-fp8": 2}, "predicate": predicate}))
+    rows = pa.Table.from_pylist([
+        {"predicate_key": key, "label_set_id": label_set_id,
+         "answer": True, "left_id": "r0", "right_id": None},
+        {"predicate_key": key, "label_set_id": label_set_id,
+         "answer": False, "left_id": "r1", "right_id": None}])
+    pq.write_table(rows, label_dir / "labels.parquet")
+    pq.write_table(rows, label_dir / "parts" / "part_000000_000002.parquet")
+    (label_dir / "labels.parquet.tmp").write_bytes(b"half written")
+    return key
+
+
+def test_publish_writes_where_the_loader_reads(tmp_path):
+    from quail_b.labels import load_ground_truth
+    from quail_b.store import GROUND_TRUTH_ROOT
+
+    root = tmp_path / GROUND_TRUTH_ROOT
+    key = _label_tree(root)
+    bucket = _FakeS3()
+
+    uploaded = labeling.publish(root, bucket="b", client=bucket)
+
+    assert uploaded == 4      # two manifests, the active pointer, labels
+    assert all(k.startswith(GROUND_TRUTH_ROOT + "/") for k in bucket.objects)
+    assert not any("/parts/" in k or k.endswith(".tmp") for k in bucket.objects)
+    loaded = load_ground_truth(_DictFiles(bucket.objects), scale_factor=0.1,
+                               corpus_id="c_test")
+    assert loaded.collection_id == "gt_test"
+    assert loaded.answer(key, "r0") is True
+    assert loaded.answer(key, "r1") is False
+    # a second publish finds everything in place and uploads nothing
+    assert labeling.publish(root, bucket="b", client=bucket) == 0
