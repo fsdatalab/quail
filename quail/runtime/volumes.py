@@ -16,17 +16,23 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache",
                                       create_if_missing=True)
 
 RESULTS_ROOT = "/results"
+KERNEL_CACHE_ROOT = "/root/.cache/kernels"
+
+
+def _mounted(root: str) -> bool:
+    """Whether a volume is attached here: inside Modal, at its mount point."""
+    return not modal.is_local() and os.path.isdir(root)
 
 
 def commit_results() -> None:
-    """Persist the results volume when running inside Modal."""
-    if not modal.is_local():
+    """Persist the results volume when it is attached to this container."""
+    if _mounted(RESULTS_ROOT):
         results_vol.commit()
 
 
 def commit_kernel_cache() -> None:
-    """Persist the kernel cache volume when running inside Modal."""
-    if not modal.is_local():
+    """Persist the kernel cache volume when it is attached to this container."""
+    if _mounted(KERNEL_CACHE_ROOT):
         kernel_cache.commit()
 
 
