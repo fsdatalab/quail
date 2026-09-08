@@ -125,8 +125,18 @@ predicate?). The model answers each predicate in a single token
 generation ever runs.
 
 The current scope is filter queries and joins with Qwen3 4B fp8 or
-Qwen3 32B fp8 weights. KV uses bf16. Each H100 has one model copy,
-and one Modal container can use 1, 2, 4, or 8 H100s.
+Qwen3 32B fp8 weights. KV uses bf16. Each GPU has one model copy,
+with 1, 2, 4, or 8 GPUs per host. The built in device specifications are
+`h100-sxm` and `rtx-pro-6000-blackwell-server`. RTX support includes
+planning and kernel selection; GPU validation is pending. Modal provisions
+H100s only and rejects RTX configurations before starting a worker.
+
+The RTX specification uses 96 GB of GDDR7 memory and 1.597 TB/s of memory
+bandwidth. Its estimated dense peak rates are 1 PFLOP/s for FP8 and
+0.5 PFLOP/s for BF16, derived by assuming NVIDIA's rounded server tensor
+rates include sparsity and halving them. The server page does not explicitly
+label sparsity, so these remain approximate planning assumptions. See the [device report](shipped_features/2026-09-07-rtx-pro-6000.md)
+for sources and validation status. Memory budgets remain per GPU.
 
 ### End-to-end flow
 
@@ -890,9 +900,11 @@ time the anchor is packed). The suffixes are the partner documents
 (for joins) or the question texts (for filters).
 
 The Pipeline has two attention implementations, selected per
-workload by `attention_mode` (issue #24):
+workload by `attention_mode` (issue #24). Both use FlashAttention-3 on
+H100 and FlashAttention-2 on RTX PRO 6000 Blackwell.
+`flash_attention_version()` selects the version from CUDA capability:
 
-- **`unified`** - one causal FlashAttention-3 paged call per layer.
+- **`unified`** - one causal FlashAttention paged call per layer.
   Current KV (prefix and suffix) is scattered into the document's
   arena pages first (the arena reserves capacity pages for the
   suffix beyond the document's logical length), then a single
@@ -963,12 +975,12 @@ The `merge_quant` two-call pattern runs per layer as follows
 
 **Call A** (self-attention): causal attention over the segment
 boundaries. Each prefix attends to itself; each suffix attends to
-itself. This is a standard FlashAttention-3 varlen call with
+itself. This is a standard FlashAttention varlen call with
 cumulative sequence lengths (`cu_seqlens`).
 
 **Call B** (cross-attention): every suffix token attends to its
 group's kept context in the arena. The kept context is the anchor's
-KV, stored in the arena's pages. Call B uses FlashAttention-3's paged
+KV, stored in the arena's pages. Call B uses FlashAttention's paged
 attention variant, reading KV through the block table. Call B is
 non-causal (the suffix needs to see the full prefix, not just
 earlier tokens).

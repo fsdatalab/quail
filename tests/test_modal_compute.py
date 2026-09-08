@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pyarrow as pa
+import pytest
 
 import quail
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
@@ -45,6 +46,20 @@ def test_modal_request_copies_only_needed_local_columns():
         "id", "body"
     ]
     assert request["sources"]["docs"]["id_col"] == "id"
+
+
+def test_modal_rejects_rtx_before_allocating_an_h100(monkeypatch):
+    provider = quail.ModalComputeProvider()
+
+    def unexpected_allocation(*args, **kwargs):
+        raise AssertionError("allocated an H100 for an RTX plan")
+
+    monkeypatch.setattr(provider, "_function", unexpected_allocation)
+    request = _request()
+    request = replace(request, config=replace(
+        request.config, device="rtx-pro-6000-blackwell-server"))
+    with pytest.raises(ValueError, match="provisions H100s only"):
+        provider.execute(request)
 
 
 def test_modal_request_leaves_remote_source_on_worker():

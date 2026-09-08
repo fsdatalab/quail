@@ -73,7 +73,23 @@ H100_SXM = DeviceSpec(
 )
 ```
 
+The built in devices use these per-GPU constants:
+
+| Device name | Memory | Memory bandwidth | Dense FP8 | Dense BF16 |
+| --- | --- | --- | --- | --- |
+| `h100-sxm` | 80 GB | 3.35 TB/s | 1,979 TFLOPS | 989.5 TFLOPS |
+| `rtx-pro-6000-blackwell-server` | 96 GB | 1.597 TB/s | about 1,000 TFLOPS | about 500 TFLOPS |
+
+The RTX constants describe the Blackwell Server Edition with GDDR7 memory.
+They come from [NVIDIA's server specifications](https://www.nvidia.com/en-us/data-center/rtx-pro-6000-blackwell-server-edition/).
+The dense compute estimates assume the rounded server tensor rates include
+sparsity and halve them. The server page does not explicitly label sparsity;
+they are approximate planning assumptions, not published dense server specs. Quail does not use sparse weights. `hbm_bw` stores memory
+bandwidth for both HBM and GDDR devices.
+
 Register with `registry.register_device(spec)` and select with
-`Session(EngineConfig(device="name"))`. The Modal worker asks for H100s regardless;
-another device spec is useful for planning experiments, not for
-running on other hardware yet.
+`Session(EngineConfig(device="name"))`. A backend must also accept the device,
+and its kernels must support that GPU. Quail selects FlashAttention-3 on H100
+and FlashAttention-2 on RTX PRO 6000 Blackwell. RTX execution still needs a
+GPU validation run. The Modal provider provisions H100s only and rejects other
+device names. Use the in-process provider on an RTX host.

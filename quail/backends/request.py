@@ -836,7 +836,7 @@ def request_runtimes() -> dict:
 
 
 SUPPORTED_MODELS = frozenset({"qwen3-4b-fp8", "qwen3-32b-fp8"})
-SUPPORTED_DEVICE = "h100-sxm"
+SUPPORTED_DEVICES = frozenset({"h100-sxm", "rtx-pro-6000-blackwell-server"})
 
 
 def _warm_boot() -> dict:
@@ -874,7 +874,7 @@ class RequestBackend:
             return SupportResult.reject(
                 f"{label} does not support model {model.name!r}"
             )
-        if device.name != SUPPORTED_DEVICE:
+        if device.name not in SUPPORTED_DEVICES:
             return SupportResult.reject(
                 f"{label} does not support device {device.name!r}"
             )

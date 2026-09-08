@@ -1,11 +1,11 @@
 """Packed forward pass over the paged arena.
 
-DeepGEMM matmuls, fused Triton kernels, FlashAttention-3 varlen
+DeepGEMM matmuls, fused Triton kernels, FlashAttention varlen
 self-attention, paged cross-attention against the arena, and
 softmax-state merge.
 
-Two attention paths: merge_quant (two FA3 calls merged with a fused
-kernel) and unified (one causal paged FA3 call after scattering
+Two attention paths: merge_quant (two attention calls merged with a fused
+kernel) and unified (one causal paged attention call after scattering
 current KV into the arena). A chunk with no arena pages skips the
 arena and runs one causal varlen call per group.
 
@@ -15,10 +15,19 @@ unfused equivalents. torch is imported lazily.
 
 GROUP = 128            # fp8 quant group size, matches the engine
 
-# Filters run "unified" (one causal paged FA3 call); joins run
+# Filters run "unified" (one causal paged attention call); joins run
 # "merge_quant" (two-call pattern with fused merge+quant kernel).
 FILTER_ATTENTION = "unified"
 JOIN_ATTENTION = "merge_quant"
+
+
+def flash_attention_version(capability: tuple[int, int]) -> int:
+    """Select the attention implementation for a supported CUDA architecture."""
+    if capability == (9, 0):
+        return 3
+    if capability == (12, 0):
+        return 2
+    raise ValueError(f"Quail does not support CUDA capability {capability}")
 
 
 class Pipeline:
@@ -35,6 +44,7 @@ class Pipeline:
         self.kernels = kernels
         self.attention_mode = attention_mode
 
+        self.fa_version = flash_attention_version(torch.cuda.get_device_capability())
         self.torch = torch
         self.model = model
         self.arena = arena
@@ -423,14 +433,14 @@ class Pipeline:
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None):
-        # FlashAttention-3 via vLLM's vendored fork; block_table +
-        # seqused_k is FA3's paged-KV API
+        # vLLM's FA2 and FA3 both accept 16-token pages and return
+        # LSE as [heads, total_queries] for the merge kernel.
         from vllm.vllm_flash_attn import flash_attn_varlen_func
         return flash_attn_varlen_func(
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
             max_seqlen_k=max_k, cu_seqlens_k=cu_k,
             block_table=block_table, seqused_k=seqused_k,
-            causal=causal, fa_version=3, return_softmax_lse=True)
+            causal=causal, fa_version=self.fa_version, return_softmax_lse=True)
 
     def attention_merge_quant(self, q, k, v, meta):
         """The two-call attention path with the fused merge plus FP8 quantize.
@@ -471,7 +481,7 @@ class Pipeline:
         return q_out, scales
 
     def attention_unified(self, q, k, v, meta):
-        """Write current KV to its cache slots, then one causal paged FA3 call.
+        """Write current KV to its cache slots, then one causal paged attention call.
 
         The call reads retained and current KV together.
 
