@@ -23,7 +23,6 @@ class QueryRequest:
     logical_plan: LogicalPlan
     providers: Mapping[str, TableProvider]
     config: EngineConfig
-    device: str
     order: str | None = None
     registry: ExtensionRegistry = field(
         default_factory=ExtensionRegistry.with_built_ins)
@@ -37,7 +36,7 @@ class QueryRequest:
             raise ValueError("query request needs at least one provider")
         if not all(isinstance(name, str) and name for name in self.providers):
             raise TypeError("query request providers need nonempty names")
-        if not self.device:
+        if not self.config.device:
             raise ValueError("query request needs a device")
 
     @property
@@ -151,7 +150,6 @@ def _modal_request(request: QueryRequest) -> dict:
         "logical_plan": request.logical_plan,
         "sources": sources,
         "config": request.config,
-        "device": request.device,
         "order": request.order,
         "registry": request.registry,
     }

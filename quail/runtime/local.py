@@ -143,8 +143,7 @@ def execute_query_request(
     started = time.perf_counter()
     query = request.planned_query
     if not isinstance(query, Query):
-        session = Session(request.config, device=request.device,
-                          registry=request.registry)
+        session = Session(request.config, registry=request.registry)
         for name, provider in request.providers.items():
             session.register(name, provider)
         query = Query(session, request.logical_plan, order=request.order)

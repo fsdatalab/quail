@@ -86,3 +86,4 @@ class EngineConfig:
     gpus: int = 1
     model: str = "qwen3-4b-fp8"
     backend: str = "quail"
+    device: str = "h100-sxm"

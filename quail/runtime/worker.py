@@ -79,7 +79,6 @@ def _execute_logical_query(value, gpu_count: int, initialize_worker=None):
         logical_plan=value["logical_plan"],
         providers=providers,
         config=config_value,
-        device=str(value["device"]),
         order=value["order"],
         registry=registry,
     ))

@@ -61,7 +61,9 @@ def main() -> None:
     print(f"reviews: {n_docs}, loaded in {time.perf_counter() - t0:.1f} s",
           flush=True)
 
-    with quail.Session() as session:
+    with quail.Session(
+        config=quail.EngineConfig(gpus=1, device="h100-sxm"),
+    ) as session:
         session.register(
             "reviews",
             quail.DocumentProvider.from_dataset(reviews, id_col="review_id"),

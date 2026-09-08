@@ -72,7 +72,9 @@ The user selects a built in model through `EngineConfig` when the default
 Qwen3 4B fp8 model is not the one they want:
 
 ```python
-session = quail.Session(quail.EngineConfig(model="qwen3-32b-fp8"))
+session = quail.Session(quail.EngineConfig(
+    model="qwen3-32b-fp8", gpus=1, device="h100-sxm",
+))
 ```
 
 The benchmark backends use the same query and result interface:
