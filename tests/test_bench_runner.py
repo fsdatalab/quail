@@ -1,5 +1,8 @@
 """CPU checks for Quail's QUAIL-B runner: specs to queries, results to ids."""
 
+import json
+from datetime import datetime, timezone
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -9,10 +12,108 @@ from quail.bench.quailb import answer_oracle, build_query, queries, run_output
 from quail.catalog import DocumentProvider
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
+from quailb.labels import GroundTruthCollection, PredicateLabels
 from quailb.queries import AliasSpec, JoinSpec, QuerySpec
 from quailb.queries import queries as query_specs
 from quailb.scoring import Evaluator
-from tests.test_quailb_scoring import CORPUS, FILTER, JOIN, SPEC, _truth, fever_truth
+
+FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
+JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
+SPEC = QuerySpec(
+    "TEST-1", "one filter then one join",
+    (AliasSpec("r", "reviews", "body", (FILTER,)),
+     AliasSpec("a", "aspects", "aspect")),
+    (JoinSpec(JOIN, ("r", "a")),),
+    ("r.id", "a.id"),
+)
+CORPUS = {
+    "reviews": [{"id": "r0", "body": "good film"},
+                {"id": "r1", "body": "bad film"}],
+    "aspects": [{"id": "a0", "aspect": "acting"},
+                {"id": "a1", "aspect": "ending"}],
+}
+
+
+def _predicate(key, template, kind, left_table, right_table=None):
+    columns = {"reviews": "body", "aspects": "aspect"}
+    return {
+        "key": key,
+        "template": template,
+        "kind": kind,
+        "left_table": left_table,
+        "left_column": columns[left_table],
+        "right_table": right_table,
+        "right_column": columns[right_table] if right_table else None,
+    }
+
+
+def _truth():
+    filter_key = "test.review.filter"
+    join_key = "test.review.aspect"
+    return GroundTruthCollection(
+        collection_id="gt_test",
+        corpus_id="c_test",
+        scale_factor=0.1,
+        reference_model="qwen3-32b-fp8",
+        predicates={
+            filter_key: PredicateLabels(
+                key=filter_key,
+                label_set_id="ls_filter",
+                predicate=_predicate(
+                    filter_key, FILTER, "filter", "reviews"),
+                answers={("r0", None): True, ("r1", None): False},
+                source_rows={"qwen3-32b-fp8": 2},
+            ),
+            join_key: PredicateLabels(
+                key=join_key,
+                label_set_id="ls_join",
+                predicate=_predicate(
+                    join_key, JOIN, "join", "reviews", "aspects"),
+                answers={
+                    ("r0", "a0"): True,
+                    ("r0", "a1"): False,
+                    ("r1", "a0"): False,
+                    ("r1", "a1"): True,
+                },
+                source_rows={"qwen3-32b-fp8": 4},
+            ),
+        },
+    )
+
+
+def fever_truth():
+    """Labels for FEV-9 over a three claim, three evidence corpus."""
+    from quailb.judge_pass import PREDICATES, predicate_payload
+    from quailb.prompts import F11, F13, REFUTE, SUPPORT
+
+    corpus = {
+        "claims": pa.table({"id": ["c0", "c1", "c2"],
+                            "claim": ["person one", "person two", "a place"]}),
+        "evidence": pa.table({"id": ["e0", "e1", "e2"],
+                              "text": ["person one", "person two", "a place"]}),
+    }
+    true_pairs = {
+        SUPPORT: {("c0", "e0"), ("c1", "e1"), ("c2", "e0"), ("c1", "e2")},
+        REFUTE: {("c1", "e0"), ("c2", "e0"), ("c0", "e2")},
+    }
+    predicates = {}
+    for spec in PREDICATES:
+        if spec.template not in (F11, F13, SUPPORT, REFUTE):
+            continue
+        ids = corpus[spec.left_table]["id"].to_pylist()
+        answers = (
+            {(row_id, None): index < 2 for index, row_id in enumerate(ids)}
+            if spec.kind == "filter" else {
+                (left, right): (left, right) in true_pairs[spec.template]
+                for left in ids
+                for right in corpus[spec.right_table]["id"].to_pylist()
+            }
+        )
+        predicates[spec.key] = PredicateLabels(
+            spec.key, f"ls_{spec.key}", predicate_payload(spec), answers, {},
+        )
+    truth = GroundTruthCollection("gt_fev9", "c_fev9", 0.1, None, predicates)
+    return corpus, truth
 
 
 def _session(tmp_path, backend="quail"):
@@ -296,3 +397,81 @@ def test_benchmark_prompt_text_matches_what_quail_sends():
                 assert render_join_prompt(
                     spec.template, ("doc one", "doc two"), anchor=anchor
                 ) == expected, (spec.key, anchor)
+
+
+def test_report_writer_creates_markdown_and_plot(tmp_path):
+    from quail.bench.quailb import _artifact_stem
+    from reports.make_quailb_eval_plots import (
+        make_plot,
+        plot_path_for,
+        write_report,
+    )
+
+    artifact_stem = _artifact_stem(
+        datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+        0.1, 1, "qwen3-4b-fp8")
+    assert artifact_stem.startswith("20260825T120000Z-")
+    answer = {
+        "evaluated": 4, "correct": 3, "accuracy": 0.75,
+        "precision": 1.0, "recall": 0.5, "f1": 2 / 3,
+        "true_positive": 1, "true_negative": 2,
+        "false_positive": 0, "false_negative": 1,
+    }
+    row = {
+        "query": "TEST-1", "runtime_s": 2.0, "boot_s": 3.0,
+        "inference_cost_usd": 0.002, "cost_with_boot_usd": 0.005,
+        "tokens_processed": 100,
+        "inference_cost_per_million_tokens_usd": 20.0,
+        "documents_per_second": 2.0,
+        "accuracy": {
+            "answer_accuracy": answer,
+            "output_accuracy": {"f1": 0.5},
+        },
+    }
+    data = {
+        "model": "qwen3-4b-fp8", "sf": 0.1, "gpus": 1,
+        "artifact_stem": artifact_stem,
+        "corpus_id": "c_test", "prediction": "Accuracy will exceed 70%.",
+        "ground_truth": {
+            "collection_id": "gt_test",
+            "reference_model": "qwen3-32b-fp8",
+        },
+        "pricing": {"h100_usd_per_hour": 3.6},
+        "raw_volume_path": "/results/benchmarks/quailb/runs/qb_test",
+        "aggregate_volume_path": (
+            "/results/benchmarks/quailb/runs/qb_test/"
+            "20260825T120000Z-quailb-sf0.1-lf1-qwen3-4b-fp8.json"),
+        "passes": {
+            "warm": {
+                "queries": [row],
+                "summary": {
+                    "queries_completed": 1, "query_runtime_s": 2.0,
+                    "tokens_processed": 100, "inference_cost_usd": 0.002,
+                    "cost_with_boot_usd": 0.005,
+                    "answer_accuracy": answer,
+                },
+            },
+        },
+    }
+    input_path = tmp_path / "results" / "benchmark" / "summary.json"
+    input_path.parent.mkdir(parents=True)
+    input_path.write_text(json.dumps(data))
+    report_path = (tmp_path / "results" / "benchmark"
+                   / f"{data['artifact_stem']}.md")
+    plot_path = (tmp_path / "reports" / "plots" / "benchmark"
+                 / f"{data['artifact_stem']}.png")
+
+    make_plot(data, plot_path)
+    write_report(data, input_path, report_path, plot_path)
+
+    assert plot_path.read_bytes().startswith(b"\x89PNG")
+    report = report_path.read_text()
+    assert "Accuracy will exceed 70%." in report
+    assert "Cost per 1M tokens" in report
+    assert ("Figure: ../../reports/plots/benchmark/"
+            f"{data['artifact_stem']}.png") in report
+    assert ("Ground truth loading happens before the run starts. It is "
+            "excluded from every runtime and cost metric.") in report
+    assert data["aggregate_volume_path"] in report
+    generated_plot = plot_path_for(data, report_path)
+    assert generated_plot.name == f"{data['artifact_stem']}.png"

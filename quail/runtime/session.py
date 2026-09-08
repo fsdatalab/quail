@@ -125,7 +125,7 @@ class Session:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *_exc):
         self.close()
 
     def register(self, name: str, provider: TableProvider) -> None:

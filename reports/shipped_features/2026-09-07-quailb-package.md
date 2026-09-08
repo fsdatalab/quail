@@ -1,14 +1,16 @@
-# QUAIL-B split into its own package, with Quail as one runner
+# QUAIL-B split into its own repository, with Quail as one runner
 
 Date: 2026-09-07.
 
 Second step of moving QUAIL-B out of the engine repository. The
-benchmark is now a top-level package, `quailb/`, that runs no engine.
-`quail/bench/` is Quail's runner for it.
+benchmark is now its own private repository,
+https://github.com/fsdatalab/quail-bench, installed here as the
+`quailb` package and pinned to a commit in `pyproject.toml`. It runs
+no engine. `quail/bench/` is Quail's runner for it.
 
 ## What changed
 
-- `quailb/` holds the benchmark: `data.py` (document sets, pinned
+- The `quailb` package holds the benchmark: `data.py` (document sets, pinned
   sources, sampling, corpus identity), `prompts.py`, `queries.py`,
   `labels.py` (saved reference labels and collections), `judge_pass.py`
   (the labeling pass on Modal), `scoring.py`, and the README.
@@ -36,10 +38,15 @@ benchmark is now a top-level package, `quailb/`, that runs no engine.
 - `rows_from_answers` derives final rows from saved answers, for runs
   that kept their answers and not their rows; the shared KV retention
   scorer uses it.
-- Packaging, ruff, vulture, the long string check, and CI cover
-  `quailb` alongside `quail`. Every Modal image that runs the benchmark
-  ships `quailb` next to `quail`: the same-GPU runner, the labeling
-  pass, and the experiment cells that import it.
+- `quailb` is a dev dependency from the private repository. CI reads
+  it with the `QUAILB_TOKEN` secret, a token with read access to that
+  repository. Every Modal image that runs the benchmark ships the
+  installed `quailb` next to `quail`: the same-GPU runner and the
+  experiment cells that import it. The labeling pass runs from the
+  benchmark repository.
+- The benchmark repository carries the same `AGENTS.md` as this one,
+  with `CLAUDE.md` a symlink to it, so the writing and check rules are
+  shared.
 - The runner's `--report` option looked for the plot script under
   `quail/reports/`; it now looks under the repository's `reports/`.
 
@@ -55,10 +62,10 @@ pyarrow, and Quail's part is a runner in the engine repository.
 
 | | Before | After |
 | --- | --- | --- |
-| Where the benchmark lives | `quail/bench/` | `quailb/` (definition), `quail/bench/` (Quail runner) |
+| Where the benchmark lives | `quail/bench/` | `fsdatalab/quail-bench` (definition), `quail/bench/` (Quail runner) |
 | `quail` imports inside the benchmark definition | session, catalog, planner, result relations, plan nodes | none |
 | Query definitions | closures over a session | `QuerySpec` records |
-| CPU tests collected | 264 | 268 |
+| CPU tests collected here | 264 | 256, plus 33 in the benchmark repository |
 
 No GPU run. The runner produces the same `run_suite` JSON as before.
 The scoring reproduces the previous evaluator's numbers on the unit

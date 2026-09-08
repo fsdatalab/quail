@@ -34,7 +34,7 @@ these rules.
 
 CI runs these on every pull request. Run them before pushing:
 
-    uv run ruff check quail quailb tests experiments reports tools
+    uv run ruff check quail tests experiments reports tools
     uv run python tools/check_long_strings.py
     uv run vulture
     uv run pytest -q
@@ -56,6 +56,16 @@ CI runs these on every pull request. Run them before pushing:
 
 - The project is Quail (QUery-Aware Inference Layer). The package is
   `quail`. Nothing is called DocEngine any more.
+- QUAIL-B, the benchmark, is its own repository:
+  https://github.com/fsdatalab/quail-bench, installed here as the
+  `quailb` package and pinned to a commit in `pyproject.toml`.
+  `quail/bench/` is Quail's runner for it. A query or label change
+  goes to that repository first, then the pin moves here.
+- QUAIL-B, the benchmark, is its own repository:
+  https://github.com/fsdatalab/quail-bench, installed here as the
+  `quailb` package and pinned to a commit in `pyproject.toml`.
+  `quail/bench/` is Quail's runner for it. A query or label change
+  goes to that repository first, then the pin moves here.
 - The three mechanisms are "pipelining", "token-based admission", and
   "KV rewind". Say those names.
 - "Chain mode" is the internal name for KV rewind (one living request

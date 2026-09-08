@@ -23,16 +23,21 @@ dependencies = [
 dev = [
     "matplotlib>=3.9",
     "pytest>=8.0",
+    # the QUAIL-B benchmark; quail/bench/ is its runner for Quail
+    "quailb",
     "ruff==0.12.9",
     "vulture>=2.16,<3",
 ]
+
+[tool.uv.sources]
+quailb = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "11bad306d770e19ba7fdd8639113ed94899d40e3" }
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["quail", "quailb"]
+packages = ["quail"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,8 +60,8 @@ ignore = ["D1", "N803", "N806", "N812"]
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["quail", "quailb", "experiments", "reports"]
+known-first-party = ["quail", "experiments", "reports"]
 
 [tool.vulture]
-paths = ["quail", "quailb"]
+paths = ["quail"]
 min_confidence = 70

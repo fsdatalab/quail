@@ -842,6 +842,7 @@ dependencies = [
 dev = [
     { name = "matplotlib" },
     { name = "pytest" },
+    { name = "quailb" },
     { name = "ruff" },
     { name = "vulture" },
 ]
@@ -862,8 +863,23 @@ requires-dist = [
 dev = [
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "pytest", specifier = ">=8.0" },
+    { name = "quailb", git = "https://github.com/fsdatalab/quail-bench.git?rev=11bad306d770e19ba7fdd8639113ed94899d40e3" },
     { name = "ruff", specifier = "==0.12.9" },
     { name = "vulture", specifier = ">=2.16,<3" },
+]
+
+[[package]]
+name = "quailb"
+version = "0.1.0"
+source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=11bad306d770e19ba7fdd8639113ed94899d40e3#11bad306d770e19ba7fdd8639113ed94899d40e3" }
+dependencies = [
+    { name = "datasets" },
+    { name = "huggingface-hub" },
+    { name = "modal", extra = ["api-proxy-support"] },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "transformers" },
 ]
 
 [[package]]

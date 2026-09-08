@@ -8,8 +8,7 @@ description: Where things live and how to check a change.
 | Path | Contents |
 | --- | --- |
 | `quail/` | The package. See [Architecture](/docs/architecture) for the module map. |
-| `quailb/` | The QUAIL-B benchmark: document sets, prompts, queries as data, saved labels, the labeling pass, and scoring. It runs no engine. |
-| `quail/bench/` | Quail's QUAIL-B runner: builds Quail queries from the specs, runs them on the same GPU as the baselines, and hands answers to the benchmark's scoring. |
+| `quail/bench/` | Quail's QUAIL-B runner. The benchmark itself is the `quailb` package from [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench), pinned in `pyproject.toml`; the runner builds Quail queries from its specs, runs them on the same GPU as the baselines, and hands answers to its scoring. |
 | `quail_ext_examples/` | Example extensions. |
 | `tests/` | CPU tests. They fake the GPU and run in seconds. |
 | `experiments/` | Every Modal entry point that costs GPU time: ablation and profiling scripts, and the smokes, probes, and gates under `experiments/cells/`. |
