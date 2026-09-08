@@ -3,9 +3,10 @@ title: Running on Modal
 description: How the Modal compute provider runs a query and what it costs.
 ---
 
-Quail does not run a server. Each query is one call to a Modal
-Function in the `quail-engine` app. `ModalComputeProvider` is the
-default compute provider and handles that call.
+Quail does not run a server. With `ModalComputeProvider`, each query
+is one call to a Modal Function in the `quail-engine` app. It is not
+the default: `Session()` runs the model in the calling process, so pass
+this provider when that process has no GPU.
 
 ```python
 compute = quail.ModalComputeProvider(secrets=(), detach=False)

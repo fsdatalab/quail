@@ -4,8 +4,8 @@ description: Running the same logical query somewhere other than Modal.
 ---
 
 A compute provider decides where a query runs. It receives the
-logical request and returns the result. Modal is the default, but the
-interface is two methods:
+logical request and returns the result. The in-process provider is the
+default, but the interface is two methods:
 
 ```python
 class ComputeProvider(Protocol):
@@ -48,17 +48,16 @@ session = quail.Session(compute_provider=MyProvider())
 ## The in-process provider
 
 `quail.InProcessComputeProvider` runs the request in the current
-process. It is the provider for code that already runs where the GPUs
-are, such as the benchmark runner inside a Modal function, and for
-tests that fake the physical executor:
-
-```python
-session = quail.Session(compute_provider=quail.InProcessComputeProvider())
-```
+process and is what `Session()` uses when no provider is passed. The
+process needs a CUDA GPU and the backend's runtime package; vLLM is
+installed with the package on Linux. Without a GPU, `execute` raises a
+`RuntimeError` that names `ModalComputeProvider`. The benchmark runner
+inside a Modal function uses this provider too, since it already runs
+where the GPUs are.
 
 It takes an optional `physical_executor` callable that replaces the
-backend dispatch, which is how the CPU tests run the whole path
-without a GPU. The QUAIL-B runner uses this provider, so the benchmark
+backend dispatch and skips the GPU check, which is how the CPU tests
+run the whole path without a GPU. The QUAIL-B runner uses this provider, so the benchmark
 and production build the same result objects.
 
 ## Modal specifics that are not part of the protocol

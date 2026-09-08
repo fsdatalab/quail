@@ -74,14 +74,15 @@ rv2: Protocol is an implausible movie whose only saving grace is that it
 ```python
 import quail
 
-session = quail.Session()
+session = quail.Session(compute_provider=quail.ModalComputeProvider())
 session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
 session.register("aspects", quail.DocumentProvider.from_table(aspects, id_col="id"))
 ```
 
-`Session()` selects the Quail backend, Qwen3 4B fp8, one H100, and the
-Modal compute provider. `id_col` names the column that identifies a
-document. See [Configuration](/docs/user-guide/configuration) and
+`Session()` selects the Quail backend, Qwen3 4B fp8, and one H100. By
+default it loads the model in the calling process; this page passes
+`ModalComputeProvider` so the run happens on Modal. `id_col` names the
+column that identifies a document. See [Configuration](/docs/user-guide/configuration) and
 [Data sources](/docs/user-guide/data-sources) for the other choices.
 
 </Step>
@@ -277,7 +278,7 @@ anchor hit KV left by the filter. 10 pairs passed.
 session.close()
 ```
 
-Or run everything under `with quail.Session() as session:`. Closing
+Or run everything under `with quail.Session(...) as session:`. Closing
 lets the Modal function scale to zero and removes the temporary token
 files.
 

@@ -1,6 +1,9 @@
 """Register documents, plan queries, and run them through a compute provider."""
 
 import os
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
@@ -19,7 +22,8 @@ from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.physical import DocumentInput, PortRef, Project, ValueType, encode_graph
 from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
-from quail.runtime.compute import ModalComputeProvider, QueryRequest
+from quail.progress import Progress, say
+from quail.runtime.compute import InProcessComputeProvider, QueryRequest
 from quail.runtime.prefixes import prefix_metrics
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
@@ -60,6 +64,13 @@ def pick_corpus_tokenizer(primary, fast, texts, sample=25):
             return primary, ("tokenizer: transformers (bpe-qwen "
                              "failed parity on this column's sample)")
     return fast, "tokenizer: bpe-qwen (parity-checked on sample)"
+
+
+# rows per progress check; per slice overhead stays under one percent
+TOKENIZE_ROWS = 2048
+
+# documents tokenized to measure tokens per byte for a length estimate
+ESTIMATE_SAMPLE = 1024
 
 
 class Session:
@@ -104,14 +115,21 @@ class Session:
         self._column_stores = {}
         self._store_count = 0
         self._token_directory = None
+        self._corpus_tokenizers = {}
+        self._length_estimates = {}
+        self._lock = threading.RLock()
+        self._background = None
+        if compute_provider is None:
+            compute_provider = InProcessComputeProvider()
         self.compute_provider = compute_provider
 
     def close(self):
         """Close compute and temporary token storage."""
         try:
-            if self.compute_provider is not None:
-                self.compute_provider.close()
+            self.compute_provider.close()
         finally:
+            if self._background is not None:
+                self._background.shutdown(cancel_futures=True)
             for store in self._token_stores.values():
                 store.close()
             self._token_stores.clear()
@@ -182,6 +200,10 @@ class Session:
         columns reads only those columns from the provider and does not
         tokenize the documents again.
         """
+        with self._lock:
+            return self._tokenize(provider_name, column, projected_columns)
+
+    def _tokenize(self, provider_name, column, projected_columns):
         provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
         projected_columns = tuple(dict.fromkeys(projected_columns))
@@ -203,6 +225,80 @@ class Session:
                 for name in projected_columns
             },
         )
+
+    def tokenize_async(self, provider_name: str, column: str,
+                       projected_columns=()) -> Future:
+        """Start tokenize() on a background thread and return its Future."""
+        if self._background is None:
+            self._background = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="quail-tokenize")
+        return self._background.submit(
+            self.tokenize, provider_name, column, projected_columns)
+
+    def token_lengths(self, provider_name: str, column: str):
+        """Return the exact token counts when the column is tokenized."""
+        identity = self.catalog.get(provider_name).content_identity()
+        store = self._token_stores.get((identity, column))
+        return None if store is None else store.lengths
+
+    def estimate_lengths(self, provider_name: str, column: str) -> list[int]:
+        """Estimate every document's token count without tokenizing.
+
+        Reads the column's byte lengths and scales them by the tokens
+        per byte measured on the first ESTIMATE_SAMPLE documents.
+        """
+        provider = self.catalog.get(provider_name)
+        key = (provider.content_identity(), column)
+        if key in self._length_estimates:
+            return self._length_estimates[key]
+        started = time.perf_counter()
+        reader = provider.scan(ScanRequest(columns=(column,)))
+        byte_lengths = []
+        sample = []
+        try:
+            for batch in reader:
+                texts = batch.column(0)
+                byte_lengths.append(pc.binary_length(texts).cast(pa.int64()))
+                if len(sample) < ESTIMATE_SAMPLE:
+                    sample.extend(
+                        texts.slice(0, ESTIMATE_SAMPLE - len(sample)).to_pylist()
+                    )
+        finally:
+            reader.close()
+        # the primary tokenizer loads in about a second; the fast one
+        # builds its tables for longer and is picked on the background pass
+        tok = self.tokenizer
+        sample_tokens = sum(len(tok(text)) for text in sample)
+        sample_bytes = sum(len(text.encode("utf-8")) for text in sample)
+        ratio = sample_tokens / sample_bytes if sample_bytes else 0.0
+        lengths = []
+        for chunk in byte_lengths:
+            lengths.extend(
+                max(1, round(n * ratio)) for n in chunk.to_pylist()
+            )
+        self._length_estimates[key] = lengths
+        say(f"estimated {provider_name}.{column}: {len(lengths):,} documents, "
+            f"about {sum(lengths):,} tokens from a {len(sample)} document "
+            f"sample, {time.perf_counter() - started:.1f} s")
+        return lengths
+
+    def _corpus_tokenizer(self, provider_name, column, texts):
+        """Pick and cache the tokenizer and token type for one column."""
+        key = (self.catalog.get(provider_name).content_identity(), column)
+        if key not in self._corpus_tokenizers:
+            tok, note = pick_corpus_tokenizer(
+                self.tokenizer, self._fast_tokenizer(), texts)
+            self.notes.append(f"{provider_name}.{column}: {note}")
+            first_token = next(
+                (token for text in texts for token in tok(text)), None
+            )
+            token_type = (
+                pa.int32()
+                if first_token is None or isinstance(first_token, Integral)
+                else pa.string()
+            )
+            self._corpus_tokenizers[key] = (tok, token_type)
+        return self._corpus_tokenizers[key]
 
     def _store_path(self) -> str:
         if self._token_directory is None:
@@ -228,18 +324,8 @@ class Session:
             texts = batch.column(batch.schema.get_field_index(column))
             needed = 25 - len(text_sample)
             text_sample.extend(texts.slice(0, needed).to_pylist())
-        tok, note = pick_corpus_tokenizer(
-            self.tokenizer, self._fast_tokenizer(), text_sample)
-        self.notes.append(f"{provider_name}.{column}: {note}")
-        sample_rows = [tok(text) for text in text_sample]
-        first_token = next(
-            (token for row in sample_rows for token in row), None
-        )
-        token_type = (
-            pa.int32()
-            if first_token is None or isinstance(first_token, Integral)
-            else pa.string()
-        )
+        tok, token_type = self._corpus_tokenizer(
+            provider_name, column, text_sample)
         return buffered, tok, token_type
 
     def _load(self, provider_name: str, column: str | None,
@@ -280,9 +366,20 @@ class Session:
                 column_writers[name] = ColumnStoreWriter(
                     self._store_path(), source_schema.field(name))
                 writers.append(column_writers[name])
+            progress = None
+            if column is not None:
+                say(f"tokenizing {provider_name}.{column} "
+                    f"({self.notes[-1].split(': ', 1)[-1]})")
+                progress = Progress(f"tokenizing {provider_name}.{column}")
+            rows = 0
             for batch in batches:
-                for writer in writers:
-                    writer.write_batch(batch)
+                for start in range(0, batch.num_rows, TOKENIZE_ROWS):
+                    piece = batch.slice(start, TOKENIZE_ROWS)
+                    for writer in writers:
+                        writer.write_batch(piece)
+                    rows += piece.num_rows
+                    if progress is not None:
+                        progress.update(rows)
         except Exception:
             for writer in writers:
                 writer.abort()
@@ -291,6 +388,9 @@ class Session:
             scan_reader.close()
         token_store = (
             token_writer.finish() if token_writer is not None else None)
+        if progress is not None:
+            progress.finish(f"tokenized {provider_name}.{column}",
+                            f"{sum(token_store.lengths):,} tokens")
         column_stores = {
             name: writer.finish() for name, writer in column_writers.items()
         }
@@ -363,17 +463,24 @@ class Query:
         self._plan = None
         self._doc_tokens = None
         self._token_inputs = None
+        self._token_futures = {}
+        self._estimated = ()
+        self.token_wait_s = 0.0
 
     # ---- planning (the optimization) ---------------------------------
 
     def token_inputs(self) -> dict:
         """Return the token store of every scanned alias.
 
-        The logical rules run first, then each scanned column is
-        tokenized once. Planning and the speed of light estimate share
-        these stores.
+        Plans first, then waits for any background tokenization, so
+        planning and the speed of light estimate share these stores.
         """
-        if self._token_inputs is None:
+        self.plan()
+        self.wait_for_tokens()
+        return self._token_inputs
+
+    def plan(self):
+        if self._plan is None:
             self.logical, _ = apply_logical_rules(
                 self.logical,
                 tuple(self.session.registry.logical_rules.values()),
@@ -384,21 +491,25 @@ class Query:
             scans, _, _ = collect_operators(self.logical)
             self._doc_tokens = {}
             self._token_inputs = {}
+            estimated = []
             # each Scan lists the columns it must load; the projection
             # pushdown rule filled that in above
             for s in scans:
-                store = self.session.tokenize(
-                    s.provider,
-                    s.column,
-                    s.columns,
-                )
-                self._token_inputs[s.alias] = store
-                self._doc_tokens[s.alias] = store.lengths
-        return self._token_inputs
-
-    def plan(self):
-        if self._plan is None:
-            self.token_inputs()
+                exact = self.session.token_lengths(s.provider, s.column)
+                if exact is not None:
+                    store = self.session.tokenize(
+                        s.provider, s.column, s.columns)
+                    self._token_inputs[s.alias] = store
+                    self._doc_tokens[s.alias] = store.lengths
+                    continue
+                # plan on estimates while the token file is written
+                self._doc_tokens[s.alias] = self.session.estimate_lengths(
+                    s.provider, s.column)
+                self._token_futures[s.alias] = self.session.tokenize_async(
+                    s.provider, s.column, s.columns)
+                estimated.append(s.alias)
+            self._estimated = tuple(estimated)
+            started = time.perf_counter()
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
@@ -408,20 +519,33 @@ class Query:
                 backend=self.session.config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer)
+            say(f"plan ready in {time.perf_counter() - started:.2f} s")
         return self._plan
 
     def explain(self, *, verbose: bool = False) -> str:
         """Return the optimized plan, optionally including runtime settings."""
+        # plan() first: it replaces self.logical with the optimized tree
         physical = self.plan()
-        return explain(self.logical, physical, verbose=verbose)
+        text = explain(self.logical, physical, verbose=verbose)
+        if self._estimated:
+            text += ("\n\n  note: token counts for "
+                     + ", ".join(repr(a) for a in self._estimated)
+                     + f" are estimated from a {ESTIMATE_SAMPLE} document "
+                     "sample")
+        return text
+
+    def wait_for_tokens(self) -> None:
+        """Block until every background tokenization has finished."""
+        started = time.perf_counter()
+        for alias, future in list(self._token_futures.items()):
+            self._token_inputs[alias] = future.result()
+            del self._token_futures[alias]
+        self.token_wait_s += time.perf_counter() - started
 
     # ---- execution -----------------------------------------------------
 
     def run(self) -> QueryResult:
         """Execute the query through the session compute provider."""
-        if self.session.compute_provider is None:
-
-            self.session.compute_provider = ModalComputeProvider()
         result = self.session.compute_provider.execute(self._request())
         if not isinstance(result, QueryResult):
             raise TypeError("a compute provider must return QueryResult")
@@ -444,6 +568,7 @@ class Query:
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
+        self.wait_for_tokens()
         inputs = {}
         for node in plan.nodes:
             if not isinstance(node, DocumentInput):
@@ -467,6 +592,7 @@ class Query:
             device=self.session.device.name,
             order=self.order,
             registry=self.session.registry,
+            planned_query=self,
         )
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:

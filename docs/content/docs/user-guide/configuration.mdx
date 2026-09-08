@@ -52,7 +52,8 @@ quail.Session(
 - `registry`: an `ExtensionRegistry` with your extensions. See
   [Extending Quail](/docs/extending).
 - `compute_provider`: where queries run. Unset means
-  `ModalComputeProvider()` created on the first `run()`.
+  `InProcessComputeProvider()`, which loads the model in this process
+  and needs a CUDA GPU. Pass `ModalComputeProvider()` to run on Modal.
 
 ## Tokenizers
 
