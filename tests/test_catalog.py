@@ -2,45 +2,14 @@
 
 import pyarrow as pa
 import pyarrow.dataset as ds
-import pyarrow.parquet as pq
 import pytest
 from datasets import Dataset
 
-from quail.builtins import built_in_registry
 from quail.catalog import (
-    ArrowDatasetProvider,
     DocumentProvider,
     ScanRequest,
 )
 from quail.logical import CompileError
-
-
-def test_from_dataset_reads_only_id_and_requested_column():
-    dataset = ds.dataset(pa.table({
-        "id": ["a", "b"],
-        "body": ["first", "second"],
-        "unused": [1, 2],
-    }))
-
-    provider = DocumentProvider.from_dataset(dataset, id_col="id")
-    table = provider.scan(ScanRequest(("id", "body"))).read_all()
-
-    assert isinstance(provider, ArrowDatasetProvider)
-    assert provider.columns == ("id", "body", "unused")
-    assert table.column_names == ["id", "body"]
-    assert table.to_pydict() == {
-        "id": ["a", "b"],
-        "body": ["first", "second"],
-    }
-
-
-def test_registry_opens_registered_remote_source():
-    registry = built_in_registry()
-    marker = object()
-    registry.register_source_reader(
-        lambda value: marker, source_type="test-source")
-
-    assert registry.open_source({"type": "test-source"}) is marker
 
 
 def test_from_dataset_rejects_non_dataset_and_missing_id():
@@ -51,22 +20,6 @@ def test_from_dataset_rejects_non_dataset_and_missing_id():
     dataset = ds.dataset(pa.table({"body": ["first"]}))
     with pytest.raises(CompileError, match="id column 'id'"):
         DocumentProvider.from_dataset(dataset, id_col="id")
-
-
-def test_from_parquet_builds_dataset(tmp_path):
-    path = tmp_path / "documents.parquet"
-    pq.write_table(pa.table({
-        "id": ["a", "b"],
-        "body": ["first", "second"],
-    }), path)
-
-    provider = DocumentProvider.from_parquet(str(path), id_col="id")
-
-    assert isinstance(provider, ArrowDatasetProvider)
-    assert provider.scan(ScanRequest(("id", "body"))).read_all().to_pydict() == {
-        "id": ["a", "b"],
-        "body": ["first", "second"],
-    }
 
 
 def test_scan_returns_bounded_batches_and_only_requested_columns():

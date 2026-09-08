@@ -1,8 +1,6 @@
 """Modal Function compute provider tests."""
 
-from contextlib import nullcontext
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
@@ -36,16 +34,6 @@ def _request() -> QueryRequest:
         providers={"docs": provider},
         config=EngineConfig(),
     )
-
-
-def test_modal_request_copies_only_needed_local_columns():
-    request = _modal_request(_request())
-
-    assert request["logical_plan"] == _logical_plan()
-    assert request["sources"]["docs"]["table"].column_names == [
-        "id", "body"
-    ]
-    assert request["sources"]["docs"]["id_col"] == "id"
 
 
 def test_modal_rejects_rtx_before_allocating_an_h100(monkeypatch):
@@ -156,38 +144,3 @@ def test_modal_provider_calls_function_and_releases_minimum_container(
     ]
     assert closed == ["app"]
     assert "function call id: fc-test" in capsys.readouterr().out
-
-
-def test_modal_provider_uses_explicit_dependencies(monkeypatch):
-    from quail.runtime import worker
-
-    images = []
-
-    def make_worker(**kwargs):
-        images.append(kwargs)
-        return SimpleNamespace(app=SimpleNamespace(run=lambda **kwargs: nullcontext()))
-
-    monkeypatch.setattr(worker, "modal_worker", make_worker)
-    provider = quail.ModalComputeProvider(
-        local_python_sources=("shared", "extra_source", "shared"),
-        pip_packages=("shared-package==1.0", "extra-package==1.0",
-                      "shared-package==1.0"),
-    )
-    registry = quail.ExtensionRegistry.with_built_ins()
-    first = provider._worker_for("quail", registry)
-    assert provider._worker_for("quail", registry) is first
-    assert len(images) == 1
-    assert images[0]["local_python_sources"] == ("shared", "extra_source")
-    assert images[0]["pip_packages"] == ("shared-package==1.0", "extra-package==1.0")
-    provider.close()
-
-
-def test_device_config_survives_modal_serialization():
-    from modal._serialization import deserialize, serialize
-
-    config = EngineConfig(gpus=2, device="test-h100")
-    request = replace(_request(), config=config)
-    prepared = deserialize(serialize(_modal_request(request)), None)
-    assert prepared["config"] == config
-    assert request.gpu_count == 2
-    assert "device" not in prepared

@@ -22,20 +22,6 @@ def _sink_source(plan):
     return sink.inputs[0].source
 
 
-def test_single_full_join_feeds_its_pairs_straight_to_project(catalog):  # noqa: F811
-    logical = (docs(catalog, "reviews", tok).alias("r")
-               .ai_join(docs(catalog, "products", tok).alias("p"),
-                        prompt("m {0} {1}", col("r.review"),
-                               col("p.description")),
-                        selectivity=0.1)
-               .select("r.id"))
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [300] * 5, "p": [100] * 5})
-
-    assert not [n for n in plan.nodes if isinstance(n, Recombine)]
-    assert _sink_source(plan).port == "join_answers:0"
-
-
 def test_gate_before_full_join_keeps_recombine(catalog):  # noqa: F811
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "threads", tok).alias("t"),

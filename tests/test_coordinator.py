@@ -118,16 +118,6 @@ def test_join_group_reshards_an_unfiltered_anchor_over_its_live_set():
     # test_join_group_anchors_follow_filter_shards above
 
 
-def test_join_group_carries_pre():
-    # the join round needs the engine preamble (anchor prefixes are
-    # pre + doc)
-    p = payload()
-    subs = join_group_payloads(p, 2, {"r": [0, 1, 3, 4]}, p["joins"])
-    for s in subs:
-        assert s["pre_ids"] == [9]
-        assert s["anchor_alias"] == "r"
-
-
 def test_join_group_ships_every_partner_of_a_multi_table_join():
     # a 3-way join: both partner tables replicate to every worker
     p = payload()

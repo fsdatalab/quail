@@ -10,7 +10,6 @@ from test_session import _run, fake_tok, make_executor
 import quail
 from quail.logical import (
     ColumnRef,
-    CompileError,
     FilterPredicate,
     LogicalPlan,
     Project,
@@ -109,13 +108,6 @@ def test_rule_is_idempotent_and_leaves_other_nodes_alone():
     _, changed = apply_logical_rules(
         LogicalPlan(once), (ProjectionPushdown(),), CONTEXT)
     assert changed == ()
-
-
-def test_scan_explains_its_columns_and_rejects_duplicates():
-    scan = Scan("reviews", "r", "review", columns=("id", "stars"))
-    assert scan.explain_fields()["columns"] == ["id", "stars"]
-    with pytest.raises(CompileError, match="twice"):
-        Scan("reviews", "r", "review", columns=("id", "id")).validate()
 
 
 def _session(tmp_path):

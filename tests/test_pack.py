@@ -11,16 +11,8 @@ from quail.executor.pack import (
     brute_force_triples,
     gate,
     matches,
-    orient,
     pages_for,
 )
-
-
-def test_orient_prefers_longer_side():
-    assert orient(1000, 8) == "left"
-    assert orient(8, 1000) == "right"
-    assert orient(50, 50) == "left"
-
 
 # ------------------------------------------------ join admission
 

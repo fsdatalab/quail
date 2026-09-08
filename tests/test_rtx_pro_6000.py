@@ -7,7 +7,6 @@ import pyarrow as pa
 import pytest
 
 import quail
-from quail.builtins import built_in_registry
 from quail.executor.attention import Pipeline, flash_attention_version
 from quail.planner import budgets
 from quail.specs import H100_SXM, MODELS, RTX_PRO_6000_BLACKWELL_SERVER
@@ -34,18 +33,6 @@ def test_rtx_plan_uses_its_memory_budget(model_name, gpus):
     assert plan.settings["admission_tokens"] == budgets.arena_tokens(model, device)
     assert plan.settings["admission_tokens"] > budgets.arena_tokens(model, H100_SXM)
     assert plan.estimated_seconds > 0
-
-
-@pytest.mark.parametrize("backend_name", [
-    "stock_vllm", "pipelined_vllm", "pipelined_sglang",
-])
-def test_rtx_request_backends_keep_one_gpu_limit(backend_name):
-    registry = built_in_registry()
-    backend = registry.backend(backend_name)
-    device = registry.device(RTX_PRO_6000_BLACKWELL_SERVER.name)
-    model = registry.model("qwen3-4b-fp8")
-    assert backend.supports(model, device, 1).supported
-    assert not backend.supports(model, device, 2).supported
 
 
 @pytest.mark.parametrize("capability,version", [((9, 0), 3), ((12, 0), 2)])

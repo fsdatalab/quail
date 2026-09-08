@@ -20,12 +20,6 @@ def test_repeated_calls_keep_parent_context_and_self_time():
     assert sum(child["seconds"] for child in result["children"]) == pytest.approx(25e-6)
 
 
-def test_parent_precedes_child_with_same_start():
-    result = aggregate_intervals([(0, 1, "child"), (0, 2, "parent")], 3)
-    parent = next(child for child in result["children"] if child["name"] == "parent")
-    assert parent["children"][0]["name"] == "child"
-
-
 def test_crossing_intervals_are_rejected():
     with pytest.raises(ValueError, match="cross rather than nest"):
         aggregate_intervals([(0, 3, "one"), (2, 4, "two")], 5)

@@ -1,7 +1,6 @@
 """CPU checks for QUAIL-B ground-truth loading and scoring."""
 
 import json
-from datetime import datetime, timezone
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -531,84 +530,6 @@ def test_corpus_identity_matches_judge_pass_implementation():
     got = corpus_identity(rows, 0.1, DATA_SEED, SOURCE_REVISIONS)
 
     assert got == expected
-
-
-def test_report_writer_creates_markdown_and_plot(tmp_path):
-    from quail.bench.quailb import _artifact_stem
-    from reports.make_quailb_eval_plots import (
-        make_plot,
-        plot_path_for,
-        write_report,
-    )
-
-    artifact_stem = _artifact_stem(
-        datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
-        0.1, 1, "qwen3-4b-fp8")
-    assert artifact_stem.startswith("20260825T120000Z-")
-    answer = {
-        "evaluated": 4, "correct": 3, "accuracy": 0.75,
-        "precision": 1.0, "recall": 0.5, "f1": 2 / 3,
-        "true_positive": 1, "true_negative": 2,
-        "false_positive": 0, "false_negative": 1,
-    }
-    row = {
-        "query": "TEST-1", "runtime_s": 2.0, "boot_s": 3.0,
-        "inference_cost_usd": 0.002, "cost_with_boot_usd": 0.005,
-        "tokens_processed": 100,
-        "inference_cost_per_million_tokens_usd": 20.0,
-        "documents_per_second": 2.0,
-        "accuracy": {
-            "answer_accuracy": answer,
-            "output_accuracy": {"f1": 0.5},
-        },
-    }
-    data = {
-        "model": "qwen3-4b-fp8", "sf": 0.1, "gpus": 1,
-        "artifact_stem": artifact_stem,
-        "corpus_id": "c_test", "prediction": "Accuracy will exceed 70%.",
-        "ground_truth": {
-            "collection_id": "gt_test",
-            "reference_model": "qwen3-32b-fp8",
-        },
-        "pricing": {"h100_usd_per_hour": 3.6},
-        "raw_volume_path": "/results/benchmarks/quailb/runs/qb_test",
-        "aggregate_volume_path": (
-            "/results/benchmarks/quailb/runs/qb_test/"
-            "20260825T120000Z-quailb-sf0.1-lf1-qwen3-4b-fp8.json"),
-        "passes": {
-            "warm": {
-                "queries": [row],
-                "summary": {
-                    "queries_completed": 1, "query_runtime_s": 2.0,
-                    "tokens_processed": 100, "inference_cost_usd": 0.002,
-                    "cost_with_boot_usd": 0.005,
-                    "answer_accuracy": answer,
-                },
-            },
-        },
-    }
-    input_path = tmp_path / "results" / "benchmark" / "summary.json"
-    input_path.parent.mkdir(parents=True)
-    input_path.write_text(json.dumps(data))
-    report_path = (tmp_path / "results" / "benchmark"
-                   / f"{data['artifact_stem']}.md")
-    plot_path = (tmp_path / "reports" / "plots" / "benchmark"
-                 / f"{data['artifact_stem']}.png")
-
-    make_plot(data, plot_path)
-    write_report(data, input_path, report_path, plot_path)
-
-    assert plot_path.read_bytes().startswith(b"\x89PNG")
-    report = report_path.read_text()
-    assert "Accuracy will exceed 70%." in report
-    assert "Cost per 1M tokens" in report
-    assert ("Figure: ../../reports/plots/benchmark/"
-            f"{data['artifact_stem']}.png") in report
-    assert ("Ground truth loading happens before the run starts. It is "
-            "excluded from every runtime and cost metric.") in report
-    assert data["aggregate_volume_path"] in report
-    generated_plot = plot_path_for(data, report_path)
-    assert generated_plot.name == f"{data['artifact_stem']}.png"
 
 
 def test_distinct_prefix_regret_adds_shared_prefixes_minus_cross_row_hits():

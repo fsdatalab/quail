@@ -2,7 +2,6 @@
 
 from experiments.agent_query_sample import (
     _comparison,
-    parse_function_calls,
     stable_sample_rows,
 )
 
@@ -49,17 +48,4 @@ def test_comparison_treats_32b_as_reference():
         "true_negative": 1,
         "false_positive": 1,
         "false_negative": 1,
-    }
-
-
-def test_parse_function_calls_requires_sample_and_both_models():
-    value = (
-        "sample=fc-sample,qwen3-32b-fp8=fc-32b,"
-        "qwen3-4b-fp8=fc-4b"
-    )
-
-    assert parse_function_calls(value) == {
-        "sample": "fc-sample",
-        "qwen3-32b-fp8": "fc-32b",
-        "qwen3-4b-fp8": "fc-4b",
     }

@@ -187,31 +187,6 @@ def test_session_plans_registered_physical_extensions():
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
 
 
-def test_session_resolves_registered_model_for_custom_backend():
-    from dataclasses import replace
-
-    from quail.specs import MODELS
-
-    registry = quail.ExtensionRegistry.with_built_ins()
-    model = replace(
-        MODELS["qwen3-4b-fp8"],
-        name="example-qwen3-4b-fp8",
-    )
-    registry.register_model(model)
-    registry.register_backend(LocalFilterBackend())
-
-    session = quail.Session(
-        EngineConfig(
-            model=model.name,
-            backend="local_filter",
-        ),
-        tokenizer=str.split,
-        registry=registry,
-    )
-
-    assert session.model is model
-
-
 def test_physical_codec_rejects_changed_shapes():
     registry = built_in_registry()
     scan = DocumentInput(

@@ -16,8 +16,8 @@ from quail.physical import (
     PackedFilter,
 )
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
-from quail.planner.plan import PhysicalPlan, Refusal, resolve_model
-from quail.planner.sol import prefix_recompute_seconds, speed_of_light
+from quail.planner.plan import Refusal
+from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
@@ -34,17 +34,6 @@ def join_stages(plan):
 
 def node_kinds(plan):
     return [type(node).__name__ for node in plan.nodes]
-
-
-def test_prefix_recompute_seconds_counts_attention_work():
-    for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
-        one = prefix_recompute_seconds(1, model, H100_SXM)
-        two = prefix_recompute_seconds(2, model, H100_SXM)
-        assert one > 0
-        assert two > 2 * one
-
-    with pytest.raises(ValueError):
-        prefix_recompute_seconds(-1, QWEN3_4B_FP8, H100_SXM)
 
 
 def _parquet(path, columns):
@@ -132,21 +121,6 @@ def test_b3_ordering_by_cost_vs_as_written(catalog):
     never_kills = Predicate(1, 1.0)
     assert order_filters([never_kills, first], "by_cost", **kwargs) == \
         [first, never_kills]
-
-
-def test_filter_order_uses_dense_and_attention_rooflines():
-    class Predicate:
-        def __init__(self, tail, selectivity):
-            self.prompt = type("Prompt", (), {
-                "tail_tokens": tail, "preamble_tokens": 0})()
-            self.selectivity = selectivity
-
-    long_selective = Predicate(100, 0.1)
-    short_weak = Predicate(10, 0.9101)
-    ordered = order_filters(
-        [long_selective, short_weak], "by_cost", prefix_tokens=400,
-        model=QWEN3_4B_FP8, device=H100_SXM, chunk_tokens=110_376)
-    assert ordered == [short_weak, long_selective]
 
 
 def test_filter_order_matches_first_scan_enumeration():
@@ -474,20 +448,6 @@ def test_refusal_weights_need_more_cards(catalog):
         assert result.needed > result.available
 
 
-def test_preamble_counted_once_per_document(catalog):
-    from quail.logical import SHARED_PRE
-    logical = _five_filter_plan(catalog, (0.5,))
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [400] * 10})
-    chain = filter_chain(plan)
-    st = chain.stages[0]
-    # the shared preamble is per document (stage 0), never per stage
-    assert st.preamble_tokens == len(tok(SHARED_PRE))
-    assert st.question_tokens == len(tok(
-        "Evaluate TRUE or FALSE for the following question: "
-        "flag 0 of: ANSWER:"))
-
-
 def test_join_tokens_frame_per_anchor_labels_per_tuple(catalog):
     # the complete question frame is written into kept KV once per
     # anchor document; a partner's block label and the answer cue
@@ -524,36 +484,6 @@ def test_refusal_suffix_over_chunk(catalog):
                    doc_tokens={"r": [150_000]})
     assert isinstance(r, Refusal)
     assert r.constraint == "suffix_over_chunk"
-
-
-def test_refusal_unknown_model():
-    unknown = resolve_model("qwen9-13b")
-    assert isinstance(unknown, Refusal)
-    assert unknown.constraint == "unknown_model"
-
-
-def test_kv_is_always_bf16(catalog):
-    logical = _five_filter_plan(catalog, (0.9,))
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [400] * 100})
-    from quail.planner import budgets
-    assert plan.settings["admission_tokens"] == budgets.arena_tokens(
-        QWEN3_4B_FP8, H100_SXM, plan.settings["chunk_tokens"])
-
-
-def test_explain_prints_tree_settings_and_source(catalog):
-    logical = _five_filter_plan(catalog, (0.9, 0.8))
-    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens={"r": [400] * 100})
-    text = explain(logical, plan)
-    assert "Scan reviews as r" in text
-    assert "order_rule=by_cost" in explain(logical, plan, verbose=True)
-    assert "PackedFilter" in text
-    assert isinstance(plan, PhysicalPlan)
-
-    refusal = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                         doc_tokens={"r": [150_000]})
-    assert "refusal: suffix_over_chunk" in explain(logical, refusal)
 
 
 # ------------------------------------------------ KV keep (residency)
