@@ -353,33 +353,13 @@ class QueryResult:
             }
         return self
 
-    def explain(self) -> str:
-        """Return the executed physical plan with each node's metrics."""
-        # the runner imports this module, so the metrics type is
-        # imported here
-        from quail.runtime.runner import NodeMetrics
+    def explain(self, *, verbose: bool = False) -> str:
+        """Return the executed operator tree with measured rows and time."""
+        from quail.explain import physical_tree
 
         if self.plan is None:
             return "no physical plan was executed"
-        lines = []
-        for node in self.plan.topological_nodes():
-            metrics = self.node_metrics.get(node.node_id, NodeMetrics())
-            fields = ", ".join(
-                f"{key}={value}"
-                for key, value in node.explain_fields().items())
-            measured = [f"wall_s={metrics.wall_s:.3f}",
-                        f"rows={metrics.input_rows}->{metrics.output_rows}"]
-            for key in ("evaluated_documents", "evaluated_document_pairs",
-                        "fresh_tokens", "cached_tokens", "regret_tokens",
-                        "peak_gpu_bytes"):
-                value = getattr(metrics, key)
-                if value:
-                    measured.append(f"{key}={value}")
-            lines.append(
-                f"{node.type_name} {node.node_id}"
-                + (f" [{fields}]" if fields else "")
-                + "  " + " ".join(measured))
-        return "\n".join(lines)
+        return physical_tree(self.plan, verbose=verbose, metrics=self.node_metrics)
 
     def observer(self, observer) -> dict:
         """Return the report one execution observer attached.

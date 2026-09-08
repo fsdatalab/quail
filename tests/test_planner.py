@@ -247,7 +247,7 @@ def test_filter_arena_writes_decision(catalog):
     chain = filter_chain(plan)
     assert chain.arena_writes is False
     assert any("arena writes off" in r for r in plan.remarks)
-    assert "arena_writes=False" in explain(single, plan)
+    assert "arena_writes=False" in explain(single, plan, verbose=True)
 
     # a second stage re-reads survivors' KV
     plan = plan_query(_five_filter_plan(catalog, (0.9, 0.9)),
@@ -547,7 +547,7 @@ def test_explain_prints_tree_settings_and_source(catalog):
                       doc_tokens={"r": [400] * 100})
     text = explain(logical, plan)
     assert "Scan reviews as r" in text
-    assert "order=by_cost" in text
+    assert "order_rule=by_cost" in explain(logical, plan, verbose=True)
     assert "PackedFilter" in text
     assert isinstance(plan, PhysicalPlan)
 
@@ -862,3 +862,63 @@ def test_join_search_accepts_million_document_summaries():
     assert len(found["seq"]) == 3
     assert all("resident_positions" not in record
                for record in found["records"])
+
+
+@pytest.mark.parametrize("sels, expected", [
+    ((0.5, 0.25), "12.5"), ((1.0, 0.0), "0"),
+    ((None, 0.5), "unknown"), ((None, 0.0), "0"),
+])
+def test_explain_filter_output_estimates(catalog, sels, expected):
+    logical = _five_filter_plan(catalog, sels)
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [400] * 100})
+    text = explain(logical, plan)
+    physical = text.split("physical:", 1)[1]
+    assert f"Project: r.id (estimated_rows={expected})" in physical
+    assert f"PackedFilter: r (estimated_rows={expected})" in physical
+    assert "Scan reviews as r (estimated_rows=100)" in physical
+    assert "tokens=40,000" in physical
+    assert "node_id=" not in text
+    assert "arena_writes" not in text
+    assert "admission_tokens" not in text
+    assert "KV=bf16, chunk budget=" in text
+    assert "admission budget=" in text
+    assert "KV rewind=on" in text
+    assert "joins follow" not in text
+    assert "stage {" not in text
+    for index, stage in enumerate(filter_chain(plan).stages, 1):
+        template = logical.root.input.predicates[stage.written_pos].prompt.template
+        assert f"{index}. PROMPT({template!r}, r.review)" in physical
+    verbose = explain(logical, plan, verbose=True)
+    assert "node_id=filter:r" in verbose
+    assert "admission_tokens=" in verbose
+    assert "expected_docs=" in verbose
+
+
+def test_explain_limit_preserves_filter_estimate(catalog):
+    logical = _five_filter_plan(catalog, (0.25,))
+    logical = replace(logical, root=replace(logical.root, limit=10))
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [400] * 100})
+    physical = explain(logical, plan).split("physical:", 1)[1]
+    assert "Limit: 10 (estimated_rows=10)" in physical
+    assert "Project: r.id (estimated_rows=25)" in physical
+    assert "KV: not stored" in physical
+
+
+def test_explain_join_does_not_call_evaluations_output_rows(catalog):
+    logical = _filtered_join(catalog)
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens={"r": [400] * 100, "p": [40] * 10})
+    physical = explain(logical, plan).split("physical:", 1)[1]
+    assert "AnchoredJoin: anchor=" in physical
+    assert "KV: anchor=" in physical
+    assert "estimated_evaluations=" in physical
+    assert "(estimated_rows=unknown)" in physical
+    assert "expected_tuples=" not in physical
+    assert "retain KV for joins (estimated resident survivors=" in physical
+    for node in plan.nodes:
+        if isinstance(node, AnchoredJoin):
+            assert f"anchor={node.anchor}" in physical
+            for stage in node.stages:
+                assert f"{stage.semantics} ({stage.anchor}, " in physical

@@ -695,78 +695,43 @@ def _filter_alias(pred_or_list):
 
 # ------------------------------------------------------------- explain
 
-def explain(logical: LogicalPlan, physical) -> str:
-    """Format the logical and physical plan as a human-readable string."""
+def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
+    """Format the logical and physical operator trees.
+
+    Args:
+        logical: The optimized logical plan.
+        physical: The physical plan or planning refusal.
+        verbose: Include runtime settings and internal node fields.
+    """
+    from quail.explain import _fields, logical_tree, physical_tree
+
     lines = ["logical:"]
-
-    def render(node, depth):
-        pad = "  " * (depth + 1)
-        if isinstance(node, Project):
-            cols = ", ".join(f"{c.alias}.{c.column}" for c in node.columns)
-            lim = f" LIMIT {node.limit}" if node.limit is not None else ""
-            lines.append(f"{pad}Project [{cols}]{lim}")
-            render(node.input, depth + 1)
-        elif isinstance(node, SemanticJoin):
-            lines.append(f"{pad}SemanticJoin ({node.semantics}, "
-                         f"x{len(node.inputs)} inputs, "
-                         f"sel={node.selectivity}, anchor={node.anchor})")
-            for child in node.inputs:
-                render(child, depth + 1)
-        elif isinstance(node, SemanticFilter):
-            sels = [p.selectivity for p in node.predicates]
-            lines.append(f"{pad}SemanticFilter (x{len(node.predicates)}, "
-                         f"sels={sels})")
-            render(node.input, depth + 1)
-        elif isinstance(node, Scan):
-            lines.append(f"{pad}Scan {node.provider} as {node.alias} "
-                         f"[{node.column}]")
-        else:
-            fields = ", ".join(
-                f"{name}={value}"
-                for name, value in node.explain_fields().items()
-            )
-            suffix = f" [{fields}]" if fields else ""
-            lines.append(f"{pad}{node.type_name}{suffix}")
-            for child in node.children():
-                render(child, depth + 1)
-
-    render(logical.root, 0)
+    lines.extend("  " + line for line in logical_tree(logical).splitlines())
     if isinstance(physical, Refusal):
         lines.append(f"refusal: {physical.constraint}: needed "
                      f"{physical.needed} {physical.unit}, available "
                      f"{physical.available}")
-        for r in physical.reasons:
-            lines.append(f"  {r}")
+        lines.extend(f"  {reason}" for reason in physical.reasons)
         return "\n".join(lines)
-    lines.append("physical:")
-    lines.append(
-        f"  workers={physical.workers} model_copies={physical.workers}"
-    )
-    settings = physical.settings
-    lines.append(f"  backend={physical.backend}")
+    lines.append(f"physical: (backend={physical.backend}, "
+                 f"model={physical.model}, workers={physical.workers})")
     if physical.backend == "quail":
-        lines.append("  KV dtype=bf16")
-        lines.append(f"  chunk_tokens={settings['chunk_tokens']} "
-                     f"admission_tokens={settings['admission_tokens']}")
-    lines.append("  joins follow the saved order and anchors")
-    order_source = settings.get("order_source")
-    source_note = f" ({order_source})" if order_source else ""
-    lines.append(f"  order={settings.get('order_rule', 'as_written')}{source_note}")
-    for n in physical.nodes:
-        parts = [f"  {type(n).__name__} {n.node_id}"]
-        for k, v in n.explain_fields().items():
-            if k in ("shard_ranges", "shard_token_loads", "stages"):
-                continue
-            parts.append(f"{k}={v}")
-        if n.inputs:
-            parts.append("<- " + ", ".join(
-                f"{port.source.node_id}[{port.source.port}]"
-                for port in n.inputs))
-        lines.append(" ".join(parts))
-        for stage in getattr(n, "stages", ()):
-            fields = (stage.explain_fields() if isinstance(stage, JoinStage)
-                      else stage.to_dict())
-            lines.append(f"    stage {fields}")
-    for r in physical.remarks:
-        lines.append(f"  remark: {r}")
+        chunk = physical.settings.get("chunk_tokens")
+        admission = physical.settings.get("admission_tokens")
+        budgets = ["KV=bf16"]
+        if chunk is not None:
+            budgets.append(f"chunk budget={chunk:,} tokens")
+        if admission is not None:
+            budgets.append(f"admission budget={admission:,} tokens")
+        lines.append("  " + ", ".join(budgets))
+    lines.extend("  " + line for line in physical_tree(
+        physical.graph, logical=logical, verbose=verbose).splitlines())
+    if verbose:
+        lines.append("settings:")
+        lines.extend(_fields({"model": physical.model,
+                              "device": physical.device,
+                              **physical.settings}, 1))
+        if physical.backend == "quail":
+            lines.append("  KV dtype=bf16")
+        lines.extend(f"  remark: {remark}" for remark in physical.remarks)
     return "\n".join(lines)

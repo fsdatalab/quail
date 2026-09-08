@@ -186,7 +186,18 @@ app. Quail does not run an application server. One Modal container receives
 charges each query's GPU seconds, tokens, and dollars to the physical nodes
 that used them, for chargeback or a cost dashboard. It reads
 `result.plan` and `result.node_metrics`, which every finished query carries,
-and registers nothing; `result.explain()` prints the same numbers.
+and registers nothing; `result.explain(verbose=True)` prints the same numbers.
+
+`query.explain()` prints logical and physical operator trees. Predicates in
+physical filter nodes appear in execution order. `estimated_rows` means output
+rows, after filtering or a limit. An unavailable output estimate is `unknown`;
+join evaluation counts are labeled separately. Quail plans also show the model,
+chunk and admission budgets in tokens, KV rewind, retention for joins, and
+anchor KV reuse. A retained survivor percentage is a planning estimate.
+
+Use `query.explain(verbose=True)` for node ids, ports, stage estimates, and KV
+settings. After execution, `result.explain()` shows actual output rows and time
+per node. `result.explain(verbose=True)` includes the full recorded metrics.
 
 A model backend decides whether it supports a model and device. It proposes a
 physical plan, creates one model execution object per GPU, and executes the
