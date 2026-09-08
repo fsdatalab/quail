@@ -316,9 +316,10 @@ def _child_main(gpu_idx, conn):
         if kind == "shutdown":
             break
         try:
-            if kind == "registry":
-                state.update(data)
-                conn.send(("ok", None))
+            if kind == "boot":
+                state["registry"] = data["registry"]
+                state["model_path"] = data["model_path"]
+                conn.send(("ok", _child_boot(state, data)))
             elif kind == "filters":
                 conn.send(("ok", _child_filters(state, data)))
             elif kind == "joins":
@@ -347,24 +348,18 @@ def _child_boot(state, sub):
     )
     _warm(state, boot)
     _finish_boot(boot, t_boot)
-    state["boot"] = boot
-
-
+    say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
+    return boot
 
 
 def _child_filters(state, sub):
-
-    _child_boot(state, sub)
-    boot = state["boot"]
     torch = state["torch"]
     arena = state["arena"]
     if sub.get("start_query", True):
         _reset_child_query(state)
         config = sub.get("retention", {})
         apply_retention(arena, config, config.get("initial", {}))
-    out = dict(filters={}, survivors={}, retained={}, fresh_tokens=0,
-               boot_s=boot["boot_s"], boot_kind=boot["kind"],
-               boot=boot)
+    out = dict(filters={}, survivors={}, retained={}, fresh_tokens=0)
     pre = sub.get("pre_ids") or []
     filter_limit = sub.get("filter_limit")
     t0 = time.perf_counter()
@@ -425,8 +420,6 @@ def _child_filters(state, sub):
 
 
 def _child_joins(state, sub):
-
-    _child_boot(state, sub)
     torch = state["torch"]
     arena = state["arena"]
     if sub.get("start_query", False):
@@ -590,7 +583,13 @@ def execute_quail_multi(payload, registry, graph):
     model_path = resolve_model_path(spec.hf_name, spec.revision)
     model_files_s = time.perf_counter() - started
     _ensure_children(gpu_count)
-    _round("registry", [dict(registry=registry, model_path=model_path)] * gpu_count)
+    setup = {key: payload[key] for key in (
+        "model", "physical_plan", "workers", "chunk_tokens", "true_ids", "false_ids",
+    )}
+    setup.update(registry=registry, model_path=model_path)
+    boots = _round("boot", [setup] * gpu_count)
+    boot_s = round(time.perf_counter() - started, 2)
+    say(f"all {gpu_count} GPUs ready; running the query")
     report = execute_distributed_graph(
         payload,
         graph,
@@ -601,11 +600,13 @@ def execute_quail_multi(payload, registry, graph):
         registry.runtimes,
         registry,
     )
-    report["boot_s"] = round(report["boot_s"] + model_files_s, 2)
+    slowest = max(boots, key=lambda boot: boot["boot_s"])
+    report["boot_s"] = boot_s
+    report["boot_kind"] = "cold" if any(b["kind"] == "cold" for b in boots) else "warm"
     report["boot"] = {
-        **(report.get("boot") or {}),
+        **slowest,
         "model_files_s": round(model_files_s, 2),
-        "boot_s": report["boot_s"],
+        "boot_s": boot_s,
     }
     commit_results()
     commit_kernel_cache()

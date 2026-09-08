@@ -62,7 +62,6 @@ class DistributedQuailExecution:
         self.retained: dict[str, set[int]] = {}
         self.prior_shards: dict[str, list[list[int]]] = {}
         self.started = False
-        self.boot_outputs = []
         self.child_totals = [None] * gpu_count
         self.peak_gib = 0.0
         self.kv_stats = {
@@ -93,7 +92,6 @@ class DistributedQuailExecution:
             sub["start_query"] = True
         outputs = self.round_fn("filters", subs)
         self.started = True
-        self.boot_outputs.extend(outputs)
         self.peak_gib = max(
             self.peak_gib,
             *(output.get("peak_gib", 0.0) for output in outputs),
@@ -129,7 +127,6 @@ class DistributedQuailExecution:
         outputs = self.round_fn("filters", subs)
         wall = time.perf_counter() - started
         self.started = True
-        self.boot_outputs.extend(outputs)
         self.peak_gib = max(
             self.peak_gib,
             *(output.get("peak_gib", 0.0) for output in outputs),
@@ -270,19 +267,7 @@ class DistributedQuailExecution:
         for totals in self.child_totals:
             for key, value in (totals or {}).items():
                 self.kv_stats[key] = self.kv_stats.get(key, 0) + value
-        boot_s = max(
-            (output.get("boot_s", 0.0) for output in self.boot_outputs),
-            default=0.0,
-        )
-        slowest = max(
-            self.boot_outputs,
-            key=lambda output: output.get("boot_s", 0.0),
-            default={},
-        )
         return {
-            "boot_s": round(boot_s, 2),
-            "boot_kind": slowest.get("boot_kind"),
-            "boot": slowest.get("boot"),
             "kv_manager": dict(self.kv_stats),
             "peak_gib": self.peak_gib,
         }
@@ -330,7 +315,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         filters=filters,
         joins=joins,
         _outputs=export_physical_outputs(compute_subgraph(graph), result),
-        wall_s=round(elapsed - report["boot_s"], 2),
+        wall_s=round(elapsed, 2),
         fresh_tokens=result.metrics.fresh_tokens,
         regret_tokens=result.metrics.regret_tokens,
         executed_join_plan=executed_join_plan(graph),

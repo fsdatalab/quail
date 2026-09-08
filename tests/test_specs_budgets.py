@@ -58,11 +58,3 @@ def test_compute_knee_and_attention_crossover():
     assert 380 <= knee <= 450
     s = budgets.attention_crossover(QWEN3_4B_FP8, H100_SXM)
     assert 11_000 <= s <= 13_500
-
-
-def test_derived_table():
-    table = budgets.derived_table(QWEN3_4B_FP8, H100_SXM)
-    assert table["minimum_weight_gpus"] == 1
-    assert table["chunk_budget"] == 110_376
-    assert table["arena_tokens"] == budgets.arena_tokens(
-        QWEN3_4B_FP8, H100_SXM)

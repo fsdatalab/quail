@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 
 import quail
-from quail.bench.evaluate import H100_USD_PER_HOUR
+from quail.bench.evaluate import MODAL_GPU_USD_PER_HOUR
 from quail.specs import DEVICES
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -61,11 +61,12 @@ def main() -> None:
     parser.add_argument("--device", choices=sorted(DEVICES), default="h100-sxm")
     parser.add_argument("--gpus", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--gpu-usd-per-hour", type=float,
-                        help="hourly price per GPU; defaults to Modal pricing for H100")
+                        help="hourly price per GPU; defaults to Modal pricing")
     args = parser.parse_args()
     hourly_price = args.gpu_usd_per_hour
-    if hourly_price is None and args.device == "h100-sxm":
-        hourly_price = H100_USD_PER_HOUR
+    price_source = "custom" if hourly_price is not None else "Modal"
+    if hourly_price is None:
+        hourly_price = MODAL_GPU_USD_PER_HOUR[args.device]
     t0 = time.perf_counter()
     reviews = load_reviews()
     n_docs = reviews.count_rows()
@@ -99,12 +100,10 @@ def main() -> None:
         print(f"total_s: {total_s:.2f} (boot + query)")
         print(f"fresh_tokens: {report.get('fresh_tokens')}")
         print(f"documents/second: {n_docs / wall_s:.1f}")
-        if hourly_price is not None:
-            cost_per_second = args.gpus * hourly_price / 3600
-            print(f"GPU cost/query: ${wall_s * cost_per_second:.4f}")
-            print(f"GPU startup cost: ${boot_s * cost_per_second:.4f}")
-        else:
-            print("GPU cost: set --gpu-usd-per-hour to report cost")
+        cost_per_second = args.gpus * hourly_price / 3600
+        print(f"GPU price: ${hourly_price:.4f}/GPU-hour ({price_source})")
+        print(f"GPU cost/query: ${wall_s * cost_per_second:.4f}")
+        print(f"GPU startup cost: ${boot_s * cost_per_second:.4f}")
 
 
 if __name__ == "__main__":

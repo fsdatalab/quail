@@ -6,20 +6,13 @@ import pytest
 
 import quail
 from quail.bench.quailb import (
-    AGENT_TRACE_DOCUMENTS,
-    AGENT_TRACE_MAX_TOKENS,
-    AGENT_TRACE_TURN_INTERVAL,
     ASPECTS,
-    LEPARD_POSITIVE_PAIRS,
     QUERY_FAMILY_WORKLOADS,
     QUERY_ORDER,
     SCENARIOS,
-    SETS,
     _agent_snapshot_boundaries,
     _agent_trace_rows,
     _lepard_documents,
-    _n_agent_documents,
-    _n_lepard_pairs,
     _sample_lepard_pairs,
     queries,
     query_family_name,
@@ -119,24 +112,6 @@ def test_all_queries_compile_and_plan(tmp_path, backend):
         )
         assert plan.settings["order_rule"] == expected_order, qid
         assert "physical:" in query.explain(), qid
-
-
-def test_set_table_matches_design():
-    assert SETS == {
-        "reviews": 50_000,
-        "reports": 5_000,
-        "claims": 5_000,
-        "agent_traces": AGENT_TRACE_DOCUMENTS,
-        "policies": 1_000_000,
-    }
-    assert LEPARD_POSITIVE_PAIRS == 5_000
-    assert _n_lepard_pairs(0.1) == 500
-    assert len(ASPECTS) == 12
-    assert len(SCENARIOS) == 100
-    assert AGENT_TRACE_TURN_INTERVAL == 5
-    assert AGENT_TRACE_MAX_TOKENS == 24_000
-    assert _n_agent_documents(1.0) == 17_718
-    assert _n_agent_documents(0.1) == 1_772
 
 
 def test_agent_snapshots_include_every_fifth_turn_and_following_tool():

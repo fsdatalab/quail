@@ -576,7 +576,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     q_max = len(question)
     original_mode = pipeline.attention_mode
     for mode in (FILTER_ATTENTION, JOIN_ATTENTION):
-        logger.info("kernels: warming %s attention, full chunk", mode)
+        logger.debug("kernels: warming %s attention, full chunk", mode)
         pipeline.attention_mode = mode
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
                    [question], budget, arena_writes=True)
@@ -585,17 +585,17 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         for t in TINY_WARM_TOKENS:
             if t >= budget:
                 continue
-            logger.info("kernels: warming %s attention, %s tokens", mode, t)
+            logger.debug("kernels: warming %s attention, %s tokens", mode, t)
             body = (doc * (t // len(doc) + 1))[:max(8, t - q_max)]
             run_filter(torch, arena, pipeline, async_ans, [body],
                        [question], budget, arena_writes=True)
     if join_chunk:
-        logger.info("kernels: warming join forward pass")
+        logger.debug("kernels: warming join forward pass")
         pipeline.attention_mode = JOIN_ATTENTION
         run_join(torch, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
     pipeline.attention_mode = original_mode
-    logger.info("kernels: warming filter without KV writes")
+    logger.debug("kernels: warming filter without KV writes")
     run_filter(torch, arena, pipeline, async_ans, warm_docs,
                [question], budget, arena_writes=False)
 
@@ -638,6 +638,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         buf = None
         torch.cuda.synchronize()
     progress.finish("kernels: GEMM warmup done")
+    logger.info("kernels: warming filter and join forward passes")
     _forward_warm(torch, arena, pipeline, async_ans, budget,
                   join_chunk=True)
 
@@ -697,6 +698,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
             except BlockingIOError:
                 logger.info("kernels: waiting for another worker to compile")
                 fcntl.flock(lock, fcntl.LOCK_EX)
+            wait_s = time.perf_counter() - t0
             on_disk = None
             try:
                 with open(path) as f:
@@ -713,12 +715,14 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                 os.replace(tmp, path)
                 tier = "compile"
         if tier == "touch":
-            logger.info("kernels: loading and warming cached kernels")
+            logger.info("kernels: warming cached filter and join kernels")
             touch_kernels(torch, arena, pipeline, async_ans, budget)
         torch.cuda.synchronize()
-        warm_s = round(time.perf_counter() - t0, 2)
-        logger.info("kernels: %s pass done in %s s", tier, warm_s)
-        return dict(tier=tier, warm_s=warm_s)
+        warm_s = round(time.perf_counter() - t0 - wait_s, 2)
+        wait_s = round(wait_s, 2)
+        logger.info("kernels: %s pass done in %s s; waited %s s for compilation",
+                    tier, warm_s, wait_s)
+        return dict(tier=tier, warm_s=warm_s, wait_s=wait_s)
 
 
 # ---------------------------------------------------------- the filter

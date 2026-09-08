@@ -14,7 +14,12 @@ from pyarrow import parquet as pq
 
 GROUND_TRUTH_ROOT = "ground_truth/quailb/schema_v1"
 RESULTS_VOLUME = "quail-results"
-H100_USD_PER_HOUR = 3.9492
+# GPU-only per-second rates from https://modal.com/pricing, checked 2026-09-07.
+MODAL_GPU_USD_PER_HOUR = {
+    "h100-sxm": 0.001097 * 3600,
+    "rtx-pro-6000-blackwell-server": 0.000842 * 3600,
+}
+H100_USD_PER_HOUR = MODAL_GPU_USD_PER_HOUR["h100-sxm"]
 H100_PRICE_SOURCE = "https://modal.com/pricing"
 
 # Must match quail.bench.judge_pass.CORPUS_COLUMNS exactly - this is

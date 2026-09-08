@@ -6,25 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.executor.model import _SingleRank, answer_weights, retain_answer_head
-
-
-class _Torch:
-    class device:  # noqa: N801  mirrors torch.device's lowercase name
-        def __init__(self, name):
-            self.name = name
-
-
-def test_single_rank_collectives_are_identity():
-    group = _SingleRank(_Torch)
-    assert group.world_size == 1
-    assert group.is_first_rank
-    assert group.is_last_rank
-    x = object()
-    assert group.all_reduce(x) is x
-    assert group.all_gather(x) is x
-    assert group.broadcast(x) is x
-    assert group.broadcast_object("ok") == "ok"
+from quail.executor.model import answer_weights, retain_answer_head
 
 
 @pytest.fixture

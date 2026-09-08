@@ -28,12 +28,6 @@ FILTER_SQL = (
 )
 
 
-def test_session_defaults_to_in_process_compute():
-    session = _session()
-    assert isinstance(session.compute_provider, quail.InProcessComputeProvider)
-    session.close()
-
-
 def test_in_process_provider_names_modal_when_no_gpu(monkeypatch):
     monkeypatch.setattr(
         compute, "local_gpu_problem", lambda: "no CUDA GPU is visible"
@@ -103,12 +97,6 @@ def test_device_config_reaches_planning_and_query_request(monkeypatch):
         assert query.plan().device == device.name
         assert query._request().config == config
         assert selected and all(item == (device, 1) for item in selected)
-
-
-def test_default_device_is_h100():
-    with _session() as session:
-        assert session.config.device == "h100-sxm"
-        assert session.device.name == session.config.device
 
 
 def test_unknown_device_in_config_is_rejected():

@@ -1655,17 +1655,20 @@ marker check, compile pass, and marker write. Other workers sharing the
 cache wait for that operation, then run their touch passes in parallel.
 Failures release the lock without publishing completion.
 
-Warmup emits INFO messages for the GEMM sweep and subsequent forward
-passes. GPU worker logs include the GPU index, including filter and join
-progress. A completed GEMM sweep does not mean the forward passes have
+Warmup emits INFO messages for the GEMM sweep and phase summaries.
+Individual attention shapes and forward passes appear at DEBUG level.
+GPU worker logs include the GPU index, including filter and join progress. A completed GEMM sweep does not mean the forward passes have
 finished.
 
 **Cold model load** (`executor/model.py`, `runtime/worker.py`):
 the parent resolves and downloads the pinned model snapshot once before
-starting GPU children. It sends the local directory with their registry.
+starting GPU children. An explicit boot request sends the local directory
+and registry to every child. The coordinator waits for all GPUs to finish
+warming before starting any filter or join operator.
 `load_model` passes that directory to vLLM. A single-GPU call uses the same
 resolver. Resolution is cached by model and revision for the process lifetime.
-The parent adds file preparation time to startup time, outside query time.
+Startup time includes model file preparation, process startup, loading, and
+warmup. Query time begins after all GPU workers are ready.
 
 - Every vLLM image sets `VLLM_CACHE_ROOT` to the kernel-cache
   volume. vLLM resolves the model architecture by running a fresh
