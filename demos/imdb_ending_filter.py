@@ -46,9 +46,11 @@ def load_reviews() -> ds.Dataset:
         imdb["test"],
         imdb["unsupervised"],
     ])
+    # take the Arrow column as is; indexing the dataset would copy every
+    # string through Python
     return ds.dataset(pa.table({
-        "review_id": [f"review-{i}" for i in range(len(all_reviews))],
-        "review": all_reviews["text"],
+        "review_id": pa.array(f"review-{i}" for i in range(len(all_reviews))),
+        "review": all_reviews.data.table.column("text"),
     }))
 
 
