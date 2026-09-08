@@ -1,5 +1,6 @@
 """Remote source planning and execution tests."""
 
+from dataclasses import replace
 from threading import Lock
 
 import pyarrow as pa
@@ -20,10 +21,12 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
 ):
     from quail.execution import export_physical_outputs
     from quail.physical import DocumentInput, PackedFilter, decode_graph
+    from quail.planning import SupportResult
     from quail.runtime import local as local_runtime
     from quail.runtime import worker
     from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
     from quail.runtime.session import Session
+    from quail.specs import H100_SXM
 
     path = tmp_path / "documents.parquet"
     pq.write_table(pa.table({
@@ -40,6 +43,9 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
         "SELECT d.id FROM docs d WHERE "
         "AI_FILTER(PROMPT('keep {0}', d.body))"
     )
+    local.registry.register_device(replace(H100_SXM, name="test-h100"))
+    monkeypatch.setattr(local.registry.backend("quail"), "supports",
+                        lambda model, device, count: SupportResult.accept())
     request = {
         "logical_plan": query.logical,
         "sources": {"docs": {"remote": {
@@ -48,9 +54,8 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
             "id_col": "id",
         }}},
         "config": EngineConfig(
-            gpus=1, model="qwen3-4b-fp8", backend="quail"
+            gpus=1, model="qwen3-4b-fp8", backend="quail", device="test-h100"
         ),
-        "device": "h100-sxm",
         "order": None,
         "registry": local.registry,
     }
@@ -85,6 +90,7 @@ def test_worker_reads_tokenizes_plans_and_projects_remote_source(
         assert calls == ["initialize", "source", "plan"]
         calls.append("execute")
         assert "extensions" not in physical.plan
+        assert physical.plan["device"] == "test-h100"
         graph = decode_graph(
             physical.plan["graph"], registry.codecs
         )

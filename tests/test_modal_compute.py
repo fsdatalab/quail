@@ -1,9 +1,9 @@
 """Modal Function compute provider tests."""
 
-from contextlib import nullcontext
-from types import SimpleNamespace
+from dataclasses import replace
 
 import pyarrow as pa
+import pytest
 
 import quail
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
@@ -33,18 +33,21 @@ def _request() -> QueryRequest:
         logical_plan=_logical_plan(),
         providers={"docs": provider},
         config=EngineConfig(),
-        device="h100-sxm",
     )
 
 
-def test_modal_request_copies_only_needed_local_columns():
-    request = _modal_request(_request())
+def test_modal_rejects_rtx_before_allocating_an_h100(monkeypatch):
+    provider = quail.ModalComputeProvider()
 
-    assert request["logical_plan"] == _logical_plan()
-    assert request["sources"]["docs"]["table"].column_names == [
-        "id", "body"
-    ]
-    assert request["sources"]["docs"]["id_col"] == "id"
+    def unexpected_allocation(*args, **kwargs):
+        raise AssertionError("allocated an H100 for an RTX plan")
+
+    monkeypatch.setattr(provider, "_function", unexpected_allocation)
+    request = _request()
+    request = replace(request, config=replace(
+        request.config, device="rtx-pro-6000-blackwell-server"))
+    with pytest.raises(ValueError, match="provisions H100s only"):
+        provider.execute(request)
 
 
 def test_modal_request_leaves_remote_source_on_worker():
@@ -66,7 +69,6 @@ def test_modal_request_leaves_remote_source_on_worker():
         logical_plan=_logical_plan(),
         providers={"docs": RemoteProvider()},
         config=EngineConfig(),
-        device="h100-sxm",
     )
 
     prepared = _modal_request(request)
@@ -142,27 +144,3 @@ def test_modal_provider_calls_function_and_releases_minimum_container(
     ]
     assert closed == ["app"]
     assert "function call id: fc-test" in capsys.readouterr().out
-
-
-def test_modal_provider_uses_explicit_dependencies(monkeypatch):
-    from quail.runtime import worker
-
-    images = []
-
-    def make_worker(**kwargs):
-        images.append(kwargs)
-        return SimpleNamespace(app=SimpleNamespace(run=lambda **kwargs: nullcontext()))
-
-    monkeypatch.setattr(worker, "modal_worker", make_worker)
-    provider = quail.ModalComputeProvider(
-        local_python_sources=("shared", "extra_source", "shared"),
-        pip_packages=("shared-package==1.0", "extra-package==1.0",
-                      "shared-package==1.0"),
-    )
-    registry = quail.ExtensionRegistry.with_built_ins()
-    first = provider._worker_for("quail", registry)
-    assert provider._worker_for("quail", registry) is first
-    assert len(images) == 1
-    assert images[0]["local_python_sources"] == ("shared", "extra_source")
-    assert images[0]["pip_packages"] == ("shared-package==1.0", "extra-package==1.0")
-    provider.close()

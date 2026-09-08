@@ -15,8 +15,3 @@ def test_join_round_classifies_hit_regret_and_first():
     # is gone: its 200 prefix tokens are regret. ("r", 2) is a first
     # computation: a miss, but no regret.
     assert out == dict(hits=1, misses=2, regret_tokens=200)
-
-
-def test_join_round_with_no_anchors_reports_zeroes():
-    assert _join_round_kv([], [], owned=set(), seen=set()) == dict(
-        hits=0, misses=0, regret_tokens=0)

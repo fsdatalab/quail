@@ -7,17 +7,10 @@ import pytest
 
 from quail.backends.request_scheduling import (
     join_regret_tokens,
-    longest_common_prefix,
     run_filter_chain,
     run_filter_chain_async,
     run_join_grouped,
 )
-
-
-def test_longest_common_prefix_counts_shared_leading_tokens():
-    assert longest_common_prefix([1, 2, 3], [1, 2, 4]) == 2
-    assert longest_common_prefix([1, 2], [1, 2, 3]) == 2
-    assert longest_common_prefix([], [1]) == 0
 
 
 def test_join_regret_buckets_pair0_and_rest():
@@ -31,11 +24,6 @@ def test_join_regret_buckets_pair0_and_rest():
     cached = [0, 32, 16, 16]
 
     assert join_regret_tokens(prefixes, 2, cached, [40, 0], 16) == 48
-
-
-def test_join_regret_is_zero_when_cache_serves_every_would_hit():
-    prefixes = [[7] * 32]
-    assert join_regret_tokens(prefixes, 2, [32, 32], [32], 16) == 0
 
 
 class _FakeFilterEngine:

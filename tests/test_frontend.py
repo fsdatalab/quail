@@ -115,7 +115,6 @@ def test_builder_equals_sql(catalog):
                       selectivity=0.05)
              .select("r.id", "p.asin"))
     assert built == sql_plan
-    assert built == sql_plan
 
 
 THREE_WAY_TEMPLATE = ("Review {0} praises the thread in {1} and the "

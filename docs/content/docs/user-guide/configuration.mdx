@@ -14,9 +14,13 @@ class EngineConfig:
     gpus: int = 1
     model: str = "qwen3-4b-fp8"
     backend: str = "quail"
+    device: str = "h100-sxm"
 ```
 
-- `gpus`: 1, 2, 4, or 8 H100s in one Modal container. Each GPU holds
+- `device`: the registered hardware specification used for planning. Built in:
+  `h100-sxm` and `rtx-pro-6000-blackwell-server`. This setting must match the
+  hardware where the model runs. It does not attach a GPU to a local process.
+- `gpus`: 1, 2, 4, or 8 GPUs on one host. Each GPU holds
   one model copy. The request backends (vLLM and SGLang) accept 1
   only.
 - `model`: a registered model name. Built in: `qwen3-4b-fp8` and
@@ -26,26 +30,39 @@ class EngineConfig:
   never sets this. The others exist for comparison runs.
 
 ```python
-session = quail.Session(quail.EngineConfig(model="qwen3-32b-fp8", gpus=2))
+session = quail.Session(quail.EngineConfig(
+    model="qwen3-32b-fp8", gpus=2, device="h100-sxm",
+))
 ```
 
 The session checks the model, device, and backend when it is created.
 An unknown name or an unsupported combination raises
 `quail.RefusalError` before any table is registered.
 
+For an eight-GPU RTX PRO 6000 Blackwell Server Edition host:
+
+```python
+session = quail.Session(quail.EngineConfig(
+    device="rtx-pro-6000-blackwell-server", gpus=8,
+))
+```
+
+This runs on the GPUs in the calling process. RTX support includes planning
+constants and FlashAttention-2 selection; execution still needs validation on
+RTX hardware. H100 uses FlashAttention-3. `ModalComputeProvider` provisions
+H100s only and rejects an RTX configuration before starting a worker.
+
 ## Session arguments
 
 ```python
 quail.Session(
     config=EngineConfig(),
-    device="h100-sxm",
     tokenizer=None,
     registry=None,
     compute_provider=None,
 )
 ```
 
-- `device`: a registered device spec. Only `h100-sxm` is built in.
 - `tokenizer`: a callable from text to token ids. Leave it unset to
   load the model's Hugging Face tokenizer on first use. Tests pass a
   fake tokenizer so they run without downloads.

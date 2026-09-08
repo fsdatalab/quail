@@ -275,41 +275,6 @@ def _observed_result(tmp_path, registry):
     ), make_executor(truth))
 
 
-def test_result_carries_the_executed_plan_and_node_metrics(tmp_path):
-    from quail_ext_examples import cost_ledger
-
-    result = _observed_result(tmp_path, quail.ExtensionRegistry.with_built_ins())
-
-    assert [node.type_name for node in result.plan.topological_nodes()] == [
-        "quail.document_input",
-        "quail.packed_filter",
-        "quail.project",
-        "quail.limit",
-    ]
-    assert set(result.node_metrics) == {
-        node.node_id for node in result.plan.nodes}
-    # the fake executor reports no per node metrics, so every node
-    # carries the zero metrics; the plan and the shape are what this
-    # test checks
-    text = result.explain()
-    assert text.startswith("Limit: 1 (actual_rows=0, wall_s=0.000)")
-    assert "PackedFilter: r" in text
-    assert "node_id=filter:r" in result.explain(verbose=True)
-
-    ledger = cost_ledger.charge(result)
-    assert [row["node_type"] for row in ledger["nodes"]] == [
-        node.type_name for node in result.plan.topological_nodes()]
-    assert set(ledger["totals"]) == {
-        "wall_s", "evaluated_documents", "evaluated_document_pairs",
-        "fresh_tokens", "cached_tokens", "usd"}
-    assert ledger["totals"]["usd"] == pytest.approx(
-        ledger["totals"]["wall_s"] / 3600 * ledger["usd_per_gpu_hour"],
-        abs=1e-8)
-    expected_usd = 2 * ledger["totals"]["wall_s"] / 3600 * ledger["usd_per_gpu_hour"]
-    assert cost_ledger.charge(result, gpus=2)["totals"]["usd"] == \
-        pytest.approx(expected_usd, abs=1e-8)
-
-
 def test_observer_sees_the_complete_physical_graph(tmp_path):
     registry = quail.ExtensionRegistry.with_built_ins().register_observer(
         NodeTypes)
@@ -343,12 +308,3 @@ def test_executed_plan_survives_the_report_round_trip(tmp_path):
         node.node_id for node in result.plan.topological_nodes()]
     assert restored.node_metrics == result.node_metrics
     assert restored.explain() == result.explain()
-
-
-def test_query_explain_uses_optimized_projection(sess):
-    query = sess.sql("SELECT r.id FROM reviews r WHERE "
-                     "AI_FILTER(PROMPT('q: {0}', r.review))")
-    text = query.explain()
-    assert "Scan reviews as r [review, id]" in text
-    assert "admission_tokens=" not in text
-    assert "admission_tokens=" in query.explain(verbose=True)

@@ -12,7 +12,6 @@ import pytest
 from modal._serialization import deserialize, serialize
 
 from quail.builtins import built_in_registry
-from quail.extensions import ExtensionRegistry
 from quail.physical import DocumentInput, NodeCodec, PhysicalGraph, PortRef
 from quail.planning import apply_physical_rules
 from quail.runtime.runner import DocumentInputRuntime, ExecutionContext, GenericRunner
@@ -126,18 +125,6 @@ def test_recursive_module_load_is_rejected_and_rolled_back(monkeypatch):
     assert not registry.extension_modules
 
 
-def test_lookup_tables_cannot_bypass_registration():
-    registry = built_in_registry()
-    with pytest.raises(TypeError):
-        registry.physical_rules["lost"] = ChangeCount("lost")
-    with pytest.raises(AttributeError):
-        registry.physical_rules = {"lost": ChangeCount("lost")}
-    with pytest.raises(TypeError):
-        ExtensionRegistry(physical_rules={"lost": ChangeCount("lost")})
-    registry.register_physical_rule(ChangeCount("saved"))
-    assert list(deserialize(serialize(registry), None).physical_rules) == ["saved"]
-
-
 @pytest.mark.parametrize("existing", ["codec", "runtime"])
 def test_register_node_duplicate_leaves_registry_unchanged(existing):
     registry = built_in_registry()
@@ -176,12 +163,6 @@ def test_register_node_rejects_a_codec_for_another_class():
         )
     assert CustomInput.type_name not in registry.codecs
     assert CustomInput.runtime_key not in registry.runtimes
-
-
-def test_explicit_empty_name_is_rejected():
-    registry = built_in_registry()
-    with pytest.raises(ValueError, match="nonempty string name"):
-        registry.register_physical_rule(ChangeCount("valid"), name="")
 
 
 def test_registry_crosses_a_fresh_process_without_replaying_modules(

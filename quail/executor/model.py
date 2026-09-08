@@ -13,6 +13,28 @@ no-ops at world size 1, so this path installs single-rank stubs
 instead of starting NCCL or gloo.
 """
 
+from functools import lru_cache
+from pathlib import Path
+
+from quail.progress import say
+
+
+@lru_cache(maxsize=8)
+def resolve_model_path(model_name: str, revision: str | None = None) -> str:
+    """Download one model revision and return its local directory."""
+    path = Path(model_name).expanduser()
+    if path.is_dir():
+        return str(path.resolve())
+    from huggingface_hub import snapshot_download
+
+    say(f"preparing model files: {model_name}")
+    path = snapshot_download(
+        repo_id=model_name, revision=revision or None,
+        allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt", "*.tiktoken"],
+    )
+    say(f"model files ready: {path}")
+    return path
+
 
 class _SingleRank:
     """The group object get_model reads. Collectives are identity."""
@@ -119,8 +141,8 @@ def load_model(model_name: str, revision: str | None = None, *,
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.model_loader import get_model
 
-    config = EngineArgs(model=model_name, dtype="auto",
-                        revision=revision or None,
+    model_path = resolve_model_path(model_name, revision)
+    config = EngineArgs(model=model_path, dtype="auto",
                         enforce_eager=True).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):
@@ -130,7 +152,7 @@ def load_model(model_name: str, revision: str | None = None, *,
 
         from quail.logical import true_false_ids
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
         true_ids, false_ids = true_false_ids(tokenizer)
         answer_token_ids = true_ids | false_ids
     retain_answer_head(torch, model, answer_token_ids)

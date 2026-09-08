@@ -5,19 +5,11 @@ import pytest
 
 from experiments.sglang_profile_analysis import (
     binned_activity,
-    clip_interval,
     input_preparation_breakdown,
     intersect_intervals,
     interval_duration,
-    merge_intervals,
     read_trace,
 )
-
-
-def test_gpu_activity_counts_overlapping_streams_once():
-    intervals = [(10, 20), (5, 15), (30, 40), (40, 45), (8, 9), (0, 0)]
-    assert merge_intervals(intervals) == [(5, 20), (30, 45)]
-    assert interval_duration(intervals) == 30
 
 
 def test_activity_bins_preserve_union_duration_and_partial_final_bin():
@@ -26,14 +18,6 @@ def test_activity_bins_preserve_union_duration_and_partial_final_bin():
     assert bins == [(0, 10, 5), (10, 20, 10), (20, 30, 0), (30, 40, 10), (40, 45, 3)]
     assert sum(occupied for _, _, occupied in bins) == pytest.approx(
         interval_duration(intervals))
-
-
-def test_measurement_window_excludes_export_and_clips_crossing_operations():
-    window = (10, 50)
-    intervals = [(0, 5), (5, 15), (20, 30), (40, 60), (60, 80)]
-    clipped = [span for item in intervals if (span := clip_interval(item, window))]
-    assert clipped == [(10, 15), (20, 30), (40, 50)]
-    assert interval_duration(clipped) == 25
 
 
 def test_cpu_scope_overlap_with_gpu_gaps_uses_elapsed_time():

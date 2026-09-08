@@ -74,8 +74,8 @@ ESTIMATE_SAMPLE = 1024
 
 
 class Session:
-    def __init__(self, config: EngineConfig = EngineConfig(),
-                 device: str = "h100-sxm", tokenizer=None,
+    def __init__(self, config: EngineConfig = EngineConfig(), *,
+                 tokenizer=None,
                  registry: ExtensionRegistry | None = None,
                  compute_provider=None):
         self.registry = registry or built_in_registry()
@@ -84,7 +84,7 @@ class Session:
             raise RefusalError(model)
         self.config = config
         self.model = model
-        self.device = self.registry.device(device)
+        self.device = self.registry.device(config.device)
         try:
             backend = self.registry.backend(config.backend)
         except ValueError as error:
@@ -589,7 +589,6 @@ class Query:
                 for scan in scans
             },
             config=self.session.config,
-            device=self.session.device.name,
             order=self.order,
             registry=self.session.registry,
             planned_query=self,

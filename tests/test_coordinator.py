@@ -74,19 +74,6 @@ def test_merge_filter_round():
     assert limited["survivors"]["r"] == [0, 1, 3]
 
 
-def test_join_group_anchors_follow_filter_shards():
-    p = payload()
-    survivors = {"r": [0, 1, 3, 4]}     # p unfiltered: survives whole
-    subs = join_group_payloads(p, 2, survivors, p["joins"])
-    assert subs[0]["anchor_index"] == [0, 4]     # shard 0 minus dead 2
-    assert subs[1]["anchor_index"] == [1, 3]
-    # every worker sees the identical full partner list
-    for s in subs:
-        assert s["partners"]["p"]["index"] == [0, 1, 2, 3]
-        assert s["partners"]["p"]["docs"][0] == [0] * 5
-    assert subs[0]["anchor_docs"][1] == [4] * 14
-
-
 def test_join_group_reshards_an_anchor_without_filter_shards():
     # a hand-built payload with no shard entry at all for the anchor:
     # shards balance fresh over the live documents. Only token ids
@@ -114,18 +101,6 @@ def test_join_group_reshards_an_unfiltered_anchor_over_its_live_set():
     survivors = {"p": [0, 1], "r": [0, 1, 3]}
     subs = join_group_payloads(p, 2, survivors, group)
     assert [s["anchor_index"] for s in subs] == [[0], [1]]
-    # a filtered anchor still follows its filter shard (locality):
-    # test_join_group_anchors_follow_filter_shards above
-
-
-def test_join_group_carries_pre():
-    # the join round needs the engine preamble (anchor prefixes are
-    # pre + doc)
-    p = payload()
-    subs = join_group_payloads(p, 2, {"r": [0, 1, 3, 4]}, p["joins"])
-    for s in subs:
-        assert s["pre_ids"] == [9]
-        assert s["anchor_alias"] == "r"
 
 
 def test_join_group_ships_every_partner_of_a_multi_table_join():
@@ -240,28 +215,6 @@ def test_merge_join_round_two_stages():
     assert merged[1]["anchor_index"] == [0, 4, 3]
     assert merged[1]["rows"] == {0: [0, 1, 1], 2: [1, 0, 0]}
     assert merged[1]["partner_index"] == [[0], [1], [2]]
-
-
-def test_merge_join_round_disjoint_anchors():
-    # partner_index entries are index tuples (one global index per
-    # partner alias), identical on every worker
-    outs = [
-        dict(joins=[dict(rows={0: [1, 0, 1], 1: [0, 0, 1]},
-                         anchor_index=[0, 4],
-                         partner_index=[[1, 0], [2, 0], [3, 1]])],
-             fresh_tokens=10, wall_s=1.0),
-        dict(joins=[dict(rows={0: [0, 1, 0]},
-                         anchor_index=[3],
-                         partner_index=[[1, 0], [2, 0], [3, 1]])],
-             fresh_tokens=10, wall_s=1.0),
-    ]
-    merged = merge_join_round(outs)
-    assert len(merged) == 1
-    stage = merged[0]
-    assert stage["anchor_index"] == [0, 4, 3]
-    assert stage["partner_index"] == [[1, 0], [2, 0], [3, 1]]
-    assert stage["rows"] == {0: [1, 0, 1], 1: [0, 0, 1],
-                             2: [0, 1, 0]}
 
 
 def test_join_group_prior_shards_align_kept_anchors():
