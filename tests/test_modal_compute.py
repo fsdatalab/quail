@@ -1,6 +1,7 @@
 """Modal Function compute provider tests."""
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -33,7 +34,6 @@ def _request() -> QueryRequest:
         logical_plan=_logical_plan(),
         providers={"docs": provider},
         config=EngineConfig(),
-        device="h100-sxm",
     )
 
 
@@ -66,7 +66,6 @@ def test_modal_request_leaves_remote_source_on_worker():
         logical_plan=_logical_plan(),
         providers={"docs": RemoteProvider()},
         config=EngineConfig(),
-        device="h100-sxm",
     )
 
     prepared = _modal_request(request)
@@ -166,3 +165,14 @@ def test_modal_provider_uses_explicit_dependencies(monkeypatch):
     assert images[0]["local_python_sources"] == ("shared", "extra_source")
     assert images[0]["pip_packages"] == ("shared-package==1.0", "extra-package==1.0")
     provider.close()
+
+
+def test_device_config_survives_modal_serialization():
+    from modal._serialization import deserialize, serialize
+
+    config = EngineConfig(gpus=2, device="test-h100")
+    request = replace(_request(), config=config)
+    prepared = deserialize(serialize(_modal_request(request)), None)
+    assert prepared["config"] == config
+    assert request.gpu_count == 2
+    assert "device" not in prepared

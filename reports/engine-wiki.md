@@ -487,7 +487,13 @@ sets the minimum back to zero before it closes the Modal app context.
 Quail is the default backend. `Session()` therefore selects Quail without a
 backend argument. `EngineConfig(model="qwen3-32b-fp8")` selects another built
 in model. An extension can register another `ModelSpec` and a backend that
-supports it.
+supports it. GPU count, model, backend, and hardware specification name all
+live in `EngineConfig`. For example,
+`Session(EngineConfig(gpus=1, device="h100-sxm"))` selects one H100 for planning.
+Both local execution and Modal requests carry that configuration. There is
+no separate `Session.device` argument or device field on `QueryRequest`.
+The session resolves `config.device` through the registry and keeps the
+resulting `DeviceSpec` as `session.device`.
 
 ### Pushdown
 

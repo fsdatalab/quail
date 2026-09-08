@@ -19,10 +19,11 @@ class QueryRequest:
     logical_plan: LogicalPlan
     providers: Mapping[str, TableProvider]
     config: EngineConfig
-    device: str
     order: str | None = None
     registry: ExtensionRegistry = field(default_factory=ExtensionRegistry.with_built_ins)
 ```
+
+The hardware specification name is `request.config.device`.
 
 Pass yours to the session:
 

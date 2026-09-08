@@ -74,6 +74,6 @@ H100_SXM = DeviceSpec(
 ```
 
 Register with `registry.register_device(spec)` and select with
-`Session(device="name")`. The Modal worker asks for H100s regardless;
+`Session(EngineConfig(device="name"))`. The Modal worker asks for H100s regardless;
 another device spec is useful for planning experiments, not for
 running on other hardware yet.
