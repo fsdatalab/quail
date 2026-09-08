@@ -1,20 +1,45 @@
-"""Progress lines for the long steps of a query."""
+"""Progress messages for the long steps of a query, on the "quail" logger."""
 
 import contextlib
+import logging
+import sys
 import time
+
+
+class _StdoutHandler(logging.StreamHandler):
+    """Write to the sys.stdout of the moment, so output capture sees it."""
+
+    @property
+    def stream(self):
+        return sys.stdout
+
+    @stream.setter
+    def stream(self, value):
+        pass
+
+
+logger = logging.getLogger("quail")
+if not logger.handlers:
+    # INFO lines reach stdout unless the program configures the logger itself
+    _handler = _StdoutHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s quail %(message)s", datefmt="%H:%M:%S"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 _QUIET = 0
 
 
 def say(message: str) -> None:
-    """Print one progress line right away, unless inside quiet()."""
+    """Log one progress message at INFO, unless inside quiet()."""
     if not _QUIET:
-        print(f"quail: {message}", flush=True)
+        logger.info(message)
 
 
 @contextlib.contextmanager
 def quiet():
-    """Suppress progress lines, for warmup passes that reuse the loops."""
+    """Suppress progress messages, for warmup passes that reuse the loops."""
     global _QUIET
     _QUIET += 1
     try:
@@ -24,7 +49,7 @@ def quiet():
 
 
 class Progress:
-    """Report a running count, printing at most once every `every` seconds."""
+    """Report a running count, logging at most once every `every` seconds."""
 
     def __init__(self, label: str, total: int | None = None,
                  unit: str = "documents", every: float = 5.0):
@@ -37,7 +62,7 @@ class Progress:
         self._last = self.started
 
     def update(self, done: int) -> None:
-        """Record the count and print a line when enough time has passed."""
+        """Record the count and log a line when enough time has passed."""
         self.done = done
         now = time.perf_counter()
         if now - self._last >= self.every:
@@ -45,7 +70,7 @@ class Progress:
             say(self._line(self.label, now))
 
     def finish(self, label: str, extra: str = "") -> None:
-        """Print the final line under a past tense label."""
+        """Log the final line under a past tense label."""
         line = self._line(label, time.perf_counter())
         say(f"{line}, {extra}" if extra else line)
 

@@ -17,7 +17,7 @@ import time
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.executor.model import answer_weights
 from quail.executor.pack import FilterAdmission, JoinAdmission
-from quail.progress import Progress, quiet
+from quail.progress import Progress, logger, quiet
 
 
 def _tick(timing, key, t0):
@@ -703,13 +703,13 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
             os.replace(tmp, path)
             tier = "compile"
         else:
-            print(f"quail kernels: compile pass already recorded at {path}; "
-                  "running the touch pass", flush=True)
+            logger.info("kernels: compile pass already recorded at %s; "
+                        "running the touch pass", path)
             touch_kernels(torch, arena, pipeline, async_ans, budget)
             tier = "touch"
         torch.cuda.synchronize()
         warm_s = round(time.perf_counter() - t0, 2)
-        print(f"quail kernels: {tier} pass done in {warm_s} s", flush=True)
+        logger.info("kernels: %s pass done in %s s", tier, warm_s)
         return dict(tier=tier, warm_s=warm_s)
 
 

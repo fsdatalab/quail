@@ -18,8 +18,10 @@ What changed:
   pass runs once per machine.
 - `QueryRequest.planned_query` lets the in-process provider run the
   caller's query, so `explain()` then `run()` tokenizes once.
-- `quail/progress.py` prints `quail:` lines for tokenizing, planning,
-  model boot, and every five seconds of a filter or join.
+- `quail/progress.py` logs tokenizing, planning, model boot, kernel
+  warmup, and every five seconds of a filter or join at INFO on the
+  `quail` logger, which writes to stdout with a timestamp unless the
+  program configures it.
 - Planning no longer waits for tokenization. The session reads the
   document column's byte lengths, tokenizes the first 256 documents for
   a tokens per byte ratio, and plans on the scaled lengths; the token
