@@ -247,9 +247,8 @@ def release_booted_models(runtime_state: dict) -> dict:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     for state in runtime_state.values():
-        close = getattr(state, "close", None)
-        if callable(close):
-            close()
+        if isinstance(state, LoadedGpu):
+            state.close()
     runtime_state.clear()
     _release_vllm_parallel_state()
     gc.collect()
