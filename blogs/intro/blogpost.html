@@ -723,75 +723,66 @@ GPUs and make the other inputs available to each GPU. The CPU combines
 the filter survivors and join results after each operator.</p>
 <h1 id="evaluation">4. Evaluation</h1>
 <h2 id="performance-goals">Performance goals</h2>
-<p><strong>KV regret.</strong> We want to minimize KV regret, which
-counts prefix tokens that the model recomputes after it has already
-computed the same token prefix earlier in the query. We cannot always
-reduce KV regret to zero, because GPU HBM is finite. Quail therefore
+<p>We have three performance goals for Quail. First, we want to minimize
+KV regret, which counts prefix tokens that the model recomputes after it
+has already computed the same token prefix earlier in the query. KV
+regret cannot always be zero, because GPU HBM is finite. Second, we want
+the GPU to spend close to 100 percent of query execution running model
+operations. AI-SQL filters and joins spend almost all of their model
+time on prefill, and many evaluations are ready at once, so the GPU
+should not have to wait for the CPU to prepare more work. Third, while
+the GPU is active, we want high model FLOPs utilization, or MFU. MFU is
+the fraction of the GPU’s peak arithmetic throughput used during a model
+forward pass.</p>
+<p>Quail’s current design focuses on the first two goals. The KV manager
 uses the query plan to retain the KV that is expected to avoid the most
-future computation.</p>
-<p><strong>GPU active time.</strong> We want the GPU to spend close to
-100 percent of query execution running model operations. AI-SQL filters
-and joins require almost entirely prefill, and many evaluations are
-ready at once, so the GPU should not have to wait for the CPU to prepare
-more work. Quail reduces this CPU overhead by sending large chunks of
-tokens through the model, rather than submitting one request for every
-document or document pair.</p>
-<p><strong>Model FLOPs utilization.</strong> A GPU can remain active
-while using only a small fraction of its arithmetic throughput. We
-therefore also want high model FLOPs utilization, or MFU, which is the
-fraction of the GPU’s peak arithmetic throughput used during a model
-forward pass. Quail uses DeepGEMM for the main matrix multiplications,
-and FlashAttention 3 for attention. We leave further kernel optimization
-to the experts, who have shown that large improvements are possible.<a
-href="#fn2" class="footnote-ref" id="fnref2"
-role="doc-noteref"><sup>2</sup></a></p>
+future computation. The executor sends large chunks of tokens through
+the model, which reduces the CPU overhead of preparing and scheduling
+separate requests. For MFU, we use DeepGEMM for the main matrix
+multiplications, and FlashAttention 3 for attention. We leave further
+kernel optimization to the experts, who have shown that large
+improvements are possible.<a href="#fn2" class="footnote-ref"
+id="fnref2" role="doc-noteref"><sup>2</sup></a></p>
 <h2 id="experimental-setup">Experimental setup</h2>
-<p><strong>Benchmark.</strong> We evaluate Quail on QUAIL-B, which
-contains 32 AI-SQL queries over five datasets. The benchmark includes AI
-filters, AI joins, and queries with both. We will describe QUAIL-B in an
-upcoming blog post and technical report. Here, we focus on two queries
-from the benchmark.</p>
-<p><strong>Model and hardware.</strong> Every configuration uses Qwen3
-4B FP8, with BF16 KV, on one H100. Within each query family, Quail and
-vLLM run sequentially on the same physical GPU.</p>
+<p><strong>Benchmark and hardware.</strong> We evaluate Quail on
+QUAIL-B, which contains 32 AI-SQL queries over five datasets. The
+benchmark includes AI filters, AI joins, and queries with both. Every
+configuration uses Qwen3 4B FP8, with BF16 KV, on one H100. Within each
+query family, Quail and vLLM run sequentially on the same physical GPU.
+We will describe the full benchmark in an upcoming blog post and
+technical report. Here, we focus on BIO-3, which is the BioDEX query
+from the beginning of the post, and AGENT-1, where Quail is slower.</p>
 <p><strong>vLLM baseline.</strong> We compare Quail with vLLM 0.26.0,
-which we call the vLLM baseline. The baseline uses the same logical
-query plan and prompt layout as Quail. For a chain of filters, it
-submits a document’s next filter as soon as the previous filter returns
-<code>TRUE</code>. For a join, we manually choose the better anchor
-direction, and submit one inference request for each document pair in
-anchor order.</p>
-<p><strong>vLLM configuration.</strong> We enable automatic prefix
-caching, allow up to 25,305 tokens and 4,096 requests in each batch, and
-capture one CUDA graph for 8,192 tokens. We chose these limits by
-running the benchmark queries. The token limit is large enough to
-saturate the H100 when the CPU prepares work in time, while larger batch
-or memory limits caused GPU OOM errors.</p>
-<p><strong>KV capacity.</strong> We set vLLM’s GPU memory utilization to
-0.91, which gives it space for 479,616 KV tokens. Quail has space for
-362,250 KV tokens, because it reserves HBM for two larger activation
-chunks. The vLLM baseline therefore has about 32 percent more KV
-capacity than Quail.</p>
-<p><strong>Latency and cost.</strong> We measure query latency after
-model startup and kernel warmup, and exclude result collection. We
+using the same logical query plan and prompt layout. For a chain of
+filters, the baseline submits a document’s next filter as soon as the
+previous filter returns <code>TRUE</code>. For a join, we manually
+choose the better anchor direction, and submit one inference request for
+each document pair in anchor order. We enable automatic prefix caching,
+allow up to 25,305 tokens and 4,096 requests in each batch, and capture
+one CUDA graph for 8,192 tokens. The token limit is large enough to
+saturate the H100 when the CPU prepares work in time. Larger batch or
+memory limits caused GPU OOM errors. We also give the baseline more
+space for KV than Quail. We set vLLM’s GPU memory utilization to 0.91,
+which gives it space for 479,616 KV tokens. Quail has space for 362,250
+KV tokens, because it reserves HBM for two larger activation chunks. The
+baseline therefore has about 32 percent more KV capacity than Quail.</p>
+<p><strong>Metrics.</strong> For each query, we report query latency,
+GPU cost, fresh input tokens, KV regret tokens, and latency relative to
+the speed of light estimate from Section 2. Query latency begins after
+model startup and kernel warmup, and excludes result collection. We
 convert the query latency into GPU cost using Modal’s H100 price of
-$3.9492 per hour. The latency tables use runs without profiling, while
-the profile figures come from separate diagnostic runs.</p>
-<p><strong>Token computation.</strong> We report fresh input tokens and
-KV regret tokens for each query. Fresh input tokens count every input
-token processed by a model forward pass, including repeated computation.
-KV regret uses the distinct prefix definition, so it includes
-recomputing the same document prefix and recomputing a token prefix that
-an earlier document already computed. KV regret tokens are already
-included in the fresh input token count.</p>
-<p><strong>Speed of light estimate.</strong> We also compare the
-measured latency with the speed of light estimate from Section 2. The
-estimate assumes peak GPU throughput, no CPU overhead, and enough GPU
-HBM to retain all reusable prefix KV.</p>
-<p><strong>Results discussed below.</strong> Quail is faster than the
-vLLM baseline on 30 of the 32 QUAIL-B queries. We focus on BIO-3, which
-is the BioDEX query from the beginning of the post, and AGENT-1, where
-Quail is slower.</p>
+$3.9492 per hour. Fresh input tokens count every input token processed
+by a model forward pass, including repeated computation. KV regret uses
+the distinct prefix definition, so it includes recomputing the same
+document prefix and recomputing a token prefix that an earlier document
+already computed. KV regret tokens are already included in the fresh
+input token count. The speed of light estimate assumes peak GPU
+throughput, no CPU overhead, and enough GPU HBM to retain all reusable
+prefix KV.</p>
+<p>Across the full benchmark, Quail is faster than the vLLM baseline on
+30 of the 32 queries. The latency tables below use runs without
+profiling, while the profile figures come from separate diagnostic
+runs.</p>
 <h2 id="biodex-results">BioDEX results</h2>
 <ul>
 <li>BIO-3 filters 500 medical reports for female patients, then joins
