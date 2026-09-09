@@ -117,7 +117,11 @@ class LoadedGpu:
         )
 
     def warm(self):
-        """Compile and warm kernels once. Return (seconds, tier)."""
+        """Compile and warm kernels once.
+
+        Returns:
+            Tuple of (seconds spent warming, compilation tier).
+        """
         if self._warmed:
             return 0.0, None
         from quail.runtime.volumes import commit_kernel_cache
@@ -141,7 +145,7 @@ class LoadedGpu:
 
 
 def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
-    """Assemble a boot timing dict from a LoadedGpu and warm results."""
+    """Assemble a boot timing dict from a loaded GPU and warm results."""
     kind = "cold" if cold or warm_tier else "warm"
     boot = {
         "kind": kind,
