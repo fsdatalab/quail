@@ -291,11 +291,25 @@ Quail's current design focuses on the first two goals. The KV manager uses the q
 
 ## Experimental setup
 
-**Benchmark and hardware.** We evaluate Quail on QUAIL-B, which contains 32 AI-SQL queries over five datasets. The benchmark includes AI filters, AI joins, and queries with both. Every configuration uses Qwen3 4B FP8, with BF16 KV, on one H100. Within each query family, Quail and vLLM run sequentially on the same physical GPU. We will describe the full benchmark in an upcoming blog post and technical report. Here, we focus on BIO-3, which is the BioDEX query from the beginning of the post, and AGENT-1, where Quail is slower.
+**QUAIL-B.** We created [QUAIL-B](https://github.com/fsdatalab/quail-bench), a benchmark of 32 AI-SQL queries over IMDB reviews, medical reports, fact checking claims, legal documents, and software agent traces. The queries include filters, chains of filters, single joins, and multiway joins. QUAIL-B provides published corpora at scale factors 0.1, 0.5, and 1.0. The scale factor changes how many rows are sampled from each source, while the query definitions stay fixed. Each scale factor uses pinned source revisions and a fixed sampling seed, so it identifies one exact corpus. We do not go into the full benchmark in this post. Instead, we show two queries at scale factor 0.1, BIO-3 and AGENT-1.
 
-**vLLM baseline.** We compare Quail with vLLM 0.26.0, using the same logical query plan and prompt layout. For a chain of filters, the baseline submits a document's next filter as soon as the previous filter returns `TRUE`. For a join, we manually choose the better anchor direction, and submit one inference request for each document pair in anchor order. We enable automatic prefix caching, allow up to 25,305 tokens and 4,096 requests in each batch, and capture one CUDA graph for 8,192 tokens. The token limit is large enough to saturate the H100 when the CPU prepares work in time. Larger batch or memory limits caused GPU OOM errors. We also give the baseline more space for KV than Quail. We set vLLM's GPU memory utilization to 0.91, which gives it space for 479,616 KV tokens. Quail has space for 362,250 KV tokens, because it reserves HBM for two larger activation chunks. The baseline therefore has about 32 percent more KV capacity than Quail.
+**Hardware.** Every configuration uses Qwen3 4B FP8, with BF16 KV, on one H100. Within each query family, Quail and vLLM run sequentially on the same physical GPU.
 
-**Metrics.** For each query, we report query latency, GPU cost, fresh input tokens, KV regret tokens, and latency relative to the speed of light estimate from Section 2. Query latency begins after model startup and kernel warmup, and excludes result collection. We convert the query latency into GPU cost using Modal's H100 price of $3.9492 per hour. Fresh input tokens count every input token processed by a model forward pass, including repeated computation. KV regret uses the distinct prefix definition, so it includes recomputing the same document prefix and recomputing a token prefix that an earlier document already computed. KV regret tokens are already included in the fresh input token count. The speed of light estimate assumes peak GPU throughput, no CPU overhead, and enough GPU HBM to retain all reusable prefix KV.
+**vLLM baseline.** We compare Quail with vLLM 0.26.0, using the same logical query plan and prompt layout. For a chain of filters, the baseline submits a document's next filter as soon as the previous filter returns `TRUE`. For a join, we manually choose the better anchor direction, and submit one inference request for each document pair in anchor order. We configure vLLM as follows:
+
+- We enable automatic prefix caching.
+- We set `max_num_batched_tokens` to 25,305, and `max_num_seqs` to 4,096.
+- We set `gpu_memory_utilization` to 0.91, which provides space for 479,616 KV tokens.
+- We capture one CUDA graph for batches of 8,192 tokens.
+
+We chose these settings by running the benchmark queries. Larger batch or memory settings caused GPU OOM errors, while the selected token limit is large enough to saturate the H100 when the CPU prepares work in time. For comparison, Quail has space for 362,250 KV tokens, because it reserves HBM for two larger activation chunks. The vLLM baseline therefore has about 32 percent more KV capacity than Quail.
+
+**Metrics.** We report four metrics for each query:
+
+- **Query latency.** We measure the time after model startup and kernel warmup, and exclude result collection. We also report latency relative to the speed of light estimate from Section 2, which assumes peak GPU throughput, full overlap between CPU and GPU work, and enough GPU HBM to retain all reusable prefix KV.
+- **GPU cost.** We multiply the query latency in hours by Modal's H100 price of $3.9492 per hour.
+- **Fresh input tokens.** We count every input token position processed by a model forward pass, rather than read from existing KV. A token computed more than once is counted more than once.
+- **KV regret.** We count prefix tokens that the model recomputes after it has already computed the same token prefix earlier in the query. KV regret includes recomputing the same document prefix, and recomputing a shared prefix across different documents. KV regret is already included in the fresh input token count.
 
 Across the full benchmark, Quail is faster than the vLLM baseline on 30 of the 32 queries. The latency tables below use runs without profiling, while the profile figures come from separate diagnostic runs.
 
