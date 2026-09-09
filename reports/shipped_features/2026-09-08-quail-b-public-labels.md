@@ -57,8 +57,8 @@ one layout.
 - The pass that writes the labels is `quail/bench/labeling.py` here.
   It runs each predicate as a Quail query with Qwen3 32B fp8 on one
   GPU: a filter over every document, a full join over every pair.
-  `quail/bench/judge_pass.py` runs it on Modal, one H100 per workload,
-  on this repository's volumes; `--publish` uploads a finished pass to
+  It runs on Modal, one H100 per workload, on this repository's
+  volumes; `--publish-collections` uploads finished collections to
   the bucket. A different engine can flip a borderline answer, so
   labels from the Quail judge get their own judge id and label-set
   ids; the published collection, judged by vLLM, stays the reference

@@ -297,3 +297,214 @@ def test_join_parts_keep_source_labels_over_model_answers(
         ("cl1", "page0"): (False, MODEL_NAME),
         ("cl1", "page1"): (True, "fever_annotation"),
     }
+
+
+def _write_corpus(root, sf, rows):
+    """Write one corpus under root the way _materialize_corpus does."""
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    identity = labeling._corpus_identity(rows, sf)
+    target = root / "corpora" / identity["corpus_id"]
+    target.mkdir(parents=True, exist_ok=True)
+    for table, table_rows in rows.items():
+        pq.write_table(pa.Table.from_pylist(table_rows),
+                       target / f"{table}.parquet")
+    manifest = {**identity, "columns": labeling.CORPUS_COLUMNS}
+    (target / "manifest.json").write_text(json.dumps(manifest))
+    return target, manifest, rows
+
+
+def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
+                 passages):
+    return {
+        "reviews": [{"id": f"rv{i}", "body": body}
+                    for i, body in enumerate(reviews)],
+        "aspects": [{"id": "as0", "aspect": "the plot"}],
+        "reports": [{"id": f"rp{i}", "report": text, "reactions": ["x"]}
+                    for i, text in enumerate(reports)],
+        "terms": [{"id": f"tm{i}", "term": term}
+                  for i, term in enumerate(terms)],
+        "claims": [{"id": f"cl{i}", "claim": claim, "label": label,
+                    "evidence_wiki_url": page}
+                   for i, (claim, label, page) in enumerate(claims)],
+        "evidence": [{"id": page, "text": text}
+                     for page, text in evidence],
+        "citation_contexts": [
+            {"id": f"lc{i}", "destination_context": text,
+             "cited_passage_ids": cited}
+            for i, (text, cited) in enumerate(contexts)],
+        "citation_passages": [
+            {"id": f"lp{i}", "passage_text": text, "passage_ids": ids}
+            for i, (text, ids) in enumerate(passages)],
+        "agent_traces": [{"id": "at0000-t005", "trace": "yes trace",
+                          "trajectory_id": "at0000", "turn_index": 5,
+                          "token_count": 2}],
+    }
+
+
+def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
+    import json
+
+    import pyarrow.parquet as pq
+
+    import quail
+
+    monkeypatch.setattr(quail, "Session", _FakeSession)
+    monkeypatch.setattr(labeling, "ROOT", tmp_path)
+    specs = (
+        _spec("quailb.imdb.review.mentions_positive_aspect"),
+        _spec("quailb.biodex.report.experienced_reaction"),
+        _spec("quailb.fever.passage.supports_claim"),
+        _spec("quailb.lepard.excerpt.cites_passage"),
+    )
+    monkeypatch.setattr(labeling, "PREDICATES", specs)
+
+    # the large corpus: two of everything, the LePaRD context cites p2
+    source_rows = _corpus_rows(
+        reviews=["yes good", "bad", "yes again"],
+        reports=["yes report", "other report"],
+        terms=["yes fever", "cough"],
+        claims=[("yes claim", "REFUTES", "page0"),
+                ("second claim", "SUPPORTS", "page1")],
+        evidence=[("page0", "yes page"), ("page1", "no")],
+        contexts=[("context one", ["p1", "p2"]), ("context two", ["p3"])],
+        passages=[("passage a", ["p2"]), ("passage b", ["p1"])])
+    _, source_corpus, _ = _write_corpus(tmp_path, 1.0, source_rows)
+    source_id = source_corpus["corpus_id"]
+    identities = {
+        spec.key: labeling.label_set_identity(
+            spec, source_id, source_corpus["corpus_full_hash"])
+        for spec in specs}
+    judge = labeling.QuailJudge()
+    sample = labeling.VerificationSample()
+    labeling._write_filter_parts(
+        judge, sample, source_rows["reviews"], [specs[0]], identities,
+        source_id, 4096 // 3)
+    labeling._write_qwen_join_parts(
+        judge, sample, specs[1], source_rows["reports"],
+        source_rows["terms"], identities[specs[1].key], source_id)
+    labeling._write_qwen_join_parts(
+        judge, sample, specs[2], source_rows["claims"],
+        source_rows["evidence"], identities[specs[2].key], source_id,
+        source_label=labeling._fever_source_label)
+    labeling._write_lepard_source(
+        specs[3], source_rows["citation_contexts"],
+        source_rows["citation_passages"], identities[specs[3].key],
+        source_id)
+    for spec in specs:
+        labeling._complete_manifest(spec, identities[spec.key], source_rows)
+    collection_dir = tmp_path / "collections" / "gt_source"
+    collection_dir.mkdir(parents=True)
+    (collection_dir / "manifest.json").write_text(json.dumps({
+        "status": "complete", "collection_id": "gt_source",
+        "scale_factor": 1.0, "corpus_id": source_id,
+        "label_sets": {key: identity["label_set_id"]
+                       for key, identity in identities.items()}}))
+
+    # the small corpus: a prefix of the documents, terms renumbered,
+    # and the context no longer cites p2 because that pair was not sampled
+    target_rows = _corpus_rows(
+        reviews=["yes good", "bad"],
+        reports=["yes report"],
+        terms=["cough", "yes fever"],
+        claims=[("yes claim", "REFUTES", "page0")],
+        evidence=[("page0", "yes page")],
+        contexts=[("context one", ["p1"])],
+        passages=[("passage a", ["p2"]), ("passage b", ["p1"])])
+    monkeypatch.setattr(
+        labeling, "_materialize_corpus",
+        lambda sf: _write_corpus(tmp_path, sf, target_rows))
+
+    summary = labeling.derive_collection(0.1, "gt_source")
+
+    assert summary["cell"] == "quailb_ground_truth_collection_derived"
+    assert summary["source_collection_id"] == "gt_source"
+    assert summary["total_labels"] == 2 + 2 + 1 + 2
+    assert summary["qwen_judgments"] == 2 + 2
+    sets = summary["label_sets"]
+    assert sets[specs[1].key]["copied_from"] == identities[
+        specs[1].key]["label_set_id"]
+    assert "recomputed_from" in sets[specs[3].key]
+
+    def answers(spec):
+        label_dir = labeling._label_dir_by_id(
+            spec, sets[spec.key]["label_set_id"])
+        table = pq.read_table(label_dir / "labels.parquet")
+        return {(row["left_id"], row["right_id"]):
+                (row["answer"], row["label_source"])
+                for row in table.to_pylist()}
+
+    assert answers(specs[0]) == {("rv0", None): (True, MODEL_NAME),
+                                 ("rv1", None): (False, MODEL_NAME)}
+    # tm1 is "yes fever" here but was tm0 in the source
+    assert answers(specs[1]) == {("rp0", "tm0"): (False, MODEL_NAME),
+                                 ("rp0", "tm1"): (True, MODEL_NAME)}
+    assert answers(specs[2]) == {
+        ("cl0", "page0"): (False, "fever_annotation")}
+    assert answers(specs[3]) == {
+        ("lc0", "lp0"): (False, "lepard_citation_edge"),
+        ("lc0", "lp1"): (True, "lepard_citation_edge")}
+    active = json.loads((tmp_path / "corpora"
+                         / summary["corpus_id"]
+                         / "active_collection.json").read_text())
+    assert active["collection_id"] == summary["collection_id"]
+
+
+class _FakeS3:
+    """Records uploads; the bucket already holds one label file."""
+
+    def __init__(self, existing):
+        self.existing = existing
+        self.uploads = []
+
+    def get_paginator(self, _name):
+        existing = self.existing
+
+        class _Paginator:
+            def paginate(self, **_kwargs):
+                return [{"Contents": [{"Key": key, "Size": size}
+                                      for key, size in existing.items()]}]
+
+        return _Paginator()
+
+    def upload_file(self, path, _bucket, key):
+        self.uploads.append(key)
+
+
+def test_publish_uploads_only_what_a_reader_needs(monkeypatch, tmp_path):
+    import json
+
+    from quail_b.store import GROUND_TRUTH_ROOT
+
+    monkeypatch.setattr(labeling, "ROOT", tmp_path)
+    spec = _spec("quailb.imdb.review.discusses_ending")
+    monkeypatch.setattr(labeling, "PREDICATES", (spec,))
+    corpus_dir = tmp_path / "corpora" / "c_x"
+    corpus_dir.mkdir(parents=True)
+    (corpus_dir / "manifest.json").write_text("{}")
+    (corpus_dir / "reviews.parquet").write_bytes(b"rows")
+    (corpus_dir / "active_collection.json").write_text("{}")
+    label_dir = tmp_path / "label_sets" / spec.workload / spec.slug / "ls_x"
+    (label_dir / "parts").mkdir(parents=True)
+    (label_dir / "manifest.json").write_text("{}")
+    (label_dir / "labels.parquet").write_bytes(b"labels")
+    (label_dir / "parts" / "part_000000_000002.parquet").write_bytes(b"p")
+    collection_dir = tmp_path / "collections" / "gt_x"
+    collection_dir.mkdir(parents=True)
+    (collection_dir / "manifest.json").write_text(json.dumps({
+        "status": "complete", "corpus_id": "c_x",
+        "label_sets": {spec.key: "ls_x"}}))
+    (collection_dir / "summary.json").write_text("{}")
+    prefix = f"{GROUND_TRUTH_ROOT}/label_sets/{spec.workload}/{spec.slug}"
+    client = _FakeS3({f"{prefix}/ls_x/labels.parquet": 6})
+
+    result = labeling.publish(tmp_path, ["gt_x"], client=client)
+
+    assert result["uploaded"] == 6 and result["skipped"] == 1
+    assert not any("/parts/" in key for key in client.uploads)
+    assert f"{GROUND_TRUTH_ROOT}/corpora/c_x/reviews.parquet" in client.uploads
+    assert (f"{GROUND_TRUTH_ROOT}/corpora/c_x/active_collection.json"
+            in client.uploads)

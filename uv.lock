@@ -2544,7 +2544,7 @@ dev = [
     { name = "boto3", specifier = ">=1.34" },
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "pytest", specifier = ">=8.0" },
-    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=cd469a8d3bfb4d96737ba05bf14fe3da7b205afd" },
+    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=106c0ffa774688179d20944d48e3013bf91c9d44" },
     { name = "ruff", specifier = "==0.12.9" },
     { name = "vulture", specifier = ">=2.16,<3" },
 ]
@@ -2552,7 +2552,7 @@ dev = [
 [[package]]
 name = "quail-b"
 version = "0.1.0"
-source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=cd469a8d3bfb4d96737ba05bf14fe3da7b205afd#cd469a8d3bfb4d96737ba05bf14fe3da7b205afd" }
+source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=106c0ffa774688179d20944d48e3013bf91c9d44#106c0ffa774688179d20944d48e3013bf91c9d44" }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },

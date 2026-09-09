@@ -155,12 +155,24 @@ def _boot_gpu(state, backend, spec, device, gpu_index, workers,
     boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
                 pipeline_s=0.0, warm_kernels_s=0.0)
     if "model_execution" not in state:
-        say(f"loading {spec.hf_name} onto GPU {gpu_index}")
+        # a GPU handed over before its previous tenant released memory
+        # fails later in cuBLAS; this line makes that visible
+        free, total = torch.cuda.mem_get_info()
+        say(f"loading {spec.hf_name} onto GPU {gpu_index}, "
+            f"{free / 2**30:.1f} of {total / 2**30:.1f} GiB free")
         t0 = time.perf_counter()
         model = load_model(model_path or spec.hf_name,
                            revision=None if model_path else spec.revision,
                            answer_token_ids=answer_token_ids)
         boot["load_model_s"] = time.perf_counter() - t0
+        # cuBLAS makes its first handle with a raw device allocation
+        # outside the caching allocator. Its first use is the answer
+        # head at the warm-up's activation peak, where the allocator
+        # already holds every free byte, so make the handle now.
+        torch.cuda.current_blas_handle()
+        probe = torch.ones(8, 64, device="cuda", dtype=torch.bfloat16)
+        F.linear(probe, probe)
+        torch.cuda.synchronize()
         # budgets.* is tiny CPU; fold into arena_s so the four phases
         # cover the cold-load span without a leftover residual
         t0 = time.perf_counter()

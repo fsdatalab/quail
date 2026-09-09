@@ -1,28 +1,32 @@
-"""Build the sf=0.1 QUAIL-B reference labels with Quail on one GPU.
+"""Build the QUAIL-B reference labels with Quail, one H100 per workload.
 
 Each predicate runs as a Quail query over the corpus with Qwen3 32B
 fp8: a filter over every document, a full join over every pair. FEVER
 and LePaRD supply source truth where the dataset gives the exact
-answer. Every part file is written under a content-addressed path and
-skipped when it already exists, so an interrupted pass resumes where
-it stopped.
+answer. Every part file is written under a content-addressed path on
+the `quail-results` volume and skipped when it already exists, so an
+interrupted pass resumes where it stopped. Scale factors 0.1, 0.5 and
+1.0 are supported; a smaller one samples a prefix of a larger one's
+documents, so its labels are derived from the larger pass on the CPU
+by matching document content.
 
-On a machine with one GPU of at least 80 GB:
+    uv run modal run --detach -m quail.bench.labeling --sf 1.0
+    uv run modal run --detach -m quail.bench.labeling --sf 0.1 \
+      --derive-from-collection <collection>
 
-    uv run python -m quail.bench.labeling --root ~/quail-b-data --publish
+Publish finished collections to the public bucket, with the AWS
+credentials of the machine that runs the command (a profile, the
+environment, or SSO, resolved the way the aws CLI resolves them):
 
-`ROOT` is where this process reads and writes labels; the Modal wrapper
-in `judge_pass.py` points it at the results volume. `--publish` uploads
-the finished tree to the public bucket with this machine's AWS
-credentials. Label-set and collection ids come from
-`quail_b.predicates` and depend only on the corpus, the prompts, and
-the judge, so a pass made here and a pass made on Modal write the same
-files.
+    uv run modal run -m quail.bench.labeling \
+      --publish-collections <collection>,<collection>
+
+Label-set and collection ids come from `quail_b.predicates` and
+depend only on the corpus, the prompts, and the judge.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import shutil
@@ -31,8 +35,11 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+import modal
 import pyarrow as pa
 
+from quail.runtime.volumes import hf_cache, kernel_cache, results_vol
+from quail.runtime.worker import build_worker_image
 from quail_b import data
 from quail_b.predicates import (
     MODEL_NAME,
@@ -55,6 +62,7 @@ from quail_b.predicates import label_set_identity as _label_set_identity
 from quail_b.store import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 
 SCALE_FACTOR = 0.1
+SUPPORTED_SCALE_FACTORS = (0.1, 0.5, 1.0)
 VERIFY_PER_PREDICATE = 16
 
 ROOT = Path.home() / ".cache" / "quail-b" / GROUND_TRUTH_ROOT
@@ -67,16 +75,43 @@ def _no_commit() -> None:
 # called after every part file lands; the Modal wrapper commits the volume
 after_write = _no_commit
 
-PREDICTION_TEXT = (
-    "At sf=0.1, 21 predicates need 1,210,264 labels: 993,450 model "
-    "judgments through Quail and 216,814 source labels. The rerun of 16 "
-    "saved answers per predicate shows no differences, and every "
-    "workload finishes on one H100 without an out-of-memory failure."
-)
+# Label counts follow from the table sizes each scale factor samples.
+# The hours use the 14,000 fresh tokens per second measured for the
+# BIO-2 join at 32B, so they are estimates until a pass confirms them.
+_PREDICTIONS = {
+    0.1: ("21 predicates need 1,210,264 labels: 993,450 model judgments "
+          "through Quail and 216,814 source labels, about 1.5 H100 hours "
+          "in total."),
+    0.5: ("21 predicates need 17,618,467 labels: 13,233,865 model "
+          "judgments through Quail and 4,384,602 source labels, about 8 "
+          "H100 hours in total with agent traces the slowest workload."),
+    1.0: ("21 predicates need 51,801,003 labels: 36,926,465 model "
+          "judgments through Quail and 14,874,538 source labels, about 23 "
+          "H100 hours in total with no workload over 8 hours."),
+}
 REUSE_PREDICTION_TEXT = (
     "The unchanged table manifests will match exactly. Their label sets "
     "can be reused with the relabeled workloads."
 )
+DERIVE_PREDICTION_TEXT = (
+    "Every document of the smaller corpus appears in the larger one, so "
+    "every model judgment and FEVER source label copies over by content "
+    "hash. The LePaRD citation join is recomputed from the smaller "
+    "corpus; at sf=0.1 from sf=1.0, 2 of its 216,500 labels differ."
+)
+
+
+def prediction_text(sf: float) -> str:
+    """The stated prediction for one scale factor's labeling pass."""
+    try:
+        counts = _PREDICTIONS[float(sf)]
+    except KeyError as error:
+        raise ValueError(
+            f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}"
+        ) from error
+    return (f"At sf={sf}, {counts} The rerun of 16 saved answers per "
+            "predicate shows no differences, and every workload finishes "
+            "on one H100 without an out-of-memory failure.")
 
 
 # One Quail query is one Parquet part, setting the resume granularity.
@@ -84,6 +119,13 @@ REUSE_PREDICTION_TEXT = (
 # older sets still compact.
 PROMPTS_PER_CALL = 4096
 LEGACY_PROMPTS_PER_CALL = 256
+# A join part holds this many pairs. The planner may anchor on the
+# right table, and every part then computes every right-table anchor
+# again: at sf=1.0 FEVER's 1,478 passages take about 45 seconds per
+# part, so a part must carry many left rows. 563,500 pairs ran as one
+# query at sf=0.1. Label sets without this field split joins by
+# PROMPTS_PER_CALL.
+JOIN_PAIRS_PER_CALL = 500_000
 
 
 def rows_per_call(prompts_per_row: int,
@@ -113,7 +155,27 @@ def label_set_identity(spec: PredicateSpec, corpus_id: str,
     """This pass's label-set identity: the Quail judge, this part size."""
     identity = _label_set_identity(
         spec, corpus_id, corpus_full_hash, judge=QUAIL_JUDGE_SPEC)
-    return {**identity, "prompts_per_call": PROMPTS_PER_CALL}
+    return {**identity, "prompts_per_call": PROMPTS_PER_CALL,
+            "join_pairs_per_call": JOIN_PAIRS_PER_CALL}
+
+
+def join_anchor_batch(identity: dict, right_rows: int) -> int:
+    """Left rows per join part for one label set, never fewer than one."""
+    pairs = identity.get("join_pairs_per_call")
+    if pairs is None:
+        return rows_per_call(
+            right_rows,
+            identity.get("prompts_per_call", LEGACY_PROMPTS_PER_CALL))
+    return max(1, pairs // max(1, right_rows))
+
+
+def part_size_fields(manifest: dict) -> dict:
+    """The part-size settings a saved manifest records."""
+    fields = {"prompts_per_call": manifest.get(
+        "prompts_per_call", LEGACY_PROMPTS_PER_CALL)}
+    if "join_pairs_per_call" in manifest:
+        fields["join_pairs_per_call"] = manifest["join_pairs_per_call"]
+    return fields
 
 
 def join_specs(specs) -> tuple:
@@ -309,7 +371,8 @@ def _part_bounds(spec: PredicateSpec, identity: dict,
     elif spec.source_policy == "lepard_citation_edge":
         step = 50
     else:
-        step = rows_per_call(len(corpus_rows[spec.right_table]), per_call)
+        step = join_anchor_batch(identity,
+                                 len(corpus_rows[spec.right_table]))
     return [(start, min(start + step, left))
             for start in range(0, left, step)]
 
@@ -577,8 +640,7 @@ def _write_qwen_join_parts(judge: QuailJudge,
                            spec: PredicateSpec, left_rows: list[dict],
                            right_rows: list[dict], identity: dict,
                            corpus_id: str, source_label=None) -> None:
-    anchor_batch = rows_per_call(len(right_rows),
-                                 identity["prompts_per_call"])
+    anchor_batch = join_anchor_batch(identity, len(right_rows))
     for start in range(0, len(left_rows), anchor_batch):
         end = min(start + anchor_batch, len(left_rows))
         part = _part_path(spec, identity, start, end)
@@ -776,11 +838,8 @@ def compact_ground_truth(collection_id: str) -> dict:
         manifest_path = label_dir / "manifest.json"
         with open(manifest_path) as f:
             manifest = json.load(f)
-        identity = {
-            "label_set_id": label_set_id,
-            "prompts_per_call": manifest.get(
-                "prompts_per_call", LEGACY_PROMPTS_PER_CALL),
-        }
+        identity = {"label_set_id": label_set_id,
+                    **part_size_fields(manifest)}
         compact_path, rows = _compact_label_parts(
             label_dir, _expected_parts(spec, identity, corpus_rows))
         manifest["compact_path"] = str(compact_path)
@@ -809,8 +868,9 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> dict:
     Reports whether the collection the corpus implies is already
     complete.
     """
-    if sf != SCALE_FACTOR:
-        raise ValueError("the ground-truth pass is fixed at sf=0.1")
+    if float(sf) not in SUPPORTED_SCALE_FACTORS:
+        raise ValueError(
+            f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}")
     _, corpus_manifest, _ = _materialize_corpus(sf)
     identities = {
         spec.key: label_set_identity(
@@ -935,7 +995,7 @@ def finalize_collection(sf: float, corpus_id: str,
     summary = {
         "cell": "quailb_judge_pass",
         "judge": QUAIL_JUDGE_SPEC,
-        "prediction": PREDICTION_TEXT,
+        "prediction": prediction_text(sf),
         "collection_id": collection["collection_id"],
         "corpus_id": corpus_manifest["corpus_id"],
         "scale_factor": sf,
@@ -1095,80 +1155,541 @@ def activate_reused_collection(
     return summary
 
 
-def run_workloads(sf: float, only: list[str] | None = None) -> dict:
-    """Build the corpus, label the workloads one after another, finalize."""
-    prepared = prepare_corpus(sf)
-    corpus_id = prepared["corpus"]["corpus_id"]
-    if prepared["complete"] and not only:
-        print(f"collection {prepared['collection_id']} is already complete",
-              flush=True)
-        return prepared
-    names = list(only) if only else list(WORKLOADS)
-    unknown = [w for w in names if w not in WORKLOADS]
-    if unknown:
-        raise ValueError(f"unknown workloads: {unknown}")
-    partials = {}
-    for workload in names:
-        partials[workload] = judge_workload(corpus_id, workload)
-        print(f"[main] {workload} finished in "
-              f"{partials[workload]['total_wall_s']:.1f}s", flush=True)
-    if only:
-        print("--only was given, so the collection is not finalized",
-              flush=True)
-        return partials
-    return finalize_collection(sf, corpus_id, partials)
+def _source_labels_by_content(
+        spec: PredicateSpec, source_label_set_id: str,
+        target_rows: dict[str, list[dict]]) -> dict:
+    """Read one finished label set, keyed by document content hashes.
 
-
-def publish(root: Path, bucket: str = PUBLIC_BUCKET) -> int:
-    """Upload every file under root that the bucket lacks; return the count.
-
-    Needs AWS credentials with write access to the bucket. Files are
-    content-addressed, so an existing key of the same size is skipped.
+    Only rows whose documents also appear in the target corpus are
+    kept, so a join over a large corpus does not have to fit in memory
+    as Python objects.
     """
-    import boto3
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
 
-    client = boto3.client("s3")
+    _, manifest = _label_manifest(source_label_set_id)
+    if manifest.get("status") != "complete":
+        raise ValueError(f"label set {source_label_set_id} is not complete")
+    _, _source_manifest, source_rows = _load_corpus(manifest["corpus_id"])
+    source_identity = {"label_set_id": source_label_set_id,
+                       **part_size_fields(manifest)}
+    label_dir = _label_dir_by_id(spec, source_label_set_id)
+    compact_path, _rows = _compact_label_parts(
+        label_dir, _expected_parts(spec, source_identity, source_rows))
+    table = pq.read_table(compact_path, columns=[
+        "left_content_sha256", "right_content_sha256", "answer",
+        "label_source"])
+    left_hashes = pa.array(
+        sorted({_content_hash(row, spec.left_column)
+                for row in target_rows[spec.left_table]}))
+    table = table.filter(
+        pc.is_in(table["left_content_sha256"], value_set=left_hashes))
+    if spec.kind == "join":
+        right_hashes = pa.array(
+            sorted({_content_hash(row, spec.right_column)
+                    for row in target_rows[spec.right_table]}))
+        table = table.filter(
+            pc.is_in(table["right_content_sha256"], value_set=right_hashes))
+    return {
+        (left, right): (bool(answer), source)
+        for left, right, answer, source in zip(
+            table["left_content_sha256"].to_pylist(),
+            table["right_content_sha256"].to_pylist(),
+            table["answer"].to_pylist(),
+            table["label_source"].to_pylist())
+    }
+
+
+def _copy_label_set(spec: PredicateSpec, source_label_set_id: str,
+                    identity: dict, corpus_id: str,
+                    rows: dict[str, list[dict]]) -> int:
+    """Write one predicate's target parts from a larger corpus's labels.
+
+    Returns the number of labels written. Raises when a target document
+    or pair has no label in the source set.
+    """
+    parts = _expected_parts(spec, identity, rows)
+    if all(part.exists() for part in parts):
+        return 0
+    labels = _source_labels_by_content(spec, source_label_set_id, rows)
+    left_rows = rows[spec.left_table]
+    right_rows = rows[spec.right_table] if spec.kind == "join" else [None]
+    right_hashes = [
+        None if right is None else _content_hash(right, spec.right_column)
+        for right in right_rows]
+    written = 0
+    for part, (start, end) in zip(parts,
+                                  _part_bounds(spec, identity, rows)):
+        if part.exists():
+            continue
+        output = []
+        missing = 0
+        for left in left_rows[start:end]:
+            left_hash = _content_hash(left, spec.left_column)
+            for right, right_hash in zip(right_rows, right_hashes):
+                found = labels.get((left_hash, right_hash))
+                if found is None:
+                    missing += 1
+                    continue
+                answer, source = found
+                output.append(_answer_row(
+                    spec, identity, corpus_id, left, right, answer, source,
+                    None))
+        if missing:
+            raise ValueError(
+                f"{spec.key}: {missing} target labels are not in "
+                f"{source_label_set_id}")
+        if spec.kind == "join":
+            output.sort(key=lambda row: (row["left_id"], row["right_id"]))
+        _atomic_parquet(part, output)
+        after_write()
+        written += len(output)
+        print(f"[derive] {spec.key} rows {start}:{end}", flush=True)
+    return written
+
+
+def derive_collection(sf: float, source_collection_id: str) -> dict:
+    """Build one scale factor's collection from a larger one, on the CPU.
+
+    Every model judgment and FEVER source label is copied by document
+    content hash. The LePaRD citation join depends on which citation
+    pairs the corpus sampled, so it is recomputed from the target
+    corpus instead.
+    """
+    if float(sf) not in SUPPORTED_SCALE_FACTORS:
+        raise ValueError(
+            f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}")
+    source_path = (ROOT / "collections" / source_collection_id
+                   / "manifest.json")
+    with open(source_path) as f:
+        source = json.load(f)
+    if (source.get("status") != "complete"
+            or source.get("collection_id") != source_collection_id):
+        raise ValueError(
+            f"source collection {source_collection_id} is invalid")
+    if float(source["scale_factor"]) <= float(sf):
+        raise ValueError(
+            f"source collection has scale factor {source['scale_factor']}, "
+            f"which is not larger than {sf}")
+    missing = [spec.key for spec in PREDICATES
+               if spec.key not in source["label_sets"]]
+    if missing:
+        raise ValueError(f"source collection has no label set for: {missing}")
+
+    t_total = time.perf_counter()
+    _, corpus_manifest, rows = _materialize_corpus(sf)
+    corpus_id = corpus_manifest["corpus_id"]
+    identities = {
+        spec.key: label_set_identity(
+            spec, corpus_id, corpus_manifest["corpus_full_hash"])
+        for spec in PREDICATES
+    }
+    origin = {}
+    for spec in PREDICATES:
+        identity = identities[spec.key]
+        label_dir = _label_dir(spec, identity)
+        label_dir.mkdir(parents=True, exist_ok=True)
+        if not (label_dir / "manifest.json").exists():
+            _atomic_json(label_dir / "manifest.json", {
+                **identity,
+                "status": "running",
+                "predicate": asdict(spec),
+                "expected_rows": _expected_rows(spec, rows),
+            })
+        if spec.source_policy == "lepard_citation_edge":
+            _write_lepard_source(spec, rows[spec.left_table],
+                                 rows[spec.right_table], identity, corpus_id)
+            origin[spec.key] = {"recomputed_from": corpus_id}
+            continue
+        source_label_set_id = source["label_sets"][spec.key]
+        _copy_label_set(spec, source_label_set_id, identity, corpus_id, rows)
+        origin[spec.key] = {"copied_from": source_label_set_id}
+
+    manifests = {spec.key: _complete_manifest(spec, identities[spec.key], rows)
+                 for spec in PREDICATES}
+    collection = _collection_identity(corpus_manifest, identities)
+    collection_dir = ROOT / "collections" / collection["collection_id"]
+    qwen_rows = sum(m["source_rows"].get(MODEL_NAME, 0)
+                    for m in manifests.values())
+    total_rows = sum(m["rows"] for m in manifests.values())
+    summary = {
+        "cell": "quailb_ground_truth_collection_derived",
+        "judge": QUAIL_JUDGE_SPEC,
+        "prediction": DERIVE_PREDICTION_TEXT,
+        "collection_id": collection["collection_id"],
+        "corpus_id": corpus_id,
+        "scale_factor": sf,
+        "model": MODEL_NAME,
+        "model_revision": MODEL_REVISION,
+        "source_collection_id": source_collection_id,
+        "source_corpus_id": source["corpus_id"],
+        "source_scale_factor": source["scale_factor"],
+        "qwen_judgments": qwen_rows,
+        "source_labels": total_rows - qwen_rows,
+        "total_labels": total_rows,
+        "predicate_count": len(PREDICATES),
+        "total_wall_s": round(time.perf_counter() - t_total, 2),
+        "label_sets": {
+            key: {"label_set_id": m["label_set_id"], "rows": m["rows"],
+                  "true_rows": m["true_rows"],
+                  "source_rows": m["source_rows"], **origin[key]}
+            for key, m in sorted(manifests.items())},
+        "volume_path": str(collection_dir),
+    }
+    _atomic_json(collection_dir / "manifest.json", {
+        **collection, "status": "complete",
+        "corpus_manifest": str(
+            ROOT / "corpora" / corpus_id / "manifest.json"),
+        "derived_from_collection": source_collection_id,
+        "summary": summary})
+    _atomic_json(collection_dir / "summary.json", summary)
+    _activate_collection(corpus_id, collection["collection_id"])
+    print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
+    return summary
+
+
+def collection_files(root: Path, collection_id: str) -> list[Path]:
+    """Every file a reader of one collection needs, under root.
+
+    The collection and corpus manifests, the corpus tables, each
+    label set's manifest and compact `labels.parquet`, and the
+    manifests of any collection and corpus it reuses labels from.
+    Part files are not needed once a label set is compacted.
+    """
+    collection_dir = root / "collections" / collection_id
+    with open(collection_dir / "manifest.json") as f:
+        manifest = json.load(f)
+    if manifest.get("status") != "complete":
+        raise ValueError(f"collection {collection_id} is not complete")
+    files = [collection_dir / "manifest.json", collection_dir / "summary.json"]
+    corpus_dir = root / "corpora" / manifest["corpus_id"]
+    files += sorted(path for path in corpus_dir.iterdir()
+                    if path.is_file() and path.suffix in (".json", ".parquet"))
+    for key, label_set_id in sorted(manifest["label_sets"].items()):
+        spec = PREDICATE_BY_KEY[key]
+        label_dir = (root / "label_sets" / spec.workload / spec.slug
+                     / label_set_id)
+        compact = label_dir / "labels.parquet"
+        if not compact.exists():
+            raise FileNotFoundError(
+                f"{label_set_id} has no labels.parquet; compact the "
+                "collection first")
+        files += [label_dir / "manifest.json", compact]
+    for record in manifest.get("reused_label_sets", {}).values():
+        files.append(root / "collections" / record["source_collection_id"]
+                     / "manifest.json")
+        files.append(root / "corpora" / record["source_corpus_id"]
+                     / "manifest.json")
+    return list(dict.fromkeys(files))
+
+
+def publish(root: Path, collection_ids: list[str],
+            bucket: str = PUBLIC_BUCKET, client=None) -> dict:
+    """Upload the files of these collections that the bucket lacks.
+
+    A parquet file whose key already exists with the same size is
+    skipped; every JSON file is uploaded, because a corpus's
+    `active_collection.json` changes without changing size.
+    """
+    if client is None:
+        import boto3
+
+        client = boto3.client("s3")
     prefix = GROUND_TRUTH_ROOT
     existing = {}
-    paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix + "/"):
+    for page in client.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=prefix + "/"):
         for item in page.get("Contents", ()):
             existing[item["Key"]] = item["Size"]
-    uploaded = 0
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.suffix == ".tmp":
-            continue
+    files = []
+    for collection_id in collection_ids:
+        files += collection_files(root, collection_id)
+    uploaded = skipped = 0
+    uploaded_bytes = 0
+    for path in dict.fromkeys(files):
         key = f"{prefix}/{path.relative_to(root).as_posix()}"
-        if existing.get(key) == path.stat().st_size:
+        size = path.stat().st_size
+        if path.suffix == ".parquet" and existing.get(key) == size:
+            skipped += 1
             continue
         client.upload_file(str(path), bucket, key)
         uploaded += 1
-    print(f"[publish] {uploaded} files uploaded to s3://{bucket}/{prefix}",
-          flush=True)
-    return uploaded
-
-
-def main() -> None:
-    global ROOT
-
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument(
-        "--root", type=Path, default=Path.home() / ".cache" / "quail-b",
-        help="directory that holds ground_truth/quailb/schema_v1")
-    parser.add_argument("--sf", type=float, default=SCALE_FACTOR)
-    parser.add_argument("--only", default=None,
-                        help="comma-separated workloads, no finalize")
-    parser.add_argument("--publish", action="store_true",
-                        help="upload the finished tree to the public bucket")
-    args = parser.parse_args()
-    ROOT = args.root.expanduser() / GROUND_TRUTH_ROOT
-    print(f"PREDICTION: {PREDICTION_TEXT}", flush=True)
-    only = [w.strip() for w in args.only.split(",")] if args.only else None
-    result = run_workloads(args.sf, only)
+        uploaded_bytes += size
+        print(f"[publish] {key} ({size / 2**20:.1f} MiB)", flush=True)
+    result = {"bucket": bucket, "collections": list(collection_ids),
+              "files": len(set(files)), "uploaded": uploaded,
+              "skipped": skipped, "uploaded_bytes": uploaded_bytes}
     print(json.dumps(result, indent=2, sort_keys=True), flush=True)
-    if args.publish and not only:
-        publish(ROOT)
+    return result
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------- Modal
+
+# The judge runs through Quail's executor, so the GPU and volume
+# functions use the worker image the benchmark runner uses. Publishing
+# needs boto3 and no engine, so it gets a small image; the AWS keys
+# come from the machine that runs the command.
+image = build_worker_image(local_python_sources=("quail_b",))
+publish_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("boto3", "pyarrow", "numpy", "sqlglot>=27.0",
+                 "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+    .add_local_python_source("quail", "quail_b"))
+
+
+def _aws_credentials() -> dict[str, str]:
+    """The launching machine's AWS credentials, resolved like the aws CLI.
+
+    Empty where boto3 is missing or finds none, so the module imports
+    inside containers and the GPU functions never need AWS.
+    """
+    try:
+        import boto3
+
+        session = boto3.Session()
+        credentials = session.get_credentials()
+    except Exception:  # no credentials is a normal state, not an error
+        return {}
+    if credentials is None:
+        return {}
+    frozen = credentials.get_frozen_credentials()
+    found = {"AWS_ACCESS_KEY_ID": frozen.access_key,
+             "AWS_SECRET_ACCESS_KEY": frozen.secret_key}
+    if frozen.token:
+        found["AWS_SESSION_TOKEN"] = frozen.token
+    if session.region_name:
+        found["AWS_DEFAULT_REGION"] = session.region_name
+    return found
+
+
+aws_from_launcher = modal.Secret.from_dict(_aws_credentials())
+# Experiment cells attach to this existing app so its caches remain useful.
+app = modal.App("quail-milestone1")
+
+# Compaction and finalize read every part of a label set; at sf=1.0
+# the BioDEX join alone has 20.7 million rows.
+CPU_TIMEOUT_S = 3600
+CPU_MEMORY_MB = 16384
+
+
+def _mount() -> None:
+    """Point the pass at the volume: labels live there, parts commit as written."""
+    global ROOT, after_write
+    results_vol.reload()
+    ROOT = Path("/results") / GROUND_TRUTH_ROOT
+    after_write = results_vol.commit
+
+
+def parse_function_calls(value: str) -> dict[str, str]:
+    calls = {}
+    for item in value.split(","):
+        try:
+            workload, function_call_id = item.split("=", 1)
+        except ValueError as exc:
+            raise ValueError(
+                "function calls must use workload=fc-id") from exc
+        workload = workload.strip()
+        function_call_id = function_call_id.strip()
+        if workload in calls:
+            raise ValueError(f"duplicate workload {workload!r}")
+        calls[workload] = function_call_id
+    missing = set(WORKLOADS) - set(calls)
+    unknown = set(calls) - set(WORKLOADS)
+    if missing or unknown:
+        raise ValueError(
+            f"function calls have missing={sorted(missing)}, "
+            f"unknown={sorted(unknown)}")
+    if any(not value.startswith("fc-") for value in calls.values()):
+        raise ValueError("every function call id must start with fc-")
+    return calls
+
+
+@app.function(
+    image=image, memory=CPU_MEMORY_MB, timeout=CPU_TIMEOUT_S,
+    volumes={"/results": results_vol})
+def run_compact(collection_id: str) -> str:
+    _mount()
+    result = compact_ground_truth(collection_id)
+    results_vol.commit()
+    return json.dumps(result, sort_keys=True)
+
+
+# Building the sf=1.0 corpus downloads SWE-Next and tokenizes 17,711
+# trace snapshots, which is far slower than the other tables.
+@app.function(
+    image=image, memory=CPU_MEMORY_MB, timeout=2 * CPU_TIMEOUT_S,
+    volumes={"/root/.cache/huggingface": hf_cache,
+             "/results": results_vol})
+def run_prepare_corpus(sf: float = SCALE_FACTOR) -> str:
+    _mount()
+    result = prepare_corpus(sf)
+    results_vol.commit()
+    return json.dumps(result, sort_keys=True)
+
+
+# The slowest sf=1.0 workload took 7.7 hours; 24 hours is Modal's
+# limit. Parts commit as written, so a container that dies loses only
+# the part it was on.
+@app.function(
+    image=image, gpu="H100!", memory=98304, timeout=86400,
+    volumes={"/root/.cache/huggingface": hf_cache,
+             "/root/.cache/kernels": kernel_cache,
+             "/results": results_vol})
+def run_judge_workload(corpus_id: str, workload: str) -> str:
+    """Label one workload's predicates on one GPU."""
+    _mount()
+    partial = judge_workload(corpus_id, workload)
+    results_vol.commit()
+    kernel_cache.commit()
+    return json.dumps(partial, sort_keys=True)
+
+
+@app.function(
+    image=image, memory=CPU_MEMORY_MB, timeout=CPU_TIMEOUT_S,
+    volumes={"/results": results_vol})
+def run_finalize(sf: float, corpus_id: str, partials: str) -> str:
+    """Assemble five workloads and activate their ground truth."""
+    _mount()
+    summary = finalize_collection(sf, corpus_id, json.loads(partials))
+    results_vol.commit()
+    return json.dumps(summary, sort_keys=True)
+
+
+@app.function(
+    image=image, memory=CPU_MEMORY_MB, timeout=CPU_TIMEOUT_S,
+    volumes={"/results": results_vol})
+def run_activate_reused(
+        sf: float, target_corpus_id: str, source_collection_id: str,
+        relabeled_workloads: str) -> str:
+    """Build one collection from new labels and verified unchanged tables."""
+    _mount()
+    summary = activate_reused_collection(
+        sf, target_corpus_id, source_collection_id, relabeled_workloads)
+    results_vol.commit()
+    return json.dumps(summary, sort_keys=True)
+
+
+# The derive step holds the target's share of a source join in memory:
+# at sf=0.5 from sf=1.0, 7.3 million BioDEX pairs.
+@app.function(
+    image=image, memory=2 * CPU_MEMORY_MB, timeout=2 * CPU_TIMEOUT_S,
+    volumes={"/root/.cache/huggingface": hf_cache,
+             "/results": results_vol})
+def run_derive(sf: float, source_collection_id: str) -> str:
+    """Build one scale factor's collection from a larger one, on the CPU."""
+    _mount()
+    summary = derive_collection(sf, source_collection_id)
+    results_vol.commit()
+    return json.dumps(summary, sort_keys=True)
+
+
+@app.function(
+    image=publish_image, memory=CPU_MEMORY_MB, timeout=2 * CPU_TIMEOUT_S,
+    volumes={"/results": results_vol}, secrets=[aws_from_launcher])
+def run_publish(collection_ids: str) -> str:
+    """Upload the named collections from the volume to the public bucket."""
+    _mount()
+    ids = [value.strip() for value in collection_ids.split(",")
+           if value.strip()]
+    return json.dumps(publish(ROOT, ids), sort_keys=True)
+
+
+@app.local_entrypoint()
+def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
+         only: str | None = None, finalize_from: str | None = None,
+         reuse_from_collection: str | None = None,
+         relabeled_workloads: str = "lepard",
+         target_corpus: str | None = None,
+         derive_from_collection: str | None = None,
+         publish_collections: str | None = None):
+    """Run the five workloads side by side, then activate the result.
+
+    ``--only imdb,fever`` restricts the pass to those workloads; the
+    finalize step is skipped because a collection needs all label sets.
+    ``--derive-from-collection`` copies a finished larger collection's
+    labels to this scale factor instead of running the model.
+    ``--publish-collections`` uploads finished collections to the
+    public bucket.
+    """
+    if publish_collections:
+        call = run_publish.spawn(publish_collections)
+        print(f"function call id (publish): {call.object_id}", flush=True)
+        print(call.get(), flush=True)
+        return
+    if compact_collection:
+        call = run_compact.spawn(compact_collection)
+        print(f"function call id: {call.object_id}", flush=True)
+        print(call.get(), flush=True)
+        return
+    if derive_from_collection:
+        print(f"PREDICTION: {DERIVE_PREDICTION_TEXT}", flush=True)
+        call = run_derive.spawn(sf, derive_from_collection)
+        print(f"function call id (derive): {call.object_id}", flush=True)
+        print(call.get(), flush=True)
+        return
+    prediction = (REUSE_PREDICTION_TEXT if reuse_from_collection
+                  else prediction_text(sf))
+    print(f"PREDICTION: {prediction}", flush=True)
+
+    if reuse_from_collection and target_corpus:
+        corpus_id = target_corpus
+        prepared = None
+    else:
+        call = run_prepare_corpus.spawn(sf)
+        print(f"function call id (prepare_corpus): {call.object_id}",
+              flush=True)
+        prepared = json.loads(call.get())
+        corpus_id = prepared["corpus"]["corpus_id"]
+    if reuse_from_collection:
+        call = run_activate_reused.spawn(
+            sf, corpus_id, reuse_from_collection, relabeled_workloads)
+        print("function call id (activate_reused_collection): "
+              f"{call.object_id}", flush=True)
+        print(call.get(), flush=True)
+        return
+    if finalize_from:
+        partials = {}
+        for workload, function_call_id in parse_function_calls(
+                finalize_from).items():
+            result = modal.FunctionCall.from_id(function_call_id).get()
+            partial = json.loads(result)
+            if partial["workload"] != workload:
+                raise ValueError(
+                    f"{function_call_id} returned workload "
+                    f"{partial['workload']!r}, expected {workload!r}")
+            partials[workload] = partial
+        call = run_finalize.spawn(sf, corpus_id, json.dumps(partials))
+        print(f"function call id (finalize_collection): {call.object_id}",
+              flush=True)
+        print(call.get(), flush=True)
+        return
+    if prepared["complete"] and not only:
+        print(f"collection {prepared['collection_id']} is already complete",
+              flush=True)
+        return
+
+    names = ([w.strip() for w in only.split(",")] if only
+             else list(WORKLOADS))
+    unknown = [w for w in names if w not in WORKLOADS]
+    if unknown:
+        raise ValueError(f"unknown workloads: {unknown}")
+
+    calls = {w: run_judge_workload.spawn(corpus_id, w) for w in names}
+    for w, c in calls.items():
+        print(f"function call id (judge_workload {w}): {c.object_id}",
+              flush=True)
+    partials = {}
+    for w, c in calls.items():
+        partials[w] = json.loads(c.get())
+        print(f"[main] {w} finished in "
+              f"{partials[w]['total_wall_s']:.1f}s", flush=True)
+
+    if only:
+        print("--only was given, so the collection is not finalized",
+              flush=True)
+        return
+    call = run_finalize.spawn(sf, corpus_id, json.dumps(partials))
+    print(f"function call id (finalize_collection): {call.object_id}",
+          flush=True)
+    print(call.get(), flush=True)

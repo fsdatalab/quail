@@ -24,8 +24,8 @@ calling process, or on Modal.
   or model. Corpus and labels are public in the `quail-bench` S3
   bucket. It is installed here as the `quail_b` package, pinned in
   `pyproject.toml`. The pass that writes the labels is
-  `quail/bench/labeling.py`, one GPU; `quail/bench/judge_pass.py` runs
-  it on Modal.
+  `quail/bench/labeling.py`, on Modal with one H100 per workload, at
+  scale factors 0.1, 0.5 and 1.0.
 - `demos/` has runnable examples for a machine with a GPU:
   `local_gpu_smoke.py` runs one filter over four short documents, and
   `imdb_ending_filter.py` filters all 100,000 IMDB reviews.
