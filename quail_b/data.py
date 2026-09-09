@@ -20,7 +20,11 @@ CACHE_SCHEMA_VERSION = 9
 # The labeled corpus for each scale factor, saved beside its labels in
 # the public bucket. build_sets downloads it instead of rebuilding from
 # the sources; the corpus id is checked after download.
-PUBLISHED_CORPORA = {0.1: "c_1aa2c4f0d0b6c816fd37aa5748c33341"}
+PUBLISHED_CORPORA = {
+    0.1: "c_1aa2c4f0d0b6c816fd37aa5748c33341",
+    0.5: "c_6773c85b3754908434661c1dadfad0fa",
+    1.0: "c_81a95887a650aaa1a343e0d688b81bef",
+}
 LEPARD_POSITIVE_PAIRS = 5_000
 # The base count for scaling. SWE-Next at the pinned revision yields
 # 17,711 eligible snapshots, so the full scale takes every one of them
