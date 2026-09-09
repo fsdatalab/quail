@@ -289,7 +289,9 @@ $$
   3. We want high model FLOPs utilization, or MFU, while the GPU is active. MFU measures how much of the GPU's peak arithmetic throughput the model uses during a forward pass.
 - Quail's KV manager decides which KV to retain and evict, with the goal of minimizing KV regret.
 - Packed execution groups model work into large batches, with the goal of keeping the GPU busy.
-- For MFU, we use DeepGEMM for the main matrix multiplications and FlashAttention 3 for attention, and leave further improvements to the authors of those kernels.
+- For MFU, we use DeepGEMM for the main matrix multiplications and FlashAttention 3 for attention, and leave further kernel optimization to the experts, who have shown that large improvements are possible.[^sail-mfu]
+
+[^sail-mfu]: In ["Chasing Speed of Light on TPU v6e"](https://www.sailresearch.com/blog/tpu-v6e-gemma), Sail Research describes increasing Gemma 4 31B prefill MFU from about 32 percent to 63 percent through attention tuning, communication overlap, and custom kernel work.
 
 ## Experimental setup
 
