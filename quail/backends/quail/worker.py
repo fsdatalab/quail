@@ -173,17 +173,25 @@ def quail_runtime_payload(request, graph) -> dict:
     }
 
 
-def _boot_for_query(runtime_state, backend, spec, device, workers,
+def _single_gpu_context(registry, envelope):
+    """Build the GPU context for the single-GPU boot path."""
+    return GpuContext(
+        gpu_index=0,
+        gpu_count=envelope["workers"],
+        model=registry.model(envelope["model"]),
+        device=registry.device(envelope["device"]),
+        query_settings={},
+    )
+
+
+def _boot_for_query(runtime_state, backend, gpu_context,
                     chunk_tokens, true_ids, false_ids):
     """Load or reuse a GPU, bind a query, warm kernels."""
-    key = (backend.name, spec.name)
+    key = (backend.name, gpu_context.model.name)
     gpu = runtime_state.get(key)
     t_boot = time.perf_counter()
     if gpu is None:
-        gpu = LoadedGpu(backend, GpuContext(
-            gpu_index=0, gpu_count=workers, model=spec, device=device,
-            query_settings={},
-        ), true_ids + false_ids)
+        gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids)
         runtime_state[key] = gpu
         cold = True
     else:
@@ -202,12 +210,9 @@ def prepare_quail_request(context) -> None:
     envelope = context.request.plan
     settings = dict(envelope["settings"])
     registry = context.registry
-    backend = registry.backend(envelope["backend"])
-    spec = registry.model(envelope["model"])
-    device = registry.device(envelope["device"])
     gpu, boot = _boot_for_query(
-        context.runtime_state, backend, spec, device,
-        envelope["workers"], settings["chunk_tokens"],
+        context.runtime_state, registry.backend(envelope["backend"]),
+        _single_gpu_context(registry, envelope), settings["chunk_tokens"],
         settings["true_ids"], settings["false_ids"])
     gpu.prepared_boot = boot
 
@@ -273,10 +278,9 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
         run_record_path,
     )
 
-    spec = registry.model(payload["model"])
-    device = registry.device(payload["physical_plan"]["device"])
+    gpu_context = _single_gpu_context(registry, payload["physical_plan"])
 
-    key = (backend.name, spec.name)
+    key = (backend.name, gpu_context.model.name)
     gpu = runtime_state.get(key)
     boot = None
     if isinstance(gpu, LoadedGpu):
@@ -284,8 +288,8 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
         gpu.prepared_boot = None
     if boot is None:
         gpu, boot = _boot_for_query(
-            runtime_state, backend, spec, device, payload["workers"],
-            payload["chunk_tokens"], payload["true_ids"], payload["false_ids"])
+            runtime_state, backend, gpu_context, payload["chunk_tokens"],
+            payload["true_ids"], payload["false_ids"])
     say("running the query")
 
     state = _gpu_state(gpu)
