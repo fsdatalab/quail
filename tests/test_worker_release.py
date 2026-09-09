@@ -23,13 +23,15 @@ def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
         "_release_vllm_parallel_state",
         lambda: calls.append("release_parallel_state"),
     )
-    booted = {"test": {"model": object()}}
+    mock_gpu = SimpleNamespace(close=lambda: calls.append("close"))
+    booted = {("quail", "test"): mock_gpu}
 
     result = worker.release_booted_models(booted)
 
     assert booted == {}
     assert calls == [
         "synchronize",
+        "close",
         "release_parallel_state",
         "gc",
         "empty_cache",
