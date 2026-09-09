@@ -117,6 +117,66 @@ def test_second_query_reuses_the_loaded_model(booted):
     assert calls == ["bind_query:4096"]
 
 
+ENVELOPE = {
+    "backend": "quail", "model": "qwen3-4b-fp8", "device": "h100-sxm",
+    "workers": 1,
+    "settings": {"chunk_tokens": 8192, "true_ids": [1], "false_ids": [2]},
+}
+
+
+def payload_for(envelope):
+    """Build the flattened payload execute_quail_payload expects."""
+    return {
+        "physical_plan": envelope, "model": envelope["model"],
+        "workers": envelope["workers"], "docs": {},
+        **dict(envelope["settings"]),
+    }
+
+
+def test_prepared_boot_is_handed_to_the_query_and_used_once(
+        booted, monkeypatch):
+    registry = built_in_registry()
+    backend = registry.backend("quail")
+    runtime_state = {}
+    boots = []
+    real_boot_for_query = worker._boot_for_query
+
+    def counting_boot(*args, **kwargs):
+        boots.append(1)
+        return real_boot_for_query(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "_boot_for_query", counting_boot)
+    monkeypatch.setattr(worker, "execute_single",
+                        lambda *a, **k: {"_outputs": {}, "wall_s": 1.0})
+    monkeypatch.setattr("quail.runtime.volumes.run_record_path", lambda: None)
+    monkeypatch.setattr("quail.runtime.volumes.commit_results", lambda: None)
+    monkeypatch.setattr("quail.runtime.volumes.commit_kernel_cache",
+                        lambda: None)
+
+    worker.prepare_quail_request(SimpleNamespace(
+        gpu_count=1, registry=registry, runtime_state=runtime_state,
+        request=SimpleNamespace(plan=ENVELOPE),
+    ))
+
+    gpu = runtime_state[("quail", "qwen3-4b-fp8")]
+    assert gpu.prepared_boot["kind"] == "cold"
+    assert len(boots) == 1
+
+    response = worker.execute_quail_payload(
+        payload_for(ENVELOPE), registry, object(), backend, runtime_state)
+
+    assert response.metrics["boot_kind"] == "cold"
+    assert gpu.prepared_boot is None
+    assert len(boots) == 1
+
+    second = worker.execute_quail_payload(
+        payload_for(ENVELOPE), registry, object(), backend, runtime_state)
+
+    assert second.metrics["boot_kind"] == "warm"
+    assert len(boots) == 2
+    assert runtime_state[("quail", "qwen3-4b-fp8")] is gpu
+
+
 def test_gpu_state_carries_what_the_graph_reads(booted):
     registry = built_in_registry()
     context = worker._single_gpu_context(registry, {
