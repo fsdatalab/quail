@@ -4,6 +4,17 @@ import sys
 from types import SimpleNamespace
 
 from quail.backends.quail import worker
+from quail.backends.quail.worker import LoadedGpu
+
+
+class _MockGpu(LoadedGpu):
+    """Minimal stand-in that skips real GPU init."""
+
+    def __init__(self, close_fn):
+        self._close_fn = close_fn
+
+    def close(self):
+        self._close_fn()
 
 
 def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
@@ -23,13 +34,15 @@ def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
         "_release_vllm_parallel_state",
         lambda: calls.append("release_parallel_state"),
     )
-    booted = {"test": {"model": object()}}
+    mock_gpu = _MockGpu(close_fn=lambda: calls.append("close"))
+    booted = {("quail", "test"): mock_gpu}
 
     result = worker.release_booted_models(booted)
 
     assert booted == {}
     assert calls == [
         "synchronize",
+        "close",
         "release_parallel_state",
         "gc",
         "empty_cache",

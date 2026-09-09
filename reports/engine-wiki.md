@@ -1453,7 +1453,7 @@ for known join pairs. The current queries use 21 predicates.
 | claims | `fever/fever` | 5,000 | Factual claims (train + labelled_dev) |
 | citation_contexts | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Legal citation excerpts |
 | citation_passages | `rmahari/LePaRD` | deduplicated from 5,000 pairs | Cited legal passages |
-| agent_traces | `TIGER-Lab/SWE-Next-SFT-Trajectories` | 17,718 | Cumulative software agent trace snapshots |
+| agent_traces | `TIGER-Lab/SWE-Next-SFT-Trajectories` | 17,711 | Cumulative software agent trace snapshots |
 | policies | `mukund/PrivacyPolicies` | 1,000,000 | Privacy policies (optional) |
 
 LePaRD first samples known citation pairs with a stable hash. At scale factor
@@ -1467,7 +1467,7 @@ turn, including the following tool output when one exists. Documents from the
 same trajectory stay together in time order. The builder keeps documents with
 at most 24,000 Qwen3 tokens and excludes trajectories without a user issue.
 Scale factor 0.1 uses 1,772 documents from 376 trajectories. The documents
-contain 17,252,669 tokens. Scale factor 1.0 uses 17,718 documents.
+contain 17,252,669 tokens. Scale factor 1.0 uses every eligible snapshot, 17,711 documents, because the source has fewer than the 17,718 base count.
 
 Partner tables (fixed vocabulary, not scaled by SF):
 - **aspects** (12 rows): film aspects ("the acting", "the plot", ...)
@@ -1484,7 +1484,7 @@ graph LR
         reports["reports (10K)"]
         claims["claims (5K)"]
         citation_contexts["citation_contexts"]
-        agent_traces["agent_traces (17,718)"]
+        agent_traces["agent_traces (17,711)"]
         policies["policies (1M, optional)"]
     end
     subgraph Partner tables
@@ -1570,6 +1570,18 @@ graph LR
 PRIV-1 and PRIV-2 run only when `register_privacy_sets()` has been
 called. They have no ground truth and are not part of the default
 benchmark runner or judge pass.
+
+### Scale factors and derived collections
+
+The labeling pass (`quail/bench/labeling.py`) supports scale factors 0.1,
+0.5 and 1.0. A smaller scale factor samples a prefix of the larger one's
+documents, so `derive_collection` builds the smaller collection from a
+finished larger one on the CPU by matching document content hashes. Only
+the LePaRD citation join is recomputed from the smaller corpus, because its
+source labels depend on which citation pairs the corpus sampled. A derived
+collection is an ordinary collection for its corpus; its manifest records
+`derived_from_collection`. Labels are written to the `quail-results` volume
+and published to the bucket in a separate step.
 
 ### Selectivity estimates
 

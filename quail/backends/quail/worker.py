@@ -43,6 +43,119 @@ from quail.runtime.tokens import (
 _CHILDREN: list = []
 
 
+class LoadedGpu:
+    """One model loaded on one GPU, reusable across queries."""
+
+    def __init__(self, backend, context, answer_token_ids, *,
+                 model_path=None):
+        import torch
+        import torch.nn.functional as F
+
+        spec, device = context.model, context.device
+        gpu_index = context.gpu_index
+        self.torch = torch
+        self.F = F
+        self.spec = spec
+        self._warmed = False
+        self.prepared_boot = None
+
+        set_gpu_index(gpu_index)
+        free, total = torch.cuda.mem_get_info()
+        say(f"loading {spec.hf_name} onto GPU {gpu_index}, "
+            f"{free / 2**30:.1f} of {total / 2**30:.1f} GiB free")
+
+        t0 = time.perf_counter()
+        self.model = load_model(model_path or spec.hf_name,
+                                revision=None if model_path else spec.revision,
+                                answer_token_ids=answer_token_ids)
+        self.load_model_s = time.perf_counter() - t0
+
+        # cuBLAS allocates its handle outside PyTorch's caching allocator.
+        # At the warm-up peak the allocator holds every free byte, so
+        # create the handle now while memory is available.
+        torch.cuda.current_blas_handle()
+        probe = torch.ones(8, 64, device="cuda", dtype=torch.bfloat16)
+        F.linear(probe, probe)
+        torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        budget = budgets.chunk_budget(spec, device)
+        arena_tok = budgets.arena_tokens(spec, device, budget)
+        self.arena = KVArena(n_layers=spec.layers,
+                             n_pages=arena_tok // budgets.PAGE_TOKENS,
+                             page_tokens=budgets.PAGE_TOKENS,
+                             n_kv=spec.n_kv, d_head=spec.d_head,
+                             dtype=torch.bfloat16)
+        self.arena_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        self.pipeline = Pipeline(self.model, self.arena,
+                                 attention_mode=FILTER_ATTENTION)
+        self.pipeline_s = time.perf_counter() - t0
+
+        self.execution = backend.start(context)
+        self.execution.bind_loaded_model(
+            model=self.model, arena=self.arena, pipeline=self.pipeline)
+
+        self.async_ans = None
+        self.chunk_tokens = None
+
+    def bind_query(self, true_ids, false_ids, chunk_tokens):
+        """Attach the answerer and chunk budget for one query."""
+        answerer = _PayloadAnswerer(self.torch, self.F, self.model,
+                                    true_ids, false_ids)
+        self.async_ans = AsyncAnswers(self.torch, answerer)
+        self.chunk_tokens = chunk_tokens
+        self.execution.bind_query(
+            torch=self.torch,
+            async_answers=self.async_ans,
+            chunk_tokens=chunk_tokens,
+        )
+
+    def warm(self):
+        """Compile and warm kernels once.
+
+        Returns:
+            Tuple of (seconds spent warming, compilation tier).
+        """
+        if self._warmed:
+            return 0.0, None
+        from quail.runtime.volumes import commit_kernel_cache
+
+        t0 = time.perf_counter()
+        with self.torch.inference_mode():
+            warm = warm_kernels(self.torch, self.arena, self.pipeline,
+                                self.async_ans, self.chunk_tokens,
+                                model_name=self.spec.hf_name)
+        self.torch.cuda.synchronize()
+        commit_kernel_cache()
+        warm_s = time.perf_counter() - t0
+        self._warmed = True
+        return warm_s, warm["tier"]
+
+    def close(self):
+        """Release GPU resources held by the execution context."""
+        close_fn = getattr(self.execution, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+
+def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
+    """Assemble a boot timing dict from a loaded GPU and warm results."""
+    kind = "cold" if cold or warm_tier else "warm"
+    boot = {
+        "kind": kind,
+        "load_model_s": round(gpu.load_model_s if cold else 0.0, 2),
+        "arena_s": round(gpu.arena_s if cold else 0.0, 2),
+        "pipeline_s": round(gpu.pipeline_s if cold else 0.0, 2),
+        "warm_kernels_s": round(warm_s, 2),
+        "boot_s": round(time.perf_counter() - t_boot, 2),
+    }
+    if warm_tier:
+        boot["warm_tier"] = warm_tier
+    return boot
+
+
 def quail_runtime_payload(request, graph) -> dict:
     """Build private Quail scheduler state from a standard request."""
     envelope = request.plan
@@ -60,6 +173,36 @@ def quail_runtime_payload(request, graph) -> dict:
     }
 
 
+def _single_gpu_context(registry, envelope):
+    """Build the GPU context for the single-GPU boot path."""
+    return GpuContext(
+        gpu_index=0,
+        gpu_count=envelope["workers"],
+        model=registry.model(envelope["model"]),
+        device=registry.device(envelope["device"]),
+        query_settings={},
+    )
+
+
+def _boot_for_query(runtime_state, backend, gpu_context,
+                    chunk_tokens, true_ids, false_ids):
+    """Load or reuse a GPU, bind a query, warm kernels."""
+    key = (backend.name, gpu_context.model.name)
+    gpu = runtime_state.get(key)
+    t_boot = time.perf_counter()
+    if gpu is None:
+        gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids)
+        runtime_state[key] = gpu
+        cold = True
+    else:
+        cold = False
+    gpu.bind_query(true_ids, false_ids, chunk_tokens)
+    warm_s, warm_tier = gpu.warm()
+    boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
+    say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
+    return gpu, boot
+
+
 def prepare_quail_request(context) -> None:
     """Boot one GPU from the plan alone; the documents can arrive later."""
     if context.gpu_count != 1:
@@ -67,26 +210,11 @@ def prepare_quail_request(context) -> None:
     envelope = context.request.plan
     settings = dict(envelope["settings"])
     registry = context.registry
-    backend = registry.backend(envelope["backend"])
-    spec = registry.model(envelope["model"])
-    device = registry.device(envelope["device"])
-    state = context.runtime_state.setdefault((backend.name, spec.name), {})
-    state["prepared_boot"] = _boot_for_query(
-        state, backend, spec, device, envelope["workers"],
-        settings["chunk_tokens"], settings["true_ids"], settings["false_ids"])
-
-
-def _boot_for_query(state, backend, spec, device, workers, chunk_tokens,
-                    true_ids, false_ids) -> dict:
-    """Load, bind, and warm the GPU for one query; return its boot record."""
-    t_boot = time.perf_counter()
-    boot = _boot_gpu(state, backend, spec, device, 0, workers,
-                     chunk_tokens, true_ids + false_ids)
-    _bind_query(state, true_ids, false_ids, chunk_tokens)
-    _warm(state, boot)
-    _finish_boot(boot, t_boot)
-    say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
-    return boot
+    gpu, boot = _boot_for_query(
+        context.runtime_state, registry.backend(envelope["backend"]),
+        _single_gpu_context(registry, envelope), settings["chunk_tokens"],
+        settings["true_ids"], settings["false_ids"])
+    gpu.prepared_boot = boot
 
 
 def execute_quail_request(context):
@@ -122,11 +250,8 @@ def release_booted_models(runtime_state: dict) -> dict:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     for state in runtime_state.values():
-        if not isinstance(state, dict):
-            continue
-        close = state.get("close")
-        if callable(close):
-            close()
+        if isinstance(state, LoadedGpu):
+            state.close()
     runtime_state.clear()
     _release_vllm_parallel_state()
     gc.collect()
@@ -145,100 +270,6 @@ def release_booted_models(runtime_state: dict) -> dict:
     }
 
 
-def _boot_gpu(state, backend, spec, device, gpu_index, workers,
-              chunk_tokens, answer_token_ids, *, model_path=None):
-    """Load the model, arena, and pipeline once per GPU executor."""
-    import torch
-    import torch.nn.functional as F
-
-    set_gpu_index(gpu_index)
-    boot = dict(kind="warm", load_model_s=0.0, arena_s=0.0,
-                pipeline_s=0.0, warm_kernels_s=0.0)
-    if "model_execution" not in state:
-        say(f"loading {spec.hf_name} onto GPU {gpu_index}")
-        t0 = time.perf_counter()
-        model = load_model(model_path or spec.hf_name,
-                           revision=None if model_path else spec.revision,
-                           answer_token_ids=answer_token_ids)
-        boot["load_model_s"] = time.perf_counter() - t0
-        # budgets.* is tiny CPU; fold into arena_s so the four phases
-        # cover the cold-load span without a leftover residual
-        t0 = time.perf_counter()
-        budget = budgets.chunk_budget(spec, device)
-        arena_tok = budgets.arena_tokens(spec, device, budget)
-        arena = KVArena(n_layers=spec.layers,
-                        n_pages=arena_tok // budgets.PAGE_TOKENS,
-                        page_tokens=budgets.PAGE_TOKENS,
-                        n_kv=spec.n_kv, d_head=spec.d_head,
-                        dtype=torch.bfloat16)
-        boot["arena_s"] = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        pipeline = Pipeline(model, arena,
-                            attention_mode=FILTER_ATTENTION)
-        boot["pipeline_s"] = time.perf_counter() - t0
-        execution = backend.start(GpuContext(
-            gpu_index=gpu_index,
-            gpu_count=workers,
-            model=spec,
-            device=device,
-            query_settings={"chunk_tokens": chunk_tokens},
-        ))
-        execution.bind_loaded_model(
-            model=model, arena=arena, pipeline=pipeline
-        )
-        state.update(torch=torch, F=F, model_execution=execution,
-                     model=model, arena=arena, pipeline=pipeline,
-                     spec=spec, warmed=False)
-        boot["kind"] = "cold"
-    return boot
-
-
-def _bind_query(state, true_ids, false_ids, chunk_tokens):
-    """Attach the answerer and chunk budget for one query."""
-    torch = state["torch"]
-    # the worker has no tokenizer: the TRUE/FALSE token ids ride in the
-    # payload
-    answerer = _PayloadAnswerer(torch, state["F"], state["model"],
-                                true_ids, false_ids)
-    state["async_ans"] = AsyncAnswers(torch, answerer)
-    state["chunk_tokens"] = chunk_tokens
-    state["model_execution"].bind_query(
-        torch=torch,
-        async_answers=state["async_ans"],
-        chunk_tokens=chunk_tokens,
-    )
-
-
-def _warm(state, boot):
-    """Compile and touch the kernels once per container."""
-    from quail.runtime.volumes import commit_kernel_cache
-
-    if state["warmed"]:
-        return
-    torch = state["torch"]
-    t0 = time.perf_counter()
-    with torch.inference_mode():
-        # boot-side warmup on synthetic tokens: the compile pass once
-        # ever per stack+model+budget (marker on the kernel cache
-        # volume), the millisecond-loads touch pass on every container
-        # after that
-        warm = warm_kernels(torch, state["arena"], state["pipeline"],
-                            state["async_ans"], state["chunk_tokens"],
-                            model_name=state["spec"].hf_name)
-    torch.cuda.synchronize()
-    commit_kernel_cache()   # keep the compiles even if the run dies
-    boot["warm_kernels_s"] = time.perf_counter() - t0
-    boot["warm_tier"] = warm["tier"]
-    state["warmed"] = True
-    boot["kind"] = "cold"
-
-
-def _finish_boot(boot, t_boot):
-    for k in ("load_model_s", "arena_s", "pipeline_s", "warm_kernels_s"):
-        boot[k] = round(boot[k], 2)
-    boot["boot_s"] = round(time.perf_counter() - t_boot, 2)
-
-
 def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     """Execute one Quail payload on the worker's own GPU."""
     from quail.runtime.volumes import (
@@ -247,17 +278,21 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
         run_record_path,
     )
 
-    spec = registry.model(payload["model"])
-    device = registry.device(payload["physical_plan"]["device"])
+    gpu_context = _single_gpu_context(registry, payload["physical_plan"])
 
-    state = runtime_state.setdefault((backend.name, spec.name), {})
-    boot = state.pop("prepared_boot", None)
+    key = (backend.name, gpu_context.model.name)
+    gpu = runtime_state.get(key)
+    boot = None
+    if isinstance(gpu, LoadedGpu):
+        boot = gpu.prepared_boot
+        gpu.prepared_boot = None
     if boot is None:
-        boot = _boot_for_query(
-            state, backend, spec, device, payload["workers"],
-            payload["chunk_tokens"], payload["true_ids"], payload["false_ids"])
+        gpu, boot = _boot_for_query(
+            runtime_state, backend, gpu_context, payload["chunk_tokens"],
+            payload["true_ids"], payload["false_ids"])
     say("running the query")
 
+    state = _gpu_state(gpu)
     report = execute_single(state, payload, registry, graph)
     outputs = report.pop("_outputs")
     report.pop("filters", None)
@@ -282,13 +317,23 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     return PhysicalResponse(outputs, report)
 
 
+def _gpu_state(gpu):
+    """Build a state dict from a LoadedGpu for graph execution."""
+    return {
+        "torch": gpu.torch, "F": gpu.F,
+        "model_execution": gpu.execution,
+        "model": gpu.model, "arena": gpu.arena,
+        "pipeline": gpu.pipeline, "spec": gpu.spec,
+    }
+
+
 def execute_single(state, payload: dict, registry, graph) -> dict:
     """Execute the typed Quail graph on one GPU."""
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
         "runtimes": registry.runtimes,
-        "model_spec": state["spec"],
+        "model_spec": state.get("spec") or state.get("model_spec"),
         "device": registry.device(payload["physical_plan"]["device"]),
         "chunk_tokens": payload["chunk_tokens"],
     }
@@ -307,7 +352,7 @@ def _child_main(gpu_idx, conn):
     import os as _os
     _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
     set_gpu_index(gpu_idx)
-    state = {"gpu_index": gpu_idx}
+    state = {"gpu_index": gpu_idx, "gpu": None}
     while True:
         try:
             kind, data = conn.recv()
@@ -336,25 +381,32 @@ def _child_boot(state, sub):
     device = registry.device(envelope["device"])
     backend = registry.backend(envelope["backend"])
     t_boot = time.perf_counter()
-    boot = _boot_gpu(state, backend, spec, device, state["gpu_index"],
-                     sub["workers"], sub["chunk_tokens"],
-                     sub["true_ids"] + sub["false_ids"],
-                     model_path=state["model_path"])
-    _bind_query(state, sub["true_ids"], sub["false_ids"],
-                sub["chunk_tokens"])
+    gpu = state.get("gpu")
+    if gpu is None:
+        gpu = LoadedGpu(backend, GpuContext(
+            gpu_index=state["gpu_index"], gpu_count=sub["workers"],
+            model=spec, device=device, query_settings={},
+        ), sub["true_ids"] + sub["false_ids"],
+            model_path=state["model_path"])
+        state["gpu"] = gpu
+        cold = True
+    else:
+        cold = False
+    gpu.bind_query(sub["true_ids"], sub["false_ids"],
+                   sub["chunk_tokens"])
     state["runtime_context"] = ExecutionContext(
-        runtimes=registry.runtimes,
-        model_execution=state["model_execution"],
+        runtimes=registry.runtimes, model_execution=gpu.execution,
     )
-    _warm(state, boot)
-    _finish_boot(boot, t_boot)
+    warm_s, warm_tier = gpu.warm()
+    boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
     say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
     return boot
 
 
 def _child_filters(state, sub):
-    torch = state["torch"]
-    arena = state["arena"]
+    gpu = state.get("gpu")
+    torch = gpu.torch if gpu else state["torch"]
+    arena = gpu.arena if gpu else state["arena"]
     if sub.get("start_query", True):
         _reset_child_query(state)
         config = sub.get("retention", {})
@@ -364,7 +416,8 @@ def _child_filters(state, sub):
     filter_limit = sub.get("filter_limit")
     t0 = time.perf_counter()
     with torch.inference_mode():
-        state["pipeline"].attention_mode = FILTER_ATTENTION
+        pipeline = gpu.pipeline if gpu else state["pipeline"]
+        pipeline.attention_mode = FILTER_ATTENTION
         node_id = sub.get("node_id")
         if node_id is not None:
             graph = decode_graph(
@@ -398,8 +451,6 @@ def _child_filters(state, sub):
                     key[1] for key in arena.accounting.retained
                     if key[0] == alias)
             out["fresh_tokens"] += result.metrics.fresh_tokens
-            # answers is keyed by document position; every answered
-            # document's prefix was computed once in this query
             state["seen"].update((alias, document)
                                  for document in answers)
             out["filters"][alias] = {
@@ -420,8 +471,9 @@ def _child_filters(state, sub):
 
 
 def _child_joins(state, sub):
-    torch = state["torch"]
-    arena = state["arena"]
+    gpu = state.get("gpu")
+    torch = gpu.torch if gpu else state["torch"]
+    arena = gpu.arena if gpu else state["arena"]
     if sub.get("start_query", False):
         _reset_child_query(state)
     pre = sub.get("pre_ids") or []
@@ -444,11 +496,10 @@ def _child_joins(state, sub):
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
-        state["pipeline"].attention_mode = JOIN_ATTENTION
+        pipeline = gpu.pipeline if gpu else state["pipeline"]
+        pipeline.attention_mode = JOIN_ATTENTION
         stage_suffixes, tuple_globs = [], []
         for j in group:
-            # partner docs ride keyed by local position; tuples
-            # combine one local position per partner alias
             locals_ = [range(len(sub["partners"][p]["index"]))
                        for p in j["partners"]]
             combos = list(itertools.product(*locals_))
@@ -499,7 +550,6 @@ def _child_joins(state, sub):
         )
         ans = result.metrics.extension["answers"]
         seen.update(anchor_keys)
-        # settle anchors run_join never called back (no live suffixes)
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
             if key not in arena.accounting.owned:
@@ -538,7 +588,8 @@ def _child_joins(state, sub):
 
 def _reset_child_query(state):
     """Clear KV and counters before a child starts a new query."""
-    arena = state["arena"]
+    gpu = state.get("gpu")
+    arena = gpu.arena if gpu else state["arena"]
     for key in list(arena.accounting.owned):
         arena.free_key(key)
     arena.reset_stats()
