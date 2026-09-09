@@ -46,11 +46,13 @@ _CHILDREN: list = []
 class LoadedGpu:
     """One model loaded on one GPU, reusable across queries."""
 
-    def __init__(self, backend, spec, device, gpu_index, workers,
-                 chunk_tokens, answer_token_ids, *, model_path=None):
+    def __init__(self, backend, context, answer_token_ids, *,
+                 model_path=None):
         import torch
         import torch.nn.functional as F
 
+        spec, device = context.model, context.device
+        gpu_index = context.gpu_index
         self.torch = torch
         self.F = F
         self.spec = spec
@@ -91,18 +93,12 @@ class LoadedGpu:
                                  attention_mode=FILTER_ATTENTION)
         self.pipeline_s = time.perf_counter() - t0
 
-        self.execution = backend.start(GpuContext(
-            gpu_index=gpu_index,
-            gpu_count=workers,
-            model=spec,
-            device=device,
-            query_settings={"chunk_tokens": chunk_tokens},
-        ))
+        self.execution = backend.start(context)
         self.execution.bind_loaded_model(
             model=self.model, arena=self.arena, pipeline=self.pipeline)
 
         self.async_ans = None
-        self.chunk_tokens = chunk_tokens
+        self.chunk_tokens = None
 
     def bind_query(self, true_ids, false_ids, chunk_tokens):
         """Attach the answerer and chunk budget for one query."""
@@ -184,8 +180,10 @@ def _boot_for_query(runtime_state, backend, spec, device, workers,
     gpu = runtime_state.get(key)
     t_boot = time.perf_counter()
     if gpu is None:
-        gpu = LoadedGpu(backend, spec, device, 0, workers,
-                        chunk_tokens, true_ids + false_ids)
+        gpu = LoadedGpu(backend, GpuContext(
+            gpu_index=0, gpu_count=workers, model=spec, device=device,
+            query_settings={},
+        ), true_ids + false_ids)
         runtime_state[key] = gpu
         cold = True
     else:
@@ -381,10 +379,11 @@ def _child_boot(state, sub):
     t_boot = time.perf_counter()
     gpu = state.get("gpu")
     if gpu is None:
-        gpu = LoadedGpu(backend, spec, device, state["gpu_index"],
-                        sub["workers"], sub["chunk_tokens"],
-                        sub["true_ids"] + sub["false_ids"],
-                        model_path=state["model_path"])
+        gpu = LoadedGpu(backend, GpuContext(
+            gpu_index=state["gpu_index"], gpu_count=sub["workers"],
+            model=spec, device=device, query_settings={},
+        ), sub["true_ids"] + sub["false_ids"],
+            model_path=state["model_path"])
         state["gpu"] = gpu
         cold = True
     else:
