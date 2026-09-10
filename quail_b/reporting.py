@@ -87,13 +87,15 @@ def _query_directory(directory, item):
     return path
 
 
-def report(run_dir, *, cache_dir=None, root=None):
-    """Rescore a saved run with its pinned labels, without executing queries."""
+def report(run_dir, *, rescore=True, cache_dir=None, root=None):
+    """Write a report, optionally reusing scores already saved in the run."""
     directory = Path(run_dir)
     path = directory / "run.json"
     record = json.loads(path.read_text())
     if record["schema_version"] != 1:
         raise ValueError("unsupported run format")
+    if not rescore:
+        return _write_report(directory, record)
     ids = [item["id"] for item in record["queries"]]
     with download_cache(cache_dir):
         suite = load_benchmark(

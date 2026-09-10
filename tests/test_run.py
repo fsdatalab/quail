@@ -94,6 +94,9 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
         assert metrics["document_pairs_per_second"] == 1.0
         assert metrics["cost_usd"] == 0.004
         assert metrics["accuracy"]["output_accuracy"]["exact_match"]
+        before = (destination / "report.md").read_text()
+        quail_b.report(destination, rescore=False)
+        assert (destination / "report.md").read_text() == before
         completed = subprocess.run(
             [sys.executable, "-m", "quail_b", "report", str(destination),
              "--root", str(tmp_path)], capture_output=True, text=True, timeout=30)
