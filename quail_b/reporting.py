@@ -10,7 +10,9 @@ from quail_b.run import _query_hash, _read_output, _score, _write_json
 
 
 def _number(value):
-    return "unavailable" if value is None else f"{value:.6g}"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "unavailable"
+    return f"{value:.6g}"
 
 
 def _write_report(directory, record):

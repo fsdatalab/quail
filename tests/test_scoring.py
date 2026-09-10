@@ -328,6 +328,16 @@ def test_load_benchmark_with_local_reference_labels(tmp_path):
             root=tmp_path, collection_id=collection_id)
     assert json.loads((tmp_path / "broken/run.json").read_text())["status"] == "failed"
 
+    def invalid_duration(query, tables):
+        return RunOutput(None, None, pa.table({"r": ["r0"]}), runtime_s="invalid")
+
+    with pytest.raises(ValueError, match="runtime_s"):
+        benchmark.run(
+            invalid_duration, queries=["IMDB-1"],
+            output_dir=tmp_path / "bad-duration",
+            root=tmp_path, collection_id=collection_id)
+    assert (tmp_path / "bad-duration/report.md").exists()
+
     record["queries"][0]["definition_hash"] = "changed"
     (output_dir / "run.json").write_text(json.dumps(record))
     with pytest.raises(ValueError, match="query definition changed"):
