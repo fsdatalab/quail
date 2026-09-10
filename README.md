@@ -20,6 +20,40 @@ Counts are at scale factor 0.1, the default. One seed (`DATA_SEED`) and one pinn
 | `citation_passages` | `rmahari/LePaRD` | 433 |
 | `agent_traces` | `TIGER-Lab/SWE-Next-SFT-Trajectories` | 1,772 |
 
+## Load a table
+
+```python
+import quail_b as benchmark
+
+reviews = benchmark.load_table("reviews", limit=100)
+query = benchmark.get_query("IMDB-1")
+```
+
+The loader returns an Arrow table with the original review ids and columns.
+It reads only the requested table from the published scale-factor 0.1 corpus.
+Omit `limit` to load every row, or set `scale_factor=0.5` or `1.0` for another
+published corpus. A row limit returns a prefix of the table, not a new benchmark
+scale factor. The query definition is unchanged.
+
+S3 paths and Parquet reads are handled inside the package. To read a local copy,
+pass `root="/path/to/data"` with the same directory layout as the public bucket.
+A missing file raises an error; the loader does not rebuild data from upstream
+sources. `build_sets()` remains available for that workflow.
+
+For a join, load every input table at the same scale factor. A repeated table
+needs to be loaded only once, even if the query gives it several aliases.
+
+```python
+query = benchmark.get_query("IMDB-4")
+tables = {}
+for name in {alias.table for alias in query.aliases}:
+    tables[name] = benchmark.load_table(name, scale_factor=0.5)
+```
+
+The review table has 5,000, 25,000, or 50,000 rows at scale factors 0.1, 0.5,
+and 1.0. The aspect table has 12 rows at every scale. Join pair counts depend
+on the input tables and filters, not a separate join scale factor.
+
 ## Queries
 
 `QUERIES` in `quail_b/queries.py` holds 32 queries in five families. A query has a base document
@@ -57,8 +91,8 @@ FEVER and LePaRD use source labels where the dataset gives the exact answer. `ev
 
 Corpus and labels are public in the `quail-bench` S3 bucket under
 `s3://quail-bench/ground_truth/quailb/schema_v1/`, 145 MB, readable without an AWS account.
-`load_ground_truth()` in `quail_b/labels.py` reads from there by default. `LocalFiles(dir)` in
-`quail_b/store.py` reads a directory with the same layout instead.
+`load_ground_truth()` in `quail_b/labels.py` reads from there by default. Pass `root="/path/to/data"` to read a local directory with the same layout instead.
+You can also pass an `s3://` root. The loaders use anonymous reads for S3.
 
 ## Running it
 
@@ -94,7 +128,6 @@ A changed prompt or input role makes a new predicate version and needs a new lab
 | `quail_b/prompts.py` | the filter and join prompt templates |
 | `quail_b/queries.py` | the 32 queries as data, with selectivity estimates |
 | `quail_b/rendering.py` | the exact prompt text a predicate asks |
-| `quail_b/store.py` | the public bucket and the local directory that hold corpus and labels |
 | `quail_b/labels.py` | saved label sets and collections |
 | `quail_b/predicates.py` | the 21 predicates and the identity of their labels |
 | `quail_b/scoring.py` | `RunOutput` and the scoring of one run |

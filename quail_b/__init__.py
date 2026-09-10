@@ -1,11 +1,7 @@
-"""QUAIL-B: a benchmark of AI filter and join queries over document sets.
+"""QUAIL-B document tables, query definitions, and reference labels."""
 
-The package holds what defines the benchmark and nothing that runs it:
-the dataset builders (`data`), the prompts (`prompts`), the query
-specifications (`queries`), the predicates and the identity of their
-labels (`predicates`), the saved reference labels (`labels`), the exact
-prompt text a predicate asks (`rendering`), the file stores (`store`),
-and the scoring of one run (`scoring`). A runner for one engine turns
-the specifications into that engine's queries and hands the answers
-back as a `RunOutput`.
-"""
+from quail_b.data import load_table
+from quail_b.labels import load_ground_truth, load_ground_truth_workload
+from quail_b.queries import get_query
+
+__all__ = ["load_table", "get_query", "load_ground_truth", "load_ground_truth_workload"]

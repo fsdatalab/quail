@@ -5,6 +5,7 @@ import json
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from quail_b.data import GROUND_TRUTH_ROOT
 from quail_b.labels import (
     GroundTruthCollection,
     PredicateLabels,
@@ -19,7 +20,6 @@ from quail_b.scoring import (
     rows_from_answers,
     summarize_queries,
 )
-from quail_b.store import GROUND_TRUTH_ROOT, LocalFiles
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
@@ -259,7 +259,7 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
     ]), label_dir / "parts" / "part_000.parquet")
 
     loaded = load_ground_truth(
-        LocalFiles(tmp_path), scale_factor=0.1,
+        tmp_path, scale_factor=0.1,
         corpus_id="c_test")
 
     assert loaded.collection_id == collection_id
@@ -267,23 +267,9 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
     assert loaded.answer(predicate_key, "r1") is False
     assert loaded.key_for_template(FILTER) == predicate_key
 
-    files = LocalFiles(tmp_path)
-    files.write_json("benchmarks/quailb/runs/qb_test/query.json",
-                     {"query": "TEST-1"})
-    saved = json.loads((tmp_path / "benchmarks/quailb/runs/qb_test"
-                        / "query.json").read_text())
-    assert saved == {"query": "TEST-1"}
-    answer_table = pa.table({"document": [0, 1],
-                             "answer": [True, False]})
-    files.write_parquet(
-        "benchmarks/quailb/runs/qb_test/answers.parquet", answer_table)
-    assert pq.read_table(
-        tmp_path / "benchmarks/quailb/runs/qb_test/answers.parquet"
-    ).equals(answer_table)
 
 
 def _reused_label_layout(tmp_path):
-    files = LocalFiles(tmp_path)
     predicate_key = "test.review.filter"
     table_manifest = {
         "rows": 2,
@@ -327,28 +313,28 @@ def _reused_label_layout(tmp_path):
                 predicate_key, FILTER, "filter", "reviews"),
         },
     }
-    return files, collection, manifests
+    return tmp_path, collection, manifests
 
 
 def test_reused_label_set_accepts_identical_table_manifest(tmp_path):
-    files, collection, manifests = _reused_label_layout(tmp_path)
+    root, collection, manifests = _reused_label_layout(tmp_path)
 
-    _validate_label_set_corpora(files, collection, manifests)
+    _validate_label_set_corpora(root, collection, manifests)
 
 
 def test_reused_label_set_accepts_transitive_collection_reuse(tmp_path):
-    files, collection, manifests = _reused_label_layout(tmp_path)
+    root, collection, manifests = _reused_label_layout(tmp_path)
     source_path = (tmp_path / GROUND_TRUTH_ROOT / "collections"
                    / "gt_source" / "manifest.json")
     source = json.loads(source_path.read_text())
     source["corpus_id"] = "c_intermediate"
     source_path.write_text(json.dumps(source))
 
-    _validate_label_set_corpora(files, collection, manifests)
+    _validate_label_set_corpora(root, collection, manifests)
 
 
 def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
-    files, collection, manifests = _reused_label_layout(tmp_path)
+    root, collection, manifests = _reused_label_layout(tmp_path)
     target_path = (tmp_path / GROUND_TRUTH_ROOT / "corpora" / "c_target"
                    / "manifest.json")
     target = json.loads(target_path.read_text())
@@ -356,9 +342,8 @@ def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
     target_path.write_text(json.dumps(target))
 
     try:
-        _validate_label_set_corpora(files, collection, manifests)
+        _validate_label_set_corpora(root, collection, manifests)
     except ValueError as exc:
         assert "table reviews changed" in str(exc)
     else:
         raise AssertionError("changed table manifest was accepted")
-

@@ -11,11 +11,12 @@ import io
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 
 from pyarrow import parquet as pq
 
-from quail_b.data import _full_hash
-from quail_b.store import GROUND_TRUTH_ROOT, S3Files
+from quail_b._files import _list_files, _read_bytes
+from quail_b.data import GROUND_TRUTH_ROOT, _full_hash
 
 
 @dataclass(frozen=True)
@@ -72,26 +73,26 @@ class GroundTruthCollection:
         return labels.answer(left_id, right_id)
 
 
-def _read_json(files, path: str) -> dict:
-    return json.loads(files.read_bytes(path))
+def _read_json(root, path: str) -> dict:
+    return json.loads(_read_bytes(root, path))
 
 
-def _read_many(files, paths: list[str]) -> dict[str, bytes]:
+def _read_many(root, paths: list[str]) -> dict[str, bytes]:
     workers = min(8, len(paths))
     if workers <= 1:
-        return {path: files.read_bytes(path) for path in paths}
+        return {path: _read_bytes(root, path) for path in paths}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        contents = pool.map(files.read_bytes, paths)
+        contents = pool.map(partial(_read_bytes, root), paths)
         return dict(zip(paths, contents))
 
 
-def _choose_collection(files, scale_factor: float,
+def _choose_collection(root, scale_factor: float,
                        corpus_id: str | None,
                        collection_id: str | None) -> tuple[str, dict]:
     if collection_id:
         path = (f"{GROUND_TRUTH_ROOT}/collections/{collection_id}"
                 "/manifest.json")
-        manifest = _read_json(files, path)
+        manifest = _read_json(root, path)
         if manifest.get("status") != "complete":
             raise ValueError(f"ground truth collection {collection_id} "
                              "is not complete")
@@ -100,14 +101,14 @@ def _choose_collection(files, scale_factor: float,
     if corpus_id:
         active_path = (f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}"
                        "/active_collection.json")
-        corpus_files = files.list_files(
+        corpus_files = _list_files(root,
             f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}")
         if active_path in corpus_files:
-            active = _read_json(files, active_path)
+            active = _read_json(root, active_path)
             active_id = active["collection_id"]
             path = (f"{GROUND_TRUTH_ROOT}/collections/{active_id}"
                     "/manifest.json")
-            manifest = _read_json(files, path)
+            manifest = _read_json(root, path)
             if manifest.get("status") != "complete":
                 raise ValueError(
                     f"active ground truth collection {active_id} is not "
@@ -123,13 +124,13 @@ def _choose_collection(files, scale_factor: float,
             return path, manifest
 
     paths = [
-        path for path in files.list_files(
+        path for path in _list_files(root,
             f"{GROUND_TRUTH_ROOT}/collections")
         if path.endswith("/manifest.json")
     ]
     matches = []
     for path in paths:
-        manifest = _read_json(files, path)
+        manifest = _read_json(root, path)
         if manifest.get("status") != "complete":
             continue
         if float(manifest.get("scale_factor")) != float(scale_factor):
@@ -149,15 +150,14 @@ def _choose_collection(files, scale_factor: float,
     return matches[0]
 
 
-def load_ground_truth(files=None, scale_factor: float = 0.1,
+def load_ground_truth(root=None, scale_factor: float = 0.1,
                       corpus_id: str | None = None,
                       collection_id: str | None = None
                       ) -> GroundTruthCollection:
-    """Load one complete collection; the public bucket when no store is given."""
-    files = S3Files() if files is None else files
+    """Load labels from the public bucket or a local root directory."""
     _path, collection = _choose_collection(
-        files, scale_factor, corpus_id, collection_id)
-    return _load_ground_truth_collection(files, collection)
+        root, scale_factor, corpus_id, collection_id)
+    return _load_ground_truth_collection(root, collection)
 
 
 def _predicate_tables(predicate: dict) -> tuple[str, ...]:
@@ -167,7 +167,7 @@ def _predicate_tables(predicate: dict) -> tuple[str, ...]:
     return tuple(sorted(tables))
 
 
-def _validate_label_set_corpora(files, collection: dict,
+def _validate_label_set_corpora(root, collection: dict,
                                 manifests: dict[str, dict]) -> None:
     """Validate every label set against the tables its predicate reads."""
     target_corpus_id = collection["corpus_id"]
@@ -178,7 +178,7 @@ def _validate_label_set_corpora(files, collection: dict,
     def corpus_manifest(corpus_id):
         if corpus_id not in corpus_manifests:
             path = f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}/manifest.json"
-            corpus_manifests[corpus_id] = _read_json(files, path)
+            corpus_manifests[corpus_id] = _read_json(root, path)
         return corpus_manifests[corpus_id]
 
     target = None
@@ -211,7 +211,7 @@ def _validate_label_set_corpora(files, collection: dict,
         if source_collection_id not in source_collections:
             path = (f"{GROUND_TRUTH_ROOT}/collections/"
                     f"{source_collection_id}/manifest.json")
-            source_collections[source_collection_id] = _read_json(files, path)
+            source_collections[source_collection_id] = _read_json(root, path)
         source_collection = source_collections[source_collection_id]
         if (source_collection.get("status") != "complete"
                 or source_collection.get("collection_id")
@@ -245,10 +245,10 @@ def _validate_label_set_corpora(files, collection: dict,
                     f"{source_corpus_id} and {target_corpus_id}")
 
 
-def _load_ground_truth_collection(files, collection: dict
+def _load_ground_truth_collection(root, collection: dict
                                   ) -> GroundTruthCollection:
     wanted = collection["label_sets"]
-    all_paths = files.list_files(f"{GROUND_TRUTH_ROOT}/label_sets")
+    all_paths = _list_files(root, f"{GROUND_TRUTH_ROOT}/label_sets")
     manifest_paths = {}
     for key, label_set_id in sorted(wanted.items()):
         marker = f"/{label_set_id}/manifest.json"
@@ -258,12 +258,12 @@ def _load_ground_truth_collection(files, collection: dict
                 f"expected one manifest for {label_set_id}, found "
                 f"{len(matches)}")
         manifest_paths[key] = matches[0]
-    manifest_bytes = _read_many(files, list(manifest_paths.values()))
+    manifest_bytes = _read_many(root, list(manifest_paths.values()))
     manifests = {
         key: json.loads(manifest_bytes[path])
         for key, path in manifest_paths.items()
     }
-    _validate_label_set_corpora(files, collection, manifests)
+    _validate_label_set_corpora(root, collection, manifests)
     data_paths = {}
     for key, label_set_id in sorted(wanted.items()):
         manifest_path = manifest_paths[key]
@@ -283,7 +283,7 @@ def _load_ground_truth_collection(files, collection: dict
             raise FileNotFoundError(f"label set {label_set_id} has no rows")
         data_paths[key] = part_paths
     data_bytes = _read_many(
-        files, [path for paths in data_paths.values() for path in paths])
+        root, [path for paths in data_paths.values() for path in paths])
     predicates = {}
     for key, label_set_id in sorted(wanted.items()):
         manifest = manifests[key]
@@ -329,7 +329,7 @@ def _load_ground_truth_collection(files, collection: dict
     )
 
 
-def load_ground_truth_workload(files, scale_factor: float, corpus_id: str,
+def load_ground_truth_workload(root=None, *, scale_factor: float, corpus_id: str,
                                corpus_full_hash: str, workload: str
                                ) -> GroundTruthCollection:
     """Load completed label sets for one benchmark workload."""
@@ -359,4 +359,4 @@ def load_ground_truth_workload(files, scale_factor: float, corpus_id: str,
         "collection_id": f"gtw_{_full_hash(payload)[:32]}",
         "summary": {"model": MODEL_NAME},
     }
-    return _load_ground_truth_collection(files, collection)
+    return _load_ground_truth_collection(root, collection)

@@ -15,6 +15,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from quail_b._files import GROUND_TRUTH_ROOT, _list_files, _location, _read_bytes
+from quail_b._files import PUBLIC_BUCKET as PUBLIC_BUCKET
+
 DATA_SEED = 20260818
 CACHE_SCHEMA_VERSION = 9
 # The labeled corpus for each scale factor, saved beside its labels in
@@ -763,33 +766,28 @@ def _build_agent_traces(d, sf, force=False):
     )
 
 
-def _fetch_published_corpus(d, sf, files=None) -> bool:
+def _fetch_published_corpus(d, sf, root=None) -> bool:
     """Download the labeled corpus for this scale factor into d.
 
     Returns False when no corpus is published for sf, the bucket is
     unreachable, or the downloaded tables do not hash to the published
     corpus id; the caller then builds from the sources.
     """
-    import urllib.error
-
-    from quail_b.store import GROUND_TRUTH_ROOT, S3Files
-
     corpus_id = PUBLISHED_CORPORA.get(sf)
     if corpus_id is None:
         return False
-    files = S3Files() if files is None else files
     prefix = f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}"
     try:
-        paths = [path for path in files.list_files(prefix)
+        paths = [path for path in _list_files(root, prefix)
                  if path.endswith(".parquet")]
-    except (OSError, urllib.error.URLError) as error:
+    except OSError as error:
         print(f"[data] cannot reach the published corpus: {error}", flush=True)
         return False
     if not paths:
         return False
     d.mkdir(parents=True, exist_ok=True)
     for path in paths:
-        (d / Path(path).name).write_bytes(files.read_bytes(path))
+        (d / Path(path).name).write_bytes(_read_bytes(root, path))
     identity = corpus_identity(read_corpus(d), sf, DATA_SEED, SOURCE_REVISIONS)
     if identity["corpus_id"] != corpus_id:
         for path in paths:
@@ -979,3 +977,34 @@ def read_corpus(data_dir: str | Path) -> dict[str, pa.Table]:
             data_dir / f"{table}.parquet", columns=list(columns))
         for table, columns in CORPUS_COLUMNS.items()
     }
+
+
+def load_table(name: str, *, scale_factor: float = 0.1,
+               limit: int | None = None, root=None) -> pa.Table:
+    """Load one published benchmark table.
+
+    Args:
+        name: Document set name, such as "reviews".
+        scale_factor: Published corpus scale factor.
+        limit: Maximum rows to return, or None for the full table.
+        root: Local directory or S3 URI with the published layout.
+            Defaults to the public benchmark bucket.
+
+    Returns:
+        An Arrow table with the original benchmark ids and columns.
+
+    Raises:
+        ValueError: The table, scale factor, or row limit is invalid.
+    """
+    if name not in CORPUS_COLUMNS:
+        raise ValueError(f"unknown benchmark table {name!r}")
+    if scale_factor not in PUBLISHED_CORPORA:
+        raise ValueError(f"no published corpus for scale factor {scale_factor}")
+    if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+        raise ValueError("limit must be a nonnegative integer or None")
+    corpus = PUBLISHED_CORPORA[scale_factor]
+    path = f"{GROUND_TRUTH_ROOT}/corpora/{corpus}/{name}.parquet"
+    filesystem, _, source = _location(root, path)
+    table = pq.read_table(source, filesystem=filesystem)
+    return table if limit is None else table.slice(0, limit)

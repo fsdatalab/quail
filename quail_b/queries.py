@@ -401,3 +401,8 @@ def query_family_name(ids):
         return QUERY_FAMILY_WORKLOADS[prefix]
     except KeyError as error:
         raise ValueError(f"unknown query family {prefix!r}") from error
+
+
+def get_query(query_id: str) -> QuerySpec:
+    """Return one benchmark query definition by id."""
+    return queries()[query_id]
