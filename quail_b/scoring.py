@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 import pyarrow as pa
 
 from quail_b.data import _ids
-from quail_b.labels import GroundTruthCollection
 from quail_b.queries import QuerySpec
 
 
@@ -28,12 +27,16 @@ class RunOutput:
         join_answers: written position to a table with one id column
             per joined alias and a boolean `answer` column, one row per
             evaluated tuple.
-        rows: The final rows, one id column per alias in the query.
+        rows: The final rows, one ID column per selected alias.
+        runtime_s: Completed query execution time, excluding result collection.
+        measurements: Additional engine measurements, including startup and tokens.
     """
 
-    filter_answers: dict[tuple[str, int], pa.Table]
-    join_answers: dict[int, pa.Table]
+    filter_answers: dict[tuple[str, int], pa.Table] | None
+    join_answers: dict[int, pa.Table] | None
     rows: pa.Table
+    runtime_s: float | None = None
+    measurements: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -197,191 +200,105 @@ def rows_from_answers(spec: QuerySpec, filter_answers, join_answers
     return _distinct(rows.select(sorted(rows.column_names)))
 
 
-class Evaluator:
-    """Score answers and final rows against one label collection."""
-
-    def __init__(self, ground_truth: GroundTruthCollection,
-                 corpus_rows: dict[str, pa.Table | list[dict]]):
-        self.ground_truth = ground_truth
-        self.corpus_rows = corpus_rows
-
-    def answer(self, template: str, ids: tuple[str, ...]) -> bool:
-        """Return the saved label of one prompt template for one or two ids."""
-        key = self.ground_truth.key_for_template(template)
-        if len(ids) == 1:
-            return self.ground_truth.answer(key, ids[0])
-        if len(ids) == 2:
-            return self.ground_truth.answer(key, ids[0], ids[1])
-        raise NotImplementedError(
-            "ground truth evaluation supports one or two prompt arguments")
-
-    def expected_survivors(self, spec: QuerySpec) -> dict[str, list[str]]:
-        """Return, per alias, the ids that pass every filter on it."""
-        survivors = {}
-        for alias_spec in spec.aliases:
-            survivors[alias_spec.alias] = [
-                str(row_id)
-                for row_id in _ids(self.corpus_rows[alias_spec.table])
-                if all(self.answer(template, (str(row_id),))
-                       for template in alias_spec.filters)
-            ]
-        return survivors
-
-    def expected_rows(self, spec: QuerySpec) -> pa.Table:
-        """Return the final rows the labels say the query should return."""
-        survivors = self.expected_survivors(spec)
-        relations = []
-        for join in spec.joins:
-            key = self.ground_truth.key_for_template(join.template)
-            labels = self.ground_truth.predicates[key]
-            left, right = join.aliases
-            columns = {left: [], right: []}
-            for (left_id, right_id), answer in labels.answers.items():
-                if answer:
-                    columns[left].append(left_id)
-                    columns[right].append(right_id)
-            relations.append(_id_table(columns))
-        if relations:
-            rows = _join_all(relations)
-        else:
-            rows = _id_table({spec.base_alias: survivors[spec.base_alias]})
-        for alias in rows.column_names:
-            rows = rows.join(
-                _id_table({alias: survivors[alias]}),
-                keys=[alias], join_type="inner")
-        return _distinct(rows.select(sorted(rows.column_names)))
-
-    def evaluate(self, spec: QuerySpec, output: RunOutput) -> dict:
-        per_predicate = []
-        total = BinaryCounts()
-        for (alias, written_pos), table in output.filter_answers.items():
-            template = spec.alias(alias).filters[written_pos]
-            key = self.ground_truth.key_for_template(template)
-            item = _PredicateCount(key, "filter", alias)
-            ids = table.column(alias).to_pylist()
-            answers = table.column("answer").to_pylist()
-            for row_id, predicted in zip(ids, answers):
-                item.counts.add(
-                    bool(predicted), self.answer(template, (str(row_id),)))
-            total.merge(item.counts)
-            per_predicate.append(item.as_dict())
-        for written_pos, table in output.join_answers.items():
-            join = spec.joins[written_pos]
-            key = self.ground_truth.key_for_template(join.template)
-            item = _PredicateCount(key, "join")
-            columns = [table.column(alias).to_pylist()
-                       for alias in join.aliases]
-            answers = table.column("answer").to_pylist()
-            for row_index, predicted in enumerate(answers):
-                ids = tuple(str(column[row_index]) for column in columns)
-                item.counts.add(bool(predicted), self.answer(join.template, ids))
-            total.merge(item.counts)
-            per_predicate.append(item.as_dict())
-
-        expected = self.expected_rows(spec)
-        aliases = expected.column_names
-        predicted = _as_string_ids(output.rows, aliases)
-        matched = predicted.join(expected, keys=aliases, join_type="inner")
-        input_document_rows = sum(
-            len(self.corpus_rows[alias_spec.table])
-            for alias_spec in spec.aliases)
-        unique_documents = {
-            (alias_spec.table, str(row_id))
-            for alias_spec in spec.aliases
-            for row_id in _ids(self.corpus_rows[alias_spec.table])
-        }
-        return {
-            "ground_truth_collection_id": self.ground_truth.collection_id,
-            "ground_truth_reference_model": self.ground_truth.reference_model,
-            "answer_accuracy": total.as_dict(),
-            "output_accuracy": _row_metrics(
-                predicted.num_rows, expected.num_rows, matched.num_rows),
-            "per_predicate": per_predicate,
-            "input_document_rows": input_document_rows,
-            "unique_input_documents": len(unique_documents),
-        }
+def reference_answer(ground_truth, template: str, ids: tuple[str, ...]) -> bool:
+    """Return the saved label of one prompt template for one or two ids."""
+    key = ground_truth.key_for_template(template)
+    if len(ids) == 1:
+        return ground_truth.answer(key, ids[0])
+    if len(ids) == 2:
+        return ground_truth.answer(key, ids[0], ids[1])
+    raise NotImplementedError(
+        "ground truth evaluation supports one or two prompt arguments")
 
 
-def _divide(numerator: float, denominator: float) -> float:
-    return numerator / denominator if denominator else 0.0
+def expected_survivors(spec: QuerySpec, ground_truth, corpus_rows
+                       ) -> dict[str, list[str]]:
+    """Return, per alias, the ids that pass every filter on it."""
+    survivors = {}
+    for alias_spec in spec.aliases:
+        survivors[alias_spec.alias] = [
+            str(row_id)
+            for row_id in _ids(corpus_rows[alias_spec.table])
+            if all(reference_answer(ground_truth, template, (str(row_id),))
+                   for template in alias_spec.filters)
+        ]
+    return survivors
 
 
-def add_query_metrics(row: dict, evaluation: dict,
-                      h100_usd_per_hour: float, gpus: int) -> dict:
-    wall_s = float(row["wall_s"])
-    boot_s = float(row.get("boot_s") or 0.0)
-    tokens = int(row["fresh_tokens"])
-    gpu_rate = h100_usd_per_hour * gpus
-    inference_cost = wall_s * gpu_rate / 3600
-    cost_with_boot = (wall_s + boot_s) * gpu_rate / 3600
-    input_rows = int(evaluation["input_document_rows"])
-    calls = int(evaluation["answer_accuracy"]["evaluated"])
-    row.update({
-        "runtime_s": wall_s,
-        "runtime_with_boot_s": round(wall_s + boot_s, 2),
-        "tokens_processed": tokens,
-        "tokens_per_second": round(_divide(tokens, wall_s), 2),
-        "input_document_rows": input_rows,
-        "unique_input_documents": evaluation["unique_input_documents"],
-        "documents_per_second": round(_divide(input_rows, wall_s), 4),
-        "inference_calls": calls,
-        "inference_calls_per_second": round(_divide(calls, wall_s), 4),
-        "inference_cost_usd": round(inference_cost, 8),
-        "inference_cost_per_token_usd": round(
-            _divide(inference_cost, tokens), 12),
-        "inference_cost_per_million_tokens_usd": round(
-            _divide(inference_cost, tokens) * 1_000_000, 6),
-        "cost_with_boot_usd": round(cost_with_boot, 8),
-        "cost_with_boot_per_million_tokens_usd": round(
-            _divide(cost_with_boot, tokens) * 1_000_000, 6),
-        "accuracy": {
-            key: value for key, value in evaluation.items()
-            if key not in ("input_document_rows", "unique_input_documents")
-        },
-    })
-    return row
+def expected_rows(spec: QuerySpec, ground_truth, corpus_rows) -> pa.Table:
+    """Return the final rows the labels say the query should return."""
+    survivors = expected_survivors(spec, ground_truth, corpus_rows)
+    relations = []
+    for join in spec.joins:
+        key = ground_truth.key_for_template(join.template)
+        labels = ground_truth.predicates[key]
+        left, right = join.aliases
+        columns = {left: [], right: []}
+        for (left_id, right_id), answer in labels.answers.items():
+            if answer:
+                columns[left].append(left_id)
+                columns[right].append(right_id)
+        relations.append(_id_table(columns))
+    if relations:
+        rows = _join_all(relations)
+    else:
+        rows = _id_table({spec.base_alias: survivors[spec.base_alias]})
+    for alias in rows.column_names:
+        rows = rows.join(
+            _id_table({alias: survivors[alias]}),
+            keys=[alias], join_type="inner")
+    return _distinct(rows.select(sorted(rows.column_names)))
 
 
-def summarize_queries(rows: list[dict], h100_usd_per_hour: float,
-                      gpus: int) -> dict:
-    good = [row for row in rows if "error" not in row]
-    wall_s = sum(float(row["wall_s"]) for row in good)
-    boot_s = sum(float(row.get("boot_s") or 0.0) for row in good)
-    tokens = sum(int(row["tokens_processed"]) for row in good)
-    input_rows = sum(int(row["input_document_rows"]) for row in good)
-    calls = sum(int(row["inference_calls"]) for row in good)
-    cost = wall_s * h100_usd_per_hour * gpus / 3600
-    cost_with_boot = ((wall_s + boot_s) * h100_usd_per_hour * gpus
-                      / 3600)
-    counts = BinaryCounts()
-    for row in good:
-        accuracy = row["accuracy"]["answer_accuracy"]
-        counts.merge(BinaryCounts(
-            correct=accuracy["correct"],
-            evaluated=accuracy["evaluated"],
-            true_positive=accuracy["true_positive"],
-            true_negative=accuracy["true_negative"],
-            false_positive=accuracy["false_positive"],
-            false_negative=accuracy["false_negative"],
-        ))
+def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> dict:
+    per_predicate = []
+    total = BinaryCounts()
+    for (alias, written_pos), table in (output.filter_answers or {}).items():
+        template = spec.alias(alias).filters[written_pos]
+        key = ground_truth.key_for_template(template)
+        item = _PredicateCount(key, "filter", alias)
+        ids = table.column(alias).to_pylist()
+        answers = table.column("answer").to_pylist()
+        for row_id, predicted in zip(ids, answers):
+            item.counts.add(
+                bool(predicted),
+                reference_answer(ground_truth, template, (str(row_id),)))
+        total.merge(item.counts)
+        per_predicate.append(item.as_dict())
+    for written_pos, table in (output.join_answers or {}).items():
+        join = spec.joins[written_pos]
+        key = ground_truth.key_for_template(join.template)
+        item = _PredicateCount(key, "join")
+        columns = [table.column(alias).to_pylist()
+                   for alias in join.aliases]
+        answers = table.column("answer").to_pylist()
+        for row_index, predicted in enumerate(answers):
+            ids = tuple(str(column[row_index]) for column in columns)
+            item.counts.add(
+                bool(predicted), reference_answer(ground_truth, join.template, ids))
+        total.merge(item.counts)
+        per_predicate.append(item.as_dict())
+
+    expected = expected_rows(spec, ground_truth, corpus_rows)
+    aliases = [name.split(".")[0] for name in spec.select]
+    expected = _distinct(expected.select(aliases))
+    predicted = _as_string_ids(output.rows, aliases)
+    matched = predicted.join(expected, keys=aliases, join_type="inner")
+    input_document_rows = sum(
+        len(corpus_rows[alias_spec.table])
+        for alias_spec in spec.aliases)
+    unique_documents = {
+        (alias_spec.table, str(row_id))
+        for alias_spec in spec.aliases
+        for row_id in _ids(corpus_rows[alias_spec.table])
+    }
     return {
-        "queries_completed": len(good),
-        "queries_failed": len(rows) - len(good),
-        "query_runtime_s": round(wall_s, 2),
-        "boot_s": round(boot_s, 2),
-        "runtime_with_boot_s": round(wall_s + boot_s, 2),
-        "tokens_processed": tokens,
-        "tokens_per_second": round(_divide(tokens, wall_s), 2),
-        "input_document_rows": input_rows,
-        "documents_per_second": round(_divide(input_rows, wall_s), 4),
-        "inference_calls": calls,
-        "inference_cost_usd": round(cost, 8),
-        "inference_cost_per_token_usd": round(
-            _divide(cost, tokens), 12),
-        "inference_cost_per_million_tokens_usd": round(
-            _divide(cost, tokens) * 1_000_000, 6),
-        "cost_with_boot_usd": round(cost_with_boot, 8),
-        "cost_with_boot_per_million_tokens_usd": round(
-            _divide(cost_with_boot, tokens) * 1_000_000, 6),
-        "answer_accuracy": counts.as_dict(),
+        "ground_truth_collection_id": ground_truth.collection_id,
+        "ground_truth_reference_model": ground_truth.reference_model,
+        "answer_accuracy": (total.as_dict() if total.evaluated else None),
+        "output_accuracy": _row_metrics(
+            predicted.num_rows, expected.num_rows, matched.num_rows),
+        "per_predicate": per_predicate,
+        "input_document_rows": input_document_rows,
+        "unique_input_documents": len(unique_documents),
     }

@@ -15,7 +15,13 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from quail_b._files import GROUND_TRUTH_ROOT, _list_files, _location, _read_bytes
+from quail_b._files import (
+    GROUND_TRUTH_ROOT,
+    _cached_file,
+    _list_files,
+    _location,
+    _read_bytes,
+)
 from quail_b._files import PUBLIC_BUCKET as PUBLIC_BUCKET
 
 DATA_SEED = 20260818
@@ -1005,6 +1011,8 @@ def load_table(name: str, *, scale_factor: float = 0.1,
         raise ValueError("limit must be a nonnegative integer or None")
     corpus = PUBLISHED_CORPORA[scale_factor]
     path = f"{GROUND_TRUTH_ROOT}/corpora/{corpus}/{name}.parquet"
+    cached = _cached_file(root, path)
     filesystem, _, source = _location(root, path)
-    table = pq.read_table(source, filesystem=filesystem)
+    table = (pq.read_table(cached) if cached is not None else
+             pq.read_table(source, filesystem=filesystem))
     return table if limit is None else table.slice(0, limit)

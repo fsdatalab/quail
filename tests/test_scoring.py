@@ -14,11 +14,10 @@ from quail_b.labels import (
 )
 from quail_b.queries import AliasSpec, JoinSpec, QuerySpec, queries
 from quail_b.scoring import (
-    Evaluator,
     RunOutput,
-    add_query_metrics,
+    evaluate,
+    expected_rows,
     rows_from_answers,
-    summarize_queries,
 )
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
@@ -99,9 +98,8 @@ def _output(join_answers, rows):
     )
 
 
-def test_evaluator_scores_answers_and_final_rows():
-    evaluation = Evaluator(_truth(), CORPUS).evaluate(
-        SPEC, _output([0, 0], []))
+def test_scores_answers_and_final_rows():
+    evaluation = evaluate(SPEC, _output([0, 0], []), _truth(), CORPUS)
 
     assert evaluation["answer_accuracy"]["evaluated"] == 4
     assert evaluation["answer_accuracy"]["correct"] == 3
@@ -133,48 +131,6 @@ def test_rows_from_answers_joins_true_pairs_of_surviving_documents():
     # r0 passes its filter and pairs with both aspects; r1 was never asked
     assert rows.sort_by("a").to_pydict() == {"a": ["a0", "a1"], "r": ["r0", "r0"]}
 
-
-def test_query_cost_token_and_document_metrics():
-    evaluation = Evaluator(_truth(), CORPUS).evaluate(
-        SPEC, _output([1, 0], [("r0", "a0")]))
-
-    row = add_query_metrics(
-        {"wall_s": 2.0, "boot_s": 3.0, "fresh_tokens": 100},
-        evaluation, h100_usd_per_hour=3.6, gpus=1)
-    assert row["runtime_s"] == 2.0
-    assert row["runtime_with_boot_s"] == 5.0
-    assert row["documents_per_second"] == 2.0
-    assert row["tokens_per_second"] == 50.0
-    assert row["inference_calls"] == 4
-    assert row["inference_cost_usd"] == 0.002
-    assert row["inference_cost_per_token_usd"] == 0.00002
-    assert row["inference_cost_per_million_tokens_usd"] == 20.0
-    assert row["cost_with_boot_usd"] == 0.005
-    assert row["accuracy"]["output_accuracy"]["exact_match"] is True
-
-    summary = summarize_queries([row], 3.6, 1)
-    assert summary["tokens_processed"] == 100
-    assert summary["documents_per_second"] == 2.0
-    assert summary["answer_accuracy"]["accuracy"] == 1.0
-
-    from quail_b import Benchmark
-
-    benchmark = Benchmark((SPEC,), {
-        name: pa.Table.from_pylist(rows) for name, rows in CORPUS.items()
-    }, 0.1, "c_test", _truth())
-    scored = benchmark.score(
-        SPEC.id, _output([1, 0], [("r0", "a0")]),
-        {"wall_s": 2.0, "boot_s": 3.0, "fresh_tokens": 100},
-        h100_usd_per_hour=3.6)
-    assert scored["accuracy"] == row["accuracy"]
-    assert scored["evaluated_document_pairs"] == 2
-    assert scored["document_pairs_per_second"] == 1.0
-    assert scored["inference_cost_usd"] == 0.002
-    suite = benchmark.summarize(
-        [scored], model="test", backend="test", h100_usd_per_hour=3.6,
-        pass_wall_s=2.0)
-    assert suite["passes"]["single"]["summary"] == summary
-    assert suite["input_tables"] == {"reviews": 2, "aspects": 2}
 
 
 def fever_truth():
@@ -222,7 +178,7 @@ def test_fev9_expected_rows_follow_the_join_chain_and_every_filter():
     assert [join.aliases for join in spec.joins] == [
         ("c1", "e1"), ("c2", "e1"), ("c2", "e2")]
 
-    rows = Evaluator(truth, corpus).expected_rows(spec)
+    rows = expected_rows(spec, truth, corpus)
 
     # c2 is filtered out; e1 supports c0, refutes c1, and c1 has e1 as
     # different supporting evidence
@@ -303,17 +259,79 @@ def test_load_benchmark_with_local_reference_labels(tmp_path):
     corpus["corpus_id"] = corpus_id
     (corpus_dir / "manifest.json").write_text(json.dumps(corpus))
     pq.write_table(reviews, corpus_dir / "reviews.parquet")
-    suite = benchmark.load_benchmark("IMDB-1", root=tmp_path)
-    output = RunOutput(
-        {("r", 0): pa.table({"r": ["r0", "r1"], "answer": [True, False]})},
-        {}, pa.table({"r": ["r0"]}))
-    row = suite.score(
-        "IMDB-1", output, {"wall_s": 2.0, "fresh_tokens": 100},
-        h100_usd_per_hour=3.6)
+    calls = []
+
+    def run_query(query, tables):
+        calls.append(query.id)
+        assert set(tables) == {"reviews"}
+        return RunOutput(
+            {("r", 0): pa.table({"r": ["r0", "r1"], "answer": [True, False]})},
+            {}, pa.table({"r": ["r0"]}), runtime_s=2.0,
+            measurements={"fresh_tokens": 100})
+
+    output_dir = tmp_path / "run"
+    record = benchmark.run(
+        run_query, queries=["IMDB-1"], output_dir=output_dir, root=tmp_path,
+        gpu_hourly_rate_usd=3.6, metadata={"engine": "test"})
+    row = record["queries"][0]["metrics"]
     assert row["accuracy"]["answer_accuracy"]["accuracy"] == 1.0
     assert row["documents_per_second"] == 1.0
+    assert row["cost_usd"] == 0.002
     assert "document_pairs_per_second" not in row
-    assert suite.ground_truth.collection_id == collection_id
+    assert record["collection_id"] == collection_id
+    assert pq.read_table(output_dir / "IMDB-1/rows.parquet").to_pydict() == {
+        "r": ["r0"]}
+    before = (output_dir / "report.md").read_text()
+    (corpus_dir / "active_collection.json").write_text(
+        json.dumps({"collection_id": "gt_missing"}))
+    assert benchmark.report(output_dir, root=tmp_path) == output_dir / "report.md"
+    assert (output_dir / "report.md").read_text() == before
+    assert calls == ["IMDB-1"]
+    import pytest
+    with pytest.raises(FileExistsError):
+        benchmark.run(run_query, queries=["IMDB-1"],
+                      output_dir=output_dir, root=tmp_path)
+
+    def output_only(query, tables):
+        return RunOutput(None, None, pa.table({"r": ["r0"]}), runtime_s=2.0)
+
+    untraced = benchmark.run(
+        output_only, queries=["IMDB-1"], output_dir=tmp_path / "untraced",
+        root=tmp_path, collection_id=collection_id)
+    accuracy = untraced["queries"][0]["metrics"]["accuracy"]
+    assert accuracy["answer_accuracy"] is None
+    assert accuracy["output_accuracy"]["precision"] == 1.0
+    assert "unavailable" in (tmp_path / "untraced/report.md").read_text()
+
+    def wrong_id(query, tables):
+        return RunOutput(None, None, pa.table({"r": ["unknown"]}), runtime_s=2.0)
+
+    with pytest.raises(ValueError, match="unknown document ID"):
+        benchmark.run(
+            wrong_id, queries=["IMDB-1"], output_dir=tmp_path / "bad",
+            root=tmp_path, collection_id=collection_id)
+    failed = json.loads((tmp_path / "bad/run.json").read_text())
+    assert failed["queries"][0]["status"] == "scoring_failed"
+    assert (tmp_path / "bad/IMDB-1/rows.parquet").exists()
+    pq.write_table(pa.table({"r": ["r0"]}), tmp_path / "bad/IMDB-1/rows.parquet")
+    benchmark.report(tmp_path / "bad", root=tmp_path)
+    recovered = json.loads((tmp_path / "bad/run.json").read_text())
+    assert recovered["status"] == "complete"
+    assert "error" not in recovered["queries"][0]
+
+    def broken(query, tables):
+        raise RuntimeError("engine failed")
+
+    with pytest.raises(RuntimeError, match="engine failed"):
+        benchmark.run(
+            broken, queries=["IMDB-1"], output_dir=tmp_path / "broken",
+            root=tmp_path, collection_id=collection_id)
+    assert json.loads((tmp_path / "broken/run.json").read_text())["status"] == "failed"
+
+    record["queries"][0]["definition_hash"] = "changed"
+    (output_dir / "run.json").write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="query definition changed"):
+        benchmark.report(output_dir, root=tmp_path)
 
 
 def _reused_label_layout(tmp_path):

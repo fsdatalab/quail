@@ -1,9 +1,10 @@
 # QUAIL-B
 
-QUAIL-B is a benchmark of 32 AI filter and join queries over movie reviews,
-medical reports, factual claims, legal citations, and agent conversations.
-It provides the data, query definitions, and reference labels. Your inference
-engine runs the queries.
+QUAIL-B contains 32 AI filter and join queries over movie reviews, medical
+reports, factual claims, legal citations, and agent conversations.
+
+Your engine runs the queries. QUAIL-B loads the inputs and reference labels,
+saves the returned answers, computes metrics, and writes a report.
 
 ## Install
 
@@ -13,52 +14,66 @@ Use Python 3.12.
 uv add "quail-b @ git+https://github.com/fsdatalab/quail-bench.git"
 ```
 
-## Use
+## Run
 
-Load a benchmark's queries, input tables, and reference labels:
+Supply a function `run_query(query, tables)` that returns a `quail_b.RunOutput`.
+The query is a benchmark definition. The tables are Arrow tables with document IDs.
 
 ```python
-import quail_b as benchmark
+import quail_b
 
-suite = benchmark.load_benchmark(["IMDB-4"], scale_factor=0.1)
-query = suite.queries[0]
-tables = suite.tables
+quail_b.run(
+    run_query,
+    queries=["IMDB-4"],
+    scale_factor=0.1,
+    output_dir="results/my-run",
+)
 ```
 
-IMDB-4 filters reviews for positive aspects and discussion of the ending,
-then joins them with the movie aspects they discuss.
+For example, [Quail's runner](https://github.com/fsdatalab/quail-exploration/blob/main/quail/bench/quailb.py)
+translates each definition into a Quail query. Your calling script owns model
+startup, engine configuration, hardware, and any Modal resources.
 
-- Scale factors `0.1`, `0.5`, and `1.0` are supported.
-- Inputs and labels load from public S3. No AWS account or Modal volume is needed.
-- QUAIL-B checks input contents and row order against the published corpus.
-- For a small example, use `benchmark.load_table("reviews", limit=100)`.
-  Full benchmark scoring requires the complete inputs.
-- For execution, use your engine's runner. For example, the
-  [Quail runner](https://github.com/fsdatalab/quail-exploration/blob/main/quail/bench/quailb.py)
-  translates these definitions into Quail queries.
+- Scale factors `0.1`, `0.5`, and `1.0` are supported for filters and joins.
+- Inputs and labels come from public S3. No AWS account is needed.
+- Downloads use `~/.cache/quail-b`, or `$XDG_CACHE_HOME/quail-b` when set.
+  Override with `cache_dir=` or `QUAIL_B_CACHE_DIR`. Active label pointers
+  are refreshed; each run records one exact collection.
+- Use `metadata=` to record engine, model, configuration, warmup, and cache settings.
+  Supply `gpu_count=` and `gpu_hourly_rate_usd=` to include GPU cost.
+- Existing run directories are never overwritten.
 
-See the [query definitions](quail_b/queries.py),
-[data sources](quail_b/data.py), and [query diagram](figures/quailb_anatomy.pdf).
+## Return results
 
-## Generate a report
+`RunOutput` contains:
 
-Your runner supplies a `RunOutput` with predicate answers and final document IDs,
-plus measured runtime and token counts. [`suite.score()`](quail_b/benchmark.py)
-computes accuracy, throughput, and GPU cost. `suite.summarize()` combines the
-query records. QUAIL-B does not execute queries or save files.
+- `rows`: an Arrow table of final document IDs, with columns named for selected aliases.
+- `runtime_s`: completed query time, excluding startup, result collection,
+  scoring, and saving. Report those other durations in `measurements`.
+- `filter_answers`: tables keyed by `(alias, predicate_position)`.
+- `join_answers`: tables keyed by join position.
+- `measurements`: optional values such as `fresh_tokens`, `regret_tokens`,
+  and `evaluated_document_pairs`.
 
-Model-generated labels use Qwen3 32B fp8. FEVER and LePaRD also use source labels.
+Answer tables contain alias ID columns and a non-null boolean `answer` column.
+Use `None` for unavailable predicate answers. QUAIL-B still scores final-output
+precision and recall. Missing measurements are reported as unavailable.
 
-For example, Quail generates a report from its saved summary JSON with this
-command, run from the [Quail repository](https://github.com/fsdatalab/quail-exploration):
+## Report
+
+A run saves `run.json`, per-query Parquet answers, and `report.md`.
+Completed answers are saved before scoring. Errors remain recorded in the run.
+
+Regenerate the report from saved answers without executing queries:
 
 ```sh
-uv run --with matplotlib python reports/make_quailb_eval_plots.py \
-    --input /path/to/summary.json \
-    --report /path/to/report.md
+quail-b report results/my-run
 ```
 
-Quail's script writes a Markdown report and a PNG with timings, costs, token
-counts, and accuracy. It reads saved results and does not rerun inference.
-Other engines can use QUAIL-B's [scoring functions](quail_b/scoring.py)
-to produce their own reports.
+The report includes query time, throughput, GPU cost when supplied, and accuracy.
+Filter throughput counts input documents; join throughput counts evaluated pairs
+across all stages. Predicate accuracy is agreement on evaluated answers, whose
+count can differ between engines. Model-generated reference labels use Qwen3 32B
+fp8; FEVER and LePaRD also use source labels.
+
+See the [query definitions](quail_b/queries.py) and [data sources](quail_b/data.py).

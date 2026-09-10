@@ -1,4 +1,4 @@
-"""Load benchmark inputs and score engine results."""
+"""Load and validate benchmark inputs and reference labels."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,14 +16,7 @@ from quail_b.data import (
     load_table,
 )
 from quail_b.labels import GroundTruthCollection, _read_json, load_ground_truth
-from quail_b.queries import (
-    SELECTIVITY_ESTIMATE_COLLECTION,
-    SELECTIVITY_ESTIMATE_CORPUS,
-    SELECTIVITY_ESTIMATE_SCALE_FACTOR,
-    QuerySpec,
-    queries,
-)
-from quail_b.scoring import Evaluator, RunOutput, add_query_metrics, summarize_queries
+from quail_b.queries import QuerySpec, queries
 
 
 def select_queries(only=None, *, scale_factor=0.1) -> tuple[QuerySpec, ...]:
@@ -52,49 +45,6 @@ class Benchmark:
     scale_factor: float
     corpus_id: str
     ground_truth: GroundTruthCollection | None
-
-    def score(self, query_id, output: RunOutput, measurements, *,
-              h100_usd_per_hour, gpus=1):
-        """Compute one query's accuracy, throughput, and GPU cost."""
-        spec = next((spec for spec in self.queries if spec.id == query_id), None)
-        if spec is None:
-            raise ValueError(f"query {query_id!r} is not in this benchmark")
-        row = dict(measurements, query=query_id, desc=spec.description,
-                   rows=output.rows.num_rows)
-        if self.ground_truth is not None:
-            evaluation = Evaluator(self.ground_truth, self.tables).evaluate(
-                spec, output)
-            add_query_metrics(row, evaluation, h100_usd_per_hour, gpus)
-        if spec.joins:
-            pairs = sum(len(table) for table in output.join_answers.values())
-            row["evaluated_document_pairs"] = pairs
-            row["document_pairs_per_second"] = (
-                round(pairs / row["wall_s"], 4) if row["wall_s"] else 0.0)
-        return row
-
-    def summarize(self, rows, *, model, backend, h100_usd_per_hour,
-                  gpus=1, pass_wall_s):
-        """Build the suite summary from scored query records."""
-        expected = [spec.id for spec in self.queries]
-        if [row["query"] for row in rows] != expected:
-            raise ValueError("scored queries do not match the selected queries")
-        passed = dict(queries=rows, pass_wall_s=round(pass_wall_s, 1))
-        if self.ground_truth is not None:
-            passed["summary"] = summarize_queries(rows, h100_usd_per_hour, gpus)
-        return dict(
-            sf=self.scale_factor, model=model, backend=backend, gpus=gpus,
-            corpus_id=self.corpus_id,
-            input_tables={name: len(table) for name, table in self.tables.items()},
-            selectivity_estimates=dict(
-                source_collection=SELECTIVITY_ESTIMATE_COLLECTION,
-                source_corpus=SELECTIVITY_ESTIMATE_CORPUS,
-                source_scale_factor=SELECTIVITY_ESTIMATE_SCALE_FACTOR),
-            pricing=dict(h100_usd_per_hour=h100_usd_per_hour, gpu_count=gpus),
-            ground_truth=(
-                dict(collection_id=self.ground_truth.collection_id,
-                     reference_model=self.ground_truth.reference_model)
-                if self.ground_truth else None),
-            passes={"single": passed})
 
 
 def load_benchmark(only=None, *, scale_factor=0.1, data_dir=None,
@@ -133,6 +83,8 @@ def load_benchmark(only=None, *, scale_factor=0.1, data_dir=None,
         truth = load_ground_truth(
             root, scale_factor=scale_factor, corpus_id=corpus_id,
             collection_id=collection_id)
+        if collection_id is not None and truth.collection_id != collection_id:
+            raise ValueError("ground truth has the wrong collection ID")
         if truth.corpus_id != corpus_id or truth.scale_factor != scale_factor:
             raise ValueError("ground truth does not match the input corpus")
     return Benchmark(specs, tables, scale_factor, corpus_id, truth)

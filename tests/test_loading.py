@@ -56,13 +56,21 @@ def test_public_s3_and_local_reads(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_files.fs, "S3FileSystem", s3_filesystem)
     expected = ["labels/a.json", "labels/nested/b.parquet"]
-    for root in [None, "s3://quail-bench", bucket]:
-        assert _files._list_files(root, "labels") == expected
-        assert json.loads(_files._read_bytes(root, "/labels/a.json")) == {
-            "answer": True}
-        assert _files._list_files(root, "missing") == []
-        with pytest.raises(FileNotFoundError):
-            _files._read_bytes(root, "missing.json")
+    with _files.download_cache(tmp_path / "cache"):
+        for root in [None, "s3://quail-bench", bucket]:
+            assert _files._list_files(root, "labels") == expected
+            assert json.loads(_files._read_bytes(root, "/labels/a.json")) == {
+                "answer": True}
+            assert _files._list_files(root, "missing") == []
+            with pytest.raises(FileNotFoundError):
+                _files._read_bytes(root, "missing.json")
+        (directory / "a.json").write_text(json.dumps({"answer": False}))
+        assert json.loads(_files._read_bytes(None, "labels/a.json"))["answer"] is True
+        pointer = directory / "active_collection.json"
+        for collection in ("old", "new"):
+            pointer.write_text(json.dumps({"collection": collection}))
+            assert json.loads(_files._read_bytes(
+                None, "labels/active_collection.json"))["collection"] == collection
     assert anonymous and all(options == {"anonymous": True} for options in anonymous)
 
 

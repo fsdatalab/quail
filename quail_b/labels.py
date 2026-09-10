@@ -10,8 +10,8 @@ from __future__ import annotations
 import io
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
-from functools import partial
 
 from pyarrow import parquet as pq
 
@@ -82,8 +82,9 @@ def _read_many(root, paths: list[str]) -> dict[str, bytes]:
     if workers <= 1:
         return {path: _read_bytes(root, path) for path in paths}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        contents = pool.map(partial(_read_bytes, root), paths)
-        return dict(zip(paths, contents))
+        futures = [pool.submit(copy_context().run, _read_bytes, root, path)
+                   for path in paths]
+        return {path: future.result() for path, future in zip(paths, futures)}
 
 
 def _choose_collection(root, scale_factor: float,

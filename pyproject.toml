@@ -1,6 +1,6 @@
 [project]
 name = "quail-b"
-version = "0.1.0"
+version = "0.2.0"
 description = "quail-b: a benchmark of AI filter and join queries over document sets"
 readme = "README.md"
 # <3.13: the same Python as Quail, which installs this package
@@ -20,6 +20,9 @@ dev = [
     "ruff==0.12.9",
     "vulture>=2.16,<3",
 ]
+
+[project.scripts]
+quail-b = "quail_b.reporting:main"
 
 [build-system]
 requires = ["hatchling"]
