@@ -3,7 +3,7 @@ from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.work import Work
 
 
-def test_exact_live_rows_reduces_a_tree_to_exact_projections():
+def test_live_rows_for_trees_and_cycles():
     live = exact_live_rows(
         {"a": (0, 1), "b": (0, 1), "c": (0, 1)},
         (
@@ -14,8 +14,6 @@ def test_exact_live_rows_reduces_a_tree_to_exact_projections():
 
     assert live == {"a": (0,), "b": (0,), "c": (0,)}
 
-
-def test_exact_live_rows_handles_cycle_consistency():
     live = exact_live_rows(
         {"a": (0, 1), "b": (0, 1), "c": (0, 1)},
         (

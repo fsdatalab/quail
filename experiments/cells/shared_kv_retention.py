@@ -17,11 +17,27 @@ from pathlib import Path
 
 import modal
 
-from quail.runtime.worker import build_worker_image
-
 baseline = Path(os.environ.get(
     "QUAIL_BASELINE_DIR", "/tmp/quail-first-anchor-baseline-02bd7a2"))
-image = build_worker_image(local_python_sources=("quail_b",)).add_local_dir(
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
+    .entrypoint([])
+    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow",
+                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+    .env({
+        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
+        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+        "VLLM_LOGGING_LEVEL": "WARNING",
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
+        "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
+    })
+    .add_local_python_source("quail", "quail_b")
+).add_local_dir(
     baseline / "quail", "/opt/quail-baseline/quail", ignore=["__pycache__", "*.pyc"]
 )
 app = modal.App("quail-milestone1")
@@ -46,7 +62,6 @@ def _run(label, output_dir):
     from quail.bench.quailb import queries, register_sets
     from quail.physical import AnchoredJoin, PackedFilter
     from quail.planner.plan import EngineConfig
-    from quail.runtime.compute import InProcessComputeProvider
     from quail.specs import H100_USD_PER_HOUR
     from quail_b.data import build_sets
 
@@ -58,7 +73,7 @@ def _run(label, output_dir):
         source_hash.update(str(path.relative_to(source)).encode())
         source_hash.update(path.read_bytes())
     with quail.Session(EngineConfig(model="qwen3-4b-fp8", gpus=1),
-                       compute_provider=InProcessComputeProvider()) as session:
+                       ) as session:
         register_sets(session, build_sets("/results/quailb_data", 0.1, 1))
         query = queries(session)["FEV-9"][1]()
         plan = query.plan()

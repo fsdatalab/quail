@@ -21,9 +21,9 @@ def fake_tok(text):
 
 
 def _run(query, execute):
-    from quail.runtime.local import execute_worker_query
+    from quail.runtime.execute import execute_query
 
-    return execute_worker_query(query, physical_executor=execute)
+    return execute_query(query, physical_executor=execute)
 
 
 def runtime_plan(request):
@@ -73,7 +73,8 @@ def sess(tmp_path):
             "asin": [f"p{i}" for i in range(4)],
             "description": [f"product {i}" for i in range(4)],
         }), id_col="asin"))
-    return s
+    yield s
+    s.close()
 
 
 def make_executor(filter_truth, join_truth=None, seen=None):
@@ -154,64 +155,6 @@ def make_executor(filter_truth, join_truth=None, seen=None):
     return _exec
 
 
-def test_remote_source_query_does_not_scan_or_tokenize_on_client():
-    from quail.catalog import TableStatistics
-    from quail.runtime.result import QueryResult
-
-    class RemoteProvider:
-        id_col = "id"
-        columns = ("id", "body")
-
-        def schema(self):
-            return pa.schema({"id": pa.string(), "body": pa.string()})
-
-        def content_identity(self):
-            return "remote:test"
-
-        def statistics(self):
-            return TableStatistics(row_count=2)
-
-        def scan(self, request):
-            raise AssertionError("the client scanned a remote source")
-
-        def remote_source(self):
-            return {
-                "type": "parquet",
-                "paths": ["s3://bucket/docs.parquet"],
-                "id_col": "id",
-            }
-
-    class RemoteCompute:
-        def __init__(self):
-            self.request = None
-
-        def execute(self, request):
-            self.request = request
-            return QueryResult.from_table(
-                pa.table({"d.id": ["a"]}),
-                report={"wall_s": 1.0, "fresh_tokens": 5},
-            )
-
-        def close(self):
-            pass
-
-    compute = RemoteCompute()
-    session = quail.Session(tokenizer=fake_tok, compute_provider=compute)
-    session.register("docs", RemoteProvider())
-
-    result = session.sql(
-        "SELECT d.id FROM docs d WHERE "
-        "AI_FILTER(PROMPT('question {0}', d.body))"
-    ).run()
-
-    assert result.to_rows() == [("a",)]
-    assert compute.request.providers["docs"].remote_source()["paths"] == [
-        "s3://bucket/docs.parquet"
-    ]
-    assert compute.request.logical_plan.root.type_name \
-        == "quail.logical_project"
-
-
 FILTER_SQL = """
     SELECT r.id FROM reviews r
     WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5})
@@ -219,7 +162,7 @@ FILTER_SQL = """
 """
 
 
-def test_filter_query_rows_and_report(sess):
+def test_query_rows_observers_and_saved_reports(sess, tmp_path):
     truth = {"r": {"q1:": [1, 1, 0, 1, 1, 0],
                          "q2:": [1, 0, 1, 1, 0, 1]}}
     q = sess.sql(FILTER_SQL)
@@ -237,6 +180,35 @@ def test_filter_query_rows_and_report(sess):
     limited = _run(
         sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(truth))
     assert limited.count() == 1
+
+    registry = quail.ExtensionRegistry.with_built_ins().register_observer(
+        NodeTypes)
+
+    result = _observed_result(tmp_path, registry)
+
+    assert result.observer(NodeTypes)["types"] == [
+        "quail.document_input",
+        "quail.packed_filter",
+        "quail.project",
+        "quail.limit",
+    ]
+    assert result.observer(NodeTypes) is result.observer("test.node_types")
+    with pytest.raises(KeyError):
+        result.observer("example.missing")
+
+    from quail.runtime.result import QueryResult
+
+    # Saved reports can be loaded separately from their result tables.
+    table, report = result.collect(), dict(result.report)
+
+    restored = QueryResult.from_table(table, report=report)
+    assert restored.plan is None
+    restored.attach_executed_plan(registry.codecs)
+
+    assert [node.node_id for node in restored.plan.topological_nodes()] == [
+        node.node_id for node in result.plan.topological_nodes()]
+    assert restored.node_metrics == result.node_metrics
+    assert restored.explain() == result.explain()
 
 
 class NodeTypes:
@@ -259,7 +231,6 @@ def _observed_result(tmp_path, registry):
         EngineConfig(gpus=1),
         tokenizer=fake_tok,
         registry=registry,
-        compute_provider=object(),
     )
     session.register("reviews", quail.DocumentProvider.from_parquet(
         _parquet(tmp_path / "reviews.parquet", {
@@ -273,38 +244,3 @@ def _observed_result(tmp_path, registry):
         "SELECT r.id FROM reviews r WHERE "
         "AI_FILTER(PROMPT('q: {0}', r.review)) LIMIT 1"
     ), make_executor(truth))
-
-
-def test_observer_sees_the_complete_physical_graph(tmp_path):
-    registry = quail.ExtensionRegistry.with_built_ins().register_observer(
-        NodeTypes)
-
-    result = _observed_result(tmp_path, registry)
-
-    assert result.observer(NodeTypes)["types"] == [
-        "quail.document_input",
-        "quail.packed_filter",
-        "quail.project",
-        "quail.limit",
-    ]
-    assert result.observer(NodeTypes) is result.observer("test.node_types")
-    with pytest.raises(KeyError):
-        result.observer("example.missing")
-
-
-def test_executed_plan_survives_the_report_round_trip(tmp_path):
-    from quail.runtime.result import QueryResult
-
-    registry = quail.ExtensionRegistry.with_built_ins()
-    result = _observed_result(tmp_path, registry)
-    # Saved reports can be loaded separately from their result tables.
-    table, report = result.collect(), dict(result.report)
-
-    restored = QueryResult.from_table(table, report=report)
-    assert restored.plan is None
-    restored.attach_executed_plan(registry.codecs)
-
-    assert [node.node_id for node in restored.plan.topological_nodes()] == [
-        node.node_id for node in result.plan.topological_nodes()]
-    assert restored.node_metrics == result.node_metrics
-    assert restored.explain() == result.explain()

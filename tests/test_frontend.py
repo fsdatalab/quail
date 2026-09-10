@@ -52,7 +52,7 @@ FILTER_JOIN_SQL = """
 """
 
 
-def test_filter_join_shape(catalog):
+def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     plan = compile_sql(FILTER_JOIN_SQL, catalog, tok)
     root = plan.root
     assert isinstance(root, Project)
@@ -83,8 +83,6 @@ def test_filter_join_shape(catalog):
     assert [(c.alias, c.column) for c in star.root.columns] == \
         [("r", "id"), ("r", "review")]
 
-
-def test_snowflake_ai_filter_and_bq_ai_if_compile_equal(catalog):
     snowflake = compile_sql(
         "SELECT r.id FROM reviews r WHERE "
         "AI_FILTER(PROMPT('negative {0}', r.review))",
@@ -103,8 +101,6 @@ def test_snowflake_ai_filter_and_bq_ai_if_compile_equal(catalog):
     assert SQLDialect.BQ.value == "bq"
     assert bq == snowflake
 
-
-def test_builder_equals_sql(catalog):
     sql_plan = compile_sql(FILTER_JOIN_SQL, catalog, tok)
     built = (docs(catalog, "reviews", tok).alias("r")
              .ai_filter(prompt("This review is negative: {0}",
@@ -115,6 +111,31 @@ def test_builder_equals_sql(catalog):
                       selectivity=0.05)
              .select("r.id", "p.asin"))
     assert built == sql_plan
+
+    # one prompt, three placeholders, all three documents in the same
+    # model call - never a chain of pairwise stages
+    plan = compile_sql(THREE_WAY_ON, catalog, tok)
+    join = plan.root.input
+    assert isinstance(join, SemanticJoin)
+    assert join.anchor == "b"
+    assert join.selectivity == 0.02
+    assert len(join.inputs) == 3
+    assert isinstance(join.inputs[0], Scan)   # no inner join anywhere
+    assert [r.alias for r in join.predicate.args] == ["a", "b", "p"]
+
+    # Snowflake style (bare JOINs, the predicate on the last ON),
+    # BigQuery style (comma cross product, the predicate in WHERE),
+    # and the builder all produce the same plan
+    on_plan = compile_sql(THREE_WAY_ON, catalog, tok)
+    where_plan = compile_sql(THREE_WAY_WHERE, catalog, tok)
+    built = (docs(catalog, "reviews", tok).alias("a")
+             .ai_join([docs(catalog, "threads", tok).alias("b"),
+                       docs(catalog, "products", tok).alias("p")],
+                      prompt(THREE_WAY_TEMPLATE, col("a.review"),
+                             col("b.thread"), col("p.description")),
+                      selectivity=0.02, anchor="b")
+             .select("a.id", "b.id", "p.asin"))
+    assert on_plan == where_plan == built
 
 
 THREE_WAY_TEMPLATE = ("Review {0} praises the thread in {1} and the "
@@ -137,36 +158,7 @@ THREE_WAY_WHERE = """
 """ % THREE_WAY_TEMPLATE
 
 
-def test_three_way_is_one_cross_product_join(catalog):
-    # one prompt, three placeholders, all three documents in the same
-    # model call - never a chain of pairwise stages
-    plan = compile_sql(THREE_WAY_ON, catalog, tok)
-    join = plan.root.input
-    assert isinstance(join, SemanticJoin)
-    assert join.anchor == "b"
-    assert join.selectivity == 0.02
-    assert len(join.inputs) == 3
-    assert isinstance(join.inputs[0], Scan)   # no inner join anywhere
-    assert [r.alias for r in join.predicate.args] == ["a", "b", "p"]
-
-
-def test_three_way_forms_compile_equal(catalog):
-    # Snowflake style (bare JOINs, the predicate on the last ON),
-    # BigQuery style (comma cross product, the predicate in WHERE),
-    # and the builder all produce the same plan
-    on_plan = compile_sql(THREE_WAY_ON, catalog, tok)
-    where_plan = compile_sql(THREE_WAY_WHERE, catalog, tok)
-    built = (docs(catalog, "reviews", tok).alias("a")
-             .ai_join([docs(catalog, "threads", tok).alias("b"),
-                       docs(catalog, "products", tok).alias("p")],
-                      prompt(THREE_WAY_TEMPLATE, col("a.review"),
-                             col("b.thread"), col("p.description")),
-                      selectivity=0.02, anchor="b")
-             .select("a.id", "b.id", "p.asin"))
-    assert on_plan == where_plan == built
-
-
-def test_join_prompt_keeps_markers_and_labels_blocks():
+def test_prompt_layout_and_predicate_order(catalog):
     from quail.logical import (
         ANSWER_CUE,
         ColumnRef,
@@ -192,6 +184,52 @@ def test_join_prompt_keeps_markers_and_labels_blocks():
     assert p.labels[0][2] == len(tok(render_join_frame(p.template, 0)))
     assert render_join_question(p.template) == p.frame
 
+    sql = """
+        SELECT r.id FROM reviews r
+        WHERE AI_FILTER(PROMPT('first: {0}', r.review))
+          AND AI_FILTER(PROMPT('second: {0}', r.review))
+          AND AI_FILTER(PROMPT('third: {0}', r.review))
+    """
+    plan = compile_sql(sql, catalog, tok)
+    templates = [p.prompt.template
+                 for p in plan.root.input.predicates]
+    # canonical layout: the engine preamble sits before the document
+    # and the user's pre-document text is relocated after it
+    assert templates == [SHARED_PRE + "{0}\n\nfirst:",
+                         SHARED_PRE + "{0}\n\nsecond:",
+                         SHARED_PRE + "{0}\n\nthird:"]
+
+    from quail.logical import canonicalize_template, split_frame
+    # no user text before the document: the preamble is prepended
+    assert canonicalize_template("{0}\nQ: is it good?") == \
+        SHARED_PRE + "{0}\nQ: is it good?"
+    # user text before the document relocates after it, so the fixed
+    # preamble is the only thing ahead of the document's KV
+    assert canonicalize_template("negative review: {0}") == \
+        SHARED_PRE + "{0}\n\nnegative review:"
+    # two placeholders: only the first (the KV-owning document) moves
+    # behind the preamble
+    assert canonicalize_template("Does {0} match {1}?") == \
+        SHARED_PRE + "{0}\n\nDoes match {1}?"
+    # no placeholder: no document to own, unchanged
+    assert canonicalize_template("no placeholders") == "no placeholders"
+    # the relocated text is recorded as the frame
+    assert split_frame("Does {0} match {1}?")[0] == "Does"
+    assert split_frame("{0} then {1}")[0] == ""
+
+    plan = compile_sql(FILTER_JOIN_SQL, catalog, tok)
+    pred = plan.root.input.inputs[0].predicates[0]
+    # the preamble is always the engine's; the user's pre-document
+    # text ("This review is negative:") moves into the tail
+    assert pred.prompt.preamble == SHARED_PRE
+    assert pred.prompt.tail == ("{0}\n\nEvaluate TRUE or FALSE for the "
+                                "following question: This review is "
+                                "negative:\nANSWER:")
+    assert pred.prompt.preamble_tokens == len(tok(SHARED_PRE))
+    assert pred.prompt.tail_tokens == len(tok(
+        "Evaluate TRUE or FALSE for the following question: "
+        "This review is negative: ANSWER:"))
+
 
 TWO_ONS = """
     SELECT a.id FROM reviews a
@@ -212,7 +250,7 @@ TWO_WHERE = """
 """
 
 
-def test_two_join_predicates_compile_to_two_specs(catalog):
+def test_join_predicates_and_semantics(catalog):
     # a chain: each multi-table AI_FILTER is its own pairwise join
     plan = compile_sql(TWO_ONS, catalog, tok)
     outer = plan.root.input
@@ -233,8 +271,60 @@ def test_two_join_predicates_compile_to_two_specs(catalog):
              .select("a.id"))
     assert plan == compile_sql(TWO_WHERE, catalog, tok) == built
 
+    sql = """
+        SELECT t.id FROM threads t
+        WHERE AI_FILTER(PROMPT('good: {0}', t.thread))
+          AND NOT EXISTS (SELECT 1 FROM products s
+                          WHERE AI_FILTER(PROMPT('match {0} {1}',
+                                                 t.thread,
+                                                 s.description)))
+    """
+    plan = compile_sql(sql, catalog, tok)
+    join = plan.root.input
+    assert isinstance(join, SemanticJoin)
+    assert join.semantics == "anti"
+    # the gate applies to the outer table, so it always anchors there
+    assert join.anchor == "t"
+    built = (docs(catalog, "threads", tok).alias("t")
+             .ai_filter(prompt("good: {0}", col("t.thread")))
+             .ai_join(docs(catalog, "products", tok).alias("s"),
+                      prompt("match {0} {1}", col("t.thread"),
+                             col("s.description")),
+                      semantics="anti")
+             .select("t.id"))
+    assert built == plan
 
-def test_join_validation_errors(catalog):
+    exists_sql = sql.replace("NOT EXISTS", "EXISTS")
+    assert compile_sql(exists_sql, catalog,
+                       tok).root.input.semantics == "exists"
+
+    with pytest.raises(CompileError) as e:
+        docs(catalog, "threads", tok).alias("t").ai_join(
+            docs(catalog, "products", tok).alias("s"),
+            prompt("match {0} {1}", col("t.thread"),
+                   col("s.description")),
+            semantics="exists", anchor="s")
+    assert "outer table" in str(e.value)
+
+    # two predicates over the same two tables: two specs; a pair must
+    # answer TRUE to both. Only the first spec carries the joined
+    # table into the tree
+    sql = ("SELECT r.id FROM reviews r JOIN products p ON AI_FILTER("
+           "PROMPT('x {0} {1}', r.review, p.description)) "
+           "WHERE AI_FILTER(PROMPT('y {0} {1}', r.review, "
+           "p.description))")
+    plan = compile_sql(sql, catalog, tok)
+    outer = plan.root.input
+    assert isinstance(outer, SemanticJoin)
+    assert len(outer.inputs) == 1              # p already in the tree
+    inner = outer.inputs[0]
+    assert isinstance(inner, SemanticJoin)
+    assert len(inner.inputs) == 2
+    assert [r.alias for r in inner.predicate.args] == ["r", "p"]
+    assert [r.alias for r in outer.predicate.args] == ["r", "p"]
+
+
+def test_invalid_queries_and_limits(catalog):
     cases = [
         ("""
             SELECT a.id FROM reviews a, threads b, products p
@@ -284,94 +374,28 @@ def test_join_validation_errors(catalog):
         docs(catalog, "reviews", tok).alias("r").ai_filter(
             prompt("x {0} {1}", col("r.review"), col("r.id")))
 
+    for sql, fragment in REJECTED:
+        with pytest.raises(CompileError) as e:
+            compile_sql(sql, catalog, tok)
+        assert fragment.lower() in str(e.value).lower()
 
-def test_exists_and_anti(catalog):
-    sql = """
-        SELECT t.id FROM threads t
-        WHERE AI_FILTER(PROMPT('good: {0}', t.thread))
-          AND NOT EXISTS (SELECT 1 FROM products s
-                          WHERE AI_FILTER(PROMPT('match {0} {1}',
-                                                 t.thread,
-                                                 s.description)))
-    """
+    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
+           "PROMPT('x: {0}', r.review)) LIMIT 5")
     plan = compile_sql(sql, catalog, tok)
-    join = plan.root.input
-    assert isinstance(join, SemanticJoin)
-    assert join.semantics == "anti"
-    # the gate applies to the outer table, so it always anchors there
-    assert join.anchor == "t"
-    built = (docs(catalog, "threads", tok).alias("t")
-             .ai_filter(prompt("good: {0}", col("t.thread")))
-             .ai_join(docs(catalog, "products", tok).alias("s"),
-                      prompt("match {0} {1}", col("t.thread"),
-                             col("s.description")),
-                      semantics="anti")
-             .select("t.id"))
-    assert built == plan
-
-    exists_sql = sql.replace("NOT EXISTS", "EXISTS")
-    assert compile_sql(exists_sql, catalog,
-                       tok).root.input.semantics == "exists"
-
-    with pytest.raises(CompileError) as e:
-        docs(catalog, "threads", tok).alias("t").ai_join(
-            docs(catalog, "products", tok).alias("s"),
-            prompt("match {0} {1}", col("t.thread"),
-                   col("s.description")),
-            semantics="exists", anchor="s")
-    assert "outer table" in str(e.value)
-
-
-def test_where_conjuncts_keep_written_order(catalog):
-    sql = """
-        SELECT r.id FROM reviews r
-        WHERE AI_FILTER(PROMPT('first: {0}', r.review))
-          AND AI_FILTER(PROMPT('second: {0}', r.review))
-          AND AI_FILTER(PROMPT('third: {0}', r.review))
-    """
-    plan = compile_sql(sql, catalog, tok)
-    templates = [p.prompt.template
-                 for p in plan.root.input.predicates]
-    # canonical layout: the engine preamble sits before the document
-    # and the user's pre-document text is relocated after it
-    assert templates == [SHARED_PRE + "{0}\n\nfirst:",
-                         SHARED_PRE + "{0}\n\nsecond:",
-                         SHARED_PRE + "{0}\n\nthird:"]
-
-
-def test_canonicalize_template():
-    from quail.logical import canonicalize_template, split_frame
-    # no user text before the document: the preamble is prepended
-    assert canonicalize_template("{0}\nQ: is it good?") == \
-        SHARED_PRE + "{0}\nQ: is it good?"
-    # user text before the document relocates after it, so the fixed
-    # preamble is the only thing ahead of the document's KV
-    assert canonicalize_template("negative review: {0}") == \
-        SHARED_PRE + "{0}\n\nnegative review:"
-    # two placeholders: only the first (the KV-owning document) moves
-    # behind the preamble
-    assert canonicalize_template("Does {0} match {1}?") == \
-        SHARED_PRE + "{0}\n\nDoes match {1}?"
-    # no placeholder: no document to own, unchanged
-    assert canonicalize_template("no placeholders") == "no placeholders"
-    # the relocated text is recorded as the frame
-    assert split_frame("Does {0} match {1}?")[0] == "Does"
-    assert split_frame("{0} then {1}")[0] == ""
-
-
-def test_prompt_split_and_counts(catalog):
-    plan = compile_sql(FILTER_JOIN_SQL, catalog, tok)
-    pred = plan.root.input.inputs[0].predicates[0]
-    # the preamble is always the engine's; the user's pre-document
-    # text ("This review is negative:") moves into the tail
-    assert pred.prompt.preamble == SHARED_PRE
-    assert pred.prompt.tail == ("{0}\n\nEvaluate TRUE or FALSE for the "
-                                "following question: This review is "
-                                "negative:\nANSWER:")
-    assert pred.prompt.preamble_tokens == len(tok(SHARED_PRE))
-    assert pred.prompt.tail_tokens == len(tok(
-        "Evaluate TRUE or FALSE for the following question: "
-        "This review is negative: ANSWER:"))
+    assert plan.root.limit == 5
+    built = (docs(catalog, "reviews", tok).alias("r")
+             .ai_filter(prompt("x: {0}", col("r.review")))
+             .limit(3)
+             .select("r.id"))
+    assert built.root.limit == 3
+    with pytest.raises(CompileError, match="positive integer"):
+        compile_sql("SELECT r.id FROM reviews r WHERE AI_FILTER("
+                    "PROMPT('x: {0}', r.review)) LIMIT 0",
+                    catalog, tok)
+    with pytest.raises(CompileError):
+        compile_sql("SELECT r.id FROM reviews r WHERE AI_FILTER("
+                    "PROMPT('x: {0}', r.review)) LIMIT 'five'",
+                    catalog, tok)
 
 
 REJECTED = [
@@ -411,49 +435,3 @@ REJECTED = [
     ("SELECT r.id FROM reviews r WHERE r.id IN (SELECT p.asin FROM "
      "products p)", "subquer"),
 ]
-
-
-def test_rejected_with_named_error(catalog):
-    for sql, fragment in REJECTED:
-        with pytest.raises(CompileError) as e:
-            compile_sql(sql, catalog, tok)
-        assert fragment.lower() in str(e.value).lower()
-
-
-def test_two_join_predicates_over_the_same_pair(catalog):
-    # two predicates over the same two tables: two specs; a pair must
-    # answer TRUE to both. Only the first spec carries the joined
-    # table into the tree
-    sql = ("SELECT r.id FROM reviews r JOIN products p ON AI_FILTER("
-           "PROMPT('x {0} {1}', r.review, p.description)) "
-           "WHERE AI_FILTER(PROMPT('y {0} {1}', r.review, "
-           "p.description))")
-    plan = compile_sql(sql, catalog, tok)
-    outer = plan.root.input
-    assert isinstance(outer, SemanticJoin)
-    assert len(outer.inputs) == 1              # p already in the tree
-    inner = outer.inputs[0]
-    assert isinstance(inner, SemanticJoin)
-    assert len(inner.inputs) == 2
-    assert [r.alias for r in inner.predicate.args] == ["r", "p"]
-    assert [r.alias for r in outer.predicate.args] == ["r", "p"]
-
-
-def test_limit_parsing_and_builder(catalog):
-    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER("
-           "PROMPT('x: {0}', r.review)) LIMIT 5")
-    plan = compile_sql(sql, catalog, tok)
-    assert plan.root.limit == 5
-    built = (docs(catalog, "reviews", tok).alias("r")
-             .ai_filter(prompt("x: {0}", col("r.review")))
-             .limit(3)
-             .select("r.id"))
-    assert built.root.limit == 3
-    with pytest.raises(CompileError, match="positive integer"):
-        compile_sql("SELECT r.id FROM reviews r WHERE AI_FILTER("
-                    "PROMPT('x: {0}', r.review)) LIMIT 0",
-                    catalog, tok)
-    with pytest.raises(CompileError):
-        compile_sql("SELECT r.id FROM reviews r WHERE AI_FILTER("
-                    "PROMPT('x: {0}', r.review)) LIMIT 'five'",
-                    catalog, tok)

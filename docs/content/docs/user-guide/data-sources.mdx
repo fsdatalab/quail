@@ -23,38 +23,27 @@ column is what you normally select.
 
 ## Built in providers
 
-| Factory | Source | Read where |
-| --- | --- | --- |
-| `from_table(table, id_col, identity="memory")` | An in memory Arrow table | Client sends the needed columns to the worker |
-| `from_parquet(path_or_paths, id_col)` | Parquet file, directory, or list | Worker opens it when the path is remote, otherwise client sends columns |
-| `from_ipc(path, id_col)` | Arrow IPC file | Client sends columns |
-| `from_dataset(dataset, id_col)` | Any `pyarrow.dataset.Dataset` | Worker opens it when the dataset is remote |
-| `from_hf(dataset, id_col, split="train", config="")` | A Hugging Face dataset | Worker opens it |
+| Factory | Source |
+| --- | --- |
+| `from_table(table, id_col, identity="memory")` | An in memory Arrow table |
+| `from_parquet(path_or_paths, id_col)` | Parquet file, directory, or list |
+| `from_ipc(path, id_col)` | Arrow IPC file |
+| `from_dataset(dataset, id_col)` | Any `pyarrow.dataset.Dataset` |
+| `from_hf(dataset, id_col, split="train", config="")` | A Hugging Face dataset |
 
-"Remote" means a path such as `s3://` or `gs://` that the Modal worker
-can open itself. For those, the client reads only the schema and file
-list so it can check column names. It never reads document rows. The
-worker reads bounded batches, tokenizes them, and writes the tokens to
-a temporary memory mapped Arrow file.
+All providers read data in the session's process. Quail reads bounded
+batches of the id, document, and projected columns. It tokenizes documents
+into temporary memory mapped Arrow files.
 
-For a client-only source, the client reads just the columns the query
-uses (the id column, the document column, and the projected columns)
-and sends them as raw Arrow. The worker tokenizes them.
+On Modal, create and register providers inside the GPU function. For
+remote Parquet, pass the path to that function. For data available only
+on your machine, pass an Arrow table and register it with `from_table`.
+Modal transfers function arguments; Quail does not transfer data automatically.
 
-If the worker needs credentials to open a remote source, give the
-compute provider a Modal secret:
-
-```python
-import modal
-
-compute = quail.ModalComputeProvider(secrets=(
-    modal.Secret.from_name("quail-s3"),
-))
-session = quail.Session(compute_provider=compute)
-session.register("documents", quail.DocumentProvider.from_parquet(
-    "s3://my-bucket/documents.parquet", id_col="document_id",
-))
-```
+If a source needs credentials, make them available in the query process.
+On Modal, attach a secret to the function with
+`secrets=(modal.Secret.from_name("quail-s3"),)`. See
+[Running on Modal](/docs/user-guide/compute).
 
 ## The identity of a table
 
@@ -79,13 +68,7 @@ class TableProvider(Protocol):
     def content_identity(self) -> str: ...
     def statistics(self) -> TableStatistics: ...
     def scan(self, request: ScanRequest) -> pa.RecordBatchReader: ...
-    def remote_source(self) -> Mapping[str, Any] | None: ...
 ```
 
 - `scan` returns bounded record batches for the columns in
   `ScanRequest.columns`.
-- `remote_source` returns a small mapping the worker can open on its
-  own, or `None` for a client-only source. The mapping's `type` key
-  selects a registered source reader on the worker. See
-  [Table providers](/docs/extending/table-providers) for a full
-  example.

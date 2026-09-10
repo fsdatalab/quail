@@ -12,18 +12,34 @@ from experiments.sglang_profile_analysis import (
 )
 
 
-def test_activity_bins_preserve_union_duration_and_partial_final_bin():
+def test_profile_time_accounting():
     intervals = [(5, 15), (10, 20), (30, 43)]
     bins = binned_activity(intervals, 0, 45, 10)
     assert bins == [(0, 10, 5), (10, 20, 10), (20, 30, 0), (30, 40, 10), (40, 45, 3)]
     assert sum(occupied for _, _, occupied in bins) == pytest.approx(
         interval_duration(intervals))
 
-
-def test_cpu_scope_overlap_with_gpu_gaps_uses_elapsed_time():
     assert intersect_intervals([(0, 10), (8, 20), (30, 50)], [(5, 15), (18, 35)]) == [
         (5, 15), (18, 20), (30, 35),
     ]
+
+    base = 1_788_000_000_000_000_000
+    trace = {"base_ns": base, "start_us": 0, "gpu_busy_intervals": [(10e6, 12e6)]}
+    events = [
+        ("normalize_batch_and_arguments", 0, 1),
+        ("_batch_tokenize_and_process", 2, 6),
+        ("_send_batch_request", 6, 8),
+        ("_dispatch_to_scheduler", 6, 8),
+        ("normalize_batch_and_arguments", 11, 12),
+    ]
+    join = {"input_preparation": {"intervals": [
+        {"name": f"sglang.input.{name}", "start_unix_ns": base + start * 10**9,
+         "end_unix_ns": base + end * 10**9}
+        for name, start, end in events
+    ]}}
+    assert input_preparation_breakdown(join, trace) == {
+        "normalize_s": 1, "prepare_s": 4, "send_s": 2, "first_gpu_s": 10, "other_s": 3,
+    }
 
 
 def test_trace_alignment_excludes_events_outside_the_driver_join(tmp_path):
@@ -49,23 +65,3 @@ def test_trace_alignment_excludes_events_outside_the_driver_join(tmp_path):
     assert summary["scope_us"]["scheduler.run_batch"] == 40
     assert summary["scope_gpu_idle_us"]["scheduler.run_batch"] == 25
     assert "export_only" not in summary["kernels"]
-
-
-def test_initial_input_breakdown_excludes_nested_dispatch_and_late_work():
-    base = 1_788_000_000_000_000_000
-    trace = {"base_ns": base, "start_us": 0, "gpu_busy_intervals": [(10e6, 12e6)]}
-    events = [
-        ("normalize_batch_and_arguments", 0, 1),
-        ("_batch_tokenize_and_process", 2, 6),
-        ("_send_batch_request", 6, 8),
-        ("_dispatch_to_scheduler", 6, 8),
-        ("normalize_batch_and_arguments", 11, 12),
-    ]
-    join = {"input_preparation": {"intervals": [
-        {"name": f"sglang.input.{name}", "start_unix_ns": base + start * 10**9,
-         "end_unix_ns": base + end * 10**9}
-        for name, start, end in events
-    ]}}
-    assert input_preparation_breakdown(join, trace) == {
-        "normalize_s": 1, "prepare_s": 4, "send_s": 2, "first_gpu_s": 10, "other_s": 3,
-    }

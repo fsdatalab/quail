@@ -11,14 +11,16 @@ Derived data is uploaded to quail-results before plots read it.
 
 import argparse
 import gzip
+import io
 import json
 import math
 from collections import Counter
 from pathlib import Path
 
+import modal
+
 from experiments.profile_cpu_timeline import read_cpu_window
 from experiments.profile_gpu_timeline import read_gpu_intervals
-from quail.runtime.volumes import ModalVolumeFiles
 
 
 def main_thread(path):
@@ -73,5 +75,8 @@ if __name__ == "__main__":
     parser.add_argument("output_volume_path")
     args = parser.parse_args()
     summary = analyze(args.workdir, args.source)
-    ModalVolumeFiles().write_json(args.output_volume_path, summary)
+    volume = modal.Volume.from_name("quail-results")
+    data = io.BytesIO(json.dumps(summary, indent=2).encode())
+    with volume.batch_upload(force=True) as batch:
+        batch.put_file(data, args.output_volume_path.lstrip("/"))
     print(json.dumps({key: value for key, value in summary.items() if key != "window"}))

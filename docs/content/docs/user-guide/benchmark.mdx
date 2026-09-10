@@ -1,70 +1,86 @@
 ---
 title: Running QUAIL-B
-description: The benchmark suite and how to run it on Modal.
+description: Run queries with Quail and generate reports with QUAIL-B.
 ---
 
-QUAIL-B is Quail's benchmark: 32 filter and join queries over IMDB,
-BioDEX, FEVER, LePaRD, and SWE-Next agent traces at scale factor 0.1,
-plus two optional PrivacyPolicies queries. Ground truth is saved per
-predicate, so accuracy is scored on exact TRUE or FALSE answers, not
-on model agreement.
+QUAIL-B defines 32 filter and join queries at scale factors 0.1, 0.5, and 1.0.
+It loads inputs and labels from public S3, saves answers, and computes metrics.
+Quail executes the queries.
 
-The full instructions live in the README of the benchmark's own
-repository, [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench). The short version:
+## Run on Modal
+
+State your expected result before starting an experiment.
 
 ```bash
 mkdir -p results/benchmark
-run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb.log"
-
 uv run modal run --detach -m quail.bench.quailb_parallel \
-  --sf 0.1 \
-  --model qwen3-4b-fp8 \
-  --prediction "State the expected runtime and accuracy." \
-  2>&1 | tee "$run_log"
+  --sf 0.1 --model qwen3-4b-fp8 --query IMDB-4 \
+  --output-dir /results/benchmarks/quailb \
+  2>&1 | tee results/benchmark/quailb.log
 ```
 
-Add `--query IMDB-4` to run one query.
+Omit `--query` to run all queries. Each query family uses one H100 for
+Quail and both vLLM submission strategies. SGLang uses a separate container.
+Use `--no-include-baselines` to run Quail alone.
 
-On a machine with a GPU and no Modal account, the same runner reads the
-corpus and labels from the public bucket:
+The command prints the run directory and Modal function call IDs.
+It saves results under `/results/benchmarks/quailb/<run-id>/` on the
+`quail-results` volume. The wrapper owns the volume mounts and caches.
+
+- `manifest.json` records overall status, backend run paths, and function call IDs.
+- `quail/run.json` and `quail/report.md` contain combined Quail results.
+- `quail/imdb/run.json` and `quail/imdb/report.md` contain the IMDB family run.
+- `quail/imdb/IMDB-4/` contains the final IDs and predicate-answer Parquet files.
+- Other backends have their own directories beside `quail/`.
+
+One reference-label collection is resolved before starting any query families.
+Completed results are committed even when a later query fails.
+Existing run directories are not overwritten.
+
+## Use the Python API
+
+Inside the GPU process, use Quail's function with the shared benchmark runner:
+
+```python
+from functools import partial
+
+import quail
+import quail_b
+from quail.bench.quailb import run_query
+
+with quail.Session() as session:
+    quail_b.run(
+        partial(run_query, session),
+        queries=["IMDB-4"],
+        scale_factor=0.1,
+        output_dir="/results/my-run",
+        metadata={"engine": "quail", "model": session.config.model},
+    )
+```
+
+`run_query` translates and executes one query. It returns document IDs,
+predicate answers, and measured duration. QUAIL-B saves and scores the results.
+No evaluator or saving callback is needed.
+
+The `run_suite()` convenience function in the same module also records Quail's
+configuration and GPU price. It requires an `output_dir`.
+
+## Generate a report
+
+Download the printed run directory, replacing `<run-id>` with its ID:
 
 ```bash
-uv run python -m quail.bench.quailb --sf 0.1 --model qwen3-4b-fp8
+uv run modal volume get quail-results \
+  "benchmarks/quailb/<run-id>/" "./results/<run-id>/"
+uv run quail-b report "./results/<run-id>/quail"
 ```
 
-## What one run does
+The command writes `report.md` beside `run.json`. Use another backend's
+directory to report that backend, or a family directory to report a partial run.
 
-- Modal starts one H100 container per query family.
-- Inside it, Quail runs in one process group. After its results are
-  saved the parent stops that group and waits for GPU memory to fall
-  below 1 GiB.
-- Stock vLLM and pipelined vLLM then run in a second process group on
-  the same GPU, sharing one loaded model. The runner records the GPU
-  UUID both groups saw and stops the family if they differ.
-- Pipelined SGLang runs in a separate container. vLLM 0.26.0 and
-  SGLang 0.5.18 need different exact versions of `apache-tvm-ffi`, so
-  they cannot share an image. Its driver runs in a child process with the
-  same cleanup and GPU-memory checks.
-- The command prints one Modal function call id per family. Results go
-  to the `quail-results` volume under
-  `/results/benchmarks/quailb/runs/<run_id>/`, with a manifest under
-  `family-runs/`.
+Reports use the run's saved label collection and do not rerun inference.
+Query time and GPU cost exclude model startup and result collection.
+Filter throughput is input documents per second. Join throughput is evaluated
+document pairs per second, summed across join stages.
 
-## What is reported
-
-For every query: query time, documents per second (or document pairs
-per second for joins), GPU cost in dollars per query, tokens, answer
-accuracy, and final-row precision, recall, and F1. Query time and cost
-exclude model startup. Startup is reported separately.
-
-The definitions are fixed so numbers compare across reports:
-
-- `documents/second` = input document rows / query seconds.
-- `document pairs/second` = evaluated pairs across all join stages /
-  query seconds.
-- `$/query` = query hours × GPU count × the H100 hourly price from
-  `quail.specs.H100_USD_PER_HOUR`.
-- `regret_tokens`, `shared_prefix_tokens`, `cross_row_cached_tokens`,
-  and `regret_distinct_tokens` come from the engine's own report on
-  every `QueryResult`. The benchmark copies them; it does not compute
-  them from the plan.
+Historical plot scripts under `reports/` still read their original saved formats.

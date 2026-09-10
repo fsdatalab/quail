@@ -8,7 +8,6 @@ from quail.backends import (
 )
 from quail.backends.quail import quail_runtimes
 from quail.backends.request import request_runtimes
-from quail.catalog import built_in_source_readers
 from quail.extensions import ExtensionRegistry
 from quail.logical_rules import built_in_logical_rules
 from quail.physical import built_in_codecs
@@ -34,6 +33,4 @@ def built_in_registry() -> ExtensionRegistry:
     for runtimes in (built_in_runtimes(), quail_runtimes(), request_runtimes()):
         for runtime_key, runtime in runtimes.items():
             registry.register_runtime(runtime, key=runtime_key)
-    for name, reader in built_in_source_readers().items():
-        registry.register_source_reader(reader, source_type=name)
     return registry

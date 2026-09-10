@@ -1,17 +1,15 @@
 ---
 title: Table providers
-description: Supplying documents from your own storage, on the client or from the worker.
+description: Supplying documents from storage in the query process.
 ---
 
 A table provider gives Quail a schema, an id column, and bounded
-Arrow batches. There are two ways to implement one, depending on where
-the data can be read.
+Arrow batches. Construct and register the provider in the process that
+runs the query.
 
-## A client-only provider
+## A provider over Arrow rows
 
-If only the client process can reach the data, implement `scan` and
-return `None` from `remote_source`. The compute provider reads the
-columns the query needs and sends them to the worker as raw Arrow.
+Implement `scan` to return the requested columns in bounded batches.
 
 ```python
 import pyarrow as pa
@@ -43,9 +41,6 @@ class RowsProvider:
             table = table.slice(0, request.limit)
         return table.to_reader(max_chunksize=request.batch_rows)
 
-    def remote_source(self):
-        return None
-
 
 session.register("docs", RowsProvider(rows))
 ```
@@ -53,67 +48,29 @@ session.register("docs", RowsProvider(rows))
 `content_identity` must change when the content changes. The session
 keys its tokenized copy of each column by it.
 
-## A worker-opened provider
+## Other storage systems
 
-If the worker can open the data itself, return a small description
-from `remote_source` and register a reader for its `type`. The client
-then sends only the description, and the worker streams the rows.
+Create a provider with a working `scan` method and register it directly:
 
 ```python
-class WarehouseProvider:
-    id_col = "doc_id"
+from my_package import WarehouseProvider
 
-    def __init__(self, table_name: str, schema: pa.Schema):
-        self._name = table_name
-        self._schema = schema
-
-    @property
-    def columns(self):
-        return tuple(self._schema.names)
-
-    def schema(self):
-        return self._schema
-
-    def content_identity(self):
-        return f"warehouse:{self._name}"
-
-    def statistics(self):
-        return TableStatistics()
-
-    def scan(self, request):
-        raise RuntimeError("scanned only inside the worker")
-
-    def remote_source(self):
-        return {"type": "warehouse", "table": self._name}
-
-
-def open_warehouse(value: dict):
-    """Return a client-only provider the worker can scan."""
-    table = read_whole_table(value["table"])   # your code
-    from quail.catalog import DocumentProvider
-    return DocumentProvider.from_table(table, id_col="doc_id",
-                                       identity=f"warehouse:{value['table']}")
-
-
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.register_source_reader(open_warehouse, source_type="warehouse")
+session.register("docs", WarehouseProvider("documents"))
 ```
 
-A reader is a plain function, so it travels to the worker by pickle:
-define it at module level, not inline.
+The provider handles connections and storage reads. It does not need an
+extension registry entry or a description for another process to reopen.
 
-The reader receives the description and returns any `TableProvider`
-the worker can scan locally. The built in `parquet` and `huggingface`
-readers work the same way.
+On Modal, create connections and providers inside the GPU function.
+Attach credentials through the function's `secrets` argument. If documents
+exist only on the caller's machine, pass an Arrow table as a function argument.
+See [Running on Modal](/docs/user-guide/compute).
 
-Credentials the reader needs go in a Modal secret passed to
-`ModalComputeProvider(secrets=...)`.
+## Reading batches
 
-## What the worker does with the batches
-
-The worker reads batches for the id column, the document column, and
+The session reads batches for the id column, the document column, and
 the projected columns only. It tokenizes the document column and
 writes tokens, lengths, and the projected columns to a temporary
 memory mapped Arrow file. Batches are released as they are written,
-so a provider can be much larger than worker memory as long as the
+so a provider can be much larger than process memory as long as the
 token file fits on local disk.

@@ -12,8 +12,7 @@
   and leaves every other node unchanged.
 - `Query.plan()` reads the pruned Scans to decide what each token
   store holds. Before, it recomputed the set from the root Project on
-  its own. `_modal_request` does the same when it copies local Arrow
-  columns to the worker, so both paths use one definition.
+  its own. The same in-process path handles sessions inside Modal functions.
 - The result projection now raises a clear `CompileError` when a
   column was not loaded, instead of a bare `KeyError`.
 - `Scan.explain_fields()` shows the kept columns.

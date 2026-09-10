@@ -154,7 +154,7 @@ class KeepFirstDocument:
         )
 
 
-def test_session_plans_registered_physical_extensions():
+def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     registry = quail.ExtensionRegistry.with_built_ins()
     backend = LocalFilterBackend()
     planner = PreferredPlanner()
@@ -186,8 +186,6 @@ def test_session_plans_registered_physical_extensions():
     assert "physical rule keep_first_document" in plan.remarks[0]
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
 
-
-def test_physical_codec_rejects_changed_shapes():
     registry = built_in_registry()
     scan = DocumentInput(
         node_id="input:d",
@@ -211,67 +209,66 @@ def test_physical_codec_rejects_changed_shapes():
     with pytest.raises(ValueError, match="unknown fields"):
         decode_graph(extra, registry.codecs)
 
+    with monkeypatch.context() as patch:
+        import sys
+        import types
 
-def test_worker_dispatches_to_the_backend_loaded_from_an_extension(monkeypatch):
-    import sys
-    import types
+        from quail.physical import plan_envelope
+        from quail.runtime.execute import _execute_physical
 
-    from quail.physical import plan_envelope
-    from quail.runtime.local import _execute_physical
+        class ExampleBackend:
+            name = "test.example"
 
-    class RemoteBackend:
-        name = "test.remote"
+            def execute_request(self, context):
+                from quail.execution import PhysicalResponse
 
-        def execute_request(self, context):
-            from quail.execution import PhysicalResponse
+                return PhysicalResponse({}, {
+                    "backend": self.name,
+                    "nodes": [node.node_id for node in context.graph.nodes],
+                })
 
-            return PhysicalResponse({}, {
-                "backend": self.name,
-                "nodes": [node.node_id for node in context.graph.nodes],
-            })
+        module_name = "test_quail_extension"
+        module = types.ModuleType(module_name)
 
-    module_name = "test_remote_quail_extension"
-    module = types.ModuleType(module_name)
+        def register(registry):
+            registry.register_backend(ExampleBackend())
 
-    def register(registry):
-        registry.register_backend(RemoteBackend())
+        module.register_quail_extension = register
+        patch.setitem(sys.modules, module_name, module)
+        registry = built_in_registry()
+        scan = DocumentInput(
+            node_id="input:d",
+            alias="d",
+            input_id="d",
+            n_docs=2,
+        )
+        graph = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
+        from quail.execution import (
+            PhysicalRequest,
+            document_input,
+        )
 
-    module.register_quail_extension = register
-    monkeypatch.setitem(sys.modules, module_name, module)
-    registry = built_in_registry()
-    scan = DocumentInput(
-        node_id="input:d",
-        alias="d",
-        input_id="d",
-        n_docs=2,
-    )
-    graph = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
-    from quail.execution import (
-        PhysicalRequest,
-        document_input,
-    )
+        request = PhysicalRequest(
+            plan_envelope(
+                backend=ExampleBackend.name,
+                model="qwen3-4b-fp8",
+                device="h100-sxm",
+                workers=1,
+                graph=graph,
+                codecs=registry.codecs,
+            ),
+            {"d": document_input(pa.array([[1], [2]]))},
+        )
+        registry.load_extension(module)
+        response = _execute_physical(request, registry)
 
-    request = PhysicalRequest(
-        plan_envelope(
-            backend=RemoteBackend.name,
-            model="qwen3-4b-fp8",
-            device="h100-sxm",
-            workers=1,
-            graph=graph,
-            codecs=registry.codecs,
-        ),
-        {"d": document_input(pa.array([[1], [2]]))},
-    )
-    registry.load_extension(module)
-    response = _execute_physical(request, registry)
-
-    assert response.metrics == {
-        "backend": "test.remote",
-        "nodes": ["input:d"],
-    }
+        assert response.metrics == {
+            "backend": "test.example",
+            "nodes": ["input:d"],
+        }
 
 
-def test_explain_shared_inputs_and_extension_fields():
+def test_physical_explain_shows_shared_inputs_and_metrics():
     from quail.physical.base import input_ports
 
     source = DocumentInput(node_id="input:d", alias="d", n_docs=100)
@@ -296,8 +293,6 @@ def test_explain_shared_inputs_and_extension_fields():
     assert "input:d" not in text
     assert "input:d[ids:d]" in graph.explain(verbose=True)
 
-
-def test_explain_missing_metrics_are_not_zero():
     from quail.explain import physical_tree
     from quail.runtime.runner import NodeMetrics
 

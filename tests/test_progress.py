@@ -3,7 +3,7 @@
 from quail.progress import Progress, logger, quiet, say, set_gpu_index
 
 
-def test_quiet_suppresses_progress_lines(capsys):
+def test_progress_labels_and_quiet_mode(capsys):
     say("shown")
     with quiet():
         say("hidden")
@@ -16,8 +16,6 @@ def test_quiet_suppresses_progress_lines(capsys):
     assert "[quail] step done: 0/2 documents" in out
     assert out.strip().endswith("documents/s, extra")
 
-
-def test_gpu_labels_include_warmup_and_filter_progress(capsys):
     try:
         set_gpu_index(3)
         with quiet():

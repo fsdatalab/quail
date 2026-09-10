@@ -6,7 +6,6 @@
     "logical-rules",
     "physical-nodes",
     "model-backends",
-    "compute-providers",
     "observers",
     "models"
   ],

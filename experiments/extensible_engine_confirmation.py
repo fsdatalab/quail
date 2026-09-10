@@ -41,6 +41,7 @@ image = (
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
         "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
@@ -87,10 +88,10 @@ def _save(name: str, value: dict) -> str:
 
 
 def _query_record(query_id, query, gpu_count):
-    from quail.runtime.local import execute_worker_query
+    from quail.runtime.execute import execute_query
     from quail.specs import H100_USD_PER_HOUR
 
-    result = execute_worker_query(query)
+    result = execute_query(query)
     table = result.collect()
     report = result.report
     join_stages = [

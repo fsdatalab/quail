@@ -1,8 +1,8 @@
 """Create the plot and Markdown report for one QUAIL-B evaluation.
 
 uv run --with matplotlib python reports/make_quailb_eval_plots.py \
-        --input results/benchmark/<summary>.json \
-        --report results/benchmark/<report>.md
+        --input results/<run-id> \
+        --report results/<run-id>/report.md
 """
 
 import argparse
@@ -18,8 +18,6 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-PLOTS = HERE / "plots" / "benchmark"
-PLOTS.mkdir(parents=True, exist_ok=True)
 
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
@@ -29,11 +27,6 @@ from plot_colors import BLUE, GREEN, ORANGE  # noqa: E402
 def _successful(data: dict, pass_name: str) -> list[dict]:
     return [row for row in data["passes"][pass_name]["queries"]
             if "error" not in row]
-
-
-def plot_path_for(data: dict, report_path: Path) -> Path:
-    stem = data.get("artifact_stem", report_path.stem)
-    return PLOTS / f"{stem}.png"
 
 
 def make_plot(data: dict, destination: Path) -> None:
@@ -85,7 +78,7 @@ def _query_table(rows: list[dict]) -> list[str]:
     lines = [
         "| Query | Runtime (s) | Boot (s) | H100 inference cost (USD) | "
         "H100 cost with boot (USD) | Tokens | Cost per 1M tokens | "
-        "Documents per second | Answer accuracy | Output F1 |",
+        "Throughput | Answer accuracy | Output F1 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
@@ -95,6 +88,9 @@ def _query_table(rows: list[dict]) -> list[str]:
             continue
         answer = row["accuracy"]["answer_accuracy"]
         output = row["accuracy"]["output_accuracy"]
+        pair_rate = row.get("document_pairs_per_second")
+        throughput = (f"{pair_rate:.2f} pairs/s" if pair_rate is not None
+                      else f"{row['documents_per_second']:.2f} docs/s")
         lines.append(
             f"| {row['query']} | {row['runtime_s']:.2f} | "
             f"{float(row.get('boot_s') or 0):.2f} | "
@@ -102,7 +98,7 @@ def _query_table(rows: list[dict]) -> list[str]:
             f"{row['cost_with_boot_usd']:.6f} | "
             f"{row['tokens_processed']:,} | "
             f"${row['inference_cost_per_million_tokens_usd']:.4f} | "
-            f"{row['documents_per_second']:.2f} | "
+            f"{throughput} | "
             f"{_percent(answer['accuracy'])} | "
             f"{_percent(output['f1'])} |")
     return lines
@@ -133,10 +129,6 @@ def write_report(data: dict, input_path: Path,
         "- The cost estimate excludes Modal CPU, host memory, and volume costs.",
         ("- Ground truth loading happens before the run starts. It is "
          "excluded from every runtime and cost metric."),
-        "",
-        "## Prediction",
-        "",
-        data.get("prediction") or "No prediction was supplied before the run.",
         "",
         "## Measured results",
         "",
@@ -182,8 +174,9 @@ def write_report(data: dict, input_path: Path,
         ("`tokens_processed` is the sum of fresh tokens sent through "
          "model forward calls. Tokens read from KV are not counted again."),
         "",
-        ("`documents_per_second` divides the input row count by query "
-         "runtime. A self join counts the table once for each alias."),
+        ("Filter throughput divides input document rows by query runtime. "
+         "Join throughput divides evaluated pairs across all join stages "
+         "by query runtime."),
         "",
         ("`inference_cost_usd` multiplies query runtime by the H100 hourly "
          "price and GPU count. `cost_with_boot_usd` also includes model "
@@ -196,27 +189,35 @@ def write_report(data: dict, input_path: Path,
         "## Data",
         "",
         f"- The local aggregate summary is `{shown_input}`.",
-        ("- The same aggregate summary is "
-         f"`{data['aggregate_volume_path']}` on the `quail-results` "
-         "Modal volume."),
-        f"- The raw query data is `{data['raw_volume_path']}` on the "
-        "`quail-results` Modal volume.",
-        "- Ground-truth labels remain under "
-        "`/results/ground_truth/quailb/schema_v1`.",
     ])
+    for field, label in (
+        ("aggregate_volume_path", "Saved summary"),
+        ("raw_volume_path", "Saved query answers"),
+    ):
+        if data.get(field):
+            lines.append(f"- {label}: `{data[field]}`.")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text("\n".join(lines) + "\n")
+
+
+def load_summary(path, backend="quail"):
+    """Read a summary JSON or one backend from a downloaded run directory."""
+    path = Path(path).resolve()
+    if path.is_dir():
+        manifest = json.loads((path / "manifest.json").read_text())
+        path = path / manifest["summaries"][backend]
+    return json.loads(path.read_text()), path
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--report", required=True)
+    parser.add_argument("--backend", default="quail")
     args = parser.parse_args()
-    input_path = Path(args.input).resolve()
+    data, input_path = load_summary(args.input, args.backend)
     report_path = Path(args.report).resolve()
-    data = json.loads(input_path.read_text())
-    plot_path = plot_path_for(data, report_path)
+    plot_path = report_path.with_suffix(".png")
     make_plot(data, plot_path)
     write_report(data, input_path, report_path, plot_path)
     print(f"wrote {report_path}")

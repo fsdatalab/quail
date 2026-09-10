@@ -49,7 +49,7 @@ def _scans(plan):
             if isinstance(node, Scan)}
 
 
-def test_rule_keeps_only_returned_columns_on_each_scan():
+def test_projection_rule_preserves_schema_and_is_idempotent():
     plan = _joined_plan([
         ColumnRef("r", "reviews", "id"),
         ColumnRef("p", "products", "asin"),
@@ -79,8 +79,6 @@ def test_rule_keeps_only_returned_columns_on_each_scan():
         ColumnRef("p", "products", "asin"),
     )
 
-
-def test_rule_is_idempotent_and_leaves_other_nodes_alone():
     plan = _joined_plan([ColumnRef("r", "reviews", "id")])
     once = push_down_projection(plan.root)
     twice = push_down_projection(once)
@@ -94,8 +92,8 @@ def test_rule_is_idempotent_and_leaves_other_nodes_alone():
     assert changed == ()
 
 
-def _session(tmp_path):
-    session = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
+def _session(tmp_path, tokenizer=fake_tok):
+    session = quail.Session(EngineConfig(gpus=1), tokenizer=tokenizer)
     path = tmp_path / "reviews.parquet"
     pq.write_table(pa.table({
         "id": ["r0", "r1", "r2"],
@@ -108,8 +106,17 @@ def _session(tmp_path):
     return session
 
 
-def test_session_loads_only_the_columns_the_query_returns(tmp_path):
-    session = _session(tmp_path)
+def test_projected_results_and_token_reuse(tmp_path):
+    reviews = ["good one", "bad one", "fine one"]
+    calls = []
+
+    def counting_tok(text):
+        # Prompts are tokenized on every query; count documents only.
+        if text in reviews:
+            calls.append(text)
+        return fake_tok(text)
+
+    session = _session(tmp_path, tokenizer=counting_tok)
     truth = {"r": {"q:": [1, 0, 1]}}
     query = session.sql(
         "SELECT r.stars, r.id FROM reviews r WHERE "
@@ -122,10 +129,18 @@ def test_session_loads_only_the_columns_the_query_returns(tmp_path):
     assert scan.columns == ("stars", "id")
     store = query._token_inputs["r"]
     assert store.projected_columns == ("stars", "id")
+    tokenized = len(calls)
+    assert tokenized > 0
 
+    second = _run(session.sql(
+        "SELECT r.stars, r.review FROM reviews r WHERE "
+        "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
+    assert sorted(second.to_rows()) == [(3, "fine one"), (5, "good one")]
+    assert len(calls) == tokenized
+    assert len(session._token_stores) == 1
+    assert sorted(name for _, name in session._column_stores) == [
+        "id", "review", "stars"]
 
-def test_session_returns_the_document_text_and_star(tmp_path):
-    session = _session(tmp_path)
     truth = {"r": {"q:": [0, 1, 0]}}
 
     text = _run(session.sql(
@@ -138,48 +153,8 @@ def test_session_returns_the_document_text_and_star(tmp_path):
         "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
     assert star.columns == ["r.id", "r.review", "r.stars", "r.wide"]
     assert star.to_rows() == [("r1", "bad one", 1, "y" * 50)]
-
-
-def test_second_query_with_other_columns_does_not_tokenize_again(tmp_path):
-    reviews = ["good one", "bad one", "fine one"]
-    calls = []
-
-    def counting_tok(text):
-        # prompt parts are tokenized on every query; count documents only
-        if text in reviews:
-            calls.append(text)
-        return fake_tok(text)
-
-    session = quail.Session(EngineConfig(gpus=1), tokenizer=counting_tok)
-    path = tmp_path / "reviews.parquet"
-    pq.write_table(pa.table({
-        "id": ["r0", "r1", "r2"],
-        "review": reviews,
-        "stars": [5, 1, 3],
-    }), str(path))
-    session.register("reviews", quail.DocumentProvider.from_parquet(
-        str(path), id_col="id"))
-    truth = {"r": {"q:": [1, 0, 1]}}
-
-    first = _run(session.sql(
-        "SELECT r.id FROM reviews r WHERE "
-        "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
-    # the first query tokenizes the 25 document sample once to pick the
-    # token type and once more when writing the file
-    tokenized = len(calls)
-    assert tokenized > 0
-    second = _run(session.sql(
-        "SELECT r.stars, r.review FROM reviews r WHERE "
-        "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
-
-    assert sorted(first.to_rows()) == [("r0",), ("r2",)]
-    assert sorted(second.to_rows()) == [(3, "fine one"), (5, "good one")]
-    # the tokenizer sample and the token file are written once; the
-    # second query only copies the two new value columns
     assert len(calls) == tokenized
-    assert len(session._token_stores) == 1
-    assert sorted(name for _, name in session._column_stores) == [
-        "id", "review", "stars"]
+    session.close()
 
 
 class _UnstableProvider:
@@ -212,11 +187,8 @@ class _UnstableProvider:
         }).select(list(request.columns))
         return table.to_reader()
 
-    def remote_source(self):
-        return None
 
-
-def test_misaligned_second_scan_raises_and_caches_nothing():
+def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
     session = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
     provider = _UnstableProvider()
     session.register("docs", provider)
@@ -231,9 +203,6 @@ def test_misaligned_second_scan_raises_and_caches_nothing():
     assert len(list(Path(session._token_directory.name).iterdir())) == 2
     session.close()
 
-
-def test_failed_tokenizer_surfaces_its_own_error_and_leaves_no_files(
-        tmp_path):
     def broken(text):
         raise ValueError("tokenizer failed")
 

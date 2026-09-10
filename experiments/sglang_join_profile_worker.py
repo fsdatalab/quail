@@ -132,8 +132,8 @@ def profile_worker(directory, connection, input_detail=False):
 
         request_module.run_join_grouped = profiled_join
         result = run_backend_group(
-            data_dir="/results/quailb_data", model="qwen3-4b-fp8", sf=0.1, lf=1,
-            query_ids=("FEV-9",), run_label=root.name, prediction=PREDICTION_TEXT,
+            data_dir="/results/quailb_data", model="qwen3-4b-fp8", sf=0.1,
+            query_ids=("FEV-9",), run_dir=str(root),
             ground_truth_collection="gt_77bb8b128743a79aedddaa24c808c3f8",
             methods=("pipelined_sglang",),
         )

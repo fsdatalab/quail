@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-from urllib.parse import urlparse
 
 import pyarrow as pa
 
@@ -48,8 +46,6 @@ class TableProvider(Protocol):
 
     def scan(self, request: ScanRequest) -> pa.RecordBatchReader: ...
 
-    def remote_source(self) -> Mapping[str, Any] | None: ...
-
 
 def _check_request(schema: pa.Schema, request: ScanRequest) -> None:
     missing = [name for name in request.columns
@@ -75,9 +71,6 @@ class ArrowDatasetProvider:
 
     dataset: Any
     id_col: str
-    source: Mapping[str, Any] | None = field(
-        default=None, compare=False, repr=False
-    )
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -105,9 +98,6 @@ class ArrowDatasetProvider:
             return scanner.to_reader()
         return _table_reader(scanner.head(request.limit), request.batch_rows)
 
-    def remote_source(self) -> Mapping[str, Any] | None:
-        """Return a source that another process can open."""
-        return None if self.source is None else dict(self.source)
 
 @dataclass(frozen=True)
 class HuggingFaceProvider:
@@ -165,15 +155,6 @@ class HuggingFaceProvider:
             table = table.slice(0, request.limit)
         return _table_reader(table, request.batch_rows)
 
-    def remote_source(self) -> Mapping[str, Any]:
-        """Return a source that another process can open."""
-        return {
-            "type": "huggingface",
-            "dataset": self.dataset_name,
-            "id_col": self.id_col,
-            "split": self.split,
-            "config": self.config,
-        }
 
 @dataclass(frozen=True)
 class MemoryTableProvider:
@@ -206,9 +187,6 @@ class MemoryTableProvider:
             table = table.slice(0, request.limit)
         return _table_reader(table, request.batch_rows)
 
-    def remote_source(self) -> None:
-        """Return no remote source for process local memory."""
-        return None
 
 class DocumentProvider:
     """Factories for built in table providers."""
@@ -226,11 +204,7 @@ class DocumentProvider:
         if id_col not in columns:
             raise CompileError(
                 f"id column {id_col!r} not in dataset schema {columns}")
-        return ArrowDatasetProvider(
-            dataset,
-            id_col,
-            source=_remote_arrow_source(dataset, id_col),
-        )
+        return ArrowDatasetProvider(dataset, id_col)
 
     @classmethod
     def from_parquet(
@@ -240,23 +214,7 @@ class DocumentProvider:
         import pyarrow.dataset as ds
 
         dataset = ds.dataset(path, format="parquet")
-        provider = cls.from_dataset(dataset, id_col=id_col)
-        paths = (
-            [os.fspath(path)]
-            if isinstance(path, (str, os.PathLike))
-            else [os.fspath(value) for value in path]
-        )
-        if paths and all(_is_remote_path(value) for value in paths):
-            return ArrowDatasetProvider(
-                dataset,
-                id_col,
-                source={
-                    "type": "parquet",
-                    "paths": paths,
-                    "id_col": id_col,
-                },
-            )
-        return provider
+        return cls.from_dataset(dataset, id_col=id_col)
 
     @classmethod
     def from_ipc(cls, path: str, id_col: str) -> ArrowDatasetProvider:
@@ -325,73 +283,3 @@ class Catalog:
 
     def __contains__(self, name: str) -> bool:
         return name in self.providers
-
-
-def _is_remote_path(path: str) -> bool:
-    return urlparse(path).scheme.lower() in {
-        "s3", "gs", "gcs", "abfs", "abfss", "hdfs"
-    }
-
-
-def _remote_arrow_source(dataset, id_col: str) -> Mapping[str, Any] | None:
-    files = list(getattr(dataset, "files", ()) or ())
-    if not files:
-        return None
-    file_format = type(getattr(dataset, "format", None)).__name__
-    if file_format != "ParquetFileFormat":
-        return None
-    filesystem = type(getattr(dataset, "filesystem", None)).__name__
-    prefixes = {
-        "S3FileSystem": "s3://",
-        "GcsFileSystem": "gs://",
-        "AzureFileSystem": "abfs://",
-        "HadoopFileSystem": "hdfs://",
-    }
-    prefix = prefixes.get(filesystem)
-    if prefix is None:
-        return None
-    paths = [
-        path if _is_remote_path(path) else prefix + path.lstrip("/")
-        for path in files
-    ]
-    return {
-        "type": "parquet",
-        "paths": paths,
-        "id_col": id_col,
-    }
-
-
-def _source_id_column(value: Mapping[str, Any]) -> str:
-    id_col = str(value.get("id_col", ""))
-    if not id_col:
-        raise ValueError("a remote source needs an id_col")
-    return id_col
-
-
-def _read_remote_parquet(value: Mapping[str, Any]) -> TableProvider:
-    paths = value.get("paths")
-    if not isinstance(paths, list) or not paths:
-        raise ValueError("a Parquet source needs at least one path")
-    if not all(isinstance(path, str) and path for path in paths):
-        raise TypeError("Parquet source paths must be strings")
-    source = paths[0] if len(paths) == 1 else paths
-    return DocumentProvider.from_parquet(
-        source, id_col=_source_id_column(value)
-    )
-
-
-def _read_remote_huggingface(value: Mapping[str, Any]) -> TableProvider:
-    return DocumentProvider.from_hf(
-        str(value["dataset"]),
-        id_col=_source_id_column(value),
-        split=str(value.get("split", "train")),
-        config=str(value.get("config", "")),
-    )
-
-
-def built_in_source_readers() -> dict[str, Any]:
-    """Return the built in remote table source readers."""
-    return {
-        "parquet": _read_remote_parquet,
-        "huggingface": _read_remote_huggingface,
-    }

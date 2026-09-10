@@ -22,7 +22,7 @@ def _sink_source(plan):
     return sink.inputs[0].source
 
 
-def test_gate_before_full_join_keeps_recombine(catalog):  # noqa: F811
+def test_join_recombination_plans_and_results(catalog, tmp_path):  # noqa: F811
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "threads", tok).alias("t"),
                         prompt("g {0} {1}", col("r.review"),
@@ -40,8 +40,6 @@ def test_gate_before_full_join_keeps_recombine(catalog):  # noqa: F811
     assert [n for n in plan.nodes if isinstance(n, Recombine)]
     assert _sink_source(plan).node_id == "recombine"
 
-
-def test_request_backend_skips_recombine_for_one_full_join():
     table = pa.table({
         "id": ["a", "b"], "body": ["one", "two"],
     })
@@ -60,8 +58,6 @@ def test_request_backend_skips_recombine_for_one_full_join():
         assert not [n for n in plan.nodes if isinstance(n, Recombine)]
         assert _sink_source(plan).port == "join_answers:0"
 
-
-def test_single_join_query_returns_the_true_pairs(tmp_path):
     session = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
     pq.write_table(pa.table({
         "id": ["r0", "r1", "r2"],

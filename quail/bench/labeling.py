@@ -38,9 +38,8 @@ from pathlib import Path
 import modal
 import pyarrow as pa
 
-from quail.runtime.volumes import hf_cache, kernel_cache, results_vol
-from quail.runtime.worker import build_worker_image
 from quail_b import data
+from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (
     MODEL_NAME,
     MODEL_REVISION,
@@ -59,7 +58,6 @@ from quail_b.predicates import (
     workload_specs,
 )
 from quail_b.predicates import label_set_identity as _label_set_identity
-from quail_b.store import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 
 SCALE_FACTOR = 0.1
 SUPPORTED_SCALE_FACTORS = (0.1, 0.5, 1.0)
@@ -1430,7 +1428,28 @@ def publish(root: Path, collection_ids: list[str],
 # functions use the worker image the benchmark runner uses. Publishing
 # needs boto3 and no engine, so it gets a small image; the AWS keys
 # come from the machine that runs the command.
-image = build_worker_image(local_python_sources=("quail_b",))
+hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
+results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
+    .entrypoint([])
+    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow",
+                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+    .env({
+        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
+        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+        "VLLM_LOGGING_LEVEL": "WARNING",
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
+        "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
+    })
+    .add_local_python_source("quail", "quail_b")
+)
 publish_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("boto3", "pyarrow", "numpy", "sqlglot>=27.0",

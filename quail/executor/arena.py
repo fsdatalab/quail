@@ -177,8 +177,7 @@ class KVArena:
     """The tensor backing for the arena, plus the accounting above.
 
     Per-layer K and V pools of shape (n_pages, page_tokens, n_kv,
-    d_head). Import-time torch dependency is deliberate here; this
-    class only exists inside the Modal image.
+    d_head). Torch is imported when the tensor pools are created.
     """
 
     def __init__(self, n_layers: int, n_pages: int, page_tokens: int,
