@@ -15,24 +15,24 @@ uv add "quail-b @ git+https://github.com/fsdatalab/quail-bench.git"
 
 ## Use
 
-Load a query and its input tables. The same code works for filters and joins:
+Load a benchmark's queries, input tables, and reference labels:
 
 ```python
 import quail_b as benchmark
 
-query = benchmark.get_query("IMDB-4")
-tables = {}
-for name in sorted({alias.table for alias in query.aliases}):
-    tables[name] = benchmark.load_table(name, scale_factor=0.1)
+suite = benchmark.load_benchmark(["IMDB-4"], scale_factor=0.1)
+query = suite.queries[0]
+tables = suite.tables
 ```
 
 IMDB-4 filters reviews for positive aspects and discussion of the ending,
 then joins them with the movie aspects they discuss.
 
-- Scale factors `0.1`, `0.5`, and `1.0` are supported. Use the same scale
-  for every input table.
-- Tables are downloaded from public S3 as Arrow tables. No AWS account is needed.
-- Add `limit=100` for a small example. Omit it for a full benchmark run.
+- Scale factors `0.1`, `0.5`, and `1.0` are supported.
+- Inputs and labels load from public S3. No AWS account or Modal volume is needed.
+- QUAIL-B checks input contents and row order against the published corpus.
+- For a small example, use `benchmark.load_table("reviews", limit=100)`.
+  Full benchmark scoring requires the complete inputs.
 - For execution, use your engine's runner. For example, the
   [Quail runner](https://github.com/fsdatalab/quail-exploration/blob/main/quail/bench/quailb.py)
   translates these definitions into Quail queries.
@@ -42,10 +42,12 @@ See the [query definitions](quail_b/queries.py),
 
 ## Generate a report
 
-The runner compares its answers with the saved reference labels using
-[`Evaluator`](quail_b/scoring.py). Model-generated labels use Qwen3 32B fp8;
-FEVER and LePaRD also use source labels. Keep the query id, scale factor,
-and label collection id with the results.
+Your runner supplies a `RunOutput` with predicate answers and final document IDs,
+plus measured runtime and token counts. [`suite.score()`](quail_b/benchmark.py)
+computes accuracy, throughput, and GPU cost. `suite.summarize()` combines the
+query records. QUAIL-B does not execute queries or save files.
+
+Model-generated labels use Qwen3 32B fp8. FEVER and LePaRD also use source labels.
 
 For example, Quail generates a report from its saved summary JSON with this
 command, run from the [Quail repository](https://github.com/fsdatalab/quail-exploration):

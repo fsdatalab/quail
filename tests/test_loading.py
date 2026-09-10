@@ -64,3 +64,40 @@ def test_public_s3_and_local_reads(monkeypatch, tmp_path):
         with pytest.raises(FileNotFoundError):
             _files._read_bytes(root, "missing.json")
     assert anonymous and all(options == {"anonymous": True} for options in anonymous)
+
+
+def test_load_benchmark_validates_selected_inputs(tmp_path):
+    from quail_b.data import DATA_SEED, SOURCE_REVISIONS, corpus_identity
+
+    tables = {
+        "reviews": pa.table({
+            "id": ["r0", "r1"], "body": ["good acting", "poor ending"]}),
+        "aspects": pa.table({"id": ["a0"], "aspect": ["acting"]}),
+    }
+    for sf, corpus_id in PUBLISHED_CORPORA.items():
+        directory = tmp_path / GROUND_TRUTH_ROOT / "corpora" / corpus_id
+        directory.mkdir(parents=True)
+        manifest = corpus_identity(tables, sf, DATA_SEED, SOURCE_REVISIONS)
+        manifest["corpus_id"] = corpus_id
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+        for name, table in tables.items():
+            pq.write_table(table, directory / f"{name}.parquet")
+        for data_dir in (None, directory):
+            loaded = benchmark.load_benchmark(
+                ["IMDB-4"], scale_factor=sf, root=tmp_path,
+                data_dir=data_dir, accuracy=False)
+            assert loaded.corpus_id == corpus_id
+            assert loaded.tables == tables
+            assert loaded.queries == (benchmark.get_query("IMDB-4"),)
+        filtered = benchmark.load_benchmark(
+            "IMDB-1", scale_factor=sf, root=tmp_path, accuracy=False)
+        assert set(filtered.tables) == {"reviews"}
+        pq.write_table(tables["reviews"].slice(0, 1), directory / "reviews.parquet")
+        with pytest.raises(ValueError, match="reviews does not match"):
+            benchmark.load_benchmark(
+                "IMDB-4", scale_factor=sf, root=tmp_path, accuracy=False)
+    for ids in (["unknown"], [], ["IMDB-1", "IMDB-1"]):
+        with pytest.raises(ValueError):
+            benchmark.select_queries(ids)
+    with pytest.raises(ValueError, match="scale factor"):
+        benchmark.select_queries(scale_factor=0.2)

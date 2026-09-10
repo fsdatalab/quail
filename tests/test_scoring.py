@@ -157,6 +157,25 @@ def test_query_cost_token_and_document_metrics():
     assert summary["documents_per_second"] == 2.0
     assert summary["answer_accuracy"]["accuracy"] == 1.0
 
+    from quail_b import Benchmark
+
+    benchmark = Benchmark((SPEC,), {
+        name: pa.Table.from_pylist(rows) for name, rows in CORPUS.items()
+    }, 0.1, "c_test", _truth())
+    scored = benchmark.score(
+        SPEC.id, _output([1, 0], [("r0", "a0")]),
+        {"wall_s": 2.0, "boot_s": 3.0, "fresh_tokens": 100},
+        h100_usd_per_hour=3.6)
+    assert scored["accuracy"] == row["accuracy"]
+    assert scored["evaluated_document_pairs"] == 2
+    assert scored["document_pairs_per_second"] == 1.0
+    assert scored["inference_cost_usd"] == 0.002
+    suite = benchmark.summarize(
+        [scored], model="test", backend="test", h100_usd_per_hour=3.6,
+        pass_wall_s=2.0)
+    assert suite["passes"]["single"]["summary"] == summary
+    assert suite["input_tables"] == {"reviews": 2, "aspects": 2}
+
 
 def fever_truth():
     """Labels for FEV-9 over a three claim, three evidence corpus."""
@@ -211,9 +230,20 @@ def test_fev9_expected_rows_follow_the_join_chain_and_every_filter():
         "c1": ["c0"], "c2": ["c1"], "e1": ["e0"], "e2": ["e1"]}
 
 
-def test_load_ground_truth_from_volume_layout(tmp_path):
+def test_load_benchmark_with_local_reference_labels(tmp_path):
     collection_id = "gt_test"
     label_set_id = "ls_filter"
+    import quail_b as benchmark
+    from quail_b.data import (
+        DATA_SEED,
+        PUBLISHED_CORPORA,
+        SOURCE_REVISIONS,
+        corpus_identity,
+    )
+
+    corpus_id = PUBLISHED_CORPORA[0.1]
+    spec = benchmark.get_query("IMDB-1")
+    template = spec.aliases[0].filters[0]
     predicate_key = "test.review.filter"
     collection_dir = (tmp_path / GROUND_TRUTH_ROOT / "collections"
                       / collection_id)
@@ -224,7 +254,7 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
     collection = {
         "status": "complete",
         "collection_id": collection_id,
-        "corpus_id": "c_test",
+        "corpus_id": corpus_id,
         "scale_factor": 0.1,
         "label_sets": {predicate_key: label_set_id},
         "summary": {"model": "qwen3-32b-fp8"},
@@ -235,10 +265,10 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
     (old_dir / "manifest.json").write_text(json.dumps({
         "status": "complete",
         "collection_id": "gt_old",
-        "corpus_id": "c_test",
+        "corpus_id": corpus_id,
         "scale_factor": 0.1,
     }))
-    corpus_dir = (tmp_path / GROUND_TRUTH_ROOT / "corpora" / "c_test")
+    corpus_dir = (tmp_path / GROUND_TRUTH_ROOT / "corpora" / corpus_id)
     corpus_dir.mkdir(parents=True)
     (corpus_dir / "active_collection.json").write_text(json.dumps({
         "collection_id": collection_id,
@@ -248,7 +278,7 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
         "rows": 2,
         "source_rows": {"qwen3-32b-fp8": 2},
         "predicate": _predicate(
-            predicate_key, FILTER, "filter", "reviews"),
+            predicate_key, template, "filter", "reviews"),
     }
     (label_dir / "manifest.json").write_text(json.dumps(manifest))
     pq.write_table(pa.Table.from_pylist([
@@ -260,13 +290,30 @@ def test_load_ground_truth_from_volume_layout(tmp_path):
 
     loaded = load_ground_truth(
         tmp_path, scale_factor=0.1,
-        corpus_id="c_test")
+        corpus_id=corpus_id)
 
     assert loaded.collection_id == collection_id
     assert loaded.answer(predicate_key, "r0") is True
     assert loaded.answer(predicate_key, "r1") is False
-    assert loaded.key_for_template(FILTER) == predicate_key
+    assert loaded.key_for_template(template) == predicate_key
 
+    reviews = pa.Table.from_pylist(CORPUS["reviews"])
+    corpus = corpus_identity(
+        {"reviews": reviews}, 0.1, DATA_SEED, SOURCE_REVISIONS)
+    corpus["corpus_id"] = corpus_id
+    (corpus_dir / "manifest.json").write_text(json.dumps(corpus))
+    pq.write_table(reviews, corpus_dir / "reviews.parquet")
+    suite = benchmark.load_benchmark("IMDB-1", root=tmp_path)
+    output = RunOutput(
+        {("r", 0): pa.table({"r": ["r0", "r1"], "answer": [True, False]})},
+        {}, pa.table({"r": ["r0"]}))
+    row = suite.score(
+        "IMDB-1", output, {"wall_s": 2.0, "fresh_tokens": 100},
+        h100_usd_per_hour=3.6)
+    assert row["accuracy"]["answer_accuracy"]["accuracy"] == 1.0
+    assert row["documents_per_second"] == 1.0
+    assert "document_pairs_per_second" not in row
+    assert suite.ground_truth.collection_id == collection_id
 
 
 def _reused_label_layout(tmp_path):
