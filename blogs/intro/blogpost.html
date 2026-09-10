@@ -122,8 +122,11 @@ table of medical reports, and another table of possible adverse
 reactions.<a href="#fn1" class="footnote-ref" id="fnref1"
 role="doc-noteref"><sup>1</sup></a> The user wants to identify which
 reactions each report attributes to the patient, but only for reports
-that describe female patients. They might run the following AI-SQL query
-(which we refer to as BIO-3 in the benchmark we are building):</p>
+that describe female patients. They might run the following AI-SQL
+query, which we call BIO-3 in <a
+href="https://github.com/fsdatalab/quail-bench">quail-bench</a>.<a
+href="#fn2" class="footnote-ref" id="fnref2"
+role="doc-noteref"><sup>2</sup></a></p>
 <div class="sourceCode" id="cb1"><pre
 class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> r.<span class="kw">id</span>, m.<span class="kw">id</span></span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> reports <span class="kw">AS</span> r</span>
@@ -161,14 +164,23 @@ But still, the resulting query plans can end up needing hundreds of
 thousands, or even millions, of LLM calls.</p>
 <h1 id="challenges-of-executing-ai-sql-queries">2. Challenges of
 executing AI-SQL queries</h1>
-<p><strong>Executing the query with vLLM</strong>. Let us use vLLM to
-execute the example query plan.</p>
+<p><strong>Executing the query with vLLM.</strong> A natural thought is
+to use an existing inference engine, such as vLLM, to execute the query
+plan. For now, we take the query plan as given, and use the following
+“expert” plan:</p>
+<ol type="1">
+<li>We first run the report filter, so rejected reports never enter the
+join.</li>
+<li>We then join the reports that pass the filter with the reaction
+terms.</li>
+</ol>
+<div class="figure-block">
 <p><a href="figures/vllm-query-plan.svg"><img
-src="figures/vllm-query-plan.svg" style="width:90.0%"
+src="figures/vllm-query-plan.svg" style="width:100.0%"
 alt="The vLLM query plan for BIO-3." /></a></p>
-<p><em>Figure 1. To execute BIO-3, the vLLM baseline can run the report
-filter before the join, and uses each surviving report as the join
-anchor.</em></p>
+<p><em>Figure 1. The expert plan for BIO-3 runs the report filter before
+the join, and uses each surviving report as the join anchor.</em></p>
+</div>
 <p>To execute the plan with vLLM, we’d render one prompt for each report
 in the filter, and one prompt for each report and reaction pair in the
 join. We’d submit every prompt as a separate inference request. A simple
@@ -198,8 +210,7 @@ KV. It stores KV from every filter request, and evicts the least
 recently used blocks when the cache fills. As a result, vLLM may keep KV
 for a rejected report, while evicting KV for a report that will be used
 in the join. The evicted report prefix must then be computed again
-during the join. We call any prefix token that the engine recomputes
-after the same token prefix was computed earlier in the query <em>KV
+during the join. We call this unnecessary recomputation <em>KV
 regret</em>. Our vLLM implementation incurs 1.08 million KV regret
 tokens on this query! Then, during the join, vLLM also stores KV for the
 entire prompt, even though later requests reuse only the report prefix.
@@ -210,6 +221,7 @@ documents.</p>
 <p>The join submits hundreds of thousands of report and reaction pairs
 to vLLM as separate requests. The profiler trace below shows five
 seconds of GPU and CPU activity during the BIO-3 join.</p>
+<div class="figure-block wide-figure">
 <p><a href="figures/bio3_join_window.pdf"><img
 src="figures/bio3_join_window.png" style="width:100.0%"
 alt="Five seconds of GPU activity and recorded CPU operations during the profiled BIO-3 join." /></a></p>
@@ -221,34 +233,30 @@ below the operation that called them. Orange rectangles are vLLM
 scheduler operations, and blue rectangles are PyTorch or CUDA API calls
 from the CPU. Gray intervals have no recorded CPU operation, but they do
 not necessarily mean that the CPU is idle.</em></p>
+</div>
 <p>More than 99 percent of the prompt tokens come from the prefix cache,
 so each batch contains very little model computation. The GPU finishes
 each batch quickly, but the CPU still has to process and schedule every
 request in the next batch. When the CPU does not prepare the next batch
 in time, the GPU sits idle, even though hundreds of thousands of pairs
-are waiting. The GPU may also use its arithmetic units poorly while a
-batch is running, which is known as low model FLOPs utilization, or MFU.
-We do not address low MFU here. Modal provides useful background on <a
-href="https://modal.com/blog/gpu-utilization-guide">GPU utilization</a>
-and <a
-href="https://modal.com/blog/host-overhead-inference-efficiency">host
-overhead</a>.</p>
-<p>We can compare vLLM’s measured latency with a speed of light estimate
-for the same query plan. Although we don’t go into the full calculation
-in this post, we use a <a
+are waiting.<a href="#fn3" class="footnote-ref" id="fnref3"
+role="doc-noteref"><sup>3</sup></a></p>
+<p>We compare vLLM’s measured latency with a <em>speed of light
+estimate</em>, which is an optimistic lower bound on the latency of the
+same query plan. At a high level, we count the arithmetic work and HBM
+traffic required by the model, based on the model dimensions and token
+lengths. For each model operation, a <a
 href="https://modal.com/gpu-glossary/perf/roofline-model">roofline
-model</a> to estimate the time for each model operation. The roofline
-model takes the larger of an operation’s arithmetic time and the time
-required to move its data through GPU high bandwidth memory, or HBM. We
-then combine these operation level estimates according to the query
-plan. We assume that CPU and GPU work overlap, so the GPU never sits
-idle. We also assume that every model operation reaches the relevant
-peak hardware rate, and that the engine retains all reusable KV. Of
-course, no implementation can satisfy all of these assumptions in
-practice, so the estimate is an intentionally optimistic lower bound.
-The <a
+model</a> takes the larger of its arithmetic time and HBM time. We then
+add the times for operations that run one after another. The estimate
+assumes that the GPU reaches peak arithmetic throughput,<a href="#fn4"
+class="footnote-ref" id="fnref4" role="doc-noteref"><sup>4</sup></a> CPU
+and GPU work overlap, and all reusable KV remains available. No
+implementation can satisfy these assumptions exactly, so the speed of
+light estimate is not an achievable runtime. We do not describe the full
+calculation here, but the <a
 href="https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py">implementation
-in Quail</a> contains the full calculation.</p>
+in Quail</a> contains the details.</p>
 <p>For BIO-3, vLLM computes 14 percent of its input tokens more than
 once, because it evicted their KV. The vLLM run takes almost 12 times
 the speed of light estimate. Surely, we can do better!</p>
@@ -271,17 +279,17 @@ operators, planning rules, execution backends, models, or support for
 other hardware.</p>
 <p>We’ll walk through the components of Quail in the following
 paragraphs.</p>
-<figure>
-<img src="figures/quail-architecture.svg" style="width:100.0%"
-alt="Figure 3. Quail has three parts. Through the query frontend, the user provides Arrow tables or datasets and an AI-SQL or Python query, and selects the model and GPU. The frontend creates a logical plan. The query planner lowers it into a physical operator plan, after ordering filters and joins, choosing anchors, and sizing each model forward pass. The execution engine runs the physical operators." />
-<figcaption aria-hidden="true">Figure 3. Quail has three parts. Through
-the query frontend, the user provides Arrow tables or datasets and an
-AI-SQL or Python query, and selects the model and GPU. The frontend
-creates a logical plan. The query planner lowers it into a physical
-operator plan, after ordering filters and joins, choosing anchors, and
-sizing each model forward pass. The execution engine runs the physical
-operators.</figcaption>
-</figure>
+<div class="figure-block wide-figure">
+<p><a href="figures/quail-architecture.svg"><img
+src="figures/quail-architecture.svg" style="width:100.0%"
+alt="Quail architecture." /></a></p>
+<p><em>Figure 3. The query frontend creates a logical plan from the
+registered Arrow data and query. The model and GPU settings also inform
+planning. The planner estimates dataset statistics, and uses them to set
+the forward pass batch size and KV capacity. The planner then applies
+the three query rewrites shown, and produces a physical plan. The
+execution engine runs the physical plan across the CPU and GPU.</em></p>
+</div>
 <h2 id="query-frontend">Query frontend</h2>
 <p><strong>Dataset registration.</strong> Users begin by creating a
 <code>quail.Session</code> and registering each input under a table
@@ -322,10 +330,10 @@ is not provided, Quail will select it in the query planner.</p>
 GPUs when they create the session. The current release supports Qwen3 4B
 FP8 and Qwen3 32B FP8 on H100 GPUs. Users can add another model or GPU
 through Quail’s extension interface.</p>
-<p><strong>Query parsing.</strong> Quail uses SQLGlot to parse both
-Snowflake’s <code>AI_FILTER</code> syntax and BigQuery’s
-<code>AI.IF</code> syntax. The parser returns a logical query plan,
-which becomes the input to the query planner.</p>
+<p><strong>Query parsing.</strong> Quail uses SQLGlot to parse AI-SQL.<a
+href="#fn5" class="footnote-ref" id="fnref5"
+role="doc-noteref"><sup>5</sup></a> The parser returns a logical query
+plan, which becomes the input to the query planner.</p>
 <h2 id="query-planner">Query planner</h2>
 <p><strong>Overview.</strong> For BIO-3, we should run the filter before
 the join, to reduce the number of report and reaction pairs we evaluate.
@@ -345,10 +353,10 @@ estimated execution costs.</li>
 <p><strong>Estimating input sizes.</strong> We need the row count,
 average document length, and maximum document length for each dataset.
 Tokenizing every document before planning would delay the planner, so we
-tokenize up to 1,024 documents and calculate the average number of
-tokens per byte. We apply that ratio to the byte length of every
-document in the column. The planner uses the estimated lengths, while a
-background CPU thread tokenizes the full document columns.</p>
+estimate the document lengths from a random sample.<a href="#fn6"
+class="footnote-ref" id="fnref6" role="doc-noteref"><sup>6</sup></a> The
+planner uses the estimated lengths, while a background CPU thread
+tokenizes the full document columns.</p>
 <p><strong>Choosing the forward pass size.</strong> The planner chooses
 the maximum number of tokens to process in one model forward pass. The
 limit is the smaller of what fits in temporary activation memory, and
@@ -367,12 +375,14 @@ columns that appear in a prompt or in the final query result. We then
 push each filter down to its source dataset, so a document that fails a
 filter does not enter a later join. Figure 4 shows the filter pushdown
 for BIO-3.</p>
+<div class="figure-block wide-figure">
 <p><a href="figures/filter-pushdown.svg"><img
 src="figures/filter-pushdown.svg" style="width:100.0%"
 alt="BIO-3 before and after filter pushdown." /></a></p>
 <p><em>Figure 4. The logical plan from the parser places the report
 filter above the join. Quail pushes the filter down to the reports
 dataset, so rejected reports do not enter the join.</em></p>
+</div>
 <h3 id="ordering-filters">Ordering filters</h3>
 <p><strong>Filter rank.</strong> In 1993, <a
 href="https://dsf.berkeley.edu/jmh/miscpapers/sigmod93.pdf">Hellerstein
@@ -403,14 +413,15 @@ class="math inline">\(c_i^{\mathrm{later}}\)</span>, is the estimated
 time when another filter has already computed the document KV, so the
 model processes only the new filter prompt and attends to the cached
 document.</p>
-<p>We calculate both costs with a speed of light estimate. At a high
-level, we count the fresh tokens, attention pairs, KV tokens written,
-and KV tokens read. A fresh token is a token that the model must
-process, rather than a token whose KV is already available. We translate
-these counts into arithmetic work and HBM traffic for each part of the
-model. Let <span class="math inline">\(r\)</span> index the model parts
-that run one after another. For either cost, the estimated latency
-is:</p>
+<p>We calculate both costs with the speed of light estimate introduced
+in Section 2. We provide a bit more detail here, because Quail uses the
+estimate to compare physical plans. For each filter, we count the fresh
+tokens, attention pairs, KV tokens written, and KV tokens read. A fresh
+token is a token that the model must process, rather than a token whose
+KV is already available. We translate these counts into arithmetic work
+and HBM traffic for each part of the model. Let <span
+class="math inline">\(r\)</span> index the model parts that run one
+after another. For either cost, the estimated latency is:</p>
 <p><span class="math display">\[
 \sum_r \max\left(
 \frac{\mathrm{FLOPs}_{r}}{\mathrm{arithmetic\ throughput}_r},
@@ -419,10 +430,10 @@ is:</p>
 \]</span></p>
 <p>The maximum accounts for whether each part of the model is limited by
 arithmetic or HBM bandwidth. The sum accounts for the parts that run one
-after another. The estimate assumes peak hardware throughput and
-excludes software overhead. For filter ordering, we also assume an
-“infinite” KV cache, so document KV is never evicted between filters. We
-will describe the full speed of light model in a follow up post.</p>
+after another. For filter ordering, we also assume an “infinite” KV
+cache, so document KV is never evicted between filters. We will describe
+the full speed of light model, with worked examples for different models
+and GPUs, in a follow up post.</p>
 <p><strong>Costing a filter order.</strong> For an order <span
 class="math inline">\(\pi\)</span> over <span
 class="math inline">\(m\)</span> filters and <span
@@ -450,10 +461,13 @@ with the lowest estimated time.</p>
 <h3 id="ordering-joins-and-choosing-anchors">Ordering joins and choosing
 anchors</h3>
 <p><strong>Planning decisions.</strong> After ordering the filters, we
-choose the order of the joins and the anchor for each join. The join
-order determines how many documents reach each later join. The anchor is
-the document placed first in the prompt, so the anchor choice determines
-which document KV can be reused across pairs.</p>
+choose the <em>join order</em>, or the order in which Quail executes the
+joins. Documents that do not appear in any passing pair do not reach
+later joins, so an earlier join can reduce the number of pairs that
+later joins evaluate. We also choose an <em>anchor</em> for each join,
+which is the input whose document appears first in each prompt. The
+anchor choice determines which document KV Quail can reuse across
+pairs.</p>
 <p><strong>Estimating join cost.</strong> For a join between inputs
 <span class="math inline">\(A\)</span> and <span
 class="math inline">\(B\)</span>, let <span
@@ -482,25 +496,38 @@ n_A&#39; = n_A\left(1 - (1 - \sigma_{AB})^{n_B}\right),
 \qquad
 n_B&#39; = n_B\left(1 - (1 - \sigma_{AB})^{n_A}\right).
 \]</span></p>
+<p>A document in <span class="math inline">\(A\)</span> survives the
+join when it matches at least one of the <span
+class="math inline">\(n_B\)</span> documents in <span
+class="math inline">\(B\)</span>. Under the independence assumption, its
+probability of matching none of them is <span class="math inline">\((1 -
+\sigma_{AB})^{n_B}\)</span>, so its probability of surviving is <span
+class="math inline">\(1 - (1 - \sigma_{AB})^{n_B}\)</span>. We multiply
+the survival probability by <span class="math inline">\(n_A\)</span> to
+estimate <span class="math inline">\(n_A&#39;\)</span>, and estimate
+<span class="math inline">\(n_B&#39;\)</span> in the same way.</p>
 <p>We use <span class="math inline">\(n_A&#39;\)</span> and <span
 class="math inline">\(n_B&#39;\)</span> when estimating the costs of
 later joins. As with filters, we count the model computation and KV
 traffic for each candidate plan, and use the speed of light model to
 estimate its execution time. We will describe the full join cost model
 in a follow up post.</p>
-<p><strong>Searching the join plans.</strong> We search for the join
-order and anchor choices with the lowest estimated total execution time.
-In 1979, <a href="https://doi.org/10.1145/582095.582099">Selinger et
-al.</a> introduced the System R query optimizer, which searches left
-deep join plans with bottom up dynamic programming. In a left deep plan,
-each join adds one base dataset to the intermediate result built so far.
-A bushy plan can instead join two intermediate results.</p>
+<p><strong>Searching the join plans.</strong> We adapt the System R join
+ordering algorithm, introduced by <a
+href="https://doi.org/10.1145/582095.582099">Selinger et al.</a> in
+1979, to search for the join order and anchor choices with the lowest
+estimated total execution time. System R searches left-deep join plans
+with bottom up dynamic programming. In a left-deep plan, each join adds
+one base dataset to the intermediate result built so far. A bushy plan
+can instead join two intermediate results.</p>
+<div class="figure-block wide-figure">
 <p><a href="figures/join-plan-shapes.svg"><img
-src="figures/join-plan-shapes.svg" style="width:90.0%"
-alt="Left deep and bushy join plans." /></a></p>
-<p><em>Figure 5. A left deep plan adds one base dataset to the
+src="figures/join-plan-shapes.svg" style="width:100.0%"
+alt="Left-deep and bushy join plans." /></a></p>
+<p><em>Figure 5. A left-deep plan adds one base dataset to the
 intermediate result at each join, while a bushy plan can join two
-intermediate results. Quail searches left deep plans.</em></p>
+intermediate results. Quail searches left-deep plans.</em></p>
+</div>
 <p>Starting with one dataset at a time, the System R algorithm builds
 plans over two datasets, then three, and so on. It normally keeps only
 the cheapest partial plan for each subset of datasets. Selinger et
@@ -508,75 +535,115 @@ al. also retain a more expensive partial plan when it produces rows in
 an <a href="https://doi.org/10.1145/582095.582099">“interesting
 order”</a>, because that order may reduce the cost of a later join or
 sort.</p>
-<p><strong>Adapting System R for KV.</strong> We cannot keep only the
-cheapest partial plan for each set of datasets, because two plans over
-the same datasets may retain KV for different anchors. For example,
-after joining <span class="math inline">\(A\)</span> and <span
-class="math inline">\(B\)</span>, one plan may retain <span
-class="math inline">\(A\)</span>’s KV, while another retains <span
-class="math inline">\(B\)</span>’s. If the next join compares <span
-class="math inline">\(A\)</span> with <span
-class="math inline">\(C\)</span>, only the first plan can reuse <span
-class="math inline">\(A\)</span>’s KV. Fortunately, we can adapt System
-R’s rule for interesting orders, and retain separate partial plans for
-each anchor whose KV remains available. The chosen plan specifies the
-join order, the anchor for each join, and which dataset KV the execution
-engine should retain for a later join. We will describe the full
-algorithm in an upcoming technical report.</p>
+<p>We find that we have to adapt the System R algorithm slightly, for
+two reasons:</p>
+<ul>
+<li><p><strong>Available KV is part of the dynamic programming
+state.</strong> The set of joined datasets is not enough to describe a
+partial plan, because the cost of the remaining joins also depends on
+which dataset’s KV remains in HBM. For example, suppose two partial
+plans have both joined datasets <code>A</code> and <code>B</code>. One
+keeps <code>A</code>’s KV, while the other keeps <code>B</code>’s. If
+the next join compares <code>A</code> with <code>C</code>, only the
+first plan can reuse <code>A</code>’s KV. We could therefore miss the
+cheapest complete plan if we kept only the cheaper of the two partial
+plans. System R handles a related problem by retaining plans with
+different interesting orders. We apply the same idea to KV, and keep the
+cheapest partial plan for each combination of joined datasets and
+available anchor KV.</p></li>
+<li><p><strong>We retain plans with different kinds of work.</strong>
+Recall that the speed of light model tracks arithmetic work and HBM
+traffic separately, and estimates the time for each model component as
+the larger of its arithmetic time and HBM time. One partial plan may
+require less arithmetic work but more HBM traffic than another, so we
+cannot discard either plan based only on its current estimated time. We
+therefore keep the Pareto frontier over fresh tokens, attention pairs,
+KV tokens written, and KV tokens read. We discard a plan only when
+another plan requires no more work in every category. Once the dynamic
+program has constructed complete plans that include every join in the
+query, we apply the speed of light model and choose the plan with the
+lowest estimated time.</p></li>
+</ul>
+<p>The selected plan specifies the join order, the anchor for each join,
+and which KV the execution engine should retain. We will describe the
+full algorithm in an upcoming technical report.</p>
 <h2 id="execution-engine">Execution engine</h2>
+<div class="figure-block wide-figure">
+<p><a href="figures/execution-engine.svg"><img
+src="figures/execution-engine.svg" style="width:100.0%"
+alt="The physical operator plan and execution path for BIO-3." /></a></p>
+<p><em>Figure 6. Quail lowers BIO-3 to the physical plan shown on the
+left. On the right, one CPU worker executes the physical plan and
+manages KV for one GPU. The GPU holds one model copy and its KV pages.
+The CPU prepares the next token chunk while the GPU processes the
+current chunk. With multiple GPUs, Quail assigns one CPU worker, one
+model copy, and one KV pool to each GPU. The numbered labels refer to
+the sections below.</em></p>
+</div>
 <h3 id="physical-operators-1-in-figure-6">Physical operators, #1 in
 Figure 6</h3>
 <p><strong>Physical plan.</strong> The planner lowers the logical plan
 into a graph of physical operators, which specifies how Quail will
-execute each part of the query. <code>Packed Filter</code> and
-<code>Anchored Join</code> each represent a complete stage of model
-calls, rather than one physical operator for every call. The BIO-3 plan
-contains the following operators:</p>
+execute each part of the query. A <code>PackedFilter</code> can combine
+any number of AI filters on one dataset, and an
+<code>AnchoredJoin</code> can combine any number of consecutive AI joins
+that use the same anchor. The BIO-3 plan contains the following
+operators:</p>
 <ul>
-<li><strong><code>Document Input</code>.</strong> The two document input
-operators provide the tokenized medical reports and reaction terms.</li>
-<li><strong><code>Packed Filter</code>.</strong> The packed filter
-evaluates the report filter, and returns the IDs of reports that
-pass.</li>
-<li><strong><code>Anchored Join</code>.</strong> The anchored join
-evaluates the surviving reports against the reaction terms, using each
-report as the anchor.</li>
-<li><strong><code>Project</code>.</strong> The project reads the
-requested report and reaction columns for the pairs that returned
-<code>TRUE</code>.</li>
+<li><strong><code>DocumentInput</code>.</strong> A
+<code>DocumentInput</code> accepts one registered dataset, and returns
+its document IDs. BIO-3 has two instances of this operator, one for the
+medical reports, and one for the reaction terms.</li>
+<li><strong><code>PackedFilter</code>.</strong> A
+<code>PackedFilter</code> accepts document IDs and an ordered list of AI
+filters, and returns the IDs of documents that pass every filter. It
+pipelines documents through the filters, so a later filter can reuse the
+document KV computed by an earlier filter. In BIO-3, the operator
+evaluates the female-patient filter over the medical reports.</li>
+<li><strong><code>AnchoredJoin</code>.</strong> An
+<code>AnchoredJoin</code> accepts document IDs from one anchor dataset
+and one or more partner datasets, along with consecutive AI joins that
+use the same anchor. It returns the tuple IDs that pass each join, and
+reuses the anchor KV across the joins. In BIO-3, the medical reports are
+the anchor, and the reaction terms are the partner dataset.</li>
+<li><strong><code>Project</code>.</strong> A <code>Project</code>
+accepts the surviving document or tuple IDs and the requested columns,
+and returns the final result table. In BIO-3, it returns the requested
+report and reaction IDs.</li>
 </ul>
 <p><strong>Other physical operators.</strong> A query with several joins
 may contain an <code>Exchange</code>, which updates the surviving
-document IDs between join groups, or a <code>Recombine</code>, which
-uses Arrow Acero to combine the tuple IDs returned by several joins. A
-query with a <code>LIMIT</code> also contains a separate
-<code>Limit</code> operator. BIO-3 needs none of these operators.</p>
-<p><a href="figures/execution-engine.svg"><img
-src="figures/execution-engine.svg" style="width:100.0%"
-alt="The physical operator plan and execution path for BIO-3." /></a></p>
-<p><em>Figure 6. The BIO-3 physical plan appears on the left. On the
-right, one CPU worker executes the plan, schedules each
-<code>Packed Filter</code> or <code>Anchored Join</code>, and manages KV
-for one GPU. The GPU holds one model copy, loaded through vLLM, and one
-KV pool. While the GPU runs the current token chunk, the CPU reads the
-previous answers and prepares the next chunk. The numbered labels refer
-to the corresponding sections in the text. Quail runs one copy of this
-CPU and GPU execution path for each GPU.</em></p>
-<p><strong>Running the plan.</strong> The physical plan executor runs
-each operator after its inputs are available. <code>Packed Filter</code>
-and <code>Anchored Join</code> use the scheduling and model execution
-loop described below. Relational operators, such as
-<code>Project</code>, run on the CPU.</p>
+document IDs between join groups,<a href="#fn7" class="footnote-ref"
+id="fnref7" role="doc-noteref"><sup>7</sup></a> or a
+<code>Recombine</code>, which uses Arrow Acero to combine the tuple IDs
+returned by several joins. A query with a <code>LIMIT</code> also
+contains a separate <code>Limit</code> operator. BIO-3 needs none of
+these operators.</p>
+<p><strong>Running one operator at a time.</strong> Quail finishes each
+physical operator, and materializes its output, before starting the
+next. The design follows the operator-at-a-time model pioneered by
+columnar analytical database engines such as <a
+href="https://ir.cwi.nl/pub/19929/19929B.pdf">MonetDB</a>, rather than
+the tuple-at-a-time iterator model introduced by <a
+href="https://people.eecs.berkeley.edu/~prabal/teaching/resources/eecs582/graefe94volcano.pdf">Volcano</a>.</p>
+<p>An iterator model can pipeline each output tuple, or batch of tuples,
+directly into the next AI operator, which makes it easier to reuse
+document KV. However, an AI-SQL plan may place ordinary relational
+operators between AI operators, so maintaining one pipeline would
+require the relational engine to participate as well. Quail therefore
+materializes results at physical operator boundaries, and groups
+consecutive AI operators into a <code>PackedFilter</code> or
+<code>AnchoredJoin</code> to reuse KV within each physical operator.</p>
 <h3 id="preparing-the-documents-and-model-2-in-figure-6">Preparing the
 documents and model, #2 in Figure 6</h3>
 <p><strong>Tokenizing documents.</strong> The model reads token IDs,
 rather than strings, so Quail tokenizes every document column used by a
-<code>Packed Filter</code> or <code>Anchored Join</code>. During
-planning, we estimate token lengths from a random sample, while a
-background CPU thread tokenizes the full columns. For Qwen models, we
-use <code>bpe-qwen</code>. In our measurement over about four million
-tokens, it was about seven times faster than the Hugging Face tokenizer.
-We store the tokens and requested result columns in memory mapped Arrow
+<code>PackedFilter</code> or <code>AnchoredJoin</code>. During planning,
+we estimate token lengths from a random sample, while a background CPU
+thread tokenizes the full columns. Since Quail currently supports Qwen
+models, we use the <code>bpe-qwen</code> tokenizer.<a href="#fn8"
+class="footnote-ref" id="fnref8" role="doc-noteref"><sup>8</sup></a> We
+store the tokens and requested result columns in memory-mapped Arrow
 files, so another query can reuse them without reading and tokenizing
 the documents again.</p>
 <p><strong>Loading the model.</strong> Quail calls vLLM’s model loader,
@@ -633,7 +700,7 @@ immediately.</p>
 <h3 id="executing-filters-and-joins-4-and-5-in-figure-6">Executing
 filters and joins, #4 and #5 in Figure 6</h3>
 <p><strong>Overlapping CPU and GPU work.</strong>
-<code>Packed Filter</code> and <code>Anchored Join</code> use the same
+<code>PackedFilter</code> and <code>AnchoredJoin</code> use the same
 execution loop. The CPU builds a token chunk up to the budget chosen by
 the planner, subject to the available KV pages, then launches one model
 forward pass on the GPU. While the GPU runs the current chunk, the CPU
@@ -642,53 +709,52 @@ previous chunk, updates the scheduler and KV manager, and prepares the
 next chunk. The GPU can therefore begin the next forward pass without
 waiting for the CPU, as long as the CPU prepares the next chunk in
 time.</p>
-<p><strong>Executing filters.</strong> A <code>Packed Filter</code>
+<p><strong>Executing filters.</strong> A <code>PackedFilter</code>
 evaluates all AI predicates on one dataset, in the order chosen by the
-planner. The scheduler first adds documents that passed an earlier
-predicate, because their KV is already in HBM, then uses the remaining
-token budget for documents that have not started. When a document
-returns <code>TRUE</code>, the scheduler adds its next predicate to a
-later chunk, if another predicate remains. When a document returns
-<code>FALSE</code>, the scheduler stops evaluating it and releases its
-KV pages. A document that passes the final predicate keeps its KV only
-when a later join uses the document as an anchor.</p>
-<p><strong>Executing joins.</strong> An <code>Anchored Join</code>
-evaluates one or more consecutive joins that use the same anchor
-dataset. For each anchor document, the scheduler adds as many candidate
-pairs as the token budget allows, and keeps the anchor KV in HBM as its
-pairs continue across chunks. One chunk can contain candidate pairs for
-several anchors, and each pair reads the KV for its own anchor. If
-another join uses the same anchor, the scheduler can begin that join
-once every pair in the current join has been submitted, and at least one
-pair has returned <code>TRUE</code>. If every pair returns
-<code>FALSE</code>, the scheduler releases the anchor KV. Otherwise, the
-KV remains in HBM until the anchor’s final join has finished.</p>
+planner. Instead of running one predicate over the entire dataset before
+starting the next, Quail evaluates the next predicate for a document
+while its KV remains in HBM. Quail stops after the first
+<code>FALSE</code> answer and releases the document’s KV. If a document
+passes every predicate, Quail keeps its KV only when a later join uses
+the document as an anchor.</p>
+<p><strong>Executing joins.</strong> An <code>AnchoredJoin</code>
+evaluates one or more consecutive AI joins that use the same anchor
+dataset. Quail computes, or reuses, the KV for each anchor document,
+then evaluates the join predicate between that anchor and every
+candidate document in the other input. The pairs for one anchor may span
+several token chunks, and one token chunk may contain pairs for several
+anchors. Quail keeps each anchor’s KV until every pair that uses it has
+been evaluated. If the operator contains another join with the same
+anchor, Quail keeps the KV for that join as well.</p>
 <p>TODO: Revisit the join batching diagram.</p>
-<p><strong>Producing the result.</strong> Each
-<code>Anchored Join</code> returns the tuple IDs and Boolean answers for
-the candidate tuples it evaluated. For a query with one join,
-<code>Project</code> reads the requested columns for the tuples that
-returned <code>TRUE</code>. For a query with several joins,
-<code>Recombine</code> first uses Arrow Acero to combine the passing
-tuple IDs.</p>
+<p><strong>Producing the result.</strong> Each <code>AnchoredJoin</code>
+returns the tuple IDs and Boolean answers for the candidate tuples it
+evaluated. For a query with one join, <code>Project</code> reads the
+requested columns for the tuples that returned <code>TRUE</code>. For a
+query with several joins, <code>Recombine</code> first uses Arrow Acero
+to combine the passing tuple IDs.</p>
 <h3 id="running-the-model-forward-pass-6-in-figure-6">Running the model
 forward pass, #6 in Figure 6</h3>
-<p><strong>Reusing existing kernels.</strong> Most of Quail’s model
-forward pass is the same as vLLM’s, and we load the model through vLLM.
-We use DeepGEMM for the main matrix multiplications, and <a
+<p><strong>Reusing existing kernels.</strong> Quail reuses most of
+vLLM’s model implementation. We load the model through vLLM, use
+DeepGEMM for the main matrix multiplications, and use <a
 href="https://arxiv.org/abs/2407.08608">FlashAttention 3</a> for
-attention. Quail changes how join attention is represented. It also
-fuses several small operations, and computes only the output scores
-needed for a Boolean answer.</p>
-<p><strong>Computing join attention.</strong> The new tokens for each
-tuple must attend to the KV for their anchor, but one chunk may contain
-several different anchors. We split attention into two parts at every
-model layer. One FlashAttention 3 call computes causal attention among
-the new tokens for each tuple, and another computes attention from those
-tokens into the corresponding anchor KV. We then merge the two outputs.
-Let <span class="math inline">\(o_{\mathrm{new}}\)</span> and <span
-class="math inline">\(o_{\mathrm{anchor}}\)</span> be the outputs of
-these two calls, and let <span
+attention. Quail makes only three changes to the forward pass. First,
+when evaluating a join, we run attention over the new tokens separately
+from attention over the shared anchor KV, then merge the results.
+Second, we fuse several small operations around normalization, RoPE,
+activation, and quantization. Third, we compute output scores only for
+<code>TRUE</code> and <code>FALSE</code>, rather than for every token in
+the model’s vocabulary.</p>
+<p><strong>Computing attention for joins.</strong> The new tokens for
+each tuple must attend to the KV for their anchor, but one chunk may
+contain several different anchors. We split attention into two parts at
+every model layer. One FlashAttention 3 call computes causal attention
+among the new tokens for each tuple, and another computes attention from
+those tokens into the corresponding anchor KV. We then merge the two
+outputs. Let <span class="math inline">\(o_{\mathrm{new}}\)</span> and
+<span class="math inline">\(o_{\mathrm{anchor}}\)</span> be the outputs
+of these two calls, and let <span
 class="math inline">\(\ell_{\mathrm{new}}\)</span> and <span
 class="math inline">\(\ell_{\mathrm{anchor}}\)</span> be their log sum
 exp values. The full attention output is:</p>
@@ -709,11 +775,14 @@ merge with the FP8 quantization required by the following output
 projection. We also fuse several small operations around normalization,
 RoPE, activation, and quantization. The join attention path therefore
 adds one fused kernel around the two FlashAttention 3 calls.</p>
-<p><strong>Computing the answer.</strong> A standard language model
-output head computes one score for every token in the vocabulary.
-Filters and joins need only a <code>TRUE</code> or <code>FALSE</code>
-answer, so we select the corresponding rows of the output matrix and
-compute only those scores.</p>
+<p><strong>Computing the answer.</strong> After the model processes a
+prompt, it produces a hidden state for the answer position. A standard
+output head multiplies this hidden state by the full vocabulary matrix,
+to score every possible next token. Quail needs only the scores for the
+token IDs that represent <code>TRUE</code> and <code>FALSE</code>. When
+we load the model, we keep only those rows of the vocabulary matrix. For
+each filter or join evaluation, we use the smaller matrix to compare the
+best <code>TRUE</code> score with the best <code>FALSE</code> score.</p>
 <h3 id="using-multiple-gpus">Using multiple GPUs</h3>
 <p><strong>Data parallel execution.</strong> Quail supports one, two,
 four, or eight H100s in one Modal container, with one model copy and one
@@ -723,38 +792,41 @@ GPUs and make the other inputs available to each GPU. The CPU combines
 the filter survivors and join results after each operator.</p>
 <h1 id="evaluation">4. Evaluation</h1>
 <h2 id="performance-goals">Performance goals</h2>
-<p>We have three performance goals for Quail. First, we want to minimize
-KV regret, which counts prefix tokens that the model recomputes after it
-has already computed the same token prefix earlier in the query. KV
-regret cannot always be zero, because GPU HBM is finite. Second, we want
-the GPU to spend close to 100 percent of query execution running model
-operations. AI-SQL filters and joins spend almost all of their model
-time on prefill, and many evaluations are ready at once, so the GPU
-should not have to wait for the CPU to prepare more work. Third, while
-the GPU is active, we want high model FLOPs utilization, or MFU. MFU is
-the fraction of the GPU’s peak arithmetic throughput used during a model
-forward pass.</p>
+<p>We have three performance goals for Quail:</p>
+<ul>
+<li>First, we want to minimize KV regret, or input tokens recomputed
+because reusable KV was not available. KV regret cannot always be zero,
+because GPU HBM is finite.</li>
+<li>Second, we want the GPU to spend close to 100 percent of query
+execution running model operations. AI-SQL filters and joins spend
+almost all of their model time on prefill, and many evaluations are
+ready at once, so the GPU should not have to wait for the CPU to prepare
+more work.</li>
+<li>Third, while the GPU is active, we want high model FLOPs
+utilization, or MFU. MFU is the fraction of the GPU’s peak arithmetic
+throughput used during a model forward pass.</li>
+</ul>
 <p>Quail’s current design focuses on the first two goals. The KV manager
 uses the query plan to retain the KV that is expected to avoid the most
 future computation. The executor sends large chunks of tokens through
 the model, which reduces the CPU overhead of preparing and scheduling
 separate requests. For MFU, we use DeepGEMM for the main matrix
 multiplications, and FlashAttention 3 for attention. We leave further
-kernel optimization to the experts, who have shown that large
-improvements are possible.<a href="#fn2" class="footnote-ref"
-id="fnref2" role="doc-noteref"><sup>2</sup></a></p>
+kernel optimization to the experts, in spirit to others working on batch
+inference optimization.<a href="#fn9" class="footnote-ref" id="fnref9"
+role="doc-noteref"><sup>9</sup></a></p>
 <h2 id="experimental-setup">Experimental setup</h2>
 <p><strong>QUAIL-B.</strong> We created <a
 href="https://github.com/fsdatalab/quail-bench">QUAIL-B</a>, a benchmark
 of 32 AI-SQL queries over IMDB reviews, medical reports, fact checking
 claims, legal documents, and software agent traces. The queries include
-filters, chains of filters, single joins, and multiway joins. QUAIL-B
-provides published corpora at scale factors 0.1, 0.5, and 1.0. The scale
-factor changes how many rows are sampled from each source, while the
-query definitions stay fixed. Each scale factor uses pinned source
-revisions and a fixed sampling seed, so it identifies one exact corpus.
-We do not go into the full benchmark in this post. Instead, we show two
-queries at scale factor 0.1, BIO-3 and AGENT-1.</p>
+filters, chains of filters, single joins, and multiple joins. QUAIL-B
+includes three sizes of each dataset, which we call scale factors 0.1,
+0.5, and 1.0. A larger scale factor includes more rows, while the query
+definitions stay fixed. Each scale factor uses pinned source revisions
+and a fixed sampling seed, so it identifies one exact corpus. We do not
+go into the full benchmark in this post. Instead, we show two queries at
+scale factor 0.1, BIO-3 and AGENT-1.</p>
 <p><strong>Hardware.</strong> Every configuration uses Qwen3 4B FP8,
 with BF16 KV, on one H100. Within each query family, Quail and vLLM run
 sequentially on the same physical GPU.</p>
@@ -768,16 +840,19 @@ each document pair in anchor order. We configure vLLM as follows:</p>
 <li>We enable automatic prefix caching.</li>
 <li>We set <code>max_num_batched_tokens</code> to 25,305, and
 <code>max_num_seqs</code> to 4,096.</li>
-<li>We set <code>gpu_memory_utilization</code> to 0.91, which provides
-space for 479,616 KV tokens.</li>
+<li>We set <code>gpu_memory_utilization</code> to 0.91.</li>
 <li>We capture one CUDA graph for batches of 8,192 tokens.</li>
 </ul>
-<p>We chose these settings by running the benchmark queries. Larger
-batch or memory settings caused GPU OOM errors, while the selected token
-limit is large enough to saturate the H100 when the CPU prepares work in
-time. For comparison, Quail has space for 362,250 KV tokens, because it
-reserves HBM for two larger activation chunks. The vLLM baseline
-therefore has about 32 percent more KV capacity than Quail.</p>
+<p>We chose the parameters above by running the benchmark queries.
+Increasing the batch or memory limits caused GPU OOM errors. Our
+roofline model predicts that the selected token budget is well above the
+point where model computation becomes compute bound.</p>
+<p>vLLM and Quail reserve HBM differently. vLLM runs a profiling forward
+pass at startup, then uses the measured peak memory to decide how much
+HBM remains for KV. Quail instead calculates the memory needed for the
+model weights and two activation chunks at the maximum size, then
+assigns the remaining HBM to KV. Quail therefore reserves more temporary
+memory, and vLLM has more space for KV in this comparison.</p>
 <p><strong>Metrics.</strong> We report four metrics for each query:</p>
 <ul>
 <li><strong>Query latency.</strong> We measure the time after model
@@ -788,24 +863,25 @@ enough GPU HBM to retain all reusable prefix KV.</li>
 <li><strong>GPU cost.</strong> We multiply the query latency in hours by
 Modal’s H100 price of $3.9492 per hour.</li>
 <li><strong>Fresh input tokens.</strong> We count every input token
-position processed by a model forward pass, rather than read from
-existing KV. A token computed more than once is counted more than
-once.</li>
+computed by the model, ignoring tokens read from KV. For example, if the
+model computes a report’s tokens during the filter, then computes the
+same tokens again during the join, those tokens count twice.</li>
 <li><strong>KV regret.</strong> We count prefix tokens that the model
-recomputes after it has already computed the same token prefix earlier
-in the query. KV regret includes recomputing the same document prefix,
-and recomputing a shared prefix across different documents. KV regret is
-already included in the fresh input token count.</li>
+computes more than once, based on their token content, rather than which
+row contains them. For example, if two rows begin with the same tokens,
+and the model computes that shared prefix twice, the second computation
+is KV regret. KV regret is included in the fresh input token total.</li>
 </ul>
 <p>Across the full benchmark, Quail is faster than the vLLM baseline on
-30 of the 32 queries. The latency tables below use runs without
-profiling, while the profile figures come from separate diagnostic
-runs.</p>
-<h2 id="biodex-results">BioDEX results</h2>
-<ul>
-<li>BIO-3 filters 500 medical reports for female patients, then joins
-the surviving reports with 1,127 possible reaction terms.</li>
-</ul>
+30 of the 32 queries at sf=0.1. We show examples of a great query for
+Quail and a terrible query for Quail below. Note that the latency tables
+below use runs without profiling, while the profile figures come from
+separate diagnostic runs.</p>
+<h2 id="bio-3-where-quail-wins">BIO-3: Where Quail Wins</h2>
+<p>BIO-3 is the motivating query in this post. It filters 500 medical
+reports for female patients, then joins the surviving reports with 1,127
+possible reaction terms.</p>
+<div class="metrics-table">
 <table>
 <colgroup>
 <col style="width: 27%" />
@@ -847,17 +923,17 @@ the surviving reports with 1,127 possible reaction terms.</li>
 </tr>
 </tbody>
 </table>
-<ul>
-<li>Quail is 5.68 times faster than the vLLM baseline.</li>
-<li>Quail reduces KV regret, but does not eliminate it, because the KV
-for all surviving medical reports does not fit in GPU HBM.</li>
-<li>As the profile in Section 2 shows, vLLM finishes each model batch
-quickly, because most document KV is already cached, but the CPU cannot
-process the individual requests fast enough to keep the GPU busy.</li>
-<li>Quail sends large token chunks directly through the model, so it
-does not pay vLLM’s request processing cost for every document
-pair.</li>
-</ul>
+</div>
+<p>Quail runs BIO-3 in 89.92 seconds, which is 5.68 times faster than
+the vLLM baseline. Quail also incurs less KV regret, but cannot
+eliminate it, because the KV for all surviving medical reports does not
+fit in GPU HBM.</p>
+<p>As Figure 7 shows, vLLM finishes each model batch quickly, because
+most document KV is already cached. However, the CPU cannot process the
+individual requests fast enough to keep the GPU busy. Quail sends large
+token chunks directly through the model, so it does not pay vLLM’s
+request processing cost for every document pair.</p>
+<div class="figure-block wide-figure">
 <p><a href="figures/bio3_profile_comparison.pdf"><img
 src="figures/bio3_profile_comparison.png" style="width:100.0%"
 alt="Five seconds of GPU activity and CPU operations during the BIO-3 join with Quail and pipelined vLLM." /></a></p>
@@ -865,14 +941,14 @@ alt="Five seconds of GPU activity and CPU operations during the BIO-3 join with 
 4.997 seconds with Quail and 1.892 seconds with vLLM. The CPU calls
 appear below the GPU timeline. Both runs use an H100 and the same Qwen3
 4B FP8 model.</em></p>
-<h2 id="agent-trace-results">Agent trace results</h2>
-<ul>
-<li>AGENT-1 contains 1,772 cumulative snapshots from software agent
-runs. Each snapshot contains the complete trace up to one point in the
-run, so later snapshots from the same run begin with the full contents
-of earlier snapshots.</li>
-<li>A simplified pair of rows looks like the following:</li>
-</ul>
+</div>
+<h2 id="agent-1-where-vllm-wins">AGENT-1: Where vLLM wins</h2>
+<p>AGENT-1 contains 1,772 cumulative snapshots from software agent runs.
+Each snapshot contains the complete trace up to one point in the run, so
+later snapshots from the same run begin with the full contents of
+earlier snapshots. For example, two rows might look like the
+following:</p>
+<div class="example-data-table">
 <table>
 <colgroup>
 <col style="width: 23%" />
@@ -903,9 +979,8 @@ of earlier snapshots.</li>
 </tr>
 </tbody>
 </table>
-<ul>
-<li>Here is the AGENT-1 query, simplified for this post:</li>
-</ul>
+</div>
+<p>Here is the AGENT-1 query, simplified for this post:</p>
 <div class="sourceCode" id="cb3"><pre
 class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> t.<span class="kw">id</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> agent_traces <span class="kw">AS</span> t</span>
@@ -913,9 +988,9 @@ class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#c
 <span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  PROMPT(</span>
 <span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">&#39;Did the agent recover after trying an approach that did not work?</span><span class="ch">\n\n</span><span class="st">{0}&#39;</span>,</span>
 <span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    t.<span class="kw">trace</span></span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  ),</span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  {<span class="st">&#39;selectivity&#39;</span>: <span class="fl">0.32</span>}</span>
-<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>);</span></code></pre></div>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  )</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>);</span></code></pre></div>
+<div class="metrics-table">
 <table>
 <colgroup>
 <col style="width: 27%" />
@@ -957,9 +1032,10 @@ class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#c
 </tr>
 </tbody>
 </table>
-<ul>
-<li>The vLLM baseline is 2.43 times faster than Quail on AGENT-1.</li>
-</ul>
+</div>
+<p>vLLM runs AGENT-1 in 99.15 seconds, which is 2.43 times faster than
+Quail.</p>
+<div class="figure-block wide-figure">
 <p><a href="figures/agent1_profile_comparison.pdf"><img
 src="figures/agent1_profile_comparison.png" style="width:100.0%"
 alt="Five seconds of GPU activity and CPU operations during the AGENT-1 filter with Quail and pipelined vLLM." /></a></p>
@@ -967,26 +1043,20 @@ alt="Five seconds of GPU activity and CPU operations during the AGENT-1 filter w
 cover 4.998 seconds with Quail and 4.988 seconds with vLLM in these
 five-second windows. Both keep the GPU busy, but vLLM computes far fewer
 fresh tokens by reusing prefixes across snapshots.</em></p>
-<ul>
-<li>vLLM’s automatic prefix caching feature reuses KV across different
-rows when their token prefixes match, while Quail currently reuses KV
-only when the same document appears again in the query.</li>
-<li>Quail therefore incurs 11.88 million KV regret tokens, while the
-vLLM baseline incurs only 20,386.</li>
-<li>We plan to add automatic prefix caching to Quail, but the lookup
-must remain cheap at the request volumes that AI-SQL queries can
-produce.</li>
-</ul>
+</div>
+<p>vLLM wins because its automatic prefix caching feature can reuse KV
+across different rows when their token prefixes match. Quail currently
+reuses KV only when the same document appears again in the query. As a
+result, Quail incurs 11.88 million KV regret tokens, while the vLLM
+baseline incurs only 20,386.</p>
+<p>We plan to add automatic prefix caching to Quail, but the lookup must
+remain cheap at the request volumes that AI-SQL queries can produce.</p>
 <h1 id="getting-started">5. Getting started</h1>
-<ul>
-<li>Here is how you can get started with Quail.</li>
-<li>In this demo, we use all 100,000 movie reviews from the <a
+<p>We can use Quail to run two AI filters over all 100,000 movie reviews
+in the <a
 href="https://huggingface.co/datasets/stanfordnlp/imdb">Stanford IMDB
-dataset</a>.</li>
-<li>The following code downloads the reviews from Hugging Face, and
-loads them into an Arrow dataset.</li>
-<li>We assume that the Python process has access to an H100.</li>
-</ul>
+dataset</a>. We first download the reviews from Hugging Face, and load
+them into an Arrow dataset.</p>
 <div class="sourceCode" id="cb4"><pre
 class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.dataset <span class="im">as</span> ds</span>
@@ -1003,95 +1073,67 @@ class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a hr
 <span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    imdb[<span class="st">&quot;unsupervised&quot;</span>],</span>
 <span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>])</span>
 <span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>reviews <span class="op">=</span> ds.dataset(pa.table({</span>
-<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;review_id&quot;</span>: pa.array(</span>
-<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>        <span class="ss">f&quot;review-</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="bu">len</span>(all_reviews))</span>
-<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    ),</span>
-<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;review&quot;</span>: all_reviews.data.table.column(<span class="st">&quot;text&quot;</span>),</span>
-<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>}))</span>
-<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="co"># Assuming there is an H100 attached to this Python process.</span></span>
-<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> quail.Session(</span>
-<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    config<span class="op">=</span>quail.EngineConfig(gpus<span class="op">=</span><span class="dv">1</span>, device<span class="op">=</span><span class="st">&quot;h100-sxm&quot;</span>),</span>
-<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>    compute_provider<span class="op">=</span>quail.InProcessComputeProvider(),</span>
-<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>) <span class="im">as</span> session:</span>
-<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    session.register(</span>
-<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;reviews&quot;</span>,</span>
-<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>        quail.DocumentProvider.from_dataset(reviews, id_col<span class="op">=</span><span class="st">&quot;review_id&quot;</span>),</span>
-<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>    )</span>
-<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>    query <span class="op">=</span> session.sql(<span class="st">&quot;&quot;&quot;</span></span>
-<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a><span class="st">        SELECT r.review_id</span></span>
-<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a><span class="st">        FROM reviews AS r</span></span>
-<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a><span class="st">        WHERE AI.IF(</span></span>
-<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a><span class="st">            PROMPT(</span></span>
-<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a><span class="st">                &#39;Does this review discuss the ending of the movie?</span><span class="ch">\n\n</span><span class="sc">{0}</span><span class="st">&#39;,</span></span>
-<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a><span class="st">                r.review</span></span>
-<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a><span class="st">            ),</span></span>
-<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a><span class="st">            {&#39;selectivity&#39;: 0.25}</span></span>
-<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a><span class="st">        )</span></span>
-<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a><span class="st">        AND AI.IF(</span></span>
-<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a><span class="st">            PROMPT(</span></span>
-<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a><span class="st">                &#39;Does the reviewer recommend watching the movie?</span><span class="ch">\n\n</span><span class="sc">{0}</span><span class="st">&#39;,</span></span>
-<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a><span class="st">                r.review</span></span>
-<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a><span class="st">            ),</span></span>
-<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a><span class="st">            {&#39;selectivity&#39;: 0.5}</span></span>
-<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a><span class="st">        )</span></span>
-<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;&quot;&quot;</span>, dialect<span class="op">=</span><span class="st">&quot;bq&quot;</span>)</span>
-<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(query.explain())</span>
-<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>    result <span class="op">=</span> query.run()</span>
-<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a>    table <span class="op">=</span> result.collect()</span></code></pre></div>
-<ul>
-<li><code>query.explain()</code> prints the logical and physical plans.
-The following output keeps only the parts that describe the two filters
-and their execution settings.</li>
-</ul>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;review_id&quot;</span>: pa.array(<span class="ss">f&quot;review-</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="bu">len</span>(all_reviews))),</span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;review&quot;</span>: all_reviews.data.table.column(<span class="st">&quot;text&quot;</span>),</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>}))</span></code></pre></div>
+<p>The query keeps reviews that discuss the movie’s ending, and
+recommend watching the movie.</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># This Python process has access to one H100.</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> quail.Session(</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    config<span class="op">=</span>quail.EngineConfig(gpus<span class="op">=</span><span class="dv">1</span>, device<span class="op">=</span><span class="st">&quot;h100-sxm&quot;</span>),</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>) <span class="im">as</span> session:</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    session.register(</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;reviews&quot;</span>,</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>        quail.DocumentProvider.from_dataset(reviews, id_col<span class="op">=</span><span class="st">&quot;review_id&quot;</span>),</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    query <span class="op">=</span> session.sql(<span class="st">&quot;&quot;&quot;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="st">        SELECT r.review_id</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="st">        FROM reviews AS r</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="st">        WHERE AI.IF(</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="st">            PROMPT(</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="st">                &#39;Does this review discuss the ending of the movie?</span><span class="ch">\n\n</span><span class="sc">{0}</span><span class="st">&#39;,</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="st">                r.review</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="st">            ),</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="st">            {&#39;selectivity&#39;: 0.25}</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="st">        )</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="st">        AND AI.IF(</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="st">            PROMPT(</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="st">                &#39;Does the reviewer recommend watching the movie?</span><span class="ch">\n\n</span><span class="sc">{0}</span><span class="st">&#39;,</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="st">                r.review</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="st">            ),</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="st">            {&#39;selectivity&#39;: 0.5}</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="st">        )</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;&quot;&quot;</span>, dialect<span class="op">=</span><span class="st">&quot;bq&quot;</span>)</span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(query.explain())</span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>    result <span class="op">=</span> query.run()</span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>    table <span class="op">=</span> result.collect()</span></code></pre></div>
+<p>Before running the query, <code>query.explain()</code> prints the
+logical and physical plans. The output below keeps only the parts that
+describe the two filters and their execution settings.</p>
 <pre class="text"><code>logical:
   Project [r.review_id]
     SemanticFilter (x2, sels=[0.25, 0.5])
       Scan reviews as r [review]
 
 physical:
-  workers=1 model_copies=1
-  backend=quail
-  KV dtype=bf16
+  workers=1 model_copies=1 backend=quail
   chunk_tokens=110376 admission_tokens=362250
-  order=by_cost
-  DocumentInput input:r alias=r n_docs=100000 total_tokens=29926924
-  PackedFilter filter:r alias=r arena_writes=True keep_kv=False
-    stage {&#39;written_pos&#39;: 0, &#39;question_tokens&#39;: 23,
-           &#39;selectivity&#39;: 0.25, &#39;expected_docs&#39;: 100000.0}
-    stage {&#39;written_pos&#39;: 1, &#39;question_tokens&#39;: 21,
-           &#39;selectivity&#39;: 0.5, &#39;expected_docs&#39;: 25000.0}
-  Project sink columns=[&#39;r.review_id&#39;]
-
-  note: token counts for &#39;r&#39; are estimated from a 1024 document sample</code></pre>
-<ul>
-<li><p>The physical plan uses one <code>PackedFilter</code> for both
-predicates, and estimates that 25,000 of the 100,000 reviews will reach
-the second predicate.</p></li>
-<li><p>While the query is running, Quail passes the KV for each
-surviving review directly from the first predicate to the second
-predicate, rather than finishing the first predicate over the entire
-dataset and then starting the second.</p></li>
-<li><p>The chunk budget allows up to 110,376 tokens in each model
-forward pass on the selected H100.</p></li>
-<li><p>The admission budget allows up to 362,250 tokens of document KV
-to reside in GPU HBM at once, and is separate from the number of tokens
-processed in one forward pass.</p></li>
-<li><p><code>keep_kv=False</code> means that Quail releases the document
-KV after the second predicate, because no later operator needs
-it.</p></li>
-<li><p>For longer queries, the physical plan also shows KV rewind
-between filters, survivor KV retention for joins, and each join’s anchor
-and expected KV reuse.</p></li>
-<li><p>Use <code>query.explain(verbose=True)</code> to inspect internal
-node IDs, port connections, and all planning settings.</p></li>
-<li><p>The session keeps the model loaded until the <code>with</code>
-block ends, so several queries can reuse it.</p></li>
-<li><p>The <a href="../../demos/imdb_ending_filter.py">complete demo</a>
-prints the following results at the end of the run:</p></li>
-</ul>
+  DocumentInput input:r alias=r n_docs=100000
+  PackedFilter filter:r alias=r keep_kv=False
+    stage {&#39;selectivity&#39;: 0.25, &#39;expected_docs&#39;: 100000.0}
+    stage {&#39;selectivity&#39;: 0.5, &#39;expected_docs&#39;: 25000.0}
+  Project sink columns=[&#39;r.review_id&#39;]</code></pre>
+<p>Quail combines the two predicates into one <code>PackedFilter</code>,
+and passes each surviving review’s KV directly from the first predicate
+to the second. The plan also shows the token budget for each model
+forward pass, the total KV capacity, and that no later operator needs
+the review KV. <code>query.explain(verbose=True)</code> prints the
+remaining planning details.</p>
+<p>The <a href="../../demos/imdb_ending_filter.py">complete demo</a>
+prints the following results at the end of the run:</p>
 <pre class="text"><code>matching reviews: 16057 of 100000
   stage evaluated 100000 reviews, 0.283 passed
   stage evaluated 28296 reviews, 0.568 passed
@@ -1102,221 +1144,94 @@ total_s: 287.04 (boot + query)
 fresh_tokens: 32499738
 documents/second: 371.0
 GPU cost: $0.3149</code></pre>
-<ul>
-<li>The first predicate passes 28,296 reviews, and 16,057 reviews pass
-both predicates.</li>
-<li>The query takes 269.57 seconds, processes 371 input documents per
-second, and computes 32,499,738 fresh input tokens with zero KV
-regret.</li>
-<li>The full run takes 287.04 seconds, including 17.47 seconds to load
-the model, and costs $0.3149 at <a
-href="https://modal.com/pricing">Modal’s H100 price</a> of $3.9492 per
-hour.</li>
-<li>The IMDB dataset was already downloaded to disk, so the run does not
-include the time or cost to download it.</li>
-</ul>
+<p>The first predicate passes 28,296 reviews, and 16,057 reviews pass
+both predicates. The query takes 269.57 seconds, processes 371 input
+documents per second, and computes 32,499,738 fresh input tokens with
+zero KV regret. The full run takes 287.04 seconds, including 17.47
+seconds to load the model, and costs $0.3149 at <a
+href="https://modal.com/pricing">Modal’s H100 price</a>. The IMDB
+dataset was already on disk, so the measurement excludes the time and
+cost of downloading it.</p>
 <h2 id="comparing-the-cost-with-gpt-5-nano">Comparing the cost with
 GPT-5 nano</h2>
-<ul>
-<li>As of September 2026, <a
-href="https://developers.openai.com/api/docs/models/gpt-5-nano">OpenAI
-lists GPT-5 nano</a> at $0.05 per million input tokens, $0.005 per
-million cached input tokens, and $0.40 per million output tokens.</li>
-<li>The Quail run computes 32,499,738 new input tokens across the two
-filters.</li>
-<li>The second filter evaluates 28,296 reviews. Based on the average
-review length in this run, it reads about 8.41 million document tokens
-that the first filter already processed.</li>
-<li>For the infinite cache estimate, we charge the 32.50 million new
-input tokens at the regular input price, and only the 8.41 million
-reused document tokens at the cached input price.</li>
-<li>We use a conservative output estimate of 200,000 tokens, one output
-token per predicate for each of the 100,000 documents.</li>
-</ul>
-<table>
-<colgroup>
-<col style="width: 27%" />
-<col style="width: 36%" />
-<col style="width: 36%" />
-</colgroup>
-<thead>
-<tr>
-<th>Execution</th>
-<th style="text-align: right;">Cost calculation</th>
-<th style="text-align: right;">Estimated cost</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Quail</td>
-<td style="text-align: right;">287.04 H100 seconds at $3.9492 per
-hour</td>
-<td style="text-align: right;">$0.3149</td>
-</tr>
-<tr>
-<td>GPT-5 nano, infinite cache</td>
-<td style="text-align: right;">32.500M new input × $0.05/M + 8.409M
-cached input × $0.005/M + 0.2M output × $0.40/M</td>
-<td style="text-align: right;">$1.7470</td>
-</tr>
-</tbody>
-</table>
-<ul>
-<li>With an infinite cache for the reused document tokens, the GPT-5
-nano estimate is $1.7470, or 5.5 times the measured Quail cost.</li>
-<li>The comparison uses the same token counts, but does not assume that
-Qwen3 4B and GPT-5 nano return the same answers.</li>
-</ul>
+<p>At current GPT-5 nano prices, the same two-filter workload would cost
+about $1.7470, or 5.5 times the measured Quail cost.<a href="#fn10"
+class="footnote-ref" id="fnref10" role="doc-noteref"><sup>10</sup></a>
+Of course, Qwen3 4B and GPT-5 nano may not return the same answers, so
+the cost of reaching the same answer quality could be different.</p>
 <h2 id="running-from-a-local-python-process">Running from a local Python
 process</h2>
-<ul>
-<li>If you do not have a dedicated GPU, you can keep the Python process
-and source Arrow dataset on your laptop, or in a notebook, and let
-<code>ModalComputeProvider</code> start an H100 function on Modal:</li>
-</ul>
-<div class="sourceCode" id="cb7"><pre
-class="sourceCode python"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>session <span class="op">=</span> quail.Session(</span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    compute_provider<span class="op">=</span>quail.ModalComputeProvider(),</span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
-<ul>
-<li>The Python process and source Arrow dataset remain on your laptop,
-or in your notebook.</li>
-<li>Quail sends the logical plan and required Arrow columns to Modal,
-where it plans and executes the query.</li>
-<li>The result comes back to the local process as an Arrow table.</li>
-<li><code>InProcessComputeProvider</code> is the default, so the Modal
-path must be selected explicitly.</li>
-<li>The published version will link the repository, installation
-instructions, and complete examples for both paths.</li>
-</ul>
+<p>If you do not have a dedicated GPU, put the whole query inside a
+Modal GPU function. The function creates a normal Quail session and runs
+it in process:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> modal</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> quail</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>app <span class="op">=</span> modal.App(<span class="st">&quot;quail-engine&quot;</span>)</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>image <span class="op">=</span> (</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    modal.Image.from_registry(</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;nvidia/cuda:13.0.1-devel-ubuntu24.04&quot;</span>, add_python<span class="op">=</span><span class="st">&quot;3.12&quot;</span>)</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    .entrypoint([])</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    .pip_install(<span class="st">&quot;vllm==0.26.0&quot;</span>, <span class="st">&quot;pyarrow&quot;</span>, <span class="st">&quot;sqlglot&gt;=27.0&quot;</span>,</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>                 <span class="st">&quot;bpe-qwen&gt;=0.1.5&quot;</span>, <span class="st">&quot;datasets&gt;=5.0.1&quot;</span>)</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    .add_local_python_source(<span class="st">&quot;quail&quot;</span>)</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="at">@app.function</span>(image<span class="op">=</span>image, gpu<span class="op">=</span><span class="st">&quot;H100!&quot;</span>, memory<span class="op">=</span><span class="dv">98304</span>, timeout<span class="op">=</span><span class="dv">1200</span>)</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> run_query(sql, documents):</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> quail.Session() <span class="im">as</span> session:</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>        session.register(<span class="st">&quot;docs&quot;</span>, quail.DocumentProvider.from_table(</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>            documents, id_col<span class="op">=</span><span class="st">&quot;id&quot;</span>,</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>        ))</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>        result <span class="op">=</span> session.sql(sql).run()</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> result.collect(), result.report</span></code></pre></div>
+<p>Modal allocates the H100 and transfers the function arguments and
+return value. Quail reads the documents, plans, and runs the query
+inside that function. For a large dataset, pass its path and open it
+there instead of sending an Arrow table. The script can mount volumes at any path
+and set library cache directories through environment variables. Quail does not
+configure Modal or choose result storage. The complete submission example
+is in <code>demos/quickstart_modal.py</code>.</p>
 <h1 id="what-comes-next">6. What comes next</h1>
-<ol type="1">
-<li><p><strong>Support more AI-SQL operators.</strong></p>
-<ul>
-<li>Quail currently supports AI filters and joins, where the model
-returns <code>TRUE</code> or <code>FALSE</code> after processing the
-prompt.</li>
-<li>Operators such as <code>AI_EXTRACT</code> and
-<code>AI_CLASSIFY</code> may generate several output tokens, so we will
-need to support decode.</li>
-<li>The planner will also need to account for the generated tokens when
-it estimates cost and chooses a batch size.</li>
-</ul></li>
-<li><p><strong>Support more models and hardware.</strong></p>
-<ul>
-<li>Quail currently supports Qwen3 4B FP8 and Qwen3 32B FP8 on H100
-GPUs.</li>
-<li>We want to support hybrid model architectures, including Qwen3.5 and
-Liquid models.</li>
-<li>We also want to support Blackwell GPUs, and add an Apple Silicon
-backend for machines such as an M5 MacBook.</li>
-<li>The Apple Silicon backend would let coding agents run AI-SQL queries
-over private data without provisioning a server GPU.</li>
-<li>Mixture of experts (MoE) models introduce another problem, because
-each token uses only a subset of the model’s experts.</li>
-<li>We do not yet know the best way to serve MoE models for AI-SQL, or
-whether predicting which experts each batch will use can improve
-throughput.</li>
-</ul></li>
-<li><p><strong>Improve KV and HBM management.</strong></p>
-<ul>
-<li>We want to add automatic prefix caching across rows, since
-cumulative agent traces and other datasets can contain many long, shared
-token prefixes.</li>
-<li>We need to find the shared prefixes without spending more CPU time
-managing the cache than we save in GPU computation.</li>
-<li>Quail currently keeps KV only in GPU HBM, and we also want to use
-host DRAM for KV that does not fit in HBM.</li>
-<li>Copying KV from host DRAM may take longer than recomputing a short
-document, so the planner should compare the transfer and recomputation
-costs before deciding where to keep the KV.</li>
-<li>Quail currently has naive support for up to eight data parallel H100
-model copies in one container, where each GPU holds a complete copy of
-the model.</li>
-<li>We divide the input documents across the GPUs, but filters and joins
-can leave one GPU with much more useful KV and work than another.</li>
-<li>Some GPUs can then have unused HBM, or finish their work while
-another GPU is still running.</li>
-<li>We want to rebalance the surviving documents, their KV, or the
-downstream join work, and extend execution across multiple containers
-and larger GPU counts.</li>
-</ul></li>
-<li><p><strong>Improve model FLOPs utilization.</strong></p>
-<ul>
-<li>AI-SQL workloads combine large prefills and shared document
-prefixes, while producing only one Boolean token for each
-evaluation.</li>
-<li>Quail currently uses DeepGEMM for its main matrix multiplications,
-and FlashAttention 3 for attention.</li>
-<li>We have not tried to optimize the matrix multiplication or attention
-kernels themselves.</li>
-<li>If you work on GPU kernels, and this workload sounds interesting, we
-would like to work with you.</li>
-</ul></li>
-<li><p><strong>Train models for AI-SQL operators.</strong></p>
-<ul>
-<li>One direction is to fine tune small models for a particular AI
-predicate and dataset.</li>
-<li>AI filters and joins are prefill oriented, because they process a
-long input and generate only a Boolean answer.</li>
-<li>A custom model for these operators can therefore be optimized for
-prefill, rather than long decode.</li>
-<li>Google’s <a href="https://arxiv.org/abs/2603.15970">work on
-lightweight proxy models</a> uses lightweight classifiers over
-embeddings, rather than small language models.</li>
-<li>The proxy models reduced the cost and latency of simple semantic
-filters by more than 100 times, which suggests that models specialized
-to one query and dataset can be promising.</li>
-<li>The planner could choose between a custom model and the larger model
-for each predicate, based on their expected cost and accuracy.</li>
-<li>We do not yet know how to run the small model while the larger model
-processes other prefills on the same GPU, without reducing the
-throughput of either model.</li>
-<li>Another direction is to train models for AI joins that are
-insensitive to the order of the documents in the prompt.</li>
-<li>Quail chooses which document is the anchor, and therefore which
-document appears first, based on the execution cost of each choice.</li>
-<li>Small models may return different answers when the two documents
-swap positions, so we cannot assume that both anchor choices have the
-same accuracy.</li>
-<li>Perhaps removing RoPE could work, but, we want to study order
-invariant join models, e.g., training on both prompt orders.</li>
-</ul></li>
-</ol>
-<ul>
-<li>More implementation posts, and a technical report, are coming
-soon.</li>
-<li>For now, please try Quail, tell us where it breaks, and reach out if
-you want to work on this research with us.</li>
-<li>We are hiring PhD students and postdocs.</li>
-</ul>
-<h1 id="notes-before-publication">Notes before publication</h1>
-<ul>
-<li>The SQL example should use the exact syntax accepted by the public
-Quail release.</li>
-<li>The query plan figure should show the filter below the join, the
-materialized survivor relation, and the long medical report as the join
-anchor.</li>
-<li>A KV figure should show vLLM retaining blocks from the full filter
-prompt, while Quail releases failed rows and keeps only useful survivor
-prefixes.</li>
-<li>The profiling figure should use the current BIO-3 CPU and GPU
-trace.</li>
-<li>A results figure should compare BIO-3 latency and token work, with
-the speed of light estimate labeled as an estimate.</li>
-<li>A second results figure should compare AGENT-1 latency and fresh
-tokens, and label the shared row prefix reuse that vLLM captures and
-Quail misses.</li>
-<li>The benchmark pass should pin the public commit, model revision,
-vLLM and SGLang versions, Modal GPU type, memory settings, prompt
-templates, anchor choices, and startup policy.</li>
-<li>The benchmark pass should report exact request counts and observed
-selectivities from each backend, because different model answers can
-change downstream work.</li>
-<li>The final version should link the repository, installation page, API
-reference, QUAIL B reproduction commands, and one issue or discussion
-page for feedback.</li>
-</ul>
+<p>We are actively working on Quail, and we are excited about many
+directions. Here are some of the ones we are thinking about now.</p>
+<p><strong>Support more AI-SQL operators.</strong> Quail currently
+supports filters and joins, both of which return only <code>TRUE</code>
+or <code>FALSE</code>, and are 100% prefill. As we add operators such as
+<code>AI_EXTRACT</code> and <code>AI_CLASSIFY</code>, which require
+decode, we’ll need to adapt our cost models and execution
+strategies.</p>
+<p><strong>Support more models and hardware.</strong> Quail currently
+supports Qwen3 4B FP8 and Qwen3 32B FP8 on H100 GPUs. We want to add
+more models, including hybrid models such as Qwen3.5 and Liquid models.
+We also want to support more hardware, including Blackwell GPUs and
+Apple Silicon. We still need to determine how to serve mixture of
+experts models efficiently for AI-SQL.</p>
+<p><strong>Improve KV and HBM management.</strong> We want to support
+automatic prefix caching across rows, and use host CPU DRAM for KV that
+does not fit in GPU HBM. We also want to improve KV management across
+GPUs. Quail currently partitions input documents across model copies,
+but filters can leave each GPU with a different number of surviving
+documents. As a result, one GPU may evict useful KV while another has
+unused HBM, and the GPUs may receive different amounts of downstream
+join work.</p>
+<p><strong>Improve model FLOPs utilization.</strong> Quail currently
+relies on DeepGEMM and FlashAttention for its main GPU kernels. We have
+not optimized the kernels themselves, and we would love to work with
+inference experts who are interested in this workload.</p>
+<p><strong>Train models for AI-SQL operators.</strong> We want to fine
+tune small models for specific predicates, which <a
+href="https://arxiv.org/abs/2603.15970">Google’s work on lightweight
+proxy models for AI-SQL</a> suggests can reduce cost substantially. One
+systems question is how to run and train these models alongside a larger
+model on the same GPU. Moreover, for joins, we want to train models that
+return the same answer when the two documents swap positions, since
+Quail chooses their order based on execution cost.</p>
+<p>More implementation posts, and a technical report, are coming soon.
+For now, please try Quail, tell us where it breaks, and reach out if you
+want to work on this research with us. We are hiring PhD students and
+postdocs.</p>
 <section id="footnotes" class="footnotes footnotes-end-of-document"
 role="doc-endnotes">
 <hr />
@@ -1325,12 +1240,51 @@ role="doc-endnotes">
 href="https://aclanthology.org/2023.findings-emnlp.896/">BioDEX
 dataset</a>.<a href="#fnref1" class="footnote-back"
 role="doc-backlink">↩︎</a></p></li>
-<li id="fn2"><p>In <a
+<li id="fn2"><p>We are building quail-bench to evaluate AI-SQL query
+engines.<a href="#fnref2" class="footnote-back"
+role="doc-backlink">↩︎</a></p></li>
+<li id="fn3"><p>Modal provides useful background on <a
+href="https://modal.com/blog/gpu-utilization-guide">GPU utilization</a>
+and <a
+href="https://modal.com/blog/host-overhead-inference-efficiency">host
+overhead</a> in inference engines.<a href="#fnref3"
+class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn4"><p><em>Model FLOPs utilization (MFU)</em> is the fraction
+of the GPU’s peak arithmetic throughput used during a model forward
+pass. Reaching the speed of light estimate would require 100 percent
+MFU. Quail does not optimize the GPU kernels themselves, so we leave
+that problem to the GPU kernel experts.<a href="#fnref4"
+class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn5"><p>Quail supports both Snowflake’s <code>AI_FILTER</code>
+syntax and BigQuery’s <code>AI.IF</code> syntax.<a href="#fnref5"
+class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn6"><p>We tokenize up to 1,024 documents and calculate the
+average number of tokens per byte. We apply that ratio to the byte
+length of every document in the column.<a href="#fnref6"
+class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn7"><p>The name <code>Exchange</code> comes from Volcano’s <a
+href="https://sigmodrecord.org/1990/06/06/encapsulation-of-parallelism-in-the-volcano-query-processing-system/">exchange
+operator</a>, which repartitions data between parallel operators.<a
+href="#fnref7" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn8"><p>In our measurement over about four million tokens,
+<code>bpe-qwen</code> was about seven times faster than the Hugging Face
+tokenizer.<a href="#fnref8" class="footnote-back"
+role="doc-backlink">↩︎</a></p></li>
+<li id="fn9"><p>In <a
 href="https://www.sailresearch.com/blog/tpu-v6e-gemma">“Chasing Speed of
 Light on TPU v6e”</a>, Sail Research describes increasing Gemma 4 31B
 prefill MFU from about 32 percent to 63 percent through attention
-tuning, communication overlap, and custom kernel work.<a href="#fnref2"
+tuning, communication overlap, and custom kernel work.<a href="#fnref9"
 class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn10"><p>As of September 2026, <a
+href="https://developers.openai.com/api/docs/models/gpt-5-nano">OpenAI
+lists GPT-5 nano</a> at $0.05 per million input tokens, $0.005 per
+million cached input tokens, and $0.40 per million output tokens. The
+estimate applies the regular rate to 32.50 million input tokens, the
+cached rate to 8.41 million document tokens reused by the second filter,
+and the output rate to 200,000 tokens. We assume an infinite cache, so
+every reusable document token receives the cached rate.<a
+href="#fnref10" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
 </ol>
 </section>
 </body>

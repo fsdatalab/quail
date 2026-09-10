@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Lora:wght@600;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&family=Lora:wght@600;700&display=swap");
 
 html {
   background: #ffffff;
@@ -54,18 +54,192 @@ a {
 
 code,
 pre {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-variant-ligatures: none;
+}
+
+:not(pre) > code {
+  font-size: 0.94em;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+}
+
+pre {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  padding: 1rem 1.1rem;
+  overflow-x: hidden;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  background: #f8fafc;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+pre code {
+  font-size: inherit;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  white-space: inherit;
+  overflow-wrap: inherit;
+}
+
+div.sourceCode {
+  max-width: 100%;
+  overflow-x: visible;
+}
+
+pre > code.sourceCode {
+  white-space: pre-wrap;
+}
+
+pre > code.sourceCode > span {
+  display: inline;
+  overflow-wrap: anywhere;
+}
+
+mjx-container {
+  color: inherit;
+}
+
+mjx-container:not([display="true"]) {
+  font-size: 0.92em !important;
+}
+
+mjx-container[display="true"] {
+  margin: 1.25rem 0 !important;
+  overflow-x: auto;
+  overflow-y: hidden;
+  font-size: 1.15em !important;
 }
 
 figcaption {
   color: #4b5563;
   font-size: 0.9rem;
-  line-height: 1.4;
+  line-height: 1.5;
 }
 
 table {
+  display: table;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  margin: 1.5rem 0 2rem;
+  border-collapse: collapse;
+  border-top: 1px solid #cbd5e1;
+  font-size: 0.92rem;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+}
+
+thead {
+  border-bottom: 1px solid #94a3b8;
+}
+
+tbody tr {
+  border-bottom: 1px solid #e5e7eb;
+}
+
+th,
+td {
+  padding: 0.65rem 0.7rem;
+  vertical-align: top;
+}
+
+th {
+  color: #111827;
+  font-weight: 600;
+}
+
+th:first-child,
+td:first-child {
+  padding-left: 0.25rem;
+}
+
+th:last-child,
+td:last-child {
+  padding-right: 0.25rem;
+}
+
+.metrics-table table,
+.example-data-table table {
+  table-layout: fixed;
+}
+
+.metrics-table col:nth-child(1) {
+  width: 56% !important;
+}
+
+.metrics-table col:nth-child(2),
+.metrics-table col:nth-child(3) {
+  width: 22% !important;
+}
+
+.example-data-table table {
+  font-size: 0.84rem;
+}
+
+.example-data-table col:nth-child(1) {
+  width: 22% !important;
+}
+
+.example-data-table col:nth-child(2) {
+  width: 18% !important;
+}
+
+.example-data-table col:nth-child(3) {
+  width: 12% !important;
+}
+
+.example-data-table col:nth-child(4) {
+  width: 48% !important;
+}
+
+.example-data-table code {
+  overflow-wrap: anywhere;
+  font-size: 0.94em;
+  font-weight: 400;
+}
+
+img,
+svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.figure-block {
+  margin: 1.75rem 0;
+}
+
+.figure-block > p:first-child {
+  margin: 0;
+}
+
+.figure-block img {
   display: block;
-  overflow-x: auto;
+  width: 100% !important;
+}
+
+.figure-block > p:last-child {
+  margin: 0.75rem 0 0;
+  color: #4b5563;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.wide-figure {
+  width: min(68rem, calc(100vw - 2rem));
+  max-width: none;
+  margin-left: calc(50% - min(34rem, 50vw - 1rem));
+}
+
+.wide-figure > p:last-child,
+.wide-figure figcaption {
+  max-width: 43rem;
+  margin: 0.75rem auto 0;
 }
 
 @media (max-width: 600px) {
