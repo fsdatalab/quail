@@ -34,7 +34,7 @@ then joins them with the movie aspects they discuss.
 - Tables are downloaded from public S3 as Arrow tables. No AWS account is needed.
 - Add `limit=100` for a small example. Omit it for a full benchmark run.
 - For execution, use your engine's runner. For example, the
-  [Quail runner](https://github.com/fsdatalab/quail-exploration/blob/blogs/quail/bench/quailb.py)
+  [Quail runner](https://github.com/fsdatalab/quail-exploration/blob/main/quail/bench/quailb.py)
   translates these definitions into Quail queries.
 
 See the [query definitions](quail_b/queries.py),
