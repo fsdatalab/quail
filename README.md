@@ -47,8 +47,8 @@ The runner compares its answers with the saved reference labels using
 FEVER and LePaRD also use source labels. Keep the query id, scale factor,
 and label collection id with the results.
 
-For a Quail run, use its saved summary JSON. Run the following command from
-the [Quail repository](https://github.com/fsdatalab/quail-exploration), not here:
+For example, Quail generates a report from its saved summary JSON with this
+command, run from the [Quail repository](https://github.com/fsdatalab/quail-exploration):
 
 ```sh
 uv run --with matplotlib python reports/make_quailb_eval_plots.py \
@@ -56,7 +56,7 @@ uv run --with matplotlib python reports/make_quailb_eval_plots.py \
     --report /path/to/report.md
 ```
 
-The script writes a Markdown report and a PNG with timings, costs, token
+Quail's script writes a Markdown report and a PNG with timings, costs, token
 counts, and accuracy. It reads saved results and does not rerun inference.
 Other engines can use QUAIL-B's [scoring functions](quail_b/scoring.py)
 to produce their own reports.
